@@ -267,7 +267,20 @@ struct SearchEngineState {
     /// for O(1) lookup; updated only at engine start (env changes
     /// mid-run are not picked up to keep the hot path lock-free).
     ignored_servers: std::collections::HashSet<Ipv4Addr>,
+    /// R2-43 (partial): recently-resolved searches kept for a short
+    /// TTL so a *second* SEARCH reply for the same cid (announcing a
+    /// different server) can be diagnosed as "multiply-defined PV".
+    /// libca `cac.cpp::transferChanToVirtCircuit` runs an async DNS
+    /// lookup and emits the canonical
+    /// `Channel: <PV> connected to: <X> but searched on: <Y>`
+    /// diagnostic. Rust emits the IP-only variant — no async DNS to
+    /// avoid pulling a resolver into the search hot path. Entry is
+    /// FIFO-evicted at `MULTIPLY_DEFINED_RESOLVED_CAP` to bound
+    /// memory and removed on `remove_channel`.
+    resolved: HashMap<u32, (String, SocketAddr)>,
 }
+
+const MULTIPLY_DEFINED_RESOLVED_CAP: usize = 1024;
 
 impl SearchEngineState {
     #[cfg(test)]
@@ -288,6 +301,7 @@ impl SearchEngineState {
             last_valid_seq: None,
             send_errors: HashMap::new(),
             ignored_servers: super::epics_rs_client_ignore().into_iter().collect(),
+            resolved: HashMap::new(),
         }
     }
 
@@ -297,6 +311,9 @@ impl SearchEngineState {
             self.buckets[p.bucket].retain(|x| *x != cid);
         }
         self.attempts.remove(&cid);
+        // R2-43: drop the multiply-defined tracker — a new CREATE_CHAN
+        // for the same cid is a fresh resolution lifecycle.
+        self.resolved.remove(&cid);
     }
 
     /// pvxs `client.cpp:713 poke()` parity: reset every pending
@@ -1124,7 +1141,36 @@ fn handle_search_response(
                         pv = %pv_name, cid, server = %server_addr,
                         "PV search resolved"
                     );
+                    // R2-43: record the resolved server so a second
+                    // SEARCH reply for the same cid (from a different
+                    // IOC) can be diagnosed as multiply-defined.
+                    if state.resolved.len() >= MULTIPLY_DEFINED_RESOLVED_CAP {
+                        if let Some(&victim) = state.resolved.keys().next() {
+                            state.resolved.remove(&victim);
+                        }
+                    }
+                    state.resolved.insert(cid, (pv_name, server_addr));
                     let _ = response_tx.send(SearchResponse::Found { cid, server_addr });
+                } else if let Some((pv_name, prev_addr)) = state.resolved.get(&cid) {
+                    // R2-43: cid already resolved. If the second reply
+                    // names a different server, this is the
+                    // libca `msgForMultiplyDefinedPV` condition — the
+                    // same PV is hosted on two IOCs and silent races
+                    // would otherwise surface as intermittent data
+                    // corruption. Emit a canonical-shape diagnostic
+                    // (IP-only; no async DNS lookup — see
+                    // `SearchEngineState::resolved` docstring).
+                    if *prev_addr != server_addr {
+                        tracing::warn!(
+                            target: "epics_ca_rs::client::search",
+                            pv = %pv_name,
+                            cid,
+                            connected_to = %prev_addr,
+                            but_also_on = %server_addr,
+                            "Channel multiply defined: PV is also hosted on a second server"
+                        );
+                        metrics::counter!("ca_client_multiply_defined_pv_total").increment(1);
+                    }
                 }
             }
             CA_PROTO_NOT_FOUND => {

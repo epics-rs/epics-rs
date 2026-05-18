@@ -545,16 +545,6 @@ C reference: `libca/cac.cpp:60-89` TCP jump table includes `CA_PROTO_SEARCH` (`s
 
 Impact: a CA name server or gateway emitting these frames kills the Rust circuit per occurrence. R2-29 made unknown lethal — gap is misclassifying known-valid opcodes as unknown.
 
-### R2-43: No equivalent of libca's `msgForMultiplyDefinedPV` diagnostic
-
-Severity: Low
-
-Rust: `client/search.rs:1072-1099` silently advances when SEARCH reply arrives for a cid no longer pending.
-
-C reference: `libca/cac.cpp:591-661` `transferChanToVirtCircuit` compares responding server address against the channel's already-resolved address. If different, constructs `msgForMultiplyDefinedPV` with async DNS lookup; emits canonical diagnostic `"Channel: <PV> connected to: <X> but searched on: <Y>"`.
-
-Impact: site-misconfiguration where same PV is exposed by two IOCs gets immediate actionable diagnostics from libca; Rust silently uses whichever answered first, surfacing as data races later.
-
 ### R2-45: Oversized TCP payload kills circuit; libca skips message
 
 Severity: Low
@@ -827,6 +817,21 @@ then runs the standard `recv_loop`. Mirrors `rsrv/caservertask.c:367-371,
 633-668` (`casMCastAddrList` + per-NIC `IP_ADD_MEMBERSHIP`). Multicast
 SEARCH topologies now receive replies from a Rust IOC configured with
 multicast intf entries.
+
+### R2-43: Multiply-defined PV diagnostic now emitted (IP-only variant)
+
+`client/search.rs::SearchEngineState` gained a `resolved:
+HashMap<u32, (String, SocketAddr)>` map (FIFO-evicted at 1024 entries,
+dropped on `remove_channel`). The Found path inserts the resolution;
+a *second* SEARCH reply for the same cid hits the new
+`else if let Some((pv_name, prev_addr)) = state.resolved.get(&cid)`
+branch and — when the new server differs — logs at warn:
+`Channel multiply defined: PV is also hosted on a second server`
+with `pv`/`cid`/`connected_to`/`but_also_on` fields, plus a
+`ca_client_multiply_defined_pv_total` metric. Partial vs. libca: no
+async DNS lookup, so we emit IPs instead of hostnames — adding a
+resolver to the search hot path would be a heavier change than the
+diagnostic warrants.
 
 ### R2-44: VERSION priority field is wire-equivalent at default
 

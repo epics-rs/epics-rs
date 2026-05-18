@@ -157,20 +157,23 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
         // registration (backward compat with pre-3.12 repeaters).
         //
         // R2-20: C `register_new_client` (`repeater.cpp:374-424`)
-        // applies the same loopback gate to BOTH the zero-length
+        // applies the same locality gate to BOTH the zero-length
         // legacy form and `CA_PROTO_REPEATER_REGISTER`. Pre-fix
         // Rust registered any zero-length datagram regardless of
-        // source — a remote host that could reach the repeater
-        // port could become a registered fan-out recipient,
-        // exposing beacon traffic / PV presence outside the local
-        // host and turning local beacon traffic into outbound
-        // sends to the remote. Match C: zero-length registrations
-        // must come from a loopback source too.
+        // source.
+        //
+        // R2-35: C accepts loopback OR any source IP that belongs
+        // to a local interface (the bind-test compatibility quirk
+        // for clients alternating between loopback and the first
+        // non-loopback interface). Use the same `is_local_source`
+        // helper as `CA_PROTO_REPEATER_REGISTER` so a site-local
+        // legacy client registering from e.g. `192.168.x.y` is
+        // accepted, matching C.
         if len == 0 {
-            if !src.ip().is_loopback() {
+            if !is_local_source(src) {
                 tracing::warn!(
                     src = %src,
-                    "caRepeater: zero-length registration from non-loopback source rejected"
+                    "caRepeater: zero-length registration from non-local source rejected"
                 );
                 metrics::counter!("ca_repeater_register_non_loopback_rejects_total").increment(1);
                 continue;
@@ -206,10 +209,15 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
             // transition); modern libca always uses 127.0.0.1
             // (`repeater.cpp:466-478` `caRepeaterRegistrationMessage`
             // sets the destination to loopback explicitly).
-            if !src.ip().is_loopback() {
+            // R2-35: accept loopback OR any source IP that
+            // belongs to a local interface (C bind-test
+            // compatibility, `repeater.cpp::register_new_client`
+            // accepts a non-loopback source if `bind()` to that
+            // address succeeds locally).
+            if !is_local_source(src) {
                 tracing::warn!(
                     src = %src,
-                    "caRepeater: REPEATER_REGISTER from non-loopback source rejected"
+                    "caRepeater: REPEATER_REGISTER from non-local source rejected"
                 );
                 metrics::counter!("ca_repeater_register_non_loopback_rejects_total").increment(1);
                 continue;
@@ -245,6 +253,25 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
 struct DatagramAction {
     register: bool,
     fanout: Option<Vec<u8>>,
+}
+
+/// R2-35: C `repeater.cpp::register_new_client` accepts a registration
+/// when the source IP is loopback OR when `bind()` to that address
+/// succeeds locally (the 3.13-era compatibility quirk that allows
+/// clients which alternate between loopback and the first non-
+/// loopback interface). Pre-fix Rust simplified to loopback-only.
+/// We replicate the C bind-test by trying to bind a fresh UDP socket
+/// to `(src.ip(), 0)`; if the kernel accepts the bind, the address
+/// belongs to a local interface.
+fn is_local_source(src: SocketAddr) -> bool {
+    if src.ip().is_loopback() {
+        return true;
+    }
+    match src {
+        SocketAddr::V4(v4) => StdUdpSocket::bind(SocketAddrV4::new(*v4.ip(), 0)).is_ok(),
+        // C `register_new_client` rejects non-AF_INET (IPv6) explicitly.
+        SocketAddr::V6(_) => false,
+    }
 }
 
 fn decode_datagram(buf: &[u8], hdr: &CaHeader, src: SocketAddr) -> DatagramAction {

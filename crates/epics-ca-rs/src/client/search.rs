@@ -435,7 +435,9 @@ pub(crate) async fn run_search_engine(
 
             tcp_dgram = tcp_response_rx.recv() => {
                 let Some((bytes, src)) = tcp_dgram else { continue };
-                handle_udp_response(&mut state, &bytes, src, &response_tx);
+                // R2-26: TCP nameserver path uses the libca-equivalent
+                // SEARCH-reply contract (no per-reply VERSION header).
+                handle_tcp_response(&mut state, &bytes, src, &response_tx);
             }
 
             _ = tick.tick() => {
@@ -531,15 +533,19 @@ async fn run_nameserver_connection(
         let user = epics_base_rs::runtime::env::get("USER")
             .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
             .unwrap_or_else(|| "unknown".to_string());
+        // R2-28: extended-form headers when the USER / hostname
+        // payload exceeds 16-bit postsize (libca's
+        // `insertRequestHeader` parity). See the matching note in
+        // `client/transport.rs` connect path.
         let user_payload = pad_string(&user);
         let mut client = CaHeader::new(CA_PROTO_CLIENT_NAME);
-        client.postsize = user_payload.len() as u16;
-        handshake.extend_from_slice(&client.to_bytes());
+        client.set_payload_size(user_payload.len(), 0);
+        handshake.extend_from_slice(&client.to_bytes_extended());
         handshake.extend_from_slice(&user_payload);
         let host_payload = pad_string(&epics_base_rs::runtime::env::hostname());
         let mut host = CaHeader::new(CA_PROTO_HOST_NAME);
-        host.postsize = host_payload.len() as u16;
-        handshake.extend_from_slice(&host.to_bytes());
+        host.set_payload_size(host_payload.len(), 0);
+        handshake.extend_from_slice(&host.to_bytes_extended());
         handshake.extend_from_slice(&host_payload);
         if writer.write_all(&handshake).await.is_err() {
             tokio::time::sleep(backoff).await;
@@ -893,6 +899,34 @@ fn handle_udp_response(
     src: SocketAddr,
     response_tx: &mpsc::UnboundedSender<SearchResponse>,
 ) {
+    handle_search_response(state, data, src, response_tx, /*is_tcp=*/ false);
+}
+
+/// R2-26: C `libca/tcpiiu.cpp::searchRespNotify` accepts TCP search
+/// replies directly — TCP search replies from
+/// `rsrv/camessage.c::search_reply_tcp` carry no per-reply VERSION
+/// header. The UDP freshness check (`last_valid_seq`) does not
+/// apply on TCP. Pre-fix Rust fed TCP responses into the same UDP
+/// handler, so a SEARCH reply was accepted only when a VERSION
+/// happened to land in the same TCP segment — making TCP discovery
+/// depend on TCP segmentation. The `is_tcp` flag bypasses the
+/// VERSION-required gate on the TCP path.
+fn handle_tcp_response(
+    state: &mut SearchEngineState,
+    data: &[u8],
+    src: SocketAddr,
+    response_tx: &mpsc::UnboundedSender<SearchResponse>,
+) {
+    handle_search_response(state, data, src, response_tx, /*is_tcp=*/ true);
+}
+
+fn handle_search_response(
+    state: &mut SearchEngineState,
+    data: &[u8],
+    src: SocketAddr,
+    response_tx: &mpsc::UnboundedSender<SearchResponse>,
+    is_tcp: bool,
+) {
     if data.len() < CaHeader::SIZE {
         return;
     }
@@ -905,7 +939,12 @@ fn handle_udp_response(
     // first datagram but accepted later after an unrelated VERSION-
     // bearing response set the marker. Reset here to keep the
     // freshness check datagram-local.
-    state.last_valid_seq = None;
+    //
+    // R2-26: TCP replies carry no VERSION; pre-seed `last_valid_seq`
+    // to `Some(0)` so the SEARCH-required-VERSION gate further
+    // below treats every TCP search reply as valid (libca
+    // `searchRespNotify` does no seq check on TCP).
+    state.last_valid_seq = if is_tcp { Some(0) } else { None };
 
     let recv_time = Instant::now();
     let mut offset = 0;
@@ -1313,7 +1352,14 @@ fn build_search_payload(cid: u32, pv_name: &str) -> Vec<u8> {
 
     let mut search_hdr = CaHeader::new(CA_PROTO_SEARCH);
     search_hdr.postsize = pv_payload.len() as u16;
-    search_hdr.data_type = CA_DO_REPLY;
+    // R2-30: C `libca/udpiiu.cpp::searchMsg()` sets
+    // `m_dataType = DONTREPLY`. The TCP search path on the server
+    // only sends CA_PROTO_NOT_FOUND when `DOREPLY` is set, and
+    // libca's TCP response table treats CA_PROTO_NOT_FOUND as a
+    // bad TCP response. Pre-fix Rust used `CA_DO_REPLY` for every
+    // search, eliciting negative replies that libca never asks
+    // for and that the Rust parser then ignores.
+    search_hdr.data_type = CA_DONT_REPLY;
     search_hdr.count = CA_MINOR_VERSION;
     search_hdr.cid = cid;
     search_hdr.available = cid;

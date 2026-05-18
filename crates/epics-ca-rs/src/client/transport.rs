@@ -509,18 +509,23 @@ fn process_command(
         } => {
             let mut hdr = CaHeader::new(CA_PROTO_EVENT_CANCEL);
             hdr.data_type = data_type;
-            // R2-23: include the subscription's original count
-            // (libca `tcpiiu.cpp::subscriptionCancelRequest()` parity).
-            // Pre-fix Rust left `m_count = 0` here so the CANCEL frame
-            // diverged from libca byte-for-byte on the wire.
-            hdr.count = count as u16;
+            // R2-23 refinement: include the subscription's original
+            // count, and serialise in extended form for counts
+            // >= 0xFFFF. libca
+            // `tcpiiu.cpp::subscriptionCancelRequest` routes through
+            // `comQueSend::insertRequestHeader` which emits the
+            // extended annex automatically. Pre-fix Rust truncated
+            // the count to u16 and used `to_bytes()`, so a CANCEL
+            // for a >= 65,535-element monitor lost the count and
+            // diverged from libca byte-for-byte.
+            hdr.set_payload_size(0, count);
             hdr.cid = sid;
             hdr.available = subid;
             send_frame(
                 connections,
                 server_writers,
                 server_addr,
-                hdr.to_bytes().to_vec(),
+                hdr.to_bytes_extended(),
                 event_tx,
             );
         }
@@ -670,16 +675,25 @@ async fn connect_server(
     let username = epics_base_rs::runtime::env::get("USER")
         .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
         .unwrap_or_else(|| "unknown".to_string());
+    // R2-28: C `libca/tcpiiu.cpp::userNameSetRequest` and
+    // `hostNameSetRequest` route through `comQueSend::
+    // insertRequestHeader` which emits the extended annex when
+    // the payload exceeds 16 bits. Pre-fix Rust truncated the
+    // postsize via `as u16` while still writing the full payload,
+    // so an unusually large USER/USERNAME env value or hostname
+    // produced a frame the server parses as if the excess bytes
+    // were the next CA header — desynchronising the circuit
+    // before channel creation.
     let user_payload = pad_string(&username);
     let mut user_hdr = CaHeader::new(CA_PROTO_CLIENT_NAME);
-    user_hdr.postsize = user_payload.len() as u16;
-    handshake.extend_from_slice(&user_hdr.to_bytes());
+    user_hdr.set_payload_size(user_payload.len(), 0);
+    handshake.extend_from_slice(&user_hdr.to_bytes_extended());
     handshake.extend_from_slice(&user_payload);
     let hostname = epics_base_rs::runtime::env::hostname();
     let host_payload = pad_string(&hostname);
     let mut host_hdr = CaHeader::new(CA_PROTO_HOST_NAME);
-    host_hdr.postsize = host_payload.len() as u16;
-    handshake.extend_from_slice(&host_hdr.to_bytes());
+    host_hdr.set_payload_size(host_payload.len(), 0);
+    handshake.extend_from_slice(&host_hdr.to_bytes_extended());
     handshake.extend_from_slice(&host_payload);
     pending_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _ = write_tx.send(handshake);
@@ -1265,7 +1279,22 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // this path. But Rust client ↔ C IOC does — C IOC
                     // delivers the no-read-access frame instead of
                     // tearing down. Gate matches libca.
-                    if hdr.cid != ECA_NORMAL {
+                    //
+                    // R2-27: C `libca/cac.cpp::eventRespAction()`
+                    // returns immediately when `!hdr.m_postsize`,
+                    // BEFORE the status/payload handling. Rsrv's
+                    // `event_cancel_reply` intentionally sends a
+                    // zero-payload `CA_PROTO_EVENT_ADD` confirmation;
+                    // treating it as monitor data or as a status
+                    // error surfaces the cancel ack as a bogus
+                    // monitor event in the rare race where the
+                    // subscription record is still present. The
+                    // `if/else if/else` chain below skips the entire
+                    // monitor delivery path when this is set — the
+                    // outer `offset += msg_len` still advances.
+                    if actual_post == 0 {
+                        // zero-payload EVENT_ADD = cancel ack, drop silently
+                    } else if hdr.cid != ECA_NORMAL {
                         // libca `cac::eventAddRespAction`
                         // (`cac.cpp:973-977`): when the monitor frame
                         // carries a non-NORMAL status, drop the
@@ -1449,7 +1478,29 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         server_addr,
                     });
                 }
-                _ => {}
+                unknown => {
+                    // R2-29: C `libca/cac.cpp::executeResponse()`
+                    // dispatches unknown opcodes to
+                    // `badTCPRespAction()`, which logs and returns
+                    // false; `tcpiiu.cpp` treats
+                    // `processIncoming() == false` as a protocol
+                    // failure and calls `initiateAbortShutdown()`.
+                    // Pre-fix Rust skipped unknown opcodes
+                    // silently — a broken or hostile server could
+                    // inject response frames that libca uses to
+                    // tear down the circuit while Rust quietly
+                    // advanced past them. Emit TcpClosed so the
+                    // coordinator drops the circuit; the
+                    // surrounding reconnect path will rebuild.
+                    tracing::warn!(
+                        server = %server_addr,
+                        cmd = unknown,
+                        "unknown TCP response opcode; closing circuit (C badTCPRespAction parity)"
+                    );
+                    metrics::counter!("ca_client_bad_tcp_response_total").increment(1);
+                    let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                    return;
+                }
             }
 
             offset += msg_len;

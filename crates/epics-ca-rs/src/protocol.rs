@@ -56,6 +56,9 @@ pub const DBE_PROPERTY: u16 = 8;
 
 // Reply flags
 pub const CA_DO_REPLY: u16 = 10;
+/// C `caProto.h`: `DONTREPLY = 5u`. Used by libca search requests to
+/// suppress per-request NOT_FOUND replies.
+pub const CA_DONT_REPLY: u16 = 5;
 
 // ECA status codes — DEFMSG(severity, msg_no) encoding per caerr.h.
 // Values match epics-base verbatim so the wire protocol is interoperable.

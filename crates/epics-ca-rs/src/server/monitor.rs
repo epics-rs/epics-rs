@@ -145,18 +145,28 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     // `rsrv/camessage.c:507-571` parity). The helper returns the
     // header count to use; `data_count == 0` means autosize (use the
     // live snapshot count).
+    // R2-12 refinement: enforce request count in BOTH directions —
+    // pad when requested > actual AND truncate when requested <
+    // actual. C `read_reply` (`rsrv/camessage.c:507-571`) sizes
+    // the payload to `dbr_size_n(type, request_count)` either way.
     let actual_count = event.snapshot.value.count() as u32;
     let element_count = if data_type == epics_base_rs::types::DBR_CLASS_NAME {
         1
     } else if data_count == 0 {
         actual_count
-    } else {
-        let extra = data_count.saturating_sub(actual_count) as usize;
-        if extra > 0 {
-            if let Ok(native) = epics_base_rs::types::native_type_for_dbr(data_type) {
-                payload.extend(std::iter::repeat_n(0u8, extra * native.element_size()));
+    } else if let Ok(native) = epics_base_rs::types::native_type_for_dbr(data_type) {
+        let meta_size = epics_base_rs::types::dbr_buffer_size(data_type, native, 0);
+        let target_size = meta_size + (data_count as usize) * native.element_size();
+        if data_count > actual_count {
+            let cur = payload.len();
+            if cur < target_size {
+                payload.extend(std::iter::repeat_n(0u8, target_size - cur));
             }
+        } else if data_count < actual_count && payload.len() > target_size {
+            payload.truncate(target_size);
         }
+        data_count
+    } else {
         data_count
     };
     let mut padded = payload;

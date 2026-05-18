@@ -1723,10 +1723,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 ));
             }
 
-            let end = payload
+            // R2-33: C `claim_ciu_action` (`rsrv/camessage.c`) forces
+            // `pName[mp->m_postsize - 1] = '\0'` after rejecting
+            // `m_postsize <= 1`. Effect: an unterminated name of
+            // exactly `postsize` non-NUL bytes is treated as a
+            // `postsize - 1` byte name. Pre-fix Rust used all
+            // `payload.len()` bytes on the unterminated path, so a
+            // malformed peer could resolve a different name than
+            // rsrv would.
+            let scan_end = payload.len().saturating_sub(1).max(0);
+            let end = payload[..scan_end]
                 .iter()
                 .position(|&b| b == 0)
-                .unwrap_or(payload.len());
+                .unwrap_or(scan_end);
             let pv_name = String::from_utf8_lossy(&payload[..end]).to_string();
             let client_cid = hdr.cid;
             // epics-base 3.15.7 channel-filter suffix
@@ -1883,6 +1892,35 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let ioid = hdr.available;
             let requested_type = hdr.data_type;
             let requested_count = hdr.actual_count();
+
+            // R2-34: C `read_notify_action` (`rsrv/camessage.c:693-697`)
+            // checks `INVALID_DB_REQ(m_dataType)` BEFORE the channel
+            // lookup and returns RSRV_ERROR with no wire frame.
+            // Deprecated `read_action` resolves the channel first
+            // but still checks `INVALID_DB_REQ` BEFORE the access
+            // check — bad DBR type sends ECA_BADTYPE + drops. Pre-
+            // fix Rust ran the access check first, so a read-denied
+            // peer sending a bad DBR type saw a NORDACCESS reply
+            // (or, on READ_NOTIFY, a `no_read_access_event` frame
+            // using an invalid type) where rsrv would have treated
+            // the request as a bad protocol frame and dropped.
+            // `LAST_BUFFER_TYPE = 38` (caProto.h); request types
+            // above that are not encodable.
+            const LAST_BUFFER_TYPE: u16 = 38;
+            if requested_type > LAST_BUFFER_TYPE {
+                if !is_notify {
+                    // Deprecated READ: ECA_BADTYPE via CA_PROTO_ERROR.
+                    // We don't have entry.cid yet (matches C: bad
+                    // type is checked before channel lookup is
+                    // strictly required), so use the sentinel.
+                    send_ca_error(writer, hdr, ECA_BADTYPE, u32::MAX, "bad READ data type").await?;
+                }
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "READ with unsupported DBR type {} > LAST_BUFFER_TYPE \
+                     (matches C read_(notify_)action INVALID_DB_REQ RSRV_ERROR)",
+                    requested_type
+                )));
+            }
 
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,
@@ -2150,29 +2188,22 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     Ok(g) => g,
                     Err(denied) => {
                         if is_notify {
-                            let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-                            resp.data_type = hdr.data_type;
-                            resp.count = hdr.count;
-                            resp.cid = denied.eca_code();
-                            resp.available = ioid;
-                            let mut w = writer.lock().await;
-                            w.write_all(&resp.to_bytes()).await?;
+                            send_put_notify_response(
+                                writer,
+                                hdr.data_type,
+                                hdr.actual_count(),
+                                denied.eca_code(),
+                                ioid,
+                            )
+                            .await?;
                         } else {
                             // C `write_action` (`rsrv/camessage.c:741-751`)
                             // sends `send_err(mp, ECA_NOWTACCESS, client,
-                            // RECORD_NAME(pciu->dbch))` — i.e.
-                            // CA_PROTO_ERROR — for the deprecated
-                            // CA_PROTO_WRITE on write denial. DBR_PUT_ACKT/
-                            // DBR_PUT_ACKS travel the same WRITE opcodes,
-                            // so this branch covers alarm-acknowledge PUTs
-                            // too. Pre-fix Rust silently dropped the
-                            // denied PROTO_WRITE, so a libca client looked
-                            // like its put had succeeded — no error
-                            // callback even though the value never
-                            // reached the DB.
-                            // R2-15: outer cid is `pciu->cid` per C
-                            // `vsend_err` (camessage.c:160-170), not
-                            // the SID we received in `hdr.cid`.
+                            // RECORD_NAME(pciu->dbch))` even for the no-
+                            // notify WRITE. DBR_PUT_ACKT/DBR_PUT_ACKS
+                            // travel the same WRITE opcodes, so this
+                            // branch covers alarm-acknowledge PUTs too.
+                            // R2-15: outer cid is `pciu->cid`.
                             let audit_pv = match &entry.target {
                                 ChannelTarget::SimplePv(pv) => pv.name.clone(),
                                 ChannelTarget::RecordField { record, field } => {
@@ -2215,14 +2246,8 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         Ok(()) => ECA_NORMAL,
                         Err(_) => ECA_PUTFAIL,
                     };
-                    let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-                    resp.data_type = hdr.data_type;
-                    resp.count = hdr.count;
-                    resp.cid = eca;
-                    resp.available = ioid;
-                    let mut w = writer.lock().await;
-                    w.write_all(&resp.to_bytes()).await?;
-                    // flush deferred to handle_client outer loop (batched)
+                    send_put_notify_response(writer, hdr.data_type, hdr.actual_count(), eca, ioid)
+                        .await?;
                 } else if let Err(e) = &result {
                     // R2-14: deprecated CA_PROTO_WRITE for DBR_PUT_ACKT/
                     // DBR_PUT_ACKS must surface put failure via
@@ -2296,17 +2321,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     if is_notify {
                         // R2-8: C `putNotifyErrorReply` (`camessage.c:
                         // 1482-1501`) preserves `m_dataType` and
-                        // `m_count` from the request. Pre-fix Rust
-                        // used `send_cmd_error` which always emits
-                        // `count = 0` — diverges from libca byte-
-                        // for-byte on the wire.
-                        let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-                        resp.data_type = hdr.data_type;
-                        resp.count = hdr.count;
-                        resp.cid = ECA_BADTYPE;
-                        resp.available = ioid;
-                        let mut w = writer.lock().await;
-                        w.write_all(&resp.to_bytes()).await?;
+                        // `m_count` from the request — `caHdrLargeArray`
+                        // count is the 32-bit decoded value re-emitted
+                        // in extended form when needed.
+                        send_put_notify_response(
+                            writer,
+                            hdr.data_type,
+                            hdr.actual_count(),
+                            ECA_BADTYPE,
+                            ioid,
+                        )
+                        .await?;
                     } else {
                         send_ca_error(writer, hdr, ECA_BADTYPE, entry_cid, "bad data type").await?;
                     }
@@ -2349,7 +2374,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             };
 
             let count = hdr.actual_count() as usize;
-            let write_count = hdr.count; // Echo back in response (matches C EPICS)
+            // R2-8 refinement: echo the FULL 32-bit count
+            // (`hdr.actual_count()`); pre-fix used `hdr.count`
+            // which is the 0 marker for extended requests and
+            // therefore lost the count on large array put-callbacks.
+            let write_count = hdr.actual_count();
             let new_value = match EpicsValue::from_bytes_array(write_type, payload, count) {
                 Ok(v) => v,
                 Err(_) => {
@@ -2359,16 +2388,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // drop the connection. C `caNetConvert` failure
                     // in `write_action` returns RSRV_ERROR.
                     if is_notify {
-                        // R2-8: same `putNotifyErrorReply` shape as
-                        // the bad-DBR-type branch above — preserve
-                        // request count and data type.
-                        let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-                        resp.data_type = hdr.data_type;
-                        resp.count = hdr.count;
-                        resp.cid = ECA_BADTYPE;
-                        resp.available = ioid;
-                        let mut w = writer.lock().await;
-                        w.write_all(&resp.to_bytes()).await?;
+                        // R2-8 same `putNotifyErrorReply` shape.
+                        send_put_notify_response(
+                            writer,
+                            hdr.data_type,
+                            hdr.actual_count(),
+                            ECA_BADTYPE,
+                            ioid,
+                        )
+                        .await?;
                     } else {
                         send_ca_error(
                             writer,
@@ -2466,13 +2494,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // writes).
                     let busy_arc = entry.put_notify_busy.clone();
                     if busy_arc.swap(true, Ordering::AcqRel) {
-                        let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-                        resp.data_type = write_type as u16;
-                        resp.count = write_count;
-                        resp.cid = ECA_PUTCBINPROG;
-                        resp.available = ioid;
-                        let mut w = writer.lock().await;
-                        w.write_all(&resp.to_bytes()).await?;
+                        send_put_notify_response(
+                            writer,
+                            write_type as u16,
+                            write_count,
+                            ECA_PUTCBINPROG,
+                            ioid,
+                        )
+                        .await?;
                         return Ok(());
                     }
                     let writer_c = writer.clone();
@@ -2488,14 +2517,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             Err(_) => ECA_PUTFAIL,
                         };
 
-                        let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-                        resp.data_type = write_type as u16;
-                        resp.count = write_count;
-                        resp.cid = final_status;
-                        resp.available = ioid;
-
+                        let _ = send_put_notify_response(
+                            &writer_c,
+                            write_type as u16,
+                            write_count,
+                            final_status,
+                            ioid,
+                        )
+                        .await;
                         let mut w = writer_c.lock().await;
-                        let _ = w.write_all(&resp.to_bytes()).await;
                         let _ = w.flush().await;
                         drop(w);
                         // Clear the per-channel busy gate so the next
@@ -2515,15 +2545,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     state.write_notify_tasks.push((sid, join.abort_handle()));
                 } else {
                     // Synchronous completion — respond immediately
-                    let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-                    resp.data_type = write_type as u16;
-                    resp.count = write_count;
-                    resp.cid = eca_status;
-                    resp.available = ioid;
-
-                    let mut w = writer.lock().await;
-                    w.write_all(&resp.to_bytes()).await?;
-                    // flush deferred to handle_client outer loop (batched)
+                    send_put_notify_response(
+                        writer,
+                        write_type as u16,
+                        write_count,
+                        eca_status,
+                        ioid,
+                    )
+                    .await?;
                 }
             }
         }
@@ -2545,12 +2574,24 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .filter(|s| s.channel_sid == sid)
                 .count();
             if subs_for_channel >= max_subs_per_channel() {
-                send_cmd_error(
+                // R2-36: C `event_add_action` sends admission
+                // failures through `send_err(ECA_ALLOCMEM, ...)`
+                // i.e. CA_PROTO_ERROR — libca's
+                // `cac::eventRespAction` returns immediately for
+                // zero-payload EVENT_ADD because that shape is the
+                // historical cancel-confirmation no-op. Pre-fix
+                // Rust used `send_cmd_error` which emits zero-
+                // payload EVENT_ADD, so a libca client treated the
+                // refusal as a cancel ack and waited forever for
+                // monitor updates that never arrived. Use
+                // CA_PROTO_ERROR so the exception path fires.
+                let entry_cid = state.channels.get(&sid).map(|e| e.cid).unwrap_or(u32::MAX);
+                send_ca_error(
                     writer,
-                    CA_PROTO_EVENT_ADD,
-                    requested_type,
+                    hdr,
                     ECA_ALLOCMEM,
-                    sub_id,
+                    entry_cid,
+                    "EVENT_ADD refused: per-channel subscription cap",
                 )
                 .await?;
                 return Ok(());
@@ -2666,12 +2707,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 sub_id,
                                 "EVENT_ADD refused: PV subscriber cap reached"
                             );
-                            send_cmd_error(
+                            // R2-36: CA_PROTO_ERROR for the
+                            // admission failure (see comment above
+                            // on the per-channel cap branch).
+                            send_ca_error(
                                 writer,
-                                CA_PROTO_EVENT_ADD,
-                                requested_type,
+                                hdr,
                                 ECA_ALLOCMEM,
-                                sub_id,
+                                entry.cid,
+                                "EVENT_ADD refused: per-PV subscriber cap",
                             )
                             .await?;
                             return Ok(());
@@ -2694,7 +2738,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             )
                             .await?;
                         } else {
-                            let snap = pv.snapshot().await;
+                            let mut snap = pv.snapshot().await;
+                            // R2-12 refinement: initial event honours
+                            // the EVENT_ADD request count (C
+                            // `read_reply` parity). Pre-truncate the
+                            // snapshot value when the request asks
+                            // for fewer elements than the live PV;
+                            // the producer task already truncates
+                            // future updates via send_event's
+                            // `data_count` parameter.
+                            if requested_count > 0 && requested_count < snap.value.count() {
+                                snap.value.truncate(requested_count as usize);
+                            }
                             send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
                         }
 
@@ -2744,12 +2799,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 "EVENT_ADD refused: record-field subscriber cap reached"
                             );
                             drop(instance);
-                            send_cmd_error(
+                            // R2-36: CA_PROTO_ERROR for admission
+                            // failure (libca's eventRespAction
+                            // treats zero-payload EVENT_ADD as a
+                            // cancel ack, so the prior
+                            // send_cmd_error path silently lost).
+                            send_ca_error(
                                 writer,
-                                CA_PROTO_EVENT_ADD,
-                                requested_type,
+                                hdr,
                                 ECA_ALLOCMEM,
-                                sub_id,
+                                entry.cid,
+                                "EVENT_ADD refused: record-field subscriber cap",
                             )
                             .await?;
                             return Ok(());
@@ -2796,7 +2856,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 ECA_NORDACCESS,
                             )
                             .await?;
-                        } else if let Some(snap) = initial_snap {
+                        } else if let Some(mut snap) = initial_snap {
+                            // R2-12 refinement: initial event honours
+                            // the EVENT_ADD request count.
+                            if requested_count > 0 && requested_count < snap.value.count() {
+                                snap.value.truncate(requested_count as usize);
+                            }
                             send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
                         }
 
@@ -3033,20 +3098,24 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     });
                 }
 
-                // R2-23: C `event_cancel_reply` (`camessage.c:2002-2014`)
-                // echoes the stored event's `pevext->msg` fields back
-                // with a zero payload: original DBR type, original
-                // event count, ECA_NORMAL, original sub id. Pre-fix
-                // Rust set `m_count = 0` so the CANCEL ack diverged
-                // from libca on the wire — strict CA dissectors and
-                // replay tooling saw a different frame than rsrv.
+                // R2-23 refinement: C `event_cancel_reply`
+                // (`camessage.c:2002-2014`) calls cas_copy_in_header
+                // with `pevext->msg.m_dataType`, `pevext->msg.m_count`,
+                // `pevext->msg.m_cid` (the SID stored on the original
+                // EVENT_ADD), and `pevext->msg.m_available`. Pre-fix
+                // Rust truncated the count to u16 (losing extended-
+                // form counts >= 0xFFFF) and used ECA_NORMAL in
+                // m_cid instead of the stored SID. Use
+                // `set_payload_size` with `to_bytes_extended` so
+                // large counts get the extended annex, and echo
+                // `sub.channel_sid` as the m_cid field.
                 let mut resp = CaHeader::new(CA_PROTO_EVENT_ADD);
                 resp.data_type = sub.data_type;
-                resp.count = sub.data_count as u16;
-                resp.cid = ECA_NORMAL;
+                resp.set_payload_size(0, sub.data_count);
+                resp.cid = sub.channel_sid;
                 resp.available = sub_id;
                 let mut w = writer.lock().await;
-                w.write_all(&resp.to_bytes()).await?;
+                w.write_all(&resp.to_bytes_extended()).await?;
                 // flush deferred to handle_client outer loop (batched)
             } else {
                 // C `event_cancel_reply` (`camessage.c:1998-2021`):
@@ -3192,10 +3261,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             if hdr.postsize <= 1 {
                 return Ok(());
             }
-            let end = payload
+            // R2-33: C `search_reply_tcp` forces NUL at postsize-1.
+            let scan_end = payload.len().saturating_sub(1).max(0);
+            let end = payload[..scan_end]
                 .iter()
                 .position(|&b| b == 0)
-                .unwrap_or(payload.len());
+                .unwrap_or(scan_end);
             let pv_name = String::from_utf8_lossy(&payload[..end]).to_string();
 
             if db.has_name(&pv_name).await {
@@ -3483,20 +3554,13 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
         }
         if !new_read {
             // Read access REVOKED. C path: db_post_single_event
-            // (which emits the `no_read_access_event` —
-            // ECA_NORDACCESS in m_cid, zeroed payload) then
-            // db_event_disable. We flip the gate so the producer
-            // task suppresses future deliveries, and emit a
-            // header-only EVENT_ADD frame carrying ECA_NORDACCESS
-            // in m_cid; libca's `cac::eventAddRespAction`
-            // (`cac.cpp:973-977`) routes that through the
-            // per-subscription exception callback without touching
-            // the payload bytes (it never reads them on the
-            // non-NORMAL path), so a header-only frame is
-            // sufficient for modern peers and matches our own
-            // client's MonitorStatusError path. The subscription
-            // itself stays alive so a later access restoration can
-            // re-arm it.
+            // (which emits `no_read_access_event` — ECA_NORDACCESS
+            // in m_cid plus a `dbr_size_n(type, count)` zero-filled
+            // payload sized from the stored EVENT_ADD request) then
+            // db_event_disable. Pre-fix Rust sent a header-only
+            // frame; R2-1 refinement: use `send_no_read_access_event`
+            // so the wire frame matches C byte-for-byte (the stored
+            // request count drives the zero-fill).
             for sub_id in &affected {
                 let Some(sub) = state.subscriptions.get(sub_id) else {
                     continue;
@@ -3504,12 +3568,16 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                 sub.denied.store(true, Ordering::Release);
                 let data_type = sub.data_type;
                 let sub_id_v = sub.sub_id;
-                let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
-                hdr.data_type = data_type;
-                hdr.cid = ECA_NORDACCESS;
-                hdr.available = sub_id_v;
-                let mut w = writer.lock().await;
-                w.write_all(&hdr.to_bytes()).await?;
+                let data_count = sub.data_count;
+                send_no_read_access_event(
+                    writer,
+                    CA_PROTO_EVENT_ADD,
+                    data_type,
+                    data_count,
+                    sub_id_v,
+                    ECA_NORDACCESS,
+                )
+                .await?;
             }
             let mut w = writer.lock().await;
             w.flush().await?;
@@ -3520,15 +3588,30 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
             // the current value so the subscriber sees a fresh
             // event the moment access comes back (rather than
             // waiting for the next natural update).
+            //
+            // R2-1 refinement: truncate the restore snapshot to
+            // `data_count` (matches the EVENT_ADD request)
+            // instead of sending the full live native count.
+            // C `read_reply` always honours the stored request
+            // count; pre-fix Rust used `send_monitor_snapshot`
+            // which always uses live `snapshot.value.count()`.
             for sub_id in &affected {
-                let (target, data_type, sub_id_val) = {
+                let (target, data_type, data_count, sub_id_val) = {
                     let Some(sub) = state.subscriptions.get(sub_id) else {
                         continue;
                     };
                     sub.denied.store(false, Ordering::Release);
-                    (sub.target.clone(), sub.data_type, sub.sub_id)
+                    (
+                        sub.target.clone(),
+                        sub.data_type,
+                        sub.data_count,
+                        sub.sub_id,
+                    )
                 };
-                if let Some(snap) = get_full_snapshot(&target).await {
+                if let Some(mut snap) = get_full_snapshot(&target).await {
+                    if data_count > 0 && data_count < snap.value.count() {
+                        snap.value.truncate(data_count as usize);
+                    }
                     send_monitor_snapshot(writer, sub_id_val, data_type, &snap).await?;
                 }
             }
@@ -3553,6 +3636,37 @@ async fn send_cmd_error<W: AsyncWrite + Unpin + Send + 'static>(
     resp.available = ioid_or_subid;
     let mut w = writer.lock().await;
     w.write_all(&resp.to_bytes()).await?;
+    // flush deferred to handle_client outer loop (batched)
+    Ok(())
+}
+
+/// R2-8 refinement: CA_PROTO_WRITE_NOTIFY reply with extended-form
+/// count support. C `putNotifyErrorReply` / `write_notify_reply`
+/// (`rsrv/camessage.c:1482-1501` / `1731+`) call
+/// `cas_copy_in_header` with `mp->m_count` / `msgtmp.m_count` from
+/// `caHdrLargeArray`, which is the decoded 32-bit count for
+/// extended requests and re-emits in extended form when needed.
+/// Pre-fix Rust set `resp.count = hdr.count as u16` and serialised
+/// with `to_bytes()`, so a `ca_array_put_callback()` on a
+/// `>= 0xFFFF`-element array received a normal-form Rust reply
+/// with `count = 0` (the extended marker) where rsrv preserves
+/// the count with an extended header.
+async fn send_put_notify_response<W: AsyncWrite + Unpin + Send + 'static>(
+    writer: &Arc<Mutex<BufWriter<W>>>,
+    data_type: u16,
+    count: u32,
+    eca_status: u32,
+    ioid: u32,
+) -> CaResult<()> {
+    let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
+    resp.data_type = data_type;
+    // postsize = 0 (WRITE_NOTIFY replies have no payload);
+    // set_payload_size promotes to extended form when count >= 0xFFFF.
+    resp.set_payload_size(0, count);
+    resp.cid = eca_status;
+    resp.available = ioid;
+    let mut w = writer.lock().await;
+    w.write_all(&resp.to_bytes_extended()).await?;
     // flush deferred to handle_client outer loop (batched)
     Ok(())
 }
@@ -3594,11 +3708,16 @@ async fn send_no_read_access_event<W: AsyncWrite + Unpin + Send + 'static>(
     Ok(())
 }
 
-/// Zero-pad an encoded DBR payload up to the requested element count.
-/// C `read_reply` (`rsrv/camessage.c:566-571`) keeps the request-count
-/// header and pads bytes past the actual element count with zeros.
-/// Returns the header element count to use (`requested_count` when
-/// non-zero, `actual_count` when zero / autosize).
+/// Resize an encoded DBR payload to the requested element count.
+/// C `read_reply` (`rsrv/camessage.c:507-571`) sets the response
+/// header count to `mp->m_count` (non-autosize) and sizes the
+/// payload to `dbr_size_n(type, request_count)`: extra bytes are
+/// zero-filled, and a response that decoded fewer elements than
+/// requested is still framed at the request count. R2-12 refinement
+/// covers BOTH directions: pad when requested > actual, truncate
+/// when requested < actual. Returns the header element count to
+/// use (`requested_count` when non-zero, `actual_count` when
+/// zero / autosize).
 fn pad_dbr_to_requested_count(
     encoded: &mut Vec<u8>,
     actual_count: u32,
@@ -3608,10 +3727,19 @@ fn pad_dbr_to_requested_count(
     if requested_count == 0 {
         return actual_count;
     }
-    if requested_count > actual_count {
-        if let Ok(native) = epics_base_rs::types::native_type_for_dbr(data_type) {
-            let extra = (requested_count - actual_count) as usize * native.element_size();
-            encoded.extend(std::iter::repeat_n(0u8, extra));
+    if let Ok(native) = epics_base_rs::types::native_type_for_dbr(data_type) {
+        // Plain types (0-6) have no metadata; STS / TIME / GR /
+        // CTRL slot metadata before the value array.
+        // `dbr_buffer_size(_, _, 0)` returns just the metadata size.
+        let meta_size = epics_base_rs::types::dbr_buffer_size(data_type, native, 0);
+        let target_size = meta_size + (requested_count as usize) * native.element_size();
+        if requested_count > actual_count {
+            let cur = encoded.len();
+            if cur < target_size {
+                encoded.extend(std::iter::repeat_n(0u8, target_size - cur));
+            }
+        } else if requested_count < actual_count && encoded.len() > target_size {
+            encoded.truncate(target_size);
         }
     }
     requested_count

@@ -356,10 +356,17 @@ async fn recv_loop(
                 let payload = &buf[payload_start..payload_end];
 
                 // Extract PV name (null-terminated)
-                let pv_name_end = payload
+                // R2-33: C `search_reply_udp` forces
+                // `pName[mp->m_postsize - 1] = '\0'`. Cap the
+                // NUL search at `postsize - 1` so an unterminated
+                // peer name is treated as a `postsize - 1` byte
+                // name (matching rsrv) rather than the full
+                // payload (Rust pre-fix).
+                let scan_end = payload.len().saturating_sub(1).max(0);
+                let pv_name_end = payload[..scan_end]
                     .iter()
                     .position(|&b| b == 0)
-                    .unwrap_or(payload.len());
+                    .unwrap_or(scan_end);
                 if let Ok(pv_name) = std::str::from_utf8(&payload[..pv_name_end]) {
                     if db.has_name(pv_name).await {
                         // C parity: `search_reply_udp`

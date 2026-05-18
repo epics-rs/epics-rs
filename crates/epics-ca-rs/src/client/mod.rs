@@ -1366,6 +1366,18 @@ impl CaChannel {
         count: u32,
         ioid: u32,
     ) -> CaResult<()> {
+        // R2-31: C `libca/nciu.cpp::read()` rejects before queueing
+        // when `!accessRightState.readPermit()` (ECA_NORDACCESS).
+        // Pre-fix Rust forwarded the request anyway and let the
+        // server (or a timeout) surface the denial; the cached
+        // access bits from the last CA_PROTO_ACCESS_RIGHTS frame
+        // are the authoritative client-side gate libca consults.
+        if !snap.access_rights.read {
+            return Err(CaError::Protocol(format!(
+                "read denied by cached access rights (matches libca \
+                 nciu::read ECA_NORDACCESS); ioid {ioid}"
+            )));
+        }
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_read_notify_frame(
                 snap.sid, data_type, count, ioid,
@@ -1395,6 +1407,14 @@ impl CaChannel {
         ioid: u32,
         payload: Vec<u8>,
     ) -> CaResult<()> {
+        // R2-31: C `libca/nciu.cpp::write()` rejects before queueing
+        // when `!accessRightState.writePermit()` (ECA_NOWTACCESS).
+        if !snap.access_rights.write {
+            return Err(CaError::Protocol(format!(
+                "write denied by cached access rights (matches libca \
+                 nciu::write ECA_NOWTACCESS); ioid {ioid}"
+            )));
+        }
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE_NOTIFY,
@@ -1427,6 +1447,16 @@ impl CaChannel {
         count: u32,
         payload: Vec<u8>,
     ) -> CaResult<()> {
+        // R2-31: cached-access write gate (see send_write_notify_fast).
+        // The nowait variant otherwise returned Ok(()) after putting
+        // an oversized / forbidden request on the wire.
+        if !snap.access_rights.write {
+            return Err(CaError::Protocol(
+                "write denied by cached access rights (matches libca \
+                 nciu::write ECA_NOWTACCESS)"
+                    .into(),
+            ));
+        }
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE,
@@ -1851,11 +1881,21 @@ impl CaChannel {
     pub async fn get_with_metadata_count(&self, class: DbrClass, count: u32) -> CaResult<Snapshot> {
         let snap = self.snapshot()?;
 
-        let request_count = if count > 0 {
-            count.min(snap.element_count)
-        } else {
-            snap.element_count
-        };
+        // R2-32: C `libca/nciu.cpp::read()` rejects `countIn >
+        // this->count` with ECA_BADCOUNT before queueing the read.
+        // Pre-fix Rust silently clamped with `.min(snap.element_count)`,
+        // so a caller bug requesting 100 elements from a 10-element PV
+        // got a 10-element response from Rust where libca would have
+        // returned ECA_BADCOUNT without sending anything. Validate
+        // up front; `count == 0` keeps the autosize semantic.
+        if count > 0 && count > snap.element_count {
+            return Err(CaError::Protocol(format!(
+                "get count {} exceeds channel element count {} \
+                 (matches libca nciu::read ECA_BADCOUNT)",
+                count, snap.element_count
+            )));
+        }
+        let request_count = if count > 0 { count } else { snap.element_count };
 
         let native = DbFieldType::from_u16(snap.native_type as u16)?;
         // `from_u16` only yields the six CA wire types (0..6), so `native`
@@ -2845,6 +2885,32 @@ async fn run_coordinator(
                             let _ = search_tx.send(SearchRequest::ConnectResult {
                                 cid,
                                 success: true,
+                                server_addr,
+                            });
+                        } else {
+                            // R2-25: CREATE_CHAN response arrived for
+                            // an unknown CID — the user dropped the
+                            // channel after CREATE_CHAN went out but
+                            // before the server reply landed. C
+                            // `libca/cac.cpp::createChannelRespAction`
+                            // immediately sends
+                            // `tcpiiu::clearChannelRequest(sid, cid)`
+                            // to free the server SID it just learned;
+                            // pre-fix Rust ignored the response, so
+                            // the server-side channel sat allocated
+                            // until the TCP circuit closed. Forward
+                            // a CLEAR_CHANNEL to the transport
+                            // manager so it can drain the leaked
+                            // server-side state.
+                            tracing::debug!(
+                                cid,
+                                sid,
+                                server = %server_addr,
+                                "late CREATE_CHAN response for unknown CID; sending CLEAR_CHANNEL (libca parity)"
+                            );
+                            let _ = transport_tx.send(TransportCommand::ClearChannel {
+                                cid,
+                                sid,
                                 server_addr,
                             });
                         }

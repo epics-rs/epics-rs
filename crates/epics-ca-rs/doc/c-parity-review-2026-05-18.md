@@ -495,6 +495,276 @@ confirmation, and wait for monitor updates that will never arrive. rsrv
 delivers an exception and tears down the virtual circuit for the same
 allocation-failure class.
 
+### R2-37: Subscription callbacks never receive `ECA_DISCONN` on disconnect
+
+Severity: High
+
+Rust: `crates/epics-ca-rs/src/client/subscription.rs` `SubscriptionRegistry::mark_disconnected()` only flips `needs_restore = true` and clears `pending_deliveries`; it never invokes `rec.callback_tx` with an error. `client/mod.rs` disconnect paths (`TcpClosed`, `ServerDisconnect`) call `drain_waiters_for_cids` for reads/writes but route subscriptions only through `mark_disconnected`.
+
+C reference: `libca/cac.cpp:678-698` `cac::disconnectAllIO()` iterates every in-flight IO on the channel (including subscriptions) and calls `pNetIO->exception(guard, *this, ECA_DISCONN, hostName)`. `libca/netSubscription.cpp:86-107` routes through `notify.exception(...ECA_DISCONN...)`. Fires on every disconnect class — SERVER_DISCONN, unresponsive circuit, removeAllChannels.
+
+Impact: a Rust `MonitorHandle::recv()` against a C IOC observes silence when the circuit dies — no `Err(ServerError(ECA_DISCONN))`. C contract is one ECA_DISCONN per active monitor on disconnect.
+
+### R2-38: CircuitUnresponsive skips ECA_UNRESPTMO, per-channel access clear, per-IO ECA_DISCONN
+
+Severity: High
+
+Rust: `crates/epics-ca-rs/src/client/mod.rs` `TransportEvent::CircuitUnresponsive` only flips `ch.state = Unresponsive` and sends `ConnectionEvent::Unresponsive`. No global exception hook with ECA_UNRESPTMO, no `AccessRightsChanged{read:false,write:false}` per channel, no in-flight read/write/subscription failure.
+
+C reference: `libca/tcpiiu.cpp:899-941` `unresponsiveCircuitNotify` calls `genLocalExcep(... ECA_UNRESPTMO ...)`, walks `connectedList`, calls `pChan->unresponsiveCircuitNotify` → `disconnectAllIO()` + `accessRightsNotify(noRights)`.
+
+Impact: `on_exception` handler never sees ECA_UNRESPTMO; in-flight ops keep waiting their full timeout; access-rights subscribers don't get notified that writes/reads are refused.
+
+### R2-39: Responsive-recovery does not resend per-subscription READ_NOTIFY
+
+Severity: Medium
+
+Rust: `crates/epics-ca-rs/src/client/mod.rs` `TransportEvent::CircuitResponsive` only flips state back to `Connected`. No call to send a fresh READ_NOTIFY per active subscription on the recovered channel.
+
+C reference: `libca/tcpRecvWatchdog.cpp:131-158` `probeResponseNotify` → `iiu.responsiveCircuitNotify` → `tcpiiu.cpp:861-877` walks `unrespCircuit` and calls `pChan->connect()`, moving channels to `subscripUpdateReqPend`. Send thread then calls `sendSubscriptionUpdateRequests` (`tcpiiu.cpp:1610-1644`) — a forced READ_NOTIFY per subscription.
+
+Impact: a Rust monitor against a C IOC whose circuit briefly went unresponsive sees no value update at recovery — values changed during the gap are invisible until the next natural update.
+
+### R2-40: Send-side stall closes circuit at 10 s; libca only marks unresponsive
+
+Severity: Medium
+
+Rust: `client/transport.rs:826` sets `send_timeout = ECHO_TIMEOUT_SECS * 2` (10 s); `transport.rs:869-872` converts any timeout/error into `TcpClosed`, tearing the circuit down.
+
+C reference: `libca/tcpSendWatchdog.cpp:43-64` fires `iiu.sendTimeoutNotify` after `connTMO` (default 30 s); `tcpiiu.cpp:879-888` calls `unresponsiveCircuitNotify` and starts a recv probe. TCP socket is kept; only closed if probe also fails.
+
+Impact: a slow but live server is torn down by Rust after 10 s, forcing full search/connect. Drops all subscriptions/reads/writes in flight.
+
+### R2-41: TCP dispatcher misses SEARCH / READ / CLEAR_CHANNEL opcodes
+
+Severity: Medium
+
+Rust: `client/transport.rs:1181-1503` match arms cover VERSION, ACCESS_RIGHTS, CREATE_CHAN, READ_NOTIFY, WRITE_NOTIFY, EVENT_ADD, ECHO, READ_SYNC, CREATE_CH_FAIL, ERROR, SERVER_DISCONN. Everything else hits R2-29's `unknown` branch and closes the circuit.
+
+C reference: `libca/cac.cpp:60-89` TCP jump table includes `CA_PROTO_SEARCH` (`searchRespNotify`, used when server doubles as nameserver), `CA_PROTO_READ` (`readRespAction`, deprecated sync read), `CA_PROTO_CLEAR_CHANNEL` (no-op). `cac.cpp:1208-1218` `executeResponse` routes only truly out-of-range opcodes to `badTCPRespAction`.
+
+Impact: a CA name server or gateway emitting these frames kills the Rust circuit per occurrence. R2-29 made unknown lethal — gap is misclassifying known-valid opcodes as unknown.
+
+### R2-42: Stray ACCESS_RIGHTS frames leak per-circuit `pending_access` entries
+
+Severity: Low
+
+Rust: `client/transport.rs:1189-1199` unconditionally inserts `(hdr.cid, access)` into `pending_access` and emits `AccessRightsChanged`. Drained only when matching CREATE_CHAN arrives. A misbehaving server's ACCESS_RIGHTS for a cid the server never names in CREATE_CHAN grows the map for circuit lifetime.
+
+C reference: `libca/cac.cpp:1121-1136` `accessRightsRespAction` looks up channel by `m_cid` and silently returns if not found — no state retained.
+
+Impact: memory leak at the rate of one map entry per stray frame; ACF reload re-emitting ACCESS_RIGHTS for known channels fires both paths in Rust (event + pending update).
+
+### R2-43: No equivalent of libca's `msgForMultiplyDefinedPV` diagnostic
+
+Severity: Low
+
+Rust: `client/search.rs:1072-1099` silently advances when SEARCH reply arrives for a cid no longer pending.
+
+C reference: `libca/cac.cpp:591-661` `transferChanToVirtCircuit` compares responding server address against the channel's already-resolved address. If different, constructs `msgForMultiplyDefinedPV` with async DNS lookup; emits canonical diagnostic `"Channel: <PV> connected to: <X> but searched on: <Y>"`.
+
+Impact: site-misconfiguration where same PV is exposed by two IOCs gets immediate actionable diagnostics from libca; Rust silently uses whichever answered first, surfacing as data races later.
+
+### R2-44: CA_PROTO_VERSION request omits priority in `m_dataType`
+
+Severity: Low
+
+Rust: `client/transport.rs:672-674` builds VERSION with `data_type = 0`.
+
+C reference: `libca/tcpiiu.cpp:1381-1399` `versionMessage` calls `insertRequestHeader(... priority, CA_MINOR_PROTOCOL_REVISION ...)` — `m_dataType = priority` (per-context priLev).
+
+Impact: priority negotiation channel is absent on Rust client; default-0 is wire-equivalent but no way to expose non-default priority.
+
+### R2-45: Oversized TCP payload kills circuit; libca skips message
+
+Severity: Low
+
+Rust: `protocol.rs:405-407` `from_bytes_extended` returns `Err("payload too large")` when `ext_post > max_payload_size()`. `transport.rs:1138-1145` converts to `TcpClosed`.
+
+C reference: `libca/tcpiiu.cpp:1269-1284` — when `m_postsize > curDataMax` and realloc fails, logs ONCE then drains via `recvQue.removeBytes` and continues. Circuit kept.
+
+Impact: a single oversized monitor frame tears down the Rust circuit and forces full reconnect; libca tolerates and continues.
+
+### R2-46: WRITE_NOTIFY regular-write denied path bypasses `send_put_notify_response` helper
+
+Severity: Low
+
+Rust: `server/tcp.rs:2351-2358` regular WRITE_NOTIFY write-denied early-out builds the reply inline with `resp.count = hdr.count` (16-bit, 0 for extended) and `to_bytes()`. The ACKT/ACKS-denied branch at `tcp.rs:2191` correctly routes through `send_put_notify_response` (R2-8 refinement helper).
+
+C reference: `rsrv/camessage.c::write_notify_action:1653-1656` routes `!rsrvCheckPut` through `putNotifyErrorReply` → `cas_copy_in_header(..., mp->m_dataType, mp->m_count, ECA_NOWTACCESS, ...)`. `m_count` is decoded 32-bit; `cas_copy_in_header` re-emits extended annex when `nElem >= 0xffff`.
+
+Impact: large-array put-callback refused by ACF-denied client gets normal-form Rust reply with `count = 0`; rsrv preserves count via extended header. Same defect class as R2-8.
+
+### R2-47: TCP server omits unsolicited VERSION on accept
+
+Severity: Medium
+
+Rust: `server/tcp.rs:1000-1006` after accept/audit/TLS handshake enters read loop with no proactive write. VERSION emitted only as response to client's VERSION.
+
+C reference: `rsrv/caservertask.c:1525` `create_tcp_client` calls `rsrv_version_reply` immediately after `db_start_events`. Next flush ships VERSION as server's first wire frame.
+
+Impact: libca `tcpRecvWatchdog::messageArrivalNotify` resets recv timer on every frame; server-side unsolicited VERSION is the first liveness beat. Without it, slow handshake (client batching VERSION+HOST_NAME+CLIENT_NAME with Nagle) can drift toward CA_ECHO_TIMEOUT. Wire-trace replay against rsrv breaks on first byte.
+
+### R2-48: UDP search responder emits one VERSION-prefixed datagram per match (not batched)
+
+Severity: Medium
+
+Rust: `server/udp.rs:315-424` per-message SEARCH loop calls `send_to(&reply, src)` for each matched PV — each its own datagram with leading VERSION.
+
+C reference: `rsrv/cast_server.c:163-281` one `recvfrom` per datagram; `camessage` walks chained messages and each `search_reply_udp` appends to the same `send.buf`; after parse, `cas_send_dg_msg` ships accumulated buffer as ONE datagram. `caserverio.c:185-201` asserts first message is the placeholder VERSION (seeded by `rsrv_version_reply` and re-seeded after each flush).
+
+Impact: SEARCH datagram with N matches yields N Rust datagrams vs 1 rsrv datagram. N× IP overhead, N× kernel `sendto` cost, search-storm amplification.
+
+### R2-49: UDP SEARCH reply ships unsolicited VERSION to pre-V411 clients
+
+Severity: Low
+
+Rust: `server/udp.rs:248-417` always prepends fresh VERSION to reply; when `client_seq.is_none()` VERSION still ships with `cid=0, data_type=0, count=CA_MINOR_VERSION`.
+
+C reference: `rsrv/caserverio.c:193-201` keeps VERSION on wire only when `CA_V411(minor_version)`; for older peers bytes are stripped.
+
+Impact: pre-V4.11 libca client receives extra VERSION header where rsrv would send none. Wire-trace divergence.
+
+### R2-50: Duplicate-sub_id EVENT_ADD refusal uses cancel-ack wire shape
+
+Severity: Medium
+
+Rust: `server/tcp.rs:2675-2689` when second EVENT_ADD with duplicate sub_id arrives, calls `send_cmd_error(CA_PROTO_EVENT_ADD, ..., ECA_BADMONID, sub_id)` — zero-payload EVENT_ADD with `m_cid = ECA_BADMONID`.
+
+C reference: `rsrv/camessage.c::event_add_action:1762-1866` performs no per-client sub_id dedup. Two EVENT_ADDs with identical `m_available` both install; later cancel cancels first match. No C path returns ECA_BADMONID on duplicate-add.
+
+Impact: Rust dedup itself is unexpected (rsrv accepts duplicates). Worse: zero-payload EVENT_ADD reply is exactly the R2-36/R2-27 cancel-ack shape — libca `eventRespAction` returns immediately for `!hdr.m_postsize`. Refusal silently swallowed; application waits forever. Use `send_ca_error(CA_PROTO_ERROR, ECA_BADMONID, ...)`.
+
+### R2-51: ACCESS_RIGHTS pushed for every channel on reload even when unchanged
+
+Severity: Medium
+
+Rust: `server/tcp.rs:3514-3534` `reeval_access_rights` iterates every entry in `state.channels` and unconditionally writes ACCESS_RIGHTS before computing transitions. Cache update via `insert`, but wire emission not gated on `old_level != new_level`.
+
+C reference: `libcom/src/as/asLibRoutines.c:1047-1051` `asComputePvt` fires `pclient->pcallback(... asClientCOAR)` only when `oldaccess != access`. ACF reload that leaves every channel at same level emits zero ACCESS_RIGHTS frames.
+
+Impact: routine ACF reload triggers `O(channels-per-client)` ACCESS_RIGHTS burst per connection. Gateway-front IOC with thousands of channels sees visible network blip; strict clients keying off ACCESS_RIGHTS as a "re-read" hint mass-refresh on every reload.
+
+### R2-52: Cap-token verification doesn't update `auth_method`/`auth_authority` for ACF METHOD/AUTHORITY
+
+Severity: Medium
+
+Rust: `server/tcp.rs:1631-1653` on successful `TokenVerifier::verify` only `state.username = claims.sub` is set. `auth_method` and `auth_authority` (consumed by `compute_access` and `AccessSecurityConfig::check_access_method`) never updated to `"cap-token"`/`claims.iss`.
+
+C reference: epics-base doesn't implement cap-tokens but PR #563/#618 defines METHOD/AUTHORITY as scoping by authenticator subsystem. Rust's own `TokenClaims` carries `iss` precisely for this scoping.
+
+Impact: ACF rule `RULE(1, WRITE) { METHOD("cap-token") AUTHORITY("ops-issuer-1") }` never matches authenticated cap-token peer. Operators can't express "writes only via cap-token"; a stolen plain CLIENT_NAME and a verified cap-token for same subject are indistinguishable to rule engine.
+
+### R2-53: TRAPWRITE rules silently no-op — `asTrapWrite` listener subsystem not wired
+
+Severity: Medium
+
+Rust: `server/tcp.rs:2147-2469` WRITE/WRITE_NOTIFY arms perform ACF gate, put, wire reply — no before/after notifications to registered write-trap listener. `epics-base-rs/src/server/access_security.rs:356-362` parses `TRAPWRITE` keyword and stores in `AccessRule::trap`, but field has no consumer.
+
+C reference: `libcom/src/as/asLib.h:57-62` `asTrapWriteWithData` invoked unconditionally around every `dbChannel_put` in `rsrv/camessage.c:768-779` (write_action) and WRITE_NOTIFY equivalent. Macro reads `asClientPvt->trapMask` and dispatches to listeners registered via `asTrapWriteRegisterListener`. This is what `caPutLog`/site put-loggers attach to.
+
+Impact: every put-logging tool expecting to run on Rust CA server gets zero events even when ACF requests TRAPWRITE. Sites migrating from rsrv with `caPutLog`-style audit trails see silent regression.
+
+### R2-54: Runtime ASG-field change does not re-evaluate access rights for live clients
+
+Severity: Medium
+
+Rust: `server/tcp.rs:404-479` `compute_access` reads `instance.common.asg` live on each invocation, but re-eval triggers limited to CREATE_CHAN, HOST_NAME, CLIENT_NAME, ACF reload. `caput record.ASG NEW_ASG` updates `common.asg` directly but never invokes `reeval_access_rights`.
+
+C reference: `database/src/ioc/as/asDbLib.c:107-110,144` `asInitCommon` registers `asSpcAsCallback` as ASG-field special callback. `dbPut record.ASG` invokes `asChangeGroup` → `asAddMemberPvt` → `asComputePvt` on every ASGCLIENT — fires COAR for each affected CA connection.
+
+Impact: operator reassigning a record's ASG at runtime gets correct enforcement on next op (Rust reads live) but the wire ACCESS_RIGHTS the client sees still reflects OLD ASG until something else triggers re-eval. UIs gating put-button enable on cached ACCESS_RIGHTS show stale state; a peer who held WRITE before the change and lost it issues a doomed WRITE that the server denies via live `compute_access` — unexpected NORDACCESS/NOWTACCESS the UI didn't predict.
+
+### R2-55: CREATE_CHAN's `m_available` minor-version override not honoured
+
+Severity: Low
+
+Rust: `server/tcp.rs:1473` `state.client_minor_version` set only from `CA_PROTO_VERSION` handler. CREATE_CHAN handler reads but never writes `client_minor_version`.
+
+C reference: `rsrv/camessage.c:1190-1199` `claim_ciu_action` unconditionally executes `client->minor_version_number = mp->m_available;` before VSUPPORTED gate. CA protocol comment: "The available field is used (abused) here to communicate the minor version number starting with CA 4.1". Client that handshakes v4.4 then CREATE_CHANs v4.13 gets the upgrade — including `CA_V49` extended-form decision.
+
+Impact: client using "negotiate v4.4 then upgrade on first CREATE_CHAN" pattern works against rsrv, loses upgrade against Rust. nelem cap stays in normal-form for peer whose CREATE_CHAN minor was 13 — peer sees truncated count on large arrays.
+
+### R2-56: ACF reload while client has no channels yet leaves no per-client signal
+
+Severity: Low
+
+Rust: `server/tcp.rs:3500-3502` `reeval_access_rights` early-returns when `state.channels.is_empty()`. `acf_reload_rx` arm consumes/acknowledges the event without per-client state capture.
+
+C reference: `libcom/src/as/asLibRoutines.c:148-167` `asInitialize` re-runs `asAddMemberPvt` for every `ASGMEMBER` carried forward; new clients/channels created after reload pick up the new policy because `claim_ciu_action::asAddClient` attaches to freshly-rebuilt member list.
+
+Impact: reload that happens during CLIENT_NAME parsing leaves a window where new ACF is visible to `compute_access` but per-channel cache holds pre-reload `AccessLevel`. Next op uses cached `lookup_access` (stale) for one cycle until something triggers `reeval_access_rights`. Narrow race; on busy ACF-managed site a `RULE(WRITE)` revocation can be effective on wire while already-open channel's WRITE uses cached pre-revocation `ReadWrite` for one op cycle.
+
+### R2-57: Client `EPICS_CA_AUTO_ADDR_LIST` parser diverges from C's substring "no" check
+
+Severity: Medium
+
+Rust: `client/mod.rs:3470-3475` `auto_addr.eq_ignore_ascii_case("YES")`. Anything not equal to `"YES"` (e.g. `"1"`, `"true"`, `"on"`, `"bogus"`) disables auto-discovery.
+
+C reference: `ca/src/client/iocinf.cpp:186-193` `yes = true; if (strstr(pstr,"no") || strstr(pstr,"NO")) yes = false;`. Substring (not equality) check: any value not containing `"no"`/`"NO"` keeps `yes = true`.
+
+Impact: site setting `EPICS_CA_AUTO_ADDR_LIST=1` or `=true` gets auto-discovery ON on C, OFF on Rust. Silent loss of per-NIC broadcast SEARCH coverage. Server-side parser is correctly strict-YES (matches C server); only client-side var has the strstr quirk.
+
+### R2-58: Client REPEATER_REGISTER sends 16-byte frame; libca sends zero-length by default
+
+Severity: Low
+
+Rust: `client/beacon_monitor.rs:805-817` and `repeater.rs:481-492` build a 16-byte CaHeader and `send_to`. Always full frame.
+
+C reference: `ca/src/client/udpiiu.cpp:494-535` `caRepeaterRegistrationMessage` default `len = 0`. Also alternates `attemptNumber & 1` between `osiLocalAddr` and `INADDR_LOOPBACK` as source for pre-3.13-beta-12 compat.
+
+Impact: Rust client can't register with pre-3.12 (1998-era) C repeater. Modern repeaters accept both shapes; practical impact today near-zero. Divergence in emitted shape only.
+
+### R2-59: `EPICS_CA_NAME_SERVERS` bare hostnames default to 5064, ignore `EPICS_CA_SERVER_PORT`
+
+Severity: Medium
+
+Rust: `client/mod.rs:3824-3835` `parse_nameserver_list` bare-hostname branch uses hardcoded `CA_SERVER_PORT = 5064`. The sibling `parse_addr_list_with_hostnames:3413` correctly reads `EPICS_CA_SERVER_PORT`.
+
+C reference: `ca/src/client/cac.cpp:259` `addAddrToChannelAccessAddressList(..., this->_serverPort, ...)`, `_serverPort` from `envGetInetPortConfigParam` at `cac.cpp:185-186`.
+
+Impact: site with `EPICS_CA_SERVER_PORT=5066` and `EPICS_CA_NAME_SERVERS="ioc.example.com"` has Rust try port 5064, C try 5066. Silent connection refused or wrong service. Two related env parsers in same file disagree.
+
+### R2-60: Rust IOC UDP server does not join multicast groups from `EPICS_CAS_INTF_ADDR_LIST`
+
+Severity: Medium
+
+Rust: `server/udp.rs:141-184` `bind_responder_socket` and `server/addr_list.rs:43-51` — multicast entries (224.0.0.0/4) treated identically to unicast/broadcast; only `bind` + `set_broadcast(true)`, never `join_multicast_v4`. No `casMCastAddrList` analog.
+
+C reference: `rsrv/caservertask.c:367-371, 633-668` splits multicast into `casMCastAddrList`; per-interface UDP responder issues `setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, ...)` for each multicast entry.
+
+Impact: C IOC with `EPICS_CAS_INTF_ADDR_LIST="192.168.1.10 224.0.10.5"` joins `224.0.10.5` group; Rust silently ignores multicast entry (likely fails the `bind` to a multicast address). Multicast SEARCH topologies work with libca, produce no replies on Rust.
+
+### R2-61: Rust beacon emitter ignores `EPICS_CAS_INTF_ADDR_LIST` when expanding AUTO_BEACON
+
+Severity: Medium
+
+Rust: `server/addr_list.rs:114-132` `discover_broadcast_addrs` walks every non-loopback interface via `if_addrs::get_if_addrs()`. `cfg.intf_addrs` not consulted for filtering.
+
+C reference: `rsrv/caservertask.c:374-388, 390-392` when auto-beacon on AND `casIntfAddrList` has specific (non-wildcard) IPs, C calls `osiSockDiscoverBroadcastAddresses(..., &match)` per listed interface — beacons only from those NICs' broadcasts. Line 380 sets `autobeaconlist = 0` to suppress wildcard fallback. Lines 390-392: `cantProceed` if both `0.0.0.0` and specific IP present.
+
+Impact: multi-NIC IOC bound to one isolated subnet via `EPICS_CAS_INTF_ADDR_LIST="192.168.1.10"` beacons to `192.168.1.255` on C; Rust beacons to every discovered NIC broadcast, leaking IOC presence onto unrelated networks. Wildcard-conflict check also missing.
+
+### R2-62: `EPICS_CA_MAX_SEARCH_PERIOD` recognised by lint but never read
+
+Severity: Low
+
+Rust: `client/search.rs` hard-fixed `N_SEARCH_BUCKETS = 30` and `NORMAL_TICK = 1s`. `EPICS_CA_MAX_SEARCH_PERIOD` only in `bin/ca-lint-rs.rs:68` whitelist — no production reader.
+
+C reference: `ca/src/client/udpiiu.cpp:71-89` reads via `envGetDoubleConfigParam`, default 300 s, clamp 60 s. Sizes `nTimers` in searchTimer; bounds exponential backoff.
+
+Impact: site setting `EPICS_CA_MAX_SEARCH_PERIOD=600` gets effect on C, zero on Rust. Rust default cap (~30 s) already 10× more aggressive than C default (300 s) — slow nameserver gets 10× more search traffic from Rust.
+
+### R2-63: `EPICS_CA_CONN_TMO` clamps sub-second values and treats 0 as 1 s
+
+Severity: Low
+
+Rust: `client/transport.rs:112-117` `.map(|v| v.max(1.0) as u64)` fallback 30 only on absent/unparseable. (1) positive <1.0 rounds up to 1; (2) fractional truncated via `as u64`; (3) explicit 0 or negative clamped to 1.
+
+C reference: `ca/src/client/cac.cpp:186-194` `envGetDoubleConfigParam`, then `if (status || connTMO <= 0.0) connTMO = CA_CONN_VERIFY_PERIOD;` (default 30). Kept as `double`; sub-second honoured; 0/negative falls back to 30.
+
+Impact: `EPICS_CA_CONN_TMO=0.5` gets 0.5 on C, 1 on Rust. `=0` (operator sentinel for "use default") gets 30 on C but 1 on Rust — Rust pumps ECHO every second on every circuit, multiplying inbound TCP load on each server 30×.
+
 ## Cleared During Review
 
 ### R2-2: Monitor status errors are already delivered
@@ -634,3 +904,18 @@ matching `rsrv/camessage.c::event_cancel_reply()`.
   to the remaining current defects. Finding R2-34 recorded.
 - 2026-05-18: Continued repeater registration and EVENT_ADD admission-failure
   pass. Findings R2-35 and R2-36 recorded.
+- 2026-05-18: Ran Codex-style multi-agent audit (4 parallel sub-agents
+  covering libca client wire/lifecycle, rsrv non-RWE opcodes, access
+  security / ACF, beacon / repeater / discovery). 27 new divergences
+  recorded as R2-37 through R2-63. Theme summary: (a) disconnect /
+  unresponsive lifecycle does not fan exception out to per-IO/per-sub
+  waiters (R2-37/38/39/40), (b) TCP dispatcher misclassifies known-valid
+  opcodes as unknown after R2-29 (R2-41), (c) ACF state model gaps —
+  COAR no-change suppression missing, TRAPWRITE not wired, runtime
+  ASG change has no re-eval trigger, cap-token METHOD/AUTHORITY not
+  propagated (R2-51/52/53/54), (d) env-var parser divergences across
+  AUTO_ADDR_LIST / NAME_SERVERS / MAX_SEARCH_PERIOD / CONN_TMO
+  (R2-57/59/62/63), (e) multicast and per-interface beacon scoping
+  missing (R2-60/61), (f) UDP search batching, accept-time VERSION,
+  duplicate-sub_id wire shape (R2-47/48/49/50), (g) miscellaneous wire
+  parity (R2-42/43/44/45/46/55/56/58).

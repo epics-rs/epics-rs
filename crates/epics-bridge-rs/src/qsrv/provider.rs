@@ -714,17 +714,22 @@ impl BridgeProvider {
             ));
         }
 
-        // Single record channel — use metadata cache to avoid repeated introspection
-        let (record_name, _) = epics_base_rs::server::database::parse_pv_name(name);
+        // Single record (or `record.FIELD`) channel — BR-R2.
+        // Cache by the full requested name so field PVs do not
+        // poison the record's VAL-shaped cache entry.
+        let (record_name, field) = epics_base_rs::server::database::parse_pv_name(name);
+        let field_upper = field.to_ascii_uppercase();
 
         // Check cache first
         {
             let cache = self.record_cache.read().await;
-            if let Some(&(nt_type, value_dbf)) = cache.get(record_name) {
+            if let Some(&(nt_type, value_dbf)) = cache.get(name) {
                 return Ok(AnyChannel::Single(
                     BridgeChannel::from_cached(
                         self.db.clone(),
+                        name.to_string(),
                         record_name.to_string(),
+                        field_upper,
                         nt_type,
                         value_dbf,
                     )
@@ -737,12 +742,11 @@ impl BridgeProvider {
         if self.db.has_name(name).await {
             let channel = BridgeChannel::new(self.db.clone(), name).await?;
 
-            // Populate cache
+            // Populate cache keyed by the full PV identity so a
+            // subsequent `record.FIELD` hit isn't served from a
+            // `record`-only entry (or vice versa).
             let mut cache = self.record_cache.write().await;
-            cache.insert(
-                record_name.to_string(),
-                (channel.nt_type(), channel.value_dbf()),
-            );
+            cache.insert(name.to_string(), (channel.nt_type(), channel.value_dbf()));
 
             return Ok(AnyChannel::Single(channel.with_access(access_ctx)));
         }
@@ -870,6 +874,8 @@ ASG(SECURE) {
         let ch = BridgeChannel::from_cached(
             db,
             "PROT".to_string(),
+            "PROT".to_string(),
+            "VAL".to_string(),
             super::super::pvif::NtType::Scalar,
             epics_base_rs::types::DbFieldType::Double,
         )
@@ -896,6 +902,8 @@ ASG(SECURE) {
         let ch = BridgeChannel::from_cached(
             db.clone(),
             "BLOCKED".to_string(),
+            "BLOCKED".to_string(),
+            "VAL".to_string(),
             super::super::pvif::NtType::Scalar,
             epics_base_rs::types::DbFieldType::Double,
         )
@@ -910,6 +918,8 @@ ASG(SECURE) {
         let ch2 = BridgeChannel::from_cached(
             db,
             "ALLOWED".to_string(),
+            "ALLOWED".to_string(),
+            "VAL".to_string(),
             super::super::pvif::NtType::Scalar,
             epics_base_rs::types::DbFieldType::Double,
         )
@@ -940,6 +950,8 @@ ASG(SECURE) {
         let ch = BridgeChannel::from_cached(
             db,
             "PROT".to_string(),
+            "PROT".to_string(),
+            "VAL".to_string(),
             super::super::pvif::NtType::Scalar,
             epics_base_rs::types::DbFieldType::Double,
         )
@@ -1005,6 +1017,7 @@ ASG(SECURE) {
         let mut monitor = super::super::monitor::BridgeMonitor::new(
             db,
             "PROT".to_string(),
+            "VAL".to_string(),
             super::super::pvif::NtType::Scalar,
         )
         .with_access(access);

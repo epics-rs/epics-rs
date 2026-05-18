@@ -43,7 +43,14 @@ async fn get_ai_scalar_returns_current_value() {
     db.add_record("TEST:ai", Box::new(AiRecord::new(2.5)))
         .await
         .unwrap();
-    let ch = BridgeChannel::from_cached(db, "TEST:ai".into(), NtType::Scalar, DbFieldType::Double);
+    let ch = BridgeChannel::from_cached(
+        db,
+        "TEST:ai".into(),
+        "TEST:ai".into(),
+        "VAL".into(),
+        NtType::Scalar,
+        DbFieldType::Double,
+    );
 
     let result = ch.get(&empty_request()).await.expect("get");
     let value = extract_value(&result).expect("NTScalar.value");
@@ -60,6 +67,8 @@ async fn put_then_get_round_trips_double() {
     let ch = BridgeChannel::from_cached(
         db.clone(),
         "TEST:ai_rt".into(),
+        "TEST:ai_rt".into(),
+        "VAL".into(),
         NtType::Scalar,
         DbFieldType::Double,
     );
@@ -89,6 +98,8 @@ async fn put_then_get_round_trips_long() {
     let ch = BridgeChannel::from_cached(
         db.clone(),
         "TEST:longin".into(),
+        "TEST:longin".into(),
+        "VAL".into(),
         NtType::Scalar,
         DbFieldType::Long,
     );
@@ -116,6 +127,8 @@ async fn put_then_get_round_trips_string() {
     let ch = BridgeChannel::from_cached(
         db.clone(),
         "TEST:str".into(),
+        "TEST:str".into(),
+        "VAL".into(),
         NtType::Scalar,
         DbFieldType::String,
     );
@@ -159,6 +172,8 @@ async fn waveform_array_round_trips() {
     let ch = BridgeChannel::from_cached(
         db.clone(),
         "TEST:wf".into(),
+        "TEST:wf".into(),
+        "VAL".into(),
         NtType::ScalarArray,
         DbFieldType::Double,
     );
@@ -174,11 +189,95 @@ async fn waveform_array_round_trips() {
     );
 }
 
-/// `BridgeChannel::channel_name` reports the configured record name
-/// — guards against accidental field-suffix leakage.
+/// `BridgeChannel::channel_name` reports the full requested PV name —
+/// the record name when no field suffix is given, and the full
+/// `record.FIELD` string when one is (BR-R2).
 #[test]
 fn channel_name_matches_record() {
     let db = Arc::new(PvDatabase::new());
-    let ch = BridgeChannel::from_cached(db, "TEST:abc".into(), NtType::Scalar, DbFieldType::Double);
+    let ch = BridgeChannel::from_cached(
+        db.clone(),
+        "TEST:abc".into(),
+        "TEST:abc".into(),
+        "VAL".into(),
+        NtType::Scalar,
+        DbFieldType::Double,
+    );
     assert_eq!(ch.channel_name(), "TEST:abc");
+
+    let ch_field = BridgeChannel::from_cached(
+        db,
+        "TEST:abc.DESC".into(),
+        "TEST:abc".into(),
+        "DESC".into(),
+        NtType::Scalar,
+        DbFieldType::String,
+    );
+    assert_eq!(ch_field.channel_name(), "TEST:abc.DESC");
+    assert_eq!(ch_field.record_name(), "TEST:abc");
+    assert_eq!(ch_field.field(), "DESC");
+}
+
+/// BR-R2: a `record.FIELD` PV name binds to that field, not to VAL.
+/// GET on `test:ai.EGU` returns the EGU string, not the AI VAL double.
+/// PUT through the channel writes EGU, not VAL.
+#[tokio::test]
+async fn channel_with_field_suffix_binds_to_field() {
+    use epics_bridge_rs::qsrv::provider::BridgeProvider;
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:fld_ai", Box::new(AiRecord::new(3.14)))
+        .await
+        .unwrap();
+    db.put_pv("TEST:fld_ai.EGU", EpicsValue::String("Volts".into()))
+        .await
+        .expect("seed EGU");
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let any = provider
+        .create_channel_for("TEST:fld_ai.EGU", "u", "h")
+        .await
+        .expect("create_channel");
+    let ch = match any {
+        epics_bridge_rs::qsrv::AnyChannel::Single(c) => c,
+        _ => panic!("expected single-record channel"),
+    };
+
+    assert_eq!(ch.channel_name(), "TEST:fld_ai.EGU");
+
+    // GET returns EGU string, not VAL double.
+    let result = ch.get(&empty_request()).await.expect("get EGU");
+    let value = extract_value(&result).expect("NTScalar.value");
+    match value {
+        PvField::Scalar(ScalarValue::String(s)) => assert_eq!(s, "Volts"),
+        other => panic!("expected string EGU, got {other:?}"),
+    }
+
+    // PUT writes EGU, not VAL. After the put, EGU must change; VAL
+    // must NOT change.
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields.push((
+        "value".into(),
+        PvField::Scalar(ScalarValue::String("Amps".into())),
+    ));
+    ch.put(&put).await.expect("put EGU");
+
+    let egu_after = {
+        let rec = db.get_record("TEST:fld_ai").await.expect("rec exists");
+        let inst = rec.read().await;
+        inst.snapshot_for_field("EGU").map(|s| s.value)
+    };
+    assert!(
+        matches!(egu_after, Some(EpicsValue::String(ref s)) if s == "Amps"),
+        "EGU should be 'Amps', got {egu_after:?}"
+    );
+
+    let val_after = {
+        let rec = db.get_record("TEST:fld_ai").await.expect("rec exists");
+        let inst = rec.read().await;
+        inst.snapshot_for_field("VAL").map(|s| s.value)
+    };
+    assert!(
+        matches!(val_after, Some(EpicsValue::Double(v)) if (v - 3.14).abs() < 1e-9),
+        "VAL must NOT have been overwritten, got {val_after:?}"
+    );
 }

@@ -35,6 +35,8 @@ use crate::error::{BridgeError, BridgeResult};
 pub struct BridgeMonitor {
     db: Arc<PvDatabase>,
     record_name: String,
+    /// Bound field (uppercased; defaults to `VAL`). BR-R2.
+    field: String,
     nt_type: NtType,
     /// VALUE | ALARM subscription — matches pvxs QSRV default DBE mask
     /// (singlesource.cpp:142). Replaces the previous VALUE | LOG default
@@ -57,10 +59,11 @@ pub struct BridgeMonitor {
 }
 
 impl BridgeMonitor {
-    pub fn new(db: Arc<PvDatabase>, record_name: String, nt_type: NtType) -> Self {
+    pub fn new(db: Arc<PvDatabase>, record_name: String, field: String, nt_type: NtType) -> Self {
         Self {
             db,
             record_name,
+            field,
             nt_type,
             subscription: None,
             property_subscription: None,
@@ -105,11 +108,17 @@ impl PvaMonitor for BridgeMonitor {
         // not inherit DbSubscription::subscribe's CA-leaning
         // VALUE|LOG default, which would deliver archive-LOG
         // events while missing alarm transitions.
+        //
+        // BR-R2: subscribe to the bound field (`record.FIELD`), not
+        // unconditionally to `VAL`. `DbSubscription::subscribe_with_mask`
+        // parses the PV name via `parse_pv_name`, so passing
+        // `record.FIELD` binds the subscriber slot to that field's
+        // subscribers vector.
+        let pv_name = format!("{}.{}", self.record_name, self.field);
         let value_alarm_mask = (EventMask::VALUE | EventMask::ALARM).bits();
-        let sub =
-            DbSubscription::subscribe_with_mask(&self.db, &self.record_name, 0, value_alarm_mask)
-                .await
-                .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
+        let sub = DbSubscription::subscribe_with_mask(&self.db, &pv_name, 0, value_alarm_mask)
+            .await
+            .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
         // BR-R36: pvxs QSRV opens a second subscription with the
         // PROPERTY mask (singlesource.cpp:161) so a PVA monitor
@@ -117,14 +126,10 @@ impl PvaMonitor for BridgeMonitor {
         // not just when VAL changes. The full snapshot is rebuilt
         // on every wake so the property-channel firing alone is
         // enough to push fresh metadata down the wire.
-        let property_sub = DbSubscription::subscribe_with_mask(
-            &self.db,
-            &self.record_name,
-            0,
-            EventMask::PROPERTY.bits(),
-        )
-        .await
-        .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
+        let property_sub =
+            DbSubscription::subscribe_with_mask(&self.db, &pv_name, 0, EventMask::PROPERTY.bits())
+                .await
+                .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
         // The native PVA server emits the initial snapshot via
         // ChannelSource::get_value() at MONITOR INIT time (server_native/
@@ -201,7 +206,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut mon = BridgeMonitor::new(db.clone(), "MON_LIFECYCLE".into(), NtType::Scalar);
+        let mut mon = BridgeMonitor::new(
+            db.clone(),
+            "MON_LIFECYCLE".into(),
+            "VAL".into(),
+            NtType::Scalar,
+        );
         mon.start().await.expect("start ok");
         assert!(mon.running);
 
@@ -230,7 +240,12 @@ mod tests {
         // After stop, a fresh BridgeMonitor against the same record
         // re-subscribes cleanly (regression for "leaked sender keeps
         // the broadcast at saturated subscriber count" issues).
-        let mut mon2 = BridgeMonitor::new(db.clone(), "MON_LIFECYCLE".into(), NtType::Scalar);
+        let mut mon2 = BridgeMonitor::new(
+            db.clone(),
+            "MON_LIFECYCLE".into(),
+            "VAL".into(),
+            NtType::Scalar,
+        );
         mon2.start().await.expect("re-subscribe ok");
         assert!(mon2.running);
         mon2.stop().await;
@@ -249,7 +264,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut mon = BridgeMonitor::new(db.clone(), "MON_PROPERTY".into(), NtType::Scalar);
+        let mut mon = BridgeMonitor::new(
+            db.clone(),
+            "MON_PROPERTY".into(),
+            "VAL".into(),
+            NtType::Scalar,
+        );
         mon.start().await.expect("start ok");
 
         // Manually post a PROPERTY-only event for the VAL field — no

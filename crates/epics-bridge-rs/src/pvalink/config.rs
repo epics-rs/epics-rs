@@ -86,6 +86,14 @@ pub struct PvaLinkConfig {
     /// (pvalink_link.cpp:122). Default `false` — record must be
     /// scanned externally.
     pub scan_on_update: bool,
+    /// BR-R28: when true, the `scan_on_update` processing fires only
+    /// when the owning record's `SCAN` is `Passive`. Distinguishes
+    /// pvxs `CPP` (`scanOnUpdatePassive`, pvalink_link.cpp:122 →
+    /// pvalink_channel.cpp:313) from `CP` (`scanOnUpdateYes`, which
+    /// always fires). Without this flag, `CPP` collapses to `CP` and
+    /// can trigger processing on non-Passive records — changing
+    /// FLNK/output-link cascades vs pvxs.
+    pub scan_on_passive: bool,
     /// When true, `scan_on_update` processing fires on *every* monitor
     /// event even if the linked field value did not change. Mirrors
     /// pvxs `pvaLinkConfig::always` — without it, `CP`/`CPP` scans are
@@ -196,10 +204,12 @@ impl PvaLinkConfig {
                 "CP" | "cp" => {
                     cfg.monitor = true;
                     cfg.scan_on_update = true;
+                    cfg.scan_on_passive = false;
                 }
                 "CPP" | "cpp" => {
                     cfg.monitor = true;
                     cfg.scan_on_update = true;
+                    cfg.scan_on_passive = true;
                 }
                 other => return Err(PvaLinkParseError::BadOption(other.to_string())),
             }
@@ -258,10 +268,12 @@ impl PvaLinkConfig {
                 "CP" | "cp" => {
                     cfg.monitor = true;
                     cfg.scan_on_update = true;
+                    cfg.scan_on_passive = false;
                 }
                 "CPP" | "cpp" => {
                     cfg.monitor = true;
                     cfg.scan_on_update = true;
+                    cfg.scan_on_passive = true;
                 }
                 "MS" | "ms" => cfg.sevr = SevrMode::Ms,
                 "MSI" | "msi" => cfg.sevr = SevrMode::Msi,
@@ -286,6 +298,7 @@ impl PvaLinkConfig {
             process: false,
             notify: false,
             scan_on_update: false,
+            scan_on_passive: false,
             always: false,
             sevr: SevrMode::Nms,
             queue_size: DEFAULT_QUEUE_SIZE,
@@ -368,6 +381,38 @@ mod tests {
         assert!(c.time, "time=true must parse");
         let c = PvaLinkConfig::parse("pva://X?time=false", LinkDirection::Inp).unwrap();
         assert!(!c.time, "time=false must parse");
+    }
+
+    /// BR-R28: `CP` sets scan_on_update without scan_on_passive;
+    /// `CPP` sets both. The legacy bare `CP` / `CPP` modifier path
+    /// follows the same rule.
+    #[test]
+    fn cp_vs_cpp_distinguished() {
+        let cp = PvaLinkConfig::parse("pva://X?proc=CP", LinkDirection::Inp).unwrap();
+        assert!(cp.scan_on_update, "CP must enable scan_on_update");
+        assert!(
+            !cp.scan_on_passive,
+            "CP must NOT set scan_on_passive (pvxs scanOnUpdateYes)"
+        );
+
+        let cpp = PvaLinkConfig::parse("pva://X?proc=CPP", LinkDirection::Inp).unwrap();
+        assert!(cpp.scan_on_update, "CPP must enable scan_on_update");
+        assert!(
+            cpp.scan_on_passive,
+            "CPP must set scan_on_passive (pvxs scanOnUpdatePassive)"
+        );
+
+        // Legacy bare modifier
+        let bare_cpp = PvaLinkConfig::parse("pva://X CPP", LinkDirection::Inp).unwrap();
+        assert!(
+            bare_cpp.scan_on_passive,
+            "bare CPP must set scan_on_passive"
+        );
+        let bare_cp = PvaLinkConfig::parse("pva://X CP", LinkDirection::Inp).unwrap();
+        assert!(
+            !bare_cp.scan_on_passive,
+            "bare CP must not set scan_on_passive"
+        );
     }
 
     #[test]

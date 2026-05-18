@@ -134,6 +134,11 @@ struct ScanTarget {
     /// monitor batch, and an atomic group scans whenever *any* of its
     /// members changed (so siblings stay consistent within the batch).
     atomic: bool,
+    /// BR-R28: pvxs distinguishes `CP` (scanOnUpdateYes) from `CPP`
+    /// (scanOnUpdatePassive). `CPP` is gated by the owning record's
+    /// SCAN being Passive (pvalink_channel.cpp:313). True here means
+    /// "skip processing when the owning record's SCAN != Passive".
+    passive_only: bool,
 }
 
 impl PvaLinkResolver {
@@ -308,6 +313,7 @@ impl PvaLinkResolver {
                         always: cfg.always,
                         monorder: cfg.monorder,
                         atomic: cfg.atomic,
+                        passive_only: cfg.scan_on_passive,
                     });
             }
         }
@@ -548,28 +554,54 @@ async fn run_notify_forwarder(
 
         // Snapshot the fan-out, then order it: atomic group first,
         // then non-atomic; `monorder` within each group.
-        let mut targets: Vec<(String, bool, i32, bool)> = match scan_targets.read().get(&pv_name) {
-            Some(fanout) => fanout
-                .records
-                .iter()
-                .map(|t| (t.record.clone(), t.always, t.monorder, t.atomic))
-                .collect(),
-            None => Vec::new(),
-        };
+        let mut targets: Vec<(String, bool, i32, bool, bool)> =
+            match scan_targets.read().get(&pv_name) {
+                Some(fanout) => fanout
+                    .records
+                    .iter()
+                    .map(|t| {
+                        (
+                            t.record.clone(),
+                            t.always,
+                            t.monorder,
+                            t.atomic,
+                            t.passive_only,
+                        )
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
         // Sort key: (!atomic, monorder) → atomic (false sorts first),
         // then ascending monorder.
-        targets.sort_by_key(|(_, _, order, atomic)| (!*atomic, *order));
+        targets.sort_by_key(|(_, _, order, atomic, _)| (!*atomic, *order));
 
         let Some(db_handle) = db.read().clone() else {
             continue;
         };
-        for (record, always, _order, atomic) in targets {
+        for (record, always, _order, atomic, passive_only) in targets {
             // pvxs: a CPP (`always=false`) link only scans when the
             // input value actually changed; CP with `always` scans
             // unconditionally. An atomic link scans whenever the
             // batch changed so atomic siblings stay consistent.
             if !changed && !always && !atomic {
                 continue;
+            }
+            // BR-R28: `CPP` (passive_only) only fires when the owning
+            // record's SCAN is Passive. pvxs `pvalink_channel.cpp:313`
+            // checks `prec->scan != 0` and skips processing; non-zero
+            // SCAN (Event, IO Intr, periodic) means the record has
+            // its own scan source and must not be re-fired from CPP.
+            if passive_only {
+                let is_passive = match db_handle.get_record(&record).await {
+                    Some(rec) => matches!(
+                        rec.read().await.common.scan,
+                        epics_base_rs::server::record::ScanType::Passive
+                    ),
+                    None => continue,
+                };
+                if !is_passive {
+                    continue;
+                }
             }
             // B3: process WITH links so the CP/CPP-driven scan fans
             // out via INP/OUT/FLNK — a pvalink feeding a calc record
@@ -939,6 +971,7 @@ mod tests {
             always: true,
             monorder: 0,
             atomic: false,
+            passive_only: false,
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -985,6 +1018,7 @@ mod tests {
             always: false,
             monorder: 0,
             atomic: false,
+            passive_only: false,
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -1053,6 +1087,7 @@ mod tests {
             always: true,
             monorder: 0,
             atomic: false,
+            passive_only: false,
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -1196,12 +1231,14 @@ mod tests {
             always: true,
             monorder: 1,
             atomic: false,
+            passive_only: false,
         });
         fanout.records.push(ScanTarget {
             record: "D".into(),
             always: true,
             monorder: -1,
             atomic: false,
+            passive_only: false,
         });
         // Atomic, monorder 5 / 0.
         fanout.records.push(ScanTarget {
@@ -1209,12 +1246,14 @@ mod tests {
             always: true,
             monorder: 5,
             atomic: true,
+            passive_only: false,
         });
         fanout.records.push(ScanTarget {
             record: "B".into(),
             always: true,
             monorder: 0,
             atomic: true,
+            passive_only: false,
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -1259,6 +1298,7 @@ mod tests {
             always: false, // CPP
             monorder: 0,
             atomic: true, // but atomic → scans anyway
+            passive_only: false,
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([

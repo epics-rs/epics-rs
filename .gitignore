@@ -18,3 +18,4 @@ kodex-out/
 # Claude Code per-project state
 .claude/
 .DS_Store
+*.bak

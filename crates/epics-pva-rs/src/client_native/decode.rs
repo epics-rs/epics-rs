@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
     BitSet, ByteOrder, Command, ControlCommand, HeaderFlags, PvaHeader, ReadExt, Status,
-    decode_size, decode_string, ip_from_bytes,
+    decode_size, decode_string, ip_from_bytes_allow_unspec,
 };
 use crate::pvdata::{FieldDesc, PvField};
 
@@ -164,8 +164,14 @@ pub fn decode_search_response(frame: &Frame) -> PvaResult<SearchResponse> {
         );
     }
 
-    let ip = ip_from_bytes(&addr)
-        .ok_or_else(|| PvaError::Protocol("search response unspecified address".to_string()))?;
+    // PVA-R18: a wildcard/unspecified server address means "use the
+    // datagram source IP". pvxs `client.cpp:841-843` does the
+    // substitution; we carry the raw advertised address through here
+    // and let the search engine apply the substitution on receipt
+    // (where the source addr is available). `ip_from_bytes_allow_unspec`
+    // returns `IpAddr::V6(::)` for all-zero — search_engine treats
+    // unspecified as the substitution sentinel.
+    let ip = ip_from_bytes_allow_unspec(&addr);
     let server_addr = SocketAddr::new(ip, port);
 
     Ok(SearchResponse {

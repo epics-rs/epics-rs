@@ -31,7 +31,7 @@ pub use bitset::BitSet;
 pub use buffer::{ByteOrder, DecodeError, ReadExt, WriteExt};
 pub use command::{Command, ControlCommand, MessageType, QosFlags};
 pub use header::{HeaderFlags, MAGIC, PVA_VERSION, PvaHeader};
-pub use ip::{ip_from_bytes, ip_to_bytes};
+pub use ip::{ip_from_bytes, ip_from_bytes_allow_unspec, ip_to_bytes};
 pub use selector::Selector;
 pub use size::{NULL_MARKER, decode_size, encode_size, encode_size_into};
 pub use status::{Status, StatusKind};

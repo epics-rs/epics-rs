@@ -36,6 +36,23 @@ pub fn ip_from_bytes(addr: &[u8; 16]) -> Option<IpAddr> {
     Some(IpAddr::V6(Ipv6Addr::from(*addr)))
 }
 
+/// PVA-R18: decode a 16-byte PVA address treating the all-zero
+/// pattern as the unspecified IPv6 address (`::`) rather than as
+/// "decode failed". pvxs `evhelper.cpp:911-937` accepts it as
+/// `SockAddr::isAny()` and `util.cpp:552-558` classifies IPv6
+/// unspecified as wildcard; downstream code substitutes the UDP
+/// packet's source address for any wildcard SEARCH_RESPONSE /
+/// BEACON (pvxs `client.cpp:841-843`, `udp_collector.cpp:471-476`).
+/// Pre-fix Rust mapped all-zero to `None` and rejected the frame
+/// — so an IPv6-capable peer advertising wildcard via the raw-zero
+/// encoding was ignored by the Rust client.
+pub fn ip_from_bytes_allow_unspec(addr: &[u8; 16]) -> IpAddr {
+    if addr[0..10].iter().all(|&b| b == 0) && addr[10] == 0xFF && addr[11] == 0xFF {
+        return IpAddr::V4(Ipv4Addr::new(addr[12], addr[13], addr[14], addr[15]));
+    }
+    IpAddr::V6(Ipv6Addr::from(*addr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

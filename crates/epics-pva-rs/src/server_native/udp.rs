@@ -295,6 +295,7 @@ pub async fn run_udp_responder_with_config(
                 ByteOrder::Little,
                 beacon_seq,
                 change_count,
+                protocol,
             );
             for dest in &beacon_destinations {
                 // Limited broadcast / multicast destinations need
@@ -679,15 +680,27 @@ async fn process_search_datagram(
                     }
                 };
 
+                // PVA-R10: filter by protocol. pvxs
+                // `udp_collector.cpp:424-443` only queues channel
+                // matches when the SEARCH carried the advertised
+                // protocol ("tcp"). Pre-fix Rust answered every
+                // SEARCH regardless of what the client asked for.
+                // Empty protocol list = legacy peer that omitted the
+                // field — tolerate (treat as wildcard).
+                let protocol_ok =
+                    req.protocols.is_empty() || req.protocols.iter().any(|p| p == protocol);
                 let mut matched_cids: Vec<u32> = Vec::with_capacity(req.queries.len());
-                for (cid, name) in &req.queries {
-                    // `searchable` (not `has_pv`): a name hosted only
-                    // by a non-search-advertised source — the built-in
-                    // `ServerInfoSource` / `server` PV — must not be
-                    // answered to a broadcast SEARCH. Direct TCP
-                    // connect still resolves it via `has_pv`.
-                    if source.searchable(name).await {
-                        matched_cids.push(*cid);
+                if protocol_ok {
+                    for (cid, name) in &req.queries {
+                        // `searchable` (not `has_pv`): a name hosted
+                        // only by a non-search-advertised source —
+                        // the built-in `ServerInfoSource` / `server`
+                        // PV — must not be answered to a broadcast
+                        // SEARCH. Direct TCP connect still resolves
+                        // it via `has_pv`.
+                        if source.searchable(name).await {
+                            matched_cids.push(*cid);
+                        }
                     }
                 }
                 // pvxs `server.cpp:730-732`: when `nreply==0` AND the
@@ -950,6 +963,7 @@ fn build_beacon(
     order: ByteOrder,
     sequence: u8,
     change_count: u16,
+    protocol: &str,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&guid);
@@ -960,7 +974,12 @@ fn build_beacon(
     let addr = ip_to_bytes(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     payload.extend_from_slice(&addr);
     payload.put_u16(tcp_port, order);
-    encode_string_into("tcp", order, &mut payload);
+    // PVA-R10: beacons advertise the runtime transport. Pre-fix
+    // Rust hard-coded "tcp" even when SEARCH_RESPONSE said "tls",
+    // making discovery inconsistent across the two announcement
+    // channels. pvxs `server.cpp:738-745, 773-781` keeps both
+    // consistent.
+    encode_string_into(protocol, order, &mut payload);
     payload.put_u8(0xFF); // null serverStatus marker (matches pvxs)
     let header = PvaHeader::application(true, order, Command::Beacon.code(), payload.len() as u32);
     let mut out = Vec::new();
@@ -992,6 +1011,12 @@ struct SearchRequest {
     /// `nreply==0`. pvxs honours it at `server.cpp:730-732`
     /// (`if(nreply==0 && !msg.mustReply) return;`).
     must_reply: bool,
+    /// PVA-R10: the transport protocols the client requested in this
+    /// SEARCH. pvxs `udp_collector.cpp:408-421` records whether
+    /// "tcp" appeared and `:424-443` only queues channel matches
+    /// when it did. Empty = legacy SEARCH that omitted the field
+    /// (tolerate as "tcp by default").
+    protocols: Vec<String>,
     /// Total bytes consumed from the input slice (header + payload),
     /// used by the multi-message drain loop to advance to the next
     /// chained message in the same datagram.
@@ -1053,8 +1078,18 @@ fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     };
     let reply_port = p.get_u16(order).ok()?;
     let n_proto = decode_size(&mut p, order).ok().flatten()? as usize;
+    // PVA-R10: collect the requested protocol list so the responder
+    // can filter to PVs whose transport matches. pvxs
+    // `udp_collector.cpp:408-421` records whether the SEARCH
+    // included "tcp" and `:424-443` only queues matches when it
+    // did. Pre-fix Rust read-and-discarded the list, then answered
+    // every SEARCH regardless of the protocols the client asked
+    // for.
+    let mut protocols: Vec<String> = Vec::with_capacity(n_proto.min(8));
     for _ in 0..n_proto {
-        let _ = decode_string(&mut p, order).ok()?;
+        if let Ok(Some(s)) = decode_string(&mut p, order) {
+            protocols.push(s);
+        }
     }
     let n = p.get_u16(order).ok()? as usize;
     // P-G22 follow-up: cap pre-alloc against attacker-announced
@@ -1077,6 +1112,7 @@ fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
         reply_port,
         unicast,
         must_reply,
+        protocols,
         consumed: PvaHeader::SIZE + payload_len,
     })
 }
@@ -1552,7 +1588,7 @@ mod tests {
     #[test]
     fn beacon_payload_carries_sequence_and_change_count() {
         let guid = [0x11; 12];
-        let bytes = build_beacon(guid, 5075, ByteOrder::Little, 42, 0xBEEF);
+        let bytes = build_beacon(guid, 5075, ByteOrder::Little, 42, 0xBEEF, "tcp");
         // 8-byte PVA header + 12-byte GUID = 20 bytes prefix.
         let payload = &bytes[8..];
         assert_eq!(&payload[0..12], &guid);

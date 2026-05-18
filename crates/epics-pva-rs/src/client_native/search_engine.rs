@@ -31,7 +31,9 @@ use tracing::{debug, warn};
 
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
-use crate::proto::{Command, PvaHeader, ReadExt, decode_size, decode_string, ip_from_bytes};
+use crate::proto::{
+    Command, PvaHeader, ReadExt, decode_size, decode_string, ip_from_bytes_allow_unspec,
+};
 
 use super::beacon_throttle::BeaconTracker;
 use super::decode::{PeerRole, decode_search_response, try_parse_frame_role};
@@ -1457,6 +1459,17 @@ fn handle_search_response(
     if !resp.found {
         return consumed;
     }
+    // PVA-R10: pvxs `client.cpp:849-880` ignores SEARCH_RESPONSE
+    // frames whose `proto != "tcp"`. The Rust UDP search engine
+    // only opens plain TCP connections to resolved servers; a
+    // server advertising a non-tcp transport (tls without an
+    // established trust path, or an experimental scheme) must be
+    // dropped — connecting on plain TCP would fail at handshake.
+    // Accept "tcp" only here. An empty protocol is tolerated for
+    // back-compat with older shims that omit the field.
+    if !resp.protocol.is_empty() && resp.protocol != "tcp" {
+        return consumed;
+    }
     // pvxs procSearchReply (client.cpp:857-863) drops responses whose
     // server GUID is on the blocklist.
     if ignore_guids.contains(&resp.guid) {
@@ -1541,9 +1554,12 @@ fn handle_beacon(
     guid_arr.copy_from_slice(&guid);
     let mut addr_arr = [0u8; 16];
     addr_arr.copy_from_slice(&addr_bytes);
-    let Some(ip) = ip_from_bytes(&addr_arr) else {
-        return consumed;
-    };
+    // PVA-R18: accept all-zero (IPv6 unspecified) too — pvxs
+    // `udp_collector.cpp:471-476` substitutes the UDP source for any
+    // wildcard BEACON. Pre-fix Rust returned early and dropped the
+    // beacon, so an IPv6-capable server advertising wildcard via the
+    // raw-zero encoding never entered the tracker.
+    let ip = ip_from_bytes_allow_unspec(&addr_arr);
     // pvxs udp_collector.cpp:480: when the beacon's advertised server
     // address is 0.0.0.0 (server bound wildcard), substitute the UDP
     // datagram's source address. Without this, we'd try to connect

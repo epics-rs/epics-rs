@@ -85,23 +85,36 @@ impl RestartTracker {
 }
 
 /// Error returned by [`supervise`] when the policy refuses another
-/// restart, or when the inner task panics / errors permanently.
+/// restart.
 #[derive(Debug)]
 pub enum SuperviseError<E> {
-    /// Restart policy hit `max_restarts` inside `window`.
-    TooManyRestarts,
-    /// Inner task returned an error and supervision was abandoned
-    /// (currently `supervise` keeps retrying on inner errors until
-    /// the policy cap; this variant is reserved for callers that
-    /// build custom flows).
-    Inner(E),
+    /// Restart policy hit `max_restarts` inside `window`. Carries the
+    /// final inner error that triggered the abandoned restart, so the
+    /// caller does not lose the root cause — the C ca-gateway master
+    /// loop likewise reports the last child-exit reason when it gives
+    /// up (`gateway.cc` restart loop).
+    TooManyRestarts {
+        /// `max_restarts` from the policy that was exceeded.
+        max_restarts: u32,
+        /// `window` (seconds) the count was measured over.
+        window_secs: u64,
+        /// The inner-task error from the final failed attempt.
+        last_error: E,
+    },
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for SuperviseError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooManyRestarts => write!(f, "supervisor: too many restarts"),
-            Self::Inner(e) => write!(f, "supervisor inner error: {e}"),
+            Self::TooManyRestarts {
+                max_restarts,
+                window_secs,
+                last_error,
+            } => write!(
+                f,
+                "supervisor: too many restarts ({max_restarts} in {window_secs}s); \
+                 last error: {last_error}"
+            ),
         }
     }
 }
@@ -137,19 +150,26 @@ where
         tracing::info!(attempt, "supervise: starting attempt");
         let result = task_factory().await;
 
-        match result {
+        let last_error = match result {
             Ok(()) => {
                 tracing::info!(attempt, "supervise: task exited normally");
                 return Ok(());
             }
             Err(e) => {
                 tracing::warn!(attempt, error = ?e, "supervise: task failed");
+                e
             }
-        }
+        };
 
         if let Err((max, win)) = tracker.try_record(&policy) {
             tracing::error!(max, window_secs = win, "supervise: too many restarts");
-            return Err(SuperviseError::TooManyRestarts);
+            // Carry the final inner error so the caller sees the root
+            // cause of the abandoned supervision, not just the cap.
+            return Err(SuperviseError::TooManyRestarts {
+                max_restarts: max,
+                window_secs: win,
+                last_error,
+            });
         }
 
         tracing::info!(
@@ -242,6 +262,18 @@ mod tests {
         };
         let result: Result<(), SuperviseError<&str>> =
             supervise(policy, || async { Err::<(), &str>("always fails") }).await;
-        assert!(matches!(result, Err(SuperviseError::TooManyRestarts)));
+        match result {
+            Err(SuperviseError::TooManyRestarts {
+                max_restarts,
+                window_secs,
+                last_error,
+            }) => {
+                assert_eq!(max_restarts, 2);
+                assert_eq!(window_secs, 60);
+                // L5: the final inner error is preserved, not discarded.
+                assert_eq!(last_error, "always fails");
+            }
+            other => panic!("expected TooManyRestarts, got {other:?}"),
+        }
     }
 }

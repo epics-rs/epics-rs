@@ -33,6 +33,11 @@ pub struct BoRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    /// Set when a HIGH one-shot timer is in flight. The next
+    /// `process()` (the timer-driven reprocess) forces `VAL = 0`,
+    /// mirroring C `boRecord.c::myCallbackFunc` which sets
+    /// `prec->val = 0` before `dbProcess`.
+    high_reset_pending: bool,
 }
 
 impl Default for BoRecord {
@@ -60,6 +65,7 @@ impl Default for BoRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            high_reset_pending: false,
         }
     }
 }
@@ -87,12 +93,37 @@ impl BoRecord {
 }
 
 /// Try to parse a DOL string as a constant value.
+///
+/// C `recGblInitConstantLink(&prec->dol, DBF_USHORT, …)` converts the
+/// constant link string with the field's type. Plain decimal, hex
+/// (`0x…`), negative (wraps mod 2^16) and floating-point (`1.0`)
+/// forms all convert to a `DBF_USHORT`. The naive `parse::<u16>()`
+/// rejected every one of those except a plain non-negative decimal.
 fn dol_as_constant(dol: &str) -> Option<u16> {
     let s = dol.trim();
     if s.is_empty() {
         return None;
     }
-    s.parse::<u16>().ok()
+    // Hex form (0x.. / -0x..).
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        return u32::from_str_radix(hex, 16).ok().map(|v| v as u16);
+    }
+    if let Some(hex) = s.strip_prefix("-0x").or_else(|| s.strip_prefix("-0X")) {
+        return u32::from_str_radix(hex, 16)
+            .ok()
+            .map(|v| (v as i32).wrapping_neg() as u16);
+    }
+    // Decimal integer (handles negatives via wrap-around).
+    if let Ok(v) = s.parse::<i64>() {
+        return Some(v as u16);
+    }
+    // Floating-point constant — DBF_USHORT truncates toward zero.
+    if let Ok(v) = s.parse::<f64>() {
+        if v.is_finite() {
+            return Some(v as i64 as u16);
+        }
+    }
+    None
 }
 
 static FIELDS: &[FieldDesc] = &[
@@ -245,6 +276,14 @@ impl Record for BoRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // HIGH one-shot: a pending HIGH timer fired and triggered this
+        // reprocess. C `boRecord.c::myCallbackFunc` sets `prec->val = 0`
+        // before `dbProcess`, driving a momentary output back to Done.
+        if self.high_reset_pending {
+            self.high_reset_pending = false;
+            self.val = 0;
+        }
+
         // DOL/OMSL: constant DOL handling
         if self.omsl == 1 && !self.dol.is_empty() {
             if let Some(v) = dol_as_constant(&self.dol) {
@@ -258,9 +297,11 @@ impl Record for BoRecord {
         self.oraw = self.rval;
         self.orbv = self.rbv;
 
-        // HIGH toggle: if val==1 and high>0, schedule reprocess after HIGH seconds
+        // HIGH toggle: if val==1 and high>0, schedule reprocess after HIGH
+        // seconds — the reprocess then drives the output back to 0.
         let mut actions = Vec::new();
         if self.val == 1 && self.high > 0.0 {
+            self.high_reset_pending = true;
             actions.push(ProcessAction::ReprocessAfter(
                 std::time::Duration::from_secs_f64(self.high),
             ));
@@ -271,6 +312,30 @@ impl Record for BoRecord {
             actions,
             device_did_compute: false,
         })
+    }
+
+    /// C `boRecord.c::checkAlarms` — STATE alarm (ZSV for VAL=0,
+    /// OSV for VAL=1) and COS alarm (COSV). The framework's
+    /// `rec_gbl_check_udf` raises the UDF alarm separately; unlike
+    /// `bi`, C `boRecord.c::checkAlarms` evaluates STATE/COS even
+    /// when UDF is set, so this method does not early-return on UDF.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
+
+        let val = self.val;
+        let state_sev = if val == 0 { self.zsv } else { self.osv };
+        let sev = AlarmSeverity::from_u16(state_sev as u16);
+        if sev != AlarmSeverity::NoAlarm {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, sev);
+        }
+        if val != self.lalm {
+            let cos_sev = AlarmSeverity::from_u16(self.cosv as u16);
+            if cos_sev != AlarmSeverity::NoAlarm {
+                recgbl::rec_gbl_set_sevr(common, alarm_status::COS_ALARM, cos_sev);
+            }
+            self.lalm = val;
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

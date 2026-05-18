@@ -309,6 +309,14 @@ pub struct NDArray {
     pub data: NDDataBuffer,
     pub attributes: NDAttributeList,
     pub codec: Option<Codec>,
+    /// Identity of the pool that allocated this array (C++ `pNDArrayPool`).
+    /// `0` means the array was not allocated through any pool. `NDArrayPool::release`
+    /// verifies this matches its own id before returning the buffer to the free list.
+    pub pool_id: u64,
+    /// Requested byte count at allocation time (C++ `dataSize`). This is the exact
+    /// `num_elements * element_size` requested, NOT the allocator-rounded Vec capacity.
+    /// Pool memory accounting adds/subtracts this exact value.
+    pub data_size: usize,
 }
 
 impl NDArray {
@@ -327,6 +335,28 @@ impl NDArray {
             data: NDDataBuffer::zeros(data_type, num_elements),
             attributes: NDAttributeList::new(),
             codec: None,
+            pool_id: 0,
+            data_size: num_elements * data_type.element_size(),
+        }
+    }
+
+    /// Create an NDArray wrapping an already-built data buffer.
+    ///
+    /// The array is not pool-allocated (`pool_id == 0`); `data_size` is taken
+    /// from the buffer's element count. Use this when a producer fills its own
+    /// buffer instead of allocating through an [`crate::ndarray_pool::NDArrayPool`].
+    pub fn with_data(dims: Vec<NDDimension>, data: NDDataBuffer) -> Self {
+        let data_size = data.len() * data.data_type().element_size();
+        Self {
+            unique_id: 0,
+            timestamp: EpicsTimestamp::default(),
+            time_stamp: 0.0,
+            dims,
+            data,
+            attributes: NDAttributeList::new(),
+            codec: None,
+            pool_id: 0,
+            data_size,
         }
     }
 
@@ -353,14 +383,18 @@ impl NDArray {
 
         let (x_size, y_size, color_size, x_dim, y_dim, color_dim, x_stride, y_stride, color_stride) =
             match ndims {
+                // C++ getInfo: ySize/colorSize/strides stay 0-initialized for <2-D.
+                // The `colorSize == 0` idiom signals "no color dimension"; keeping it
+                // at 0 (not 1) preserves C parity for that check.
                 0 => (0, 0, 0, 0, 0, 0, 0, 0, 0),
-                1 => (self.dims[0].size, 1, 1, 0, 0, 0, 1, self.dims[0].size, 0),
+                1 => (self.dims[0].size, 0, 0, 0, 0, 0, 1, 0, 0),
                 2 => {
                     let xs = self.dims[0].size;
                     let ys = self.dims[1].size;
-                    (xs, ys, 1, 0, 1, 0, 1, xs, 0)
+                    // C++ getInfo for 2-D: yStride = xSize, colorSize/colorStride = 0.
+                    (xs, ys, 0, 0, 1, 0, 1, xs, 0)
                 }
-                _ => {
+                3 => {
                     // 3D: layout depends on ColorMode
                     match color_mode {
                         NDColorMode::RGB1 => {
@@ -385,13 +419,29 @@ impl NDArray {
                             (xs, ys, cs, 0, 1, 2, 1, xs, xs * ys)
                         }
                         _ => {
-                            // Mono or other: treat as dim[0]=X, dim[1]=Y, dim[2]=Z
+                            // Mono / Bayer / YUV444 / YUV422 / YUV411: treated
+                            // as a plain 3-D array (dim[0]=X, dim[1]=Y,
+                            // dim[2]=Z). G4: C++ NDArray::getInfo has the SAME
+                            // limitation — it only special-cases RGB1/RGB2/RGB3
+                            // and falls through to this generic 3-D layout for
+                            // YUV modes. This is a shared C-parity gap, not a
+                            // Rust regression; YUV layout-awareness would have
+                            // to be added to both implementations together.
                             let xs = self.dims[0].size;
                             let ys = self.dims[1].size;
                             let cs = self.dims[2].size;
                             (xs, ys, cs, 0, 1, 2, 1, xs, xs * ys)
                         }
                     }
+                }
+                // R3: C++ getInfo gates the color-dimension block on
+                // `ndims == 3` exactly. For 4-D and higher arrays it leaves
+                // colorSize/colorDim/colorStride at 0 and only fills xDim/yDim
+                // from the first two dimensions — same as the 2-D case.
+                _ => {
+                    let xs = self.dims[0].size;
+                    let ys = self.dims[1].size;
+                    (xs, ys, 0, 0, 1, 0, 1, xs, 0)
                 }
             };
 
@@ -410,6 +460,54 @@ impl NDArray {
             color_stride,
             color_mode,
         }
+    }
+
+    /// Produce a diagnostic text dump (matching C++ `NDArray::report`).
+    ///
+    /// `details > 5` additionally lists attributes.
+    pub fn report(&self, details: i32) -> String {
+        let mut out = String::new();
+        out.push('\n');
+        out.push_str("NDArray:\n");
+        let dim_sizes: Vec<String> = self.dims.iter().map(|d| d.size.to_string()).collect();
+        out.push_str(&format!(
+            "  ndims={} dims=[{}]\n",
+            self.dims.len(),
+            dim_sizes.join(" ")
+        ));
+        out.push_str(&format!(
+            "  dataType={:?}, dataSize={}, numElements={}\n",
+            self.data.data_type(),
+            self.data_size,
+            self.data.len()
+        ));
+        out.push_str(&format!(
+            "  uniqueId={}, timeStamp={}, epicsTS.secPastEpoch={}, epicsTS.nsec={}\n",
+            self.unique_id, self.time_stamp, self.timestamp.sec, self.timestamp.nsec
+        ));
+        out.push_str(&format!("  poolId={}\n", self.pool_id));
+        match &self.codec {
+            Some(c) => out.push_str(&format!(
+                "  codec={:?}, compressedSize={}\n",
+                c.name, c.compressed_size
+            )),
+            None => out.push_str("  codec=none\n"),
+        }
+        out.push_str(&format!(
+            "  number of attributes={}\n",
+            self.attributes.len()
+        ));
+        if details > 5 {
+            for attr in self.attributes.iter() {
+                out.push_str(&format!(
+                    "    attribute name={}, value={}, source={:?}\n",
+                    attr.name,
+                    attr.value.as_string(),
+                    attr.source
+                ));
+            }
+        }
+        out
     }
 
     /// Validate that buffer length matches dimension product.
@@ -513,7 +611,8 @@ mod tests {
         let info = arr.info();
         assert_eq!(info.x_size, 640);
         assert_eq!(info.y_size, 480);
-        assert_eq!(info.color_size, 1);
+        // C parity: 2-D arrays have colorSize == 0 (no color dimension).
+        assert_eq!(info.color_size, 0);
         assert_eq!(info.num_elements, 640 * 480);
         assert_eq!(info.bytes_per_element, 2);
         assert_eq!(info.total_bytes, 640 * 480 * 2);
@@ -548,6 +647,7 @@ mod tests {
             description: "Color Mode".into(),
             source: NDAttrSource::Driver,
             value: NDAttrValue::Int32(NDColorMode::RGB1 as i32),
+            source_impl: None,
         });
         let info = arr.info();
         assert_eq!(info.color_size, 3);
@@ -565,8 +665,34 @@ mod tests {
         let arr = NDArray::new(dims, NDDataType::Float64);
         let info = arr.info();
         assert_eq!(info.x_size, 1024);
-        assert_eq!(info.y_size, 1);
-        assert_eq!(info.color_size, 1);
+        // C parity: 1-D arrays leave ySize / colorSize at 0.
+        assert_eq!(info.y_size, 0);
+        assert_eq!(info.color_size, 0);
+    }
+
+    #[test]
+    fn test_ndarray_info_4d_not_color() {
+        // R3: C++ getInfo gates the color block on `ndims == 3` exactly.
+        // A 4-D array must leave color_size / color_dim / color_stride at 0
+        // and only fill x/y from the first two dimensions.
+        let dims = vec![
+            NDDimension::new(8),
+            NDDimension::new(640),
+            NDDimension::new(480),
+            NDDimension::new(5),
+        ];
+        let arr = NDArray::new(dims, NDDataType::UInt8);
+        let info = arr.info();
+        assert_eq!(info.x_size, 8);
+        assert_eq!(info.y_size, 640);
+        assert_eq!(info.color_size, 0, "4-D array must not get a color size");
+        assert_eq!(info.x_dim, 0);
+        assert_eq!(info.y_dim, 1);
+        assert_eq!(info.color_dim, 0);
+        assert_eq!(info.x_stride, 1);
+        assert_eq!(info.y_stride, 8);
+        assert_eq!(info.color_stride, 0);
+        assert_eq!(info.num_elements, 8 * 640 * 480 * 5);
     }
 
     #[test]

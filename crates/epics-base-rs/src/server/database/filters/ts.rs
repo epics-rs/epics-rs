@@ -134,20 +134,27 @@ impl SubscriptionFilter for TimestampFilter {
                 event.event.snapshot.value = EpicsValue::Double(v);
             }
             TsMode::Seconds => {
+                // C `ts.c:199` sets `field_type = DBF_ULONG` and
+                // writes an `epicsUInt32`. The Rust value model has
+                // no unsigned-32 scalar; `Int64` carries the full
+                // `epicsUInt32` range losslessly so a Unix-epoch
+                // `sec` past `i32::MAX` (year 2038) is not truncated.
                 let (sec, _) = ts_parts(event.event.snapshot.timestamp, self.epoch);
-                event.event.snapshot.value =
-                    EpicsValue::Long(sec.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+                event.event.snapshot.value = EpicsValue::Int64(sec);
             }
             TsMode::Nanoseconds => {
+                // Nanoseconds are always < 1e9 — fits any width;
+                // kept as `Int64` for type-consistency with the
+                // seconds / array modes.
                 let (_, nsec) = ts_parts(event.event.snapshot.timestamp, self.epoch);
-                event.event.snapshot.value = EpicsValue::Long(nsec as i32);
+                event.event.snapshot.value = EpicsValue::Int64(nsec as i64);
             }
             TsMode::Array => {
+                // C `ts_array` produces a 2-element `DBF_ULONG`
+                // array. `Int64Array` holds the unsigned-32 range
+                // without the post-2038 seconds truncation.
                 let (sec, nsec) = ts_parts(event.event.snapshot.timestamp, self.epoch);
-                event.event.snapshot.value = EpicsValue::LongArray(vec![
-                    sec.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-                    nsec as i32,
-                ]);
+                event.event.snapshot.value = EpicsValue::Int64Array(vec![sec, nsec as i64]);
             }
             TsMode::StringEpics => {
                 event.event.snapshot.value =
@@ -215,8 +222,10 @@ mod tests {
         let f = TimestampFilter::with_mode_epoch(TsMode::Seconds, TsEpoch::Epics);
         let out = f.apply(make_event(ts)).unwrap();
         match out.event.snapshot.value {
-            EpicsValue::Long(v) => assert_eq!(v, 10),
-            other => panic!("expected Long(10), got {other:?}"),
+            // C `ts.c` uses DBF_ULONG — modelled as Int64 (no
+            // unsigned-32 scalar in the Rust value model).
+            EpicsValue::Int64(v) => assert_eq!(v, 10),
+            other => panic!("expected Int64(10), got {other:?}"),
         }
     }
 
@@ -228,8 +237,8 @@ mod tests {
         let f = TimestampFilter::with_mode_epoch(TsMode::Seconds, TsEpoch::Unix);
         let out = f.apply(make_event(ts)).unwrap();
         match out.event.snapshot.value {
-            EpicsValue::Long(v) => assert_eq!(v as u64, EPICS_UNIX_EPOCH_OFFSET_SECS + 10),
-            other => panic!("expected Long, got {other:?}"),
+            EpicsValue::Int64(v) => assert_eq!(v as u64, EPICS_UNIX_EPOCH_OFFSET_SECS + 10),
+            other => panic!("expected Int64, got {other:?}"),
         }
     }
 
@@ -240,8 +249,8 @@ mod tests {
         let f = TimestampFilter::with_mode(TsMode::Nanoseconds);
         let out = f.apply(make_event(ts)).unwrap();
         match out.event.snapshot.value {
-            EpicsValue::Long(v) => assert_eq!(v, 123_456_789),
-            other => panic!("expected Long(123456789), got {other:?}"),
+            EpicsValue::Int64(v) => assert_eq!(v, 123_456_789),
+            other => panic!("expected Int64(123456789), got {other:?}"),
         }
     }
 
@@ -260,7 +269,7 @@ mod tests {
         }
     }
 
-    /// `num=ts` returns a `LongArray[sec, nsec]`.
+    /// `num=ts` returns an `Int64Array[sec, nsec]` (C DBF_ULONG pair).
     #[test]
     fn array_mode_returns_sec_nsec_pair() {
         let ts =
@@ -268,10 +277,30 @@ mod tests {
         let f = TimestampFilter::with_mode(TsMode::Array);
         let out = f.apply(make_event(ts)).unwrap();
         match out.event.snapshot.value {
-            EpicsValue::LongArray(v) => {
+            EpicsValue::Int64Array(v) => {
                 assert_eq!(v, vec![7, 500_000_000]);
             }
-            other => panic!("expected LongArray, got {other:?}"),
+            other => panic!("expected Int64Array, got {other:?}"),
+        }
+    }
+
+    /// Post-2038 regression: a Unix-epoch `sec` value beyond
+    /// `i32::MAX` must NOT be truncated. C `ts.c` uses the full
+    /// `epicsUInt32` range; the Rust port keeps it lossless in
+    /// `Int64`.
+    #[test]
+    fn sec_mode_unix_epoch_no_post_2038_truncation() {
+        // 2^31 + 1000 seconds past the Unix epoch — beyond i32::MAX.
+        let big = i32::MAX as u64 + 1000;
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + big);
+        let f = TimestampFilter::with_mode_epoch(TsMode::Seconds, TsEpoch::Unix);
+        let out = f.apply(make_event(ts)).unwrap();
+        match out.event.snapshot.value {
+            EpicsValue::Int64(v) => {
+                assert_eq!(v as u64, EPICS_UNIX_EPOCH_OFFSET_SECS + big);
+                assert!(v > i32::MAX as i64, "post-2038 value not truncated");
+            }
+            other => panic!("expected Int64, got {other:?}"),
         }
     }
 

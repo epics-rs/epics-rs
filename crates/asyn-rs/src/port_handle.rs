@@ -62,6 +62,8 @@ pub struct PortHandle {
     port_name: String,
     interrupts: Arc<InterruptManager>,
     can_block: bool,
+    multi_device: bool,
+    max_addr: i32,
 }
 
 impl PortHandle {
@@ -75,6 +77,8 @@ impl PortHandle {
             port_name,
             interrupts,
             can_block: false,
+            multi_device: false,
+            max_addr: 1,
         }
     }
 
@@ -86,6 +90,30 @@ impl PortHandle {
     /// Whether this port can perform blocking I/O.
     pub fn can_block(&self) -> bool {
         self.can_block
+    }
+
+    /// Record the port's multi-device capability and address count.
+    /// Called by the runtime layer at handle construction so the
+    /// flags reflect the driver's `PortFlags::multi_device` /
+    /// `PortDriverBase::max_addr`.
+    pub fn set_capabilities(&mut self, multi_device: bool, max_addr: i32) {
+        self.multi_device = multi_device;
+        self.max_addr = max_addr.max(1);
+    }
+
+    /// Whether this port is multi-device. C parity:
+    /// `pasynManager::isMultiDevice` (`asynManager.c::isMultiDevice`)
+    /// — used by clients to decide whether to address sub-units
+    /// individually or always pass `addr=0`.
+    pub fn is_multi_device(&self) -> bool {
+        self.multi_device
+    }
+
+    /// Maximum sub-device address (exclusive upper bound).
+    /// Mirrors C `pport->numAddr` / the `maxAddr` constructor
+    /// argument of `asynPortDriver`. Always at least 1.
+    pub fn max_addr(&self) -> i32 {
+        self.max_addr
     }
 
     /// Port name this handle is connected to.
@@ -232,6 +260,29 @@ impl PortHandle {
             status: AsynStatus::Error,
             message: "octet read returned no data".into(),
         })
+    }
+
+    /// Read variant that also surfaces the end-of-message reason
+    /// flags. C parity: `asynOctet::read(... int *eomReason)`
+    /// (`interfaces/asynOctet.h:38-40`) — consumers like asynRecord
+    /// (`EOMR` field, `asynRecord.c`) need the flag bitmap to tell
+    /// "byte count reached" from "EOS matched" from "END asserted".
+    pub async fn read_octet_eom(
+        &self,
+        reason: usize,
+        addr: i32,
+        buf_size: usize,
+    ) -> AsynResult<(Vec<u8>, crate::interpose::EomReason)> {
+        let user = AsynUser::new(reason).with_addr(addr);
+        let result = self
+            .submit_async(RequestOp::OctetRead { buf_size }, user)
+            .await?;
+        let data = result.data.ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: "octet read returned no data".into(),
+        })?;
+        let eom = crate::interpose::EomReason::from_bits_truncate(result.eom_reason);
+        Ok((data, eom))
     }
 
     pub async fn write_octet(&self, reason: usize, addr: i32, data: Vec<u8>) -> AsynResult<()> {
@@ -541,6 +592,52 @@ impl PortHandle {
         Ok(())
     }
 
+    /// Address-aware setOption — iocsh `asynSetOption portName addr key value`.
+    /// The C surface (`asynShellCommands.c:604-606`) carries `addr`
+    /// via `connectDevice`; here we attach it to the AsynUser so the
+    /// driver can disambiguate device-scoped options.
+    pub fn set_option_addr_blocking(&self, addr: i32, key: &str, value: &str) -> AsynResult<()> {
+        let user = AsynUser::default().with_addr(addr);
+        self.submit_blocking(
+            RequestOp::SetOption {
+                key: key.to_string(),
+                value: value.to_string(),
+            },
+            user,
+        )?;
+        Ok(())
+    }
+
+    /// Run the port driver's `report(level)` callback on the actor
+    /// thread. Mirrors C asyn `asynReport` (asynShellCommands.c:586)
+    /// which calls `pasynManager->report` to walk each port's
+    /// `pasynCommon->report` interface. Output is written to stderr
+    /// by the driver itself.
+    pub fn report_blocking(&self, level: i32) -> AsynResult<()> {
+        let user = AsynUser::default();
+        self.submit_blocking(RequestOp::Report { level }, user)?;
+        Ok(())
+    }
+
+    /// Apply input EOS bytes to the port through the actor — C
+    /// `pasynOctet->setInputEos`. asynRecord IEOS writes (and any
+    /// other caller that wants to change the in-driver EOS) MUST
+    /// reach the driver via this path; the previous option-key
+    /// route only wrote to `PortDriverBase::options` which no
+    /// driver consumes.
+    pub fn set_input_eos_blocking(&self, eos: &[u8]) -> AsynResult<()> {
+        let user = AsynUser::default();
+        self.submit_blocking(RequestOp::SetInputEos { eos: eos.to_vec() }, user)?;
+        Ok(())
+    }
+
+    /// Apply output EOS bytes — C `pasynOctet->setOutputEos`.
+    pub fn set_output_eos_blocking(&self, eos: &[u8]) -> AsynResult<()> {
+        let user = AsynUser::default();
+        self.submit_blocking(RequestOp::SetOutputEos { eos: eos.to_vec() }, user)?;
+        Ok(())
+    }
+
     pub async fn get_option(&self, key: &str) -> AsynResult<String> {
         let user = AsynUser::default();
         let result = self
@@ -596,6 +693,26 @@ impl PortHandle {
         Ok(())
     }
 
+    /// Enable or disable the entire port. C parity:
+    /// `pasynManager->enable(pasynUser, enable)` — fired by
+    /// `asynRecord` `ENBL` field writes (`asynRecord.c:484-486`).
+    pub fn set_enable_blocking(&self, enable: bool) -> AsynResult<()> {
+        let user = AsynUser::default();
+        self.submit_blocking(RequestOp::SetEnable { yes: enable }, user)?;
+        Ok(())
+    }
+
+    /// Enable or disable auto-connect for the port. C parity:
+    /// `pasynManager->autoConnect(pasynUser, autoConnect)` — fired
+    /// by `asynRecord` `AUCT` field writes
+    /// (`asynRecord.c:481-482`). Emits `asynExceptionAutoConnect`
+    /// unconditionally.
+    pub fn set_auto_connect_blocking(&self, yes: bool) -> AsynResult<()> {
+        let user = AsynUser::default();
+        self.submit_blocking(RequestOp::SetAutoConnect { yes }, user)?;
+        Ok(())
+    }
+
     // --- Bounds convenience methods ---
 
     pub fn get_bounds_int32_blocking(&self, reason: usize, addr: i32) -> AsynResult<(i64, i64)> {
@@ -614,6 +731,20 @@ impl PortHandle {
             status: AsynStatus::Error,
             message: "get_bounds returned no bounds".into(),
         })
+    }
+
+    // --- Port-state query convenience methods ---
+
+    /// Query whether the port is currently enabled (blocking).
+    pub fn is_enabled_blocking(&self) -> AsynResult<bool> {
+        let result = self.submit_blocking(RequestOp::GetEnable, AsynUser::new(0))?;
+        Ok(result.int_val.unwrap_or(0) != 0)
+    }
+
+    /// Query whether auto-connect is enabled for the port (blocking).
+    pub fn is_auto_connect_blocking(&self) -> AsynResult<bool> {
+        let result = self.submit_blocking(RequestOp::GetAutoConnect, AsynUser::new(0))?;
+        Ok(result.int_val.unwrap_or(0) != 0)
     }
 }
 
@@ -722,5 +853,113 @@ mod tests {
     fn handle_port_name() {
         let handle = make_handle(TestDriver::new());
         assert_eq!(handle.port_name(), "handle_test");
+    }
+
+    /// C parity: `pasynManager::isMultiDevice` reads back the
+    /// port-level flag set at registration. The Rust handle must
+    /// expose the same so clients can decide whether to issue
+    /// addr-scoped requests or always use `addr=0`.
+    #[test]
+    fn handle_exposes_multi_device_and_max_addr() {
+        let mut handle = make_handle(TestDriver::new());
+        // Defaults — single-device, max_addr=1.
+        assert!(!handle.is_multi_device());
+        assert_eq!(handle.max_addr(), 1);
+
+        handle.set_capabilities(true, 8);
+        assert!(handle.is_multi_device());
+        assert_eq!(handle.max_addr(), 8);
+
+        // Floor guard: a degenerate `set_capabilities(_, 0)` must
+        // still report at least 1 (C asyn enforces the same in
+        // `paramList` constructor).
+        handle.set_capabilities(false, 0);
+        assert!(!handle.is_multi_device());
+        assert_eq!(handle.max_addr(), 1);
+    }
+
+    /// C parity: `asynRecord` ENBL field writes call
+    /// `pasynManager->enable(...)`, which in turn flips the
+    /// per-port `enabled` flag and emits `asynExceptionEnable`. The
+    /// Rust analogue routes through `RequestOp::SetEnable` →
+    /// `PortDriver::enable/disable` → `PortDriverBase::set_enabled`.
+    #[test]
+    fn handle_set_enable_blocking_propagates_to_driver() {
+        use crate::exception::{AsynException, ExceptionManager};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut base = PortDriverBase::new("enbl_prop", 1, PortFlags::default());
+        base.create_param("VAL", ParamType::Int32).unwrap();
+        let exc_mgr = Arc::new(ExceptionManager::new());
+        base.exception_sink = Some(exc_mgr.clone());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        exc_mgr.add_callback(move |event| {
+            if event.exception == AsynException::Enable {
+                hits2.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        struct Drv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let handle = make_handle(Drv { base });
+        handle.set_enable_blocking(false).unwrap();
+        handle.set_enable_blocking(true).unwrap();
+        // C `enable` fires on every transition; both calls land.
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+    }
+
+    /// C parity: `asynRecord` AUCT writes call
+    /// `pasynManager->autoConnect(...)`, which always emits
+    /// `asynExceptionAutoConnect` — even on no-op (same-value)
+    /// writes. The Rust analogue routes through
+    /// `RequestOp::SetAutoConnect` → `set_auto_connect`.
+    #[test]
+    fn handle_set_auto_connect_blocking_propagates_to_driver() {
+        use crate::exception::{AsynException, ExceptionManager};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut base = PortDriverBase::new("auct_prop", 1, PortFlags::default());
+        base.create_param("VAL", ParamType::Int32).unwrap();
+        let exc_mgr = Arc::new(ExceptionManager::new());
+        base.exception_sink = Some(exc_mgr.clone());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        exc_mgr.add_callback(move |event| {
+            if event.exception == AsynException::AutoConnect {
+                hits2.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        struct Drv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let handle = make_handle(Drv { base });
+        // Both true→true and true→false fire (C unconditional).
+        handle.set_auto_connect_blocking(true).unwrap();
+        handle.set_auto_connect_blocking(false).unwrap();
+        handle.set_auto_connect_blocking(false).unwrap();
+        assert_eq!(hits.load(Ordering::Relaxed), 3);
     }
 }

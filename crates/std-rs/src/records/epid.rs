@@ -2,7 +2,11 @@ use std::any::Any;
 use std::time::Instant;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
+use epics_base_rs::server::recgbl::{self, alarm_status};
+use epics_base_rs::server::record::{
+    AlarmSeverity, CommonFields, FieldDesc, LinkType, ProcessAction, ProcessContext,
+    ProcessOutcome, Record, link_field_type,
+};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 /// Feedback mode for the epid record.
@@ -165,6 +169,86 @@ pub struct EpidRecord {
     /// device support's read() already performed the PID computation.
     /// process() checks this to avoid running the built-in PID a second time.
     device_did_compute: bool,
+    /// Set by `do_pid` when the `INP` link is a CONSTANT link (a literal
+    /// value, not a PV reference). C `devEpidSoft.c:110-112`
+    /// (`if (pepid->inp.type == CONSTANT) recGblSetSevr(...,SOFT_ALARM,
+    /// INVALID_ALARM)`): with a constant INP there is "nothing to
+    /// control", so the PID compute is skipped and SOFT/INVALID is
+    /// raised. The framework `check_alarms` hook reads this flag and
+    /// applies the severity via `recGblSetSevr`.
+    pub inp_constant: bool,
+    /// Framework-owned `dbCommon.udf`, pushed by the framework via
+    /// [`Record::set_process_context`] immediately before `process()`.
+    /// C `epidRecord.c:195` reads `pepid->udf` at the top of
+    /// `process()` and skips `do_pid` entirely while it is set. The
+    /// matching `UDF_ALARM` (C `epidRecord.c:199`,
+    /// `recGblSetSevr(pepid,UDF_ALARM,pepid->udfs)`) is raised by the
+    /// framework's centralised `rec_gbl_check_udf` after `process()`.
+    udf: bool,
+    /// Set by `process()` for a cycle on which the UDF gate skipped
+    /// `do_pid`. C `epidRecord.c:201` `return(0)` is reached before
+    /// `recGblFwdLink` and before `do_pid` writes the output, so on
+    /// such a cycle the framework must NOT write the OUTL link
+    /// (`multi_output_links`) or fire the forward link.
+    compute_skipped: bool,
+    /// True iff the framework's input-link fetch for `STPL` actually
+    /// produced a value this cycle — the framework analogue of C
+    /// `RTN_SUCCESS(dbGetLink(&prec->stpl, ...))`. Pushed by the
+    /// framework via [`Record::set_resolved_input_links`] after the
+    /// `multi_input_links` fetch (STPL is only in that list when
+    /// `SMSL == closed_loop`). C `epidRecord.c:191-193` clears `udf`
+    /// only on this success — a STPL that is empty, or a DB/CA link
+    /// whose fetch failed, leaves `udf` set.
+    stpl_resolved: bool,
+    /// Framework-owned `dbCommon.dtyp`, pushed by the framework via
+    /// [`Record::set_process_context`] before the input-link fetch.
+    /// C device support for the epid record lives in two distinct
+    /// DSETs — `devEpidSoft` (`devEpidSoft.c`, no TRIG handling) and
+    /// `devEpidSoftCallback` (`devEpidSoftCallback.c`, which drives the
+    /// TRIG readback link). [`Record::pre_input_link_actions`] checks
+    /// this to emit the TRIG write only when the callback DSET (DTYP
+    /// `"Epid Async Soft"`) is selected.
+    dtyp: String,
+    /// Epid-owned `dbCommon.udf` projection, returned by
+    /// [`Record::value_is_undefined`]. C `epidRecord.c` has
+    /// `special = NULL` (line 105) — there is no operator UDF clear,
+    /// and `udf` is cleared ONLY by the two C conditions:
+    ///
+    /// - `epidRecord.c:160-164` init: a CONSTANT `STPL` link holding
+    ///   a valid constant clears `udf` (mirrored by
+    ///   [`Record::post_init_finalize_undef`] / a CONSTANT `STPL`
+    ///   making `value_is_undefined()` return `false`).
+    /// - `epidRecord.c:191-193` process: closed-loop (`SMSL=1`) with
+    ///   a successful `dbGetLink(stpl)` clears `udf`.
+    ///
+    /// `process()` recomputes this each cycle; the framework's
+    /// post-process `common.udf = value_is_undefined()` then keeps a
+    /// supervisory / empty-STPL epid permanently undefined, exactly as
+    /// C leaves `udf == TRUE` forever for such a record.
+    value_undefined: bool,
+    /// Set by [`crate::device_support::epid_soft_callback::
+    /// EpidSoftCallbackDeviceSupport::read`] on the first (trigger) pass
+    /// of a CA-type TRIG link, cleared by `process()`.
+    ///
+    /// C `devEpidSoftCallback.c:143-145`: a CA TRIG link fires the
+    /// readback trigger asynchronously (`dbCaPutLinkCallback`), sets
+    /// `pepid->pact = TRUE` and `return(0)`. C `epidRecord.c:207`
+    /// `if (!pact && pepid->pact) return(0)` then returns BEFORE
+    /// `recGblGetTimeStamp` / `checkAlarms` / `monitor` /
+    /// `recGblFwdLink` — so the trigger pass runs NONE of the
+    /// process tail; the tail runs exactly once, on the callback
+    /// (reprocess) pass.
+    ///
+    /// The Rust framework runs device support `read()` before
+    /// `process()`; `read()` cannot itself short-circuit the cycle.
+    /// This flag is `read()`'s signal to `process()` that the cycle is
+    /// a CA-trigger pass — `process()` consumes it and returns
+    /// `ProcessOutcome::async_pending()`, which makes the framework
+    /// skip the alarm/timestamp/snapshot/OUT/FLNK tail for this cycle
+    /// (the `read()`-returned `WriteDbLink{TRIG}` + `ReprocessAfter`
+    /// actions are still executed). The reprocess pass runs `do_pid`
+    /// and the tail exactly once.
+    ca_trig_pending: bool,
 }
 
 impl Default for EpidRecord {
@@ -223,53 +307,98 @@ impl Default for EpidRecord {
             ct: now,
             ctp: now,
             device_did_compute: false,
+            inp_constant: false,
+            dtyp: String::new(),
+            udf: true,
+            compute_skipped: false,
+            stpl_resolved: false,
+            // C `epidRecord.c` init: `udf` starts TRUE and is cleared
+            // only by the two clear-conditions — see `value_undefined`.
+            value_undefined: true,
+            ca_trig_pending: false,
         }
     }
 }
 
 impl EpidRecord {
-    /// Check alarms using hysteresis-based threshold comparison on VAL.
-    /// Ported from epidRecord.c `checkAlarms()`.
-    pub fn check_alarms(&mut self) -> Option<(u16, u16)> {
+    /// Decide the alarm condition using hysteresis-based threshold
+    /// comparison on VAL. Ported from epidRecord.c `checkAlarms()`,
+    /// which mirrors `aiRecord.c::checkAlarms` — per-level hysteresis
+    /// against VAL with `lalm` tracking the last-alarmed threshold.
+    ///
+    /// Returns `Some((stat, sevr, alev))` where `stat` is the canonical
+    /// `epicsAlarmCondition` status code (`HIHI_ALARM`, `HIGH_ALARM`,
+    /// `LOLO_ALARM`, `LOW_ALARM`), `sevr` the configured severity, and
+    /// `alev` the threshold that fired (the candidate `lalm` value).
+    /// Returns `None` when VAL is inside the (hysteresis-adjusted) limits.
+    ///
+    /// `lalm` (last-alarmed threshold) is committed by the caller, NOT
+    /// here, for the alarm case. C `aiRecord.c:403-406` gates the `lalm`
+    /// update on `recGblSetSevr` actually raising the severity:
+    /// `if (recGblSetSevr(...)) prec->lalm = alev;`. A lower-severity
+    /// alarm that loses to an already-higher pending severity must NOT
+    /// advance `lalm`, or the hysteresis band would be silently re-based.
+    /// The [`Record::check_alarms`] trait hook below performs that gate.
+    ///
+    /// The no-alarm case writes `lalm = val` here unconditionally,
+    /// matching C `aiRecord.c:409` (`prec->lalm = val;` — not gated).
+    pub fn check_alarms(&mut self) -> Option<(u16, AlarmSeverity, f64)> {
         let val = self.val;
         let hyst = self.hyst;
         let lalm = self.lalm;
 
         // HIHI alarm
-        if self.hhsv != 0 {
-            if val >= self.hihi || (lalm == self.hihi && val >= self.hihi - hyst) {
-                self.lalm = self.hihi;
-                return Some((3, self.hhsv as u16)); // HIHI_ALARM
-            }
+        if self.hhsv != 0 && (val >= self.hihi || (lalm == self.hihi && val >= self.hihi - hyst)) {
+            return Some((
+                alarm_status::HIHI_ALARM,
+                AlarmSeverity::from_u16(self.hhsv as u16),
+                self.hihi,
+            ));
         }
 
         // LOLO alarm
-        if self.llsv != 0 {
-            if val <= self.lolo || (lalm == self.lolo && val <= self.lolo + hyst) {
-                self.lalm = self.lolo;
-                return Some((4, self.llsv as u16)); // LOLO_ALARM
-            }
+        if self.llsv != 0 && (val <= self.lolo || (lalm == self.lolo && val <= self.lolo + hyst)) {
+            return Some((
+                alarm_status::LOLO_ALARM,
+                AlarmSeverity::from_u16(self.llsv as u16),
+                self.lolo,
+            ));
         }
 
         // HIGH alarm
-        if self.hsv != 0 {
-            if val >= self.high || (lalm == self.high && val >= self.high - hyst) {
-                self.lalm = self.high;
-                return Some((1, self.hsv as u16)); // HIGH_ALARM
-            }
+        if self.hsv != 0 && (val >= self.high || (lalm == self.high && val >= self.high - hyst)) {
+            return Some((
+                alarm_status::HIGH_ALARM,
+                AlarmSeverity::from_u16(self.hsv as u16),
+                self.high,
+            ));
         }
 
         // LOW alarm
-        if self.lsv != 0 {
-            if val <= self.low || (lalm == self.low && val <= self.low + hyst) {
-                self.lalm = self.low;
-                return Some((2, self.lsv as u16)); // LOW_ALARM
-            }
+        if self.lsv != 0 && (val <= self.low || (lalm == self.low && val <= self.low + hyst)) {
+            return Some((
+                alarm_status::LOW_ALARM,
+                AlarmSeverity::from_u16(self.lsv as u16),
+                self.low,
+            ));
         }
 
-        // No alarm
+        // No alarm — C `aiRecord.c:409` resets LALM to VAL unconditionally.
         self.lalm = val;
         None
+    }
+
+    /// Mark this cycle as a CA-TRIG trigger pass.
+    ///
+    /// Called by [`crate::device_support::epid_soft_callback::
+    /// EpidSoftCallbackDeviceSupport::read`] on the first pass of a
+    /// CA-type TRIG link, before `process()` runs. `process()` consumes
+    /// the flag and returns `ProcessOutcome::async_pending()` so the
+    /// trigger pass skips the process tail (checkAlarms / monitor /
+    /// recGblFwdLink) — C `devEpidSoftCallback.c:143-145` +
+    /// `epidRecord.c:205-210`. See [`EpidRecord::ca_trig_pending`].
+    pub fn set_ca_trig_pending(&mut self) {
+        self.ca_trig_pending = true;
     }
 
     /// Update monitor tracking fields. Returns list of fields that changed.
@@ -551,6 +680,51 @@ impl Record for EpidRecord {
         "epid"
     }
 
+    /// Bumpless-transfer readback — C `devEpidSoft.c:153-158` (PID) and
+    /// `devEpidSoft.c:178-184` / `devEpidSoftCallback.c:214-220`
+    /// (MaxMin).
+    ///
+    /// On the feedback OFF->ON edge (`FBOP==0 && FBON!=0`) C seeds the
+    /// turn-on state from the `OUTL` output link's *actual current
+    /// value* via `dbGetLink(&pepid->outl, DBR_DOUBLE, ...)`, guarded by
+    /// `outl.type != CONSTANT`. The seeded field differs by FMOD:
+    ///
+    ///   - PID (`fmod==0`), C `devEpidSoft.c:155`:
+    ///     `dbGetLink(&pepid->outl, DBR_DOUBLE, &i, ...)` — the OUTL
+    ///     readback lands in the integral term `I`.
+    ///   - MaxMin (`fmod==1`), C `devEpidSoft.c:181` /
+    ///     `devEpidSoftCallback.c:217`:
+    ///     `dbGetLink(&pepid->outl, DBR_DOUBLE, &oval, ...)` — the OUTL
+    ///     readback lands in the output value `OVAL`.
+    ///
+    /// The Rust framework's `ReadDbLink` pre-process action performs
+    /// exactly that synchronous read of the DB link's target value into
+    /// a record field, executed BEFORE `process()` / `do_pid` runs.
+    ///
+    /// `FBOP` still holds the *previous* cycle's `FBON` at this point
+    /// (it is committed at the end of `do_pid`), so the edge is
+    /// detectable here. The action is emitted only for a non-CONSTANT
+    /// `OUTL` link, mirroring C's `outl.type != CONSTANT` guard — for a
+    /// CONSTANT/empty `OUTL` the seeded field keeps its prior value.
+    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+        let edge = self.fbon != 0 && self.fbop == 0;
+        if edge {
+            // PID seeds `I` from OUTL (devEpidSoft.c:153-158);
+            // MaxMin seeds `OVAL` from OUTL (devEpidSoft.c:178-184).
+            let target_field = if self.fmod == 0 { "I" } else { "OVAL" };
+            match link_field_type(&self.outl) {
+                LinkType::Db | LinkType::Ca => {
+                    return vec![ProcessAction::ReadDbLink {
+                        link_field: "OUTL",
+                        target_field,
+                    }];
+                }
+                _ => {}
+            }
+        }
+        Vec::new()
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // In the C code, process() always calls pdset->do_pid() — a custom
         // device support function unique to the epid record. In Rust, the
@@ -564,17 +738,161 @@ impl Record for EpidRecord {
         // For "Soft Channel" or no device support, the framework skips
         // read(), so pid_done stays false and process() runs the built-in
         // PID here.
+
+        // C `epidRecord.c:189-203`: the UDF gate is taken only on the
+        // non-callback pass (`if (!pact)`). `device_did_compute` is the
+        // Rust equivalent of "device support already ran do_pid" — the
+        // callback pass — so the gate applies only when it is false.
+        //
+        // C `epidRecord.c` clears `udf` ONLY at two sites (`special` is
+        // NULL — there is no operator UDF clear):
+        //   - `epidRecord.c:160-164` init: a CONSTANT `STPL` link with a
+        //     valid constant. A constant link's value never changes, so
+        //     it is "defined" on every cycle thereafter.
+        //   - `epidRecord.c:191-193` process: closed-loop (`SMSL=1`)
+        //     with `RTN_SUCCESS(dbGetLink(&prec->stpl, ...))` — an
+        //     ACTUAL fetch success. `self.stpl_resolved` is the
+        //     framework's report of exactly that (a STPL that is empty,
+        //     or whose DB/CA fetch failed, leaves it false).
+        // Otherwise `udf` stays TRUE forever and C `epidRecord.c:195`
+        // `return(0)` skips `do_pid` every cycle — e.g. a supervisory
+        // (`SMSL=0`) epid with an empty/non-constant STPL NEVER runs
+        // `do_pid`.
+        //
+        // `self.udf` is the framework `dbCommon.udf` pushed before
+        // `process()`; it is last cycle's value because the framework
+        // recomputes `common.udf` (from `value_is_undefined()`) only
+        // *after* `process()`. C reads `pepid->udf` at process-start
+        // identically. `udf` is sticky-false: once C clears it, it is
+        // never re-set — so the gate keys off `self.udf`, and a closed-
+        // loop epid whose STPL later fails keeps running `do_pid`.
+        //
+        // `value_undefined` is recomputed here for the framework's
+        // post-process `common.udf = value_is_undefined()`.
+        self.compute_skipped = false;
+
+        // CA-TRIG trigger pass — C `devEpidSoftCallback.c:143-145` +
+        // `epidRecord.c:205-210`. `EpidSoftCallbackDeviceSupport::read`
+        // ran first this cycle, saw a CA-type TRIG link, fired the
+        // asynchronous readback trigger (returning `WriteDbLink{TRIG}` +
+        // `ReprocessAfter` actions), and set `ca_trig_pending` — the
+        // analogue of C `do_pid` setting `pepid->pact = TRUE` and
+        // `return(0)`.
+        //
+        // C `epidRecord.c:207` `if (!pact && pepid->pact) return(0)`
+        // then returns BEFORE `recGblGetTimeStamp` / `checkAlarms` /
+        // `monitor` / `recGblFwdLink`: the trigger pass runs NONE of
+        // the process tail. Return `async_pending` so the framework
+        // skips the alarm/timestamp/snapshot/OUT/FLNK tail for this
+        // cycle. The `read()`-returned actions were merged by the
+        // framework and are still executed; the reprocess pass runs
+        // `do_pid` and the tail exactly once.
+        //
+        // `device_did_compute` is cleared here because the trigger pass
+        // performed NO compute — without this reset the reprocess pass
+        // could observe a stale `true`.
+        if self.ca_trig_pending {
+            self.ca_trig_pending = false;
+            self.device_did_compute = false;
+            return Ok(ProcessOutcome::async_pending());
+        }
+
+        // C clear-conditions, evaluated at process-start:
+        //  - CONSTANT STPL link  → init `recGblInitConstantLink` cleared
+        //    udf permanently (`epidRecord.c:160-164`).
+        //  - closed-loop STPL fetch succeeded this cycle
+        //    (`epidRecord.c:191-193`).
+        //
+        // `stpl_resolved` is a per-cycle signal: consume it and reset
+        // so a later `process_local`-path cycle (which performs no
+        // link resolution and never calls `set_resolved_input_links`)
+        // cannot read a stale "resolved" from an earlier links-path
+        // cycle.
+        let stpl_resolved = self.stpl_resolved;
+        self.stpl_resolved = false;
+        let stpl_clears_udf =
+            link_field_type(&self.stpl) == LinkType::Constant || (self.smsl == 1 && stpl_resolved);
+        // udf state this cycle: undefined unless already cleared
+        // (`!self.udf`) or a clear-condition fires now.
+        self.value_undefined = self.udf && !stpl_clears_udf;
+        if !self.device_did_compute {
+            if self.value_undefined {
+                // C `epidRecord.c:195-202`: while `udf==TRUE`, skip
+                // `do_pid` entirely and `return 0` — *before*
+                // `recGblGetTimeStamp`, `checkAlarms`, `monitor` and
+                // `recGblFwdLink`. The framework's centralised UDF
+                // check (`rec_gbl_check_udf`, run after process())
+                // raises `UDF_ALARM` with `udfs` severity, matching C's
+                // `recGblSetSevr(pepid, UDF_ALARM, pepid->udfs)`.
+                //
+                // `update_monitors()` is deliberately NOT called here:
+                // C's early `return(0)` skips `monitor()`, so the
+                // previous-value fields (`pp`/`ip`/`dp`/...) and the
+                // `mlst`/`alst` deadband baselines must NOT advance
+                // while the record is undefined.
+                //
+                // C `return(0)` is reached before `recGblFwdLink` and
+                // the `do_pid` output write. The Rust framework drives
+                // the OUTL write (`multi_output_links`) and FLNK; flag
+                // this cycle so `multi_output_links` and
+                // `should_fire_forward_link` suppress them — otherwise
+                // a stale OVAL would be pushed to the OUTL target.
+                self.device_did_compute = false;
+                self.compute_skipped = true;
+                return Ok(ProcessOutcome::complete());
+            }
+        }
+
         if !self.device_did_compute {
             crate::device_support::epid_soft::EpidSoftDeviceSupport::do_pid(self);
         }
         self.device_did_compute = false; // Reset for next cycle
 
-        self.check_alarms();
+        // Alarm evaluation is NOT done here. The framework invokes the
+        // `Record::check_alarms` trait hook (below) after `process()`,
+        // which is where the computed severity is applied to SEVR/STAT
+        // via `recGblSetSevr`. Calling the inherent `check_alarms` here
+        // would advance `lalm` an extra time and double-step the
+        // hysteresis state, so it is deliberately omitted.
         self.update_monitors();
 
         // Device support actions are now merged by the framework
         let actions = Vec::new();
         Ok(ProcessOutcome::complete_with(actions))
+    }
+
+    /// Per-record alarm hook — C `epidRecord.c::checkAlarms`.
+    ///
+    /// The framework calls this after `process()`; it computes the
+    /// HIHI/HIGH/LOW/LOLO condition (with `lalm` hysteresis) via the
+    /// inherent [`EpidRecord::check_alarms`] and applies the result to
+    /// the record's pending alarm state with `recGblSetSevr`. That
+    /// accumulates into `nsta`/`nsev` (raise-only / maximize-severity),
+    /// which the framework later transfers to `STAT`/`SEVR` via
+    /// `recGblResetAlarms`. Returning `None` raises nothing, so a value
+    /// that stays inside the limits leaves the record un-alarmed and a
+    /// held value does not re-fire.
+    fn check_alarms(&mut self, common: &mut CommonFields) {
+        // C `devEpidSoft.c:110-112` / `devEpidSoftCallback.c:115-117`:
+        // a CONSTANT `INP` link means "nothing to control" — raise
+        // SOFT_ALARM/INVALID_ALARM. `do_pid` set `inp_constant` and
+        // skipped the compute; apply the severity here (the framework
+        // calls this hook after `process()`).
+        if self.inp_constant {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::SOFT_ALARM, AlarmSeverity::Invalid);
+        }
+        if let Some((stat, sevr, alev)) = EpidRecord::check_alarms(self) {
+            // C `aiRecord.c:403-406`: `if (recGblSetSevr(...)) prec->lalm = alev;`
+            // — the LALM update is gated on `recGblSetSevr` returning TRUE,
+            // i.e. on the alarm actually raising the pending severity.
+            // `rec_gbl_set_sevr` is raise-only and returns nothing, so detect
+            // the raise by observing whether `nsev` increased across the call.
+            let before = common.nsev;
+            recgbl::rec_gbl_set_sevr(common, stat, sevr);
+            if common.nsev != before {
+                self.lalm = alev;
+            }
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -887,8 +1205,111 @@ impl Record for EpidRecord {
         Some(self)
     }
 
+    /// C `epidRecord.c` UDF ownership — see [`EpidRecord::value_undefined`].
+    ///
+    /// The framework's post-`process()` step runs
+    /// `common.udf = value_is_undefined()` (gated on `clears_udf()`,
+    /// left at its `true` default). Returning the epid-owned
+    /// `value_undefined` — recomputed in `process()` from the two C
+    /// clear-conditions — keeps `udf` TRUE for a supervisory / empty-
+    /// STPL epid (so its UDF gate fires every cycle, as C does) and
+    /// clears it only on a CONSTANT STPL or a successful closed-loop
+    /// `dbGetLink(stpl)`.
+    ///
+    /// The default `value_is_undefined()` keys off `VAL` being NaN,
+    /// which for an epid (`VAL` defaults to a finite `0.0`, never NaN)
+    /// would wrongly clear `udf` after the first cycle — the bug this
+    /// override fixes.
+    fn value_is_undefined(&self) -> bool {
+        self.value_undefined
+    }
+
     fn set_device_did_compute(&mut self, did_compute: bool) {
         self.device_did_compute = did_compute;
+    }
+
+    /// C `epidRecord.c:195` reads `pepid->udf` at the top of
+    /// `process()`. The framework owns `dbCommon.udf`; this hook
+    /// captures it so `process()` can gate `do_pid` on it.
+    fn set_process_context(&mut self, ctx: &ProcessContext) {
+        self.udf = ctx.udf;
+        self.dtyp.clear();
+        self.dtyp.push_str(&ctx.dtyp);
+    }
+
+    /// C `devEpidSoftCallback.c:120-132` — the DB-type TRIG readback
+    /// link write.
+    ///
+    /// `devEpidSoftCallback.c::do_pid`, within ONE process pass, does:
+    ///   1. `if (ptriglink->type != CA_LINK)` →
+    ///      `dbPutLink(ptriglink, DBR_DOUBLE, &pepid->tval, 1)`
+    ///      (`devEpidSoftCallback.c:121-127`) — a synchronous write that
+    ///      processes the triggered source chain;
+    ///   2. `dbGetLink(&pepid->inp, DBR_DOUBLE, &pepid->cval, ...)`
+    ///      (`devEpidSoftCallback.c:151`) — read CVAL from INP;
+    ///   3. run the PID.
+    ///
+    /// So for a DB-type TRIG link the trigger write must land BEFORE
+    /// this cycle's `INP -> CVAL` fetch. The framework resolves input
+    /// links before `pre_process_actions`, so the TRIG write is emitted
+    /// here, from `pre_input_link_actions`, which the framework runs
+    /// strictly before the input-link fetch.
+    ///
+    /// Only the `devEpidSoftCallback` DSET (DTYP `"Epid Async Soft"`)
+    /// drives the TRIG link — `devEpidSoft` (`devEpidSoft.c`) has no
+    /// TRIG handling at all. The action is therefore gated on `dtyp`.
+    ///
+    /// The CA-type TRIG link is deliberately NOT emitted here: C
+    /// `devEpidSoftCallback.c:133-147` cannot wait synchronously on a
+    /// CA link, so it uses `dbCaPutLinkCallback` + `pact=TRUE` and
+    /// re-processes on the callback. That two-pass path stays in
+    /// `EpidSoftCallbackDeviceSupport::read` (`WriteDbLink` +
+    /// `ReprocessAfter`).
+    fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
+        if self.dtyp != "Epid Async Soft" {
+            return Vec::new();
+        }
+        if link_field_type(&self.trig) == LinkType::Db {
+            return vec![ProcessAction::WriteDbLink {
+                link_field: "TRIG",
+                value: EpicsValue::Double(self.tval),
+            }];
+        }
+        Vec::new()
+    }
+
+    /// Framework report of which `multi_input_links` fetches produced a
+    /// value this cycle — the analogue of C
+    /// `RTN_SUCCESS(dbGetLink(&prec->stpl, ...))` (`epidRecord.c:191`).
+    /// `STPL` is only ever in `multi_input_links` when
+    /// `SMSL == closed_loop`; its presence here means the closed-loop
+    /// setpoint fetch actually succeeded this cycle. A STPL that is
+    /// empty, or a DB/CA link whose fetch failed, is absent — so
+    /// `stpl_resolved` is reset to false and `udf` is not cleared.
+    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
+        self.stpl_resolved = resolved.contains(&"STPL");
+    }
+
+    /// C `epidRecord.c:160-164` `init_record`: when `STPL` is a
+    /// CONSTANT link holding a valid constant, `recGblInitConstantLink`
+    /// seeds `VAL` from the constant and `udf` is cleared. The
+    /// framework owns `dbCommon.udf`; this hook is its controlled
+    /// access point. Runs once after `init_record`.
+    ///
+    /// For `SMSL == closed_loop` the framework also fetches `STPL` into
+    /// `VAL` via `multi_input_links` every cycle; the constant seed
+    /// here matters for the supervisory (`SMSL=0`) case and for the
+    /// first cycle before any process.
+    fn post_init_finalize_undef(&mut self, udf: &mut bool) -> CaResult<()> {
+        let parsed = epics_base_rs::server::record::parse_link_v2(&self.stpl);
+        if parsed.link_type() == LinkType::Constant {
+            if let Some(EpicsValue::Double(v)) = parsed.constant_value() {
+                self.val = v;
+                *udf = false;
+                self.value_undefined = false;
+            }
+        }
+        Ok(())
     }
 
     fn put_field_internal(
@@ -955,8 +1376,20 @@ impl Record for EpidRecord {
     }
 
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
+        // C `epidRecord.c:195-202`: on a UDF-gated cycle `process()`
+        // returns before `do_pid` writes the output — suppress the
+        // OUTL->OVAL write so a stale OVAL is not pushed downstream.
+        if self.compute_skipped {
+            return &[];
+        }
         // OUTL -> OVAL (output link)
         static LINKS: &[(&str, &str)] = &[("OUTL", "OVAL")];
         LINKS
+    }
+
+    fn should_fire_forward_link(&self) -> bool {
+        // C `epidRecord.c:201` `return(0)` on a UDF-gated cycle is
+        // reached before `recGblFwdLink` — no forward link this cycle.
+        !self.compute_skipped
     }
 }

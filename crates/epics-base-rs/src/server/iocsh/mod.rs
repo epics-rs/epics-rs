@@ -1,4 +1,6 @@
+mod access_commands;
 mod commands;
+mod core_commands;
 pub mod registry;
 
 use std::collections::HashMap;
@@ -8,10 +10,31 @@ use std::sync::{Arc, RwLock};
 use crate::server::database::PvDatabase;
 use registry::*;
 
+/// Error-handling mode set by the `on error` command (M-6).
+/// Mirrors C `iocsh.cpp` `onCallFunc` (`continue` / `break` / `halt` /
+/// `wait`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum OnError {
+    /// Default: report the error and run the next line.
+    #[default]
+    Continue,
+    /// Stop the script at the first failing line (return its error).
+    Break,
+    /// Like `break` — C `halt` aborts; in-process this is equivalent
+    /// to stopping the current script with the failing error.
+    Halt,
+    /// Pause `delay` seconds after a failing line, then continue.
+    Wait(u64),
+}
+
 /// Interactive IOC shell with extensible command registration.
 pub struct IocShell {
     registry: Arc<RwLock<CommandRegistry>>,
     ctx: CommandContext,
+    /// Error-handling mode for the running script (M-6). `Cell`
+    /// because the shell drives one script at a time on a single
+    /// thread; the `on error` command mutates it mid-script.
+    on_error: std::cell::Cell<OnError>,
 }
 
 impl IocShell {
@@ -22,6 +45,7 @@ impl IocShell {
         Self {
             registry: Arc::new(RwLock::new(registry)),
             ctx: CommandContext::new(db, handle),
+            on_error: std::cell::Cell::new(OnError::Continue),
         }
     }
 
@@ -60,17 +84,56 @@ impl IocShell {
         // string directly.
         {
             let toks = tokenize(line);
-            if toks.first().map(|s| s.as_str()) == Some("iocshLoad") {
-                if toks.len() < 2 {
-                    return Err("iocshLoad <path> [macros]".into());
+            match toks.first().map(|s| s.as_str()) {
+                Some("iocshLoad") => {
+                    if toks.len() < 2 {
+                        return Err("iocshLoad <path> [macros]".into());
+                    }
+                    let macros = toks
+                        .get(2)
+                        .map(|s| commands::parse_macro_string(s))
+                        .unwrap_or_default();
+                    return self
+                        .execute_script_with_macros(&toks[1], &macros)
+                        .map(|_| CommandOutcome::Continue);
                 }
-                let macros = toks
-                    .get(2)
-                    .map(|s| commands::parse_macro_string(s))
-                    .unwrap_or_default();
-                return self
-                    .execute_script_with_macros(&toks[1], &macros)
-                    .map(|_| CommandOutcome::Continue);
+                // H-5: `iocshCmd("cmd")` runs a single command line;
+                // `iocshRun("c1; c2")` runs `;`-separated commands.
+                // Both re-enter `execute_line`, so they must be
+                // dispatched here (the registry handler signature has
+                // no access to the shell). Mirrors C `iocsh.cpp`
+                // `iocshCmd` / `iocshRun`.
+                Some("iocshCmd") => {
+                    let Some(cmd) = toks.get(1) else {
+                        return Err("iocshCmd <command>".into());
+                    };
+                    return self.execute_line(cmd);
+                }
+                Some("iocshRun") => {
+                    let Some(cmds) = toks.get(1) else {
+                        return Err("iocshRun <commands>".into());
+                    };
+                    let mut last = Ok(CommandOutcome::Continue);
+                    for one in cmds.split(';') {
+                        let one = one.trim();
+                        if one.is_empty() {
+                            continue;
+                        }
+                        match self.execute_line(one) {
+                            Ok(CommandOutcome::Exit) => return Ok(CommandOutcome::Exit),
+                            Ok(CommandOutcome::Continue) => {}
+                            Err(e) => last = Err(e),
+                        }
+                    }
+                    return last;
+                }
+                // M-6: `on error continue|break|halt|wait <delay>` —
+                // sets how the running script reacts to a failing
+                // line. Mirrors C `iocsh.cpp` `onCallFunc`.
+                Some("on") => {
+                    return self.handle_on_command(&toks);
+                }
+                _ => {}
             }
         }
 
@@ -88,6 +151,19 @@ impl IocShell {
     /// Execute a command, optionally redirecting output to a file.
     fn execute_command(&self, line: &str, redirect: Option<&Redirect>) -> CommandResult {
         if let Some(redir) = redirect {
+            // C parity: iocsh.cpp supports fd-numbered redirects 1..9
+            // (`2>file` for stderr, etc.). Only fd 1 (stdout) is plumbed
+            // through CommandContext::with_output today; fd 2+ is parsed
+            // for syntax compatibility (so an st.cmd that says
+            // `dbl 2>/dev/null` doesn't error) but the captured output
+            // still routes through the stdout sink. Emit a diagnostic
+            // so operators know the fd-2 capture is approximate.
+            if redir.fd != 1 {
+                eprintln!(
+                    "iocsh: fd {} redirect not fully plumbed — routing to stdout sink",
+                    redir.fd
+                );
+            }
             let file_result = if redir.append {
                 std::fs::OpenOptions::new()
                     .create(true)
@@ -111,6 +187,12 @@ impl IocShell {
     }
 
     fn execute_command_inner(&self, line: &str) -> CommandResult {
+        // L-5: C `iocsh.cpp` split() flags an unbalanced quote or a
+        // trailing backslash and skips the line. Surface the same
+        // diagnostic instead of silently tokenizing a malformed line.
+        if let Some(diag) = registry::lint_line(line) {
+            return Err(diag.to_string());
+        }
         let tokens = tokenize(line);
         if tokens.is_empty() {
             return Ok(CommandOutcome::Continue);
@@ -161,7 +243,13 @@ impl IocShell {
                 }
                 Err(e) => {
                     eprintln!("{path}:{line_num}: Error: {e}");
-                    last_err = Some(format!("{path}:{line_num}: {e}"));
+                    let formatted = format!("{path}:{line_num}: {e}");
+                    // M-6: honour `on error break|halt` — stop the
+                    // script at the first failing line.
+                    if self.react_to_error() {
+                        return Err(formatted);
+                    }
+                    last_err = Some(formatted);
                 }
             }
         }
@@ -190,7 +278,14 @@ impl IocShell {
                 }
                 Err(e) => {
                     eprintln!("{path}:{line_num}: Error: {e}");
-                    last_err = Some(format!("{path}:{line_num}: {e}"));
+                    let formatted = format!("{path}:{line_num}: {e}");
+                    // M-6: honour `on error break|halt` — stop the
+                    // script at the first failing line instead of
+                    // the hardcoded "continue, report at end".
+                    if self.react_to_error() {
+                        return Err(formatted);
+                    }
+                    last_err = Some(formatted);
                 }
             }
         }
@@ -311,6 +406,45 @@ impl IocShell {
         Ok(())
     }
 
+    /// Handle the `on error ...` command (M-6). Tokens are the
+    /// already-tokenised line (`["on", "error", "<mode>", ...]`).
+    fn handle_on_command(&self, toks: &[String]) -> CommandResult {
+        if toks.get(1).map(|s| s.as_str()) != Some("error") {
+            return Err("on error continue|break|halt|wait <delay>".into());
+        }
+        let mode = match toks.get(2).map(|s| s.as_str()) {
+            Some("continue") => OnError::Continue,
+            Some("break") => OnError::Break,
+            Some("halt") => OnError::Halt,
+            Some("wait") => {
+                let delay = toks
+                    .get(3)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or("on error wait <delay-seconds>")?;
+                OnError::Wait(delay)
+            }
+            _ => return Err("on error continue|break|halt|wait <delay>".into()),
+        };
+        self.on_error.set(mode);
+        Ok(CommandOutcome::Continue)
+    }
+
+    /// React to a failing script line per the current `on error`
+    /// mode. Returns `true` if the script should stop (with the
+    /// error) — `false` to continue to the next line.
+    fn react_to_error(&self) -> bool {
+        match self.on_error.get() {
+            OnError::Continue => false,
+            OnError::Break | OnError::Halt => true,
+            OnError::Wait(delay) => {
+                if delay > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(delay));
+                }
+                false
+            }
+        }
+    }
+
     fn execute_help(&self, arg_tokens: &[String], registry: &CommandRegistry) -> CommandResult {
         if let Some(name) = arg_tokens.first() {
             if let Some(def) = registry.get(name) {
@@ -394,49 +528,71 @@ pub(crate) fn join_backslash_continuations(input: &str) -> Vec<(usize, String)> 
 struct Redirect {
     path: String,
     append: bool,
+    /// File descriptor target. C iocsh (iocsh.cpp:287-303) accepts
+    /// `1>` through `9>` (and `1>>` ... `9>>`). The Rust port currently
+    /// only plumbs through stdout (fd 1) — `with_output` captures
+    /// `ctx.println` / `print_fmt` writes. Tracking the fd here lets
+    /// us recognize the C syntax without erroring; non-1 fds emit a
+    /// diagnostic but otherwise route to stdout (best-effort) so an
+    /// st.cmd `2>/dev/null` doesn't fail-fast.
+    fd: u8,
 }
 
-/// Parse `>` / `>>` redirect from end of line.
+/// Parse `>` / `>>` / `N>` / `N>>` redirect from a line.
 /// Returns (command_part, optional redirect).
+///
+/// C parity (iocsh.cpp:287-303): `1>file` through `9>file` and the
+/// double-`>>` (append) variants. Default fd when bare `>` is used is
+/// stdout (fd 1).
 fn parse_redirect(line: &str) -> (&str, Option<Redirect>) {
     let bytes = line.as_bytes();
     let mut in_quote = false;
-    let mut redir_pos = None;
-    let mut is_append = false;
 
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'"' => in_quote = !in_quote,
             b'>' if !in_quote => {
-                redir_pos = Some(i);
-                is_append = i + 1 < bytes.len() && bytes[i + 1] == b'>';
-                break; // use first unquoted > position
+                // C parity: if the char before `>` is a single ASCII
+                // digit 1..9 AND that digit follows a separator (start
+                // of line, space, tab) — interpret as N>.
+                let (op_start, fd) = if i > 0 && bytes[i - 1].is_ascii_digit() {
+                    let d = bytes[i - 1];
+                    // Confirm the digit is at a token boundary: either
+                    // i==1 (digit is first non-empty char in line) or
+                    // the char before the digit is whitespace.
+                    let at_boundary =
+                        i == 1 || matches!(bytes[i - 2], b' ' | b'\t' | b'\r' | b'\n');
+                    if at_boundary && (b'1'..=b'9').contains(&d) {
+                        (i - 1, d - b'0')
+                    } else {
+                        (i, 1u8)
+                    }
+                } else {
+                    (i, 1u8)
+                };
+                let is_append = i + 1 < bytes.len() && bytes[i + 1] == b'>';
+                let cmd = line[..op_start].trim_end();
+                let skip = if is_append { 2 } else { 1 };
+                let path = line[i + skip..].trim();
+                if path.is_empty() {
+                    return (line, None);
+                }
+                return (
+                    cmd,
+                    Some(Redirect {
+                        path: registry::substitute_env_vars(path),
+                        append: is_append,
+                        fd,
+                    }),
+                );
             }
             _ => {}
         }
         i += 1;
     }
 
-    match redir_pos {
-        Some(pos) => {
-            let cmd = line[..pos].trim();
-            let skip = if is_append { 2 } else { 1 };
-            let path = line[pos + skip..].trim();
-            if path.is_empty() {
-                (line, None)
-            } else {
-                (
-                    cmd,
-                    Some(Redirect {
-                        path: registry::substitute_env_vars(path),
-                        append: is_append,
-                    }),
-                )
-            }
-        }
-        None => (line, None),
-    }
+    (line, None)
 }
 
 #[cfg(test)]
@@ -602,14 +758,68 @@ mod tests {
         let r = redir.unwrap();
         assert_eq!(r.path, "/tmp/out.txt");
         assert!(!r.append);
+        assert_eq!(r.fd, 1, "bare > defaults to fd 1");
 
         let (cmd, redir) = parse_redirect("dbl >> /tmp/out.txt");
         assert_eq!(cmd, "dbl");
-        assert!(redir.unwrap().append);
+        let r = redir.unwrap();
+        assert!(r.append);
+        assert_eq!(r.fd, 1);
 
         let (cmd, redir) = parse_redirect("dbl");
         assert_eq!(cmd, "dbl");
         assert!(redir.is_none());
+    }
+
+    /// C parity (iocsh.cpp:287-303): `1>file` and `1>>file` are
+    /// fd-numbered variants of `>` and `>>`, and `2>file` requests
+    /// stderr capture. The parser MUST accept these forms; bare `dbl
+    /// 2>err.log` should not error out the line.
+    #[test]
+    fn test_parse_redirect_fd_numbered() {
+        // 1> equivalent to >
+        let (cmd, redir) = parse_redirect("dbl 1>/tmp/out.txt");
+        assert_eq!(cmd, "dbl");
+        let r = redir.unwrap();
+        assert_eq!(r.path, "/tmp/out.txt");
+        assert!(!r.append);
+        assert_eq!(r.fd, 1);
+
+        // 2> stderr
+        let (cmd, redir) = parse_redirect("dbl 2>/tmp/err.txt");
+        assert_eq!(cmd, "dbl");
+        let r = redir.unwrap();
+        assert_eq!(r.path, "/tmp/err.txt");
+        assert!(!r.append);
+        assert_eq!(r.fd, 2);
+
+        // 2>> stderr append
+        let (cmd, redir) = parse_redirect("dbl 2>>/tmp/err.txt");
+        assert_eq!(cmd, "dbl");
+        let r = redir.unwrap();
+        assert_eq!(r.path, "/tmp/err.txt");
+        assert!(r.append);
+        assert_eq!(r.fd, 2);
+
+        // Digit not at boundary — `cmd5>file` is NOT a fd-redirect;
+        // `5` is part of the previous token. Should parse as bare `>`
+        // with fd=1, path=file. (The cmd portion includes the trailing
+        // `5`; this is a syntax oddity but matches C behavior.)
+        let (cmd, redir) = parse_redirect("cmd5>file");
+        let r = redir.unwrap();
+        assert_eq!(r.fd, 1, "digit not at boundary is part of command");
+        assert_eq!(cmd, "cmd5");
+
+        // 9> high fd parses to fd=9
+        let (_cmd, redir) = parse_redirect("foo 9>x");
+        assert_eq!(redir.unwrap().fd, 9);
+
+        // `0>` does NOT parse as fd-numbered (C only accepts 1..9);
+        // it parses as bare `>` with fd=1 leaving `0` in cmd.
+        let (cmd, redir) = parse_redirect("foo 0>x");
+        let r = redir.unwrap();
+        assert_eq!(r.fd, 1);
+        assert_eq!(cmd, "foo 0");
     }
 
     /// epics-base PR #812 — `dbCreateRecord <type> <name>` creates a
@@ -872,6 +1082,120 @@ mod tests {
         let colored = format_error("oops", true);
         assert!(colored.starts_with("\x1b[1;31mError:\x1b[0m "));
         assert!(colored.contains("oops"));
+    }
+
+    /// H-5: `iocshCmd("dbl")` runs a single command line by
+    /// re-entering the shell.
+    #[test]
+    fn test_iocsh_cmd_runs_single_command() {
+        let shell = make_shell();
+        let result = shell.execute_line(r#"iocshCmd("dbl")"#);
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+    }
+
+    /// H-5: `iocshRun` runs `;`-separated commands.
+    #[test]
+    fn test_iocsh_run_runs_multiple_commands() {
+        let shell = make_shell();
+        let result = shell.execute_line(r#"iocshRun("dbl; pwd")"#);
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+    }
+
+    /// H-5: core commands `echo`, `pwd`, `date` are registered so a
+    /// stock `st.cmd` no longer errors on them.
+    #[test]
+    fn test_core_commands_registered() {
+        let shell = make_shell();
+        for line in ["echo hello", "pwd", "date", "epicsPrtEnvParams"] {
+            assert!(
+                matches!(shell.execute_line(line), Ok(CommandOutcome::Continue)),
+                "core command line `{line}` must run"
+            );
+        }
+    }
+
+    /// H-5: the `as*` family is registered — `asInit` without a
+    /// filename errors (it does not silently succeed).
+    #[test]
+    fn test_as_commands_registered() {
+        let shell = make_shell();
+        // asInit without asSetFilename must error.
+        assert!(shell.execute_line("asInit").is_err());
+        // asprules with no config loaded prints a notice, returns Ok.
+        assert!(matches!(
+            shell.execute_line("asprules"),
+            Ok(CommandOutcome::Continue)
+        ));
+    }
+
+    /// H-6: `dbsr` is the Database Server Report, not the name search.
+    #[test]
+    fn test_dbsr_is_server_report() {
+        let shell = make_shell();
+        let tmp = std::env::temp_dir().join("iocsh_dbsr_report.txt");
+        let _ = std::fs::remove_file(&tmp);
+        let line = format!("dbsr > {}", tmp.display());
+        assert!(matches!(
+            shell.execute_line(&line),
+            Ok(CommandOutcome::Continue)
+        ));
+        let content = std::fs::read_to_string(&tmp).unwrap();
+        assert!(
+            content.contains("Database Server Report"),
+            "dbsr must print the server report, got: {content}"
+        );
+        // The server report must NOT be a record listing.
+        assert!(
+            !content.contains("Total:") || content.contains("Total channels"),
+            "dbsr must not be the dbgrep name-search output"
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// M-6: `on error break` stops the script at the first failing
+    /// line. Without it (default `continue`) the whole script runs.
+    #[test]
+    fn test_on_error_break_stops_script() {
+        let shell = make_shell();
+        let tmp = std::env::temp_dir().join("iocsh_on_error_break.cmd");
+        // Line 2 fails; line 3 would create a record if reached.
+        std::fs::write(
+            &tmp,
+            "on error break\nnonexistent_cmd\ndbCreateRecord ai SHOULD_NOT_EXIST\n",
+        )
+        .unwrap();
+        let result = shell.execute_script(tmp.to_str().unwrap());
+        std::fs::remove_file(&tmp).ok();
+        assert!(result.is_err(), "on error break must surface Err");
+        // The record from line 3 must NOT have been created.
+        assert!(
+            shell.execute_line("dbgf SHOULD_NOT_EXIST").is_err(),
+            "on error break must stop before line 3 runs"
+        );
+    }
+
+    /// M-1: single-quoted arguments tokenize as one token.
+    #[test]
+    fn test_single_quote_tokenization() {
+        assert_eq!(
+            tokenize("dbpf REC:VAL 'hello world'"),
+            vec!["dbpf", "REC:VAL", "hello world"]
+        );
+        assert_eq!(tokenize("cmd('a, b', c)"), vec!["cmd", "a, b", "c"]);
+    }
+
+    /// L-5: an unbalanced quote / trailing backslash is flagged.
+    #[test]
+    fn test_malformed_line_is_rejected() {
+        let shell = make_shell();
+        assert!(
+            shell.execute_line(r#"echo "unterminated"#).is_err(),
+            "unbalanced quote must be rejected"
+        );
+        assert!(
+            shell.execute_line("echo trailing\\").is_err(),
+            "trailing backslash must be rejected"
+        );
     }
 
     /// `NO_COLOR` and `EPICS_RS_IOCSH_NO_COLOR` env vars opt out of

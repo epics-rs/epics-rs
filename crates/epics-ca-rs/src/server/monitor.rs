@@ -134,10 +134,136 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     hdr.cid = 1; // ECA_NORMAL status
     hdr.available = sub_id;
 
+    // Abort-safety: this runs inside a monitor task that
+    // `handle_client` may `task.abort()` (EVENT_CANCEL / CLEAR_CHANNEL
+    // / disconnect cleanup). `tokio::abort()` drops the task at the
+    // next await point. If the header and payload were written in two
+    // separate `write_all` awaits, an abort landing between them would
+    // leave an orphan header in the shared BufWriter, mis-framing every
+    // subsequent message the next lock holder ships. Build the whole
+    // CA_PROTO_EVENT_ADD frame as ONE contiguous buffer and issue a
+    // single `write_all`, so an abort can only land at a frame boundary
+    // (before or after the complete write), never mid-frame. The flush
+    // stays separate: an aborted flush merely leaves whole frames
+    // buffered, which the next lock holder flushes — harmless.
     let hdr_bytes = hdr.to_bytes_extended();
+    let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
+    frame.extend_from_slice(&hdr_bytes);
+    frame.extend_from_slice(&padded);
     let mut w = writer.lock().await;
-    w.write_all(&hdr_bytes).await?;
-    w.write_all(&padded).await?;
+    w.write_all(&frame).await?;
     w.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Mock `AsyncWrite` that records the length of every `poll_write`
+    /// batch it receives. Wrapped in a zero-capacity `BufWriter`, each
+    /// `write_all` is forwarded straight through (tokio's `BufWriter`
+    /// bypasses its buffer when the input is at least as large as the
+    /// buffer capacity), so the recorded batches map 1:1 to the
+    /// `write_all` calls `send_event` issues.
+    #[derive(Default)]
+    struct RecordingWriter {
+        /// One entry per `poll_write` batch — the bytes delivered.
+        batches: Vec<Vec<u8>>,
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.batches.push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Abort-safety regression: `send_event` must emit the CA_PROTO_EVENT_ADD
+    /// header and payload as ONE contiguous `write_all`. A split across two
+    /// `write_all` awaits would let a `task.abort()` land between them,
+    /// leaving an orphan header in the shared `BufWriter` and mis-framing
+    /// every subsequent message. A true abort-race is non-deterministic to
+    /// schedule, so this asserts the structural property that makes the
+    /// race impossible: exactly one write batch, equal to the full frame.
+    #[tokio::test]
+    async fn send_event_writes_frame_in_single_write_all() {
+        use epics_base_rs::server::pv::MonitorEvent;
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::{DBR_LONG, EpicsValue};
+
+        // Zero-capacity BufWriter: every write_all forwards directly to the
+        // RecordingWriter, so batch count == write_all count.
+        let writer = Arc::new(Mutex::new(BufWriter::with_capacity(
+            0,
+            RecordingWriter::default(),
+        )));
+
+        let snapshot = Snapshot::new(
+            EpicsValue::Long(42),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let event = MonitorEvent {
+            snapshot,
+            origin: 0,
+        };
+
+        send_event(DBR_LONG, 7, &event, &writer)
+            .await
+            .expect("send_event must succeed");
+
+        let guard = writer.lock().await;
+        let batches = &guard.get_ref().batches;
+
+        // Exactly one write batch — header and payload are not split.
+        assert_eq!(
+            batches.len(),
+            1,
+            "send_event must issue exactly one write_all (got {} batches: {:?})",
+            batches.len(),
+            batches.iter().map(|b| b.len()).collect::<Vec<_>>(),
+        );
+
+        let frame = &batches[0];
+
+        // A single scalar DBR_LONG (4 bytes -> 8 padded, count 1) stays
+        // under the 0xFFFF extended-header threshold, so the frame is a
+        // standard 16-byte header followed by the padded payload. The
+        // single batch must be exactly that complete frame.
+        assert!(
+            frame.len() >= 16,
+            "frame shorter than a CA header: {} bytes",
+            frame.len(),
+        );
+        let payload_size = u16::from_be_bytes([frame[2], frame[3]]) as usize;
+        assert_ne!(
+            payload_size, 0xFFFF,
+            "test value unexpectedly produced an extended header",
+        );
+        assert_eq!(
+            16 + payload_size,
+            frame.len(),
+            "header-declared payload size ({payload_size}) plus header (16) \
+             must equal the contiguous frame length ({})",
+            frame.len(),
+        );
+        // Payload is 8-byte aligned (C client TCP parser requirement).
+        assert_eq!(payload_size % 8, 0, "payload not 8-byte aligned");
+    }
 }

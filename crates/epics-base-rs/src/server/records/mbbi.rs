@@ -191,6 +191,14 @@ impl MbbiRecord {
         }
         65535
     }
+
+    /// Per-state severity fields ZRSV..FFSV indexed by state 0..15.
+    fn state_severities(&self) -> [i16; 16] {
+        [
+            self.zrsv, self.onsv, self.twsv, self.thsv, self.frsv, self.fvsv, self.sxsv, self.svsv,
+            self.eisv, self.nisv, self.tesv, self.elsv, self.tvsv, self.ttsv, self.ftsv, self.ffsv,
+        ]
+    }
 }
 
 static MBBI_FIELDS: &[FieldDesc] = &[
@@ -216,6 +224,31 @@ static MBBI_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "SHFT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    // Simulation-mode fields. `mbbiRecord.c:125-126` declares SIML/SIOL
+    // and `mbbiRecord.c:379-396` reads SIOL when SIMM != NO. These were
+    // missing from the field table / get_field / put_field, so the
+    // database simulation path (`check_simulation_mode`) could never
+    // observe SIMM on an mbbi.
+    FieldDesc {
+        name: "SIMM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIML",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIMS",
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
@@ -496,6 +529,22 @@ static MBBI_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// True for the mbbi/mbbo state-table fields whose modification must
+/// trigger an `sdef` recompute — the 16 state values (ZRVL..FFVL) and
+/// the 16 state strings (ZRST..FFST). Shared by `mbbi` and `mbbo`
+/// `special()` (C `mbbiRecord.c`/`mbboRecord.c` `init_common`).
+pub(crate) fn is_state_table_field(field: &str) -> bool {
+    const VL: [&str; 16] = [
+        "ZRVL", "ONVL", "TWVL", "THVL", "FRVL", "FVVL", "SXVL", "SVVL", "EIVL", "NIVL", "TEVL",
+        "ELVL", "TVVL", "TTVL", "FTVL", "FFVL",
+    ];
+    const ST: [&str; 16] = [
+        "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST", "TEST",
+        "ELST", "TVST", "TTST", "FTST", "FFST",
+    ];
+    VL.contains(&field) || ST.contains(&field)
+}
+
 /// Helper macro: maps EPICS field name strings to struct fields.
 macro_rules! mbb_get_field {
     ($self:expr, $name:expr, $( $str:literal => $field:ident : $variant:ident ),* $(,)?) => {
@@ -559,7 +608,12 @@ impl Record for MbbiRecord {
         if !self.skip_convert {
             let mut rval = self.rval;
             if self.shft > 0 {
-                rval = ((rval as u32) >> (self.shft as u32)) as i32;
+                // C `mbbiRecord.c:175-176` does `rval >>= prec->shft`
+                // on a 32-bit `epicsUInt32`. A CA-written SHFT >= 32
+                // makes that shift UB in C (no crash). Rust `>>`
+                // panics in debug builds; `checked_shr` mapped to 0
+                // matches the defined fully-shifted-out result.
+                rval = (rval as u32).checked_shr(self.shft as u32).unwrap_or(0) as i32;
             }
             self.val = self.raw_to_val(rval);
         }
@@ -573,6 +627,8 @@ impl Record for MbbiRecord {
             "RVAL" => rval: Long, "ORAW" => oraw: Long, "MASK" => mask: Long,
             "SHFT" => shft: Short, "MLST" => mlst: Enum, "LALM" => lalm: Enum,
             "NOBT" => nobt: Short,
+            "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String,
+            "SIMS" => sims: Short,
             "ZRSV" => zrsv: Short, "ONSV" => onsv: Short, "TWSV" => twsv: Short, "THSV" => thsv: Short,
             "FRSV" => frsv: Short, "FVSV" => fvsv: Short, "SXSV" => sxsv: Short, "SVSV" => svsv: Short,
             "EISV" => eisv: Short, "NISV" => nisv: Short, "TESV" => tesv: Short, "ELSV" => elsv: Short,
@@ -595,6 +651,8 @@ impl Record for MbbiRecord {
             "RVAL" => rval: Long, "ORAW" => oraw: Long, "MASK" => mask: Long,
             "SHFT" => shft: Short, "MLST" => mlst: Enum, "LALM" => lalm: Enum,
             "NOBT" => nobt: Short,
+            "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String,
+            "SIMS" => sims: Short,
             "ZRSV" => zrsv: Short, "ONSV" => onsv: Short, "TWSV" => twsv: Short, "THSV" => thsv: Short,
             "FRSV" => frsv: Short, "FVSV" => fvsv: Short, "SXSV" => sxsv: Short, "SVSV" => svsv: Short,
             "EISV" => eisv: Short, "NISV" => nisv: Short, "TESV" => tesv: Short, "ELSV" => elsv: Short,
@@ -615,6 +673,67 @@ impl Record for MbbiRecord {
 
     fn set_device_did_compute(&mut self, did: bool) {
         self.skip_convert = did;
+    }
+
+    /// `mbbi` has an `RVAL → VAL` `convert()` step. A `Soft Channel`
+    /// `mbbi` must skip it — C `devMbbiSoft.c` `read_mbbi` returns 2.
+    fn soft_channel_skips_convert(&self) -> bool {
+        true
+    }
+
+    /// C `mbbiRecord.c::checkAlarms` — UDF alarm, STATE alarm from the
+    /// per-state severity (ZRSV..FFSV, or UNSV for an unknown state)
+    /// with the AFTC low-pass filter (PR #817), and COS alarm (COSV).
+    /// C `checkAlarms:300-305` raises `UDF_ALARM/udfs`, zeroes AFVL,
+    /// and returns early when `udf` is set; we mirror that (raising
+    /// UDF is idempotent with the framework's `rec_gbl_check_udf`).
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
+
+        if common.udf {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);
+            self.afvl = 0.0;
+            return;
+        }
+        let val = self.val;
+        let raw_sev = if val > 15 {
+            self.unsv
+        } else {
+            self.state_severities()[val as usize]
+        };
+        let (filtered, new_afvl) = super::bi::aftc_filter(
+            raw_sev as u16,
+            self.aftc,
+            self.afvl,
+            common.time,
+            crate::runtime::general_time::get_current(),
+        );
+        self.afvl = new_afvl;
+        let sev = AlarmSeverity::from_u16(filtered);
+        if sev != AlarmSeverity::NoAlarm {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, sev);
+        }
+        if val != self.lalm {
+            let cos_sev = AlarmSeverity::from_u16(self.cosv as u16);
+            if cos_sev != AlarmSeverity::NoAlarm {
+                recgbl::rec_gbl_set_sevr(common, alarm_status::COS_ALARM, cos_sev);
+            }
+            self.lalm = val;
+        }
+    }
+
+    /// C `mbbiRecord.c::special` — after a runtime write to any of the
+    /// state value (ZRVL..FFVL) or state string (ZRST..FFST) fields,
+    /// `init_common()` re-derives `sdef`. Without this a record that
+    /// started with an empty state table (`sdef=false`) would stay on
+    /// the no-states `VAL=RVAL` path even after a CA put populated a
+    /// state value.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if after && is_state_table_field(field) {
+            self.compute_sdef();
+        }
+        Ok(())
     }
 
     /// Override set_val: convert raw value from hardware → enum index.
@@ -648,7 +767,9 @@ impl Record for MbbiRecord {
         };
         self.rval = raw;
         let shifted = if self.shft > 0 {
-            ((raw as u32) >> (self.shft as u32)) as i32
+            // See `process` — `checked_shr` so a CA-written SHFT >= 32
+            // yields 0 instead of panicking in debug builds.
+            (raw as u32).checked_shr(self.shft as u32).unwrap_or(0) as i32
         } else {
             raw
         };

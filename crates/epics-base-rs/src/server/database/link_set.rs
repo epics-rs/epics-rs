@@ -67,6 +67,23 @@ pub trait LinkSet: Send + Sync {
         None
     }
 
+    /// Alarm severity (`0 = NO_ALARM` … `3 = INVALID`) to fold into
+    /// the owning record's `LINK_ALARM`, when the link should
+    /// propagate one.
+    ///
+    /// `None` means "do not propagate" — either the upstream has no
+    /// alarm, the lset has no cache, or the link's maximize-severity
+    /// mode (`NMS`/`MS`/`MSI`) suppresses it. The lset is expected to
+    /// apply that mode gate itself (the `pva://X?sevr=MS` modifier is
+    /// stripped before epics-base-rs sees the link, so only the lset
+    /// retains it). A returned `Some(sev)` is therefore already
+    /// gated and the record processing loop propagates it verbatim
+    /// as a maximize-severity contribution. Mirrors pvxs
+    /// `pvalink_lset.cpp` `pvaGetAlarm` feeding `recGblSetSevr`.
+    fn alarm_severity(&self, _name: &str) -> Option<i32> {
+        None
+    }
+
     /// `(seconds_past_epoch, nanoseconds)` from the upstream PV's
     /// timestamp slot, when available.
     fn time_stamp(&self, _name: &str) -> Option<(i64, i32)> {

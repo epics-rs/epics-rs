@@ -26,10 +26,12 @@ use tracing::debug;
 
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
-use crate::proto::{BitSet, ByteOrder, Command, PvaHeader, QosFlags, WriteExt};
+use crate::proto::{BitSet, ByteOrder, Command, PvaHeader, QosFlags, ReadExt, WriteExt};
 use crate::pv_request::{build_pv_request_fields, build_pv_request_value_only};
-use crate::pvdata::encode::{encode_pv_field, encode_type_desc};
-use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue};
+use crate::pvdata::encode::{encode_pv_field, encode_pv_field_with_bitset, encode_type_desc};
+use crate::pvdata::{
+    FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, UnionItem, VariantValue,
+};
 
 use super::channel::Channel;
 use super::decode::{OpResponse, decode_op_response, decode_op_response_cached};
@@ -498,7 +500,10 @@ pub async fn op_put_field(
     let mut changed = BitSet::new();
     changed.set(bit);
     changed.write_into(order, &mut payload);
-    encode_pv_field(&value, &intro, order, &mut payload);
+    // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
+    // only the fields whose bit is set. Encode consistently so a desync
+    // does not corrupt the server-side decode.
+    encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();
     header.write_into(&mut frame);
@@ -581,7 +586,9 @@ pub async fn op_put_value(
         changed.set(0);
     }
     changed.write_into(order, &mut payload);
-    encode_pv_field(value, &intro, order, &mut payload);
+    // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
+    // only the fields whose bit is set. Encode consistently.
+    encode_pv_field_with_bitset(value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();
     header.write_into(&mut frame);
@@ -666,7 +673,9 @@ async fn op_put_inner(
         changed.set(0);
     }
     changed.write_into(order, &mut payload);
-    encode_pv_field(&value, &intro, order, &mut payload);
+    // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
+    // only the fields whose bit is set. Encode consistently.
+    encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();
     header.write_into(&mut frame);
@@ -1770,6 +1779,245 @@ pub async fn op_rpc(
     result
 }
 
+// ── PUT_GET (cmd 12) ────────────────────────────────────────────────────
+
+/// F11: PVA `PUT_GET` (cmd 12) — atomic put-then-get round trip.
+///
+/// Puts `value_str` to the channel's `.value` field, then receives the
+/// (possibly post-processed) value back, all in one operation. The
+/// wire lifecycle mirrors the GET / PUT ops:
+///
+/// 1. INIT (`subcmd 0x08`): send the pvRequest; server replies with
+///    `status + putIF + getIF` (two type descriptors).
+/// 2. PUT-GET (`subcmd 0x00`): send `put bitset + put value`; server
+///    applies the put then replies `status + get bitset + get value`.
+/// 3. DESTROY (`subcmd 0x10`): release the op.
+///
+/// pvxs leaves `handle_PUT_GET` empty; the Rust server implements the
+/// full operation (see `server_native::tcp::handle_put_get`).
+pub async fn op_put_get(
+    channel: &Arc<Channel>,
+    value_str: &str,
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, PvField)> {
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let order = server.byte_order;
+    let big_endian = matches!(order, ByteOrder::Big);
+    let codec = PvaCodec { big_endian };
+    let ioid = alloc_ioid();
+
+    let pv_req = build_pv_request_value_only(big_endian);
+    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
+    let cache = server.type_cache();
+
+    // INIT — `sid + ioid + 0x08 + pvRequest`.
+    let mut init = Vec::with_capacity(9 + pv_req.len());
+    init.put_u32(sid, order);
+    init.put_u32(ioid, order);
+    init.put_u8(QosFlags::INIT);
+    init.extend_from_slice(&pv_req);
+    let init_h = PvaHeader::application(false, order, Command::PutGet.code(), init.len() as u32);
+    let mut init_frame = Vec::with_capacity(8 + init.len());
+    init_h.write_into(&mut init_frame);
+    init_frame.extend_from_slice(&init);
+    server.send(init_frame).await?;
+
+    let init_resp = await_frame(&mut stream, op_timeout).await?;
+    let intro = decode_put_get_init(&init_resp, &mut cache.lock())?;
+    ioid_guard.arm_destroy(sid);
+
+    // Build the value against the negotiated introspection.
+    let value = build_put_value(&intro, value_str)?;
+
+    // PUT-GET data — `sid + ioid + 0x00 + put bitset + put value`.
+    let mut data = Vec::new();
+    data.put_u32(sid, order);
+    data.put_u32(ioid, order);
+    data.put_u8(0x00);
+    let mut changed = BitSet::new();
+    if let Some(bit) = intro.bit_for_path("value") {
+        changed.set(bit);
+    } else {
+        changed.set(0);
+    }
+    changed.write_into(order, &mut data);
+    // pvxs `from_wire_valid` decodes a BitSet delta — only the fields
+    // whose bit is set. Encode consistently.
+    encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut data);
+    let data_h = PvaHeader::application(false, order, Command::PutGet.code(), data.len() as u32);
+    let mut data_frame = Vec::with_capacity(8 + data.len());
+    data_h.write_into(&mut data_frame);
+    data_frame.extend_from_slice(&data);
+    server.send(data_frame).await?;
+
+    let resp_frame = await_frame(&mut stream, op_timeout).await?;
+    let result = decode_put_get_data(&resp_frame, &intro);
+
+    ioid_guard.disarm();
+    let destroy = codec.build_destroy_request(sid, ioid);
+    let _ = server.send(destroy).await;
+    server.unregister_ioid(ioid);
+    result.map(|v| (intro, v))
+}
+
+/// Decode a `PUT_GET` INIT response: `ioid + subcmd + status + putIF +
+/// getIF`. Returns the get-leg introspection (used to encode the put
+/// value and decode the readback). On a non-success status this is an
+/// error.
+fn decode_put_get_init(
+    frame: &super::decode::Frame,
+    type_cache: &mut crate::pvdata::encode::TypeCache,
+) -> PvaResult<FieldDesc> {
+    if frame.header.command != Command::PutGet.code() {
+        return Err(PvaError::Protocol(format!(
+            "expected PUT_GET INIT, got command {}",
+            frame.header.command
+        )));
+    }
+    let order = frame.order();
+    let mut cur = frame.cursor();
+    let _ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+    if subcmd & QosFlags::INIT == 0 {
+        return Err(PvaError::Protocol(format!(
+            "expected PUT_GET INIT subcmd, got 0x{subcmd:02x}"
+        )));
+    }
+    let status = crate::proto::Status::decode(&mut cur, order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    if !status.is_success() {
+        return Err(PvaError::Protocol(format!(
+            "PUT_GET INIT failed: {status:?}"
+        )));
+    }
+    // putIF then getIF. The put structure is decoded (advancing the
+    // cursor + populating the type cache) but the get structure is
+    // what the data legs use.
+    let _put_if = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let get_if = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    Ok(get_if)
+}
+
+/// Decode a `PUT_GET` data response: `ioid + subcmd + status + get
+/// bitset + get value`.
+fn decode_put_get_data(frame: &super::decode::Frame, intro: &FieldDesc) -> PvaResult<PvField> {
+    if frame.header.command != Command::PutGet.code() {
+        return Err(PvaError::Protocol(format!(
+            "expected PUT_GET data, got command {}",
+            frame.header.command
+        )));
+    }
+    let order = frame.order();
+    let mut cur = frame.cursor();
+    let _ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let _subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+    let status = crate::proto::Status::decode(&mut cur, order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    if !status.is_success() {
+        return Err(PvaError::Protocol(format!("PUT_GET: {status:?}")));
+    }
+    let changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    let value =
+        crate::pvdata::encode::decode_pv_field_with_bitset(intro, &changed, 0, &mut cur, order)
+            .map_err(|e| PvaError::Decode(e.to_string()))?;
+    Ok(value)
+}
+
+// ── PROCESS (cmd 16) ────────────────────────────────────────────────────
+
+/// F11: PVA `PROCESS` (cmd 16) — trigger record processing without
+/// transferring a value.
+///
+/// Wire lifecycle:
+/// 1. INIT (`subcmd 0x08`): send the pvRequest; server replies
+///    `status` (no introspection — there is no value type).
+/// 2. PROCESS (`subcmd 0x00`): no payload; server runs the processing
+///    hook and replies `status`.
+/// 3. DESTROY (`subcmd 0x10`): release the op.
+pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResult<()> {
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let order = server.byte_order;
+    let big_endian = matches!(order, ByteOrder::Big);
+    let codec = PvaCodec { big_endian };
+    let ioid = alloc_ioid();
+
+    let pv_req = build_pv_request_value_only(big_endian);
+    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
+
+    // INIT — `sid + ioid + 0x08 + pvRequest`.
+    let mut init = Vec::with_capacity(9 + pv_req.len());
+    init.put_u32(sid, order);
+    init.put_u32(ioid, order);
+    init.put_u8(QosFlags::INIT);
+    init.extend_from_slice(&pv_req);
+    let init_h = PvaHeader::application(false, order, Command::Process.code(), init.len() as u32);
+    let mut init_frame = Vec::with_capacity(8 + init.len());
+    init_h.write_into(&mut init_frame);
+    init_frame.extend_from_slice(&init);
+    server.send(init_frame).await?;
+
+    let init_resp = await_frame(&mut stream, op_timeout).await?;
+    decode_process_status(&init_resp, QosFlags::INIT)?;
+    ioid_guard.arm_destroy(sid);
+
+    // PROCESS data — `sid + ioid + 0x00`, no payload.
+    let mut data = Vec::with_capacity(9);
+    data.put_u32(sid, order);
+    data.put_u32(ioid, order);
+    data.put_u8(0x00);
+    let data_h = PvaHeader::application(false, order, Command::Process.code(), data.len() as u32);
+    let mut data_frame = Vec::with_capacity(8 + data.len());
+    data_h.write_into(&mut data_frame);
+    data_frame.extend_from_slice(&data);
+    server.send(data_frame).await?;
+
+    let resp_frame = await_frame(&mut stream, op_timeout).await?;
+    let result = decode_process_status(&resp_frame, 0x00);
+
+    ioid_guard.disarm();
+    let destroy = codec.build_destroy_request(sid, ioid);
+    let _ = server.send(destroy).await;
+    server.unregister_ioid(ioid);
+    result
+}
+
+/// Decode a `PROCESS` response: `ioid + subcmd + status`.
+/// `expected_init` is `QosFlags::INIT` when an INIT reply is expected,
+/// `0x00` for the PROCESS-done reply — only used to label errors.
+fn decode_process_status(frame: &super::decode::Frame, expected_init: u8) -> PvaResult<()> {
+    if frame.header.command != Command::Process.code() {
+        return Err(PvaError::Protocol(format!(
+            "expected PROCESS response, got command {}",
+            frame.header.command
+        )));
+    }
+    let order = frame.order();
+    let mut cur = frame.cursor();
+    let _ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let _subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+    let status = crate::proto::Status::decode(&mut cur, order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    if !status.is_success() {
+        let phase = if expected_init & QosFlags::INIT != 0 {
+            "PROCESS INIT"
+        } else {
+            "PROCESS"
+        };
+        return Err(PvaError::Protocol(format!("{phase} failed: {status:?}")));
+    }
+    Ok(())
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
 
 async fn await_frame(
@@ -1895,8 +2143,591 @@ fn build_put_value(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
             }
             Ok(PvField::Structure(s))
         }
-        _ => Err(PvaError::InvalidValue(format!(
-            "PUT not supported for descriptor {desc}"
-        ))),
+        FieldDesc::Union { variants, .. } => build_put_union(variants, value_str),
+        FieldDesc::UnionArray { variants, .. } => {
+            // Element-per-token: each `;`-separated token becomes one
+            // union element built via `build_put_union`. An empty input
+            // is a legal zero-length array.
+            let mut items = Vec::new();
+            for tok in value_str
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let elem = build_put_union(variants, tok)?;
+                match elem {
+                    PvField::Union {
+                        selector,
+                        variant_name,
+                        value,
+                    } => items.push(UnionItem {
+                        selector,
+                        variant_name,
+                        value: *value,
+                    }),
+                    other => {
+                        return Err(PvaError::InvalidValue(format!(
+                            "internal: build_put_union yielded {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(PvField::UnionArray(items))
+        }
+        FieldDesc::Variant => build_put_variant(value_str),
+        FieldDesc::VariantArray => {
+            // Comma-separated tokens, each inferred independently.
+            let mut items = Vec::new();
+            for tok in value_str
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                match build_put_variant(tok)? {
+                    PvField::Variant(vv) => items.push(*vv),
+                    other => {
+                        return Err(PvaError::InvalidValue(format!(
+                            "internal: build_put_variant yielded {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(PvField::VariantArray(items))
+        }
+        FieldDesc::StructureArray { struct_id, fields } => {
+            // Each `;`-separated token builds one element structure; the
+            // token is routed into the element's `value` field (or, if
+            // there is none, its first scalar leaf) exactly like the
+            // scalar `Structure` arm above. An empty input yields a
+            // zero-length array.
+            let mut items = Vec::new();
+            for tok in value_str
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let element_desc = FieldDesc::Structure {
+                    struct_id: struct_id.clone(),
+                    fields: fields.clone(),
+                };
+                match build_put_struct_element(&element_desc, tok)? {
+                    PvField::Structure(s) => items.push(s),
+                    other => {
+                        return Err(PvaError::InvalidValue(format!(
+                            "internal: structure-array element built as {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(PvField::StructureArray(items))
+        }
+        FieldDesc::BoundedString(_) => {
+            Ok(PvField::Scalar(ScalarValue::String(value_str.to_string())))
+        }
+    }
+}
+
+/// Build a union PUT value (`F4`). The variant is selected either
+/// explicitly — `value_str` of the form `variantName=payload` (or
+/// `variantName:payload`) — or implicitly by picking the first variant
+/// whose descriptor the bare payload parses against. An empty
+/// `value_str` produces the null union (`selector == -1`).
+fn build_put_union(variants: &[(String, FieldDesc)], value_str: &str) -> PvaResult<PvField> {
+    let trimmed = value_str.trim();
+    if trimmed.is_empty() {
+        return Ok(PvField::Union {
+            selector: -1,
+            variant_name: String::new(),
+            value: Box::new(PvField::Null),
+        });
+    }
+
+    // Explicit `name=payload` / `name:payload` selection. The split
+    // point is the first `=` or `:`; a leading variant name that itself
+    // contains neither is required for the explicit form to engage.
+    let explicit = trimmed
+        .find(['=', ':'])
+        .map(|i| (trimmed[..i].trim(), trimmed[i + 1..].trim()));
+    if let Some((name, payload)) = explicit {
+        if let Some(idx) = variants.iter().position(|(n, _)| n == name) {
+            let (_, vdesc) = &variants[idx];
+            let value = build_put_value(vdesc, payload)?;
+            return Ok(PvField::Union {
+                selector: idx as i32,
+                variant_name: name.to_string(),
+                value: Box::new(value),
+            });
+        }
+        // Name not found — fall through to implicit matching against the
+        // whole `value_str` so e.g. a timestamp "1:2:3" still parses.
+    }
+
+    // Implicit: first variant the bare payload builds against cleanly.
+    for (idx, (name, vdesc)) in variants.iter().enumerate() {
+        if let Ok(value) = build_put_value(vdesc, trimmed) {
+            return Ok(PvField::Union {
+                selector: idx as i32,
+                variant_name: name.clone(),
+                value: Box::new(value),
+            });
+        }
+    }
+    Err(PvaError::InvalidValue(format!(
+        "value '{value_str}' does not match any union variant; \
+         use 'variantName=value' to select explicitly"
+    )))
+}
+
+/// Build a variant ("any") PUT value (`F4`). The carried scalar type is
+/// inferred from the textual form — narrowest type wins: `bool` →
+/// `i64` → `f64` → `String`. An empty `value_str` produces the null
+/// variant (no embedded descriptor).
+fn build_put_variant(value_str: &str) -> PvaResult<PvField> {
+    let trimmed = value_str.trim();
+    if trimmed.is_empty() {
+        return Ok(PvField::Variant(Box::new(VariantValue {
+            desc: None,
+            value: PvField::Null,
+        })));
+    }
+    let (st, sv) = if trimmed.eq_ignore_ascii_case("true") {
+        (ScalarType::Boolean, ScalarValue::Boolean(true))
+    } else if trimmed.eq_ignore_ascii_case("false") {
+        (ScalarType::Boolean, ScalarValue::Boolean(false))
+    } else if let Ok(i) = trimmed.parse::<i64>() {
+        (ScalarType::Long, ScalarValue::Long(i))
+    } else if let Ok(d) = trimmed.parse::<f64>() {
+        (ScalarType::Double, ScalarValue::Double(d))
+    } else {
+        (ScalarType::String, ScalarValue::String(trimmed.to_string()))
+    };
+    Ok(PvField::Variant(Box::new(VariantValue {
+        desc: Some(FieldDesc::Scalar(st)),
+        value: PvField::Scalar(sv),
+    })))
+}
+
+/// Build one element of a structure array (`F4`). The token is routed
+/// into the element's `value` field if present, otherwise into its
+/// first scalar / scalar-array leaf; every other field is default-
+/// filled. Distinct from [`build_put_value`]'s `Structure` arm only in
+/// the fallback-to-first-scalar-leaf behaviour, which matters because
+/// structure-array elements are frequently plain `{ value: scalar }`
+/// records without an NT wrapper.
+fn build_put_struct_element(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
+    let FieldDesc::Structure { fields, struct_id } = desc else {
+        return build_put_value(desc, value_str);
+    };
+    // Prefer a field literally named "value"; else the first scalar or
+    // scalar-array leaf.
+    let target = fields.iter().position(|(n, _)| n == "value").or_else(|| {
+        fields
+            .iter()
+            .position(|(_, d)| matches!(d, FieldDesc::Scalar(_) | FieldDesc::ScalarArray(_)))
+    });
+    let mut s = PvStructure::new(struct_id);
+    for (idx, (name, child)) in fields.iter().enumerate() {
+        if Some(idx) == target {
+            s.fields
+                .push((name.clone(), build_put_value(child, value_str)?));
+        } else {
+            s.fields.push((
+                name.clone(),
+                crate::pvdata::encode::default_value_for(child),
+            ));
+        }
+    }
+    Ok(PvField::Structure(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pvdata::encode::{decode_pv_field, encode_pv_field};
+    use std::io::Cursor;
+
+    /// Round-trip a built PUT value through encode/decode against its
+    /// descriptor — proves the value built by `build_put_value` is
+    /// wire-valid, not merely well-typed.
+    fn assert_round_trips(desc: &FieldDesc, value: &PvField) {
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut buf = Vec::new();
+            encode_pv_field(value, desc, order, &mut buf);
+            let mut cur = Cursor::new(buf.as_slice());
+            let decoded = decode_pv_field(desc, &mut cur, order)
+                .unwrap_or_else(|e| panic!("decode failed ({order:?}): {e:?}"));
+            assert_eq!(
+                cur.position() as usize,
+                buf.len(),
+                "trailing bytes after decode"
+            );
+            assert_eq!(
+                format!("{decoded}"),
+                format!("{value}"),
+                "round-trip mismatch order={order:?}"
+            );
+        }
+    }
+
+    fn union_desc() -> FieldDesc {
+        FieldDesc::Union {
+            struct_id: String::new(),
+            variants: vec![
+                ("intValue".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("doubleValue".into(), FieldDesc::Scalar(ScalarType::Double)),
+                ("stringValue".into(), FieldDesc::Scalar(ScalarType::String)),
+            ],
+        }
+    }
+
+    #[test]
+    fn put_union_explicit_variant_selection() {
+        let desc = union_desc();
+        let v = build_put_value(&desc, "doubleValue=2.5").unwrap();
+        match &v {
+            PvField::Union {
+                selector,
+                variant_name,
+                value,
+            } => {
+                assert_eq!(*selector, 1);
+                assert_eq!(variant_name, "doubleValue");
+                assert_eq!(**value, PvField::Scalar(ScalarValue::Double(2.5)));
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_union_explicit_colon_form() {
+        let desc = union_desc();
+        let v = build_put_value(&desc, "stringValue:hello world").unwrap();
+        match &v {
+            PvField::Union {
+                selector, value, ..
+            } => {
+                assert_eq!(*selector, 2);
+                assert_eq!(
+                    **value,
+                    PvField::Scalar(ScalarValue::String("hello world".into()))
+                );
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_union_implicit_first_matching_variant() {
+        let desc = union_desc();
+        // "7" parses as Int (the first variant) — selector 0.
+        let v = build_put_value(&desc, "7").unwrap();
+        match &v {
+            PvField::Union { selector, .. } => assert_eq!(*selector, 0),
+            other => panic!("expected union, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_union_empty_is_null() {
+        let desc = union_desc();
+        let v = build_put_value(&desc, "").unwrap();
+        assert!(matches!(v, PvField::Union { selector: -1, .. }));
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_union_unknown_name_falls_back_to_implicit() {
+        let desc = union_desc();
+        // "1:2:3" — no variant named "1"; the bare string matches the
+        // String variant via implicit fallback.
+        let v = build_put_value(&desc, "1:2:3").unwrap();
+        match &v {
+            PvField::Union {
+                selector, value, ..
+            } => {
+                assert_eq!(*selector, 2, "string variant");
+                assert_eq!(
+                    **value,
+                    PvField::Scalar(ScalarValue::String("1:2:3".into()))
+                );
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_variant_infers_scalar_type() {
+        for (input, expect_st, expect_val) in [
+            ("true", ScalarType::Boolean, ScalarValue::Boolean(true)),
+            ("-42", ScalarType::Long, ScalarValue::Long(-42)),
+            ("3.5", ScalarType::Double, ScalarValue::Double(3.5)),
+            (
+                "text",
+                ScalarType::String,
+                ScalarValue::String("text".into()),
+            ),
+        ] {
+            let v = build_put_value(&FieldDesc::Variant, input).unwrap();
+            match &v {
+                PvField::Variant(vv) => {
+                    assert_eq!(vv.desc, Some(FieldDesc::Scalar(expect_st)), "input {input}");
+                    assert_eq!(vv.value, PvField::Scalar(expect_val), "input {input}");
+                }
+                other => panic!("expected variant, got {other:?}"),
+            }
+            assert_round_trips(&FieldDesc::Variant, &v);
+        }
+    }
+
+    #[test]
+    fn put_variant_empty_is_null() {
+        let v = build_put_value(&FieldDesc::Variant, "").unwrap();
+        match &v {
+            PvField::Variant(vv) => assert!(vv.desc.is_none()),
+            other => panic!("expected variant, got {other:?}"),
+        }
+        assert_round_trips(&FieldDesc::Variant, &v);
+    }
+
+    #[test]
+    fn put_structure_array_elements() {
+        let desc = FieldDesc::StructureArray {
+            struct_id: "elem_t".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("flag".into(), FieldDesc::Scalar(ScalarType::Boolean)),
+            ],
+        };
+        let v = build_put_value(&desc, "10; 20; 30").unwrap();
+        match &v {
+            PvField::StructureArray(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(
+                    items[1].get_field("value"),
+                    Some(&PvField::Scalar(ScalarValue::Int(20)))
+                );
+            }
+            other => panic!("expected structure array, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_structure_array_first_scalar_leaf_when_no_value_field() {
+        // Element struct has no field named "value"; the token routes
+        // into the first scalar leaf — here "n", declared before the
+        // non-scalar nested struct.
+        let desc = FieldDesc::StructureArray {
+            struct_id: "pair_t".into(),
+            fields: vec![
+                (
+                    "meta".into(),
+                    FieldDesc::Structure {
+                        struct_id: "m_t".into(),
+                        fields: vec![("tag".into(), FieldDesc::Scalar(ScalarType::String))],
+                    },
+                ),
+                ("n".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        };
+        let v = build_put_value(&desc, "5; 6").unwrap();
+        match &v {
+            PvField::StructureArray(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(
+                    items[0].get_field("n"),
+                    Some(&PvField::Scalar(ScalarValue::Int(5)))
+                );
+                assert_eq!(
+                    items[1].get_field("n"),
+                    Some(&PvField::Scalar(ScalarValue::Int(6)))
+                );
+            }
+            other => panic!("expected structure array, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_structure_array_empty() {
+        let desc = FieldDesc::StructureArray {
+            struct_id: "elem_t".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+        };
+        let v = build_put_value(&desc, "").unwrap();
+        assert!(matches!(&v, PvField::StructureArray(items) if items.is_empty()));
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_union_array_elements() {
+        let desc = FieldDesc::UnionArray {
+            struct_id: String::new(),
+            variants: vec![
+                ("i".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("s".into(), FieldDesc::Scalar(ScalarType::String)),
+            ],
+        };
+        let v = build_put_value(&desc, "i=1; s=hi; 2").unwrap();
+        match &v {
+            PvField::UnionArray(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0].selector, 0);
+                assert_eq!(items[1].selector, 1);
+                assert_eq!(items[2].selector, 0, "bare '2' matches Int variant");
+            }
+            other => panic!("expected union array, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_variant_array_elements() {
+        let desc = FieldDesc::VariantArray;
+        let v = build_put_value(&desc, "1, 2.5, hello").unwrap();
+        match &v {
+            PvField::VariantArray(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0].desc, Some(FieldDesc::Scalar(ScalarType::Long)));
+                assert_eq!(items[1].desc, Some(FieldDesc::Scalar(ScalarType::Double)));
+                assert_eq!(items[2].desc, Some(FieldDesc::Scalar(ScalarType::String)));
+            }
+            other => panic!("expected variant array, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_bounded_string() {
+        let desc = FieldDesc::BoundedString(16);
+        let v = build_put_value(&desc, "abc").unwrap();
+        assert_eq!(v, PvField::Scalar(ScalarValue::String("abc".into())));
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_union_value_field_inside_structure() {
+        // NT-style wrapper: { value: union, alarm: ... } — build_put_value
+        // recurses into the `value` field which is itself a union.
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTUnion:1.0".into(),
+            fields: vec![
+                ("value".into(), union_desc()),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+            ],
+        };
+        let v = build_put_value(&desc, "intValue=99").unwrap();
+        match &v {
+            PvField::Structure(s) => match s.get_field("value") {
+                Some(PvField::Union {
+                    selector, value, ..
+                }) => {
+                    assert_eq!(*selector, 0);
+                    assert_eq!(**value, PvField::Scalar(ScalarValue::Int(99)));
+                }
+                other => panic!("expected union in value field, got {other:?}"),
+            },
+            other => panic!("expected structure, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    /// F4 regression: the PUT EXEC DATA frame must encode a BitSet *delta*
+    /// — only the fields whose bit is set — so a pvxs server's
+    /// `from_wire_valid` (serverget.cpp:451) decodes the exact bytes the
+    /// client emitted. Previously the BitSet marked only `value` while
+    /// `encode_pv_field` wrote the *full* NT structure, desyncing the
+    /// server-side decode.
+    #[test]
+    fn put_data_frame_bitset_matches_encoded_field_set() {
+        use crate::pvdata::encode::decode_pv_field_with_bitset;
+
+        // NT-style wrapper with several non-`value` siblings.
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![
+                            ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("message".into(), FieldDesc::Scalar(ScalarType::String)),
+                        ],
+                    },
+                ),
+                (
+                    "timeStamp".into(),
+                    FieldDesc::Structure {
+                        struct_id: "time_t".into(),
+                        fields: vec![
+                            (
+                                "secondsPastEpoch".into(),
+                                FieldDesc::Scalar(ScalarType::Long),
+                            ),
+                            ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        };
+        let value = build_put_value(&desc, "42.5").unwrap();
+
+        // Same BitSet the PUT ops build: only the `value` bit.
+        let mut changed = BitSet::new();
+        let value_bit = desc.bit_for_path("value").expect("value bit");
+        changed.set(value_bit);
+
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            // Delta encode — what op_put_inner / op_put_value now emit.
+            let mut delta = Vec::new();
+            encode_pv_field_with_bitset(&value, &desc, &changed, 0, order, &mut delta);
+
+            // Full encode — the previous (buggy) emission.
+            let mut full = Vec::new();
+            encode_pv_field(&value, &desc, order, &mut full);
+
+            // The delta must be strictly smaller — siblings are omitted.
+            assert!(
+                delta.len() < full.len(),
+                "delta ({}) must omit unmarked fields vs full ({}), order={order:?}",
+                delta.len(),
+                full.len()
+            );
+
+            // Decoding the delta with the SAME BitSet must consume every
+            // byte and reproduce the marked field — this is exactly the
+            // pvxs `from_wire_valid` contract.
+            let mut cur = Cursor::new(delta.as_slice());
+            let decoded = decode_pv_field_with_bitset(&desc, &changed, 0, &mut cur, order)
+                .unwrap_or_else(|e| panic!("delta decode failed ({order:?}): {e:?}"));
+            assert_eq!(
+                cur.position() as usize,
+                delta.len(),
+                "BitSet-driven decode left trailing bytes, order={order:?}"
+            );
+            match &decoded {
+                PvField::Structure(s) => {
+                    assert_eq!(
+                        s.get_field("value"),
+                        Some(&PvField::Scalar(ScalarValue::Double(42.5))),
+                        "value field mismatch, order={order:?}"
+                    );
+                }
+                other => panic!("expected structure, got {other:?}"),
+            }
+        }
     }
 }

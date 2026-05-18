@@ -44,6 +44,11 @@ pub struct AoRecord {
     pub mlst: f64,
     // Runtime
     pub init: bool,
+    /// Set by `convert()` when `LINR >= 3` selects a breakpoint-table
+    /// linearisation this port cannot resolve. C `aoRecord.c::convert`
+    /// raises `SOFT_ALARM/MAJOR_ALARM` on a BPT failure; `check_alarms`
+    /// consumes this flag to do the same.
+    bpt_error: bool,
     // Simulation
     pub simm: i16,
     pub siml: String,
@@ -87,6 +92,7 @@ impl Default for AoRecord {
             alst: 0.0,
             mlst: 0.0,
             init: false,
+            bpt_error: false,
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -101,6 +107,83 @@ impl AoRecord {
             val,
             ..Default::default()
         }
+    }
+
+    /// C `aoRecord.c::convert`: drive-limit clamp, OROC rate-of-change
+    /// limiting, engineering→raw linearisation and raw rounding. Factored
+    /// out of `process()` so the IVOA=Set_output_to_IVOV path can re-run
+    /// the same conversion on `VAL = IVOV` without re-fetching DOL.
+    fn convert(&mut self) {
+        // Drive limits
+        if self.drvh > self.drvl {
+            self.val = self.val.clamp(self.drvl, self.drvh);
+        }
+
+        // C: value = prec->val, then OROC modifies value (not VAL)
+        let mut value = self.val;
+        self.pval = value; // pval = drive-limited desired value (like C)
+
+        // OROC: rate of change limiting (C applies unconditionally when oroc != 0)
+        if self.oroc != 0.0 {
+            let diff = value - self.oval;
+            if diff < 0.0 {
+                if self.oroc < -diff {
+                    value = self.oval - self.oroc;
+                }
+            } else if self.oroc < diff {
+                value = self.oval + self.oroc;
+            }
+        }
+
+        self.oval = value; // oval = rate-limited output value
+
+        // convert(): engineering units to raw value
+        // Step 1: linearization (SLOPE or LINEAR)
+        self.bpt_error = false;
+        match self.linr {
+            1 | 2 => {
+                // SLOPE/LINEAR: (value - eoff) / eslo
+                if self.eslo == 0.0 {
+                    value = 0.0;
+                } else {
+                    value = (value - self.eoff) / self.eslo;
+                }
+            }
+            0 => {} // NO_CONVERSION
+            _ => {
+                // LINR >= 3 selects a breakpoint-table linearisation.
+                // epics-base-rs has no breakpoint-table registry, so the
+                // table cannot be applied — the value passes through
+                // unconverted. C `aoRecord.c::convert` (lines 494-499)
+                // raises `SOFT_ALARM/MAJOR_ALARM` and returns on a BPT
+                // failure; flag it here so `check_alarms` raises the same
+                // alarm rather than leaving the misconfiguration silent.
+                self.bpt_error = true;
+            }
+        }
+
+        // Step 2: AOFF/ASLO adjustment
+        value -= self.aoff;
+        if self.aslo != 0.0 {
+            value /= self.aslo;
+        }
+
+        // Step 3: ROFF subtraction and rounding with i32 saturation
+        value -= self.roff as f64;
+        if value >= 0.0 {
+            if value >= (i32::MAX as f64 - 0.5) {
+                self.rval = i32::MAX;
+            } else {
+                self.rval = (value + 0.5) as i32;
+            }
+        } else if value > (i32::MIN as f64 - 0.5) {
+            self.rval = (value - 0.5) as i32;
+        } else {
+            self.rval = i32::MIN;
+        }
+
+        self.oraw = self.rval;
+        self.init = true;
     }
 }
 
@@ -307,10 +390,20 @@ impl Record for AoRecord {
         "ao"
     }
 
-    // C recAo.c IVOA=set_to_IVOV: oval = ivov; val = oval; writeValue.
+    // C `aoRecord.c::process` IVOA=Set_output_to_IVOV (lines 207-213):
+    //   prec->val = prec->ivov; value = prec->ivov; convert(prec, value);
+    // The full convert() runs, so OVAL *and* RVAL reflect the converted
+    // IVOV — not just OVAL/VAL. Re-running process() here reproduces the
+    // C convert() (OROC rate-limit + linearisation + raw rounding) so a
+    // hardware ao whose device support writes RVAL drives the correctly
+    // converted invalid-output value.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
-        self.put_field("OVAL", ivov.clone())?;
-        self.put_field("VAL", ivov)
+        let v = ivov
+            .to_f64()
+            .ok_or_else(|| CaError::TypeMismatch("IVOV".into()))?;
+        self.val = v;
+        self.process()?;
+        Ok(())
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
@@ -360,66 +453,7 @@ impl Record for AoRecord {
             // PV link DOL: framework already applied the value
         }
 
-        // Drive limits
-        if self.drvh > self.drvl {
-            self.val = self.val.clamp(self.drvl, self.drvh);
-        }
-
-        // C: value = prec->val, then OROC modifies value (not VAL)
-        let mut value = self.val;
-        self.pval = value; // pval = drive-limited desired value (like C)
-
-        // OROC: rate of change limiting (C applies unconditionally when oroc != 0)
-        if self.oroc != 0.0 {
-            let diff = value - self.oval;
-            if diff < 0.0 {
-                if self.oroc < -diff {
-                    value = self.oval - self.oroc;
-                }
-            } else if self.oroc < diff {
-                value = self.oval + self.oroc;
-            }
-        }
-
-        self.oval = value; // oval = rate-limited output value
-
-        // convert(): engineering units to raw value
-        // Step 1: linearization (SLOPE or LINEAR)
-        match self.linr {
-            1 | 2 => {
-                // SLOPE/LINEAR: (value - eoff) / eslo
-                if self.eslo == 0.0 {
-                    value = 0.0;
-                } else {
-                    value = (value - self.eoff) / self.eslo;
-                }
-            }
-            0 => {} // NO_CONVERSION
-            _ => {} // breakpoint tables not yet supported
-        }
-
-        // Step 2: AOFF/ASLO adjustment
-        value -= self.aoff;
-        if self.aslo != 0.0 {
-            value /= self.aslo;
-        }
-
-        // Step 3: ROFF subtraction and rounding with i32 saturation
-        value -= self.roff as f64;
-        if value >= 0.0 {
-            if value >= (i32::MAX as f64 - 0.5) {
-                self.rval = i32::MAX;
-            } else {
-                self.rval = (value + 0.5) as i32;
-            }
-        } else if value > (i32::MIN as f64 - 0.5) {
-            self.rval = (value - 0.5) as i32;
-        } else {
-            self.rval = i32::MIN;
-        }
-
-        self.oraw = self.rval;
-        self.init = true;
+        self.convert();
         Ok(ProcessOutcome::complete())
     }
 
@@ -535,9 +569,20 @@ impl Record for AoRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
+            // SPC_LINCONV parity (aoRecord.c:242-267): LINR / EGUF / EGUL
+            // are tagged `special(SPC_LINCONV)` in aoRecord.dbd. C path
+            // rebases `eoff = egul` when LINR=LINEAR before invoking the
+            // device-support `special_linconv` callback. Rust soft-channel
+            // ports have no such callback, so the eoff rebase is the only
+            // visible effect. ao has no smoothing, so `init` is not reset
+            // here (mirroring that aoRecord.c does set init=TRUE but never
+            // consumes it from convert()).
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
+                    if self.linr == 2 {
+                        self.eoff = self.egul;
+                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -545,6 +590,9 @@ impl Record for AoRecord {
             "EGUF" => match value {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
+                    if self.linr == 2 {
+                        self.eoff = self.egul;
+                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -552,6 +600,9 @@ impl Record for AoRecord {
             "EGUL" => match value {
                 EpicsValue::Double(v) => {
                     self.egul = v;
+                    if self.linr == 2 {
+                        self.eoff = self.egul;
+                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -702,5 +753,61 @@ impl Record for AoRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         FIELDS
+    }
+
+    /// C `aoRecord.c::convert` raises `SOFT_ALARM/MAJOR_ALARM` when the
+    /// breakpoint-table conversion fails. epics-base-rs has no
+    /// breakpoint-table registry, so any `LINR >= 3` is an unresolvable
+    /// table — `convert()` flags `bpt_error` and this hook raises the
+    /// C-equivalent alarm so the misconfiguration is visible.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        if self.bpt_error {
+            crate::server::recgbl::rec_gbl_set_sevr_msg(
+                common,
+                crate::server::recgbl::alarm_status::SOFT_ALARM,
+                crate::server::record::AlarmSeverity::Major,
+                "BPT Error",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SPC_LINCONV parity (aoRecord.c:242-267): writing LINR / EGUF / EGUL
+    /// under LINR=LINEAR (2) must rebase `eoff = egul`. Without this fix
+    /// the C path's `eoff = egul` step (which the device-support
+    /// `special_linconv` callback then refines) was silently skipped on
+    /// the Rust port, so a user retuning EGUL via CA put kept the stale
+    /// eoff and computed `RVAL = (val - stale_eoff) / eslo` — the
+    /// hardware ended up driven by a constant offset the operator never
+    /// configured.
+    #[test]
+    fn egul_put_under_linear_rebases_eoff() {
+        let mut rec = AoRecord::default();
+        rec.linr = 2; // LINEAR
+        rec.eoff = 1.5;
+
+        rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
+
+        assert_eq!(rec.eoff, 7.25, "EGUL put under LINEAR must set eoff=egul");
+    }
+
+    /// SLOPE mode (LINR=1) preserves user-configured eoff/eslo across EGUL
+    /// edits — the C path only rebases eoff when LINR == menuConvertLINEAR.
+    #[test]
+    fn egul_put_under_slope_does_not_touch_eoff() {
+        let mut rec = AoRecord::default();
+        rec.linr = 1; // SLOPE
+        rec.eoff = 1.5;
+
+        rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
+
+        assert_eq!(
+            rec.eoff, 1.5,
+            "EGUL put under SLOPE must leave user-configured eoff alone"
+        );
     }
 }

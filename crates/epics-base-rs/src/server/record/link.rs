@@ -108,7 +108,55 @@ pub struct DbLink {
     pub monitor_switch: MonitorSwitch,
 }
 
+/// Discriminated link *type* — the Rust analogue of the C
+/// `link.h` `pv_link` / `constantStr` discrimination
+/// (`modules/database/src/ioc/dbStatic/link.h:28-39`):
+///
+/// ```text
+/// #define CONSTANT  0   -> LinkType::Constant
+/// #define PV_LINK   1   -> (unresolved; resolves to Db or Ca)
+/// #define DB_LINK   10  -> LinkType::Db
+/// #define CA_LINK   11  -> LinkType::Ca
+/// ```
+///
+/// C device support inspects `prec->inp.type` to decide behaviour —
+/// e.g. `devEpidSoft.c:110` (`if (pepid->inp.type == CONSTANT)`),
+/// `devEpidSoftCallback.c:116` (`if (ptriglink->type != CA_LINK)`).
+/// This enum gives a record's `process()` / its device support the
+/// same discrimination on the framework's string link fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkType {
+    /// Empty / unset link — C has no value and no target.
+    Empty,
+    /// `CONSTANT` — the link is a literal numeric/string value, not a
+    /// reference to another PV. C `link.h` `#define CONSTANT 0`.
+    Constant,
+    /// `DB_LINK` — a reference to a record.field in *this* IOC's
+    /// database. C `link.h` `#define DB_LINK 10`.
+    Db,
+    /// `CA_LINK` — a reference to a PV reached over Channel Access /
+    /// PV Access (a remote PV). C `link.h` `#define CA_LINK 11`.
+    Ca,
+    /// A hardware (`@dev …` / `#Cn Sn`) or `lnkCalc` JSON link — not
+    /// one of the C `link.h` value-bearing scalar discriminants the
+    /// records in this task care about. Kept distinct so a caller is
+    /// never forced to mis-classify it.
+    Other,
+}
+
 impl ParsedLink {
+    /// The discriminated [`LinkType`] of this link — the C
+    /// `prec->xxx.type` analogue. See [`LinkType`] for the C mapping.
+    pub fn link_type(&self) -> LinkType {
+        match self {
+            ParsedLink::None => LinkType::Empty,
+            ParsedLink::Constant(_) => LinkType::Constant,
+            ParsedLink::Db(_) => LinkType::Db,
+            ParsedLink::Ca(_) | ParsedLink::Pva(_) => LinkType::Ca,
+            ParsedLink::Hw(_) | ParsedLink::Calc(_) => LinkType::Other,
+        }
+    }
+
     /// Extract the constant as an EpicsValue (Double if numeric, else String).
     pub fn constant_value(&self) -> Option<EpicsValue> {
         if let ParsedLink::Constant(s) = self {
@@ -129,6 +177,23 @@ impl ParsedLink {
     /// True iff this link is a hardware (`@dev …` / `#Cn Sn`) link.
     pub fn is_hw(&self) -> bool {
         matches!(self, ParsedLink::Hw(_))
+    }
+
+    /// True iff this link is a writable OUT-link target — a local
+    /// `Db` link or an external `Ca`/`Pva` link.
+    ///
+    /// The OUT-link write stage in `processing.rs` uses this to decide
+    /// whether a record's OUT link has a target the value should be
+    /// driven into. `Constant`/`Hw`/`Calc`/`None` are not writable
+    /// targets (C `dbPutLink` returns `S_db_noLSET` for a link with no
+    /// lset). Mirrors C `dbLink.c::dbPutLink` (dbLink.c:434-448), which
+    /// dispatches DB *and* CA link writes uniformly through the link
+    /// set's `putValue`.
+    pub fn is_writable_out_link(&self) -> bool {
+        matches!(
+            self,
+            ParsedLink::Db(_) | ParsedLink::Ca(_) | ParsedLink::Pva(_)
+        )
     }
 }
 
@@ -311,10 +376,21 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
         return ParsedLink::Pva(rest.to_string());
     }
 
-    // Strip trailing link attributes: PP, NPP, CP, CPP, MS, NMS, MSS, MSI
+    // Strip trailing link attributes: PP, NPP, CP, CPP, CA, MS, NMS, MSS, MSI
     // They can appear in any order: "REC.FIELD NPP NMS", "REC CP", etc.
+    //
+    // The bare ` CA` modifier forces a `pv_link` to be a CA link
+    // (C `link.h` `CA_LINK` 11). C `dbStaticLib.c:2372`
+    // (`else if (strstr(pstr, "CA")) pinfo->modifiers = pvlOptCA;`)
+    // sets `pvlOptCA`; `dbAccess.c:1103-1104` then keeps the link a
+    // `PV_LINK` instead of creating a local `dbChannel`, so the link
+    // ends up a `CA_LINK` after `dbCaAddLink`. A ` CA` may co-occur
+    // with `PP`/`MS`-style modifiers — `force_ca` records the CA
+    // override while `policy`/`ms` continue to capture the rest, and
+    // a CA-forced link is classified `ParsedLink::Ca` below.
     let mut policy = LinkProcessPolicy::ProcessPassive;
     let mut ms = MonitorSwitch::NoMaximize;
+    let mut force_ca = false;
     let mut link_part = s;
     loop {
         let trimmed = link_part.trim_end();
@@ -356,8 +432,29 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
             link_part = rest;
             continue;
         }
+        // Bare ` CA` modifier — forces the link to be a CA link.
+        // C `dbStaticLib.c:2372`. Stripped here so a combination such
+        // as `REC.FIELD CA MS` leaves `link_part == "REC.FIELD"` and
+        // both `force_ca` and `ms` are recorded.
+        if let Some(rest) = trimmed.strip_suffix(" CA") {
+            force_ca = true;
+            link_part = rest;
+            continue;
+        }
         link_part = trimmed;
         break;
+    }
+
+    // A bare ` CA` modifier forces the link to be a CA link. C
+    // `dbParseLink` only reaches the modifier scan after the
+    // constant test (`dbStaticLib.c:2347`) has already failed — a
+    // string carrying a ` CA` suffix never parses as a bare double,
+    // so a CA-forced link is always a `PV_LINK`. Honour that here:
+    // once ` CA` was stripped, classify as `ParsedLink::Ca` with the
+    // remaining `link_part` (the `record.field` PV name) verbatim,
+    // never as a Constant or local Db link.
+    if force_ca {
+        return ParsedLink::Ca(link_part.to_string());
     }
 
     // Numeric constant
@@ -401,6 +498,65 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
         policy,
         monitor_switch: ms,
     })
+}
+
+/// True when a link string carries an explicit `PP` (or `CP`/`CPP`)
+/// process modifier as a whitespace-separated token.
+///
+/// C `dbStaticLib.c::dbParseLink` sets the link's `pvlOptPP` flag only
+/// when the modifier string contains an explicit `PP` token. For a
+/// `DBF_OUTLINK` the absence of `PP` means NPP — `dbDbPutValue`
+/// (`dbDbLink.c:386-389`) writes the value but does **not** call
+/// `processTarget`.
+fn link_has_explicit_pp(raw: &str) -> bool {
+    raw.split_whitespace()
+        .any(|tok| tok == "PP" || tok == "CP" || tok == "CPP")
+}
+
+/// Parse an **output** link.
+///
+/// Identical to [`parse_link_v2`] except for the process-policy
+/// default: C `dbDbPutValue` (`dbDbLink.c:386-389`) processes the
+/// target only when the destination field is `.PROC` **or** the link
+/// carries an explicit `pvlOptPP` flag (an explicit ` PP` token). A
+/// bare OUT link is NPP — the value is written but the target is not
+/// processed.
+///
+/// `parse_link_v2` defaults *every* modifier-less link to
+/// `ProcessPassive`, which is the right default for INPUT links (so a
+/// PP source is processed before its value is read) but wrong for
+/// OUTPUT links. This wrapper downgrades a bare `Db` OUT link's policy
+/// to `NoProcess` so the OUT-link write path does not spuriously
+/// process the target. Writing the destination's `.PROC` field is
+/// handled separately by the write path (C's `dbChannelField ==
+/// &pdest->proc` branch), so `.PROC` is left at `ProcessPassive`.
+pub fn parse_output_link_v2(s: &str) -> ParsedLink {
+    let parsed = parse_link_v2(s);
+    if let ParsedLink::Db(ref db) = parsed {
+        if db.policy == LinkProcessPolicy::ProcessPassive
+            && db.field != "PROC"
+            && !link_has_explicit_pp(s)
+        {
+            let mut db = db.clone();
+            db.policy = LinkProcessPolicy::NoProcess;
+            return ParsedLink::Db(db);
+        }
+    }
+    parsed
+}
+
+/// Determine the [`LinkType`] of a record's string link field directly
+/// from its raw text — the convenience API a record's `process()` or
+/// its device support uses to discriminate one of its `INP` / `OUTL` /
+/// `TRIG` link fields without having to match the whole [`ParsedLink`]
+/// enum.
+///
+/// This is the framework's answer to C device support reading
+/// `prec->inp.type` (`devEpidSoft.c:110`,
+/// `devEpidSoftCallback.c:116`): the existing string link fields are
+/// kept as-is, and this query is layered on top.
+pub fn link_field_type(s: &str) -> LinkType {
+    parse_link_v2(s).link_type()
 }
 
 /// Parse a link string into a LinkAddress (legacy wrapper around parse_link_v2).
@@ -522,6 +678,101 @@ mod json_link_tests {
         }
     }
 
+    // Link-type discrimination — C `link.h` CONSTANT / DB_LINK /
+    // CA_LINK (`dbStatic/link.h:28-39`).
+
+    #[test]
+    fn link_type_constant_numeric() {
+        assert_eq!(link_field_type("3.14"), LinkType::Constant);
+        assert_eq!(link_field_type("{const: 7}"), LinkType::Constant);
+    }
+
+    #[test]
+    fn link_type_constant_quoted_string() {
+        assert_eq!(link_field_type(r#""hello""#), LinkType::Constant);
+    }
+
+    #[test]
+    fn link_type_empty_is_empty() {
+        assert_eq!(link_field_type(""), LinkType::Empty);
+        assert_eq!(link_field_type("   "), LinkType::Empty);
+        assert_eq!(link_field_type(r#""""#), LinkType::Empty);
+    }
+
+    #[test]
+    fn link_type_db_link() {
+        assert_eq!(link_field_type("REC.VAL"), LinkType::Db);
+        assert_eq!(link_field_type("REC"), LinkType::Db);
+        assert_eq!(link_field_type("REC.VAL PP"), LinkType::Db);
+    }
+
+    #[test]
+    fn link_type_ca_link() {
+        assert_eq!(link_field_type("ca://REMOTE:PV"), LinkType::Ca);
+        assert_eq!(link_field_type("pva://REMOTE:PV"), LinkType::Ca);
+        assert_eq!(link_field_type(r#"{ca: { pv: "REMOTE" }}"#), LinkType::Ca);
+    }
+
+    #[test]
+    fn link_type_hw_and_calc_are_other() {
+        assert_eq!(link_field_type("@dev 0 IN"), LinkType::Other);
+        assert_eq!(link_field_type("#C0 S2"), LinkType::Other);
+        // calc link uses strict JSON (quoted keys) — serde_json parse.
+        assert_eq!(
+            link_field_type(r#"{calc: {"expr": "A+1", "args": ["pv1"]}}"#),
+            LinkType::Other
+        );
+    }
+
+    // Bare ` CA` modifier — C `dbStaticLib.c:2372` forces a
+    // `pv_link` to a CA link (`link.h` `CA_LINK` 11).
+
+    #[test]
+    fn ca_modifier_classifies_as_ca() {
+        // `REC.FIELD CA` must parse as a CA link carrying the
+        // `record.field` PV name — NOT a Db link to field "FIELD CA".
+        assert_eq!(
+            parse_link_v2("REC.FIELD CA"),
+            ParsedLink::Ca("REC.FIELD".to_string())
+        );
+        assert_eq!(link_field_type("REC.FIELD CA"), LinkType::Ca);
+    }
+
+    #[test]
+    fn ca_modifier_bare_pv_name() {
+        // No field suffix — `localPv CA` is still a CA link.
+        assert_eq!(
+            parse_link_v2("localPv CA"),
+            ParsedLink::Ca("localPv".to_string())
+        );
+        assert_eq!(link_field_type("localPv CA"), LinkType::Ca);
+    }
+
+    #[test]
+    fn ca_modifier_combined_with_pp_ms() {
+        // `CA` may co-occur with PP/MS-style modifiers in any order.
+        // All non-CA modifiers are stripped; the link is still a CA
+        // link carrying just the PV name.
+        assert_eq!(
+            parse_link_v2("REC.VAL CA MS"),
+            ParsedLink::Ca("REC.VAL".to_string())
+        );
+        assert_eq!(
+            parse_link_v2("REC.VAL PP CA"),
+            ParsedLink::Ca("REC.VAL".to_string())
+        );
+        assert_eq!(link_field_type("REC.VAL CA NMS"), LinkType::Ca);
+    }
+
+    #[test]
+    fn ca_modifier_does_not_affect_plain_db_link() {
+        // A link with no ` CA` modifier stays a Db link — the fix
+        // must not over-trigger on record names that merely contain
+        // the letters "ca".
+        assert_eq!(link_field_type("camera.VAL"), LinkType::Db);
+        assert_eq!(link_field_type("REC.VAL PP"), LinkType::Db);
+    }
+
     #[test]
     fn json_unknown_key_falls_through_to_legacy() {
         // Unknown JSON top-level key must NOT be hijacked — leave it
@@ -534,5 +785,57 @@ mod json_link_tests {
             result,
             ParsedLink::None | ParsedLink::Db(_) | ParsedLink::Constant(_)
         ));
+    }
+
+    /// BUG 2 — a bare OUT link defaults to NPP (`NoProcess`). C
+    /// `dbDbPutValue` (dbDbLink.c:386-389) processes the target only
+    /// on an explicit `PP` flag.
+    #[test]
+    fn parse_output_link_bare_is_noprocess() {
+        match parse_output_link_v2("TARGET.VAL") {
+            ParsedLink::Db(db) => {
+                assert_eq!(db.policy, LinkProcessPolicy::NoProcess);
+                assert_eq!(db.record, "TARGET");
+                assert_eq!(db.field, "VAL");
+            }
+            other => panic!("expected Db link, got {other:?}"),
+        }
+    }
+
+    /// BUG 2 — an explicit ` PP` on an OUT link keeps `ProcessPassive`.
+    #[test]
+    fn parse_output_link_explicit_pp_processes() {
+        match parse_output_link_v2("TARGET.VAL PP") {
+            ParsedLink::Db(db) => {
+                assert_eq!(db.policy, LinkProcessPolicy::ProcessPassive);
+            }
+            other => panic!("expected Db link, got {other:?}"),
+        }
+    }
+
+    /// BUG 2 — an OUT link whose destination field is `.PROC` keeps
+    /// `ProcessPassive` even with no `PP` token: C processes the
+    /// target whenever the destination field is `&pdest->proc`.
+    #[test]
+    fn parse_output_link_proc_field_keeps_process_passive() {
+        match parse_output_link_v2("TARGET.PROC") {
+            ParsedLink::Db(db) => {
+                assert_eq!(db.field, "PROC");
+                assert_eq!(db.policy, LinkProcessPolicy::ProcessPassive);
+            }
+            other => panic!("expected Db link, got {other:?}"),
+        }
+    }
+
+    /// BUG 2 — an explicit ` NPP` OUT link is `NoProcess` (unchanged
+    /// from `parse_link_v2`, but pinned here for completeness).
+    #[test]
+    fn parse_output_link_explicit_npp_is_noprocess() {
+        match parse_output_link_v2("TARGET.VAL NPP") {
+            ParsedLink::Db(db) => {
+                assert_eq!(db.policy, LinkProcessPolicy::NoProcess);
+            }
+            other => panic!("expected Db link, got {other:?}"),
+        }
     }
 }

@@ -168,8 +168,9 @@ async fn handle_incoming_message(
     for (reason, addr) in subscribers {
         match decode_payload(payload_str, addr) {
             Ok(decoded) => {
-                // ParamSetValue supports Int32, Float64, Octet, Float64Array.
-                // UInt32Digital and Int32Array need individual writes.
+                // ParamSetValue carries every inbound value shape:
+                // Int32, Float64, Octet, Float64Array, Int32Array,
+                // UInt32Digital.
                 match decoded {
                     DecodedValue::Int32(v) => {
                         batch_updates.push(ParamSetValue::Int32 {
@@ -207,12 +208,12 @@ async fn handle_incoming_message(
                             mask: 0xFFFF_FFFF,
                         });
                     }
-                    DecodedValue::Int32Array(_v) => {
-                        // No ParamSetValue::Int32Array; log a warning for now.
-                        // Int32Array updates would need an asyn-rs extension.
-                        tracing::debug!(
-                            "Int32Array via set_params_and_notify not yet supported for topic '{topic}'"
-                        );
+                    DecodedValue::Int32Array(v) => {
+                        batch_updates.push(ParamSetValue::Int32Array {
+                            reason: *reason,
+                            addr: 0,
+                            value: v,
+                        });
                     }
                 }
             }

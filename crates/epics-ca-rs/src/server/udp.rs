@@ -66,6 +66,79 @@ async fn run_single_responder(
     tcp_port: u16,
     ignore_addrs: Vec<Ipv4Addr>,
 ) -> CaResult<()> {
+    let socket = bind_responder_socket(bind_ip, port)?;
+    let socket = Arc::new(socket);
+
+    // C `caservertask.c::start_tcp_server_tasks` (lines 670-708) opens a
+    // *second* UDP responder bound to the interface's broadcast address
+    // whenever the primary socket is bound to a specific (non-INADDR_ANY)
+    // interface IP. The comment at line 671 documents the BSD-sockets
+    // oddity: a unicast-bound socket on POSIX does NOT receive UDP
+    // datagrams whose destination is the interface's broadcast addr —
+    // only the secondary socket bound to the broadcast addr will.
+    // Without this second responder, every libca client SEARCH that
+    // targets the broadcast network address (the default
+    // `EPICS_CA_ADDR_LIST` fan-out shape) goes unanswered on a Rust IOC
+    // configured with a specific `EPICS_CAS_INTF_ADDR_LIST` entry —
+    // PVs become invisible to broadcast clients despite the server
+    // running and accepting unicast searches.
+    //
+    // On Windows the kernel behaviour differs (a specific-IP-bound
+    // socket receives broadcasts), so C `caservertask.c:670, 728`
+    // guards the secondary socket with `#if !(_WIN32 || __CYGWIN__)`.
+    // Mirror that gate.
+    let bcast_socket: Option<Arc<UdpSocket>> = {
+        #[cfg(any(windows, target_os = "windows"))]
+        {
+            None
+        }
+        #[cfg(not(any(windows, target_os = "windows")))]
+        {
+            super::addr_list::broadcast_for_ip(bind_ip).and_then(|bcast_ip| {
+                match bind_responder_socket(bcast_ip, port) {
+                    Ok(s) => Some(Arc::new(s)),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "epics_ca_rs::server::udp",
+                            %bind_ip,
+                            %bcast_ip,
+                            error = %e,
+                            "CA server bcast responder bind failed; broadcast SEARCHes \
+                             to this interface will not be answered"
+                        );
+                        None
+                    }
+                }
+            })
+        }
+    };
+
+    let udp_rl = Arc::new(UdpRateLimiter::from_env());
+    let primary = recv_loop(
+        socket.clone(),
+        db.clone(),
+        bind_ip,
+        tcp_port,
+        ignore_addrs.clone(),
+        udp_rl.clone(),
+    );
+
+    match bcast_socket {
+        Some(bsock) => {
+            let secondary = recv_loop(bsock, db, bind_ip, tcp_port, ignore_addrs, udp_rl);
+            // First task to error wins; the other is dropped when this
+            // future returns. tokio::try_join is `Drop` on cancel, so the
+            // surviving loop's recv() future cancels cleanly.
+            tokio::try_join!(primary, secondary).map(|_| ())
+        }
+        None => primary.await,
+    }
+}
+
+/// Build and configure the per-bind UDP socket. Centralised so the
+/// primary (interface IP) and secondary (interface broadcast addr)
+/// sockets share identical socket-option setup.
+fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     // libcom commits 19146a5 + 5064931 + 65ef6e9: SO_REUSEADDR has dangerous
     // hijack semantics on Windows (any process can rebind), so it's POSIX-only.
@@ -107,7 +180,17 @@ async fn run_single_responder(
             "SO_RXQ_OVFL enable failed (non-fatal)"
         );
     }
+    Ok(socket)
+}
 
+async fn recv_loop(
+    socket: Arc<UdpSocket>,
+    db: Arc<PvDatabase>,
+    bind_ip: Ipv4Addr,
+    tcp_port: u16,
+    ignore_addrs: Vec<Ipv4Addr>,
+    udp_rl: Arc<UdpRateLimiter>,
+) -> CaResult<()> {
     // 64 KB receive buffer — IPv4 maximum datagram size. The previous
     // 4 KB cap silently truncated bursts of multi-PV searches in
     // active facilities (each search message is ~24 bytes inc. PV
@@ -118,11 +201,6 @@ async fn run_single_responder(
     // and the `Box<[u8]>` cost is amortized over the listener's
     // lifetime — one allocation, reused on every recv.
     let mut buf = vec![0u8; 64 * 1024];
-    // Per-source-IP token bucket. Off by default; when
-    // EPICS_CAS_UDP_SEARCH_RATE_LIMIT is set, drops excess packets to
-    // mitigate amplification attacks where a tiny search reflects a
-    // larger response.
-    let udp_rl = UdpRateLimiter::from_env();
 
     // Tracks the previously-observed SO_RXQ_OVFL counter for this
     // socket. Logged on transitions only — pvxs `udp_collector.cpp:55-67`.
@@ -164,14 +242,72 @@ async fn run_single_responder(
                 Ok(h) => h,
                 Err(_) => break,
             };
-            let payload_size = align8(hdr.postsize as usize);
+            // C `rsrv/camessage.c:2452` rejects misaligned `m_postsize`.
+            // UDP path drops silently (no error response). Without this
+            // check, the `align8(postsize)` advancement would jump
+            // into the next message's body, mis-parsing chained
+            // SEARCH datagrams.
+            if (hdr.postsize as usize) & 0x7 != 0 {
+                break;
+            }
+            let payload_size = hdr.postsize as usize;
             let msg_len = CaHeader::SIZE + payload_size;
 
             if offset + msg_len > len {
                 break;
             }
 
+            // C UDP dispatcher (camessage.c:2505-2516) allows only
+            // udp_version_action (cmd 0) and search_reply_udp (cmd 6)
+            // to succeed. Every other cmd index in the udpJumpTable
+            // is bound to bad_udp_cmd_action which returns RSRV_ERROR
+            // — the dispatcher loop then `break`s out, dropping the
+            // rest of this datagram. Pre-fix Rust just advanced
+            // `offset` and parsed the next message regardless;
+            // a peer could chain a junk cmd before a SEARCH and the
+            // chained SEARCH would still be processed even though
+            // C IOC would have stopped parsing at the junk cmd.
+            //
+            // VERSION's UDP handler (udp_version_action, camessage.c:
+            // 2094-2110) is a no-op for the stateless Rust responder:
+            // it only stored per-client minor_version_number +
+            // seqNoOfReq in C; Rust doesn't track UDP-per-datagram
+            // state, so we just allow the VERSION header to pass and
+            // continue.
+            if hdr.cmmd != CA_PROTO_VERSION && hdr.cmmd != CA_PROTO_SEARCH {
+                break;
+            }
             if hdr.cmmd == CA_PROTO_SEARCH {
+                // C `search_reply_udp` (rsrv/camessage.c:2151-2154)
+                // rejects unsupported minor versions BEFORE the
+                // empty-name check. `CA_VSUPPORTED(minor) = minor >= 4`
+                // (CA_MINIMUM_SUPPORTED_VERSION in caProto.h:34). C
+                // returns RSRV_ERROR which skips the reply. Ancient
+                // libca clients (pre-V4.4) parse search replies with a
+                // different layout; emitting our V4.13 reply confuses
+                // them or worse, fabricates a usable channel they
+                // can't actually open.
+                const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
+                if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
+                    offset += msg_len;
+                    continue;
+                }
+                // C `search_reply_udp` (rsrv/camessage.c:2159) rejects
+                // SEARCH whose `m_postsize <= 1` ("empty PV name in UDP
+                // search request") and silently returns RSRV_OK. The
+                // null-terminator alone is 1 byte; a usable PV name
+                // needs at least one non-null byte plus the terminator
+                // (postsize >= 2). Without this guard the Rust path
+                // would parse `pv_name = ""` from an attacker's empty-
+                // postsize SEARCH burst and call `db.has_name("")` on
+                // every datagram — wasted lookups + a non-trivial
+                // amplification vector if a record happened to be
+                // named "" (impossible in practice, but the C side
+                // documents the reject and we match it).
+                if hdr.postsize <= 1 {
+                    offset += msg_len;
+                    continue;
+                }
                 let payload_start = offset + CaHeader::SIZE;
                 let payload_end = payload_start + hdr.postsize as usize;
                 let payload = &buf[payload_start..payload_end];
@@ -183,12 +319,29 @@ async fn run_single_responder(
                     .unwrap_or(payload.len());
                 if let Ok(pv_name) = std::str::from_utf8(&payload[..pv_name_end]) {
                     if db.has_name(pv_name).await {
-                        let server_ip = local_ip_for(src);
+                        // C parity: `search_reply_udp`
+                        // (`rsrv/camessage.c:2193-2207`) sets
+                        // `sid = ~0U` (INADDR_BROADCAST), telling
+                        // the client to use the UDP packet's source
+                        // address as the server IP. The previous
+                        // code embedded a probe-derived
+                        // `local_ip_for(src)` which (a) diverged from
+                        // C byte-for-byte and (b) could resolve to
+                        // the wrong interface on multi-homed hosts —
+                        // the probe binds 0.0.0.0:0 and `connect`s
+                        // to the client, but the kernel's outgoing-
+                        // interface choice may not match the
+                        // interface the client used to reach us.
+                        // Using the sentinel delegates the IP
+                        // determination to the receiver, which gets
+                        // it right by construction (the UDP source
+                        // IP is whatever the client sees on the
+                        // reply packet).
                         let mut resp = CaHeader::new(CA_PROTO_SEARCH);
                         resp.postsize = 8;
                         resp.data_type = tcp_port;
                         resp.count = 0;
-                        resp.cid = u32::from_be_bytes(server_ip.octets());
+                        resp.cid = u32::MAX; // ~0U — "use UDP source address"
                         resp.available = hdr.available;
 
                         let mut ver = CaHeader::new(CA_PROTO_VERSION);
@@ -202,39 +355,21 @@ async fn run_single_responder(
                         reply.extend_from_slice(&search_payload);
 
                         let _ = socket.send_to(&reply, src).await;
-                    } else if hdr.data_type == CA_DO_REPLY {
-                        // Client asked for an explicit negative reply
-                        // (search header data_type == CA_DO_REPLY=10).
-                        // Send CA_PROTO_NOT_FOUND so it doesn't have to
-                        // wait for the search timeout.
-                        let mut nf = CaHeader::new(CA_PROTO_NOT_FOUND);
-                        nf.data_type = CA_DO_REPLY;
-                        nf.count = CA_MINOR_VERSION;
-                        nf.cid = hdr.available;
-                        nf.available = hdr.available;
-                        let _ = socket.send_to(&nf.to_bytes(), src).await;
                     }
+                    // C parity: `search_reply_udp` (rsrv/camessage.c:2167)
+                    // silently returns on `dbChannelTest` failure for ALL
+                    // UDP searches — there is no DO_REPLY branch on the
+                    // UDP path. Only `search_reply_tcp` honours the flag
+                    // and emits CA_PROTO_NOT_FOUND. Emitting NOT_FOUND
+                    // here surprised C libca clients running through a
+                    // name-server-list iteration: a UDP NOT_FOUND from a
+                    // peer would short-circuit the broadcast search,
+                    // missing IOCs that hadn't responded yet.
                 }
             }
 
             offset += msg_len;
         }
-    }
-}
-
-/// Determine the local interface IP that would route to `remote`.
-/// Creates a temporary unconnected UDP socket and "connects" it (no data
-/// is sent — this just lets the OS pick the outgoing interface via routing).
-fn local_ip_for(remote: SocketAddr) -> Ipv4Addr {
-    let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") else {
-        return Ipv4Addr::UNSPECIFIED;
-    };
-    if sock.connect(remote).is_err() {
-        return Ipv4Addr::UNSPECIFIED;
-    }
-    match sock.local_addr() {
-        Ok(SocketAddr::V4(a)) => *a.ip(),
-        _ => Ipv4Addr::UNSPECIFIED,
     }
 }
 

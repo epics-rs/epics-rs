@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 // --- Busy-specific types (inlined from busy-rs/types.rs) ---
@@ -124,9 +124,12 @@ pub struct BusyRecord {
     pub mask: u32,
     pub rbv: u32,
     pub orbv: u32,
-    // HIGH timer state
-    _high_active: bool,
-    // Internal alarm state (set during process, used for IVOA check)
+    // HIGH timer state — set when a HIGH one-shot is in flight; the
+    // next (timer-driven) process() forces VAL=0, mirroring C
+    // boRecord.c::myCallbackFunc.
+    high_reset_pending: bool,
+    // Internal alarm state (highest severity from the last
+    // check_alarms() — STATE vs COS). Retained for inspection/tests.
     nsev: AlarmSevr,
 }
 
@@ -152,7 +155,7 @@ impl Default for BusyRecord {
             mask: 0,
             rbv: 0,
             orbv: 0,
-            _high_active: false,
+            high_reset_pending: false,
             nsev: AlarmSevr::None,
         }
     }
@@ -172,26 +175,22 @@ impl BusyRecord {
         }
     }
 
-    /// Check alarms: UDF (handled by framework), STATE, COS.
-    /// Sets internal nsev for IVOA check.
-    fn check_alarms(&mut self) {
+    /// Compute the highest alarm severity for the current VAL —
+    /// STATE (ZSV/OSV) vs COS (COSV). Records the result in `nsev`
+    /// but does NOT advance `lalm`; the COS state transition is owned
+    /// by the trait `check_alarms` so it happens exactly once per
+    /// process cycle (mirroring C `busyRecord.c::checkAlarms`).
+    fn compute_state_severity(&mut self) -> AlarmSevr {
         let mut max_sev = AlarmSevr::None;
-
-        // State alarm: val==0 → zsv, val!=0 → osv
         let state_sev = if self.val == 0 { self.zsv } else { self.osv };
         if (state_sev as u16) > (max_sev as u16) {
             max_sev = state_sev;
         }
-
-        // COS alarm: val changed from lalm
-        if self.val != self.lalm {
-            if (self.cosv as u16) > (max_sev as u16) {
-                max_sev = self.cosv;
-            }
-            self.lalm = self.val;
+        if self.val != self.lalm && (self.cosv as u16) > (max_sev as u16) {
+            max_sev = self.cosv;
         }
-
         self.nsev = max_sev;
+        max_sev
     }
 
     /// Update monitoring fields.
@@ -307,19 +306,31 @@ impl Record for BusyRecord {
         "busy"
     }
 
-    // C recBusy.c IVOA=set_to_IVOV: val = ivov; rval = ivov; oval = ivov.
+    /// C `boRecord.c::process` IVOA=set_to_IVOV: `val = ivov` then
+    /// `rval = (epicsUInt32)val` (busy shares boRecord's process).
+    /// OVAL is the *saved previous* VAL and is NOT overwritten by the
+    /// IVOA policy — matches the `Record::apply_invalid_output_value`
+    /// trait contract (`bo`/`busy`/`mbbo`/`mbboDirect`: RVAL=IVOV,
+    /// VAL=IVOV).
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
         let rval = match &ivov {
             EpicsValue::Enum(e) => EpicsValue::Long(*e as i32),
             EpicsValue::Short(s) => EpicsValue::Long(*s as i32),
             other => other.clone(),
         };
-        self.put_field("OVAL", ivov.clone())?;
         self.put_field("RVAL", rval)?;
         self.put_field("VAL", ivov)
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // HIGH one-shot: a pending HIGH timer fired and triggered this
+        // reprocess — drive the busy flag back to Done (VAL=0), as C
+        // boRecord.c::myCallbackFunc does before dbProcess.
+        if self.high_reset_pending {
+            self.high_reset_pending = false;
+            self.val = 0;
+        }
+
         // Step 1: DOL reading handled by framework (OMSL=ClosedLoop)
 
         // Step 2: VAL → RVAL conversion
@@ -328,37 +339,47 @@ impl Record for BusyRecord {
         // Step 3: Save current VAL before write (for FLNK decision)
         self.oval = self.val;
 
-        // Step 4: Check alarms
-        self.check_alarms();
+        // Step 4: precompute alarm severity for inspection (the real
+        // alarm raising is in the trait check_alarms() hook, and the
+        // INVALID-output IVOA policy is enforced by the framework
+        // which gates the OUT write on common.sevr == Invalid).
+        self.compute_state_severity();
 
-        // Step 5: IVOA handling
-        // The framework handles IVOA for known record types, but "busy" is external.
-        // We handle IVOA ourselves: if alarm severity is INVALID, apply IVOA policy.
-        if self.nsev == AlarmSevr::Invalid {
-            match self.ivoa {
-                Ivoa::ContinueNormally => {
-                    // proceed normally — write will happen via framework
-                }
-                Ivoa::DontDriveOutputs => {
-                    // We can't prevent framework OUT write from here,
-                    // but the framework's IVOA check won't fire for "busy".
-                    // For now, this is a best-effort: the framework still writes OUT.
-                    // Full IVOA support requires framework integration.
-                }
-                Ivoa::SetOutputToIvov => {
-                    self.val = self.ivov;
-                    self.convert_val_to_rval();
-                }
-            }
-        }
-
-        // Step 6: HIGH timer (Phase C — skip for now)
-
-        // Step 7: Monitor
+        // Step 5: Monitor
         self.monitor();
 
-        // Step 8: FLNK handled by should_fire_forward_link()
-        Ok(ProcessOutcome::complete())
+        // Step 6: HIGH one-shot — when the record is busy (VAL=1) and
+        // HIGH > 0, schedule a reprocess that drives VAL back to 0.
+        let mut actions = Vec::new();
+        if self.val == 1 && self.high > 0.0 {
+            self.high_reset_pending = true;
+            actions.push(ProcessAction::ReprocessAfter(
+                std::time::Duration::from_secs_f64(self.high),
+            ));
+        }
+
+        // Step 7: FLNK handled by should_fire_forward_link()
+        Ok(ProcessOutcome::complete_with(actions))
+    }
+
+    /// C `busyRecord.c::checkAlarms` (bo variant) — STATE alarm
+    /// (ZSV for VAL=0, OSV for VAL=1) and COS alarm (COSV). Raising
+    /// these into `common` lets the framework's IVOA handler gate the
+    /// OUT-link write: with SEVR=INVALID and IVOA="Don't drive", the
+    /// framework's `skip_out` path suppresses the write entirely.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        use crate::server::recgbl::{self, alarm_status};
+
+        let state_sev = if self.val == 0 { self.zsv } else { self.osv };
+        if state_sev != AlarmSevr::None {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, state_sev.to_base());
+        }
+        if self.val != self.lalm {
+            if self.cosv != AlarmSevr::None {
+                recgbl::rec_gbl_set_sevr(common, alarm_status::COS_ALARM, self.cosv.to_base());
+            }
+            self.lalm = self.val;
+        }
     }
 
     fn should_fire_forward_link(&self) -> bool {
@@ -502,6 +523,19 @@ impl Record for BusyRecord {
             "MASK" => {
                 self.mask = match value {
                     EpicsValue::Long(v) => v as u32,
+                    _ => return Err(CaError::TypeMismatch(name.to_string())),
+                };
+                Ok(())
+            }
+            // RVAL is the converted output value (C `boRecord.h`
+            // `DBF_ULONG`). Writable so the IVOA=set_to_IVOV policy
+            // (`apply_invalid_output_value`) can drive it directly.
+            "RVAL" => {
+                self.rval = match value {
+                    EpicsValue::Long(v) => v as u32,
+                    EpicsValue::Enum(v) => v as u32,
+                    EpicsValue::Short(v) => v as u32,
+                    EpicsValue::Double(v) => v as u32,
                     _ => return Err(CaError::TypeMismatch(name.to_string())),
                 };
                 Ok(())
@@ -714,17 +748,22 @@ mod tests {
 
     #[test]
     fn test_cos_alarm() {
+        use crate::server::record::CommonFields;
         let mut rec = BusyRecord::new();
         rec.cosv = AlarmSevr::Minor;
         rec.lalm = 0;
         rec.val = 1; // changed from lalm=0
-        rec.process().unwrap();
-        // COS alarm should fire and update lalm
+        let mut common = CommonFields::default();
+        rec.check_alarms(&mut common);
+        // COS alarm fires and advances lalm.
         assert_eq!(rec.lalm, 1);
+        assert_eq!(common.nsev, crate::server::record::AlarmSeverity::Minor);
 
-        // Process again with same val — no COS change
-        rec.process().unwrap();
-        assert_eq!(rec.lalm, 1); // unchanged
+        // Same val — no COS change.
+        let mut common2 = CommonFields::default();
+        rec.check_alarms(&mut common2);
+        assert_eq!(rec.lalm, 1);
+        assert_eq!(common2.nsev, crate::server::record::AlarmSeverity::NoAlarm);
     }
 
     #[test]
@@ -857,53 +896,50 @@ mod tests {
         assert!(rec.should_fire_forward_link());
     }
 
-    // --- IVOA tests ---
+    // --- IVOA / alarm-raising tests ---
+    //
+    // IVOA policy is enforced by the framework (processing.rs), which
+    // gates the OUT write on `common.sevr == Invalid`. The record's
+    // job is to raise the INVALID severity via `check_alarms` and to
+    // apply IVOV via `apply_invalid_output_value`.
 
     #[test]
-    fn test_ivoa_continue() {
+    fn test_check_alarms_raises_invalid_state() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
         let mut rec = BusyRecord::new();
-        rec.ivoa = Ivoa::ContinueNormally;
-        rec.zsv = AlarmSevr::Invalid;
-        rec.val = 0;
-        rec.process().unwrap();
-        // Should process normally
-        assert_eq!(rec.val, 0);
-    }
-
-    #[test]
-    fn test_ivoa_dont_drive() {
-        let mut rec = BusyRecord::new();
-        rec.ivoa = Ivoa::DontDriveOutputs;
-        rec.zsv = AlarmSevr::Invalid;
-        rec.val = 0;
-        rec.process().unwrap();
-        // Val unchanged (best-effort, framework OUT write not blocked from record)
-        assert_eq!(rec.val, 0);
-    }
-
-    #[test]
-    fn test_ivoa_set_ivov() {
-        let mut rec = BusyRecord::new();
-        rec.ivoa = Ivoa::SetOutputToIvov;
-        rec.ivov = 0;
-        rec.osv = AlarmSevr::Invalid; // val=1 → Invalid alarm
+        rec.osv = AlarmSevr::Invalid;
         rec.val = 1;
-        rec.process().unwrap();
-        // IVOA=SetOutputToIvov + Invalid alarm → val set to ivov=0
+        let mut common = CommonFields::default();
+        rec.check_alarms(&mut common);
+        // INVALID state severity propagates into common — the
+        // framework's IVOA "Don't drive" then suppresses the OUT write.
+        assert_eq!(common.nsev, AlarmSeverity::Invalid);
+        assert_eq!(
+            common.nsta,
+            crate::server::recgbl::alarm_status::STATE_ALARM
+        );
+    }
+
+    #[test]
+    fn test_check_alarms_no_alarm_when_severities_unset() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
+        let mut rec = BusyRecord::new();
+        rec.val = 0;
+        let mut common = CommonFields::default();
+        rec.check_alarms(&mut common);
+        assert_eq!(common.nsev, AlarmSeverity::NoAlarm);
+    }
+
+    #[test]
+    fn test_apply_invalid_output_value() {
+        let mut rec = BusyRecord::new();
+        rec.val = 1;
+        rec.rval = 1;
+        rec.apply_invalid_output_value(EpicsValue::Enum(0)).unwrap();
+        // IVOA=SetOutputToIvov path: VAL/OVAL/RVAL all become IVOV.
         assert_eq!(rec.val, 0);
+        assert_eq!(rec.oval, 0);
         assert_eq!(rec.rval, 0);
-    }
-
-    #[test]
-    fn test_ivoa_no_effect_without_invalid() {
-        let mut rec = BusyRecord::new();
-        rec.ivoa = Ivoa::SetOutputToIvov;
-        rec.ivov = 0;
-        rec.osv = AlarmSevr::Minor; // Not Invalid
-        rec.val = 1;
-        rec.process().unwrap();
-        // No IVOA effect since alarm is not Invalid
-        assert_eq!(rec.val, 1);
     }
 
     // --- State transition cycle ---

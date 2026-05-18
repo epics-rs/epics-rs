@@ -93,20 +93,35 @@ fn expand_includes_inner(
     // These override the caller-provided macros for subsequent includes.
     let mut local_macros = macros.clone();
 
+    // Include search path. Starts from the caller-supplied config and
+    // is mutated by `path`/`addpath` directives encountered in the
+    // file (L-3): C `dbPathCmd` replaces the path, `dbAddPathCmd`
+    // appends to it (`dbLexRoutines.c:433-441`).
+    let mut local_paths: Vec<PathBuf> = config.include_paths.clone();
+
     let mut output = String::with_capacity(content.len());
     for line in content.lines() {
         if let Some(subst_str) = parse_substitute_directive(line) {
-            // Apply substitute overrides to local macros
-            for pair in subst_str.split(',') {
-                if let Some((k, v)) = pair.split_once('=') {
-                    let expanded_v = substitute_macros(v.trim(), &local_macros);
-                    local_macros.insert(k.trim().to_string(), expanded_v);
-                }
+            // Apply substitute overrides to local macros. Quote- and
+            // escape-aware splitting (M-4) matches C `macParseDefns`
+            // (macUtil.c): a `,` or `=` inside `'...'`/`"..."` or after
+            // a `\` does not act as a separator.
+            for (k, v) in parse_macro_defns(&subst_str) {
+                let expanded_v = substitute_macros(&v, &local_macros);
+                local_macros.insert(k, expanded_v);
             }
+        } else if let Some(dirs) = parse_path_directive(line, "path") {
+            // `path "a:b:c"` — replace the search path. C separates
+            // entries with the OS path separator.
+            let expanded = substitute_macros(&dirs, &local_macros);
+            local_paths = split_path_list(&expanded);
+        } else if let Some(dirs) = parse_path_directive(line, "addpath") {
+            // `addpath "a:b"` — append to the search path.
+            let expanded = substitute_macros(&dirs, &local_macros);
+            local_paths.extend(split_path_list(&expanded));
         } else if let Some(filename) = parse_include_directive(line) {
             let expanded_filename = substitute_macros(&filename, &local_macros);
-            let include_path =
-                resolve_include_path(&expanded_filename, parent_dir, &config.include_paths)?;
+            let include_path = resolve_include_path(&expanded_filename, parent_dir, &local_paths)?;
             let canonical = include_path
                 .canonicalize()
                 .map_err(|e| CaError::DbParseError {
@@ -184,6 +199,126 @@ pub(crate) fn parse_substitute_directive(line: &str) -> Option<String> {
     Some(after_quote[..quote_end].to_string())
 }
 
+/// Parse a `path "..."` / `addpath "..."` directive line. `keyword`
+/// is `"path"` or `"addpath"`. Returns the quoted directory list if
+/// the line is that directive.
+///
+/// Mirrors C dbStatic (`dbYacc.y:71-81`): `tokenPATH`/`tokenADDPATH`
+/// followed by a quoted string.
+pub(crate) fn parse_path_directive(line: &str, keyword: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') {
+        return None;
+    }
+    let rest = trimmed.strip_prefix(keyword)?;
+    // The keyword must be followed by whitespace or a quote, so
+    // `pathological` is not mistaken for `path`.
+    let first = rest.chars().next()?;
+    if !first.is_whitespace() && first != '"' {
+        return None;
+    }
+    let quote_start = rest.find('"')?;
+    let after_quote = &rest[quote_start + 1..];
+    let quote_end = after_quote.find('"')?;
+    Some(after_quote[..quote_end].to_string())
+}
+
+/// Split an OS path list (`a:b:c` on Unix, `a;b;c` on Windows) into
+/// individual directory paths.
+fn split_path_list(list: &str) -> Vec<PathBuf> {
+    std::env::split_paths(list)
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect()
+}
+
+/// Parse a `name=value,name2=value2,...` macro-definition string into
+/// `(name, value)` pairs, quote- and escape-aware.
+///
+/// Mirrors C `macParseDefns` (`macUtil.c`): a `,` or `=` is only a
+/// separator when it is outside `'...'`/`"..."` and not immediately
+/// preceded by a backslash. Whitespace around names/values is
+/// trimmed; surrounding quotes are NOT stripped (macLib keeps them so
+/// the value can carry literal separators). Definitions with no `=`
+/// are dropped.
+pub(crate) fn parse_macro_defns(defns: &str) -> Vec<(String, String)> {
+    let chars: Vec<char> = defns.chars().collect();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut name = String::new();
+    let mut value = String::new();
+    let mut quote: Option<char> = None;
+    // false = collecting name, true = collecting value
+    let mut in_value = false;
+    let mut has_eq = false;
+    let mut i = 0;
+
+    let flush = |name: &mut String,
+                 value: &mut String,
+                 has_eq: &mut bool,
+                 pairs: &mut Vec<(String, String)>| {
+        let k = name.trim();
+        if *has_eq && !k.is_empty() {
+            pairs.push((k.to_string(), value.trim().to_string()));
+        }
+        name.clear();
+        value.clear();
+        *has_eq = false;
+    };
+
+    while i < chars.len() {
+        let c = chars[i];
+        // Escape: backslash + next char are a literal 2-char unit.
+        if c == '\\' && i + 1 < chars.len() {
+            if in_value {
+                value.push(c);
+                value.push(chars[i + 1]);
+            } else {
+                name.push(c);
+                name.push(chars[i + 1]);
+            }
+            i += 2;
+            continue;
+        }
+        // Quote state.
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            if in_value {
+                value.push(c);
+            } else {
+                name.push(c);
+            }
+            i += 1;
+            continue;
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+            if in_value {
+                value.push(c);
+            } else {
+                name.push(c);
+            }
+            i += 1;
+            continue;
+        }
+        // Unquoted separators.
+        match c {
+            '=' if !in_value => {
+                in_value = true;
+                has_eq = true;
+            }
+            ',' => {
+                flush(&mut name, &mut value, &mut has_eq, &mut pairs);
+                in_value = false;
+            }
+            _ if in_value => value.push(c),
+            _ => name.push(c),
+        }
+        i += 1;
+    }
+    flush(&mut name, &mut value, &mut has_eq, &mut pairs);
+    pairs
+}
+
 /// Resolve an include filename to a path.
 /// Search order: current file's directory → config.include_paths.
 pub(crate) fn resolve_include_path(
@@ -242,5 +377,68 @@ pub fn override_dtyp(records: &mut [DbRecordDef], dtyp: &str) {
                 *value = dtyp.to_string();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod macro_defns_tests {
+    use super::*;
+
+    #[test]
+    fn simple_pairs() {
+        assert_eq!(
+            parse_macro_defns("A=1,B=2"),
+            vec![("A".into(), "1".into()), ("B".into(), "2".into())]
+        );
+    }
+
+    #[test]
+    fn whitespace_trimmed() {
+        assert_eq!(
+            parse_macro_defns(" A = 1 , B = 2 "),
+            vec![("A".into(), "1".into()), ("B".into(), "2".into())]
+        );
+    }
+
+    /// M-4: a comma inside a quoted value does NOT split the pair.
+    #[test]
+    fn quoted_comma_not_split() {
+        assert_eq!(
+            parse_macro_defns(r#"MSG="a,b",N=1"#),
+            vec![("MSG".into(), r#""a,b""#.into()), ("N".into(), "1".into())]
+        );
+    }
+
+    /// M-4: an `=` inside a quoted value does not start a new value.
+    #[test]
+    fn quoted_equals_not_split() {
+        assert_eq!(
+            parse_macro_defns(r#"EXPR="x=y""#),
+            vec![("EXPR".into(), r#""x=y""#.into())]
+        );
+    }
+
+    /// An unquoted comma still splits (C parity for `MSG=a,b`).
+    #[test]
+    fn unquoted_comma_splits() {
+        assert_eq!(
+            parse_macro_defns("MSG=a,b"),
+            // `b` has no `=` so it is dropped (not a definition).
+            vec![("MSG".into(), "a".into())]
+        );
+    }
+
+    /// An escaped separator is literal, not a split point.
+    #[test]
+    fn escaped_separator_is_literal() {
+        assert_eq!(
+            parse_macro_defns(r"K=a\,b"),
+            vec![("K".into(), r"a\,b".into())]
+        );
+    }
+
+    #[test]
+    fn empty_input() {
+        assert!(parse_macro_defns("").is_empty());
     }
 }

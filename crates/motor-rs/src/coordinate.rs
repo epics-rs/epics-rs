@@ -14,16 +14,26 @@ pub fn user_to_dial(user: f64, dir: MotorDir, off: f64) -> f64 {
 
 /// Convert dial position to raw steps.
 /// raw = round(dial / mres)
-pub fn dial_to_raw(dial: f64, mres: f64) -> Result<i32, MotorError> {
+/// 64-bit result to cover high-resolution / long-travel axes
+/// (epics-modules/motor #192).
+pub fn dial_to_raw(dial: f64, mres: f64) -> Result<i64, MotorError> {
     if mres == 0.0 {
         return Err(MotorError::InvalidFieldValue("MRES cannot be zero".into()));
     }
-    Ok((dial / mres).round() as i32)
+    let raw = dial / mres;
+    // A non-finite result (NaN dial, infinite ratio) would silently cast to
+    // 0 or i64::MIN/MAX. Reject it so the caller does not corrupt RVAL.
+    if !raw.is_finite() {
+        return Err(MotorError::InvalidFieldValue(format!(
+            "dial/mres is not finite (dial={dial}, mres={mres})"
+        )));
+    }
+    Ok(raw.round() as i64)
 }
 
 /// Convert raw steps to dial position.
 /// dial = raw * mres
-pub fn raw_to_dial(raw: i32, mres: f64) -> f64 {
+pub fn raw_to_dial(raw: i64, mres: f64) -> f64 {
     raw as f64 * mres
 }
 
@@ -72,7 +82,7 @@ pub fn cascade_from_val(
     mres: f64,
     set_mode: bool,
     current_dval: f64,
-) -> Result<(f64, i32, f64), MotorError> {
+) -> Result<(f64, i64, f64), MotorError> {
     if set_mode {
         // SET mode: redefine offset, no move
         let new_off = calc_offset(val, current_dval, dir);
@@ -97,7 +107,7 @@ pub fn cascade_from_dval(
     mres: f64,
     set_mode: bool,
     current_val: f64,
-) -> Result<(f64, i32, f64), MotorError> {
+) -> Result<(f64, i64, f64), MotorError> {
     let rval = dial_to_raw(dval, mres)?;
     if set_mode {
         let new_off = calc_offset(current_val, dval, dir);
@@ -112,7 +122,7 @@ pub fn cascade_from_dval(
 /// Update position cascade when RVAL is written.
 /// Returns (new_val, new_dval, new_off).
 pub fn cascade_from_rval(
-    rval: i32,
+    rval: i64,
     dir: MotorDir,
     off: f64,
     _foff: FreezeOffset,
@@ -188,6 +198,14 @@ mod tests {
     #[test]
     fn test_dial_to_raw_zero_mres() {
         assert!(dial_to_raw(10.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn test_dial_to_raw_rejects_non_finite() {
+        // NaN/Inf must error, not silently cast to 0 or i64 saturation.
+        assert!(dial_to_raw(f64::NAN, 0.01).is_err());
+        assert!(dial_to_raw(f64::INFINITY, 0.01).is_err());
+        assert!(dial_to_raw(f64::NEG_INFINITY, 0.01).is_err());
     }
 
     #[test]

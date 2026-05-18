@@ -40,7 +40,8 @@ use crate::proto::{
 };
 
 use super::decode::{
-    Frame, decode_connection_validated, decode_connection_validation_request, try_parse_frame,
+    Frame, PeerRole, decode_connection_validated, decode_connection_validation_request,
+    try_parse_frame_role,
 };
 
 /// How often we send heartbeat ECHO_REQUEST.
@@ -91,6 +92,12 @@ pub(crate) enum IoidSlot {
 pub struct ServerConn {
     pub addr: SocketAddr,
     pub byte_order: ByteOrder,
+    /// X.509 identity of the *server* peer, derived from the verified
+    /// TLS certificate chain (`pvas://` only — `None` for a plain
+    /// `pva://` TCP connection). Mirrors pvxs `Connected::cred`, which
+    /// `pvxinfo -v` prints as the server's credentials. Populated by
+    /// [`ServerConn::connect_tls`] before the TLS stream is split.
+    server_identity: Option<crate::auth::X509Credentials>,
     writer_tx: mpsc::UnboundedSender<Vec<u8>>,
     cancel: CancellationToken,
     alive: Arc<AtomicBool>,
@@ -142,7 +149,8 @@ impl ServerConn {
         let (reader, writer) = stream.into_split();
         let reader: DynRead = Box::new(reader);
         let writer: DynWrite = Box::new(writer);
-        Self::run_handshake_and_spawn(target, reader, writer, user, host, op_timeout).await
+        // Plain `pva://` TCP — no TLS, so no server X.509 identity.
+        Self::run_handshake_and_spawn(target, reader, writer, None, user, host, op_timeout).await
     }
 
     /// Open a TLS-wrapped connection (`pvas://`).
@@ -168,10 +176,31 @@ impl ServerConn {
             .map_err(|_| PvaError::Timeout)?
             .map_err(PvaError::Io)?;
 
+        // Derive the *server*'s X.509 identity from the verified
+        // certificate chain before the stream is split — rustls only
+        // exposes `peer_certificates()` on the whole `TlsStream`. The
+        // chain has already passed the client-side verifier, so this
+        // is the cryptographically-checked server identity that pvxs
+        // `pvxinfo -v` reports (`Connected::cred`).
+        let server_identity = {
+            let (_, conn) = tls_stream.get_ref();
+            conn.peer_certificates()
+                .and_then(crate::auth::x509_credentials_from_chain)
+        };
+
         let (reader, writer) = tokio::io::split(tls_stream);
         let reader: DynRead = Box::new(reader);
         let writer: DynWrite = Box::new(writer);
-        Self::run_handshake_and_spawn(target, reader, writer, user, host, op_timeout).await
+        Self::run_handshake_and_spawn(
+            target,
+            reader,
+            writer,
+            server_identity,
+            user,
+            host,
+            op_timeout,
+        )
+        .await
     }
 
     /// Internal: takes already-split read/write halves, runs the handshake,
@@ -181,6 +210,7 @@ impl ServerConn {
         target: SocketAddr,
         mut reader: DynRead,
         writer: DynWrite,
+        server_identity: Option<crate::auth::X509Credentials>,
         user: &str,
         host: &str,
         op_timeout: Duration,
@@ -280,6 +310,13 @@ impl ServerConn {
             let mut seg_cmd: u8 = 0;
             let mut seg_flags: crate::proto::HeaderFlags = crate::proto::HeaderFlags(0);
             let mut expect_seg = false;
+            // Reader-task-owned type cache. Type-cache markers (0xFD
+            // define / 0xFE reference) are resolved here, in strict wire
+            // order, before frames are routed to per-op tasks — see
+            // `flatten_type_cache_markers`. The per-op tasks then decode
+            // self-contained frames, so a 0xFE reference can never be
+            // decoded before the 0xFD define that fills its slot.
+            let mut reader_type_cache = crate::pvdata::encode::TypeCache::new();
             loop {
                 tokio::select! {
                     _ = cancel_reader.cancelled() => break,
@@ -312,7 +349,14 @@ impl ServerConn {
                                     }
                                 }
                             }
-                            while let Ok(Some((frame, fn_)) ) = try_parse_frame(&buf) {
+                            // Role-aware parse: a client's inbound frames must
+                            // have the Server direction bit SET (pvxs
+                            // `conn.cpp:160`). Reject mismatches so we can't
+                            // be fooled by a peer that echoes our own
+                            // outbound shape back.
+                            while let Ok(Some((frame, fn_))) =
+                                try_parse_frame_role(&buf, PeerRole::Client)
+                            {
                                 buf.drain(..fn_);
                                 if frame.header.flags.is_control() {
                                     handle_control_frame(&frame, &writer_tx_reader, order_reader);
@@ -375,7 +419,7 @@ impl ServerConn {
                                     continue;
                                 }
                                 expect_seg = false;
-                                let dispatch_frame = if raw_seg == 0 {
+                                let mut dispatch_frame = if raw_seg == 0 {
                                     frame
                                 } else {
                                     Frame {
@@ -394,6 +438,15 @@ impl ServerConn {
                                         payload: std::mem::take(&mut seg_buf),
                                     }
                                 };
+                                // Flatten type-cache markers in wire
+                                // order before routing, so per-op tasks
+                                // never decode a 0xFE reference ahead of
+                                // its 0xFD define (cross-op decode order
+                                // is not guaranteed).
+                                crate::client_native::decode::flatten_type_cache_markers(
+                                    &mut dispatch_frame,
+                                    &mut reader_type_cache,
+                                );
                                 route_frame(dispatch_frame, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, order_reader);
                             }
                         }
@@ -456,6 +509,7 @@ impl ServerConn {
         Ok(Arc::new(Self {
             addr: target,
             byte_order,
+            server_identity,
             writer_tx,
             cancel,
             alive,
@@ -470,6 +524,22 @@ impl ServerConn {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    /// The server peer's verified X.509 identity, or `None` for a
+    /// plain `pva://` connection (or a `pvas://` server presenting no
+    /// usable certificate). Mirrors pvxs `Connected::cred` — the
+    /// `account` / `authority` `pvxinfo -v` prints as the server's
+    /// credentials.
+    pub fn server_identity(&self) -> Option<&crate::auth::X509Credentials> {
+        self.server_identity.as_ref()
+    }
+
+    /// True iff this is a TLS (`pvas://`) connection. Inferred from a
+    /// present server X.509 identity — the identity is only populated
+    /// after a successful TLS handshake.
+    pub fn is_tls(&self) -> bool {
+        self.server_identity.is_some()
     }
 
     /// Get a clone of the per-connection FieldDesc cache (Arc shared).
@@ -666,7 +736,10 @@ async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
     op_timeout: Duration,
 ) -> PvaResult<Frame> {
     loop {
-        if let Some((frame, n)) = try_parse_frame(rx_buf)? {
+        // Role-aware: read_one_frame is used by client connections, so
+        // require the Server direction bit on inbound frames (pvxs
+        // `conn.cpp:160` parity).
+        if let Some((frame, n)) = try_parse_frame_role(rx_buf, PeerRole::Client)? {
             rx_buf.drain(..n);
             return Ok(frame);
         }

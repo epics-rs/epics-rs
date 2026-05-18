@@ -256,15 +256,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             }
 
             let dims = vec![NDDimension::new(nx), NDDimension::new(nz)];
-            let mut frame = NDArray {
-                unique_id: 0,
-                timestamp: ad_core_rs::timestamp::EpicsTimestamp::default(),
-                time_stamp: 0.0,
-                dims,
-                data: NDDataBuffer::U16(u16_data),
-                attributes: ad_core_rs::attributes::NDAttributeList::new(),
-                codec: None,
-            };
+            let mut frame = NDArray::with_data(dims, NDDataBuffer::U16(u16_data));
 
             // Update counters
             num_counter += 1;

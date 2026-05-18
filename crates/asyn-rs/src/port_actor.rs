@@ -201,15 +201,6 @@ impl PortActor {
             return;
         }
 
-        // Deadline check
-        if Instant::now() > deadline {
-            let _ = reply.send(Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "request deadline expired before execution".into(),
-            }));
-            return;
-        }
-
         let is_connect_op = matches!(
             op,
             RequestOp::Connect
@@ -218,10 +209,26 @@ impl PortActor {
                 | RequestOp::DisconnectAddr
                 | RequestOp::EnableAddr
                 | RequestOp::DisableAddr
+                | RequestOp::SetEnable { .. }
+                | RequestOp::SetAutoConnect { .. }
+                | RequestOp::GetEnable
+                | RequestOp::GetAutoConnect
                 | RequestOp::BlockProcess
                 | RequestOp::UnblockProcess
                 | RequestOp::ShutdownPort
         );
+
+        // Deadline check — I/O ops only. Lifecycle / queue-management ops
+        // (connect, block, unblock, shutdown) are not subject to the queue
+        // deadline: an UnblockProcess that waited out its deadline must
+        // still run, or the port stays wedged for every non-owner caller.
+        if !is_connect_op && Instant::now() > deadline {
+            let _ = reply.send(Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "request deadline expired before execution".into(),
+            }));
+            return;
+        }
         let is_connect_priority = user.priority == QueuePriority::Connect;
 
         // Connect ops and Connect-priority requests bypass enabled/connected checks
@@ -278,16 +285,27 @@ impl PortActor {
             }
             RequestOp::OctetRead { buf_size } => {
                 let mut buf = vec![0u8; *buf_size];
-                let n = self.driver.io_read_octet(user, &mut buf)?;
+                let (n, eom) = self.driver.io_read_octet_eom(user, &mut buf)?;
                 buf.truncate(n);
-                Ok(RequestResult::octet_read(buf, n))
+                Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
             }
             RequestOp::OctetWriteRead { data, buf_size } => {
+                // C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:250)
+                // does flush() → write() → read() under a single
+                // queueLockPort. The flush drains any stale bytes
+                // left in the driver's input buffer from a prior
+                // read so that the post-write read returns only the
+                // response to *this* command (e.g. echoes from a
+                // serial line, leftover prompts from a TCP device).
+                // Skipping the flush leaks pre-existing input into
+                // the response and breaks every command-response
+                // protocol when the line was warm.
+                self.driver.io_flush(user)?;
                 self.driver.io_write_octet(user, data)?;
                 let mut buf = vec![0u8; *buf_size];
-                let n = self.driver.io_read_octet(user, &mut buf)?;
+                let (n, eom) = self.driver.io_read_octet_eom(user, &mut buf)?;
                 buf.truncate(n);
-                Ok(RequestResult::octet_read(buf, n))
+                Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
             }
             RequestOp::Int32Write { value } => {
                 self.driver.io_write_int32(user, *value)?;
@@ -361,6 +379,33 @@ impl PortActor {
                 self.driver.disable_addr(user)?;
                 Ok(RequestResult::write_ok())
             }
+            RequestOp::SetEnable { yes } => {
+                // C parity: pasynManager->enable(pasynUser, enable) at
+                // asynManager.c — toggles per-port `enabled` state and
+                // emits `asynExceptionEnable`. Routed through the
+                // driver trait so subclasses can override.
+                if *yes {
+                    self.driver.enable(user)?;
+                } else {
+                    self.driver.disable(user)?;
+                }
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::SetAutoConnect { yes } => {
+                // C parity: pasynManager->autoConnect(pasynUser, value)
+                // at asynManager.c:2310-2324 — fires
+                // `asynExceptionAutoConnect` unconditionally.
+                self.driver.base_mut().set_auto_connect(*yes);
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::GetEnable => {
+                let enabled = self.driver.base().enabled;
+                Ok(RequestResult::int32_read(i32::from(enabled)))
+            }
+            RequestOp::GetAutoConnect => {
+                let auto = self.driver.base().auto_connect;
+                Ok(RequestResult::int32_read(i32::from(auto)))
+            }
             RequestOp::GetBoundsInt32 => {
                 let (low, high) = self.driver.get_bounds_int32(user)?;
                 Ok(RequestResult::bounds_read(low as i64, high as i64))
@@ -370,6 +415,16 @@ impl PortActor {
                 Ok(RequestResult::bounds_read(low, high))
             }
             RequestOp::BlockProcess => {
+                // Block-token contract: the block identity is
+                // `user.block_token` when set, else it falls back to
+                // `user.reason`. CALLER CONTRACT: any caller that
+                // relies on block/unblock exclusivity MUST set a
+                // distinct `block_token` — two callers that share a
+                // `reason` and both omit `block_token` would collide
+                // on the same fallback token, so one could
+                // unblock/nest the other's lock. `block` /
+                // `unblock` / and any owner-gated op must use the
+                // SAME token; mismatched tokens are rejected below.
                 let token = user.block_token.unwrap_or(user.reason as u64);
                 if let Some((existing, ref mut count)) = self.blocked_by {
                     if existing == token {
@@ -383,6 +438,22 @@ impl PortActor {
                     }
                 } else {
                     self.blocked_by = Some((token, 1));
+                    // Messages already drained into the heap before this
+                    // BlockProcess executed would otherwise still be
+                    // dispatched to the driver, breaking block-port
+                    // exclusivity. enqueue_message only diverts messages
+                    // that arrive *after* the block, so sweep the heap now
+                    // and divert every non-owner, non-unblock message.
+                    let drained: Vec<ActorMessage> = self.heap.drain().collect();
+                    for msg in drained {
+                        let is_owner = msg.block_token == Some(token);
+                        let is_unblock = matches!(msg.op, RequestOp::UnblockProcess);
+                        if is_owner || is_unblock {
+                            self.heap.push(msg);
+                        } else {
+                            self.pending_while_blocked.push(msg);
+                        }
+                    }
                 }
                 Ok(RequestResult::write_ok())
             }
@@ -512,6 +583,13 @@ impl PortActor {
                         } => {
                             let _ = base.params.set_float64_array(*reason, *addr, value.clone());
                         }
+                        crate::request::ParamSetValue::Int32Array {
+                            reason,
+                            addr,
+                            value,
+                        } => {
+                            let _ = base.params.set_int32_array(*reason, *addr, value.clone());
+                        }
                         crate::request::ParamSetValue::UInt32Digital {
                             reason,
                             addr,
@@ -531,6 +609,31 @@ impl PortActor {
             }
             RequestOp::SetOption { key, value } => {
                 self.driver.set_option(key, value)?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::Report { level } => {
+                // C parity: `asynManager::report` (asynManager.c) walks
+                // every registered port and calls each driver's
+                // `pasynCommon->report` callback. The iocsh wrapper
+                // (`asynReport`) does the per-port loop; here we
+                // dispatch the per-port `report(level)` from the
+                // actor thread so the driver observes its own state
+                // under the actor's serial ownership.
+                self.driver.report(*level);
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::SetInputEos { eos } => {
+                // C parity: asynRecord IEOS write at asynRecord.c:391
+                // calls `pasynOctet->setInputEos(pasynUser, eos, len)`.
+                // Route through the driver trait so the EOS interpose
+                // layer (interpose/eos.rs) reads from a single source
+                // of truth (`PortDriverBase::input_eos`) rather than
+                // the orphaned options HashMap.
+                self.driver.set_input_eos(eos)?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::SetOutputEos { eos } => {
+                self.driver.set_output_eos(eos)?;
                 Ok(RequestResult::write_ok())
             }
         };
@@ -563,6 +666,7 @@ mod tests {
     use super::*;
     use crate::param::ParamType;
     use crate::port::{PortDriverBase, PortFlags};
+    use std::sync::Arc;
     use std::time::Duration;
 
     struct TestDriver {
@@ -661,6 +765,160 @@ mod tests {
         assert_eq!(&result.data.unwrap()[..5], b"hello");
     }
 
+    /// C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:250)
+    /// calls flush() before write() so any stale input bytes (echoes,
+    /// half-received responses from a previous command) are drained
+    /// out of the driver's input buffer before the new write+read
+    /// pair. The atomic OctetWriteRead op must do the same.
+    #[test]
+    fn actor_octet_write_read_calls_flush_first() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FlushTracker {
+            base: PortDriverBase,
+            flush_calls: Arc<AtomicUsize>,
+            write_calls: Arc<AtomicUsize>,
+            sequence: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+        }
+        impl PortDriver for FlushTracker {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+                self.flush_calls.fetch_add(1, Ordering::Relaxed);
+                self.sequence.lock().push("flush");
+                Ok(())
+            }
+            fn io_write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<()> {
+                self.write_calls.fetch_add(1, Ordering::Relaxed);
+                self.sequence.lock().push("write");
+                Ok(())
+            }
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+                self.sequence.lock().push("read");
+                let resp = b"RSP";
+                let n = resp.len().min(buf.len());
+                buf[..n].copy_from_slice(&resp[..n]);
+                Ok(n)
+            }
+        }
+
+        let flush_calls = Arc::new(AtomicUsize::new(0));
+        let write_calls = Arc::new(AtomicUsize::new(0));
+        let sequence = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let drv = FlushTracker {
+            base: PortDriverBase::new("flush_test", 1, PortFlags::default()),
+            flush_calls: flush_calls.clone(),
+            write_calls: write_calls.clone(),
+            sequence: sequence.clone(),
+        };
+        let tx = spawn_actor(drv);
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let result = send_and_wait(
+            &tx,
+            RequestOp::OctetWriteRead {
+                data: b"CMD".to_vec(),
+                buf_size: 16,
+            },
+            user,
+        )
+        .unwrap();
+        assert_eq!(result.data.unwrap(), b"RSP".to_vec());
+        assert_eq!(flush_calls.load(Ordering::Relaxed), 1, "flush called once");
+        assert_eq!(write_calls.load(Ordering::Relaxed), 1);
+        // Order must be: flush, then write, then read.
+        let seq = sequence.lock().clone();
+        assert_eq!(seq, vec!["flush", "write", "read"]);
+    }
+
+    /// C parity: `asynOctet::read` returns `nbytes` together with
+    /// `int *eomReason` (`interfaces/asynOctet.h:38-40`). Drivers
+    /// that override `io_read_octet_eom` must have their EOM flags
+    /// propagated through `RequestResult::eom_reason` so consumers
+    /// (e.g. asynRecord `EOMR`) can distinguish "byte count" /
+    /// "EOS match" / "END indicator" terminations.
+    #[test]
+    fn actor_octet_read_eom_propagates_driver_flags() {
+        use crate::interpose::EomReason;
+
+        struct EomDriver {
+            base: PortDriverBase,
+        }
+        impl PortDriver for EomDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> AsynResult<(usize, EomReason)> {
+                let payload = b"ABC";
+                let n = payload.len().min(buf.len());
+                buf[..n].copy_from_slice(&payload[..n]);
+                // Driver explicitly reports both EOS match and END indicator
+                // (e.g. a GPIB END line plus terminator detection).
+                Ok((n, EomReason::EOS | EomReason::END))
+            }
+        }
+        let drv = EomDriver {
+            base: PortDriverBase::new("eom_test", 1, PortFlags::default()),
+        };
+        let tx = spawn_actor(drv);
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let result = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 16 }, user).unwrap();
+        assert_eq!(result.data.as_deref(), Some(&b"ABC"[..]));
+        let eom = EomReason::from_bits_truncate(result.eom_reason);
+        assert!(eom.contains(EomReason::EOS));
+        assert!(eom.contains(EomReason::END));
+        assert!(!eom.contains(EomReason::CNT));
+    }
+
+    /// Default `io_read_octet_eom` (drivers that override only the
+    /// non-eom `io_read_octet`) must synthesize `CNT` when the
+    /// buffer filled — C `asynOctetSyncIO::read` synthesises the
+    /// same flag at the syncIO level (`asynOctetSyncIO.c:213-217`).
+    #[test]
+    fn actor_octet_read_eom_default_synthesizes_cnt_on_buffer_full() {
+        use crate::interpose::EomReason;
+
+        struct FillDriver {
+            base: PortDriverBase,
+        }
+        impl PortDriver for FillDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+                // Always fill the buffer to completion.
+                for b in buf.iter_mut() {
+                    *b = b'X';
+                }
+                Ok(buf.len())
+            }
+        }
+        let drv = FillDriver {
+            base: PortDriverBase::new("fill_test", 1, PortFlags::default()),
+        };
+        let tx = spawn_actor(drv);
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let result = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 4 }, user).unwrap();
+        assert_eq!(result.nbytes, 4);
+        let eom = EomReason::from_bits_truncate(result.eom_reason);
+        assert!(eom.contains(EomReason::CNT));
+        assert!(!eom.contains(EomReason::EOS));
+        assert!(!eom.contains(EomReason::END));
+    }
+
     #[test]
     fn actor_cancel() {
         let tx = spawn_actor(TestDriver::new());
@@ -711,6 +969,25 @@ mod tests {
     }
 
     #[test]
+    fn actor_get_enable_and_auto_connect() {
+        // GetEnable/GetAutoConnect report the driver's actual state and
+        // answer even when the port is disabled (they are lifecycle ops
+        // that bypass the enabled/connected check).
+        let mut drv = TestDriver::new();
+        drv.base.enabled = false;
+        drv.base.auto_connect = true;
+        let tx = spawn_actor(drv);
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let r = send_and_wait(&tx, RequestOp::GetEnable, user).unwrap();
+        assert_eq!(r.int_val, Some(0));
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let r = send_and_wait(&tx, RequestOp::GetAutoConnect, user).unwrap();
+        assert_eq!(r.int_val, Some(1));
+    }
+
+    #[test]
     fn actor_connect_disconnect() {
         let tx = spawn_actor(TestDriver::new());
 
@@ -753,6 +1030,30 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::Int32Read, user).unwrap();
         assert_eq!(result.int_val, Some(99));
+    }
+
+    #[test]
+    fn actor_unblock_with_expired_deadline_still_runs() {
+        // An UnblockProcess that waited out its queue deadline must still
+        // execute — otherwise the port stays wedged for every non-owner
+        // caller forever. Lifecycle ops bypass the deadline short-circuit.
+        let tx = spawn_actor(TestDriver::new());
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        user.block_token = Some(7);
+        send_and_wait(&tx, RequestOp::BlockProcess, user).unwrap();
+
+        // Submit the unblock with an already-expired deadline.
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_nanos(1));
+        user.block_token = Some(7);
+        std::thread::sleep(Duration::from_millis(1));
+        send_and_wait(&tx, RequestOp::UnblockProcess, user)
+            .expect("expired-deadline UnblockProcess must still run");
+
+        // Port must be unblocked: a non-owner request now succeeds.
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        send_and_wait(&tx, RequestOp::Int32Read, user)
+            .expect("port should be unblocked after UnblockProcess");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! into a single PvStructure.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -12,10 +13,10 @@ use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::types::DbFieldType;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType};
 
-use super::convert::{dbf_to_scalar_type, epics_to_pv_field};
 use super::group_config::{GroupMember, GroupPvDef, TriggerDef};
 use super::monitor::BridgeMonitor;
 use super::pvif::{self, FieldMapping, NtType};
+use crate::convert::{dbf_to_scalar_type, epics_to_pv_field};
 use crate::error::{BridgeError, BridgeResult};
 
 // ---------------------------------------------------------------------------
@@ -335,19 +336,41 @@ impl GroupChannel {
         // For atomic groups, hold all record locks simultaneously to
         // prevent intermediate states from being observed (pvxs
         // groupsource.cpp:444-459 DBManyLocker pattern).
-        let _guards = if self.def.atomic {
-            lock_group_records_read(&self.db, &self.def.members).await
-        } else {
-            Vec::new()
-        };
-
-        for member in &self.def.members {
-            if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Structure {
-                continue;
+        //
+        // CRITICAL: an atomic group MUST NOT re-lock a member record
+        // inside `read_member` — `lock_group_records_read` already
+        // holds an `OwnedRwLockReadGuard` on every member record, and
+        // `tokio::sync::RwLock` is write-preferring. A plain CA/PVA
+        // writer queued between the first guard and a second `.read()`
+        // would make that `.read().await` block behind the writer,
+        // which itself blocks behind the still-held first guard — a
+        // recursive-read deadlock. So the atomic path resolves every
+        // member against the pre-acquired guards and never re-locks.
+        if self.def.atomic {
+            let guards = lock_group_records_read(&self.db, &self.def.members).await;
+            // Build a name→guard lookup so each member resolves
+            // against the already-held guard for its backing record.
+            let guard_map: HashMap<&str, &epics_base_rs::server::record::RecordInstance> = guards
+                .iter()
+                .map(|(name, g)| (name.as_str(), &**g))
+                .collect();
+            for member in &self.def.members {
+                if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Structure
+                {
+                    continue;
+                }
+                let field = self.read_member_locked(member, &guard_map)?;
+                set_nested_field(&mut pv, &member.field_name, field);
             }
-
-            let field = self.read_member(member).await?;
-            set_nested_field(&mut pv, &member.field_name, field);
+        } else {
+            for member in &self.def.members {
+                if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Structure
+                {
+                    continue;
+                }
+                let field = self.read_member(member).await?;
+                set_nested_field(&mut pv, &member.field_name, field);
+            }
         }
 
         Ok(pv)
@@ -382,20 +405,31 @@ impl GroupChannel {
         Ok(pv)
     }
 
-    /// Read a single member's value from the database.
+    /// Resolve the channel-less mappings (Const / Structure / Proc)
+    /// that need no record lock. Returns `Some(field)` for those
+    /// mappings, `None` for a mapping that requires a backing record.
+    fn read_member_channelless(member: &GroupMember) -> Option<PvField> {
+        match member.mapping {
+            FieldMapping::Const => Some(
+                member
+                    .const_value
+                    .clone()
+                    .unwrap_or(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(0))),
+            ),
+            FieldMapping::Structure => Some(PvField::Structure(PvStructure::new(""))),
+            FieldMapping::Proc => Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(0))),
+            _ => None,
+        }
+    }
+
+    /// Read a single member's value from the database. Used by the
+    /// non-atomic [`read_group`] path: it locks the backing record
+    /// itself (no pre-held guard exists). The atomic path MUST use
+    /// [`Self::read_member_locked`] instead — see the deadlock note
+    /// in [`read_group`].
     async fn read_member(&self, member: &GroupMember) -> BridgeResult<PvField> {
-        // Const and Structure have no backing channel — return immediately.
-        if member.mapping == FieldMapping::Const {
-            return Ok(member
-                .const_value
-                .clone()
-                .unwrap_or(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(0))));
-        }
-        if member.mapping == FieldMapping::Structure {
-            return Ok(PvField::Structure(PvStructure::new("")));
-        }
-        if member.mapping == FieldMapping::Proc {
-            return Ok(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(0)));
+        if let Some(field) = Self::read_member_channelless(member) {
+            return Ok(field);
         }
 
         let (record_name, field_name) =
@@ -408,7 +442,40 @@ impl GroupChannel {
             .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
 
         let instance = rec.read().await;
+        Self::decode_member(member, record_name, field_name, &instance)
+    }
 
+    /// Read a single member's value against a record instance that the
+    /// caller already holds a read guard on. The atomic [`read_group`]
+    /// path uses this so it never re-locks a record whose guard is
+    /// held by `lock_group_records_read` (recursive-read deadlock).
+    fn read_member_locked(
+        &self,
+        member: &GroupMember,
+        guard_map: &HashMap<&str, &epics_base_rs::server::record::RecordInstance>,
+    ) -> BridgeResult<PvField> {
+        if let Some(field) = Self::read_member_channelless(member) {
+            return Ok(field);
+        }
+
+        let (record_name, field_name) =
+            epics_base_rs::server::database::parse_pv_name(&member.channel);
+
+        let instance = *guard_map
+            .get(record_name)
+            .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
+        Self::decode_member(member, record_name, field_name, instance)
+    }
+
+    /// Decode one member's value from an already-borrowed record
+    /// instance. Shared by the locked (atomic) and self-locking
+    /// (non-atomic) read paths so both produce identical output.
+    fn decode_member(
+        member: &GroupMember,
+        record_name: &str,
+        field_name: &str,
+        instance: &epics_base_rs::server::record::RecordInstance,
+    ) -> BridgeResult<PvField> {
         match member.mapping {
             FieldMapping::Scalar => {
                 let snapshot = instance.snapshot_for_field(field_name).ok_or_else(|| {
@@ -529,13 +596,13 @@ impl GroupChannel {
         match pv_field {
             PvField::Scalar(sv) => {
                 let target = self.member_dbf_type(member).await;
-                Some(super::convert::scalar_to_epics_typed(sv, target))
+                Some(crate::convert::scalar_to_epics_typed(sv, target))
             }
             // Arrays and structures: defer to the fallback array converter.
             // C++ QSRV uses dbChannelFinalNoElements + DBR types for arrays;
             // for now we delegate to pv_field_to_epics which preserves
             // element types.
-            _ => super::convert::pv_field_to_epics(pv_field),
+            _ => crate::convert::pv_field_to_epics(pv_field),
         }
     }
 }
@@ -571,11 +638,32 @@ impl super::provider::Channel for GroupChannel {
         ordered.sort_by_key(|m| m.put_order);
 
         if self.def.atomic {
-            // Atomic put: convert all values up-front (DBF-typed), then
-            // perform the actual writes in order. In C++ QSRV this uses
-            // DBManyLocker to hold all record locks simultaneously.
-            // Since epics-base-rs doesn't expose multi-lock, we write
-            // sequentially without yielding between writes.
+            // Atomic put. C++ QSRV holds every member record's lock
+            // simultaneously via `DBManyLocker` for the whole write.
+            // `epics-base-rs` exposes no multi-record write lock, and
+            // the per-record write lock is taken *inside*
+            // `put_record_field_from_ca` / `process_record` — so the
+            // gateway cannot hold `write_owned()` guards across the
+            // member loop without deadlocking those helpers.
+            //
+            // Instead we serialize on the group's shared
+            // `atomic_write_lock`: holding it across the whole member
+            // loop guarantees two PUTs to the *same atomic group*
+            // cannot interleave, so a downstream client never observes
+            // a group half-applied by a concurrent group PUT. Each
+            // member write still `.await`s, but no other atomic-group
+            // PUT can run a member write in between.
+            //
+            // Residual limitation (documented on `atomic_write_lock`):
+            // a non-group writer — a plain CA/PVA PUT addressed to a
+            // record that also backs a group member — is not gated by
+            // this lock and can still land between member writes.
+            // Closing that needs multi-record write locking in
+            // `epics-base-rs`.
+            let _atomic_guard = self.def.atomic_write_lock.lock().await;
+
+            // Convert all values up-front (DBF-typed), then perform the
+            // actual writes in order.
             let mut writes: Vec<(&GroupMember, Option<epics_base_rs::types::EpicsValue>)> =
                 Vec::new();
 
@@ -1294,6 +1382,8 @@ fn build_timestamp_from_snapshot_masked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qsrv::provider::Channel;
+    use std::time::Duration;
 
     #[test]
     fn nested_field_set_simple() {
@@ -1547,5 +1637,230 @@ mod tests {
         assert_eq!(comps.len(), 2);
         assert_eq!(comps[0].index, Some(1));
         assert_eq!(comps[1].index, Some(2));
+    }
+
+    // ---- BUG 4: atomic-group PUT serialization ----
+
+    /// Build a two-member atomic group over `A:rec` / `B:rec`,
+    /// returning the db and the parsed `GroupPvDef`.
+    async fn atomic_group_fixture() -> (Arc<PvDatabase>, GroupPvDef) {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("A:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("B:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let cfg = r#"{
+            "ATOMIC:GRP": {
+                "+atomic": true,
+                "a": {"+type": "plain", "+channel": "A:rec.VAL", "+putorder": 0},
+                "b": {"+type": "plain", "+channel": "B:rec.VAL", "+putorder": 1}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        assert!(def.atomic);
+        (db, def)
+    }
+
+    /// A PvStructure carrying `a` and `b` plain double values for the
+    /// atomic group PUT path.
+    fn atomic_put_value(a: f64, b: f64) -> PvStructure {
+        use epics_pva_rs::pvdata::ScalarValue;
+        let mut pv = PvStructure::new("structure");
+        pv.fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Double(a))));
+        pv.fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Double(b))));
+        pv
+    }
+
+    /// BUG 4 regression: an atomic-group PUT holds the group's shared
+    /// `atomic_write_lock` for the whole member-write loop, so a
+    /// concurrent PUT to the same atomic group cannot run a member
+    /// write in between. Pre-fix the atomic branch `.await`-ed each
+    /// member write with no cross-write lock, letting a second PUT
+    /// interleave and leave the group observably half-applied.
+    #[tokio::test]
+    async fn bug4_atomic_put_serializes_on_group_lock() {
+        let (db, def) = atomic_group_fixture().await;
+        let channel = GroupChannel::new(db.clone(), def.clone());
+
+        // Hold the group's atomic_write_lock — exactly the guard the
+        // atomic PUT branch acquires. While held, a `put` on the same
+        // group def must not be able to enter the member-write loop.
+        let guard = def.atomic_write_lock.clone().lock_owned().await;
+
+        let put_fut = tokio::spawn(async move {
+            channel.put(&atomic_put_value(11.0, 22.0)).await.unwrap();
+        });
+
+        // The PUT must still be blocked on the lock.
+        let blocked = tokio::time::timeout(Duration::from_millis(150), async {}).await;
+        assert!(blocked.is_ok());
+        assert!(
+            !put_fut.is_finished(),
+            "atomic PUT must block while another holder owns atomic_write_lock"
+        );
+
+        // Release the lock — the PUT now proceeds and completes.
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(5), put_fut)
+            .await
+            .expect("atomic PUT must complete once the lock is free")
+            .expect("put task did not panic");
+
+        // Both member records received the written values.
+        let a = db.get_pv("A:rec.VAL").await.unwrap();
+        let b = db.get_pv("B:rec.VAL").await.unwrap();
+        match (a, b) {
+            (
+                epics_base_rs::types::EpicsValue::Double(va),
+                epics_base_rs::types::EpicsValue::Double(vb),
+            ) => {
+                assert_eq!(va, 11.0);
+                assert_eq!(vb, 22.0);
+            }
+            other => panic!("unexpected member values: {other:?}"),
+        }
+    }
+
+    /// CRITICAL regression: an atomic-group `read_group` must not
+    /// deadlock when a plain writer is contending for a member
+    /// record's `RwLock`. Pre-fix `read_group` held an
+    /// `OwnedRwLockReadGuard` on every member record, then
+    /// `read_member` called `rec.read().await` on the SAME lock — a
+    /// recursive read that, with a write-preferring `tokio::RwLock`
+    /// and a writer queued in between, deadlocked unresolvably. The
+    /// fixed path resolves members against the pre-held guards and
+    /// never re-locks, so a concurrent writer cannot wedge it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critical_atomic_read_group_no_deadlock_under_writer() {
+        let (db, def) = atomic_group_fixture().await;
+        let channel = GroupChannel::new(db.clone(), def.clone());
+
+        // Spawn a writer that hammers a member record (A:rec) — each
+        // `put_pv` acquires the record write lock. Without the fix, a
+        // writer queued between the read_group guard and the
+        // read_member re-lock wedges the reader forever.
+        let writer_db = db.clone();
+        let writer = tokio::spawn(async move {
+            for i in 0..200 {
+                let _ = writer_db
+                    .put_pv(
+                        "A:rec.VAL",
+                        epics_base_rs::types::EpicsValue::Double(i as f64),
+                    )
+                    .await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Concurrently read the atomic group many times. Each
+        // `read_group` must complete — a deadlock would hang the
+        // timeout below.
+        let reader = tokio::spawn(async move {
+            for _ in 0..200 {
+                channel
+                    .read_group()
+                    .await
+                    .expect("atomic read_group must succeed");
+                tokio::task::yield_now().await;
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            reader.await.expect("reader task panicked");
+            writer.await.expect("writer task panicked");
+        })
+        .await
+        .expect("atomic read_group deadlocked under a concurrent writer");
+    }
+
+    /// CRITICAL regression: the atomic read path returns the same
+    /// values the non-atomic path would — proves `read_member_locked`
+    /// (guard reuse) decodes identically to `read_member` (self-lock).
+    #[tokio::test]
+    async fn critical_atomic_read_group_returns_member_values() {
+        let (db, def) = atomic_group_fixture().await;
+        db.put_pv("A:rec.VAL", epics_base_rs::types::EpicsValue::Double(7.5))
+            .await
+            .unwrap();
+        db.put_pv("B:rec.VAL", epics_base_rs::types::EpicsValue::Double(9.25))
+            .await
+            .unwrap();
+
+        let channel = GroupChannel::new(db.clone(), def);
+        let pv = channel.read_group().await.unwrap();
+
+        match get_nested_field(&pv, "a").as_deref() {
+            Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(v))) => {
+                assert_eq!(*v, 7.5)
+            }
+            other => panic!("member a: expected Double(7.5), got {other:?}"),
+        }
+        match get_nested_field(&pv, "b").as_deref() {
+            Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(v))) => {
+                assert_eq!(*v, 9.25)
+            }
+            other => panic!("member b: expected Double(9.25), got {other:?}"),
+        }
+    }
+
+    /// BUG 4 regression: two concurrent atomic-group PUTs serialize —
+    /// the second cannot start its member-write loop until the first
+    /// releases `atomic_write_lock`. With the lock removed the two
+    /// `.await`-ing loops would interleave member writes.
+    #[tokio::test]
+    async fn bug4_concurrent_atomic_puts_do_not_interleave() {
+        let (db, def) = atomic_group_fixture().await;
+
+        let ch1 = GroupChannel::new(db.clone(), def.clone());
+        let ch2 = GroupChannel::new(db.clone(), def.clone());
+
+        // Pre-acquire the lock so PUT #1 blocks deterministically;
+        // start both PUTs, then release. They must run strictly
+        // serially through the shared lock.
+        let guard = def.atomic_write_lock.clone().lock_owned().await;
+        let p1 = tokio::spawn(async move {
+            ch1.put(&atomic_put_value(1.0, 1.0)).await.unwrap();
+        });
+        let p2 = tokio::spawn(async move {
+            ch2.put(&atomic_put_value(2.0, 2.0)).await.unwrap();
+        });
+        // Neither PUT can proceed while the lock is held externally.
+        tokio::time::timeout(Duration::from_millis(120), async {})
+            .await
+            .ok();
+        assert!(!p1.is_finished() && !p2.is_finished());
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            p1.await.unwrap();
+            p2.await.unwrap();
+        })
+        .await
+        .expect("both atomic PUTs must complete");
+
+        // Final state is one of the two PUTs fully applied — never a
+        // mix (1.0,2.0) / (2.0,1.0). The lock guarantees the loops did
+        // not interleave member writes.
+        let a = db.get_pv("A:rec.VAL").await.unwrap();
+        let b = db.get_pv("B:rec.VAL").await.unwrap();
+        match (a, b) {
+            (
+                epics_base_rs::types::EpicsValue::Double(va),
+                epics_base_rs::types::EpicsValue::Double(vb),
+            ) => {
+                assert_eq!(
+                    va, vb,
+                    "atomic group must not be half-applied: a={va} b={vb}"
+                );
+                assert!(va == 1.0 || va == 2.0);
+            }
+            other => panic!("unexpected member values: {other:?}"),
+        }
     }
 }

@@ -508,11 +508,92 @@ impl EpicsValue {
         }
     }
 
-    /// Convert to a different native type (scalar only; arrays use first element).
+    /// Extract every element of an array variant as `f64`. Returns
+    /// `None` for scalar variants. `StringArray`/`CharArray` are not
+    /// covered here — their cross-type conversion is handled
+    /// separately in `convert_to`.
+    fn as_f64_array(&self) -> Option<Vec<f64>> {
+        match self {
+            Self::ShortArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
+            Self::FloatArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
+            Self::EnumArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
+            Self::LongArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
+            Self::DoubleArray(a) => Some(a.clone()),
+            Self::Int64Array(a) => Some(a.iter().map(|&v| v as f64).collect()),
+            _ => None,
+        }
+    }
+
+    /// Convert to a different native type.
+    ///
+    /// Scalars convert element-wise via `to_f64`. Array variants
+    /// convert **element-by-element** to the target array variant
+    /// (C `dbConvert` runs the per-type GET routine over the whole
+    /// array). Without this an array requested as a different DBR
+    /// native type would collapse to a single zero scalar.
     pub fn convert_to(&self, target: DbFieldType) -> EpicsValue {
         if self.db_field_type() == target {
             return self.clone();
         }
+
+        // Array → array conversion: map each element through the
+        // numeric-array view, then materialize the target variant.
+        // CharArray is also handled here: as a byte array it converts
+        // element-wise to numeric arrays, and to String it decodes as
+        // text. StringArray falls through to the scalar path (its
+        // cross-type semantics are not numeric).
+        if let Some(nums) = self.as_f64_array() {
+            return match target {
+                DbFieldType::Short => {
+                    EpicsValue::ShortArray(nums.iter().map(|&v| v as i16).collect())
+                }
+                DbFieldType::Float => {
+                    EpicsValue::FloatArray(nums.iter().map(|&v| v as f32).collect())
+                }
+                DbFieldType::Enum => {
+                    EpicsValue::EnumArray(nums.iter().map(|&v| v as u16).collect())
+                }
+                DbFieldType::Long => {
+                    EpicsValue::LongArray(nums.iter().map(|&v| v as i32).collect())
+                }
+                DbFieldType::Double => EpicsValue::DoubleArray(nums),
+                DbFieldType::Int64 => {
+                    EpicsValue::Int64Array(nums.iter().map(|&v| v as i64).collect())
+                }
+                DbFieldType::Char => EpicsValue::CharArray(nums.iter().map(|&v| v as u8).collect()),
+                DbFieldType::String => {
+                    EpicsValue::StringArray(nums.iter().map(|v| v.to_string()).collect())
+                }
+            };
+        }
+        if let EpicsValue::CharArray(bytes) = self {
+            return match target {
+                DbFieldType::Short => {
+                    EpicsValue::ShortArray(bytes.iter().map(|&b| b as i8 as i16).collect())
+                }
+                DbFieldType::Float => {
+                    EpicsValue::FloatArray(bytes.iter().map(|&b| b as i8 as f32).collect())
+                }
+                DbFieldType::Enum => {
+                    EpicsValue::EnumArray(bytes.iter().map(|&b| b as u16).collect())
+                }
+                DbFieldType::Long => {
+                    EpicsValue::LongArray(bytes.iter().map(|&b| b as i8 as i32).collect())
+                }
+                DbFieldType::Double => {
+                    EpicsValue::DoubleArray(bytes.iter().map(|&b| b as i8 as f64).collect())
+                }
+                DbFieldType::Int64 => {
+                    EpicsValue::Int64Array(bytes.iter().map(|&b| b as i8 as i64).collect())
+                }
+                // CharArray as text: decode the byte buffer as UTF-8.
+                DbFieldType::String => {
+                    EpicsValue::String(String::from_utf8_lossy(bytes).into_owned())
+                }
+                DbFieldType::Char => EpicsValue::CharArray(bytes.clone()),
+            };
+        }
+
         // Menu string resolution: when converting String to Short/Enum,
         // try resolve_menu_string first (e.g. "MINOR" -> 1).
         if let EpicsValue::String(s) = self {
@@ -860,5 +941,76 @@ mod parse_radix_tests {
             EpicsValue::parse(DbFieldType::Char, "0xFF").unwrap(),
             EpicsValue::Char(255)
         );
+    }
+}
+
+#[cfg(test)]
+mod array_convert_tests {
+    use super::*;
+
+    /// H-4: a numeric array converted to a different DBR native type
+    /// must convert element-by-element, not collapse to one scalar.
+    #[test]
+    fn double_array_to_short_array() {
+        let v = EpicsValue::DoubleArray(vec![1.5, 2.9, -3.1]);
+        assert_eq!(
+            v.convert_to(DbFieldType::Short),
+            EpicsValue::ShortArray(vec![1, 2, -3])
+        );
+    }
+
+    #[test]
+    fn short_array_to_double_array() {
+        let v = EpicsValue::ShortArray(vec![10, 20, 30]);
+        assert_eq!(
+            v.convert_to(DbFieldType::Double),
+            EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0])
+        );
+    }
+
+    #[test]
+    fn long_array_to_float_array() {
+        let v = EpicsValue::LongArray(vec![-1, 0, 7]);
+        assert_eq!(
+            v.convert_to(DbFieldType::Float),
+            EpicsValue::FloatArray(vec![-1.0, 0.0, 7.0])
+        );
+    }
+
+    #[test]
+    fn double_array_to_int64_array() {
+        let v = EpicsValue::DoubleArray(vec![100.0, 200.0]);
+        assert_eq!(
+            v.convert_to(DbFieldType::Int64),
+            EpicsValue::Int64Array(vec![100, 200])
+        );
+    }
+
+    /// CharArray converts element-wise as signed `epicsInt8`.
+    #[test]
+    fn char_array_to_short_array_signed() {
+        let v = EpicsValue::CharArray(vec![0x01, 0xFF]); // 1, -1
+        assert_eq!(
+            v.convert_to(DbFieldType::Short),
+            EpicsValue::ShortArray(vec![1, -1])
+        );
+    }
+
+    /// Empty array stays an empty array of the target type (count
+    /// preserved), not a scalar zero.
+    #[test]
+    fn empty_array_conversion_preserves_emptiness() {
+        let v = EpicsValue::DoubleArray(Vec::new());
+        assert_eq!(
+            v.convert_to(DbFieldType::Short),
+            EpicsValue::ShortArray(Vec::new())
+        );
+    }
+
+    /// Same-type conversion is an identity clone.
+    #[test]
+    fn same_type_array_identity() {
+        let v = EpicsValue::LongArray(vec![1, 2, 3]);
+        assert_eq!(v.convert_to(DbFieldType::Long), v);
     }
 }

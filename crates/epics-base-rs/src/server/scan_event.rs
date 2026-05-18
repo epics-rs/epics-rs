@@ -147,6 +147,16 @@ impl ScanSchedulerV2 {
             .await;
     }
 
+    /// Post a software event by name — processes every `SCAN=Event`
+    /// record whose `EVNT` resolves to `event_name`.
+    ///
+    /// Mirrors C `dbScan.c` `postEvent`: only the records belonging
+    /// to that one `event_list` are processed, not every Event-scanned
+    /// record. A record configured `EVNT=5` fires only on event 5.
+    pub async fn post_event_named(&self, event_name: &str) {
+        self.db.post_event_named(event_name).await;
+    }
+
     /// Submit a delayed scan for a record (processes after the given delay).
     pub async fn submit_delayed(&self, record_name: &str, delay: Duration) {
         let db = self.db.clone();

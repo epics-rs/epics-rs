@@ -216,6 +216,62 @@ mod tests {
     }
 
     #[test]
+    #[serial(epics_env)]
+    fn test_ca_server_port_rejects_privileged_port() {
+        // H2 C-parity: a port <= IPPORT_USERRESERVED (5000) is rejected
+        // by `envGetInetPortConfigParam` and falls back to the
+        // compiled default — `EPICS_CA_SERVER_PORT=80` must NOT be
+        // honoured.
+        unsafe { std::env::set_var("EPICS_CA_SERVER_PORT", "80") };
+        assert_eq!(
+            ca_server_port(),
+            CA_SERVER_PORT,
+            "privileged port 80 must fall back to the default 5064"
+        );
+        unsafe { std::env::set_var("EPICS_CA_SERVER_PORT", "5000") };
+        assert_eq!(
+            ca_server_port(),
+            CA_SERVER_PORT,
+            "port 5000 (== IPPORT_USERRESERVED) must fall back to default"
+        );
+        unsafe { std::env::set_var("EPICS_CA_SERVER_PORT", "0") };
+        assert_eq!(ca_server_port(), CA_SERVER_PORT, "port 0 must fall back");
+        unsafe { std::env::remove_var("EPICS_CA_SERVER_PORT") };
+    }
+
+    #[test]
+    #[serial(epics_env)]
+    fn test_ca_server_port_accepts_valid_high_port() {
+        // 5001 is the first acceptable port (> IPPORT_USERRESERVED).
+        unsafe { std::env::set_var("EPICS_CA_SERVER_PORT", "5001") };
+        assert_eq!(ca_server_port(), 5001);
+        unsafe { std::env::set_var("EPICS_CA_SERVER_PORT", "6064") };
+        assert_eq!(ca_server_port(), 6064);
+        unsafe { std::env::remove_var("EPICS_CA_SERVER_PORT") };
+    }
+
+    #[test]
+    #[serial(epics_env)]
+    fn test_ca_repeater_port_rejects_out_of_range() {
+        // H2 applies to every port reader, not just CA server.
+        unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", "443") };
+        assert_eq!(ca_repeater_port(), CA_REPEATER_PORT);
+        unsafe { std::env::remove_var("EPICS_CA_REPEATER_PORT") };
+    }
+
+    #[test]
+    #[serial(epics_env)]
+    fn test_port_reader_lenient_parse() {
+        // H3 C-parity: `sscanf("%ld")` tolerates leading whitespace and
+        // a trailing garbage suffix that `u16::parse` would reject.
+        unsafe { std::env::set_var("EPICS_CA_SERVER_PORT", " 6064") };
+        assert_eq!(ca_server_port(), 6064);
+        unsafe { std::env::set_var("EPICS_CA_SERVER_PORT", "6064xyz") };
+        assert_eq!(ca_server_port(), 6064);
+        unsafe { std::env::remove_var("EPICS_CA_SERVER_PORT") };
+    }
+
+    #[test]
     fn test_parse_socket_addr_valid() {
         let addr = parse_socket_addr("127.0.0.1:5064").unwrap();
         assert_eq!(addr.port(), 5064);

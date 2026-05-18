@@ -89,14 +89,29 @@ pub struct AlarmResetResult {
     pub prev_stat: u16,
     /// True iff `amsg` value changed in this reset cycle (epics-base PR #568).
     pub amsg_changed: bool,
+    /// True iff `acks` value was raised in this reset cycle (C parity
+    /// with `recGblResetAlarms` — `acks` tracks the highest unacknowledged
+    /// severity so operators can clear sticky alarms via a CA put).
+    pub acks_changed: bool,
 }
 
 /// Set new alarm severity if it's higher than current nsta/nsev.
-/// Matches EPICS recGblSetSevr: only raises alarm, never lowers.
+/// Matches EPICS `recGblSetSevr` (recGbl.c:258-261): `recGblSetSevr`
+/// delegates to `recGblSetSevrMsg(..., NULL)` → `recGblSetSevrVMsg`
+/// with `msg == NULL`. When the new severity raises the pending
+/// state, the `msg == NULL` branch (recGbl.c:248-250) executes
+/// `prec->namsg[0] = '\0'` — i.e. it **clears** any pending alarm
+/// message. A stale `namsg` written by an earlier MSS link (or
+/// `evaluate_alarms`) must not survive when a later, higher-severity
+/// no-message alarm raises the record severity; otherwise the
+/// record's final `amsg` carries an unrelated upstream record's
+/// alarm text.
 pub fn rec_gbl_set_sevr(common: &mut CommonFields, stat: u16, sevr: AlarmSeverity) {
     if (sevr as u16) > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = sevr;
+        // C `msg == NULL` branch clears the pending message.
+        common.namsg.clear();
     }
 }
 
@@ -129,6 +144,17 @@ pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
     let prev_sevr = common.sevr;
     let prev_stat = common.stat;
     let prev_amsg = std::mem::take(&mut common.amsg);
+    let prev_acks = common.acks;
+
+    // C parity (recGbl.c:188-189): clamp pending severity at INVALID_ALARM.
+    // Records that erroneously call `recGblSetSevr` with a severity > 3
+    // (e.g. via field-typed values that round-trip through u16) would
+    // otherwise corrupt `sevr` into an undefined alarm severity. Keep the
+    // existing nsev variant if it's already valid — only re-encode when
+    // an out-of-range value snuck in.
+    if (common.nsev as u16) > (AlarmSeverity::Invalid as u16) {
+        common.nsev = AlarmSeverity::Invalid;
+    }
 
     // Transfer new alarm state
     common.sevr = common.nsev;
@@ -143,11 +169,34 @@ pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
     let alarm_changed = common.sevr != prev_sevr || common.stat != prev_stat;
     let amsg_changed = common.amsg != prev_amsg;
 
+    // C parity (recGbl.c:209-217): when an alarm-class field changed
+    // this cycle, update the alarm-acknowledge severity `acks`. If
+    // `ackt` is false (alarm is transient — automatically resets when
+    // the condition clears) OR the new severity is >= the currently
+    // remembered acks, raise `acks` to the new severity. Operators
+    // clear `acks` back to NoAlarm via a CA put to ACKS (handled in
+    // record_instance::put_common_field). Without this update, the
+    // alarm-handler workflow (sticky severity tracking) is silently
+    // disabled — every operator clear is a no-op because acks never
+    // gets raised in the first place.
+    let mut acks_changed = false;
+    if alarm_changed || amsg_changed {
+        if !common.ackt || (common.sevr as u16) >= (common.acks as u16) {
+            if common.acks != common.sevr {
+                common.acks = common.sevr;
+                acks_changed = true;
+            }
+        }
+    }
+
+    let _ = prev_acks; // reserved for future post-event integration
+
     AlarmResetResult {
         alarm_changed,
         prev_sevr,
         prev_stat,
         amsg_changed,
+        acks_changed,
     }
 }
 
@@ -328,5 +377,71 @@ mod tests {
         assert!(!mask.intersects(EventMask::PROPERTY));
         assert!(!mask.is_empty());
         assert!(EventMask::NONE.is_empty());
+    }
+
+    // ----- ACKS / ACKT auto-raise (recGbl.c:209-217 parity) -----
+
+    /// C `recGblResetAlarms` raises `acks` to the new severity when the
+    /// alarm changes, unless `ackt` is true AND the new severity is
+    /// below the current `acks`. Default `ackt=true` is the "sticky"
+    /// alarm-acknowledge mode — once raised, `acks` only drops when an
+    /// operator writes back to ACKS. Without this, sticky-alarm
+    /// tracking is dead on every record built with default ACKT=YES.
+    #[test]
+    fn reset_alarms_raises_acks_to_new_severity() {
+        let mut common = CommonFields::default();
+        assert_eq!(common.acks, AlarmSeverity::NoAlarm);
+        assert!(common.ackt, "ACKT defaults to true (sticky)");
+
+        rec_gbl_set_sevr(&mut common, alarm_status::HIHI_ALARM, AlarmSeverity::Major);
+        let result = rec_gbl_reset_alarms(&mut common);
+
+        assert!(result.alarm_changed);
+        assert!(result.acks_changed, "first alarm raise must update acks");
+        assert_eq!(common.acks, AlarmSeverity::Major);
+    }
+
+    /// `ackt=true` + dropping severity must NOT lower `acks` — the
+    /// operator clears it via a CA put to ACKS. C path:
+    /// `if (!ackt || new_sevr >= acks) acks = new_sevr` — when ackt=true
+    /// AND new_sevr < acks, neither branch matches and acks stays.
+    #[test]
+    fn reset_alarms_keeps_acks_sticky_when_ackt_true_and_severity_drops() {
+        let mut common = CommonFields::default();
+        // First cycle: raise to MAJOR.
+        rec_gbl_set_sevr(&mut common, alarm_status::HIHI_ALARM, AlarmSeverity::Major);
+        rec_gbl_reset_alarms(&mut common);
+        assert_eq!(common.acks, AlarmSeverity::Major);
+
+        // Second cycle: drop to MINOR. acks must stay at MAJOR (sticky).
+        rec_gbl_set_sevr(&mut common, alarm_status::HIGH_ALARM, AlarmSeverity::Minor);
+        let result = rec_gbl_reset_alarms(&mut common);
+        assert!(result.alarm_changed);
+        assert!(
+            !result.acks_changed,
+            "ackt=true must NOT lower acks when severity drops"
+        );
+        assert_eq!(common.acks, AlarmSeverity::Major);
+    }
+
+    /// `ackt=false` (transient alarm acknowledge) drops `acks` together
+    /// with severity. C path: `!ackt` short-circuits and assigns
+    /// `acks = new_sevr` unconditionally on every alarm change.
+    #[test]
+    fn reset_alarms_drops_acks_when_ackt_false() {
+        let mut common = CommonFields::default();
+        common.ackt = false; // transient mode
+        rec_gbl_set_sevr(&mut common, alarm_status::HIHI_ALARM, AlarmSeverity::Major);
+        rec_gbl_reset_alarms(&mut common);
+        assert_eq!(common.acks, AlarmSeverity::Major);
+
+        rec_gbl_set_sevr(&mut common, alarm_status::HIGH_ALARM, AlarmSeverity::Minor);
+        let result = rec_gbl_reset_alarms(&mut common);
+        assert!(result.acks_changed);
+        assert_eq!(
+            common.acks,
+            AlarmSeverity::Minor,
+            "ackt=false drops acks with severity"
+        );
     }
 }

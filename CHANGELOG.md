@@ -1,5 +1,280 @@
 # Changelog
 
+## v0.18.0 — 2026-05-18
+
+First `main` release rolling up the `review/codebase-hardening-202605`
+branch. `main` was at `v0.17.0`; this release encompasses everything
+recorded under `v0.17.1` (C-parity hardening, 126 commits across
+eleven review rounds) and `v0.17.2` (areaDetector RBV constructor-time
+flag-consumption fix), plus the new entries below. See those sections
+for the full audit trail.
+
+### modbus-rs — absolute-mode array I/O length safety
+
+- **fix(modbus-rs)** `read_int32_array` absolute-mode requests now use
+  the record array length, not the driver-wide `modbusLength`, so a
+  short waveform record never asks the device for more registers than
+  it can buffer (`dac0dd6`).
+- **fix(modbus-rs)** Absolute-mode array writes clamp the request
+  length to `modbusLength` to prevent overrun on the device side
+  (`28160ae`).
+- **fix(modbus-rs)** Relative-mode array writes apply the same clamp
+  for the `modbusLength`-bounded register window
+  (`4b5a38c`).
+
+Workspace: `cargo fmt --all` clean, `cargo clippy --workspace
+--all-targets -- -D warnings` clean.
+
+## v0.17.2 — 2026-05-15
+
+Patch release.
+
+### ad-core-rs — areaDetector static RBV records populate at IOC startup
+
+- **fix(ad-core-rs)** Drop the premature `call_param_callbacks(0)` at
+  the end of `ADDriverBase::new`. Constructor time has no record
+  subscribers (`dbLoadRecords` runs strictly after), so the call
+  silently consumed the change flags of every just-set parameter
+  (`MAX_SIZE_X/Y`, `SIZE_X/Y`, `BIN_X/Y`, `IMAGE_MODE`,
+  `NUM_IMAGES`, `NUM_EXPOSURES`, `ACQUIRE_TIME`, `ACQUIRE_PERIOD`,
+  `STATUS`, `DATA_TYPE`, `COLOR_MODE`, ...) and fired
+  `InterruptManager.notify` into an empty mailbox list before
+  clearing the flags. Records registering during `dbLoadRecords`
+  got fresh mailboxes with no buffered value and — for static
+  parameters never re-set during operation — waited forever.
+  Symptom on synthetic detectors (mini-beamline `MovingDotDetector`):
+  `MaxSizeX_RBV` / `MaxSizeY_RBV` / `SizeX_RBV` / `SizeY_RBV` /
+  `BinX_RBV` / `BinY_RBV` / `NumImages_RBV` at `VAL=0`,
+  `Timestamp=<undefined>` indefinitely. Real cameras masked the
+  gap by refreshing these from device polling on first acquire;
+  synthetic detectors exposed it. Fix removes the call; pending
+  flags now accumulate through construction and flush on the
+  first post-iocInit `call_param_callbacks` (acquire start,
+  write-driven update, dirty-flag handler). (`870acc3`)
+
+  **Anchor**: `call_param_callbacks` inside an `fn new` body.
+  Workspace audit shows ad_driver.rs:92 was the only constructor-time
+  site; all other call sites live in operational methods
+  (`prepare_array`, `write_int32`, `write_float64`, `write_*`) and
+  are correct.
+
+  Verified on a live mini-beamline IOC: after restart, `MaxSizeX_RBV=640`,
+  `MaxSizeY_RBV=480`, `SizeX_RBV=640`, `SizeY_RBV=480`, `BinX_RBV=1`,
+  `BinY_RBV=1`, `NumImages_RBV=100`, all with concrete timestamps. No
+  regression on previously-working RBVs (`Manufacturer_RBV`,
+  `Model_RBV`, `DataType_RBV`).
+
+## v0.17.1 — 2026-05-15
+
+C-parity hardening release: 126 commits across eleven review rounds.
+Rounds 1-5 ran four parallel sub-agent teams (A: `epics-base-rs`,
+B: `asyn-rs`, C: `epics-pva-rs` ↔ pvxs C++, D: `epics-ca-rs`) auditing
+each crate against its C reference in worktree isolation, with each
+finding gated on the global *Fixes from reported defects* +
+*Invariant-driven fixes* rules (anchor → workspace `rg` → classify
+every hit → bundle-fix in one commit). Rounds 6-11 focused
+exclusively on `epics-ca-rs` server/client wire correctness. Each
+fix carries its own audit-trail commit body; this entry is the
+summary. See `docs/c-parity-review-2026-05-15.md` (round 1) +
+`docs/c-parity-review-2026-05-15-round2.md` (round 2).
+
+Workspace: `cargo nextest --workspace` 3633/3633 PASS (32 skipped),
+`cargo test --doc --workspace` clean, `cargo clippy --workspace
+--all-targets -- -D warnings` clean.
+
+No wire-protocol breaking changes. Several rsrv error-emission paths
+now match libca byte-for-byte where they previously diverged
+silently (see CA server section below); these are bug fixes from
+the libca-client perspective, not protocol breaks.
+
+### epics-base-rs — record / processing / iocsh parity
+
+- **fix(record)** `dbProcess` entry-level PACT guard + AsyncPending
+  sets pact — closes mid-cycle re-entry hole on FLNK/scan/CA-put
+  callers. C `dbAccess.c:537-559` parity (silent bail until
+  MAX_LOCK=10). Owner-driven continuations use new
+  `process_record_continuation` to bypass the guard
+  (`16e0ff6`, `27e0bb0`).
+- **fix(record)** PUTF lifecycle — keep through process cycle, clear
+  on FLNK end + propagate through DB OUT/FLNK
+  (`925b46f`, `7168911`).
+- **fix(record)** ReprocessAfter continuation invariant — only the
+  async cycle owner bypasses PACT guard; foreign callers always
+  routed through `process_record_with_links` (`27e0bb0`).
+- **fix(record)** `check_deadband` fires on NaN/infinity transition
+  (recGbl.c parity); `rec_gbl_reset_alarms` INVALID_ALARM clamp +
+  ACKS auto-raise; AMSG event posting on amsg-only alarm-message
+  change; TSE=-1 always overwrites via BestTime; SDIS disable bail
+  clears rpro/putf; OMSL=closed_loop honored on `dfanout`; UDF
+  cleared synchronously on primary-field CA put
+  (`d9aa8ea`, `73880c7`, `334f8ac`, `4d2a007`, `c3f0fdc`,
+  `76645cc`, `dd6b9f5`).
+- **fix(record)** `ai`/`ao` SPC_LINCONV — LINR/EGUF/EGUL puts rebase
+  eoff + reprime SMOO (`544ae66`).
+- **feat(record)** TPRO diagnostic on PACT entry guard (`31f57b4`).
+- **feat(epics-base-rs)** calc record analog alarm limits + AFTC
+  filter (HIHI/HHSV/HIGH/.../LLSV + C `calcRecord.c:339-381`
+  hysteresis) (`6dc7293`).
+- **fix(iocsh)** `substitute_env_vars` accepts `${NAME}` brace form;
+  `substitute_macros` backslash escape blocks `\$` expansion;
+  fd-numbered redirect parser (`N>` / `N>>`)
+  (`63b4551`, `531ec4f`, `54fc7ac`).
+
+### asyn-rs — paramList / trace / interrupt callback parity
+
+- **fix(asyn-rs)** trace setters fire `asynExceptionTrace*` —
+  match C asyn manager (`e3d481d`).
+- **fix(asyn-rs)** connect / disconnect edge-only (no duplicate
+  announces) (`e7c36fc`).
+- **refactor(asyn-rs)** `set_connected` owner-API closes
+  Connect-edge invariant (`3766c2c`).
+- **fix(asyn-rs)** `OctetWriteRead` flushes input first — match C
+  asyn (`6a2b7ca`).
+- **fix(asyn-rs)** strict `get_*_strict` variants + setter
+  defined-flip on first write — C parity (`ad575cf`).
+- **feat(asyn-rs)** `TraceManager::output_device_*` + `asyn_trace_device!`
+  macros — match C `tracePrint` device → port → global hierarchy
+  (`242a4ce`).
+- **fix(asyn-rs)** `InterruptValue` carries `aux_status` +
+  `alarmStatus/Severity` — C `asynPortDriver.cpp:631-642` parity
+  for callback plumbing (`0b9e8d5`).
+- **feat(asyn-rs)** paramList strict `create_param` +
+  UInt32Digital rising/falling masks + interrupt config helpers
+  (`657d7c4`, `7c31e08`).
+- **feat(asyn-rs)** asynOctet `eomReason` plumbing through
+  `OctetRead` path (`ae50b6c`).
+- **feat(asyn-rs)** asynRecord ENBL/AUCT propagate to port +
+  handle exposes `multi_device`; OEOS/IEOS routes through driver
+  `setInputEos` hook + DBIT key parity; iocsh trace setters honor
+  per-device `addr` (`137672d`, `2e2b5a9`, `7883367`).
+- **feat(asyn-rs)** `PortDriver` gains `io_read_octet_eom` + UInt32
+  interrupt config (`7c31e08`).
+- **feat(asyn-rs)** iocsh module registers six `asynShellCommand`
+  entries (`40efa0b`).
+
+### epics-pva-rs — pvxs C++ parity
+
+- **fix(pva)** SEARCH `MustReply` flag honored + emit `found=0` on
+  empty reply (pvxs `server.cpp:730-744`) (`3bea633`).
+- **fix(pva)** `DESTROY_CHANNEL` on unknown SID silently drops
+  (pvxs `serverchan.cpp:382-386`) (`20d0d60`).
+- **fix(pva)** echo request `subcmd` in PUT/GET/RPC data response
+  (pvxs `serverget.cpp:83`) — fixes PUT_GET readback wire desync
+  for pvxs C++ clients (`5a3245a`).
+- **fix(pva)** reject `GET_FIELD` when IOID collides with active op
+  (pvxs `serverintrospect.cpp:159`) (`80a447b`).
+- **fix(pva)** reject zero version byte in frame header (pvxs
+  `pvaproto.h:687` `from_wire`) (`a6e63c6`).
+- **fix(pva)** role-aware direction-bit check on frame parse (pvxs
+  `conn.cpp:160`) (`749de8d`).
+- **fix(pva)** consume pipeline nack on MONITOR INIT (pvxs
+  `servermon.cpp:493`) (`fd099c1`).
+- **fix(pva)** reject unadvertised auth method on ConnValidation
+  (pvxs `serverconn.cpp:238`) (`e617f36`).
+- **fix(pva)** `CANCEL_REQUEST` preserves subscriber task (pvxs
+  `serverconn.cpp:262`) (`0a081bc`).
+- **fix(pva)** `CREATE_CHANNEL count > 1` multi-name handling
+  (pvxs `serverchan.cpp:269`) (`c0105ca`).
+- **fix(pva)** cap `FieldDesc` nesting depth at 20 (pvxs
+  `dataencode.cpp:71`) (`7e2e63d`).
+
+### epics-ca-rs — wire / server / client / repeater C parity
+
+CA server `send_ca_error` field-swap fix (★★) — `m_cid` carried ECA
+status and `m_available=0`, opposite of C `vsend_err`
+(`rsrv/camessage.c:139-224`) and libca decoder (`cac.cpp:1118`).
+Every server-emitted `CA_PROTO_ERROR` looked like `ECA_NORMAL` to C
+clients, masking real failures (`21240ad`).
+
+- **fix(ca-server)** SEARCH reply `m_cid = ~0U` sentinel + TCP
+  `m_postsize = 0` — restores C `camessage.c:2193-2287` semantics;
+  multi-NIC routing preserved via per-interface UDP binding +
+  client-side "use UDP src addr" decode (`6ea50bd`, doc-only
+  follow-up `148c4b7`).
+- **fix(ca-server)** EVENT_CANCEL with unknown sub-id replies
+  `ECA_BADMONID` + channel-mismatch detection
+  (`90c56e8`, `0cbee2d`, `4f532cf`).
+- **fix(ca-server)** TCP ECHO echoes back request header + payload
+  (`b7e7722`).
+- **fix(ca-server)** CREATE_CHAN cap reached emits
+  `ERROR/ECA_ALLOCMEM` + per-client cap disconnects + V<9 nElem
+  cap at `0xfffe` (`6089b84`, `0f7c949`, `b36d4f4`).
+- **fix(ca-server)** CLEAR_CHANNEL aborts pending WRITE_NOTIFY
+  tasks for sid + on unknown SID disconnects silently
+  (`06ec795`, `24ea874`).
+- **fix(ca-server)** drop TCP after `CA_PROTO_ERROR` on unknown
+  command / WRITE bad type / READ bad type
+  (`5ab609f`, `fdf6ead`, `5bf852e`).
+- **fix(ca-server)** enforce `CA_MINIMUM_SUPPORTED_VERSION` on TCP
+  VERSION + UDP SEARCH; TCP SEARCH from minor<4 client
+  disconnects; non-VERSION command from pre-V4.4 →
+  `ECA_DEFUNCT`; SEARCH postsize≤1 reject
+  (`dbb4b28`, `7c6af61`, `88d1911`, `773523c`).
+- **fix(ca-server)** EVENT_ADD silent-drops on bad type / unknown
+  SID; READ + WRITE on unknown SID silent-drop (C `logBadId`
+  parity); UDP non-VERSION/non-SEARCH cmd stops parsing
+  (`9fdbc37`, `e5d2922`, `a4e5435`).
+- **fix(ca-server)** HOST_NAME/CLIENT_NAME 511-byte cap +
+  post-claim freeze + null-terminator check
+  (`6b4d512`, `f5ec57d`, `5636637`).
+- **fix(ca-server)** `ECA_TOLARGE` wire reply for oversized
+  payload; bound `CA_PROTO_ERROR` diagnostic at 480 bytes
+  (`fb94fb2`, `e0de0fa`).
+- **fix(ca-server)** READ_SYNC echoes request header; CA_PROTO_READ
+  response carries client cid; NOT_FOUND parity — drop UDP
+  DOREPLY, echo request fields on TCP; VERSION reply zero-fill +
+  beacon `m_available=0`; WRITE access-denial → `ECA_NOWTACCESS`
+  (`c5d9f41`, `f05952b`, `d3312ab`, `7c49850`, `3542f4e`).
+- **fix(ca-server,multi-NIC)** bind every `EPICS_CAS_INTF_ADDR_LIST`
+  interface + secondary broadcast UDP socket when
+  `INTF_ADDR_LIST` is specific IP + `AUTO_BEACON_ADDR_LIST` +
+  `BEACON_PERIOD` C parity + drop deprecated `EPICS_CA_ADDR_LIST`
+  beacon fallback + honour deprecated `EPICS_CA_BEACON_PERIOD`
+  fallback
+  (`e21e4c0`, `9c62f61`, `c450499`, `cd5a3db`, `e58b405`).
+- **fix(ca-wire)** misaligned `m_postsize` reject — C `& 0x7`
+  rule (`f690729`).
+- **fix(ca-wire)** extended-header threshold — `>= 0xFFFF`,
+  not `> 0xFFFF` (`7fcc26e`).
+- **fix(ca-client)** `CA_PROTO_ERROR` status reads `m_available`,
+  not `m_cid` (mirror of server-side `21240ad`); MonitorData
+  delivery gated on `hdr.cid == ECA_NORMAL`; CREATE_CHAN inherits
+  stashed ACCESS_RIGHTS; HOST_NAME / CLIENT_NAME handshake order;
+  beacon `m_count=0` fallback honors `EPICS_CA_SERVER_PORT`;
+  AUTO_ADDR_LIST loopback fallback when bcast enum empty
+  (`d2472cc`, `8616655`, `94e877c`, `50282a3`, `51934ac`,
+  `6091794`).
+- **fix(ca-client,cap-tokens)** signed-beacon verifier lookup must
+  use UDP source IP; lookup uses `hdr.available` (repeater rewrite
+  target), not `meta.src`; `cap-tokens` build error (_src typo +
+  missing sha2 dep) (`e162924`, `fcd8eca`, `7d6af83`).
+- **fix(ca-client)** demote reconnect-restored log from `eprintln`
+  to `tracing::debug` (`4a0563a`).
+- **fix(ca-repeater)** fanout remainder after stripped REGISTER +
+  tighten `m_available` rewrite; reject REPEATER_REGISTER from
+  non-loopback peers; honour `EPICS_CA_REPEATER_PORT` for daemon
+  bind + REGISTER targets (`9facef5`, `e7bdb4a`, `cf8ae27`).
+
+### Documentation
+
+- **docs(parity)** `docs/c-parity-review-2026-05-15.md` — round 1
+  multi-team audit log (`5f61621`).
+- **docs(parity)** `docs/c-parity-review-2026-05-15-round2.md` —
+  round 2 audit log + tool-level retrospective on agent worktree
+  base divergence (`211cf3a`, `148c4b7` correction).
+- **docs(ca-proto)** clarify `EPICS_CA_MAX_ARRAY_BYTES` default
+  divergence from C (`e73b1c7`).
+- **docs(recgbl)** record `check_deadband_ext` NaN-as-sentinel
+  design rationale (`82305e5`).
+
+### Internal
+
+- **build** drop accidentally committed sim-detector autosave tmp
+  (`db926af`).
+- **style** workspace `cargo fmt --all` post round-2 merges
+  (`96ce0a7`); `is_multiple_of` for clippy::manual_is_multiple_of
+  (`50f5e4c`).
+
 ## v0.17.0 — 2026-05-14
 
 Upstream-features release: 192 commits closing out asyn-rs C-source

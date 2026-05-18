@@ -31,15 +31,62 @@ impl Frame {
     }
 }
 
+/// Local role of the peer that is *reading* the wire. Used by
+/// [`try_parse_frame_role`] to enforce the direction-bit invariant from
+/// pvxs `conn.cpp:160` (`isClient ^ !!(header[2]&pva_flags::Server)`):
+/// a server's inbound frames must have the `Server` flag CLEAR (client →
+/// server direction), and a client's inbound frames must have it SET
+/// (server → client). Reject mismatches as a protocol fault so a peer
+/// can't echo our own outbound traffic back at us — defense-in-depth
+/// against simple replay or loopback misconfigurations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRole {
+    /// The local end is a PVA server reading frames from a client.
+    Server,
+    /// The local end is a PVA client reading frames from a server.
+    Client,
+    /// Role-agnostic (sniffers, mixed-mode CLI tools, unit tests).
+    Either,
+}
+
 /// Try to decode a single frame from the start of `buf`. On success returns
 /// the frame plus the number of bytes consumed; on incomplete input returns
 /// `Ok(None)` so the caller can read more.
+///
+/// Role-agnostic — equivalent to `try_parse_frame_role(buf, PeerRole::Either)`.
+/// Production read loops should use [`try_parse_frame_role`] with their
+/// actual role so the direction-bit check engages.
 pub fn try_parse_frame(buf: &[u8]) -> PvaResult<Option<(Frame, usize)>> {
+    try_parse_frame_role(buf, PeerRole::Either)
+}
+
+/// Role-aware variant of [`try_parse_frame`]. Enforces the pvxs direction
+/// invariant: a [`PeerRole::Server`] reader expects the `Server` flag bit
+/// to be CLEAR on inbound frames; a [`PeerRole::Client`] reader expects
+/// it SET. Mismatches return `Err(Protocol)` so the caller can drop the
+/// connection. [`PeerRole::Either`] skips the check entirely.
+pub fn try_parse_frame_role(buf: &[u8], role: PeerRole) -> PvaResult<Option<(Frame, usize)>> {
     if buf.len() < PvaHeader::SIZE {
         return Ok(None);
     }
     let mut cur = Cursor::new(buf);
     let header = PvaHeader::decode(&mut cur).map_err(|e| PvaError::Decode(e.to_string()))?;
+    let from_server = header.flags.is_server();
+    match role {
+        PeerRole::Server if from_server => {
+            return Err(PvaError::Protocol(format!(
+                "inbound frame has Server direction bit set (cmd=0x{:02X}, flags=0x{:02X}) — expected client→server",
+                header.command, header.flags.0
+            )));
+        }
+        PeerRole::Client if !from_server => {
+            return Err(PvaError::Protocol(format!(
+                "inbound frame has Server direction bit clear (cmd=0x{:02X}, flags=0x{:02X}) — expected server→client",
+                header.command, header.flags.0
+            )));
+        }
+        _ => {}
+    }
     if header.flags.is_control() {
         // Control messages have no body; payload_length carries the data word.
         return Ok(Some((
@@ -429,6 +476,154 @@ pub fn decode_op_response_cached(
     }))
 }
 
+// ─── Type-cache marker flattening (reader-task owned) ───────────────────
+
+/// Resolve any 0xFD/0xFE type-cache markers in an inbound op-response
+/// frame, rewriting the frame payload to carry self-contained inline
+/// descriptors.
+///
+/// **Why this runs in the reader task.** Type-cache markers (`0xFD`
+/// define / `0xFE` reference) only resolve correctly if every define is
+/// observed before any reference to its slot. The connection reader task
+/// is the single component that observes frames in strict wire order;
+/// per-op tasks are scheduled by tokio in arbitrary order, so decoding a
+/// `0xFE` reference in a per-op task could race ahead of the `0xFD`
+/// define carried by an earlier (but not-yet-decoded) frame on a
+/// different op. Flattening here, against a reader-task-owned `cache`,
+/// makes the routed frames self-contained: per-op decoders never touch a
+/// shared cache and the race is structurally impossible.
+///
+/// `cache` is owned by the reader task and threaded across every frame on
+/// the connection. On any parse difficulty the frame payload is left
+/// untouched — the per-op decoder will then surface a precise error
+/// rather than this function masking it.
+///
+/// Invariant: only the reader task calls this, and exactly once per
+/// inbound application frame, in wire order.
+pub fn flatten_type_cache_markers(frame: &mut Frame, cache: &mut crate::pvdata::encode::TypeCache) {
+    let order = frame.header.flags.byte_order();
+    let Some(cmd) = Command::from_code(frame.header.command) else {
+        return;
+    };
+
+    // Descriptor count carried after `ioid + subcmd + status`:
+    //   0 — no descriptor (drop the frame through untouched)
+    //   1 — Get/Put/Monitor/Rpc/GetField introspection or Rpc data type
+    //   2 — PutGet INIT: putIF then getIF
+    let desc_count: u8 = match cmd {
+        Command::GetField => {
+            // ioid(4) + status + [type-desc] — no subcmd byte, unlike the
+            // op responses below. Mirrors `decode_get_field_response`,
+            // which reads `ioid` (u32, 4 bytes) then `Status`.
+            rewrite_after_status(frame, order, cache, 4, 1);
+            return;
+        }
+        Command::Get | Command::Put | Command::Monitor => {
+            let Some(subcmd) = peek_u8(&frame.payload, 4) else {
+                return;
+            };
+            // INIT phase carries the introspection; FINISH (0x10) does
+            // not; DATA phase carries no descriptor (uses INIT's type).
+            if subcmd & 0x08 != 0 && subcmd & 0x10 == 0 {
+                1
+            } else {
+                return;
+            }
+        }
+        Command::Rpc => {
+            let Some(subcmd) = peek_u8(&frame.payload, 4) else {
+                return;
+            };
+            if subcmd & 0x10 != 0 {
+                return; // FINISH/DESTROY
+            }
+            if subcmd & 0x08 != 0 {
+                return; // RPC INIT carries no type descriptor
+            }
+            1 // RPC data response: status + type + value
+        }
+        Command::PutGet => {
+            let Some(subcmd) = peek_u8(&frame.payload, 4) else {
+                return;
+            };
+            if subcmd & 0x08 != 0 && subcmd & 0x10 == 0 {
+                2 // PutGet INIT: putIF + getIF
+            } else {
+                return;
+            }
+        }
+        _ => return,
+    };
+
+    // ioid(4) + subcmd(1) + status, then `desc_count` descriptors.
+    rewrite_after_status(frame, order, cache, 5, desc_count);
+}
+
+/// Rewrite a frame whose layout is `prefix_len` fixed bytes, then a
+/// `Status`, then `desc_count` type descriptors, then an arbitrary tail.
+///
+/// The fixed prefix, the `Status` bytes, and the tail are copied
+/// verbatim; each descriptor is flattened through [`crate::pvdata::encode
+/// ::rewrite_type_desc_inline`]. On a failure status the descriptors are
+/// absent — the function detects this via the `Status` parse and leaves
+/// the (descriptor-free) frame untouched.
+fn rewrite_after_status(
+    frame: &mut Frame,
+    order: ByteOrder,
+    cache: &mut crate::pvdata::encode::TypeCache,
+    prefix_len: usize,
+    desc_count: u8,
+) {
+    if frame.payload.len() < prefix_len {
+        return;
+    }
+    let mut cur = Cursor::new(frame.payload.as_slice());
+    cur.set_position(prefix_len as u64);
+    let status = match Status::decode(&mut cur, order) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    // A non-success status has no trailing descriptor (mirrors the
+    // decoder fast-paths in `decode_op_response_cached`).
+    if !status.is_success() {
+        return;
+    }
+    let descs_start = cur.position() as usize;
+
+    // Flatten each descriptor in order, capturing where the descriptor
+    // region ends so the value tail can be copied verbatim.
+    let mut inline = Vec::new();
+    for _ in 0..desc_count {
+        if crate::pvdata::encode::rewrite_type_desc_inline(&mut cur, order, cache, &mut inline)
+            .is_err()
+        {
+            // Markers unresolved or malformed — leave the frame as-is so
+            // the per-op decoder surfaces the precise error.
+            return;
+        }
+    }
+    let descs_end = cur.position() as usize;
+
+    // Fast path: if the descriptor region already had no markers the
+    // flattened bytes are byte-identical; skip the realloc.
+    if inline.as_slice() == &frame.payload[descs_start..descs_end] {
+        return;
+    }
+
+    let mut rebuilt =
+        Vec::with_capacity(descs_start + inline.len() + (frame.payload.len() - descs_end));
+    rebuilt.extend_from_slice(&frame.payload[..descs_start]);
+    rebuilt.extend_from_slice(&inline);
+    rebuilt.extend_from_slice(&frame.payload[descs_end..]);
+    frame.header.payload_length = rebuilt.len() as u32;
+    frame.payload = rebuilt;
+}
+
+/// Read a single byte at `off` from a payload slice, `None` if short.
+fn peek_u8(payload: &[u8], off: usize) -> Option<u8> {
+    payload.get(off).copied()
+}
+
 // ─── GET_FIELD response ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -561,5 +756,349 @@ mod tests {
             }
             other => panic!("expected init, got {other:?}"),
         }
+    }
+
+    /// pvxs `conn.cpp:160` defense-in-depth: a server's read path must
+    /// reject inbound frames that have the `Server` direction bit set
+    /// (those originated from another server, not a client). And a
+    /// client's read path must reject frames with the bit clear.
+    /// `PeerRole::Either` skips the check (sniffers, mixed-mode tests).
+    #[test]
+    fn try_parse_frame_role_rejects_wrong_direction() {
+        // Build a header with Server flag SET (server-originated frame).
+        let order = ByteOrder::Little;
+        let header = PvaHeader::application(true, order, Command::CreateChannel.code(), 0);
+        let mut bytes = Vec::new();
+        header.write_into(&mut bytes);
+
+        // PeerRole::Either accepts either direction.
+        assert!(matches!(
+            try_parse_frame_role(&bytes, PeerRole::Either),
+            Ok(Some(_))
+        ));
+        // PeerRole::Client expects Server bit set — accepted here.
+        assert!(matches!(
+            try_parse_frame_role(&bytes, PeerRole::Client),
+            Ok(Some(_))
+        ));
+        // PeerRole::Server expects Server bit CLEAR — rejected.
+        let err = try_parse_frame_role(&bytes, PeerRole::Server).unwrap_err();
+        assert!(
+            matches!(err, PvaError::Protocol(_)),
+            "expected Protocol error, got {err:?}"
+        );
+
+        // Same payload but Server flag CLEAR.
+        let header2 = PvaHeader::application(false, order, Command::CreateChannel.code(), 0);
+        let mut bytes2 = Vec::new();
+        header2.write_into(&mut bytes2);
+        // PeerRole::Server expects Server bit clear — accepted here.
+        assert!(matches!(
+            try_parse_frame_role(&bytes2, PeerRole::Server),
+            Ok(Some(_))
+        ));
+        // PeerRole::Client expects Server bit SET — rejected.
+        let err = try_parse_frame_role(&bytes2, PeerRole::Client).unwrap_err();
+        assert!(
+            matches!(err, PvaError::Protocol(_)),
+            "expected Protocol error, got {err:?}"
+        );
+    }
+
+    /// Build a Get INIT frame whose introspection is encoded against
+    /// `enc_cache` — so the first such frame emits a `0xFD` define and
+    /// later ones a `0xFE` reference.
+    fn build_get_init_frame(
+        order: ByteOrder,
+        ioid: u32,
+        desc: &FieldDesc,
+        enc_cache: &mut crate::pvdata::encode::EncodeTypeCache,
+    ) -> Frame {
+        use crate::proto::WriteExt;
+        let mut payload = Vec::new();
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x08); // subcmd = INIT
+        Status::ok().write_into(order, &mut payload);
+        crate::pvdata::encode::encode_type_desc_cached(desc, order, enc_cache, &mut payload);
+        let header = PvaHeader::application(true, order, Command::Get.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    /// BUG 2 regression. A server with the type cache enabled emits the
+    /// introspection once as a `0xFD` define and then as `0xFE`
+    /// references. The per-op tasks decode frames in arbitrary order, so
+    /// if a `0xFE` frame is decoded before its `0xFD` frame the lookup
+    /// misses. `flatten_type_cache_markers` resolves markers in the
+    /// reader task (strict wire order) so the routed frames are
+    /// self-contained and decode correctly regardless of op order.
+    #[test]
+    fn type_cache_reference_decodes_before_define_after_flatten() {
+        use crate::pvdata::ScalarType;
+
+        let order = ByteOrder::Little;
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+            ],
+        };
+
+        // Frame A (ioid 1): server's first emission — carries 0xFD define.
+        // Frame B (ioid 2): same type — carries 0xFE reference.
+        let mut enc_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let mut frame_a = build_get_init_frame(order, 1, &intro, &mut enc_cache);
+        let mut frame_b = build_get_init_frame(order, 2, &intro, &mut enc_cache);
+
+        // Sanity: B really did emit a 0xFE reference (cache marker).
+        assert_eq!(
+            frame_b.payload[6], 0xFE,
+            "expected 0xFE type-cache reference in frame B"
+        );
+        assert_eq!(
+            frame_a.payload[6], 0xFD,
+            "expected 0xFD type-cache define in frame A"
+        );
+
+        // Reader task flattens both frames in strict WIRE order: A then B.
+        let mut reader_cache = crate::pvdata::encode::TypeCache::new();
+        flatten_type_cache_markers(&mut frame_a, &mut reader_cache);
+        flatten_type_cache_markers(&mut frame_b, &mut reader_cache);
+
+        // After flattening neither frame carries a marker — both are
+        // self-contained inline descriptors.
+        assert_ne!(frame_a.payload[6], 0xFD);
+        assert_ne!(frame_a.payload[6], 0xFE);
+        assert_ne!(frame_b.payload[6], 0xFD);
+        assert_ne!(frame_b.payload[6], 0xFE);
+        assert_eq!(
+            frame_a.header.payload_length as usize,
+            frame_a.payload.len()
+        );
+        assert_eq!(
+            frame_b.header.payload_length as usize,
+            frame_b.payload.len()
+        );
+
+        // Per-op tasks decode in REVERSE order (B before A) with empty
+        // caches — the cross-op race condition. Both must still decode.
+        let decode = |f: &Frame| {
+            let mut empty = crate::pvdata::encode::TypeCache::new();
+            decode_op_response_cached(f, None, &mut empty)
+        };
+        for (label, f) in [("B (was 0xFE)", &frame_b), ("A (was 0xFD)", &frame_a)] {
+            match decode(f).unwrap_or_else(|e| panic!("decode {label} failed: {e}")) {
+                OpResponse::Init(init) => match init.introspection {
+                    FieldDesc::Structure { struct_id, fields } => {
+                        assert_eq!(struct_id, "epics:nt/NTScalar:1.0", "{label}");
+                        assert_eq!(fields.len(), 2, "{label}");
+                    }
+                    other => panic!("{label}: expected structure, got {other:?}"),
+                },
+                other => panic!("{label}: expected init, got {other:?}"),
+            }
+        }
+    }
+
+    /// A frame with no type-cache markers — i.e. the introspection
+    /// encoded inline, as a server with the type cache disabled emits —
+    /// must pass through `flatten_type_cache_markers` byte-identically
+    /// (fast path).
+    #[test]
+    fn flatten_leaves_marker_free_frame_unchanged() {
+        use crate::proto::WriteExt;
+        use crate::pvdata::ScalarType;
+
+        let order = ByteOrder::Little;
+        let intro = FieldDesc::Structure {
+            struct_id: "s".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        // Inline (marker-free) encoding — the wire form a server emits
+        // with the type cache disabled.
+        let mut payload = Vec::new();
+        payload.put_u32(7, order); // ioid
+        payload.put_u8(0x08); // subcmd = INIT
+        Status::ok().write_into(order, &mut payload);
+        crate::pvdata::encode::encode_type_desc(&intro, order, &mut payload);
+        let header = PvaHeader::application(true, order, Command::Get.code(), payload.len() as u32);
+        let mut frame = Frame {
+            header,
+            payload: payload.clone(),
+        };
+
+        let mut reader_cache = crate::pvdata::encode::TypeCache::new();
+        flatten_type_cache_markers(&mut frame, &mut reader_cache);
+        assert_eq!(
+            frame.payload, payload,
+            "marker-free frame must be unchanged"
+        );
+    }
+
+    /// Build a GetField response frame whose type descriptor is encoded
+    /// against `enc_cache` — first such frame emits a `0xFD` define, later
+    /// ones a `0xFE` reference. GetField wire layout is `ioid(4) + Status
+    /// + type-desc`: no subcmd byte, unlike the op responses.
+    fn build_get_field_frame(
+        order: ByteOrder,
+        ioid: u32,
+        desc: &FieldDesc,
+        enc_cache: &mut crate::pvdata::encode::EncodeTypeCache,
+    ) -> Frame {
+        use crate::proto::WriteExt;
+        let mut payload = Vec::new();
+        payload.put_u32(ioid, order); // ioid
+        Status::ok().write_into(order, &mut payload);
+        crate::pvdata::encode::encode_type_desc_cached(desc, order, enc_cache, &mut payload);
+        let header =
+            PvaHeader::application(true, order, Command::GetField.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    /// Regression: a GetField response carrying a `0xFE` type-cache
+    /// reference must be flattened correctly. The GetField arm of
+    /// `flatten_type_cache_markers` used `prefix_len = 0`, so
+    /// `rewrite_after_status` parsed the first byte of the `ioid` u32 as
+    /// the Status kind byte — the `0xFE` reference was never resolved and
+    /// `decode_get_field_response` hit a 0xFE slot miss. The correct
+    /// prefix is `4` (ioid only; GetField has no subcmd byte).
+    #[test]
+    fn flatten_resolves_get_field_type_cache_reference() {
+        use crate::pvdata::ScalarType;
+
+        let order = ByteOrder::Little;
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+            ],
+        };
+
+        // Frame A (ioid 1): server's first emission — carries 0xFD define.
+        // Frame B (ioid 2): same type — carries 0xFE reference.
+        let mut enc_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let mut frame_a = build_get_field_frame(order, 1, &intro, &mut enc_cache);
+        let mut frame_b = build_get_field_frame(order, 2, &intro, &mut enc_cache);
+
+        // Sanity: the type descriptor starts right after `ioid(4) +
+        // Status`. `Status::ok()` (OkNoMsg) is a single 0xFF byte, so the
+        // descriptor's first byte is at payload offset 5.
+        assert_eq!(
+            frame_a.payload[5], 0xFD,
+            "expected 0xFD type-cache define in frame A"
+        );
+        assert_eq!(
+            frame_b.payload[5], 0xFE,
+            "expected 0xFE type-cache reference in frame B"
+        );
+
+        // Reader task flattens both frames in strict WIRE order: A then B.
+        let mut reader_cache = crate::pvdata::encode::TypeCache::new();
+        flatten_type_cache_markers(&mut frame_a, &mut reader_cache);
+        flatten_type_cache_markers(&mut frame_b, &mut reader_cache);
+
+        // After flattening neither frame carries a marker.
+        assert_ne!(frame_a.payload[5], 0xFD);
+        assert_ne!(frame_a.payload[5], 0xFE);
+        assert_ne!(frame_b.payload[5], 0xFD);
+        assert_ne!(frame_b.payload[5], 0xFE);
+        assert_eq!(
+            frame_a.header.payload_length as usize,
+            frame_a.payload.len()
+        );
+        assert_eq!(
+            frame_b.header.payload_length as usize,
+            frame_b.payload.len()
+        );
+
+        // Per-op tasks decode in REVERSE wire order (B before A): the
+        // reference-before-define race. Both must still decode.
+        for (label, f) in [("B (was 0xFE)", &frame_b), ("A (was 0xFD)", &frame_a)] {
+            let resp = decode_get_field_response(f)
+                .unwrap_or_else(|e| panic!("decode {label} failed: {e}"));
+            assert_eq!(
+                resp.ioid,
+                if label.starts_with('B') { 2 } else { 1 },
+                "{label}"
+            );
+            assert_eq!(resp.status, Status::OkNoMsg, "{label}");
+            match resp.introspection {
+                Some(FieldDesc::Structure { struct_id, fields }) => {
+                    assert_eq!(struct_id, "epics:nt/NTScalar:1.0", "{label}");
+                    assert_eq!(fields.len(), 2, "{label}");
+                }
+                other => panic!("{label}: expected structure introspection, got {other:?}"),
+            }
+        }
+    }
+
+    /// A marker-free GetField response (server with the type cache
+    /// disabled) must pass through `flatten_type_cache_markers`
+    /// byte-identically.
+    #[test]
+    fn flatten_leaves_marker_free_get_field_frame_unchanged() {
+        use crate::proto::WriteExt;
+        use crate::pvdata::ScalarType;
+
+        let order = ByteOrder::Little;
+        let intro = FieldDesc::Structure {
+            struct_id: "s".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let mut payload = Vec::new();
+        payload.put_u32(7, order); // ioid
+        Status::ok().write_into(order, &mut payload);
+        crate::pvdata::encode::encode_type_desc(&intro, order, &mut payload);
+        let header =
+            PvaHeader::application(true, order, Command::GetField.code(), payload.len() as u32);
+        let mut frame = Frame {
+            header,
+            payload: payload.clone(),
+        };
+
+        let mut reader_cache = crate::pvdata::encode::TypeCache::new();
+        flatten_type_cache_markers(&mut frame, &mut reader_cache);
+        assert_eq!(
+            frame.payload, payload,
+            "marker-free GetField frame must be unchanged"
+        );
+        // And it still decodes.
+        let resp = decode_get_field_response(&frame).unwrap();
+        assert_eq!(resp.ioid, 7);
+        assert!(resp.introspection.is_some());
+    }
+
+    /// A failure-status INIT frame carries no descriptor; flattening must
+    /// leave it untouched and not error.
+    #[test]
+    fn flatten_skips_failure_status_frame() {
+        use crate::proto::WriteExt;
+
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(5, order);
+        payload.put_u8(0x08); // INIT
+        Status::error("boom").write_into(order, &mut payload);
+        let header = PvaHeader::application(true, order, Command::Get.code(), payload.len() as u32);
+        let mut frame = Frame {
+            header,
+            payload: payload.clone(),
+        };
+        let mut reader_cache = crate::pvdata::encode::TypeCache::new();
+        flatten_type_cache_markers(&mut frame, &mut reader_cache);
+        assert_eq!(frame.payload, payload);
     }
 }

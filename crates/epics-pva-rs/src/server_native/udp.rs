@@ -681,11 +681,22 @@ async fn process_search_datagram(
 
                 let mut matched_cids: Vec<u32> = Vec::with_capacity(req.queries.len());
                 for (cid, name) in &req.queries {
-                    if source.has_pv(name).await {
+                    // `searchable` (not `has_pv`): a name hosted only
+                    // by a non-search-advertised source — the built-in
+                    // `ServerInfoSource` / `server` PV — must not be
+                    // answered to a broadcast SEARCH. Direct TCP
+                    // connect still resolves it via `has_pv`.
+                    if source.searchable(name).await {
                         matched_cids.push(*cid);
                     }
                 }
-                if !matched_cids.is_empty() {
+                // pvxs `server.cpp:730-732`: when `nreply==0` AND the
+                // SEARCH header did not set `MustReply`, drop the
+                // SEARCH silently. Honouring `MustReply` even with
+                // `nreply==0` is what lets `pvlist` build its server
+                // list — without this, our server stays invisible to
+                // discovery probes.
+                if !matched_cids.is_empty() || req.must_reply {
                     let resp = build_search_response_proto(
                         guid,
                         req.seq,
@@ -845,11 +856,18 @@ async fn process_v6_search_datagram(
                 let reply_dest = udp_src;
                 let mut matched_cids: Vec<u32> = Vec::with_capacity(req.queries.len());
                 for (cid, name) in &req.queries {
-                    if source.has_pv(name).await {
+                    // `searchable` (not `has_pv`): non-search-advertised
+                    // built-in sources (the `server` PV) must stay
+                    // unanswered on broadcast SEARCH. See the v4 path.
+                    if source.searchable(name).await {
                         matched_cids.push(*cid);
                     }
                 }
-                if !matched_cids.is_empty() {
+                // pvxs `server.cpp:730-732` (also reached for v6
+                // SEARCH via the same handler): honour `MustReply`
+                // with an empty (`found=0`, `nreply=0`) response so
+                // pvlist-style discovery sees the server.
+                if !matched_cids.is_empty() || req.must_reply {
                     let resp = build_search_response_proto(
                         guid,
                         req.seq,
@@ -876,7 +894,14 @@ async fn process_v6_search_datagram(
     }
 }
 
-/// Build a (one-PV) SEARCH_RESPONSE frame with explicit protocol name.
+/// Build a SEARCH_RESPONSE frame with explicit protocol name.
+///
+/// pvxs `server.cpp:743-746`: when `nreply==0`, the `found` byte is set to
+/// `0` (clients see "this server has none of those names" rather than
+/// "this server has empty matches"). When `cids` is empty the response is
+/// still a valid frame — used as an answer to `MustReply`-flagged
+/// SEARCHes (pvlist-style discovery probes) so the requester can build
+/// its server list.
 fn build_search_response_proto(
     guid: [u8; 12],
     seq: u32,
@@ -892,7 +917,7 @@ fn build_search_response_proto(
     payload.extend_from_slice(&addr);
     payload.put_u16(tcp_port, order);
     encode_string_into(protocol, order, &mut payload);
-    payload.put_u8(1); // found
+    payload.put_u8(if cids.is_empty() { 0 } else { 1 }); // found
     payload.put_u16(cids.len() as u16, order);
     for &cid in cids {
         payload.put_u32(cid, order);
@@ -961,6 +986,12 @@ struct SearchRequest {
     /// that the forwarder must clear before relaying via the loopback
     /// ORIGIN_TAG channel (`udp_collector.cpp:391`).
     unicast: bool,
+    /// True when the SEARCH header had the `MustReply` flag (`0x01`,
+    /// `pva_search_flags::MustReply`) set — pvlist-style discovery
+    /// probes set this so every reachable server answers even with
+    /// `nreply==0`. pvxs honours it at `server.cpp:730-732`
+    /// (`if(nreply==0 && !msg.mustReply) return;`).
+    must_reply: bool,
     /// Total bytes consumed from the input slice (header + payload),
     /// used by the multi-message drain loop to advance to the next
     /// chained message in the same datagram.
@@ -1005,6 +1036,10 @@ fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     let seq = p.get_u32(order).ok()?;
     let flags = p.get_u8().ok()?;
     let unicast = flags & 0x80 != 0;
+    // `pva_search_flags::MustReply = 0x01`. pvxs `udp_collector.cpp:363`
+    // mirrors the field into `SearchMsg::mustReply`; pvlist relies on
+    // this to enumerate reachable servers regardless of name matches.
+    let must_reply = flags & 0x01 != 0;
     let _ = p.get_bytes(3).ok()?;
     let addr_bytes = p.get_bytes(16).ok()?;
     let mut addr16 = [0u8; 16];
@@ -1041,6 +1076,7 @@ fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
         reply_addr,
         reply_port,
         unicast,
+        must_reply,
         consumed: PvaHeader::SIZE + payload_len,
     })
 }
@@ -1361,6 +1397,84 @@ mod tests {
         );
     }
 
+    /// F6: a UDP SEARCH for the built-in `server` PV MUST NOT be
+    /// answered — pvxs `ServerSource::onSearch` is empty so `server`
+    /// resolves only by direct TCP connect, never by broadcast
+    /// discovery. The built-in `ServerInfoSource::searchable` returns
+    /// `false`, so `process_search_datagram` adds no matched CID and
+    /// (with `must_reply=false`) emits nothing. The same source's
+    /// `get_value("server")` — the direct-connect GET path — still
+    /// returns the server-info structure.
+    #[tokio::test]
+    async fn server_pv_not_answered_to_udp_search_but_direct_get_works() {
+        use crate::server_native::peers::PeerRegistry;
+        use crate::server_native::server_info::{SERVER_PV_NAME, ServerInfoSource};
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let peers = PeerRegistry::new();
+        let server_src =
+            ServerInfoSource::new([0xCD; 12], peers, || async { Vec::<String>::new() });
+
+        // Direct-connect path still resolves `server`.
+        assert!(
+            server_src.has_pv(SERVER_PV_NAME).await,
+            "has_pv must still resolve `server` for direct TCP connect"
+        );
+        assert!(
+            !server_src.searchable(SERVER_PV_NAME).await,
+            "`server` must NOT be UDP-search-advertised"
+        );
+        assert!(
+            server_src.get_value(SERVER_PV_NAME).await.is_some(),
+            "direct GET of `server` must still return the info structure"
+        );
+
+        // UDP search path: a broadcast SEARCH naming `server` must
+        // produce no reply on the sniffer socket.
+        let source: DynSource = Arc::new(server_src);
+        let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        let sniffer = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("sniffer bind");
+        let sniffer_addr = sniffer.local_addr().unwrap();
+
+        // Non-unicast SEARCH (no MustReply) for the literal name
+        // `server`, reply addr = the sniffer socket.
+        let codec = PvaCodec { big_endian: false };
+        let frame = codec.build_search(
+            7,
+            42,
+            SERVER_PV_NAME,
+            [127, 0, 0, 1],
+            sniffer_addr.port(),
+            false,
+        );
+
+        process_search_datagram(
+            &source,
+            &socket,
+            None,
+            5076,
+            &frame,
+            sniffer_addr,
+            Ipv4Addr::LOCALHOST,
+            Origin::Direct,
+            5076,
+            [0u8; 12],
+            "tcp",
+        )
+        .await;
+
+        let mut buf = [0u8; 4096];
+        let r = tokio::time::timeout(Duration::from_millis(200), sniffer.recv_from(&mut buf)).await;
+        assert!(
+            r.is_err(),
+            "UDP SEARCH for `server` must NOT be answered; sniffer got {r:?}"
+        );
+    }
+
     /// `try_build_forward_frame` rewrites the first SEARCH's reply
     /// addr + port with the resolved destination AND clears the
     /// Unicast flag (pvxs `udp_collector.cpp:387-396`). Returns
@@ -1522,5 +1636,56 @@ mod tests {
         );
 
         task.abort();
+    }
+
+    /// pvxs `udp_collector.cpp:363`: `mustReply = flags & pva_search_flags::
+    /// MustReply`. The `MustReply` bit (`0x01`) and the `Unicast` bit
+    /// (`0x80`) live in the same flags byte and are extracted by the
+    /// parser; previously only `Unicast` survived the round trip.
+    #[test]
+    fn parse_search_extracts_must_reply_flag() {
+        let codec = PvaCodec { big_endian: false };
+        // build_discover_search sets flags = 0x01 (MustReply only).
+        let frame = codec.build_discover_search(7, 9999);
+        let req = parse_search_request(&frame).expect("discover SEARCH parses");
+        assert!(
+            req.must_reply,
+            "MustReply flag (0x01) must be extracted into SearchRequest"
+        );
+        assert!(!req.unicast, "Unicast flag (0x80) should be clear");
+
+        // Plain non-must-reply unicast SEARCH (flags = 0x80) keeps both
+        // bits independent.
+        let frame2 = codec.build_search(1, 7, "MY:PV", [0, 0, 0, 0], 5076, true);
+        let req2 = parse_search_request(&frame2).expect("plain SEARCH parses");
+        assert!(req2.unicast);
+        assert!(!req2.must_reply);
+    }
+
+    /// pvxs `server.cpp:743-744`: when `nreply==0` the `found` byte is
+    /// `0`, not `1`. Building a response with an empty CID slice must
+    /// emit `found=0` so a MustReply discovery probe sees the correct
+    /// shape and counts our server as reachable-but-no-match.
+    #[test]
+    fn search_response_empty_cids_emits_found_zero() {
+        let guid = [0x55u8; 12];
+        let bytes = build_search_response_proto(guid, 42, 5075, &[], ByteOrder::Little, "tcp");
+        // Header (8) + GUID (12) + seq (4) + addr16 (16) + port (2) +
+        // size(1)+"tcp"(3) = offset 46 for the `found` byte.
+        let found_off = PvaHeader::SIZE + 12 + 4 + 16 + 2 + 1 + 3;
+        assert_eq!(
+            bytes[found_off], 0,
+            "found byte must be 0 when no CIDs claimed (pvxs nreply==0 path)"
+        );
+        // nreply u16 immediately follows; must also be 0.
+        assert_eq!(
+            u16::from_le_bytes([bytes[found_off + 1], bytes[found_off + 2]]),
+            0,
+            "nreply must be 0 alongside found=0"
+        );
+
+        // Sanity check: non-empty CIDs still emit found=1.
+        let bytes2 = build_search_response_proto(guid, 42, 5075, &[7u32], ByteOrder::Little, "tcp");
+        assert_eq!(bytes2[found_off], 1, "found must be 1 when CIDs present");
     }
 }

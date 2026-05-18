@@ -620,6 +620,7 @@ mod tests {
             account: account.to_string(),
             method: method.to_string(),
             host: host.to_string(),
+            authority: String::new(),
         }
     }
 

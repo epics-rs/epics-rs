@@ -8,7 +8,22 @@ use std::sync::{Arc, Mutex};
 
 use super::channel::{NDArrayOutput, NDArraySender};
 
-/// Instance-scoped registry: port name -> shared NDArrayOutput.
+/// Resolve a `(port, addr)` pair to a `WiringRegistry` key (G6).
+///
+/// Address 0 keys on the bare port name (the common single-address case);
+/// a non-zero address appends `:<addr>` so a multi-address driver can
+/// register a distinct output per source address. C++ `NDArrayPort` +
+/// `NDArrayAddr` together identify the upstream callback source; this key
+/// is the Rust equivalent of that pair.
+pub fn upstream_key(port: &str, addr: i32) -> String {
+    if port.is_empty() || addr == 0 {
+        port.to_string()
+    } else {
+        format!("{port}:{addr}")
+    }
+}
+
+/// Instance-scoped registry: `(port, addr)` key -> shared NDArrayOutput.
 ///
 /// Owned by `PluginManager` as `Arc<WiringRegistry>`, enabling test isolation
 /// (each test can create its own registry without port name collisions).
@@ -23,13 +38,34 @@ impl WiringRegistry {
         }
     }
 
-    /// Register a port's output in the wiring registry.
+    /// Register a port's output under the bare port name (addr 0).
+    ///
+    /// Equivalent to `register_output_addrs(port_name, 1, output)`.
     pub fn register_output(&self, port_name: &str, output: Arc<parking_lot::Mutex<NDArrayOutput>>) {
-        let mut reg = self.inner.lock().unwrap();
-        reg.insert(port_name.to_string(), output);
+        self.register_output_addrs(port_name, 1, output);
     }
 
-    /// Look up a port's output by name.
+    /// Register a port's single output under every address it serves (G6).
+    ///
+    /// A plugin runtime has one `NDArrayOutput` but a multi-address port
+    /// (`max_addr > 1`) must be selectable at any `NDArrayAddr` in
+    /// `0..max_addr`. The same output is registered under `upstream_key(port,
+    /// addr)` for each address, so a downstream plugin selecting a non-zero
+    /// `NDArrayAddr` resolves to the same broadcast point — matching the
+    /// single-output-per-port model. `max_addr` is clamped to at least 1.
+    pub fn register_output_addrs(
+        &self,
+        port_name: &str,
+        max_addr: usize,
+        output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    ) {
+        let mut reg = self.inner.lock().unwrap();
+        for addr in 0..max_addr.max(1) {
+            reg.insert(upstream_key(port_name, addr as i32), output.clone());
+        }
+    }
+
+    /// Look up a port's output by `(port, addr)` key.
     pub fn lookup_output(&self, port_name: &str) -> Option<Arc<parking_lot::Mutex<NDArrayOutput>>> {
         let reg = self.inner.lock().ok()?;
         reg.get(port_name).cloned()
@@ -161,6 +197,26 @@ mod tests {
         let found = registry.lookup_output("DRV1");
         assert!(found.is_some());
         assert!(registry.lookup_output("NONEXISTENT").is_none());
+    }
+
+    #[test]
+    fn test_register_multi_addr() {
+        // G6: a max_addr=3 port is registered under "P", "P:1", "P:2".
+        let registry = WiringRegistry::new();
+        let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
+        registry.register_output_addrs("P", 3, output.clone());
+
+        assert!(registry.lookup_output("P").is_some());
+        assert!(registry.lookup_output(&upstream_key("P", 1)).is_some());
+        assert!(registry.lookup_output(&upstream_key("P", 2)).is_some());
+        assert!(registry.lookup_output(&upstream_key("P", 3)).is_none());
+
+        // All addresses resolve to the same underlying output.
+        let (sender, _rx) = ndarray_channel("CONSUMER", 10);
+        registry
+            .rewire(&sender, "", &upstream_key("P", 2))
+            .expect("rewire to addr 2 must succeed");
+        assert_eq!(output.lock().num_senders(), 1);
     }
 
     #[test]

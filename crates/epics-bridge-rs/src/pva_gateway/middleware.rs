@@ -5,7 +5,9 @@
 //! composable [`Layer`]s that add cross-cutting concerns:
 //!
 //! - [`AclLayer`] — refuse `has_pv` / `put_value` for PV names that
-//!   match the deny list
+//!   match the deny list. Patterns may be glob (`*` wildcard) or,
+//!   via [`AclConfig::deny_regex`] / [`AclConfig::allow_regex`],
+//!   full anchored regular expressions (B7).
 //! - [`ReadOnlyLayer`] — fail every PUT, even if upstream allows
 //!   it. Mirrors the existing `read_only` flag but as a composable
 //!   layer so operators can stack it with audit / ACL.
@@ -85,6 +87,41 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Result<(), String> {
         Err("read-only mode: PUT rejected".into())
     }
+    // A BitSet-delta PUT is still a PUT. Reject it here exactly the
+    // way `put_value_checked` does — without this override the trait
+    // default would run get_value + merge + put_value_checked, which
+    // happens to still reject (put_value_checked above), but only
+    // after a wasted read-merge and after bypassing the inner
+    // source's atomic `put_delta_checked`. Short-circuit instead.
+    async fn put_delta_checked(
+        &self,
+        _checked: epics_pva_rs::server_native::source::AccessChecked,
+        _desc: FieldDesc,
+        _changed: epics_pva_rs::proto::BitSet,
+        _delta: PvField,
+        _ctx: ChannelContext,
+    ) -> Result<(), String> {
+        Err("read-only mode: PUT rejected".into())
+    }
+    // PROCESS mutates upstream record state — it is a WRITE-class op,
+    // so reject it here exactly the way `put_value` does. Without this
+    // override the trait-default `process` (`Ok(())`) would falsely
+    // report success and let a PROCESS slip past read-only mode.
+    async fn process(&self, _name: &str) -> Result<(), String> {
+        Err("read-only mode: PROCESS rejected".into())
+    }
+    // Typed PROCESS — same WRITE-class rejection as `process` above.
+    // Without this override the trait-default `process_checked` would
+    // fall through to `process` (rejected) but only after the gate
+    // check; short-circuit here so a PROCESS never reaches the inner
+    // source under read-only mode.
+    async fn process_checked(
+        &self,
+        _checked: epics_pva_rs::server_native::source::AccessChecked,
+        _ctx: ChannelContext,
+    ) -> Result<(), String> {
+        Err("read-only mode: PROCESS rejected".into())
+    }
     async fn is_writable(&self, _name: &str) -> bool {
         false
     }
@@ -149,31 +186,109 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
 
 // ── AclLayer ─────────────────────────────────────────────────────
 
-/// Pattern-matched access control. PV names matching any entry in
-/// `deny` are rejected at the layer before reaching the upstream
+/// Pattern-matched access control. PV names matching any `deny`
+/// pattern are rejected at the layer before reaching the upstream
 /// proxy. `allow_only` (when non-empty) flips the policy — only
 /// names matching one of these patterns get through.
 ///
-/// Patterns are simple glob-style — `*` matches any chars, exact
-/// match otherwise. For full regex see the per-rule `pvlist` system
-/// in the CA gateway; here we keep the surface minimal.
+/// B7: two pattern syntaxes are supported and may be mixed freely.
+///
+/// * **Glob** — the `deny` / `allow_only` `Vec<String>` fields.
+///   `*` matches any run of characters; a pattern with no `*` is an
+///   exact match. Backward-compatible with the original AclConfig.
+/// * **Regex** — added via [`AclConfig::deny_regex`] /
+///   [`AclConfig::allow_regex`]. The pattern is a full
+///   [`regex`]-crate regular expression, **anchored** at both ends
+///   (the matcher wraps it as `^(?:pattern)$`) so `BL10C:.*`
+///   matches the same names a `BL10C:*` glob would, and a bare
+///   `MOTOR:VAL` regex matches only that exact name. Regexes are
+///   compiled once at config-build time, not per PV check.
+///
+/// A name is allowed iff it matches **no** deny pattern (glob or
+/// regex) AND, when any allow pattern is configured, matches **at
+/// least one** allow pattern (glob or regex). Deny always wins.
 #[derive(Clone, Default)]
 pub struct AclConfig {
+    /// Glob deny patterns (`*` wildcard / exact match).
     pub deny: Vec<String>,
+    /// Glob allow-only patterns (`*` wildcard / exact match).
     pub allow_only: Vec<String>,
+    /// B7: compiled regex deny patterns. Built via
+    /// [`AclConfig::deny_regex`]; anchored at both ends.
+    deny_re: Vec<regex::Regex>,
+    /// B7: compiled regex allow-only patterns. Built via
+    /// [`AclConfig::allow_regex`]; anchored at both ends.
+    allow_re: Vec<regex::Regex>,
 }
 
 impl AclConfig {
+    /// B7: add a regex pattern to the deny list. The pattern is
+    /// anchored (`^(?:pattern)$`) and compiled immediately; an
+    /// invalid pattern returns the [`regex::Error`] so the operator
+    /// learns about the typo at config time, not on the first PV
+    /// check.
+    pub fn deny_regex(mut self, pattern: &str) -> Result<Self, regex::Error> {
+        self.deny_re.push(compile_anchored(pattern)?);
+        Ok(self)
+    }
+
+    /// B7: add a regex pattern to the allow-only list. Anchored and
+    /// compiled like [`Self::deny_regex`]. As with glob
+    /// `allow_only`, a non-empty allow list flips the policy to
+    /// default-deny.
+    pub fn allow_regex(mut self, pattern: &str) -> Result<Self, regex::Error> {
+        self.allow_re.push(compile_anchored(pattern)?);
+        Ok(self)
+    }
+
+    /// True iff any allow pattern (glob or regex) is configured —
+    /// i.e. the policy is default-deny.
+    fn has_allow_list(&self) -> bool {
+        !self.allow_only.is_empty() || !self.allow_re.is_empty()
+    }
+
     pub fn allowed(&self, name: &str) -> bool {
-        if self.deny.iter().any(|p| matches_pattern(p, name)) {
-            return false;
-        }
-        if !self.allow_only.is_empty() && !self.allow_only.iter().any(|p| matches_pattern(p, name))
+        // Deny always wins — glob or regex.
+        if self.deny.iter().any(|p| matches_pattern(p, name))
+            || self.deny_re.iter().any(|re| re.is_match(name))
         {
             return false;
         }
+        // Allow-only: when configured, the name must match at least
+        // one allow pattern (glob or regex).
+        if self.has_allow_list() {
+            let allowed = self.allow_only.iter().any(|p| matches_pattern(p, name))
+                || self.allow_re.iter().any(|re| re.is_match(name));
+            if !allowed {
+                return false;
+            }
+        }
         true
     }
+}
+
+/// B7: per-pattern compiled-program size limit for operator-supplied
+/// ACL regexes. 256 KiB is far more than any realistic PV-name
+/// pattern needs (a generous allow/deny list compiles to a few KiB)
+/// while still rejecting a pathological pattern up front instead of
+/// letting it consume unbounded memory at compile time.
+const ACL_REGEX_SIZE_LIMIT: usize = 256 * 1024;
+
+/// B7: compile `pattern` as a both-ends-anchored regex so a regex
+/// ACL entry matches whole PV names, mirroring glob semantics
+/// (`BL10C:*` ≡ `BL10C:.*`, bare token ≡ exact match). Wrapping in a
+/// non-capturing group keeps top-level alternation (`a|b`) anchored
+/// as `^(?:a|b)$` rather than `^a|b$`.
+///
+/// Compiled via [`regex::RegexBuilder`] with explicit `size_limit`
+/// and `dfa_size_limit` so an operator-supplied pathological pattern
+/// fails fast with a bounded `regex::Error` rather than compiling
+/// with the crate defaults (which allow far larger programs).
+fn compile_anchored(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(&format!("^(?:{pattern})$"))
+        .size_limit(ACL_REGEX_SIZE_LIMIT)
+        .dfa_size_limit(ACL_REGEX_SIZE_LIMIT)
+        .build()
 }
 
 fn matches_pattern(pattern: &str, name: &str) -> bool {
@@ -243,6 +358,16 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.put_value(name, value).await
     }
+    // PROCESS mutates upstream record state — a WRITE-class op. Gate
+    // it by the layer's static allowlist BEFORE forwarding, exactly
+    // the way `put_value` is gated. Without this override the trait
+    // default `process` (`Ok(())`) bypasses the ACL entirely.
+    async fn process(&self, name: &str) -> Result<(), String> {
+        if !self.config.allowed(name) {
+            return Err(format!("ACL: PV '{name}' denied"));
+        }
+        self.inner.process(name).await
+    }
     // Round 43: type-state op variants gate by the layer's static
     // allowlist BEFORE delegating. The inner source still gets the
     // full AccessChecked + ctx and may apply its own ACF / per-
@@ -270,6 +395,28 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
             return Err(format!("ACL: PV '{}' denied", checked.pv_name()));
         }
         self.inner.put_value_checked(checked, value, ctx).await
+    }
+    // A BitSet-delta PUT is a PUT — gate it by the same static
+    // allowlist as `put_value_checked`, then forward to the inner's
+    // `put_delta_checked`. Without this override the trait default
+    // would run get_value + merge + put_value_checked on THIS layer,
+    // bypassing the inner source's atomic `put_delta_checked`
+    // (`SharedSource` / `CompositeSource` merge under one lock) and
+    // re-opening the concurrent-partial-PUT lost-update window.
+    async fn put_delta_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        desc: FieldDesc,
+        changed: epics_pva_rs::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> Result<(), String> {
+        if !self.config.allowed(checked.pv_name()) {
+            return Err(format!("ACL: PV '{}' denied", checked.pv_name()));
+        }
+        self.inner
+            .put_delta_checked(checked, desc, changed, delta, ctx)
+            .await
     }
     async fn is_writable(&self, name: &str) -> bool {
         self.config.allowed(name) && self.inner.is_writable(name).await
@@ -331,6 +478,20 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
             .rpc_checked(checked, request_desc, request_value, ctx)
             .await
     }
+    // Typed PROCESS — gate by the static allowlist BEFORE forwarding,
+    // mirroring `rpc_checked` / `put_value_checked`. The inner source
+    // still gets the full AccessChecked + ctx and may apply its own
+    // ACF gate (PROCESS is WRITE-class) on top.
+    async fn process_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Result<(), String> {
+        if !self.config.allowed(checked.pv_name()) {
+            return Err(format!("ACL: PV '{}' denied", checked.pv_name()));
+        }
+        self.inner.process_checked(checked, ctx).await
+    }
     fn notify_watermark_high(&self, name: &str) {
         self.inner.notify_watermark_high(name);
     }
@@ -365,6 +526,16 @@ pub struct NoopAudit;
 
 impl AuditSink for NoopAudit {
     fn record(&self, _event: AuditEvent) {}
+}
+
+/// Forward through a shared / type-erased sink. Lets a config carry an
+/// `Arc<dyn AuditSink>` (the gateway's audit-sink plumbing) and still
+/// satisfy `AuditLayer::new`'s concrete `A: AuditSink` bound. Covers
+/// both `Arc<ConcreteSink>` and `Arc<dyn AuditSink>`.
+impl<A: AuditSink + ?Sized> AuditSink for Arc<A> {
+    fn record(&self, event: AuditEvent) {
+        (**self).record(event);
+    }
 }
 
 /// Boxed-closure audit sink — convenient for inline tests +
@@ -477,6 +648,10 @@ pub enum AuditEventKind {
     Subscribe,
     /// RPC dispatch.
     Rpc,
+    /// PROCESS operation (PVA wire cmd 16) — record-state mutation
+    /// without a value payload. WRITE-class for ACF, always audited
+    /// alongside PUT.
+    Process,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,6 +828,61 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         let result = self.inner.put_value_checked(checked, value, ctx).await;
         self.sink
             .record(make_audit_event(&pv, &user, &host, &result));
+        result
+    }
+    // A BitSet-delta PUT records the same audit row shape as
+    // `put_value_checked` (event kind Put, peer credentials) and
+    // forwards through the inner's `put_delta_checked`. Without this
+    // override the trait default would run get_value + merge +
+    // put_value_checked on THIS layer: it would still audit (via the
+    // put_value_checked above) but bypass the inner source's atomic
+    // `put_delta_checked`, re-opening the concurrent-partial-PUT
+    // lost-update window.
+    async fn put_delta_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        desc: FieldDesc,
+        changed: epics_pva_rs::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> Result<(), String> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self
+            .inner
+            .put_delta_checked(checked, desc, changed, delta, ctx)
+            .await;
+        self.sink
+            .record(make_audit_event(&pv, &user, &host, &result));
+        result
+    }
+    // PROCESS is a record-state mutation — audit it with the same
+    // row shape as PUT (`AuditEventKind::Process`), then forward.
+    // Without this override the trait-default `process` would never
+    // reach the inner source and no audit row would be emitted.
+    async fn process(&self, name: &str) -> Result<(), String> {
+        let result = self.inner.process(name).await;
+        let mut ev = make_audit_event(name, "", "", &result);
+        ev.event = AuditEventKind::Process;
+        self.sink.record(ev);
+        result
+    }
+    // Typed PROCESS — emits a credential-aware audit row (mirroring
+    // `put_value_checked`) and forwards through the inner's
+    // gate-enforced `process_checked`.
+    async fn process_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Result<(), String> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self.inner.process_checked(checked, ctx).await;
+        let mut ev = make_audit_event(&pv, &user, &host, &result);
+        ev.event = AuditEventKind::Process;
+        self.sink.record(ev);
         result
     }
     async fn get_value_checked(
@@ -837,10 +1067,135 @@ mod tests {
         let cfg = AclConfig {
             allow_only: vec!["MOTOR:*".into()],
             deny: vec!["MOTOR:JOG:*".into()],
+            ..Default::default()
         };
         assert!(cfg.allowed("MOTOR:VAL"));
         assert!(!cfg.allowed("MOTOR:JOG:UP"));
         assert!(!cfg.allowed("OTHER:PV"));
+    }
+
+    // ── B7: regex ACL ────────────────────────────────────────────
+
+    /// A regex deny entry is anchored at both ends, so `BL10C:.*`
+    /// matches the same names a `BL10C:*` glob would.
+    #[test]
+    fn acl_regex_deny_anchored() {
+        let cfg = AclConfig::default().deny_regex(r"BL10C:.*:HV").unwrap();
+        assert!(!cfg.allowed("BL10C:RFP:HV"));
+        assert!(!cfg.allowed("BL10C::HV"));
+        // Anchored: the regex must match the WHOLE name.
+        assert!(cfg.allowed("X:BL10C:RFP:HV"));
+        assert!(cfg.allowed("BL10C:RFP:HV:SETPOINT"));
+        assert!(cfg.allowed("BL10D:RFP:HV"));
+    }
+
+    /// A regex allow-only entry flips the policy to default-deny,
+    /// exactly like a glob allow-only entry.
+    #[test]
+    fn acl_regex_allow_only_default_denies() {
+        let cfg = AclConfig::default().allow_regex(r"(SR|BL)\d+:.*").unwrap();
+        assert!(cfg.allowed("SR01:CURRENT"));
+        assert!(cfg.allowed("BL10:SHUTTER"));
+        assert!(!cfg.allowed("RFP:HV"));
+        // Alternation stays anchored as ^(?:(SR|BL)\d+:.*)$ — a name
+        // that merely contains a branch must not slip through.
+        assert!(!cfg.allowed("X-SR01:CURRENT"));
+    }
+
+    /// Glob and regex patterns may be mixed in the same config;
+    /// deny (glob or regex) always wins over allow (glob or regex).
+    #[test]
+    fn acl_glob_and_regex_mixed() {
+        let cfg = AclConfig {
+            allow_only: vec!["MOTOR:*".into()],
+            ..Default::default()
+        }
+        .allow_regex(r"TEMP:\d+")
+        .unwrap()
+        .deny_regex(r"MOTOR:.*:JOG")
+        .unwrap();
+        // Glob allow.
+        assert!(cfg.allowed("MOTOR:X:VAL"));
+        // Regex allow.
+        assert!(cfg.allowed("TEMP:42"));
+        assert!(!cfg.allowed("TEMP:hot")); // \d+ requires digits
+        // Regex deny beats glob allow.
+        assert!(!cfg.allowed("MOTOR:X:JOG"));
+        // Not in any allow list → default-deny.
+        assert!(!cfg.allowed("RFP:HV"));
+    }
+
+    /// An invalid regex is reported at config-build time, not on the
+    /// first PV check.
+    #[test]
+    fn acl_invalid_regex_rejected_at_build() {
+        assert!(AclConfig::default().deny_regex(r"BL10C:[").is_err());
+        assert!(AclConfig::default().allow_regex(r"(unclosed").is_err());
+    }
+
+    /// B7: a pathological operator-supplied ACL regex whose compiled
+    /// program exceeds `ACL_REGEX_SIZE_LIMIT` must fail fast at build
+    /// time with a bounded `regex::Error` rather than compiling with
+    /// the crate's larger defaults. A bounded counted repetition of a
+    /// large bounded inner repetition blows the program size well
+    /// past 256 KiB while staying a syntactically valid pattern.
+    #[test]
+    fn acl_oversized_regex_rejected_by_size_limit() {
+        // `(?:a{1000}){1000}` — syntactically valid, but the compiled
+        // program is far larger than the 256 KiB ACL limit.
+        let pathological = r"(?:a{1000}){1000}";
+
+        // `compile_anchored` is the single funnel both `deny_regex`
+        // and `allow_regex` route through — test it directly so the
+        // failing error variant is observable (`AclConfig` is not
+        // `Debug`, so `expect_err` on the builder is unavailable).
+        match compile_anchored(pathological) {
+            Err(regex::Error::CompiledTooBig(_)) => {}
+            other => panic!("expected CompiledTooBig, got {other:?}"),
+        }
+        // Both ACL builder entry points reject it.
+        assert!(
+            AclConfig::default().deny_regex(pathological).is_err(),
+            "oversized deny regex must be rejected"
+        );
+        assert!(
+            AclConfig::default().allow_regex(pathological).is_err(),
+            "oversized allow regex must be rejected"
+        );
+
+        // A realistic ACL pattern still compiles fine under the limit.
+        assert!(compile_anchored(r"BL\d+C:.*:HV").is_ok());
+        assert!(AclConfig::default().deny_regex(r"BL\d+C:.*:HV").is_ok());
+    }
+
+    /// The regex ACL still gates through the `AclLayer` wrapper on a
+    /// real `ChannelSource`, not just the bare `AclConfig::allowed`.
+    #[tokio::test]
+    async fn acl_layer_applies_regex_via_channel_source() {
+        use super::super::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL};
+        use super::super::source::GatewayChannelSource;
+        use epics_pva_rs::client::PvaClient;
+
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, DEFAULT_CLEANUP_INTERVAL);
+        let inner = GatewayChannelSource::new(cache);
+
+        let cfg = AclConfig::default().deny_regex(r"SECRET:.*").unwrap();
+        let acl = AclLayer::new(cfg).layer(inner);
+
+        // Denied name short-circuits at the layer — has_pv is false
+        // and no upstream search is triggered.
+        assert!(!acl.has_pv("SECRET:KEY").await);
+        // put_value on a denied name returns the ACL error without
+        // reaching the upstream.
+        let err = acl
+            .put_value(
+                "SECRET:KEY",
+                PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(0.0)),
+            )
+            .await
+            .expect_err("regex-denied PUT must fail at the ACL layer");
+        assert!(err.contains("denied"));
     }
 
     /// Audit-event classifier tags ACL/read-only error messages
@@ -875,5 +1230,426 @@ mod tests {
         let ok = make_audit_event("MOTOR:VAL", "alice", "host1", &Ok(()));
         assert_eq!(ok.result, AuditResult::Ok);
         assert!(ok.error.is_empty());
+    }
+
+    // ── put_delta_checked forwarding through the wrappers ────────────
+
+    use epics_pva_rs::pvdata::{ScalarType, ScalarValue};
+    use epics_pva_rs::server_native::source::{AccessChecked, AccessGate};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Minimal `ChannelSource` stub that records which PUT method
+    /// the wrapper routed a delta PUT to. `put_delta_checked` is
+    /// overridden (atomic merge stand-in); the default
+    /// `put_value_checked` chains through it. If a wrapper bypasses
+    /// `put_delta_checked` and runs the non-atomic default merge, it
+    /// lands in `put_value_checked` and `delta_reached` stays false.
+    struct RecordingSource {
+        delta_reached: Arc<AtomicBool>,
+        value_reached: Arc<AtomicBool>,
+        process_reached: Arc<AtomicBool>,
+    }
+
+    impl ChannelSource for RecordingSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["X".into()]
+        }
+        async fn has_pv(&self, _name: &str) -> bool {
+            true
+        }
+        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            Some(FieldDesc::Scalar(ScalarType::Double))
+        }
+        async fn get_value(&self, _name: &str) -> Option<PvField> {
+            Some(PvField::Scalar(ScalarValue::Double(0.0)))
+        }
+        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
+            Ok(())
+        }
+        async fn put_value_checked(
+            &self,
+            _checked: AccessChecked,
+            _value: PvField,
+            _ctx: ChannelContext,
+        ) -> Result<(), String> {
+            self.value_reached.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn put_delta_checked(
+            &self,
+            _checked: AccessChecked,
+            _desc: FieldDesc,
+            _changed: epics_pva_rs::proto::BitSet,
+            _delta: PvField,
+            _ctx: ChannelContext,
+        ) -> Result<(), String> {
+            self.delta_reached.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        // Inner PROCESS sink. The trait-default `process_checked`
+        // applies the `allows_write()` gate then delegates here, so a
+        // wrapper that correctly forwards `process_checked` lands in
+        // this method and flips `process_reached`.
+        async fn process(&self, _name: &str) -> Result<(), String> {
+            self.process_reached.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn is_writable(&self, _name: &str) -> bool {
+            true
+        }
+        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            None
+        }
+    }
+
+    fn test_ctx() -> ChannelContext {
+        ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "alice".into(),
+            method: "anonymous".into(),
+            host: "host1".into(),
+            authority: String::new(),
+        }
+    }
+
+    async fn checked_for(name: &str) -> AccessChecked {
+        AccessGate::open()
+            .check(name, "host1", "alice", "anonymous", "")
+            .await
+    }
+
+    /// A delta PUT through the `Acl` wrapper must reach the inner
+    /// source's `put_delta_checked` — not the non-atomic
+    /// get+put_value_checked default merge.
+    #[tokio::test]
+    async fn acl_forwards_put_delta_checked_to_inner() {
+        let delta_reached = Arc::new(AtomicBool::new(false));
+        let value_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: delta_reached.clone(),
+            value_reached: value_reached.clone(),
+            process_reached: Arc::new(AtomicBool::new(false)),
+        };
+        let acl = AclLayer::new(AclConfig::default()).layer(inner);
+
+        let mut changed = epics_pva_rs::proto::BitSet::new();
+        changed.set(0);
+        let res = acl
+            .put_delta_checked(
+                checked_for("X").await,
+                FieldDesc::Scalar(ScalarType::Double),
+                changed,
+                PvField::Scalar(ScalarValue::Double(1.0)),
+                test_ctx(),
+            )
+            .await;
+        assert!(res.is_ok());
+        assert!(
+            delta_reached.load(Ordering::SeqCst),
+            "Acl must route delta PUT to inner put_delta_checked"
+        );
+        assert!(
+            !value_reached.load(Ordering::SeqCst),
+            "Acl must NOT fall back to the non-atomic put_value_checked merge"
+        );
+    }
+
+    /// An `Acl`-denied delta PUT must be rejected at the layer and
+    /// never reach the inner source at all.
+    #[tokio::test]
+    async fn acl_denied_put_delta_checked_short_circuits() {
+        let delta_reached = Arc::new(AtomicBool::new(false));
+        let value_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: delta_reached.clone(),
+            value_reached: value_reached.clone(),
+            process_reached: Arc::new(AtomicBool::new(false)),
+        };
+        let cfg = AclConfig::default().deny_regex(r"SECRET:.*").unwrap();
+        let acl = AclLayer::new(cfg).layer(inner);
+
+        let mut changed = epics_pva_rs::proto::BitSet::new();
+        changed.set(0);
+        let err = acl
+            .put_delta_checked(
+                checked_for("SECRET:KEY").await,
+                FieldDesc::Scalar(ScalarType::Double),
+                changed,
+                PvField::Scalar(ScalarValue::Double(1.0)),
+                test_ctx(),
+            )
+            .await
+            .expect_err("ACL-denied delta PUT must fail at the layer");
+        assert!(err.contains("denied"));
+        assert!(!delta_reached.load(Ordering::SeqCst));
+        assert!(!value_reached.load(Ordering::SeqCst));
+    }
+
+    /// A delta PUT through the `Audited` wrapper must reach the
+    /// inner's `put_delta_checked` and emit one `Put` audit row
+    /// carrying the peer credentials.
+    #[tokio::test]
+    async fn audited_forwards_put_delta_checked_and_records() {
+        let delta_reached = Arc::new(AtomicBool::new(false));
+        let value_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: delta_reached.clone(),
+            value_reached: value_reached.clone(),
+            process_reached: Arc::new(AtomicBool::new(false)),
+        };
+        let events: Arc<std::sync::Mutex<Vec<AuditEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_sink = events.clone();
+        let audited = AuditLayer::new(ClosureAudit(move |ev| {
+            events_sink.lock().unwrap().push(ev);
+        }))
+        .layer(inner);
+
+        let mut changed = epics_pva_rs::proto::BitSet::new();
+        changed.set(0);
+        let res = audited
+            .put_delta_checked(
+                checked_for("X").await,
+                FieldDesc::Scalar(ScalarType::Double),
+                changed,
+                PvField::Scalar(ScalarValue::Double(1.0)),
+                test_ctx(),
+            )
+            .await;
+        assert!(res.is_ok());
+        assert!(
+            delta_reached.load(Ordering::SeqCst),
+            "Audited must route delta PUT to inner put_delta_checked"
+        );
+        assert!(
+            !value_reached.load(Ordering::SeqCst),
+            "Audited must NOT fall back to the non-atomic put_value_checked merge"
+        );
+        let recorded = events.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one audit row per delta PUT");
+        assert_eq!(recorded[0].event, AuditEventKind::Put);
+        assert_eq!(recorded[0].result, AuditResult::Ok);
+        assert_eq!(recorded[0].pv, "X");
+        assert_eq!(recorded[0].user, "alice");
+        assert_eq!(recorded[0].host, "host1");
+    }
+
+    /// A delta PUT through the `ReadOnly` wrapper must be rejected
+    /// at the layer and never reach the inner source.
+    #[tokio::test]
+    async fn read_only_rejects_put_delta_checked() {
+        let delta_reached = Arc::new(AtomicBool::new(false));
+        let value_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: delta_reached.clone(),
+            value_reached: value_reached.clone(),
+            process_reached: Arc::new(AtomicBool::new(false)),
+        };
+        let ro = ReadOnlyLayer.layer(inner);
+
+        let mut changed = epics_pva_rs::proto::BitSet::new();
+        changed.set(0);
+        let err = ro
+            .put_delta_checked(
+                checked_for("X").await,
+                FieldDesc::Scalar(ScalarType::Double),
+                changed,
+                PvField::Scalar(ScalarValue::Double(1.0)),
+                test_ctx(),
+            )
+            .await
+            .expect_err("read-only delta PUT must be rejected");
+        assert!(err.contains("read-only"));
+        assert!(!delta_reached.load(Ordering::SeqCst));
+        assert!(!value_reached.load(Ordering::SeqCst));
+    }
+
+    // ── process / process_checked forwarding through the wrappers ────
+
+    /// A typed PROCESS through the `Acl` wrapper (allowed name) must
+    /// reach the inner source's PROCESS path. Pre-fix the trait
+    /// default `process_checked` → `process` (`Ok(())`) ran on the
+    /// `Acl` layer itself and never forwarded.
+    #[tokio::test]
+    async fn acl_forwards_process_checked_to_inner() {
+        let process_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: Arc::new(AtomicBool::new(false)),
+            value_reached: Arc::new(AtomicBool::new(false)),
+            process_reached: process_reached.clone(),
+        };
+        let acl = AclLayer::new(AclConfig::default()).layer(inner);
+
+        let res = acl
+            .process_checked(checked_for("X").await, test_ctx())
+            .await;
+        assert!(res.is_ok());
+        assert!(
+            process_reached.load(Ordering::SeqCst),
+            "Acl must route PROCESS to the inner source's process_checked"
+        );
+    }
+
+    /// An `Acl`-denied PROCESS must be rejected at the layer and never
+    /// reach the inner source.
+    #[tokio::test]
+    async fn acl_denied_process_checked_short_circuits() {
+        let process_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: Arc::new(AtomicBool::new(false)),
+            value_reached: Arc::new(AtomicBool::new(false)),
+            process_reached: process_reached.clone(),
+        };
+        let cfg = AclConfig::default().deny_regex(r"SECRET:.*").unwrap();
+        let acl = AclLayer::new(cfg).layer(inner);
+
+        let err = acl
+            .process_checked(checked_for("SECRET:KEY").await, test_ctx())
+            .await
+            .expect_err("ACL-denied PROCESS must fail at the layer");
+        assert!(err.contains("denied"));
+        assert!(
+            !process_reached.load(Ordering::SeqCst),
+            "ACL-denied PROCESS must not reach the inner source"
+        );
+    }
+
+    /// A PROCESS through the `ReadOnly` wrapper must be rejected at
+    /// the layer (WRITE-class op) and never reach the inner source.
+    #[tokio::test]
+    async fn read_only_rejects_process_checked() {
+        let process_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: Arc::new(AtomicBool::new(false)),
+            value_reached: Arc::new(AtomicBool::new(false)),
+            process_reached: process_reached.clone(),
+        };
+        let ro = ReadOnlyLayer.layer(inner);
+
+        let err = ro
+            .process_checked(checked_for("X").await, test_ctx())
+            .await
+            .expect_err("read-only PROCESS must be rejected");
+        assert!(err.contains("read-only"));
+        assert!(
+            !process_reached.load(Ordering::SeqCst),
+            "read-only PROCESS must not reach the inner source"
+        );
+        // The ctx-less `process` is rejected the same way.
+        let err = ro
+            .process("X")
+            .await
+            .expect_err("read-only ctx-less PROCESS must be rejected");
+        assert!(err.contains("read-only"));
+        assert!(!process_reached.load(Ordering::SeqCst));
+    }
+
+    /// A PROCESS through the `Audited` wrapper must reach the inner
+    /// source and emit exactly one `Process` audit row carrying the
+    /// peer credentials.
+    #[tokio::test]
+    async fn audited_forwards_process_checked_and_records() {
+        let process_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: Arc::new(AtomicBool::new(false)),
+            value_reached: Arc::new(AtomicBool::new(false)),
+            process_reached: process_reached.clone(),
+        };
+        let events: Arc<std::sync::Mutex<Vec<AuditEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_sink = events.clone();
+        let audited = AuditLayer::new(ClosureAudit(move |ev| {
+            events_sink.lock().unwrap().push(ev);
+        }))
+        .layer(inner);
+
+        let res = audited
+            .process_checked(checked_for("X").await, test_ctx())
+            .await;
+        assert!(res.is_ok());
+        assert!(
+            process_reached.load(Ordering::SeqCst),
+            "Audited must route PROCESS to the inner source's process_checked"
+        );
+        let recorded = events.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one audit row per PROCESS");
+        assert_eq!(recorded[0].event, AuditEventKind::Process);
+        assert_eq!(recorded[0].result, AuditResult::Ok);
+        assert_eq!(recorded[0].pv, "X");
+        assert_eq!(recorded[0].user, "alice");
+        assert_eq!(recorded[0].host, "host1");
+    }
+
+    /// The full production layer stack `Audited(Acl(inner))` (what
+    /// `PvaGateway::start` builds) must forward a PROCESS all the way
+    /// to the inner source — proving the fix is effective in the real
+    /// layered deployment, not just for a single wrapper. Pre-fix the
+    /// PROCESS hit `Audited`'s trait-default `process_checked` →
+    /// `process` (`Ok(())`) and never reached `Acl`, let alone the
+    /// inner source.
+    #[tokio::test]
+    async fn layered_audited_acl_forwards_process_to_inner() {
+        let process_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: Arc::new(AtomicBool::new(false)),
+            value_reached: Arc::new(AtomicBool::new(false)),
+            process_reached: process_reached.clone(),
+        };
+        let events: Arc<std::sync::Mutex<Vec<AuditEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_sink = events.clone();
+        let acl = AclLayer::new(AclConfig::default()).layer(inner);
+        let layered = AuditLayer::new(ClosureAudit(move |ev| {
+            events_sink.lock().unwrap().push(ev);
+        }))
+        .layer(acl);
+
+        let res = layered
+            .process_checked(checked_for("X").await, test_ctx())
+            .await;
+        assert!(res.is_ok());
+        assert!(
+            process_reached.load(Ordering::SeqCst),
+            "PROCESS through Audited(Acl(inner)) must reach the inner source"
+        );
+        assert_eq!(
+            events.lock().unwrap()[0].event,
+            AuditEventKind::Process,
+            "the layered PROCESS must still be audited"
+        );
+    }
+
+    /// In the layered stack, an ACL deny still short-circuits a
+    /// PROCESS at the `Acl` layer (the audit row records the denial).
+    #[tokio::test]
+    async fn layered_audited_acl_denies_process() {
+        let process_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: Arc::new(AtomicBool::new(false)),
+            value_reached: Arc::new(AtomicBool::new(false)),
+            process_reached: process_reached.clone(),
+        };
+        let events: Arc<std::sync::Mutex<Vec<AuditEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_sink = events.clone();
+        let cfg = AclConfig::default().deny_regex(r"SECRET:.*").unwrap();
+        let acl = AclLayer::new(cfg).layer(inner);
+        let layered = AuditLayer::new(ClosureAudit(move |ev| {
+            events_sink.lock().unwrap().push(ev);
+        }))
+        .layer(acl);
+
+        let err = layered
+            .process_checked(checked_for("SECRET:KEY").await, test_ctx())
+            .await
+            .expect_err("ACL-denied PROCESS must fail through the layered stack");
+        assert!(err.contains("denied"));
+        assert!(
+            !process_reached.load(Ordering::SeqCst),
+            "ACL-denied PROCESS must not reach the inner source"
+        );
+        let recorded = events.lock().unwrap();
+        assert_eq!(recorded[0].event, AuditEventKind::Process);
+        assert_eq!(recorded[0].result, AuditResult::Denied);
     }
 }

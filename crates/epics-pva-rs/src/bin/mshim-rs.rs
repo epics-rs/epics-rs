@@ -11,31 +11,37 @@
 //!
 //! # 2. Forward multicast BEACONs back to local clients:
 //! mshim-rs -L 224.1.1.1:5076 -F 127.0.0.1:15076
+//!
+//! # 3. Join / forward via a specific interface, custom TTL:
+//! mshim-rs -L 224.1.1.1:5076@eth0 -F 224.1.1.1:5076,32@eth1
 //! ```
 //!
-//! Multicast addresses (224.0.0.0/4) on the listen side are joined
-//! automatically. On the send side, multicast destinations use the
-//! OS-default outbound interface and TTL. The full pvxs syntax
-//! (`@iface` interface override, `,ttl#`) is accepted at the parser
-//! level but currently logged as advisory — the simpler default
-//! routes work for the common cross-subnet scenario.
+//! pvxs syntax (`tools/mshim.cpp`): a `-L`/`-F` entry may carry a
+//! `,ttl#` TTL override and/or an `@iface` interface override.
+//! `@iface` accepts either an interface name (`eth0`) or that
+//! interface's IPv4 address; on the listen side it scopes the
+//! multicast group join, on the forward side it selects the outbound
+//! multicast interface. `,ttl#` sets `IP_MULTICAST_TTL` on forwarded
+//! multicast packets.
 
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 
 use clap::Parser;
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
 
 #[derive(Parser)]
 #[command(name = "mshim-rs", version, about = "PVA beacon/search multicast shim")]
 struct Args {
-    /// Listen endpoint. Repeat for multiple. Multicast groups are
-    /// joined automatically.
+    /// Listen endpoint `<ip>[:port][,ttl#][@iface]`. Repeat for
+    /// multiple. Multicast groups are joined automatically; `@iface`
+    /// scopes the join to one interface.
     #[arg(short = 'L', long = "listen", required = true)]
     listen: Vec<String>,
 
-    /// Forward destination. Repeat for multiple.
+    /// Forward destination `<ip>[:port][,ttl#][@iface]`. Repeat for
+    /// multiple. `,ttl#` / `@iface` apply to multicast destinations.
     #[arg(short = 'F', long = "forward", required = true)]
     forward: Vec<String>,
 
@@ -48,17 +54,42 @@ struct Args {
 struct Endpoint {
     ip: IpAddr,
     port: u16,
-    /// `@iface` override or `,ttl#` modifiers (parsed but advisory
-    /// only — kernel-default routing handles the common case).
-    extra: Option<String>,
+    /// `,ttl#` override — multicast TTL for forwarded packets.
+    ttl: Option<u32>,
+    /// `@iface` override — interface name or IPv4 address. The join
+    /// (listen side) / outbound interface (forward side) is scoped to
+    /// this interface.
+    iface: Option<String>,
 }
 
+/// Parse the pvxs `<ip>[:port][,ttl#][@iface]` endpoint syntax. The
+/// `,ttl#` and `@iface` suffixes may appear in either order after the
+/// `ip[:port]` head.
 fn parse_endpoint(s: &str, default_port: u16) -> Result<Endpoint, String> {
-    // Split off any `,ttl#` or `@iface` suffix first.
-    let (head, extra) = match s.find([',', '@']) {
-        Some(idx) => (&s[..idx], Some(s[idx..].to_string())),
-        None => (s, None),
-    };
+    // Peel `@iface` and `,ttl#` suffixes off the end. Either may come
+    // first; the head (`ip[:port]`) is whatever remains.
+    let mut head = s;
+    let mut ttl: Option<u32> = None;
+    let mut iface: Option<String> = None;
+    while let Some(idx) = head.rfind(['@', ',']) {
+        let sep = &head[idx..idx + 1];
+        let suffix = &head[idx + 1..];
+        if sep == "@" {
+            if suffix.is_empty() {
+                return Err("empty @iface override".into());
+            }
+            iface = Some(suffix.to_string());
+        } else {
+            let v: u32 = suffix
+                .parse()
+                .map_err(|e| format!("ttl {suffix:?} invalid: {e}"))?;
+            if v == 0 || v > 255 {
+                return Err(format!("ttl {v} out of range 1..=255"));
+            }
+            ttl = Some(v);
+        }
+        head = &head[..idx];
+    }
     let (ip_str, port) = if let Some((a, b)) = head.rsplit_once(':') {
         let port: u16 = b.parse().map_err(|e| format!("port {b:?} invalid: {e}"))?;
         (a, port)
@@ -68,7 +99,71 @@ fn parse_endpoint(s: &str, default_port: u16) -> Result<Endpoint, String> {
     let ip: IpAddr = ip_str
         .parse()
         .map_err(|e| format!("ip {ip_str:?} invalid: {e}"))?;
-    Ok(Endpoint { ip, port, extra })
+    Ok(Endpoint {
+        ip,
+        port,
+        ttl,
+        iface,
+    })
+}
+
+/// Resolve an `@iface` spec to the interface's IPv4 address. Accepts
+/// either an interface name (`eth0`) or a literal IPv4 address (which
+/// is returned verbatim). Used to scope multicast joins and select
+/// the outbound multicast interface.
+fn resolve_iface_v4(spec: &str) -> Result<Ipv4Addr, String> {
+    // A literal IPv4 address is accepted directly — pvxs allows this.
+    if let Ok(v4) = spec.parse::<Ipv4Addr>() {
+        return Ok(v4);
+    }
+    #[cfg(unix)]
+    {
+        iface_name_to_v4(spec)
+    }
+    #[cfg(not(unix))]
+    {
+        Err(format!(
+            "interface-name override {spec:?} requires a Unix host; \
+             pass the interface's IPv4 address instead"
+        ))
+    }
+}
+
+/// Look up an interface's first IPv4 address by name via `getifaddrs`.
+#[cfg(unix)]
+fn iface_name_to_v4(name: &str) -> Result<Ipv4Addr, String> {
+    use std::ffi::CStr;
+
+    // SAFETY: getifaddrs allocates a linked list we free via
+    // freeifaddrs; every pointer is null-checked before deref.
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return Err(format!(
+                "getifaddrs failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut cur = ifap;
+        let mut found: Option<Ipv4Addr> = None;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
+                let ifa_name = CStr::from_ptr(ifa.ifa_name).to_string_lossy();
+                let sa = &*ifa.ifa_addr;
+                if ifa_name == name && sa.sa_family as i32 == libc::AF_INET {
+                    let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    // s_addr is in network byte order.
+                    let addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                    found = Some(addr);
+                    break;
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+        found.ok_or_else(|| format!("interface {name:?} has no IPv4 address"))
+    }
 }
 
 fn bind_listen(ep: &Endpoint) -> std::io::Result<UdpSocket> {
@@ -91,10 +186,47 @@ fn bind_listen(ep: &Endpoint) -> std::io::Result<UdpSocket> {
     if let IpAddr::V4(v4) = ep.ip
         && v4.is_multicast()
     {
-        sock.join_multicast_v4(&v4, &Ipv4Addr::UNSPECIFIED)?;
+        // `@iface`: scope the group join to the named interface, by
+        // its IPv4 address. Without it the kernel picks the default.
+        let join_iface = match &ep.iface {
+            Some(spec) => resolve_iface_v4(spec)
+                .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?,
+            None => Ipv4Addr::UNSPECIFIED,
+        };
+        sock.join_multicast_v4(&v4, &join_iface)?;
     }
     let std_sock: StdUdpSocket = sock.into();
     UdpSocket::from_std(std_sock)
+}
+
+/// A resolved forward destination plus its per-destination multicast
+/// settings (TTL, outbound interface).
+#[derive(Clone)]
+struct ForwardTarget {
+    addr: SocketAddr,
+    ttl: Option<u32>,
+    iface_v4: Option<Ipv4Addr>,
+}
+
+/// The `IP_MULTICAST_TTL` / `IP_MULTICAST_IF` values to assert on the
+/// shared send socket before forwarding to `tgt`.
+///
+/// `None` for a unicast destination — no multicast setsockopt is
+/// needed. For a multicast destination it is always `Some`: the
+/// override when present, otherwise the platform defaults (TTL 1,
+/// interface `INADDR_ANY`). Returning the defaults rather than `None`
+/// is the F3 fix — a multicast target WITHOUT overrides must still
+/// reset the shared socket so a prior destination's state cannot
+/// bleed through. Mirrors pvxs `mcast_prep_sendto`, which runs for
+/// every multicast destination.
+fn multicast_opts_for(tgt: &ForwardTarget) -> Option<(u32, Ipv4Addr)> {
+    if !tgt.addr.ip().is_multicast() {
+        return None;
+    }
+    Some((
+        tgt.ttl.unwrap_or(1),
+        tgt.iface_v4.unwrap_or(Ipv4Addr::UNSPECIFIED),
+    ))
 }
 
 #[tokio::main]
@@ -134,23 +266,58 @@ async fn main() {
         }
     };
 
-    // Single send socket — the kernel routes per-destination IP.
-    // Tokio requires nonblocking sockets when adopting via
-    // `from_std`, otherwise the runtime registration panics.
-    let send_sock_std = match StdUdpSocket::bind("0.0.0.0:0") {
+    // Resolve each forward destination's `@iface` up-front so a bad
+    // interface name fails fast rather than per-datagram.
+    let forward_targets: Vec<ForwardTarget> = match forward
+        .iter()
+        .map(|e| {
+            let iface_v4 = match &e.iface {
+                Some(spec) => Some(resolve_iface_v4(spec)?),
+                None => None,
+            };
+            Ok(ForwardTarget {
+                addr: SocketAddr::new(e.ip, e.port),
+                ttl: e.ttl,
+                iface_v4,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("mshim-rs: forward interface: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Build the send socket via socket2 so we can set per-socket
+    // multicast options (TTL / outbound interface). Tokio requires
+    // nonblocking sockets when adopting via `from_std`.
+    let send_socket = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("mshim-rs: bind send socket: {e}");
+            eprintln!("mshim-rs: create send socket: {e}");
             std::process::exit(1);
         }
     };
-    if let Err(e) = send_sock_std.set_nonblocking(true) {
-        eprintln!("mshim-rs: send_sock set_nonblocking: {e}");
+    if let Err(e) = send_socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).into())
+    {
+        eprintln!("mshim-rs: bind send socket: {e}");
         std::process::exit(1);
     }
-    if let Err(e) = send_sock_std.set_broadcast(true) {
+    if let Err(e) = send_socket.set_nonblocking(true) {
+        eprintln!("mshim-rs: send socket set_nonblocking: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = send_socket.set_broadcast(true) {
         eprintln!("mshim-rs: set_broadcast: {e}");
     }
+    // mshim uses a single shared send socket. `IP_MULTICAST_TTL` /
+    // `IP_MULTICAST_IF` are setsockopt state on that socket, so the
+    // recv loop re-asserts both for every multicast destination before
+    // its send — overrides when present, platform defaults otherwise —
+    // so one destination's settings never bleed into another's.
+    let send_sock_std: StdUdpSocket = send_socket.into();
     let send_sock = match UdpSocket::from_std(send_sock_std) {
         Ok(s) => s,
         Err(e) => {
@@ -160,34 +327,34 @@ async fn main() {
     };
     let send_sock = std::sync::Arc::new(send_sock);
 
-    let forward_targets: Vec<SocketAddr> = forward
-        .iter()
-        .map(|e| SocketAddr::new(e.ip, e.port))
-        .collect();
-
     eprintln!(
         "mshim-rs: listening on {} endpoint(s), forwarding to {} target(s)",
         listen.len(),
         forward.len()
     );
     for ep in &listen {
-        if let Some(extra) = &ep.extra {
-            eprintln!(
-                "  listen {}:{} (extra {extra:?} — advisory)",
-                ep.ip, ep.port
-            );
-        } else {
+        let mut extras = Vec::new();
+        if let Some(i) = &ep.iface {
+            extras.push(format!("iface={i}"));
+        }
+        if extras.is_empty() {
             eprintln!("  listen {}:{}", ep.ip, ep.port);
+        } else {
+            eprintln!("  listen {}:{} [{}]", ep.ip, ep.port, extras.join(" "));
         }
     }
-    for ep in &forward {
-        if let Some(extra) = &ep.extra {
-            eprintln!(
-                "  forward → {}:{} (extra {extra:?} — advisory)",
-                ep.ip, ep.port
-            );
-        } else {
+    for (ep, tgt) in forward.iter().zip(forward_targets.iter()) {
+        let mut extras = Vec::new();
+        if let Some(t) = tgt.ttl {
+            extras.push(format!("ttl={t}"));
+        }
+        if let Some(i) = tgt.iface_v4 {
+            extras.push(format!("iface={i}"));
+        }
+        if extras.is_empty() {
             eprintln!("  forward → {}:{}", ep.ip, ep.port);
+        } else {
+            eprintln!("  forward → {}:{} [{}]", ep.ip, ep.port, extras.join(" "));
         }
     }
 
@@ -212,13 +379,38 @@ async fn main() {
                             // Avoid an obvious feedback loop: don't
                             // forward back to the source endpoint of
                             // the same datagram.
-                            if *tgt == peer {
+                            if tgt.addr == peer {
                                 continue;
                             }
-                            if let Err(e) = send_sock.send_to(payload, tgt).await
+                            // Apply per-destination multicast options
+                            // before the send — for EVERY multicast
+                            // target, override or not (see
+                            // `multicast_opts_for`). `set_multicast_*`
+                            // operate on the shared send socket, so a
+                            // destination without overrides must still
+                            // reset to the defaults or it inherits the
+                            // previous destination's settings.
+                            if let Some((ttl, iface)) = multicast_opts_for(tgt) {
+                                // `SockRef` borrows the tokio socket's
+                                // fd so we can reach the setsockopt-
+                                // backed multicast options tokio's
+                                // `UdpSocket` doesn't expose directly
+                                // (notably `IP_MULTICAST_IF`).
+                                let sref = SockRef::from(send_sock.as_ref());
+                                if let Err(e) = sref.set_multicast_ttl_v4(ttl) {
+                                    eprintln!("mshim-rs: set multicast ttl for {}: {e}", tgt.addr);
+                                }
+                                if let Err(e) = sref.set_multicast_if_v4(&iface) {
+                                    eprintln!(
+                                        "mshim-rs: set multicast iface for {}: {e}",
+                                        tgt.addr
+                                    );
+                                }
+                            }
+                            if let Err(e) = send_sock.send_to(payload, tgt.addr).await
                                 && e.kind() != ErrorKind::WouldBlock
                             {
-                                eprintln!("mshim-rs: forward to {tgt}: {e}");
+                                eprintln!("mshim-rs: forward to {}: {e}", tgt.addr);
                             }
                         }
                     }
@@ -256,7 +448,8 @@ mod tests {
         let ep = parse_endpoint("127.0.0.1:5076", 9999).unwrap();
         assert_eq!(ep.ip.to_string(), "127.0.0.1");
         assert_eq!(ep.port, 5076);
-        assert!(ep.extra.is_none());
+        assert!(ep.ttl.is_none());
+        assert!(ep.iface.is_none());
     }
 
     #[test]
@@ -267,18 +460,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_endpoint_ttl_modifier_kept_as_extra() {
+    fn parse_endpoint_ttl_modifier_parsed() {
         let ep = parse_endpoint("224.1.1.1,255", 5076).unwrap();
         assert_eq!(ep.ip.to_string(), "224.1.1.1");
         assert_eq!(ep.port, 5076);
-        assert_eq!(ep.extra.as_deref(), Some(",255"));
+        assert_eq!(ep.ttl, Some(255));
+        assert!(ep.iface.is_none());
     }
 
     #[test]
-    fn parse_endpoint_iface_modifier_kept_as_extra() {
+    fn parse_endpoint_iface_modifier_parsed() {
         let ep = parse_endpoint("224.1.1.1@eth0", 5076).unwrap();
         assert_eq!(ep.ip.to_string(), "224.1.1.1");
-        assert_eq!(ep.extra.as_deref(), Some("@eth0"));
+        assert_eq!(ep.iface.as_deref(), Some("eth0"));
+        assert!(ep.ttl.is_none());
     }
 
     #[test]
@@ -287,7 +482,25 @@ mod tests {
         let ep = parse_endpoint("224.1.1.1:5076@eth0", 9999).unwrap();
         assert_eq!(ep.ip.to_string(), "224.1.1.1");
         assert_eq!(ep.port, 5076);
-        assert_eq!(ep.extra.as_deref(), Some("@eth0"));
+        assert_eq!(ep.iface.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn parse_endpoint_ttl_and_iface_together() {
+        // pvxs syntax: "<ip>:port,ttl#@iface"
+        let ep = parse_endpoint("224.1.1.1:5076,32@eth1", 9999).unwrap();
+        assert_eq!(ep.ip.to_string(), "224.1.1.1");
+        assert_eq!(ep.port, 5076);
+        assert_eq!(ep.ttl, Some(32));
+        assert_eq!(ep.iface.as_deref(), Some("eth1"));
+    }
+
+    #[test]
+    fn parse_endpoint_iface_then_ttl_order() {
+        // suffixes accepted in either order
+        let ep = parse_endpoint("224.1.1.1@eth0,8", 5076).unwrap();
+        assert_eq!(ep.ttl, Some(8));
+        assert_eq!(ep.iface.as_deref(), Some("eth0"));
     }
 
     #[test]
@@ -298,5 +511,104 @@ mod tests {
     #[test]
     fn parse_endpoint_rejects_bad_port() {
         assert!(parse_endpoint("127.0.0.1:notaport", 5076).is_err());
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_ttl_out_of_range() {
+        assert!(parse_endpoint("224.1.1.1,0", 5076).is_err());
+        assert!(parse_endpoint("224.1.1.1,256", 5076).is_err());
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_bad_ttl() {
+        assert!(parse_endpoint("224.1.1.1,abc", 5076).is_err());
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_empty_iface() {
+        assert!(parse_endpoint("224.1.1.1@", 5076).is_err());
+    }
+
+    #[test]
+    fn resolve_iface_accepts_literal_ipv4() {
+        let v4 = resolve_iface_v4("192.168.1.5").unwrap();
+        assert_eq!(v4, Ipv4Addr::new(192, 168, 1, 5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_iface_loopback_name() {
+        // The loopback interface is named `lo` on Linux and `lo0` on
+        // macOS/BSD; one of them must resolve to 127.0.0.1.
+        let lo = resolve_iface_v4("lo").or_else(|_| resolve_iface_v4("lo0"));
+        if let Ok(v4) = lo {
+            assert!(
+                v4.is_loopback(),
+                "loopback iface should map to a loopback addr"
+            );
+        }
+    }
+
+    fn fwd(ip: &str, ttl: Option<u32>, iface: Option<Ipv4Addr>) -> ForwardTarget {
+        ForwardTarget {
+            addr: SocketAddr::new(ip.parse().unwrap(), 5076),
+            ttl,
+            iface_v4: iface,
+        }
+    }
+
+    /// F3: a unicast destination needs no multicast setsockopt.
+    #[test]
+    fn multicast_opts_none_for_unicast() {
+        assert_eq!(multicast_opts_for(&fwd("192.168.1.10", None, None)), None);
+        // An override on a unicast target is still irrelevant.
+        assert_eq!(
+            multicast_opts_for(&fwd("192.168.1.10", Some(64), None)),
+            None
+        );
+    }
+
+    /// F3: a multicast destination WITH overrides reports them verbatim.
+    #[test]
+    fn multicast_opts_uses_override() {
+        let iface = Ipv4Addr::new(192, 168, 1, 5);
+        assert_eq!(
+            multicast_opts_for(&fwd("224.1.1.1", Some(32), Some(iface))),
+            Some((32, iface))
+        );
+    }
+
+    /// F3 regression: a multicast destination WITHOUT overrides must
+    /// still report the platform defaults (TTL 1, INADDR_ANY) so the
+    /// shared send socket is reset — it must NOT report `None`, which
+    /// would let a prior destination's TTL/IF bleed through.
+    #[test]
+    fn multicast_opts_resets_to_defaults_without_override() {
+        assert_eq!(
+            multicast_opts_for(&fwd("224.1.1.1", None, None)),
+            Some((1, Ipv4Addr::UNSPECIFIED))
+        );
+    }
+
+    /// F3: mixed targets — an override target followed by a bare
+    /// multicast target — each resolve to independent option sets, so
+    /// forwarding to the bare target after the override target resets
+    /// the socket instead of inheriting TTL 32 / the override iface.
+    #[test]
+    fn multicast_opts_mixed_targets_do_not_bleed() {
+        let iface = Ipv4Addr::new(10, 0, 0, 1);
+        let with_override = fwd("239.0.0.1", Some(32), Some(iface));
+        let bare = fwd("239.0.0.2", None, None);
+
+        assert_eq!(
+            multicast_opts_for(&with_override),
+            Some((32, iface)),
+            "override target keeps its settings"
+        );
+        assert_eq!(
+            multicast_opts_for(&bare),
+            Some((1, Ipv4Addr::UNSPECIFIED)),
+            "bare target resets to defaults, not the prior target's 32/{iface}"
+        );
     }
 }

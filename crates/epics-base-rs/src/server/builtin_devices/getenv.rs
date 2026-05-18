@@ -96,13 +96,31 @@ impl DeviceSupport for GetenvDeviceSupport {
         // Perform the initial read so PINI / first monitor sees the
         // resolved value rather than the empty default. Mirrors C
         // getenvDevSup's `init_record` behaviour.
-        let value = if let Some(ref var) = self.cached_var {
-            std::env::var(var).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        record.put_field("VAL", EpicsValue::String(value))?;
-        Ok(())
+        let value = self
+            .cached_var
+            .as_ref()
+            .and_then(|var| std::env::var(var).ok());
+        match value {
+            Some(s) => {
+                record.put_field("VAL", EpicsValue::String(s))?;
+                Ok(())
+            }
+            None => {
+                // L2: an unset env var (or empty INP) at init is
+                // signalled the SAME way as on `read()` — VAL is
+                // cleared to empty and an `Err` is returned so the
+                // framework flags the record. Previously init wrote
+                // an empty VAL and returned `Ok`, producing a
+                // healthy-looking record with no alarm while the
+                // same condition on a later `read()` raised
+                // READ_ALARM. C flags the alarm at init too.
+                record.put_field("VAL", EpicsValue::String(String::new()))?;
+                Err(CaError::InvalidValue(format!(
+                    "getenv: variable '{}' is unset",
+                    self.cached_var.as_deref().unwrap_or("")
+                )))
+            }
+        }
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -117,9 +135,13 @@ impl DeviceSupport for GetenvDeviceSupport {
                 Ok(DeviceReadOutcome::ok())
             }
             None => {
-                // Unset env var or empty INP: leave VAL alone and
-                // signal the framework via a soft Err so it sets
-                // READ_ALARM / INVALID severity per C semantics.
+                // L1: an env var that was set at init and later
+                // unset must not leave the record showing the stale
+                // value. C `getenv` devsup re-reads every process
+                // and reflects the current (empty) value. Clear VAL
+                // to empty, then signal the framework via a soft Err
+                // so it sets READ_ALARM / INVALID severity.
+                record.put_field("VAL", EpicsValue::String(String::new()))?;
                 Err(CaError::InvalidValue(format!(
                     "getenv: variable '{}' is unset",
                     self.cached_var.as_deref().unwrap_or("")

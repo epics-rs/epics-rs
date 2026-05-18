@@ -212,7 +212,20 @@ impl ProcessVariable {
         self.value.read().await.clone()
     }
 
-    /// Build a Snapshot (minimal: value + zero alarm + now, no metadata).
+    /// Build a Snapshot for this bare PV.
+    ///
+    /// A `ProcessVariable` is a non-record-backed channel: it has no
+    /// alarm engine, no DESC/EGU/PREC metadata, no timestamp user
+    /// tag and no enum/control limits. The snapshot is therefore
+    /// deliberately minimal — value + `NO_ALARM` + wall-clock now,
+    /// with `display`/`control`/`enums` = `None` and `user_tag` = 0.
+    /// These zeros are correct, not placeholder: there is no source
+    /// to draw richer metadata from. Record-backed channels build
+    /// their snapshot via `RecordInstance::snapshot_for_field`, which
+    /// carries the record's alarm/metadata. The only path that
+    /// injects a non-zero alarm onto a bare PV is [`Self::post_alarm`]
+    /// (used by the CA/PVA gateway adapter to surface upstream
+    /// disconnect).
     pub async fn snapshot(&self) -> Snapshot {
         let value = self.value.read().await.clone();
         Snapshot::new(value, 0, 0, crate::runtime::time::now_wall())
@@ -267,6 +280,15 @@ impl ProcessVariable {
             };
             if sub.tx.try_send(event.clone()).is_err() {
                 if let Ok(mut slot) = sub.coalesced.lock() {
+                    // L4: an alarm event overwriting an unconsumed
+                    // coalesced slot is genuinely lost — bump the
+                    // diagnostic counter exactly as
+                    // `notify_subscribers` does for value events, so
+                    // alarm events dropped to a slow consumer are
+                    // visible in the `dropped_events` metric.
+                    if slot.is_some() {
+                        record_dropped_monitor();
+                    }
                     *slot = Some(event);
                 }
             }

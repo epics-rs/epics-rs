@@ -173,9 +173,17 @@ fn header_set_payload_boundary_at_0xfffe() {
 fn header_set_payload_count_boundary_at_0xffff() {
     let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
 
-    // count = 0xFFFF fits in normal form
-    hdr.set_payload_size(100, 0xFFFF);
+    // count = 0xFFFE fits in normal form
+    hdr.set_payload_size(100, 0xFFFE);
     assert!(!hdr.is_extended());
+    assert_eq!(hdr.count, 0xFFFE);
+
+    // count = 0xFFFF triggers extended (C `comQueSend.cpp:285` —
+    // `nElem < 0xffff` is the normal threshold, so exact `0xFFFF`
+    // requires extended form).
+    hdr.set_payload_size(100, 0xFFFF);
+    assert!(hdr.is_extended());
+    assert_eq!(hdr.actual_count(), 0xFFFF);
 
     // count = 0x10000 triggers extended
     hdr.set_payload_size(100, 0x10000);
@@ -787,4 +795,677 @@ async fn server_database_accessor() {
     let db = server.database();
     assert!(db.has_name("DB:ACCESS").await);
     assert!(!db.has_name("NONEXISTENT").await);
+}
+
+/// C `tcp_echo_action` (`rsrv/camessage.c:403-420`) echoes the full
+/// request header AND payload back to the client. The previous Rust
+/// behaviour replied with an all-zero CA_PROTO_ECHO header, dropping
+/// the request fields and any payload. Real clients (libca
+/// `tcpiiu::echoRequest`) only ever send zero-payload echos so the
+/// difference was masked in practice, but a diagnostic / probe client
+/// that puts a marker payload (e.g. RTT measurement, transparent-
+/// proxy detection) saw a stripped reply — a wire-level divergence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_echo_round_trips_request_header_and_payload() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("ECHO:PV", EpicsValue::Double(1.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    // Handshake: send VERSION, drain server's VERSION reply.
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = CA_MINOR_VERSION;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+    let mut buf = [0u8; 64];
+    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .expect("server VERSION reply timed out")
+        .expect("read VERSION");
+
+    // Send CA_PROTO_ECHO with a non-trivial header AND an 8-byte
+    // payload — the C server is documented to echo m_postsize bytes
+    // verbatim.
+    let mut echo = CaHeader::new(CA_PROTO_ECHO);
+    echo.data_type = 0xAAAA;
+    echo.count = 0; // padded post-write — set_payload_size below will adjust
+    echo.cid = 0x1122_3344;
+    echo.available = 0xAABB_CCDD;
+    echo.set_payload_size(8, 0);
+    let payload: [u8; 8] = *b"PROBE!\0\0";
+    let mut req = Vec::new();
+    req.extend_from_slice(&echo.to_bytes());
+    req.extend_from_slice(&payload);
+    sock.write_all(&req).await.unwrap();
+
+    // Read the response: 16-byte header + 8-byte payload = 24 bytes.
+    let mut resp = [0u8; 64];
+    let mut total = 0;
+    while total < 24 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+            .await
+            .expect("ECHO reply timed out")
+            .expect("read ECHO reply");
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    assert!(total >= 24, "expected 24 bytes, got {total}");
+
+    let resp_hdr = CaHeader::from_bytes(&resp[..16]).expect("parse response header");
+    assert_eq!(resp_hdr.cmmd, CA_PROTO_ECHO, "must echo CA_PROTO_ECHO");
+    assert_eq!(
+        resp_hdr.data_type, 0xAAAA,
+        "must echo m_dataType; got 0x{:04x}",
+        resp_hdr.data_type
+    );
+    assert_eq!(
+        resp_hdr.cid, 0x1122_3344,
+        "must echo m_cid; got 0x{:08x}",
+        resp_hdr.cid
+    );
+    assert_eq!(
+        resp_hdr.available, 0xAABB_CCDD,
+        "must echo m_available; got 0x{:08x}",
+        resp_hdr.available
+    );
+    assert_eq!(
+        resp_hdr.postsize, 8,
+        "must echo m_postsize; got {}",
+        resp_hdr.postsize
+    );
+    assert_eq!(
+        &resp[16..24],
+        &payload,
+        "must echo payload verbatim; got {:02x?}",
+        &resp[16..24]
+    );
+}
+
+/// C `event_cancel_reply` (`rsrv/camessage.c:1998-2021`) replies with
+/// CA_PROTO_ERROR + ECA_BADMONID when a CA_PROTO_EVENT_CANCEL request
+/// references a sub-id that doesn't match any active subscription on
+/// the channel. The previous Rust behaviour was a silent ignore — the
+/// client (or test driver) waited forever for an exception that never
+/// arrived.
+///
+/// This test sends a raw EVENT_CANCEL on an unopened sub-id over a
+/// real TCP CA connection and verifies the server replies with
+/// CA_PROTO_ERROR carrying ECA_BADMONID in m_available (per the
+/// `send_ca_error` field-assignment fix).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_event_cancel_unknown_subid_replies_eca_badmonid() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("BADMONID:PV", EpicsValue::Double(1.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Connect a raw TCP socket and complete the CA handshake.
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    // Send VERSION (priority=0, minor=13).
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = CA_MINOR_VERSION;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+
+    // Send HOST_NAME and CLIENT_NAME (server will ack VERSION but the
+    // handshake doesn't strictly require these — keep minimal).
+    // Server replies with its own VERSION; we drain it before
+    // proceeding.
+    let mut buf = [0u8; 64];
+    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .expect("server VERSION reply timed out")
+        .expect("read VERSION");
+
+    // Send EVENT_CANCEL with a sub-id that was never opened. We use
+    // an arbitrary m_cid (server sid) that's also unmapped — the
+    // server falls back to chan_cid = 0xFFFFFFFF in the reply.
+    let mut cancel = CaHeader::new(CA_PROTO_EVENT_CANCEL);
+    cancel.data_type = 6; // DBR_DOUBLE
+    cancel.count = 1;
+    cancel.cid = 0xDEAD_BEEF; // bogus sid
+    cancel.available = 0xCAFE_BABE; // bogus sub_id
+    sock.write_all(&cancel.to_bytes()).await.unwrap();
+
+    // Read the response. Expect CA_PROTO_ERROR (24-byte extended
+    // header, since send_ca_error always emits extended form).
+    let mut resp = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp))
+        .await
+        .expect("server did not reply within 2s — likely silent ignore regression")
+        .expect("read response");
+    assert!(n >= CaHeader::SIZE, "server reply too short: {n} bytes");
+
+    let resp_hdr = CaHeader::from_bytes(&resp[..n]).expect("parse response header");
+    assert_eq!(
+        resp_hdr.cmmd, CA_PROTO_ERROR,
+        "expected CA_PROTO_ERROR, got cmmd={}",
+        resp_hdr.cmmd
+    );
+    assert_eq!(
+        resp_hdr.available, ECA_BADMONID,
+        "expected ECA_BADMONID in m_available; got 0x{:08x}",
+        resp_hdr.available
+    );
+    // chan_cid is 0xFFFFFFFF when the request's m_cid doesn't map to
+    // an opened channel (C `vsend_err` default branch).
+    assert_eq!(
+        resp_hdr.cid, 0xFFFF_FFFF,
+        "expected 0xFFFFFFFF sentinel m_cid for unknown channel; got 0x{:08x}",
+        resp_hdr.cid
+    );
+}
+
+/// C `bad_tcp_cmd_action` (`rsrv/camessage.c:337-352`) on an unknown
+/// TCP command: (1) emit `CA_PROTO_ERROR` with `ECA_INTERNAL` and the
+/// channel-cid 0xFFFFFFFF sentinel (per `vsend_err` non-channel-scoped
+/// convention), then (2) return `RSRV_ERROR` so the dispatcher
+/// (`camessage.c:2519-2524`) breaks out of the message loop, which
+/// tears down the connection. The C source comment is explicit:
+/// "by default, clients don't recover from this".
+///
+/// Pre-fix Rust handler emitted the CA_PROTO_ERROR but kept the
+/// connection open — a malicious peer could flood the server with
+/// unknown commands and force one reply per frame indefinitely. This
+/// test verifies the server now drops the TCP connection after the
+/// error reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_unknown_tcp_command_replies_error_and_disconnects() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("BAD:CMD", EpicsValue::Double(1.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    // Handshake: send VERSION, drain server's VERSION reply.
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = CA_MINOR_VERSION;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+    let mut buf = [0u8; 64];
+    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .expect("server VERSION reply timed out")
+        .expect("read VERSION");
+
+    // Send a TCP frame with an unknown command code. CA_PROTO_LAST_CMMD
+    // in C is 27 (CA_PROTO_SERVER_DISCONN); 250 is comfortably past
+    // every defined command across all minor versions.
+    let mut unknown = CaHeader::new(250);
+    unknown.cid = 0xDEAD_BEEF;
+    sock.write_all(&unknown.to_bytes()).await.unwrap();
+
+    // Expect CA_PROTO_ERROR with ECA_INTERNAL + 0xFFFFFFFF sentinel cid.
+    let mut resp = [0u8; 256];
+    let mut total = 0;
+    while total < 16 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+            .await
+            .expect("server error-reply timed out")
+            .expect("read error reply");
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    assert!(
+        total >= 16,
+        "expected at least one CA_PROTO_ERROR header before disconnect, got {total}"
+    );
+    let err_hdr = CaHeader::from_bytes(&resp[..16]).expect("parse error header");
+    assert_eq!(err_hdr.cmmd, CA_PROTO_ERROR);
+    assert_eq!(err_hdr.available, ECA_INTERNAL);
+    assert_eq!(err_hdr.cid, 0xFFFF_FFFF);
+
+    // Drain any trailing payload bytes the server queued before
+    // closing (the original-header echo + diagnostic string).
+    let drain_start = total;
+    let _ = tokio::time::timeout(
+        Duration::from_millis(200),
+        sock.read(&mut resp[drain_start..]),
+    )
+    .await;
+
+    // Server must close the connection: a subsequent read returns 0
+    // (EOF) within a reasonable timeout.
+    let mut tail = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tail))
+        .await
+        .expect("server did not close TCP connection after unknown command")
+        .expect("read after error");
+    assert_eq!(
+        n, 0,
+        "server must drop the connection after CA_PROTO_ERROR on unknown command \
+         (C bad_tcp_cmd_action parity); instead read {n} more bytes"
+    );
+}
+
+/// C `tcp_version_action` (`rsrv/camessage.c:366-369`) rejects clients
+/// whose minor version is below `CA_MINIMUM_SUPPORTED_VERSION` (= 4 per
+/// `caProto.h:34`) by returning `RSRV_ERROR`, which tears down the TCP
+/// connection. Without this gate an ancient peer could complete
+/// VERSION and proceed to CREATE_CHAN with a wire format the modern
+/// server no longer fully supports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_tcp_version_below_minimum_drops_connection() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("VER:OLD", EpicsValue::Double(1.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    // CA V4.0 (minor = 0) is below CA_MINIMUM_SUPPORTED_VERSION = 4.
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = 0;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+
+    // Server must drop the connection — no VERSION reply, just EOF.
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .expect("server did not close TCP after unsupported VERSION")
+        .expect("read");
+    assert_eq!(
+        n, 0,
+        "server must drop the connection on VERSION minor < 4 \
+         (C tcp_version_action parity); instead read {n} bytes"
+    );
+}
+
+/// C `write_notify_action` (`rsrv/camessage.c:1647-1651`) emits a
+/// CA_PROTO_WRITE_NOTIFY error reply (`putNotifyErrorReply` with
+/// `m_cid = ECA_BADTYPE`) when the WRITE_NOTIFY data type exceeds
+/// `LAST_BUFFER_TYPE` (= DBR_CLASS_NAME = 38), then returns
+/// `RSRV_ERROR` which tears the connection down. Pre-fix Rust sent
+/// the error reply but kept the connection open, letting a peer
+/// flood the server with bad-type WRITE_NOTIFYs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_write_notify_bad_type_replies_error_and_disconnects() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("WRBAD:PV", EpicsValue::Double(0.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    // VERSION handshake
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = CA_MINOR_VERSION;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+    let mut hello = [0u8; 64];
+    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello))
+        .await
+        .expect("VERSION reply timed out")
+        .expect("read VERSION");
+
+    // CLIENT_NAME + HOST_NAME (required before CREATE_CHAN)
+    for (cmd, name) in [
+        (CA_PROTO_CLIENT_NAME, "testuser\0"),
+        (CA_PROTO_HOST_NAME, "testhost\0"),
+    ] {
+        let mut h = CaHeader::new(cmd);
+        let mut body = name.as_bytes().to_vec();
+        while !body.len().is_multiple_of(8) {
+            body.push(0);
+        }
+        h.set_payload_size(body.len(), 0);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&h.to_bytes());
+        frame.extend_from_slice(&body);
+        sock.write_all(&frame).await.unwrap();
+    }
+
+    // CREATE_CHAN on WRBAD:PV to get a valid SID
+    let mut create = CaHeader::new(CA_PROTO_CREATE_CHAN);
+    create.cid = 0xCAFEBABE;
+    let pv_name = b"WRBAD:PV\0";
+    let mut create_body = pv_name.to_vec();
+    while !create_body.len().is_multiple_of(8) {
+        create_body.push(0);
+    }
+    create.set_payload_size(create_body.len(), 0);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&create.to_bytes());
+    frame.extend_from_slice(&create_body);
+    sock.write_all(&frame).await.unwrap();
+
+    // Drain ACCESS_RIGHTS + CREATE_CHAN reply (read up to 64 bytes)
+    let mut buf = [0u8; 128];
+    let _ = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf)).await;
+    // Find the CREATE_CHAN reply to extract SID. ACCESS_RIGHTS comes
+    // first (16 bytes); CREATE_CHAN reply follows. Parse second header.
+    let create_resp = CaHeader::from_bytes(&buf[16..32]).expect("parse CREATE_CHAN");
+    assert_eq!(create_resp.cmmd, CA_PROTO_CREATE_CHAN);
+    let sid = create_resp.available;
+
+    // Send WRITE_NOTIFY with data_type = 100 (well past
+    // LAST_BUFFER_TYPE = 38). Payload size 0; C rejects on type
+    // alone before reading payload.
+    let mut bad = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
+    bad.data_type = 100;
+    bad.count = 1;
+    bad.cid = sid;
+    bad.available = 0xDEAD_BEEF; // ioid
+    sock.write_all(&bad.to_bytes()).await.unwrap();
+
+    // Expect CA_PROTO_WRITE_NOTIFY error reply with cid = ECA_BADTYPE.
+    let mut resp = [0u8; 64];
+    let mut total = 0;
+    while total < 16 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+            .await
+            .expect("error reply timed out")
+            .expect("read error reply");
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    assert!(total >= 16, "expected error reply, got {total} bytes");
+    let err_hdr = CaHeader::from_bytes(&resp[..16]).expect("parse error reply");
+    assert_eq!(err_hdr.cmmd, CA_PROTO_WRITE_NOTIFY);
+    assert_eq!(
+        err_hdr.cid, ECA_BADTYPE,
+        "cid carries ECA status per putNotifyErrorReply convention"
+    );
+    assert_eq!(err_hdr.available, 0xDEAD_BEEF, "ioid echoed");
+
+    // Server must disconnect after the error reply.
+    let mut tail = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tail))
+        .await
+        .expect("server did not close after WRITE_NOTIFY bad type")
+        .expect("read after error");
+    assert_eq!(
+        n, 0,
+        "server must drop the connection after WRITE_NOTIFY bad type \
+         (C write_notify_action RSRV_ERROR parity); got {n} more bytes"
+    );
+}
+
+/// C `read_action` (`rsrv/camessage.c:616-620`): `INVALID_DB_REQ`
+/// (data_type > LAST_BUFFER_TYPE = 38) emits a CA_PROTO_ERROR with
+/// ECA_BADTYPE, then returns RSRV_ERROR which tears the connection
+/// down. Pre-fix Rust sent the error reply but kept the connection
+/// open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_read_notify_bad_type_replies_error_and_disconnects() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("RDBAD:PV", EpicsValue::Double(0.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    // VERSION + CLIENT_NAME + HOST_NAME + CREATE_CHAN handshake.
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = CA_MINOR_VERSION;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+    let mut hello = [0u8; 64];
+    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello))
+        .await
+        .expect("VERSION reply timed out")
+        .expect("read VERSION");
+    for (cmd, name) in [
+        (CA_PROTO_CLIENT_NAME, "testuser\0"),
+        (CA_PROTO_HOST_NAME, "testhost\0"),
+    ] {
+        let mut h = CaHeader::new(cmd);
+        let mut body = name.as_bytes().to_vec();
+        while !body.len().is_multiple_of(8) {
+            body.push(0);
+        }
+        h.set_payload_size(body.len(), 0);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&h.to_bytes());
+        frame.extend_from_slice(&body);
+        sock.write_all(&frame).await.unwrap();
+    }
+    let mut create = CaHeader::new(CA_PROTO_CREATE_CHAN);
+    create.cid = 0xC0FFEEEE;
+    let pv_name = b"RDBAD:PV\0";
+    let mut create_body = pv_name.to_vec();
+    while !create_body.len().is_multiple_of(8) {
+        create_body.push(0);
+    }
+    create.set_payload_size(create_body.len(), 0);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&create.to_bytes());
+    frame.extend_from_slice(&create_body);
+    sock.write_all(&frame).await.unwrap();
+    let mut buf = [0u8; 128];
+    let _ = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf)).await;
+    let create_resp = CaHeader::from_bytes(&buf[16..32]).expect("parse CREATE_CHAN");
+    let sid = create_resp.available;
+
+    // READ_NOTIFY with data_type = 200 (well past LAST_BUFFER_TYPE = 38).
+    let mut bad = CaHeader::new(CA_PROTO_READ_NOTIFY);
+    bad.data_type = 200;
+    bad.count = 1;
+    bad.cid = sid;
+    bad.available = 0xFADE_FADE; // ioid
+    sock.write_all(&bad.to_bytes()).await.unwrap();
+
+    // Expect CA_PROTO_READ_NOTIFY error reply with cid = ECA_BADTYPE.
+    let mut resp = [0u8; 64];
+    let mut total = 0;
+    while total < 16 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+            .await
+            .expect("error reply timed out")
+            .expect("read error reply");
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    assert!(total >= 16, "expected error reply, got {total} bytes");
+    let err_hdr = CaHeader::from_bytes(&resp[..16]).expect("parse error reply");
+    assert_eq!(err_hdr.cmmd, CA_PROTO_READ_NOTIFY);
+    assert_eq!(err_hdr.cid, ECA_BADTYPE);
+    assert_eq!(err_hdr.available, 0xFADE_FADE, "ioid echoed");
+
+    // Server must disconnect after the error.
+    let mut tail = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tail))
+        .await
+        .expect("server did not close after READ_NOTIFY bad type")
+        .expect("read after error");
+    assert_eq!(
+        n, 0,
+        "server must drop after READ_NOTIFY bad type \
+         (C read_action RSRV_ERROR parity); got {n} more bytes"
+    );
+}
+
+/// C `read_sync_reply` (`rsrv/camessage.c:2053-2067`) echoes the
+/// request header back with cmmd=CA_PROTO_READ_SYNC, m_postsize=0,
+/// and the request's m_dataType / m_count / m_cid / m_available
+/// preserved. libca client treats this as ECHO (`cac.cpp:72-73`).
+/// Pre-fix Rust silently no-op-ed; this regression test ensures the
+/// echo reply now arrives with the expected fields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_read_sync_echoes_request_header() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("SYNC:PV", EpicsValue::Double(0.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = CA_MINOR_VERSION;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+    let mut hello = [0u8; 64];
+    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello))
+        .await
+        .expect("VERSION reply timed out")
+        .expect("read VERSION");
+
+    // Send READ_SYNC with distinctive field values to verify echo.
+    let mut sync = CaHeader::new(CA_PROTO_READ_SYNC);
+    sync.data_type = 0xBEEF;
+    sync.count = 0x1234;
+    sync.cid = 0xCAFE_F00D;
+    sync.available = 0xDEAD_BEEF;
+    sock.write_all(&sync.to_bytes()).await.unwrap();
+
+    // Expect CA_PROTO_READ_SYNC reply with the same fields echoed.
+    let mut resp = [0u8; 32];
+    let mut total = 0;
+    while total < 16 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+            .await
+            .expect("READ_SYNC echo timed out")
+            .expect("read echo");
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    assert!(total >= 16, "expected echo reply, got {total} bytes");
+    let echo = CaHeader::from_bytes(&resp[..16]).expect("parse echo");
+    assert_eq!(echo.cmmd, CA_PROTO_READ_SYNC);
+    assert_eq!(echo.data_type, 0xBEEF, "m_dataType echoed");
+    assert_eq!(echo.count, 0x1234, "m_count echoed");
+    assert_eq!(echo.cid, 0xCAFE_F00D, "m_cid echoed");
+    assert_eq!(echo.available, 0xDEAD_BEEF, "m_available echoed");
+    assert_eq!(echo.postsize, 0, "no payload");
 }

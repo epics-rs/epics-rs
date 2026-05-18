@@ -438,7 +438,9 @@ fn test_roi_param_change_enables_output() {
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(10));
 
-    // Send array — ROI1 has default size=0, should produce NO output
+    // Send array — ROI1 has default size=0. Matching C++ NDPluginROI
+    // (size = MAX(size, 1)), an enabled ROI dim with size 0 clamps to a
+    // 1-pixel ROI and still produces an output, so STATS1 receives it.
     let mut arr = NDArray::new(
         vec![NDDimension::new(8), NDDimension::new(8)],
         NDDataType::UInt8,
@@ -448,8 +450,8 @@ fn test_roi_param_change_enables_output() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert_eq!(
         *last_id.lock(),
-        -1,
-        "STATS1 should NOT receive with ROI size=0"
+        100,
+        "ROI size=0 clamps to a 1-pixel ROI (C++ MAX(size,1)) and still emits"
     );
 
     // Now set ROI size via param write (like PINI or user).
@@ -648,12 +650,12 @@ fn test_attribute_plugin_value_extraction() {
     let mut proc = AttributeProcessor::new("exposure");
 
     let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-    arr.attributes.add(NDAttribute {
-        name: "exposure".into(),
-        description: "".into(),
-        source: NDAttrSource::Driver,
-        value: NDAttrValue::Float64(0.5),
-    });
+    arr.attributes.add(NDAttribute::new_static(
+        "exposure",
+        "",
+        NDAttrSource::Driver,
+        NDAttrValue::Float64(0.5),
+    ));
 
     let result = proc.process_array(&arr, &pool);
     // AttributeProcessor is a sink (no output arrays)
@@ -759,7 +761,12 @@ fn test_process_and_publish_writes_array_size_params() {
 
     assert_eq!(size_x, 64, "ArraySizeX should be 64");
     assert_eq!(size_y, 48, "ArraySizeY should be 48");
-    assert_eq!(size_z, 1, "ArraySizeZ should be 1 for 2D mono");
+    // C parity: NDArray::getInfo leaves colorSize at 0 for a 2-D array (no
+    // color dimension), so ArraySizeZ_RBV is 0 for 2D mono.
+    assert_eq!(
+        size_z, 0,
+        "ArraySizeZ should be 0 for 2D mono (no color dim)"
+    );
     assert_eq!(array_size, 64 * 48, "ArraySize should be total bytes");
     assert_eq!(counter, 1, "ArrayCounter should be 1");
     assert_eq!(unique_id, 42, "UniqueId should be 42");

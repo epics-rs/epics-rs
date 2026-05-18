@@ -11,13 +11,17 @@ use std::time::Duration;
 
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::error::PvaResult;
+use epics_pva_rs::server_native::source::{ChannelSource, DynSource};
 use epics_pva_rs::server_native::{
     CompositeSource, PvaServer, PvaServerConfig, runtime::ServerReport,
 };
 
 use super::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL};
 use super::control::ControlSource;
-use super::error::GwResult;
+use super::error::{GwError, GwResult};
+use super::middleware::{
+    AclConfig, AclLayer, AuditLayer, AuditSink, Layer, NoopAudit, ReadOnlyLayer,
+};
 use super::source::GatewayChannelSource;
 
 /// Configuration for [`PvaGateway::start`]. All fields have sensible
@@ -58,6 +62,27 @@ pub struct PvaGatewayConfig {
     /// disables the feature so the gateway only proxies upstream PVs.
     /// Override via `EPICS_PVA_GW_CONTROL_PREFIX` env var.
     pub control_prefix: Option<String>,
+
+    /// CRITICAL-1: when `true`, every downstream PUT is rejected by a
+    /// [`ReadOnlyLayer`] before it can reach the upstream — a
+    /// read-only proxy deployment. Pre-fix the `read_only` intent had
+    /// no config surface at all and the middleware was dead code.
+    /// Override via `EPICS_PVA_GW_READONLY` (`YES`/`1`/`true`).
+    pub read_only: bool,
+
+    /// CRITICAL-1: optional pattern-matched access control. When
+    /// `Some`, an [`AclLayer`] filters every op (`has_pv`, GET, PUT,
+    /// MONITOR, RPC, `list_pvs`) by the configured glob / regex
+    /// deny / allow lists, short-circuiting denied PV names before
+    /// they reach the upstream proxy. `None` installs no ACL layer.
+    pub acl: Option<AclConfig>,
+
+    /// CRITICAL-1: optional PUT (and, if the sink opts in, GET /
+    /// MONITOR / RPC) audit sink. When `Some`, an [`AuditLayer`]
+    /// emits a structured [`super::middleware::AuditEvent`] for every
+    /// PUT, carrying the downstream peer's credentials and the
+    /// outcome. `None` installs no audit layer.
+    pub audit: Option<Arc<dyn AuditSink>>,
 }
 
 impl Default for PvaGatewayConfig {
@@ -78,6 +103,9 @@ impl Default for PvaGatewayConfig {
             max_cache_entries: super::channel_cache::DEFAULT_MAX_ENTRIES,
             max_subscribers: 100_000,
             control_prefix: None,
+            read_only: false,
+            acl: None,
+            audit: None,
         }
     }
 }
@@ -129,6 +157,14 @@ impl PvaGatewayConfig {
                 self.control_prefix = Some(trimmed.to_string());
             }
         }
+        // CRITICAL-1: read-only deployments are commonly toggled by
+        // env in containerised gateways; `acl` / `audit` carry
+        // structured state and stay programmatic-only.
+        if let Ok(s) = std::env::var("EPICS_PVA_GW_READONLY") {
+            let t = s.trim();
+            self.read_only =
+                t.eq_ignore_ascii_case("YES") || t.eq_ignore_ascii_case("TRUE") || t == "1";
+        }
         self
     }
 }
@@ -149,6 +185,20 @@ impl PvaGateway {
     /// Start a gateway. The downstream server begins accepting on the
     /// configured port; upstream channels are opened lazily on the
     /// first downstream search for each PV.
+    ///
+    /// CRITICAL-1: the `read_only` / `acl` / `audit` config fields are
+    /// wired here into the [`super::middleware`] layer chain. The
+    /// chain wrapping the proxy source is
+    /// `Audit( ReadOnly?( Acl( GatewayChannelSource ) ) )`:
+    ///
+    /// - `Acl` is innermost so a denied PV name short-circuits before
+    ///   the call reaches the proxy (no upstream search for a denied
+    ///   PV) — and `list_pvs` is filtered at the proxy boundary.
+    /// - `ReadOnly` (only when `read_only`) sits above `Acl` so it
+    ///   rejects every PUT regardless of upstream policy.
+    /// - `Audit` is outermost so it records the *final* outcome,
+    ///   including ACL / read-only denials, not just PUTs that
+    ///   reached the upstream.
     pub fn start(config: PvaGatewayConfig) -> GwResult<Self> {
         let client = config
             .upstream_client
@@ -161,28 +211,49 @@ impl PvaGateway {
         let mut source = GatewayChannelSource::new(cache.clone());
         source.connect_timeout = config.connect_timeout;
         source.max_subscribers = config.max_subscribers;
+
+        // Build the middleware chain over a clone of the proxy source.
+        // The retained `source` field stays the *unlayered*
+        // `GatewayChannelSource` so `set_acf` / `set_asg_resolver` /
+        // `prefetch` keep operating on the live policy holder; the
+        // ACL/ReadOnly/Audit layers forward `access()` to it.
+        //
+        // `Acl` and `Audit` are always present (permissive `AclConfig`
+        // / `NoopAudit` when not configured) so the final type is
+        // uniform; only `read_only` is a genuine branch. The audit
+        // sink is type-erased to `Arc<dyn AuditSink>` so the wrapped
+        // type does not depend on the concrete sink.
+        let acl_cfg = config.acl.clone().unwrap_or_default();
+        let audit_sink: Arc<dyn AuditSink> =
+            config.audit.clone().unwrap_or_else(|| Arc::new(NoopAudit));
+
+        let acl_layer = AclLayer::new(acl_cfg).layer(source.clone());
+
         // G-G2: when control_prefix is set, run the proxy and the
         // diagnostic PVs through a CompositeSource. The control source
         // is registered at order=-100 so its PV-name lookups always
         // win over the proxy (which would otherwise try to forward
-        // `<prefix>:cacheSize` upstream and time out).
-        let server = match &config.control_prefix {
-            Some(prefix) if !prefix.is_empty() => {
-                let composite = CompositeSource::new();
-                let control = ControlSource::new(prefix, cache.clone(), source.clone());
-                composite
-                    .add_source("__gw_control", Arc::new(control), -100)
-                    .map_err(|e| {
-                        super::error::GwError::Other(format!("control source registration: {e}"))
-                    })?;
-                composite
-                    .add_source("gateway", Arc::new(source.clone()), 0)
-                    .map_err(|e| {
-                        super::error::GwError::Other(format!("gateway source registration: {e}"))
-                    })?;
-                PvaServer::start(composite, config.server_config)
-            }
-            _ => PvaServer::start(Arc::new(source.clone()), config.server_config),
+        // `<prefix>:cacheSize` upstream and time out). The control
+        // source is intentionally NOT layered — its PVs are already
+        // read-only diagnostics and must stay reachable.
+        let server = if config.read_only {
+            let layered = AuditLayer::new(audit_sink).layer(ReadOnlyLayer.layer(acl_layer));
+            Self::start_server(
+                layered,
+                &cache,
+                &source,
+                &config.control_prefix,
+                config.server_config,
+            )?
+        } else {
+            let layered = AuditLayer::new(audit_sink).layer(acl_layer);
+            Self::start_server(
+                layered,
+                &cache,
+                &source,
+                &config.control_prefix,
+                config.server_config,
+            )?
         };
         Ok(Self {
             cache,
@@ -191,19 +262,50 @@ impl PvaGateway {
         })
     }
 
+    /// Stand up the downstream `PvaServer` over the fully-layered
+    /// gateway source, optionally behind a `CompositeSource` that also
+    /// hosts the runtime-control diagnostic PVs. Generic over the
+    /// concrete layered source type so `start` branches only on
+    /// `read_only`.
+    fn start_server<S>(
+        layered: S,
+        cache: &Arc<ChannelCache>,
+        source: &GatewayChannelSource,
+        control_prefix: &Option<String>,
+        server_config: PvaServerConfig,
+    ) -> GwResult<PvaServer>
+    where
+        S: ChannelSource + 'static,
+    {
+        match control_prefix {
+            Some(prefix) if !prefix.is_empty() => {
+                let composite = CompositeSource::new();
+                let control = ControlSource::new(prefix, cache.clone(), source.clone());
+                composite
+                    .add_source("__gw_control", Arc::new(control) as DynSource, -100)
+                    .map_err(|e| GwError::Other(format!("control source registration: {e}")))?;
+                composite
+                    .add_source("gateway", Arc::new(layered) as DynSource, 0)
+                    .map_err(|e| GwError::Other(format!("gateway source registration: {e}")))?;
+                Ok(PvaServer::start(composite, server_config)?)
+            }
+            _ => Ok(PvaServer::start(Arc::new(layered), server_config)?),
+        }
+    }
+
     /// Convenience: loopback-only gateway with auto-picked free
     /// ports. Mirrors `PvaServer::isolated` semantics — useful for
     /// in-process tests where the gateway should not interact with
     /// the real network.
-    pub fn isolated(client: Arc<PvaClient>) -> Self {
+    pub fn isolated(client: Arc<PvaClient>) -> GwResult<Self> {
         let cache = ChannelCache::new(client, DEFAULT_CLEANUP_INTERVAL);
         let source = GatewayChannelSource::new(cache.clone());
-        let server = PvaServer::isolated(Arc::new(source.clone()));
-        Self {
+        let server = PvaServer::isolated(Arc::new(source.clone()))?;
+        Ok(Self {
             cache,
             server,
             source,
-        }
+        })
     }
 
     /// Cache handle for diagnostics / iocsh `gwstats`.

@@ -5,6 +5,7 @@
 //! port-state change notifications (connect, enable, autoConnect, trace changes)
 //! to all registered callbacks.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
@@ -40,7 +41,7 @@ pub struct ExceptionEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExceptionCallbackId(u64);
 
-type CallbackFn = Box<dyn Fn(&ExceptionEvent) + Send + Sync>;
+type CallbackFn = Arc<dyn Fn(&ExceptionEvent) + Send + Sync>;
 
 struct CallbackEntry {
     id: ExceptionCallbackId,
@@ -72,7 +73,7 @@ impl ExceptionManager {
         let id = ExceptionCallbackId(self.next_id.fetch_add(1, Ordering::Relaxed));
         self.callbacks.lock().push(CallbackEntry {
             id,
-            callback: Box::new(callback),
+            callback: Arc::new(callback),
         });
         id
     }
@@ -83,10 +84,18 @@ impl ExceptionManager {
     }
 
     /// Announce an exception event to all registered callbacks.
+    ///
+    /// The callback list is snapshotted under the lock and the lock is
+    /// released before any callback runs, so a callback may freely call
+    /// [`Self::add_callback`] / [`Self::remove_callback`] (or re-enter
+    /// `announce`) without deadlocking on the non-reentrant mutex.
     pub fn announce(&self, event: &ExceptionEvent) {
-        let cbs = self.callbacks.lock();
-        for entry in cbs.iter() {
-            (entry.callback)(event);
+        let snapshot: Vec<CallbackFn> = {
+            let cbs = self.callbacks.lock();
+            cbs.iter().map(|e| e.callback.clone()).collect()
+        };
+        for callback in &snapshot {
+            callback(event);
         }
     }
 }

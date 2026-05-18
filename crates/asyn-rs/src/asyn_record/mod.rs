@@ -105,6 +105,74 @@ fn menu_index_to_baud_rate(idx: i32) -> i32 {
     }
 }
 
+/// Decode a C-style backslash-escaped string into the raw bytes the
+/// driver layer expects. Mirrors EPICS base's `dbTranslateEscape`
+/// (`libCom/misc/dbTranslateEscape.c`) — supports the standard
+/// escape sequences `\r \n \t \\ \" \0` plus octal `\NNN`. Used by
+/// asynRecord OEOS/IEOS writes (C asynRecord.c:374-393) so a
+/// configured `\r\n` terminator in the DB field reaches the driver
+/// as the two raw bytes `0x0D 0x0A`, not the four-byte literal.
+/// `asynFMT` menu value for binary I/O format — selects the raw BOUT /
+/// BINP byte buffers over the ASCII AOUT / AINP string buffers.
+/// (`asynFMT_Binary` in EPICS `asynRecord.dbd`; ASCII = 0, Hybrid = 1.)
+const ASYN_FMT_BINARY: i32 = 2;
+
+fn translate_escape(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut chars = s.bytes().peekable();
+    while let Some(c) = chars.next() {
+        if c != b'\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(next) = chars.next() else {
+            // dangling backslash at end of input → pass through, C
+            // `dbTranslateEscape` returns input length on incomplete
+            // escape so we match (push the literal `\`).
+            out.push(b'\\');
+            break;
+        };
+        let decoded = match next {
+            b'r' => 0x0D,
+            b'n' => 0x0A,
+            b't' => 0x09,
+            b'\\' => b'\\',
+            b'"' => b'"',
+            b'\'' => b'\'',
+            b'0'..=b'7' => {
+                // Octal escape `\N`, `\NN`, `\NNN` — C `dbTranslateEscape`
+                // consumes up to three octal digits. `\0` with no further
+                // digits still decodes to NUL.
+                let mut val = u32::from(next - b'0');
+                for _ in 0..2 {
+                    match chars.peek() {
+                        Some(&d) if (b'0'..=b'7').contains(&d) => {
+                            val = val * 8 + u32::from(d - b'0');
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                out.push((val & 0xFF) as u8);
+                continue;
+            }
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0C,
+            b'v' => 0x0B,
+            other => {
+                // Unknown escape — pass through literally (C does the
+                // same for unrecognized backslash sequences).
+                out.push(b'\\');
+                out.push(other);
+                continue;
+            }
+        };
+        out.push(decoded);
+    }
+    out
+}
+
 // ===== AsynRecord =====
 
 /// Full asynRecord with all 67 fields.
@@ -1043,8 +1111,17 @@ impl AsynRecord {
                 // Mark connected
                 self.pcnct = 1;
                 self.cnct = 1;
-                self.enbl = 1;
-                self.auct = 1;
+                // C asynRecord.c connectDevice queries the port's actual
+                // enable / auto-connect state into ENBL / AUCT — it must
+                // not force them to 1, which would discard a user who
+                // configured ENBL=0 or a port registered noAutoConnect.
+                // Keep the current field value if the query fails.
+                if let Ok(enabled) = entry.handle.is_enabled_blocking() {
+                    self.enbl = i32::from(enabled);
+                }
+                if let Ok(auto) = entry.handle.is_auto_connect_blocking() {
+                    self.auct = i32::from(auto);
+                }
                 // Only clear errors if drv_user_create succeeded (don't mask the error)
                 if self.errs.is_empty() || self.resolved_reason != 0 || self.drvinfo.is_empty() {
                     self.errs.clear();
@@ -1057,6 +1134,21 @@ impl AsynRecord {
                 self.port_entry = None;
             }
         }
+    }
+
+    /// Build an `AsynUser` for an I/O transfer, applying the record's
+    /// `TMOT` timeout field. C `asynRecord.c` sets
+    /// `pasynUser->timeout = precord->tmot` before every transfer; a
+    /// non-positive `tmot` falls back to the 1 s default.
+    fn io_user(&self) -> crate::user::AsynUser {
+        let timeout = if self.tmot > 0.0 {
+            std::time::Duration::from_secs_f64(self.tmot)
+        } else {
+            std::time::Duration::from_secs(1)
+        };
+        crate::user::AsynUser::new(self.resolved_reason)
+            .with_addr(self.addr)
+            .with_timeout(timeout)
     }
 
     /// Perform I/O based on TMOD and IFACE.
@@ -1076,13 +1168,29 @@ impl AsynRecord {
         if matches!(tmod, TransferMode::Write | TransferMode::WriteRead) {
             match iface {
                 InterfaceType::Octet => {
-                    let data = self.aout.as_bytes().to_vec();
+                    // C asynRecord.c selects the output buffer by OFMT:
+                    // Binary (asynFMT_Binary) writes the raw BOUT byte
+                    // array, ASCII / Hybrid write the AOUT string. NOWT
+                    // bytes are written (NOWT defaults to OMAX), not the
+                    // whole buffer. Rust `io_write_octet` is all-or-error,
+                    // so a successful write transferred exactly the slice.
+                    let full: &[u8] = if self.ofmt == ASYN_FMT_BINARY {
+                        &self.bout
+                    } else {
+                        self.aout.as_bytes()
+                    };
+                    let n = if self.nowt > 0 {
+                        (self.nowt as usize).min(full.len())
+                    } else {
+                        full.len()
+                    };
+                    let data = full[..n].to_vec();
                     match entry.handle.submit_blocking(
-                        crate::request::RequestOp::OctetWrite { data: data.clone() },
-                        crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
+                        crate::request::RequestOp::OctetWrite { data },
+                        self.io_user(),
                     ) {
                         Ok(_) => {
-                            self.nawt = data.len() as i32;
+                            self.nawt = n as i32;
                         }
                         Err(e) => {
                             self.errs = format!("write: {e}");
@@ -1090,10 +1198,9 @@ impl AsynRecord {
                     }
                 }
                 InterfaceType::Int32 => {
-                    match entry.handle.write_int32_blocking(
-                        self.resolved_reason,
-                        self.addr,
-                        self.i32out,
+                    match entry.handle.submit_blocking(
+                        crate::request::RequestOp::Int32Write { value: self.i32out },
+                        self.io_user(),
                     ) {
                         Ok(_) => {}
                         Err(e) => {
@@ -1107,7 +1214,7 @@ impl AsynRecord {
                             value: self.ui32out,
                             mask: self.ui32mask,
                         },
-                        crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
+                        self.io_user(),
                     ) {
                         Ok(_) => {}
                         Err(e) => {
@@ -1116,10 +1223,9 @@ impl AsynRecord {
                     }
                 }
                 InterfaceType::Float64 => {
-                    match entry.handle.write_float64_blocking(
-                        self.resolved_reason,
-                        self.addr,
-                        self.f64out,
+                    match entry.handle.submit_blocking(
+                        crate::request::RequestOp::Float64Write { value: self.f64out },
+                        self.io_user(),
                     ) {
                         Ok(_) => {}
                         Err(e) => {
@@ -1134,16 +1240,23 @@ impl AsynRecord {
         if matches!(tmod, TransferMode::Read | TransferMode::WriteRead) {
             match iface {
                 InterfaceType::Octet => {
+                    // Clamp against negative IMAX/NRRD — both are settable
+                    // Long fields; a negative value sign-extends to a huge
+                    // usize and would request a multi-GB buffer.
+                    let imax = self.imax.max(0) as usize;
                     let buf_size = if self.nrrd > 0 {
-                        self.nrrd as usize
+                        (self.nrrd as usize).min(imax)
                     } else {
-                        self.imax as usize
+                        imax
                     };
                     match entry.handle.submit_blocking(
                         crate::request::RequestOp::OctetRead { buf_size },
-                        crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
+                        self.io_user(),
                     ) {
                         Ok(result) => {
+                            // C asynRecord.c stores the driver's returned
+                            // EOM reason into EOMR after every octet read.
+                            self.eomr = result.eom_reason as i32;
                             if let Some(data) = result.data {
                                 self.nord = data.len() as i32;
                                 self.ainp = String::from_utf8_lossy(&data).to_string();
@@ -1160,10 +1273,14 @@ impl AsynRecord {
                 InterfaceType::Int32 => {
                     match entry
                         .handle
-                        .read_int32_blocking(self.resolved_reason, self.addr)
+                        .submit_blocking(crate::request::RequestOp::Int32Read, self.io_user())
                     {
-                        Ok(v) => {
-                            self.i32inp = v;
+                        Ok(result) => {
+                            if let Some(v) = result.int_val {
+                                self.i32inp = v;
+                            } else {
+                                self.errs = "read: int32 read returned no value".to_string();
+                            }
                         }
                         Err(e) => {
                             self.errs = format!("read: {e}");
@@ -1175,7 +1292,7 @@ impl AsynRecord {
                         crate::request::RequestOp::UInt32DigitalRead {
                             mask: self.ui32mask,
                         },
-                        crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
+                        self.io_user(),
                     ) {
                         Ok(result) => {
                             if let Some(v) = result.uint_val {
@@ -1190,10 +1307,14 @@ impl AsynRecord {
                 InterfaceType::Float64 => {
                     match entry
                         .handle
-                        .read_float64_blocking(self.resolved_reason, self.addr)
+                        .submit_blocking(crate::request::RequestOp::Float64Read, self.io_user())
                     {
-                        Ok(v) => {
-                            self.f64inp = v;
+                        Ok(result) => {
+                            if let Some(v) = result.float_val {
+                                self.f64inp = v;
+                            } else {
+                                self.errs = "read: float64 read returned no value".to_string();
+                            }
                         }
                         Err(e) => {
                             self.errs = format!("read: {e}");
@@ -1627,6 +1748,28 @@ impl Record for AsynRecord {
                 self.apply_trace_file();
             }
 
+            // Enable / disable the entire port (C parity:
+            // pasynManager->enable from asynRecord.c:484-486).
+            // Forward the typed flag through the port handle so the
+            // driver sees `enable()` / `disable()` (and the
+            // associated asynExceptionEnable fan-out from
+            // PortDriverBase::set_enabled).
+            "ENBL" => {
+                if let Some(ref entry) = self.port_entry {
+                    let _ = entry.handle.set_enable_blocking(self.enbl != 0);
+                }
+            }
+
+            // Auto-connect (C parity: pasynManager->autoConnect from
+            // asynRecord.c:481-482). C fires
+            // asynExceptionAutoConnect unconditionally, which Rust
+            // mirrors via PortDriverBase::set_auto_connect.
+            "AUCT" => {
+                if let Some(ref entry) = self.port_entry {
+                    let _ = entry.handle.set_auto_connect_blocking(self.auct != 0);
+                }
+            }
+
             // Connection management
             "CNCT" => {
                 if self.cnct != 0 {
@@ -1686,7 +1829,13 @@ impl Record for AsynRecord {
                     4 => "8",
                     _ => return Ok(()),
                 };
-                self.write_option("csize", val);
+                // C parity: `drvAsynSerialPort.c:146/360` recognises
+                // the key `"bits"` (not `"csize"`). Rust's serial
+                // driver follows the same C key (`serial_port.rs:649`)
+                // so the asynRecord DBIT write must use `"bits"` to
+                // actually reach the driver — previously routed to
+                // `"csize"` which no driver consumes.
+                self.write_option("bits", val);
             }
             "SBIT" => {
                 let val = match self.sbit {
@@ -1766,11 +1915,35 @@ impl Record for AsynRecord {
             }
 
             // --- EOS (end-of-string) delimiters ---
+            //
+            // C parity: `asynRecord.c::monitor` (the `OEOS`/`IEOS`
+            // special-write path at lines 374-393) decodes the
+            // backslash-escaped DB field via `dbTranslateEscape`
+            // and calls `pasynOctet->setOutputEos /
+            // setInputEos(pasynUser, eos, eos_len)`. Previously
+            // Rust routed through `set_option_blocking("oeos", ...)`
+            // which lands in `PortDriverBase::options` — no driver
+            // consumes the `oeos`/`ieos` keys, so the EOS interpose
+            // ignores the asynRecord write. The actor-routed
+            // `SetInputEos`/`SetOutputEos` ops drive the driver
+            // trait hooks (`set_input_eos` / `set_output_eos`) so
+            // the value reaches `PortDriverBase::input_eos /
+            // output_eos`, which is what the EOS interpose reads.
             "OEOS" => {
-                self.write_option("oeos", &self.oeos.clone());
+                let bytes = translate_escape(&self.oeos);
+                if let Some(ref entry) = self.port_entry {
+                    if let Err(e) = entry.handle.set_output_eos_blocking(&bytes) {
+                        self.errs = format!("set_output_eos: {e}");
+                    }
+                }
             }
             "IEOS" => {
-                self.write_option("ieos", &self.ieos.clone());
+                let bytes = translate_escape(&self.ieos);
+                if let Some(ref entry) = self.port_entry {
+                    if let Err(e) = entry.handle.set_input_eos_blocking(&bytes) {
+                        self.errs = format!("set_input_eos: {e}");
+                    }
+                }
             }
 
             // --- UI32MASK change ---
@@ -1996,5 +2169,38 @@ mod tests {
         assert_eq!(rec.record_type(), "asyn");
         // Verify it's our full version with all fields
         assert!(rec.field_list().len() > 3);
+    }
+
+    /// C parity for `dbTranslateEscape` (epics-base
+    /// `libCom/misc/dbTranslateEscape.c`). asynRecord stores OEOS/IEOS
+    /// as a backslash-escaped DB field and the device-support layer
+    /// MUST decode it before handing off to `pasynOctet->setInputEos`
+    /// — otherwise a "\r\n" record string sends four literal bytes
+    /// instead of the two-byte terminator.
+    #[test]
+    fn test_translate_escape_standard_sequences() {
+        assert_eq!(translate_escape("\\r\\n"), vec![0x0D, 0x0A]);
+        assert_eq!(translate_escape("\\t"), vec![0x09]);
+        assert_eq!(translate_escape("\\\\"), vec![b'\\']);
+        assert_eq!(translate_escape("\\0"), vec![0x00]);
+        assert_eq!(translate_escape("abc"), vec![b'a', b'b', b'c']);
+        // Pass-through for unknown escapes (matches C dbTranslateEscape).
+        assert_eq!(translate_escape("\\x"), vec![b'\\', b'x']);
+        // Dangling backslash passes through.
+        assert_eq!(translate_escape("a\\"), vec![b'a', b'\\']);
+    }
+
+    #[test]
+    fn test_translate_escape_octal() {
+        // C dbTranslateEscape decodes octal \N, \NN, \NNN.
+        assert_eq!(translate_escape("\\033"), vec![0x1B]); // ESC
+        assert_eq!(translate_escape("\\7"), vec![0x07]); // BEL, one digit
+        assert_eq!(translate_escape("\\101"), vec![b'A']); // 0o101 == 65
+        // Octal escape followed by a non-octal byte stops the run.
+        assert_eq!(translate_escape("\\0119"), vec![0x09, b'9']);
+        // \0 with no further digits still decodes to NUL.
+        assert_eq!(translate_escape("\\0"), vec![0x00]);
+        // A terminator built from two octal escapes (e.g. CR LF).
+        assert_eq!(translate_escape("\\015\\012"), vec![0x0D, 0x0A]);
     }
 }

@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 use crate::calc::NumericInputs;
@@ -22,6 +22,12 @@ pub struct TransformRecord {
     pub copt: i16, // 0=Conditional (only if calc non-empty), 1=Always
     pub ivla: i16, // 0=Ignore error, 1=Do Nothing
     pub prec: i16,
+    /// Per-channel "value field A..P was written by a `put` since the
+    /// last `process()`" flags. synApps `transformRecord` does not
+    /// re-compute a channel whose value field was just `dbPut` this
+    /// cycle ("don't overwrite a fresh put"). Set by `put_field` for the
+    /// `A..P` value fields, cleared at the start of `process()`.
+    fresh_put: [bool; NUM_CHANNELS],
 }
 
 impl Default for TransformRecord {
@@ -36,6 +42,7 @@ impl Default for TransformRecord {
             copt: 0,
             ivla: 0,
             prec: 0,
+            fresh_put: [false; NUM_CHANNELS],
         }
     }
 }
@@ -450,8 +457,19 @@ impl Record for TransformRecord {
         // Save previous values
         self.prev_vals = self.vals;
 
-        // Evaluate each calc expression A-P
+        // Snapshot and clear the fresh-put flags for this cycle.
+        let fresh_put = std::mem::take(&mut self.fresh_put);
+
+        // Evaluate each calc expression A-P.
         for i in 0..NUM_CHANNELS {
+            // S5 — synApps `transformRecord` does NOT re-compute a
+            // channel whose value field (A..P) was directly written by
+            // a `put` since the last process. Skip it so a CA put to a
+            // transform value field survives one cycle instead of being
+            // immediately overwritten by its CLCx.
+            if fresh_put[i] {
+                continue;
+            }
             if let Some(ref compiled) = self.compiled[i] {
                 let mut inputs = NumericInputs::new();
                 inputs.vars[..NUM_CHANNELS].copy_from_slice(&self.vals);
@@ -460,17 +478,41 @@ impl Record for TransformRecord {
                         self.vals[i] = result;
                     }
                     Err(_) => {
+                        // S6 — IVLA=Do_Nothing applies the no-op
+                        // PER FAILING CHANNEL (synApps semantics), not
+                        // globally: restore only this channel's value
+                        // and continue with the rest.
                         if self.ivla == 1 {
-                            // Do Nothing — restore all values
-                            self.vals = self.prev_vals;
-                            return Ok(ProcessOutcome::complete());
+                            self.vals[i] = self.prev_vals[i];
                         }
-                        // Ignore error — continue
+                        // IVLA=Ignore error — leave value, continue.
                     }
                 }
             }
         }
-        Ok(ProcessOutcome::complete())
+
+        // S4 — COPT semantics for the OUT links. Emit a WriteDbLink per
+        // channel that should drive its OUTx link:
+        //   COPT=Always (1):       every channel with a non-empty OUTx.
+        //   COPT=Conditional (0):  only channels whose CLCx is non-empty
+        //                          AND have a non-empty OUTx.
+        // Previously `multi_output_links()` returned the full 16-entry
+        // slice for both modes, so a Conditional channel with an empty
+        // CLCx still had its OUTx written — diverging from synApps.
+        let mut actions = Vec::new();
+        for i in 0..NUM_CHANNELS {
+            if self.out_links[i].is_empty() {
+                continue;
+            }
+            let write = self.copt == 1 || !self.calcs[i].is_empty();
+            if write {
+                actions.push(ProcessAction::WriteDbLink {
+                    link_field: OUT_FIELD_NAMES[i],
+                    value: EpicsValue::Double(self.vals[i]),
+                });
+            }
+        }
+        Ok(ProcessOutcome::complete_with(actions))
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -572,6 +614,29 @@ impl Record for TransformRecord {
         Err(CaError::FieldNotFound(name.to_string()))
     }
 
+    /// S5 — mark a value channel (VAL / A..P) "freshly put" when it is
+    /// written by an *external* put. The framework calls `special(field,
+    /// true)` only on the CA / database-access put path
+    /// (`field_io.rs`); the multi-input-link propagation
+    /// (`processing.rs`) writes A..P via `put_field` directly *without*
+    /// `special()`, so input-linked channels are NOT marked fresh and
+    /// still re-compute from their CLCx every cycle. The next
+    /// `process()` skips re-computing a fresh-put channel so a CA put to
+    /// `transform.A` survives one cycle.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if after {
+            let idx = if field == "VAL" {
+                Some(0)
+            } else {
+                Self::channel_index(field)
+            };
+            if let Some(i) = idx {
+                self.fresh_put[i] = true;
+            }
+        }
+        Ok(())
+    }
+
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         &[
             ("INPA", "A"),
@@ -593,43 +658,18 @@ impl Record for TransformRecord {
         ]
     }
 
-    fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
-        static ALL: [(&str, &str); 16] = [
-            ("OUTA", "A"),
-            ("OUTB", "B"),
-            ("OUTC", "C"),
-            ("OUTD", "D"),
-            ("OUTE", "E"),
-            ("OUTF", "F"),
-            ("OUTG", "G"),
-            ("OUTH", "H"),
-            ("OUTI", "I"),
-            ("OUTJ", "J"),
-            ("OUTK", "K"),
-            ("OUTL", "L"),
-            ("OUTM", "M"),
-            ("OUTN", "N"),
-            ("OUTO", "O"),
-            ("OUTP", "P"),
-        ];
-        if self.copt == 1 {
-            // COPT=Always: write all output links
-            &ALL
-        } else {
-            // COPT=Conditional: only write outputs with non-empty calcs.
-            // Since we can't return a dynamic slice from a &'static ref,
-            // we return ALL and rely on the framework skipping empty link
-            // strings. To suppress output for channels without calcs,
-            // process() clears the OUTx link field for those channels.
-            // (This is a pragmatic workaround since the trait requires &'static.)
-            &ALL
-        }
-    }
-
     fn field_list(&self) -> &'static [FieldDesc] {
         TRANSFORM_FIELDS
     }
 }
+
+/// OUTA..OUTP field names, indexed by channel 0..15. Used by
+/// `process()` to name the per-channel OUT link for a `WriteDbLink`
+/// action — `ProcessAction::link_field` requires a `&'static str`.
+static OUT_FIELD_NAMES: [&str; NUM_CHANNELS] = [
+    "OUTA", "OUTB", "OUTC", "OUTD", "OUTE", "OUTF", "OUTG", "OUTH", "OUTI", "OUTJ", "OUTK", "OUTL",
+    "OUTM", "OUTN", "OUTO", "OUTP",
+];
 
 #[cfg(test)]
 mod tests {

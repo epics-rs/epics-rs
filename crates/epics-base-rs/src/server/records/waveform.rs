@@ -143,6 +143,38 @@ impl WaveformRecord {
         };
         self.nord = 0;
     }
+
+    /// Resize the VAL buffer to the current NELM **while preserving
+    /// existing element data** — shrink truncates, grow zero-pads, and
+    /// NORD is clamped to the new length.
+    ///
+    /// C parity (M-6): `waveformRecord` does not support a destructive
+    /// run-time NELM change — `init_record` allocates `bptr` once and a
+    /// freely-writable NELM that wiped VAL would lose the waveform
+    /// contents a CA client just stored. Keeping the data on resize is
+    /// the non-destructive equivalent.
+    fn resize_val_preserving(&mut self) {
+        let n = self.nelm.max(0) as usize;
+        match &mut self.val {
+            EpicsValue::CharArray(v) => v.resize(n, 0),
+            EpicsValue::ShortArray(v) => v.resize(n, 0),
+            EpicsValue::LongArray(v) => v.resize(n, 0),
+            EpicsValue::Int64Array(v) => v.resize(n, 0),
+            EpicsValue::FloatArray(v) => v.resize(n, 0.0),
+            EpicsValue::DoubleArray(v) => v.resize(n, 0.0),
+            EpicsValue::EnumArray(v) => v.resize(n, 0),
+            EpicsValue::StringArray(v) => v.resize(n, String::new()),
+            // VAL is not currently an array variant — fall back to a
+            // fresh allocation sized to the new NELM.
+            _ => {
+                self.reallocate_val();
+                return;
+            }
+        }
+        if (self.nord as usize) > n {
+            self.nord = n as i32;
+        }
+    }
 }
 
 static WAVEFORM_FIELDS_CHAR: &[FieldDesc] = &[
@@ -350,12 +382,19 @@ impl Record for WaveformRecord {
                     // (subArrayRecord.c:310-311 in `readValue`,
                     // init at line 103-104). Other array kinds do
                     // not have MALM and are unaffected.
-                    self.nelm = if matches!(self.kind, ArrayKind::SubArray) && self.malm > 0 {
-                        n.min(self.malm)
+                    if matches!(self.kind, ArrayKind::SubArray) {
+                        // subArray: NELM is the slice length, clamped
+                        // to MALM; the buffer is re-derived from the
+                        // source on `set_val`, so a fresh zeroed
+                        // allocation here is correct.
+                        self.nelm = if self.malm > 0 { n.min(self.malm) } else { n };
+                        self.reallocate_val();
                     } else {
-                        n
-                    };
-                    self.reallocate_val();
+                        // waveform/aai/aao: M-6 — preserve the existing
+                        // element data instead of wiping VAL.
+                        self.nelm = n;
+                        self.resize_val_preserving();
+                    }
                     Ok(())
                 } else {
                     Err(CaError::InvalidValue(format!(

@@ -4,10 +4,127 @@ use std::sync::Arc;
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 
+use crate::attributes::{
+    EpicsPvAttributeSource, FunctionAttributeSource, NDAttrSource, NDAttrValue, NDAttribute,
+    NDAttributeFunctionRegistry, ParamAttributeSource,
+};
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::NDArrayPool;
 use crate::params::ndarray_driver::NDArrayDriverParams;
 use crate::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
+
+/// `ND_ATTRIBUTES_STATUS` code: attributes loaded successfully
+/// (C++ `NDAttributesOK`).
+pub const ATTR_STATUS_OK: i32 = 0;
+/// `ND_ATTRIBUTES_STATUS` code: the attributes file could not be opened
+/// (C++ `NDAttributesFileNotFound`).
+pub const ATTR_STATUS_FILE_NOT_FOUND: i32 = 1;
+/// `ND_ATTRIBUTES_STATUS` code: the attributes XML failed to parse
+/// (C++ `NDAttributesXMLSyntaxError`).
+pub const ATTR_STATUS_XML_SYNTAX_ERROR: i32 = 2;
+/// `ND_ATTRIBUTES_STATUS` code: macro expansion failed
+/// (C++ `NDAttributesMacroError`). Reserved — macro substitution is not
+/// implemented in the Rust port.
+pub const ATTR_STATUS_MACRO_ERROR: i32 = 3;
+
+/// Extract the value of an XML attribute `key="..."` from a single tag body.
+fn xml_attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
+    let pat = format!("{key}=\"");
+    let start = tag.find(&pat)? + pat.len();
+    let end = tag[start..].find('"')? + start;
+    Some(&tag[start..end])
+}
+
+/// Parse the areaDetector `NDAttributesFile` XML schema.
+///
+/// Recognizes a root `<Attributes>` element containing
+/// `<Attribute name="..." source="..." type="..." description="..." .../>`
+/// children. The `type` attribute selects the [`NDAttrSource`]; C++
+/// `NDAttribute::attrSourceString` defines the canonical uppercase names
+/// `PARAM`, `EPICS_PV`, `FUNCTION`, `CONST` — the match is case-insensitive so
+/// historic lowercase forms still parse.
+///
+/// G10: live attributes are built with concrete [`NDAttributeSource`]
+/// backends:
+/// - `PARAM` → [`ParamAttributeSource`], fed by the driver from the asyn
+///   parameter library (optional `addr` attribute, default 0).
+/// - `FUNCTION` → [`FunctionAttributeSource`], calling a function registered
+///   in `registry` (optional `param` attribute passed to the function).
+/// - `EPICS_PV` → [`EpicsPvAttributeSource`], fed by a CA-monitor task.
+/// - `CONST` → static value carrying the literal `source` string.
+fn parse_attributes_xml(
+    xml: &str,
+    registry: &std::sync::Arc<NDAttributeFunctionRegistry>,
+) -> Result<Vec<NDAttribute>, String> {
+    if !xml.contains("<Attributes>") {
+        return Err("missing <Attributes> root element".into());
+    }
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(open) = rest.find("<Attribute ") {
+        let after = &rest[open + 1..];
+        let close = after
+            .find("/>")
+            .or_else(|| after.find('>'))
+            .ok_or_else(|| "unterminated <Attribute> tag".to_string())?;
+        let tag = &after[..close];
+
+        let name = xml_attr(tag, "name")
+            .ok_or_else(|| "Attribute missing name".to_string())?
+            .to_string();
+        let description = xml_attr(tag, "description").unwrap_or("").to_string();
+        let source_str =
+            xml_attr(tag, "source").ok_or_else(|| format!("Attribute {name} missing source"))?;
+        // C++ default attribute type is EPICS_PV.
+        let attr_type = xml_attr(tag, "type").unwrap_or("EPICS_PV");
+
+        let attr = match attr_type.to_ascii_uppercase().as_str() {
+            "EPICS_PV" => {
+                // G10: a CA-monitor task feeds the cell; backend is pluggable.
+                let src = EpicsPvAttributeSource::new(source_str);
+                NDAttribute::new_with_source(name, description, NDAttrSource::EpicsPV, src)
+            }
+            "PARAM" => {
+                // C++ paramAttribute: optional `addr` (default 0).
+                let addr = xml_attr(tag, "addr")
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(0);
+                let src = ParamAttributeSource::new(source_str, addr);
+                NDAttribute::new_with_source(
+                    name,
+                    description,
+                    NDAttrSource::Param {
+                        port_name: String::new(),
+                        param_name: source_str.to_string(),
+                    },
+                    src,
+                )
+            }
+            "FUNCTION" => {
+                // C++ functAttribute: `source` is the function name, optional
+                // `param` is the string passed to the function.
+                let func_param = xml_attr(tag, "param").unwrap_or("");
+                let src = FunctionAttributeSource::new(registry.clone(), source_str, func_param);
+                NDAttribute::new_with_source(name, description, NDAttrSource::Function, src)
+            }
+            "CONST" => NDAttribute::new_static(
+                name,
+                description,
+                NDAttrSource::Constant,
+                NDAttrValue::String(source_str.to_string()),
+            ),
+            other => {
+                return Err(format!(
+                    "unknown attribute type '{other}' for attribute {name}"
+                ));
+            }
+        };
+
+        out.push(attr);
+        rest = &after[close..];
+    }
+    Ok(out)
+}
 
 /// Parse a C printf-style template with two `%s` and one `%d`-like specifier.
 ///
@@ -65,16 +182,29 @@ fn sprintf_template(template: &str, path: &str, name: &str, number: i32) -> Stri
 }
 
 /// Format an integer with a printf-style width/precision spec.
-/// Handles specs like "", "3.3", "04", "06", "3", ".3", etc.
+///
+/// Emulates C `printf` integer conversion:
+/// - **precision** (`.N`) is the minimum number of digits — the value is
+///   zero-padded on the left to at least that many digits.
+/// - **width** (`N`) is the minimum field width — the (already
+///   precision-padded) string is then padded with spaces on the left
+///   (right-justified) to at least that width.
+/// - the `0` flag, when present and there is no precision, makes the width
+///   pad with zeros instead of spaces (C ignores `0` when a precision is
+///   given for integer conversions).
+///
+/// Examples: `%3.3d` of 7 → `"007"`; `%5.3d` of 42 → `"  042"`;
+/// `%04d` of 7 → `"0007"`; `%5d` of 7 → `"    7"`.
 fn format_int_spec(spec: &str, value: i32) -> String {
     if spec.is_empty() {
         return value.to_string();
     }
 
-    let zero_pad = spec.starts_with('0');
-    let spec_clean = spec.trim_start_matches('0');
+    let zero_flag = spec.starts_with('0');
+    // Strip only the leading flag '0' before parsing width digits.
+    let spec_clean = if zero_flag { &spec[1..] } else { spec };
 
-    // Split on '.' for width.precision
+    // Split on '.' into width.precision.
     let (width_str, prec_str) = if let Some(dot_pos) = spec_clean.find('.') {
         (&spec_clean[..dot_pos], Some(&spec_clean[dot_pos + 1..]))
     } else {
@@ -82,17 +212,173 @@ fn format_int_spec(spec: &str, value: i32) -> String {
     };
 
     let width: usize = width_str.parse().unwrap_or(0);
+    let has_precision = prec_str.is_some();
     let precision: usize = prec_str.and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    let min_digits = width.max(precision);
-    if min_digits == 0 {
-        return value.to_string();
+    // Step 1: render the integer, zero-padded to `precision` digits.
+    let negative = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let digits = if digits.len() < precision {
+        format!("{}{}", "0".repeat(precision - digits.len()), digits)
+    } else {
+        digits
+    };
+    let body = if negative {
+        format!("-{digits}")
+    } else {
+        digits
+    };
+
+    // Step 2: pad to the field width. C uses zero-padding for the width only
+    // when the `0` flag is set AND no precision was specified.
+    if body.len() >= width {
+        body
+    } else if zero_flag && !has_precision {
+        let pad = width - body.len();
+        if negative {
+            // Keep the sign at the front of zero-padding (C behavior).
+            format!("-{}{}", "0".repeat(pad), &body[1..])
+        } else {
+            format!("{}{}", "0".repeat(pad), body)
+        }
+    } else {
+        format!("{}{}", " ".repeat(width - body.len()), body)
+    }
+}
+
+/// Write all per-array parameters from an `NDArray` into the parameter library.
+///
+/// This is the shared body used by both `NDArrayDriverBase::prepare_array` and
+/// `ADDriverBase::prepare_array`. It populates the array-info parameters that
+/// C++ drivers set for every frame:
+/// `ARRAY_SIZE_X/Y/Z`, `ARRAY_SIZE`, `UNIQUE_ID`, `ARRAY_NDIMENSIONS`,
+/// `ARRAY_DIMENSIONS`, `DATA_TYPE`, `COLOR_MODE`, `BAYER_PATTERN`,
+/// `TIME_STAMP`, `EPICS_TS_SEC`, `EPICS_TS_NSEC`, `CODEC`, `COMPRESSED_SIZE`.
+pub(crate) fn write_array_params(
+    port_base: &mut PortDriverBase,
+    params: &NDArrayDriverParams,
+    array: &NDArray,
+) -> AsynResult<()> {
+    let info = array.info();
+    port_base.set_int32_param(params.array_size_x, 0, info.x_size as i32)?;
+    port_base.set_int32_param(params.array_size_y, 0, info.y_size as i32)?;
+    port_base.set_int32_param(params.array_size_z, 0, info.color_size as i32)?;
+    port_base.set_int32_param(params.array_size, 0, info.total_bytes as i32)?;
+    port_base.set_int32_param(params.unique_id, 0, array.unique_id)?;
+
+    // G7: dimensions.
+    port_base.set_int32_param(params.n_dimensions, 0, array.dims.len() as i32)?;
+    let dim_sizes: Vec<i32> = array.dims.iter().map(|d| d.size as i32).collect();
+    port_base
+        .params
+        .set_int32_array(params.array_dimensions, 0, dim_sizes)?;
+
+    // G7: data type and color mode.
+    port_base.set_int32_param(params.data_type, 0, array.data.data_type() as i32)?;
+    port_base.set_int32_param(params.color_mode, 0, info.color_mode as i32)?;
+
+    // G5: Bayer pattern, derived from the `bayerPattern` array attribute.
+    if let Some(bp) = array
+        .attributes
+        .get("bayerPattern")
+        .and_then(|a| a.value.as_i64())
+    {
+        let pattern = crate::color::NDBayerPattern::from_i32(bp as i32);
+        port_base.set_int32_param(params.bayer_pattern, 0, pattern.as_i32())?;
     }
 
-    if zero_pad || precision > 0 {
-        format!("{:0>width$}", value, width = min_digits)
+    // G7: timestamps. `time_stamp` is the double timestamp; `timestamp` is the
+    // epicsTS (sec/nsec) split across the two Int32 params.
+    port_base.set_float64_param(params.timestamp_rbv, 0, array.time_stamp)?;
+    port_base.set_int32_param(params.epics_ts_sec, 0, array.timestamp.sec as i32)?;
+    port_base.set_int32_param(params.epics_ts_nsec, 0, array.timestamp.nsec as i32)?;
+
+    // G6: codec name and compressed size, published from NDArray.codec.
+    match &array.codec {
+        Some(codec) => {
+            port_base.set_string_param(params.codec, 0, codec.name.as_str().into())?;
+            port_base.set_int32_param(params.compressed_size, 0, codec.compressed_size as i32)?;
+        }
+        None => {
+            port_base.set_string_param(params.codec, 0, String::new())?;
+            port_base.set_int32_param(params.compressed_size, 0, info.total_bytes as i32)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refresh the pool-statistics parameters (`POOL_MAX_MEMORY`,
+/// `POOL_USED_MEMORY`, `POOL_ALLOC_BUFFERS`, `POOL_FREE_BUFFERS`) from a pool.
+///
+/// Shared by the `NDPoolPollStats` dispatch and `preAllocateBuffers`.
+pub(crate) fn refresh_pool_stats(
+    port_base: &mut PortDriverBase,
+    params: &NDArrayDriverParams,
+    pool: &NDArrayPool,
+) -> AsynResult<()> {
+    const MEGABYTE: f64 = 1_048_576.0;
+    port_base.set_float64_param(
+        params.pool_max_memory,
+        0,
+        pool.max_memory() as f64 / MEGABYTE,
+    )?;
+    port_base.set_float64_param(
+        params.pool_used_memory,
+        0,
+        pool.allocated_bytes() as f64 / MEGABYTE,
+    )?;
+    port_base.set_int32_param(
+        params.pool_alloc_buffers,
+        0,
+        pool.num_alloc_buffers() as i32,
+    )?;
+    port_base.set_int32_param(params.pool_free_buffers, 0, pool.num_free_buffers() as i32)?;
+    Ok(())
+}
+
+/// Handle a write to a pool-control Int32 parameter, mirroring the pool branch
+/// of C++ `asynNDArrayDriver::writeInt32` (asynNDArrayDriver.cpp:684-694).
+///
+/// `param_index` is the parameter that was just written; `value` is the value
+/// written. Returns `true` when the parameter was a recognized pool-control
+/// parameter and was handled. `template_array` is used by the
+/// `POOL_PRE_ALLOC_BUFFERS` path (C++ uses `pArrays[0]` — the most recent
+/// array); pass the driver's last array, or `None` if none exists yet.
+pub(crate) fn handle_pool_write_int32(
+    port_base: &mut PortDriverBase,
+    params: &NDArrayDriverParams,
+    pool: &NDArrayPool,
+    param_index: usize,
+    template_array: Option<&NDArray>,
+) -> AsynResult<bool> {
+    if param_index == params.pool_empty_free_list {
+        pool.empty_free_list();
+        refresh_pool_stats(port_base, params, pool)?;
+        Ok(true)
+    } else if param_index == params.pool_poll_stats {
+        refresh_pool_stats(port_base, params, pool)?;
+        Ok(true)
+    } else if param_index == params.pool_pre_alloc {
+        if let Some(template) = template_array {
+            let count = port_base
+                .get_int32_param(params.pool_num_pre_alloc_buffers, 0)
+                .unwrap_or(0)
+                .max(0) as usize;
+            // C++ preAllocateBuffers ignores allocation errors per-array; here
+            // we surface them so the caller knows the pool limit was hit.
+            pool.pre_allocate_buffers(template, count).map_err(|e| {
+                asyn_rs::error::AsynError::Status {
+                    status: asyn_rs::error::AsynStatus::Error,
+                    message: e.to_string(),
+                }
+            })?;
+            refresh_pool_stats(port_base, params, pool)?;
+        }
+        // C++ resets NDPoolPreAllocBuffers back to 0 after running.
+        port_base.set_int32_param(params.pool_pre_alloc, 0, 0)?;
+        Ok(true)
     } else {
-        format!("{:>width$}", value, width = min_digits)
+        Ok(false)
     }
 }
 
@@ -103,6 +389,15 @@ pub struct NDArrayDriverBase {
     pub pool: Arc<NDArrayPool>,
     pub array_output: NDArrayOutput,
     pub queued_counter: Arc<QueuedArrayCounter>,
+    /// Most recently prepared array (C++ `pArrays[0]`), used as the template
+    /// for `preAllocateBuffers`.
+    pub last_array: Option<Arc<NDArray>>,
+    /// NDArray attribute definitions loaded from `ND_ATTRIBUTES_FILE`
+    /// (C++ `asynNDArrayDriver::pAttributeList`).
+    pub attributes: crate::attributes::NDAttributeList,
+    /// Registry of named attribute functions for `FUNCTION`-type attributes
+    /// (C++ `registryFunctionFind` / `registerNDAttributeFunction`).
+    pub attr_functions: std::sync::Arc<NDAttributeFunctionRegistry>,
 }
 
 impl NDArrayDriverBase {
@@ -129,6 +424,9 @@ impl NDArrayDriverBase {
             pool,
             array_output: NDArrayOutput::new(),
             queued_counter: Arc::new(QueuedArrayCounter::new()),
+            last_array: None,
+            attributes: crate::attributes::NDAttributeList::new(),
+            attr_functions: NDAttributeFunctionRegistry::new(),
         })
     }
 
@@ -136,6 +434,24 @@ impl NDArrayDriverBase {
     pub fn connect_downstream(&mut self, mut sender: NDArraySender) {
         sender.set_queued_counter(self.queued_counter.clone());
         self.array_output.add(sender);
+    }
+
+    /// Handle a write to a pool-control Int32 parameter (`POOL_EMPTY_FREELIST`,
+    /// `POOL_POLL_STATS`, `POOL_PRE_ALLOC_BUFFERS`), mirroring the pool branch
+    /// of C++ `asynNDArrayDriver::writeInt32`.
+    ///
+    /// Returns `true` when `param_index` was a recognized pool-control
+    /// parameter. Driver layers route their `writeInt32` through this so the
+    /// `POOL_*` parameters act on the pool instead of being dead.
+    pub fn write_int32_pool(&mut self, param_index: usize, _value: i32) -> AsynResult<bool> {
+        let template = self.last_array.clone();
+        handle_pool_write_int32(
+            &mut self.port_base,
+            &self.params,
+            &self.pool,
+            param_index,
+            template.as_deref(),
+        )
     }
 
     /// Number of connected downstream channels.
@@ -150,7 +466,7 @@ impl NDArrayDriverBase {
     ///
     /// This function does NOT publish the array — the caller is responsible
     /// for that in an async context. Returns `None` when callbacks are disabled.
-    pub fn prepare_array(&mut self, array: Arc<NDArray>) -> AsynResult<Option<Arc<NDArray>>> {
+    pub fn prepare_array(&mut self, mut array: Arc<NDArray>) -> AsynResult<Option<Arc<NDArray>>> {
         let counter = self
             .port_base
             .get_int32_param(self.params.array_counter, 0)?
@@ -158,17 +474,24 @@ impl NDArrayDriverBase {
         self.port_base
             .set_int32_param(self.params.array_counter, 0, counter)?;
 
-        let info = array.info();
-        self.port_base
-            .set_int32_param(self.params.array_size_x, 0, info.x_size as i32)?;
-        self.port_base
-            .set_int32_param(self.params.array_size_y, 0, info.y_size as i32)?;
-        self.port_base
-            .set_int32_param(self.params.array_size_z, 0, info.color_size as i32)?;
-        self.port_base
-            .set_int32_param(self.params.array_size, 0, info.total_bytes as i32)?;
-        self.port_base
-            .set_int32_param(self.params.unique_id, 0, array.unique_id)?;
+        // G10: re-evaluate every live attribute (PARAM from the parameter
+        // library, FUNCTION from the registry, EPICS_PV from its CA cell) and
+        // merge the fresh values onto the outgoing array. Port of C++
+        // `asynNDArrayDriver::doCallbacksGenericPointer` calling
+        // `getAttributes(pArray->pAttributeList)` before the callback. Skipped
+        // when the driver has no attribute definitions, so a plain array is
+        // never needlessly deep-copied via `Arc::make_mut`.
+        if !self.attributes.is_empty() {
+            let fresh = self.update_attributes();
+            Arc::make_mut(&mut array).attributes.copy_from(&fresh);
+        }
+
+        // G5/G6/G7: write all per-array parameters (size, dims, type, color,
+        // Bayer, timestamps, codec).
+        write_array_params(&mut self.port_base, &self.params, &array)?;
+
+        // Record this as the template array for preAllocateBuffers.
+        self.last_array = Some(array.clone());
 
         // Update pool stats
         self.port_base.set_float64_param(
@@ -225,12 +548,10 @@ impl NDArrayDriverBase {
             .get_int32_param(self.params.auto_increment, 0)
             .unwrap_or(0);
 
-        let full = if template.is_empty() {
-            format!("{}{}{:04}", path, name, number)
-        } else {
-            // Parse C printf-style template: two %s args (path, name) and one %d-like arg (number)
-            sprintf_template(template, path, name, number)
-        };
+        // C parity: an empty FILE_TEMPLATE is passed straight to epicsSnprintf,
+        // which yields an empty string. Do NOT fabricate a default template.
+        // sprintf_template handles the empty case correctly (no specifiers).
+        let full = sprintf_template(template, path, name, number);
 
         self.port_base
             .set_string_param(self.params.full_file_name, 0, full.clone())?;
@@ -259,6 +580,227 @@ impl NDArrayDriverBase {
         self.port_base
             .set_int32_param(self.params.file_path_exists, 0, exists as i32)?;
         Ok(exists)
+    }
+
+    /// Recursively create the directory components of `path`.
+    ///
+    /// Mirrors C++ `asynNDArrayDriver::createFilePath`: directory parts at
+    /// index `>= path_depth` are created (parts before that depth are assumed
+    /// to already exist). A `path_depth` of 0 is a no-op; a negative
+    /// `path_depth` counts from the end (`num_parts + path_depth`, clamped to a
+    /// minimum of 1). `EEXIST` is not an error.
+    pub fn create_file_path(path: &str, path_depth: i32) -> AsynResult<()> {
+        if path_depth == 0 {
+            return Ok(());
+        }
+
+        // Leading prefix to preserve verbatim: an optional Windows drive
+        // designator ("C:") plus any leading path separators.
+        let bytes: Vec<char> = path.chars().collect();
+        let mut i = 0usize;
+        let mut prefix = String::new();
+        if bytes.len() >= 2 && bytes[1] == ':' {
+            prefix.push(bytes[0]);
+            prefix.push(':');
+            i = 2;
+        }
+        while i < bytes.len() && (bytes[i] == '/' || bytes[i] == '\\') {
+            prefix.push(bytes[i]);
+            i += 1;
+        }
+
+        let rest: String = bytes[i..].iter().collect();
+        let parts: Vec<&str> = rest.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+        let num_parts = parts.len() as i32;
+
+        let mut depth = path_depth;
+        if depth < 0 {
+            depth += num_parts;
+            if depth < 1 {
+                depth = 1;
+            }
+        }
+
+        let mut next_dir = prefix;
+        for (idx, part) in parts.iter().enumerate() {
+            next_dir.push_str(part);
+            if idx as i32 >= depth {
+                match std::fs::create_dir(&next_dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            next_dir.push('/');
+        }
+        Ok(())
+    }
+
+    /// Handle a write to an Octet parameter, mirroring the relevant branches of
+    /// C++ `asynNDArrayDriver::writeOctet`.
+    ///
+    /// - `ND_ATTRIBUTES_FILE` / `ND_ATTRIBUTES_MACROS`: reload the attribute
+    ///   definitions via [`Self::read_nd_attributes_file`].
+    /// - `FILE_PATH`: run `checkPath`; if the directory does not exist, attempt
+    ///   `createFilePath` bounded by `CREATE_DIR`, then re-check.
+    ///
+    /// The caller is expected to have already stored `value` into the parameter
+    /// library. Returns `true` when `param_index` was a recognized parameter.
+    pub fn write_octet(&mut self, param_index: usize, value: &str) -> AsynResult<bool> {
+        if param_index == self.params.attributes_file
+            || param_index == self.params.attributes_macros
+        {
+            let _ = self.read_nd_attributes_file();
+            Ok(true)
+        } else if param_index == self.params.file_path {
+            if !self.check_path()? {
+                let depth = self
+                    .port_base
+                    .get_int32_param(self.params.create_dir, 0)
+                    .unwrap_or(0);
+                let _ = Self::create_file_path(value, depth);
+                self.check_path()?;
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Load NDArray attribute definitions from the `ND_ATTRIBUTES_FILE`
+    /// parameter, mirroring C++ `asynNDArrayDriver::readNDAttributesFile`.
+    ///
+    /// The parameter value is either a path to an XML file or inline XML
+    /// (recognized by containing `<Attributes>`). The XML schema is the
+    /// areaDetector `NDAttributesFile` schema: a root `<Attributes>` element
+    /// with `<Attribute name="..." source="..." type="..." .../>` children.
+    /// Macro substitution (C++ `ND_ATTRIBUTES_MACROS`) is not supported and is
+    /// ignored. Attributes are stored on `self.attributes`; `ND_ATTRIBUTES_STATUS`
+    /// is set to the resulting status code.
+    pub fn read_nd_attributes_file(&mut self) -> AsynResult<()> {
+        let file_param = self
+            .port_base
+            .get_string_param(self.params.attributes_file, 0)?
+            .to_string();
+
+        // Clear any existing attributes (C++ clears unconditionally first).
+        self.attributes.clear();
+        if file_param.is_empty() {
+            self.port_base
+                .set_int32_param(self.params.attributes_status, 0, ATTR_STATUS_OK)?;
+            return Ok(());
+        }
+
+        // The parameter is inline XML if it contains the root element.
+        let xml = if file_param.contains("<Attributes>") {
+            file_param
+        } else {
+            match std::fs::read_to_string(&file_param) {
+                Ok(s) => s,
+                Err(_) => {
+                    self.port_base.set_int32_param(
+                        self.params.attributes_status,
+                        0,
+                        ATTR_STATUS_FILE_NOT_FOUND,
+                    )?;
+                    return Err(asyn_rs::error::AsynError::Status {
+                        status: asyn_rs::error::AsynStatus::Error,
+                        message: format!("readNDAttributesFile: cannot open {file_param}"),
+                    });
+                }
+            }
+        };
+
+        match parse_attributes_xml(&xml, &self.attr_functions) {
+            Ok(attrs) => {
+                for attr in attrs {
+                    self.attributes.add(attr);
+                }
+                self.port_base
+                    .set_int32_param(self.params.attributes_status, 0, ATTR_STATUS_OK)?;
+                Ok(())
+            }
+            Err(msg) => {
+                self.port_base.set_int32_param(
+                    self.params.attributes_status,
+                    0,
+                    ATTR_STATUS_XML_SYNTAX_ERROR,
+                )?;
+                Err(asyn_rs::error::AsynError::Status {
+                    status: asyn_rs::error::AsynStatus::Error,
+                    message: format!("readNDAttributesFile: {msg}"),
+                })
+            }
+        }
+    }
+
+    /// Access the driver's NDArray attribute list (populated by
+    /// `read_nd_attributes_file`).
+    pub fn attributes(&self) -> &crate::attributes::NDAttributeList {
+        &self.attributes
+    }
+
+    /// Re-evaluate every live attribute, then return a snapshot of the list to
+    /// attach to an outgoing NDArray.
+    ///
+    /// Port of C++ `asynNDArrayDriver::getAttributes` →
+    /// `NDAttributeList::updateValues()`. `PARAM` attributes are refreshed from
+    /// this driver's asyn parameter library (mirroring
+    /// `paramAttribute::updateValue`, which reads `pDriver->getXxxParam`);
+    /// `FUNCTION` attributes call their registered function; `EPICS_PV`
+    /// attributes read whatever value a CA-monitor task last fed into their
+    /// cell. `CONST` / `DRIVER` attributes are static.
+    pub fn update_attributes(&mut self) -> crate::attributes::NDAttributeList {
+        // 1. Feed each PARAM attribute's cell from the parameter library.
+        //    Done first (immutable borrow of attributes + port_base), so the
+        //    subsequent update_values() re-read picks up the fresh value.
+        for attr in self.attributes.iter() {
+            if let Some(param_src) = attr.param_source() {
+                if let Some(value) = self.read_param_value(&param_src.param_name, param_src.addr) {
+                    param_src.cell().set(value);
+                }
+            }
+        }
+        // 2. Re-evaluate every attribute from its (now-fresh) source.
+        self.attributes.update_values();
+        // 3. Return a snapshot for the outgoing array.
+        self.attributes.clone()
+    }
+
+    /// Read a parameter's current value from the asyn parameter library,
+    /// converting it to an [`NDAttrValue`]. Returns `None` when the parameter
+    /// name is unknown or its value is undefined.
+    fn read_param_value(&self, param_name: &str, addr: i32) -> Option<NDAttrValue> {
+        use asyn_rs::param::ParamType;
+        let index = self.port_base.params.find_param(param_name)?;
+        match self.port_base.params.param_type(index)? {
+            ParamType::Int32 | ParamType::Enum | ParamType::UInt32Digital => self
+                .port_base
+                .params
+                .get_int32(index, addr)
+                .ok()
+                .map(NDAttrValue::Int32),
+            ParamType::Int64 => self
+                .port_base
+                .params
+                .get_int64(index, addr)
+                .ok()
+                .map(NDAttrValue::Int64),
+            ParamType::Float64 => self
+                .port_base
+                .params
+                .get_float64(index, addr)
+                .ok()
+                .map(NDAttrValue::Float64),
+            ParamType::Octet => self
+                .port_base
+                .params
+                .get_string(index, addr)
+                .ok()
+                .map(|s| NDAttrValue::String(s.to_string())),
+            // Array / pointer parameters have no scalar attribute mapping.
+            _ => None,
+        }
     }
 }
 
@@ -329,7 +871,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_file_name_default() {
+    fn test_create_file_name_empty_template_yields_empty() {
+        // C parity (B9): an empty FILE_TEMPLATE is passed through epicsSnprintf
+        // verbatim, producing an empty string — no fabricated default.
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
         drv.port_base
             .set_string_param(drv.params.file_path, 0, "/tmp/".into())
@@ -345,7 +889,41 @@ mod tests {
             .unwrap();
 
         let name = drv.create_file_name().unwrap();
-        assert_eq!(name, "/tmp/test_0042");
+        assert_eq!(name, "");
+    }
+
+    #[test]
+    fn test_create_file_name_standard_template() {
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_path, 0, "/tmp/".into())
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_name, 0, "test".into())
+            .unwrap();
+        drv.port_base
+            .set_int32_param(drv.params.file_number, 0, 42)
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_template, 0, "%s%s_%3.3d.dat".into())
+            .unwrap();
+
+        let name = drv.create_file_name().unwrap();
+        assert_eq!(name, "/tmp/test_042.dat");
+    }
+
+    #[test]
+    fn test_format_int_spec_width_vs_precision() {
+        // B10: precision = min digits (zero-pad); width = field (space-pad).
+        assert_eq!(format_int_spec("3.3", 7), "007");
+        assert_eq!(format_int_spec("5.3", 42), "  042");
+        assert_eq!(format_int_spec("04", 7), "0007");
+        assert_eq!(format_int_spec("5", 7), "    7");
+        assert_eq!(format_int_spec("", 7), "7");
+        assert_eq!(format_int_spec("2.5", 12345), "12345");
+        // Negative values keep the sign in front.
+        assert_eq!(format_int_spec("6.3", -4), "  -004");
+        assert_eq!(format_int_spec("05", -4), "-0004");
     }
 
     #[test]
@@ -364,6 +942,113 @@ mod tests {
             .set_string_param(drv.params.file_path, 0, "/nonexistent_path_xyz".into())
             .unwrap();
         assert!(!drv.check_path().unwrap());
+    }
+
+    #[test]
+    fn test_prepare_array_publishes_dims_type_timestamps() {
+        // G7: prepare_array must publish N_DIMENSIONS, ARRAY_DIMENSIONS,
+        // DATA_TYPE, COLOR_MODE, TIME_STAMP, EPICS_TS_SEC/NSEC.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut arr = drv
+            .pool
+            .alloc(
+                vec![
+                    crate::ndarray::NDDimension::new(64),
+                    crate::ndarray::NDDimension::new(48),
+                ],
+                crate::ndarray::NDDataType::UInt16,
+            )
+            .unwrap();
+        arr.time_stamp = 100.5;
+        arr.timestamp = crate::timestamp::EpicsTimestamp {
+            sec: 1234,
+            nsec: 5678,
+        };
+        drv.prepare_array(Arc::new(arr)).unwrap();
+
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.n_dimensions, 0)
+                .unwrap(),
+            2
+        );
+        let dims = drv
+            .port_base
+            .params
+            .get_int32_array(drv.params.array_dimensions, 0)
+            .unwrap();
+        assert_eq!(&dims[..], &[64, 48]);
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.data_type, 0)
+                .unwrap(),
+            crate::ndarray::NDDataType::UInt16 as i32
+        );
+        assert_eq!(
+            drv.port_base
+                .get_float64_param(drv.params.timestamp_rbv, 0)
+                .unwrap(),
+            100.5
+        );
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.epics_ts_sec, 0)
+                .unwrap(),
+            1234
+        );
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.epics_ts_nsec, 0)
+                .unwrap(),
+            5678
+        );
+    }
+
+    #[test]
+    fn test_prepare_array_publishes_codec_and_bayer() {
+        // G5/G6: prepare_array publishes CODEC, COMPRESSED_SIZE, BAYER_PATTERN.
+        use crate::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut arr = drv
+            .pool
+            .alloc(
+                vec![crate::ndarray::NDDimension::new(16)],
+                crate::ndarray::NDDataType::UInt8,
+            )
+            .unwrap();
+        arr.codec = Some(crate::codec::Codec {
+            name: crate::codec::CodecName::BSLZ4,
+            compressed_size: 9,
+            level: 0,
+            shuffle: 0,
+            compressor: 0,
+        });
+        arr.attributes.add(NDAttribute {
+            name: "bayerPattern".into(),
+            description: String::new(),
+            source: NDAttrSource::Driver,
+            value: NDAttrValue::Int32(crate::color::NDBayerPattern::GRBG as i32),
+            source_impl: None,
+        });
+        drv.prepare_array(Arc::new(arr)).unwrap();
+
+        assert_eq!(
+            drv.port_base.get_string_param(drv.params.codec, 0).unwrap(),
+            "bslz4"
+        );
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.compressed_size, 0)
+                .unwrap(),
+            9
+        );
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.bayer_pattern, 0)
+                .unwrap(),
+            crate::color::NDBayerPattern::GRBG as i32
+        );
     }
 
     #[test]
@@ -387,9 +1072,220 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(drv.array_output.publish(to_publish));
+        let _ = rt.block_on(drv.array_output.publish(to_publish));
 
         let received = receiver.blocking_recv().unwrap();
         assert_eq!(received.unique_id, id);
+    }
+
+    #[test]
+    fn test_create_file_path_recursive() {
+        // G9: createFilePath creates directory components at depth >= path_depth.
+        let base = std::env::temp_dir().join(format!(
+            "ad_core_rs_cfp_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = base.join("a").join("b").join("c");
+        let path = format!("{}/", nested.to_string_lossy());
+        // path_depth 0 = no-op.
+        NDArrayDriverBase::create_file_path(&path, 0).unwrap();
+        assert!(!nested.exists());
+        // path_depth 1 creates everything from index 1 onward.
+        NDArrayDriverBase::create_file_path(&path, 1).unwrap();
+        assert!(nested.is_dir());
+        // Idempotent — EEXIST is not an error.
+        NDArrayDriverBase::create_file_path(&path, 1).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_read_nd_attributes_file_inline_xml() {
+        // G9: readNDAttributesFile parses inline XML (NDAttributesFile schema).
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let xml = r#"<Attributes>
+            <Attribute name="Gain" type="param" source="GAIN" description="detector gain"/>
+            <Attribute name="Comment" type="const" source="hello"/>
+            <Attribute name="Temp" type="EPICS_PV" source="$(P)Temp"/>
+        </Attributes>"#;
+        drv.port_base
+            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .unwrap();
+        drv.read_nd_attributes_file().unwrap();
+
+        assert_eq!(drv.attributes().len(), 3);
+        let gain = drv.attributes().get("Gain").unwrap();
+        assert!(matches!(gain.source, NDAttrSource::Param { .. }));
+        let comment = drv.attributes().get("Comment").unwrap();
+        assert_eq!(comment.value, NDAttrValue::String("hello".into()));
+        assert!(matches!(
+            drv.attributes().get("Temp").unwrap().source,
+            NDAttrSource::EpicsPV
+        ));
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.attributes_status, 0)
+                .unwrap(),
+            ATTR_STATUS_OK
+        );
+    }
+
+    #[test]
+    fn test_param_attribute_reevaluates_from_param_library() {
+        // G10: a PARAM attribute loaded from NDAttributesFile XML must
+        // re-evaluate from the driver's asyn parameter library on
+        // update_attributes(), not stay frozen at its Undefined load value.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let xml = r#"<Attributes>
+            <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
+            <Attribute name="Maker" type="PARAM" source="MANUFACTURER" datatype="STRING"/>
+        </Attributes>"#;
+        drv.port_base
+            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .unwrap();
+        drv.read_nd_attributes_file().unwrap();
+
+        // Drive the parameter library, then re-evaluate the attributes.
+        drv.port_base
+            .set_int32_param(drv.params.array_counter, 0, 17)
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.manufacturer, 0, "ACME".into())
+            .unwrap();
+        let snap = drv.update_attributes();
+        assert_eq!(snap.get("Counter").unwrap().value, NDAttrValue::Int32(17));
+        assert_eq!(
+            snap.get("Maker").unwrap().value,
+            NDAttrValue::String("ACME".into())
+        );
+
+        // A later parameter change is picked up on the next update.
+        drv.port_base
+            .set_int32_param(drv.params.array_counter, 0, 99)
+            .unwrap();
+        let snap2 = drv.update_attributes();
+        assert_eq!(snap2.get("Counter").unwrap().value, NDAttrValue::Int32(99));
+    }
+
+    #[test]
+    fn test_function_attribute_reevaluates_from_registry() {
+        // G10: a FUNCTION attribute loaded from XML must call its registered
+        // function on update_attributes().
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        // Register a function whose return value changes on each call.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let c = counter.clone();
+        drv.attr_functions.register("tick", move |param: &str| {
+            let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            // The XML `param` string is passed through to the function.
+            NDAttrValue::String(format!("{param}={n}"))
+        });
+
+        let xml = r#"<Attributes>
+            <Attribute name="Live" type="FUNCTION" source="tick" param="seq"/>
+        </Attributes>"#;
+        drv.port_base
+            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .unwrap();
+        drv.read_nd_attributes_file().unwrap();
+        // Construction evaluated the function once (value = "seq=1").
+        assert_eq!(
+            drv.attributes().get("Live").unwrap().value,
+            NDAttrValue::String("seq=1".into())
+        );
+
+        let snap = drv.update_attributes();
+        assert_eq!(
+            snap.get("Live").unwrap().value,
+            NDAttrValue::String("seq=2".into())
+        );
+        let snap2 = drv.update_attributes();
+        assert_eq!(
+            snap2.get("Live").unwrap().value,
+            NDAttrValue::String("seq=3".into())
+        );
+    }
+
+    #[test]
+    fn test_function_attribute_missing_function_is_undefined() {
+        // G10: a FUNCTION attribute naming an unregistered function evaluates
+        // to Undefined (C++ functAttribute::updateValue returns asynError).
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let xml = r#"<Attributes>
+            <Attribute name="Missing" type="FUNCTION" source="no_such_fn"/>
+        </Attributes>"#;
+        drv.port_base
+            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .unwrap();
+        drv.read_nd_attributes_file().unwrap();
+        let snap = drv.update_attributes();
+        assert_eq!(snap.get("Missing").unwrap().value, NDAttrValue::Undefined);
+    }
+
+    #[test]
+    fn test_read_nd_attributes_file_empty_is_ok() {
+        // G9: an empty ND_ATTRIBUTES_FILE clears attributes and reports OK.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.read_nd_attributes_file().unwrap();
+        assert_eq!(drv.attributes().len(), 0);
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.attributes_status, 0)
+                .unwrap(),
+            ATTR_STATUS_OK
+        );
+    }
+
+    #[test]
+    fn test_read_nd_attributes_file_missing_file() {
+        // G9: a non-existent file path yields FILE_NOT_FOUND status.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.port_base
+            .set_string_param(
+                drv.params.attributes_file,
+                0,
+                "/nonexistent_attrs_xyz.xml".into(),
+            )
+            .unwrap();
+        assert!(drv.read_nd_attributes_file().is_err());
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.attributes_status, 0)
+                .unwrap(),
+            ATTR_STATUS_FILE_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn test_write_octet_file_path_creates_dir() {
+        // G9: writeOctet on FILE_PATH runs checkPath then createFilePath.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "ad_core_rs_wo_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = base.join("sub");
+        let path = format!("{}/", target.to_string_lossy());
+        drv.port_base
+            .set_int32_param(drv.params.create_dir, 0, 1)
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_path, 0, path.clone())
+            .unwrap();
+        let handled = drv.write_octet(drv.params.file_path, &path).unwrap();
+        assert!(handled);
+        assert!(target.is_dir());
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.file_path_exists, 0)
+                .unwrap(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

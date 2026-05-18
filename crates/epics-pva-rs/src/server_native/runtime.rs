@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::error::PvaResult;
+use crate::error::{PvaError, PvaResult};
 
 use super::source::{ChannelSource, ChannelSourceObj, DynSource};
 use super::udp::{random_guid, run_udp_responder_v6, run_udp_responder_with_config};
@@ -299,7 +299,7 @@ pub async fn run_pva_server<S>(source: Arc<S>, config: PvaServerConfig) -> PvaRe
 where
     S: ChannelSource + 'static,
 {
-    let server = PvaServer::start(source, config);
+    let server = PvaServer::start(source, config)?;
     server.wait().await
 }
 
@@ -380,7 +380,7 @@ impl PvaServer {
     /// free ports. Mirrors pvxs `Config::isolated().build()`. Useful
     /// for self-contained tests where a UDP-discoverable production
     /// config would interfere with concurrent runs.
-    pub fn isolated<S>(source: Arc<S>) -> Self
+    pub fn isolated<S>(source: Arc<S>) -> PvaResult<Self>
     where
         S: ChannelSource + 'static,
     {
@@ -398,28 +398,90 @@ impl PvaServer {
         // pre-bound socket through; UDP search is also self-contained
         // (each test gets its own ephemeral port and discovers via
         // direct addr) so the race window is harmless there.
-        let pick_udp = || {
-            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .expect("isolated udp port");
-            let p = l.local_addr().unwrap().port();
+        let pick_udp = || -> PvaResult<u16> {
+            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+            let p = l.local_addr()?.port();
             drop(l);
-            p
+            Ok(p)
         };
         let cfg = PvaServerConfig {
             tcp_port: 0,
-            udp_port: pick_udp(),
+            udp_port: pick_udp()?,
             ..PvaServerConfig::isolated()
         };
         Self::start(source, cfg)
     }
 
     /// Spawn the UDP responder and TCP listener; return a handle.
-    pub fn start<S>(source: Arc<S>, config: PvaServerConfig) -> Self
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PvaError::Io`] if the TCP listener cannot be bound —
+    /// e.g. the requested `bind_ip` is not a local address, or the
+    /// requested port is taken and not eligible for the ephemeral
+    /// fallback (the fallback covers `AddrInUse` / `PermissionDenied`
+    /// on a non-zero requested port only). A bind failure returns
+    /// `Err` rather than aborting the process.
+    ///
+    /// The user-supplied `source` is wrapped in a
+    /// [`super::CompositeSource`] together with the built-in
+    /// [`super::server_info::ServerInfoSource`] (F6). The built-in
+    /// source is registered at `order = i32::MAX` — the lowest
+    /// priority slot — so a user source serving a PV literally named
+    /// `server` always wins, mirroring pvxs registering its
+    /// `ServerSource` at `(order = -1, "__server")` (the lowest pvxs
+    /// priority). The built-in source answers GET / RPC against the
+    /// `server` PV so `pvlist`-style clients can enumerate hosted
+    /// channels and read server info (GUID, version, peer counts).
+    pub fn start<S>(source: Arc<S>, config: PvaServerConfig) -> PvaResult<Self>
     where
         S: ChannelSource + 'static,
     {
-        let dyn_source: DynSource = source as Arc<dyn ChannelSourceObj>;
         let guid = random_guid();
+        // The live per-peer registry is created up-front so the
+        // built-in server-info source can report connection counts.
+        let peers = crate::server_native::peers::PeerRegistry::new();
+
+        // User source kept as a dyn handle: the built-in source's
+        // channel-list closure enumerates it directly (rather than
+        // the composite, which would also include the built-in source
+        // — harmless since its `list_pvs` is empty, but enumerating
+        // the user half keeps the intent explicit).
+        let user_source: DynSource = source as Arc<dyn ChannelSourceObj>;
+        let server_info = Arc::new(super::server_info::ServerInfoSource::new(
+            guid,
+            peers.clone(),
+            {
+                let user_source = user_source.clone();
+                move || {
+                    let user_source = user_source.clone();
+                    async move { user_source.list_pvs().await }
+                }
+            },
+        ));
+
+        // Composite registry: user source at order 0 (highest
+        // priority), built-in `__server` at i32::MAX (lowest). pvxs
+        // `server.cpp:667` registers `ServerSource` analogously.
+        let composite = super::CompositeSource::new();
+        composite
+            .add_source("__user", user_source, 0)
+            .map_err(|e| {
+                PvaError::Protocol(format!("PvaServer::start: register user source: {e}"))
+            })?;
+        composite
+            .add_source(
+                super::server_info::SERVER_SOURCE_NAME,
+                server_info as DynSource,
+                i32::MAX,
+            )
+            .map_err(|e| {
+                PvaError::Protocol(format!(
+                    "PvaServer::start: register built-in server source: {e}"
+                ))
+            })?;
+        let dyn_source: DynSource = composite as Arc<dyn ChannelSourceObj>;
+
         let bind_addr = SocketAddr::new(config.bind_ip, config.tcp_port);
 
         // Robustness: bind the TCP listener synchronously here so the
@@ -450,8 +512,7 @@ impl PvaServer {
                         || e.kind() == std::io::ErrorKind::PermissionDenied) =>
             {
                 let fallback_addr = SocketAddr::new(config.bind_ip, 0);
-                let listener = std::net::TcpListener::bind(fallback_addr)
-                    .expect("PvaServer::start: bind TCP listener (ephemeral fallback)");
+                let listener = std::net::TcpListener::bind(fallback_addr)?;
                 tracing::warn!(
                     requested = ?bind_addr,
                     bound = ?listener.local_addr().ok(),
@@ -460,17 +521,11 @@ impl PvaServer {
                 );
                 listener
             }
-            Err(e) => panic!("PvaServer::start: bind TCP listener: {e}"),
+            Err(e) => return Err(PvaError::Io(e)),
         };
-        std_listener
-            .set_nonblocking(true)
-            .expect("PvaServer::start: set_nonblocking");
-        let bound_tcp_port = std_listener
-            .local_addr()
-            .expect("PvaServer::start: local_addr")
-            .port();
-        let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
-            .expect("PvaServer::start: TcpListener::from_std");
+        std_listener.set_nonblocking(true)?;
+        let bound_tcp_port = std_listener.local_addr()?.port();
+        let tokio_listener = tokio::net::TcpListener::from_std(std_listener)?;
 
         let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
         let udp_handle = tokio::spawn(run_udp_responder_with_config(
@@ -504,7 +559,6 @@ impl PvaServer {
         } else {
             None
         };
-        let peers = crate::server_native::peers::PeerRegistry::new();
         let tcp_handle = tokio::spawn(crate::server_native::tcp::run_tcp_server_on_listener(
             dyn_source,
             tokio_listener,
@@ -515,7 +569,7 @@ impl PvaServer {
         let udp_abort = udp_handle.abort_handle();
         let udp_v6_abort = udp_v6_handle.as_ref().map(|h| h.abort_handle());
         let tcp_abort = tcp_handle.abort_handle();
-        Self {
+        Ok(Self {
             udp_handle: Some(udp_handle),
             udp_v6_handle,
             tcp_handle: Some(tcp_handle),
@@ -526,7 +580,7 @@ impl PvaServer {
             bound_tcp_port,
             interrupt: Arc::new(tokio::sync::Notify::new()),
             peers,
-        }
+        })
     }
 
     /// Build a [`crate::client_native::context::PvaClient`] pointed at
@@ -727,8 +781,9 @@ mod tcp_fallback_tests {
             ..Default::default()
         };
 
-        // The pre-fix code would panic here.
-        let server = PvaServer::start(source, config);
+        // The pre-fix code would panic here; now the requested port
+        // being taken triggers the ephemeral fallback, not a panic.
+        let server = PvaServer::start(source, config).expect("fallback must not error");
         let report = server.report();
         assert_ne!(
             report.tcp_port, blocked_port,
@@ -764,7 +819,7 @@ mod tcp_fallback_tests {
             beacon_destinations: Vec::new(),
             ..Default::default()
         };
-        let server = PvaServer::start(source, config);
+        let server = PvaServer::start(source, config).expect("v6 listener must start");
         let report = server.report();
         assert!(report.tcp_port != 0, "v6 listener must bind a port");
 
@@ -818,7 +873,7 @@ mod tcp_fallback_tests {
             enable_ipv6_udp: true,
             ..Default::default()
         };
-        let server = PvaServer::start(source, config);
+        let server = PvaServer::start(source, config).expect("v6 udp server must start");
         let server_tcp_port = server.report().tcp_port;
         // Wait briefly for the v6 listener to bind.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -920,7 +975,7 @@ mod tcp_fallback_tests {
             beacon_destinations: Vec::new(),
             ..Default::default()
         };
-        let server = PvaServer::start(source, config);
+        let server = PvaServer::start(source, config).expect("v6 loopback server must start");
         let client = server.client_config();
 
         let got: f64 =
@@ -930,6 +985,63 @@ mod tcp_fallback_tests {
                 .expect("pvget must succeed over IPv6");
         assert_eq!(got, value, "round-trip value must match over IPv6");
         drop(server);
+    }
+
+    /// A TCP bind failure that is NOT eligible for the ephemeral
+    /// fallback (the fallback only covers `AddrInUse` / `PermissionDenied`
+    /// on a non-zero requested port) must surface as `Err(PvaError)`
+    /// rather than aborting the process. Binding to an address that is
+    /// not assigned to any local interface yields `AddrNotAvailable`,
+    /// which is outside the fallback set, so `start` returns `Err`.
+    #[tokio::test]
+    async fn start_returns_err_on_unbindable_address() {
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: 5075,
+            udp_port: 0,
+            // 192.0.2.0/24 is the TEST-NET-1 documentation range
+            // (RFC 5737); it is never assigned to a local interface,
+            // so binding it fails with AddrNotAvailable.
+            bind_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+        let result = PvaServer::start(source, config);
+        assert!(
+            result.is_err(),
+            "bind to an unassigned address must return Err, not panic",
+        );
+        assert!(
+            matches!(result, Err(crate::error::PvaError::Io(_))),
+            "TCP bind failure must surface as PvaError::Io",
+        );
+    }
+
+    /// A second server asking for an already-bound port with the
+    /// ephemeral fallback eligible must succeed (fallback), and the
+    /// happy/fallback paths both return `Ok` — `start` never panics.
+    #[tokio::test]
+    async fn start_returns_ok_when_port_taken_with_fallback() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("blocker bind");
+        let blocked_port = blocker.local_addr().expect("blocker addr").port();
+
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: blocked_port,
+            udp_port: 0,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+        let result = PvaServer::start(source, config);
+        assert!(
+            result.is_ok(),
+            "an in-use port must trigger the ephemeral fallback, returning Ok",
+        );
+        drop(result);
+        drop(blocker);
     }
 
     /// Sanity: when the requested port IS available, no fallback is
@@ -958,7 +1070,7 @@ mod tcp_fallback_tests {
             ..Default::default()
         };
 
-        let server = PvaServer::start(source, config);
+        let server = PvaServer::start(source, config).expect("server must start");
         let report = server.report();
         // Either we got the requested port (happy path) or fallback
         // kicked in (sibling test grabbed it). Both are valid; only

@@ -13,7 +13,7 @@ pub mod drivers;
 pub mod error;
 pub(crate) mod exception;
 pub mod interfaces;
-pub(crate) mod interpose;
+pub mod interpose;
 pub mod interrupt;
 pub mod manager;
 pub mod param;
@@ -32,3 +32,5 @@ pub mod user;
 pub mod adapter;
 #[cfg(feature = "epics")]
 pub mod asyn_record;
+#[cfg(feature = "epics")]
+pub mod iocsh;

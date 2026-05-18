@@ -30,6 +30,21 @@ pub const CA_PROTO_CREATE_CH_FAIL: u16 = 26;
 pub const CA_SERVER_PORT: u16 = 5064;
 pub const CA_REPEATER_PORT: u16 = 5065;
 
+/// Resolved CA repeater UDP port. Mirrors libca
+/// `envGetInetPortConfigParam(&EPICS_CA_REPEATER_PORT, …)` (e.g.
+/// `repeater.cpp:511`, `udpiiu.cpp:168`, `casw.cpp:103`): the env var
+/// `EPICS_CA_REPEATER_PORT` takes precedence; otherwise the compiled
+/// default [`CA_REPEATER_PORT`] (5065) is used. Returning a value
+/// outside u16 (or a non-numeric value) falls back to the default;
+/// C `envGetInetPortConfigParam` similarly clamps. Centralizing this
+/// keeps the repeater daemon bind, the client REGISTER target, and
+/// the beacon-monitor REGISTER target in lockstep with operator env.
+pub fn repeater_port() -> u16 {
+    epics_base_rs::runtime::env::get("EPICS_CA_REPEATER_PORT")
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(CA_REPEATER_PORT)
+}
+
 // CA protocol version
 pub const CA_MINOR_VERSION: u16 = 13;
 
@@ -203,9 +218,24 @@ pub const ECA_MESSAGE_TEXT: &[&str] = &[
     "Virtual circuit unresponsive",
 ];
 
-/// Maximum payload size for DoS prevention (16 MB).
 /// Maximum payload size for DoS prevention.
-/// Default 16 MB, configurable via EPICS_CA_MAX_ARRAY_BYTES (matches C EPICS).
+///
+/// **Default divergence from C**: this Rust port defaults to 16 MB
+/// when `EPICS_CA_MAX_ARRAY_BYTES` is unset. The C client/server
+/// (`epics-base/configure/CONFIG_ENV:36`) defaults to **16384 bytes
+/// (16 KB)** — `cac.cpp:197-214` reads the env and rounds it up to
+/// MAX_TCP = `1024 * 16u` (`caProto.h:67` "so waveforms fit").
+///
+/// Rationale for the Rust default: most modern deployments override
+/// this to multi-megabyte values anyway (large waveforms,
+/// area-detector frames), so the C default rejects in practice
+/// before the operator even knows the env exists. Rust ships with
+/// the operator-friendly default but honours the env override
+/// when present.
+///
+/// Strict-C-parity callers who want the 16 KB default can set
+/// `EPICS_CA_MAX_ARRAY_BYTES=16384` explicitly. The env-honour
+/// behaviour is unchanged.
 pub fn max_payload_size() -> usize {
     epics_base_rs::runtime::env::get("EPICS_CA_MAX_ARRAY_BYTES")
         .and_then(|s| s.parse::<usize>().ok())
@@ -248,13 +278,20 @@ impl CaHeader {
     }
 
     /// Whether this header uses extended form.
+    ///
+    /// Wire detection is by `postsize == 0xFFFF` alone, matching C
+    /// `tcpiiu.cpp::processIncoming` (line 1168), `cac.cpp:1097`, and
+    /// `rsrv/camessage.c:2410`. The `count == 0` field is set by the
+    /// emit-side per the spec but is NOT checked on receive — a peer
+    /// sending garbage in `m_count` of an extended header is still
+    /// correctly parsed by C. We mirror C's lenient receive behavior.
     pub fn is_extended(&self) -> bool {
-        self.postsize == 0xFFFF && self.count == 0 && self.extended_postsize.is_some()
+        self.postsize == 0xFFFF && self.extended_postsize.is_some()
     }
 
     /// Actual payload size in bytes.
     pub fn actual_postsize(&self) -> usize {
-        if self.postsize == 0xFFFF && self.count == 0 {
+        if self.postsize == 0xFFFF {
             if let Some(ext) = self.extended_postsize {
                 return ext as usize;
             }
@@ -264,7 +301,7 @@ impl CaHeader {
 
     /// Actual element count.
     pub fn actual_count(&self) -> u32 {
-        if self.postsize == 0xFFFF && self.count == 0 {
+        if self.postsize == 0xFFFF {
             if let Some(ext) = self.extended_count {
                 return ext;
             }
@@ -275,8 +312,15 @@ impl CaHeader {
     /// Set payload size and count, automatically switching to extended form if needed.
     /// `size` is the actual data length (unpadded). Wire-level 8-byte alignment padding
     /// is handled by the caller when writing to the socket, NOT stored in the header.
+    ///
+    /// Extended-form trigger matches C `comQueSend.cpp:285`:
+    /// `payloadSize < 0xffff && nElem < 0xffff` → normal; equivalently,
+    /// extended if `size >= 0xFFFF` OR `count >= 0xFFFF`. The previous
+    /// Rust threshold (`count > 0xFFFF`) under-triggered for the exact
+    /// `count == 0xFFFF` case, sending a normal-form header where C
+    /// would have used extended — byte-mismatch on the wire.
     pub fn set_payload_size(&mut self, size: usize, count: u32) {
-        if size > 0xFFFE || count > 0xFFFF {
+        if size >= 0xFFFF || count >= 0xFFFF {
             self.postsize = 0xFFFF;
             self.count = 0;
             self.extended_postsize = Some(size as u32);
@@ -344,7 +388,12 @@ impl CaHeader {
         let mut hdr = Self::from_bytes(buf)?;
         let mut consumed = 16;
 
-        if hdr.postsize == 0xFFFF && hdr.count == 0 {
+        // C parity: extended-form detection is `m_postsize == 0xffff`
+        // alone — see `tcpiiu.cpp:1168`, `cac.cpp:1097`, and
+        // `rsrv/camessage.c:2410`. The `m_count == 0` half was an
+        // overly-strict Rust addition that rejected legal extended
+        // headers if a peer left non-zero garbage in `m_count`.
+        if hdr.postsize == 0xFFFF {
             if buf.len() < 24 {
                 return Err(CaError::Protocol("extended header incomplete".into()));
             }
@@ -412,6 +461,50 @@ mod tests {
         assert_eq!(align8(9), 16);
     }
 
+    /// `repeater_port()` honours `EPICS_CA_REPEATER_PORT`, falls back
+    /// to the compiled default when the env var is absent, and clamps
+    /// to the default on garbage input — matching libca
+    /// `envGetInetPortConfigParam(&EPICS_CA_REPEATER_PORT, …)` shape.
+    ///
+    /// Sequential because all three branches mutate process env. Use
+    /// `serial_test::serial` to keep them out of each other's way.
+    #[test]
+    #[serial_test::serial]
+    fn repeater_port_honours_env_with_default_fallback() {
+        // Save & clear to make the test idempotent.
+        let saved = std::env::var("EPICS_CA_REPEATER_PORT").ok();
+        // SAFETY: serial_test::serial; mutations are confined to this
+        // test and the saved value is restored in a finally block at
+        // the end.
+        unsafe { std::env::remove_var("EPICS_CA_REPEATER_PORT") };
+
+        assert_eq!(
+            repeater_port(),
+            CA_REPEATER_PORT,
+            "no env → compiled default"
+        );
+
+        // SAFETY: see comment above.
+        unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", "5165") };
+        assert_eq!(repeater_port(), 5165, "valid u16 env override");
+
+        // SAFETY: see comment above.
+        unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", "not-a-port") };
+        assert_eq!(
+            repeater_port(),
+            CA_REPEATER_PORT,
+            "garbage env → compiled default"
+        );
+
+        // SAFETY: see comment above. Restore for subsequent serial tests.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("EPICS_CA_REPEATER_PORT", v),
+                None => std::env::remove_var("EPICS_CA_REPEATER_PORT"),
+            }
+        }
+    }
+
     #[test]
     fn test_pad_string() {
         let padded = pad_string("TEST");
@@ -472,12 +565,21 @@ mod tests {
 
     #[test]
     fn test_extended_count_overflow() {
-        // count > 0xFFFF triggers extended even if size is small
+        // count >= 0xFFFF triggers extended even if size is small.
+        // C `comQueSend.cpp:285` uses `nElem < 0xffff` as the normal
+        // threshold, so exact 0xFFFF must take the extended branch.
         let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
         hdr.set_payload_size(100, 100_000);
         assert!(hdr.is_extended());
         assert_eq!(hdr.actual_postsize(), 100);
         assert_eq!(hdr.actual_count(), 100_000);
+
+        // Exact 0xFFFF boundary — must trigger extended (regression
+        // for the prior `count > 0xFFFF` under-trigger).
+        let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+        hdr.set_payload_size(100, 0xFFFF);
+        assert!(hdr.is_extended());
+        assert_eq!(hdr.actual_count(), 0xFFFF);
     }
 
     #[test]

@@ -552,6 +552,27 @@ impl BridgeProvider {
         self.groups.read().len()
     }
 
+    /// Whether `name` is registered as a QSRV group composite PV.
+    ///
+    /// Synchronous, lock-cheap (one `parking_lot::RwLock` read). Used
+    /// by the pvalink `local=true` locality check so a link to a
+    /// QSRV group PV hosted by this IOC is accepted as local rather
+    /// than wrongly rejected with `NotLocal`. Mirrors the group arm
+    /// of [`ChannelProvider::channel_find`].
+    pub fn has_group_pv(&self, name: &str) -> bool {
+        self.groups.read().contains_key(name)
+    }
+
+    /// Whether this provider hosts `name` as any channel — a QSRV
+    /// group composite PV *or* a single-record / simple PV in the
+    /// backing database. This is the same name set
+    /// [`ChannelProvider::channel_find`] resolves, exposed as an
+    /// inherent method so the pvalink `local=true` locality check can
+    /// query it without depending on the `ChannelProvider` trait.
+    pub async fn hosts_pv(&self, name: &str) -> bool {
+        self.channel_find(name).await
+    }
+
     /// Drop every registered group definition. Mirrors pvxs
     /// `resetGroups` (groupsourcehooks.cpp:222) — used between
     /// `iocInit` cycles in tests so the second run starts clean. The

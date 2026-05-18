@@ -81,8 +81,22 @@ pub enum PortCommand {
     DisconnectAddr,
     EnableAddr,
     DisableAddr,
+    /// Port-wide enable / disable (C parity:
+    /// `pasynManager->enable(pasynUser, value)`).
+    SetEnable {
+        yes: bool,
+    },
+    /// Port-wide auto-connect toggle (C parity:
+    /// `pasynManager->autoConnect(pasynUser, value)`).
+    SetAutoConnect {
+        yes: bool,
+    },
     GetBoundsInt32,
     GetBoundsInt64,
+    /// Query whether the port is currently enabled.
+    GetEnable,
+    /// Query whether auto-connect is enabled for the port.
+    GetAutoConnect,
     BlockProcess,
     UnblockProcess,
     DrvUserCreate {
@@ -97,6 +111,20 @@ pub enum PortCommand {
     SetOption {
         key: String,
         value: String,
+    },
+    /// Driver `report(level)` invocation — iocsh `asynReport`.
+    Report {
+        level: i32,
+    },
+    /// Set input EOS bytes — C `pasynOctet->setInputEos` /
+    /// asynRecord IEOS.
+    SetInputEos {
+        eos: Vec<u8>,
+    },
+    /// Set output EOS bytes — C `pasynOctet->setOutputEos` /
+    /// asynRecord OEOS.
+    SetOutputEos {
+        eos: Vec<u8>,
     },
 }
 
@@ -143,8 +171,12 @@ mod tests {
             PortCommand::DisconnectAddr,
             PortCommand::EnableAddr,
             PortCommand::DisableAddr,
+            PortCommand::SetEnable { yes: true },
+            PortCommand::SetAutoConnect { yes: false },
             PortCommand::GetBoundsInt32,
             PortCommand::GetBoundsInt64,
+            PortCommand::GetEnable,
+            PortCommand::GetAutoConnect,
             PortCommand::BlockProcess,
             PortCommand::UnblockProcess,
             PortCommand::DrvUserCreate {

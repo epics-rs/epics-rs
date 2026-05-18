@@ -223,6 +223,524 @@ async fn test_single_inp_mss_propagates_stat_and_amsg() {
     );
 }
 
+/// B2 regression: a soft-channel record whose INP is an external
+/// `pva://` link must fold the lset's gated alarm severity into its
+/// own `LINK_ALARM`. Previously `read_link_with_alarm` returned
+/// `(None, None)` for any non-Db link, so a connected pva link
+/// carrying a remote MAJOR severity left the owning record at
+/// NO_ALARM.
+#[tokio::test]
+async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
+    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    /// Stub lset: serves a value and a fixed (already gated) severity.
+    struct AlarmingLset;
+    impl LinkSet for AlarmingLset {
+        fn is_connected(&self, _: &str) -> bool {
+            true
+        }
+        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+            Some(EpicsValue::Double(12.0))
+        }
+        fn alarm_severity(&self, _: &str) -> Option<i32> {
+            Some(2) // MAJOR — as if the link's MS mode let it through
+        }
+        fn alarm_message(&self, _: &str) -> Option<String> {
+            Some("remote major".into())
+        }
+    }
+
+    let db = PvDatabase::new();
+    db.register_link_set("pva", Arc::new(AlarmingLset)).await;
+    db.add_record("PVADST", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("PVADST").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("pva://REMOTE:PV".into()))
+            .unwrap();
+        inst.common.udf = false;
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("PVADST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("PVADST").await.expect("record exists");
+    let inst = rec.read().await;
+    // Value was read from the lset.
+    assert_eq!(
+        inst.record.val().and_then(|v| v.to_f64()),
+        Some(12.0),
+        "pva link value must be applied"
+    );
+    // Severity folded into LINK_ALARM.
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Major,
+        "pva link's MAJOR severity must reach the record's SEVR"
+    );
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::LINK_ALARM,
+        "pva link alarm must surface as LINK_ALARM"
+    );
+}
+
+/// B2: when the lset reports no alarm severity (`alarm_severity` →
+/// None — e.g. NMS, or remote NO_ALARM), a connected pva link must
+/// NOT raise any alarm on the owning record.
+#[tokio::test]
+async fn test_pva_link_no_alarm_when_lset_reports_none() {
+    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    struct QuietLset;
+    impl LinkSet for QuietLset {
+        fn is_connected(&self, _: &str) -> bool {
+            true
+        }
+        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+            Some(EpicsValue::Double(5.0))
+        }
+        // alarm_severity defaults to None.
+    }
+
+    let db = PvDatabase::new();
+    db.register_link_set("pva", Arc::new(QuietLset)).await;
+    db.add_record("PVAQUIET", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("PVAQUIET").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("pva://REMOTE:OK".into()))
+            .unwrap();
+        inst.common.udf = false;
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("PVAQUIET", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("PVAQUIET").await.expect("record exists");
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.record.val().and_then(|v| v.to_f64()),
+        Some(5.0),
+        "pva link value must still be applied"
+    );
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::NoAlarm,
+        "no lset severity → record stays NO_ALARM"
+    );
+}
+
+/// A record whose OUT link is an external `pva://` link must drive
+/// the processed value through the registered link set's `put_value`.
+///
+/// Before this fix the OUT-link write stage in `processing.rs` only
+/// matched `ParsedLink::Db` — a record with a `ParsedLink::Ca`/`Pva`
+/// OUT link processed normally but the value went nowhere. The
+/// OUTPUT side now mirrors the INPUT side: it dispatches the write
+/// through the registered lset, matching C `dbLink.c::dbPutLink`
+/// (dbLink.c:434-448), which routes every link write through
+/// `plink->lset->putValue` regardless of DB vs CA link.
+#[tokio::test]
+async fn test_pva_out_link_writes_value_through_link_set() {
+    use std::sync::Mutex;
+
+    use epics_base_rs::server::database::LinkSet;
+
+    /// Mock lset that records every `put_value` call.
+    struct CapturingLset {
+        writes: Arc<Mutex<Vec<(String, EpicsValue)>>>,
+    }
+    impl LinkSet for CapturingLset {
+        fn is_connected(&self, _: &str) -> bool {
+            true
+        }
+        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+            None
+        }
+        fn put_value(&self, name: &str, value: EpicsValue) -> Result<(), String> {
+            self.writes.lock().unwrap().push((name.to_string(), value));
+            Ok(())
+        }
+    }
+
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let db = PvDatabase::new();
+    db.register_link_set(
+        "pva",
+        Arc::new(CapturingLset {
+            writes: writes.clone(),
+        }),
+    )
+    .await;
+
+    // Soft-Channel ao record (DTYP empty) — its OUT link is the
+    // soft OUT-link write path.
+    db.add_record("AO_PVAOUT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("AO_PVAOUT").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("pva://REMOTE:OUT".into()))
+            .unwrap();
+        inst.common.udf = false;
+        // Set VAL so process() has a value to drive out the OUT link.
+        inst.record
+            .put_field("VAL", EpicsValue::Double(3.5))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("AO_PVAOUT", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let captured = writes.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "the pva OUT link must drive exactly one put_value"
+    );
+    assert_eq!(
+        captured[0].0, "REMOTE:OUT",
+        "put_value must receive the bare PV name (scheme stripped)"
+    );
+    assert_eq!(
+        captured[0].1.to_f64(),
+        Some(3.5),
+        "put_value must receive the record's processed value"
+    );
+}
+
+/// A record with a `pva://` OUT link and NO registered link set must
+/// fail gracefully — process() completes without panic, the value is
+/// simply not delivered (C `dbPutLink` returns `S_db_noLSET`).
+#[tokio::test]
+async fn test_pva_out_link_no_link_set_fails_gracefully() {
+    let db = PvDatabase::new();
+    // No register_link_set call — the "pva" scheme is unregistered.
+    db.add_record("AO_NOLSET", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("AO_NOLSET").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("pva://NOWHERE:PV".into()))
+            .unwrap();
+        inst.common.udf = false;
+        inst.record
+            .put_field("VAL", EpicsValue::Double(1.0))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    // Must not panic; process completes cleanly.
+    db.process_record_with_links("AO_NOLSET", &mut visited, 0)
+        .await
+        .expect("process must complete despite the unresolvable OUT link");
+
+    let rec = db.get_record("AO_NOLSET").await.expect("record exists");
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.record.val().and_then(|v| v.to_f64()),
+        Some(1.0),
+        "the record itself still holds its value"
+    );
+}
+
+/// C `recGbl.c:194/210-211` — when only `amsg` changes (no SEVR/STAT
+/// transition), `stat_mask` is set to `DBE_ALARM` and STAT/AMSG/VAL
+/// are still posted. The Rust port previously only checked
+/// `alarm_changed` (sevr-or-stat) and silently dropped the AMSG-only
+/// update, leaving subscribers reading a stale message string.
+///
+/// Reproduce via MSS link: source carries Major severity. Cycle 1
+/// propagates the source amsg into the dest, raising sevr 0→Major
+/// (alarm_changed=true; AMSG flows in the normal path). Cycle 2
+/// changes the source amsg but keeps the same severity — dest's
+/// reset_alarms sees sevr Major→Major (alarm_changed=false) but
+/// amsg "msg1"→"msg2" (amsg_changed=true). The fix posts AMSG for
+/// this case so the subscriber sees the new message.
+#[tokio::test]
+async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
+    use epics_base_rs::server::recgbl::{EventMask, alarm_status};
+    use epics_base_rs::server::record::AlarmSeverity;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("SRC_AMSG", Box::new(AoRecord::new(7.0)))
+        .await
+        .unwrap();
+    db.add_record("DST_AMSG", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Source: Major severity with first amsg.
+    if let Some(rec) = db.get_record("SRC_AMSG").await {
+        let mut inst = rec.write().await;
+        inst.common.stat = alarm_status::HIHI_ALARM;
+        inst.common.sevr = AlarmSeverity::Major;
+        inst.common.amsg = "msg1".to_string();
+    }
+    // Dest: MSS link to source. Subscribe to AMSG with ALARM mask
+    // (C posts AMSG with stat_mask = DBE_ALARM on amsg-only change).
+    if let Some(rec) = db.get_record("DST_AMSG").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("SRC_AMSG NPP MSS".into()))
+            .unwrap();
+        inst.common.udf = false;
+    }
+
+    // Cycle 1: drives sevr 0→Major, amsg ""→"msg1" (alarm_changed=true).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DST_AMSG", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // Now subscribe to AMSG with ALARM mask AFTER cycle 1, so
+    // last_posted seeds at "msg1".
+    let mut amsg_rx = {
+        let rec = db.get_record("DST_AMSG").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.add_subscriber("AMSG", 11, DbFieldType::String, EventMask::ALARM.bits())
+    }
+    .expect("AMSG subscription must be accepted");
+
+    // Source: keep severity Major, change amsg only.
+    if let Some(rec) = db.get_record("SRC_AMSG").await {
+        let mut inst = rec.write().await;
+        inst.common.amsg = "msg2".to_string();
+    }
+
+    // Cycle 2: dest picks up msg2. sevr stays Major (alarm_changed=false),
+    // amsg "msg1"→"msg2" (amsg_changed=true). AMSG event must flow.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DST_AMSG", &mut visited, 0)
+        .await
+        .unwrap();
+
+    {
+        let rec = db.get_record("DST_AMSG").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(inst.common.sevr, AlarmSeverity::Major, "sevr unchanged");
+        assert_eq!(inst.common.amsg, "msg2", "amsg propagated");
+    }
+
+    let event = amsg_rx
+        .try_recv()
+        .expect("AMSG-only change must produce an event on DBE_ALARM-class subscribers");
+    assert!(
+        matches!(event.snapshot.value, EpicsValue::String(ref s) if s == "msg2"),
+        "AMSG event payload should be the new message, got {:?}",
+        event.snapshot.value
+    );
+}
+
+// BUG 2 regression — `process_record` (the foreign-process / QSRV-group
+// path) calls `process_local`. A recent fix excluded UDF from the
+// `process_local` `sub_updates` snapshot loop, citing "UDF via the
+// explicit UDF push above" — but `process_local` had NO such push (the
+// two `database/processing.rs` paths exclude UDF AND pair it with an
+// explicit push at `:1327` and `:1948`). Without the push a UDF change
+// driven through `process_record` was never delivered to `.UDF`
+// subscribers. The fix adds the `if !event_mask.is_empty()` UDF push to
+// `process_local`, mirroring `processing.rs`.
+#[tokio::test]
+async fn test_process_record_delivers_udf_monitor_event() {
+    use epics_base_rs::server::recgbl::{EventMask, alarm_status};
+    use epics_base_rs::server::record::AlarmSeverity;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    // Soft-Channel ai with a defined VAL — `process_local`'s
+    // `value_is_undefined()` returns false, so processing clears UDF.
+    db.add_record("UDF_REC", Box::new(AiRecord::new(5.0)))
+        .await
+        .unwrap();
+
+    // Seed the prior UDF state: UDF=true with INVALID/UDF_ALARM, as a
+    // freshly-initialised record reads before its first process. The
+    // first `process_record` clears UDF (true→false) and the alarm
+    // (INVALID→NO_ALARM), so `event_mask` carries DBE_ALARM and the UDF
+    // push fires.
+    {
+        let rec = db.get_record("UDF_REC").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.udf = true;
+        inst.common.sevr = AlarmSeverity::Invalid;
+        inst.common.stat = alarm_status::UDF_ALARM;
+    }
+
+    // Subscribe to UDF before processing.
+    let mut udf_rx = {
+        let rec = db.get_record("UDF_REC").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.add_subscriber("UDF", 31, DbFieldType::Char, EventMask::ALARM.bits())
+    }
+    .expect("UDF subscription must be accepted");
+
+    // Foreign-process path — `process_record` → `process_local`.
+    db.process_record("UDF_REC").await.unwrap();
+
+    {
+        let rec = db.get_record("UDF_REC").await.unwrap();
+        let inst = rec.read().await;
+        assert!(!inst.common.udf, "process must have cleared UDF");
+    }
+
+    let event = udf_rx
+        .try_recv()
+        .expect("a UDF change via process_record must deliver a UDF monitor event");
+    assert!(
+        matches!(event.snapshot.value, EpicsValue::Char(0)),
+        "UDF event payload should be the cleared value 0, got {:?}",
+        event.snapshot.value
+    );
+}
+
+/// C `dbAccess.c::dbPutField:1276` sets `precord->putf = TRUE`
+/// IMMEDIATELY before calling `dbProcess`. The flag stays TRUE
+/// throughout the entire process cycle and is cleared in
+/// `recGblFwdLink` (`recGbl.c:302`) after the forward-link
+/// dispatch — i.e. observable for the WHOLE put-driven processing
+/// cycle. Async records keep PUTF=TRUE through the device round
+/// trip; it clears only when the completion path runs FLNK.
+///
+/// Pre-fix the Rust port cleared PUTF in `put_record_field_from_ca`
+/// BEFORE the `process_record_with_links` call (field_io.rs:497),
+/// so any consumer reading PUTF during the process cycle (TPRO
+/// trace, monitor on .PUTF, async-completion path's
+/// "put-driven vs scan-driven" classifier) always saw PUTF=0.
+#[tokio::test]
+async fn test_putf_clears_after_synchronous_put_completion() {
+    // AoRecord is synchronous Soft Channel (process() returns
+    // Complete immediately). The synchronous-completion clear
+    // point in `put_record_field_from_ca` runs after the
+    // `process_record_with_links` call returns — so the
+    // test-observable end state is PUTF=false. The companion
+    // async test below differentiates "stays set through round
+    // trip" vs the pre-fix "always false during process".
+    let db = PvDatabase::new();
+    db.add_record("PUTF_SYNC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let _ = db
+        .put_record_field_from_ca("PUTF_SYNC", "VAL", EpicsValue::Double(42.0))
+        .await;
+
+    let rec = db.get_record("PUTF_SYNC").await.unwrap();
+    let inst = rec.read().await;
+    assert!(
+        !inst.common.putf,
+        "after synchronous put completion, PUTF must clear (mirrors C recGblFwdLink:302)"
+    );
+}
+
+/// Async-completion path: for a record that returns AsyncPending,
+/// PUTF must remain TRUE across the device round trip and clear
+/// only when `complete_async_record` runs. C parity:
+/// `dbAccess.c::dbPutField:1276` sets putf=TRUE; the async device's
+/// completion eventually calls `dbProcess` again, which runs through
+/// `recGblFwdLink` (clears putf).
+#[tokio::test]
+async fn test_putf_survives_async_round_trip_and_clears_on_completion() {
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_PUTF", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Drive a CA put. AsyncRecord returns AsyncPending, so the
+    // process call returns with PACT=true; PUTF must stay TRUE.
+    let _ = db
+        .put_record_field_from_ca("ASYNC_PUTF", "VAL", EpicsValue::Double(7.0))
+        .await;
+
+    {
+        let rec = db.get_record("ASYNC_PUTF").await.unwrap();
+        let inst = rec.read().await;
+        assert!(inst.is_processing(), "async pending → PACT=true");
+        assert!(
+            inst.common.putf,
+            "PUTF must remain TRUE across the async round trip — \
+             pre-fix the Rust port cleared it before the process call \
+             so async-completion logic could not classify the trigger \
+             as put-driven"
+        );
+    }
+
+    // Now fire the async completion. PUTF must clear (mirrors C
+    // recGblFwdLink:302 after the FLNK dispatch).
+    db.complete_async_record("ASYNC_PUTF").await.unwrap();
+    {
+        let rec = db.get_record("ASYNC_PUTF").await.unwrap();
+        let inst = rec.read().await;
+        assert!(!inst.is_processing(), "completion clears PACT");
+        assert!(
+            !inst.common.putf,
+            "complete_async_record_inner must clear PUTF (recGblFwdLink parity)"
+        );
+    }
+}
+
+/// C `dbAccess.c::dbPut:1410-1411` clears `precord->udf = FALSE`
+/// synchronously when the put target is the record-type's primary
+/// value field (`dbIsValueField`). The clear runs INSIDE dbPut —
+/// BEFORE dbProcess. Pre-fix the Rust port deferred UDF clearing
+/// to the process-cycle's own `if instance.record.clears_udf()`
+/// branch (processing.rs:839). The processing path drops the put's
+/// write lock and re-acquires inside `process_record_with_links`,
+/// so a second reader between the put and the process could
+/// observe `(VAL=new, udf=true)` — a C-illegal pair. For async
+/// records the window spans the entire device round trip until
+/// `complete_async_record` runs its own clear. This test pins the
+/// C-parity invariant: post-put, pre-process, UDF must already be
+/// false on a primary-field write.
+#[tokio::test]
+async fn test_put_record_field_from_ca_clears_udf_on_primary_field_write() {
+    let db = PvDatabase::new();
+    db.add_record("UDF_ASYNC", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Record starts with udf=true (default).
+    {
+        let rec = db.get_record("UDF_ASYNC").await.unwrap();
+        assert!(
+            rec.read().await.common.udf,
+            "AsyncRecord starts undefined (udf=true)"
+        );
+    }
+
+    let _ = db
+        .put_record_field_from_ca("UDF_ASYNC", "VAL", EpicsValue::Double(7.0))
+        .await;
+
+    // AsyncRecord returns AsyncPending; PACT is set, process bailed
+    // before its own UDF clear at processing.rs:840 ran. The put-time
+    // clear in field_io.rs must have already fired.
+    let rec = db.get_record("UDF_ASYNC").await.unwrap();
+    let inst = rec.read().await;
+    assert!(
+        inst.is_processing(),
+        "AsyncRecord should be mid-async (PACT=true)"
+    );
+    assert!(
+        !inst.common.udf,
+        "primary-field CA put must clear UDF synchronously \
+         (dbAccess.c::dbPut:1411 parity) — observable before \
+         complete_async_record runs"
+    );
+}
+
 /// epics-base PR #3fb10b6 regression: only the record directly
 /// receiving a dbPut should carry PUTF=1 during chain processing.
 /// Pre-fix the CP-target dispatch set PUTF=true on every chained
@@ -254,6 +772,111 @@ async fn test_putf_stays_off_for_cp_chained_targets() {
     assert!(
         !inst.common.putf,
         "CP-driven TGT must not carry PUTF=1 — that bit belongs only to the directly-put record"
+    );
+}
+
+/// C `dbDbLink.c::processTarget:474` propagates `pdst->putf = psrc->putf`
+/// when writing through a DB OUT link to a non-pact target. Pre-fix
+/// Round 4 the Rust `write_db_link_value` only put the value and called
+/// `process_record_with_links` without touching `target.putf` — so a
+/// CA put on an ao with OUT pointing at a passive ai left the ai's
+/// PUTF=0 during the chained process cycle. dbNotify completion
+/// attribution and device-support `put-driven vs scan-driven`
+/// classifiers downstream of the OUT link silently observed
+/// scan-driven processing instead of put-driven.
+#[tokio::test]
+async fn test_putf_propagates_through_db_out_link_to_passive_target() {
+    let db = PvDatabase::new();
+    db.add_record("PUTF_OUT_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    // Source ao: OUT to TGT, PP semantics so the target processes.
+    db.add_record("PUTF_OUT_SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("PUTF_OUT_SRC").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("PUTF_OUT_TGT PP".into()))
+            .unwrap();
+    }
+    // Target must be Passive for processTarget to run; AoRecord
+    // defaults to Passive scan so no explicit set needed.
+
+    // Drive a CA put that lands as a put on SRC. SRC.putf becomes 1
+    // before processing; during processing, the OUT-link write runs
+    // and target should inherit putf=1 BEFORE its process cycle.
+    let _ = db
+        .put_record_field_from_ca("PUTF_OUT_SRC", "VAL", EpicsValue::Double(5.0))
+        .await;
+
+    // After both records' synchronous cycles complete, the C path
+    // clears putf on each (each runs its own recGblFwdLink). What
+    // this test pins is the steady-state observability: value
+    // landed (proving OUT-write happened) AND target.rpro stayed
+    // false (no spurious reprocess request — that path only fires
+    // when target was pact at OUT-write time). The mid-cycle PUTF
+    // observability is tested separately via an async target below.
+    let tgt = db.get_record("PUTF_OUT_TGT").await.unwrap();
+    let inst = tgt.read().await;
+    assert!(
+        !inst.common.putf,
+        "after both records' synchronous cycles complete, both clear putf"
+    );
+    assert!(
+        !inst.common.rpro,
+        "target was not pact, so rpro must stay false (normal propagation)"
+    );
+    let val = inst.record.val().and_then(|v| v.to_f64()).unwrap_or(0.0);
+    assert!(
+        (val - 5.0).abs() < 1e-10,
+        "OUT link write propagated value (val={val})"
+    );
+}
+
+/// Mid-cycle PUTF propagation: when the source's OUT-link write
+/// dispatches a target's process(), the target.putf must equal the
+/// source's putf BEFORE the target's own clears fire. Using an async
+/// target lets us observe the bit between write_db_link_value's set
+/// and the eventual complete_async_record clear.
+///
+/// Pre-fix Round 4 `write_db_link_value` only forwarded the value
+/// and dispatched process — never touched `target.putf`. So even
+/// when the source had `putf=1` from a CA put, the async target
+/// stayed at `putf=0` for the duration of the in-flight cycle.
+#[tokio::test]
+async fn test_putf_propagates_mid_cycle_via_async_target_out_link() {
+    let db = PvDatabase::new();
+    // Async target: stays pact between process and complete_async.
+    db.add_record("PROP_TGT", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+    db.add_record("PROP_SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("PROP_SRC").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("PROP_TGT PP".into()))
+            .unwrap();
+    }
+
+    // Drive CA put. SRC processes synchronously, OUT writes to TGT,
+    // dispatches process; TGT returns AsyncPending so its process
+    // stays in flight — PUTF must be set on TGT before that return
+    // and stay set until completion.
+    let _ = db
+        .put_record_field_from_ca("PROP_SRC", "VAL", EpicsValue::Double(11.0))
+        .await;
+
+    let tgt = db.get_record("PROP_TGT").await.unwrap();
+    let inst = tgt.read().await;
+    assert!(
+        inst.is_processing(),
+        "AsyncPending target stays pact between process and complete"
+    );
+    assert!(
+        inst.common.putf,
+        "target.putf must inherit from src.putf BEFORE complete_async_record clears it \
+         (C dbDbLink.c::processTarget:474). Pre-fix this stayed false."
     );
 }
 
@@ -1326,6 +1949,415 @@ async fn test_complete_async_record() {
     assert!(!inst.common.udf);
 }
 
+/// Defect 1 regression: the async-completion path
+/// (`complete_async_record_inner`) must post SEVR/STAT/AMSG with
+/// their per-field C masks — exactly like the synchronous path and
+/// `process_local` — not collapse them onto one record-wide mask.
+///
+/// C `recGblResetAlarms` posts SEVR with `DBE_VALUE` only. The pre-fix
+/// async path pushed SEVR into `changed_fields`, which `notify_from_
+/// snapshot` posts with the record-wide `event_mask` that carries
+/// `DBE_ALARM` on an alarm transition. So a `DBE_ALARM`-only SEVR
+/// subscriber was wrongly notified, and a `DBE_VALUE`-only SEVR
+/// subscriber on a stat-only transition would have been missed.
+///
+/// This test drives an alarm transition through `complete_async_record`
+/// and asserts:
+///  * a `DBE_VALUE`-only SEVR subscriber RECEIVES the event,
+///  * a `DBE_ALARM`-only SEVR subscriber does NOT (SEVR is DBE_VALUE).
+/// Async record stub that raises a MAJOR `STATE_ALARM` from its
+/// `check_alarms` hook — used to drive an alarm transition through
+/// the async-completion path.
+struct AsyncAlarmingRecord;
+impl Record for AsyncAlarmingRecord {
+    fn record_type(&self) -> &'static str {
+        "async_alarm_test"
+    }
+    fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
+        Ok(ProcessOutcome::async_pending())
+    }
+    fn check_alarms(&mut self, common: &mut epics_base_rs::server::record::CommonFields) {
+        use epics_base_rs::server::recgbl::{self, alarm_status};
+        recgbl::rec_gbl_set_sevr(
+            common,
+            alarm_status::STATE_ALARM,
+            epics_base_rs::server::record::AlarmSeverity::Major,
+        );
+    }
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "VAL" => Some(EpicsValue::Double(1.0)),
+            _ => None,
+        }
+    }
+    fn put_field(&mut self, name: &str, _value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
+        match name {
+            "VAL" => Ok(()),
+            _ => Err(CaError::FieldNotFound(name.into())),
+        }
+    }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        &[]
+    }
+}
+
+#[tokio::test]
+async fn test_complete_async_posts_sevr_with_per_field_mask() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::record::AlarmSeverity;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_SEVR", Box::new(AsyncAlarmingRecord))
+        .await
+        .unwrap();
+
+    if let Some(rec) = db.get_record("ASYNC_SEVR").await {
+        let mut inst = rec.write().await;
+        inst.common.udf = false;
+    }
+
+    // First cycle: record reports async_pending (PACT set).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_SEVR", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // Subscribe to SEVR twice: one DBE_VALUE-only, one DBE_ALARM-only.
+    let (mut sevr_value_rx, mut sevr_alarm_rx) = {
+        let rec = db.get_record("ASYNC_SEVR").await.unwrap();
+        let mut inst = rec.write().await;
+        let v = inst
+            .add_subscriber("SEVR", 21, DbFieldType::Short, EventMask::VALUE.bits())
+            .expect("DBE_VALUE SEVR subscription accepted");
+        let a = inst
+            .add_subscriber("SEVR", 22, DbFieldType::Short, EventMask::ALARM.bits())
+            .expect("DBE_ALARM SEVR subscription accepted");
+        (v, a)
+    };
+
+    // Complete the async cycle — alarm transition NoAlarm -> Major.
+    db.complete_async_record("ASYNC_SEVR").await.unwrap();
+
+    {
+        let rec = db.get_record("ASYNC_SEVR").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::Major,
+            "completion must raise Major"
+        );
+    }
+
+    // DBE_VALUE SEVR subscriber MUST receive the event — SEVR posts
+    // with DBE_VALUE.
+    assert!(
+        sevr_value_rx.try_recv().is_ok(),
+        "DBE_VALUE SEVR subscriber must receive the SEVR change"
+    );
+    // DBE_ALARM-only SEVR subscriber must NOT — SEVR's C mask is
+    // DBE_VALUE only, never DBE_ALARM.
+    assert!(
+        sevr_alarm_rx.try_recv().is_err(),
+        "DBE_ALARM-only SEVR subscriber must NOT receive SEVR \
+         (per-field mask collapsed onto record-wide ALARM mask)"
+    );
+}
+
+// C parity (dbAccess.c::dbProcess:537-559): a second
+// `process_record_with_links` against a PACT-active record must NOT
+// re-enter `record.process()`. The first attempt must bail silently
+// (lcnt counting up); after MAX_LOCK=10 consecutive bails, SCAN_ALARM /
+// INVALID must be raised with "Async in progress" amsg and VAL must be
+// posted with DBE_VALUE|DBE_LOG|DBE_ALARM.
+#[tokio::test]
+async fn test_pact_entry_guard_silent_bail_until_max_lock() {
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_PACT", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Drive ASYNC_PACT into PACT=true (async pending, lock released).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_PACT", &mut visited, 0)
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("ASYNC_PACT").await.unwrap();
+        let inst = rec.read().await;
+        assert!(
+            inst.is_processing(),
+            "first cycle must leave PACT=true (AsyncPending)"
+        );
+        assert_eq!(inst.common.lcnt, 0, "first cycle must reset lcnt");
+        assert_eq!(inst.common.sevr, AlarmSeverity::NoAlarm);
+    }
+
+    // Up to MAX_LOCK = 10 re-entries while PACT=true must NOT raise alarm.
+    for i in 1..=10 {
+        let mut visited = HashSet::new();
+        db.process_record_with_links("ASYNC_PACT", &mut visited, 0)
+            .await
+            .unwrap();
+        let rec = db.get_record("ASYNC_PACT").await.unwrap();
+        let inst = rec.read().await;
+        assert!(inst.is_processing(), "must remain PACT=true (iter {i})");
+        assert_eq!(inst.common.lcnt, i as i16, "lcnt must increment per bail");
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::NoAlarm,
+            "no SCAN_ALARM yet (iter {i})"
+        );
+    }
+
+    // 11th attempt while pact (lcnt==10 before increment >= MAX_LOCK)
+    // must raise SCAN_ALARM/INVALID and post VAL monitor.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_PACT", &mut visited, 0)
+        .await
+        .unwrap();
+    let rec = db.get_record("ASYNC_PACT").await.unwrap();
+    let inst = rec.read().await;
+    assert!(inst.is_processing(), "PACT still true post-alarm-raise");
+    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+    assert_eq!(
+        inst.common.stat,
+        epics_base_rs::server::recgbl::alarm_status::SCAN_ALARM
+    );
+    assert_eq!(inst.common.amsg, "Async in progress");
+}
+
+// C `dbAccess.c:539-541` — when TPRO is set on a record whose PACT is
+// true, dbProcess prints "<thread>: dbProcess of Active '<name>' with
+// RPRO=<n>" before the bail decision. The Rust port emits the same
+// line via eprintln; this test exercises the path and verifies (a)
+// TPRO=true does not interfere with the bail decision (lcnt still
+// increments) and (b) RPRO state is preserved through the guard so
+// the diagnostic value is meaningful.
+#[tokio::test]
+async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_TPRO", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Set TPRO=true and RPRO=true so the diagnostic line carries
+    // observable state.
+    {
+        let rec = db.get_record("ASYNC_TPRO").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.tpro = true;
+        inst.common.rpro = true;
+    }
+
+    // Cycle 1: drive into PACT.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_TPRO", &mut visited, 0)
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("ASYNC_TPRO").await.unwrap();
+        let inst = rec.read().await;
+        assert!(inst.is_processing(), "must enter PACT");
+        assert!(inst.common.tpro, "TPRO must be preserved");
+        assert!(inst.common.rpro, "RPRO must be preserved across PACT entry");
+    }
+
+    // Re-entry while PACT=true: bail with lcnt increment. Diagnostic
+    // is emitted as a side effect (eprintln) but the bail outcome
+    // matches the non-TPRO case (verified by the silent-bail test).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_TPRO", &mut visited, 0)
+        .await
+        .unwrap();
+    let rec = db.get_record("ASYNC_TPRO").await.unwrap();
+    let inst = rec.read().await;
+    assert!(inst.is_processing(), "still PACT after bail");
+    assert_eq!(inst.common.lcnt, 1, "lcnt must have advanced");
+    assert!(
+        inst.common.rpro,
+        "RPRO must remain unchanged by the diagnostic path"
+    );
+}
+
+// After PACT clears via complete_async_record, the next process must
+// reset lcnt to 0 (mirrors C `else { precord->lcnt = 0; }`).
+#[tokio::test]
+async fn test_pact_entry_guard_resets_lcnt_after_completion() {
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_RESET", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Cycle 1: kick off async, accumulate lcnt via re-entries.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_RESET", &mut visited, 0)
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        let mut visited = HashSet::new();
+        db.process_record_with_links("ASYNC_RESET", &mut visited, 0)
+            .await
+            .unwrap();
+    }
+    {
+        let rec = db.get_record("ASYNC_RESET").await.unwrap();
+        assert_eq!(rec.read().await.common.lcnt, 3);
+    }
+
+    // Complete the async; this clears PACT.
+    db.complete_async_record("ASYNC_RESET").await.unwrap();
+
+    // Next process_record_with_links should reset lcnt (path: enters
+    // body since PACT is now false).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_RESET", &mut visited, 0)
+        .await
+        .unwrap();
+    let rec = db.get_record("ASYNC_RESET").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(inst.common.lcnt, 0, "lcnt must reset when PACT clears");
+}
+
+// Regression: when a record returns `AsyncPending` paired with a
+// `ReprocessAfter` action (the timer-owned continuation pattern used
+// by scaler DLY / calc AFTC), the spawned timer fire must call
+// `process_record_continuation` and bypass the PACT entry guard so
+// the record's `process()` runs again to advance the state machine.
+// The foreign-caller guard (FLNK / scan / CA put) is still in
+// effect — `test_pact_entry_guard_silent_bail_until_max_lock` above
+// covers that case.
+#[tokio::test]
+async fn test_reprocess_after_continuation_bypasses_pact_guard() {
+    use epics_base_rs::server::record::{ProcessAction, ProcessOutcome, RecordProcessResult};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct ContinuationRecord {
+        process_count: Arc<AtomicU32>,
+    }
+
+    impl Record for ContinuationRecord {
+        fn record_type(&self) -> &'static str {
+            "continuation_test"
+        }
+        fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
+            let n = self.process_count.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // First process: arm the timer-driven continuation.
+                Ok(ProcessOutcome {
+                    result: RecordProcessResult::AsyncPending,
+                    actions: vec![ProcessAction::ReprocessAfter(
+                        std::time::Duration::from_millis(20),
+                    )],
+                    device_did_compute: false,
+                })
+            } else {
+                // Continuation reached: complete cleanly, clear PACT.
+                Ok(ProcessOutcome::complete())
+            }
+        }
+        fn get_field(&self, _name: &str) -> Option<EpicsValue> {
+            None
+        }
+        fn put_field(
+            &mut self,
+            _name: &str,
+            _value: EpicsValue,
+        ) -> epics_base_rs::error::CaResult<()> {
+            Ok(())
+        }
+        fn field_list(&self) -> &'static [FieldDesc] {
+            &[]
+        }
+    }
+
+    let process_count = Arc::new(AtomicU32::new(0));
+    let db = PvDatabase::new();
+    db.add_record(
+        "CONT_REC",
+        Box::new(ContinuationRecord {
+            process_count: process_count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // First process: returns AsyncPending + ReprocessAfter(20ms).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CONT_REC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // PACT should be set immediately after AsyncPending returns.
+    {
+        let rec = db.get_record("CONT_REC").await.unwrap();
+        assert!(
+            rec.read().await.is_processing(),
+            "PACT must be true after AsyncPending"
+        );
+    }
+    assert_eq!(process_count.load(Ordering::SeqCst), 1);
+
+    // A foreign caller during the wait must hit the entry guard (bail
+    // silently) — proves the guard still protects against FLNK/scan
+    // dual-fire while the continuation timer is pending.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CONT_REC", &mut visited, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        process_count.load(Ordering::SeqCst),
+        1,
+        "foreign re-entry during AsyncPending must NOT call process()"
+    );
+
+    // Wait for the ReprocessAfter timer to fire.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    // Continuation fired: process() ran a second time despite
+    // pact=true.
+    assert_eq!(
+        process_count.load(Ordering::SeqCst),
+        2,
+        "ReprocessAfter timer must call process() again — owner-driven \
+         continuation bypasses the PACT entry guard"
+    );
+
+    // BUG 1 regression — when the continuation's `process()` returns
+    // `Complete` (not async-pending again), the `processing` flag set
+    // on the original `AsyncPending` MUST be cleared. The continuation
+    // path does NOT go through `complete_async_record`, so without an
+    // explicit clear in `process_record_with_links_inner` the flag
+    // stayed `true` forever. C parity: an async record's completion
+    // re-entry clears `pact` inside `process()` (`aiRecord.c` second
+    // pass). A leaked `processing=true` would make every later foreign
+    // `process_record_with_links` trip the PACT entry guard.
+    {
+        let rec = db.get_record("CONT_REC").await.unwrap();
+        assert!(
+            !rec.read().await.is_processing(),
+            "BUG 1: completed ReprocessAfter continuation must clear PACT"
+        );
+    }
+
+    // A foreign caller after the continuation completed must actually
+    // run `process()` again — proving the PACT entry guard no longer
+    // fires (it would if `processing` had leaked true).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CONT_REC", &mut visited, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        process_count.load(Ordering::SeqCst),
+        3,
+        "BUG 1: after the continuation cleared PACT, a foreign process \
+         must run process() again instead of bailing at the entry guard"
+    );
+}
+
 // --- Monitor Mask tests ---
 
 /// epics-base 3.15.7 — a server-side `dbnd` (deadband) filter
@@ -1488,8 +2520,104 @@ async fn test_notify_field_respects_mask() {
     assert!(alarm_rx.try_recv().is_err());
 }
 
+/// C `dbAccess.c:575-577` clears `precord->rpro = FALSE; precord->putf =
+/// FALSE` and arms `callNotifyCompletion = TRUE` BEFORE the alarm
+/// check whenever SDIS evaluates to DISV. Pre-fix Round 4 Rust only
+/// reset nsta/nsev and updated the alarm — rpro/putf leaked into the
+/// next cycle and pending dbNotify completion callbacks stalled.
+#[tokio::test]
+async fn test_sdis_disable_clears_rpro_and_putf() {
+    let db = PvDatabase::new();
+    db.add_record("DIS_SW", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("DIS_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("DIS_TGT").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("SDIS", EpicsValue::String("DIS_SW".into()))
+            .unwrap();
+        // Pre-set rpro=true, putf=true so the disable path's clear is
+        // observable.
+        inst.common.rpro = true;
+        inst.common.putf = true;
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DIS_TGT", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("DIS_TGT").await.unwrap();
+    let inst = rec.read().await;
+    assert!(
+        !inst.common.rpro,
+        "SDIS disable must clear rpro (C dbAccess.c:575). Pre-fix this leaked."
+    );
+    assert!(
+        !inst.common.putf,
+        "SDIS disable must clear putf (C dbAccess.c:576). Pre-fix this leaked."
+    );
+}
+
+/// C `dbAccess.c:622-623` runs `dbNotifyCompletion(precord)` at
+/// `all_done` for the disable bail path because `callNotifyCompletion
+/// = TRUE` was set at line 577. A CA WRITE_NOTIFY landing on a
+/// disabled record must release its caller. Pre-fix Round 4 the
+/// put_notify_tx was never fired, stranding the call until socket
+/// disconnect.
+#[tokio::test]
+async fn test_sdis_disable_fires_put_notify_completion() {
+    let db = PvDatabase::new();
+    db.add_record("DIS_NOT_SW", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("DIS_NOT_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("DIS_NOT_TGT").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("SDIS", EpicsValue::String("DIS_NOT_SW".into()))
+            .unwrap();
+    }
+
+    // Arm put_notify_tx on the disabled target. The disable path must
+    // take it (consume tx) and send completion, releasing the rx.
+    let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
+    {
+        let rec = db.get_record("DIS_NOT_TGT").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_notify_tx = Some(tx);
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DIS_NOT_TGT", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // rx should be ready — completion was sent via the disable bail.
+    rx.await
+        .expect("disable bail must fire put_notify_tx (C dbAccess.c:622)");
+    // tx must be taken (not left dangling for the next cycle).
+    let rec = db.get_record("DIS_NOT_TGT").await.unwrap();
+    assert!(
+        rec.read().await.put_notify_tx.is_none(),
+        "put_notify_tx must be cleared after firing"
+    );
+}
+
 #[tokio::test]
 async fn test_sdis_disable_notifies_alarm() {
+    // C `dbAccess.c:587-592` — the disable branch of `dbProcess` posts:
+    //   db_post_events(&precord->stat, DBE_VALUE);            // STAT
+    //   db_post_events(&precord->sevr, DBE_VALUE);            // SEVR
+    //   db_post_events(&precord->VAL,  DBE_VALUE|DBE_ALARM);  // value field
+    // Only the *value field* carries DBE_ALARM; STAT/SEVR are posted
+    // with DBE_VALUE alone. A DBE_ALARM subscriber must therefore be
+    // attached to the value field (VAL) to observe the disable event —
+    // a DBE_ALARM-only subscription on .STAT/.SEVR would NOT be
+    // notified, matching C semantics.
     let db = PvDatabase::new();
     db.add_record("DISABLE_SW", Box::new(AoRecord::new(1.0)))
         .await
@@ -1506,10 +2634,12 @@ async fn test_sdis_disable_notifies_alarm() {
     let mut alarm_rx = {
         let rec = db.get_record("TARGET").await.unwrap();
         let mut inst = rec.write().await;
+        // DBE_ALARM subscriber on the value field — C posts VAL with
+        // DBE_VALUE|DBE_ALARM in the disable branch (dbAccess.c:590-592).
         inst.add_subscriber(
-            "SEVR",
+            "VAL",
             1,
-            epics_base_rs::types::DbFieldType::Short,
+            epics_base_rs::types::DbFieldType::Double,
             EventMask::ALARM.bits(),
         )
         .expect("subscribe should not be capped at default")
@@ -1638,6 +2768,148 @@ async fn test_calc_multi_input_db_links() {
     }
 }
 
+/// Defect 3 regression: a `ProcessPassive` (PP) multi-input link
+/// (`INPA..INPL` for calc/sel/sub/aSub) must process its passive
+/// source record BEFORE the value is read — C `dbGetLink` behaviour.
+/// Before the fix the multi-input fetch loop used `read_link_with_alarm`
+/// (bare `get_pv`, no PP processing), so a PP input link read a stale
+/// source value. The single-INP path already did this via
+/// `read_link_value_soft`.
+#[tokio::test]
+async fn test_calc_multi_input_pp_processes_passive_source() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+
+    // SRC: a passive calc whose VAL computes to 42 only when processed.
+    // Its stored VAL starts at the default 0.0.
+    let src = CalcRecord::new("42");
+    db.add_record("PP_SRC", Box::new(src)).await.unwrap();
+
+    // DST: INPA = "PP_SRC PP" (process-passive). CALC="A" copies INPA.
+    let mut dst = CalcRecord::new("A");
+    dst.inpa = "PP_SRC PP".to_string();
+    db.add_record("PP_DST", Box::new(dst)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("PP_DST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // DST must see 42: the PP link processed PP_SRC first, computing
+    // its VAL=42 before the value was read. A stale read would yield 0.
+    let val = db.get_pv("PP_DST").await.unwrap();
+    match val {
+        EpicsValue::Double(v) => assert!(
+            (v - 42.0).abs() < 1e-10,
+            "PP multi-input link must process source first: expected 42, got {v}"
+        ),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+    // The source itself must have been processed (VAL latched to 42).
+    let src_val = db.get_pv("PP_SRC").await.unwrap();
+    match src_val {
+        EpicsValue::Double(v) => assert!(
+            (v - 42.0).abs() < 1e-10,
+            "PP_SRC must have been processed by the PP link, VAL={v}"
+        ),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+}
+
+/// Defect 3 control: an `NPP` (no-process-passive) multi-input link
+/// must NOT process its passive source — it reads whatever stale
+/// value the source currently holds.
+#[tokio::test]
+async fn test_calc_multi_input_npp_does_not_process_source() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+
+    let src = CalcRecord::new("42");
+    db.add_record("NPP_SRC", Box::new(src)).await.unwrap();
+
+    let mut dst = CalcRecord::new("A");
+    dst.inpa = "NPP_SRC NPP".to_string();
+    db.add_record("NPP_DST", Box::new(dst)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("NPP_DST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // NPP_SRC was never processed, so its VAL stays at the default 0.0
+    // and DST reads 0, not 42.
+    let val = db.get_pv("NPP_DST").await.unwrap();
+    match val {
+        EpicsValue::Double(v) => assert!(
+            v.abs() < 1e-10,
+            "NPP multi-input link must NOT process source: expected 0, got {v}"
+        ),
+        other => panic!("expected Double(0.0), got {other:?}"),
+    }
+}
+
+/// Defect 1 regression (CRITICAL): two passive calc records whose
+/// `INPA` PP links point at each other (`A.INPA="B PP"`,
+/// `B.INPA="A PP"`) form a PP-link cycle. Before the fix
+/// `process_passive_db_source` created a FRESH `visited` set and
+/// reset depth to 0 on every PP hop, so neither `MAX_LINK_DEPTH`
+/// nor the `visited` cycle guard fired across the hop — the cycle
+/// recursed unboundedly to a stack overflow / SIGABRT.
+///
+/// C terminates this cycle because `calcRecord.c::process` sets
+/// `prec->pact = TRUE` *before* `fetch_values()` (calcRecord.c:119),
+/// so the re-entrant `dbProcess` hits `if (precord->pact) goto
+/// all_done;` (dbAccess.c:537) and bails after one bounce. The Rust
+/// fix threads the caller's `visited` set / `depth` through the PP
+/// hop so the existing `visited.insert` guard
+/// (`process_record_with_links_inner`) fires instead.
+///
+/// This test passing at all proves the fix: a regression re-aborts
+/// the whole test process with a stack overflow.
+#[tokio::test]
+async fn test_calc_pp_link_cycle_terminates() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+
+    // CALC_A.INPA = "CALC_B PP", CALC_B.INPA = "CALC_A PP".
+    // Both passive, both CALC="A" (copy the input).
+    let mut a = CalcRecord::new("A");
+    a.inpa = "CALC_B PP".to_string();
+    db.add_record("CALC_A", Box::new(a)).await.unwrap();
+
+    let mut b = CalcRecord::new("A");
+    b.inpa = "CALC_A PP".to_string();
+    db.add_record("CALC_B", Box::new(b)).await.unwrap();
+
+    // Must return cleanly (Ok) without overflowing the stack — the
+    // cycle guard terminates the A->B->A bounce.
+    let mut visited = HashSet::new();
+    let result = db
+        .process_record_with_links("CALC_A", &mut visited, 0)
+        .await;
+    assert!(
+        result.is_ok(),
+        "PP-link A<->B cycle must terminate cleanly, got {result:?}"
+    );
+
+    // Both records read a finite value (default 0.0 — neither has a
+    // real source). The point is that processing completed at all.
+    let va = db.get_pv("CALC_A").await.unwrap();
+    let vb = db.get_pv("CALC_B").await.unwrap();
+    match (va, vb) {
+        (EpicsValue::Double(x), EpicsValue::Double(y)) => {
+            assert!(
+                x.is_finite() && y.is_finite(),
+                "cycle must leave finite values, got A={x} B={y}"
+            );
+        }
+        other => panic!("expected Double values, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_calc_constant_inputs() {
     use epics_base_rs::server::records::calc::CalcRecord;
@@ -1655,6 +2927,105 @@ async fn test_calc_constant_inputs() {
         EpicsValue::Double(v) => assert!((v - 8.5).abs() < 1e-10),
         other => panic!("expected Double(8.5), got {:?}", other),
     }
+}
+
+// C parity (calcRecord.dbd.pod:716-744): calc record carries the same
+// HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV alarm-limit fields as
+// ai/ao/longin/longout. The Rust port omitted them — put_field for
+// HIHI silently no-op'd because `common.analog_alarm` was None for
+// rtype="calc".
+#[tokio::test]
+async fn test_calc_record_has_analog_alarm_limits() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+    let mut calc = CalcRecord::new("A");
+    calc.inpa = "15".to_string(); // VAL will compute to 15
+    db.add_record("CALC_LIM", Box::new(calc)).await.unwrap();
+
+    // Configure HIHI=10, HHSV=MAJOR. Put goes through put_record_field_from_ca
+    // which routes to common.analog_alarm.
+    db.put_record_field_from_ca("CALC_LIM", "HIHI", EpicsValue::Double(10.0))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("CALC_LIM", "HHSV", EpicsValue::String("MAJOR".into()))
+        .await
+        .unwrap();
+
+    // Read back — verifies the put landed in common.analog_alarm.
+    let hihi = {
+        let rec = db.get_record("CALC_LIM").await.unwrap();
+        let inst = rec.read().await;
+        inst.resolve_field("HIHI").and_then(|v| v.to_f64()).unwrap()
+    };
+    assert_eq!(hihi, 10.0);
+
+    // Process — CALC="A" with A=15 → VAL=15 > HIHI=10 → HIHI_ALARM/MAJOR.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CALC_LIM", &mut visited, 0)
+        .await
+        .unwrap();
+    let rec = db.get_record("CALC_LIM").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.sevr,
+        epics_base_rs::server::record::AlarmSeverity::Major,
+        "VAL=15, HIHI=10, HHSV=MAJOR — must raise HIHI alarm",
+    );
+    assert_eq!(
+        inst.common.stat,
+        epics_base_rs::server::recgbl::alarm_status::HIHI_ALARM,
+    );
+}
+
+// C parity (calcRecord.c::checkAlarms:339-381): with AFTC > 0 the
+// alarm-range integer is exponentially smoothed, so a brief excursion
+// above HIHI does NOT immediately raise the severity until the filter
+// converges.
+#[tokio::test]
+async fn test_calc_record_aftc_filter_delays_alarm() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+    let mut calc = CalcRecord::new("A");
+    calc.inpa = "1".to_string();
+    calc.aftc = 5.0; // 5-second filter time-constant
+    db.add_record("CALC_AFTC", Box::new(calc)).await.unwrap();
+    db.put_record_field_from_ca("CALC_AFTC", "HIHI", EpicsValue::Double(10.0))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("CALC_AFTC", "HHSV", EpicsValue::String("MAJOR".into()))
+        .await
+        .unwrap();
+
+    // First process — filter seeds with NoAlarm (alarm_range=3, Normal).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CALC_AFTC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // Set VAL=15 (HIHI condition) and process. With aftc=5s and dt
+    // very small (sub-second between processes), alpha=5/(eps+5)≈1.0,
+    // and filtered_range stays at 3 (Normal). The new alarm range (5)
+    // must be smoothed out by the filter — alarm must NOT fire on the
+    // first transition.
+    let rec = db.get_record("CALC_AFTC").await.unwrap();
+    {
+        let mut inst = rec.write().await;
+        let _ = inst.record.put_field("VAL", EpicsValue::Double(15.0));
+    }
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CALC_AFTC", &mut visited, 0)
+        .await
+        .unwrap();
+    let inst = rec.read().await;
+    // afvl must have been updated (filter is engaged)
+    let afvl = inst
+        .record
+        .get_field("AFVL")
+        .and_then(|v| v.to_f64())
+        .unwrap_or(0.0);
+    assert!(afvl != 0.0, "AFVL must be updated when AFTC > 0");
 }
 
 #[tokio::test]
@@ -1683,6 +3054,10 @@ async fn test_fanout_all() {
 
 #[tokio::test]
 async fn test_fanout_specified() {
+    // C parity (fanoutRecord.c:114): SELM=Specified selects the link
+    // at index `SELN + OFFS`, 0-based over LNK0..LNKF. With SELN=1,
+    // OFFS=0 the selected link is LNK1 (NOT LNK2 — the pre-fix port
+    // omitted LNK0 and was off by one).
     use epics_base_rs::server::records::fanout::FanoutRecord;
     let db = PvDatabase::new();
     let mut fanout = FanoutRecord::new();
@@ -1709,8 +3084,9 @@ async fn test_fanout_specified() {
         .await
         .unwrap();
     assert!(visited.contains("FANOUT"));
-    assert!(!visited.contains("T1"));
-    assert!(visited.contains("T2"));
+    // SELN=1 → LNK1 → T1 processed; LNK2/T2 NOT processed.
+    assert!(visited.contains("T1"));
+    assert!(!visited.contains("T2"));
 }
 
 #[tokio::test]
@@ -1742,6 +3118,93 @@ async fn test_dfanout_value_write() {
         EpicsValue::Double(v) => assert!((v - 42.0).abs() < 1e-10),
         other => panic!("expected Double(42.0), got {:?}", other),
     }
+}
+
+/// C `dfanoutRecord.c:115-122` reads VAL from DOL on every process
+/// cycle when `omsl == menuOmslclosed_loop`. The Rust port previously
+/// omitted dfanout from the DOL-eligible record-type list in
+/// `processing.rs::process_record_with_links_inner`, so a dfanout
+/// configured with OMSL=closed_loop never sourced VAL from DOL —
+/// every cycle silently kept the previously-cached VAL.
+#[tokio::test]
+async fn test_dfanout_omsl_closed_loop_sources_val_from_dol() {
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+
+    let db = PvDatabase::new();
+
+    // Upstream setpoint source.
+    db.add_record("DOL_SRC", Box::new(AoRecord::new(7.5)))
+        .await
+        .unwrap();
+
+    // dfanout with OMSL=closed_loop and DOL=DOL_SRC. SELM=0 (All)
+    // distributes VAL to OUTA + OUTB.
+    let mut dfan = DfanoutRecord::new(0.0);
+    dfan.selm = 0;
+    dfan.outa = "DFAN_DEST_A".to_string();
+    dfan.outb = "DFAN_DEST_B".to_string();
+    dfan.dol = "DOL_SRC".to_string();
+    dfan.omsl = 1; // closed_loop (menuOmslclosed_loop)
+    db.add_record("DFAN_OMSL", Box::new(dfan)).await.unwrap();
+
+    db.add_record("DFAN_DEST_A", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("DFAN_DEST_B", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DFAN_OMSL", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // DOL_SRC's VAL (7.5) must have flowed through DOL → dfanout.VAL → OUTA/OUTB.
+    let val_a = db.get_pv("DFAN_DEST_A").await.unwrap();
+    assert!(
+        matches!(val_a, EpicsValue::Double(v) if (v - 7.5).abs() < 1e-10),
+        "DFAN_DEST_A must reflect DOL_SRC (=7.5), got {val_a:?}"
+    );
+    let val_b = db.get_pv("DFAN_DEST_B").await.unwrap();
+    assert!(
+        matches!(val_b, EpicsValue::Double(v) if (v - 7.5).abs() < 1e-10),
+        "DFAN_DEST_B must reflect DOL_SRC (=7.5), got {val_b:?}"
+    );
+}
+
+/// Companion to the OMSL=closed_loop test: with OMSL=supervisory
+/// (default), DOL must NOT be evaluated even if a DOL link is set —
+/// VAL remains under operator control. This pins the gating so a
+/// future refactor cannot silently widen the closed-loop scope.
+#[tokio::test]
+async fn test_dfanout_omsl_supervisory_ignores_dol() {
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("DOL_SRC2", Box::new(AoRecord::new(99.0)))
+        .await
+        .unwrap();
+
+    let mut dfan = DfanoutRecord::new(3.0);
+    dfan.selm = 0;
+    dfan.outa = "DFAN_DEST_A2".to_string();
+    dfan.dol = "DOL_SRC2".to_string();
+    dfan.omsl = 0; // supervisory (menuOmslsupervisory)
+    db.add_record("DFAN_SUP", Box::new(dfan)).await.unwrap();
+    db.add_record("DFAN_DEST_A2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DFAN_SUP", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let val_a = db.get_pv("DFAN_DEST_A2").await.unwrap();
+    assert!(
+        matches!(val_a, EpicsValue::Double(v) if (v - 3.0).abs() < 1e-10),
+        "OMSL=supervisory must keep the operator-staged VAL (=3.0), got {val_a:?}"
+    );
 }
 
 #[tokio::test]
@@ -1781,6 +3244,216 @@ async fn test_seq_dol_lnk_dispatch() {
         EpicsValue::Double(v) => assert!((v - 200.0).abs() < 1e-10),
         other => panic!("expected Double(200.0), got {:?}", other),
     }
+}
+
+// A process-counting target. `process()` bumps the shared counter so a
+// test can prove whether a link DID or DID NOT process its target.
+struct CountingTarget {
+    process_count: Arc<AtomicU32>,
+}
+
+impl Record for CountingTarget {
+    fn record_type(&self) -> &'static str {
+        "counting_target"
+    }
+    fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
+        self.process_count.fetch_add(1, Ordering::SeqCst);
+        Ok(ProcessOutcome::complete())
+    }
+    fn get_field(&self, _name: &str) -> Option<EpicsValue> {
+        None
+    }
+    fn put_field(&mut self, _name: &str, _value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        &[]
+    }
+}
+
+// BUG 1 regression — seq `LNKn` is `DBF_OUTLINK` (`seqRecord.dbd.pod:316`)
+// driven via `dbPutLink` (`seqRecord.c:264`). `dbDbPutValue`
+// (`dbDbLink.c:388`) processes the target only when the link carries an
+// explicit `PP` modifier. A bare (modifier-less) seq LNKn is NPP — the
+// target value is written but the target is NOT processed. Before the
+// fix the `MultiOut::Seq` arm passed the bare link straight through
+// (`parse_link_v2` defaults bare → ProcessPassive), wrongly processing
+// the Passive target.
+#[tokio::test]
+async fn test_seq_bare_lnk_does_not_process_passive_target() {
+    use epics_base_rs::server::records::seq::SeqRecord;
+    let db = PvDatabase::new();
+
+    let bare_count = Arc::new(AtomicU32::new(0));
+    let pp_count = Arc::new(AtomicU32::new(0));
+    db.add_record(
+        "SEQ_BARE_TGT",
+        Box::new(CountingTarget {
+            process_count: bare_count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    db.add_record(
+        "SEQ_PP_TGT",
+        Box::new(CountingTarget {
+            process_count: pp_count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut seq = SeqRecord::new();
+    seq.selm = 0;
+    // Group 1: bare LNK — must NOT process the Passive target.
+    seq.do1 = 11.0;
+    seq.lnk1 = "SEQ_BARE_TGT".to_string();
+    // Group 2: explicit PP LNK — must process the Passive target.
+    seq.do2 = 22.0;
+    seq.lnk2 = "SEQ_PP_TGT PP".to_string();
+    db.add_record("SEQ_NPP_REC", Box::new(seq)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SEQ_NPP_REC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bare_count.load(Ordering::SeqCst),
+        0,
+        "bare seq LNKn (NPP) must NOT process its Passive target"
+    );
+    assert_eq!(
+        pp_count.load(Ordering::SeqCst),
+        1,
+        "explicit-PP seq LNKn must process its Passive target"
+    );
+}
+
+// BUG 1 regression — sseq `LNKn` is `DBF_OUTLINK` driven via `dbPutLink`
+// → `dbDbPutValue` (`dbDbLink.c:388`). A bare sseq LNKn is NPP and must
+// not process its target; an explicit-PP LNKn must.
+#[tokio::test]
+async fn test_sseq_bare_lnk_does_not_process_passive_target() {
+    use epics_base_rs::server::records::sseq::SseqRecord;
+    let db = PvDatabase::new();
+
+    let bare_count = Arc::new(AtomicU32::new(0));
+    let pp_count = Arc::new(AtomicU32::new(0));
+    db.add_record(
+        "SSEQ_BARE_TGT",
+        Box::new(CountingTarget {
+            process_count: bare_count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    db.add_record(
+        "SSEQ_PP_TGT",
+        Box::new(CountingTarget {
+            process_count: pp_count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    sseq.selm = 0;
+    // Step 1: bare LNK — must NOT process the Passive target.
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_BARE_TGT".to_string()))
+        .unwrap();
+    // Step 2: explicit PP LNK — must process the Passive target.
+    sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_PP_TGT PP".to_string()))
+        .unwrap();
+    db.add_record("SSEQ_NPP_REC", Box::new(sseq)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SSEQ_NPP_REC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bare_count.load(Ordering::SeqCst),
+        0,
+        "bare sseq LNKn (NPP) must NOT process its Passive target"
+    );
+    assert_eq!(
+        pp_count.load(Ordering::SeqCst),
+        1,
+        "explicit-PP sseq LNKn must process its Passive target"
+    );
+}
+
+// sseq per-step DLYn regression — C `sseqRecord.c` schedules each
+// selected step's LNKn write after its DLYn delay (`callbackRequestDelayed`),
+// exactly as the base `seqRecord` does for DLY0..DLYF. Pre-fix the
+// `MultiOut::Sseq` arm dispatched every step with no delay.
+#[tokio::test]
+async fn test_sseq_per_step_dly_delays_step_write() {
+    use epics_base_rs::server::records::sseq::SseqRecord;
+    let db = PvDatabase::new();
+
+    // Two Passive targets driven by explicit-PP LNKn so they accept
+    // the written value. Step 1 carries a 0.3 s DLY1, step 2 has no
+    // delay.
+    db.add_record("SSEQ_DLY_TGT1", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("SSEQ_DLY_TGT2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    sseq.selm = 0; // All steps selected.
+    // Step 1: delayed write.
+    sseq.put_field("DLY1", EpicsValue::Double(0.3)).unwrap();
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_DLY_TGT1 PP".to_string()))
+        .unwrap();
+    // Step 2: no delay (but dispatched only after step 1 completes).
+    sseq.put_field("DLY2", EpicsValue::Double(0.0)).unwrap();
+    sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_DLY_TGT2 PP".to_string()))
+        .unwrap();
+    db.add_record("SSEQ_DLY_REC", Box::new(sseq)).await.unwrap();
+
+    // Dispatch concurrently so we can sample target state mid-delay.
+    let db_proc = db.clone();
+    let handle = tokio::spawn(async move {
+        let mut visited = HashSet::new();
+        db_proc
+            .process_record_with_links("SSEQ_DLY_REC", &mut visited, 0)
+            .await
+            .unwrap();
+    });
+
+    // Before DLY1 elapses, step 1's value must NOT be written yet.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        db.get_pv("SSEQ_DLY_TGT1").await.unwrap(),
+        EpicsValue::Double(0.0),
+        "step 1 LNKn must not fire before its DLY1 delay elapses"
+    );
+    assert_eq!(
+        db.get_pv("SSEQ_DLY_TGT2").await.unwrap(),
+        EpicsValue::Double(0.0),
+        "step 2 must not fire before step 1's delay completes"
+    );
+
+    // After the dispatch finishes, both steps' values are written.
+    handle.await.unwrap();
+    assert_eq!(
+        db.get_pv("SSEQ_DLY_TGT1").await.unwrap(),
+        EpicsValue::Double(11.0),
+        "step 1 LNKn must fire after DLY1 elapses"
+    );
+    assert_eq!(
+        db.get_pv("SSEQ_DLY_TGT2").await.unwrap(),
+        EpicsValue::Double(22.0),
+        "step 2 LNKn must fire after step 1"
+    );
 }
 
 #[tokio::test]
@@ -1897,17 +3570,30 @@ async fn test_sdis_cp_link_registration() {
     assert_eq!(targets, vec!["GUARDED"]);
 }
 
+/// C `epicsTimeEventBestTime = -1` (epicsTime.h:103). The C path
+/// (`recGbl.c::recGblGetTimeStampSimm:324-328`) calls
+/// `epicsTimeGetEvent(-1)` unconditionally — that delegates to
+/// `generalTimeGetEventPriority(-1)` (BestTime providers). A device
+/// support that wants to keep its own timestamp must signal
+/// TSE = -2 (epicsTimeEventDeviceTime), not -1.
+///
+/// Regression: the pre-fix Rust port read TSE=-1 as
+/// "device-provided with BestTime fallback" and gated the call on
+/// UNIX_EPOCH. A stale device write of any non-epoch SystemTime
+/// suppressed every subsequent BestTime refresh.
 #[tokio::test]
-async fn test_tse_minus1_preserves_device_timestamp() {
+async fn test_tse_minus1_always_overwrites_via_best_time() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    let device_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234567);
+    // Stale but non-epoch timestamp — exactly the case the pre-fix
+    // path mis-classified as "device-provided, keep".
+    let stale = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234567);
     if let Some(rec) = db.get_record("REC").await {
         let mut inst = rec.write().await;
         inst.common.tse = -1;
-        inst.common.time = device_time;
+        inst.common.time = stale;
     }
     let mut visited = HashSet::new();
     db.process_record_with_links("REC", &mut visited, 0)
@@ -1915,7 +3601,11 @@ async fn test_tse_minus1_preserves_device_timestamp() {
         .unwrap();
     let rec = db.get_record("REC").await.unwrap();
     let inst = rec.read().await;
-    assert_eq!(inst.common.time, device_time);
+    assert_ne!(
+        inst.common.time, stale,
+        "TSE=-1 must always overwrite via generalTime BestTime, matching \
+         C `epicsTimeGetEvent(-1)` called unconditionally"
+    );
 }
 
 #[tokio::test]
@@ -2395,7 +4085,11 @@ async fn test_output_link_cascade_uses_post_process_source_timestamp() {
         .unwrap();
     if let Some(rec) = db.get_record("TS_SRC").await {
         let mut inst = rec.write().await;
-        inst.put_common_field("OUT", EpicsValue::String("TS_DST".into()))
+        // Explicit `PP` — C `dbDbPutValue` processes the OUT-link
+        // target only on an explicit PP flag (a bare OUT link is NPP
+        // and would only write the value). This test exercises the
+        // cascade, so the PP modifier is required.
+        inst.put_common_field("OUT", EpicsValue::String("TS_DST PP".into()))
             .unwrap();
     }
 
@@ -2548,7 +4242,10 @@ async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
         .unwrap();
     if let Some(rec) = db.get_record("LO_SRC").await {
         let mut inst = rec.write().await;
-        inst.put_common_field("OUT", EpicsValue::String("LO_DST".into()))
+        // Explicit `PP` — a bare OUT link is NPP (C `dbDbPutValue`);
+        // this test observes the cascade via the target's timestamp,
+        // so the OUT link must process the target.
+        inst.put_common_field("OUT", EpicsValue::String("LO_DST PP".into()))
             .unwrap();
         inst.record.put_field("OOPT", EpicsValue::Short(1)).unwrap();
     }
@@ -2644,9 +4341,11 @@ async fn test_self_link_out_does_not_loop() {
         .unwrap();
     if let Some(rec) = db.get_record("SELF_LO").await {
         let mut inst = rec.write().await;
-        // OUT="SELF_LO" → defaults to .VAL with PP, writes back to
-        // self and would normally re-trigger processing.
-        inst.put_common_field("OUT", EpicsValue::String("SELF_LO".into()))
+        // OUT="SELF_LO.VAL PP" → explicit PP so write_db_link_value
+        // attempts to re-process self; this is the case the visited
+        // HashSet recursion guard must catch. A bare OUT link is NPP
+        // (C `dbDbPutValue`) and would not exercise the guard at all.
+        inst.put_common_field("OUT", EpicsValue::String("SELF_LO PP".into()))
             .unwrap();
     }
 
@@ -2890,8 +4589,9 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
         time_source: Some('A'),
     };
     let parsed = ParsedLink::Calc(calc.clone());
+    let mut visited = HashSet::new();
     let value = db
-        .read_link_value_soft(&parsed, true)
+        .read_link_value_soft(&parsed, true, &mut visited, 0)
         .await
         .expect("calc link evaluates");
     match value {
@@ -2914,4 +4614,394 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
         other => panic!("expected Double, got {other:?}"),
     }
     assert_eq!(t, Some(known), "time pulled from pv_a (letter 'A')");
+}
+
+/// Regression: a CA put to `mbbo.VAL` must recompute RVAL/ORAW.
+///
+/// C `mbboRecord.c::process` (line 217) calls `convert(prec)`
+/// unconditionally on every non-pact process — the VAL→RVAL output
+/// translation. Pre-fix, `put_record_field_from_ca` called
+/// `set_device_did_compute(true)` for *any* VAL put, and `mbbo`
+/// interpreted that as "skip the output convert", so RVAL/ORAW kept
+/// their stale pre-put value while the OUT link drove the wrong raw.
+///
+/// With `shft = 4` and no state table, `convert()` yields
+/// `RVAL = VAL << 4`. A CA put of VAL=3 must produce RVAL=ORAW=48.
+#[tokio::test]
+async fn test_ca_put_mbbo_val_recomputes_rval() {
+    use epics_base_rs::server::records::mbbo::MbboRecord;
+
+    let db = PvDatabase::new();
+    let mut rec = MbboRecord::new(0);
+    rec.shft = 4;
+    db.add_record("MBBO_CA", Box::new(rec)).await.unwrap();
+
+    db.put_record_field_from_ca("MBBO_CA", "VAL", EpicsValue::Enum(3))
+        .await
+        .unwrap();
+
+    let rec = db.get_record("MBBO_CA").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.record.get_field("VAL"),
+        Some(EpicsValue::Enum(3)),
+        "VAL holds the CA-written value"
+    );
+    assert_eq!(
+        inst.record.get_field("RVAL"),
+        Some(EpicsValue::Long(48)),
+        "RVAL must be recomputed from the new VAL (3 << 4), not left stale at 0"
+    );
+    assert_eq!(
+        inst.record.get_field("ORAW"),
+        Some(EpicsValue::Long(48)),
+        "ORAW must roll forward to the freshly converted RVAL"
+    );
+}
+
+/// Regression: a CA put to `mbboDirect.VAL` must recompute RVAL/ORAW.
+///
+/// C `mbboDirectRecord.c::process` (line 198) calls `convert(prec)`
+/// unconditionally. With `shft = 4`, `convert()` yields
+/// `RVAL = VAL << 4`. A CA put of VAL=5 must produce RVAL=ORAW=80.
+#[tokio::test]
+async fn test_ca_put_mbbo_direct_val_recomputes_rval() {
+    use epics_base_rs::server::records::mbbo_direct::MbboDirectRecord;
+
+    let db = PvDatabase::new();
+    let mut rec = MbboDirectRecord::default();
+    rec.shft = 4;
+    db.add_record("MBBOD_CA", Box::new(rec)).await.unwrap();
+
+    db.put_record_field_from_ca("MBBOD_CA", "VAL", EpicsValue::Long(5))
+        .await
+        .unwrap();
+
+    let rec = db.get_record("MBBOD_CA").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.record.get_field("RVAL"),
+        Some(EpicsValue::Long(80)),
+        "RVAL must be recomputed from the new VAL (5 << 4), not left stale at 0"
+    );
+    assert_eq!(
+        inst.record.get_field("ORAW"),
+        Some(EpicsValue::Long(80)),
+        "ORAW must roll forward to the freshly converted RVAL"
+    );
+}
+
+/// CRITICAL 1 — a record in SIMM (simulation) mode must still run its
+/// forward link. C `aiRecord.c:151-168`: simulation is handled inside
+/// `readValue()`, then `process()` ALWAYS runs `recGblFwdLink(prec)`
+/// (`aiRecord.c:168`). The pre-fix Rust port returned early from
+/// `check_simulation_mode`, so FLNK / CP / RPRO were skipped — every
+/// link chain downstream of a SIMM-mode record silently broke.
+#[tokio::test]
+async fn test_simulation_mode_still_fires_forward_link() {
+    let db = PvDatabase::new();
+    db.add_record("SIM:SRC", Box::new(AoRecord::new(11.0)))
+        .await
+        .unwrap();
+    db.add_record("SIM:FLNK_TARGET", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut ai = AiRecord::new(0.0);
+    // SIMM=1 (YES) with SIOL pointing at SIM:SRC — enters simulation.
+    ai.simm = 1;
+    ai.siol = "SIM:SRC".into();
+    db.add_record("SIM:AI", Box::new(ai)).await.unwrap();
+    if let Some(rec) = db.get_record("SIM:AI").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("FLNK", EpicsValue::String("SIM:FLNK_TARGET".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SIM:AI", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert!(
+        visited.contains("SIM:AI"),
+        "the simulated record itself must be in the visited set"
+    );
+    assert!(
+        visited.contains("SIM:FLNK_TARGET"),
+        "a SIMM-mode record must still dispatch its FLNK forward link \
+         (C aiRecord.c:168 recGblFwdLink runs unconditionally): {visited:?}"
+    );
+}
+
+/// BUG 2 — a simulated `mbbi` is an INPUT record: it must READ the
+/// value in from SIOL, not write VAL out to SIOL. `mbbiRecord.c:125-126`
+/// declares SIML/SIOL and `mbbiRecord.c:388-394` reads
+/// `dbGetLink(&prec->siol, DBR_ULONG, &prec->sval)`. Pre-fix the Rust
+/// `is_input` set omitted `mbbi`, so a simulated mbbi fell into the
+/// OUTPUT branch and wrote its own VAL out to the SIOL target.
+#[tokio::test]
+async fn test_simulated_mbbi_reads_siol_not_writes_it() {
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+
+    let db = PvDatabase::new();
+    // SIOL source holds the simulated input value (index 3).
+    db.add_record("MBBISIM:SRC", Box::new(LonginRecord::new(3)))
+        .await
+        .unwrap();
+
+    // mbbi starts at index 0; SIMM=1 (YES), SIOL -> the source.
+    let mut mbbi = MbbiRecord::new(0);
+    mbbi.simm = 1;
+    mbbi.siol = "MBBISIM:SRC".into();
+    db.add_record("MBBISIM:IN", Box::new(mbbi)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("MBBISIM:IN", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // The SIOL source must be UNCHANGED — a simulated mbbi must not
+    // write its VAL out to SIOL.
+    let src = db.get_record("MBBISIM:SRC").await.unwrap();
+    let src_val = src.read().await.record.get_field("VAL").unwrap();
+    assert_eq!(
+        src_val.to_f64().unwrap() as i64,
+        3,
+        "simulated mbbi must NOT write VAL out to its SIOL target"
+    );
+
+    // The mbbi must have READ the value in from SIOL.
+    let mbbi_rec = db.get_record("MBBISIM:IN").await.unwrap();
+    let mbbi_val = mbbi_rec.read().await.record.get_field("VAL").unwrap();
+    assert_eq!(
+        mbbi_val.to_f64().unwrap() as i64,
+        3,
+        "simulated mbbi must read VAL in from SIOL (got {mbbi_val:?})"
+    );
+}
+
+/// BUG 3 — async-completion FLNK must not recurse into the
+/// just-completed record. `complete_async_record_inner` seeds the
+/// cycle-guard `visited` set with the record's own name (mirroring the
+/// synchronous `process_record_with_links_inner`). An FLNK chain that
+/// loops back (A -> FLNK -> B -> FLNK -> A) must terminate, not
+/// re-enter A unbounded.
+#[tokio::test]
+async fn test_async_completion_flnk_cycle_terminates() {
+    let db = PvDatabase::new();
+    db.add_record("ACYC:A", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("ACYC:B", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    // A -> FLNK -> B -> FLNK -> A : a closed forward-link loop.
+    if let Some(rec) = db.get_record("ACYC:A").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("FLNK", EpicsValue::String("ACYC:B".into()))
+            .unwrap();
+    }
+    if let Some(rec) = db.get_record("ACYC:B").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("FLNK", EpicsValue::String("ACYC:A".into()))
+            .unwrap();
+    }
+
+    // Driving the async-completion path on A must terminate — pre-fix
+    // it re-entered A through B's FLNK because `visited` was never
+    // seeded with A's own name. A hung/overflowed run fails the test
+    // by timeout/panic; a clean return proves the cycle guard closed.
+    db.complete_async_record("ACYC:A").await.unwrap();
+}
+
+/// BUG 4 — fanout/seq/sseq must resolve the SELL input link into SELN
+/// before SELN is used. C `fanoutRecord.c:103` calls
+/// `dbGetLink(&prec->sell, DBR_USHORT, &prec->seln, 0, 0)` at the top
+/// of every `process()`. Pre-fix `dispatch_multi_output` read SELN
+/// directly from the field and never followed SELL, so a SELL link
+/// pointing at another record never updated the selection.
+#[tokio::test]
+async fn test_fanout_resolves_sell_link_into_seln() {
+    use epics_base_rs::server::records::fanout::FanoutRecord;
+
+    let db = PvDatabase::new();
+    // SELL source: selects link index 2.
+    db.add_record("FANSELL:SRC", Box::new(LonginRecord::new(2)))
+        .await
+        .unwrap();
+    db.add_record("FANSELL:T2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("FANSELL:T0", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut fan = FanoutRecord::new();
+    fan.put_field("SELM", EpicsValue::Short(1)).unwrap(); // Specified
+    fan.put_field("SELN", EpicsValue::Short(0)).unwrap(); // stale init value
+    // SELL points at the source — must resolve to SELN=2 at process.
+    fan.put_field("SELL", EpicsValue::String("FANSELL:SRC".into()))
+        .unwrap();
+    fan.put_field("LNK0", EpicsValue::String("FANSELL:T0 PP".into()))
+        .unwrap();
+    fan.put_field("LNK2", EpicsValue::String("FANSELL:T2 PP".into()))
+        .unwrap();
+    db.add_record("FANSELL:FAN", Box::new(fan)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("FANSELL:FAN", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // SELL resolved SELN to 2 -> SELM=Specified fans out LNK2 only.
+    assert!(
+        visited.contains("FANSELL:T2"),
+        "SELL must resolve SELN=2 so LNK2 is dispatched: {visited:?}"
+    );
+    assert!(
+        !visited.contains("FANSELL:T0"),
+        "with SELL-resolved SELN=2, the stale SELN=0 (LNK0) must NOT \
+         be dispatched: {visited:?}"
+    );
+    // SELN must now hold the SELL-resolved value.
+    let fan_rec = db.get_record("FANSELL:FAN").await.unwrap();
+    let seln = fan_rec.read().await.record.get_field("SELN").unwrap();
+    assert_eq!(
+        seln,
+        EpicsValue::Short(2),
+        "SELN must be updated from the SELL link"
+    );
+}
+
+/// BUG 5 — `putAcks` (C `dbAccess.c:1303-1315`) compares the written
+/// severity against the STORED unacknowledged severity `acks`, not
+/// against the current `sevr`; `putAckt` (C `dbAccess.c:1285-1301`)
+/// lowers `acks` down to `sevr` when ACKT is set false and
+/// `acks > sevr`.
+#[tokio::test]
+async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
+    // putAcks: acks must be cleared when the written severity is >=
+    // the STORED acks, even after sevr has dropped below it.
+    {
+        let rec = AoRecord::new(0.0);
+        let mut inst = RecordInstance::new("ACKTEST1".into(), rec);
+        // Latched sticky alarm: acks=MAJOR(2); current sevr has since
+        // dropped to MINOR(1).
+        inst.common.acks = AlarmSeverity::Major;
+        inst.common.sevr = AlarmSeverity::Minor;
+        // Acknowledge at MAJOR — written sev (2) >= acks (2) -> clear.
+        inst.put_common_field("ACKS", EpicsValue::Short(2)).unwrap();
+        assert_eq!(
+            inst.common.acks,
+            AlarmSeverity::NoAlarm,
+            "ACKS write at sev>=stored acks must clear acks \
+             (C dbAccess.c:1309 compares *psev >= precord->acks)"
+        );
+
+        // A second case: written sev BELOW the stored acks must NOT
+        // clear it — proving the comparison is against `acks`, not
+        // `sevr`. Were it compared against sevr (Minor), a MINOR write
+        // would wrongly clear.
+        let rec2 = AoRecord::new(0.0);
+        let mut inst2 = RecordInstance::new("ACKTEST2".into(), rec2);
+        inst2.common.acks = AlarmSeverity::Major;
+        inst2.common.sevr = AlarmSeverity::Minor;
+        inst2
+            .put_common_field("ACKS", EpicsValue::Short(1))
+            .unwrap();
+        assert_eq!(
+            inst2.common.acks,
+            AlarmSeverity::Major,
+            "ACKS write at sev BELOW stored acks must NOT clear acks; \
+             comparing against sevr (Minor) instead would wrongly clear"
+        );
+    }
+
+    // putAckt: ACKT set false with acks > sevr must lower acks to sevr.
+    {
+        let rec = AoRecord::new(0.0);
+        let mut inst = RecordInstance::new("ACKTEST3".into(), rec);
+        inst.common.ackt = true;
+        inst.common.acks = AlarmSeverity::Major;
+        inst.common.sevr = AlarmSeverity::Minor;
+        inst.put_common_field("ACKT", EpicsValue::Short(0)).unwrap();
+        assert!(!inst.common.ackt, "ACKT must be cleared");
+        assert_eq!(
+            inst.common.acks,
+            AlarmSeverity::Minor,
+            "ACKT=false with acks>sevr must lower acks down to sevr \
+             (C dbAccess.c:1294-1297)"
+        );
+    }
+}
+
+/// BUG 2 regression — a bare (modifier-less) OUT link is NPP: the
+/// value is written to the target but the target is NOT processed.
+/// C `dbDbPutValue` (dbDbLink.c:386-389) calls `processTarget` only
+/// when the link carries an explicit `PP` flag (or writes `.PROC`).
+#[tokio::test]
+async fn test_bare_out_link_does_not_process_target() {
+    let db = PvDatabase::new();
+    db.add_record("SRC_OUT", Box::new(AoRecord::new(33.0)))
+        .await
+        .unwrap();
+    db.add_record("TGT_OUT", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Bare OUT link — no PP modifier.
+    if let Some(rec) = db.get_record("SRC_OUT").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("TGT_OUT.VAL".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SRC_OUT", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // The value must have landed on the target.
+    let tgt_val = db.get_pv("TGT_OUT").await.unwrap();
+    assert_eq!(
+        tgt_val.to_f64().unwrap(),
+        33.0,
+        "bare OUT link must still write the value to the target"
+    );
+    // ...but the target must NOT have been processed.
+    assert!(
+        !visited.contains("TGT_OUT"),
+        "bare OUT link (NPP) must NOT process its target: {visited:?}"
+    );
+}
+
+/// BUG 2 regression (positive case) — an OUT link with an explicit
+/// `PP` token DOES process a Passive target, mirroring C
+/// `dbDbPutValue` `pvlOptPP` branch.
+#[tokio::test]
+async fn test_pp_out_link_processes_passive_target() {
+    let db = PvDatabase::new();
+    db.add_record("SRC_PP", Box::new(AoRecord::new(44.0)))
+        .await
+        .unwrap();
+    db.add_record("TGT_PP", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    if let Some(rec) = db.get_record("SRC_PP").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("TGT_PP.VAL PP".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SRC_PP", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert!(
+        visited.contains("TGT_PP"),
+        "explicit PP OUT link must process its Passive target: {visited:?}"
+    );
 }

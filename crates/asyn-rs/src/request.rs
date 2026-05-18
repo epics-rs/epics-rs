@@ -30,6 +30,11 @@ pub enum ParamSetValue {
         addr: i32,
         value: Vec<f64>,
     },
+    Int32Array {
+        reason: usize,
+        addr: i32,
+        value: Vec<i32>,
+    },
     UInt32Digital {
         reason: usize,
         addr: i32,
@@ -88,10 +93,31 @@ pub enum RequestOp {
     EnableAddr,
     /// Disable a specific device address (multi-device ports).
     DisableAddr,
+    /// Enable / disable the entire port. C parity:
+    /// `pasynManager->enable(pasynUser, enable)`
+    /// (`asynManager.c::enable`, fired by asynRecord `ENBL` writes
+    /// at `asynRecord.c:484-486`).
+    SetEnable {
+        yes: bool,
+    },
+    /// Enable / disable auto-connect for the port. C parity:
+    /// `pasynManager->autoConnect(pasynUser, autoConnect)`
+    /// (`asynManager.c::autoConnect`, fired by asynRecord `AUCT`
+    /// writes at `asynRecord.c:481-482`). `asynExceptionAutoConnect`
+    /// is emitted unconditionally on every call.
+    SetAutoConnect {
+        yes: bool,
+    },
     /// Query int32 bounds (low, high).
     GetBoundsInt32,
     /// Query int64 bounds (low, high).
     GetBoundsInt64,
+    /// Query whether the port is currently enabled. C parity:
+    /// `pasynManager->isEnabled` (`asynManager.c`).
+    GetEnable,
+    /// Query whether auto-connect is enabled for the port. C parity:
+    /// `pasynManager->isAutoConnect` (`asynManager.c`).
+    GetAutoConnect,
     /// Block the port: only this user's requests will be dequeued until unblocked.
     BlockProcess,
     /// Unblock the port.
@@ -172,6 +198,27 @@ pub enum RequestOp {
         key: String,
         value: String,
     },
+    /// Print a driver report (matches C `asynManager->report` /
+    /// iocsh `asynReport`). The actor calls
+    /// [`crate::port::PortDriver::report`] which writes to stderr
+    /// at the requested verbosity. Carried by the actor so the
+    /// driver is observed from its own thread (consistent with C
+    /// asyn's `pport->lock` invariant for `report`).
+    Report {
+        level: i32,
+    },
+    /// Set the port's input EOS bytes — C `pasynOctet->setInputEos`.
+    /// Drives the same `PortDriver::set_input_eos(&[u8])` hook the EOS
+    /// interpose layer reads, so asynRecord IEOS writes survive a
+    /// round trip through the actor (previously routed through the
+    /// generic option HashMap which no driver consumes).
+    SetInputEos {
+        eos: Vec<u8>,
+    },
+    /// Set the port's output EOS bytes — C `pasynOctet->setOutputEos`.
+    SetOutputEos {
+        eos: Vec<u8>,
+    },
 }
 
 /// Result returned by the worker after executing a request.
@@ -211,6 +258,15 @@ pub struct RequestResult {
     pub option_value: Option<String>,
     /// Int64 bounds (from GetBoundsInt32/Int64).
     pub bounds: Option<(i64, i64)>,
+    /// End-of-message reason flags from an octet read.
+    ///
+    /// C parity: `asynOctet::read` returns `nbytes` together with
+    /// `int *eomReason` (`interfaces/asynOctet.h:38-40`). The flags
+    /// `ASYN_EOM_CNT | ASYN_EOM_EOS | ASYN_EOM_END` mirror
+    /// [`crate::interpose::EomReason`]. Stored as `u32` so the
+    /// request layer stays bitflag-crate-free; converters live on
+    /// `EomReason::from_bits_truncate`.
+    pub eom_reason: u32,
 }
 
 impl RequestResult {
@@ -237,6 +293,7 @@ impl RequestResult {
             timestamp: None,
             option_value: None,
             bounds: None,
+            eom_reason: 0,
         }
     }
 
@@ -248,6 +305,20 @@ impl RequestResult {
         Self {
             nbytes,
             data: Some(buf),
+            ..Self::base()
+        }
+    }
+
+    /// Variant of [`Self::octet_read`] that carries the
+    /// end-of-message reason flags returned by
+    /// [`crate::port::PortDriver::io_read_octet_eom`]. The raw `u32`
+    /// is decoded with `EomReason::from_bits_truncate` on the
+    /// consumer side.
+    pub fn octet_read_eom(buf: Vec<u8>, nbytes: usize, eom_reason: u32) -> Self {
+        Self {
+            nbytes,
+            data: Some(buf),
+            eom_reason,
             ..Self::base()
         }
     }

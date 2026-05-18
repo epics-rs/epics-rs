@@ -133,8 +133,17 @@ fn opposite_direction_retarget_stops_and_replans() {
     }
 }
 
+/// BUG 3 regression: a VAL write during motion with NTM=No must still
+/// re-issue a move. C `do_work` (motorRecord.cc:2241) re-runs the move
+/// block on every `dval != ldvl || !dmov` — completely independent of
+/// NTM. NTM (motorRecord.cc:1327-1331) gates only the opposite-direction
+/// `STOP_AXIS` in the `process()` `movn` block.
+///
+/// NTM has no `initial()` in `motorRecord.dbd`, so it defaults to No —
+/// meaning a buggy `if !ntm { Ignore }` gate would silently discard
+/// EVERY mid-motion VAL write on a default-configured record.
 #[test]
-fn ntm_false_ignores_retarget() {
+fn ntm_false_same_direction_retarget_still_reissues_move() {
     let mut rec = make_record();
     rec.timing.ntm = false;
 
@@ -144,12 +153,69 @@ fn ntm_false_ignores_retarget() {
 
     motor_moving(&mut rec, 25.0);
 
-    // New target while NTM=false → ignored
+    // New target while NTM=No, same direction (80 > 25, moving +).
+    // C do_work re-issues the move regardless of NTM.
     rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
 
-    // Should be ignored (no commands)
-    assert!(effects.commands.is_empty());
+    assert_eq!(
+        effects.commands.len(),
+        1,
+        "NTM=No write during motion must still re-issue a move"
+    );
+    let new_target = match &effects.commands[0] {
+        MotorCommand::MoveAbsolute { position, .. } => *position,
+        MotorCommand::MoveRelative { distance, .. } => 25.0 + distance,
+        other => panic!("expected Move command, got {other:?}"),
+    };
+    assert!(
+        (new_target - 80.0).abs() < 1e-6,
+        "retarget should reach 80, got {new_target}"
+    );
+    assert!(!rec.stat.dmov);
+}
+
+/// BUG 3 regression: with NTM=No, an opposite-direction VAL write during
+/// motion must re-issue a move directly (no stop-and-replan). C do_work
+/// re-issues; the opposite-direction `STOP_AXIS` path in the `movn` block
+/// is gated on `ntm == menuYesNoYES` and therefore does NOT fire here.
+#[test]
+fn ntm_false_opposite_direction_retarget_reissues_without_stop() {
+    let mut rec = make_record();
+    rec.timing.ntm = false;
+
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.internal.ldvl = 50.0;
+
+    motor_moving(&mut rec, 25.0);
+    // Moving toward +50 from 25 → commanded direction is positive.
+    rec.stat.cdir = true;
+
+    // Opposite-direction target (-20) while NTM=No. C does NOT stop
+    // first (the STOP_AXIS path requires NTM=Yes); do_work re-issues
+    // a move straight to the new target.
+    rec.put_field("VAL", EpicsValue::Double(-20.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+
+    assert_eq!(effects.commands.len(), 1, "expected one command");
+    assert!(
+        !matches!(effects.commands[0], MotorCommand::Stop { .. }),
+        "NTM=No must NOT stop-and-replan; it re-issues a move directly"
+    );
+    assert!(
+        !rec.stat.mip.contains(MipFlags::STOP),
+        "MIP_STOP must not be set for an NTM=No retarget"
+    );
+    let new_target = match &effects.commands[0] {
+        MotorCommand::MoveAbsolute { position, .. } => *position,
+        MotorCommand::MoveRelative { distance, .. } => 25.0 + distance,
+        other => panic!("expected Move command, got {other:?}"),
+    };
+    assert!(
+        (new_target - (-20.0)).abs() < 1e-6,
+        "retarget should reach -20, got {new_target}"
+    );
 }
 
 #[test]

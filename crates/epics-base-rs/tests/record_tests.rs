@@ -574,27 +574,27 @@ fn test_deadband_mdel() {
 
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 
     instance.record.set_val(EpicsValue::Double(3.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 
     instance.record.set_val(EpicsValue::Double(6.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 
     instance.record.set_val(EpicsValue::Double(10.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 
     instance.record.set_val(EpicsValue::Double(12.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 }
 
@@ -606,12 +606,12 @@ fn test_deadband_mdel_zero() {
 
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 
     instance.record.set_val(EpicsValue::Double(0.001)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 }
 
@@ -623,7 +623,7 @@ fn test_deadband_mdel_negative() {
 
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 }
 
@@ -637,11 +637,16 @@ fn test_bi_state_alarm() {
     let mut instance = RecordInstance::new("SW".into(), rec);
     instance.common.udf = false;
 
+    // bi STATE alarm lives in the `Record::check_alarms` hook (C
+    // `biRecord.c::checkAlarms`); `process_local` calls it before
+    // `evaluate_alarms`. Mirror that order here.
+    instance.record.check_alarms(&mut instance.common);
     instance.evaluate_alarms();
     recgbl::rec_gbl_reset_alarms(&mut instance.common);
     assert_eq!(instance.common.sevr, AlarmSeverity::Major);
 
     instance.record.set_val(EpicsValue::Enum(1)).unwrap();
+    instance.record.check_alarms(&mut instance.common);
     instance.evaluate_alarms();
     recgbl::rec_gbl_reset_alarms(&mut instance.common);
     assert_eq!(instance.common.sevr, AlarmSeverity::Minor);
@@ -659,16 +664,22 @@ fn test_mbbi_state_alarm() {
     let mut instance = RecordInstance::new("SEL".into(), rec);
     instance.common.udf = false;
 
+    // mbbi STATE alarm lives in the `Record::check_alarms` hook (C
+    // `mbbiRecord.c::checkAlarms`); `process_local` calls it before
+    // `evaluate_alarms`. Mirror that order here.
+    instance.record.check_alarms(&mut instance.common);
     instance.evaluate_alarms();
     recgbl::rec_gbl_reset_alarms(&mut instance.common);
     assert_eq!(instance.common.sevr, AlarmSeverity::NoAlarm);
 
     instance.record.set_val(EpicsValue::Enum(1)).unwrap();
+    instance.record.check_alarms(&mut instance.common);
     instance.evaluate_alarms();
     recgbl::rec_gbl_reset_alarms(&mut instance.common);
     assert_eq!(instance.common.sevr, AlarmSeverity::Minor);
 
     instance.record.set_val(EpicsValue::Enum(2)).unwrap();
+    instance.record.check_alarms(&mut instance.common);
     instance.evaluate_alarms();
     recgbl::rec_gbl_reset_alarms(&mut instance.common);
     assert_eq!(instance.common.sevr, AlarmSeverity::Major);
@@ -689,17 +700,94 @@ fn test_mbbi_unsv() {
 }
 
 #[test]
-fn test_deadband_alarm_always_included() {
+fn test_deadband_alarm_on_change_bypasses_value_deadband() {
+    // C `recGbl.c:202-210` (`recGblResetAlarms`): SEVR is posted only
+    // when `prev_sevr != new_sevr`, and STAT only when `stat_mask` is
+    // set (sevr change / stat change / amsg change). The alarm-field
+    // posts are NOT gated by the VAL monitor deadband (MDEL/ADEL) —
+    // `db_post_events(&pdbc->stat, …)` runs independently of the
+    // value-change check. This test verifies the C-correct behavior:
+    // a genuine SEVR transition posts SEVR and STAT even though the
+    // VAL change is smaller than MDEL and is therefore deadband-
+    // filtered out of the same snapshot. `process_local` returns
+    // SEVR/STAT in `alarm_posts` (each with its own C event mask),
+    // not in the record-wide `changed_fields` snapshot.
+    use epics_base_rs::server::recgbl::EventMask;
     let mut rec = AiRecord::default();
-    rec.mdel = 100.0;
+    rec.mdel = 100.0; // VAL change of 1.0 is below the value deadband.
     let mut instance = RecordInstance::new("TEST".into(), rec);
+    // HIGH=0.5/Major so VAL=1.0 trips a HIGH alarm — a real
+    // NoAlarm -> Major SEVR transition.
+    instance.common.analog_alarm = Some(AnalogAlarmConfig {
+        hihi: 1000.0,
+        high: 0.5,
+        low: -1000.0,
+        lolo: -2000.0,
+        hhsv: AlarmSeverity::Major,
+        hsv: AlarmSeverity::Major,
+        lsv: AlarmSeverity::Minor,
+        llsv: AlarmSeverity::Major,
+    });
 
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, alarm_posts) = instance.process_local().unwrap();
+    // VAL is deadband-filtered (|1.0 - 0.0| < MDEL=100).
     assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
-    assert!(snap.changed_fields.iter().any(|(k, _)| k == "SEVR"));
-    assert!(snap.changed_fields.iter().any(|(k, _)| k == "STAT"));
+    // SEVR / STAT are NOT in the record-wide snapshot — they ride
+    // the per-field `alarm_posts` list instead.
+    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "SEVR"));
+    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "STAT"));
+    // SEVR posted DBE_VALUE on a sevr change.
+    let sevr_mask = alarm_posts
+        .iter()
+        .find(|(f, _)| *f == "SEVR")
+        .map(|(_, m)| *m);
+    assert_eq!(
+        sevr_mask,
+        Some(EventMask::VALUE),
+        "SEVR must post with DBE_VALUE only"
+    );
+    // STAT posted DBE_ALARM (sevr change) | DBE_VALUE (stat change).
+    let stat_mask = alarm_posts
+        .iter()
+        .find(|(f, _)| *f == "STAT")
+        .map(|(_, m)| *m);
+    assert_eq!(
+        stat_mask,
+        Some(EventMask::ALARM | EventMask::VALUE),
+        "STAT must post with DBE_ALARM | DBE_VALUE on a sevr+stat change"
+    );
+    // Defect 2: AMSG must be posted alongside STAT with the SAME mask.
+    // C `recGblResetAlarms` posts AMSG whenever any alarm field moved;
+    // `process_local` previously omitted it entirely.
+    let amsg_mask = alarm_posts
+        .iter()
+        .find(|(f, _)| *f == "AMSG")
+        .map(|(_, m)| *m);
+    assert_eq!(
+        amsg_mask, stat_mask,
+        "AMSG must be posted with the same mask as STAT"
+    );
+}
+
+#[test]
+fn test_no_alarm_change_does_not_post_sevr_stat() {
+    // C `recGbl.c:202-207`: when `prev_sevr == new_sevr` and
+    // `prev_stat == new_stat`, `recGblResetAlarms` posts neither
+    // SEVR nor STAT. A record processed with no alarm transition
+    // must not emit alarm-field monitor events — neither in the
+    // record-wide snapshot nor in the per-field `alarm_posts` list.
+    let mut rec = AiRecord::default();
+    rec.mdel = 100.0;
+    let mut instance = RecordInstance::new("TEST".into(), rec);
+    instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
+    instance.record.set_device_did_compute(true);
+    let (snap, alarm_posts) = instance.process_local().unwrap();
+    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "SEVR"));
+    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "STAT"));
+    assert!(!alarm_posts.iter().any(|(f, _)| *f == "SEVR"));
+    assert!(!alarm_posts.iter().any(|(f, _)| *f == "STAT"));
 }
 
 #[test]
@@ -1182,11 +1270,11 @@ fn test_snapshot_alarm_state() {
 // place. These tests pin the post-PR-817 contract end-to-end.
 // ---------------------------------------------------------------------------
 
-/// (PR #817) bi record AFTC integration. After the first
-/// `evaluate_alarms` call the AFVL accumulator must be seeded to
-/// the raw-severity float (not zero) and the reported severity
-/// must equal the unfiltered ZSV severity (initial-sample
-/// pass-through is part of the upstream filter contract).
+/// (PR #817) bi record AFTC integration. C `biRecord.c::checkAlarms`
+/// (biRecord.c:249-263) seeds the AFVL accumulator with the RAW
+/// severity number — `afvl = (double) alarm;` (biRecord.c:252) — NOT
+/// a unit sign. On the first (seed) sample `alarm` is left unchanged
+/// so the raw severity passes through `recGblSetSevr` verbatim.
 #[test]
 fn test_bi_aftc_seeds_afvl_on_initial_sample() {
     let mut rec = BiRecord::new(0); // val=0 → ZSV path
@@ -1197,16 +1285,22 @@ fn test_bi_aftc_seeds_afvl_on_initial_sample() {
     let mut inst = RecordInstance::new("BI:AFTC".into(), rec);
     inst.common.udf = false;
 
+    // AFTC alarm filter runs inside `Record::check_alarms` (C
+    // `biRecord.c::checkAlarms`), the hook `process_local` invokes.
+    inst.record.check_alarms(&mut inst.common);
     inst.evaluate_alarms();
     epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
 
-    // Initial sample: alarm passes through unfiltered.
+    // Initial sample: C `biRecord.c:251-252` `if (afvl == 0) afvl =
+    // (double) alarm;` leaves `alarm` unchanged → raw severity passes
+    // through.
     assert_eq!(
         inst.common.sevr,
         AlarmSeverity::Major,
         "initial AFTC sample must pass raw severity through"
     );
-    // AFVL must have been seeded with the raw severity float (=2 for Major).
+    // C `biRecord.c:252` — AFVL is seeded with the RAW severity number
+    // (2.0 for MAJOR), NOT a unit sign.
     let afvl = inst
         .record
         .get_field("AFVL")
@@ -1214,7 +1308,78 @@ fn test_bi_aftc_seeds_afvl_on_initial_sample() {
         .expect("AFVL readable");
     assert!(
         (afvl - 2.0).abs() < 1e-9,
-        "AFVL must be seeded with raw severity (Major=2.0), got {afvl}"
+        "AFVL seed must be the raw severity 2.0 for a MAJOR sample, got {afvl}"
+    );
+}
+
+/// (PR #817) The AFTC filter delays the CLEARING of an alarm. C
+/// `biRecord.c::checkAlarms` (biRecord.c:249-263): once AFVL holds a
+/// non-zero severity, a NO_ALARM sample decays it by
+/// `afvl = alpha*afvl + (1-alpha)*0` and the fold-back
+/// `if (afvl - floor(afvl) > THRESHOLD) afvl = -afvl;` keeps
+/// `abs(floor(afvl))` reporting the prior MAJOR until enough
+/// NO_ALARM time has elapsed. A sustained MAJOR holds AFVL at 2.0.
+#[test]
+fn test_bi_aftc_delays_alarm_clear() {
+    use std::time::Duration;
+
+    // Direct unit test of the filter primitive across cycles.
+    use epics_base_rs::server::records::bi::aftc_filter;
+    let aftc = 10.0;
+    let t0 = std::time::SystemTime::UNIX_EPOCH;
+
+    // Cycle 1: seed with a MAJOR sample. C `biRecord.c:251-252`
+    // `if (afvl == 0) afvl = (double) alarm;` → afvl = 2.0, alarm = 2.
+    let (a1, afvl1) = aftc_filter(2, aftc, 0.0, t0, t0);
+    assert_eq!(a1, 2, "MAJOR seed must report the raw MAJOR severity");
+    assert!(
+        (afvl1 - 2.0).abs() < 1e-9,
+        "MAJOR seed must set afvl=2.0 (raw severity), got {afvl1}"
+    );
+
+    // Cycle 2: a single NO_ALARM sample 1s later. C
+    // `biRecord.c:255-262`: alpha = 10/(1+10) ≈ 0.909,
+    // afvl = 0.909*2 + 0.0 ≈ 1.818; fractional part 0.818 > 0.6321
+    // → afvl = -1.818; alarm = abs(floor(-1.818)) = abs(-2) = 2.
+    // The momentary clear is FILTERED — still reports MAJOR.
+    let t1 = t0 + Duration::from_secs(1);
+    let (a2, afvl2) = aftc_filter(0, aftc, afvl1, t0, t1);
+    assert!(
+        (afvl2 - (-1.0 * (10.0 / 11.0) * 2.0)).abs() < 1e-9,
+        "one NO_ALARM sample must fold afvl to -1.818..., got {afvl2}"
+    );
+    assert_eq!(
+        a2, 2,
+        "a momentary alarm-clear must be FILTERED (still reports MAJOR)"
+    );
+
+    // Sustained NO_ALARM: feed NO_ALARM repeatedly until the reported
+    // severity finally drops to 0.
+    let mut afvl = afvl2;
+    let mut t = t1;
+    let mut reported = 2u16;
+    for _ in 0..400 {
+        let prev = t;
+        t += Duration::from_secs(1);
+        let (a, v) = aftc_filter(0, aftc, afvl, prev, t);
+        afvl = v;
+        reported = a;
+        if reported == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        reported, 0,
+        "after sustained NO_ALARM the filter eventually clears the alarm"
+    );
+
+    // A sustained MAJOR holds the accumulator at 2.0 — C smoothing
+    // `afvl = alpha*2 + (1-alpha)*2 = 2` is a fixed point.
+    let (a3, afvl3) = aftc_filter(2, aftc, 2.0, t0, t1);
+    assert_eq!(a3, 2, "sustained MAJOR keeps reporting MAJOR");
+    assert!(
+        (afvl3 - 2.0).abs() < 1e-9,
+        "sustained MAJOR holds afvl at the fixed point 2.0, got {afvl3}"
     );
 }
 
@@ -1236,6 +1401,9 @@ fn test_mbbi_aftc_writes_afvl_back_each_cycle() {
     let mut inst = RecordInstance::new("MBBI:AFTC".into(), rec);
     inst.common.udf = false;
 
+    // AFTC alarm filter runs inside `Record::check_alarms` (C
+    // `mbbiRecord.c::checkAlarms`), the hook `process_local` invokes.
+    inst.record.check_alarms(&mut inst.common);
     inst.evaluate_alarms();
     let afvl_after_first = inst
         .record
@@ -1248,6 +1416,7 @@ fn test_mbbi_aftc_writes_afvl_back_each_cycle() {
     );
     // Second cycle with the same val keeps the filter state alive
     // and yields a positive accumulator (steady-state aim is 2.0).
+    inst.record.check_alarms(&mut inst.common);
     inst.evaluate_alarms();
     let afvl_after_second = inst
         .record
@@ -1287,8 +1456,10 @@ fn test_mbbi_lalm_updates_when_cosv_set() {
     inst.common.udf = false;
 
     // Transition 0 → 2: COS_ALARM fires (cosv=Major), LALM must
-    // advance to 2.
+    // advance to 2. COS/LALM logic lives in `Record::check_alarms`
+    // (C `mbbiRecord.c::checkAlarms`), the hook `process_local` runs.
     inst.record.set_val(EpicsValue::Enum(2)).unwrap();
+    inst.record.check_alarms(&mut inst.common);
     inst.evaluate_alarms();
     let lalm_after_first = inst
         .record
@@ -1308,6 +1479,7 @@ fn test_mbbi_lalm_updates_when_cosv_set() {
     // transition would have looked like "val == lalm" and the COS
     // path would have returned early without updating either.
     inst.record.set_val(EpicsValue::Enum(0)).unwrap();
+    inst.record.check_alarms(&mut inst.common);
     inst.evaluate_alarms();
     let lalm_after_second = inst
         .record
@@ -1347,7 +1519,10 @@ fn test_bi_lalm_updates_when_cosv_set() {
     let mut inst = RecordInstance::new("BI:LALM".into(), rec);
     inst.common.udf = false;
 
+    // COS/LALM logic lives in `Record::check_alarms` (C
+    // `biRecord.c::checkAlarms`), the hook `process_local` runs.
     inst.record.set_val(EpicsValue::Enum(1)).unwrap();
+    inst.record.check_alarms(&mut inst.common);
     inst.evaluate_alarms();
     let lalm = inst
         .record

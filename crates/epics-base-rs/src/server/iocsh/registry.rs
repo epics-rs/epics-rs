@@ -234,7 +234,10 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
     tokens
 }
 
-/// Find the closing ')' in a string, respecting quoted strings and `$(...)` sequences.
+/// Find the closing ')' in a string, respecting quoted strings, `$(...)`
+/// macro references, and `${...}` macro references (which C macLib treats
+/// equivalently — see macCore.c:777). A `)` inside a `${...}` body (e.g.
+/// `${foo(bar)}`) must NOT be mistaken for the outer call's closing paren.
 /// Returns the byte offset of ')' or the string length if not found.
 fn find_closing_paren(s: &str) -> usize {
     let mut in_quotes = false;
@@ -251,9 +254,16 @@ fn find_closing_paren(s: &str) -> usize {
         } else if ch == b'"' {
             in_quotes = true;
         } else if ch == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
-            // Skip $(...)  — find the matching ')' for the macro ref
+            // Skip $(...) — find the matching ')' for the macro ref
             if let Some(end) = bytes[i + 2..].iter().position(|&c| c == b')') {
                 i += 2 + end + 1; // skip past the macro's ')'
+                continue;
+            }
+        } else if ch == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            // Skip ${...} — find the matching '}' for the macro ref so any
+            // ')' inside the macro body doesn't terminate the outer call.
+            if let Some(end) = bytes[i + 2..].iter().position(|&c| c == b'}') {
+                i += 2 + end + 1; // skip past the macro's '}'
                 continue;
             }
         } else if ch == b')' {
@@ -266,19 +276,24 @@ fn find_closing_paren(s: &str) -> usize {
 
 /// Split comma-separated arguments, respecting quoted strings.
 /// Trims whitespace around each argument and strips outer quotes.
+///
+/// M-1: both `"` and `'` open a quoted string; the quote is closed
+/// only by the *same* character it was opened with — matching C
+/// `iocsh.cpp` `split()` (`if ((c == '"') || (c == '\'')) quote = c;`).
 fn split_comma_args(s: &str) -> Vec<String> {
     // First, split on commas respecting quoted strings
     let mut raw_parts: Vec<String> = Vec::new();
     let mut current = String::new();
-    let mut in_quotes = false;
+    // `0` = not in a quote; otherwise the opening quote char.
+    let mut quote: char = '\0';
     let mut chars = s.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if in_quotes {
+        if quote != '\0' {
             if ch == '\\' {
                 if let Some(&next) = chars.peek() {
                     match next {
-                        '"' | '\\' => {
+                        '"' | '\'' | '\\' => {
                             current.push(chars.next().unwrap());
                         }
                         _ => {
@@ -288,14 +303,14 @@ fn split_comma_args(s: &str) -> Vec<String> {
                 } else {
                     current.push(ch);
                 }
-            } else if ch == '"' {
-                in_quotes = false;
+            } else if ch == quote {
+                quote = '\0';
                 current.push(ch);
             } else {
                 current.push(ch);
             }
-        } else if ch == '"' {
-            in_quotes = true;
+        } else if ch == '"' || ch == '\'' {
+            quote = ch;
             current.push(ch);
         } else if ch == ',' {
             raw_parts.push(std::mem::take(&mut current));
@@ -312,52 +327,59 @@ fn split_comma_args(s: &str) -> Vec<String> {
         if trimmed.is_empty() && args.is_empty() {
             continue; // skip leading empty
         }
-        if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-            // Strip outer quotes and process escapes
-            let inner = &trimmed[1..trimmed.len() - 1];
-            let mut val = String::new();
-            let mut chs = inner.chars().peekable();
-            while let Some(c) = chs.next() {
-                if c == '\\' {
-                    if let Some(&next) = chs.peek() {
-                        match next {
-                            '"' | '\\' => {
-                                val.push(chs.next().unwrap());
+        let outer_quote = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'');
+        if let Some(q) = outer_quote {
+            if trimmed.len() >= 2 && trimmed.ends_with(q) {
+                // Strip outer quotes and process escapes
+                let inner = &trimmed[1..trimmed.len() - 1];
+                let mut val = String::new();
+                let mut chs = inner.chars().peekable();
+                while let Some(c) = chs.next() {
+                    if c == '\\' {
+                        if let Some(&next) = chs.peek() {
+                            match next {
+                                '"' | '\'' | '\\' => {
+                                    val.push(chs.next().unwrap());
+                                }
+                                _ => {
+                                    val.push(c);
+                                }
                             }
-                            _ => {
-                                val.push(c);
-                            }
+                        } else {
+                            val.push(c);
                         }
                     } else {
                         val.push(c);
                     }
-                } else {
-                    val.push(c);
                 }
+                args.push(val);
+                continue;
             }
-            args.push(val);
-        } else {
-            args.push(trimmed.to_string());
         }
+        args.push(trimmed.to_string());
     }
 
     args
 }
 
 /// Split space/tab separated arguments, respecting quoted strings.
+///
+/// M-1: both `"` and `'` delimit a quoted string; the quote is closed
+/// only by the matching character — mirrors C `iocsh.cpp` `split()`.
 fn split_space_args(s: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
-    let mut in_quotes = false;
+    // `0` = not in a quote; otherwise the opening quote char.
+    let mut quote: char = '\0';
     let mut has_token = false;
     let mut chars = s.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if in_quotes {
+        if quote != '\0' {
             if ch == '\\' {
                 if let Some(&next) = chars.peek() {
                     match next {
-                        '"' | '\\' => {
+                        '"' | '\'' | '\\' => {
                             current.push(chars.next().unwrap());
                         }
                         _ => {
@@ -367,13 +389,13 @@ fn split_space_args(s: &str) -> Vec<String> {
                 } else {
                     current.push(ch);
                 }
-            } else if ch == '"' {
-                in_quotes = false;
+            } else if ch == quote {
+                quote = '\0';
             } else {
                 current.push(ch);
             }
-        } else if ch == '"' {
-            in_quotes = true;
+        } else if ch == '"' || ch == '\'' {
+            quote = ch;
             has_token = true;
         } else if ch == ' ' || ch == '\t' {
             if has_token {
@@ -393,19 +415,68 @@ fn split_space_args(s: &str) -> Vec<String> {
     args
 }
 
-/// Substitute `$(NAME)` references with environment variable values.
+/// Scan a command line for the malformed-input conditions C
+/// `iocsh.cpp` `split()` (lines 362-371) flags: an unbalanced quote
+/// (`"` or `'`) and a trailing backslash. Returns a human-readable
+/// diagnostic for the first problem found, or `None` if the line is
+/// well-formed. L-5: C marks such a line errored; the Rust tokenizer
+/// previously consumed them silently.
+pub(crate) fn lint_line(line: &str) -> Option<&'static str> {
+    let mut quote: char = '\0';
+    let mut backslash = false;
+    for ch in line.chars() {
+        if backslash {
+            backslash = false;
+            continue;
+        }
+        if ch == '\\' {
+            backslash = true;
+            continue;
+        }
+        if quote != '\0' {
+            if ch == quote {
+                quote = '\0';
+            }
+        } else if ch == '"' || ch == '\'' {
+            quote = ch;
+        }
+    }
+    if quote != '\0' {
+        return Some("Unbalanced quote.");
+    }
+    if backslash {
+        return Some("Trailing backslash.");
+    }
+    None
+}
+
+/// Substitute `$(NAME)` and `${NAME}` references with environment variable
+/// values. Mirrors C macLib (macCore.c:777) which accepts both bracket
+/// forms: `(*r++ == '(') ? "=,)" : "=,}"`. Default values via
+/// `$(NAME=DEFAULT)` / `${NAME=DEFAULT}` are supported.
+///
+/// Unresolved references are passed through verbatim using the bracket
+/// pair they came in with — so `${X}` with X unset emits `${X}`, not
+/// `$(X)`.
 pub(crate) fn substitute_env_vars(s: &str) -> String {
-    if !s.contains("$(") {
+    if !s.contains("$(") && !s.contains("${") {
         return s.to_string();
     }
     let mut result = String::with_capacity(s.len());
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        if i + 1 < chars.len() && chars[i] == '$' && chars[i + 1] == '(' {
-            if let Some(end) = chars[i + 2..].iter().position(|&c| c == ')') {
+        if i + 1 < chars.len() && chars[i] == '$' && (chars[i + 1] == '(' || chars[i + 1] == '{') {
+            // Track the bracket pair so the verbatim passthrough on
+            // lookup miss reproduces the original syntax.
+            let (open, close) = if chars[i + 1] == '(' {
+                ('(', ')')
+            } else {
+                ('{', '}')
+            };
+            if let Some(end) = chars[i + 2..].iter().position(|&c| c == close) {
                 let var_expr: String = chars[i + 2..i + 2 + end].iter().collect();
-                // Support $(VAR=DEFAULT) syntax
+                // Support $(VAR=DEFAULT) / ${VAR=DEFAULT} syntax
                 let (var_name, default_val) = if let Some(eq_pos) = var_expr.find('=') {
                     (&var_expr[..eq_pos], Some(&var_expr[eq_pos + 1..]))
                 } else {
@@ -416,7 +487,10 @@ pub(crate) fn substitute_env_vars(s: &str) -> String {
                 } else if let Some(def) = default_val {
                     result.push_str(def);
                 } else {
-                    result.push_str(&format!("$({})", var_expr));
+                    result.push('$');
+                    result.push(open);
+                    result.push_str(&var_expr);
+                    result.push(close);
                 }
                 i += 2 + end + 1;
                 continue;
@@ -654,5 +728,47 @@ mod tests {
         assert!(reg.get("test").is_some());
         assert!(reg.get("nonexistent").is_none());
         assert_eq!(reg.list(), vec!["test"]);
+    }
+
+    // C macLib (macCore.c:777) accepts both `$(NAME)` and `${NAME}` bracket
+    // forms — `(*r++ == '(') ? "=,)" : "=,}"`. Rust port previously only
+    // honored `$(...)`. iocsh scripts that used `${IOC}/db/foo.db`
+    // (the shell-style form many sites adopted in `st.cmd`) had their
+    // variables silently left unexpanded.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn substitute_env_vars_handles_brace_form() {
+        // SAFETY: serial(epics_env) serialises every env-mutating test in
+        // the crate, and we restore the prior state below.
+        let prev = std::env::var("EPICS_PARITY_TEST_BRACE").ok();
+        unsafe {
+            std::env::set_var("EPICS_PARITY_TEST_BRACE", "expanded");
+        }
+
+        let expanded = substitute_env_vars("prefix-${EPICS_PARITY_TEST_BRACE}-suffix");
+        assert_eq!(expanded, "prefix-expanded-suffix");
+
+        // Default value via ${VAR=default} — same syntax C macLib supports.
+        unsafe {
+            std::env::remove_var("EPICS_PARITY_TEST_BRACE_UNSET");
+        }
+        let expanded = substitute_env_vars("${EPICS_PARITY_TEST_BRACE_UNSET=fallback}");
+        assert_eq!(expanded, "fallback");
+
+        // Unset without default — passes through verbatim using the bracket
+        // pair it came in with. Caller may then resubstitute later.
+        let expanded = substitute_env_vars("${EPICS_PARITY_TEST_BRACE_UNSET}");
+        assert_eq!(expanded, "${EPICS_PARITY_TEST_BRACE_UNSET}");
+
+        // $(...) still works exactly as before.
+        let expanded = substitute_env_vars("$(EPICS_PARITY_TEST_BRACE)");
+        assert_eq!(expanded, "expanded");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("EPICS_PARITY_TEST_BRACE", v),
+                None => std::env::remove_var("EPICS_PARITY_TEST_BRACE"),
+            }
+        }
     }
 }

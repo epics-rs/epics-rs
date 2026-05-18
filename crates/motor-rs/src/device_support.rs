@@ -147,6 +147,31 @@ impl MotorDeviceSupport {
                     tracing::info!("motor command: ProfileReadback");
                     motor.readback_profile(&user).map(|_| ())
                 }
+                MotorCommand::MoveToHome {
+                    position,
+                    velocity,
+                    acceleration,
+                } => {
+                    tracing::info!(
+                        "motor command: MoveToHome position={position} velocity={velocity} accel={acceleration}"
+                    );
+                    motor.move_to_home(&user, *position, *velocity, *acceleration)
+                }
+                MotorCommand::EnablePco { enable } => {
+                    tracing::info!("motor command: EnablePco({enable})");
+                    motor.enable_pco(&user, *enable)
+                }
+                MotorCommand::SetPcoConfig {
+                    start,
+                    end,
+                    increment,
+                    pulse_width_us,
+                } => {
+                    tracing::info!(
+                        "motor command: SetPcoConfig start={start} end={end} inc={increment} pw={pulse_width_us}"
+                    );
+                    motor.set_pco_config(&user, *start, *end, *increment, *pulse_width_us)
+                }
                 MotorCommand::Poll => Ok(()),
             };
 
@@ -158,25 +183,36 @@ impl MotorDeviceSupport {
 
         // Manage poll loop — only send StartPolling when transitioning
         // idle → active to avoid redundant messages while already polling.
+        // The polling_active tracking flag is updated only when the command
+        // is actually delivered; otherwise record state and poller state
+        // would diverge (record thinks it polls, poller is idle). A failed
+        // send leaves the flag unchanged so the next process() retries.
         match actions.poll {
             PollDirective::Start => {
                 if !self.polling_active {
-                    let _ = self.poll_cmd_tx.try_send(PollCommand::StartPolling);
-                    self.polling_active = true;
+                    match self.poll_cmd_tx.try_send(PollCommand::StartPolling) {
+                        Ok(()) => self.polling_active = true,
+                        Err(e) => {
+                            tracing::error!("motor: failed to send StartPolling: {e}")
+                        }
+                    }
                 }
             }
-            PollDirective::Stop => {
-                let _ = self.poll_cmd_tx.try_send(PollCommand::StopPolling);
-                self.polling_active = false;
-            }
+            PollDirective::Stop => match self.poll_cmd_tx.try_send(PollCommand::StopPolling) {
+                Ok(()) => self.polling_active = false,
+                Err(e) => tracing::error!("motor: failed to send StopPolling: {e}"),
+            },
             PollDirective::None => {}
         }
         if let Some(ref delay) = actions.schedule_delay {
-            let _ = self
+            match self
                 .poll_cmd_tx
-                .try_send(PollCommand::ScheduleDelay(delay.id, delay.duration));
-            // Poll loop goes idle during delay — sync our tracking flag
-            self.polling_active = false;
+                .try_send(PollCommand::ScheduleDelay(delay.id, delay.duration))
+            {
+                // Poll loop goes idle during the delay — sync the flag.
+                Ok(()) => self.polling_active = false,
+                Err(e) => tracing::error!("motor: failed to schedule settle delay: {e}"),
+            }
         }
     }
 }
@@ -194,15 +230,28 @@ impl DeviceSupport for MotorDeviceSupport {
 
         // Sync driver position with pass0-restored DVAL (if any).
         // C: set_position uses dval/mres (raw steps), not val (user coordinates)
+        //
+        // The reseed must be gated on whether a position was actually
+        // *restored* during pass0 — NOT on `dval != 0.0`. C `init_record`
+        // syncs the controller to the restored position regardless of its
+        // value; a genuine restored position of exactly 0.0 must still
+        // reseed the controller. An earlier Rust version used
+        // `if dval != 0.0`, which silently skipped the controller sync
+        // for a legitimate 0.0 restore. `was_position_restored()` is the
+        // proper signal: it reports whether a VAL/DVAL/RVAL/RLV field was
+        // written during pass0 (autosave restore), independent of the
+        // restored value. It is queried here, before `clear_last_write()`
+        // runs later in this `init()`.
         let user = self.make_user();
-        let dval = record
-            .get_field("DVAL")
-            .and_then(|v| match v {
-                EpicsValue::Double(d) => Some(d),
-                _ => None,
-            })
-            .unwrap_or(0.0);
-        if dval != 0.0 {
+        let restored_dval = record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
+            .filter(|rec| rec.was_position_restored())
+            .map(|rec| match rec.get_field("DVAL") {
+                Some(EpicsValue::Double(d)) => d,
+                _ => 0.0,
+            });
+        if let Some(dval) = restored_dval {
             let mut motor = self.motor.lock().map_err(|e| {
                 epics_base_rs::error::CaError::InvalidValue(format!("motor lock: {e}"))
             })?;

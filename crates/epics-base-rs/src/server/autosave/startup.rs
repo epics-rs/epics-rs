@@ -8,9 +8,10 @@ use crate::server::iocsh::registry::{
 };
 
 use super::backup::BackupConfig;
+use super::format::CompatMode;
 use super::macros::MacroContext;
 use super::manager::AutosaveBuilder;
-use super::save_set::{SaveSetConfig, SaveStrategy};
+use super::save_set::{SaveSetConfig, SaveStrategy, TriggerMode};
 
 /// Definition of a monitor/triggered save set from st.cmd.
 #[derive(Debug, Clone)]
@@ -18,6 +19,11 @@ pub struct MonitorSetDef {
     pub filename: String,
     pub period_seconds: u32,
     pub macros: String,
+    /// Trigger PV name for a triggered save set. `None` for periodic
+    /// monitor sets (`create_monitor_set`). `Some(pv)` for
+    /// `create_triggered_set` — the set is saved whenever this PV
+    /// changes, mapped to [`SaveStrategy::Triggered`].
+    pub trigger_pv: Option<String>,
 }
 
 /// Definition of a restore file from st.cmd.
@@ -40,6 +46,10 @@ pub struct AutosaveStartupConfig {
     pub triggered_sets: Vec<MonitorSetDef>,
     pub pass0_restores: Vec<RestoreDef>,
     pub pass1_restores: Vec<RestoreDef>,
+    /// On-disk save-file format. Default [`CompatMode::Native`]; set
+    /// to [`CompatMode::CRead`] (via the `save_restoreSet_CompatMode`
+    /// iocsh command) so a C IOC can read the produced `.sav` files.
+    pub compat: CompatMode,
 }
 
 impl AutosaveStartupConfig {
@@ -82,7 +92,7 @@ impl AutosaveStartupConfig {
 
     /// Build an AutosaveBuilder from the collected configuration.
     pub fn into_builder(&self) -> AutosaveBuilder {
-        let mut builder = AutosaveBuilder::new();
+        let mut builder = AutosaveBuilder::new().compat(self.compat);
 
         if let Some(ref prefix) = self.status_prefix {
             builder = builder.status_prefix(prefix);
@@ -111,7 +121,12 @@ impl AutosaveStartupConfig {
             });
         }
 
-        // Add triggered sets (OnChange strategy with polling)
+        // Add triggered sets. C-autosave `create_triggered_set`
+        // saves the set whenever its trigger PV changes — mapped to
+        // the real `SaveStrategy::Triggered` (trigger-PV watcher),
+        // NOT `OnChange` polling of every member PV. The `period`
+        // argument is the trigger-watcher poll interval (debounce),
+        // matching the `poll_interval` of `SaveStrategy::Triggered`.
         for def in &self.triggered_sets {
             let request_file = self.resolve_request_file(&def.filename);
             let save_path = self.resolve_save_file(&def.filename);
@@ -120,13 +135,33 @@ impl AutosaveStartupConfig {
             } else {
                 MacroContext::parse_inline(&def.macros)
             };
+            // A poll interval of 0 would busy-loop the watcher; clamp
+            // to 1s so a bare `create_triggered_set(file, pv)` has a
+            // sane debounce.
+            let poll_secs = def.period_seconds.max(1) as u64;
+            let strategy = match &def.trigger_pv {
+                Some(pv) => SaveStrategy::Triggered {
+                    trigger_pv: pv.clone(),
+                    mode: TriggerMode::AnyChange,
+                    poll_interval: Duration::from_secs(poll_secs),
+                },
+                None => {
+                    // No trigger PV supplied — fall back to OnChange
+                    // polling of member PVs so the set still saves.
+                    eprintln!(
+                        "create_triggered_set({}): no trigger PV — using OnChange polling",
+                        def.filename
+                    );
+                    SaveStrategy::OnChange {
+                        min_interval: Duration::from_secs(poll_secs),
+                        float_epsilon: 0.0,
+                    }
+                }
+            };
             builder = builder.add_set(SaveSetConfig {
                 name: format!("{}_triggered", def.filename),
                 save_path,
-                strategy: SaveStrategy::OnChange {
-                    min_interval: Duration::from_secs(def.period_seconds as u64),
-                    float_epsilon: 0.0,
-                },
+                strategy,
                 request_file,
                 request_pvs: Vec::new(),
                 backup: BackupConfig::default(),
@@ -258,13 +293,19 @@ impl AutosaveStartupConfig {
                         filename,
                         period_seconds: period,
                         macros,
+                        trigger_pv: None,
                     });
                     Ok(CommandOutcome::Continue)
                 },
             ));
         }
 
-        // create_triggered_set(filename, period, macrostring)
+        // create_triggered_set(filename, trigger_channel, macrostring)
+        //
+        // C-autosave parity: the second argument is the *trigger PV
+        // name*, not a poll period — the save set is written whenever
+        // that PV changes/processes. Maps to `SaveStrategy::Triggered`
+        // in `into_builder`.
         {
             let h = holder.clone();
             commands.push(CommandDef::new(
@@ -276,8 +317,8 @@ impl AutosaveStartupConfig {
                         optional: false,
                     },
                     ArgDesc {
-                        name: "period",
-                        arg_type: ArgType::Int,
+                        name: "trigger_channel",
+                        arg_type: ArgType::String,
                         optional: false,
                     },
                     ArgDesc {
@@ -286,25 +327,29 @@ impl AutosaveStartupConfig {
                         optional: true,
                     },
                 ],
-                "create_triggered_set(filename, period, macrostring) - Create triggered save set",
+                "create_triggered_set(filename, trigger_channel, macrostring) - \
+                 Create triggered save set (saves when trigger_channel changes)",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
                     let filename = match &args[0] {
                         ArgValue::String(s) => s.clone(),
                         _ => return Err("filename argument required".into()),
                     };
-                    let period = match &args[1] {
-                        ArgValue::Int(n) => *n as u32,
-                        _ => return Err("period argument required".into()),
+                    let trigger_channel = match &args[1] {
+                        ArgValue::String(s) if !s.is_empty() => s.clone(),
+                        _ => return Err("trigger_channel argument required".into()),
                     };
                     let macros = match args.get(2) {
                         Some(ArgValue::String(s)) => s.clone(),
                         _ => String::new(),
                     };
-                    eprintln!("create_triggered_set: {filename}, period={period}s");
+                    eprintln!("create_triggered_set: {filename}, trigger={trigger_channel}");
                     h.lock().unwrap().triggered_sets.push(MonitorSetDef {
                         filename,
-                        period_seconds: period,
+                        // Trigger-watcher poll interval (debounce).
+                        // 0 → clamped to 1s in `into_builder`.
+                        period_seconds: 0,
                         macros,
+                        trigger_pv: Some(trigger_channel),
                     });
                     Ok(CommandOutcome::Continue)
                 },
@@ -385,6 +430,41 @@ impl AutosaveStartupConfig {
             ));
         }
 
+        // save_restoreSet_CompatMode(mode)
+        //
+        // Rust extension: select the on-disk save-file format.
+        // `mode="C"` / `"CRead"` writes `.sav` files a C IOC can
+        // read (mixed Rust + C IOC site); anything else (default)
+        // keeps the autosave-rs native format.
+        {
+            let h = holder.clone();
+            commands.push(CommandDef::new(
+                "save_restoreSet_CompatMode",
+                vec![ArgDesc {
+                    name: "mode",
+                    arg_type: ArgType::String,
+                    optional: false,
+                }],
+                "save_restoreSet_CompatMode(mode) - 'C'/'CRead' for C-readable .sav, \
+                 else native",
+                move |args: &[ArgValue], _ctx: &CommandContext| {
+                    let mode = match &args[0] {
+                        ArgValue::String(s) => s.clone(),
+                        _ => return Err("mode argument required".into()),
+                    };
+                    let compat =
+                        if mode.eq_ignore_ascii_case("c") || mode.eq_ignore_ascii_case("cread") {
+                            CompatMode::CRead
+                        } else {
+                            CompatMode::Native
+                        };
+                    eprintln!("save_restoreSet_CompatMode: {compat:?}");
+                    h.lock().unwrap().compat = compat;
+                    Ok(CommandOutcome::Continue)
+                },
+            ));
+        }
+
         // save_restoreSet_status_prefix(prefix)
         {
             let h = holder.clone();
@@ -409,5 +489,79 @@ impl AutosaveStartupConfig {
         }
 
         commands
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::autosave::save_set::{SaveStrategy, TriggerMode};
+    use std::time::Duration;
+
+    /// M3 regression: a triggered save set must build as a real
+    /// `SaveStrategy::Triggered` (trigger-PV watcher), NOT
+    /// `SaveStrategy::OnChange` polling. Pre-fix `into_builder`
+    /// mapped every triggered set to `OnChange`, so the
+    /// `SaveStrategy::Triggered` variant was unreachable from the
+    /// iocsh `create_triggered_set` command.
+    #[test]
+    fn triggered_set_maps_to_triggered_strategy() {
+        let mut cfg = AutosaveStartupConfig::new();
+        cfg.triggered_sets.push(MonitorSetDef {
+            filename: "settings.req".to_string(),
+            period_seconds: 0,
+            macros: String::new(),
+            trigger_pv: Some("IOC:saveTrigger".to_string()),
+        });
+
+        let builder = cfg.into_builder();
+        // The builder owns the configs; rebuild to inspect the set.
+        // `AutosaveBuilder` does not expose its set list, so verify
+        // through a constructed `SaveSetConfig` shape instead by
+        // re-running the mapping logic the public path uses.
+        // Direct check: `into_builder` is the public mapping; assert
+        // the strategy via a SaveSet built from it.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mgr = rt.block_on(builder.build()).expect("builder must build");
+        let sets = mgr.sets();
+        assert_eq!(sets.len(), 1, "one triggered set expected");
+        match &sets[0].0.config().strategy {
+            SaveStrategy::Triggered {
+                trigger_pv,
+                mode,
+                poll_interval,
+            } => {
+                assert_eq!(trigger_pv.as_str(), "IOC:saveTrigger");
+                assert_eq!(*mode, TriggerMode::AnyChange);
+                // period 0 clamped to a 1s debounce.
+                assert_eq!(*poll_interval, Duration::from_secs(1));
+            }
+            other => panic!("expected SaveStrategy::Triggered, got {other:?}"),
+        }
+    }
+
+    /// M3: a triggered set with no trigger PV falls back to
+    /// `OnChange` so the set still saves (defensive — the iocsh
+    /// command requires the trigger arg, but a programmatic
+    /// `MonitorSetDef` could omit it).
+    #[test]
+    fn triggered_set_without_trigger_pv_falls_back_to_onchange() {
+        let mut cfg = AutosaveStartupConfig::new();
+        cfg.triggered_sets.push(MonitorSetDef {
+            filename: "settings.req".to_string(),
+            period_seconds: 5,
+            macros: String::new(),
+            trigger_pv: None,
+        });
+
+        let builder = cfg.into_builder();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mgr = rt.block_on(builder.build()).expect("builder must build");
+        match &mgr.sets()[0].0.config().strategy {
+            SaveStrategy::OnChange { min_interval, .. } => {
+                assert_eq!(*min_interval, Duration::from_secs(5));
+            }
+            other => panic!("expected OnChange fallback, got {other:?}"),
+        }
     }
 }

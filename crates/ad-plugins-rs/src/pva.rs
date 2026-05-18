@@ -183,14 +183,7 @@ fn epics_ts_to_nt(ts: &ad_core_rs::timestamp::EpicsTimestamp) -> NdTimeStamp {
 }
 
 fn codec_name_to_string(name: ad_core_rs::codec::CodecName) -> String {
-    use ad_core_rs::codec::CodecName;
-    match name {
-        CodecName::None => String::new(),
-        CodecName::JPEG => "jpeg".into(),
-        CodecName::LZ4 => "lz4".into(),
-        CodecName::Blosc => "blosc".into(),
-        CodecName::BSLZ4 => "bslz4".into(),
-    }
+    name.as_str().to_string()
 }
 
 fn ndattr_source_type(src: &ad_core_rs::attributes::NDAttrSource) -> i32 {

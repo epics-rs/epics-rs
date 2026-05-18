@@ -88,12 +88,12 @@ impl MotorRecord {
     /// Update readback positions from driver status.
     pub fn process_motor_info(&mut self, status: &asyn_rs::interfaces::motor::MotorStatus) {
         // Layer 1: update raw positions
-        self.pos.rmp = (status.position / self.conv.mres).round() as i32;
+        self.pos.rmp = (status.position / self.conv.mres).round() as i64;
 
         // REP: use ERES when UEIP is set, MRES otherwise
         let eres_valid = self.conv.eres.is_finite() && self.conv.eres != 0.0;
         if self.conv.ueip && eres_valid {
-            self.pos.rep = (status.encoder_position / self.conv.eres).round() as i32;
+            self.pos.rep = (status.encoder_position / self.conv.eres).round() as i64;
         } else {
             if self.conv.ueip && !eres_valid {
                 tracing::warn!(
@@ -101,7 +101,7 @@ impl MotorRecord {
                     self.conv.eres
                 );
             }
-            self.pos.rep = (status.encoder_position / self.conv.mres).round() as i32;
+            self.pos.rep = (status.encoder_position / self.conv.mres).round() as i64;
         }
 
         // RRBV depends on UEIP
@@ -119,7 +119,7 @@ impl MotorRecord {
                 } else {
                     1.0
                 };
-                self.pos.rrbv = ((rdbl_value * rres) / self.conv.mres).round() as i32;
+                self.pos.rrbv = ((rdbl_value * rres) / self.conv.mres).round() as i64;
             }
         }
 
@@ -138,7 +138,7 @@ impl MotorRecord {
         self.pos.diff = self.pos.dval - self.pos.drbv;
         // C: rdif = NINT(diff / mres) -- raw step difference
         self.pos.rdif = if self.conv.mres != 0.0 {
-            (self.pos.diff / self.conv.mres).round() as i32
+            (self.pos.diff / self.conv.mres).round() as i64
         } else {
             0
         };
@@ -148,6 +148,20 @@ impl MotorRecord {
         let ls_active =
             (status.high_limit && self.stat.cdir) || (status.low_limit && !self.stat.cdir);
         self.stat.movn = !(ls_active || status.done || status.problem);
+
+        // C: ea063f5f (2008) — when the driver is moving but the record had no
+        // pending motion, this is an externally initiated move (someone called
+        // the controller directly, or another record drove the same axis).
+        // Mark MIP_EXTERNAL and clear DMOV; do_process() routes the next
+        // process() into check_completion via the MIP_EXTERNAL bit.
+        if self.stat.movn
+            && self.stat.dmov
+            && self.stat.phase == MotionPhase::Idle
+            && !self.stat.mip.contains(MipFlags::EXTERNAL)
+        {
+            self.stat.dmov = false;
+            self.stat.mip |= MipFlags::EXTERNAL;
+        }
 
         // Limit switches: map raw -> user based on DIR and MRES sign
         // C: hls = ((dir == Pos) == (mres >= 0)) ? rhls : rlls
@@ -198,6 +212,11 @@ impl MotorRecord {
         if status.has_encoder {
             msta |= MstaFlags::ENCODER_PRESENT;
         }
+        // epics-modules/motor #76 — drivers that don't honor VBAS expose it
+        // via MSTA bit 15 so the record can drop VBAS from accel math.
+        if !status.vbas_supported {
+            msta |= MstaFlags::VBAS_UNSUPPORTED;
+        }
         // Preserve record-managed bits
         if self.stat.msta.contains(MstaFlags::HOMED) || status.homed {
             msta |= MstaFlags::HOMED;
@@ -210,6 +229,11 @@ impl MotorRecord {
 
         // C: tdir = msta.RA_DIRECTION (from driver on every poll)
         self.stat.tdir = status.direction;
+
+        // C: devMotorAsyn.c — RVEL is the raw velocity reported by the
+        // driver, stored as floor(status.velocity) (motorRecord.dbd RVEL is
+        // DBF_LONG "Raw Velocity").
+        self.stat.rvel = status.velocity.floor() as i64;
 
         // Recompute LVIO from current position and soft limits
         self.limits.lvio =
@@ -229,14 +253,82 @@ impl MotorRecord {
     }
 
     /// Initial readback and position sync at startup.
+    ///
+    /// On entry `self.pos.dval` holds the autosave-restored target (or 0 if
+    /// none). C: `devMotorAsyn.c::init_controller` consults RSTM to decide
+    /// whether to push that value back into the driver instead of adopting
+    /// the driver's current readback.
     pub fn initial_readback(
         &mut self,
         status: &asyn_rs::interfaces::motor::MotorStatus,
     ) -> ProcessEffects {
         let mut effects = ProcessEffects::default();
 
+        // Capture the autosaved target before the driver readback overwrites it.
+        let autosaved_dval = self.pos.dval;
+        let autosaved_rval = self.pos.rval;
         self.process_motor_info(status);
-        self.sync_positions();
+
+        // C: devMotorAsyn.c init_controller — RSTM restore decision.
+        // rdbd = max(|RDBD|, |MRES|); dval_non_zero_pos_near_zero is true when
+        // the autosaved DVAL is meaningful but the driver currently sits near
+        // zero (i.e. the controller lost its position across the IOC restart).
+        //
+        // C compares `fabs(status.position * mres)` — the *motor* position
+        // dial value, always via MRES. Use the motor raw position (RMP), not
+        // DRBV, since DRBV follows the encoder (ERES) when UEIP=Yes.
+        let rdbd = self.retry.rdbd.abs().max(self.conv.mres.abs());
+        let motor_dial = coordinate::raw_to_dial(self.pos.rmp, self.conv.mres);
+        let dval_non_zero_pos_near_zero =
+            autosaved_dval.abs() > rdbd && self.conv.mres != 0.0 && motor_dial.abs() < rdbd;
+        let mut restore = self
+            .conv
+            .rstm
+            .should_restore(self.use_relative_moves(), dval_non_zero_pos_near_zero);
+
+        // epics-modules/motor #231 — if LOAD_POS is blocked for this axis
+        // (absolute encoder), never push a SetPosition; adopt driver readback.
+        if restore && self.conv.loadpos_blocked {
+            restore = false;
+        }
+
+        // epics-modules/motor #196 — guard against an MRES change since the
+        // autosave was written. If both DVAL and RVAL were autosaved, they
+        // must satisfy DVAL ≈ RVAL * MRES under the *current* MRES. A mismatch
+        // means MRES changed; restoring would place the axis at the wrong
+        // position, so skip the restore and adopt the driver readback instead.
+        if restore && autosaved_rval != 0 {
+            let rval_implied_dval = autosaved_rval as f64 * self.conv.mres;
+            if (rval_implied_dval - autosaved_dval).abs() > rdbd {
+                tracing::warn!(
+                    "RSTM restore skipped: autosaved DVAL {:.4} inconsistent with \
+                     RVAL {} * MRES {:.6} = {:.4} — MRES likely changed since autosave",
+                    autosaved_dval,
+                    autosaved_rval,
+                    self.conv.mres,
+                    rval_implied_dval,
+                );
+                restore = false;
+            }
+        }
+
+        if restore {
+            // Adopt the autosaved DVAL: keep record coordinates and tell the
+            // driver to redefine its current position to that value.
+            self.pos.dval = autosaved_dval;
+            self.pos.val = coordinate::dial_to_user(autosaved_dval, self.conv.dir, self.pos.off);
+            if let Ok(rval) = coordinate::dial_to_raw(autosaved_dval, self.conv.mres) {
+                self.pos.rval = rval;
+            }
+            self.internal.ldvl = autosaved_dval;
+            self.internal.lval = self.pos.val;
+            self.internal.lrvl = self.pos.rval;
+            effects.commands.push(MotorCommand::SetPosition {
+                position: autosaved_dval,
+            });
+        } else {
+            self.sync_positions();
+        }
 
         // DMOV from driver
         self.stat.dmov = status.done && !status.moving;

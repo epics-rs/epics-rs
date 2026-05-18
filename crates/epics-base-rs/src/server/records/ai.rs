@@ -32,6 +32,12 @@ pub struct AiRecord {
     pub mlst: f64,
     pub init: bool,
     skip_convert: bool,
+    /// Set by `process()` when `LINR >= 3` selects a breakpoint-table
+    /// linearisation that this port cannot resolve (no breakpoint-table
+    /// registry). C `aiRecord.c::convert` raises `SOFT_ALARM/MAJOR_ALARM`
+    /// on a BPT failure; `check_alarms` consumes this flag to do the
+    /// same so the misconfiguration is not silent.
+    bpt_error: bool,
     // Simulation
     pub simm: i16,
     pub siml: String,
@@ -65,6 +71,7 @@ impl Default for AiRecord {
             mlst: 0.0,
             init: false,
             skip_convert: false,
+            bpt_error: false,
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -258,13 +265,25 @@ impl Record for AiRecord {
             v += self.aoff;
 
             // Step 2: Apply linearization based on LINR
+            self.bpt_error = false;
             match self.linr {
                 0 => {} // NO_CONVERSION: skip linearization
                 1 | 2 => {
                     // SLOPE (1) and LINEAR (2): apply eslo/eoff
                     v = v * self.eslo + self.eoff;
                 }
-                _ => {} // breakpoint tables not yet supported
+                _ => {
+                    // LINR >= 3 selects a breakpoint-table linearisation
+                    // (a `.dbd` breakpoint-menu choice). epics-base-rs
+                    // has no breakpoint-table registry, so the table
+                    // cannot be applied — the value passes through
+                    // unconverted. C `aiRecord.c::convert` (lines
+                    // 433-436) treats a BPT failure as
+                    // `SOFT_ALARM/MAJOR_ALARM`; flag it here so
+                    // `check_alarms` raises the same alarm rather than
+                    // leaving the misconfiguration silent.
+                    self.bpt_error = true;
+                }
             }
 
             // Step 3: Smoothing filter
@@ -361,9 +380,22 @@ impl Record for AiRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
+            // SPC_LINCONV parity (aiRecord.c:181-200): LINR / EGUF / EGUL
+            // are tagged `special(SPC_LINCONV)` in aiRecord.dbd. Every put
+            // must (1) clear the smoothing-primed flag so the next
+            // process() reprimes the SMOO filter under the new linearisation,
+            // and (2) for LINR=LINEAR rebase `eoff` to `egul` (the C path
+            // sets eoff=egul before calling the device-support
+            // `special_linconv` callback; Rust ports usually don't carry
+            // such a callback, so the eoff-rebase is the only visible
+            // effect for soft-channel records).
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
+                    self.init = false;
+                    if self.linr == 2 {
+                        self.eoff = self.egul;
+                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -371,6 +403,10 @@ impl Record for AiRecord {
             "EGUF" => match value {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
+                    self.init = false;
+                    if self.linr == 2 {
+                        self.eoff = self.egul;
+                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -378,6 +414,10 @@ impl Record for AiRecord {
             "EGUL" => match value {
                 EpicsValue::Double(v) => {
                     self.egul = v;
+                    self.init = false;
+                    if self.linr == 2 {
+                        self.eoff = self.egul;
+                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -496,7 +536,89 @@ impl Record for AiRecord {
         FIELDS
     }
 
+    /// C `aiRecord.c::convert` raises `SOFT_ALARM/MAJOR_ALARM` when the
+    /// breakpoint-table conversion fails. epics-base-rs has no
+    /// breakpoint-table registry, so any `LINR >= 3` is an unresolvable
+    /// table — `process()` flags `bpt_error` and this hook raises the
+    /// C-equivalent alarm so the misconfiguration is visible.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        if self.bpt_error {
+            crate::server::recgbl::rec_gbl_set_sevr_msg(
+                common,
+                crate::server::recgbl::alarm_status::SOFT_ALARM,
+                crate::server::record::AlarmSeverity::Major,
+                "BPT Error",
+            );
+        }
+    }
+
     fn set_device_did_compute(&mut self, did_compute: bool) {
         self.skip_convert = did_compute;
+    }
+
+    /// `ai` has an `RVAL → VAL` `convert()` step (raw → engineering
+    /// units). A `Soft Channel` `ai` must skip it — C `devAiSoft.c`
+    /// `read_ai` returns 2 ("don't convert").
+    fn soft_channel_skips_convert(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SPC_LINCONV parity (aiRecord.c:181-200): writing LINR / EGUF / EGUL
+    /// must clear the smoothing-primed flag so the next process() reprimes
+    /// the SMOO filter under the new linearisation. Without this fix the
+    /// SMOO low-pass blended pre-LINR-change and post-LINR-change values
+    /// together, leaking the old engineering unit into the new one for
+    /// every subsequent sample until lcnt or restart cleared it.
+    #[test]
+    fn linr_put_resets_init_flag_for_smoothing_prime() {
+        let mut rec = AiRecord::default();
+        rec.init = true; // simulate post-first-process primed state
+        rec.smoo = 0.5;
+
+        rec.put_field("LINR", EpicsValue::Short(2)).unwrap();
+
+        assert!(
+            !rec.init,
+            "LINR put must clear init so next process reprimes SMOO"
+        );
+    }
+
+    /// SPC_LINCONV parity (aiRecord.c:188-198): in LINR=LINEAR mode, the
+    /// C path rebases `eoff = egul` before invoking the device-support
+    /// `special_linconv` callback. Rust soft-channel ports carry no such
+    /// callback, so the eoff-rebase is the only visible effect — but it
+    /// is the one users actually depend on when retuning LINR or EGUL
+    /// from CA/PVA.
+    #[test]
+    fn egul_put_rebases_eoff_under_linear_mode() {
+        let mut rec = AiRecord::default();
+        rec.linr = 2; // LINEAR
+        rec.eoff = 1.5;
+
+        rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
+
+        assert_eq!(rec.eoff, 7.25, "EGUL put under LINEAR must set eoff=egul");
+        assert_eq!(rec.egul, 7.25);
+    }
+
+    /// SLOPE (LINR=1) preserves user-configured eoff/eslo across EGUL
+    /// edits — the C path only rebases eoff when LINR == menuConvertLINEAR.
+    #[test]
+    fn egul_put_under_slope_mode_does_not_touch_eoff() {
+        let mut rec = AiRecord::default();
+        rec.linr = 1; // SLOPE
+        rec.eoff = 1.5;
+
+        rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
+
+        assert_eq!(
+            rec.eoff, 1.5,
+            "EGUL put under SLOPE must leave user-configured eoff alone"
+        );
     }
 }

@@ -84,6 +84,10 @@ struct State {
     /// Bridge version string captured during connect. Mainly for
     /// diagnostics — not used for protocol decisions.
     version: String,
+    /// Bytes of a bridge response that did not fit the caller's buffer
+    /// on the previous `read_octet`. Drained first on the next call so
+    /// no device data is lost when the caller's buffer is too small.
+    read_carry: Vec<u8>,
 }
 
 pub struct DrvAsynPrologixPort {
@@ -140,6 +144,7 @@ impl DrvAsynPrologixPort {
                 last_secondary: -1,
                 eos: None,
                 version: String::new(),
+                read_carry: Vec::new(),
             }),
         })
     }
@@ -314,7 +319,7 @@ impl PortDriver for DrvAsynPrologixPort {
                 }
             }
         }
-        self.base.connected = true;
+        self.base.set_connected(true);
         Ok(())
     }
 
@@ -322,8 +327,20 @@ impl PortDriver for DrvAsynPrologixPort {
         if user.addr < 0 {
             self.inner.disconnect(user)?;
         }
-        self.base.connected = false;
+        // Drop any buffered read remainder — it belongs to the old
+        // connection and must not leak into the next session.
+        self.state.lock().unwrap().read_carry.clear();
+        self.base.set_connected(false);
         Ok(())
+    }
+
+    fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+        // OctetWriteRead does flush -> write -> read to drop stale input.
+        // The transport flush cannot see `read_carry` (an application
+        // buffer), so clear it here too or a stale carry would be
+        // returned as the response to the new command.
+        self.state.lock().unwrap().read_carry.clear();
+        self.inner.io_flush(user)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
@@ -343,6 +360,19 @@ impl PortDriver for DrvAsynPrologixPort {
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         self.base.check_ready()?;
+        // Drain bytes left over from a previous read whose buffer was
+        // too small before issuing a new bridge `++read` — otherwise
+        // that data is lost and the next read returns fresh device
+        // output out of order.
+        {
+            let mut st = self.state.lock().unwrap();
+            if !st.read_carry.is_empty() {
+                let n = st.read_carry.len().min(buf.len());
+                buf[..n].copy_from_slice(&st.read_carry[..n]);
+                st.read_carry.drain(..n);
+                return Ok(n);
+            }
+        }
         self.set_address(user)?;
         let eos = self.state.lock().unwrap().eos;
         // Issue the bridge `++read` command. Two flavours mirror C
@@ -406,6 +436,11 @@ impl PortDriver for DrvAsynPrologixPort {
         }
         let n = acc.len().min(buf.len());
         buf[..n].copy_from_slice(&acc[..n]);
+        if n < acc.len() {
+            // Caller's buffer was too small — stash the remainder so the
+            // next read_octet returns it instead of dropping device data.
+            self.state.lock().unwrap().read_carry = acc.split_off(n);
+        }
         Ok(n)
     }
 }

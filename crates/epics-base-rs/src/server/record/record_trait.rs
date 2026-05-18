@@ -145,6 +145,52 @@ pub enum CommonFieldPutResult {
     },
 }
 
+/// Read-only snapshot of framework-owned `CommonFields` state that a
+/// record's `process()` or device support's `read()` needs to see
+/// *during* the processing cycle.
+///
+/// The framework owns `RecordInstance.common`; a record `process()`
+/// receives only `&mut self` (the concrete record) and device support
+/// `read()` receives only `&mut dyn Record`. Neither can reach
+/// `CommonFields`. C records, by contrast, see `dbCommon` directly —
+/// e.g. `epidRecord.c:195` reads `pepid->udf`, `timestampRecord.c:90`
+/// reads `ptimestamp->tse`, `devTimeOfDay.c:122` reads `psi->phas`.
+///
+/// The framework builds a `ProcessContext` from `common` and pushes it
+/// onto the record (via [`Record::set_process_context`]) and onto the
+/// device support (via
+/// [`crate::server::device_support::DeviceSupport::set_process_context`])
+/// immediately before the respective call. This mirrors the existing
+/// `set_device_did_compute` framework-set-hook pattern: additive,
+/// no `process()` / `read()` signature change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessContext {
+    /// `dbCommon.udf` — value is undefined. C records check this at the
+    /// top of `process()` (e.g. `epidRecord.c:195`).
+    pub udf: bool,
+    /// `dbCommon.udfs` — alarm severity raised for a UDF record.
+    pub udfs: crate::server::record::AlarmSeverity,
+    /// `dbCommon.phas` — phase. Used by device support for format
+    /// selection (`devTimeOfDay.c:122`).
+    pub phas: i16,
+    /// `dbCommon.tse` — time-stamp event. `timestampRecord.c:90`
+    /// branches on `tse == epicsTimeEventDeviceTime`.
+    pub tse: i16,
+    /// `dbCommon.tsel` — time-stamp event link string.
+    pub tsel: String,
+    /// `dbCommon.dtyp` — device-support type name. A record's
+    /// `process()` / pre-process hooks can branch on the DTYP to mirror
+    /// C device support that lives in a separate DSET (e.g. the epid
+    /// record's `devEpidSoftCallback` callback DSET drives the TRIG
+    /// readback link, whereas `devEpidSoft` does not).
+    pub dtyp: String,
+}
+
+/// C `epicsTime.h`: `epicsTimeEventDeviceTime` — the `TSE` sentinel
+/// meaning "device support provides the time stamp". `timestampRecord.c`
+/// uses it to take the OS-clock branch instead of `recGblGetTimeStamp`.
+pub const EPICS_TIME_EVENT_DEVICE_TIME: i16 = -2;
+
 /// Snapshot of changes from a process cycle, used for notify outside lock.
 pub struct ProcessSnapshot {
     pub changed_fields: Vec<(String, EpicsValue)>,
@@ -332,6 +378,20 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// The value the MDEL/ADEL deadband is evaluated against.
+    ///
+    /// For most records C `monitor()` applies the value deadband to
+    /// `VAL`, so the default is [`Self::val`]. A record whose monitored
+    /// quantity is not its primary value must override this: the motor
+    /// record, for instance, has `VAL` as the setpoint and applies
+    /// MDEL/ADEL to `RBV` (the readback) — its C `monitor()` deadbands
+    /// `RBV`, not `VAL`. Such a record returns its readback field here.
+    ///
+    /// Default is `val()`, so existing records are unaffected.
+    fn monitor_deadband_value(&self) -> Option<EpicsValue> {
+        self.val()
+    }
+
     /// Initialize record (pass 0: field defaults; pass 1: dependent init).
     fn init_record(&mut self, _pass: u8) -> CaResult<()> {
         Ok(())
@@ -351,6 +411,26 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Called by the framework immediately after applying this cycle's
+    /// [`Record::multi_input_links`] fetches, before `process()`.
+    ///
+    /// `resolved` lists the `link_field` names (the first element of
+    /// each `multi_input_links` pair) whose fetch actually produced a
+    /// value this cycle — i.e. the link was non-empty and the read
+    /// succeeded. A link field absent from the slice either had no link
+    /// configured or its DB/CA fetch failed.
+    ///
+    /// This is the framework analogue of C device support inspecting
+    /// `RTN_SUCCESS(dbGetLink(...))` — e.g. `epidRecord.c:191-193`
+    /// clears `udf` only when `dbGetLink(&prec->stpl, ...)` returns
+    /// success. A record's `process()` cannot otherwise observe whether
+    /// an input link's fetch succeeded, because a failed fetch simply
+    /// leaves the target field unwritten.
+    ///
+    /// Additive, framework-set-hook pattern (same shape as
+    /// [`Record::set_process_context`]). Default: ignore.
+    fn set_resolved_input_links(&mut self, _resolved: &[&'static str]) {}
+
     /// Called before/after a field put for side-effect processing.
     fn special(&mut self, _field: &str, _after: bool) -> CaResult<()> {
         Ok(())
@@ -367,6 +447,51 @@ pub trait Record: Send + Sync + 'static {
     fn clears_udf(&self) -> bool {
         true
     }
+
+    /// Whether the record's current `VAL` is undefined (UDF must
+    /// stay set).
+    ///
+    /// C parity: `aiRecord.c:285` / `calcRecord.c::checkAlarms` /
+    /// `int64inRecord.c:144` clear `UDF` **only** when the computed /
+    /// read value is valid — `if (status == 0)` and, for floating
+    /// records, only when `VAL` is not NaN. The framework owns
+    /// `common.udf`; it calls `clears_udf()` to decide whether this
+    /// record type clears UDF at all, then this method to decide
+    /// whether the *value produced this cycle* is actually defined.
+    ///
+    /// Default: a floating `VAL` that is NaN (e.g. a calc
+    /// divide-by-zero, or a soft input whose link read failed and
+    /// left VAL un-updated) is undefined; everything else is defined.
+    /// A record whose `val()` yields `None` (no primary value) is
+    /// also treated as undefined.
+    fn value_is_undefined(&self) -> bool {
+        match self.val() {
+            Some(EpicsValue::Double(v)) => v.is_nan(),
+            Some(EpicsValue::Float(v)) => v.is_nan(),
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    /// Per-record alarm hook — evaluate record-type-specific alarms
+    /// (STATE / COS / analog limit / SOFT) and accumulate them into
+    /// `nsta`/`nsev` via `recGblSetSevr`.
+    ///
+    /// The framework centralises the generic alarm machinery (UDF
+    /// check, `recGblResetAlarms` transfer, MS/MSI/MSS link-alarm
+    /// inheritance). The record-type-specific severity logic that C
+    /// puts in each record's `checkAlarms()` belongs here so a record
+    /// can raise its own alarms without the framework hardcoding a
+    /// per-type `match` on `record_type()`.
+    ///
+    /// `common` is the record's [`CommonFields`]; implementations
+    /// raise alarms with [`crate::server::recgbl::rec_gbl_set_sevr`]
+    /// / [`crate::server::recgbl::rec_gbl_set_sevr_msg`].
+    ///
+    /// Default: no-op — records that have not yet migrated their
+    /// `checkAlarms` logic here are still covered by the framework's
+    /// legacy centralised `evaluate_alarms` match.
+    fn check_alarms(&mut self, _common: &mut crate::server::record::CommonFields) {}
 
     /// Return multi-input link field pairs: (link_field, value_field).
     /// Override in calc, calcout, sel, sub to return INPA..INPL → A..L mappings.
@@ -396,12 +521,76 @@ pub trait Record: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Return actions the framework must execute BEFORE the input-link
+    /// (`multi_input_links`, INP -> value-field) fetch for this cycle.
+    ///
+    /// This is strictly earlier than [`Self::pre_process_actions`]: the
+    /// framework resolves input links *before* it calls
+    /// `pre_process_actions`, so an action that must affect what an
+    /// input link reads cannot be expressed there.
+    ///
+    /// The motivating case is the epid record's `devEpidSoftCallback`
+    /// DB-type TRIG link: C `devEpidSoftCallback.c:120-132` writes the
+    /// readback-trigger link with `dbPutLink` — which synchronously
+    /// processes the triggered source chain — and only *then*
+    /// (`devEpidSoftCallback.c:151`) does `dbGetLink(&pepid->inp, ...)`
+    /// read `CVAL`. The trigger write therefore has to land before the
+    /// `INP -> CVAL` fetch, in the same process pass.
+    ///
+    /// Called once per cycle, while a record write lock is held; the
+    /// framework executes the returned actions (currently `WriteDbLink`
+    /// and `ReadDbLink`) and then performs the input-link fetch.
+    /// Default returns empty.
+    fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
+        Vec::new()
+    }
+
+    /// Called by the framework immediately before `process()` to push a
+    /// read-only snapshot of framework-owned [`CommonFields`] state
+    /// ([`ProcessContext`]) that the record's `process()` needs to see.
+    ///
+    /// The framework owns `RecordInstance.common`; a record `process()`
+    /// only gets `&mut self`. C records read `dbCommon` directly — e.g.
+    /// `epidRecord.c:195` checks `pepid->udf` at the top of `process()`,
+    /// `timestampRecord.c:90` branches on `ptimestamp->tse`. This hook
+    /// is the controlled equivalent: a record that needs `udf`/`phas`/
+    /// `tse`/`tsel` during `process()` overrides this to stash the
+    /// values into its own fields.
+    ///
+    /// Additive, framework-set-hook pattern (same shape as
+    /// [`Record::set_device_did_compute`]). Default: ignore — most
+    /// records never need common state during `process()`.
+    fn set_process_context(&mut self, _ctx: &ProcessContext) {}
+
     /// Called by the framework before process() to indicate whether device
     /// support's read() already performed the record's compute step.
     /// Override in records that have a built-in compute (e.g., epid PID)
     /// to skip it when device support already ran it.
     /// Default: ignore.
     fn set_device_did_compute(&mut self, _did_compute: bool) {}
+
+    /// Whether this record has a raw-to-engineering (`RVAL → VAL`)
+    /// `convert()` step that must be skipped on a `Soft Channel` input.
+    ///
+    /// C `devAiSoft.c:65` `read_ai` (and the other soft-channel input
+    /// `read_xxx`) always returns 2 ("don't convert"), so `aiRecord.c`'s
+    /// `if (status==0) convert(prec)` is bypassed for a `Soft Channel`
+    /// input record. The framework expresses this by calling
+    /// [`Record::set_device_did_compute(true)`] on the record before
+    /// `process()`.
+    ///
+    /// This hook exists so the framework only suppresses `convert()` —
+    /// NOT a record's entire built-in compute. Records like `epid` also
+    /// override `set_device_did_compute` but interpret it as "skip the
+    /// whole compute step" (the PID loop); those records have no
+    /// `RVAL → VAL` convert and MUST keep the default `false` so a
+    /// `Soft Channel` `epid` still runs `do_pid()` in `process()`.
+    ///
+    /// Default `false`: a record is only opted into the soft-channel
+    /// convert-skip when it explicitly returns `true`.
+    fn soft_channel_skips_convert(&self) -> bool {
+        false
+    }
 }
 
 /// Subroutine function type for sub records.

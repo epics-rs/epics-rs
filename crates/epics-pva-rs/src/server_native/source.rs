@@ -23,13 +23,18 @@ pub use epics_base_rs::server::access_security::{AccessChecked, AccessGate};
 pub struct ChannelContext {
     /// Downstream client TCP socket address.
     pub peer: SocketAddr,
-    /// Account name from CONNECTION_VALIDATION (`anonymous` when the
-    /// client didn't authenticate).
+    /// Account name. For `ca`/`anonymous` this comes from
+    /// CONNECTION_VALIDATION; for `x509` it is the verified peer
+    /// leaf-certificate subject CommonName.
     pub account: String,
     /// Auth method (`"anonymous"`, `"ca"`, `"x509"`).
     pub method: String,
     /// Reverse-resolved host name. Empty when DNS lookup failed.
     pub host: String,
+    /// Certificate authority for the `x509` method: the root CA's
+    /// subject CommonName. Empty for non-TLS methods. ACF
+    /// `AUTHORITY(...)` rule scopes match against this.
+    pub authority: String,
 }
 
 /// A backend that can answer pvAccess GET / PUT / MONITOR requests for a
@@ -57,6 +62,21 @@ pub trait ChannelSource: Send + Sync + 'static {
 
     /// True iff `name` resolves to a known PV.
     fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send;
+
+    /// True iff `name` should be answered to a UDP SEARCH broadcast.
+    ///
+    /// Distinct from [`Self::has_pv`]: a name may be reachable via a
+    /// direct TCP connect (`has_pv` true) yet deliberately NOT be
+    /// advertised on UDP discovery (`searchable` false). pvxs's
+    /// built-in `ServerSource` does exactly this — `onSearch` is empty
+    /// so the `server` PV resolves only by direct connect, never by
+    /// broadcast SEARCH (`serversource.cpp`). The default impl
+    /// delegates to `has_pv`, so ordinary sources are unaffected; the
+    /// built-in [`crate::server_native::ServerInfoSource`] overrides
+    /// this to return `false`.
+    fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+        self.has_pv(name)
+    }
 
     /// Fetch the type descriptor for a PV (used by GET-INIT and GET_FIELD).
     fn get_introspection(
@@ -94,9 +114,12 @@ pub trait ChannelSource: Send + Sync + 'static {
         let host = ctx.host.clone();
         let account = ctx.account.clone();
         let method = ctx.method.clone();
+        let authority = ctx.authority.clone();
         let name = pv_name.to_string();
         async move {
-            let checked = gate.check(&name, &host, &account, &method, "").await;
+            let checked = gate
+                .check(&name, &host, &account, &method, &authority)
+                .await;
             if checked.allows_read() {
                 Some(checked)
             } else {
@@ -155,6 +178,59 @@ pub trait ChannelSource: Send + Sync + 'static {
                 ));
             }
             self.put_value(checked.pv_name(), value).await
+        }
+    }
+
+    /// Type-state-enforced **BitSet-delta PUT**.
+    ///
+    /// PVA PUT/PUT_GET data frames carry only the changed fields plus
+    /// a changed-BitSet. Applying the delta is a read-merge-write:
+    /// read the PV's current complete value, overlay the marked
+    /// fields, store the result. The default impl below does that as
+    /// `get_value` + `fill_unmarked_from_prior` + `put_value_checked`,
+    /// which is correct for a single client but has a TOCTOU
+    /// lost-update window under concurrent partial PUTs to the same
+    /// PV (two writers read the same prior; the second write drops
+    /// the first's disjoint fields).
+    ///
+    /// The default impl forwards to [`Self::put_value_checked`] (not
+    /// the ctx-less `put_value`) so credential-aware sources — the
+    /// pva-gateway routes PUTs through a per-`(account, method)`
+    /// upstream client — keep their identity propagation. The
+    /// `put_value_checked` call performs the `allows_write()` gate.
+    ///
+    /// Sources whose backing store can merge under a single lock
+    /// override this to close the TOCTOU window —
+    /// [`crate::server_native::shared_pv::SharedSource`] forwards to
+    /// [`crate::server_native::shared_pv::SharedPV::put_delta`], which
+    /// reads + merges + stores under one mutex acquisition.
+    ///
+    /// `desc` is the PV introspection (per-field bit numbering);
+    /// `changed` is the wire changed-BitSet; `delta` is the decoded
+    /// sparse value (unmarked leaves hold type defaults).
+    fn put_delta_checked(
+        &self,
+        checked: AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async move {
+            // Default (non-atomic) merge for sources without a
+            // contained merge primitive. Single-client correct.
+            // `put_value_checked` enforces the WRITE gate, so a
+            // denied token never reaches the merge below as a write —
+            // but read the prior unconditionally (READ is implied by
+            // a ReadWrite token; for a denied token put_value_checked
+            // rejects before the merged value is stored).
+            let merged = match self.get_value(checked.pv_name()).await {
+                Some(prior) => crate::pvdata::encode::fill_unmarked_from_prior(
+                    &desc, &changed, 0, delta, &prior,
+                ),
+                None => delta,
+            };
+            self.put_value_checked(checked, merged, ctx).await
         }
     }
 
@@ -261,6 +337,47 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
+    /// Trigger record/PV **processing** without transferring a value
+    /// (PVA wire command `PROCESS`, cmd 16). Unlike PUT-with-
+    /// `record[process=true]`, this carries no value payload — it is
+    /// the wire equivalent of an EPICS `dbProcess` / `caput .PROC`.
+    ///
+    /// Default impl returns `Ok(())` — sources whose PVs have no
+    /// processing semantics (constant / mailbox PVs) treat PROCESS as
+    /// a no-op success, matching how a passive record handles a `.PROC`
+    /// write. Sources backed by a processable record (IOC database,
+    /// `SharedPV` with an `on_process` hook) override to actually run
+    /// the processing chain. An `Err` surfaces to the client as a
+    /// PROCESS error status.
+    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let _ = name;
+        async move { Ok(()) }
+    }
+
+    /// Type-state-enforced PROCESS. pvxs treats `process()` as a
+    /// WRITE-class operation for ACF (it mutates record state), so a
+    /// non-`ReadWrite` token is refused with an error; on `ReadWrite`
+    /// it delegates to the ctx-less [`Self::process`]. Sources that
+    /// need credential-aware routing override this directly.
+    fn process_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async move {
+            if !checked.allows_write() {
+                return Err(format!(
+                    "PROCESS denied by access security: '{}' from {}/{}/{}",
+                    checked.pv_name(),
+                    ctx.host,
+                    ctx.account,
+                    ctx.method,
+                ));
+            }
+            self.process(checked.pv_name()).await
+        }
+    }
+
     /// Notify the source that the per-connection monitor outbox for
     /// `name` just crossed UP through its high watermark. Producers
     /// can throttle their post() rate in response. Default impl is
@@ -322,6 +439,11 @@ pub trait ChannelSourceObj: Send + Sync {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    /// Dyn forwarder for [`ChannelSource::searchable`].
+    fn searchable<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     fn get_introspection<'a>(
         &'a self,
         name: &'a str,
@@ -354,6 +476,15 @@ pub trait ChannelSourceObj: Send + Sync {
         &'a self,
         checked: AccessChecked,
         value: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    /// Dyn forwarder for type-state atomic BitSet-delta PUT.
+    fn put_delta_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
     fn is_writable<'a>(
@@ -406,6 +537,16 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'a>,
     >;
+    fn process<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    /// Dyn forwarder for type-state PROCESS.
+    fn process_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
     fn notify_watermark_high(&self, name: &str);
     fn notify_watermark_low(&self, name: &str);
 }
@@ -421,6 +562,12 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::has_pv(self, name))
+    }
+    fn searchable<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::searchable(self, name))
     }
     fn get_introspection<'a>(
         &'a self,
@@ -469,6 +616,18 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::put_value_checked(
             self, checked, value, ctx,
+        ))
+    }
+    fn put_delta_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::put_delta_checked(
+            self, checked, desc, changed, delta, ctx,
         ))
     }
     fn is_writable<'a>(
@@ -546,6 +705,19 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
             request_value,
             ctx,
         ))
+    }
+    fn process<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::process(self, name))
+    }
+    fn process_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::process_checked(self, checked, ctx))
     }
     fn notify_watermark_high(&self, name: &str) {
         <Self as ChannelSource>::notify_watermark_high(self, name);

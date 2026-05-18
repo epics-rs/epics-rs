@@ -13,7 +13,7 @@ use crate::types::{DbFieldType, EpicsValue};
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::CommonFields;
-use super::link::{ParsedLink, parse_link_v2};
+use super::link::{ParsedLink, parse_link_v2, parse_output_link_v2};
 use super::record_trait::{
     CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
@@ -174,7 +174,15 @@ impl RecordInstance {
     pub fn new_boxed(name: String, record: Box<dyn Record>) -> Self {
         let rtype = record.record_type();
         let analog_alarm = match rtype {
-            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" => {
+            // C parity: every record type whose dbd carries
+            // HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV gets an analog-alarm
+            // config slot. Previously calc / calcout were missing —
+            // their put_field for those fields silently no-op'd
+            // because `self.common.analog_alarm` was None at the
+            // mutation site. Confirmed via
+            // calcRecord.dbd.pod:716-744 (HIHI..LLSV) and
+            // calcoutRecord.dbd.pod:1103+ (same).
+            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout" => {
                 Some(AnalogAlarmConfig::default())
             }
             _ => None,
@@ -631,11 +639,14 @@ impl RecordInstance {
             "DTYP" => Some(EpicsValue::String(self.common.dtyp.clone())),
             "TSE" => Some(EpicsValue::Short(self.common.tse)),
             "TSEL" => Some(EpicsValue::String(self.common.tsel.clone())),
+            // C `UTAG` is DBF_UINT64 — modelled as Int64 (no
+            // unsigned-64 scalar in the Rust value model).
+            "UTAG" => Some(EpicsValue::Int64(self.common.utag as i64)),
             "ASG" => Some(EpicsValue::String(self.common.asg.clone())),
             "ASL" => Some(EpicsValue::Char(self.common.asl)),
             "DESC" => Some(EpicsValue::String(self.common.desc.clone())),
             "PHAS" => Some(EpicsValue::Short(self.common.phas)),
-            "EVNT" => Some(EpicsValue::Short(self.common.evnt)),
+            "EVNT" => Some(EpicsValue::String(self.common.evnt.clone())),
             "PRIO" => Some(EpicsValue::Short(self.common.prio)),
             "DISV" => Some(EpicsValue::Short(self.common.disv)),
             "DISA" => Some(EpicsValue::Short(self.common.disa)),
@@ -750,17 +761,38 @@ impl RecordInstance {
             "ACKS" => {
                 if let EpicsValue::Short(v) = value {
                     let sev = AlarmSeverity::from_u16(v as u16);
-                    // Writing ACKS clears alarm acknowledge if written severity >= current
-                    if sev >= self.common.sevr {
+                    // C `dbAccess.c:1309` putAcks:
+                    //   `if (*psev >= precord->acks) precord->acks = 0;`
+                    // The written severity is compared against the
+                    // STORED unacknowledged severity `acks` — NOT the
+                    // current `sevr`. An operator acknowledging an
+                    // alarm at the severity that was latched into ACKS
+                    // must clear it even after `sevr` has since
+                    // dropped; comparing against `sevr` instead would
+                    // leave a stale unacknowledged alarm stuck.
+                    if sev >= self.common.acks {
                         self.common.acks = AlarmSeverity::NoAlarm;
                     }
                 }
             }
-            "ACKT" => match value {
-                EpicsValue::Char(v) => self.common.ackt = v != 0,
-                EpicsValue::Short(v) => self.common.ackt = v != 0,
-                _ => {}
-            },
+            "ACKT" => {
+                let new_ackt = match value {
+                    EpicsValue::Char(v) => v != 0,
+                    EpicsValue::Short(v) => v != 0,
+                    _ => return Ok(CommonFieldPutResult::NoChange),
+                };
+                self.common.ackt = new_ackt;
+                // C `dbAccess.c:1294-1297` putAckt: when ACKT is set
+                // false (transient acknowledgement disabled) and the
+                // stored unacknowledged severity is higher than the
+                // current `sevr`, lower `acks` down to `sevr` — a
+                // transient alarm that has already cleared should not
+                // keep a sticky higher-severity ACKS once transient
+                // acknowledgement is turned off.
+                if !new_ackt && self.common.acks > self.common.sevr {
+                    self.common.acks = self.common.sevr;
+                }
+            }
             "UDF" => {
                 if let EpicsValue::Char(v) = value {
                     self.common.udf = v != 0;
@@ -846,7 +878,14 @@ impl RecordInstance {
                         );
                     }
                     self.common.out = s;
-                    self.parsed_out = parse_link_v2(&self.common.out);
+                    // C `dbDbPutValue` (dbDbLink.c:386-389): an OUT
+                    // link processes its target only on an explicit
+                    // ` PP` token (or a `.PROC` destination). A bare
+                    // OUT link is NPP — `parse_output_link_v2`
+                    // downgrades the modifier-less `ProcessPassive`
+                    // default that `parse_link_v2` would otherwise
+                    // apply.
+                    self.parsed_out = parse_output_link_v2(&self.common.out);
                     // C `longoutRecord.c::special` (PR #6c573b4 part 2)
                     // and similar OOCH-style hooks need `after=true`
                     // to fire after the link has actually moved. The
@@ -869,6 +908,18 @@ impl RecordInstance {
                 if let EpicsValue::String(s) = value {
                     self.common.tsel = s;
                     self.parsed_tsel = parse_link_v2(&self.common.tsel);
+                }
+            }
+            "UTAG" => {
+                // C UTAG is DBF_UINT64 — accept any integer-shaped
+                // value and store the unsigned 64-bit tag.
+                match value {
+                    EpicsValue::Int64(v) => self.common.utag = v as u64,
+                    EpicsValue::Long(v) => self.common.utag = v as u64,
+                    EpicsValue::Short(v) => self.common.utag = v as u64,
+                    EpicsValue::Enum(v) => self.common.utag = v as u64,
+                    EpicsValue::Char(v) => self.common.utag = v as u64,
+                    _ => {}
                 }
             }
             "ASG" => {
@@ -916,8 +967,21 @@ impl RecordInstance {
                 }
             }
             "EVNT" => {
-                if let EpicsValue::Short(v) = value {
-                    self.common.evnt = v;
+                // C `EVNT` is DBF_STRING (event name). Accept a
+                // string directly; accept a numeric value too for
+                // backward compatibility (numeric events / a calc
+                // record driving EVNT) by formatting it as a string.
+                match value {
+                    EpicsValue::String(s) => self.common.evnt = s,
+                    EpicsValue::Short(v) => self.common.evnt = v.to_string(),
+                    EpicsValue::Long(v) => self.common.evnt = v.to_string(),
+                    EpicsValue::Enum(v) => self.common.evnt = v.to_string(),
+                    EpicsValue::Double(v) => {
+                        // Match C `eventNameToHandle`: a double with
+                        // an integer part is treated as that integer.
+                        self.common.evnt = (v as i64).to_string();
+                    }
+                    _ => {}
                 }
             }
             "PRIO" => {
@@ -1048,7 +1112,8 @@ impl RecordInstance {
                 if self.record.record_type() == "swait" {
                     if let EpicsValue::String(s) = value {
                         self.common.out = s;
-                        self.parsed_out = parse_link_v2(&self.common.out);
+                        // Bare OUT link is NPP — see the "OUT" arm.
+                        self.parsed_out = parse_output_link_v2(&self.common.out);
                     }
                 }
             }
@@ -1137,7 +1202,7 @@ impl RecordInstance {
         }
 
         match rtype {
-            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" => {
+            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout" => {
                 if let Some(ref alarm_cfg) = self.common.analog_alarm.clone() {
                     let val = match self.record.val() {
                         Some(EpicsValue::Double(v)) => v,
@@ -1148,201 +1213,10 @@ impl RecordInstance {
                     self.evaluate_analog_alarm(val, alarm_cfg);
                 }
             }
-            "bi" | "bo" | "busy" => {
-                let val = match self.record.val() {
-                    Some(EpicsValue::Enum(v)) => v,
-                    _ => return,
-                };
-                let zsv = self
-                    .record
-                    .get_field("ZSV")
-                    .and_then(|v| {
-                        if let EpicsValue::Short(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                let osv = self
-                    .record
-                    .get_field("OSV")
-                    .and_then(|v| {
-                        if let EpicsValue::Short(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                let cosv = self
-                    .record
-                    .get_field("COSV")
-                    .and_then(|v| {
-                        if let EpicsValue::Short(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-
-                // Guard: val > 1 means no alarm check (like C)
-                if val <= 1 {
-                    // State alarm: ZSV for val==0, OSV for val==1
-                    let state_sev = if val == 0 { zsv } else { osv };
-                    // AFTC low-pass filter on alarm severity (PR #817).
-                    // bi only carries AFTC for `bi`, not `bo`/`busy` —
-                    // skip filter for the latter two by checking rtype.
-                    let filtered_sev = if rtype == "bi" {
-                        let aftc = self
-                            .record
-                            .get_field("AFTC")
-                            .and_then(|v| v.to_f64())
-                            .unwrap_or(0.0);
-                        let afvl = self
-                            .record
-                            .get_field("AFVL")
-                            .and_then(|v| v.to_f64())
-                            .unwrap_or(0.0);
-                        let now = crate::runtime::general_time::get_current();
-                        let (out, new_afvl) =
-                            Self::aftc_filter(state_sev as u16, aftc, afvl, self.common.time, now);
-                        let _ = self.record.put_field("AFVL", EpicsValue::Double(new_afvl));
-                        out as i16
-                    } else {
-                        state_sev
-                    };
-                    let sev = AlarmSeverity::from_u16(filtered_sev as u16);
-                    if sev != AlarmSeverity::NoAlarm {
-                        recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::STATE_ALARM, sev);
-                    }
-
-                    // COS alarm: only fires when val changed from LALM
-                    let lalm = self
-                        .record
-                        .get_field("LALM")
-                        .and_then(|v| {
-                            if let EpicsValue::Enum(s) = v {
-                                Some(s)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(val);
-
-                    if val != lalm {
-                        let cos_sev = AlarmSeverity::from_u16(cosv as u16);
-                        if cos_sev != AlarmSeverity::NoAlarm {
-                            recgbl::rec_gbl_set_sevr(
-                                &mut self.common,
-                                alarm_status::COS_ALARM,
-                                cos_sev,
-                            );
-                        }
-                        let _ = self.record.put_field("LALM", EpicsValue::Enum(val));
-                    }
-                }
-            }
-            "mbbi" | "mbbo" => {
-                let val = match self.record.val() {
-                    Some(EpicsValue::Enum(v)) => v as usize,
-                    _ => return,
-                };
-                let sv_fields = [
-                    "ZRSV", "ONSV", "TWSV", "THSV", "FRSV", "FVSV", "SXSV", "SVSV", "EISV", "NISV",
-                    "TESV", "ELSV", "TVSV", "TTSV", "FTSV", "FFSV",
-                ];
-                let unsv = self
-                    .record
-                    .get_field("UNSV")
-                    .and_then(|v| {
-                        if let EpicsValue::Short(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                let cosv = self
-                    .record
-                    .get_field("COSV")
-                    .and_then(|v| {
-                        if let EpicsValue::Short(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-
-                // State alarm: per-state severity or UNSV for unknown states
-                let state_sev = if val < 16 {
-                    self.record
-                        .get_field(sv_fields[val])
-                        .and_then(|v| {
-                            if let EpicsValue::Short(s) = v {
-                                Some(s)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(0)
-                } else {
-                    unsv
-                };
-
-                // AFTC low-pass filter on alarm severity (PR #817).
-                // mbbi only — mbbo skipped, matching epics-base.
-                let filtered_state_sev = if rtype == "mbbi" {
-                    let aftc = self
-                        .record
-                        .get_field("AFTC")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0);
-                    let afvl = self
-                        .record
-                        .get_field("AFVL")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0);
-                    let now = crate::runtime::general_time::get_current();
-                    let (out, new_afvl) =
-                        Self::aftc_filter(state_sev as u16, aftc, afvl, self.common.time, now);
-                    let _ = self.record.put_field("AFVL", EpicsValue::Double(new_afvl));
-                    out as i16
-                } else {
-                    state_sev
-                };
-                let sev = AlarmSeverity::from_u16(filtered_state_sev as u16);
-                if sev != AlarmSeverity::NoAlarm {
-                    recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::STATE_ALARM, sev);
-                }
-
-                // COS alarm: only when val changed from LALM (like bi/bo)
-                let lalm = self
-                    .record
-                    .get_field("LALM")
-                    .and_then(|v| {
-                        if let EpicsValue::Enum(s) = v {
-                            Some(s as usize)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(val);
-
-                if val != lalm {
-                    let cos_sev = AlarmSeverity::from_u16(cosv as u16);
-                    if cos_sev != AlarmSeverity::NoAlarm {
-                        recgbl::rec_gbl_set_sevr(
-                            &mut self.common,
-                            alarm_status::COS_ALARM,
-                            cos_sev,
-                        );
-                    }
-                    let _ = self.record.put_field("LALM", EpicsValue::Enum(val as u16));
-                }
-            }
+            // bi / bo / busy / mbbi / mbbo STATE+COS (and mbbo SOFT)
+            // alarm evaluation now lives in each record's
+            // `Record::check_alarms` hook (C `checkAlarms`). Keeping an
+            // arm here would double-raise.
             _ => {} // no-op for other types
         }
     }
@@ -1360,25 +1234,73 @@ impl RecordInstance {
         // C-style per-level hysteresis: alarm fires if val passes the level,
         // OR if we were already at that alarm level (lalm == alev) and val
         // hasn't retreated past the hysteresis margin.
-        let (new_sevr, new_stat, alev) = if cfg.hhsv != AlarmSeverity::NoAlarm
+        //
+        // `alarm_range` is the C-style integer level: 1=Lolo, 2=Low,
+        // 3=Normal, 4=High, 5=Hihi. Required for the calc-record AFTC
+        // filter (`calcRecord.c::checkAlarms:339-381`) which filters
+        // on the range level (not on severity) and re-maps back.
+        let (mut new_sevr, mut new_stat, mut alev, mut alarm_range) = if cfg.hhsv
+            != AlarmSeverity::NoAlarm
             && (val >= cfg.hihi || (lalm == cfg.hihi && val >= cfg.hihi - hyst))
         {
-            (cfg.hhsv, alarm_status::HIHI_ALARM, cfg.hihi)
+            (cfg.hhsv, alarm_status::HIHI_ALARM, cfg.hihi, 5u16)
         } else if cfg.llsv != AlarmSeverity::NoAlarm
             && (val <= cfg.lolo || (lalm == cfg.lolo && val <= cfg.lolo + hyst))
         {
-            (cfg.llsv, alarm_status::LOLO_ALARM, cfg.lolo)
+            (cfg.llsv, alarm_status::LOLO_ALARM, cfg.lolo, 1u16)
         } else if cfg.hsv != AlarmSeverity::NoAlarm
             && (val >= cfg.high || (lalm == cfg.high && val >= cfg.high - hyst))
         {
-            (cfg.hsv, alarm_status::HIGH_ALARM, cfg.high)
+            (cfg.hsv, alarm_status::HIGH_ALARM, cfg.high, 4u16)
         } else if cfg.lsv != AlarmSeverity::NoAlarm
             && (val <= cfg.low || (lalm == cfg.low && val <= cfg.low + hyst))
         {
-            (cfg.lsv, alarm_status::LOW_ALARM, cfg.low)
+            (cfg.lsv, alarm_status::LOW_ALARM, cfg.low, 2u16)
         } else {
-            (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, 0.0)
+            (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, val, 3u16)
         };
+
+        // C parity: calcRecord.c::checkAlarms applies the AFTC low-pass
+        // filter on `alarmRange` and re-maps. calcoutRecord.c does NOT
+        // (no AFTC field on calcout — confirmed via
+        // calcoutRecord.dbd.pod). Only `calc` runs the filter.
+        if self.record.record_type() == "calc" {
+            let aftc = self
+                .record
+                .get_field("AFTC")
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0);
+            let afvl = self
+                .record
+                .get_field("AFVL")
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0);
+            if aftc > 0.0 {
+                let now = crate::runtime::general_time::get_current();
+                let (filtered_range, new_afvl) =
+                    Self::aftc_filter(alarm_range, aftc, afvl, self.common.time, now);
+                let _ = self.record.put_field("AFVL", EpicsValue::Double(new_afvl));
+                if filtered_range != alarm_range {
+                    // Re-map filtered range back to (sevr, stat, alev).
+                    let (mapped_sevr, mapped_stat, mapped_alev) = match filtered_range {
+                        5 => (cfg.hhsv, alarm_status::HIHI_ALARM, cfg.hihi),
+                        4 => (cfg.hsv, alarm_status::HIGH_ALARM, cfg.high),
+                        2 => (cfg.lsv, alarm_status::LOW_ALARM, cfg.low),
+                        1 => (cfg.llsv, alarm_status::LOLO_ALARM, cfg.lolo),
+                        _ => (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, val),
+                    };
+                    new_sevr = mapped_sevr;
+                    new_stat = mapped_stat;
+                    alev = mapped_alev;
+                    alarm_range = filtered_range;
+                }
+            } else {
+                // aftc <= 0 disables filter; C also clears afvl on
+                // UDF/initial-pass — leave afvl untouched here (no
+                // active filter state to maintain).
+            }
+        }
+        let _ = alarm_range; // suppress unused-var on non-calc paths
 
         if new_sevr != AlarmSeverity::NoAlarm {
             recgbl::rec_gbl_set_sevr(&mut self.common, new_stat, new_sevr);
@@ -1392,7 +1314,22 @@ impl RecordInstance {
 
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.
     /// This does NOT handle links — see process_with_context in database.rs.
-    pub fn process_local(&mut self) -> CaResult<ProcessSnapshot> {
+    ///
+    /// Returns the value/log snapshot plus a list of alarm-field posts
+    /// (`SEVR`/`STAT`/`AMSG`/`ACKS`) with their individual C event masks.
+    /// `SEVR` is posted `DBE_VALUE` only; `STAT`/`AMSG` carry `DBE_ALARM`
+    /// (sevr/amsg change) and/or `DBE_VALUE` (stat change). The caller
+    /// must fire these via `notify_field` so a `DBE_VALUE`-only `.SEVR`
+    /// subscriber is not missed on an alarm-only change and a
+    /// `DBE_ALARM`-only subscriber is not wrongly notified — C parity
+    /// with `recGblResetAlarms` (recGbl.c:201-220), matching the
+    /// `processing.rs` link path.
+    pub fn process_local(
+        &mut self,
+    ) -> CaResult<(
+        ProcessSnapshot,
+        Vec<(&'static str, crate::server::recgbl::EventMask)>,
+    )> {
         use crate::server::recgbl::{self, EventMask};
         const LCNT_ALARM_THRESHOLD: i16 = 10;
 
@@ -1404,11 +1341,41 @@ impl RecordInstance {
             if self.common.lcnt >= LCNT_ALARM_THRESHOLD {
                 self.common.sevr = AlarmSeverity::Invalid;
                 self.common.stat = recgbl::alarm_status::SCAN_ALARM;
+                // Post the SCAN_ALARM transition so subscribers see it.
+                // The synchronous link path (`process_record_with_links_inner`,
+                // mirroring C `dbAccess.c:559-583`) posts VAL with
+                // DBE_VALUE|DBE_LOG|DBE_ALARM when the LCNT guard raises
+                // SCAN_ALARM/INVALID. The pre-fix branch here flipped
+                // sevr/stat but returned an empty snapshot, so a
+                // `process_local`-driven reentrant record went INVALID
+                // silently — no monitor ever reached the operator.
+                let mut changed_fields = Vec::new();
+                if let Some(val) = self.record.val() {
+                    changed_fields.push(("VAL".to_string(), val));
+                }
+                changed_fields.push((
+                    "SEVR".to_string(),
+                    EpicsValue::Short(self.common.sevr as i16),
+                ));
+                changed_fields.push((
+                    "STAT".to_string(),
+                    EpicsValue::Short(self.common.stat as i16),
+                ));
+                return Ok((
+                    ProcessSnapshot {
+                        changed_fields,
+                        event_mask: EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
+                    },
+                    Vec::new(),
+                ));
             }
-            return Ok(ProcessSnapshot {
-                changed_fields: Vec::new(),
-                event_mask: EventMask::NONE,
-            });
+            return Ok((
+                ProcessSnapshot {
+                    changed_fields: Vec::new(),
+                    event_mask: EventMask::NONE,
+                },
+                Vec::new(),
+            ));
         }
         self.common.lcnt = 0;
         // RAII guard that resets `self.processing` to false on drop —
@@ -1442,6 +1409,44 @@ impl RecordInstance {
         if let Some(ref sub_fn) = self.subroutine {
             sub_fn(&mut *self.record)?;
         }
+        // Soft-Channel input records must skip the RVAL->VAL convert
+        // (C `devAiSoft.c` `read_ai` returns 2 = "don't convert" for
+        // every Soft-Channel input record, incl. one with a constant /
+        // unset INP). Without this, `process_local` on a soft input
+        // with a preset VAL — e.g. NaN — would run `convert()` and
+        // clobber it, after which the UDF check below would see a
+        // defined value and wrongly clear UDF (06-H-2). The
+        // `processing.rs` link path already does this; `process_local`
+        // is the separate foreign-call path (`db.process_record`) and
+        // needs the same skip. "Raw Soft Channel" has a distinct DTYP
+        // so it is excluded by `is_soft` and still runs convert.
+        //
+        // Gated on `soft_channel_skips_convert()` — identical to the
+        // `processing.rs` link path — so this only suppresses the
+        // `RVAL → VAL` convert step. `set_device_did_compute` is an
+        // overloaded hook: `ai/bi/mbbi/mbbi_direct` read it as
+        // "skip convert" (override true), but `epid` reads it as
+        // "skip the whole built-in PID compute" (keeps default false).
+        // Without this gate, a Soft-Channel `epid` driven through
+        // `process_local` (`db.process_record`, e.g. QSRV group proc
+        // members) would skip `do_pid()` entirely — the regression
+        // d1032fe5 fixed on the `processing.rs` path only.
+        {
+            let is_soft = self.common.dtyp.is_empty() || self.common.dtyp == "Soft Channel";
+            let is_output = self.record.can_device_write();
+            if is_soft && !is_output && self.record.soft_channel_skips_convert() {
+                self.record.set_device_did_compute(true);
+            }
+        }
+        // Push framework-owned common state (UDF/PHAS/TSE/TSEL) so the
+        // record's process() can see it — same as the processing.rs link
+        // path. `process_local` is the foreign-call path
+        // (`db.process_record`); without this a record driven through it
+        // (e.g. QSRV group-process members) would not see UDF/TSE.
+        {
+            let ctx = self.common.process_context();
+            self.record.set_process_context(&ctx);
+        }
         let outcome = self.record.process()?;
         let process_result = outcome.result;
         // Note: process_local() does not execute ProcessActions — those are
@@ -1459,10 +1464,13 @@ impl RecordInstance {
             // Async: PACT stays set, no further processing this cycle
             // Don't clear processing flag (guard won't run — we leak it intentionally)
             std::mem::forget(_guard);
-            return Ok(ProcessSnapshot {
-                changed_fields: Vec::new(),
-                event_mask: EventMask::NONE,
-            });
+            return Ok((
+                ProcessSnapshot {
+                    changed_fields: Vec::new(),
+                    event_mask: EventMask::NONE,
+                },
+                Vec::new(),
+            ));
         }
         if let RecordProcessResult::AsyncPendingNotify(fields) = process_result {
             // Intermediate notification (e.g. DMOV=0 at move start).
@@ -1494,11 +1502,24 @@ impl RecordInstance {
                 EventMask::VALUE | EventMask::ALARM
             };
             // _guard drops here, clearing the processing flag
-            return Ok(ProcessSnapshot {
-                changed_fields,
-                event_mask,
-            });
+            return Ok((
+                ProcessSnapshot {
+                    changed_fields,
+                    event_mask,
+                },
+                Vec::new(),
+            ));
         }
+
+        // UDF update before alarm evaluation — C parity (see
+        // `processing.rs`). A NaN / undefined value keeps UDF true so
+        // `recGblCheckUDF` raises UDF_ALARM this cycle instead of the
+        // record reporting a stale/garbage value with no alarm.
+        if self.record.clears_udf() {
+            self.common.udf = self.record.value_is_undefined();
+        }
+        // Per-record alarm hook (C `checkAlarms()`).
+        self.record.check_alarms(&mut self.common);
 
         // Evaluate alarms (accumulates into nsta/nsev)
         self.evaluate_alarms();
@@ -1507,9 +1528,7 @@ impl RecordInstance {
         let alarm_result = recgbl::rec_gbl_reset_alarms(&mut self.common);
 
         self.common.time = crate::runtime::general_time::get_current();
-        if self.record.clears_udf() {
-            self.common.udf = false;
-        }
+        // UDF already updated above — do not clear unconditionally.
 
         // Compute event mask
         let mut event_mask = EventMask::NONE;
@@ -1522,7 +1541,13 @@ impl RecordInstance {
         if include_archive {
             event_mask |= EventMask::LOG;
         }
-        if alarm_result.alarm_changed {
+        // Carry DBE_ALARM on the record-wide event mask whenever the
+        // severity/status OR the alarm message moved — aligning with
+        // the `processing.rs` link path (`event_mask |= ALARM` on
+        // `alarm_changed || amsg_changed`). The pre-fix branch checked
+        // only `alarm_changed`, so a put that changed AMSG without
+        // moving SEVR/STAT posted VAL without the DBE_ALARM bit.
+        if alarm_result.alarm_changed || alarm_result.amsg_changed {
             event_mask |= EventMask::ALARM;
         }
 
@@ -1533,21 +1558,83 @@ impl RecordInstance {
                 changed_fields.push(("VAL".to_string(), val));
             }
         }
-        if alarm_result.alarm_changed {
+        // C `recGblResetAlarms` (recGbl.c:201-220) posts each alarm
+        // field with its OWN per-field mask, not one record-wide mask:
+        //   * SEVR — DBE_VALUE, ONLY on a sevr change.
+        //   * STAT — DBE_ALARM (sevr change) | DBE_VALUE (stat change).
+        //   * ACKS — DBE_VALUE, only when an alarm field moved.
+        // Pushing SEVR/STAT into `changed_fields` collapses them onto
+        // the single record-wide `event_mask` (which carries ALARM on
+        // `alarm_changed`): a DBE_VALUE-only `.SEVR` subscriber would
+        // miss a stat-only-driven sevr change, and a DBE_ALARM-only
+        // `.SEVR` subscriber would be wrongly notified. Post them via
+        // `notify_field` with their individual masks instead — exactly
+        // as the `processing.rs` link path does.
+        let sevr_changed = self.common.sevr != alarm_result.prev_sevr;
+        let stat_changed = self.common.stat != alarm_result.prev_stat;
+        let stat_mask = {
+            let mut m = EventMask::NONE;
+            // C `recGblResetAlarms` carries DBE_ALARM on the STAT/AMSG
+            // posts whenever the severity OR the alarm message moved —
+            // not on a severity change alone. Aligning with the
+            // `processing.rs` link path (and `complete_async_record`).
+            if sevr_changed || alarm_result.amsg_changed {
+                m |= EventMask::ALARM;
+            }
+            if stat_changed {
+                m |= EventMask::VALUE;
+            }
+            m
+        };
+        let mut alarm_posts: Vec<(&'static str, EventMask)> = Vec::new();
+        if sevr_changed {
+            alarm_posts.push(("SEVR", EventMask::VALUE));
+        }
+        if !stat_mask.is_empty() {
+            alarm_posts.push(("STAT", stat_mask));
+            // AMSG shares STAT's mask — C posts it alongside STAT when
+            // any alarm field moved.
+            alarm_posts.push(("AMSG", stat_mask));
+        }
+        // C parity (recGbl.c:216): ACKS is posted (DBE_VALUE) only when
+        // an alarm field moved (`stat_mask != 0`) AND it was raised.
+        if alarm_result.acks_changed && !stat_mask.is_empty() {
+            alarm_posts.push(("ACKS", EventMask::VALUE));
+        }
+
+        // Post UDF on the snapshot whenever any monitor event fires this
+        // cycle — mirrors the two `processing.rs` UDF pushes
+        // (`database/processing.rs:1327` and `:1948`,
+        // `if !event_mask.is_empty()`). C `recGblResetAlarms` /
+        // `recGblCheckUDF` (recGbl.c) keep UDF current every process
+        // cycle, and `db_post_events` delivers `.UDF` alongside the
+        // record-wide post. `process_local` is the foreign-process path
+        // (`db.process_record`, e.g. QSRV group-process members); without
+        // this push a UDF change here is never delivered to `.UDF`
+        // subscribers — the `sub_updates` loop below deliberately excludes
+        // UDF to avoid a double-post, so the push must be here.
+        if !event_mask.is_empty() {
             changed_fields.push((
-                "SEVR".to_string(),
-                EpicsValue::Short(self.common.sevr as i16),
-            ));
-            changed_fields.push((
-                "STAT".to_string(),
-                EpicsValue::Short(self.common.stat as i16),
+                "UDF".to_string(),
+                EpicsValue::Char(if self.common.udf { 1 } else { 0 }),
             ));
         }
 
         // Add subscribed fields that actually changed since last notification.
+        // Exclude VAL/SEVR/STAT/AMSG/UDF — all five are already emitted by
+        // this path (VAL in `changed_fields`, SEVR/STAT/AMSG via
+        // `alarm_posts`, UDF via the explicit UDF push above). Mirrors the
+        // two `processing.rs` snapshot gates, which exclude the same five;
+        // excluding only the first three would double-post AMSG and UDF.
         let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
         for (field, subs) in &self.subscribers {
-            if !subs.is_empty() && field != "VAL" && field != "SEVR" && field != "STAT" {
+            if !subs.is_empty()
+                && field != "VAL"
+                && field != "SEVR"
+                && field != "STAT"
+                && field != "AMSG"
+                && field != "UDF"
+            {
                 if let Some(val) = self.resolve_field(field) {
                     let changed = match self.last_posted.get(field) {
                         Some(prev) => prev != &val,
@@ -1567,17 +1654,15 @@ impl RecordInstance {
             event_mask |= EventMask::VALUE;
         }
 
-        Ok(ProcessSnapshot {
-            changed_fields,
-            event_mask,
-        })
+        Ok((
+            ProcessSnapshot {
+                changed_fields,
+                event_mask,
+            },
+            alarm_posts,
+        ))
     }
 
-    /// Check deadband (MDEL/ADEL) for VAL monitor/archive filtering.
-    /// Returns (monitor_trigger, archive_trigger).
-    /// Updates ALST/MLST in the record when triggered.
-    /// For records without MDEL/ADEL fields (e.g. motor), defaults to MDEL=0
-    /// (trigger on any actual change) and uses CommonFields.mlst/alst as fallback.
     /// Put a f64 value into a record field, coercing to the field's native type.
     pub(crate) fn put_coerced(&mut self, field: &str, val: f64) {
         use crate::types::EpicsValue;
@@ -1590,8 +1675,45 @@ impl RecordInstance {
         let _ = self.record.put_field(field, coerced);
     }
 
+    /// Check MDEL/ADEL deadbands for VAL monitor/archive filtering.
+    /// Returns `(monitor_trigger, archive_trigger)`.
+    ///
+    /// Updates `MLST`/`ALST` (record-owned) and the `CommonFields`
+    /// `mlst/alst` shadow when a trigger fires. Records without
+    /// MDEL/ADEL (e.g. motor) default to deadband=0 (any actual
+    /// change triggers).
+    ///
+    /// Delegates per-axis deadband comparison to the free function
+    /// [`check_deadband`] below — see that function's docstring for
+    /// the four-quadrant NaN/infinity rule mirroring C
+    /// `recGblCheckDeadband` (recGbl.c:345-370).
+    ///
+    /// **C-parity design note**: the Rust port uses `NaN` as the
+    /// "never posted" sentinel for `MLST`/`ALST`. C achieves the
+    /// same first-publish guarantee by allocating MLST/ALST in
+    /// BSS-zeroed storage with a value of 0.0 that the C code is
+    /// allowed to match against — but the first observed value is
+    /// not necessarily 0.0, and the C rule "MLST==0 means never
+    /// posted" relies on the deadband comparison `abs(val - 0.0)`
+    /// firing on any non-zero first value. NaN is strictly more
+    /// correct for the Rust port because a legitimate first
+    /// `val=0.0` still fires on `NaN.is_nan() → true`. This
+    /// sentinel-as-design is intentional, documented inside
+    /// [`check_deadband`] (the `oldval.is_nan() → return true` short
+    /// circuit). It is NOT a deviation inherited from a Round-1/2
+    /// silent compromise — `record_tests.rs::deadband_*` pins both
+    /// the NaN-sentinel behaviour and the C four-quadrant transitions.
     pub fn check_deadband_ext(&mut self) -> (bool, bool) {
-        let val = match self.record.val().and_then(|v| v.to_f64()) {
+        // The deadband is evaluated against `monitor_deadband_value()`,
+        // not `val()` directly: a record whose monitored quantity is
+        // not its primary value (e.g. the motor record, VAL=setpoint /
+        // RBV=readback — C `monitor()` deadbands RBV) overrides that
+        // hook. Default is `val()`, so other records are unaffected.
+        let val = match self
+            .record
+            .monitor_deadband_value()
+            .and_then(|v| v.to_f64())
+        {
             Some(v) => v,
             None => return (true, true),
         };
@@ -1621,8 +1743,8 @@ impl RecordInstance {
             .or(self.common.alst)
             .unwrap_or(f64::NAN);
 
-        let monitor_trigger = mdel < 0.0 || mlst.is_nan() || (val - mlst).abs() > mdel;
-        let archive_trigger = adel < 0.0 || alst.is_nan() || (val - alst).abs() > adel;
+        let monitor_trigger = check_deadband(val, mlst, mdel);
+        let archive_trigger = check_deadband(val, alst, adel);
 
         if archive_trigger {
             self.put_coerced("ALST", val);
@@ -1854,6 +1976,52 @@ impl RecordInstance {
             subs.retain(|s| !s.tx.is_closed());
         }
     }
+}
+
+/// C `recGblCheckDeadband` parity (recGbl.c:345-370). The four branches
+/// the C path enumerates:
+///
+/// 1. Both `newval` and `oldval` finite: `delta = |old - new|`, fire when
+///    `delta > deadband`.
+/// 2. Exactly one of {newval, oldval} is NaN, the other not — OR exactly
+///    one is +/-inf, the other not: `delta = +inf`, always fires.
+/// 3. Both infinite with opposite signs: `delta = +inf`, always fires.
+/// 4. Otherwise (e.g. both NaN, both same-signed infinity): no fire.
+///
+/// `oldval = NaN` is treated as "never posted" and fires (matches the
+/// `mlst.is_nan() → trigger` short-circuit the Rust port already had).
+/// `deadband < 0` fires unconditionally (matches `delta > deadband`
+/// with a negative deadband — same effect on every numeric value).
+pub(crate) fn check_deadband(newval: f64, oldval: f64, deadband: f64) -> bool {
+    // Fire unconditionally when no prior posting has happened. C achieves
+    // the same effect through the field being default-initialised to a
+    // sentinel; Rust uses NaN-as-sentinel.
+    if oldval.is_nan() {
+        return true;
+    }
+    // Negative deadband short-circuits — any value passes.
+    if deadband < 0.0 {
+        return true;
+    }
+    let new_finite = newval.is_finite();
+    let old_finite = oldval.is_finite();
+    if new_finite && old_finite {
+        return (newval - oldval).abs() > deadband;
+    }
+    // From here on, at least one of the two is not finite. We've already
+    // ruled out oldval=NaN above, so any newval=NaN here is the "newval
+    // went NaN while oldval was finite/inf" case — must fire (C case 2).
+    if newval.is_nan() {
+        return true;
+    }
+    // Exactly one infinite, the other finite: C case 2 → fire.
+    if new_finite != old_finite {
+        return true;
+    }
+    // Both infinite. Opposite signs → fire (C case 3); same sign → no
+    // fire (C path leaves delta=0 and the `delta > deadband` check fails
+    // for any non-negative deadband).
+    newval != oldval
 }
 
 #[cfg(test)]
@@ -2269,5 +2437,77 @@ mod aftc_filter_tests {
             "after 5 s of steady raw=2 with aftc=1 s, output must reach 2"
         );
         assert!(afvl.abs() >= 1.99 && afvl.abs() <= 2.0);
+    }
+}
+
+#[cfg(test)]
+mod check_deadband_tests {
+    use super::check_deadband;
+
+    /// Sentinel: `oldval=NaN` means "no prior posting", always fire.
+    #[test]
+    fn nan_old_value_fires() {
+        assert!(check_deadband(0.0, f64::NAN, 1.0));
+        assert!(check_deadband(f64::NAN, f64::NAN, 1.0));
+    }
+
+    /// C path: `delta > deadband` with both finite. delta within deadband
+    /// must NOT fire.
+    #[test]
+    fn within_finite_deadband_does_not_fire() {
+        assert!(!check_deadband(10.0, 10.5, 1.0));
+        assert!(!check_deadband(10.0, 9.5, 1.0));
+        // Boundary: `delta == deadband` is NOT strictly greater.
+        assert!(!check_deadband(10.0, 11.0, 1.0));
+    }
+
+    /// `delta > deadband` with both finite, beyond → fire.
+    #[test]
+    fn beyond_finite_deadband_fires() {
+        assert!(check_deadband(10.0, 12.0, 1.0));
+    }
+
+    /// Negative deadband acts as "always fire" (C `delta > deadband` is
+    /// trivially true for any non-negative delta).
+    #[test]
+    fn negative_deadband_fires() {
+        assert!(check_deadband(10.0, 10.0, -1.0));
+    }
+
+    /// C parity bug fix (recGbl.c:355-358): exactly one of {newval,
+    /// oldval} is NaN — fire. Rust port previously short-circuited only
+    /// on `oldval=NaN`; `newval=NaN` with `oldval=finite` produced
+    /// `(NaN - finite).abs() = NaN`, `NaN > deadband = false` →
+    /// silently dropped the NaN transition. End effect: a record that
+    /// went UDF (e.g. divide-by-zero in calc) never posted the change
+    /// to monitors, leaving every camonitor seeing the last valid value.
+    #[test]
+    fn newval_nan_with_finite_oldval_fires() {
+        assert!(check_deadband(f64::NAN, 10.0, 1.0));
+    }
+
+    /// C path case 2 (recGbl.c:355): exactly one infinite, the other
+    /// finite — fire.
+    #[test]
+    fn one_finite_one_infinite_fires() {
+        assert!(check_deadband(f64::INFINITY, 10.0, 1.0));
+        assert!(check_deadband(10.0, f64::INFINITY, 1.0));
+        assert!(check_deadband(f64::NEG_INFINITY, 10.0, 1.0));
+    }
+
+    /// C path case 3 (recGbl.c:360-362): both infinite with opposite
+    /// signs — fire.
+    #[test]
+    fn opposite_signed_infinities_fire() {
+        assert!(check_deadband(f64::INFINITY, f64::NEG_INFINITY, 1.0));
+        assert!(check_deadband(f64::NEG_INFINITY, f64::INFINITY, 1.0));
+    }
+
+    /// Same-signed infinity → no fire (C path leaves `delta = 0`,
+    /// `0 > deadband` is false for any non-negative deadband).
+    #[test]
+    fn same_signed_infinity_does_not_fire() {
+        assert!(!check_deadband(f64::INFINITY, f64::INFINITY, 1.0));
+        assert!(!check_deadband(f64::NEG_INFINITY, f64::NEG_INFINITY, 1.0));
     }
 }

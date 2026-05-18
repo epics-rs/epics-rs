@@ -65,11 +65,16 @@ fn convert_and_serialize(native: DbFieldType, value: &EpicsValue) -> CaResult<Ve
 /// RISC alignment padding bytes required between metadata header and value.
 fn sts_pad(native: DbFieldType) -> &'static [u8] {
     match native {
-        // status(2)+severity(2) = 4 → short/enum need 0 pad, char needs 1 pad byte
+        // status(2)+severity(2) = 4 → short/enum need 0 pad.
+        // `dbr_sts_char` (db_access.h:218-223): `dbr_char_t RISC_pad`
+        // (epicsInt8, 1 byte) between severity and value.
         DbFieldType::Char => &[0],
-        // double needs 2 pad bytes to reach 8-byte alignment: sts(4)+pad(2) = 6? No.
-        // C struct: sts_double has RISC_pad (dbr_short_t) between severity and value
-        DbFieldType::Double => &[0, 0],
+        // `dbr_sts_double` (db_access.h:233-238): `dbr_long_t RISC_pad`
+        // (epicsInt32, **4 bytes** — `db_access.h:45 typedef epicsInt32
+        // dbr_long_t`) between severity and value. Layout is
+        // status(2)+severity(2)+RISC_pad(4)+value(8) → value at offset 8.
+        // Int64 is served over CA as DBR_DOUBLE so it shares the pad.
+        DbFieldType::Double | DbFieldType::Int64 => &[0, 0, 0, 0],
         _ => &[],
     }
 }
@@ -581,6 +586,33 @@ pub fn decode_dbr(dbr_type: u16, data: &[u8], count: usize) -> CaResult<Snapshot
         snap.class_name = Some(name);
         return Ok(snap);
     }
+    // DBR_STSACK_STRING (37): alarm-acknowledge string. Layout per
+    // `dbr_stsack_string` (db_access.h:184-190):
+    //   status(2) severity(2) ackt(2) acks(2) value(40) = 48 bytes.
+    // The inverse of the `encode_dbr` STSACK_STRING arm — without
+    // this the encode/decode pair is asymmetric (M-6).
+    if dbr_type == super::DBR_STSACK_STRING {
+        if data.len() < 48 {
+            return Err(CaError::Protocol(format!(
+                "DBR_STSACK_STRING requires 48-byte payload, got {}",
+                data.len()
+            )));
+        }
+        let status = read_u16(data, 0)?;
+        let severity = read_u16(data, 2)?;
+        let ackt = read_u16(data, 4)?;
+        let acks = read_u16(data, 6)?;
+        let value = read_string(data, 8, 40);
+        let mut snap = Snapshot::new(
+            EpicsValue::String(value),
+            status,
+            severity,
+            SystemTime::UNIX_EPOCH,
+        );
+        snap.alarm.ackt = Some(ackt);
+        snap.alarm.acks = Some(acks);
+        return Ok(snap);
+    }
     let native = super::native_type_for_dbr(dbr_type)?;
     match dbr_type {
         0..=6 => {
@@ -843,4 +875,118 @@ fn decode_enum_metadata(data: &[u8], off: usize) -> CaResult<(EnumInfo, usize)> 
         pos += MAX_ENUM_STRING_SIZE;
     }
     Ok((EnumInfo { strings }, pos))
+}
+
+#[cfg(test)]
+mod wire_format_tests {
+    use super::*;
+
+    /// C-1: `DBR_STS_DOUBLE` (type 13) wire layout is
+    /// `status(2) + severity(2) + RISC_pad(4) + value(8)` — the
+    /// `RISC_pad` is `dbr_long_t` (epicsInt32, 4 bytes) per
+    /// `db_access.h:233-238`. Total 16 bytes, value at offset 8.
+    #[test]
+    fn sts_double_value_at_offset_8() {
+        let v = EpicsValue::Double(3.5);
+        let buf = serialize_dbr(
+            super::super::DBR_STS_DOUBLE,
+            &v,
+            1,
+            2,
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(
+            buf.len(),
+            16,
+            "STS_DOUBLE must be 16 bytes (4 meta + 4 pad + 8 value)"
+        );
+        // status(2) + severity(2)
+        assert_eq!(&buf[0..2], &1u16.to_be_bytes());
+        assert_eq!(&buf[2..4], &2u16.to_be_bytes());
+        // RISC_pad(4) — all zero
+        assert_eq!(&buf[4..8], &[0, 0, 0, 0]);
+        // value(8) at offset 8
+        assert_eq!(&buf[8..16], &3.5f64.to_be_bytes());
+    }
+
+    /// C-1: STS_DOUBLE encode→decode round-trips with the 4-byte pad.
+    #[test]
+    fn sts_double_round_trip() {
+        let v = EpicsValue::Double(-12.75);
+        let buf = serialize_dbr(
+            super::super::DBR_STS_DOUBLE,
+            &v,
+            7,
+            3,
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        let snap = decode_dbr(super::super::DBR_STS_DOUBLE, &buf, 1).unwrap();
+        assert_eq!(snap.value, EpicsValue::Double(-12.75));
+        assert_eq!(snap.alarm.status, 7);
+        assert_eq!(snap.alarm.severity, 3);
+    }
+
+    /// C-1 cross-check: STS_CHAR keeps its 1-byte `RISC_pad`
+    /// (`dbr_sts_char`, db_access.h:218-223) — value at offset 5.
+    #[test]
+    fn sts_char_value_at_offset_5() {
+        let v = EpicsValue::Char(0x41);
+        let buf =
+            serialize_dbr(super::super::DBR_STS_CHAR, &v, 0, 0, SystemTime::UNIX_EPOCH).unwrap();
+        assert_eq!(
+            buf.len(),
+            6,
+            "STS_CHAR must be 6 bytes (4 meta + 1 pad + 1 value)"
+        );
+        assert_eq!(buf[4], 0, "RISC_pad");
+        assert_eq!(buf[5], 0x41, "value at offset 5");
+    }
+
+    /// STS_SHORT has no RISC pad — value immediately after the
+    /// 4-byte status/severity header (`dbr_sts_short`).
+    #[test]
+    fn sts_short_no_pad() {
+        let v = EpicsValue::Short(0x1234);
+        let buf = serialize_dbr(
+            super::super::DBR_STS_SHORT,
+            &v,
+            0,
+            0,
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 6, "STS_SHORT is 4 meta + 2 value, no pad");
+        assert_eq!(&buf[4..6], &0x1234i16.to_be_bytes());
+    }
+
+    /// M-6: `DBR_STSACK_STRING` (37) must decode, not just encode.
+    /// Layout: status(2) severity(2) ackt(2) acks(2) value(40).
+    #[test]
+    fn stsack_string_decodes() {
+        let mut buf = Vec::with_capacity(48);
+        buf.extend_from_slice(&5u16.to_be_bytes()); // status
+        buf.extend_from_slice(&2u16.to_be_bytes()); // severity
+        buf.extend_from_slice(&1u16.to_be_bytes()); // ackt
+        buf.extend_from_slice(&3u16.to_be_bytes()); // acks
+        let mut value = [0u8; 40];
+        value[..5].copy_from_slice(b"HIHI\0");
+        buf.extend_from_slice(&value);
+        assert_eq!(buf.len(), 48);
+
+        let snap = decode_dbr(super::super::DBR_STSACK_STRING, &buf, 1).unwrap();
+        assert_eq!(snap.value, EpicsValue::String("HIHI".into()));
+        assert_eq!(snap.alarm.status, 5);
+        assert_eq!(snap.alarm.severity, 2);
+        assert_eq!(snap.alarm.ackt, Some(1));
+        assert_eq!(snap.alarm.acks, Some(3));
+    }
+
+    /// A short STSACK_STRING payload is a malformed frame, rejected.
+    #[test]
+    fn stsack_string_short_payload_errors() {
+        let buf = [0u8; 16];
+        assert!(decode_dbr(super::super::DBR_STSACK_STRING, &buf, 1).is_err());
+    }
 }

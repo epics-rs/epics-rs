@@ -22,7 +22,7 @@ use tracing::debug;
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
 
-use super::decode::{SearchResponse, decode_search_response, try_parse_frame};
+use super::decode::{PeerRole, SearchResponse, decode_search_response, try_parse_frame_role};
 
 /// Parse `EPICS_PVA_ADDR_LIST` style strings into a list of IPs/SocketAddrs.
 pub fn parse_addr_list(env: &str) -> Vec<SocketAddr> {
@@ -178,7 +178,9 @@ pub async fn search(pv_name: &str, total_timeout: Duration) -> PvaResult<SocketA
         let mut buf = vec![0u8; 1500];
         match timeout(wait, socket.recv_from(&mut buf)).await {
             Ok(Ok((n, peer))) => {
-                if let Ok(Some((frame, _))) = try_parse_frame(&buf[..n]) {
+                // UDP SearchResponse/Beacon are server-originated — enforce
+                // the direction bit (pvxs `conn.cpp:160` parity).
+                if let Ok(Some((frame, _))) = try_parse_frame_role(&buf[..n], PeerRole::Client) {
                     if let Ok(resp) = decode_search_response(&frame) {
                         if resp.found && resp.cids.contains(&search_id) {
                             return Ok(rewrite_loopback_target(&resp, peer));

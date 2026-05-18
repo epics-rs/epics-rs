@@ -89,6 +89,9 @@ pub struct ProcessConfig {
     pub save_background: bool,
     /// One-shot flag: save current input as flat field on next process().
     pub save_flat_field: bool,
+    /// One-shot flag: compute offset/scale automatically from the next input
+    /// array (C++ `NDPluginProcessAutoOffsetScale`). Cleared after it runs.
+    pub auto_offset_scale_pending: bool,
     /// Read-only status: whether a valid background is loaded.
     pub valid_background: bool,
     /// Read-only status: whether a valid flat field is loaded.
@@ -115,6 +118,7 @@ impl Default for ProcessConfig {
             output_type: None,
             save_background: false,
             save_flat_field: false,
+            auto_offset_scale_pending: false,
             valid_background: false,
             valid_flat_field: false,
         }
@@ -317,7 +321,12 @@ impl ProcessState {
     }
 
     /// Process an array through the configured pipeline.
-    pub fn process(&mut self, src: &NDArray) -> NDArray {
+    /// Process one input array.
+    ///
+    /// Returns `Some(output)` for a normal frame, or `None` when the frame is
+    /// suppressed by the recursive-filter `filter_callbacks` setting (C++ sets
+    /// `doCallbacks = 0` and the frame is dropped — nothing goes downstream).
+    pub fn process(&mut self, src: &NDArray) -> Option<NDArray> {
         let n = src.data.len();
         let mut values = vec![0.0f64; n];
         for i in 0..n {
@@ -332,6 +341,13 @@ impl ProcessState {
         if self.config.save_flat_field {
             self.save_flat_field(src);
             self.config.save_flat_field = false;
+        }
+        // 0b. Auto offset/scale (one-shot): compute offset/scale from this
+        // input array and enable offset/scale + clipping (C++ writeInt32 for
+        // NDPluginProcessAutoOffsetScale).
+        if self.config.auto_offset_scale_pending {
+            self.auto_offset_scale(src);
+            self.config.auto_offset_scale_pending = false;
         }
 
         // Stages 1-4: element-wise operations (background, flat field, offset+scale, clipping)
@@ -466,8 +482,14 @@ impl ProcessState {
             let o_offset = fc.o_offset;
             let f_offset = fc.f_offset;
 
-            // C++: data[i] = oOffset + O1*filter[i] + O2*data[i]
-            //      filter[i] = fOffset + F1*filter[i] + F2*data[i]
+            // C++ NDPluginProcess.cpp:220-227 doProcess:
+            //   newData   = oOffset + O1*filter[i] + O2*data[i];
+            //   newFilter = fOffset + F1*filter[i] + F2*data[i];
+            //   data[i]   = newData;
+            //   filter[i] = newFilter;
+            // Both newData AND newFilter are computed from the ORIGINAL
+            // data[i]; data[i] = newData is assigned only afterward. So the
+            // filter-state update must use the original input, not new_data.
             for i in 0..n {
                 let new_data = o_offset + o1 * filter[i] + o2 * values[i];
                 let new_filter = f_offset + f1 * filter[i] + f2 * values[i];
@@ -475,11 +497,12 @@ impl ProcessState {
                 filter[i] = new_filter;
             }
 
-            // Suppress output if filterCallbacks is set and we haven't reached numFilter
+            // Suppress output if filterCallbacks is set and we haven't reached
+            // numFilter. C++ sets doCallbacks = 0 and does NOT call
+            // endProcessCallbacks — the frame is dropped, nothing goes
+            // downstream (the unprocessed input is NOT forwarded).
             if fc.filter_callbacks > 0 && self.num_filtered != fc.num_filter {
-                // C++: doCallbacks = 0 — skip output
-                // Return the input unchanged (no processing output)
-                return src.clone();
+                return None;
             }
         }
 
@@ -495,7 +518,7 @@ impl ProcessState {
         arr.unique_id = src.unique_id;
         arr.timestamp = src.timestamp;
         arr.attributes = src.attributes.clone();
-        arr
+        Some(arr)
     }
 }
 
@@ -567,7 +590,12 @@ impl NDPluginProcess for ProcessProcessor {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 
         let out = self.state.process(array);
-        let mut result = ProcessResult::arrays(vec![Arc::new(out)]);
+        // A suppressed frame (filter_callbacks) produces no output array but
+        // still publishes readback params.
+        let mut result = match out {
+            Some(arr) => ProcessResult::arrays(vec![Arc::new(arr)]),
+            None => ProcessResult::sink(vec![]),
+        };
 
         // Push readback params
         if let Some(idx) = self.params.valid_background {
@@ -736,13 +764,14 @@ impl NDPluginProcess for ProcessProcessor {
             s.config.enable_offset_scale = params.value.as_i32() != 0;
         } else if Some(reason) == p.auto_offset_scale {
             if params.value.as_i32() != 0 {
-                if let Some(ref arr) = self.state.background {
-                    // Use background to estimate range if available
-                    let _ = arr; // auto_offset_scale needs an NDArray, deferred to process_array
+                // Arm the one-shot: auto_offset_scale() runs on the next
+                // process() call (it needs an NDArray to read the data
+                // range). C++ resets NDPluginProcessAutoOffsetScale to 0
+                // after handling, so echo a 0 readback here.
+                s.config.auto_offset_scale_pending = true;
+                if let Some(idx) = p.auto_offset_scale {
+                    updates.push(ParamUpdate::int32(idx, 0));
                 }
-                // Will be applied when next array arrives — set flag
-                // C ADCore applies auto-calc immediately on the latest array.
-                // We apply it as a one-shot in process_array via the flag.
             }
         } else if Some(reason) == p.offset {
             s.config.offset = params.value.as_f64();
@@ -873,7 +902,7 @@ mod tests {
         });
         state.save_background(&bg_arr);
 
-        let result = state.process(&input);
+        let result = state.process(&input).unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             assert_eq!(v[0], 5);
             assert_eq!(v[1], 5);
@@ -893,7 +922,7 @@ mod tests {
         });
         state.save_flat_field(&ff_arr);
 
-        let result = state.process(&input);
+        let result = state.process(&input).unwrap();
         // After flat field: all values should be normalized to the mean
         if let NDDataBuffer::U8(ref v) = result.data {
             // ff_mean ~= 116.67, so all values should be ~= 116
@@ -913,7 +942,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = state.process(&input);
+        let result = state.process(&input).unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             // C++: value = (value + offset) * scale
             assert_eq!(v[0], 30); // (10+5)*2
@@ -935,7 +964,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = state.process(&input);
+        let result = state.process(&input).unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             assert_eq!(v[0], 10); // clipped up
             assert_eq!(v[1], 50); // unchanged
@@ -965,17 +994,25 @@ mod tests {
             ..Default::default()
         });
 
-        // Frame 0: reset: filter=100
-        // N=1: F1=0.5, F2=0.5, O1=1
-        // data = 0+1*100+0*100 = 100, filter = 0+0.5*100+0.5*100 = 100
+        // C++ NDPluginProcess.cpp:220-227 doProcess recurrence:
+        //   newData   = oOffset + O1*filter[i] + O2*data[i];
+        //   newFilter = fOffset + F1*filter[i] + F2*data[i];  // ORIGINAL data[i]
+        //   data[i]   = newData;
+        //   filter[i] = newFilter;
+        //
+        // Frame 0: reset: filter = 0 + 0*100 + 1*100 = 100
+        // N=1: F1=0.5, F2=0.5, O1=1, O2=0
+        // data   = 0 + 1*100 + 0*100 = 100
+        // filter = 0 + 0.5*100 + 0.5*100(orig data) = 100
         let _ = state.process(&input1);
 
         // Frame 1: data=0, filter=100
-        // N=2: F1=0.5, F2=0.5, O1=1
-        // data = 0+1*100+0*0 = 100, filter = 0+0.5*100+0.5*0 = 50
-        let result = state.process(&input2);
+        // N=2: F1=0.5, F2=0.5, O1=1, O2=0
+        // data   = 0 + 1*100 + 0*0 = 100
+        // filter = 0 + 0.5*100 + 0.5*0(orig data) = 50
+        let result = state.process(&input2).unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
-            // Output is filter value BEFORE this update: data = O1*filter = 1*100 = 100
+            // Output is data = O1*filter = 1*100 = 100
             assert_eq!(v[0], 100);
             assert_eq!(v[1], 100);
         }
@@ -989,7 +1026,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = state.process(&input);
+        let result = state.process(&input).unwrap();
         assert_eq!(result.data.data_type(), NDDataType::Float64);
     }
 
@@ -1032,15 +1069,18 @@ mod tests {
             ..Default::default()
         });
 
-        // Frame 0 (reset): filter = 0 + 0*filter + 1*data = 100
-        // N=1: F1=1*(1+0/1)=1, F2=1*(1+0/1)=1 → filter=0+1*100+1*100=200? No.
-        // Actually reset first: filter = rOffset + rc1*filter + rc2*data = 0 + 0*100 + 1*100 = 100
-        // Then N increments to 1, then normal path:
+        // C++ NDPluginProcess.cpp:220-227 doProcess (newFilter uses ORIGINAL data[i]):
+        //   newData   = oOffset + O1*filter[i] + O2*data[i];
+        //   newFilter = fOffset + F1*filter[i] + F2*data[i];
+        //   data[i]   = newData; filter[i] = newFilter;
+        //
+        // Frame 0: reset first: filter = rOffset + rc1*filter + rc2*data
+        //          = 0 + 0*100 + 1*100 = 100. Then N increments to 1, normal path:
         // F1=fScale*(fc1+fc2/N)=1*(1+0/1)=1, F2=fScale*(fc3+fc4/N)=1*(1+0/1)=1
         // O1=oScale*(oc1+oc2/N)=1*(1+0/1)=1, O2=oScale*(oc3+oc4/N)=1*(0+0/1)=0
-        // data = oOffset + O1*filter + O2*data = 0 + 1*100 + 0*100 = 100
-        // filter = fOffset + F1*filter + F2*data = 0 + 1*100 + 1*100 = 200
-        let r0 = state.process(&make_f64_array(&[100.0]));
+        // data   = oOffset + O1*filter + O2*data = 0 + 1*100 + 0*100 = 100
+        // filter = fOffset + F1*filter + F2*data(orig=100) = 0 + 1*100 + 1*100 = 200
+        let r0 = state.process(&make_f64_array(&[100.0])).unwrap();
         let v0 = r0.data.get_as_f64(0).unwrap();
         assert!((v0 - 100.0).abs() < 1e-9, "frame 0: got {v0}");
 
@@ -1048,9 +1088,9 @@ mod tests {
         // N increments to 2
         // F1=1*(1+0/2)=1, F2=1*(1+0/2)=1
         // O1=1*(1+0/2)=1, O2=0
-        // data = 0+1*200+0*100 = 200
-        // filter = 0+1*200+1*100 = 300
-        let r1 = state.process(&make_f64_array(&[100.0]));
+        // data   = 0 + 1*200 + 0*100 = 200
+        // filter = 0 + 1*200 + 1*data(orig=100) = 300
+        let r1 = state.process(&make_f64_array(&[100.0])).unwrap();
         let v1 = r1.data.get_as_f64(0).unwrap();
         assert!((v1 - 200.0).abs() < 1e-9, "frame 1: got {v1}");
     }
@@ -1072,39 +1112,33 @@ mod tests {
             ..Default::default()
         });
 
-        // Frame 0 (reset): filter=100
-        // N=1: O1=oScale*(0+1/1)=1, O2=0
-        // data = 0 + 1*100 + 0 = 100
-        // filter = 0 + 1*100 + 1*100 = 200
-        let r0 = state.process(&make_f64_array(&[100.0]));
+        // C++ NDPluginProcess.cpp:220-227 doProcess (newFilter uses ORIGINAL data[i]):
+        //   newData   = oOffset + O1*filter[i] + O2*data[i];
+        //   newFilter = fOffset + F1*filter[i] + F2*data[i];
+        //   data[i]   = newData; filter[i] = newFilter;
+        //
+        // Frame 0 (reset): filter=100. N=1: O1=oScale*(0+1/1)=1, O2=0
+        // data   = 0 + 1*100 + 0 = 100
+        // filter = 0 + 1*100 + 1*100(orig data) = 200
+        let r0 = state.process(&make_f64_array(&[100.0])).unwrap();
         let v0 = r0.data.get_as_f64(0).unwrap();
         assert!((v0 - 100.0).abs() < 1e-9, "frame 0: got {v0}");
 
         // Frame 1: data=200, filter=200
         // N=2: O1=oScale*(0+1/2)=0.5, O2=0
-        // data = 0 + 0.5*200 + 0 = 100
-        // filter = 0 + 1*200 + 1*200 = 400
-        let r1 = state.process(&make_f64_array(&[200.0]));
+        // data   = 0 + 0.5*200 + 0 = 100
+        // filter = 0 + 1*200 + 1*200(orig data) = 400
+        let r1 = state.process(&make_f64_array(&[200.0])).unwrap();
         let v1 = r1.data.get_as_f64(0).unwrap();
         assert!((v1 - 100.0).abs() < 1e-9, "frame 1: got {v1}");
 
         // Frame 2: data=300, filter=400
         // N=3: O1=1/3, O2=0
-        // data = 0 + (1/3)*400 + 0 = 133.33...  but wait filter=400
-        // Actually filter = 0 + 1*400 + 1*300 = 700
-        // data = 0 + (1/3)*400 + 0 = 133.33
-        // Hmm, the output should be sum/N. After frame 2: sum=100+200+300=600, N=3, avg=200
-        // But filter tracks accumulated sum: after reset(100), then +200=300? No.
-        // Let me re-trace:
-        //   Reset: filter=100. N=1.
-        //   Frame 0 normal: filter = 0+1*100+1*100 = 200. data = 0+1*100 = 100.
-        //   Frame 1: filter = 0+1*200+1*200 = 400. N=2. data = 0+0.5*200 = 100.
-        //   Frame 2: filter = 0+1*400+1*300 = 700. N=3. data = 0+(1/3)*400 = 133.33
-        // The issue is the filter accumulates filter+data not just sum of inputs.
-        // This matches C++ behavior where the filter buffer interacts with data.
-        let r2 = state.process(&make_f64_array(&[300.0]));
+        // data   = 0 + (1/3)*400 + 0 = 400/3
+        // filter = 0 + 1*400 + 1*300(orig data) = 700
+        let r2 = state.process(&make_f64_array(&[300.0])).unwrap();
         let v2 = r2.data.get_as_f64(0).unwrap();
-        let expected = 400.0 / 3.0; // ~133.33
+        let expected = 400.0 / 3.0;
         assert!((v2 - expected).abs() < 1e-9, "frame 2: got {v2}");
     }
 
@@ -1127,28 +1161,34 @@ mod tests {
             ..Default::default()
         });
 
+        // C++ NDPluginProcess.cpp:220-227 doProcess (newFilter uses ORIGINAL data[i]):
+        //   newData   = oOffset + O1*filter[i] + O2*data[i];
+        //   newFilter = fOffset + F1*filter[i] + F2*data[i];
+        //   data[i]   = newData; filter[i] = newFilter;
+        // With O2=0, newData == O1*filter == filter, and the filter update
+        // newFilter = F1*filter + F2*data(orig) tracks the original input.
+        //
         // Frame 0: reset filter=100, N=1
-        // F1=1*(1-1/1)=0, F2=1*(0+1/1)=1
-        // O1=1*(1+0/1)=1
-        // data = 0 + 1*100 + 0*100 = 100
-        // filter = 0 + 0*100 + 1*100 = 100
-        let r0 = state.process(&make_f64_array(&[100.0]));
+        // F1=1*(1-1/1)=0, F2=1*(0+1/1)=1, O1=1*(1+0/1)=1
+        // data   = 0 + 1*100 + 0*100 = 100
+        // filter = 0 + 0*100 + 1*100(orig data) = 100
+        let r0 = state.process(&make_f64_array(&[100.0])).unwrap();
         let v0 = r0.data.get_as_f64(0).unwrap();
         assert!((v0 - 100.0).abs() < 1e-9, "frame 0: got {v0}");
 
         // Frame 1: data=200, filter=100, N=2
         // F1=(2-1)/2=0.5, F2=1/2=0.5
-        // data = 0 + 1*100 + 0*200 = 100
-        // filter = 0 + 0.5*100 + 0.5*200 = 150
-        let r1 = state.process(&make_f64_array(&[200.0]));
+        // data   = 0 + 1*100 + 0*200 = 100
+        // filter = 0 + 0.5*100 + 0.5*200(orig data) = 150
+        let r1 = state.process(&make_f64_array(&[200.0])).unwrap();
         let v1 = r1.data.get_as_f64(0).unwrap();
         assert!((v1 - 100.0).abs() < 1e-9, "frame 1: got {v1}");
 
         // Frame 2: data=300, filter=150, N=3
-        // F1=2/3, F2=1/3
-        // data = 1*150 = 150
-        // filter = (2/3)*150 + (1/3)*300 = 100+100 = 200
-        let r2 = state.process(&make_f64_array(&[300.0]));
+        // F1=2/3, F2=1/3, O1=1
+        // data   = 0 + 1*150 + 0*300 = 150
+        // filter = (2/3)*150 + (1/3)*300(orig data) = 100 + 100 = 200
+        let r2 = state.process(&make_f64_array(&[300.0])).unwrap();
         let v2 = r2.data.get_as_f64(0).unwrap();
         assert!((v2 - 150.0).abs() < 1e-9, "frame 2: got {v2}");
     }
@@ -1283,19 +1323,24 @@ mod tests {
             ..Default::default()
         });
 
+        // C++ NDPluginProcess.cpp:220-227 doProcess (newFilter uses ORIGINAL data[i]):
+        //   newData   = oOffset + O1*filter[i] + O2*data[i];
+        //   newFilter = fOffset + F1*filter[i] + F2*data[i];
+        //   data[i]   = newData; filter[i] = newFilter;
+        //
         // Frame 0: reset: filter = 0 + 0*filter + 1*50 = 50
         // N=1: F1=2*(0+0/1)=0, F2=2*(1+0/1)=2, O1=3*(1+0/1)=3, O2=0
-        // data = 5 + 3*50 + 0 = 155
-        // filter = 10 + 0*50 + 2*50 = 110
-        let r0 = state.process(&make_f64_array(&[50.0]));
+        // data   = 5 + 3*50 + 0 = 155
+        // filter = 10 + 0*50 + 2*50(orig data) = 110
+        let r0 = state.process(&make_f64_array(&[50.0])).unwrap();
         let v0 = r0.data.get_as_f64(0).unwrap();
         assert!((v0 - 155.0).abs() < 1e-9, "frame 0: got {v0}");
 
         // Frame 1: data=20, filter=110
         // N=2: F1=0, F2=2, O1=3, O2=0
-        // data = 5 + 3*110 = 335
-        // filter = 10 + 0 + 2*20 = 50
-        let r1 = state.process(&make_f64_array(&[20.0]));
+        // data   = 5 + 3*110 + 0 = 335
+        // filter = 10 + 0 + 2*20(orig data) = 50
+        let r1 = state.process(&make_f64_array(&[20.0])).unwrap();
         let v1 = r1.data.get_as_f64(0).unwrap();
         assert!((v1 - 335.0).abs() < 1e-9, "frame 1: got {v1}");
     }
@@ -1329,5 +1374,121 @@ mod tests {
         // Next frame should act as first frame (reset mode)
         let _ = state.process(&make_f64_array(&[200.0]));
         assert_eq!(state.num_filtered, 1);
+    }
+
+    #[test]
+    fn test_auto_offset_scale_applied() {
+        // Regression: arming auto_offset_scale_pending must run
+        // auto_offset_scale() on the next process() call.
+        let mut state = ProcessState::new(ProcessConfig {
+            output_type: Some(NDDataType::UInt8),
+            ..Default::default()
+        });
+        state.config.auto_offset_scale_pending = true;
+
+        // input range [10, 30] => offset=-10, scale=255/20=12.75, clipping on.
+        let out = state.process(&make_f64_array(&[10.0, 20.0, 30.0])).unwrap();
+        // The pending flag is consumed.
+        assert!(!state.config.auto_offset_scale_pending);
+        // offset/scale were computed and enabled.
+        assert!(state.config.enable_offset_scale);
+        assert!((state.config.offset - (-10.0)).abs() < 1e-9);
+        assert!((state.config.scale - 255.0 / 20.0).abs() < 1e-9);
+        // value = (value + offset) * scale, clipped to [0, 255].
+        if let NDDataBuffer::U8(v) = &out.data {
+            assert_eq!(v[0], 0); // (10-10)*12.75 = 0
+            assert_eq!(v[2], 255); // (30-10)*12.75 = 255
+        } else {
+            panic!("expected u8 output");
+        }
+    }
+
+    #[test]
+    fn test_filter_callbacks_drops_suppressed_frame() {
+        // Regression: with filter_callbacks set, a frame that has not yet
+        // reached num_filter is dropped (process() returns None), not
+        // forwarded as the raw input.
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_filter: true,
+            filter: FilterConfig {
+                num_filter: 3,
+                filter_callbacks: 1,
+                fc: [1.0, 0.0, 1.0, 0.0],
+                oc: [0.0, 1.0, 0.0, 0.0],
+                rc: [0.0, 1.0],
+                ..Default::default()
+            },
+            output_type: Some(NDDataType::Float64),
+            ..Default::default()
+        });
+
+        // Frames 1 and 2 are below num_filter => suppressed (None).
+        assert!(state.process(&make_f64_array(&[100.0])).is_none());
+        assert!(state.process(&make_f64_array(&[100.0])).is_none());
+        // Frame 3 reaches num_filter => output produced.
+        assert!(state.process(&make_f64_array(&[100.0])).is_some());
+    }
+
+    #[test]
+    fn test_filter_recurrence_matches_cpp() {
+        // Regression: the filter-state update must read the ORIGINAL input
+        // data[i], not the just-updated newData. C++ computes both newData
+        // and newFilter from data[i] before assigning data[i] = newData.
+        //
+        // C++ NDPluginProcess.cpp:220-227 doProcess:
+        //   newData   = oOffset + O1*filter[i] + O2*data[i];
+        //   newFilter = fOffset + F1*filter[i] + F2*data[i];  // ORIGINAL data[i]
+        //   data[i]   = newData;
+        //   filter[i] = newFilter;
+        //
+        // Average preset: fc=[1,0,1,0], oc=[0,1,0,0], rc=[0,1].
+        // O1=1/N, O2=0, F1=1, F2=1, all offsets/scales default (0/1).
+        // With O2=0 and oc default, the C++ recurrence is:
+        //   data[k]   = filter / N
+        //   filter'   = filter + input   (F2 multiplies the ORIGINAL input)
+        //
+        // Hand-computed reference (inputs 100, 200, 300, 400):
+        //   reset: filter = 100, N = 1
+        //   k0: N=1  data = 100/1   = 100      filter = 100 + 100 = 200
+        //   k1: N=2  data = 200/2   = 100      filter = 200 + 200 = 400
+        //   k2: N=3  data = 400/3   = 133.333  filter = 400 + 300 = 700
+        //   k3: N=4  data = 700/4   = 175      filter = 700 + 400 = 1100
+        //
+        // The STALE/new-data variant (the 650038bb regression) computed
+        //   filter' = filter + newData
+        // giving filter = 100,200,300,400 and data = 100,100,100,100 —
+        // diverging from C++ from frame 1 onward.
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_filter: true,
+            filter: FilterConfig {
+                num_filter: 100,
+                fc: [1.0, 0.0, 1.0, 0.0],
+                oc: [0.0, 1.0, 0.0, 0.0],
+                rc: [0.0, 1.0],
+                ..Default::default()
+            },
+            output_type: Some(NDDataType::Float64),
+            ..Default::default()
+        });
+
+        let inputs = [100.0, 200.0, 300.0, 400.0];
+        let expected_data = [100.0, 100.0, 400.0 / 3.0, 175.0];
+        let expected_filter = [200.0, 400.0, 700.0, 1100.0];
+
+        for k in 0..inputs.len() {
+            let r = state.process(&make_f64_array(&[inputs[k]])).unwrap();
+            let v = r.data.get_as_f64(0).unwrap();
+            assert!(
+                (v - expected_data[k]).abs() < 1e-9,
+                "frame {k}: data got {v}, expected {}",
+                expected_data[k]
+            );
+            let fs = state.filter_state.as_ref().unwrap()[0];
+            assert!(
+                (fs - expected_filter[k]).abs() < 1e-9,
+                "frame {k}: filter got {fs}, expected {}",
+                expected_filter[k]
+            );
+        }
     }
 }

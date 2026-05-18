@@ -69,15 +69,12 @@ impl SseqRecord {
         match self.selm {
             0 => true, // All
             1 => {
-                // Specified — SELN selects which step (1-based)
+                // Specified — SELN is the 1-based step number. The 10
+                // steps are numbered 1..=10 (synApps sseq DLY1..DLYA),
+                // so step number `seln` selects index `seln - 1`.
+                // `seln == 0` or `seln > 10` selects no step.
                 let sel = self.seln as usize;
-                if sel >= 1 && sel <= 9 {
-                    step_idx == sel - 1
-                } else if sel == 10 {
-                    step_idx == 9
-                } else {
-                    false
-                }
+                (1..=NUM_STEPS).contains(&sel) && step_idx == sel - 1
             }
             2 => {
                 // Mask — SELN is a bitmask
@@ -437,8 +434,17 @@ impl Record for SseqRecord {
         self.busy = 1;
         // For each selected step, prepare the output value.
         // DOL reads are handled by pre_process_actions().
-        // LNK writes are handled by the framework via multi_output_links().
-        // The step's DOV is used as the output value for numeric outputs.
+        //
+        // SINGLE-OWNER INVARIANT: `LNKn` dispatch (per-step value
+        // write + target forward-link processing) is owned solely by
+        // `PvDatabase::dispatch_multi_output`'s `MultiOut::Sseq` arm —
+        // the only path with SELL/SELM/SELN selection, DOLn input
+        // fetch, and STR/DO value precedence. `SseqRecord` therefore
+        // MUST NOT implement `Record::multi_output_links`: doing so
+        // would make the generic `multi_output_links` block in
+        // `processing.rs` §4.6 dispatch every `LNKn` a second time per
+        // cycle. C `sseqRecord.c::processNextLink` drives each step's
+        // `LNKn` via `dbPutLink` exactly once.
         self.busy = 0;
         Ok(ProcessOutcome::complete())
     }
@@ -471,22 +477,11 @@ impl Record for SseqRecord {
         actions
     }
 
-    fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
-        // Return all possible output links; the framework writes non-empty ones.
-        static LINKS: [(&str, &str); NUM_STEPS] = [
-            ("LNK1", "DO1"),
-            ("LNK2", "DO2"),
-            ("LNK3", "DO3"),
-            ("LNK4", "DO4"),
-            ("LNK5", "DO5"),
-            ("LNK6", "DO6"),
-            ("LNK7", "DO7"),
-            ("LNK8", "DO8"),
-            ("LNK9", "DO9"),
-            ("LNKA", "DOA"),
-        ];
-        &LINKS
-    }
+    // NOTE: `SseqRecord` deliberately does NOT implement
+    // `Record::multi_output_links`. Sseq `LNKn` dispatch is owned
+    // solely by `dispatch_multi_output`'s `MultiOut::Sseq` arm — see
+    // the single-owner invariant in `process()` above. Re-adding the
+    // override here would re-introduce double LNKn writes per cycle.
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {

@@ -15,7 +15,7 @@ use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
 /// JPEG file writer using `jpeg-encoder` for encoding and `jpeg-decoder` for decoding.
 pub struct JpegWriter {
     current_path: Option<PathBuf>,
-    quality: u8,
+    pub(crate) quality: u8,
 }
 
 impl JpegWriter {
@@ -198,7 +198,12 @@ impl NDPluginProcess for JpegFileProcessor {
     ) -> asyn_rs::error::AsynResult<()> {
         self.ctrl.register_params(base)?;
         use asyn_rs::param::ParamType;
-        self.jpeg_quality_idx = Some(base.create_param("JPEG_QUALITY", ParamType::Int32)?);
+        let idx = base.create_param("JPEG_QUALITY", ParamType::Int32)?;
+        // Seed the readback PV with the actual encoder default (C++ NDFileJPEG.cpp:327
+        // sets NDFileJPEGQuality default to 50). Without this the PV reads 0 while the
+        // encoder uses its constructed default, so PV and effective quality disagree.
+        base.set_int32_param(idx, 0, i32::from(self.ctrl.writer.quality))?;
+        self.jpeg_quality_idx = Some(idx);
         Ok(())
     }
 
@@ -312,6 +317,24 @@ mod tests {
 
         std::fs::remove_file(&path_high).ok();
         std::fs::remove_file(&path_low).ok();
+    }
+
+    #[test]
+    fn test_default_quality_is_50() {
+        // C++ NDFileJPEG.cpp:327 default quality is 50.
+        assert_eq!(JpegFileProcessor::default().ctrl.writer.quality, 50);
+        assert_eq!(JpegWriter::new(50).quality, 50);
+    }
+
+    #[test]
+    fn test_register_params_seeds_quality_pv() {
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new("jpeg_param_test", 1, PortFlags::default());
+        let mut proc = JpegFileProcessor::new(50);
+        proc.register_params(&mut base).unwrap();
+        let idx = proc.jpeg_quality_idx.unwrap();
+        // Readback PV must equal the encoder's effective quality, not 0.
+        assert_eq!(base.get_int32_param(idx, 0).unwrap(), 50);
     }
 
     #[test]

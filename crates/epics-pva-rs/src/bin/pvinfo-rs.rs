@@ -16,6 +16,11 @@ struct Args {
     /// Wait time in seconds
     #[arg(short = 'w', default_value = "5.0")]
     timeout: f64,
+
+    /// Verbose: also print the server's TLS X.509 credentials
+    /// (mirrors pvxs `pvxinfo -v`).
+    #[arg(short = 'v')]
+    verbose: bool,
 }
 
 #[tokio::main]
@@ -28,8 +33,31 @@ async fn main() {
         if i > 0 {
             println!();
         }
-        match client.pvinfo_full(pv_name).await {
-            Ok((desc, server_addr)) => {
+        match client.pvinfo_full_with_credentials(pv_name).await {
+            Ok((desc, server_addr, cred)) => {
+                // Under -v, print the server's credentials line first,
+                // mirroring pvxs `pvxinfo -v` (`# <Connected::cred>`).
+                // pvxs `operator<<(PeerCredentials)` formats as
+                // `TLS method:authority/account@peer`; the `TLS`
+                // prefix and `authority` segment are omitted when not
+                // applicable.
+                if args.verbose {
+                    match &cred {
+                        Some(c) => {
+                            let authority = if c.authority.is_empty() {
+                                String::new()
+                            } else {
+                                format!(":{}", c.authority)
+                            };
+                            println!("# TLS x509{authority}/{}@{server_addr}", c.account);
+                        }
+                        None => {
+                            // Plain `pva://` TCP — no peer certificate,
+                            // so no X.509 identity to report.
+                            println!("# anonymous/anonymous@{server_addr}");
+                        }
+                    }
+                }
                 println!("{pv_name}");
                 if server_addr.port() != 0 {
                     println!("Server: {server_addr}");

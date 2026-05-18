@@ -38,6 +38,14 @@ use crate::pvdata::{FieldDesc, PvField};
 /// inside the closure and return Ok.
 pub type OnPutFn = Arc<dyn Fn(&SharedPV, PvField) -> Result<(), String> + Send + Sync>;
 
+/// User-provided process handler. Fired by the PVA `PROCESS` wire
+/// command (cmd 16) — processing is triggered with no value payload,
+/// the wire equivalent of an EPICS `dbProcess` / `caput .PROC`.
+/// Returning `Err` makes the server reply with a non-success PROCESS
+/// status. When no handler is installed `process()` is a no-op
+/// success, mirroring a passive record's response to `.PROC`.
+pub type OnProcessFn = Arc<dyn Fn(&SharedPV) -> Result<(), String> + Send + Sync>;
+
 /// User-provided RPC handler. Mirrors pvxs `SharedPV::onRPC`. Handler
 /// receives `(request_desc, request_value)` and returns the response
 /// pair or an error message.
@@ -110,6 +118,9 @@ struct Inner {
     /// Optional user RPC handler; when None RPC returns "not
     /// supported". pvxs `onRPC` parity.
     on_rpc: Option<OnRpcFn>,
+    /// Optional user PROCESS handler; when None `process()` is a
+    /// no-op success (passive-record semantics).
+    on_process: Option<OnProcessFn>,
     /// Optional async RPC handler. Takes precedence over `on_rpc`
     /// when both are set. Used by the `service` framework
     /// (`#[pva_service]`) so dispatch can run on the calling task's
@@ -138,6 +149,7 @@ impl Default for Inner {
             is_open: false,
             on_put: None,
             on_rpc: None,
+            on_process: None,
             on_rpc_async: None,
             on_first_connect: None,
             on_last_disconnect: None,
@@ -267,6 +279,102 @@ impl SharedPV {
         Ok(())
     }
 
+    /// Apply a **BitSet-delta PUT** atomically.
+    ///
+    /// PVA PUT/PUT_GET data frames carry only the changed fields plus
+    /// a changed-BitSet (pvData spec §5.4). Applying such a delta
+    /// requires read-merge-write: read the PV's current "complete"
+    /// value, overlay the marked fields from `delta`, store the
+    /// result. Doing that as a separate `current()` then `put()` on
+    /// the wire layer opens a TOCTOU lost-update window — two
+    /// concurrent partial PUTs with disjoint changed-fields can both
+    /// read the same prior, and the second write silently drops the
+    /// first's fields.
+    ///
+    /// This method performs the read + merge + store under a SINGLE
+    /// acquisition of the inner mutex, so concurrent delta PUTs
+    /// serialize: the second writer's merge sees the first writer's
+    /// stored value as its prior. `desc` is the PV introspection used
+    /// for per-field bit numbering; `changed` is the wire changed-
+    /// BitSet; `delta` is the decoded sparse value (unmarked leaves
+    /// hold type defaults).
+    ///
+    /// For PVs with an [`Self::on_put`] handler, the merge against
+    /// `current()` is still atomic, but the handler then owns any
+    /// further side-effects exactly as it does for [`Self::put`].
+    pub fn put_delta(
+        &self,
+        desc: &FieldDesc,
+        changed: &crate::proto::BitSet,
+        delta: PvField,
+    ) -> Result<(), String> {
+        // Phase 1: under the lock, read prior, merge, and (for the
+        // default no-handler path) store + snapshot subscribers.
+        // `crate::pvdata::encode::fill_unmarked_from_prior` is a pure
+        // function — safe to call while holding the parking_lot mutex.
+        enum Applied {
+            // No on_put handler: value already stored under the lock;
+            // post the merged value to these subscribers.
+            Posted {
+                value: PvField,
+                subscribers: Vec<mpsc::Sender<PvField>>,
+            },
+            // on_put handler installed: run it with the merged value.
+            Handler {
+                handler: OnPutFn,
+                value: PvField,
+            },
+        }
+        let applied = {
+            let mut g = self.inner.lock();
+            if !g.is_open {
+                return Err("SharedPV not open".into());
+            }
+            let merged = match &g.value {
+                Some(prior) => {
+                    crate::pvdata::encode::fill_unmarked_from_prior(desc, changed, 0, delta, prior)
+                }
+                // No prior value yet: the delta is all we have.
+                None => delta,
+            };
+            match g.on_put.clone() {
+                Some(handler) => Applied::Handler {
+                    handler,
+                    value: merged,
+                },
+                None => {
+                    // Store atomically with the read above so a
+                    // concurrent put_delta sees this as its prior.
+                    g.value = Some(merged.clone());
+                    Applied::Posted {
+                        value: merged,
+                        subscribers: g.subscribers.clone(),
+                    }
+                }
+            }
+        };
+        // Phase 2: outside the lock — post to subscribers or run the
+        // user handler (handlers may call back into SharedPV).
+        match applied {
+            Applied::Posted {
+                value,
+                mut subscribers,
+            } => {
+                subscribers.retain(|tx| match tx.try_send(value.clone()) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                });
+                // Reconcile the subscriber set: drop the ones whose
+                // receiver closed. Re-lock briefly; new subscribers
+                // that joined between phase 1 and here are preserved.
+                let mut g = self.inner.lock();
+                g.subscribers.retain(|tx| !tx.is_closed());
+                Ok(())
+            }
+            Applied::Handler { handler, value } => handler(self, value),
+        }
+    }
+
     /// Dispatch an RPC request. Falls back to "RPC not supported" when
     /// no [`Self::on_rpc`] handler has been installed.
     pub fn rpc(
@@ -278,6 +386,21 @@ impl SharedPV {
         match on_rpc {
             Some(f) => f(self, request_desc, request_value),
             None => Err("RPC not supported by this SharedPV".into()),
+        }
+    }
+
+    /// Trigger PROCESS on this PV. Runs the installed [`Self::on_process`]
+    /// handler; with no handler this is a no-op success (a passive
+    /// record returns OK to a `.PROC` write). Mirrors how pvxs would
+    /// route a `PROCESS` wire command into the underlying record.
+    pub fn process(&self) -> Result<(), String> {
+        if !self.is_open() {
+            return Err("SharedPV not open".into());
+        }
+        let on_process = self.inner.lock().on_process.clone();
+        match on_process {
+            Some(f) => f(self),
+            None => Ok(()),
         }
     }
 
@@ -323,6 +446,15 @@ impl SharedPV {
             + 'static,
     {
         self.inner.lock().on_rpc = Some(Arc::new(handler));
+    }
+
+    /// Install a process handler. Pass `None` to clear (by re-installing).
+    /// Fired by the PVA `PROCESS` wire command — see [`OnProcessFn`].
+    pub fn on_process<F>(&self, handler: F)
+    where
+        F: Fn(&SharedPV) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.inner.lock().on_process = Some(Arc::new(handler));
     }
 
     /// Install an async RPC handler. Used by `#[pva_service]` so the
@@ -533,6 +665,37 @@ impl super::source::ChannelSource for SharedSource {
         }
     }
 
+    /// Atomic BitSet-delta PUT: routes to [`SharedPV::put_delta`],
+    /// which reads + merges + stores under a single mutex
+    /// acquisition. Closes the TOCTOU lost-update window the default
+    /// trait impl (`get_value` + merge + `put_value`) has under
+    /// concurrent partial PUTs.
+    fn put_delta_checked(
+        &self,
+        checked: super::source::AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
+        ctx: super::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let pv = self.pvs.lock().get(checked.pv_name()).cloned();
+        async move {
+            if !checked.allows_write() {
+                return Err(format!(
+                    "PUT denied by access security: '{}' from {}/{}/{}",
+                    checked.pv_name(),
+                    ctx.host,
+                    ctx.account,
+                    ctx.method,
+                ));
+            }
+            match pv {
+                Some(p) => p.put_delta(&desc, &changed, delta),
+                None => Err(format!("no such PV: {}", checked.pv_name())),
+            }
+        }
+    }
+
     fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
         let exists = self.pvs.lock().contains_key(name);
         async move { exists }
@@ -562,6 +725,17 @@ impl super::source::ChannelSource for SharedSource {
                 // future on this task's runtime — no block_on or
                 // block_in_place needed.
                 Some(p) => p.rpc_async(request_desc, request_value).await,
+                None => Err(format!("no such PV: {name}")),
+            }
+        }
+    }
+
+    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let pv = self.pvs.lock().get(name).cloned();
+        let name = name.to_string();
+        async move {
+            match pv {
+                Some(p) => p.process(),
                 None => Err(format!("no such PV: {name}")),
             }
         }

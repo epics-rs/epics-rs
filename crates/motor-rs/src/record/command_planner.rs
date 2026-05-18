@@ -17,12 +17,37 @@ impl MotorRecord {
             | CommandSource::Stop
             | CommandSource::Sync
             | CommandSource::Set
-            | CommandSource::Cnen => {}
+            | CommandSource::Cnen
+            | CommandSource::PcoEnable => {}
             _ => {
                 if !self.can_accept_command() {
                     return effects;
                 }
+                // C: db5da2f0 + 7493d50b — when URIP=Yes and the external
+                // RDBL link is in error, refuse to start a new motion. If a
+                // motion is in flight, emit a STOP so the axis halts.
+                if self.conv.urip && self.conv.rdbl_error {
+                    if self.stat.phase != MotionPhase::Idle {
+                        self.stat.mip.insert(MipFlags::STOP);
+                        effects.commands.push(MotorCommand::Stop {
+                            acceleration: self.move_accel_egu(),
+                        });
+                    }
+                    return effects;
+                }
             }
+        }
+
+        // C: 0aaf02d7 (2025-02 PR #224) — if a VAL/DVAL/RVAL/RLV write
+        // arrives while a home is in progress, clear the HOMF/HOMR buttons.
+        // Without this, the next do_work pass re-issues HOME and loops.
+        if matches!(
+            src,
+            CommandSource::Val | CommandSource::Dval | CommandSource::Rval | CommandSource::Rlv
+        ) && self.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR)
+        {
+            self.ctrl.homf = false;
+            self.ctrl.homr = false;
         }
 
         match src {
@@ -45,7 +70,7 @@ impl MotorRecord {
                             self.internal.pending_retarget = Some(self.pos.dval);
                             self.stat.mip.insert(MipFlags::STOP);
                             effects.commands.push(MotorCommand::Stop {
-                                acceleration: self.vel.accl,
+                                acceleration: self.move_accel_egu(),
                             });
                             effects.request_poll = true;
                             effects.suppress_forward_link = true;
@@ -105,6 +130,14 @@ impl MotorRecord {
                     self.ctrl.jogr
                 };
                 if starting {
+                    // epics-modules/motor #170 — latest-wins: a fresh jog
+                    // command clears a still-latched opposite-direction
+                    // button so JOGF and JOGR are never both active.
+                    if forward {
+                        self.ctrl.jogr = false;
+                    } else {
+                        self.ctrl.jogf = false;
+                    }
                     self.start_jog(forward, &mut effects);
                 } else {
                     self.stop_jog(&mut effects);
@@ -130,7 +163,7 @@ impl MotorRecord {
                 self.pos.diff = self.pos.dval - self.pos.drbv;
                 // C: rdif = NINT(diff / mres)
                 self.pos.rdif = if self.conv.mres != 0.0 {
-                    (self.pos.diff / self.conv.mres).round() as i32
+                    (self.pos.diff / self.conv.mres).round() as i64
                 } else {
                     0
                 };
@@ -144,8 +177,26 @@ impl MotorRecord {
                 });
             }
             CommandSource::Cnen => {
-                effects.commands.push(MotorCommand::SetClosedLoop {
-                    enable: self.ctrl.cnen,
+                // C: case motorRecordCNEN — only drives ENABLE/DISABL_TORQUE
+                // when the controller reports gain support (MSTA bit
+                // GAIN_SUPPORT). Drivers without it would reject the command.
+                if self.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
+                    effects.commands.push(MotorCommand::SetClosedLoop {
+                        enable: self.ctrl.cnen,
+                    });
+                }
+            }
+            CommandSource::PcoEnable => {
+                // C: 05b25c1d (PR #248) — push the latched PCO configuration
+                // first, then enable/disable so the driver uses fresh params.
+                effects.commands.push(MotorCommand::SetPcoConfig {
+                    start: self.pco.start,
+                    end: self.pco.end,
+                    increment: self.pco.increment,
+                    pulse_width_us: self.pco.pulse_width_us,
+                });
+                effects.commands.push(MotorCommand::EnablePco {
+                    enable: self.pco.enable,
                 });
             }
         }
@@ -220,7 +271,6 @@ impl MotorRecord {
                 // (with no pending event) will finalize with DMOV=1.
                 self.stat.dmov = false;
                 self.stat.movn = true;
-                self.suppress_flnk = true;
                 // Request a poll so the next I/O Intr cycle completes
                 effects.request_poll = true;
                 effects.suppress_forward_link = true;
@@ -256,12 +306,21 @@ impl MotorRecord {
 
         // DMOV pulse: set false before starting
         self.stat.dmov = false;
-        self.suppress_flnk = true;
         self.retry.rcnt = 0;
         self.retry.miss = false;
 
         // tdir reflects the actual first-command direction
         self.stat.tdir = move_target > self.pos.drbv;
+        // C parity (motorRecord.cc do_work): `diff` is recomputed
+        // fresh as `dval - drbv` immediately before CDIR is derived.
+        // The VAL/DVAL/RVAL/RLV/TWF write paths update `pos.dval` but
+        // never refresh `pos.diff` — only `process_motor_info` (poll)
+        // and the `Set` branch do. A user VAL write while idle with no
+        // poll update in the same cycle would otherwise compute CDIR
+        // (and the downstream consumers in `handle_retarget` /
+        // `ls_blocks_retry`) from a stale `diff`. Recompute here so
+        // CDIR always reflects the target being dispatched.
+        self.pos.diff = self.pos.dval - self.pos.drbv;
         // CDIR: commanded direction from the position error
         // C: cdir = (rdif < 0) ? 0 : 1, where rdif = diff/mres
         // When MRES < 0, the sign inverts
@@ -308,7 +367,7 @@ impl MotorRecord {
                 move_target - self.pos.drbv,
                 move_target,
                 self.vel.velo,
-                self.vel.accl,
+                self.move_accel_egu(),
             );
         } else if !backlash || (preferred && same_vel) {
             // Case 1: No backlash or preferred with matching vel/accel
@@ -319,7 +378,7 @@ impl MotorRecord {
                 position_error * frac,
                 self.pos.drbv + position_error * frac,
                 self.vel.velo,
-                self.vel.accl,
+                self.move_accel_egu(),
             );
         } else if within_backlash_range {
             // Case 2: Preferred direction, within backlash range
@@ -330,7 +389,7 @@ impl MotorRecord {
                 position_error * frac,
                 self.pos.drbv + position_error * frac,
                 self.vel.bvel,
-                self.vel.bacc,
+                self.backlash_accel_egu(),
             );
         } else {
             // Preferred direction, outside backlash range, vel differs
@@ -341,7 +400,7 @@ impl MotorRecord {
                 position_error * frac,
                 self.pos.drbv + position_error * frac,
                 self.vel.velo,
-                self.vel.accl,
+                self.move_accel_egu(),
             );
         }
         effects.request_poll = true;
@@ -351,32 +410,40 @@ impl MotorRecord {
     /// Handle STOP command.
     fn handle_stop(&mut self, effects: &mut ProcessEffects) {
         self.ctrl.stop = false; // pulse field
-        if self.stat.phase != MotionPhase::Idle {
+        // Record-side state changes (MIP_STOP, target sync) apply only when
+        // the record believes motion is in flight.
+        let in_motion =
+            self.stat.phase != MotionPhase::Idle || self.stat.mip.contains(MipFlags::EXTERNAL);
+        if in_motion {
             self.stat.mip.insert(MipFlags::STOP);
             self.internal.backlash_pending = false;
             self.internal.pending_retarget = None;
-            effects.commands.push(MotorCommand::Stop {
-                acceleration: self.vel.accl,
-            });
             // Sync VAL to RBV after stop
             self.pos.val = self.pos.rbv;
             self.pos.dval = self.pos.drbv;
             self.pos.rval = self.pos.rrbv;
         }
+        // C motorRecord.cc — STOP_AXIS is sent unconditionally ("just in
+        // case"): the driver may still be settling even when the record
+        // considers itself idle (e.g. after an InPosition retry, which
+        // finalizes the record but leaves the servo moving).
+        effects.commands.push(MotorCommand::Stop {
+            acceleration: self.move_accel_egu(),
+        });
     }
 
     /// Start jogging.
     fn start_jog(&mut self, forward: bool, effects: &mut ProcessEffects) {
-        // C: if motor is moving, stop first then queue jog for after stop
+        // C: if motor is moving, stop first then queue jog for after stop.
+        // The queued request lives in internal.queued_motion, NOT in the MIP
+        // JOGF/JOGR bits — otherwise a plain STOP on an active jog (which also
+        // leaves JOGF|STOP set) would be replayed as a queued jog.
         if self.stat.phase != MotionPhase::Idle && self.stat.movn {
-            self.stat.mip = if forward {
-                MipFlags::JOGF
-            } else {
-                MipFlags::JOGR
-            } | MipFlags::STOP;
+            self.stat.mip = MipFlags::STOP;
+            self.internal.queued_motion = Some(QueuedMotion::Jog { forward });
             self.internal.backlash_pending = false;
             effects.commands.push(MotorCommand::Stop {
-                acceleration: self.vel.accl,
+                acceleration: self.move_accel_egu(),
             });
             effects.request_poll = true;
             effects.suppress_forward_link = true;
@@ -392,8 +459,22 @@ impl MotorRecord {
             return;
         }
 
+        // C: 9e5b5432 PR #99 — refuse a jog command that would push past a
+        // soft limit further. Without this the record stays in MIP=JOG_REQ
+        // and the button must be released manually. The opposite direction
+        // (back inside the soft window) is still allowed.
+        if self.jog_violates_soft_limit(forward) {
+            if forward {
+                self.ctrl.jogf = false;
+            } else {
+                self.ctrl.jogr = false;
+            }
+            self.limits.lvio = true;
+            effects.suppress_forward_link = true;
+            return;
+        }
+
         self.stat.dmov = false;
-        self.suppress_flnk = true;
 
         if forward {
             self.stat.mip = MipFlags::JOGF;
@@ -420,7 +501,7 @@ impl MotorRecord {
         effects.commands.push(MotorCommand::MoveVelocity {
             direction: forward,
             velocity: self.vel.jvel,
-            acceleration: self.vel.jar,
+            acceleration: self.jog_accel_egu(),
         });
         effects.request_poll = true;
         effects.suppress_forward_link = true;
@@ -431,27 +512,21 @@ impl MotorRecord {
         self.stat.mip.insert(MipFlags::JOG_STOP);
         self.set_phase(MotionPhase::JogStopping);
         effects.commands.push(MotorCommand::Stop {
-            acceleration: if self.vel.jar > 0.0 {
-                self.vel.jar
-            } else {
-                self.vel.accl
-            },
+            acceleration: self.jog_accel_egu(),
         });
     }
 
     /// Start homing.
     fn start_home(&mut self, forward: bool, effects: &mut ProcessEffects) {
-        // C: if motor is moving, stop first then queue home for after stop
+        // C: if motor is moving, stop first then queue home for after stop.
+        // Queued request goes in internal.queued_motion (see start_jog).
         if self.stat.phase != MotionPhase::Idle && self.stat.movn {
-            self.stat.mip = if forward {
-                MipFlags::HOMF
-            } else {
-                MipFlags::HOMR
-            } | MipFlags::STOP;
+            self.stat.mip = MipFlags::STOP;
+            self.internal.queued_motion = Some(QueuedMotion::Home { forward });
             self.internal.backlash_pending = false;
             self.internal.pending_retarget = None;
             effects.commands.push(MotorCommand::Stop {
-                acceleration: self.vel.accl,
+                acceleration: self.move_accel_egu(),
             });
             effects.request_poll = true;
             effects.suppress_forward_link = true;
@@ -483,7 +558,6 @@ impl MotorRecord {
         }
 
         self.stat.dmov = false;
-        self.suppress_flnk = true;
 
         if forward {
             self.stat.mip = MipFlags::HOMF;
@@ -512,7 +586,7 @@ impl MotorRecord {
         effects.commands.push(MotorCommand::Home {
             forward: hw_forward,
             velocity: self.vel.hvel,
-            acceleration: self.vel.accl,
+            acceleration: self.move_accel_egu(),
         });
         effects.request_poll = true;
         effects.suppress_forward_link = true;
@@ -542,7 +616,35 @@ impl MotorRecord {
         };
         self.pos.val += delta;
 
-        // Cascade from VAL
+        // C motorRecord.cc — a tweak that changes VAL flows through the same
+        // VAL-change path: in SET mode it redefines coordinates rather than
+        // moving the motor.
+        if self.conv.set && !self.conv.igset {
+            // #231: LOAD_POS blocked — refuse the redefinition entirely.
+            if self.conv.loadpos_blocked {
+                self.pos.val -= delta; // undo: keep VAL/DVAL/OFF consistent
+                return;
+            }
+            if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
+                self.pos.val,
+                self.conv.dir,
+                self.pos.off,
+                self.conv.foff,
+                self.conv.mres,
+                true,
+                self.pos.dval,
+            ) {
+                self.pos.dval = dval;
+                self.pos.rval = rval;
+                self.pos.off = off;
+            }
+            effects.commands.push(MotorCommand::SetPosition {
+                position: self.pos.dval,
+            });
+            return;
+        }
+
+        // Normal (non-SET) tweak: cascade VAL->DVAL and issue a move.
         if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
             self.pos.val,
             self.conv.dir,
@@ -568,18 +670,22 @@ impl MotorRecord {
 
         match new {
             SpmgMode::Stop => {
-                if self.stat.phase != MotionPhase::Idle {
+                let in_motion = self.stat.phase != MotionPhase::Idle
+                    || self.stat.mip.contains(MipFlags::EXTERNAL);
+                if in_motion {
                     self.internal.backlash_pending = false;
                     self.internal.pending_retarget = None;
-                    effects.commands.push(MotorCommand::Stop {
-                        acceleration: self.vel.accl,
-                    });
                     // Sync VAL = RBV
                     self.pos.val = self.pos.rbv;
                     self.pos.dval = self.pos.drbv;
                     self.pos.rval = self.pos.rrbv;
                     self.finalize_motion(effects);
                 }
+                // C: STOP_AXIS is sent unconditionally — the driver may still
+                // be settling even when the record is idle.
+                effects.commands.push(MotorCommand::Stop {
+                    acceleration: self.move_accel_egu(),
+                });
             }
             SpmgMode::Pause => {
                 if self.stat.phase != MotionPhase::Idle {
@@ -590,14 +696,18 @@ impl MotorRecord {
                     self.stat.mip.insert(MipFlags::STOP);
                     self.internal.pending_retarget = None;
                     effects.commands.push(MotorCommand::Stop {
-                        acceleration: self.vel.accl,
+                        acceleration: self.move_accel_egu(),
                     });
                 }
             }
             SpmgMode::Go => {
-                // Resume: if coming from Pause and there's a saved target, replan
                 if matches!(old, SpmgMode::Pause) && self.stat.phase == MotionPhase::Idle {
-                    if (self.pos.dval - self.pos.drbv).abs() > self.retry.rdbd.max(1e-12) {
+                    // C: on Go, a still-latched jog button resumes jogging;
+                    // otherwise replan toward the saved DVAL target.
+                    if self.ctrl.jogf || self.ctrl.jogr {
+                        let forward = self.ctrl.jogf;
+                        self.start_jog(forward, effects);
+                    } else if (self.pos.dval - self.pos.drbv).abs() > self.retry.rdbd.max(1e-12) {
                         self.plan_absolute_move(effects);
                     }
                 }
@@ -640,6 +750,82 @@ impl MotorRecord {
         }
     }
 
+    /// Effective base velocity for acceleration math. Drivers that do not
+    /// support a base velocity advertise it via MSTA bit 15
+    /// (`VBAS_UNSUPPORTED`, epics-modules/motor #76); for those VBAS is
+    /// treated as 0.
+    pub(crate) fn effective_vbas(&self) -> f64 {
+        if self.stat.msta.contains(MstaFlags::VBAS_UNSUPPORTED) {
+            0.0
+        } else {
+            self.vel.vbas
+        }
+    }
+
+    /// Acceleration sent to the driver for a normal move, in EGU/sec².
+    /// Mirrors C `accEGUfromVelo`: `vmax = fabs(velo)`, `vmin = vbas`; when
+    /// ACCU=Accs the EGU/sec² value ACCS is used directly, otherwise
+    /// `(vmax - vmin) / accl`, or `vmax / accl` when `vmax <= vmin`
+    /// (C: `b201e40e`, PR #75).
+    ///
+    /// Deviation from C: the result is floored to a strictly positive value.
+    /// C lets a 0 acceleration through and the driver layer skips SET_ACCEL;
+    /// motor-rs always carries an acceleration in the MotorCommand, so a 0
+    /// (unconfigured axis, or ACCU=Accs with ACCS<=0) is replaced by a
+    /// nominal positive rate.
+    pub(crate) fn move_accel_egu(&self) -> f64 {
+        let accl = if self.vel.accl > 0.0 {
+            self.vel.accl
+        } else {
+            0.1
+        };
+        let vmax = self.vel.velo.abs();
+        let vmin = self.effective_vbas();
+        let rate = if self.vel.accu == AccsUsed::Accs {
+            self.vel.accs
+        } else if vmax > vmin {
+            (vmax - vmin) / accl
+        } else {
+            vmax / accl
+        };
+        if rate > 0.0 {
+            rate
+        } else {
+            vmax.max(1.0) / accl
+        }
+    }
+
+    /// Acceleration for a backlash move, EGU/sec². Uses BVEL/BACC.
+    /// Always strictly positive (see `move_accel_egu`).
+    pub(crate) fn backlash_accel_egu(&self) -> f64 {
+        let bacc = if self.vel.bacc > 0.0 {
+            self.vel.bacc
+        } else {
+            0.1
+        };
+        let span = self.vel.bvel - self.effective_vbas();
+        let rate = if span > 0.0 {
+            span / bacc
+        } else {
+            self.vel.bvel / bacc
+        };
+        if rate > 0.0 {
+            rate
+        } else {
+            self.vel.bvel.abs().max(1.0) / bacc
+        }
+    }
+
+    /// Acceleration for a jog, EGU/sec². JAR is already an EGU/sec² rate;
+    /// fall back to the normal move acceleration when JAR is unset.
+    pub(crate) fn jog_accel_egu(&self) -> f64 {
+        if self.vel.jar > 0.0 {
+            self.vel.jar
+        } else {
+            self.move_accel_egu()
+        }
+    }
+
     /// C: use_rel = rtry != 0 && rmod != InPosition && (ueip || urip)
     pub(crate) fn use_relative_moves(&self) -> bool {
         self.retry.rtry != 0
@@ -667,13 +853,33 @@ impl MotorRecord {
         (move_dir > 0.0) == (self.retry.bdst > 0.0)
     }
 
-    /// Handle retarget (NTM) -- new target while moving.
+    /// Handle a new target (VAL/DVAL/RVAL/RLV write) that arrives while a
+    /// motion is in progress.
+    ///
+    /// C parity (`motorRecord.cc`):
+    ///
+    /// - `do_work` (line 2241) re-issues the move block on *every*
+    ///   `dval != ldvl || !dmov` — completely INDEPENDENT of NTM. A
+    ///   VAL/DVAL/RVAL/RLV write during motion always re-dispatches a
+    ///   move. An earlier Rust version returned [`RetargetAction::Ignore`]
+    ///   whenever `ntm == No` (its `motorRecord.dbd` default, since NTM
+    ///   has no `initial()`), silently discarding the write.
+    /// - NTM gates only the *opposite-direction* stop-and-replan in the
+    ///   `process()` `movn` block (line 1327-1331): when
+    ///   `ntm == menuYesNoYES && sign_rdif != cdir &&
+    ///   fabs(diff) > ntm_deadband && move_or_retry && !MIP_STOP`, C
+    ///   sends `STOP_AXIS`. With `ntm == No` C never stops first — the
+    ///   axis retargets directly via the `do_work` re-issue.
+    ///
+    /// Therefore: a write during motion always re-issues the move
+    /// ([`RetargetAction::ExtendMove`], which routes through
+    /// `plan_absolute_move` whose own too-small/SPDB deadband checks
+    /// suppress no-op moves). NTM only promotes an opposite-direction,
+    /// beyond-deadband retarget to [`RetargetAction::StopAndReplan`].
     pub fn handle_retarget(&mut self, new_dval: f64) -> RetargetAction {
-        if !self.timing.ntm {
-            return RetargetAction::Ignore;
-        }
-
-        // Only retarget during active move or retry phases
+        // Only retarget during active move or retry phases. C's `do_work`
+        // re-issue and the `movn`-block STOP both require an in-flight
+        // move; MIP_STOP means a stop is already committed.
         let in_move = self.stat.mip.intersects(MipFlags::MOVE | MipFlags::RETRY);
         if !in_move || self.stat.mip.contains(MipFlags::STOP) {
             return RetargetAction::Ignore;
@@ -682,18 +888,28 @@ impl MotorRecord {
         let diff = new_dval - self.pos.drbv;
         let deadband = self.timing.ntmf * (self.retry.bdst.abs() + self.retry.rdbd);
 
-        // C: retarget only if direction changed AND error exceeds deadband
+        // C `movn`-block STOP_AXIS gate: opposite direction AND error
+        // beyond the NTM deadband AND NTM enabled.
         let sign_diff = diff >= 0.0;
         let direction_changed = sign_diff != self.stat.cdir;
 
-        if direction_changed && diff.abs() > deadband {
+        if self.timing.ntm && direction_changed && diff.abs() > deadband {
             RetargetAction::StopAndReplan
-        } else if !direction_changed {
-            // Same direction: extend the move without stopping
-            RetargetAction::ExtendMove
         } else {
-            // Direction changed but within deadband: ignore
-            RetargetAction::Ignore
+            // C `do_work` re-issues the move on every DVAL write during
+            // motion, regardless of NTM and regardless of direction.
+            RetargetAction::ExtendMove
+        }
+    }
+
+    /// C `enforceMinRetryDeadband` (motorRecord.cc:557): RDBD must be at
+    /// least |MRES|. C calls this at init, every do_work pass, and on RDBD/
+    /// MRES change. Without it RDBD stays at its 0.0 default and retry never
+    /// fires (and MISS never latches), since retry is gated on RDBD > 0.
+    pub(crate) fn enforce_min_retry_deadband(&mut self) {
+        let min_rdbd = self.conv.mres.abs();
+        if self.retry.rdbd < min_rdbd {
+            self.retry.rdbd = min_rdbd;
         }
     }
 
@@ -710,16 +926,42 @@ impl MotorRecord {
         }
     }
 
+    /// Whether a velocity jog in the requested direction would push past a
+    /// soft limit in user coordinates. C: `9e5b5432` PR #99.
+    fn jog_violates_soft_limit(&self, forward: bool) -> bool {
+        // C: soft limits disabled when HLM == LLM == 0.0
+        if self.limits.hlm == self.limits.llm && self.limits.llm == 0.0 {
+            return false;
+        }
+        if forward {
+            self.pos.val >= self.limits.hlm
+        } else {
+            self.pos.val <= self.limits.llm
+        }
+    }
+
     /// Process the motor record (called by EPICS record support).
     pub fn do_process(&mut self) -> ProcessEffects {
-        // STUP: one-shot status refresh
-        if self.stat.stup > 0 {
-            self.stat.stup = 0;
-            let mut effects = ProcessEffects::default();
-            effects.status_refresh = true;
-            return effects;
-        }
+        // C: do_work calls enforceMinRetryDeadband every pass.
+        self.enforce_min_retry_deadband();
 
+        // STUP: one-shot status refresh request. C handles STUP at the top of
+        // do_work and then *continues* the pass — it does not early-return.
+        // Consume the flag here, run the normal process pipeline, and OR the
+        // status_refresh into whatever effects result so a user write or
+        // device update arriving in the same cycle is not dropped.
+        let stup_requested = self.stat.stup > 0;
+        if stup_requested {
+            self.stat.stup = 0;
+        }
+        let mut effects = self.do_process_inner();
+        if stup_requested {
+            effects.status_refresh = true;
+        }
+        effects
+    }
+
+    fn do_process_inner(&mut self) -> ProcessEffects {
         // Sub-step pulse recovery: if DMOV is false but phase is Idle
         // (no real motion started), finalize to restore DMOV=1.
         if !self.stat.dmov && self.stat.phase == MotionPhase::Idle && self.stat.mip.is_empty() {
@@ -762,7 +1004,18 @@ impl MotorRecord {
                 effects.suppress_forward_link = true;
                 effects
             }
-            None => ProcessEffects::default(),
+            None => {
+                // C: ea063f5f — an externally initiated move is flagged by
+                // process_motor_info() during the Idle-phase readback, which
+                // determine_event() reports as no event. The completion
+                // pipeline still has to run so MIP_EXTERNAL clears and DMOV
+                // returns to 1 once the driver finishes.
+                if self.stat.mip.contains(MipFlags::EXTERNAL) {
+                    self.check_completion()
+                } else {
+                    ProcessEffects::default()
+                }
+            }
         }
     }
 }

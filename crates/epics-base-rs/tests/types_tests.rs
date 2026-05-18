@@ -155,13 +155,16 @@ fn test_golden_plain_double() {
 
 #[test]
 fn test_golden_sts_double() {
+    // C `struct dbr_sts_double` (db_access.h): status(2) + severity(2) +
+    // RISC_pad(dbr_long_t = epicsInt32, 4 bytes) + value(8) = 16 bytes,
+    // value at offset 8. (Parity fix 03-C-1: the pad is 4 bytes, not 2.)
     let val = EpicsValue::Double(99.9);
     let data = serialize_dbr(13, &val, 3, 2, SystemTime::UNIX_EPOCH).unwrap();
-    assert_eq!(data.len(), 14);
+    assert_eq!(data.len(), 16);
     assert_eq!(&data[0..2], &3u16.to_be_bytes());
     assert_eq!(&data[2..4], &2u16.to_be_bytes());
-    assert_eq!(&data[4..6], &[0, 0]);
-    assert_eq!(&data[6..14], &99.9f64.to_be_bytes());
+    assert_eq!(&data[4..8], &[0, 0, 0, 0]);
+    assert_eq!(&data[8..16], &99.9f64.to_be_bytes());
 }
 
 #[test]

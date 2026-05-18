@@ -36,11 +36,15 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::R2D => stack.push(ArrayStackValue::Double(180.0 / std::f64::consts::PI)),
 
                 CoreOp::Random => stack.push(ArrayStackValue::Double(simple_random())),
-                CoreOp::NormalRandom | CoreOp::FetchVal => {
+                CoreOp::NormalRandom => {
                     let u1 = simple_random();
                     let u2 = simple_random();
                     let n = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                     stack.push(ArrayStackValue::Double(n));
+                }
+                CoreOp::FetchVal => {
+                    // C FETCH_VAL pushes *presult (the record's previous result).
+                    stack.push(ArrayStackValue::Double(inputs.prev_val));
                 }
 
                 // Type-aware arithmetic via zip_map
@@ -71,11 +75,13 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Mod => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
+                    // C: itop = (epicsInt32)den; if(itop) (epicsInt32)num % itop else NaN
                     stack.push(zip_map(a, b, |x, y| {
-                        if y as i64 == 0 {
+                        let den = d2i(y);
+                        if den == 0 {
                             f64::NAN
                         } else {
-                            ((x as i64) % (y as i64)) as f64
+                            d2i(x).wrapping_rem(den) as f64
                         }
                     })?);
                 }
@@ -169,46 +175,40 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     stack.push(a.map(|x| if x == 0.0 { 1.0 } else { 0.0 }));
                 }
 
-                // Bitwise (element-wise)
+                // Bitwise (element-wise) - C d2i/d2ui conversion (wrap-on-overflow 32-bit)
                 CoreOp::BitAnd => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| ((x as i32) & (y as i32)) as f64)?);
+                    stack.push(zip_map(a, b, |x, y| (d2i(x) & d2i(y)) as f64)?);
                 }
                 CoreOp::BitOr => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| ((x as i32) | (y as i32)) as f64)?);
+                    stack.push(zip_map(a, b, |x, y| (d2i(x) | d2i(y)) as f64)?);
                 }
                 CoreOp::BitXor => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| ((x as i32) ^ (y as i32)) as f64)?);
+                    stack.push(zip_map(a, b, |x, y| (d2i(x) ^ d2i(y)) as f64)?);
                 }
                 CoreOp::BitNot => {
                     let a = pop1(&mut stack)?;
-                    stack.push(a.map(|x| !(x as i32) as f64));
+                    stack.push(a.map(|x| !d2i(x) as f64));
                 }
                 CoreOp::Shl => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| {
-                        ((x as i32) << ((y as i32) & 31)) as f64
-                    })?);
+                    stack.push(zip_map(a, b, |x, y| (d2i(x) << (d2i(y) & 31)) as f64)?);
                 }
                 CoreOp::Shr => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| {
-                        ((x as i32) >> ((y as i32) & 31)) as f64
-                    })?);
+                    stack.push(zip_map(a, b, |x, y| (d2i(x) >> (d2i(y) & 31)) as f64)?);
                 }
                 CoreOp::ShrLogical => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| {
-                        ((x as u32) >> ((y as u32) & 31)) as f64
-                    })?);
+                    stack.push(zip_map(a, b, |x, y| (d2ui(x) >> (d2ui(y) & 31)) as f64)?);
                 }
 
                 // Conditional
@@ -294,13 +294,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 }
                 CoreOp::Nint => {
                     let a = pop1(&mut stack)?;
+                    // C: *ptop = (epicsInt32)(top>=0 ? top+0.5 : top-0.5)
                     stack.push(a.map(|x| {
-                        let rounded = if x >= 0.0 {
-                            (x + 0.5) as i64
-                        } else {
-                            (x - 0.5) as i64
-                        };
-                        rounded as f64
+                        let pre = if x >= 0.0 { x + 0.5 } else { x - 0.5 };
+                        f64_to_i32_wrap(pre) as f64
                     }));
                 }
 
@@ -660,6 +657,45 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
         .unwrap_or(ArrayStackValue::Double(0.0)))
 }
 
+/// C `d2i` macro: positive doubles route through `epicsUInt32` first; negative
+/// doubles cast directly. Wraps modulo 2^32 on overflow.
+#[inline]
+fn d2i(x: f64) -> i32 {
+    if x < 0.0 {
+        f64_to_i32_wrap(x)
+    } else {
+        f64_to_u32_wrap(x) as i32
+    }
+}
+
+/// C `d2ui` macro.
+#[inline]
+fn d2ui(x: f64) -> u32 {
+    if x < 0.0 {
+        f64_to_i32_wrap(x) as u32
+    } else {
+        f64_to_u32_wrap(x)
+    }
+}
+
+/// `(epicsInt32)x` with C wrap-on-overflow semantics (Rust `as` saturates).
+#[inline]
+fn f64_to_i32_wrap(x: f64) -> i32 {
+    if x.is_nan() {
+        return 0;
+    }
+    (x.trunc().rem_euclid(4294967296.0) as u64 as u32) as i32
+}
+
+/// `(epicsUInt32)x` with C wrap-on-overflow semantics.
+#[inline]
+fn f64_to_u32_wrap(x: f64) -> u32 {
+    if x.is_nan() {
+        return 0;
+    }
+    x.trunc().rem_euclid(4294967296.0) as u64 as u32
+}
+
 fn pop1(stack: &mut Vec<ArrayStackValue>) -> Result<ArrayStackValue, CalcError> {
     stack.pop().ok_or(CalcError::Underflow)
 }
@@ -675,27 +711,30 @@ fn pop2_f64(stack: &mut Vec<ArrayStackValue>) -> Result<(f64, f64), CalcError> {
     Ok((a, b))
 }
 
+/// Forward-scan for a matching conditional opcode, mirroring C `cond_search`
+/// (calcPerform.c:520-557): `count` starts at 1, the target opcode decrements
+/// it (return when 0), `COND_IF` increments it.
 fn cond_search(code: &[Opcode], start: usize, find_else: bool) -> Result<usize, CalcError> {
-    let mut depth = 0;
+    let mut count: i32 = 1;
     let mut pc = start;
     while pc < code.len() {
-        match &code[pc] {
-            Opcode::Core(CoreOp::CondIf) => depth += 1,
-            Opcode::Core(CoreOp::CondElse) => {
-                if depth == 0 && find_else {
-                    return Ok(pc + 1);
-                }
+        let op = &code[pc];
+        if matches!(op, Opcode::Core(CoreOp::End)) {
+            break;
+        }
+        let is_match = match op {
+            Opcode::Core(CoreOp::CondElse) => find_else,
+            Opcode::Core(CoreOp::CondEnd) => !find_else,
+            _ => false,
+        };
+        if is_match {
+            count -= 1;
+            if count == 0 {
+                return Ok(pc + 1);
             }
-            Opcode::Core(CoreOp::CondEnd) => {
-                if depth == 0 && !find_else {
-                    return Ok(pc + 1);
-                }
-                if depth > 0 {
-                    depth -= 1;
-                }
-            }
-            Opcode::Core(CoreOp::End) => break,
-            _ => {}
+        }
+        if matches!(op, Opcode::Core(CoreOp::CondIf)) {
+            count += 1;
         }
         pc += 1;
     }
@@ -716,5 +755,6 @@ fn simple_random() -> f64 {
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
     SEED.store(s, Ordering::Relaxed);
-    ((s >> 11) as f64) / ((1u64 << 53) as f64) + f64::MIN_POSITIVE
+    // C calcRandom() returns (double)rand()/RAND_MAX — a closed [0,1] range.
+    (s >> 11) as f64 / ((1u64 << 53) - 1) as f64
 }

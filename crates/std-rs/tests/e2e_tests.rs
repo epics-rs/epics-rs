@@ -402,3 +402,176 @@ record(epid, "TEST:PID") {
         other => panic!("expected Double, got {:?}", other),
     }
 }
+
+// ============================================================
+// epid bumpless transfer — OUTL output-link readback (TASK 2).
+//
+// C `devEpidSoft.c:153-158`: on the feedback OFF->ON edge the
+// integral term is seeded from the OUTL output link's *actual
+// current value*. The framework reads it via a `ReadDbLink`
+// pre-process action emitted by `EpidRecord::pre_process_actions`.
+// ============================================================
+
+#[tokio::test]
+async fn test_epid_outl_readback_seeds_integral_term() {
+    // DAC holds a known current output value of 7.0; the epid's OUTL
+    // link points at it. On the feedback OFF->ON edge the epid must
+    // seed its integral term I from DAC's current value, NOT from its
+    // own last-commanded OVAL (which is 0.0).
+    let db_str = r#"
+record(ao, "DAC") {
+    field(VAL, "7.0")
+}
+record(epid, "PID") {
+    field(KP, "1.0")
+    field(KI, "0.5")
+    field(DRVH, "100")
+    field(DRVL, "-100")
+    field(OUTL, "DAC")
+    field(FMOD, "0")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // Confirm DAC holds 7.0.
+    assert_eq!(server.get("DAC").await.unwrap(), EpicsValue::Double(7.0));
+
+    // Turn feedback ON — this is the OFF->ON edge (FBOP starts 0).
+    db.put_record_field_from_ca("PID", "FBON", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    // Process the epid: pre_process_actions emits ReadDbLink{OUTL->I},
+    // the framework reads DAC's value (7.0) into I before do_pid runs,
+    // and do_pid keeps I on the bumpless edge.
+    db.put_record_field_from_ca("PID", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let i_term = server.get("PID.I").await.unwrap();
+    match i_term {
+        EpicsValue::Double(v) => assert!(
+            (v - 7.0).abs() < 1e-9,
+            "bumpless edge must seed I from OUTL's actual value 7.0, got {v}"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+}
+
+// ============================================================
+// epid devEpidSoftCallback — DB-type TRIG link write-then-read
+// ordering, within ONE process pass.
+//
+// C `devEpidSoftCallback.c::do_pid`, for `ptriglink->type != CA_LINK`:
+//   1. `dbPutLink(ptriglink, DBR_DOUBLE, &pepid->tval, 1)`
+//      (`devEpidSoftCallback.c:121-127`) — synchronous trigger write;
+//   2. `dbGetLink(&pepid->inp, DBR_DOUBLE, &pepid->cval, ...)`
+//      (`devEpidSoftCallback.c:151`) — read CVAL from INP;
+//   3. run the PID.
+//
+// The trigger write must land BEFORE the INP read so the freshly-
+// triggered source value is what reaches CVAL. The Rust port emits
+// the TRIG write from `EpidRecord::pre_input_link_actions`, which the
+// framework runs strictly before the `INP -> CVAL` input-link fetch.
+// ============================================================
+
+#[tokio::test]
+async fn test_epid_db_trig_write_then_read_in_one_cycle() {
+    // SRC starts at 1.0. The epid's TRIG link points at SRC and its
+    // TVAL is 42.0; its INP link ALSO reads SRC. In one process pass
+    // the epid must: (1) write TVAL(42.0) into SRC via TRIG, then
+    // (2) read SRC into CVAL. So CVAL must be 42.0 after a SINGLE
+    // process cycle.
+    //
+    // If the trigger write were a POST-process action (the bug this
+    // test guards), CVAL would still read SRC's stale 1.0 this cycle —
+    // the freshly-triggered value would only reach CVAL one cycle late.
+    let db_str = r#"
+record(ao, "SRC") {
+    field(VAL, "1.0")
+}
+record(epid, "PID") {
+    field(DTYP, "Epid Async Soft")
+    field(KP, "1.0")
+    field(KI, "0.0")
+    field(KD, "0.0")
+    field(VAL, "100.0")
+    field(DRVH, "1000")
+    field(DRVL, "-1000")
+    field(MDT, "0.0")
+    field(INP, "SRC")
+    field(TRIG, "SRC PP")
+    field(TVAL, "42.0")
+    field(FMOD, "0")
+    field(FBON, "1")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .register_device_support("Epid Async Soft", || {
+            Box::new(
+                std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport::new(),
+            )
+        })
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // SRC starts at 1.0, epid CVAL starts at 0.0.
+    assert_eq!(server.get("SRC").await.unwrap(), EpicsValue::Double(1.0));
+    assert_eq!(
+        server.get("PID.CVAL").await.unwrap(),
+        EpicsValue::Double(0.0)
+    );
+
+    // Process the epid ONCE.
+    db.put_record_field_from_ca("PID", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // TRIG fired this cycle: SRC now holds TVAL.
+    assert_eq!(
+        server.get("SRC").await.unwrap(),
+        EpicsValue::Double(42.0),
+        "TRIG link must have written TVAL into SRC"
+    );
+
+    // The decisive assertion: CVAL read SRC *after* the TRIG write, in
+    // the SAME process pass — so CVAL is the freshly-triggered 42.0,
+    // not SRC's stale pre-trigger 1.0.
+    let cval = server.get("PID.CVAL").await.unwrap();
+    match cval {
+        EpicsValue::Double(v) => assert!(
+            (v - 42.0).abs() < 1e-9,
+            "DB-TRIG: INP must read the freshly-triggered SRC value 42.0 \
+             in the same process pass, got {v}"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+
+    // PID ran with the fresh CVAL: ERR = VAL - CVAL = 100 - 42 = 58,
+    // P = KP*ERR = 58. Confirms do_pid consumed the post-trigger CVAL.
+    let p = server.get("PID.P").await.unwrap();
+    match p {
+        EpicsValue::Double(v) => assert!(
+            (v - 58.0).abs() < 1e-9,
+            "PID must have computed from the post-trigger CVAL (P=58.0), got {v}"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+}

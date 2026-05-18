@@ -88,8 +88,24 @@ type ClientTlsConfig = Arc<tokio_rustls::rustls::ClientConfig>;
 const ECHO_TIMEOUT_SECS: u64 = 5;
 
 /// Maximum accumulated TCP read buffer before disconnecting.
-/// Protects against malformed servers declaring huge payloads.
-const MAX_ACCUMULATED: usize = 1024 * 1024; // 1 MB
+///
+/// This MUST be >= the largest legal single frame, otherwise a valid
+/// large waveform (e.g. a 2 MB array, well under the 16 MB
+/// `max_payload_size()` default) sent by a server would push
+/// `accumulated` past the cap and the connection would be closed
+/// before the frame could be parsed — a permanent failure that
+/// survives reconnect (the server re-sends, the client closes again).
+///
+/// Largest legal frame = extended header (24 bytes) + `max_payload_size()`
+/// payload. A 64 KiB slack covers a partially-received next frame
+/// pipelined behind a full one in the same read burst. `max_payload_size()`
+/// honours `EPICS_CA_MAX_ARRAY_BYTES`, so the cap tracks operator overrides.
+/// Mirrors the server-side cap in `server/tcp.rs`.
+fn max_accumulated() -> usize {
+    crate::protocol::max_payload_size()
+        .saturating_add(24)
+        .saturating_add(64 * 1024)
+}
 
 /// Default echo interval in seconds (matches C EPICS CA_CONN_VERIFY_PERIOD).
 /// Overridden by EPICS_CA_CONN_TMO environment variable.
@@ -398,7 +414,10 @@ fn process_command(
             hdr.data_type = data_type;
             hdr.cid = sid;
             hdr.available = ioid;
-            if count > 0xFFFF {
+            // C parity (`comQueSend.cpp:285`): extended form for
+            // `nElem >= 0xffff`. See `build_read_notify_frame` in
+            // client/mod.rs for the same boundary in the slow path.
+            if count >= 0xFFFF {
                 hdr.set_payload_size(0, count);
             } else {
                 hdr.count = count as u16;
@@ -466,7 +485,9 @@ fn process_command(
             hdr.data_type = data_type;
             hdr.cid = sid;
             hdr.available = subid;
-            if count > 0xFFFF {
+            // C parity (`comQueSend.cpp:285`): extended form for
+            // `nElem >= 0xffff`. Same boundary as READ_NOTIFY above.
+            if count >= 0xFFFF {
                 hdr.set_payload_size(16, count);
             } else {
                 hdr.count = count as u16;
@@ -623,18 +644,23 @@ async fn connect_server(
     let pending_frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (beacon_arrival_tx, beacon_arrival_rx) = mpsc::unbounded_channel::<bool>();
 
-    // Build initial CA handshake (VERSION + HOST + CLIENT) — same on
-    // both plaintext and TLS paths.
+    // Build initial CA handshake.
+    //
+    // C `tcpiiu` constructor (`modules/ca/src/client/tcpiiu.cpp:755-762`)
+    // queues messages in this exact order:
+    //   1. versionMessage           → CA_PROTO_VERSION
+    //   2. userNameSetRequest       → CA_PROTO_CLIENT_NAME
+    //   3. hostNameSetRequest       → CA_PROTO_HOST_NAME
+    //
+    // Pre-fix Rust emitted VERSION → HOST_NAME → CLIENT_NAME (the
+    // last two swapped). Server `host_name_action` /
+    // `client_name_action` accept either order in isolation, but
+    // ACF rules that consult both fields and frame-byte-exact wire
+    // captures (Wireshark CA dissector, fuzzers) diverge.
     let mut handshake = Vec::new();
     let mut version_hdr = CaHeader::new(CA_PROTO_VERSION);
     version_hdr.count = CA_MINOR_VERSION;
     handshake.extend_from_slice(&version_hdr.to_bytes());
-    let hostname = epics_base_rs::runtime::env::hostname();
-    let host_payload = pad_string(&hostname);
-    let mut host_hdr = CaHeader::new(CA_PROTO_HOST_NAME);
-    host_hdr.postsize = host_payload.len() as u16;
-    handshake.extend_from_slice(&host_hdr.to_bytes());
-    handshake.extend_from_slice(&host_payload);
     let username = epics_base_rs::runtime::env::get("USER")
         .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
         .unwrap_or_else(|| "unknown".to_string());
@@ -643,6 +669,12 @@ async fn connect_server(
     user_hdr.postsize = user_payload.len() as u16;
     handshake.extend_from_slice(&user_hdr.to_bytes());
     handshake.extend_from_slice(&user_payload);
+    let hostname = epics_base_rs::runtime::env::hostname();
+    let host_payload = pad_string(&hostname);
+    let mut host_hdr = CaHeader::new(CA_PROTO_HOST_NAME);
+    host_hdr.postsize = host_payload.len() as u16;
+    handshake.extend_from_slice(&host_hdr.to_bytes());
+    handshake.extend_from_slice(&host_payload);
     pending_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _ = write_tx.send(handshake);
 
@@ -855,6 +887,25 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     let mut unresponsive_notified = false;
     let mut server_minor_version: u16 = 0;
     let mut beacon_rx_open = true;
+    // C `claim_ciu_reply` (`rsrv/camessage.c:1149-1175`) emits the
+    // CA_PROTO_ACCESS_RIGHTS frame BEFORE the CA_PROTO_CREATE_CHAN
+    // reply on the same TCP stream. The coordinator's
+    // `AccessRightsChanged` handler at `mod.rs:2531` looks up the
+    // channel by cid — but the channel doesn't exist in the
+    // coordinator's map until `ChannelCreated` arrives second. So
+    // the access bits get silently dropped, and the
+    // `ChannelCreated` event hard-coded `AccessRights::from_u32(0x3)`
+    // (full READ+WRITE) regardless of what the server actually
+    // granted. Result: a Rust client against a read-only PV could
+    // attempt writes that the server rejects later (ECA_NOWTACCESS),
+    // instead of refusing them client-side from the access cache.
+    //
+    // Stash by cid; consumed when the matching CREATE_CHAN reply
+    // arrives. If multiple ACCESS_RIGHTS frames arrive between
+    // CREATE_CHAN cycles (rare but legal — server may emit
+    // mid-stream on ACF reload), only the most recent is kept.
+    let mut pending_access: std::collections::HashMap<u32, AccessRights> =
+        std::collections::HashMap::new();
 
     // Single long-lived `Sleep` whose deadline we mutate in place
     // via `Sleep::reset`. This is what makes the libca model
@@ -1012,10 +1063,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         accumulated.extend_from_slice(&buf[..n]);
 
         // Guard against unbounded buffer growth from malformed servers.
-        if accumulated.len() > MAX_ACCUMULATED {
+        let accum_cap = max_accumulated();
+        if accumulated.len() > accum_cap {
             eprintln!(
-                "CA: {server_addr}: accumulated TCP buffer exceeded {} bytes, closing",
-                MAX_ACCUMULATED
+                "CA: {server_addr}: accumulated TCP buffer exceeded {accum_cap} bytes, closing"
             );
             let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
             return;
@@ -1023,15 +1074,53 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
 
         let mut offset = 0;
         while offset + CaHeader::SIZE <= accumulated.len() {
-            let (hdr, hdr_size) = match CaHeader::from_bytes_extended(&accumulated[offset..]) {
+            let frame = &accumulated[offset..];
+            // C `tcpiiu.cpp::processIncoming` distinguishes a *partial*
+            // extended header (await more bytes) from a *definitively
+            // malformed* one (close the connection). `from_bytes_extended`
+            // returns `Err` for both, so a blanket `break` (await more)
+            // would spin: a malformed header is re-parsed on every read,
+            // never closing until the accumulation cap is hit. Detect the
+            // only legitimate "await more" case — an extended-form header
+            // (`postsize == 0xFFFF`) with fewer than its 24 bytes present
+            // — and treat every other parse error as a hard close.
+            let is_partial_extended_header =
+                frame.len() >= 4 && frame[2] == 0xFF && frame[3] == 0xFF && frame.len() < 24;
+            let (hdr, hdr_size) = match CaHeader::from_bytes_extended(frame) {
                 Ok(v) => v,
-                Err(_) => {
-                    eprintln!("CA: {server_addr}: malformed TCP header, skipping");
+                Err(_) if is_partial_extended_header => {
+                    // Genuine TCP segment boundary inside an extended
+                    // header — wait for the remaining bytes.
                     break;
+                }
+                Err(e) => {
+                    // Definitively malformed (e.g. extended postsize
+                    // exceeds `max_payload_size()`). Re-parsing cannot
+                    // succeed; close so the reconnect loop rebuilds.
+                    eprintln!("CA: {server_addr}: malformed TCP header ({e}), closing");
+                    let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                    return;
                 }
             };
             let actual_post = hdr.actual_postsize();
-            let msg_len = hdr_size + align8(actual_post);
+            // C `tcpiiu.cpp::processIncoming` (line 1198) closes the
+            // connection if `m_postsize & 0x7 != 0`. The wire spec
+            // requires every payload to be 8-byte aligned; an
+            // unaligned postsize is either a malformed peer or an
+            // attempt to push our parser into reading the next
+            // message's header as the tail of this one. Silently
+            // rounding via `align8` (the prior behavior) lets a
+            // malicious server desync our framer. Match C: drop the
+            // connection so the reconnect loop can rebuild from a
+            // clean state.
+            if actual_post & 0x7 != 0 {
+                eprintln!(
+                    "CA: {server_addr}: misaligned payload (postsize={actual_post}), closing"
+                );
+                let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                return;
+            }
+            let msg_len = hdr_size + actual_post;
 
             if offset + msg_len > accumulated.len() {
                 break;
@@ -1056,18 +1145,32 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     });
                 }
                 CA_PROTO_ACCESS_RIGHTS => {
+                    let access = AccessRights::from_u32(hdr.available);
+                    // Stash for the next CREATE_CHAN reply on this
+                    // cid (C orders ACCESS_RIGHTS first; the
+                    // coordinator's update-by-cid is a no-op
+                    // pre-channel).
+                    pending_access.insert(hdr.cid, access);
                     let _ = event_tx.send(TransportEvent::AccessRightsChanged {
                         cid: hdr.cid,
-                        access: AccessRights::from_u32(hdr.available),
+                        access,
                     });
                 }
                 CA_PROTO_CREATE_CHAN => {
+                    // Consume the stashed ACCESS_RIGHTS for this cid
+                    // if any (C `claim_ciu_reply` always emits one
+                    // first; falls back to NoAccess if missing —
+                    // defensive default since we can't assume
+                    // RW on an open channel).
+                    let access = pending_access
+                        .remove(&hdr.cid)
+                        .unwrap_or(AccessRights::from_u32(0));
                     let _ = event_tx.send(TransportEvent::ChannelCreated {
                         cid: hdr.cid,
                         sid: hdr.available,
                         data_type: hdr.data_type,
                         element_count: hdr.actual_count(),
-                        access: AccessRights::from_u32(0x3),
+                        access,
                         server_addr,
                     });
                 }
@@ -1113,13 +1216,46 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     }
                 }
                 CA_PROTO_EVENT_ADD => {
-                    let data = accumulated[data_start..data_start + actual_post].to_vec();
-                    let _ = event_tx.send(TransportEvent::MonitorData {
-                        subid: hdr.available,
-                        data_type: hdr.data_type,
-                        count: hdr.actual_count(),
-                        data,
-                    });
+                    // libca `cac::eventAddRespAction` (`cac.cpp:960`)
+                    // gates the data delivery on `hdr.m_cid ==
+                    // ECA_NORMAL`. The CA server uses non-NORMAL m_cid
+                    // values on monitor frames to deliver out-of-band
+                    // status to the subscriber — specifically
+                    // `rsrv/camessage.c::no_read_access_event` emits
+                    // ECA_NORDACCESS with a zeroed payload of full
+                    // DBR size when read access for an active
+                    // subscription is denied (e.g. after an ACF
+                    // reload that revokes the client's identity).
+                    // Without the gate, Rust would parse the zeroed
+                    // payload as legitimate data and surface
+                    // `value = 0` to the subscriber — silent
+                    // "successful read of zero" instead of an access
+                    // denial.
+                    //
+                    // The Rust SERVER tears down subscriptions on
+                    // NoAccess (round-39), so Rust ↔ Rust never hits
+                    // this path. But Rust client ↔ C IOC does — C IOC
+                    // delivers the no-read-access frame instead of
+                    // tearing down. Gate matches libca.
+                    if hdr.cid != ECA_NORMAL {
+                        tracing::warn!(
+                            server = %server_addr,
+                            subid = hdr.available,
+                            status = hdr.cid,
+                            "MONITOR delivery with non-NORMAL status (likely \
+                             ECA_NORDACCESS from C IOC no_read_access_event); \
+                             dropping bogus zeroed payload"
+                        );
+                        metrics::counter!("ca_client_monitor_status_drops_total").increment(1);
+                    } else {
+                        let data = accumulated[data_start..data_start + actual_post].to_vec();
+                        let _ = event_tx.send(TransportEvent::MonitorData {
+                            subid: hdr.available,
+                            data_type: hdr.data_type,
+                            count: hdr.actual_count(),
+                            data,
+                        });
+                    }
                 }
                 CA_PROTO_ECHO | CA_PROTO_READ_SYNC => {
                     // Echo response from server — liveness already handled
@@ -1131,15 +1267,31 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     let _ = event_tx.send(TransportEvent::ChannelCreateFailed { cid: hdr.cid });
                 }
                 CA_PROTO_ERROR => {
-                    // CA_PROTO_ERROR wire layout (server send_ca_error):
-                    //   resp.cid = ECA status code (caerr.h)
-                    //   payload  = original 16-byte header copy + msg
-                    // hdr is the response header — hdr.cid carries the
-                    // ECA status. The first u16 of the payload is the
-                    // original request's CMD byte (READ_NOTIFY etc.),
-                    // useful as diagnostic context but distinct from
-                    // the ECA code.
-                    let eca_status = hdr.cid;
+                    // CA_PROTO_ERROR wire layout per C `vsend_err`
+                    // (`rsrv/camessage.c:139-224`):
+                    //   resp.m_cid       = channel cid (or
+                    //                      0xFFFFFFFF for non-channel-
+                    //                      scoped commands like SEARCH
+                    //                      or unknown-cmd reject)
+                    //   resp.m_available = ECA status code (caerr.h)
+                    //   payload          = original 16-byte header copy
+                    //                      + NUL-terminated diag msg
+                    //
+                    // libca `cac::exceptionRespAction`
+                    // (`modules/ca/src/client/cac.cpp:1118`) passes
+                    // `hdr.m_available` as the status to the per-cmd
+                    // exception stub — `m_available` is authoritative.
+                    //
+                    // Round-2 21240ad fixed the same field-swap on the
+                    // Rust SERVER side; this round closes it on the
+                    // Rust CLIENT side. Pre-fix Rust read `hdr.cid` as
+                    // the ECA status, so a CA_PROTO_ERROR from a C IOC
+                    // surfaced the channel cid as the user-facing
+                    // `CaException.status` — the actual ECA code (and
+                    // therefore the entire exception-callback contract)
+                    // was wrong. Symptom: clients can't distinguish
+                    // ECA_BADTYPE from ECA_NORDACCESS etc.
+                    let eca_status = hdr.available;
                     let orig_cmd = if actual_post >= 16 {
                         let orig_hdr_bytes = &accumulated[data_start..data_start + 16];
                         Some(u16::from_be_bytes([orig_hdr_bytes[0], orig_hdr_bytes[1]]))
@@ -1462,5 +1614,177 @@ mod server_connection_drop_tests {
             "abort cascade took {drain_elapsed:?} — far over the \
              tens-of-milliseconds budget (#477 reproducer)"
         );
+    }
+}
+
+#[cfg(test)]
+mod framing_cap_tests {
+    //! BUG 2: the accumulation cap must be >= the largest legal frame,
+    //! otherwise a valid large waveform (under `max_payload_size()`)
+    //! closes the connection permanently.
+    use super::max_accumulated;
+    use crate::protocol::max_payload_size;
+
+    #[test]
+    fn accumulation_cap_admits_largest_legal_frame() {
+        // A legal frame is at most extended-header (24 bytes) +
+        // `max_payload_size()`. The cap must strictly exceed it so the
+        // full frame can sit in `accumulated` before being drained.
+        let largest_legal_frame = max_payload_size() + 24;
+        assert!(
+            max_accumulated() >= largest_legal_frame,
+            "accumulation cap {} is smaller than the largest legal frame {} \
+             — a valid large waveform would be rejected (BUG 2)",
+            max_accumulated(),
+            largest_legal_frame
+        );
+    }
+
+    #[test]
+    fn accumulation_cap_admits_two_megabyte_waveform() {
+        // The concrete BUG 2 repro: a 2 MB array payload is legal under
+        // the 16 MB default and must NOT trip the cap.
+        let two_mb_frame = 2 * 1024 * 1024 + 24;
+        assert!(
+            max_accumulated() >= two_mb_frame,
+            "2 MB waveform frame ({two_mb_frame} bytes) exceeds the \
+             accumulation cap ({}) — permanent failure for arrays > 1 MB",
+            max_accumulated()
+        );
+    }
+}
+
+#[cfg(test)]
+mod malformed_header_close_tests {
+    //! BUG 3: the client read loop must distinguish a *partial*
+    //! extended header (await more bytes) from a *definitively
+    //! malformed* one (close the connection). A blanket "await more"
+    //! spins forever re-parsing the same bad bytes until the
+    //! accumulation cap is hit.
+    use super::*;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    fn loop_inputs() -> (
+        SocketAddr,
+        mpsc::UnboundedReceiver<TransportEvent>,
+        mpsc::UnboundedSender<TransportEvent>,
+        mpsc::UnboundedSender<Vec<u8>>,
+        mpsc::UnboundedReceiver<bool>,
+        super::super::types::InFlightOps,
+        super::super::types::ServerLastRxAt,
+    ) {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        (
+            server_addr,
+            event_rx,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight,
+            last_rx_at,
+        )
+    }
+
+    /// A definitively malformed extended header (postsize=0xFFFF marking
+    /// extended form, extended postsize declared far beyond
+    /// `max_payload_size()`) must CLOSE the connection: `read_loop`
+    /// emits `TcpClosed` and returns. Pre-fix it `break`d to await more
+    /// bytes and re-parsed the same error on every read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_extended_header_closes_connection() {
+        let (server_addr, mut event_rx, event_tx, write_tx, ba_rx, in_flight, last_rx_at) =
+            loop_inputs();
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight,
+            last_rx_at,
+        ));
+
+        // 24-byte extended header: postsize=0xFFFF (extended marker),
+        // extended postsize = max_payload_size() + 1 MB — over the cap,
+        // so `from_bytes_extended` returns Err("payload too large").
+        let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+        hdr.postsize = 0xFFFF;
+        let mut frame = hdr.to_bytes().to_vec();
+        let bad_post = (crate::protocol::max_payload_size() + 1024 * 1024) as u32;
+        frame.extend_from_slice(&bad_post.to_be_bytes()); // extended postsize
+        frame.extend_from_slice(&0u32.to_be_bytes()); // extended count
+        assert_eq!(frame.len(), 24);
+
+        let mut client = client_io;
+        client.write_all(&frame).await.expect("write bad header");
+        client.flush().await.expect("flush");
+
+        // The read loop must close — emit TcpClosed and return — WITHOUT
+        // waiting for more bytes. We keep the write half open so this
+        // only passes if the loop closes on its own.
+        let closed = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("read_loop must close on a malformed header, not spin");
+        assert!(
+            matches!(closed, Some(TransportEvent::TcpClosed { .. })),
+            "malformed extended header must emit TcpClosed"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+        drop(client);
+    }
+
+    /// Control: a *partial* extended header (only 20 of 24 bytes) must
+    /// NOT close — `read_loop` waits for the remaining bytes. Closing
+    /// here would be a false-positive disconnect on a benign TCP
+    /// segment boundary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_extended_header_waits_not_closes() {
+        let (server_addr, mut event_rx, event_tx, write_tx, ba_rx, in_flight, last_rx_at) =
+            loop_inputs();
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight,
+            last_rx_at,
+        ));
+
+        // 20 bytes: 16-byte base header with postsize=0xFFFF + only 4 of
+        // the 8 extended bytes.
+        let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+        hdr.postsize = 0xFFFF;
+        let mut frame = hdr.to_bytes().to_vec();
+        frame.extend_from_slice(&[0u8, 0, 0, 0]);
+        assert_eq!(frame.len(), 20);
+
+        let mut client = client_io;
+        client.write_all(&frame).await.expect("write partial");
+        client.flush().await.expect("flush");
+
+        // No TcpClosed within 300ms — the loop is blocked awaiting bytes.
+        let early = tokio::time::timeout(Duration::from_millis(300), event_rx.recv()).await;
+        assert!(
+            early.is_err(),
+            "partial extended header must NOT close — read_loop waits \
+             for the rest of the header"
+        );
+
+        // Clean EOF resolves the loop.
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
     }
 }

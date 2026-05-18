@@ -219,7 +219,11 @@ impl DrvVxi11Port {
         let config =
             Vxi11Config::from_positional(host_name, flags, def_timeout_string, vxi_name, priority);
 
-        let multi_device = matches!(config.link_kind, VxiLinkKind::Gpib | VxiLinkKind::Other);
+        // C `drvVxi11.c:1754-1760`: only `gpib*`/`hpib*` set `isGpibLink`
+        // and enable `ASYN_MULTIDEVICE`. An unrecognized prefix leaves
+        // both `isGpibLink` and `isSingleLink` clear — it must NOT be
+        // registered as a 31-address gateway.
+        let multi_device = matches!(config.link_kind, VxiLinkKind::Gpib);
         // GPIB addresses 0..30 (NUM_GPIB_ADDRESSES = 31, drvVxi11.c).
         let max_addr = if multi_device { 31 } else { 1 };
 
@@ -353,6 +357,16 @@ mod tests {
     }
 
     #[test]
+    fn unrecognized_link_is_not_multi_device() {
+        // C `drvVxi11.c`: an unrecognized vxiName prefix sets neither
+        // isGpibLink nor isSingleLink and does NOT enable ASYN_MULTIDEVICE.
+        let drv = DrvVxi11Port::configure("vxi0", "10.0.0.1", 0, "", "foo0", 0, false).unwrap();
+        assert_eq!(VxiLinkKind::from_vxi_name("foo0"), VxiLinkKind::Other);
+        assert!(!drv.base().flags.multi_device);
+        assert_eq!(drv.base().max_addr, 1);
+    }
+
+    #[test]
     fn no_auto_connect_disables_framework_auto() {
         let drv = DrvVxi11Port::configure("vxi0", "10.0.0.1", 0, "", "inst0", 0, true).unwrap();
         assert!(!drv.base().auto_connect);
@@ -380,6 +394,9 @@ mod tests {
         assert_eq!(PROC_DESTROY_LINK, 23);
     }
 
+    // Only meaningful in a build without the hardware feature — with
+    // `vxi11` enabled `connect()` reaches the (unimplemented) HW path.
+    #[cfg(not(feature = "vxi11"))]
     #[test]
     fn connect_without_hw_feature_reports_error() {
         let mut drv =

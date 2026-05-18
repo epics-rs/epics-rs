@@ -6,9 +6,11 @@ use crate::server::record::Record;
 use crate::types::EpicsValue;
 
 mod include;
+mod substitution;
 #[cfg(test)]
 pub(crate) use include::parse_include_directive;
 pub use include::{DbLoadConfig, expand_includes, override_dtyp, parse_db_file};
+pub use substitution::{TemplateLoad, load_substitution_file, parse_substitutions};
 
 /// Factory function that creates a record instance.
 pub type RecordFactory = Box<dyn Fn() -> Box<dyn Record> + Send + Sync>;
@@ -33,6 +35,7 @@ pub fn register_record_type(name: &str, factory: RecordFactory) {
 }
 
 /// A record definition parsed from a .db file.
+#[derive(Debug, Clone)]
 pub struct DbRecordDef {
     pub record_type: String,
     pub name: String,
@@ -94,6 +97,10 @@ pub(crate) fn validate_record_name(name: &str, line: usize, col: usize) -> CaRes
 pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<DbRecordDef>> {
     let expanded = substitute_macros(input, macros);
     let mut records = Vec::new();
+    // Standalone `alias("record","newname")` directives (dbYacc.y:275).
+    // Resolved against the record list after the full file is parsed
+    // so the alias target may appear before or after the directive.
+    let mut global_aliases: Vec<(String, String)> = Vec::new();
     let chars: Vec<char> = expanded.chars().collect();
     let mut pos = 0;
     let mut line = 1;
@@ -105,13 +112,59 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
             break;
         }
 
-        // Expect "record" keyword
+        // Top-level keyword. C dbStatic (`dbYacc.y:48-62`) accepts
+        // `record`/`grecord` plus the directives below at file scope.
         let word = read_word(&chars, &mut pos, &mut col);
         if word.is_empty() {
             pos += 1;
             col += 1;
             continue;
         }
+
+        // `path "dir"` / `addpath "dir"` — search-path directives
+        // (dbYacc.y:71-81). Include resolution is handled by the
+        // file-expansion layer (`expand_includes`); by the time raw
+        // text reaches `parse_db` the path is already fixed, so these
+        // are accepted and skipped rather than erroring out.
+        if word == "path" || word == "addpath" {
+            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+            let _dir = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+            continue;
+        }
+
+        // `include "file"` (dbYacc.y:65-69). Includes are normally
+        // inlined by `expand_includes` before `parse_db` runs; a bare
+        // `include` reaching here means the caller parsed un-expanded
+        // text. Accept the directive so the grammar matches C, but the
+        // file is NOT loaded at this layer — that is the expansion
+        // layer's job.
+        if word == "include" {
+            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+            let _file = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+            continue;
+        }
+
+        // Standalone 2-arg `alias("record","newname")` (dbYacc.y:275).
+        // Distinct from the in-record-body `alias("name")` form. The
+        // new name is attached to the named record's alias list once
+        // all records are parsed (the target may appear later in the
+        // file).
+        if word == "alias" {
+            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+            expect_char(&chars, &mut pos, &mut col, '(', line)?;
+            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+            let target = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+            expect_char(&chars, &mut pos, &mut col, ',', line)?;
+            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+            let alias_name = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+            validate_record_name(&alias_name, line, col)?;
+            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+            expect_char(&chars, &mut pos, &mut col, ')', line)?;
+            global_aliases.push((target, alias_name));
+            continue;
+        }
+
         if word != "record" && word != "grecord" {
             return Err(CaError::DbParseError {
                 line,
@@ -228,76 +281,325 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
         });
     }
 
+    // Attach standalone `alias("record","newname")` directives to the
+    // matching record (C `dbAlias`). An alias whose target record is
+    // not present in this database is a hard error, matching base
+    // where `dbAlias` fails on an unknown record name.
+    for (target, alias_name) in global_aliases {
+        match records.iter_mut().find(|r| r.name == target) {
+            Some(rec) => rec.aliases.push(alias_name),
+            None => {
+                return Err(CaError::DbParseError {
+                    line: 0,
+                    column: 0,
+                    message: format!(
+                        "alias \"{alias_name}\" refers to unknown record \"{target}\""
+                    ),
+                });
+            }
+        }
+    }
+
     Ok(records)
 }
 
+/// Expand `$(...)` / `${...}` macro references, mirroring the C
+/// `macLib` engine (`modules/libcom/src/macLib/macCore.c` `trans` /
+/// `refer`). Implemented behaviors:
+///
+///   - `\<char>` blocks macro detection and copies both bytes verbatim
+///     (`trans:740-749`; `macLib.plt:52`).
+///   - macros are NOT expanded inside single quotes (`trans:722-733`).
+///   - a reference name is itself macro-expanded before lookup
+///     (`refer` runs `trans` on the name — `$($(WHICH))`).
+///   - the name terminates at `=`, `,` or the closing bracket
+///     (`macEnd = "=,)"`); `,name=val` introduces scoped macro
+///     definitions visible only inside that reference's expansion.
+///   - a resolved macro value is re-scanned for further `$(...)`
+///     (chained expansion).
+///   - an undefined macro with no default emits the placeholder
+///     `$(name,undefined)` (`refer:errval = ",undefined)"`).
 pub(crate) fn substitute_macros(input: &str, macros: &HashMap<String, String>) -> String {
-    let mut result = String::with_capacity(input.len());
     let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    trans(
+        &chars,
+        0,
+        macros,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut out,
+    );
+    out
+}
+
+/// Translate `chars` into `out`, expanding macro references.
+///
+/// `scopes` is the stack of scoped-macro frames pushed by enclosing
+/// `$(name,key=val)` references; lookup walks it innermost-first then
+/// falls back to the base `macros` map. `visiting` is the stack of
+/// macro names currently being expanded — it guards against a
+/// self-referential macro (`A=$(A)`) recursing forever, mirroring C
+/// `macCore.c`'s per-entry `visited` flag.
+fn trans(
+    chars: &[char],
+    level: usize,
+    macros: &HashMap<String, String>,
+    scopes: &mut Vec<HashMap<String, String>>,
+    visiting: &mut Vec<String>,
+    out: &mut String,
+) {
+    let mut quote: Option<char> = None;
     let mut i = 0;
-
     while i < chars.len() {
-        if i + 1 < chars.len() && chars[i] == '$' && (chars[i + 1] == '(' || chars[i + 1] == '{') {
-            let close = if chars[i + 1] == '(' { ')' } else { '}' };
-            // Find matching close bracket, respecting nested $() / ${}
-            let start = i + 2;
-            let mut depth = 1usize;
-            let mut j = start;
-            while j < chars.len() && depth > 0 {
-                if j + 1 < chars.len()
-                    && chars[j] == '$'
-                    && (chars[j + 1] == '(' || chars[j + 1] == '{')
-                {
-                    depth += 1;
-                    j += 2;
-                    continue;
-                }
-                // Only match the corresponding bracket type at the outermost level
-                if (depth == 1 && chars[j] == close)
-                    || (depth > 1 && (chars[j] == ')' || chars[j] == '}'))
-                {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                j += 1;
-            }
-            if depth == 0 {
-                let macro_content: String = chars[start..j].iter().collect();
-                let (name, default) = if let Some(eq_pos) = macro_content.find('=') {
-                    (&macro_content[..eq_pos], Some(&macro_content[eq_pos + 1..]))
-                } else {
-                    (macro_content.as_str(), None)
-                };
+        let c = chars[i];
 
-                if let Some(val) = macros.get(name) {
-                    result.push_str(val);
-                } else if let Some(def) = default {
-                    // Strip outer quotes from default: $(NAME="value") → value
-                    // Matches C EPICS macLib behavior
-                    let def = if def.starts_with('"') && def.ends_with('"') && def.len() >= 2 {
-                        &def[1..def.len() - 1]
-                    } else {
-                        def
-                    };
-                    // Recursively expand macros within the default value
-                    // e.g. $(TS_PORT=$(PORT)_TS) with PORT=ATTR1 → ATTR1_TS
-                    let expanded = substitute_macros(def, macros);
-                    result.push_str(&expanded);
-                } else {
-                    // Leave macro unexpanded
-                    result.push_str(&format!("$({macro_content})"));
-                }
-                i = j + 1;
+        // Track single/double quote state (C `trans` `quote` var).
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else if c == '"' || c == '\'' {
+            quote = Some(c);
+        }
+
+        // `\<char>`: emit both verbatim, skip macro detection.
+        if c == '\\' && i + 1 < chars.len() {
+            out.push('\\');
+            out.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+
+        // Macro reference: `$` followed by `(` or `{`, and NOT inside
+        // single quotes (C `macRef && quote != '\''`).
+        let mac_ref =
+            c == '$' && i + 1 < chars.len() && (chars[i + 1] == '(' || chars[i + 1] == '{');
+        if mac_ref && quote != Some('\'') {
+            if let Some(next) = refer(chars, i, level, macros, scopes, visiting, out) {
+                i = next;
                 continue;
             }
         }
-        result.push(chars[i]);
+
+        out.push(c);
         i += 1;
     }
+}
 
-    result
+/// Expand one macro reference starting at `chars[start]` (`$`). On
+/// success returns the index just past the closing bracket; returns
+/// `None` if the reference is unterminated (caller copies `$` raw).
+fn refer(
+    chars: &[char],
+    start: usize,
+    level: usize,
+    macros: &HashMap<String, String>,
+    scopes: &mut Vec<HashMap<String, String>>,
+    visiting: &mut Vec<String>,
+    out: &mut String,
+) -> Option<usize> {
+    let close = if chars[start + 1] == '(' { ')' } else { '}' };
+    // Find the matching close bracket, honoring nested `$(`/`${`.
+    let body_start = start + 2;
+    let mut depth = 1usize;
+    let mut j = body_start;
+    while j < chars.len() && depth > 0 {
+        if j + 1 < chars.len() && chars[j] == '$' && (chars[j + 1] == '(' || chars[j + 1] == '{') {
+            depth += 1;
+            j += 2;
+            continue;
+        }
+        if depth == 1 && chars[j] == close || depth > 1 && (chars[j] == ')' || chars[j] == '}') {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+        }
+        j += 1;
+    }
+    if depth != 0 {
+        return None; // unterminated — caller emits '$' literally
+    }
+    let body = &chars[body_start..j];
+    let after = j + 1;
+
+    // Split the body at the first top-level `=` or `,` (the C
+    // `macEnd` terminator set). Nested `$(...)` brackets are skipped
+    // so a `=`/`,` inside an inner reference does not terminate.
+    let split = top_level_terminator(body);
+    let (name_chars, rest) = match split {
+        Some(k) => (&body[..k], &body[k..]),
+        None => (body, &body[body.len()..]),
+    };
+
+    // M-5: the name itself may contain macro references — expand it.
+    let mut name = String::new();
+    trans(name_chars, level + 1, macros, scopes, visiting, &mut name);
+
+    // Default value (`=...`) and scoped definitions (`,k=v`).
+    let mut default: Option<&[char]> = None;
+    let mut scoped: Vec<(String, String)> = Vec::new();
+    if let Some(first) = rest.first() {
+        if *first == '=' {
+            // Default runs until the first top-level `,` or end.
+            let dflt = &rest[1..];
+            let dsplit = top_level_comma(dflt);
+            match dsplit {
+                Some(k) => {
+                    default = Some(&dflt[..k]);
+                    parse_scoped(&dflt[k..], level, macros, scopes, visiting, &mut scoped);
+                }
+                None => default = Some(dflt),
+            }
+        } else if *first == ',' {
+            parse_scoped(rest, level, macros, scopes, visiting, &mut scoped);
+        }
+    }
+
+    // Push the scoped frame (visible only inside this expansion).
+    let mut frame: HashMap<String, String> = HashMap::new();
+    for (k, v) in scoped {
+        frame.insert(k, v);
+    }
+    scopes.push(frame);
+
+    // Look up: innermost scope first, then base macros.
+    let resolved = scopes
+        .iter()
+        .rev()
+        .find_map(|s| s.get(&name).cloned())
+        .or_else(|| macros.get(&name).cloned());
+
+    match resolved {
+        Some(val) => {
+            if visiting.contains(&name) {
+                // Recursive reference (C `refentry->visited`): emit
+                // the resolved value verbatim WITHOUT re-expansion to
+                // break the cycle, rather than recursing forever.
+                out.push_str(&val);
+            } else {
+                // M-1: re-scan the resolved value for further refs.
+                visiting.push(name.clone());
+                let val_chars: Vec<char> = val.chars().collect();
+                trans(&val_chars, level + 1, macros, scopes, visiting, out);
+                visiting.pop();
+            }
+        }
+        None => match default {
+            Some(def_chars) => {
+                // Strip a single layer of surrounding quotes from the
+                // default (`$(NAME="value")` → value).
+                let def = strip_outer_quotes(def_chars);
+                trans(def, level + 1, macros, scopes, visiting, out);
+            }
+            None => {
+                // L-4: undefined macro placeholder. C emits
+                // `$(name,undefined)` when warnings are enabled.
+                out.push_str("$(");
+                out.push_str(&name);
+                out.push_str(",undefined)");
+            }
+        },
+    }
+
+    scopes.pop();
+    Some(after)
+}
+
+/// Parse a `,key=val,key2=val2,...` scoped-definition tail. A bare
+/// `,key` with no `=` defines nothing (C silently skips it).
+fn parse_scoped(
+    rest: &[char],
+    level: usize,
+    macros: &HashMap<String, String>,
+    scopes: &mut Vec<HashMap<String, String>>,
+    visiting: &mut Vec<String>,
+    out: &mut Vec<(String, String)>,
+) {
+    let mut k = 0;
+    while k < rest.len() {
+        if rest[k] != ',' {
+            break;
+        }
+        k += 1; // step over ','
+        // Scoped name: up to next top-level `=` or `,`.
+        let seg = &rest[k..];
+        let term = top_level_terminator(seg);
+        let (name_part, tail) = match term {
+            Some(t) => (&seg[..t], &seg[t..]),
+            None => (seg, &seg[seg.len()..]),
+        };
+        let mut sname = String::new();
+        trans(name_part, level + 1, macros, scopes, visiting, &mut sname);
+        k += name_part.len();
+        if let Some('=') = tail.first() {
+            let valseg = &tail[1..];
+            let vterm = top_level_comma(valseg);
+            let (val_part, _) = match vterm {
+                Some(t) => (&valseg[..t], &valseg[t..]),
+                None => (valseg, &valseg[valseg.len()..]),
+            };
+            let mut sval = String::new();
+            trans(val_part, level + 1, macros, scopes, visiting, &mut sval);
+            out.push((sname, sval));
+            k += 1 + val_part.len();
+        }
+        // else: bare `,name` — no value, defines nothing.
+    }
+}
+
+/// Index of the first top-level `=` or `,` in `body`, skipping any
+/// `$(...)` / `${...}` nested reference.
+fn top_level_terminator(body: &[char]) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < body.len() {
+        let c = body[i];
+        if c == '$' && i + 1 < body.len() && (body[i + 1] == '(' || body[i + 1] == '{') {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if (c == ')' || c == '}') && depth > 0 {
+            depth -= 1;
+        } else if depth == 0 && (c == '=' || c == ',') {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index of the first top-level `,` in `body` (used to split a
+/// default value from trailing scoped definitions).
+fn top_level_comma(body: &[char]) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < body.len() {
+        let c = body[i];
+        if c == '$' && i + 1 < body.len() && (body[i + 1] == '(' || body[i + 1] == '{') {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if (c == ')' || c == '}') && depth > 0 {
+            depth -= 1;
+        } else if depth == 0 && c == ',' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Strip one layer of matching surrounding quotes from a char slice.
+fn strip_outer_quotes(s: &[char]) -> &[char] {
+    if s.len() >= 2 && s[0] == '"' && s[s.len() - 1] == '"' {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 fn skip_whitespace_and_comments(
@@ -354,29 +656,42 @@ fn read_quoted_string(
     *pos += 1;
     *col += 1;
 
+    // C dbStatic lexer parity (dbLex.l:90-93): a quoted `tokenSTRING`
+    // matches `{doublequote}({dqschar}|{escape})*{doublequote}` where
+    // `escape = {backslash}.`. The lexer keeps the **raw bytes** of the
+    // string body — `dbmfStrdup(yytext+1)` then NUL-terminates one byte
+    // early, so only the surrounding quotes are stripped; escape
+    // sequences are NOT translated. Escape translation
+    // (`dbTranslateEscape`) runs in `dbGetFieldValue`/`dbRecordInfo`
+    // ONLY when the value still carries quotes, which a plain
+    // `tokenSTRING` never does (dbLexRoutines.c:1398). So for `.db`
+    // field/name/info values a `\n` stays the literal 2 chars `\n`.
+    //
+    // The escape sequence still consumes its following char for
+    // delimiter purposes — `\"` does not terminate the string — but
+    // both bytes are emitted verbatim.
     let mut s = String::new();
     while *pos < chars.len() && chars[*pos] != '"' {
         if chars[*pos] == '\\' && *pos + 1 < chars.len() {
-            *pos += 1;
-            *col += 1;
-            match chars[*pos] {
-                '"' => s.push('"'),
-                '\\' => s.push('\\'),
-                'n' => s.push('\n'),
-                other => {
-                    s.push('\\');
-                    s.push(other);
-                }
-            }
+            // Emit both the backslash and the escaped char raw.
+            s.push('\\');
+            s.push(chars[*pos + 1]);
+            *pos += 2;
+            *col += 2;
         } else if chars[*pos] == '\n' {
-            *line += 1;
-            *col = 0;
-            s.push('\n');
+            // dbLex.l:131-133: a newline inside an unterminated quoted
+            // string is a hard parse error (`yyerrorAbort("Newline in
+            // string, closing quote missing")`), not a literal char.
+            return Err(CaError::DbParseError {
+                line: *line,
+                column: *col,
+                message: "Newline in string, closing quote missing".into(),
+            });
         } else {
             s.push(chars[*pos]);
+            *pos += 1;
+            *col += 1;
         }
-        *pos += 1;
-        *col += 1;
     }
 
     if *pos >= chars.len() {
@@ -401,18 +716,47 @@ fn read_field_value(
         return read_quoted_string(chars, pos, line, col);
     }
 
-    // Unquoted value: read until ')' or ','
+    // Unquoted value: a C `bareword` (dbLex.l:21) —
+    // `[a-zA-Z0-9_\-+:.\[\]<>;]+`. Leading/trailing whitespace is
+    // skipped; an embedded space or any character outside the
+    // bareword set is a lexer error in C (the text would tokenize as
+    // two tokens). L-5: the Rust parser previously accepted arbitrary
+    // bytes up to the next `,`/`)`, which is strictly more permissive
+    // than C.
+    let is_bareword = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '+' | ':' | '.' | '[' | ']' | '<' | '>' | ';')
+    };
+
     let mut s = String::new();
-    while *pos < chars.len() && chars[*pos] != ')' && chars[*pos] != ',' {
-        if chars[*pos] == '\n' {
-            *line += 1;
-            *col = 0;
-        }
+    while *pos < chars.len() && is_bareword(chars[*pos]) {
         s.push(chars[*pos]);
         *pos += 1;
         *col += 1;
     }
-    Ok(s.trim().to_string())
+    // Skip trailing whitespace before the delimiter.
+    while *pos < chars.len() && matches!(chars[*pos], ' ' | '\t' | '\r' | '\n') {
+        if chars[*pos] == '\n' {
+            *line += 1;
+            *col = 0;
+        }
+        *pos += 1;
+        *col += 1;
+    }
+    // The only thing allowed after an unquoted value is the field
+    // delimiter (`,` or `)`); anything else means the value contained
+    // an illegal bareword character.
+    if *pos < chars.len() && chars[*pos] != ')' && chars[*pos] != ',' {
+        return Err(CaError::DbParseError {
+            line: *line,
+            column: *col,
+            message: format!(
+                "illegal character '{}' in unquoted value (expected a quoted string or bareword)",
+                chars[*pos]
+            ),
+        });
+    }
+    Ok(s)
 }
 
 fn expect_char(
@@ -626,13 +970,46 @@ mod tests {
 
     #[test]
     fn test_quoted_string_escape() {
+        // C dbStatic parity (H-2): a quoted `tokenSTRING` keeps escape
+        // bytes RAW — only the surrounding quotes are stripped. A `.db`
+        // field value `"hello \"world\""` therefore stores the literal
+        // 15 chars `hello \"world\"`, NOT `hello "world"`. The `\"`
+        // still does not terminate the string.
         let input = r#"
     record(stringin, "TEST") {
     field(VAL, "hello \"world\"")
     }
     "#;
         let records = parse_db(input, &HashMap::new()).unwrap();
-        assert_eq!(records[0].fields[0].1, "hello \"world\"");
+        assert_eq!(records[0].fields[0].1, r#"hello \"world\""#);
+    }
+
+    #[test]
+    fn test_quoted_string_keeps_escapes_raw() {
+        // H-2: `\n`, `\t`, `\\` are all kept verbatim for `.db` field
+        // values — a C IOC stores the literal backslash sequences.
+        let input = r#"
+    record(stringin, "TEST") {
+    field(DESC, "line1\nline2")
+    field(OUT, "a\\b\tc")
+    }
+    "#;
+        let records = parse_db(input, &HashMap::new()).unwrap();
+        assert_eq!(records[0].fields[0].1, r"line1\nline2");
+        assert_eq!(records[0].fields[1].1, r"a\\b\tc");
+    }
+
+    #[test]
+    fn test_quoted_string_newline_aborts() {
+        // H-3: a literal newline inside a quoted string (missing
+        // closing quote) is a hard parse error in C (dbLex.l:131-133).
+        let input = "record(stringin, \"TEST\") {\n    field(DESC, \"line1\nline2\")\n}\n";
+        let res = parse_db(input, &HashMap::new());
+        assert!(
+            matches!(res, Err(CaError::DbParseError { ref message, .. })
+                if message.contains("Newline in string")),
+            "expected newline-in-string abort, got {res:?}"
+        );
     }
 
     #[test]
@@ -863,9 +1240,13 @@ mod tests {
         let mut rec = HistogramRecord::new(10, 0.0, 10.0);
         rec.add_sample(2.5); // bucket 2
         rec.add_sample(2.7); // bucket 2
-        rec.add_sample(7.0); // bucket 7
+        // C `histogramRecord.c:340-345` selects the bucket with a
+        // closed upper edge (`temp <= i*wdth`): a value exactly on a
+        // boundary lands in the LOWER bucket. sgnl=7.0, wdth=1.0 ->
+        // i=7 is the first `7.0 <= i*1.0`, dest = i-1 = bucket 6.
+        rec.add_sample(7.0); // boundary value -> bucket 6 (C parity)
         assert_eq!(rec.val[2], 2);
-        assert_eq!(rec.val[7], 1);
+        assert_eq!(rec.val[6], 1);
     }
 
     #[test]
@@ -1196,6 +1577,54 @@ mod tests {
     }
 
     #[test]
+    fn test_addpath_directive_resolves_include() {
+        // L-3: an `addpath` directive inside a .db file mutates the
+        // include search path for subsequent `include` directives.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let inc_dir = dir.path().join("extra");
+        std::fs::create_dir(&inc_dir).unwrap();
+
+        // child.db lives ONLY in the extra/ dir.
+        let child = inc_dir.join("child.db");
+        let mut f = std::fs::File::create(&child).unwrap();
+        writeln!(f, r#"record(ai, "FROM_ADDPATH") {{ field(VAL, "0") }}"#).unwrap();
+
+        let main = dir.path().join("main.db");
+        let mut f = std::fs::File::create(&main).unwrap();
+        writeln!(f, r#"addpath "{}""#, inc_dir.display()).unwrap();
+        writeln!(f, r#"include "child.db""#).unwrap();
+
+        // No include path in config — only the addpath directive can
+        // make this resolve.
+        let config = DbLoadConfig::default();
+        let result = expand_includes(&main, &HashMap::new(), &config).unwrap();
+        assert!(result.contains(r#"record(ai, "FROM_ADDPATH")"#));
+    }
+
+    #[test]
+    fn test_path_directive_replaces_search_path() {
+        // L-3: `path` replaces the search path entirely.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let inc_dir = dir.path().join("p");
+        std::fs::create_dir(&inc_dir).unwrap();
+
+        let child = inc_dir.join("c.db");
+        let mut f = std::fs::File::create(&child).unwrap();
+        writeln!(f, r#"record(ai, "VIA_PATH") {{ field(VAL, "0") }}"#).unwrap();
+
+        let main = dir.path().join("main.db");
+        let mut f = std::fs::File::create(&main).unwrap();
+        writeln!(f, r#"path "{}""#, inc_dir.display()).unwrap();
+        writeln!(f, r#"include "c.db""#).unwrap();
+
+        let config = DbLoadConfig::default();
+        let result = expand_includes(&main, &HashMap::new(), &config).unwrap();
+        assert!(result.contains(r#"record(ai, "VIA_PATH")"#));
+    }
+
+    #[test]
     fn test_dtyp_override_existing_only() {
         let mut records = vec![
             DbRecordDef {
@@ -1339,6 +1768,95 @@ mod tests {
         assert!(matches!(res, Err(CaError::DbParseError { .. })));
     }
 
+    // L-2 — top-level directive grammar coverage.
+
+    #[test]
+    fn parse_db_accepts_path_and_addpath() {
+        // `path`/`addpath` at file scope are accepted and skipped —
+        // include resolution is the expansion layer's job.
+        let src = r#"
+            path "/opt/epics/db"
+            addpath "/extra/db"
+            record(ai, "REC") { field(VAL, "1") }
+        "#;
+        let recs = parse_db(src, &HashMap::new()).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name, "REC");
+    }
+
+    #[test]
+    fn parse_db_accepts_top_level_include() {
+        // A bare `include` at file scope is accepted (grammar parity);
+        // the file is not loaded at this layer.
+        let src = r#"
+            include "common.db"
+            record(ai, "REC") { field(VAL, "1") }
+        "#;
+        let recs = parse_db(src, &HashMap::new()).unwrap();
+        assert_eq!(recs.len(), 1);
+    }
+
+    #[test]
+    fn parse_db_global_alias_two_arg() {
+        // Standalone `alias("record","newname")` attaches the new name
+        // to the target record's alias list.
+        let src = r#"
+            record(ai, "TARGET") { field(VAL, "1") }
+            alias("TARGET", "TARGET_ALIAS")
+        "#;
+        let recs = parse_db(src, &HashMap::new()).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].aliases, vec!["TARGET_ALIAS"]);
+    }
+
+    #[test]
+    fn parse_db_global_alias_forward_reference() {
+        // The alias directive may precede its target record.
+        let src = r#"
+            alias("TARGET", "EARLY_ALIAS")
+            record(ai, "TARGET") { field(VAL, "1") }
+        "#;
+        let recs = parse_db(src, &HashMap::new()).unwrap();
+        assert_eq!(recs[0].aliases, vec!["EARLY_ALIAS"]);
+    }
+
+    #[test]
+    fn parse_db_global_alias_unknown_record_errors() {
+        let src = r#"alias("NOSUCH", "X")"#;
+        let res = parse_db(src, &HashMap::new());
+        assert!(matches!(res, Err(CaError::DbParseError { .. })));
+    }
+
+    // L-5 — unquoted field values are restricted to the C bareword set.
+
+    #[test]
+    fn parse_db_unquoted_bareword_value_ok() {
+        let src = r#"record(ai, "REC") { field(VAL, 42) field(EGU, deg-C) }"#;
+        let recs = parse_db(src, &HashMap::new()).unwrap();
+        assert_eq!(recs[0].fields[0].1, "42");
+        assert_eq!(recs[0].fields[1].1, "deg-C");
+    }
+
+    #[test]
+    fn parse_db_unquoted_value_with_space_rejected() {
+        // An unquoted multi-word value is two tokens in C — a parse
+        // error. The author must quote it.
+        let src = r#"record(ai, "REC") { field(DESC, hello world) }"#;
+        let res = parse_db(src, &HashMap::new());
+        assert!(
+            matches!(res, Err(CaError::DbParseError { .. })),
+            "unquoted value with space must be rejected, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn parse_db_unquoted_value_with_illegal_char_rejected() {
+        // `*` is outside the C bareword set.
+        let src = r#"record(ai, "REC") { field(DESC, a*b) }"#;
+        let res = parse_db(src, &HashMap::new());
+        assert!(matches!(res, Err(CaError::DbParseError { .. })));
+    }
+
     #[test]
     fn parse_db_record_without_alias_has_empty_aliases() {
         let src = r#"record(ai, "PLAIN") { field(VAL, 1) }"#;
@@ -1378,5 +1896,129 @@ record(ai, "REC") {
                 .any(|(k, v)| k == "autosaveFields" && v == "VAL DESC"),
             "unquoted multi-word value must parse: {tags:?}"
         );
+    }
+
+    /// C parity (modules/libcom/test/macLib.plt:52):
+    ///   $(a)\$(b)  with a=foo  ->  foo\$(b)
+    /// The `\` MUST block the macro-reference detection of the following
+    /// `$` so `$(b)` survives as literal text. The `\` itself is
+    /// preserved verbatim (macLib level 0 semantic — downstream
+    /// caller-side escape passes may discard it).
+    #[test]
+    fn substitute_macros_backslash_escapes_dollar() {
+        let mut macros = HashMap::new();
+        macros.insert("a".to_string(), "foo".to_string());
+        macros.insert("b".to_string(), "baz".to_string());
+
+        // Anchor test: backslash before $ blocks expansion.
+        assert_eq!(substitute_macros(r"$(a)\$(b)", &macros), r"foo\$(b)");
+
+        // Backslash before brace form too.
+        assert_eq!(substitute_macros(r"\${a}", &macros), r"\${a}");
+
+        // Without backslash, both expand.
+        assert_eq!(substitute_macros("$(a)$(b)", &macros), "foobaz");
+
+        // Backslash escape consumes the IMMEDIATELY next char (one
+        // step at a time, matching C macCore.c:741-744). So `\\$(a)`
+        // emits the first `\` + second `\` literal (escape pair), then
+        // resumes parsing at `$(a)` which expands. Result: `\\foo`.
+        assert_eq!(substitute_macros(r"\\$(a)", &macros), r"\\foo");
+
+        // Backslash NOT before $ / { passes through too (escape any next char).
+        assert_eq!(
+            substitute_macros(r"path\file $(a)", &macros),
+            r"path\file foo"
+        );
+    }
+
+    // M-1 — resolved macro values are re-expanded (chained).
+    #[test]
+    fn substitute_macros_chained_expansion() {
+        // P=$(Q), Q=IOC:  →  $(P) expands to IOC:
+        let mut macros = HashMap::new();
+        macros.insert("P".to_string(), "$(Q)".to_string());
+        macros.insert("Q".to_string(), "IOC:".to_string());
+        assert_eq!(substitute_macros("$(P)TEMP", &macros), "IOC:TEMP");
+    }
+
+    // M-2 — `$(name,key=val,...)` scoped macro definitions.
+    #[test]
+    fn substitute_macros_scoped_definitions() {
+        // INNER references A and B which are only defined for the
+        // duration of this reference.
+        let mut macros = HashMap::new();
+        macros.insert("INNER".to_string(), "$(A)-$(B)".to_string());
+        assert_eq!(substitute_macros("$(INNER,A=1,B=2)", &macros), "1-2");
+    }
+
+    #[test]
+    fn substitute_macros_scoped_not_leaking() {
+        // A scoped macro must not leak past its reference.
+        let mut macros = HashMap::new();
+        macros.insert("INNER".to_string(), "$(A)".to_string());
+        // After the scoped $(INNER,A=9), a bare $(A) is undefined.
+        let out = substitute_macros("$(INNER,A=9)|$(A)", &macros);
+        assert_eq!(out, "9|$(A,undefined)");
+    }
+
+    // M-3 — macros are NOT expanded inside single quotes.
+    #[test]
+    fn substitute_macros_suppressed_in_single_quotes() {
+        let mut macros = HashMap::new();
+        macros.insert("X".to_string(), "VAL".to_string());
+        // Single quotes suppress.
+        assert_eq!(substitute_macros("'$(X)'", &macros), "'$(X)'");
+        // Double quotes do NOT suppress.
+        assert_eq!(substitute_macros("\"$(X)\"", &macros), "\"VAL\"");
+    }
+
+    // M-5 — the reference name is macro-expanded before lookup.
+    #[test]
+    fn substitute_macros_indirect_name() {
+        // $($(WHICH)) — WHICH selects which macro to read.
+        let mut macros = HashMap::new();
+        macros.insert("WHICH".to_string(), "SEL".to_string());
+        macros.insert("SEL".to_string(), "chosen".to_string());
+        assert_eq!(substitute_macros("$($(WHICH))", &macros), "chosen");
+    }
+
+    // L-4 — undefined macro with no default emits `$(name,undefined)`.
+    #[test]
+    fn substitute_macros_undefined_placeholder() {
+        let macros = HashMap::new();
+        assert_eq!(
+            substitute_macros("$(MISSING)", &macros),
+            "$(MISSING,undefined)"
+        );
+    }
+
+    #[test]
+    fn substitute_macros_default_with_comma_is_c_parity() {
+        // C parity (M-2): `$(LIST=a,b,c)` — the name is LIST, the
+        // default is `a` (terminates at the first top-level comma),
+        // and `b`/`c` are bare scoped names that define nothing.
+        let macros = HashMap::new();
+        assert_eq!(substitute_macros("$(LIST=a,b,c)", &macros), "a");
+    }
+
+    #[test]
+    fn substitute_macros_self_reference_terminates() {
+        // M-1 re-expansion must not recurse forever on `A=$(A)`.
+        // The recursion guard emits the value once without re-scan.
+        let mut macros = HashMap::new();
+        macros.insert("A".to_string(), "$(A)".to_string());
+        // Must terminate; the exact text is the cycle-broken value.
+        let out = substitute_macros("$(A)", &macros);
+        assert!(out.contains("A"), "self-ref expansion produced: {out}");
+    }
+
+    #[test]
+    fn substitute_macros_mutual_reference_terminates() {
+        // A=$(B), B=$(A) — mutual cycle must also terminate.
+        let mut macros = HashMap::new();
+        macros.insert("A".to_string(), "$(B)".to_string());
+        macros.insert("B".to_string(), "$(A)".to_string());
+        let _ = substitute_macros("$(A)", &macros); // must not hang
     }
 }

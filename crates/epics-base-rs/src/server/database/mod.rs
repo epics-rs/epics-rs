@@ -29,6 +29,21 @@ pub fn parse_pv_name(name: &str) -> (&str, &str) {
 
 /// Apply timestamp to a record based on its TSE field.
 /// `is_soft` indicates a Soft Channel device type.
+///
+/// Mirrors C `recGblGetTimeStampSimm` (recGbl.c:310-343). The TSE
+/// constants are defined in `epicsTime.h:102-104`:
+///
+///   - `epicsTimeEventCurrentTime = 0` → wall-clock now
+///   - `epicsTimeEventBestTime    = -1` → generalTime BestTime providers
+///   - `epicsTimeEventDeviceTime  = -2` → device support already set time
+///   - `1..` → event-number providers
+///
+/// The C path is symmetric: every non-`-2` case unconditionally
+/// overwrites `precord->time` via `epicsTimeGetEvent(tse)`, which
+/// delegates to `epicsTimeGetCurrent` for `tse==0` and to
+/// `generalTimeGetEventPriority` otherwise. Only `-2` (device time)
+/// is left untouched because the device support has already written
+/// the timestamp before `recGblGetTimeStamp` is called.
 fn apply_timestamp(common: &mut super::record::CommonFields, _is_soft: bool) {
     match common.tse {
         0 => {
@@ -37,16 +52,29 @@ fn apply_timestamp(common: &mut super::record::CommonFields, _is_soft: bool) {
             common.time = crate::runtime::general_time::get_current();
         }
         -1 => {
-            // Device-provided time; fallback to generalTime BestTime if not set
-            if common.time == std::time::SystemTime::UNIX_EPOCH {
-                common.time = crate::runtime::general_time::get_event(-1);
-            }
+            // C `epicsTimeEventBestTime` (epicsTime.h:103). The C path
+            // calls `epicsTimeGetEvent(-1)` unconditionally, which
+            // routes to `generalTimeGetEventPriority(-1)` — the
+            // BestTime ratchet across current-time providers.
+            //
+            // The pre-fix Rust port read this as "device-provided time
+            // with BestTime fallback" and gated the call on
+            // `common.time == UNIX_EPOCH`. That misreads C: device
+            // time is signalled by TSE=-2 (epicsTimeEventDeviceTime),
+            // not TSE=-1. The conditional fallback also produced
+            // monotonic stalls when a device incidentally wrote a
+            // stale (but non-epoch) time to `common.time` before the
+            // first BestTime call: BestTime was never queried and the
+            // record kept the stale stamp across every cycle.
+            common.time = crate::runtime::general_time::get_event(-1);
         }
         -2 => {
-            // Keep TIME field as-is
+            // `epicsTimeEventDeviceTime` (epicsTime.h:104). Device
+            // support has already written `common.time`; leave it
+            // alone (C recGbl.c:333-343 also skips the assignment).
         }
         _ => {
-            // generalTime event time
+            // Positive event number — event providers via generalTime.
             common.time = crate::runtime::general_time::get_event(common.tse as i32);
         }
     }
@@ -114,8 +142,26 @@ pub type SearchResolver = Arc<
 struct PvDatabaseInner {
     simple_pvs: RwLock<HashMap<String, Arc<ProcessVariable>>>,
     records: RwLock<HashMap<String, Arc<RwLock<RecordInstance>>>>,
-    /// Scan index: maps scan type → sorted set of (PHAS, record_name).
-    scan_index: RwLock<HashMap<ScanType, BTreeSet<(i16, String)>>>,
+    /// Scan index: maps scan type → sorted set of
+    /// `(PHAS, load_order, record_name)`.
+    ///
+    /// C parity (`dbScan.c:1052-1095`): `buildScanLists` walks records
+    /// in database / record-type **load order** and `addToList`
+    /// inserts each after the last element with `phas <= precord->phas`
+    /// — so within one PHAS value the scan list is a stable FIFO in
+    /// load order. The secondary sort key is the per-record
+    /// `load_order` sequence (NOT the record name), so two records
+    /// sharing a PHAS scan in the order they were loaded, matching a
+    /// C IOC built from the same `.db` file.
+    scan_index: RwLock<HashMap<ScanType, BTreeSet<(i16, u64, String)>>>,
+    /// Per-record load-order sequence number, assigned monotonically
+    /// at `add_record`. Used as the secondary scan-index sort key so
+    /// same-PHAS records preserve database load order. Survives a
+    /// `remove_record` + re-`add_record` (the re-add gets a fresh,
+    /// higher sequence — matching a fresh `.db` reload).
+    load_order: RwLock<HashMap<String, u64>>,
+    /// Monotonic counter feeding `load_order`.
+    load_order_counter: std::sync::atomic::AtomicU64,
     /// CP link index: maps source_record → list of target records to process when source changes.
     cp_links: RwLock<HashMap<String, Vec<String>>>,
     /// Alias map: alternate-name → real-record-name. Mirrors epics-base
@@ -173,19 +219,111 @@ pub struct PvDatabase {
     inner: Arc<PvDatabaseInner>,
 }
 
-/// Select which link indices are active based on SELM and SELN.
-/// SELM: 0=All, 1=Specified, 2=Mask
-fn select_link_indices(selm: i16, seln: i16, count: usize) -> Vec<usize> {
+/// Which record kind a SELM link selection is being computed for.
+/// The Specified/Mask base differs between record types in C, so the
+/// shared selector must know the caller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SelmKind {
+    /// `fanout` / `seq`: Specified index is `SELN + OFFS` (0-based over
+    /// LNK0..LNKF / group 0..15); Mask is shifted by `SHFT`.
+    /// Mirrors `fanoutRecord.c:106-141` and `seqRecord.c:147-178`.
+    FanoutSeq,
+    /// `dfanout`: Specified index is `SELN - 1` (1-based, `SELN==0`
+    /// means "drive nothing", `SELN > OUT_ARG_MAX` is invalid); Mask
+    /// has NO `SHFT` and `SELN==0` means "no output".
+    /// Mirrors `dfanoutRecord.c:307-339`.
+    Dfanout,
+}
+
+/// Result of resolving a SELM/SELN selection.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SelmResult {
+    /// 0-based link indices to drive (into the LNK0../OUTA.. array).
+    pub indices: Vec<usize>,
+    /// `Some` when C would raise an alarm for an out-of-range
+    /// `SELN`/`OFFS`/`SHFT`. C uses `recGblSetSevr(prec, SOFT_ALARM,
+    /// INVALID_ALARM)` in every such path.
+    pub alarm: Option<(u16, crate::server::record::AlarmSeverity)>,
+}
+
+/// Select which link indices are active based on SELM/SELN, applying
+/// the record-type-specific `OFFS`/`SHFT` bias.
+///
+/// SELM: 0 = All, 1 = Specified, 2 = Mask. `count` is the number of
+/// link slots (16 for fanout/dfanout/seq).
+///
+/// C references:
+/// * fanout — `fanoutRecord.c:106-141`
+/// * dfanout — `dfanoutRecord.c:307-339`
+/// * seq — `seqRecord.c:147-178`
+pub(crate) fn select_link_indices_ex(
+    kind: SelmKind,
+    selm: i16,
+    seln: i16,
+    offs: i16,
+    shft: i16,
+    count: usize,
+) -> SelmResult {
+    use crate::server::recgbl::alarm_status::SOFT_ALARM;
+    use crate::server::record::AlarmSeverity;
+
+    let invalid = || SelmResult {
+        indices: Vec::new(),
+        alarm: Some((SOFT_ALARM, AlarmSeverity::Invalid)),
+    };
+    let ok = |indices: Vec<usize>| SelmResult {
+        indices,
+        alarm: None,
+    };
+
     match selm {
-        0 => (0..count).collect(),
-        1 => {
-            let i = seln as usize;
-            if i < count { vec![i] } else { vec![] }
+        // All — every slot.
+        0 => ok((0..count).collect()),
+        // Specified.
+        1 => match kind {
+            SelmKind::FanoutSeq => {
+                // C: `i = seln + offs;` 0-based; `i<0 || i>=NLINKS` → INVALID.
+                let i = seln as i32 + offs as i32;
+                if i < 0 || i >= count as i32 {
+                    invalid()
+                } else {
+                    ok(vec![i as usize])
+                }
+            }
+            SelmKind::Dfanout => {
+                // C: `seln > OUT_ARG_MAX` → INVALID; `seln == 0` → no output;
+                // otherwise drive `seln - 1`. OFFS is not a dfanout field.
+                if seln as i32 > count as i32 {
+                    invalid()
+                } else if seln <= 0 {
+                    ok(Vec::new())
+                } else {
+                    ok(vec![(seln - 1) as usize])
+                }
+            }
+        },
+        // Mask.
+        2 => {
+            let mask: u32 = match kind {
+                SelmKind::FanoutSeq => {
+                    // C: SHFT shift first, with `shft` range-checked to [-15,15].
+                    if !(-15..=15).contains(&shft) {
+                        return invalid();
+                    }
+                    let raw = (seln as u16) as u32;
+                    if shft >= 0 {
+                        raw >> shft
+                    } else {
+                        raw << (-shft)
+                    }
+                }
+                // dfanout Mask has no SHFT.
+                SelmKind::Dfanout => (seln as u16) as u32,
+            };
+            ok((0..count).filter(|i| mask & (1 << i) != 0).collect())
         }
-        2 => (0..count)
-            .filter(|i| (seln as u16) & (1 << i) != 0)
-            .collect(),
-        _ => (0..count).collect(),
+        // Any other SELM value → C `default:` raises INVALID.
+        _ => invalid(),
     }
 }
 
@@ -199,6 +337,8 @@ impl PvDatabase {
                 link_sets: RwLock::new(link_set::LinkSetRegistry::new()),
                 records: RwLock::new(HashMap::new()),
                 scan_index: RwLock::new(HashMap::new()),
+                load_order: RwLock::new(HashMap::new()),
+                load_order_counter: std::sync::atomic::AtomicU64::new(0),
                 cp_links: RwLock::new(HashMap::new()),
                 aliases: RwLock::new(HashMap::new()),
                 registration_mutex: tokio::sync::Mutex::new(()),
@@ -529,6 +669,18 @@ impl PvDatabase {
             .await
             .insert(name.to_string(), Arc::new(RwLock::new(instance)));
 
+        // Assign a monotonic load-order sequence — the scan-index
+        // secondary sort key, so same-PHAS records keep load order.
+        let seq = self
+            .inner
+            .load_order_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner
+            .load_order
+            .write()
+            .await
+            .insert(name.to_string(), seq);
+
         if scan != ScanType::Passive {
             self.inner
                 .scan_index
@@ -536,7 +688,7 @@ impl PvDatabase {
                 .await
                 .entry(scan)
                 .or_default()
-                .insert((phas, name.to_string()));
+                .insert((phas, seq, name.to_string()));
         }
         Ok(())
     }
@@ -582,21 +734,26 @@ impl PvDatabase {
         let Some(rec_arc) = removed else {
             return false;
         };
-        let (scan, phas) = {
+        let scan = {
             let inst = rec_arc.read().await;
-            (inst.common.scan, inst.common.phas)
+            inst.common.scan
         };
 
-        // 2) Drop from scan index if it was scheduled.
+        // 2) Drop from scan index if it was scheduled. Match by record
+        // name only — PHAS and load_order are not needed and may be
+        // stale relative to the entry actually present.
         if scan != ScanType::Passive {
             let mut idx = self.inner.scan_index.write().await;
             if let Some(set) = idx.get_mut(&scan) {
-                set.remove(&(phas, name.to_string()));
+                set.retain(|(_, _, n)| n != name);
                 if set.is_empty() {
                     idx.remove(&scan);
                 }
             }
         }
+
+        // 2b) Drop the load-order entry.
+        self.inner.load_order.write().await.remove(name);
 
         // 3) Drop from CP-link tables. Removed both as source (channel
         // change → trigger targets) and as target (other channels'
@@ -822,15 +979,119 @@ impl PvDatabase {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_select_link_indices() {
-        // All
-        assert_eq!(select_link_indices(0, 0, 6), vec![0, 1, 2, 3, 4, 5]);
-        // Specified
-        assert_eq!(select_link_indices(1, 2, 6), vec![2]);
-        assert_eq!(select_link_indices(1, 10, 6), Vec::<usize>::new());
-        // Mask: seln=5 = 0b101 -> indices 0 and 2
-        assert_eq!(select_link_indices(2, 5, 6), vec![0, 2]);
+    /// C `recGblGetTimeStampSimm` (recGbl.c:310-343) maps TSE values
+    /// to epicsTime sources via the constants in `epicsTime.h:102-104`.
+    /// The Rust port previously misread TSE=-1 as "device-provided
+    /// with BestTime fallback" and gated the BestTime call on a
+    /// UNIX_EPOCH check. C calls `epicsTimeGetEvent(-1)`
+    /// unconditionally; only TSE=-2 (epicsTimeEventDeviceTime) leaves
+    /// `precord->time` untouched.
+    ///
+    /// Regression: a stale device write (any non-epoch SystemTime)
+    /// suppressed every BestTime refresh thereafter.
+    #[test]
+    fn apply_timestamp_tse_minus_one_always_overwrites_with_best_time() {
+        use crate::server::record::CommonFields;
+        use std::time::{Duration, SystemTime};
+
+        // Pre-populate `time` with a stale but non-epoch sentinel.
+        let stale = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut common = CommonFields::default();
+        common.tse = -1;
+        common.time = stale;
+
+        apply_timestamp(&mut common, false);
+
+        // BestTime must have run unconditionally — `common.time` is
+        // no longer the stale sentinel.
+        assert_ne!(
+            common.time, stale,
+            "TSE=-1 must always overwrite via generalTime BestTime, \
+             matching C epicsTimeGetEvent(-1) called unconditionally"
+        );
+    }
+
+    /// C `epicsTimeEventDeviceTime = -2` (epicsTime.h:104). The C
+    /// path does NOT call `epicsTimeGetEvent` for this TSE value;
+    /// device support has already set `precord->time` before the
+    /// recGbl call. The Rust port must leave `common.time` untouched.
+    #[test]
+    fn apply_timestamp_tse_minus_two_preserves_device_provided_time() {
+        use crate::server::record::CommonFields;
+        use std::time::{Duration, SystemTime};
+
+        let device_time = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let mut common = CommonFields::default();
+        common.tse = -2;
+        common.time = device_time;
+
+        apply_timestamp(&mut common, false);
+
+        assert_eq!(
+            common.time, device_time,
+            "TSE=-2 (epicsTimeEventDeviceTime) must preserve device-provided time"
+        );
+    }
+
+    #[test]
+    fn select_link_indices_fanout_all_specified_mask() {
+        use crate::server::record::AlarmSeverity;
+        // All — every slot.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 0, 0, 0, 0, 16);
+        assert_eq!(r.indices, (0..16).collect::<Vec<_>>());
+        assert!(r.alarm.is_none());
+
+        // Specified, 0-based: SELN=0 selects LNK0 (C parity, fanout).
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 0, 0, 0, 16);
+        assert_eq!(r.indices, vec![0]);
+        // Specified with OFFS bias: SELN=2 + OFFS=3 → index 5.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 2, 3, 0, 16);
+        assert_eq!(r.indices, vec![5]);
+        // Out-of-range Specified → INVALID alarm, no links.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 20, 0, 0, 16);
+        assert!(r.indices.is_empty());
+        assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
+        // Negative resolved index (SELN + negative OFFS) → INVALID.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 0, -1, 0, 16);
+        assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
+
+        // Mask: SELN=0b101 → bits 0 and 2.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 0, 16);
+        assert_eq!(r.indices, vec![0, 2]);
+        // Mask with SHFT: SELN=0b101 >> 1 = 0b10 → bit 1.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 1, 16);
+        assert_eq!(r.indices, vec![1]);
+        // Mask with negative SHFT: SELN=0b101 << 1 = 0b1010 → bits 1,3.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, -1, 16);
+        assert_eq!(r.indices, vec![1, 3]);
+        // SHFT out of [-15,15] → INVALID.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 16, 16);
+        assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
+
+        // Unknown SELM → INVALID.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 9, 0, 0, 0, 16);
+        assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
+    }
+
+    #[test]
+    fn select_link_indices_dfanout_specified_is_one_based() {
+        use crate::server::record::AlarmSeverity;
+        // dfanout Specified is 1-based: SELN=1 → OUTA (index 0).
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 1, 0, 0, 16);
+        assert_eq!(r.indices, vec![0]);
+        // SELN=2 → OUTB (index 1).
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 2, 0, 0, 16);
+        assert_eq!(r.indices, vec![1]);
+        // SELN=0 → drive nothing, NO alarm.
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 0, 0, 0, 16);
+        assert!(r.indices.is_empty());
+        assert!(r.alarm.is_none());
+        // SELN > 16 → INVALID.
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 17, 0, 0, 16);
+        assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
+        // dfanout Mask has no SHFT — SHFT arg ignored.
+        let r = select_link_indices_ex(SelmKind::Dfanout, 2, 5, 0, 7, 16);
+        assert_eq!(r.indices, vec![0, 2]);
     }
 
     /// Lset that flips to "connected" after a configurable delay.

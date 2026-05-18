@@ -179,15 +179,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             // Build NDArray from f64 data
             let dims = vec![NDDimension::new(height), NDDimension::new(width)];
-            let mut frame = NDArray {
-                unique_id: 0,
-                timestamp: ad_core_rs::timestamp::EpicsTimestamp::default(),
-                time_stamp: 0.0,
-                dims,
-                data: NDDataBuffer::F64(img_data),
-                attributes: ad_core_rs::attributes::NDAttributeList::new(),
-                codec: None,
-            };
+            let mut frame = NDArray::with_data(dims, NDDataBuffer::F64(img_data));
 
             // Exposure time delay with stop interruption
             let elapsed = start_time.elapsed().as_secs_f64();

@@ -130,7 +130,7 @@ loop {
     };
     if n == 0 { break }                         // EOF
     accumulated.extend_from_slice(&buf[..n]);
-    if accumulated.len() > MAX_ACCUMULATED { break } // 1 MB DoS guard
+    if accumulated.len() > max_accumulated() { break } // DoS guard
 
     // Frame and dispatch as many full messages as we can.
     while let Some(msg) = parse_frame(&accumulated, &mut offset) {
@@ -140,9 +140,13 @@ loop {
 }
 ```
 
-`MAX_ACCUMULATED = 1 MB` mirrors the client-side cap and prevents a
-hostile or buggy client from declaring a huge `postsize` and streaming
-nothing else (which would otherwise grow the Vec without bound).
+`max_accumulated()` mirrors the client-side cap and prevents a hostile
+or buggy client from declaring a huge `postsize` and streaming nothing
+else (which would otherwise grow the Vec without bound). It is sized at
+`max_payload_size()` (default 16 MB, honours `EPICS_CA_MAX_ARRAY_BYTES`)
+plus the extended header and a 64 KiB slack, so it never rejects a
+legal large waveform — the cap is strictly above the largest frame the
+protocol can carry.
 
 `inactivity_timeout()` reads `EPICS_CAS_INACTIVITY_TMO` (default
 600 s, minimum 30 s).
@@ -363,7 +367,7 @@ Both `ProcessVariable` and `RecordInstance` have matching
 | Guard | Default | Variable |
 |-------|---------|----------|
 | Inactivity timeout | 600 s | `EPICS_CAS_INACTIVITY_TMO` |
-| Accumulated buffer cap | 1 MB | (compile-time) |
+| Accumulated buffer cap | `max_payload_size()` + 64 KiB | `EPICS_CA_MAX_ARRAY_BYTES` |
 | Max channels per client | 4096 | `EPICS_CAS_MAX_CHANNELS` |
 | Max subscriptions per channel | 100 | `EPICS_CAS_MAX_SUBS_PER_CHAN` |
 

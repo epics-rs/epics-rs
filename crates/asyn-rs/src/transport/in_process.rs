@@ -98,7 +98,15 @@ impl RuntimeClient for InProcessClient {
 
             tokio::spawn(async move {
                 loop {
-                    match broadcast_rx.recv().await {
+                    // Exit promptly when the consumer drops its receiver,
+                    // rather than parking on `recv()` until the broadcast
+                    // channel closes (i.e. the port is destroyed) — that
+                    // leaked a task per short-lived subscription.
+                    let recv = tokio::select! {
+                        _ = tx.closed() => break,
+                        recv = broadcast_rx.recv() => recv,
+                    };
+                    match recv {
                         Ok(iv) => {
                             if let Some(r) = filter.reason {
                                 if iv.reason != r {
@@ -274,6 +282,7 @@ mod tests {
             value: crate::param::ParamValue::Int32(77),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
@@ -317,6 +326,7 @@ mod tests {
             value: crate::param::ParamValue::Int32(10),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         // Send reason=1, should pass
@@ -326,6 +336,7 @@ mod tests {
             value: crate::param::ParamValue::Int32(20),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())

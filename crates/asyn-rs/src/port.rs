@@ -39,9 +39,9 @@ impl Default for DeviceState {
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
-use crate::interpose::{OctetInterpose, OctetInterposeStack};
+use crate::interpose::{EomReason, OctetInterpose, OctetInterposeStack};
 use crate::interrupt::{InterruptManager, InterruptValue};
-use crate::param::{EnumEntry, ParamList, ParamType};
+use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType};
 use crate::trace::TraceManager;
 use crate::user::AsynUser;
 
@@ -173,6 +173,40 @@ impl PortDriverBase {
         self.connected
     }
 
+    /// Single owner-API for the port-level `connected` transition.
+    ///
+    /// C parity: `exceptionConnect` (asynManager.c:2151-2160) and
+    /// `exceptionDisconnect` (:2174-2185) fire
+    /// `asynExceptionConnect` only when the state actually changes.
+    /// All driver code that toggles connection state MUST go through
+    /// this helper — directly assigning `base.connected = ...`
+    /// followed by `announce_exception(Connect, -1)` bypasses the
+    /// edge guard and fans spurious duplicates out to listeners
+    /// (CA gateway shadow tasks, asynRecord, monitor relays).
+    ///
+    /// Returns `true` if the state actually changed (a fan-out
+    /// happened); `false` if the call was a no-op.
+    pub fn set_connected(&mut self, connected: bool) -> bool {
+        if self.connected == connected {
+            return false;
+        }
+        self.connected = connected;
+        self.announce_exception(AsynException::Connect, -1);
+        true
+    }
+
+    /// Per-address variant — for multi-device ports. Same edge
+    /// guarantee as [`Self::set_connected`].
+    pub fn set_addr_connected(&mut self, addr: i32, connected: bool) -> bool {
+        let was = self.device_state(addr).connected;
+        if was == connected {
+            return false;
+        }
+        self.device_state(addr).connected = connected;
+        self.announce_exception(AsynException::Connect, addr);
+        true
+    }
+
     /// Query whether the port is enabled.
     pub fn is_enabled(&self) -> bool {
         self.enabled
@@ -181,6 +215,28 @@ impl PortDriverBase {
     /// Query whether auto-connect is enabled.
     pub fn is_auto_connect(&self) -> bool {
         self.auto_connect
+    }
+
+    /// Toggle the auto-connect flag at runtime.
+    ///
+    /// C parity: `autoConnectAsyn` (asynManager.c:2310-2324) always
+    /// fires `asynExceptionAutoConnect` regardless of prior state
+    /// (no state-change guard). Mirror that — every call announces.
+    /// Driver constructors that initialise `base.auto_connect`
+    /// directly during `PortDriver::new()` keep the silent path
+    /// (the port is not yet registered, so no listeners exist).
+    pub fn set_auto_connect(&mut self, yes: bool) {
+        self.auto_connect = yes;
+        self.announce_exception(AsynException::AutoConnect, -1);
+    }
+
+    /// Per-address variant — for multi-device ports. C parity:
+    /// `autoConnectAsyn` walks dpCommon via findDpCommon so a per-
+    /// device pasynUser hits the device's dpc, otherwise the port's
+    /// dpc (asynManager.c:2314 + findDpCommon).
+    pub fn set_auto_connect_addr(&mut self, addr: i32, yes: bool) {
+        self.device_state(addr).auto_connect = yes;
+        self.announce_exception(AsynException::AutoConnect, addr);
     }
 
     /// Query whether the port has been marked defunct via
@@ -290,15 +346,25 @@ impl PortDriverBase {
     }
 
     /// Set a specific device address as connected.
+    ///
+    /// C parity: announce only on actual transition
+    /// (asynManager.c:2151-2160 — `exceptionConnect` rejects
+    /// already-connected; we keep an Ok return for idempotency but
+    /// suppress the duplicate fan-out so subscribers don't see
+    /// spurious connect events). Thin wrapper over
+    /// [`Self::set_addr_connected`] for callers that prefer the
+    /// directional verb.
     pub fn connect_addr(&mut self, addr: i32) {
-        self.device_state(addr).connected = true;
-        self.announce_exception(AsynException::Connect, addr);
+        self.set_addr_connected(addr, true);
     }
 
     /// Set a specific device address as disconnected.
+    ///
+    /// C parity: announce only on actual transition
+    /// (asynManager.c:2174-2185). Thin wrapper over
+    /// [`Self::set_addr_connected`].
     pub fn disconnect_addr(&mut self, addr: i32) {
-        self.device_state(addr).connected = false;
-        self.announce_exception(AsynException::Connect, addr);
+        self.set_addr_connected(addr, false);
     }
 
     /// Enable a specific device address.
@@ -346,12 +412,24 @@ impl PortDriverBase {
         self.params.get_int32(index, addr)
     }
 
+    /// Strict variant — returns [`AsynError::ParamUndefined`] when the
+    /// cache entry has never been set (C parity for `asynParamUndefined`).
+    /// See [`crate::param::ParamList::get_int32_strict`].
+    pub fn get_int32_param_strict(&self, index: usize, addr: i32) -> AsynResult<i32> {
+        self.params.get_int32_strict(index, addr)
+    }
+
     pub fn set_int64_param(&mut self, index: usize, addr: i32, value: i64) -> AsynResult<()> {
         self.params.set_int64(index, addr, value)
     }
 
     pub fn get_int64_param(&self, index: usize, addr: i32) -> AsynResult<i64> {
         self.params.get_int64(index, addr)
+    }
+
+    /// Strict variant — see [`crate::param::ParamList::get_int64_strict`].
+    pub fn get_int64_param_strict(&self, index: usize, addr: i32) -> AsynResult<i64> {
+        self.params.get_int64_strict(index, addr)
     }
 
     pub fn set_float64_param(&mut self, index: usize, addr: i32, value: f64) -> AsynResult<()> {
@@ -362,12 +440,22 @@ impl PortDriverBase {
         self.params.get_float64(index, addr)
     }
 
+    /// Strict variant — see [`crate::param::ParamList::get_float64_strict`].
+    pub fn get_float64_param_strict(&self, index: usize, addr: i32) -> AsynResult<f64> {
+        self.params.get_float64_strict(index, addr)
+    }
+
     pub fn set_string_param(&mut self, index: usize, addr: i32, value: String) -> AsynResult<()> {
         self.params.set_string(index, addr, value)
     }
 
     pub fn get_string_param(&self, index: usize, addr: i32) -> AsynResult<&str> {
         self.params.get_string(index, addr)
+    }
+
+    /// Strict variant — see [`crate::param::ParamList::get_string_strict`].
+    pub fn get_string_param_strict(&self, index: usize, addr: i32) -> AsynResult<&str> {
+        self.params.get_string_strict(index, addr)
     }
 
     pub fn set_uint32_param(
@@ -382,6 +470,11 @@ impl PortDriverBase {
 
     pub fn get_uint32_param(&self, index: usize, addr: i32) -> AsynResult<u32> {
         self.params.get_uint32(index, addr)
+    }
+
+    /// Strict variant — see [`crate::param::ParamList::get_uint32_strict`].
+    pub fn get_uint32_param_strict(&self, index: usize, addr: i32) -> AsynResult<u32> {
+        self.params.get_uint32_strict(index, addr)
     }
 
     pub fn get_enum_param(&self, index: usize, addr: i32) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
@@ -503,12 +596,24 @@ impl PortDriverBase {
                 .params
                 .get_uint32_interrupt_mask(reason, addr)
                 .unwrap_or(0);
+            // C parity: asynPortDriver.cpp:631-642 sets
+            // `pInterrupt->pasynUser->auxStatus/alarmStatus/alarmSeverity`
+            // from the param's stored status before invoking each
+            // subscriber callback. Pull those here so subscribers see
+            // the same triplet C consumers do.
+            let (aux_status, alarm_status, alarm_severity) = self
+                .params
+                .get_param_status(reason, addr)
+                .unwrap_or((AsynStatus::Success, 0, 0));
             self.interrupts.notify(InterruptValue {
                 reason,
                 addr,
                 value,
                 timestamp: ts,
                 uint32_changed_mask: uint32_mask,
+                aux_status,
+                alarm_status,
+                alarm_severity,
             });
         }
         Ok(())
@@ -526,12 +631,20 @@ impl PortDriverBase {
                 .params
                 .get_uint32_interrupt_mask(reason, addr)
                 .unwrap_or(0);
+            // C parity: see `call_param_callbacks` above.
+            let (aux_status, alarm_status, alarm_severity) = self
+                .params
+                .get_param_status(reason, addr)
+                .unwrap_or((AsynStatus::Success, 0, 0));
             self.interrupts.notify(InterruptValue {
                 reason,
                 addr,
                 value,
                 timestamp: ts,
                 uint32_changed_mask: uint32_mask,
+                aux_status,
+                alarm_status,
+                alarm_severity,
             });
         }
         Ok(())
@@ -567,14 +680,13 @@ pub trait PortDriver: Send + Sync + 'static {
     // --- AsynCommon ---
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        self.base_mut().connected = true;
-        self.base().announce_exception(AsynException::Connect, -1);
+        // Single owner-API: edge-guarded fire is in PortDriverBase::set_connected.
+        self.base_mut().set_connected(true);
         Ok(())
     }
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        self.base_mut().connected = false;
-        self.base().announce_exception(AsynException::Connect, -1);
+        self.base_mut().set_connected(false);
         Ok(())
     }
 
@@ -725,6 +837,48 @@ pub trait PortDriver: Send + Sync + 'static {
         self.base_mut().call_param_callbacks(user.addr)
     }
 
+    /// Configure rising / falling interrupt masks for a
+    /// UInt32Digital parameter. C parity:
+    /// `asynPortDriver::setInterruptUInt32Digital`
+    /// (`asynPortDriver.cpp:2346-2369`) → routes to
+    /// `paramList::setUInt32Interrupt`. The default delegates to the
+    /// param store; drivers that need to push the configuration to
+    /// hardware (e.g. real GPIB cards toggling SRQ enable) override
+    /// it.
+    fn set_interrupt_uint32_digital(
+        &mut self,
+        user: &AsynUser,
+        mask: u32,
+        reason: InterruptReason,
+    ) -> AsynResult<()> {
+        self.base_mut()
+            .params
+            .set_uint32_interrupt(user.reason, user.addr, mask, reason)
+    }
+
+    /// Clear bits from rising AND falling masks. C parity:
+    /// `asynPortDriver::clearInterruptUInt32Digital`
+    /// (`asynPortDriver.cpp:2392-2415`). Mirrors C — the call does
+    /// not take an `interruptReason`; both masks are cleared.
+    fn clear_interrupt_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<()> {
+        self.base_mut()
+            .params
+            .clear_uint32_interrupt(user.reason, user.addr, mask)
+    }
+
+    /// Read the configured rising / falling / combined mask. C
+    /// parity: `asynPortDriver::getInterruptUInt32Digital`
+    /// (`asynPortDriver.cpp:2438-2461`).
+    fn get_interrupt_uint32_digital(
+        &self,
+        user: &AsynUser,
+        reason: InterruptReason,
+    ) -> AsynResult<u32> {
+        self.base()
+            .params
+            .get_uint32_interrupt(user.reason, user.addr, reason)
+    }
+
     // --- Enum I/O (cache-based defaults) ---
 
     fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
@@ -842,6 +996,30 @@ pub trait PortDriver: Send + Sync + 'static {
 
     fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         self.read_octet(user, buf)
+    }
+
+    /// Octet read that also reports the end-of-message reason — C
+    /// parity for `asynOctet::read(... int *eomReason)`
+    /// (`asynOctet.h:38-40`). The default implementation delegates to
+    /// [`Self::io_read_octet`] and reconstructs a synthetic
+    /// [`EomReason`]: `CNT` when the buffer filled, `empty` otherwise.
+    /// Drivers that have native EOM information
+    /// (`asynOctetSyncIO::readRaw`, GPIB END, EOS match) must
+    /// override this method so consumers — `asynRecord::EOMR`,
+    /// `asynOctetSyncIO::readRaw` mirrors — receive the real flags.
+    fn io_read_octet_eom(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
+        let cap = buf.len();
+        let n = self.io_read_octet(user, buf)?;
+        let eom = if n >= cap && cap > 0 {
+            EomReason::CNT
+        } else {
+            EomReason::empty()
+        };
+        Ok((n, eom))
     }
 
     fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
@@ -1079,6 +1257,51 @@ mod tests {
         let v2 = rx.try_recv().unwrap();
         assert_eq!(v2.reason, 1);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_call_param_callbacks_propagates_aux_status_and_alarm() {
+        // C parity: asynPortDriver.cpp:631-642 writes the param's stored
+        // status / alarmStatus / alarmSeverity onto the subscriber's
+        // pasynUser before invoking the callback. The Rust port carries
+        // those fields on InterruptValue.
+        let mut drv = TestDriver::new();
+        let mut rx = drv.base_mut().interrupts.subscribe_async();
+
+        drv.base_mut().set_int32_param(0, 0, 99).unwrap();
+        drv.base_mut()
+            .params
+            .set_param_status(0, 0, crate::error::AsynStatus::Timeout, 4, 2)
+            .unwrap();
+        drv.base_mut().call_param_callbacks(0).unwrap();
+
+        let iv = rx.try_recv().unwrap();
+        assert_eq!(iv.reason, 0);
+        assert!(matches!(iv.aux_status, crate::error::AsynStatus::Timeout));
+        assert_eq!(iv.alarm_status, 4);
+        assert_eq!(iv.alarm_severity, 2);
+    }
+
+    #[test]
+    fn test_call_param_callback_single_propagates_aux_status() {
+        // Mirror for the single-flush path (call_param_callback).
+        let mut drv = TestDriver::new();
+        let mut rx = drv.base_mut().interrupts.subscribe_async();
+
+        drv.base_mut().set_int32_param(0, 0, 1).unwrap();
+        drv.base_mut()
+            .params
+            .set_param_status(0, 0, crate::error::AsynStatus::Disconnected, 7, 3)
+            .unwrap();
+        drv.base_mut().call_param_callback(0, 0).unwrap();
+
+        let iv = rx.try_recv().unwrap();
+        assert!(matches!(
+            iv.aux_status,
+            crate::error::AsynStatus::Disconnected
+        ));
+        assert_eq!(iv.alarm_status, 7);
+        assert_eq!(iv.alarm_severity, 3);
     }
 
     #[test]
@@ -1618,5 +1841,137 @@ mod tests {
 
         base.enable_addr(2);
         assert_eq!(last_addr.load(Ordering::Relaxed), 2);
+    }
+
+    /// C parity (asynManager.c:2151-2160 exceptionConnect,
+    /// :2174-2185 exceptionDisconnect): redundant connect/disconnect
+    /// on a port already in that state must NOT fan out a duplicate
+    /// `asynExceptionConnect`. Subscribers depend on the event
+    /// edge — duplicate fan-out causes them to e.g. re-subscribe or
+    /// re-arm timers that should fire exactly once per transition.
+    #[test]
+    fn test_connect_disconnect_announce_only_on_transition() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut base = PortDriverBase::new(
+            "edge",
+            4,
+            PortFlags {
+                multi_device: true,
+                can_block: false,
+                destructible: true,
+            },
+        );
+        base.create_param("V", ParamType::Int32).unwrap();
+        let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
+        base.exception_sink = Some(exc_mgr.clone());
+
+        let connect_hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = connect_hits.clone();
+        exc_mgr.add_callback(move |event| {
+            if event.exception == AsynException::Connect {
+                hits2.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // device starts connected by DeviceState::default — a redundant
+        // connect_addr is a no-op.
+        base.connect_addr(2);
+        assert_eq!(
+            connect_hits.load(Ordering::Relaxed),
+            0,
+            "redundant connect_addr must not fan out"
+        );
+
+        // First transition fires once.
+        base.disconnect_addr(2);
+        assert_eq!(connect_hits.load(Ordering::Relaxed), 1);
+
+        // Redundant disconnect is silent.
+        base.disconnect_addr(2);
+        assert_eq!(
+            connect_hits.load(Ordering::Relaxed),
+            1,
+            "redundant disconnect_addr must not fan out"
+        );
+
+        // Re-connect fires the transition.
+        base.connect_addr(2);
+        assert_eq!(connect_hits.load(Ordering::Relaxed), 2);
+    }
+
+    /// C parity: `autoConnectAsyn` (asynManager.c:2310-2324) fires
+    /// `asynExceptionAutoConnect` unconditionally — even setting the
+    /// same value as the current one. Rust mirrors that so observers
+    /// can refresh their UI after a re-confirmation, not just an edge.
+    #[test]
+    fn test_set_auto_connect_fires_unconditionally() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut base = PortDriverBase::new("ac", 1, PortFlags::default());
+        let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
+        base.exception_sink = Some(exc_mgr.clone());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        exc_mgr.add_callback(move |event| {
+            if event.exception == AsynException::AutoConnect {
+                hits2.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        // base.auto_connect defaults to true — setting true again
+        // still must fire (no state-change guard in C).
+        base.set_auto_connect(true);
+        base.set_auto_connect(false);
+        base.set_auto_connect(false);
+        assert_eq!(hits.load(Ordering::Relaxed), 3);
+    }
+
+    /// C parity: `asynPortDriver::setInterruptUInt32Digital` /
+    /// `clearInterruptUInt32Digital` / `getInterruptUInt32Digital`
+    /// (`asynPortDriver.cpp:2346-2461`) route through paramList. The
+    /// PortDriver trait default delegates to the param store; we
+    /// verify the round-trip end-to-end through the trait surface.
+    #[test]
+    fn test_port_driver_uint32_interrupt_round_trip() {
+        struct UInt32Drv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for UInt32Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mut base = PortDriverBase::new("uint32_int", 1, PortFlags::default());
+        let idx = base
+            .params
+            .create_param("BITS", ParamType::UInt32Digital)
+            .unwrap();
+        let mut drv = UInt32Drv { base };
+        let user = AsynUser::new(idx).with_addr(0);
+
+        drv.set_interrupt_uint32_digital(&user, 0xF0, InterruptReason::ZeroToOne)
+            .unwrap();
+        drv.set_interrupt_uint32_digital(&user, 0x0F, InterruptReason::OneToZero)
+            .unwrap();
+        assert_eq!(
+            drv.get_interrupt_uint32_digital(&user, InterruptReason::Both)
+                .unwrap(),
+            0xFF
+        );
+        drv.clear_interrupt_uint32_digital(&user, 0x11).unwrap();
+        assert_eq!(
+            drv.get_interrupt_uint32_digital(&user, InterruptReason::ZeroToOne)
+                .unwrap(),
+            0xE0
+        );
+        assert_eq!(
+            drv.get_interrupt_uint32_digital(&user, InterruptReason::OneToZero)
+                .unwrap(),
+            0x0E
+        );
     }
 }

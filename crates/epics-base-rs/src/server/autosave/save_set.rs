@@ -8,9 +8,10 @@ use tokio::sync::RwLock;
 
 use super::backup::{BackupConfig, BackupState, find_best_save_file, rotate_backups};
 use super::error::{AutosaveError, AutosaveResult};
+use super::format::CompatMode;
 use super::macros::MacroContext;
 use super::request::{self, RequestEntry};
-use super::save_file::{self, SaveEntry, read_save_file, write_save_file};
+use super::save_file::{self, SaveEntry, read_save_file, write_save_file_with_mode};
 
 /// Save strategy for a save set.
 #[derive(Debug, Clone)]
@@ -105,11 +106,24 @@ pub struct SaveSet {
     status: RwLock<SaveSetStatus>,
     stats: SaveSetStats,
     backup_state: RwLock<BackupState>,
+    /// On-disk save-file format used by [`SaveSet::save_once`].
+    /// [`CompatMode::Native`] by default; [`CompatMode::CRead`]
+    /// writes `.sav` files a C IOC can read.
+    compat: CompatMode,
 }
 
 impl SaveSet {
-    /// Create a new save set, loading the request file if configured.
+    /// Create a new save set in the native save-file format,
+    /// loading the request file if configured.
     pub async fn new(config: SaveSetConfig) -> AutosaveResult<Self> {
+        Self::new_with_mode(config, CompatMode::Native).await
+    }
+
+    /// Create a new save set with an explicit on-disk format.
+    ///
+    /// Use [`CompatMode::CRead`] when the produced `.sav` files must
+    /// be readable by a C IOC (mixed Rust + C IOC site).
+    pub async fn new_with_mode(config: SaveSetConfig, compat: CompatMode) -> AutosaveResult<Self> {
         let entries = Self::load_entries(&config).await?;
         Ok(Self {
             config,
@@ -117,6 +131,7 @@ impl SaveSet {
             status: RwLock::new(SaveSetStatus::Idle),
             stats: SaveSetStats::default(),
             backup_state: RwLock::new(BackupState::default()),
+            compat,
         })
     }
 
@@ -168,9 +183,16 @@ impl SaveSet {
         for pv in &pv_names {
             match db.get_pv(pv).await {
                 Ok(val) => {
+                    // Encode the value in the configured format so
+                    // the `.sav` file matches the header banner the
+                    // file is written with.
+                    let value = match self.compat {
+                        CompatMode::Native => save_file::value_to_save_str(&val),
+                        CompatMode::CRead => save_file::value_to_save_str_c(&val),
+                    };
                     save_entries.push(SaveEntry {
                         pv_name: pv.clone(),
-                        value: save_file::value_to_save_str(&val),
+                        value,
                         connected: true,
                     });
                 }
@@ -186,7 +208,7 @@ impl SaveSet {
 
         let saved_count = save_entries.iter().filter(|e| e.connected).count();
 
-        match write_save_file(&self.config.save_path, &save_entries).await {
+        match write_save_file_with_mode(&self.config.save_path, &save_entries, self.compat).await {
             Ok(()) => {
                 self.stats.save_count.fetch_add(1, Ordering::Relaxed);
                 self.stats
@@ -195,6 +217,23 @@ impl SaveSet {
                 let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 *self.stats.last_save_time.write().await = Some(now);
                 *self.status.write().await = SaveSetStatus::Idle;
+
+                // M5: seed `.savB` on the FIRST save. `rotate_backups`
+                // runs before the write and early-returns when no
+                // prior `.sav` exists, so on a fresh IOC the very
+                // first cycle leaves only one usable file — a crash
+                // during the 2nd-ever write would have no backup.
+                // Copy the freshly-written `.sav` to `.savB` when the
+                // backup file does not yet exist, so backup depth
+                // matches C autosave (one cycle behind) from the
+                // first save onward.
+                if self.config.backup.enable_savb {
+                    let savb_path = self.config.save_path.with_extension("savB");
+                    if !savb_path.exists() {
+                        let _ = tokio::fs::copy(&self.config.save_path, &savb_path).await;
+                    }
+                }
+
                 Ok(saved_count)
             }
             Err(e) => {
@@ -243,10 +282,49 @@ impl SaveSet {
     }
 }
 
-/// Best-effort restore from a save file. Each PV is independent.
+/// Restore propagation mode — controls whether a restored value is
+/// processed (rippling through PP / OUT links / FLNK chains) or
+/// written silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RestoreMode {
+    /// Write each PV with `put_pv_no_process` — the value is set but
+    /// the record is NOT processed, OUT links do not fire, FLNK
+    /// chains do not run. This is the autosave-rs default and is the
+    /// desired behaviour for the common "restore a setpoint AO at
+    /// boot" case (it avoids a spurious hardware write at startup).
+    ///
+    /// This is a deliberate divergence from C-autosave's
+    /// `reboot_restore`, which uses `dbPutField` (honours `PP`,
+    /// processes the record, lets PINI/FLNK chains run). Restoring a
+    /// `.VAL` that must ripple to OUT links, or a `.SCAN`/`.DOL`
+    /// that downstream re-evaluation depends on, will NOT propagate
+    /// in this mode — use [`RestoreMode::Process`] for those.
+    #[default]
+    NoProcess,
+    /// Write each PV with `put_pv` — the record IS processed after
+    /// the value is set, matching C-autosave's `dbPutField` restore:
+    /// `PP` fields, OUT links and FLNK chains run. Use this when
+    /// restore correctness depends on processing.
+    Process,
+}
+
+/// Best-effort restore from a save file, in [`RestoreMode::NoProcess`].
+/// Each PV is independent. See [`restore_from_entries_with_mode`] for
+/// the process-on-restore variant.
 pub async fn restore_from_entries(
     db: &PvDatabase,
     path: &std::path::Path,
+) -> AutosaveResult<RestoreResult> {
+    restore_from_entries_with_mode(db, path, RestoreMode::NoProcess).await
+}
+
+/// Best-effort restore from a save file with an explicit
+/// [`RestoreMode`]. Each PV is independent — a failed put on one PV
+/// does not abort the rest.
+pub async fn restore_from_entries_with_mode(
+    db: &PvDatabase,
+    path: &std::path::Path,
+    mode: RestoreMode,
 ) -> AutosaveResult<RestoreResult> {
     let entries = read_save_file(path)
         .await?
@@ -287,7 +365,11 @@ pub async fn restore_from_entries(
             }
         };
 
-        match db.put_pv_no_process(&entry.pv_name, parsed).await {
+        let put_result = match mode {
+            RestoreMode::NoProcess => db.put_pv_no_process(&entry.pv_name, parsed).await,
+            RestoreMode::Process => db.put_pv(&entry.pv_name, parsed).await,
+        };
+        match put_result {
             Ok(()) => {
                 result.restored += 1;
             }

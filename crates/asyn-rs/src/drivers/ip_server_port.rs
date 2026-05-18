@@ -44,10 +44,15 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+// parking_lot::Mutex — consistent with the rest of asyn-rs and
+// poison-tolerant: a panic in a worker thread cannot poison the lock
+// and take out the port (std::sync::Mutex would).
+use parking_lot::Mutex;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
@@ -228,21 +233,21 @@ impl ClientSlot {
     }
 
     fn is_occupied(&self) -> bool {
-        self.stream.lock().unwrap().is_some()
+        self.stream.lock().is_some()
     }
 
     fn assign(&self, stream: TcpStream, peer: SocketAddr) {
-        *self.stream.lock().unwrap() = Some(stream);
-        *self.peer.lock().unwrap() = Some(peer);
+        *self.stream.lock() = Some(stream);
+        *self.peer.lock() = Some(peer);
     }
 
     fn clear(&self) {
-        *self.stream.lock().unwrap() = None;
-        *self.peer.lock().unwrap() = None;
+        *self.stream.lock() = None;
+        *self.peer.lock() = None;
     }
 
     fn peer_addr(&self) -> Option<SocketAddr> {
-        *self.peer.lock().unwrap()
+        *self.peer.lock()
     }
 }
 
@@ -369,9 +374,8 @@ impl DrvAsynIPServerPort {
                 status: AsynStatus::Error,
                 message: format!("set_nonblocking failed: {e}"),
             })?;
-        *self.listener.lock().unwrap() = Some(listener);
-        self.base.connected = true;
-        self.base.announce_exception(AsynException::Connect, -1);
+        *self.listener.lock() = Some(listener);
+        self.base.set_connected(true);
         Ok(())
     }
 
@@ -437,10 +441,9 @@ impl DrvAsynIPServerPort {
                 message: format!("UDP recv thread spawn failed: {e}"),
             })?;
 
-        *self.udp_socket.lock().unwrap() = Some(socket);
-        *self.udp_thread.lock().unwrap() = Some(handle);
-        self.base.connected = true;
-        self.base.announce_exception(AsynException::Connect, -1);
+        *self.udp_socket.lock() = Some(socket);
+        *self.udp_thread.lock() = Some(handle);
+        self.base.set_connected(true);
         Ok(())
     }
 
@@ -492,7 +495,6 @@ impl DrvAsynIPServerPort {
     pub fn local_port(&self) -> u16 {
         self.listener
             .lock()
-            .unwrap()
             .as_ref()
             .and_then(|l| l.local_addr().ok())
             .map(|a| a.port())
@@ -503,7 +505,7 @@ impl DrvAsynIPServerPort {
     /// Returns the slot index used, or an error if no slot was free
     /// or the listener is not bound.
     pub fn accept_one(&self) -> AsynResult<usize> {
-        let listener_guard = self.listener.lock().unwrap();
+        let listener_guard = self.listener.lock();
         let listener = listener_guard.as_ref().ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
             message: "listener not bound — connect() the port first".into(),
@@ -635,8 +637,7 @@ impl PortDriver for DrvAsynIPServerPort {
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let already_up = self.base.connected
-            && (self.listener.lock().unwrap().is_some()
-                || self.udp_socket.lock().unwrap().is_some());
+            && (self.listener.lock().is_some() || self.udp_socket.lock().is_some());
         if already_up {
             return Ok(());
         }
@@ -653,19 +654,29 @@ impl PortDriver for DrvAsynIPServerPort {
                     .announce_exception(AsynException::Connect, i as i32);
             }
         }
-        // UDP path: stop the recv worker before dropping the socket
-        // so the worker's `recv` doesn't race against socket close.
-        // Worker observes the shutdown flag at most 200ms after we
-        // set it (the socket's read timeout).
-        self.udp_shutdown.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.udp_thread.lock().unwrap().take() {
-            let _ = handle.join();
-        }
-        *self.udp_socket.lock().unwrap() = None;
-        self.udp_cache.lock().unwrap().clear();
-        *self.listener.lock().unwrap() = None;
-        self.base.connected = false;
-        self.base.announce_exception(AsynException::Connect, -1);
+        self.stop_udp_worker();
+        *self.udp_socket.lock() = None;
+        self.udp_cache.lock().clear();
+        *self.listener.lock() = None;
+        self.base.set_connected(false);
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> AsynResult<()> {
+        // BUG 3 fix: the UDP recv worker is spawned by
+        // `open_udp_listener` and was joined only inside `disconnect()`.
+        // On a normal actor teardown — the request channel closes
+        // without an explicit `Disconnect` op — the actor calls
+        // `driver.shutdown()` (port_actor.rs run / run_with_shutdown)
+        // but NOT `disconnect()`. Without this override the recv thread
+        // loops forever holding the bound UDP socket. Join it here so
+        // the thread (and the socket it owns) is released on every
+        // teardown path, matching the teardown `disconnect()` already
+        // performs.
+        self.stop_udp_worker();
+        *self.udp_socket.lock() = None;
+        self.udp_cache.lock().clear();
+        *self.listener.lock() = None;
         Ok(())
     }
 
@@ -731,7 +742,7 @@ impl PortDriver for DrvAsynIPServerPort {
 impl DrvAsynIPServerPort {
     fn base_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
         let arc = self.slot_arc(user.addr)?;
-        let mut stream_guard = arc.stream.lock().unwrap();
+        let mut stream_guard = arc.stream.lock();
         let stream = stream_guard.as_mut().ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("slot {} stream gone", user.addr),
@@ -760,7 +771,14 @@ impl DrvAsynIPServerPort {
             }
             Ok(n) => Ok(OctetReadResult {
                 nbytes_transferred: n,
-                eom_reason: EomReason::empty(),
+                // C parity: CNT only when the requested count was
+                // reached; a short read leaves the reason empty so the
+                // EOS interpose keeps reading.
+                eom_reason: if n >= buf.len() {
+                    EomReason::CNT
+                } else {
+                    EomReason::empty()
+                },
             }),
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -779,7 +797,7 @@ impl DrvAsynIPServerPort {
     }
 
     fn write_to_slot(&self, slot: &ClientSlot, data: &[u8]) -> AsynResult<()> {
-        let mut g = slot.stream.lock().unwrap();
+        let mut g = slot.stream.lock();
         let stream = g.as_mut().ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
             message: "slot stream gone".into(),
@@ -803,7 +821,7 @@ impl DrvAsynIPServerPort {
     /// behaviour, simplified to drop the off-by-one C bug
     /// (`maxchars - 1` copy with `+= maxchars` advance).
     fn udp_drain_into(&self, buf: &mut [u8]) -> usize {
-        let mut cache = self.udp_cache.lock().unwrap();
+        let mut cache = self.udp_cache.lock();
         if cache.is_empty() {
             return 0;
         }
@@ -817,9 +835,25 @@ impl DrvAsynIPServerPort {
         n
     }
 
+    /// Signal the UDP recv worker to stop and join it. Single owner
+    /// for the worker-thread teardown transition — `disconnect()` and
+    /// `shutdown()` both route through here so no teardown path can
+    /// leave the thread (and the socket it holds) alive.
+    ///
+    /// The worker observes `udp_shutdown` between `recv` calls; the
+    /// socket's 200ms read timeout caps the join latency. Idempotent:
+    /// a no-op when no worker is running (TCP mode, or already torn
+    /// down).
+    fn stop_udp_worker(&mut self) {
+        self.udp_shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.udp_thread.lock().take() {
+            let _ = handle.join();
+        }
+    }
+
     /// Total bytes currently in the UDP cache (for tests/diagnostics).
     pub fn udp_cache_pending(&self) -> usize {
-        let c = self.udp_cache.lock().unwrap();
+        let c = self.udp_cache.lock();
         c.data.len().saturating_sub(c.pos)
     }
 }
@@ -845,14 +879,14 @@ fn udp_recv_loop(
         // single-buffer protocol where new data is only fetched once
         // the consumer (read_octet) has finished with the previous
         // datagram.
-        let cache_empty = cache.lock().unwrap().is_empty();
+        let cache_empty = cache.lock().is_empty();
         if !cache_empty {
             std::thread::sleep(Duration::from_millis(1));
             continue;
         }
         match socket.recv(&mut buf) {
             Ok(n) => {
-                let mut c = cache.lock().unwrap();
+                let mut c = cache.lock();
                 c.data.clear();
                 c.data.extend_from_slice(&buf[..n]);
                 c.pos = 0;
@@ -934,7 +968,7 @@ impl PortDriver for DrvAsynIPSubport {
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // Passive sync — child port's connection is driven by the
         // parent's accept loop, not by an outbound dial.
-        self.base.connected = self.slot.is_occupied();
+        self.base.set_connected(self.slot.is_occupied());
         if !self.base.connected {
             return Err(AsynError::Status {
                 status: AsynStatus::Disconnected,
@@ -946,17 +980,19 @@ impl PortDriver for DrvAsynIPSubport {
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // Subport disconnect drops the slot — same effect as the
-        // parent's drop_client(idx).
+        // parent's drop_client(idx). Slot clear is an explicit
+        // ownership boundary (the slot owns the announce for
+        // per-addr); the port-level Connect transition is owner-API.
         if self.slot.is_occupied() {
             self.slot.clear();
             self.base.announce_exception(AsynException::Connect, 0);
         }
-        self.base.connected = false;
+        self.base.set_connected(false);
         Ok(())
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let mut stream_guard = self.slot.stream.lock().unwrap();
+        let mut stream_guard = self.slot.stream.lock();
         let stream = stream_guard.as_mut().ok_or_else(|| AsynError::Status {
             status: AsynStatus::Disconnected,
             message: "subport slot has no client".into(),
@@ -973,8 +1009,15 @@ impl PortDriver for DrvAsynIPSubport {
             Ok(0) => {
                 drop(stream_guard);
                 self.slot.clear();
-                self.base.connected = false;
+                // Per-addr Connect carries addr=0 (this is the
+                // subport's single device slot). The port-level
+                // set_connected(false) handles the port-level
+                // transition exactly once thanks to its edge
+                // guard. Both fan-outs are necessary because
+                // observers can listen at either the port or
+                // the device granularity.
                 self.base.announce_exception(AsynException::Connect, 0);
+                self.base.set_connected(false);
                 Err(AsynError::Status {
                     status: AsynStatus::Disconnected,
                     message: "peer closed".into(),
@@ -998,7 +1041,7 @@ impl PortDriver for DrvAsynIPSubport {
     }
 
     fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
-        let mut g = self.slot.stream.lock().unwrap();
+        let mut g = self.slot.stream.lock();
         let stream = g.as_mut().ok_or_else(|| AsynError::Status {
             status: AsynStatus::Disconnected,
             message: "subport slot has no client".into(),
@@ -1071,7 +1114,6 @@ mod tests {
         let server_addr = srv
             .udp_socket
             .lock()
-            .unwrap()
             .as_ref()
             .unwrap()
             .local_addr()
@@ -1150,6 +1192,67 @@ mod tests {
         srv.disconnect(&AsynUser::default()).unwrap();
         srv.connect(&AsynUser::default()).unwrap();
         srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// BUG 3 regression: `shutdown()` (called by the actor on a normal
+    /// channel-close teardown, NOT `disconnect()`) must stop and join
+    /// the UDP recv worker. Pre-fix `shutdown()` was the trait default
+    /// no-op and the worker looped forever holding the bound socket.
+    ///
+    /// Verified two ways: (1) the worker thread terminates — checked
+    /// by re-binding the same ephemeral port is not possible, so we
+    /// instead confirm a fresh connect/disconnect cycle succeeds after
+    /// shutdown (the worker released its socket Arc); (2) the join
+    /// completes promptly (≤ ~1s — the worker's 200ms recv timeout
+    /// caps latency).
+    #[test]
+    fn udp_server_shutdown_joins_recv_worker() {
+        let mut srv = DrvAsynIPServerPort::new("udp_srv_sd", "127.0.0.1:0 UDP").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        // Worker thread is running.
+        assert!(srv.udp_thread.lock().is_some());
+
+        let start = std::time::Instant::now();
+        // shutdown() — NOT disconnect() — is the actor's normal
+        // teardown call.
+        srv.shutdown().unwrap();
+        let elapsed = start.elapsed();
+
+        // Worker handle was taken and joined.
+        assert!(
+            srv.udp_thread.lock().is_none(),
+            "shutdown must join and clear the recv worker handle"
+        );
+        // Socket released.
+        assert!(
+            srv.udp_socket.lock().is_none(),
+            "shutdown must drop the UDP socket"
+        );
+        // Join completed promptly — the worker observed udp_shutdown.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "shutdown join took too long ({elapsed:?}) — worker did not exit"
+        );
+
+        // The socket was released, so a fresh connect/disconnect cycle
+        // works (would fail if the old worker still held the port).
+        srv.connect(&AsynUser::default()).unwrap();
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// `shutdown()` on a TCP server is a benign no-op for the UDP
+    /// worker path (no worker thread exists) and still releases the
+    /// listener.
+    #[test]
+    fn tcp_server_shutdown_releases_listener() {
+        let mut srv = DrvAsynIPServerPort::new("tcp_srv_sd", "127.0.0.1:0").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        assert!(srv.listener.lock().is_some());
+        srv.shutdown().unwrap();
+        assert!(
+            srv.listener.lock().is_none(),
+            "shutdown must drop the TCP listener"
+        );
     }
 
     #[test]

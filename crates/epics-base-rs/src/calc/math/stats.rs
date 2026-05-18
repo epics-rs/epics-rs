@@ -43,8 +43,14 @@ pub fn fwhm(data: &[f64]) -> f64 {
     let mut left = max_idx as f64;
     for i in (0..max_idx).rev() {
         if data[i] <= half_max {
-            // Linear interpolation
-            let frac = (half_max - data[i]) / (data[i + 1] - data[i]);
+            // Linear interpolation; guard against a flat segment
+            // (data[i+1] == data[i]) that would divide by zero.
+            let span = data[i + 1] - data[i];
+            let frac = if span == 0.0 {
+                0.0
+            } else {
+                (half_max - data[i]) / span
+            };
             left = i as f64 + frac;
             break;
         }
@@ -54,7 +60,12 @@ pub fn fwhm(data: &[f64]) -> f64 {
     let mut right = max_idx as f64;
     for i in (max_idx + 1)..data.len() {
         if data[i] <= half_max {
-            let frac = (half_max - data[i]) / (data[i - 1] - data[i]);
+            let span = data[i - 1] - data[i];
+            let frac = if span == 0.0 {
+                0.0
+            } else {
+                (half_max - data[i]) / span
+            };
             right = i as f64 - frac;
             break;
         }

@@ -269,7 +269,14 @@ impl OctetNext for IpIoState {
                     }),
                     Ok(n) => Ok(OctetReadResult {
                         nbytes_transferred: n,
-                        eom_reason: EomReason::CNT,
+                        // C parity: CNT means the requested count was
+                        // reached. A short read leaves the reason empty
+                        // so the EOS interpose keeps reading.
+                        eom_reason: if n >= buf.len() {
+                            EomReason::CNT
+                        } else {
+                            EomReason::empty()
+                        },
                     }),
                     Err(e)
                         if e.kind() == std::io::ErrorKind::TimedOut
@@ -292,7 +299,14 @@ impl OctetNext for IpIoState {
                     }),
                     Ok(n) => Ok(OctetReadResult {
                         nbytes_transferred: n,
-                        eom_reason: EomReason::CNT,
+                        // C parity: CNT means the requested count was
+                        // reached. A short read leaves the reason empty
+                        // so the EOS interpose keeps reading.
+                        eom_reason: if n >= buf.len() {
+                            EomReason::CNT
+                        } else {
+                            EomReason::empty()
+                        },
                     }),
                     Err(e)
                         if e.kind() == std::io::ErrorKind::TimedOut
@@ -316,7 +330,14 @@ impl OctetNext for IpIoState {
                     }),
                     Ok(n) => Ok(OctetReadResult {
                         nbytes_transferred: n,
-                        eom_reason: EomReason::CNT,
+                        // C parity: CNT means the requested count was
+                        // reached. A short read leaves the reason empty
+                        // so the EOS interpose keeps reading.
+                        eom_reason: if n >= buf.len() {
+                            EomReason::CNT
+                        } else {
+                            EomReason::empty()
+                        },
                     }),
                     Err(e)
                         if e.kind() == std::io::ErrorKind::TimedOut
@@ -357,12 +378,72 @@ impl OctetNext for IpIoState {
         Ok(data.len())
     }
 
+    /// Base-layer flush — C parity with `drvAsynIPPort.c::flushIt`,
+    /// which does a non-blocking `recv` loop discarding every byte
+    /// already queued in the socket's receive buffer (the serial
+    /// driver achieves the same with `tcflush(TCIFLUSH)`).
+    ///
+    /// This is the *innermost* `OctetNext` in the interpose chain, so
+    /// when `DrvAsynIPPort::io_flush` routes through
+    /// `OctetInterposeStack::dispatch_flush`, each interpose layer's
+    /// `flush` (e.g. `EosInterpose::flush`, which resets its persistent
+    /// `in_buf`) runs first and finally delegates here to drain the OS
+    /// socket. This mirrors C, where `asynInterposeEos.c::flushIt`
+    /// resets `inBufHead/inBufTail/eosInMatch` and then calls the
+    /// lower-level (IP port) `flush`.
+    ///
+    /// EOF / connection-reset during the drain is treated as benign:
+    /// there is nothing to flush on a dead socket and the subsequent
+    /// write/read will surface the disconnect.
     fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+        let mut scratch = [0u8; 4096];
         match self.inner.as_mut() {
-            Some(IpIoInner::Tcp(stream)) => stream.flush()?,
+            Some(IpIoInner::Tcp(stream)) => {
+                let restore = stream.set_nonblocking(true);
+                loop {
+                    match stream.read(&mut scratch) {
+                        Ok(0) => break, // EOF — nothing left to drain
+                        Ok(_) => continue,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break, // reset/other — write/read will report it
+                    }
+                }
+                if restore.is_ok() {
+                    let _ = stream.set_nonblocking(false);
+                }
+            }
+            Some(IpIoInner::Udp(socket)) => {
+                let restore = socket.set_nonblocking(true);
+                loop {
+                    match socket.recv(&mut scratch) {
+                        Ok(_) => continue,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                if restore.is_ok() {
+                    let _ = socket.set_nonblocking(false);
+                }
+            }
             #[cfg(unix)]
-            Some(IpIoInner::Unix(stream)) => stream.flush()?,
-            _ => {}
+            Some(IpIoInner::Unix(stream)) => {
+                let restore = stream.set_nonblocking(true);
+                loop {
+                    match stream.read(&mut scratch) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                if restore.is_ok() {
+                    let _ = stream.set_nonblocking(false);
+                }
+            }
+            None => {}
         }
         Ok(())
     }
@@ -412,29 +493,64 @@ impl DrvAsynIPPort {
         let addr_str = format!("{}:{}", self.config.host, self.config.port);
 
         if let Some(local_port) = self.config.local_port {
-            let socket = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            )?;
-            socket.set_reuse_address(true)?;
-            let local_addr: std::net::SocketAddr = format!("0.0.0.0:{local_port}")
-                .parse()
-                .map_err(|_| AsynError::Status {
+            use std::net::ToSocketAddrs;
+            // Resolve the remote like the no-local-port branch — the old
+            // code used `SocketAddr::parse`, which only accepts literal
+            // IPs, so a hostname target (valid per the config parser)
+            // failed, as did any IPv6 target (domain was forced to IPV4).
+            let addrs: Vec<std::net::SocketAddr> = addr_str
+                .to_socket_addrs()
+                .map_err(|e| AsynError::Status {
                     status: AsynStatus::Error,
-                    message: format!("invalid local address: 0.0.0.0:{local_port}"),
-                })?;
-            socket.bind(&local_addr.into())?;
+                    message: format!("failed to resolve '{addr_str}': {e}"),
+                })?
+                .collect();
 
-            let remote_addr: std::net::SocketAddr =
-                addr_str
-                    .parse()
-                    .map_err(|e: std::net::AddrParseError| AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: format!("invalid remote address '{addr_str}': {e}"),
-                    })?;
-            socket.connect_timeout(&remote_addr.into(), self.config.connect_timeout)?;
-            Ok(TcpStream::from(socket))
+            let mut last_err: Option<AsynError> = None;
+            for remote_addr in &addrs {
+                let (domain, local_str) = if remote_addr.is_ipv6() {
+                    (socket2::Domain::IPV6, format!("[::]:{local_port}"))
+                } else {
+                    (socket2::Domain::IPV4, format!("0.0.0.0:{local_port}"))
+                };
+                let socket = match socket2::Socket::new(
+                    domain,
+                    socket2::Type::STREAM,
+                    Some(socket2::Protocol::TCP),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        last_err = Some(AsynError::Io(e));
+                        continue;
+                    }
+                };
+                if let Err(e) = socket.set_reuse_address(true) {
+                    last_err = Some(AsynError::Io(e));
+                    continue;
+                }
+                let local_addr: std::net::SocketAddr = match local_str.parse() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        last_err = Some(AsynError::Status {
+                            status: AsynStatus::Error,
+                            message: format!("invalid local address: {local_str}"),
+                        });
+                        continue;
+                    }
+                };
+                if let Err(e) = socket.bind(&local_addr.into()) {
+                    last_err = Some(AsynError::Io(e));
+                    continue;
+                }
+                match socket.connect_timeout(&(*remote_addr).into(), self.config.connect_timeout) {
+                    Ok(()) => return Ok(TcpStream::from(socket)),
+                    Err(e) => last_err = Some(AsynError::Io(e)),
+                }
+            }
+            Err(last_err.unwrap_or_else(|| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("no addresses found for '{addr_str}'"),
+            }))
         } else {
             use std::net::ToSocketAddrs;
             let addrs: Vec<std::net::SocketAddr> = addr_str
@@ -593,8 +709,7 @@ impl PortDriver for DrvAsynIPPort {
                 self.io.inner = Some(IpIoInner::Tcp(stream));
             }
         }
-        self.base.connected = true;
-        self.base.announce_exception(AsynException::Connect, -1);
+        self.base.set_connected(true);
         asyn_trace!(
             Some(self.base.trace),
             &self.base.port_name,
@@ -615,15 +730,17 @@ impl PortDriver for DrvAsynIPPort {
             "disconnect"
         );
         self.io.inner = None;
-        self.base.connected = false;
-        self.base.announce_exception(AsynException::Connect, -1);
+        self.base.set_connected(false);
         Ok(())
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        // HTTP connect-per-transaction: reconnect if disconnected
+        // HTTP connect-per-transaction: reconnect if disconnected.
+        // Surface the connect failure cause (DNS, refused, TLS reset)
+        // rather than letting check_ready() mask it as a generic
+        // "port disconnected".
         if self.config.protocol == IpProtocol::Http && !self.base.connected {
-            let _ = self.connect(&AsynUser::default());
+            self.connect(&AsynUser::default())?;
         }
         self.base.check_ready()?;
         let result = self
@@ -642,8 +759,7 @@ impl PortDriver for DrvAsynIPPort {
                 // HTTP: disconnect after each read (connect-per-transaction)
                 if self.config.protocol == IpProtocol::Http {
                     self.io.inner = None;
-                    self.base.connected = false;
-                    self.base.announce_exception(AsynException::Connect, -1);
+                    self.base.set_connected(false);
                 }
                 Ok(r.nbytes_transferred)
             }
@@ -676,8 +792,7 @@ impl PortDriver for DrvAsynIPPort {
                         "read error, disconnecting: {e}"
                     );
                     self.io.inner = None;
-                    self.base.connected = false;
-                    self.base.announce_exception(AsynException::Connect, -1);
+                    self.base.set_connected(false);
                 }
                 result.map(|r| r.nbytes_transferred)
             }
@@ -685,9 +800,10 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
-        // HTTP connect-per-transaction: reconnect if disconnected
+        // HTTP connect-per-transaction: reconnect if disconnected.
+        // Surface the connect failure cause rather than masking it.
         if self.config.protocol == IpProtocol::Http && !self.base.connected {
-            let _ = self.connect(&AsynUser::default());
+            self.connect(&AsynUser::default())?;
         }
         self.base.check_ready()?;
         asyn_trace_io!(
@@ -701,6 +817,28 @@ impl PortDriver for DrvAsynIPPort {
             .interpose_octet
             .dispatch_write(user, data, &mut self.io)?;
         Ok(())
+    }
+
+    fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+        // C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:~250)
+        // calls flushIt before write+read so the post-write read
+        // returns only the response to *this* command.
+        //
+        // The flush MUST traverse the interpose chain, not just the OS
+        // socket. C `asynInterposeEos.c::flushIt` resets the EOS
+        // interpose's persistent input buffer
+        // (`inBufHead/inBufTail/eosInMatch`) and then calls the
+        // lower-level `flush`. An earlier Rust version drained the OS
+        // socket directly and never reset the `EosInterpose`'s
+        // `in_buf` — so bytes already buffered *inside* the interpose
+        // from a prior read leaked into the next response after an
+        // `OctetWriteRead`.
+        //
+        // Routing through `dispatch_flush` runs every interpose layer's
+        // `flush` (resetting `EosInterpose::in_buf` etc.) and finally
+        // reaches `IpIoState::flush`, which drains the OS socket's
+        // receive buffer.
+        self.base.interpose_octet.dispatch_flush(user, &mut self.io)
     }
 
     fn set_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
@@ -737,14 +875,13 @@ impl PortDriver for DrvAsynIPPort {
                 // parse error) and only then drop the live socket and
                 // overwrite config.
                 let new_config = IpPortConfig::parse(value)?;
-                let was_connected = self.base.connected;
                 if self.io.inner.is_some() {
                     // Drop in-flight socket; matches C closeConnection.
                     self.io.inner = None;
-                    self.base.connected = false;
-                    if was_connected {
-                        self.base.announce_exception(AsynException::Connect, -1);
-                    }
+                    // Owner-API: set_connected handles the edge-guarded
+                    // fan-out, so a redundant call here is a no-op for
+                    // listeners just like C's exceptionDisconnect.
+                    self.base.set_connected(false);
                     // C's "if this delay is not present then the sockets
                     // are not always really closed cleanly" — same 20ms
                     // settle to ensure the kernel actually tears down
@@ -1268,6 +1405,142 @@ mod tests {
 
         handle.join().unwrap();
         let _ = std::fs::remove_file(&sock_path2);
+    }
+
+    // --- io_flush input-drain test (BUG 1 regression) ---
+
+    /// `io_flush` must drain stale bytes already queued on the socket's
+    /// receive buffer, matching C asyn `asynOctetSyncIO::writeRead`'s
+    /// pre-write flush. Pre-fix `DrvAsynIPPort` had no `io_flush`
+    /// override, so the trait default no-op left stale input in place
+    /// and a subsequent read returned it instead of the fresh response.
+    #[test]
+    fn io_flush_drains_stale_tcp_input() {
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Pre-existing stale bytes on the warm line.
+            stream.write_all(b"STALE_PROMPT>").unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(100));
+            // After the flush + client write, send the real response.
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"CMD");
+            stream.write_all(b"RESPONSE").unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        // Let the stale bytes land in the socket's receive buffer.
+        thread::sleep(Duration::from_millis(50));
+
+        // Flush should discard "STALE_PROMPT>".
+        let mut fuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.io_flush(&mut fuser).unwrap();
+
+        // Write the command and read the response — must be "RESPONSE",
+        // not the stale prompt.
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut wuser, b"CMD").unwrap();
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 64];
+        let n = drv.read_octet(&ruser, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"RESPONSE",
+            "io_flush must drain stale input; got {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+
+        handle.join().unwrap();
+    }
+
+    /// BUG 2 regression: `io_flush` must also reset the EOS interpose's
+    /// persistent input buffer, not just drain the OS socket. C
+    /// `asynInterposeEos.c::flushIt` resets `inBufHead/inBufTail/
+    /// eosInMatch`. If `io_flush` only drains the socket, bytes already
+    /// buffered *inside* the EOS interpose from a prior read leak into
+    /// the next response.
+    ///
+    /// Scenario: the server sends a long line "OLD_LINE_DATA\n" while
+    /// the client reads it with a tiny user buffer, so the EOS layer's
+    /// internal `in_buf` ends up holding the unconsumed tail. Then
+    /// `io_flush` runs (as `asynOctetSyncIO::writeRead` would before a
+    /// command), the client writes "CMD", and the server replies
+    /// "NEW\n". The post-flush read must return "NEW", not the leftover
+    /// tail of "OLD_LINE_DATA".
+    #[test]
+    fn io_flush_resets_eos_interpose_buffer() {
+        use crate::interpose::eos::{EosConfig, EosInterpose};
+
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Stale line on the warm connection.
+            stream.write_all(b"OLD_LINE_DATA\n").unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(150));
+            // Real response after the client's command.
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"CMD");
+            stream.write_all(b"NEW\n").unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.push_interpose(Box::new(EosInterpose::new(EosConfig {
+            input_eos: vec![b'\n'],
+            output_eos: vec![],
+        })));
+
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        // Read into a tiny buffer: the EOS layer reads "OLD_LINE_DATA\n"
+        // from the socket into its 2048-byte in_buf, but can only hand
+        // back 4 bytes ("OLD_") — the rest stays buffered inside the
+        // interpose.
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut small = [0u8; 4];
+        let n = drv.read_octet(&ruser, &mut small).unwrap();
+        assert_eq!(&small[..n], b"OLD_");
+
+        // Flush must clear BOTH the socket AND the interpose buffer.
+        let mut fuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.io_flush(&mut fuser).unwrap();
+
+        // Command + response cycle. If the interpose buffer was not
+        // reset, this read returns the leftover "LINE" instead of "NEW".
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut wuser, b"CMD").unwrap();
+        let ruser2 = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 64];
+        let n = drv.read_octet(&ruser2, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"NEW",
+            "io_flush must reset the EOS interpose buffer; got {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+
+        handle.join().unwrap();
+    }
+
+    /// `io_flush` on a disconnected port is a benign no-op (no socket
+    /// to drain).
+    #[test]
+    fn io_flush_noop_when_disconnected() {
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:9999").unwrap();
+        let mut user = AsynUser::new(0);
+        drv.io_flush(&mut user).unwrap();
     }
 
     // --- UDP broadcast flag test ---

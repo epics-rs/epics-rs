@@ -281,6 +281,33 @@ pub fn tls_handshake_timeout_secs() -> f64 {
         .unwrap_or(10.0)
 }
 
+/// Keychain password for a server-side TLS keychain.
+///
+/// Reads `EPICS_PVAS_TLS_KEYCHAIN_PASSWORD`, falling back to
+/// `EPICS_PVA_TLS_KEYCHAIN_PASSWORD` when the server-specific form is
+/// unset — matching pvxs's `Config::server()` env fallback chain.
+/// `$(VAR)` / `${VAR}` refs are expanded (PVA-466 parity) so operators
+/// can template `EPICS_PVAS_TLS_KEYCHAIN_PASSWORD="$(SECRET_DIR)/..."`
+/// style indirections. Returns `None` when neither variable is set;
+/// an empty string is preserved as `Some("")` (a deliberately
+/// password-less PKCS#12 is distinct from "unset").
+pub fn server_tls_keychain_password() -> Option<String> {
+    std::env::var("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD")
+        .or_else(|_| std::env::var("EPICS_PVA_TLS_KEYCHAIN_PASSWORD"))
+        .ok()
+        .map(|s| expand_dollar_vars(&s))
+}
+
+/// Keychain password for a client-side TLS keychain.
+///
+/// Reads `EPICS_PVA_TLS_KEYCHAIN_PASSWORD`. `$(VAR)` / `${VAR}` refs
+/// are expanded. Returns `None` when unset.
+pub fn client_tls_keychain_password() -> Option<String> {
+    std::env::var("EPICS_PVA_TLS_KEYCHAIN_PASSWORD")
+        .ok()
+        .map(|s| expand_dollar_vars(&s))
+}
+
 /// Parse `EPICS_PVA_NAME_SERVERS` into TCP socket addresses. Default
 /// port 5075. Empty when the variable is unset.
 pub fn name_servers() -> Vec<SocketAddr> {

@@ -73,7 +73,12 @@ pub struct MbboRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
-    skip_convert: bool,
+    /// Set by `convert()` when VAL is an illegal state (`> 15` with a
+    /// defined state table). C `mbboRecord.c::convert` raises
+    /// `SOFT_ALARM/INVALID` for this case; the alarm is actually
+    /// raised in `check_alarms()` since `convert()` has no access to
+    /// `CommonFields`.
+    soft_alarm: bool,
 }
 
 impl Default for MbboRecord {
@@ -148,7 +153,7 @@ impl Default for MbboRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
-            skip_convert: false,
+            soft_alarm: false,
         }
     }
 }
@@ -184,10 +189,17 @@ impl MbboRecord {
         }
     }
 
-    /// C convert(): VAL -> RVAL with SDEF check and SHFT
+    /// C convert(): VAL -> RVAL with SDEF check and SHFT.
+    ///
+    /// When the state table is defined and `VAL > 15` the conversion
+    /// is illegal — C `mbboRecord.c::convert` raises
+    /// `SOFT_ALARM/INVALID` and leaves RVAL stale. We flag it via
+    /// `soft_alarm` so `check_alarms()` raises the alarm.
     fn convert(&mut self) {
+        self.soft_alarm = false;
         if self.sdef {
             if self.val > 15 {
+                self.soft_alarm = true;
                 return;
             }
             let rvs = self.raw_values();
@@ -196,8 +208,26 @@ impl MbboRecord {
             self.rval = self.val as i32;
         }
         if self.shft > 0 {
-            self.rval = ((self.rval as u32) << (self.shft as u32)) as i32;
+            // C `mbboRecord.c:433-434` does `prec->rval <<= prec->shft`
+            // on a 32-bit `epicsUInt32`. A CA-written SHFT >= 32 makes
+            // that shift UB in C (it does not crash — the value just
+            // becomes 0 / implementation-defined). The Rust `<<`
+            // panics in debug builds for the same shift count, so use
+            // `checked_shl` and treat an out-of-range shift as a
+            // fully-shifted-out 0 — defined, non-panicking, and the
+            // value any sane 32-bit shift-out yields.
+            self.rval = (self.rval as u32)
+                .checked_shl(self.shft as u32)
+                .unwrap_or(0) as i32;
         }
+    }
+
+    /// Per-state severity fields ZRSV..FFSV indexed by state 0..15.
+    fn state_severities(&self) -> [i16; 16] {
+        [
+            self.zrsv, self.onsv, self.twsv, self.thsv, self.frsv, self.fvsv, self.sxsv, self.svsv,
+            self.eisv, self.nisv, self.tesv, self.elsv, self.tvsv, self.ttsv, self.ftsv, self.ffsv,
+        ]
     }
 }
 
@@ -596,11 +626,17 @@ impl Record for MbboRecord {
         Ok(())
     }
 
+    /// C `mbboRecord.c::process` (line 217) calls `convert(prec)`
+    /// UNCONDITIONALLY on every non-pact process — the VAL→RVAL output
+    /// translation. It is never gated on whether VAL was just written
+    /// (CA put, DOL fetch, or device support). A CA put to `mbbo.VAL`
+    /// must therefore recompute `RVAL`/`ORAW`/`ORBV`. `mbbo` is an
+    /// output record, so it does NOT override `set_device_did_compute`
+    /// or `soft_channel_skips_convert` — the soft-channel convert-skip
+    /// applies only to INPUT records (ai/bi/mbbi), where VAL is the
+    /// engineering value.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        if !self.skip_convert {
-            self.convert();
-        }
-        self.skip_convert = false;
+        self.convert();
         self.oraw = self.rval;
         self.orbv = self.rbv;
         Ok(ProcessOutcome::complete())
@@ -657,11 +693,50 @@ impl Record for MbboRecord {
         Ok(())
     }
 
-    fn set_device_did_compute(&mut self, did: bool) {
-        self.skip_convert = did;
-    }
-
     fn can_device_write(&self) -> bool {
         true
+    }
+
+    /// C `mbboRecord.c::checkAlarms` + the `SOFT_ALARM` raised by
+    /// `convert()` — STATE alarm from the per-state severity
+    /// (ZRSV..FFSV, or UNSV for an unknown state), COS alarm (COSV),
+    /// and `SOFT_ALARM/INVALID` when `VAL > 15` with a defined state
+    /// table. The framework's `rec_gbl_check_udf` raises UDF.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
+
+        // SOFT_ALARM for an illegal VAL — C convert() path.
+        if self.soft_alarm {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::SOFT_ALARM, AlarmSeverity::Invalid);
+        }
+
+        let val = self.val;
+        let raw_sev = if val > 15 {
+            self.unsv
+        } else {
+            self.state_severities()[val as usize]
+        };
+        let sev = AlarmSeverity::from_u16(raw_sev as u16);
+        if sev != AlarmSeverity::NoAlarm {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, sev);
+        }
+        if val != self.lalm {
+            let cos_sev = AlarmSeverity::from_u16(self.cosv as u16);
+            if cos_sev != AlarmSeverity::NoAlarm {
+                recgbl::rec_gbl_set_sevr(common, alarm_status::COS_ALARM, cos_sev);
+            }
+            self.lalm = val;
+        }
+    }
+
+    /// C `mbboRecord.c::special` — recompute `sdef` after any runtime
+    /// write to a state value (ZRVL..FFVL) or state string
+    /// (ZRST..FFST) field. See `mbbi::is_state_table_field`.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if after && super::mbbi::is_state_table_field(field) {
+            self.compute_sdef();
+        }
+        Ok(())
     }
 }

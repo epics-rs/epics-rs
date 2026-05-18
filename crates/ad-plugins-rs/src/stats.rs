@@ -133,9 +133,13 @@ pub struct ProfileResult {
 /// Compute min/max/mean/sigma/total from an NDDataBuffer, with min/max positions
 /// and optional background subtraction.
 ///
-/// When `bgd_width > 0`, the average of edge pixels (bgd_width pixels from each
-/// edge of a 2D image) is subtracted: `net = total - bgd_avg * num_elements`.
-/// When `bgd_width == 0`, `net = total`.
+/// When `bgd_width > 0`, the background is computed as N-dimensional edge
+/// strips (per dimension a low-edge and a high-edge strip, each spanning the
+/// full extent of the other dimensions) exactly as C++ `NDPluginStats`
+/// `doComputeStatistics` does — corner pixels are counted twice. The
+/// per-pixel average background is subtracted: `net = total - bgd_avg *
+/// num_elements`, where `bgd_avg = bgd_counts / bgd_pixels`. This works for
+/// any dimensionality (1-D, 2-D, 3-D+). When `bgd_width == 0`, `net = total`.
 pub fn compute_stats(
     data: &NDDataBuffer,
     dims: &[ad_core_rs::ndarray::NDDimension],
@@ -270,31 +274,90 @@ pub fn compute_stats(
             let sigma = (variance / v.len() as f64).sqrt();
             let x_size = dims.first().map_or(v.len(), |d| d.size);
 
-            // Background subtraction
-            let net = if bgd_width > 0 && dims.len() >= 2 {
-                let y_size = dims[1].size;
-                let mut bgd_sum = 0.0f64;
-                let mut bgd_count = 0usize;
-                for iy in 0..y_size {
-                    for ix in 0..x_size {
-                        let is_edge = ix < bgd_width
-                            || ix >= x_size.saturating_sub(bgd_width)
-                            || iy < bgd_width
-                            || iy >= y_size.saturating_sub(bgd_width);
-                        if is_edge {
-                            let idx = iy * x_size + ix;
-                            if idx < v.len() {
-                                bgd_sum += v[idx] as f64;
-                                bgd_count += 1;
-                            }
+            // Background subtraction.
+            //
+            // C parity: NDPluginStats.cpp:486-528 `doComputeStatistics` background
+            // section. The background is the union of, per dimension, a low-edge
+            // strip and a high-edge strip (each spanning the full extent of every
+            // other dimension). Strip totals/pixel-counts are SUMMED, so pixels in
+            // the corner of multiple strips are counted twice in both `bgdCounts`
+            // and `bgdPixels` — the C++ source documents this as intentional
+            // (NDPluginStats.cpp:485-488). Works for any dimensionality (1-D,
+            // 2-D, 3-D+).
+            let net = if bgd_width > 0 && !dims.is_empty() {
+                let sizes: Vec<usize> = dims.iter().map(|d| d.size).collect();
+                // Row-major strides: dim 0 varies fastest (matches the x_size /
+                // y_size index math used above).
+                let ndims = sizes.len();
+                let mut strides = vec![1usize; ndims];
+                for i in 1..ndims {
+                    strides[i] = strides[i - 1] * sizes[i - 1];
+                }
+
+                // Sum a strip: dimension `sd` restricted to [s_off, s_off+s_len),
+                // every other dimension spanning its full extent. Returns
+                // (sum, pixel_count).
+                let strip = |sd: usize, s_off: usize, s_len: usize| -> (f64, usize) {
+                    if s_len == 0 {
+                        return (0.0, 0);
+                    }
+                    // Number of pixels in the strip = s_len * product of other dims.
+                    let mut count = s_len;
+                    for (d, &sz) in sizes.iter().enumerate() {
+                        if d != sd {
+                            count *= sz;
                         }
                     }
-                }
-                let bgd_avg = if bgd_count > 0 {
-                    bgd_sum / bgd_count as f64
-                } else {
-                    0.0
+                    let mut sum = 0.0f64;
+                    // Iterate over every flat coordinate in the strip by counting
+                    // through per-dimension coordinates.
+                    let mut coords = vec![0usize; ndims];
+                    for _ in 0..count {
+                        let mut flat = 0usize;
+                        for d in 0..ndims {
+                            let c = if d == sd {
+                                coords[d] + s_off
+                            } else {
+                                coords[d]
+                            };
+                            flat += c * strides[d];
+                        }
+                        if flat < v.len() {
+                            sum += v[flat] as f64;
+                        }
+                        // Increment the mixed-radix coordinate counter. The radix
+                        // for the strip dimension is `s_len`; for others it is the
+                        // full dimension size.
+                        for d in 0..ndims {
+                            let radix = if d == sd { s_len } else { sizes[d] };
+                            coords[d] += 1;
+                            if coords[d] < radix {
+                                break;
+                            }
+                            coords[d] = 0;
+                        }
+                    }
+                    (sum, count)
                 };
+
+                let mut bgd_counts = 0.0f64;
+                let mut bgd_pixels = 0usize;
+                for (d, &dim_size) in sizes.iter().enumerate() {
+                    // Low-edge strip: offset 0, size min(bgd_width, dim_size).
+                    let low_len = bgd_width.min(dim_size);
+                    let (low_sum, low_n) = strip(d, 0, low_len);
+                    bgd_counts += low_sum;
+                    bgd_pixels += low_n;
+                    // High-edge strip: offset max(0, dim_size - bgd_width),
+                    // size min(bgd_width, dim_size - offset).
+                    let high_off = dim_size.saturating_sub(bgd_width);
+                    let high_len = bgd_width.min(dim_size - high_off);
+                    let (high_sum, high_n) = strip(d, high_off, high_len);
+                    bgd_counts += high_sum;
+                    bgd_pixels += high_n;
+                }
+                // C parity: NDPluginStats.cpp:526 — `if (bgdPixels < 1) bgdPixels = 1`.
+                let bgd_avg = bgd_counts / bgd_pixels.max(1) as f64;
                 total - bgd_avg * v.len() as f64
             } else {
                 total
@@ -905,7 +968,7 @@ impl NDPluginProcess for StatsProcessor {
         // Centroid computation
         let mut centroid = CentroidResult::default();
         if self.do_compute_centroid {
-            if info.color_size == 1 && array.dims.len() >= 2 {
+            if info.color_size <= 1 && array.dims.len() >= 2 {
                 centroid = compute_centroid(
                     &array.data,
                     info.x_size,
@@ -926,7 +989,7 @@ impl NDPluginProcess for StatsProcessor {
         }
 
         // Profile computation
-        if self.do_compute_profiles && info.color_size == 1 && array.dims.len() >= 2 {
+        if self.do_compute_profiles && info.color_size <= 1 && array.dims.len() >= 2 {
             let profiles = compute_profiles(
                 &array.data,
                 info.x_size,
@@ -948,7 +1011,7 @@ impl NDPluginProcess for StatsProcessor {
         }
 
         // Compute cursor value: pixel at (cursor_x, cursor_y)
-        if info.color_size == 1 && array.dims.len() >= 2 {
+        if info.color_size <= 1 && array.dims.len() >= 2 {
             let cx = self.cursor_x;
             let cy = self.cursor_y;
             if cx < info.x_size && cy < info.y_size {
@@ -956,7 +1019,7 @@ impl NDPluginProcess for StatsProcessor {
             }
         }
 
-        let updates = vec![
+        let mut updates = vec![
             ParamUpdate::float64(p.min_value, result.min),
             ParamUpdate::float64(p.max_value, result.max),
             ParamUpdate::float64(p.mean_value, result.mean),
@@ -986,6 +1049,60 @@ impl NDPluginProcess for StatsProcessor {
             ParamUpdate::int32(p.profile_size_x, info.x_size as i32),
             ParamUpdate::int32(p.profile_size_y, info.y_size as i32),
         ];
+
+        // Histogram waveforms: the counts (HIST_ARRAY) and the bin X axis
+        // (HIST_X_ARRAY). C++ NDPluginStats::computeHistX fills the X axis
+        // with bin left edges: `scale = (histMax - histMin) / histSize` and
+        // `histX[i] = histMin + i*scale` for i in 0..histSize. The divisor is
+        // the bin count (histSize), not histSize-1, so the last bin's X is
+        // histMin + (histSize-1)*scale, strictly below histMax.
+        if self.do_compute_histogram && !result.histogram.is_empty() {
+            updates.push(ParamUpdate::float64_array(
+                p.hist_array,
+                result.histogram.clone(),
+            ));
+            let n = result.histogram.len();
+            let step = (self.hist_max - self.hist_min) / n as f64;
+            let hist_x: Vec<f64> = (0..n).map(|i| self.hist_min + i as f64 * step).collect();
+            updates.push(ParamUpdate::float64_array(p.hist_x_array, hist_x));
+        }
+
+        // Profile waveforms: emit the computed X/Y projections to asyn
+        // clients (C++ doCallbacksFloat64Array for each PROFILE_* waveform).
+        if self.do_compute_profiles && !result.profile_avg_x.is_empty() {
+            updates.push(ParamUpdate::float64_array(
+                p.profile_average_x,
+                result.profile_avg_x.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_average_y,
+                result.profile_avg_y.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_threshold_x,
+                result.profile_threshold_x.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_threshold_y,
+                result.profile_threshold_y.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_centroid_x,
+                result.profile_centroid_x.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_centroid_y,
+                result.profile_centroid_y.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_cursor_x,
+                result.profile_cursor_x.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_cursor_y,
+                result.profile_cursor_y.clone(),
+            ));
+        }
 
         // Send time series data to TS port driver (if configured)
         if let Some(ref sender) = self.ts_sender {
@@ -1303,6 +1420,114 @@ mod tests {
         assert!((stats.net - 100.0).abs() < 1e-10);
     }
 
+    /// BUG 2 regression: 2-D background matches C++ `NDPluginStats`
+    /// edge-strip computation, including corner double-counting.
+    ///
+    /// 4x4 image, bgd_width=1. C++ strips (dim 0 = x fastest):
+    ///   dim x: low strip ix=0 (4 px), high strip ix=3 (4 px)
+    ///   dim y: low strip iy=0 (4 px), high strip iy=3 (4 px)
+    /// bgd_pixels = 16 (the 4 corners are counted twice; the 4 interior
+    /// pixels are never counted). bgd_counts is the sum over those 16
+    /// strip slots, corners contributing twice.
+    #[test]
+    fn test_compute_stats_bgd_2d_corner_double_count() {
+        // 4x4, row-major, dim0=x fastest. Asymmetric data so that corner
+        // double-counting demonstrably changes the result:
+        //   corners      = 100   (idx 0, 3, 12, 15)
+        //   other edges  = 10    (idx 1, 2, 4, 7, 8, 11, 13, 14)
+        //   interior     = 1     (idx 5, 6, 9, 10)
+        // Rows (y):
+        //   y0: [100,  10,  10, 100]
+        //   y1: [ 10,   1,   1,  10]
+        //   y2: [ 10,   1,   1,  10]
+        //   y3: [100,  10,  10, 100]
+        let dims = vec![NDDimension::new(4), NDDimension::new(4)];
+        let mut pixels = vec![1u16; 16];
+        for &i in &[1usize, 2, 4, 7, 8, 11, 13, 14] {
+            pixels[i] = 10;
+        }
+        for &i in &[0usize, 3, 12, 15] {
+            pixels[i] = 100;
+        }
+        let total_expected: f64 = pixels.iter().map(|&p| p as f64).sum();
+        let data = NDDataBuffer::U16(pixels);
+        let stats = compute_stats(&data, &dims, 1);
+
+        // C++ strip sum (bgd_width=1):
+        //   x low strip  (ix=0): idx 0,4,8,12  -> 100,10,10,100 = 220
+        //   x high strip (ix=3): idx 3,7,11,15 -> 100,10,10,100 = 220
+        //   y low strip  (iy=0): idx 0,1,2,3   -> 100,10,10,100 = 220
+        //   y high strip (iy=3): idx 12,13,14,15 -> 100,10,10,100 = 220
+        // Each corner (100) appears in two strips => double-counted.
+        let bgd_counts = 220 + 220 + 220 + 220; // 880
+        let bgd_pixels = 16; // 4 strips * 4 px each
+        let bgd_avg = bgd_counts as f64 / bgd_pixels as f64; // 55.0
+        let expected_net = total_expected - bgd_avg * 16.0;
+        assert!(
+            (stats.net - expected_net).abs() < 1e-9,
+            "net {} != expected {}",
+            stats.net,
+            expected_net
+        );
+
+        // A once-each perimeter (12 distinct pixels) would average
+        // (4*100 + 8*10)/12 = 40.0, NOT 55.0 — proving the corners are
+        // double-counted exactly as C++ documents.
+        let perimeter_avg = (4.0 * 100.0 + 8.0 * 10.0) / 12.0;
+        assert!(
+            (bgd_avg - perimeter_avg).abs() > 1e-9,
+            "corner double-count must change bgd_avg vs a once-each perimeter"
+        );
+        assert!((bgd_avg - 55.0).abs() < 1e-9);
+    }
+
+    /// BUG 2 regression: background works for 1-D arrays (C++ runs the
+    /// strip algorithm for any `ndims`, not just >= 2).
+    #[test]
+    fn test_compute_stats_bgd_1d() {
+        // 1-D, 8 elements: [10, 20, 30, 40, 50, 60, 70, 80], bgd_width=2.
+        let dims = vec![NDDimension::new(8)];
+        let data = NDDataBuffer::U16(vec![10, 20, 30, 40, 50, 60, 70, 80]);
+        let stats = compute_stats(&data, &dims, 2);
+
+        // Single dimension: low strip indices 0,1 -> 10,20;
+        // high strip offset 8-2=6, indices 6,7 -> 70,80.
+        // No corner overlap in 1-D (strips disjoint here).
+        let bgd_counts = 10 + 20 + 70 + 80;
+        let bgd_pixels = 4;
+        let bgd_avg = bgd_counts as f64 / bgd_pixels as f64; // 45.0
+        let total = (10 + 20 + 30 + 40 + 50 + 60 + 70 + 80) as f64;
+        let expected_net = total - bgd_avg * 8.0;
+        assert!(
+            (stats.net - expected_net).abs() < 1e-9,
+            "1-D net {} != expected {}",
+            stats.net,
+            expected_net
+        );
+    }
+
+    /// BUG 2 regression: background works for 3-D arrays.
+    #[test]
+    fn test_compute_stats_bgd_3d() {
+        // 2x2x2 array, every element = 1, bgd_width = 1.
+        // With bgd_width >= every dim size, every strip covers the whole
+        // array; corners counted many times. bgd_avg must still be 1.0
+        // (uniform data), so net = total - 1.0 * 8 = 0.
+        let dims = vec![
+            NDDimension::new(2),
+            NDDimension::new(2),
+            NDDimension::new(2),
+        ];
+        let data = NDDataBuffer::U8(vec![1u8; 8]);
+        let stats = compute_stats(&data, &dims, 1);
+        assert!(
+            stats.net.abs() < 1e-9,
+            "3-D uniform net should be 0, got {}",
+            stats.net
+        );
+        assert_eq!(stats.total, 8.0);
+    }
+
     #[test]
     fn test_centroid_uniform() {
         let data = NDDataBuffer::U8(vec![1; 16]);
@@ -1495,6 +1720,141 @@ mod tests {
         assert_eq!(stats.min, 10.0);
         assert_eq!(stats.max, 50.0);
         assert_eq!(stats.mean, 30.0);
+    }
+
+    #[test]
+    fn test_stats_emits_histogram_and_profile_arrays() {
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        let mut proc = StatsProcessor::new();
+        // Register params so the array reasons are distinct, non-zero indices.
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "_stats_scratch_",
+            1,
+            asyn_rs::port::PortFlags::default(),
+        );
+        let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
+        let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
+        proc.register_params(&mut base).unwrap();
+
+        proc.do_compute_histogram = true;
+        proc.do_compute_profiles = true;
+        proc.hist_size = 8;
+        proc.hist_min = 0.0;
+        proc.hist_max = 7.0;
+        let pool = NDArrayPool::new(1_000_000);
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for (i, val) in v.iter_mut().enumerate() {
+                *val = (i % 8) as u8;
+            }
+        }
+
+        let result = proc.process_array(&arr, &pool);
+        let p = proc.params;
+        // HIST_ARRAY, HIST_X_ARRAY and the 8 PROFILE_* waveforms must be
+        // pushed as float64 array updates.
+        let array_reasons: Vec<usize> = result
+            .param_updates
+            .iter()
+            .filter_map(|u| match u {
+                ParamUpdate::Float64Array { reason, value, .. } => {
+                    assert!(!value.is_empty(), "array waveform must not be empty");
+                    Some(*reason)
+                }
+                _ => None,
+            })
+            .collect();
+        for reason in [
+            p.hist_array,
+            p.hist_x_array,
+            p.profile_average_x,
+            p.profile_average_y,
+            p.profile_threshold_x,
+            p.profile_threshold_y,
+            p.profile_centroid_x,
+            p.profile_centroid_y,
+            p.profile_cursor_x,
+            p.profile_cursor_y,
+        ] {
+            assert!(
+                array_reasons.contains(&reason),
+                "missing array update for reason {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hist_x_array_uses_bin_count_divisor() {
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        // C++ NDPluginStats::computeHistX: scale = (histMax-histMin)/histSize,
+        // histX[i] = histMin + i*scale. For histSize=256, min=0, max=255 the
+        // last bin X must be ~254.0 (= 255*255/256), NOT 255.0.
+        let mut proc = StatsProcessor::new();
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "_stats_histx_",
+            1,
+            asyn_rs::port::PortFlags::default(),
+        );
+        let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
+        let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
+        proc.register_params(&mut base).unwrap();
+
+        proc.do_compute_histogram = true;
+        proc.hist_size = 256;
+        proc.hist_min = 0.0;
+        proc.hist_max = 255.0;
+        let pool = NDArrayPool::new(1_000_000);
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for (i, val) in v.iter_mut().enumerate() {
+                *val = (i * 16) as u8;
+            }
+        }
+
+        let result = proc.process_array(&arr, &pool);
+        let hist_x = result
+            .param_updates
+            .iter()
+            .find_map(|u| match u {
+                ParamUpdate::Float64Array { reason, value, .. }
+                    if *reason == proc.params.hist_x_array =>
+                {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .expect("HIST_X_ARRAY must be emitted");
+
+        assert_eq!(hist_x.len(), 256, "256 bins");
+        let scale = 255.0 / 256.0;
+        assert!(
+            (hist_x[0] - 0.0).abs() < 1e-9,
+            "bin 0 X must be histMin (0.0), got {}",
+            hist_x[0]
+        );
+        assert!(
+            (hist_x[1] - scale).abs() < 1e-9,
+            "bin 1 X must be {scale}, got {}",
+            hist_x[1]
+        );
+        assert!(
+            (hist_x[255] - 255.0 * scale).abs() < 1e-9,
+            "last bin X must be ~254.004 (255*255/256), got {}",
+            hist_x[255]
+        );
+        assert!(
+            hist_x[255] < 255.0,
+            "last bin X must be strictly below histMax, got {}",
+            hist_x[255]
+        );
     }
 
     #[test]

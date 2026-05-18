@@ -8,13 +8,15 @@ pub struct PositionFields {
     pub rlv: f64,
     pub off: f64,
     pub diff: f64,
-    pub rdif: i32,
+    /// Raw step difference. 64-bit to cover high-resolution / long-travel
+    /// axes beyond the 32-bit range (epics-modules/motor #192).
+    pub rdif: i64,
     pub dval: f64,
     pub drbv: f64,
-    pub rval: i32,
-    pub rrbv: i32,
-    pub rmp: i32,
-    pub rep: i32,
+    pub rval: i64,
+    pub rrbv: i64,
+    pub rmp: i64,
+    pub rep: i64,
 }
 
 impl Default for PositionFields {
@@ -51,6 +53,17 @@ pub struct ConversionFields {
     pub urip: bool,
     pub rres: f64,
     pub rdbl_value: Option<f64>,
+    /// Restore mode for autosaved DVAL at init (C: `2906f3d8`, PR #160).
+    pub rstm: RestoreMode,
+    /// External URIP readback link is in error. C: `db5da2f0` (2017-05),
+    /// `7493d50b` (2018-04). When `urip` is true and this flag is set, the
+    /// record stops any in-progress motion and refuses to start new ones.
+    pub rdbl_error: bool,
+    /// Block LOAD_POS (SetPosition). epics-modules/motor issue #231 — for
+    /// absolute-encoder axes where redefining the position would leave
+    /// DVAL/OFF inconsistent with the controller. When set, SET-mode
+    /// coordinate redefinition and RSTM restore are both refused.
+    pub loadpos_blocked: bool,
 }
 
 impl Default for ConversionFields {
@@ -68,6 +81,9 @@ impl Default for ConversionFields {
             urip: false,
             rres: 0.0,
             rdbl_value: None,
+            rstm: RestoreMode::NearZero,
+            rdbl_error: false,
+            loadpos_blocked: false,
         }
     }
 }
@@ -82,6 +98,12 @@ pub struct VelocityFields {
     pub sbas: f64,
     pub smax: f64,
     pub accl: f64,
+    /// Acceleration in EGU/sec² (C: `36177f7b`, PR #122 / #203).
+    /// Cross-calculated with ACCL via `(velo - vbas) / accl` when ACCU is `Accl`,
+    /// or `(velo - vbas) / accs` when ACCU is `Accs`.
+    pub accs: f64,
+    /// Which of ACCL/ACCS is the master (autosave target). C: `63bfe5d0`.
+    pub accu: AccsUsed,
     pub bvel: f64,
     pub bacc: f64,
     pub hvel: f64,
@@ -100,6 +122,8 @@ impl Default for VelocityFields {
             sbas: 0.0,
             smax: 0.0,
             accl: 0.2,
+            accs: 5.0, // (velo=1.0 - vbas=0.0) / accl=0.2
+            accu: AccsUsed::Accl,
             bvel: 1.0,
             bacc: 0.5,
             hvel: 1.0,
@@ -216,6 +240,11 @@ pub struct StatusFields {
     pub tdir: bool,
     pub athm: bool,
     pub stup: i16,
+    /// Raw velocity reported by the driver, in motor steps/sec.
+    /// C: `motorRecord.dbd` `field(RVEL,DBF_LONG)` "Raw Velocity"; devMotorAsyn
+    /// fills it with `floor(status.velocity)`. 64-bit here for consistency
+    /// with the other raw fields (epics-modules/motor #192).
+    pub rvel: i64,
 }
 
 impl Default for StatusFields {
@@ -230,6 +259,7 @@ impl Default for StatusFields {
             tdir: false,
             athm: false,
             stup: 0,
+            rvel: 0,
         }
     }
 }
@@ -284,19 +314,35 @@ impl Default for TimingFields {
     }
 }
 
+/// Position-compare output fields. C: `05b25c1d` (PR #248) — exposed as
+/// asyn parameters PCO_START/END/INCREMENT/PULSE_WIDTH/ENABLE.
+#[derive(Debug, Clone, Default)]
+pub struct PcoFields {
+    pub start: f64,
+    pub end: f64,
+    pub increment: f64,
+    pub pulse_width_us: f64,
+    pub enable: bool,
+}
+
 /// Internal bookkeeping fields (not directly exposed as PVs).
 #[derive(Debug, Clone, Default)]
 pub struct InternalFields {
     pub lval: f64,
     pub ldvl: f64,
-    pub lrvl: i32,
+    pub lrvl: i64,
     pub lspg: SpmgMode,
-    pub pp: bool,
     pub sync: bool,
     /// Backlash final move pending after MainMove completes
     pub backlash_pending: bool,
     /// Pending retarget value (for NTM stop-and-replan)
     pub pending_retarget: Option<f64>,
+    /// A jog/home command that arrived while the axis was already moving.
+    /// The record stops the current motion first and re-issues this once the
+    /// driver reports done. Kept separate from the MIP JOGF/JOGR/HOMF/HOMR
+    /// bits so a plain STOP on an *active* jog/home is not mistaken for a
+    /// queued request.
+    pub queued_motion: Option<QueuedMotion>,
     /// Remember jog direction for backlash (cleared by stop_jog)
     pub jog_was_forward: bool,
     /// True after the initial DMOV 1→0 notification has been sent.

@@ -136,13 +136,28 @@ impl PvaHeader {
         buf.put_u32(self.payload_length, self.flags.byte_order());
     }
 
-    /// Decode an 8-byte header. Validates magic.
+    /// Decode an 8-byte header. Validates magic AND version byte.
+    ///
+    /// pvxs `pvaproto.h::from_wire(Header)` (line 687) faults the buffer
+    /// on `buf[0]!=0xCA || buf[1]==0` — a zero version byte is reserved
+    /// (pvxs `pva_version::{client,server} = 2`; 1 is the legacy v1
+    /// release; 3 is the upcoming bump for cap-tokens). A version-zero
+    /// header has historically signalled "raw socket noise / port
+    /// scan / malformed crafted frame" and pvxs treats it as a hard
+    /// protocol fault. We previously accepted it, which let a peer
+    /// inject 8-byte zero blocks (header) and have our framing loop
+    /// happily reset rx_buf for each one — wasted CPU + buffer churn.
     pub fn decode(cur: &mut Cursor<&[u8]>) -> Result<Self, DecodeError> {
         let magic = cur.get_u8()?;
         if magic != MAGIC {
             return Err(decode_err!("bad magic 0x{magic:02X}, expected 0xCA"));
         }
         let version = cur.get_u8()?;
+        if version == 0 {
+            return Err(decode_err!(
+                "bad version byte 0x00 (pvxs from_wire(Header) reserves zero)"
+            ));
+        }
         let flags = HeaderFlags(cur.get_u8()?);
         let command = cur.get_u8()?;
         let payload_length = cur.get_u32(flags.byte_order())?;
@@ -199,6 +214,36 @@ mod tests {
         let bytes = [0xAB, PVA_VERSION, 0, 0, 0, 0, 0, 0];
         let mut cur = Cursor::new(bytes.as_slice());
         assert!(PvaHeader::decode(&mut cur).is_err());
+    }
+
+    /// pvxs `pvaproto.h::from_wire(Header)` line 687: `buf[1]==0` is a
+    /// hard protocol fault (`buf.fault(__FILE__, __LINE__)`). Our
+    /// parser was previously lenient — accepting `version=0` allowed a
+    /// peer to inject 8 zero bytes that decoded as a control frame
+    /// (flags=0 → not control; command=0; payload_length=0). On the
+    /// server side this fed the framing loop a bogus "command 0 with
+    /// no payload" entry per 8 bytes of zero traffic.
+    #[test]
+    fn rejects_zero_version_byte() {
+        let bytes = [MAGIC, 0x00, 0, 0, 0, 0, 0, 0];
+        let mut cur = Cursor::new(bytes.as_slice());
+        assert!(
+            PvaHeader::decode(&mut cur).is_err(),
+            "version=0 must be rejected (pvxs from_wire(Header) parity)"
+        );
+
+        // Non-zero versions are accepted — the parser is forward-
+        // compatible. v1 (legacy), v2 (current pvxs), v3 (upcoming
+        // cap-tokens) all decode without complaint; specific feature
+        // negotiation happens at the CONNECTION_VALIDATION layer.
+        for v in [1u8, 2, 3, 255] {
+            let bytes = [MAGIC, v, 0, 0, 0, 0, 0, 0];
+            let mut cur = Cursor::new(bytes.as_slice());
+            assert!(
+                PvaHeader::decode(&mut cur).is_ok(),
+                "version={v} must decode (forward-compat)"
+            );
+        }
     }
 
     #[test]

@@ -63,18 +63,55 @@ pub fn from_env() -> CasUdpConfig {
         })
         .unwrap_or(CA_REPEATER_PORT);
 
-    // Beacon addr list: explicit EPICS_CAS_BEACON_ADDR_LIST first; otherwise
-    // fall back to EPICS_CA_ADDR_LIST so a single setting can drive both
-    // sides at small sites.
+    // Beacon addr list: only EPICS_CAS_BEACON_ADDR_LIST. The C IOC
+    // server (rsrv/caservertask.c:413) calls
+    // `addAddrToChannelAccessAddressList ( &temp,
+    //   &EPICS_CAS_BEACON_ADDR_LIST, ca_beacon_port, 0 )` with no
+    // fallback. The fallback to EPICS_CA_ADDR_LIST was intentionally
+    // removed in EPICS 3.15 (documentation/RELEASE-3.15.md): "CA
+    // servers (RSRV and PCAS) would build the beacon address list
+    // using EPICS_CA_ADDR_LIST if EPICS_CAS_BEACON_ADDR_LIST was no
+    // set. This is no longer done. Sites depending on this should set
+    // both environment variables to the same value." The previous
+    // Rust behaviour silently re-enabled the deprecated fallback,
+    // sending beacons to every search target on the client list —
+    // unwanted UDP fan-out on sites that intentionally separated
+    // client search targets from beacon destinations. Note: the
+    // standalone `caRepeater` daemon (repeater.cpp:545-547) DOES still
+    // fall back; that path lives in `repeater.rs` and is unaffected.
     let mut beacon_addrs: Vec<SocketAddr> = Vec::new();
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_ADDR_LIST") {
         beacon_addrs.extend(parse_addr_list(&list, beacon_port));
-    } else if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
-        beacon_addrs.extend(parse_addr_list(&list, beacon_port));
     }
 
-    let auto_beacon = epics_base_rs::runtime::env::get_or("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "YES");
-    if auto_beacon.eq_ignore_ascii_case("YES") || beacon_addrs.is_empty() {
+    // C parity (`caservertask.c:281-287, 415-427`):
+    //   * Default `autobeaconlist = 1` (YES). The CONFIG_ENV default
+    //     `EPICS_CAS_AUTO_BEACON_ADDR_LIST=""` parses as NULL in
+    //     `envGetConfigParamPtr` (empty-string → NULL), so
+    //     `envGetBoolConfigParam` returns -1 and `autobeaconlist`
+    //     keeps its initial value of 1.
+    //   * Explicit `=YES` → `autobeaconlist = 1`.
+    //   * Anything else (`=NO`, `=0`, junk) → `autobeaconlist = 0`.
+    //   * Auto-discovery runs ONLY when `autobeaconlist == 1`.
+    //     Setting AUTO=NO with an empty `EPICS_CAS_BEACON_ADDR_LIST`
+    //     yields an empty beacon list (C prints
+    //     "Warning: RSRV has empty beacon address list").
+    //
+    // The previous Rust gate was `AUTO==YES || beacon_addrs.is_empty()`,
+    // which re-enabled discovery whenever the operator hadn't
+    // listed any explicit beacon destinations — even with AUTO=NO.
+    // That overrode the site's deliberate "no broadcast" intent
+    // (e.g. when only multicast targets are wanted via interface
+    // setup, or when running fully isolated). Honour AUTO==NO
+    // strictly; only run discovery when AUTO is YES.
+    let auto_beacon = epics_base_rs::runtime::env::get("EPICS_CAS_AUTO_BEACON_ADDR_LIST");
+    let auto_on = match auto_beacon.as_deref() {
+        // Unset or empty → C `envGetBoolConfigParam` returns -1,
+        // initial `autobeaconlist = 1` survives.
+        None | Some("") => true,
+        Some(s) => s.eq_ignore_ascii_case("YES"),
+    };
+    if auto_on {
         for bcast in discover_broadcast_addrs() {
             let entry = SocketAddr::V4(SocketAddrV4::new(bcast, beacon_port));
             if !beacon_addrs.contains(&entry) {
@@ -82,12 +119,21 @@ pub fn from_env() -> CasUdpConfig {
             }
         }
         if beacon_addrs.is_empty() {
-            // Last-resort fallback: limited broadcast.
+            // Last-resort fallback: limited broadcast.  C `rsrv_init`
+            // does not add this — it warns and leaves the list empty
+            // — but we keep the limited-broadcast fallback for the
+            // common single-NIC dev/test case where `getifaddrs`
+            // discovery may return no usable bcast. With AUTO=YES this
+            // matches the operator's intent.
             beacon_addrs.push(SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::BROADCAST,
                 beacon_port,
             )));
         }
+    } else if beacon_addrs.is_empty() {
+        // C prints a warning to stderr.  Surface the same diagnostic
+        // so a misconfigured operator sees why no beacons go out.
+        eprintln!("Warning: RSRV has empty beacon address list");
     }
     cfg.beacon_addrs = beacon_addrs;
 
@@ -95,11 +141,33 @@ pub fn from_env() -> CasUdpConfig {
         cfg.ignore_addrs = parse_ipv4_list(&list);
     }
 
-    if let Some(period) = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_PERIOD")
-        .and_then(|s| s.parse::<f64>().ok())
-    {
-        let secs = period.max(0.1);
-        cfg.beacon_period = Duration::from_secs_f64(secs);
+    // C `online_notify.c::rsrv_online_notify_task:52-57` reads
+    // `EPICS_CAS_BEACON_PERIOD` and falls back to the deprecated
+    // `EPICS_CA_BEACON_PERIOD` if the server-side var is unset. The
+    // legacy var is still declared in libcom `envDefs.h:62` as
+    // "deprecated" precisely because old operator deployments rely on
+    // it. Honour the same fallback so a site migrating from a C IOC
+    // doesn't silently revert to the default 15s when only the legacy
+    // var is in their environment.
+    //
+    // C parity for invalid values (`online_notify.c:58-64`):
+    //   if (longStatus || maxPeriod <= 0.0) { maxPeriod = 15.0; }
+    // i.e. parse failure OR `<= 0` falls back to the default 15s
+    // (not to a synthetic 0.1s floor). A previous Rust revision
+    // clamped via `period.max(0.1)`, which silently coerced both
+    // 0/negative and tiny-positive values to 100ms. That diverges
+    // in two directions: an explicit `0` no longer behaves like
+    // "use default", and a deliberately tiny positive (e.g. 0.05
+    // in a soak test) gets raised against the operator's wishes.
+    // Match C: accept any strictly-positive parsed value as-is;
+    // fall back to default for parse-failure or non-positive.
+    let raw_period = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_PERIOD")
+        .or_else(|| epics_base_rs::runtime::env::get("EPICS_CA_BEACON_PERIOD"));
+    if let Some(period) = raw_period.and_then(|s| s.parse::<f64>().ok()) {
+        if period > 0.0 && period.is_finite() {
+            cfg.beacon_period = Duration::from_secs_f64(period);
+        }
+        // else: keep default (15s) — matches C's `maxPeriod <= 0.0` branch.
     }
 
     cfg
@@ -183,6 +251,47 @@ pub fn discover_broadcast_addrs() -> Vec<Ipv4Addr> {
     out
 }
 
+/// Return the IPv4 broadcast address of the up, non-loopback interface
+/// whose primary IP equals `match_ip`. Mirrors the
+/// `pMatchAddr->ia.sin_addr.s_addr != htonl(INADDR_ANY)` branch in libcom
+/// `osdNetIfAddrs.c::osiSockDiscoverBroadcastAddresses` — the C IOC
+/// builds a list of broadcast addrs filtered to the matching interface
+/// before binding the secondary `udpbcast` socket in
+/// `caservertask.c::start_tcp_server_tasks` (lines 670-708).
+///
+/// Returns `None` when:
+///   * `match_ip` is the unspecified address (caller should never call
+///     in that case — the primary 0.0.0.0 socket already gets broadcasts);
+///   * `match_ip` is loopback (C special-cases this to "loopback as
+///     broadcast", but a loopback responder never needs a second
+///     broadcast bind);
+///   * no matching interface was found, or that interface lacks a
+///     broadcast addr (point-to-point links / odd kernel configs);
+///   * the discovered broadcast is `0.0.0.0` (libcom drops these).
+pub fn broadcast_for_ip(match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
+    if match_ip.is_unspecified() || match_ip.is_loopback() {
+        return None;
+    }
+    let ifs = if_addrs::get_if_addrs().ok()?;
+    for iface in ifs {
+        if iface.is_loopback() {
+            continue;
+        }
+        let if_addrs::IfAddr::V4(v4) = iface.addr else {
+            continue;
+        };
+        if v4.ip != match_ip {
+            continue;
+        }
+        let b = v4.broadcast?;
+        if b.is_unspecified() {
+            return None;
+        }
+        return Some(b);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,8 +314,230 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_for_ip_rejects_unspecified_and_loopback() {
+        // C `osdNetIfAddrs.c:42-54` special-cases loopback (returns
+        // INADDR_LOOPBACK as the "broadcast") but `caservertask.c:677`
+        // gates the secondary-bind path on `!= INADDR_ANY`. We collapse
+        // both cases by returning None for unspecified and loopback
+        // inputs — the caller (`udp.rs::run_single_responder`) only
+        // ever opens a second responder when the result is `Some`.
+        assert_eq!(broadcast_for_ip(Ipv4Addr::UNSPECIFIED), None);
+        assert_eq!(broadcast_for_ip(Ipv4Addr::LOCALHOST), None);
+    }
+
+    #[test]
+    fn broadcast_for_ip_unknown_address_returns_none() {
+        // 198.51.100.0/24 is RFC 5737 documentation space — no host
+        // machine will have it on a real interface. Lookup must
+        // gracefully return None rather than fabricating a broadcast.
+        assert_eq!(broadcast_for_ip(Ipv4Addr::new(198, 51, 100, 1)), None);
+    }
+
+    #[test]
     fn empty_list_returns_empty() {
         assert!(parse_addr_list("", 5065).is_empty());
         assert!(parse_ipv4_list("   ").is_empty());
+    }
+
+    /// `from_env` MUST NOT fall back to `EPICS_CA_ADDR_LIST` for the
+    /// IOC beacon list. C IOC `rsrv/caservertask.c:413` removed that
+    /// fallback in EPICS 3.15 (RELEASE-3.15.md). Sites now must set
+    /// both env vars; Rust no longer silently re-enables the
+    /// deprecated path. The standalone caRepeater (`repeater.rs`)
+    /// path keeps the fallback for documented parity with
+    /// `epics-base/modules/ca/src/client/repeater.cpp:545-547`.
+    #[test]
+    #[serial_test::serial]
+    fn from_env_does_not_fall_back_to_ca_addr_list() {
+        let saved_beacon = std::env::var("EPICS_CAS_BEACON_ADDR_LIST").ok();
+        let saved_ca = std::env::var("EPICS_CA_ADDR_LIST").ok();
+        let saved_auto = std::env::var("EPICS_CAS_AUTO_BEACON_ADDR_LIST").ok();
+        // SAFETY: gated by `serial_test::serial`; mutations confined
+        // to this test, restored before return.
+        unsafe {
+            std::env::remove_var("EPICS_CAS_BEACON_ADDR_LIST");
+            std::env::set_var("EPICS_CA_ADDR_LIST", "203.0.113.42:5070");
+            // Disable auto-discovery so the result is deterministic
+            // (no host broadcast addrs creeping in).
+            std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
+        }
+
+        let cfg = from_env();
+        let leaked = cfg
+            .beacon_addrs
+            .iter()
+            .any(|a| matches!(a, SocketAddr::V4(v4) if v4.ip().octets() == [203, 0, 113, 42]));
+        assert!(
+            !leaked,
+            "EPICS_CA_ADDR_LIST entry leaked into beacon_addrs: {:?}",
+            cfg.beacon_addrs
+        );
+
+        // SAFETY: same scoping as above.
+        unsafe {
+            match saved_beacon {
+                Some(v) => std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_BEACON_ADDR_LIST"),
+            }
+            match saved_ca {
+                Some(v) => std::env::set_var("EPICS_CA_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CA_ADDR_LIST"),
+            }
+            match saved_auto {
+                Some(v) => std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST"),
+            }
+        }
+    }
+
+    /// When `EPICS_CAS_BEACON_ADDR_LIST` is set, its entries appear.
+    /// Companion assertion to confirm the env-reading branch still
+    /// works after removing the fallback.
+    #[test]
+    #[serial_test::serial]
+    fn from_env_uses_beacon_addr_list_when_set() {
+        let saved_beacon = std::env::var("EPICS_CAS_BEACON_ADDR_LIST").ok();
+        let saved_auto = std::env::var("EPICS_CAS_AUTO_BEACON_ADDR_LIST").ok();
+        // SAFETY: serial_test::serial.
+        unsafe {
+            std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", "198.51.100.7:5099");
+            std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
+        }
+
+        let cfg = from_env();
+        let hit = cfg.beacon_addrs.iter().any(|a| {
+            matches!(a, SocketAddr::V4(v4)
+                if v4.ip().octets() == [198, 51, 100, 7] && v4.port() == 5099)
+        });
+        assert!(
+            hit,
+            "EPICS_CAS_BEACON_ADDR_LIST entry missing from beacon_addrs: {:?}",
+            cfg.beacon_addrs
+        );
+
+        // SAFETY: same scoping as above.
+        unsafe {
+            match saved_beacon {
+                Some(v) => std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_BEACON_ADDR_LIST"),
+            }
+            match saved_auto {
+                Some(v) => std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST"),
+            }
+        }
+    }
+
+    /// C `online_notify.c:58-64` parity for `EPICS_CAS_BEACON_PERIOD`:
+    /// any value `<= 0.0` (and parse-failure) falls back to the 15s
+    /// default — there is no 100ms floor. Verify that explicit 0,
+    /// negatives, and parse failures all keep the default; tiny
+    /// positives are accepted verbatim.
+    #[test]
+    #[serial_test::serial]
+    fn from_env_beacon_period_matches_c_default_on_nonpositive() {
+        let saved = std::env::var("EPICS_CAS_BEACON_PERIOD").ok();
+        let saved_legacy = std::env::var("EPICS_CA_BEACON_PERIOD").ok();
+        let saved_auto = std::env::var("EPICS_CAS_AUTO_BEACON_ADDR_LIST").ok();
+        // SAFETY: serial_test::serial.
+        unsafe {
+            std::env::remove_var("EPICS_CA_BEACON_PERIOD");
+            std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_CAS_BEACON_PERIOD", "0");
+        }
+        let cfg = from_env();
+        assert_eq!(
+            cfg.beacon_period,
+            Duration::from_secs(15),
+            "explicit 0 must fall back to 15s default (C parity)"
+        );
+
+        // SAFETY: serial_test::serial.
+        unsafe {
+            std::env::set_var("EPICS_CAS_BEACON_PERIOD", "-5");
+        }
+        let cfg = from_env();
+        assert_eq!(
+            cfg.beacon_period,
+            Duration::from_secs(15),
+            "negative must fall back to 15s default (C parity)"
+        );
+
+        // SAFETY: serial_test::serial.
+        unsafe {
+            std::env::set_var("EPICS_CAS_BEACON_PERIOD", "garbage");
+        }
+        let cfg = from_env();
+        assert_eq!(
+            cfg.beacon_period,
+            Duration::from_secs(15),
+            "parse failure must keep default"
+        );
+
+        // Tiny positive: accepted verbatim (no 0.1 floor).
+        // SAFETY: serial_test::serial.
+        unsafe {
+            std::env::set_var("EPICS_CAS_BEACON_PERIOD", "0.05");
+        }
+        let cfg = from_env();
+        assert_eq!(
+            cfg.beacon_period,
+            Duration::from_secs_f64(0.05),
+            "tiny positive must be honoured verbatim — no synthetic floor"
+        );
+
+        // SAFETY: serial_test::serial.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("EPICS_CAS_BEACON_PERIOD", v),
+                None => std::env::remove_var("EPICS_CAS_BEACON_PERIOD"),
+            }
+            match saved_legacy {
+                Some(v) => std::env::set_var("EPICS_CA_BEACON_PERIOD", v),
+                None => std::env::remove_var("EPICS_CA_BEACON_PERIOD"),
+            }
+            match saved_auto {
+                Some(v) => std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST"),
+            }
+        }
+    }
+
+    /// C `caservertask.c:281-287, 415-427` parity for AUTO_BEACON=NO:
+    /// when the operator sets `EPICS_CAS_AUTO_BEACON_ADDR_LIST=NO` and
+    /// leaves `EPICS_CAS_BEACON_ADDR_LIST` empty, the resulting beacon
+    /// list MUST be empty (C prints a warning). A previous Rust
+    /// revision auto-populated broadcast addrs whenever the explicit
+    /// list was empty regardless of AUTO=NO — re-enabling broadcasts
+    /// the operator intentionally disabled.
+    #[test]
+    #[serial_test::serial]
+    fn from_env_auto_beacon_no_with_empty_list_yields_empty() {
+        let saved_beacon = std::env::var("EPICS_CAS_BEACON_ADDR_LIST").ok();
+        let saved_auto = std::env::var("EPICS_CAS_AUTO_BEACON_ADDR_LIST").ok();
+        // SAFETY: serial_test::serial.
+        unsafe {
+            std::env::remove_var("EPICS_CAS_BEACON_ADDR_LIST");
+            std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
+        }
+
+        let cfg = from_env();
+        assert!(
+            cfg.beacon_addrs.is_empty(),
+            "AUTO=NO with empty explicit list must yield empty beacon_addrs (C parity), got {:?}",
+            cfg.beacon_addrs
+        );
+
+        // SAFETY: same scoping as above.
+        unsafe {
+            match saved_beacon {
+                Some(v) => std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_BEACON_ADDR_LIST"),
+            }
+            match saved_auto {
+                Some(v) => std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST"),
+            }
+        }
     }
 }

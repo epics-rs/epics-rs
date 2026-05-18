@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 /// Calcout record — calc with output.
@@ -92,6 +92,19 @@ pub struct CalcoutRecord {
     pub mlst: f64,
     // Previous values for output determination
     pub pval: f64, // previous VAL (externally readable like C)
+    // Output delay (ODLY) — C `calcoutRecord.c` `prec->odly`. When an
+    // output should fire and ODLY > 0, the OUT-link write is deferred
+    // by ODLY seconds via a delayed re-process.
+    pub odly: f64,
+    // Delay-active flag (DLYA) — C `prec->dlya`. Set to 1 while an ODLY
+    // delay is pending, cleared on the delayed re-process. Externally
+    // readable (DBF_SHORT) so clients can observe the pending state.
+    pub dlya: i16,
+    // Internal: captured output decision while an ODLY delay is pending.
+    // The delayed re-process must write the output that the *original*
+    // cycle decided on, not re-evaluate should_output() against the
+    // (by then stale) pval/val.
+    pending_output: bool,
     // CALC_ALARM flag
     pub calc_alarm: bool,
     // Cached compiled expressions (RPCL/ORPC equivalents)
@@ -184,6 +197,9 @@ impl Default for CalcoutRecord {
             alst: 0.0,
             mlst: 0.0,
             pval: 0.0,
+            odly: 0.0,
+            dlya: 0,
+            pending_output: false,
             calc_alarm: false,
             rpcl: None,
             orpc: None,
@@ -192,6 +208,15 @@ impl Default for CalcoutRecord {
 }
 
 impl CalcoutRecord {
+    /// C `calcoutRecord.c::monitor`: advance the `LX` previous-value
+    /// field only when the input `X` actually changed since the last
+    /// monitor post.
+    fn advance_prev(new: f64, prev: &mut f64) {
+        if new != *prev {
+            *prev = new;
+        }
+    }
+
     fn get_vars(&self) -> [f64; 21] {
         [
             self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
@@ -277,6 +302,16 @@ static CALCOUT_FIELDS: &[FieldDesc] = &[
         name: "OOPT",
         dbf_type: DbFieldType::Short,
         read_only: false,
+    },
+    FieldDesc {
+        name: "ODLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLYA",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
     },
     FieldDesc {
         name: "DOPT",
@@ -648,6 +683,19 @@ impl Record for CalcoutRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // ODLY continuation: this is the delayed re-process scheduled by a
+        // previous cycle (C `calcoutRecord.c::process` `pact==TRUE` +
+        // `dlya` branch). Do NOT re-evaluate CALC / should_output here —
+        // C runs `execOutput` directly. Honour the output decision the
+        // original cycle captured, clear DLYA, and let the framework
+        // write the OUT link.
+        if self.dlya == 1 {
+            self.dlya = 0;
+            self.cached_should_output = self.pending_output;
+            self.pending_output = false;
+            return Ok(ProcessOutcome::complete());
+        }
+
         // NOTE: pval is updated AFTER CALC evaluation (at the end),
         // not before. It holds the previous cycle's value for
         // transition detection in should_output().
@@ -681,37 +729,56 @@ impl Record for CalcoutRecord {
                 self.oval = self.val;
             }
         }
-        // Save current values to LA-LU for next cycle
-        self.la = self.a;
-        self.lb = self.b;
-        self.lc = self.c;
-        self.ld = self.d;
-        self.le = self.e;
-        self.lf = self.f;
-        self.lg = self.g;
-        self.lh = self.h;
-        self.li = self.i;
-        self.lj = self.j;
-        self.lk = self.k;
-        self.ll = self.l;
-        self.lm = self.m;
-        self.ln = self.n;
-        self.lo = self.o;
-        self.lp = self.p;
-        self.lq = self.q;
-        self.lr = self.r;
-        self.ls = self.s;
-        self.lt = self.t;
-        self.lu = self.u;
+        // Update LA-LU. C `calcoutRecord.c::monitor` (lines 679-685)
+        // advances `*pprev = *pnew` only inside the per-field change test
+        // (`if (*pnew != *pprev || monitor_mask & DBE_ALARM)`), i.e. only
+        // for inputs that actually changed since the last monitor post.
+        Self::advance_prev(self.a, &mut self.la);
+        Self::advance_prev(self.b, &mut self.lb);
+        Self::advance_prev(self.c, &mut self.lc);
+        Self::advance_prev(self.d, &mut self.ld);
+        Self::advance_prev(self.e, &mut self.le);
+        Self::advance_prev(self.f, &mut self.lf);
+        Self::advance_prev(self.g, &mut self.lg);
+        Self::advance_prev(self.h, &mut self.lh);
+        Self::advance_prev(self.i, &mut self.li);
+        Self::advance_prev(self.j, &mut self.lj);
+        Self::advance_prev(self.k, &mut self.lk);
+        Self::advance_prev(self.l, &mut self.ll);
+        Self::advance_prev(self.m, &mut self.lm);
+        Self::advance_prev(self.n, &mut self.ln);
+        Self::advance_prev(self.o, &mut self.lo);
+        Self::advance_prev(self.p, &mut self.lp);
+        Self::advance_prev(self.q, &mut self.lq);
+        Self::advance_prev(self.r, &mut self.lr);
+        Self::advance_prev(self.s, &mut self.ls);
+        Self::advance_prev(self.t, &mut self.lt);
+        Self::advance_prev(self.u, &mut self.lu);
 
         // Cache should_output result BEFORE updating pval, because
         // framework calls should_output() after process() returns,
         // but by then pval would already equal val.
-        self.cached_should_output = self.should_output();
+        let do_output = self.should_output();
 
         // Now update pval for next cycle
         self.pval = self.val;
 
+        // ODLY (C `calcoutRecord.c::process` lines 276-288): when an
+        // output should fire and ODLY > 0, defer the OUT-link write by
+        // ODLY seconds. Set DLYA, suppress this cycle's output, and ask
+        // the framework to re-process after the delay. The continuation
+        // branch at the top of process() then emits the captured output.
+        if do_output && self.odly > 0.0 {
+            self.dlya = 1;
+            self.pending_output = true;
+            self.cached_should_output = false;
+            let delay = std::time::Duration::from_secs_f64(self.odly);
+            return Ok(ProcessOutcome::complete_with(vec![
+                ProcessAction::ReprocessAfter(delay),
+            ]));
+        }
+
+        self.cached_should_output = do_output;
         Ok(ProcessOutcome::complete())
     }
 
@@ -731,6 +798,8 @@ impl Record for CalcoutRecord {
             "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             "PVAL" => Some(EpicsValue::Double(self.pval)),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
+            "ODLY" => Some(EpicsValue::Double(self.odly)),
+            "DLYA" => Some(EpicsValue::Short(self.dlya)),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "OCAL" => Some(EpicsValue::String(self.ocal.clone())),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
@@ -890,6 +959,14 @@ impl Record for CalcoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch("OOPT".into())),
             },
+            "ODLY" => match value {
+                EpicsValue::Double(v) => {
+                    self.odly = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("ODLY".into())),
+            },
+            "DLYA" => Err(CaError::ReadOnlyField("DLYA".into())),
             "DOPT" => match value {
                 EpicsValue::Short(v) => {
                     self.dopt = v;

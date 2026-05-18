@@ -481,6 +481,30 @@ impl PvDatabase {
                 Ok(()) => {
                     instance.record.on_put(&field);
                     let _ = instance.record.special(&field, true);
+                    // C `dbAccess.c::dbPut:1410-1411` clears
+                    // `precord->udf = FALSE` synchronously when the
+                    // put target is the record-type's primary value
+                    // field (`dbIsValueField`). The clear happens
+                    // BEFORE `dbProcess` runs, so any reader between
+                    // the put and the process-cycle's own clear sees
+                    // the new value with a consistent UDF=false.
+                    //
+                    // Rust's processing path also clears UDF via
+                    // `clears_udf()` in process/complete_async_record,
+                    // but that runs AFTER the put lock drops and the
+                    // process re-acquires — leaving a small window
+                    // where another reader can observe (new VAL,
+                    // udf=true). For async records the window spans
+                    // the entire device round trip. Clear here to
+                    // close the window. The same clear already exists
+                    // in `put_pv_and_post` (line 256-262); mirror it.
+                    if field == instance.record.primary_field() {
+                        instance.common.udf = false;
+                        if instance.common.stat == crate::server::recgbl::alarm_status::UDF_ALARM {
+                            instance.common.stat = 0;
+                            instance.common.sevr = crate::server::record::AlarmSeverity::NoAlarm;
+                        }
+                    }
                     CommonFieldPutResult::NoChange
                 }
                 Err(CaError::FieldNotFound(_)) => instance.put_common_field(&field, value)?,
@@ -494,7 +518,21 @@ impl PvDatabase {
             // field's value actually changed (faac1df1).
             instance.notify_field_written_if_changed(&field, prev_value.as_ref());
 
-            instance.common.putf = false;
+            // C `dbAccess.c::dbPutField:1276` sets `precord->putf = TRUE`
+            // immediately before calling `dbProcess`, and the flag stays
+            // TRUE through the entire process cycle. It is cleared only
+            // in `recGblFwdLink` (recGbl.c:302) after FLNK fires, OR in
+            // the disable-alarm bail (dbAccess.c:576). The Rust port
+            // previously cleared `putf` here — BEFORE the
+            // `process_record_with_links` call below — so any code
+            // path (TPRO trace, async-completion logic, monitor on
+            // .PUTF) observing the bit during the process cycle saw
+            // `putf=0` and could not distinguish put-driven vs
+            // scan-driven processing.
+            //
+            // DO NOT clear `putf` here. The clearing now happens after
+            // the process call returns (synchronous completion) or in
+            // `complete_async_record` (async completion).
 
             instance.cleanup_subscribers();
             // For non-Passive non-VAL fields, notify immediately since
@@ -552,11 +590,33 @@ impl PvDatabase {
             }
         }
 
-        // When CA put writes directly to VAL, skip built-in conversion
+        // When a CA put writes directly to VAL on an INPUT record whose
+        // VAL is the engineering value, the built-in `RVAL → VAL`
+        // `convert()` must be suppressed for the put-driven process —
+        // re-deriving VAL from a stale RVAL would clobber the value the
+        // operator just wrote (the soft ai preset-NaN case, processing.rs
+        // ~line 677). The framework expresses this by calling
+        // `set_device_did_compute(true)`.
+        //
+        // This MUST be gated on `soft_channel_skips_convert()`. Output
+        // records (mbbo/mbbo_direct/bo/ao) implement
+        // `set_device_did_compute` as "skip the VAL → RVAL output
+        // convert" — the OPPOSITE direction. C `mbboRecord.c::process`
+        // (line 217), `mbboDirectRecord.c::process` (line 198) and
+        // `boRecord.c::process` (line 207) call `convert()`
+        // unconditionally on every non-pact process; a CA VAL-put on an
+        // output record MUST recompute RVAL/ORAW. Suppressing it there
+        // left RVAL/ORAW/ORBV stale. Output records return the default
+        // `false` from `soft_channel_skips_convert()`, so this gate
+        // matches the identical gates in processing.rs (line 694) and
+        // record_instance.rs (line 1381).
         if field == "VAL" {
             let recs = self.inner.records.read().await;
             if let Some(rec_arc) = recs.get(record_name) {
-                rec_arc.write().await.record.set_device_did_compute(true);
+                let mut guard = rec_arc.write().await;
+                if guard.record.soft_channel_skips_convert() {
+                    guard.record.set_device_did_compute(true);
+                }
             }
         }
 
@@ -580,6 +640,25 @@ impl PvDatabase {
                 false
             }
         };
+
+        // C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` after
+        // the forward-link dispatch — the marker only lives for the
+        // duration of the put's processing cycle. For SYNCHRONOUS
+        // completions (PACT was cleared by the time
+        // `process_record_with_links` returns) clear it here. For
+        // async-pending records, the clearing happens later in
+        // `complete_async_record_inner` (which runs FLNK as part of
+        // the completion path) so the PUTF marker survives the
+        // device-write round trip.
+        if !pending {
+            let rec = self.inner.records.read().await;
+            if let Some(rec_arc) = rec.get(record_name) {
+                let mut guard = rec_arc.write().await;
+                if !guard.is_processing() {
+                    guard.common.putf = false;
+                }
+            }
+        }
 
         if pending {
             Ok(Some(completion_rx))

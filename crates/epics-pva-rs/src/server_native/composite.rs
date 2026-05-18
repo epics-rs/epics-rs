@@ -176,18 +176,22 @@ impl ChannelSource for CompositeSource {
         async move {
             for src in snapshot {
                 if src.has_pv(&name).await {
-                    let host = ctx.host.clone();
-                    let account = ctx.account.clone();
-                    let method = ctx.method.clone();
-                    let inner_checked = src
-                        .access_gate()
-                        .check(&name, &host, &account, &method, "")
-                        .await;
-                    return if inner_checked.allows_read() {
-                        Some(inner_checked)
-                    } else {
-                        None
-                    };
+                    // Delegate to the matched source's OWN
+                    // `revalidate_read`, not `access_gate().check()`
+                    // directly. For a leaf source the default
+                    // `revalidate_read` is exactly `gate.check(...)`,
+                    // so behaviour is unchanged. But when the matched
+                    // source is itself a nested `CompositeSource`
+                    // (e.g. `PvaServer::start` wraps the user
+                    // composite together with the built-in
+                    // `__server` source), its `access_gate()` is a
+                    // permissive `open_with_aggregator` — calling
+                    // `check()` on it would always return
+                    // `ReadWrite` and silently re-allow a denied
+                    // monitor. Recursing through `revalidate_read`
+                    // makes the nested composite resolve down to the
+                    // authoritative leaf gate.
+                    return src.revalidate_read(&name, ctx.clone()).await;
                 }
             }
             None
@@ -214,6 +218,24 @@ impl ChannelSource for CompositeSource {
             for src in sources {
                 if src.has_pv(&name).await {
                     return true;
+                }
+            }
+            false
+        }
+    }
+
+    /// Route to the first source that *hosts* the name and ask THAT
+    /// source whether it is UDP-search-advertised. A name hosted by a
+    /// non-searchable source (the built-in `ServerInfoSource`) must
+    /// stay unanswered on broadcast SEARCH even though `has_pv` is
+    /// true — so we cannot just OR `searchable` across sources.
+    fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+        let sources = self.snapshot();
+        let name = name.to_string();
+        async move {
+            for src in sources {
+                if src.has_pv(&name).await {
+                    return src.searchable(&name).await;
                 }
             }
             false
@@ -334,7 +356,7 @@ impl ChannelSource for CompositeSource {
                 if src.has_pv(&name).await {
                     let inner_checked = src
                         .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, "")
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
                         .await;
                     return src.get_value_checked(inner_checked, ctx).await;
                 }
@@ -356,9 +378,43 @@ impl ChannelSource for CompositeSource {
                 if src.has_pv(&name).await {
                     let inner_checked = src
                         .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, "")
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
                         .await;
                     return src.put_value_checked(inner_checked, value, ctx).await;
+                }
+            }
+            Err(format!("no source serves '{name}'"))
+        }
+    }
+
+    /// Resolve the matched inner source, re-check WRITE through its
+    /// gate, then forward to its `put_delta_checked` — so a composite
+    /// over a `SharedSource` still gets the atomic read-merge-write
+    /// (no TOCTOU lost update). Without this override the default
+    /// trait impl would merge against `CompositeSource::get_value`
+    /// and forward through `CompositeSource::put_value_checked` as
+    /// two un-serialized ops, defeating the inner source's atomic
+    /// `put_delta` primitive.
+    fn put_delta_checked(
+        &self,
+        checked: AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    let inner_checked = src
+                        .access_gate()
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
+                        .await;
+                    return src
+                        .put_delta_checked(inner_checked, desc, changed, delta, ctx)
+                        .await;
                 }
             }
             Err(format!("no source serves '{name}'"))
@@ -377,7 +433,7 @@ impl ChannelSource for CompositeSource {
                 if src.has_pv(&name).await {
                     let inner_checked = src
                         .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, "")
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
                         .await;
                     return src.subscribe_checked(inner_checked, ctx).await;
                 }
@@ -398,7 +454,7 @@ impl ChannelSource for CompositeSource {
                 if src.has_pv(&name).await {
                     let inner_checked = src
                         .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, "")
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
                         .await;
                     return src.subscribe_raw_checked(inner_checked, ctx).await;
                 }
@@ -421,7 +477,7 @@ impl ChannelSource for CompositeSource {
                 if src.has_pv(&name).await {
                     let inner_checked = src
                         .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, "")
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
                         .await;
                     return src
                         .rpc_checked(inner_checked, request_desc, request_value, ctx)
@@ -445,6 +501,40 @@ impl ChannelSource for CompositeSource {
                 }
             }
             None
+        }
+    }
+
+    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let name = name.to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    return src.process(&name).await;
+                }
+            }
+            Err(format!("no source serves '{name}'"))
+        }
+    }
+
+    fn process_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    let inner_checked = src
+                        .access_gate()
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
+                        .await;
+                    return src.process_checked(inner_checked, ctx).await;
+                }
+            }
+            Err(format!("no source serves '{name}'"))
         }
     }
 

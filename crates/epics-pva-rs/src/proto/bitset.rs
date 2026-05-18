@@ -10,6 +10,19 @@
 //!    the highest set bit. A BitSet with no bits set encodes as a single
 //!    `Size{0}` byte (`0x00`).
 //!
+//! **Byte order.** pvxs `bitmask.cpp::to_wire` emits each full 64-bit word
+//! via the generic `to_wire(Buffer&, uint64_t)` overload, which byte-swaps
+//! the word when the connection byte order differs from the host's. The
+//! trailing partial bytes (a final word that is not 8 bytes wide) are
+//! instead emitted byte-by-byte with explicit `uint8_t(last >> (8*i))`
+//! shifts, which are byte-order independent. So on a big-endian
+//! connection the bytes within each *full* word are reversed, while any
+//! trailing partial bytes pass through unreversed. This module reproduces
+//! that layout exactly so the wire form is byte-identical to pvxs and
+//! pvAccessJava (whose `BitSet.serialize` likewise writes full words via
+//! `ByteBuffer.putLong`, honouring the buffer's byte order, and the last
+//! partial word byte-by-byte LSB-first).
+//!
 //! Field-bit numbering on a `PvStructure` follows pvData spec §5.4: the
 //! root structure occupies bit 0, then nested fields are numbered depth-first
 //! in declaration order. This module is purely the bit container; the field-
@@ -142,7 +155,10 @@ impl BitSet {
     /// endian wire byte order, this means byte 0 of the wire = LSB byte
     /// of word 0 = our `self.bytes[0]`. For big-endian, the bytes within
     /// each 8-byte word are reversed: wire byte 0 = MSB byte of word 0
-    /// = our `self.bytes[7]`.
+    /// = our `self.bytes[7]`. Trailing partial bytes (a final word with
+    /// fewer than 8 bytes) are emitted in storage order regardless of
+    /// `order`, because pvxs writes them via byte-by-byte shifts rather
+    /// than the byte-order-aware `to_wire(uint64_t)` overload.
     pub fn write_into(&self, order: ByteOrder, buf: &mut Vec<u8>) {
         // Trim trailing zero bytes (LSB-first numbering: trim from the
         // end of `self.bytes`, which is the high-order bytes).
@@ -281,6 +297,58 @@ mod tests {
         let set: Vec<usize> = decoded.iter().collect();
         assert_eq!(set, vec![0, 7, 8, 9, 63, 64, 100, 200]);
         assert_eq!(decoded.count(), 8);
+    }
+
+    #[test]
+    fn be_and_le_identical_when_no_full_word() {
+        // pvxs `bitmask.cpp::to_wire` byte-swaps only *full* 8-byte words.
+        // When the trimmed bitset is shorter than one full word (highest
+        // set bit < 64, so ≤ 7 bytes) there is no full word, only trailing
+        // partial bytes — which pvxs writes byte-order independently. So
+        // the BE and LE encodings must be byte-identical in that regime.
+        for bits in [
+            vec![],
+            vec![0usize],
+            vec![0usize, 7, 8],
+            vec![1usize, 55],
+            vec![0usize, 1, 2, 47, 48, 55],
+        ] {
+            let mut bs = BitSet::new();
+            for &i in &bits {
+                bs.set(i);
+            }
+            assert!(
+                bs.byte_size() <= 7,
+                "test fixture must stay below one full word for bits {bits:?}"
+            );
+            let le = bs.encode(ByteOrder::Little);
+            let be = bs.encode(ByteOrder::Big);
+            assert_eq!(le, be, "BE/LE encodings differ for sub-word bits {bits:?}");
+        }
+    }
+
+    #[test]
+    fn round_trip_big_endian() {
+        // Round-trips that exercise full words plus a trailing partial
+        // word — the BE word-swap path in both encode and decode.
+        for bits in [
+            vec![0usize, 7, 8, 9, 63, 64, 100, 200],
+            vec![1usize, 63],
+            vec![1usize, 63, 64, 126],
+            vec![63usize, 64, 67],
+        ] {
+            let mut bs = BitSet::new();
+            for &i in &bits {
+                bs.set(i);
+            }
+            let encoded = bs.encode(ByteOrder::Big);
+            let mut cur = Cursor::new(encoded.as_slice());
+            let decoded = BitSet::decode(&mut cur, ByteOrder::Big).unwrap();
+            assert_eq!(bs, decoded, "BE round-trip failed for bits {bits:?}");
+            assert_eq!(cur.position() as usize, encoded.len());
+            let set: Vec<usize> = decoded.iter().collect();
+            assert_eq!(set, bits, "BE decoded set mismatch for {bits:?}");
+        }
     }
 
     #[test]

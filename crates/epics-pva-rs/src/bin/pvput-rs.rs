@@ -1,6 +1,7 @@
 use clap::Parser;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::format;
+use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::pvdata::{PvField, PvStructure};
 
 const VERSION_INFO: &str = concat!("pvput-rs ", env!("CARGO_PKG_VERSION"));
@@ -16,8 +17,9 @@ struct Args {
     #[arg(short = 'V', long, hide = true)]
     version: bool,
 
-    /// pvRequest string (`field(...)` syntax). Currently accepted for
-    /// parity; the request is delegated to the channel default.
+    /// pvRequest string (`field(...)` / `record[k=v]` syntax). When
+    /// non-empty it drives the PUT operation — e.g. `-r 'record[process=true]'`
+    /// requests a synchronous PROC after the write.
     #[arg(short = 'r', default_value = "")]
     request: String,
 
@@ -88,8 +90,24 @@ async fn main() {
     //    the gap and continues to the put.
     let old_get = client.pvget_full(&pv_name).await;
 
-    // 2. Do the put.
-    if let Err(e) = client.pvput(&pv_name, &value_str).await {
+    // 2. Do the put. When a pvRequest was supplied via `-r`, parse it
+    //    and route it onto the wire via `pvput_with_request`; otherwise
+    //    use the channel-default `field(value)` request.
+    let put_result = {
+        let trimmed = args.request.trim();
+        if trimmed.is_empty() {
+            client.pvput(&pv_name, &value_str).await
+        } else {
+            match PvRequestExpr::parse(trimmed) {
+                Ok(req) => client.pvput_with_request(&pv_name, &req, &value_str).await,
+                Err(e) => {
+                    eprintln!("error: invalid pvRequest {:?}: {e}", args.request);
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+    if let Err(e) = put_result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
@@ -125,13 +143,7 @@ async fn main() {
     }
 
     // Suppress unused-warning for parity-only flags.
-    let _ = (
-        args.request,
-        args.provider,
-        args.mode,
-        args.verbose,
-        args.debug,
-    );
+    let _ = (args.provider, args.mode, args.verbose, args.debug);
 }
 
 /// Render an `Old :` / `New :` echo line in legacy `pvput.cpp` shape:

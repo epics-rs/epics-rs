@@ -40,24 +40,23 @@ tempfile = "3"
 serial_test = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 
-# Empty mirror features so the integration test can cfg-gate the
-# extra arguments `epics_ca_rs::server::tcp::run_tcp_listener` exposes
-# under the matching `epics-ca-rs/*` features. The features are
-# *empty* — they don't activate anything in `epics-ca-rs`, they just
-# track the workspace activation state. Under `--all-features` they
-# both flip on (alongside the dev-dep features); under default
-# features both stay off. We avoided a real dev-dep passthrough
-# (e.g. `["epics-ca-rs/experimental-rust-tls"]`) because that breaks
-# `cargo publish` — dev-deps are stripped before feature parsing.
 [features]
-ca-experimental-rust-tls = []
-ca-cap-tokens = []
 # Linux PREEMPT_RT real-time deployment opt-in. Wires `runtime::sync::
 # PriorityInheritanceMutex` to a `pthread_mutex_t` configured with
 # `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op on
 # non-Linux. Off by default — only enable on systems running with
 # SCHED_FIFO / SCHED_RR where unbounded priority inversion is a risk.
 linux-rt = []
+# Test-only: enables the `client_server` integration test, whose
+# `run_tcp_listener` call must match `epics-ca-rs`'s TLS/cap-token
+# signature. `run_tcp_listener` has `#[cfg]`-gated `tls` /
+# `cap_token_verifier` params; their presence is governed by
+# `epics-ca-rs`'s own `experimental-rust-tls` / `cap-tokens` features.
+# Forcing both on here makes the function's arity deterministic
+# whenever the test compiles — so the call site passes all 12 args
+# unconditionally. `client_server.rs` is gated on this feature, so it
+# only compiles when the 12-arg signature is in effect.
+ca-server-tls-test = ["epics-ca-rs/experimental-rust-tls", "epics-ca-rs/cap-tokens"]
 
 [[bench]]
 name = "record_bench"

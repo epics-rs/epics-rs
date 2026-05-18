@@ -53,6 +53,11 @@
 //! - **Cleanup** — a 30 s background tick drops entries that have
 //!   neither been touched since the previous tick nor have any live
 //!   downstream subscribers. Mirrors p2pApp `cacheClean`.
+//! - **Control (B6)** — when a `control_prefix` is set,
+//!   [`control::ControlSource`] exposes read-only diagnostic PVs plus
+//!   credentialed control RPCs (`<prefix>:flush` / `:drop` /
+//!   `:reload`) that flush the channel cache, drop one entry, or
+//!   hot-swap the gateway-side ACF policy.
 //!
 //! ## Quick start
 //!
@@ -76,8 +81,12 @@ pub mod multi_gateway;
 pub mod source;
 
 pub use channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL, UpstreamEntry};
-pub use control::ControlSource;
+pub use control::{ControlSource, CredentialCheck};
 pub use error::{GwError, GwResult};
 pub use gateway::{PvaGateway, PvaGatewayConfig};
+pub use middleware::{
+    AclConfig, AuditEvent, AuditEventKind, AuditResult, AuditSink, ClosureAudit, MpscAuditSink,
+    NoopAudit,
+};
 pub use multi_gateway::{MultiTenantPvaGateway, MultiTenantPvaGatewayBuilder};
 pub use source::GatewayChannelSource;

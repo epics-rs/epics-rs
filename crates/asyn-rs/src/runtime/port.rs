@@ -47,13 +47,23 @@ impl PortRuntimeHandle {
     /// Closes the shutdown channel, causing the actor thread to exit after
     /// completing any in-progress request. Does not wait for the thread to stop.
     pub fn shutdown(&self) {
-        self.shutdown_tx.lock().unwrap().take();
+        // Poison-tolerant: shutdown must stay infallible even if a thread
+        // panicked while holding the lock.
+        self.shutdown_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 
     /// Signal shutdown and wait for the actor thread to exit.
     pub fn shutdown_and_wait(&self) {
         self.shutdown();
-        if let Some(rx) = self.completion_rx.lock().unwrap().take() {
+        let rx = self
+            .completion_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(rx) = rx {
             let _ = rx.recv();
         }
     }
@@ -85,6 +95,8 @@ pub fn create_port_runtime_boxed(
 ) -> (PortRuntimeHandle, std::thread::JoinHandle<()>) {
     let port_name = driver.base().port_name.clone();
     let can_block = driver.base().flags.can_block;
+    let multi_device = driver.base().flags.multi_device;
+    let max_addr = driver.base().max_addr as i32;
 
     // Event broadcast
     let (event_tx, _) = broadcast::channel(256);
@@ -123,6 +135,7 @@ pub fn create_port_runtime_boxed(
 
     let mut port_handle = PortHandle::new(tx, port_name.clone(), handle_interrupts);
     port_handle.set_can_block(can_block);
+    port_handle.set_capabilities(multi_device, max_addr);
     let client = InProcessClient::new(port_handle.clone());
 
     let handle = PortRuntimeHandle {

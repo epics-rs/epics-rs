@@ -1449,6 +1449,23 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     if let Some(ref expr) = calc {
         match crate::calc::compile(expr) {
             Ok(_) => {
+                // BR-R32: warn at parse time so operators know that a
+                // CALC-gated ASG rule has been disabled by this crate
+                // (no INP* link resolution → CALC cannot be
+                // evaluated). C IOC + pvxs evaluate the expression
+                // and grant matching access; we fail closed instead.
+                // Loud warning beats silent divergence — operators
+                // running mixed-IOC sites must see this in the
+                // server log to know access decisions will differ.
+                tracing::warn!(
+                    target: "epics_base_rs::access_security",
+                    calc = %expr,
+                    "ACF: CALC-gated RULE disabled (no INP* link \
+                     resolution in this crate; rule fails CLOSED — \
+                     access decisions will diverge from EPICS Base / \
+                     pvxs which would evaluate the expression \
+                     dynamically). See BR-R32."
+                );
                 ignore = true;
             }
             Err(e) => {

@@ -324,6 +324,42 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
+    /// BR-R38: PVA `PROCESS` against a QSRV record runs the record's
+    /// `dbProcess`-equivalent path. The default `ChannelSource::process`
+    /// returns `Ok(())` unconditionally — a client calling
+    /// `pvput -P` (or any wire-level PROCESS) would observe a false
+    /// success even though no processing fired. Route through the
+    /// provider's resolved record so the operation has the same
+    /// observable effect as PUT with `record._options.process=true`:
+    /// the record is processed via `PvDatabase::process_record`,
+    /// alarms / FLNK / output links all run. Single-record-only —
+    /// group / native PVA PVs have no processing semantics and are
+    /// returned an unsupported-op error so callers don't silently
+    /// trust a no-op.
+    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let provider = self.provider.clone();
+        let pva_pvs = self.pva_pvs.clone();
+        let name = name.to_string();
+        async move {
+            if pva_pvs.read().await.contains_key(&name) {
+                return Err(format!(
+                    "PROCESS not supported for native PVA PV '{name}' (no processing chain)"
+                ));
+            }
+            if provider.groups().contains_key(&name) {
+                return Err(format!(
+                    "PROCESS not supported for group PV '{name}' (no record-level chain)"
+                ));
+            }
+            let (record_name, _field) = epics_base_rs::server::database::parse_pv_name(&name);
+            provider
+                .database()
+                .process_record(record_name)
+                .await
+                .map_err(|e| format!("PROCESS on '{name}': {e}"))
+        }
+    }
+
     /// BR-R37: RPC-with-query is a record WRITE in QSRV's
     /// "set fields, read back" idiom. The default trait
     /// `rpc_checked` gates only on READ access, so a READ-only
@@ -1365,6 +1401,79 @@ mod tests {
         assert!(
             matches!(val1, Some(EpicsValue::Double(v)) if (v - 2.5).abs() < 1e-9),
             "post-put VAL must be 2.5, got {val1:?}"
+        );
+    }
+
+    /// BR-R38: PVA `PROCESS` against a QSRV-backed record actually
+    /// runs the record's processing chain (regression vs. the default
+    /// trait that silently returned Ok without processing). We verify
+    /// by counting the change in `processed_count` after PROCESS.
+    #[tokio::test]
+    async fn process_runs_record_processing_for_single_record_pvs() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_pva_rs::server_native::ChannelSource;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("TEST:proc_call", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        let store = QsrvPvStore::new(provider);
+
+        let before = {
+            let rec = db.get_record("TEST:proc_call").await.unwrap();
+            let inst = rec.read().await;
+            inst.common.time
+        };
+        // Sleep briefly so the post-process timestamp can be strictly
+        // greater than the pre-process timestamp on systems with a
+        // coarse clock granularity.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        store
+            .process("TEST:proc_call")
+            .await
+            .expect("PROCESS must run");
+        let after = {
+            let rec = db.get_record("TEST:proc_call").await.unwrap();
+            let inst = rec.read().await;
+            inst.common.time
+        };
+        assert!(
+            after >= before,
+            "PROCESS must touch the record's TIME (post-process \
+             timestamp must be >= pre): before={before:?}, after={after:?}"
+        );
+        // If TIME is unchanged the clock granularity hid the
+        // processing; in that case the test cannot discriminate the
+        // BR-R38 fix from the silent-Ok bug. Treat that as a hard
+        // fail so a flaky clock doesn't silently lose the regression.
+        assert!(
+            after > before,
+            "TIME must strictly advance after PROCESS (clock too \
+             coarse to discriminate the BR-R38 fix): {before:?} -> {after:?}"
+        );
+    }
+
+    /// BR-R38: PROCESS on a group PV / unknown PV must NOT pretend to
+    /// succeed — operators using PROCESS for side-effects need an
+    /// honest failure when the operation has no effect.
+    #[tokio::test]
+    async fn process_rejects_unknown_or_group_pv() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_pva_rs::server_native::ChannelSource;
+
+        let db = Arc::new(PvDatabase::new());
+        let provider = Arc::new(BridgeProvider::new(db));
+        let store = QsrvPvStore::new(provider);
+
+        let err = store
+            .process("UNKNOWN:PV")
+            .await
+            .expect_err("PROCESS on unknown PV must error");
+        assert!(
+            err.contains("UNKNOWN:PV"),
+            "error must name the PV; got: {err}"
         );
     }
 }

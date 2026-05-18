@@ -122,6 +122,39 @@ pub fn get_nested_field<'a>(pv: &'a PvStructure, path: &str) -> Option<Cow<'a, P
     None
 }
 
+/// BR-R33: pvxs default monitor queue depth for groups
+/// (`groupsource.cpp:359` uses the per-op negotiated value; in the
+/// absence of per-op negotiation today, expose pvxs's documented
+/// default so the field is present and stable).
+const GROUP_DEFAULT_QUEUE_SIZE: i32 = 4;
+
+/// BR-R33: stamp `record._options.queueSize` (int) and
+/// `record._options.atomic` (boolean) onto a group GET / MONITOR
+/// value. Adds them at the root, replacing the previous values if
+/// `_options` already exists (e.g. composed by an earlier read).
+pub fn push_record_options(pv: &mut PvStructure, atomic: bool) {
+    use epics_pva_rs::pvdata::ScalarValue;
+    let mut options = PvStructure::new("");
+    options.fields.push((
+        "queueSize".into(),
+        PvField::Scalar(ScalarValue::Int(GROUP_DEFAULT_QUEUE_SIZE)),
+    ));
+    options.fields.push((
+        "atomic".into(),
+        PvField::Scalar(ScalarValue::Boolean(atomic)),
+    ));
+    let mut record = PvStructure::new("");
+    record
+        .fields
+        .push(("_options".into(), PvField::Structure(options)));
+    let record_field = PvField::Structure(record);
+    if let Some(pos) = pv.fields.iter().position(|(n, _)| n == "record") {
+        pv.fields[pos].1 = record_field;
+    } else {
+        pv.fields.push(("record".into(), record_field));
+    }
+}
+
 /// BR-R25: place a member's resolved value into the group structure.
 ///
 /// pvxs allows a `+type:"meta"` member with an empty key (`""`) to
@@ -439,6 +472,19 @@ impl GroupChannel {
                 set_member_field(&mut pv, member, field);
             }
         }
+
+        // BR-R33: pvxs `groupsource.cpp:359` stamps
+        // `record._options.queueSize` (negotiated monitor queue depth)
+        // and `record._options.atomic` (operation atomicity) into
+        // every group GET / MONITOR value. Clients that introspect
+        // these branches — strict pvRequest matchers, archiver
+        // appliances tracking the negotiated queue — would otherwise
+        // see the structure-shape mismatch and reject the operation.
+        // Without per-op negotiation today, expose the configured
+        // group default queue depth (DEFAULT_MONITOR_QUEUE_DEPTH
+        // matches the wire-side server default) so the field is
+        // present and stable.
+        push_record_options(&mut pv, atomic);
 
         Ok(pv)
     }
@@ -1286,9 +1332,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
                 // is semantically distinct from the prior unconditional
                 // collapse. See doc/pvxs-functional-security-review-2026-05-18.md
                 // for the remaining-gap entry on the BitSet plumbing.
-                TriggerDef::SelfOnly
-                | TriggerDef::All
-                | TriggerDef::Fields(_) => {
+                TriggerDef::SelfOnly | TriggerDef::All | TriggerDef::Fields(_) => {
                     return group_channel.read_group().await.ok();
                 }
             }

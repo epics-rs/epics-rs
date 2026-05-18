@@ -157,6 +157,75 @@ async fn group_nonatomic_put_updates_all_members() {
     assert_eq!(extract_long(&result, "count"), Some(99));
 }
 
+/// BR-R33: a group GET / MONITOR value carries
+/// `record._options.queueSize` and `record._options.atomic` at
+/// its root. pvxs `groupsource.cpp:359` stamps these into every
+/// posted value; strict pvRequest clients and archiver appliances
+/// depend on the branch being present.
+#[tokio::test]
+async fn group_get_carries_record_options_queue_size_and_atomic() {
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp")
+        .cloned()
+        .expect("grp registered");
+
+    let ch = GroupChannel::new(db, def);
+    let result = ch.get(&empty_request()).await.expect("get");
+
+    let record = result
+        .fields
+        .iter()
+        .find(|(n, _)| n == "record")
+        .map(|(_, v)| v)
+        .expect("record sub-structure must be present");
+    let record_struct = match record {
+        PvField::Structure(s) => s,
+        other => panic!("expected record to be structure, got {other:?}"),
+    };
+    let options = record_struct
+        .fields
+        .iter()
+        .find(|(n, _)| n == "_options")
+        .map(|(_, v)| v)
+        .expect("record._options must be present");
+    let options_struct = match options {
+        PvField::Structure(s) => s,
+        other => panic!("expected _options to be structure, got {other:?}"),
+    };
+    // queueSize: pvxs stamps a positive int; we don't pin the
+    // exact value because per-op negotiation lands later, but it
+    // must be present and > 0.
+    let qs = options_struct
+        .fields
+        .iter()
+        .find(|(n, _)| n == "queueSize")
+        .map(|(_, v)| v)
+        .expect("queueSize must be present");
+    match qs {
+        PvField::Scalar(ScalarValue::Int(n)) => {
+            assert!(*n > 0, "queueSize must be positive, got {n}")
+        }
+        other => panic!("expected int queueSize, got {other:?}"),
+    }
+    // atomic: the group default is atomic=true (GROUP_JSON).
+    let atomic = options_struct
+        .fields
+        .iter()
+        .find(|(n, _)| n == "atomic")
+        .map(|(_, v)| v)
+        .expect("atomic must be present");
+    match atomic {
+        PvField::Scalar(ScalarValue::Boolean(b)) => {
+            assert!(*b, "atomic must reflect group default")
+        }
+        other => panic!("expected bool atomic, got {other:?}"),
+    }
+}
+
 /// BR-R17: a per-member ACF denial fails the group PUT even when the
 /// group PV itself is writable. Mirrors pvxs's per-field
 /// SecurityClient gating (groupsource.cpp:161 + 515) — "any

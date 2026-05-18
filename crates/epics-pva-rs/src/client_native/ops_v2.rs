@@ -1257,6 +1257,18 @@ where
             // here since we drive ACKs ourselves below.
             if subcmd & 0x10 != 0 {
                 server.unregister_ioid(ioid);
+                // PVA-R17: clear the handle's `active` tuple on
+                // FINISH so a later `pause()` / `resume()` / `drop()`
+                // doesn't act on a (sid, ioid) the client has already
+                // unregistered and the server has already finalised.
+                // pvxs `clientmon.cpp:720-729` treats FINISH as the
+                // operation-owner cleanup path: state→Done, IOID
+                // maps erased, no DESTROY sent. The typed monitor
+                // loop already cleared `active` here; the raw path
+                // didn't (audit-cited gap).
+                if let Some(s) = &state {
+                    s.active.lock().take();
+                }
                 // FINISH carries a Status after subcmd; a non-success
                 // status means the server is reporting an error
                 // (out-of-memory, oversubscription, etc.) rather than

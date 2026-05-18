@@ -155,9 +155,30 @@ pub fn server_broadcast_port() -> u16 {
 }
 
 /// `EPICS_PVA_SERVER_PORT` (default 5075).
+///
+/// PVA-R15: pvxs `config.cpp:568-578` lets the client TCP port come
+/// from `EPICS_PVAS_SERVER_PORT` when `EPICS_PVA_SERVER_PORT` is not
+/// set, so a site that only configured the server-specific var still
+/// has a coherent default for client name-server lookups.
 pub fn server_port() -> u16 {
     std::env::var("EPICS_PVA_SERVER_PORT")
         .ok()
+        .or_else(|| std::env::var("EPICS_PVAS_SERVER_PORT").ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5075)
+}
+
+/// PVA-R15: server-side TCP port helper that mirrors pvxs
+/// `config.cpp:402-408` `PickOne` precedence — server-specific
+/// `EPICS_PVAS_SERVER_PORT` first, then shared `EPICS_PVA_SERVER_PORT`,
+/// finally the compiled default. Pre-fix Rust read only the shared
+/// variable for the server, so a pvxs-style deployment that set
+/// `EPICS_PVAS_SERVER_PORT` was silently ignored and the Rust server
+/// bound to 5075.
+pub fn pvas_server_port() -> u16 {
+    std::env::var("EPICS_PVAS_SERVER_PORT")
+        .ok()
+        .or_else(|| std::env::var("EPICS_PVA_SERVER_PORT").ok())
         .and_then(|s| s.parse().ok())
         .unwrap_or(5075)
 }
@@ -174,10 +195,18 @@ pub fn auto_addr_list_enabled() -> bool {
 /// `EPICS_PVAS_AUTO_BEACON_ADDR_LIST` — default YES. When truthy,
 /// beacons fan out to each interface's limited broadcast (255.255.255.255
 /// scoped to the NIC).
+///
+/// PVA-R15: pvxs `config.cpp:426-431` falls back to
+/// `EPICS_PVA_AUTO_ADDR_LIST` when the server-specific var is unset
+/// so shared deployment config still drives the server's beacon
+/// auto-discovery.
 pub fn auto_beacon_addr_list_enabled() -> bool {
-    match std::env::var("EPICS_PVAS_AUTO_BEACON_ADDR_LIST") {
-        Ok(v) => parse_bool(&v),
-        Err(_) => true,
+    let v = std::env::var("EPICS_PVAS_AUTO_BEACON_ADDR_LIST")
+        .ok()
+        .or_else(|| std::env::var("EPICS_PVA_AUTO_ADDR_LIST").ok());
+    match v {
+        Some(s) => parse_bool(&s),
+        None => true,
     }
 }
 
@@ -405,10 +434,17 @@ pub fn server_ignore_addr_list() -> Vec<(IpAddr, u16)> {
 /// Parse `EPICS_PVAS_BEACON_ADDR_LIST` — explicit beacon destinations
 /// (default port = `EPICS_PVAS_BROADCAST_PORT`). Falls back to empty
 /// when unset (caller should auto-discover NIC broadcasts).
+///
+/// PVA-R15: pvxs `config.cpp:426-431` falls back to
+/// `EPICS_PVA_ADDR_LIST` when the server-specific list isn't set
+/// (shared deployment config). Pre-fix Rust read only the
+/// `EPICS_PVAS_*` var, so a site that listed beacon targets in
+/// `EPICS_PVA_ADDR_LIST` had no beacons emitted.
 pub fn server_beacon_addr_list() -> Vec<SocketAddr> {
-    std::env::var("EPICS_PVAS_BEACON_ADDR_LIST")
+    let src = std::env::var("EPICS_PVAS_BEACON_ADDR_LIST")
         .ok()
-        .map(|s| parse_addr_list_with_port(&s, server_broadcast_port()))
+        .or_else(|| std::env::var("EPICS_PVA_ADDR_LIST").ok());
+    src.map(|s| parse_addr_list_with_port(&s, server_broadcast_port()))
         .unwrap_or_default()
 }
 

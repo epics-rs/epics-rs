@@ -253,7 +253,10 @@ impl PvaServerConfig {
     /// touched — others stay at their existing values.
     pub fn with_env(mut self) -> Self {
         use crate::config::env;
-        self.tcp_port = env::server_port();
+        // PVA-R15: server respects EPICS_PVAS_SERVER_PORT first, then
+        // falls back to EPICS_PVA_SERVER_PORT (pvxs config.cpp:
+        // 402-408 PickOne precedence).
+        self.tcp_port = env::pvas_server_port();
         self.udp_port = env::server_broadcast_port();
         self.max_connections = env::max_connections();
         self.max_channels_per_connection = env::max_channels_per_connection();

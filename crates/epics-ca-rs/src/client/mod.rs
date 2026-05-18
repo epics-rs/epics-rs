@@ -2358,6 +2358,7 @@ async fn run_coordinator(
                                             sid: ch.sid,
                                             subid,
                                             data_type,
+                                            count: rec.count.unwrap_or(0),
                                             server_addr: ch.server_addr.unwrap(),
                                         });
                                     }
@@ -2395,6 +2396,7 @@ async fn run_coordinator(
                                                 sid: ch.sid,
                                                 subid,
                                                 data_type,
+                                                count: rec.count.unwrap_or(0),
                                                 server_addr: ch.server_addr.unwrap(),
                                             });
                                         }

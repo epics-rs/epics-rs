@@ -66,10 +66,18 @@ impl FlowControlGate {
 /// `tokio::net::tcp::OwnedWriteHalf` and the TLS-wrapped
 /// `WriteHalf<TlsStream<TcpStream>>` produced by the server's TLS
 /// dispatch path.
+/// R2-12: `data_count` is the original EVENT_ADD request count. When
+/// non-zero, every monitor delivery echoes this in the header and
+/// zero-pads short payloads up to `dbr_buffer_size(type, native,
+/// count)` — matches C `read_reply` which keeps the request count
+/// and pads (or uses `snapshot.value.count()` when the request was
+/// autosize=0).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_monitor_sender<W>(
     pv: Arc<ProcessVariable>,
     sub_id: u32,
     data_type: u16,
+    data_count: u32,
     writer: Arc<Mutex<BufWriter<W>>>,
     flow_control: Arc<FlowControlGate>,
     mut rx: mpsc::Receiver<MonitorEvent>,
@@ -105,7 +113,7 @@ where
             if denied.load(Ordering::Acquire) {
                 continue;
             }
-            if send_event(data_type, sub_id, &event, &writer)
+            if send_event(data_type, data_count, sub_id, &event, &writer)
                 .await
                 .is_err()
             {
@@ -117,11 +125,12 @@ where
 
 async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     data_type: u16,
+    data_count: u32,
     sub_id: u32,
     event: &MonitorEvent,
     writer: &Arc<Mutex<BufWriter<W>>>,
 ) -> std::io::Result<()> {
-    let payload = encode_dbr(data_type, &event.snapshot)
+    let mut payload = encode_dbr(data_type, &event.snapshot)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "encode"))?;
     // CA-268: DBR_CLASS_NAME wire payload is always one fixed 40-byte
     // string regardless of the underlying value count. Same override
@@ -129,10 +138,26 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     // event loop sites. SimplePv channels carry no record_type, so
     // class_name stays None and the body is 40 zero bytes — matches
     // IOC behaviour for synthetic channels.
+    //
+    // R2-12: when the EVENT_ADD request set an explicit count, every
+    // monitor delivery echoes that count and zero-pads the payload up
+    // to `dbr_buffer_size(type, native, count)` (C `read_reply`
+    // `rsrv/camessage.c:507-571` parity). The helper returns the
+    // header count to use; `data_count == 0` means autosize (use the
+    // live snapshot count).
+    let actual_count = event.snapshot.value.count() as u32;
     let element_count = if data_type == epics_base_rs::types::DBR_CLASS_NAME {
         1
+    } else if data_count == 0 {
+        actual_count
     } else {
-        event.snapshot.value.count() as u32
+        let extra = data_count.saturating_sub(actual_count) as usize;
+        if extra > 0 {
+            if let Ok(native) = epics_base_rs::types::native_type_for_dbr(data_type) {
+                payload.extend(std::iter::repeat_n(0u8, extra * native.element_size()));
+            }
+        }
+        data_count
     };
     let mut padded = payload;
     padded.resize(align8(padded.len()), 0);
@@ -234,7 +259,9 @@ mod tests {
             origin: 0,
         };
 
-        send_event(DBR_LONG, 7, &event, &writer)
+        // data_count = 0 means autosize (use snapshot's actual count);
+        // matches every pre-R2-12 producer caller.
+        send_event(DBR_LONG, 0, 7, &event, &writer)
             .await
             .expect("send_event must succeed");
 

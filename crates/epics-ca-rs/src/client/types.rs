@@ -55,9 +55,25 @@ impl DirectServerWriter {
 
         self.pending_frames.fetch_add(1, Ordering::Relaxed);
         if self.write_tx.send(frame).is_err() {
-            let prev = self.pending_frames.load(Ordering::Relaxed);
-            self.pending_frames
-                .store(prev.saturating_sub(1), Ordering::Relaxed);
+            // R2-22: same accounting fix as write_loop — use atomic
+            // CAS instead of load + store so a concurrent
+            // `send_frame` increment cannot be silently overwritten.
+            // The send-failure rollback decrements exactly one frame
+            // and saturates at zero (a concurrent write_loop drain
+            // may already have driven the counter below 1).
+            let mut current = self.pending_frames.load(Ordering::Relaxed);
+            loop {
+                let next = current.saturating_sub(1);
+                match self.pending_frames.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
             return Err(CaError::Disconnected);
         }
         Ok(())
@@ -388,6 +404,13 @@ pub(crate) enum TransportCommand {
         sid: u32,
         subid: u32,
         data_type: u16,
+        /// Original requested element count from the EVENT_ADD that
+        /// installed this subscription. C `libca/tcpiiu.cpp::
+        /// subscriptionCancelRequest()` includes the subscription's
+        /// stored count in the CANCEL request; R2-23 echoes the same
+        /// shape so strict CA dissectors / replay tooling see the
+        /// libca-equivalent frame.
+        count: u32,
         server_addr: SocketAddr,
     },
     ClearChannel {

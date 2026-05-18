@@ -504,10 +504,16 @@ fn process_command(
             sid,
             subid,
             data_type,
+            count,
             server_addr,
         } => {
             let mut hdr = CaHeader::new(CA_PROTO_EVENT_CANCEL);
             hdr.data_type = data_type;
+            // R2-23: include the subscription's original count
+            // (libca `tcpiiu.cpp::subscriptionCancelRequest()` parity).
+            // Pre-fix Rust left `m_count = 0` here so the CANCEL frame
+            // diverged from libca byte-for-byte on the wire.
+            hdr.count = count as u16;
             hdr.cid = sid;
             hdr.available = subid;
             send_frame(
@@ -816,13 +822,35 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
         match tokio::time::timeout(send_timeout, writer.write_all(&batch)).await {
             Ok(Ok(())) => {
                 batch.clear();
-                // Saturating: read_loop also sends frames (echo, flow
-                // control) that bypass send_frame's increment.
-                let prev = pending_frames.load(std::sync::atomic::Ordering::Relaxed);
-                pending_frames.store(
-                    prev.saturating_sub(drained),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                // R2-22: `pending_frames` is the local backpressure
+                // counter that decides when `send_frame` should treat
+                // a stalled circuit as disconnected. Pre-fix the
+                // decrement used `load` + `store(prev - drained)`,
+                // which silently overwrites any concurrent
+                // `send_frame::fetch_add` landing between the two
+                // operations — under sustained producer activity the
+                // counter drifted below the real queued-frame count
+                // and the SEND_BACKPRESSURE_FRAMES threshold stopped
+                // firing reliably. `fetch_sub` is the atomic
+                // equivalent and never loses a concurrent increment.
+                // `saturating_sub` semantics: a `read_loop` frame
+                // (echo / flow control) bypasses `send_frame`'s
+                // increment, so the counter occasionally undershoots
+                // `drained`; `fetch_sub` would wrap on underflow, so
+                // pre-clamp with a CAS loop.
+                let mut current = pending_frames.load(std::sync::atomic::Ordering::Relaxed);
+                loop {
+                    let next = current.saturating_sub(drained);
+                    match pending_frames.compare_exchange_weak(
+                        current,
+                        next,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(observed) => current = observed,
+                    }
+                }
             }
             Ok(Err(_)) | Err(_) => {
                 let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });

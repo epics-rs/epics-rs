@@ -903,20 +903,21 @@ async fn server_echo_round_trips_request_header_and_payload() {
     );
 }
 
-/// C `event_cancel_reply` (`rsrv/camessage.c:1998-2021`) replies with
-/// CA_PROTO_ERROR + ECA_BADMONID when a CA_PROTO_EVENT_CANCEL request
-/// references a sub-id that doesn't match any active subscription on
-/// the channel. The previous Rust behaviour was a silent ignore — the
-/// client (or test driver) waited forever for an exception that never
-/// arrived.
+/// R2-24: C `event_cancel_reply` (`rsrv/camessage.c:1998-2021`)
+/// calls `MPTOPCIU(mp)` first. If the request's channel id is
+/// unknown or belongs to another client, rsrv calls `logBadId` and
+/// returns RSRV_ERROR WITHOUT sending a wire error frame. Only
+/// after a valid channel resolves does rsrv walk that channel's
+/// event queue and emit ECA_BADMONID for an unknown monitor id.
 ///
-/// This test sends a raw EVENT_CANCEL on an unopened sub-id over a
-/// real TCP CA connection and verifies the server replies with
-/// CA_PROTO_ERROR carrying ECA_BADMONID in m_available (per the
-/// `send_ca_error` field-assignment fix).
+/// Pre-fix Rust checked the flat subscription map first, so an
+/// unknown SID elicited ECA_BADMONID via the diagnostic fallback
+/// path. This test now asserts the silent-close behaviour for the
+/// bad-SID case (matches C `logBadId`); the valid-SID + bad-sub_id
+/// case is covered by `server_event_cancel_bad_subid_on_valid_sid_replies_eca_badmonid`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn server_event_cancel_unknown_subid_replies_eca_badmonid() {
+async fn server_event_cancel_unknown_sid_closes_silently() {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -958,9 +959,9 @@ async fn server_event_cancel_unknown_subid_replies_eca_badmonid() {
         .expect("server VERSION reply timed out")
         .expect("read VERSION");
 
-    // Send EVENT_CANCEL with a sub-id that was never opened. We use
-    // an arbitrary m_cid (server sid) that's also unmapped — the
-    // server falls back to chan_cid = 0xFFFFFFFF in the reply.
+    // Send EVENT_CANCEL with an SID that was never opened. Per R2-24
+    // server must close the connection without emitting a wire frame
+    // (C `event_cancel_reply` MPTOPCIU → logBadId silent path).
     let mut cancel = CaHeader::new(CA_PROTO_EVENT_CANCEL);
     cancel.data_type = 6; // DBR_DOUBLE
     cancel.count = 1;
@@ -968,32 +969,17 @@ async fn server_event_cancel_unknown_subid_replies_eca_badmonid() {
     cancel.available = 0xCAFE_BABE; // bogus sub_id
     sock.write_all(&cancel.to_bytes()).await.unwrap();
 
-    // Read the response. Expect CA_PROTO_ERROR (24-byte extended
-    // header, since send_ca_error always emits extended form).
-    let mut resp = [0u8; 256];
+    // Expect silent EOF — no wire frame, just connection drop.
+    let mut resp = [0u8; 64];
     let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp))
         .await
-        .expect("server did not reply within 2s — likely silent ignore regression")
-        .expect("read response");
-    assert!(n >= CaHeader::SIZE, "server reply too short: {n} bytes");
-
-    let resp_hdr = CaHeader::from_bytes(&resp[..n]).expect("parse response header");
+        .expect("server did not close after EVENT_CANCEL bad-SID")
+        .expect("read after bad-SID cancel");
     assert_eq!(
-        resp_hdr.cmmd, CA_PROTO_ERROR,
-        "expected CA_PROTO_ERROR, got cmmd={}",
-        resp_hdr.cmmd
-    );
-    assert_eq!(
-        resp_hdr.available, ECA_BADMONID,
-        "expected ECA_BADMONID in m_available; got 0x{:08x}",
-        resp_hdr.available
-    );
-    // chan_cid is 0xFFFFFFFF when the request's m_cid doesn't map to
-    // an opened channel (C `vsend_err` default branch).
-    assert_eq!(
-        resp_hdr.cid, 0xFFFF_FFFF,
-        "expected 0xFFFFFFFF sentinel m_cid for unknown channel; got 0x{:08x}",
-        resp_hdr.cid
+        n, 0,
+        "EVENT_CANCEL with unknown SID must elicit a silent close \
+         (matches C event_cancel_reply logBadId); got {n} bytes: {:02x?}",
+        &resp[..n]
     );
 }
 
@@ -1377,7 +1363,8 @@ async fn server_read_notify_bad_type_closes_silently() {
         .expect("server did not close after READ_NOTIFY bad type")
         .expect("read after bad type");
     assert_eq!(
-        n, 0,
+        n,
+        0,
         "READ_NOTIFY bad-type must elicit a silent close (matches \
          C read_notify_action RSRV_ERROR); got {n} bytes: {:02x?}",
         &resp[..n]

@@ -222,6 +222,11 @@ struct SubscriptionEntry {
     channel_sid: u32,
     sub_id: u32,
     data_type: u16,
+    /// Original requested element count from the EVENT_ADD that
+    /// installed this subscription. C `event_add_action` stores
+    /// `pevext->msg.m_count`; monitor delivery (R2-12) and the
+    /// EVENT_CANCEL ack (R2-23) both echo it.
+    data_count: u32,
     /// Gate flipped by `reeval_access_rights` when read access is
     /// revoked / restored for `channel_sid`. While `true`, the
     /// producer task drops events at the send step (matches C
@@ -2275,14 +2280,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // for protocol weaknesses; either way the right
                     // response is to drop.
                     if is_notify {
-                        send_cmd_error(
-                            writer,
-                            CA_PROTO_WRITE_NOTIFY,
-                            hdr.data_type,
-                            ECA_BADTYPE,
-                            ioid,
-                        )
-                        .await?;
+                        // R2-8: C `putNotifyErrorReply` (`camessage.c:
+                        // 1482-1501`) preserves `m_dataType` and
+                        // `m_count` from the request. Pre-fix Rust
+                        // used `send_cmd_error` which always emits
+                        // `count = 0` — diverges from libca byte-
+                        // for-byte on the wire.
+                        let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
+                        resp.data_type = hdr.data_type;
+                        resp.count = hdr.count;
+                        resp.cid = ECA_BADTYPE;
+                        resp.available = ioid;
+                        let mut w = writer.lock().await;
+                        w.write_all(&resp.to_bytes()).await?;
                     } else {
                         send_ca_error(writer, hdr, ECA_BADTYPE, entry_cid, "bad data type").await?;
                     }
@@ -2335,14 +2345,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // drop the connection. C `caNetConvert` failure
                     // in `write_action` returns RSRV_ERROR.
                     if is_notify {
-                        send_cmd_error(
-                            writer,
-                            CA_PROTO_WRITE_NOTIFY,
-                            hdr.data_type,
-                            ECA_BADTYPE,
-                            ioid,
-                        )
-                        .await?;
+                        // R2-8: same `putNotifyErrorReply` shape as
+                        // the bad-DBR-type branch above — preserve
+                        // request count and data type.
+                        let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
+                        resp.data_type = hdr.data_type;
+                        resp.count = hdr.count;
+                        resp.cid = ECA_BADTYPE;
+                        resp.available = ioid;
+                        let mut w = writer.lock().await;
+                        w.write_all(&resp.to_bytes()).await?;
                     } else {
                         send_ca_error(
                             writer,
@@ -2479,6 +2491,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let sid = hdr.cid;
             let sub_id = hdr.available;
             let requested_type = hdr.data_type;
+            // R2-12: store the request's element count so each monitor
+            // delivery and the EVENT_CANCEL ack can echo it (matches
+            // C `event_add_action` capturing `pevext->msg` for later
+            // `read_reply` / `event_cancel_reply` use).
+            let requested_count = hdr.actual_count();
 
             // DoS guard: cap subscriptions per channel.
             let subs_for_channel = state
@@ -2553,20 +2570,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // missing per-op check; the typed `require_read` shape
             // is the path every future MONITOR-class op should
             // mirror.
-            let _read_grant = match state.lookup_access(sid).require_read() {
-                Ok(g) => g,
-                Err(denied) => {
-                    send_cmd_error(
-                        writer,
-                        CA_PROTO_EVENT_ADD,
-                        requested_type,
-                        denied.eca_code(),
-                        sub_id,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
+            // R2-5: C `event_add_action` (`rsrv/camessage.c:1762-1880`)
+            // installs the event unconditionally and conditionally
+            // enables it via `db_event_enable` only when
+            // `asCheckGet(pciu->asClientPVT)` allows reads; on no-read
+            // access the subscription stays installed but disabled
+            // and the initial event is `no_read_access_event`. Pre-fix
+            // Rust returned `ECA_NORDACCESS` here without installing —
+            // a subscription opened while denied was permanently
+            // absent, so a later ACF reload that granted access could
+            // not re-arm anything. Capture access as a flag and let
+            // the install path below populate the `denied` gate so
+            // `reeval_access_rights` can flip it later (Bug 4 parity).
+            let access_denied = state.lookup_access(sid).require_read().is_err();
 
             // Refuse a duplicate sub_id on the same connection. Without
             // this, two EVENT_ADDs with identical sub_id leave both
@@ -2620,15 +2636,32 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             return Ok(());
                         };
 
-                        // Send initial value
-                        let snap = pv.snapshot().await;
-                        send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
+                        let denied = Arc::new(AtomicBool::new(access_denied));
+                        // R2-5: initial event is the snapshot when read
+                        // access is granted, `no_read_access_event` when
+                        // denied (C `event_add_action` → `read_reply`
+                        // routes denial through `no_read_access_event`,
+                        // `rsrv/camessage.c:529-534`).
+                        if access_denied {
+                            send_no_read_access_event(
+                                writer,
+                                CA_PROTO_EVENT_ADD,
+                                requested_type,
+                                requested_count,
+                                sub_id,
+                                ECA_NORDACCESS,
+                            )
+                            .await?;
+                        } else {
+                            let snap = pv.snapshot().await;
+                            send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
+                        }
 
-                        let denied = Arc::new(AtomicBool::new(false));
                         let task = spawn_monitor_sender(
                             pv.clone(),
                             sub_id,
                             requested_type,
+                            requested_count,
                             writer.clone(),
                             state.flow_control.clone(),
                             rx,
@@ -2642,6 +2675,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 channel_sid: sid,
                                 sub_id,
                                 data_type: requested_type,
+                                data_count: requested_count,
                                 denied,
                                 task,
                             },
@@ -2695,24 +2729,40 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             }
                         }
 
-                        // Send initial value with full metadata
-                        if let Some(mut snap) = instance.snapshot_for_field(field) {
-                            // CA-268 monitor parity: GET path on
-                            // DBR_CLASS_NAME populates class_name from
-                            // record_type; the EVENT_ADD initial must
-                            // do the same so the first frame carries
-                            // the expected string instead of an empty
-                            // 40-byte pad.
-                            if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-                                snap.class_name = Some(instance.record.record_type().to_string());
-                            }
+                        // R2-5: snapshot when read access granted,
+                        // no_read_access_event when denied. Drop the
+                        // instance write lock before await on the
+                        // writer so the producer task can pick it up.
+                        let initial_snap = if access_denied {
+                            None
+                        } else {
+                            instance.snapshot_for_field(field).map(|mut snap| {
+                                if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
+                                    snap.class_name =
+                                        Some(instance.record.record_type().to_string());
+                                }
+                                snap
+                            })
+                        };
+                        drop(instance);
+                        if access_denied {
+                            send_no_read_access_event(
+                                writer,
+                                CA_PROTO_EVENT_ADD,
+                                requested_type,
+                                requested_count,
+                                sub_id,
+                                ECA_NORDACCESS,
+                            )
+                            .await?;
+                        } else if let Some(snap) = initial_snap {
                             send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
                         }
 
                         let writer_clone = writer.clone();
                         let flow_control = state.flow_control.clone();
                         let record_for_task = record.clone();
-                        let denied = Arc::new(AtomicBool::new(false));
+                        let denied = Arc::new(AtomicBool::new(access_denied));
                         let denied_for_task = denied.clone();
                         let task = epics_base_rs::runtime::task::spawn(async move {
                             let mut rx = rx;
@@ -2765,17 +2815,35 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                             .to_string(),
                                     );
                                 }
-                                let payload_bytes =
+                                let mut payload_bytes =
                                     match encode_dbr(requested_type, &event.snapshot) {
                                         Ok(bytes) => bytes,
                                         Err(_) => break,
                                     };
                                 // CA-268: see GET path note — fixed 1.
+                                //
+                                // R2-12: C `read_reply`
+                                // (`rsrv/camessage.c:507-571`) uses the
+                                // ORIGINAL request count as the header
+                                // value (autosize=0 case) and pads the
+                                // payload up to `dbr_size_n(type,
+                                // request_count)`. Pre-fix Rust used
+                                // the live `snapshot.value.count()`,
+                                // so an EVENT_ADD with explicit
+                                // `count=1` on a waveform received the
+                                // full N-element waveform on every
+                                // update instead of just one element.
+                                let actual_count = event.snapshot.value.count() as u32;
                                 let element_count =
                                     if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
                                         1
                                     } else {
-                                        event.snapshot.value.count() as u32
+                                        pad_dbr_to_requested_count(
+                                            &mut payload_bytes,
+                                            actual_count,
+                                            requested_count,
+                                            requested_type,
+                                        )
                                     };
                                 let mut padded = payload_bytes;
                                 padded.resize(align8(padded.len()), 0);
@@ -2821,6 +2889,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 channel_sid: sid,
                                 sub_id,
                                 data_type: requested_type,
+                                data_count: requested_count,
                                 denied,
                                 task,
                             },
@@ -2840,6 +2909,29 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         CA_PROTO_EVENT_CANCEL => {
             let sub_id = hdr.available;
             let req_channel_sid = hdr.cid;
+            // R2-24: C `event_cancel_reply` (`camessage.c:1998-2021`)
+            // calls `MPTOPCIU(mp)` first. If the request's channel id
+            // is unknown or belongs to another client, rsrv calls
+            // `logBadId` and returns RSRV_ERROR WITHOUT sending a
+            // wire error frame. Only after a valid channel resolves
+            // does rsrv walk that channel's event queue and emit
+            // ECA_BADMONID for an unknown monitor id.
+            //
+            // Pre-fix Rust checked the flat subscription map first,
+            // so an unknown SID elicited ECA_BADMONID (the diagnostic
+            // path that resolves a fallback PV name for the bad-SID
+            // case). Mirror C: silent close on bad SID; ECA_BADMONID
+            // only when SID is good but sub-id doesn't belong.
+            let (entry_cid, entry_pv_name) = match state.channels.get(&req_channel_sid) {
+                Some(entry) => (entry.cid, entry.pv_name.clone()),
+                None => {
+                    return Err(epics_base_rs::error::CaError::Protocol(format!(
+                        "EVENT_CANCEL on unknown SID {} (matches C event_cancel_reply \
+                         logBadId + RSRV_ERROR silent close)",
+                        req_channel_sid
+                    )));
+                }
+            };
             // C `event_cancel_reply` (camessage.c:2002-2010) walks
             // the CHANNEL's eventq looking for a matching sub-id.
             // The cross-check is implicit: a sub-id that exists but
@@ -2858,18 +2950,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .is_some_and(|s| s.channel_sid == req_channel_sid);
             if !channel_matches {
                 // Trigger the round-21 BAD-MONID path: emit
-                // ECA_BADMONID + disconnect. Use the request's
-                // m_cid for the diag PV name when it resolves.
-                let (chan_cid, diag) = match state.channels.get(&req_channel_sid) {
-                    Some(entry) => (entry.cid, entry.pv_name.clone()),
-                    None => (0xFFFF_FFFFu32, "unknown".to_string()),
-                };
+                // ECA_BADMONID + disconnect. The SID is known to be
+                // valid here (silent close already happened above),
+                // so use entry_cid / entry_pv_name resolved from it.
                 tracing::debug!(
                     sub_id,
                     sid = req_channel_sid,
                     "EVENT_CANCEL channel-mismatch (sub belongs to different channel); ECA_BADMONID"
                 );
-                send_ca_error(writer, hdr, ECA_BADMONID, chan_cid, &diag).await?;
+                send_ca_error(writer, hdr, ECA_BADMONID, entry_cid, &entry_pv_name).await?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "EVENT_CANCEL sub-id {} channel-mismatch (requested sid {}; \
                      matches C event_cancel_reply 'not on this channel's eventq' RSRV_ERROR)",
@@ -2903,10 +2992,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     });
                 }
 
-                // Per spec: send final EVENT_ADD response with count=0
+                // R2-23: C `event_cancel_reply` (`camessage.c:2002-2014`)
+                // echoes the stored event's `pevext->msg` fields back
+                // with a zero payload: original DBR type, original
+                // event count, ECA_NORMAL, original sub id. Pre-fix
+                // Rust set `m_count = 0` so the CANCEL ack diverged
+                // from libca on the wire — strict CA dissectors and
+                // replay tooling saw a different frame than rsrv.
                 let mut resp = CaHeader::new(CA_PROTO_EVENT_ADD);
                 resp.data_type = sub.data_type;
-                resp.count = 0;
+                resp.count = sub.data_count as u16;
                 resp.cid = ECA_NORMAL;
                 resp.available = sub_id;
                 let mut w = writer.lock().await;

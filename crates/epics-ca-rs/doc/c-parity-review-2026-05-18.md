@@ -171,26 +171,6 @@ Impact: a malformed datagram can place an old/unsupported VERSION or SEARCH
 before a valid SEARCH and still receive a Rust reply for the later message.
 rsrv drops the rest of the datagram after the unsupported-version frame.
 
-### R2-11: UDP search response VERSION state leaks across datagrams
-
-Severity: Low
-
-Rust: `crates/epics-ca-rs/src/client/search.rs`, `handle_udp_response()` stores
-the last `CA_PROTO_VERSION` marker in `state.last_valid_seq` and never resets
-it at the start of a new UDP datagram. A `CA_PROTO_SEARCH` response with no
-VERSION is dropped before any VERSION has ever been seen, but the same shape is
-accepted after an unrelated earlier datagram set `last_valid_seq`.
-
-C reference: `libca/udpiiu.cpp::postMsg()` resets
-`lastReceivedSeqNoIsValid` and `lastReceivedSeqNo` at the start of every UDP
-datagram. `versionAction()` can only mark the current datagram as carrying a
-valid sequence.
-
-Impact: search response handling depends on prior packets instead of only the
-current datagram. This breaks libca's datagram-local VERSION semantics and can
-make legacy or third-party search replies inconsistent: first packet dropped,
-later equivalent packet accepted after an unrelated VERSION-bearing response.
-
 ### R2-12: EVENT_ADD ignores the requested element count
 
 Severity: Medium
@@ -401,50 +381,32 @@ caller pending. Reusing a subscription ID can collide with an active monitor.
 This is reachable for process-lifetime clients; 100,000 operations/s wraps in
 about 11.9 hours.
 
-### R2-22: Send backpressure accounting can undercount pending frames
-
-Severity: Medium
-
-Rust: `crates/epics-ca-rs/src/client/transport.rs`, `send_frame()` increments
-`pending_frames` with `fetch_add()`, but `write_loop()` decrements by `load()`
-plus `store(prev.saturating_sub(drained))`.
-
-C reference: libca's send watchdog treats a stalled virtual circuit as a
-connection failure; the Rust counter is the local guard that decides when to
-close a circuit whose unbounded write queue is no longer draining.
-
-Impact: a concurrent `send_frame()` can increment between the write loop's
-`load()` and `store()`, and the store overwrites that increment. Under
-sustained producer activity the counter can drift below the real queued-frame
-count, so the `SEND_BACKPRESSURE_FRAMES` disconnect threshold is not reliable.
-A stalled TCP circuit can retain an unbounded queue longer than the guard
-intends.
-
-### R2-23: EVENT_CANCEL request/ack headers lose the subscription count
+### R2-23: EVENT_CANCEL request/ack headers truncate large subscription counts
 
 Severity: Low
 
 Rust client: `crates/epics-ca-rs/src/client/transport.rs`,
-`TransportCommand::Unsubscribe` sends `CA_PROTO_EVENT_CANCEL` with
-`data_type`, `sid`, and `subid`, but leaves `count = 0`.
+`TransportCommand::Unsubscribe` copies the original subscription count into
+`hdr.count` and serializes with `hdr.to_bytes()`. Counts `>= 0xffff` are
+therefore truncated into the 16-bit normal header instead of using the CA
+extended header.
 
 Rust server: `crates/epics-ca-rs/src/server/tcp.rs`, the successful
-`CA_PROTO_EVENT_CANCEL` branch replies with `CA_PROTO_EVENT_ADD`,
-`count = 0`, and `cid = ECA_NORMAL`. `SubscriptionEntry` stores only the
-requested DBR type, so the server no longer has the original EVENT_ADD count
-or original channel header fields needed to echo the stored monitor request.
+`CA_PROTO_EVENT_CANCEL` branch replies with `CA_PROTO_EVENT_ADD` and
+`resp.count = sub.data_count as u16`, then serializes with `resp.to_bytes()`.
+The normal-count case now echoes the stored subscription count, but the large
+array case still cannot represent the count.
 
 C reference: `libca/tcpiiu.cpp::subscriptionCancelRequest()` includes the
-subscription count in the cancel request. `rsrv/camessage.c::event_cancel_reply()`
-sends the stored `pevext->msg` fields back with zero payload: original event
-DBR type, original event count, original event `m_cid`, and original
-subscription id. `libca/cac.cpp::eventAddRespAction()` ignores zero-payload
-cancel confirmations, but the frame is still byte-visible on the wire.
+subscription count through `comQueSend::insertRequestHeader()`, which emits the
+extended form when `nElem >= 0xffff`. `rsrv/camessage.c::event_cancel_reply()`
+sends the stored `pevext->msg` fields back with zero payload, preserving the
+original event count.
 
-Impact: strict CA clients or trace/replay tooling see a different cancel
-confirmation from the Rust server, and strict servers see a different cancel
-request from the Rust client. This shares the same missing-state root as
-R2-12, but affects the explicit cancel handshake instead of monitor delivery.
+Impact: monitors on arrays with 65,535 or more requested elements can be
+cancelled with a different count than the one libca sends and rsrv echoes.
+Strict servers, trace/replay tooling, and protocol tests see a normal-form
+cancel/ack where C uses extended framing.
 
 ### R2-24: EVENT_CANCEL with a bad channel id sends an error frame that rsrv does not send
 
@@ -468,6 +430,196 @@ invalid-monitor request against rsrv by whether an error frame is sent. The
 Rust server sends the BADMONID error in both cases, so strict clients and
 protocol tests observe an extra frame before EOF for the bad-SID case.
 
+### R2-25: Unknown CREATE_CHAN replies leak server-side channels
+
+Severity: Medium
+
+Rust: `crates/epics-ca-rs/src/client/transport.rs` converts every
+`CA_PROTO_CREATE_CHAN` response into `TransportEvent::ChannelCreated`.
+`crates/epics-ca-rs/src/client/mod.rs` handles that event only when the CID is
+still present in `channels`; otherwise the response is ignored. If the user
+drops a channel while it is `Connecting`, `CoordRequest::DropChannel` cancels
+search and removes the channel without sending `CLEAR_CHANNEL` because no SID
+is known yet.
+
+C reference: `libca/cac.cpp::createChannelRespAction()` checks the client
+channel table. If a V4.4+ `CREATE_CHAN` response arrives for an unknown client
+CID, libca immediately sends `tcpiiu::clearChannelRequest(hdr.m_available,
+hdr.m_cid)` to free the server SID it just learned.
+
+Impact: a Rust client can drop a channel after sending `CREATE_CHAN` but before
+the server response arrives. The server allocates the channel and sends the
+SID; Rust ignores the response, so the server-side channel remains allocated
+until the TCP circuit closes. libca cleans up that race as soon as the late
+response is parsed.
+
+### R2-26: Search response freshness handling rejects unsequenced replies and accepts stale sequenced replies
+
+Severity: High
+
+Rust: `crates/epics-ca-rs/src/client/search.rs`, `run_nameserver_connection()`
+feeds TCP name-server responses into the same `handle_udp_response()` path used
+for UDP. That parser resets `state.last_valid_seq` at the start of each buffer,
+sets it for any `CA_PROTO_VERSION` in that same buffer, and drops every
+`CA_PROTO_SEARCH` response when it is `None`. It does not compare the echoed
+sequence number with the sent datagram sequence or any timer window.
+
+C reference: `libca/tcpiiu.cpp::searchRespNotify()` accepts TCP search replies
+directly; TCP search replies from `rsrv/camessage.c::search_reply_tcp()` carry
+no per-reply VERSION. On UDP, `libca/udpiiu.cpp::searchRespAction()` transfers
+the channel even when no VERSION sequence marker was present, and
+`searchTimer::uninstallChanDueToSuccessfulSearchResponse()` applies the stale
+sequence-window check only when `seqNumberIsValid` is true.
+
+Impact: TCP name-server discovery in Rust depends on TCP segmentation: a
+SEARCH reply is accepted only if a VERSION response happens to be parsed in the
+same buffer. A normal C TCP search reply arriving alone is dropped. For UDP,
+legacy or third-party unsequenced replies are dropped even though libca accepts
+them, while stale sequenced replies are accepted because Rust records the
+sequence but never validates it.
+
+### R2-27: Zero-payload EVENT_ADD cancel confirmations are treated as monitor traffic
+
+Severity: Low
+
+Rust: `crates/epics-ca-rs/src/client/transport.rs`, the `CA_PROTO_EVENT_ADD`
+branch checks `hdr.cid != ECA_NORMAL` before checking whether `postsize == 0`.
+For a zero-payload cancel confirmation it can emit
+`TransportEvent::MonitorStatusError`; if the CID happens to be `ECA_NORMAL`, it
+emits `TransportEvent::MonitorData` with an empty payload.
+
+C reference: `libca/cac.cpp::eventRespAction()` returns immediately when
+`!hdr.m_postsize`, before status handling or payload conversion. rsrv's
+`event_cancel_reply()` intentionally sends a zero-payload `CA_PROTO_EVENT_ADD`
+confirmation using the stored subscription request header.
+
+Impact: the normal unsubscribe path removes the subscription before the ack is
+usually processed, so this often degrades to a dropped internal event. In races
+where the subscription record is still present, Rust can surface a cancel
+confirmation as a monitor exception or decode error. libca treats the frame as
+a no-op acknowledgement.
+
+### R2-28: CLIENT_NAME/HOST_NAME framing truncates long payload sizes
+
+Severity: Medium
+
+Rust: `crates/epics-ca-rs/src/client/transport.rs` and
+`crates/epics-ca-rs/src/client/search.rs` build the TCP handshake by assigning
+`user_hdr.postsize = user_payload.len() as u16` and
+`host_hdr.postsize = host_payload.len() as u16`, then appending the full
+payload.
+
+C reference: `libca/tcpiiu.cpp::userNameSetRequest()` and
+`hostNameSetRequest()` route through `comQueSend::insertRequestHeader()`, whose
+serializer emits extended headers when the payload does not fit the 16-bit
+field. On the server side, `rsrv/camessage.c::client_name_action()` and
+`host_name_action()` reject over-511-byte names after consuming a well-framed
+message.
+
+Impact: a large `USER`/`USERNAME` environment value, or an unexpectedly large
+local hostname, makes Rust advertise a truncated `postsize` while still writing
+the full string. The peer parses the excess bytes as subsequent CA headers,
+which can desynchronize an IOC or TCP name-server connection before channel
+creation starts. libca either frames the message correctly or the server
+rejects it as a framed protocol error.
+
+### R2-29: Unknown TCP response opcodes are silently ignored
+
+Severity: Medium
+
+Rust: `crates/epics-ca-rs/src/client/transport.rs`, the read loop's response
+dispatcher ends with `_ => {}`. Any complete TCP frame with an unknown or
+client-invalid opcode is skipped and the virtual circuit stays open.
+
+C reference: `libca/cac.cpp::executeResponse()` dispatches unknown response
+opcodes to `badTCPRespAction()`. That function logs the bad response and
+returns false; `tcpiiu.cpp` treats `processIncoming() == false` as a protocol
+failure and calls `initiateAbortShutdown()`.
+
+Impact: a broken or hostile server can inject response opcodes that libca uses
+to tear down the TCP circuit, while Rust quietly advances past them. That hides
+protocol corruption and can leave later client operations running on a circuit
+that libca would have rebuilt.
+
+### R2-30: Client SEARCH requests ask for NOT_FOUND replies that libca avoids
+
+Severity: Low
+
+Rust: `crates/epics-ca-rs/src/client/search.rs::build_search_payload()` sets
+`search_hdr.data_type = CA_DO_REPLY` for every search request.
+
+C reference: `libca/udpiiu.cpp::searchMsg()` sets `m_dataType = DONTREPLY`.
+The C server's TCP search path sends `CA_PROTO_NOT_FOUND` only when
+`m_dataType == DOREPLY`; UDP search does not send NOT_FOUND. libca's TCP
+response table treats `CA_PROTO_NOT_FOUND` as a bad TCP response rather than a
+normal discovery result.
+
+Impact: Rust asks TCP name servers and TCP search endpoints to generate
+negative replies that libca does not request. Rust then ignores
+`CA_PROTO_NOT_FOUND` in the search parser, so the extra frames add traffic and
+exercise a response shape the C client path treats as invalid, without
+improving discovery correctness.
+
+### R2-31: Client get/put paths ignore cached access rights before sending
+
+Severity: High
+
+Rust: `crates/epics-ca-rs/src/client/mod.rs`, `CaChannel::snapshot()` returns
+`ChannelSnapshotPublic` with `access_rights`, but
+`send_read_notify_fast()`, `send_write_notify_fast()`, and
+`send_write_nowait_fast()` never check those bits. The public `get*()` and
+`put*()` methods therefore send READ_NOTIFY, WRITE_NOTIFY, or WRITE even when
+the last ACCESS_RIGHTS frame denied the operation.
+
+C reference: `libca/nciu.cpp::read()` rejects before queueing when
+`!accessRightState.readPermit()`, and `nciu::write()` / the write-callback
+overload reject before queueing when `!accessRightState.writePermit()`.
+
+Impact: Rust sends requests that libca refuses synchronously with
+`ECA_NORDACCESS` or `ECA_NOWTACCESS`. Callback variants depend on a later
+server reply or timeout, and fire-and-forget writes can return `Ok(())` even
+though the cached access state already says the write is forbidden. This also
+makes behavior race against server-side access checks instead of matching
+libca's local access-rights gate.
+
+### R2-32: Metadata reads silently clamp overlarge requested counts
+
+Severity: Medium
+
+Rust: `crates/epics-ca-rs/src/client/mod.rs`,
+`CaChannel::get_with_metadata_count()` maps `count > 0` to
+`count.min(snap.element_count)`. A caller asking for more elements than the
+channel's native count therefore receives a shorter request instead of an
+error.
+
+C reference: `libca/nciu.cpp::read()` rejects `countIn > this->count` before
+queueing the read. `cadef.h` documents `ECA_BADCOUNT` for
+`ca_array_get_callback()` / `ca_array_get()` when the requested count is larger
+than the native element count.
+
+Impact: Rust hides caller bugs and sends a different wire request than libca.
+For example, requesting metadata count 100 from a 10-element PV becomes a
+10-element READ_NOTIFY in Rust, while C returns `ECA_BADCOUNT` without sending
+anything.
+
+### R2-33: Unterminated PV names are parsed differently from rsrv
+
+Severity: Low
+
+Rust: `crates/epics-ca-rs/src/server/tcp.rs` and
+`crates/epics-ca-rs/src/server/udp.rs` parse CREATE_CHAN and SEARCH payloads by
+searching for the first NUL byte and using the full payload when no NUL exists.
+
+C reference: `rsrv/camessage.c::claim_ciu_action()`,
+`search_reply_udp()`, and `search_reply_tcp()` all force
+`pName[mp->m_postsize - 1] = '\0'` after rejecting `m_postsize <= 1`.
+
+Impact: a malformed client that omits the NUL terminator can cause Rust to
+look up a different PV name than rsrv would. For payload `ABCD` with
+`postsize = 4`, rsrv searches `ABC`; Rust searches `ABCD`. That can turn a C
+not-found path into a Rust channel creation or search reply for malformed
+frames.
+
 ## Cleared During Review
 
 ### R2-2: Monitor status errors are already delivered
@@ -476,6 +628,23 @@ The initial candidate was that non-`ECA_NORMAL` `CA_PROTO_EVENT_ADD` frames were
 warn-and-dropped. Current code has `TransportEvent::MonitorStatusError` in
 `client/types.rs`, sends it from `client/transport.rs`, and routes it through
 `SubscriptionRegistry::on_monitor_error()` in `client/mod.rs`.
+
+### R2-11: UDP search response VERSION state no longer leaks across datagrams
+
+The initial finding was that `handle_udp_response()` retained
+`state.last_valid_seq` across UDP datagrams. Current code resets
+`state.last_valid_seq = None` at the start of each parsed response buffer, so
+the cross-datagram leak itself is no longer present. The remaining current
+search-response defects are recorded separately in R2-26.
+
+### R2-22: Send backpressure accounting no longer uses load/store decrement
+
+The initial finding was that `pending_frames` decremented with `load()` plus
+`store(prev.saturating_sub(drained))`, allowing concurrent increments to be
+lost. Current `client/transport.rs::write_loop()` and
+`client/types.rs::DirectServerWriter::send_frame()` use a saturating
+compare-exchange loop for decrement/rollback, so the lost-increment defect is
+not present in the current code.
 
 ## Review Log
 
@@ -497,3 +666,15 @@ warn-and-dropped. Current code has `TransportEvent::MonitorStatusError` in
   recorded.
 - 2026-05-18: Continued EVENT_CANCEL request/reply parity pass. Findings R2-23
   and R2-24 recorded.
+- 2026-05-18: Rechecked the earlier UDP VERSION-state finding against current
+  code. R2-11 moved to cleared; R2-26 records the remaining search-response
+  freshness defect.
+- 2026-05-18: Continued client response, TCP name-server, handshake framing,
+  and search-request parity pass. Findings R2-25 through R2-30 recorded.
+- 2026-05-18: Continued client read/write preflight pass. Finding R2-31
+  recorded.
+- 2026-05-18: Rechecked send backpressure accounting against current code.
+  R2-22 moved to cleared.
+- 2026-05-18: Continued client metadata-count and server malformed-PV-name
+  pass. Findings R2-32 and R2-33 recorded. R2-23 narrowed to the remaining
+  large-count extended-framing defect.

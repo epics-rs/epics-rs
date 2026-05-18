@@ -359,7 +359,21 @@ pub(crate) enum SearchRequest {
 }
 
 pub(crate) enum SearchResponse {
-    Found { cid: u32, server_addr: SocketAddr },
+    Found {
+        cid: u32,
+        server_addr: SocketAddr,
+    },
+    /// R2-67: dispatched when a second SEARCH reply for the same cid
+    /// names a different server (the libca
+    /// `cac.cpp::msgForMultiplyDefinedPV` condition). The coordinator
+    /// fans this out to the exception handler as `ECA_DBLCHNL`,
+    /// matching libca's `pvMultiplyDefinedNotify` → `this->exception`
+    /// path.
+    MultiplyDefined {
+        pv_name: String,
+        prev_addr: SocketAddr,
+        new_addr: SocketAddr,
+    },
 }
 
 // --- Transport Manager messages ---

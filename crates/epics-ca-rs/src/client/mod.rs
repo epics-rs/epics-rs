@@ -2750,6 +2750,31 @@ async fn run_coordinator(
                             pending_found.insert(cid, server_addr);
                         }
                     }
+                    // R2-67: deliver ECA_DBLCHNL via the registered
+                    // exception handler so library users see the
+                    // multiply-defined-PV condition the same way they
+                    // see it under libca (`pvMultiplyDefinedNotify`
+                    // → `this->exception(... ECA_DBLCHNL, ...)`).
+                    // The search-side already logs and metrics.
+                    SearchResponse::MultiplyDefined {
+                        pv_name,
+                        prev_addr,
+                        new_addr,
+                    } => {
+                        types::dispatch_exception(
+                            &exception_slot,
+                            types::CaException {
+                                kind: types::CaExceptionKind::ServerError,
+                                message: format!(
+                                    "Channel: \"{}\", Connecting to: {}, Ignored: {}",
+                                    pv_name, prev_addr, new_addr,
+                                ),
+                                server_addr: Some(new_addr),
+                                pv_name: Some(pv_name),
+                                status: Some(crate::protocol::ECA_DBLCHNL),
+                            },
+                        );
+                    }
                 }
             }
             evt = transport_rx.recv() => {

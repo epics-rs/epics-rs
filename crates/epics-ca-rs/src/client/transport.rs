@@ -994,6 +994,23 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // mid-stream on ACF reload), only the most recent is kept.
     let mut pending_access: std::collections::HashMap<u32, AccessRights> =
         std::collections::HashMap::new();
+    // R2-65: cids the server has acknowledged via CREATE_CHAN. An
+    // ACCESS_RIGHTS frame for a known cid is a *post-create* update
+    // (ACF reload, server-side rule change) and must fire the event.
+    // An ACCESS_RIGHTS frame for an unknown cid is a *pre-create*
+    // stash — the matching CREATE_CHAN reply consumes it and the
+    // ChannelCreated event already carries the access, so no
+    // AccessRightsChanged is needed in that path. Pre-fix Rust
+    // emitted the event in both cases; combined with R2-42's stash
+    // cap, a stray-ACCESS_RIGHTS-flood from a hostile server loaded
+    // the unbounded event_tx mpsc one message per stray frame even
+    // though the coordinator's downstream filter dropped them all.
+    let mut known_cids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // R2-64: rate-limit the cap-hit warning so a hostile flood does
+    // not also flood the logs. One warn per circuit lifetime is
+    // enough — the metric `ca_client_pending_access_evictions_total`
+    // carries the running count for observability.
+    let mut cap_warned = false;
 
     // Single long-lived `Sleep` whose deadline we mutate in place
     // via `Sleep::reset`. This is what makes the libca model
@@ -1292,25 +1309,52 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // 1024 is well past the per-client channel cap
                     // any realistic deployment hits; well below the
                     // memory pressure threshold.
-                    const PENDING_ACCESS_CAP: usize = 1024;
-                    if pending_access.len() >= PENDING_ACCESS_CAP {
-                        // Drop the oldest stale entry. HashMap has
-                        // no LRU ordering, but `next()` on a hashmap
-                        // iter is effectively pseudo-random — good
-                        // enough to bound growth, never blocks the
-                        // legitimate ACCESS_RIGHTS-then-CREATE_CHAN
-                        // sequence which removes-on-consume.
-                        if let Some(&victim) = pending_access.keys().next() {
-                            pending_access.remove(&victim);
-                            metrics::counter!("ca_client_pending_access_evictions_total")
-                                .increment(1);
+                    // R2-65: post-create ACCESS_RIGHTS goes straight
+                    // to the coordinator as an update event; the
+                    // pre-create path stashes for the CREATE_CHAN
+                    // consumer (which folds it into ChannelCreated).
+                    if known_cids.contains(&hdr.cid) {
+                        let _ = event_tx.send(TransportEvent::AccessRightsChanged {
+                            cid: hdr.cid,
+                            access,
+                        });
+                    } else {
+                        // R2-42: bound the stash size. C
+                        // `libca/cac.cpp:1121-1136`
+                        // `accessRightsRespAction` looks up by m_cid
+                        // and silently returns if not found — never
+                        // accumulates. 1024 is well past the per-
+                        // client channel cap any realistic deployment
+                        // hits; well below memory pressure.
+                        const PENDING_ACCESS_CAP: usize = 1024;
+                        if pending_access.len() >= PENDING_ACCESS_CAP {
+                            if let Some(&victim) = pending_access.keys().next() {
+                                pending_access.remove(&victim);
+                                metrics::counter!("ca_client_pending_access_evictions_total")
+                                    .increment(1);
+                                // R2-64: log the cap-hit ONCE per
+                                // circuit so operators can correlate
+                                // with a misbehaving server. C never
+                                // accumulates so this condition can't
+                                // exist in C; we mirror C's silent-
+                                // on-unknown-cid behaviour at steady
+                                // state but surface the new failure
+                                // mode (cap exceeded) at warn level.
+                                if !cap_warned {
+                                    cap_warned = true;
+                                    tracing::warn!(
+                                        target: "epics_ca_rs::client::transport",
+                                        cap = PENDING_ACCESS_CAP,
+                                        "pending_access cap reached — server is emitting \
+                                         ACCESS_RIGHTS for cids no CREATE_CHAN names; oldest \
+                                         entry evicted. Further evictions are silent; see \
+                                         metric ca_client_pending_access_evictions_total"
+                                    );
+                                }
+                            }
                         }
+                        pending_access.insert(hdr.cid, access);
                     }
-                    pending_access.insert(hdr.cid, access);
-                    let _ = event_tx.send(TransportEvent::AccessRightsChanged {
-                        cid: hdr.cid,
-                        access,
-                    });
                 }
                 CA_PROTO_CREATE_CHAN => {
                     // Consume the stashed ACCESS_RIGHTS for this cid
@@ -1321,6 +1365,11 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     let access = pending_access
                         .remove(&hdr.cid)
                         .unwrap_or(AccessRights::from_u32(0));
+                    // R2-65: now that the server has named this cid,
+                    // subsequent ACCESS_RIGHTS frames for it are
+                    // legitimate post-create updates that must fire
+                    // AccessRightsChanged.
+                    known_cids.insert(hdr.cid);
                     let _ = event_tx.send(TransportEvent::ChannelCreated {
                         cid: hdr.cid,
                         sid: hdr.available,
@@ -1587,6 +1636,11 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     });
                 }
                 CA_PROTO_SERVER_DISCONN => {
+                    // R2-65: server retired this cid — drop it from
+                    // the post-create set so a same-cid CREATE_CHAN
+                    // reuse later in the circuit starts fresh.
+                    known_cids.remove(&hdr.cid);
+                    pending_access.remove(&hdr.cid);
                     let _ = event_tx.send(TransportEvent::ServerDisconnect {
                         cid: hdr.cid,
                         server_addr,

@@ -665,66 +665,6 @@ C reference: `ca/src/client/cac.cpp:186-194` `envGetDoubleConfigParam`, then `if
 
 Impact: `EPICS_CA_CONN_TMO=0.5` gets 0.5 on C, 1 on Rust. `=0` (operator sentinel for "use default") gets 30 on C but 1 on Rust — Rust pumps ECHO every second on every circuit, multiplying inbound TCP load on each server 30×.
 
-### R2-64: AccessRights stash cap-hit emits a metric only — no warn, no exception event
-
-Severity: Medium
-
-Rust: `client/transport.rs:1295-1308` — when `pending_access.len() >= PENDING_ACCESS_CAP`, an entry is evicted and `ca_client_pending_access_evictions_total` is incremented; no `tracing::warn!` is emitted and no exception is delivered to the per-client exception handler.
-
-C reference: `cac.cpp:1121-1136` `accessRightsRespAction` keeps no per-circuit state at all (silent return on unknown cid), so the "cap" condition cannot exist in C. The Rust R2-42 fix introduces a new failure mode (stash overflow) but signals it only through a metric most operators do not scrape on an interactive incident.
-
-Impact: A hostile/buggy server flooding ACCESS_RIGHTS for unknown cids silently churns the stash under load; the user-facing channel and the `set_exception_handler` callback (documented analog of `ca_add_exception_event`) see nothing.
-
-### R2-65: `AccessRightsChanged` event emitted for cids the channel table will not match
-
-Severity: Low
-
-Rust: `client/transport.rs:1309-1313` — `pending_access.insert(hdr.cid, access)` is unconditionally followed by `event_tx.send(TransportEvent::AccessRightsChanged { cid, access })` regardless of whether `cid` will ever be claimed by `CREATE_CHAN`. The coordinator at `mod.rs:2963-2974` filters with `channels.get_mut(&cid)` so no observer event escapes, but the mpsc traffic + per-event metric infrastructure is spent.
-
-C reference: `cac.cpp:1121-1136` only calls `pChan->accessRightsStateChange` after a successful `chanTable.lookup(hdr.m_cid)`; unknown cid produces no internal notification.
-
-Impact: Under R2-42 stress (server emitting ACCESS_RIGHTS for cids the client never created), the unbounded `event_tx` loads one message per stray frame; combined with R2-42's post-cap eviction, the event rate equals the stray-frame rate.
-
-### R2-66: `resolved` cleared on connect-success drops the connected-lifetime duplicate detection
-
-Severity: Medium
-
-Rust: `client/search.rs:309-317` — `remove_channel` always clears `self.resolved.remove(&cid)`. `search.rs:906-907` invokes `remove_channel(cid)` on `ConnectResult{success:true}`. After a successful CREATE_CHAN, `state.resolved` is empty for that cid, so a late SEARCH reply (UDP retransmit, second IOC's reply arriving after the handshake) falls through both arms at `1118`/`1154` silently — no diagnostic, no metric.
-
-C reference: `cac.cpp:621-641` `transferChanToVirtCircuit` reads the channel's current circuit address via `pChan->getPIIU(guard)->getNetworkAddress(guard)`; while the channel is connected, every late SEARCH reply from a different server fires `msgForMultiplyDefinedPV`. The detection window extends until the `nciu` is destroyed, not until first CREATE_CHAN ack.
-
-Impact: The operationally important case — two IOCs both serving PV X, the slower IOC's reply arriving seconds after the faster one's circuit is up — is silenced by R2-43's design. Diagnostic only fires in the narrow Found→ConnectResult window (typically a single RTT).
-
-### R2-67: Multiply-defined diagnostic not delivered via `ECA_DBLCHNL` exception event
-
-Severity: Medium
-
-Rust: `client/search.rs:1163-1173` — emits `tracing::warn!` and `metrics::counter!("ca_client_multiply_defined_pv_total")` only. The CA-context exception handler installed via `CaClient::set_exception_handler` (`mod.rs:712`, documented analog of `ca_add_exception_event`) is not invoked.
-
-C reference: `cac.cpp:1314-1331` `pvMultiplyDefinedNotify` formats `"Channel: \"%.64s\", Connecting to: %.64s, Ignored: %.64s"` and dispatches via `this->exception(... ECA_DBLCHNL, buf, __FILE__, __LINE__)` to every registered `ca_add_exception_event` callback. `ECA_DBLCHNL` is defined in Rust at `protocol.rs:102`.
-
-Impact: Library users that rely on the exception-handler API for operator alerting never see this condition — only a log line in a process that may not have the search target at warn level, and a metric requiring a scraper.
-
-### R2-68: Penalty / circuit-breaker gates suppress duplicate-detection for flaky duplicates
-
-Severity: Low
-
-Rust: `client/search.rs:1078-1108` — penalty-box and `state.breakers.is_blocking(server_addr)` `continue` past the cid-lookup branches before either `state.pending` or `state.resolved` is consulted.
-
-C reference: `cac.cpp:591-661` `transferChanToVirtCircuit` performs the multiply-defined check unconditionally on every incoming SEARCH reply for a known cid; libca has no per-server penalty/breaker filter on the receive path.
-
-Impact: If duplicate server B is currently penalized or breaker-open, its SEARCH reply is discarded silently and the user never learns the PV is multiply-defined — exactly when the diagnostic is most valuable.
-
-### R2-69: `last_valid_seq.is_none()` gate suppresses duplicate-detection on VERSION-less UDP
-
-Severity: Low
-
-Rust: `client/search.rs:1110-1116` — `if state.last_valid_seq.is_none() { continue }` runs before the `pending`/`resolved` branches. UDP datagrams containing a SEARCH reply without a preceding VERSION skip the whole CA_PROTO_SEARCH body, including the new R2-43 duplicate-detection arm.
-
-C reference: `cac.cpp:591-661` `transferChanToVirtCircuit` is called from `udpiiu::searchRespAction:728-737` with no seq-number gating between the two; the VERSION-seq freshness check does not short-circuit the multiply-defined emit.
-
-Impact: A server responding with SEARCH-only datagrams (non-conformant but observed) that is the second resolver for a PV won't trigger the warn.
-
 ### R2-74: Multicast responder errors are silently swallowed; only the first per-intf result propagates
 
 Severity: Medium
@@ -1112,6 +1052,73 @@ default plus `attemptNumber & 1` source toggle exists only for pre-3.12
 (1998-era) C repeater compatibility, which no longer ships. Modern
 repeaters accept the 16-byte shape. Divergence in emitted shape only,
 no functional impact on any supported deployment.
+
+### R2-64: pending_access cap-hit now warns once per circuit
+
+`client/transport.rs::read_loop` adds a `cap_warned` boolean and
+fires one `tracing::warn!` (with the `epics_ca_rs::client::transport`
+target) the first time `PENDING_ACCESS_CAP` is exceeded; subsequent
+evictions stay silent but the `ca_client_pending_access_evictions_total`
+metric continues to climb. Operators see the misbehaving-server
+signal at warn level instead of needing to scrape Prometheus.
+
+### R2-65: AccessRightsChanged event gated on known cid
+
+`client/transport.rs::read_loop` now tracks a `known_cids:
+HashSet<u32>` populated on CREATE_CHAN reply (and cleared on
+SERVER_DISCONN). An ACCESS_RIGHTS frame for a known cid is a
+post-create ACF update and fires `TransportEvent::AccessRightsChanged`
+directly. An ACCESS_RIGHTS frame for an unknown cid is stashed (and
+later consumed by the matching CREATE_CHAN, which carries the
+access via `ChannelCreated`) but no spurious event is emitted.
+Under R2-42 stray-frame stress the unbounded `event_tx` no longer
+carries one message per stray frame.
+
+### R2-66: Multiply-defined detection window extends to connected-channel lifetime
+
+`client/search.rs::ConnectResult{success:true}` no longer calls
+`remove_channel(cid)` (which dropped the `resolved` entry); it now
+takes `cid` out of `pending`/`buckets`/`attempts` directly and
+calls the new `mark_connected` helper, leaving `resolved` intact.
+The map is only cleared on `Cancel` / channel-drop. A late SEARCH
+reply from a second IOC announcing the same PV — arriving seconds
+after the connect handshake completed — now fires the duplicate-
+detect path, matching libca `cac.cpp:621-641`'s connected-lifetime
+detection window.
+
+### R2-67: ECA_DBLCHNL delivered via the exception handler
+
+`client/types.rs` `SearchResponse::MultiplyDefined { pv_name,
+prev_addr, new_addr }` carries the duplicate-detection event to
+the coordinator (`client/mod.rs`), which calls
+`types::dispatch_exception` with `kind=ServerError`,
+`status=ECA_DBLCHNL`, and a libca-shape message `"Channel: \"<pv>\",
+Connecting to: <prev>, Ignored: <new>"`. Library users that
+registered `CaClient::set_exception_handler` (the documented analog
+of `ca_add_exception_event`) now see the condition — matching
+libca's `pvMultiplyDefinedNotify` → `this->exception(...
+ECA_DBLCHNL, ...)` path.
+
+### R2-68: Duplicate-detect lifted above penalty / circuit-breaker gates
+
+`client/search.rs::handle_search_response` moves the
+`state.resolved.get(&cid)` duplicate-check branch ABOVE the
+penalty-box and `state.breakers.is_blocking(server_addr)` filters.
+Emit does not consume any reply state, so firing on a
+penalized/breaker-open server's reply is safe. A flaky duplicate
+server's SEARCH reply now triggers the multiply-defined warn even
+when we then decline to attempt connect — matching libca's
+unconditional duplicate-detect.
+
+### R2-69: Duplicate-detect lifted above the `last_valid_seq` gate
+
+Same restructuring as R2-68: the duplicate-detect branch runs
+before the `if state.last_valid_seq.is_none() { continue }` stale-
+datagram gate. A SEARCH-only datagram (no preceding VERSION;
+non-conformant but observed on older fan-outs) now triggers the
+warn for a duplicate server. Matches libca
+`cac.cpp::transferChanToVirtCircuit` which has no seq-number gate
+between datagram receipt and the multiply-defined emit.
 
 ### R2-61: AUTO_BEACON expansion now honours `EPICS_CAS_INTF_ADDR_LIST` filter
 

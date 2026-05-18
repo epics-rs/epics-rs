@@ -267,16 +267,19 @@ struct SearchEngineState {
     /// for O(1) lookup; updated only at engine start (env changes
     /// mid-run are not picked up to keep the hot path lock-free).
     ignored_servers: std::collections::HashSet<Ipv4Addr>,
-    /// R2-43 (partial): recently-resolved searches kept for a short
-    /// TTL so a *second* SEARCH reply for the same cid (announcing a
-    /// different server) can be diagnosed as "multiply-defined PV".
-    /// libca `cac.cpp::transferChanToVirtCircuit` runs an async DNS
-    /// lookup and emits the canonical
-    /// `Channel: <PV> connected to: <X> but searched on: <Y>`
-    /// diagnostic. Rust emits the IP-only variant — no async DNS to
-    /// avoid pulling a resolver into the search hot path. Entry is
-    /// FIFO-evicted at `MULTIPLY_DEFINED_RESOLVED_CAP` to bound
-    /// memory and removed on `remove_channel`.
+    /// R2-43 (partial) + R2-66: per-cid resolved-server tracker for
+    /// multiply-defined-PV detection. libca
+    /// `cac.cpp::transferChanToVirtCircuit` (lines 591-661) consults
+    /// the channel's currently-resolved circuit address on EVERY
+    /// SEARCH reply for a known cid — the detection window extends
+    /// until the `nciu` is destroyed (Cancel / channel drop), not
+    /// just until first CREATE_CHAN ack. Pre-R2-66 Rust cleared this
+    /// map on `remove_channel` which fired from `ConnectResult{
+    /// success:true}` too, closing the detection window at the very
+    /// moment the duplicate-detect was most useful (a slower second
+    /// IOC replying after the connect handshake completed). Now
+    /// `Cancel`-only clears. Bounded at
+    /// `MULTIPLY_DEFINED_RESOLVED_CAP` to cap memory.
     resolved: HashMap<u32, (String, SocketAddr)>,
 }
 
@@ -305,15 +308,33 @@ impl SearchEngineState {
         }
     }
 
-    /// Remove a channel entirely.
+    /// Remove a channel entirely (Cancel, channel drop).
     fn remove_channel(&mut self, cid: u32) {
         if let Some(p) = self.pending.remove(&cid) {
             self.buckets[p.bucket].retain(|x| *x != cid);
         }
         self.attempts.remove(&cid);
-        // R2-43: drop the multiply-defined tracker — a new CREATE_CHAN
-        // for the same cid is a fresh resolution lifecycle.
+        // R2-66: drop the multiply-defined tracker only on Cancel /
+        // channel destruction. A new CREATE_CHAN for the same cid
+        // (which only happens via reuse after cancel) is a fresh
+        // lifecycle. NOT cleared on `ConnectResult{success:true}`
+        // alone — that path now calls `mark_connected` instead so
+        // the duplicate-detect window stays open for the channel's
+        // connected lifetime (matches libca
+        // `cac.cpp:621-641`).
         self.resolved.remove(&cid);
+    }
+
+    /// R2-66: bookkeeping hook called on connect-success (the cid
+    /// stays in `resolved` so post-handshake duplicate SEARCH replies
+    /// from a *different* server still fire the multiply-defined
+    /// diagnostic, matching libca's connected-lifetime detection
+    /// window).
+    fn mark_connected(&mut self, _cid: u32) {
+        // Intentionally a no-op today — the `resolved` entry is
+        // already kept past Found. The helper exists so the
+        // coordinator's `ConnectResult{success:true}` path can
+        // declare intent (vs. silently calling `remove_channel`).
     }
 
     /// pvxs `client.cpp:713 poke()` parity: reset every pending
@@ -904,7 +925,19 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
             server_addr,
         } => {
             if success {
-                state.remove_channel(cid);
+                // R2-66: take this cid out of the *search* state
+                // (pending, buckets, attempts) but KEEP the
+                // multiply-defined `resolved` entry so a late SEARCH
+                // reply from a second IOC announcing the same PV
+                // still triggers ECA_DBLCHNL. libca
+                // `cac.cpp:621-641` runs the duplicate-detect for
+                // the connected-channel lifetime, not just until
+                // first CREATE_CHAN ack.
+                if let Some(p) = state.pending.remove(&cid) {
+                    state.buckets[p.bucket].retain(|x| *x != cid);
+                }
+                state.attempts.remove(&cid);
+                state.mark_connected(cid);
                 state.penalty.remove(&server_addr);
                 state.breakers.record_success(server_addr);
             } else {
@@ -1075,6 +1108,48 @@ fn handle_search_response(
                     }
                 }
 
+                // R2-68, R2-69: multiply-defined-PV detection runs
+                // BEFORE the penalty / breaker / `last_valid_seq`
+                // gates. libca `cac.cpp:591-661` runs this check on
+                // every SEARCH reply for a known cid with no per-
+                // server filtering and no seq-number gating between.
+                // Pre-fix Rust put the duplicate-detect after those
+                // gates, so a flaky/penalized duplicate server's
+                // reply was silently discarded — exactly when the
+                // diagnostic is most operationally valuable. Emit
+                // does not consume any reply state, so it is safe to
+                // fire even on stale/penalized datagrams. Note:
+                // resolved entries live past `ConnectResult{success}`
+                // for the channel's connected lifetime (R2-66).
+                if let Some((pv_name, prev_addr)) = state.resolved.get(&cid) {
+                    if *prev_addr != server_addr {
+                        let pv_name = pv_name.clone();
+                        let prev_addr = *prev_addr;
+                        tracing::warn!(
+                            target: "epics_ca_rs::client::search",
+                            pv = %pv_name,
+                            cid,
+                            connected_to = %prev_addr,
+                            but_also_on = %server_addr,
+                            "Channel multiply defined: PV is also hosted on a second server"
+                        );
+                        metrics::counter!("ca_client_multiply_defined_pv_total").increment(1);
+                        // R2-67: dispatch ECA_DBLCHNL via the
+                        // exception-handler path so library users
+                        // who registered a `set_exception_handler`
+                        // (the documented analog of libca
+                        // `ca_add_exception_event`) see this
+                        // condition. The coordinator translates the
+                        // SearchResponse into a CaException of kind
+                        // ServerError with status=ECA_DBLCHNL.
+                        let _ = response_tx.send(SearchResponse::MultiplyDefined {
+                            pv_name,
+                            prev_addr,
+                            new_addr: server_addr,
+                        });
+                    }
+                }
+
                 // Check penalty box — skip penalized servers so the channel
                 // can potentially find a non-penalized one.
                 let penalized = state
@@ -1151,27 +1226,10 @@ fn handle_search_response(
                     }
                     state.resolved.insert(cid, (pv_name, server_addr));
                     let _ = response_tx.send(SearchResponse::Found { cid, server_addr });
-                } else if let Some((pv_name, prev_addr)) = state.resolved.get(&cid) {
-                    // R2-43: cid already resolved. If the second reply
-                    // names a different server, this is the
-                    // libca `msgForMultiplyDefinedPV` condition — the
-                    // same PV is hosted on two IOCs and silent races
-                    // would otherwise surface as intermittent data
-                    // corruption. Emit a canonical-shape diagnostic
-                    // (IP-only; no async DNS lookup — see
-                    // `SearchEngineState::resolved` docstring).
-                    if *prev_addr != server_addr {
-                        tracing::warn!(
-                            target: "epics_ca_rs::client::search",
-                            pv = %pv_name,
-                            cid,
-                            connected_to = %prev_addr,
-                            but_also_on = %server_addr,
-                            "Channel multiply defined: PV is also hosted on a second server"
-                        );
-                        metrics::counter!("ca_client_multiply_defined_pv_total").increment(1);
-                    }
                 }
+                // R2-43 duplicate-detect was here; moved above the
+                // penalty / breaker / `last_valid_seq` gates per
+                // R2-68 / R2-69.
             }
             CA_PROTO_NOT_FOUND => {
                 // Server explicitly told us the PV is not on it. We don't

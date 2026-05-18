@@ -665,6 +665,246 @@ C reference: `ca/src/client/cac.cpp:186-194` `envGetDoubleConfigParam`, then `if
 
 Impact: `EPICS_CA_CONN_TMO=0.5` gets 0.5 on C, 1 on Rust. `=0` (operator sentinel for "use default") gets 30 on C but 1 on Rust — Rust pumps ECHO every second on every circuit, multiplying inbound TCP load on each server 30×.
 
+### R2-64: AccessRights stash cap-hit emits a metric only — no warn, no exception event
+
+Severity: Medium
+
+Rust: `client/transport.rs:1295-1308` — when `pending_access.len() >= PENDING_ACCESS_CAP`, an entry is evicted and `ca_client_pending_access_evictions_total` is incremented; no `tracing::warn!` is emitted and no exception is delivered to the per-client exception handler.
+
+C reference: `cac.cpp:1121-1136` `accessRightsRespAction` keeps no per-circuit state at all (silent return on unknown cid), so the "cap" condition cannot exist in C. The Rust R2-42 fix introduces a new failure mode (stash overflow) but signals it only through a metric most operators do not scrape on an interactive incident.
+
+Impact: A hostile/buggy server flooding ACCESS_RIGHTS for unknown cids silently churns the stash under load; the user-facing channel and the `set_exception_handler` callback (documented analog of `ca_add_exception_event`) see nothing.
+
+### R2-65: `AccessRightsChanged` event emitted for cids the channel table will not match
+
+Severity: Low
+
+Rust: `client/transport.rs:1309-1313` — `pending_access.insert(hdr.cid, access)` is unconditionally followed by `event_tx.send(TransportEvent::AccessRightsChanged { cid, access })` regardless of whether `cid` will ever be claimed by `CREATE_CHAN`. The coordinator at `mod.rs:2963-2974` filters with `channels.get_mut(&cid)` so no observer event escapes, but the mpsc traffic + per-event metric infrastructure is spent.
+
+C reference: `cac.cpp:1121-1136` only calls `pChan->accessRightsStateChange` after a successful `chanTable.lookup(hdr.m_cid)`; unknown cid produces no internal notification.
+
+Impact: Under R2-42 stress (server emitting ACCESS_RIGHTS for cids the client never created), the unbounded `event_tx` loads one message per stray frame; combined with R2-42's post-cap eviction, the event rate equals the stray-frame rate.
+
+### R2-66: `resolved` cleared on connect-success drops the connected-lifetime duplicate detection
+
+Severity: Medium
+
+Rust: `client/search.rs:309-317` — `remove_channel` always clears `self.resolved.remove(&cid)`. `search.rs:906-907` invokes `remove_channel(cid)` on `ConnectResult{success:true}`. After a successful CREATE_CHAN, `state.resolved` is empty for that cid, so a late SEARCH reply (UDP retransmit, second IOC's reply arriving after the handshake) falls through both arms at `1118`/`1154` silently — no diagnostic, no metric.
+
+C reference: `cac.cpp:621-641` `transferChanToVirtCircuit` reads the channel's current circuit address via `pChan->getPIIU(guard)->getNetworkAddress(guard)`; while the channel is connected, every late SEARCH reply from a different server fires `msgForMultiplyDefinedPV`. The detection window extends until the `nciu` is destroyed, not until first CREATE_CHAN ack.
+
+Impact: The operationally important case — two IOCs both serving PV X, the slower IOC's reply arriving seconds after the faster one's circuit is up — is silenced by R2-43's design. Diagnostic only fires in the narrow Found→ConnectResult window (typically a single RTT).
+
+### R2-67: Multiply-defined diagnostic not delivered via `ECA_DBLCHNL` exception event
+
+Severity: Medium
+
+Rust: `client/search.rs:1163-1173` — emits `tracing::warn!` and `metrics::counter!("ca_client_multiply_defined_pv_total")` only. The CA-context exception handler installed via `CaClient::set_exception_handler` (`mod.rs:712`, documented analog of `ca_add_exception_event`) is not invoked.
+
+C reference: `cac.cpp:1314-1331` `pvMultiplyDefinedNotify` formats `"Channel: \"%.64s\", Connecting to: %.64s, Ignored: %.64s"` and dispatches via `this->exception(... ECA_DBLCHNL, buf, __FILE__, __LINE__)` to every registered `ca_add_exception_event` callback. `ECA_DBLCHNL` is defined in Rust at `protocol.rs:102`.
+
+Impact: Library users that rely on the exception-handler API for operator alerting never see this condition — only a log line in a process that may not have the search target at warn level, and a metric requiring a scraper.
+
+### R2-68: Penalty / circuit-breaker gates suppress duplicate-detection for flaky duplicates
+
+Severity: Low
+
+Rust: `client/search.rs:1078-1108` — penalty-box and `state.breakers.is_blocking(server_addr)` `continue` past the cid-lookup branches before either `state.pending` or `state.resolved` is consulted.
+
+C reference: `cac.cpp:591-661` `transferChanToVirtCircuit` performs the multiply-defined check unconditionally on every incoming SEARCH reply for a known cid; libca has no per-server penalty/breaker filter on the receive path.
+
+Impact: If duplicate server B is currently penalized or breaker-open, its SEARCH reply is discarded silently and the user never learns the PV is multiply-defined — exactly when the diagnostic is most valuable.
+
+### R2-69: `last_valid_seq.is_none()` gate suppresses duplicate-detection on VERSION-less UDP
+
+Severity: Low
+
+Rust: `client/search.rs:1110-1116` — `if state.last_valid_seq.is_none() { continue }` runs before the `pending`/`resolved` branches. UDP datagrams containing a SEARCH reply without a preceding VERSION skip the whole CA_PROTO_SEARCH body, including the new R2-43 duplicate-detection arm.
+
+C reference: `cac.cpp:591-661` `transferChanToVirtCircuit` is called from `udpiiu::searchRespAction:728-737` with no seq-number gating between the two; the VERSION-seq freshness check does not short-circuit the multiply-defined emit.
+
+Impact: A server responding with SEARCH-only datagrams (non-conformant but observed) that is the second resolver for a PV won't trigger the warn.
+
+### R2-74: Multicast responder errors are silently swallowed; only the first per-intf result propagates
+
+Severity: Medium
+
+Rust: `server/udp.rs:71-87` — `run_udp_search_responder` awaits ONLY `handles_iter.next()` (the first interface responder) and unconditionally `.abort()`s every remaining handle, including all `run_multicast_responder` handles pushed after the per-interface ones. A `run_multicast_responder` returning `Err(...)` because `any_joined == false` is dropped on the floor.
+
+C reference: `caservertask.c:633-668` calls `setsockopt(IP_ADD_MEMBERSHIP, ...)` inline during `rsrv_init`, and on failure calls `errlogPrintf("CAS: Socket mcast join %s to %s failed: %s\n", ...)`. The error is surfaced per-(interface,group) pair, every time.
+
+Impact: Operator configures `EPICS_CAS_INTF_ADDR_LIST="239.10.0.1"` on a host whose interfaces all reject IP_ADD_MEMBERSHIP. Server boots successfully, logs only the per-intf `tracing::warn!`, and PVs are invisible to multicast SEARCH.
+
+### R2-75: Multicast SEARCH replies use kernel-chosen source IP; C uses the per-interface bound socket's IP
+
+Severity: Medium
+
+Rust: `server/udp.rs:219-252` — `run_multicast_responder` binds a single wildcard `0.0.0.0:port` socket and joins the group on every supplied interface. On reply (`socket.send_to(reply, src)`), the kernel selects the outbound interface + source IP via routing, with no `IP_MULTICAST_IF` or per-NIC binding.
+
+C reference: `caservertask.c:621-668` creates one socket per `casIntfAddrList` entry, binds it to `conf->udpAddr.ia.sin_addr`, and joins each group with `imr_interface = conf->udpAddr.ia.sin_addr.s_addr`. Replies source from the bound interface IP deterministically.
+
+Impact: Multi-homed IOC: C reply carries a specific NIC's IP as source; Rust reply may carry a different NIC's. Clients matching `SEARCH_REPLY` source against the `EPICS_CA_ADDR_LIST` entry that sent the SEARCH (R2-26 surface) dedup inconsistently; per-NIC firewall rules see different traffic.
+
+### R2-76: AUTO_BEACON mixed `0.0.0.0`+specific misconfig escapes detection when `EPICS_CAS_AUTO_BEACON_ADDR_LIST=NO`
+
+Severity: High
+
+Rust: `server/addr_list.rs:137-162` — the warning for `intf_has_wildcard && !intf_specific.is_empty()` is nested inside `if auto_on { ... }`. With `EPICS_CAS_AUTO_BEACON_ADDR_LIST=NO` the block is skipped and the operator gets neither warning nor abort.
+
+C reference: `caservertask.c:390-392` — `cantProceed("CAS interface address list can not contain 0.0.0.0 and other interface addresses.\n")` is OUTSIDE the `if(!doautobeacon) continue;` check. IOC aborts at startup regardless of `autobeaconlist`. `cantProceed` is fatal (libcom kills the process), not `errlogPrintf`.
+
+Impact: Operator sets `EPICS_CAS_INTF_ADDR_LIST="0.0.0.0 10.0.0.5" EPICS_CAS_AUTO_BEACON_ADDR_LIST=NO`. C IOC refuses to start; Rust IOC starts silently with the misconfig.
+
+### R2-77: AUTO_BEACON expansion drops point-to-point interfaces C populates via `ifa_dstaddr`
+
+Severity: Medium
+
+Rust: `server/addr_list.rs:328-350` — `broadcast_for_ip` only consults `if_addrs::IfAddr::V4 { broadcast, .. }`. For `IFF_POINTOPOINT` interfaces (VPN tun, PPP, WireGuard) the `broadcast` field is `None` and the helper returns `None`. The R2-61 filter then drops the interface from `bcast_iter` entirely.
+
+C reference: `osdNetIfAddrs.c:130-151` — `osiSockDiscoverBroadcastAddresses` checks `IFF_BROADCAST` first, then `IFF_POINTOPOINT`, substituting `ifa->ifa_dstaddr` so beacons go to the remote tunnel endpoint.
+
+Impact: IOC reachable to a remote subnet only via a VPN tun, configured with `EPICS_CAS_INTF_ADDR_LIST="<tun-ip>"`, emits no beacons toward the tunnel peer. C IOC sends beacons to the tunnel's `dstaddr`.
+
+### R2-78: `IP_MULTICAST_LOOP=1` not set on the beacon-sending socket
+
+Severity: Low
+
+Rust: `server/beacon.rs:41-47` — beacon sender socket sets `set_broadcast(true)` and `set_multicast_ttl_v4(...)`, but never `set_multicast_loop_v4(true)`.
+
+C reference: `caservertask.c:307-318` — `rsrv_init` explicitly `setsockopt(beaconSocket, IPPROTO_IP, IP_MULTICAST_LOOP, &flag=1, ...)` on the beacon socket. Linux default happens to match, but non-Linux and Linux kernels with site policy disabling default loop diverge.
+
+Impact: For a beacon group fan-out where the IOC runs a local CA repeater or a co-located client subscribed to multicast beacons (self-test), loopback delivery depends on platform default rather than the explicit-1 C contract.
+
+### R2-79: UDP SEARCH-reply batch flushes per-inbound; C batches across inbounds until recv queue drains
+
+Severity: Medium
+
+Rust: `server/udp.rs:545-550` — at end-of-inbound, `if !send_buf.is_empty() { socket.send_to(&send_buf, src).await }` then drops `send_buf` (new Vec each outer iteration). No `FIONREAD`/peek to defer flush when more inbound is queued.
+
+C reference: `cast_server.c:266-281` — recv loop calls `socket_ioctl(recv_sock, FIONREAD, &nchars)` after each `camessage()` and ONLY flushes via `cas_send_dg_msg(client)` when `nchars == 0`. Peer-change detection at `205-215` flushes early on src change. C accumulates SEARCH replies across multiple inbound datagrams from the same client into ONE outbound until the recv queue drains.
+
+Impact: Client search storm of 10 datagrams × 5 PVs gets 10 reply datagrams from Rust vs (typically) 1-2 from C. R2-48 only achieved within-datagram amortization; the bulk of search-storm reduction is the cross-datagram path.
+
+### R2-80: VERSION placeholder skipped when SEARCH precedes VERSION inside the same inbound datagram
+
+Severity: Medium
+
+Rust: `server/udp.rs:502-529` — `include_version = client_seq.is_some()` evaluated at each SEARCH match. Prepend VERSION only on FIRST append. If first match arrives BEFORE a `CA_PROTO_VERSION` header (legal chained inbound), `client_seq.is_none()` → no VERSION prepended → send_buf non-empty → subsequent VERSION-after-SEARCH never inserts placeholder. Datagram flushes without VERSION.
+
+C reference: `cast_server.c:154-156` calls `rsrv_version_reply(client)` BEFORE entering the loop, seeding VERSION at byte 0. `cas_send_dg_msg` re-seeds after every flush. Placeholder always present; `cas_send_dg_msg:185-201` decides at send time whether to strip, gated on `CA_V411(pclient->minor_version_number)` which is set in `udp_version_action:2096` whenever the inbound carries VERSION at any position.
+
+Impact: V4.13 client with SEARCH-then-VERSION chained inbound (legal) gets a Rust reply with no VERSION header — cannot bind seqNoOfReq to discard stale replies; every reply passes the freshness check unconditionally.
+
+### R2-81: Silent `send_to` failure on batched reply drops all N replies, not one
+
+Severity: Medium
+
+Rust: `server/udp.rs:522, 549` — both flush sites use `let _ = socket.send_to(&send_buf, src).await;`, discarding the result. Pre-R2-48 code dropped one reply on failure; batched code drops the whole batch.
+
+C reference: `caserverio.c:214-222` — `cas_send_dg_msg` on negative `sendto` calls `errlogPrintf("CAS: UDP send to %s failed: %s\n", ...)`. C logs every drop.
+
+Impact: Under EMFILE/ENOBUFS pressure during a search storm (R2-48's target scenario), operator gets no signal. Diagnostic regression — batching enlarged the blast radius per failed send.
+
+### R2-82: `UDP_FLUSH_THRESHOLD = 1472` exceeds C's `MAX_UDP_SEND = 1024`
+
+Severity: Low
+
+Rust: `server/udp.rs:334` — `const UDP_FLUSH_THRESHOLD: usize = 1472;` (IPv4 Ethernet payload max).
+
+C reference: `caProto.h:66` — `#define MAX_UDP_SEND 1024u`. `client->send.maxstk = MAX_UDP_SEND`; `cas_copy_in_header` calls `cas_send_dg_msg` when next message would push `stk > maxstk`. C never builds a UDP datagram larger than ~1024 bytes.
+
+Impact: Third-party CA implementations (Java CAJ, asyncio-ca, embedded) may assume the 1024-byte contract and truncate larger replies. libca peers unaffected (`recvBuf[MAX_UDP_RECV]`).
+
+### R2-83: Multicast responder's wildcard socket also receives unicast/broadcast — duplicate replies
+
+Severity: Low
+
+Rust: `server/udp.rs:227` — `run_multicast_responder` calls `bind_responder_socket(Ipv4Addr::UNSPECIFIED, port)`. After joining groups, this socket also receives broadcast/unicast SEARCHes targeting local interfaces (`IP_MULTICAST_ALL=0` only filters multicast). Result: SEARCH to specific interface gets handled by both the unicast responder AND the wildcard-bound mcast responder.
+
+C reference: C creates a SEPARATE socket for multicast joins (`conf->udp` bound to specific interface IP). Wildcard recv socket and per-interface mcast-joining socket have non-overlapping recv scopes.
+
+Impact: Multi-NIC+mcast configs: TWO `send_to(reply, src)` outbound per SEARCH. C fires once.
+
+### R2-84: WRITE_NOTIFY AfterWrite fires before async record completion
+
+Severity: High
+
+Rust: `server/tcp.rs:2551-2590` — for `ChannelTarget::RecordField`, `db.put_record_field_from_ca` returns `Ok(Some(rx))` synchronously when an async record starts processing. `dispatch_trap_write` fires `AfterWrite { status: Some("ok") }` at `2577-2590` before `rx.await` resolves at `2655`. The actual completion is delivered later via the background WRITE_NOTIFY task.
+
+C reference: `rsrv/camessage.c:1745-1752` captures `asWritePvt` from `asTrapWriteWithData` (Before fires here), then dispatches `dbProcessNotify`. Matching `asTrapWriteAfter(asWritePvtTmp)` lives in `write_notify_reply:1400`, executing only from the extra-labor task after `dbProcessNotify` invokes `write_notify_done_callback`. C's Before→After span covers the entire async round trip and the AfterWrite status reflects the real `ppnb->dbPutNotify.status`.
+
+Impact: caPutLog and put-loggers record every WRITE_NOTIFY on an async record as "completed=ok" the moment `dbProcessNotify` was kicked off — never observing real outcome. AfterWrite latency = 0 instead of actual device-side duration; genuine PUTFAIL logged as "ok".
+
+### R2-85: TrapWriteMessage drops C's `dbrType`, `no_elements`, raw `data`, and `userPvt` continuation slot
+
+Severity: Medium
+
+Rust: `access_security.rs:602-621` — `TrapWriteMessage` carries `pv_name`, `user`, `host`, `peer`, `value_str` (pre-rendered, truncated to 64 chars), `status`, `rule_was_trap`. No `dbrType`, no `no_elements`, no raw `data`, and no per-event `userPvt` for listeners to stash state across Before/After.
+
+C reference: `libcom/src/as/asTrapWrite.h:34-56` `asTrapWriteMessage` exposes `dbrType`, `no_elements`, `data`, `serverSpecific` (the dbChannel pointer), and `userPvt` — explicitly documented at `:45-51` as "When the listener is called before the write, this has the value 0. The listener can give it any value it desires and it will have the same value when the listener gets called again after the write." `asTrapWrite.c:144-147` initialises `userPvt=0` in Before, snapshots whatever the listener wrote, restores it in After.
+
+Impact: Port of caPutLog or any logger that times the put or wants old-vs-new dual values cannot work — no way to stash start-time in Before and read in After; no array-length/dbrType for richer audit lines.
+
+### R2-86: Listener panic propagates out of dispatch_trap_write and kills the per-connection task
+
+Severity: Medium
+
+Rust: `access_security.rs:660-672` — `dispatch_trap_write` calls `listener(msg)` directly with no `catch_unwind`. Call sites in `tcp.rs:2536-2549` / `:2577-2590` run on the per-circuit `handle_client` task. A panic unwinds dispatch_message → handle_client; the connection (and every subscription on it) is dropped.
+
+C reference: `libcom/src/as/asTrapWrite.c:135-151` invokes `plistener->func(...)` under `pasTrapWritePvt->lock`. C has no unwind concept; a panicking listener brings the whole IOC down uniformly.
+
+Impact: A buggy listener terminates exactly one CA connection. Symptom: "client randomly disconnects mid-session" with no audit trail. Remaining listeners for that BeforeWrite never fire; paired AfterWrite never dispatched.
+
+### R2-87: dispatch_trap_write deadlocks if a listener registers or drops a TrapWriteListenerHandle
+
+Severity: Medium
+
+Rust: `access_security.rs:660-672` holds `reg.read()` (`std::sync::RwLock` reader) for the entire iteration. If the listener calls `register_trap_write_listener` (acquires `reg.write()` at `:638-645`) or drops a handle (acquires `reg.write()` in Drop at `:618-623`), same thread requests writer while holding reader. `std::sync::RwLock` is not re-entrant → hard deadlock on POSIX.
+
+C reference: `asTrapWrite.c:135-151` invokes listener while `pasTrapWritePvt->lock` held; register/unregister `epicsMutexMustLock` same mutex. `epicsMutex` on POSIX uses `PTHREAD_MUTEX_RECURSIVE`; re-entry safe.
+
+Impact: Listener that auto-rotates registration, or any test harness that drops a handle from inside a callback, deadlocks the connection. No timeout — task stuck until OS tears the socket down.
+
+### R2-88: ASG forwarder task leaks per server restart and ASG event delivery never quiesces
+
+Severity: Medium
+
+Rust: `server/tcp.rs:602-626` — ASG → acf_reload forwarder is `tokio::spawn(async move { loop { match asg_rx.recv().await { ... } } })`; the `JoinHandle` is dropped (not on `accept_tasks` or any abort handle). Receiver loop only exits on `RecvError::Closed`, which only fires when the global `ASG_CHANGE_BROADCAST` Sender drops — but that Sender lives in a process-lifetime `OnceLock` static. When `run_tcp_listener` is cancelled, forwarder keeps running, holding its `acf_reload_tx_t` clone. A subsequent `run_tcp_listener` spawns *another* forwarder; every ASG put fans out into N stale `acf_reload_tx` clones whose receivers are gone.
+
+C reference: `asInitCommon:144` registers SPC_AS callback exactly once via `dbSpcAsRegisterCallback`, `epicsThreadOnce`-guarded. C has no "restart rsrv listener" operation.
+
+Impact: Long-running processes with intentional restart cycles (test fixtures, fault-tolerant supervisors, in-process gateway with reconfiguration) accumulate one zombie forwarder per restart. Each ASG put wakes N tasks; memory grows.
+
+### R2-89: Listener registry holds std::sync::RwLock::write inside Drop on a tokio worker
+
+Severity: Low
+
+Rust: `access_security.rs:618-623` — `Drop for TrapWriteListenerHandle` calls `reg.write()`, blocking OS primitive. Handle is `Send` so owned by tokio tasks; Drop runs on whatever worker schedules the future. Register-Drop racing dispatch reader on a different worker blocks the worker for the dispatch duration — and dispatch holds the reader for the entire `listener(msg)` chain (unbounded per the doc).
+
+C reference: `asTrapWrite.c:87-111` `asTrapWriteUnregisterListener` `epicsMutexMustLock`s on a single-process-IOC thread; blocking acceptable.
+
+Impact: Worker stuck waiting for writer cannot progress other futures. With `worker_threads=1`, runtime stalls until dispatch completes. Symptom: "test occasionally hangs".
+
+### R2-90: BeforeWrite fires for write_hook rejections that C would never have logged
+
+Severity: Low
+
+Rust: `server/tcp.rs:2536-2569` — BeforeWrite dispatched unconditionally before `entry.target` matches and `write_result` is computed. For `ChannelTarget::SimplePv`, a registered `write_hook` may reject; the put never reaches storage but BeforeWrite has already been logged. AfterWrite at `:2577` fires with `status=Some("fail")`. Same pattern for any `put_record_field_from_ca` error from `instance.record.put_field` (SPC_NOMOD, type-coerce rejection).
+
+C reference: `rsrv/camessage.c:741-779` — `rsrvCheckPut` is the only gate before `asTrapWriteWithData`; non-AS rejections (`caNetConvert` type mismatch at `:753-766`) return RSRV_ERROR before reaching `:768`. Once `asTrapWriteWithData` fires, `dbChannel_put` runs unconditionally and `asTrapWriteAfter:779` always follows.
+
+Impact: caPutLog-faithful consumers expect "Before always paired with an attempt that reached storage". Rust generates Before + After=fail pairs for write-hook-rejected puts that C silently drops.
+
+### R2-91: `put_pv` / `put_pv_no_process` bypass the ASG-field notifier
+
+Severity: Low
+
+Rust: `database/field_io.rs:53-150` `put_pv` and `:683-...` `put_pv_no_process` both write via `instance.put_common_field(&field, value)`, which at `record_instance.rs:925-929` handles `"ASG"` by assigning `self.common.asg = s`. Neither path contains the `if field == "ASG" { notify_asg_field_changed() }` block added to `put_record_field_from_ca:559-561`. Callers include gateway shadow PV writes, IOCsh sequencer scripts, autosave-style restore on startup, internal admin tools.
+
+C reference: `dbAccess.c:113-145` `dbPutSpecial` invoked from `dbPut` (lowest-level put primitive) for every field whose `paddr->special == SPC_AS`, regardless of caller entry path. SPC_AS callback chain fires for any put to `.ASG` including restore/admin paths.
+
+Impact: Restore script writing `.ASG` at IOC startup via `put_pv` (autosave parity), or gateway mirroring `.ASG` via `put_pv_and_post`, mutates `common.asg` without firing the re-eval notifier. Live CA clients see stale cached access-level until next ACF reload, CLIENT_NAME, or asg-field write via `put_record_field_from_ca`. Exact mirror of the bug R2-54 just fixed for the CA-write path.
+
 ## Cleared During Review
 
 ### R2-2: Monitor status errors are already delivered
@@ -937,3 +1177,35 @@ isolated subnet no longer leaks beacons onto unrelated networks.
   missing (R2-60/61), (f) UDP search batching, accept-time VERSION,
   duplicate-sub_id wire shape (R2-47/48/49/50), (g) miscellaneous wire
   parity (R2-42/43/44/45/46/55/56/58).
+- 2026-05-18: Ran a focused Codex-style audit on the 6 commits that
+  fixed R2-42 / R2-43 / R2-48 / R2-53 / R2-54 / R2-60 / R2-61. Three
+  parallel sub-agents covered (i) client R2-42/43 surface
+  (`cac.cpp::accessRightsRespAction` + `transferChanToVirtCircuit`),
+  (ii) server UDP/mcast/beacon R2-48/60/61 surface (`cast_server.c`
+  + `caservertask.c` + `caserverio.c`), (iii) ACF/listener R2-53/54
+  surface (`asLib.h` + `asTrapWrite.c` + `asDbLib.c` + `rsrv/camessage.c`
+  write paths). 24 NEW divergences recorded as R2-64..R2-69 (client),
+  R2-74..R2-83 (server UDP/mcast/beacon), R2-84..R2-91 (ACF/ASG/listeners).
+  Theme summary:
+  (a) the new fixes added cap-eviction / detection-window / dispatcher
+  patterns that under-deliver vs. C's silent-success-or-loud-fail model
+  (R2-64/65/66/67/68/69 — multiply-defined PV not via ECA_DBLCHNL, post-
+  connect detection window closed, penalty filter swallows the warn);
+  (b) multicast responder error/source-IP/socket-scope divergences
+  that R2-60's wildcard-bind shortcut introduced (R2-74/75/83);
+  (c) AUTO_BEACON misconfig escape and P2P interface drop (R2-76/77 —
+  R2-76 is severity HIGH because C `cantProceed` is fatal and Rust
+  silently misconfigs); (d) UDP batch parity is within-datagram only
+  (R2-79), VERSION ordering assumption brittle (R2-80), batched send
+  errors swallowed (R2-81), MTU constant 1472 vs C's 1024 (R2-82);
+  (e) TRAPWRITE listener API parity gaps — AfterWrite premature on async
+  records (R2-84 severity HIGH), `userPvt` / `dbrType` / `data` /
+  `no_elements` dropped from message (R2-85), no panic isolation (R2-86),
+  re-entrant deadlock (R2-87), blocking Drop on tokio worker (R2-89),
+  Before-without-After-success for write_hook rejections (R2-90);
+  (f) ASG forwarder task leaks per server restart (R2-88) and
+  `put_pv` / `put_pv_no_process` bypass the ASG notifier the way
+  CA-side R2-54 was just fixed (R2-91).
+  Two HIGH-severity items: R2-76 (silent invalid-config startup) and
+  R2-84 (caPutLog AfterWrite fires before async completion). The audit
+  found zero re-reports of R2-1..R2-63 findings.

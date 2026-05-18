@@ -534,21 +534,44 @@ impl ChannelCache {
                         // still fan out through `tx_raw` with no
                         // re-encode.
                         let outcome = apply_monitor_event(&state_inner, desc, &body, order);
+                        use crate::pva_gateway::source::RawEvent;
                         if outcome.type_changed {
                             tracing::warn!(
                                 pv = %pv_clone,
                                 "pva-gateway: upstream introspection changed — \
-                                 cache descriptor reset"
+                                 emitting type-change boundary to downstream monitors \
+                                 (cache descriptor reset)"
                             );
+                            // BR-R42: pvxs treats reconnect/type-change as
+                            // a subscription boundary
+                            // (pvalink_channel.cpp:342-351 `onTypeChange()`).
+                            // Forwarding the new body under the downstream's
+                            // original MONITOR INIT descriptor would deliver
+                            // bytes the client can't decode — possibly causing
+                            // a protocol error or silently corrupted values.
+                            // Emit a marker event with no body so the
+                            // downstream dispatch path sends MONITOR FINISH
+                            // and the client knows to reopen with a fresh
+                            // INIT against the new descriptor.
+                            let _ = tx_raw_inner.send(RawEvent {
+                                body: bytes::Bytes::new(),
+                                byte_order: order,
+                                type_changed: true,
+                            });
+                            // Skip the normal body forward — the bytes are
+                            // for the NEW descriptor; sending them under
+                            // the old INIT descriptor is exactly the
+                            // BR-R42 bug.
+                            return;
                         }
                         if outcome.was_first {
                             first_event_inner.notify_waiters();
                         }
                         // Fan out raw body — refcount only, no copy.
-                        use crate::pva_gateway::source::RawEvent;
                         let _ = tx_raw_inner.send(RawEvent {
                             body,
                             byte_order: order,
+                            type_changed: false,
                         });
                     })
                     .await;
@@ -823,6 +846,46 @@ mod tests {
             Some(full(99, 20)),
             "delta merge must keep unmarked field `b` at its prior value"
         );
+    }
+
+    /// BR-R42: `apply_monitor_event` flags a descriptor change so
+    /// the gateway loop can emit a type-change marker event instead
+    /// of forwarding the now-mismatched body. Prior code logged a
+    /// warning and forwarded the bytes anyway; the downstream
+    /// client decoded garbage under its stale INIT descriptor.
+    #[test]
+    fn br_r42_apply_monitor_event_flags_descriptor_change() {
+        // Start: scalar double, value 1.0.
+        let desc1 = FieldDesc::Scalar(ScalarType::Double);
+        let state = RwLock::new(EntryState::default());
+        let body1 = encode_body(&desc1, &PvField::Scalar(ScalarValue::Double(1.0)), &[0]);
+        let o1 = apply_monitor_event(&state, &desc1, &body1, ByteOrder::Little);
+        assert!(
+            o1.was_first && !o1.type_changed,
+            "first event must NOT report type_changed (no prior descriptor to compare)"
+        );
+
+        // Same descriptor, new value — type_changed must stay false.
+        let body2 = encode_body(&desc1, &PvField::Scalar(ScalarValue::Double(2.0)), &[0]);
+        let o2 = apply_monitor_event(&state, &desc1, &body2, ByteOrder::Little);
+        assert!(
+            !o2.was_first && !o2.type_changed,
+            "same-descriptor event must NOT flag type_changed"
+        );
+
+        // Now upstream reconnects with a different shape — Int
+        // instead of Double. The body bytes are encoded for `desc2`,
+        // so the apply_monitor_event call MUST flag `type_changed=true`
+        // so the gateway loop suppresses fan-out under the old INIT
+        // descriptor and emits the marker event instead.
+        let desc2 = FieldDesc::Scalar(ScalarType::Int);
+        let body3 = encode_body(&desc2, &PvField::Scalar(ScalarValue::Int(42)), &[0]);
+        let o3 = apply_monitor_event(&state, &desc2, &body3, ByteOrder::Little);
+        assert!(
+            o3.type_changed,
+            "introspection change must be flagged for the BR-R42 marker path"
+        );
+        assert!(o3.decoded, "the new-descriptor body still decodes cleanly");
     }
 
     /// Smoke test: we can build an entry standalone (no cache, no

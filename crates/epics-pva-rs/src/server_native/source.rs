@@ -433,6 +433,15 @@ pub struct RawMonitorEvent {
     /// default for both pva-rs and pvxs; only relevant when the
     /// server's downstream connection negotiated `Big`.
     pub byte_order: crate::proto::ByteOrder,
+    /// BR-R42: when `true`, this event signals an upstream
+    /// descriptor change. `body_bytes` is meaningless (and may be
+    /// empty); the downstream wire layer must NOT forward it under
+    /// the original MONITOR INIT descriptor. The downstream
+    /// dispatch path emits `MONITOR FINISH` instead so the client
+    /// can reopen with the new descriptor. pvxs treats reconnect /
+    /// type-change as a subscription boundary (pvalink_channel.cpp:
+    /// 342-351 `onTypeChange()`); the gateway mirrors that here.
+    pub type_changed: bool,
 }
 
 /// Type-erased handle so the server runtime can hold heterogeneous sources

@@ -3053,6 +3053,25 @@ async fn handle_op(
                             }
                         }
                         while let Some(ev) = rx_raw.recv().await {
+                            // BR-R42: an upstream descriptor change
+                            // arrives as a `type_changed=true` marker
+                            // event. The body bytes are encoded for
+                            // the NEW upstream descriptor but this
+                            // monitor was negotiated against the OLD
+                            // (now-stale) `intro_clone` at INIT.
+                            // Forwarding the body would deliver
+                            // garbage / cause a client-side protocol
+                            // error (pvxs treats this as a
+                            // subscription boundary —
+                            // pvalink_channel.cpp:342-351). Emit
+                            // MONITOR FINISH so the client knows to
+                            // reopen against the new descriptor, and
+                            // tear down this monitor task.
+                            if ev.type_changed {
+                                let finish = build_monitor_finish(ioid, order);
+                                let _ = tx_clone.send(finish).await;
+                                return;
+                            }
                             // R48-G3 + R50 audit-3: ACL re-check on
                             // policy reload. The version compare uses
                             // the source's aggregate (composite =

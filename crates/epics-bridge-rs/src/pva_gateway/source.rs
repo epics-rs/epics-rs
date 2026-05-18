@@ -36,6 +36,13 @@ use super::channel_cache::ChannelCache;
 pub struct RawEvent {
     pub body: bytes::Bytes,
     pub byte_order: epics_pva_rs::proto::ByteOrder,
+    /// BR-R42: when set, this event signals an upstream descriptor
+    /// change. The body is meaningless under the downstream's
+    /// original INIT descriptor — the downstream wire layer must
+    /// emit `MONITOR FINISH` rather than forwarding the body bytes,
+    /// because they were encoded for the new (incompatible)
+    /// upstream descriptor.
+    pub type_changed: bool,
 }
 
 /// PV-name → ASG-name resolver. Returns the ASG that the gateway
@@ -603,11 +610,20 @@ impl ChannelSource for GatewayChannelSource {
             loop {
                 match bcast.recv().await {
                     Ok(ev) => {
+                        let type_changed = ev.type_changed;
                         let out = epics_pva_rs::server_native::RawMonitorEvent {
                             body_bytes: ev.body,
                             byte_order: ev.byte_order,
+                            type_changed,
                         };
                         if mpsc_tx.send(out).await.is_err() {
+                            return;
+                        }
+                        // BR-R42: the type-change marker is end-of-stream
+                        // for this raw subscription — close the mpsc so
+                        // the downstream wire layer emits MONITOR FINISH
+                        // and the client knows to reopen.
+                        if type_changed {
                             return;
                         }
                     }

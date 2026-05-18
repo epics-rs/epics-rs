@@ -3094,12 +3094,7 @@ async fn handle_op(
                             // never sees those events under raw
                             // subscription).
                             let payload = if ev.byte_order != order {
-                                match reencode_raw_monitor(
-                                    ioid,
-                                    &intro_clone,
-                                    &ev,
-                                    order,
-                                ) {
+                                match reencode_raw_monitor(ioid, &intro_clone, &ev, order) {
                                     Ok(p) => p,
                                     Err(e) => {
                                         debug!(

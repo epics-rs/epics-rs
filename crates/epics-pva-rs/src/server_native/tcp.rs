@@ -3082,25 +3082,37 @@ async fn handle_op(
                                 mon_acl_version_at_subscribe_cell
                                     .store(live_v, std::sync::atomic::Ordering::Release);
                             }
-                            // Refuse the fast path on byte-order
-                            // mismatch (cross-host gateway, rare).
-                            // Falling back means re-decoding to
-                            // PvField then re-encoding here.
-                            if ev.byte_order != order {
-                                debug!(
-                                    pv = %pv_name,
-                                    "F-G12 byte-order mismatch — \
-                                     dropping to decode-encode path"
-                                );
-                                // Drop this event (decode/encode
-                                // fallback would require the FieldDesc
-                                // and this code path is exercised
-                                // <0.1% of the time); regular subscribe
-                                // covers it. Future work: keep both
-                                // streams active under mismatch.
-                                continue;
-                            }
-                            let payload = build_monitor_payload_raw(ioid, &ev, order);
+                            // BR-R44: on byte-order mismatch we must
+                            // decode the raw event under the upstream
+                            // order and re-encode under the downstream
+                            // order. Earlier code dropped the event
+                            // with `continue`, so any cross-host
+                            // gateway between peers with different
+                            // negotiated byte orders silently lost
+                            // every monitor update after the initial
+                            // snapshot (the decoded-fallback path
+                            // never sees those events under raw
+                            // subscription).
+                            let payload = if ev.byte_order != order {
+                                match reencode_raw_monitor(
+                                    ioid,
+                                    &intro_clone,
+                                    &ev,
+                                    order,
+                                ) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        debug!(
+                                            pv = %pv_name,
+                                            error = %e,
+                                            "F-G12 raw monitor reencode failed — dropping event"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                build_monitor_payload_raw(ioid, &ev, order)
+                            };
                             if tx_clone.send(payload).await.is_err() {
                                 return;
                             }
@@ -3523,6 +3535,63 @@ fn build_monitor_payload(
     h.write_into(&mut buf);
     buf.extend_from_slice(&payload);
     buf
+}
+
+/// BR-R44: decode a raw MONITOR event captured under upstream
+/// byte-order and re-encode it under the downstream connection's
+/// byte-order. Used when a gateway forwards raw events between
+/// peers with different negotiated byte orders.
+///
+/// Body layout (pvxs `servermon.cpp:159-178`): `changed bitset |
+/// partial value | overrun bitset`. Each leaf scalar in the
+/// partial value is byte-order-sensitive, so a memcpy-forward like
+/// the fast path would deliver mis-decoded numbers to the downstream
+/// peer; decode-and-re-encode is the only correct path.
+fn reencode_raw_monitor(
+    ioid: u32,
+    intro: &FieldDesc,
+    ev: &crate::server_native::RawMonitorEvent,
+    downstream_order: ByteOrder,
+) -> Result<Vec<u8>, String> {
+    let mut cur = std::io::Cursor::new(&ev.body_bytes[..]);
+    let changed = BitSet::decode(&mut cur, ev.byte_order)
+        .map_err(|e| format!("decode changed bitset: {e}"))?;
+    let value = crate::pvdata::encode::decode_pv_field_with_bitset(
+        intro,
+        &changed,
+        0,
+        &mut cur,
+        ev.byte_order,
+    )
+    .map_err(|e| format!("decode value with bitset: {e}"))?;
+    // The overrun bitset is optional in some upstream variants;
+    // tolerate truncation by defaulting to empty.
+    let overrun = BitSet::decode(&mut cur, ev.byte_order).unwrap_or_else(|_| BitSet::new());
+
+    let mut payload = Vec::new();
+    payload.put_u32(ioid, downstream_order);
+    payload.put_u8(0x00);
+    changed.write_into(downstream_order, &mut payload);
+    crate::pvdata::encode::encode_pv_field_with_bitset(
+        &value,
+        intro,
+        &changed,
+        0,
+        downstream_order,
+        &mut payload,
+    );
+    overrun.write_into(downstream_order, &mut payload);
+
+    let h = PvaHeader::application(
+        true,
+        downstream_order,
+        Command::Monitor.code(),
+        payload.len() as u32,
+    );
+    let mut buf = Vec::with_capacity(8 + payload.len());
+    h.write_into(&mut buf);
+    buf.extend_from_slice(&payload);
+    Ok(buf)
 }
 
 /// F-G12 raw-frame variant: build a MONITOR data frame from a

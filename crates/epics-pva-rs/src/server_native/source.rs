@@ -35,6 +35,17 @@ pub struct ChannelContext {
     /// subject CommonName. Empty for non-TLS methods. ACF
     /// `AUTHORITY(...)` rule scopes match against this.
     pub authority: String,
+    /// Decoded INIT pvRequest value for the current operation, when
+    /// the wire layer captured one. BR-R3: PVA PUT INIT carries
+    /// `record._options.process`/`block`; the data-phase payload is
+    /// just the delta, so sources that interpret per-operation
+    /// options must consult this rather than the value.
+    ///
+    /// `None` for op kinds where no pvRequest was captured (RPC INIT
+    /// today, GET/MONITOR where the request was consumed for masking)
+    /// or when the wire decoder could not parse it. Sources that
+    /// don't need per-op options can ignore the field.
+    pub pv_request: Option<PvField>,
 }
 
 /// A backend that can answer pvAccess GET / PUT / MONITOR requests for a

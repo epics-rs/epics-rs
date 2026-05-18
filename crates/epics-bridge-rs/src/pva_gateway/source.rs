@@ -817,6 +817,7 @@ mod tests {
             method: method.to_string(),
             host: host.to_string(),
             authority: String::new(),
+            pv_request: None,
         }
     }
 

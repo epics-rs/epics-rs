@@ -386,6 +386,14 @@ struct OpState {
     /// client's autoExec setting. We keep the field for diagnostic
     /// echoing but DO NOT gate write commits on it.
     put_auto_exec: bool,
+    /// BR-R3: full INIT pvRequest value (decoded). PVA PUT INIT
+    /// carries per-operation options (`record._options.process` /
+    /// `block`, etc.) that the data-phase payload does NOT carry.
+    /// We stash the value here at INIT so the data-phase PUT can
+    /// attach it to the [`ChannelContext`] forwarded to the source,
+    /// letting sources like the QSRV bridge honor process/block
+    /// without re-parsing the value (where they no longer live).
+    pv_request: Option<PvField>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1400,6 +1408,7 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
         monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         monitor_filters: Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
         put_auto_exec: true,
+        pv_request: None,
     }
 }
 
@@ -1569,6 +1578,7 @@ async fn handle_put_get(
         method: cred.method.clone(),
         host: cred.host.clone(),
         authority: cred.authority.clone(),
+        pv_request: None,
     };
 
     let mut payload = Vec::new();
@@ -1770,6 +1780,7 @@ async fn handle_process(
         method: cred.method.clone(),
         host: cred.host.clone(),
         authority: cred.authority.clone(),
+        pv_request: None,
     };
     // Processing mutates record state — WRITE-gated, like PUT.
     let result = {
@@ -2440,6 +2451,17 @@ async fn handle_op(
             true
         };
 
+        // BR-R3: stash the PUT INIT pvRequest so the data-phase PUT
+        // can forward it through `ChannelContext.pv_request`. Only
+        // worth the clone for PUT — GET / MONITOR / RPC read no
+        // per-operation options from this value beyond what was
+        // already consumed for mask/pipeline/filter parsing above.
+        let stashed_pv_request = if kind == OpKind::Put {
+            req_value.clone()
+        } else {
+            None
+        };
+
         ch.ops.insert(
             ioid,
             OpState {
@@ -2453,6 +2475,7 @@ async fn handle_op(
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 monitor_filters,
                 put_auto_exec,
+                pv_request: stashed_pv_request,
             },
         );
 
@@ -2485,7 +2508,7 @@ async fn handle_op(
 
     // Data phase
     let op = ch.ops.get(&ioid).cloned();
-    let (intro, mask) = match op {
+    let (intro, mask, init_pv_request) = match op {
         Some(o) => {
             // PVA-R24: data/control frames must match the operation
             // kind bound at INIT. pvxs `serverget.cpp:421-436`
@@ -2503,7 +2526,7 @@ async fn handle_op(
                     kind, o.kind
                 )));
             }
-            (o.intro, o.mask)
+            (o.intro, o.mask, o.pv_request)
         }
         None => {
             send_op_error(tx, kind, ioid, "operation not initialised", order).await?;
@@ -2526,6 +2549,7 @@ async fn handle_op(
                 method: cred.method.clone(),
                 host: cred.host.clone(),
                 authority: cred.authority.clone(),
+                pv_request: None,
             };
             let checked = source
                 .access_gate()
@@ -2614,6 +2638,7 @@ async fn handle_op(
                     method: cred.method.clone(),
                     host: cred.host.clone(),
                     authority: cred.authority.clone(),
+                    pv_request: None,
                 };
                 let checked = source
                     .access_gate()
@@ -2682,12 +2707,18 @@ async fn handle_op(
             // adding a new PUT-equivalent handler without taking a
             // token through `source.access().check(...)` is a compile
             // error on the trait method signature.
+            //
+            // BR-R3: forward the INIT pvRequest so the source can
+            // honor `record._options.process` / `block` (QSRV
+            // semantics). The data-phase payload is just the delta;
+            // per-operation options live in the INIT pvRequest only.
             let ctx = crate::server_native::source::ChannelContext {
                 peer,
                 account: cred.account.clone(),
                 method: cred.method.clone(),
                 host: cred.host.clone(),
                 authority: cred.authority.clone(),
+                pv_request: init_pv_request.clone(),
             };
 
             // The wire delta carries only marked fields; unmarked
@@ -2867,6 +2898,7 @@ async fn handle_op(
                     method: cred.method.clone(),
                     host: cred.host.clone(),
                     authority: cred.authority.clone(),
+                    pv_request: None,
                 };
                 // Round 42 + R49-G1: type-state MONITOR gate.
                 //
@@ -3309,6 +3341,7 @@ async fn handle_op(
                 method: cred.method.clone(),
                 host: cred.host.clone(),
                 authority: cred.authority.clone(),
+                pv_request: None,
             };
             let rpc_checked = source
                 .access_gate()
@@ -3687,6 +3720,7 @@ mod tests {
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
                 put_auto_exec: true,
+                pv_request: None,
             },
         );
         channels.insert(
@@ -4525,6 +4559,7 @@ mod tests {
                 method: "anonymous".into(),
                 host: "127.0.0.1".into(),
                 authority: String::new(),
+                pv_request: None,
             };
 
             let src_a = Arc::clone(&source);
@@ -4947,6 +4982,7 @@ mod tests {
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
                 put_auto_exec: true,
+                pv_request: None,
             },
         );
         channels.insert(

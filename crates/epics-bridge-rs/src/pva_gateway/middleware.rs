@@ -1309,6 +1309,7 @@ mod tests {
             method: "anonymous".into(),
             host: "host1".into(),
             authority: String::new(),
+            pv_request: None,
         }
     }
 

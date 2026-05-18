@@ -227,6 +227,87 @@ impl BridgeChannel {
     pub fn field(&self) -> &str {
         &self.field
     }
+
+    /// BR-R3: PUT with caller-supplied options.
+    ///
+    /// pvxs reads `record._options.process` and `record._options.block`
+    /// from the INIT pvRequest (`iocsource.cpp:429`), not from the
+    /// data-phase value. The wire layer captures the INIT pvRequest
+    /// and forwards it via [`epics_pva_rs::server_native::source::
+    /// ChannelContext::pv_request`]; the bridge converts it to
+    /// [`PutOptions`] and calls this method directly.
+    ///
+    /// The access-control check is identical to [`Channel::put`].
+    pub async fn put_with_options(
+        &self,
+        value: &PvStructure,
+        opts: PutOptions,
+    ) -> BridgeResult<()> {
+        if !self.access.can_write(&self.pv_name) {
+            return Err(BridgeError::PutRejected(format!(
+                "write denied for {} (user='{}' host='{}')",
+                self.pv_name, self.access.user, self.access.host
+            )));
+        }
+
+        // Extract value from the NormativeType structure
+        let raw_val = pv_structure_to_epics(value).ok_or_else(|| BridgeError::TypeMismatch {
+            expected: "extractable value".into(),
+            got: value.struct_id.to_string(),
+        })?;
+
+        // Use typed conversion to match the bound field's actual DBF type
+        let epics_val = match &raw_val {
+            EpicsValue::Double(_)
+            | EpicsValue::Float(_)
+            | EpicsValue::Short(_)
+            | EpicsValue::Long(_)
+            | EpicsValue::Char(_)
+            | EpicsValue::Enum(_)
+            | EpicsValue::String(_) => {
+                let sv = crate::convert::epics_to_scalar(&raw_val);
+                scalar_to_epics_typed(&sv, self.value_dbf)
+            }
+            // Arrays pass through directly
+            _ => raw_val,
+        };
+
+        // BR-R20: pvxs distinguishes Force vs Passive — both write the
+        // bound field, but Force *also* triggers an explicit
+        // process-record afterwards.
+        match opts.process {
+            ProcessMode::Inhibit => {
+                self.db
+                    .put_pv(&format!("{}.{}", self.record_name, self.field), epics_val)
+                    .await
+                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+            }
+            ProcessMode::Passive => {
+                let notify_rx = self
+                    .db
+                    .put_record_field_from_ca(&self.record_name, &self.field, epics_val)
+                    .await
+                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                if opts.block
+                    && let Some(rx) = notify_rx
+                {
+                    let _ = rx.await;
+                }
+            }
+            ProcessMode::Force => {
+                self.db
+                    .put_pv(&format!("{}.{}", self.record_name, self.field), epics_val)
+                    .await
+                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                self.db
+                    .process_record(&self.record_name)
+                    .await
+                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Channel for BridgeChannel {
@@ -265,77 +346,12 @@ impl Channel for BridgeChannel {
     }
 
     async fn put(&self, value: &PvStructure) -> BridgeResult<()> {
-        if !self.access.can_write(&self.pv_name) {
-            return Err(BridgeError::PutRejected(format!(
-                "write denied for {} (user='{}' host='{}')",
-                self.pv_name, self.access.user, self.access.host
-            )));
-        }
-
+        // Backward-compat entry: parses options from the value
+        // structure (the legacy location). New callers should
+        // prefer [`BridgeChannel::put_with_options`] and pass options
+        // extracted from the INIT pvRequest (BR-R3).
         let opts = PutOptions::from_pv_request(value);
-
-        // Extract value from the NormativeType structure
-        let raw_val = pv_structure_to_epics(value).ok_or_else(|| BridgeError::TypeMismatch {
-            expected: "extractable value".into(),
-            got: value.struct_id.to_string(),
-        })?;
-
-        // Use typed conversion to match the bound field's actual DBF type
-        let epics_val = match &raw_val {
-            EpicsValue::Double(_)
-            | EpicsValue::Float(_)
-            | EpicsValue::Short(_)
-            | EpicsValue::Long(_)
-            | EpicsValue::Char(_)
-            | EpicsValue::Enum(_)
-            | EpicsValue::String(_) => {
-                let sv = crate::convert::epics_to_scalar(&raw_val);
-                scalar_to_epics_typed(&sv, self.value_dbf)
-            }
-            // Arrays pass through directly
-            _ => raw_val,
-        };
-
-        // BR-R20: pvxs distinguishes Force vs Passive — both write the
-        // bound field, but Force *also* triggers an explicit
-        // process-record afterwards.
-        match opts.process {
-            ProcessMode::Inhibit => {
-                // Write without processing (C++ ProcInhibit).
-                self.db
-                    .put_pv(&format!("{}.{}", self.record_name, self.field), epics_val)
-                    .await
-                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-            }
-            ProcessMode::Passive => {
-                // C++ ProcPassive: write the bound field through the
-                // standard CA path, which honors PP and SCAN.
-                let notify_rx = self
-                    .db
-                    .put_record_field_from_ca(&self.record_name, &self.field, epics_val)
-                    .await
-                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                if opts.block
-                    && let Some(rx) = notify_rx
-                {
-                    let _ = rx.await;
-                }
-            }
-            ProcessMode::Force => {
-                // C++ ProcForce: write the bound field, then explicitly
-                // process the record regardless of PP / SCAN.
-                self.db
-                    .put_pv(&format!("{}.{}", self.record_name, self.field), epics_val)
-                    .await
-                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                self.db
-                    .process_record(&self.record_name)
-                    .await
-                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-            }
-        }
-
-        Ok(())
+        self.put_with_options(value, opts).await
     }
 
     async fn get_field(&self) -> BridgeResult<FieldDesc> {

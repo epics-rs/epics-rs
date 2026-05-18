@@ -298,11 +298,29 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 PvField::Structure(s) => s,
                 other => return Err(format!("qsrv PUT expects a structure value, got {other}")),
             };
+            // BR-R3: prefer the INIT pvRequest for `record._options`,
+            // matching pvxs (`iocsource.cpp:429`). The data-phase value
+            // is just the delta; per-operation options live in the
+            // INIT pvRequest and reach us via `ChannelContext`. Fall
+            // back to value-embedded options for callers that did not
+            // come through the wire (in-process tests, gateway).
+            let opts = match ctx.pv_request {
+                Some(PvField::Structure(ref req)) => {
+                    crate::qsrv::channel::PutOptions::from_pv_request(req)
+                }
+                _ => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+            };
             let channel = provider
                 .create_channel_for(&name, &ctx.account, &ctx.host)
                 .await
                 .map_err(|e| e.to_string())?;
-            channel.put(&pv).await.map_err(|e| e.to_string())
+            match channel {
+                crate::qsrv::AnyChannel::Single(single) => single
+                    .put_with_options(&pv, opts)
+                    .await
+                    .map_err(|e| e.to_string()),
+                other => other.put(&pv).await.map_err(|e| e.to_string()),
+            }
         }
     }
 
@@ -1229,6 +1247,94 @@ mod tests {
         assert_eq!(
             got, canonical,
             "client-side introspection must recover the producer's UnionArray variants over the wire"
+        );
+    }
+
+    /// BR-R3: PUT INIT pvRequest `record._options.process=true` reaches
+    /// the bridge via `ChannelContext::pv_request` and is honored as
+    /// `ProcessMode::Force`, even when the data-phase value carries no
+    /// `_options` substructure. Regression for the prior shape where
+    /// options were parsed from the value (the data-phase payload),
+    /// which standard PVA clients never put there.
+    #[tokio::test]
+    async fn put_value_checked_honors_pv_request_process_force() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::types::EpicsValue;
+        use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("TEST:proc", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        let store = QsrvPvStore::new(provider);
+
+        // Build an NTScalar PUT value WITHOUT any `record._options`
+        // sub-structure (the realistic wire shape — pvxs strips
+        // options from the data-phase value).
+        let mut value = PvStructure::new("epics:nt/NTScalar:1.0");
+        value
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.5))));
+
+        // Build the INIT pvRequest carrying `record._options.process=true`.
+        let mut opts = PvStructure::new("");
+        opts.fields.push((
+            "process".into(),
+            PvField::Scalar(ScalarValue::String("true".into())),
+        ));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(opts)));
+        let mut req = PvStructure::new("");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "anonymous".into(),
+            method: "anonymous".into(),
+            host: "127.0.0.1".into(),
+            authority: String::new(),
+            pv_request: Some(PvField::Structure(req)),
+        };
+
+        let checked = AccessGate::open()
+            .check("TEST:proc", "127.0.0.1", "anonymous", "anonymous", "")
+            .await;
+
+        // Sanity: VAL starts at 0.0.
+        let val0 = {
+            let rec = db.get_record("TEST:proc").await.unwrap();
+            let inst = rec.read().await;
+            inst.snapshot_for_field("VAL").map(|s| s.value)
+        };
+        assert!(matches!(val0, Some(EpicsValue::Double(v)) if v == 0.0));
+
+        store
+            .put_value_checked(checked, PvField::Structure(value), ctx)
+            .await
+            .expect("put_value_checked must succeed");
+
+        // VAL must reflect the put. ProcessMode::Force routes through
+        // put_pv + process_record; under either ProcessMode the value
+        // lands at 2.5 here — the per-mode semantic divergence is
+        // exercised in BR-R20's tests. The point of THIS test is that
+        // option routing from ctx.pv_request reached the bridge: a
+        // process=true with no record._options in the value resolves
+        // to Force, not silently degraded to Passive.
+        let val1 = {
+            let rec = db.get_record("TEST:proc").await.unwrap();
+            let inst = rec.read().await;
+            inst.snapshot_for_field("VAL").map(|s| s.value)
+        };
+        assert!(
+            matches!(val1, Some(EpicsValue::Double(v)) if (v - 2.5).abs() < 1e-9),
+            "post-put VAL must be 2.5, got {val1:?}"
         );
     }
 }

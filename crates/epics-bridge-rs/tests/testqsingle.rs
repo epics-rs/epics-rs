@@ -225,7 +225,7 @@ fn channel_name_matches_record() {
 async fn channel_with_field_suffix_binds_to_field() {
     use epics_bridge_rs::qsrv::provider::BridgeProvider;
     let db = Arc::new(PvDatabase::new());
-    db.add_record("TEST:fld_ai", Box::new(AiRecord::new(3.14)))
+    db.add_record("TEST:fld_ai", Box::new(AiRecord::new(3.125)))
         .await
         .unwrap();
     db.put_pv("TEST:fld_ai.EGU", EpicsValue::String("Volts".into()))
@@ -277,7 +277,7 @@ async fn channel_with_field_suffix_binds_to_field() {
         inst.snapshot_for_field("VAL").map(|s| s.value)
     };
     assert!(
-        matches!(val_after, Some(EpicsValue::Double(v)) if (v - 3.14).abs() < 1e-9),
+        matches!(val_after, Some(EpicsValue::Double(v)) if (v - 3.125).abs() < 1e-9),
         "VAL must NOT have been overwritten, got {val_after:?}"
     );
 }

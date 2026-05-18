@@ -111,6 +111,35 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
     }
 }
 
+/// BR-R16: parse `record._options.atomic` from a group operation
+/// pvRequest. Returns `Some(true|false)` when the option is set,
+/// `None` when absent — the caller then falls back to the group's
+/// default atomicity. pvxs accepts either a boolean scalar
+/// (`record._options.atomic = true`) or a `"true"`/`"false"` string;
+/// both forms are supported here.
+pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
+    let options = request
+        .get_field("record")
+        .and_then(|f| match f {
+            PvField::Structure(s) => s.get_field("_options"),
+            _ => None,
+        })
+        .and_then(|f| match f {
+            PvField::Structure(s) => Some(s),
+            _ => None,
+        })?;
+
+    match options.get_field("atomic")? {
+        PvField::Scalar(ScalarValue::Boolean(b)) => Some(*b),
+        PvField::Scalar(ScalarValue::String(s)) => match s.to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 impl PutOptions {
     /// Extract process/block options from a PvStructure.
     ///
@@ -541,9 +570,7 @@ mod tests {
     #[test]
     fn dbe_mask_parses_value_alarm() {
         use epics_base_rs::server::recgbl::EventMask;
-        let req = req_with_dbe(PvField::Scalar(ScalarValue::String(
-            "VALUE | ALARM".into(),
-        )));
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::String("VALUE | ALARM".into())));
         let mask = dbe_mask_from_pv_request(&req).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
@@ -576,5 +603,42 @@ mod tests {
     fn dbe_mask_absent_returns_none() {
         let req = PvStructure::new("request");
         assert!(dbe_mask_from_pv_request(&req).is_none());
+    }
+
+    fn req_with_atomic(value: PvField) -> PvStructure {
+        let mut options = PvStructure::new("");
+        options.fields.push(("atomic".into(), value));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+        req
+    }
+
+    /// BR-R16: boolean `record._options.atomic = true` resolves to
+    /// `Some(true)` so the group operation overrides the default.
+    #[test]
+    fn atomic_option_parses_boolean_true() {
+        let req = req_with_atomic(PvField::Scalar(ScalarValue::Boolean(true)));
+        assert_eq!(atomic_from_pv_request(&req), Some(true));
+    }
+
+    /// BR-R16: string form (`"false"`) is also accepted, matching
+    /// pvxs's lenient option parsing.
+    #[test]
+    fn atomic_option_parses_string_false() {
+        let req = req_with_atomic(PvField::Scalar(ScalarValue::String("false".into())));
+        assert_eq!(atomic_from_pv_request(&req), Some(false));
+    }
+
+    /// BR-R16: absent option resolves to None so callers fall back to
+    /// the group default.
+    #[test]
+    fn atomic_option_absent_returns_none() {
+        let req = PvStructure::new("request");
+        assert!(atomic_from_pv_request(&req).is_none());
     }
 }

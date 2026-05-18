@@ -157,6 +157,64 @@ async fn group_nonatomic_put_updates_all_members() {
     assert_eq!(extract_long(&result, "count"), Some(99));
 }
 
+/// BR-R17: a per-member ACF denial fails the group PUT even when the
+/// group PV itself is writable. Mirrors pvxs's per-field
+/// SecurityClient gating (groupsource.cpp:161 + 515) — "any
+/// member denied → operation rejected".
+#[tokio::test]
+async fn group_put_member_acf_denial_rejects_entire_put() {
+    use epics_bridge_rs::qsrv::{AccessContext, AccessControl};
+
+    /// Deny writes to a specific record (matching by full PV name as
+    /// stored on the GroupMember.channel — `record.FIELD`).
+    struct DenySpecific(String);
+    impl AccessControl for DenySpecific {
+        fn can_write(&self, channel: &str, _: &str, _: &str) -> bool {
+            channel != self.0
+        }
+    }
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp")
+        .cloned()
+        .expect("grp registered");
+
+    // Deny writes to the `count` member's backing record. The group
+    // PV itself remains writable.
+    let access = AccessContext::anonymous(Arc::new(DenySpecific("TEST:count.VAL".into())));
+    let ch = GroupChannel::new(db.clone(), def).with_access(access);
+
+    let mut put = PvStructure::new("epics:nt/NTGroup:1.0");
+    put.fields
+        .push(("level".into(), PvField::Scalar(ScalarValue::Double(42.0))));
+    put.fields
+        .push(("count".into(), PvField::Scalar(ScalarValue::Long(13))));
+    let result = ch.put(&put).await;
+    let err = result.expect_err("group PUT must be rejected per BR-R17");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("TEST:count.VAL"),
+        "error must name the denied member channel; got: {msg}"
+    );
+
+    // Verify the allowed member's record was NOT pre-emptively
+    // mutated either — pvxs rejects the whole operation before any
+    // member apply runs.
+    let level = {
+        let rec = db.get_record("TEST:level").await.unwrap();
+        let inst = rec.read().await;
+        inst.snapshot_for_field("VAL").map(|s| s.value)
+    };
+    assert!(
+        matches!(level, Some(epics_base_rs::types::EpicsValue::Double(v)) if (v - 1.5).abs() < 1e-9),
+        "allowed member must remain at seed value 1.5 after rejected group PUT, got {level:?}"
+    );
+}
+
 /// Guard: dbLoadGroup → processGroups → groups() exposes the parsed
 /// definition with the expected member roster.
 #[tokio::test]

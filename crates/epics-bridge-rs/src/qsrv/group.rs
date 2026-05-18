@@ -323,6 +323,13 @@ impl GroupChannel {
     /// read check on entry — defensive: callers also check, but if a
     /// new caller is added later this guarantees the policy still holds.
     pub(crate) async fn read_group(&self) -> BridgeResult<PvStructure> {
+        self.read_group_atomic(self.def.atomic).await
+    }
+
+    /// BR-R16: read with a caller-specified atomic mode, overriding
+    /// the group default. Used by `Channel::get` when the operation
+    /// pvRequest carries `record._options.atomic`.
+    pub(crate) async fn read_group_atomic(&self, atomic: bool) -> BridgeResult<PvStructure> {
         if !self.access.can_read(&self.def.name) {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for group {} (user='{}' host='{}')",
@@ -346,7 +353,7 @@ impl GroupChannel {
         // which itself blocks behind the still-held first guard — a
         // recursive-read deadlock. So the atomic path resolves every
         // member against the pre-acquired guards and never re-locks.
-        if self.def.atomic {
+        if atomic {
             let guards = lock_group_records_read(&self.db, &self.def.members).await;
             // Build a name→guard lookup so each member resolves
             // against the already-held guard for its backing record.
@@ -619,7 +626,9 @@ impl super::provider::Channel for GroupChannel {
                 self.def.name, self.access.user, self.access.host
             )));
         }
-        let full = self.read_group().await?;
+        // BR-R16: pvRequest can override the group default atomicity.
+        let atomic = super::channel::atomic_from_pv_request(request).unwrap_or(self.def.atomic);
+        let full = self.read_group_atomic(atomic).await?;
         Ok(pvif::filter_by_request(&full, request))
     }
 
@@ -633,6 +642,11 @@ impl super::provider::Channel for GroupChannel {
 
         let opts = super::channel::PutOptions::from_pv_request(value);
         let use_process = opts.process != super::channel::ProcessMode::Inhibit;
+
+        // BR-R16: pvRequest can override the group default atomicity
+        // (`record._options.atomic = true|false`). Falls back to the
+        // group default when the option is absent.
+        let atomic = super::channel::atomic_from_pv_request(value).unwrap_or(self.def.atomic);
 
         // BR-R30: only members with an explicit `+putorder` are
         // writable. pvxs sentinel `i64::MIN` (fieldconfig.h:37)
@@ -667,7 +681,32 @@ impl super::provider::Channel for GroupChannel {
             }
         }
 
-        if self.def.atomic {
+        // BR-R17: pvxs builds a per-field SecurityClient at group PUT
+        // (groupsource.cpp:161 + 515) so a group PV writable for the
+        // caller doesn't tunnel writes into members the caller cannot
+        // write directly. Re-check write access for each member's
+        // backing dbChannel under the caller's identity (already
+        // captured in `self.access`). A single denial fails the whole
+        // PUT — matching pvxs's "any member denied → operation
+        // rejected" remote-error behavior.
+        for m in &ordered {
+            if m.channel.is_empty() {
+                // Structure / Const members have no backing channel
+                // to security-check; pvxs skips these in the
+                // SecurityClient list as well.
+                continue;
+            }
+            if !self.access.can_write(&m.channel) {
+                return Err(BridgeError::PutRejected(format!(
+                    "group {} PUT: member '{}' field '{}' write denied for \
+                     user='{}' host='{}' (per-member ACF, pvxs \
+                     groupsource.cpp:161)",
+                    self.def.name, m.field_name, m.channel, self.access.user, self.access.host
+                )));
+            }
+        }
+
+        if atomic {
             // Atomic put. C++ QSRV holds every member record's lock
             // simultaneously via `DBManyLocker` for the whole write.
             // `epics-base-rs` exposes no multi-record write lock, and

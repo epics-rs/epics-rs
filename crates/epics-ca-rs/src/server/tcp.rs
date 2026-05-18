@@ -1894,12 +1894,26 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 Ok(g) => g,
                 Err(denied) => {
                     if is_notify {
-                        send_cmd_error(
+                        // R2-7: C `read_notify_action` →
+                        // `read_reply` → `no_read_access_event`
+                        // (`rsrv/camessage.c:450-480`) builds a
+                        // CA_PROTO_READ_NOTIFY frame with the
+                        // ORIGINAL requested count and a
+                        // `dbr_size_n`-sized zero payload, abusing
+                        // `m_cid` to carry the ECA status. Pre-fix
+                        // Rust used `send_cmd_error` which always
+                        // emits `count = 0` + zero-byte payload — a
+                        // libca-style client validating callback
+                        // metadata saw the wrong shape for the same
+                        // no-read-access `caget` path. The helper
+                        // mirrors the C wire format.
+                        send_no_read_access_event(
                             writer,
                             CA_PROTO_READ_NOTIFY,
                             requested_type,
-                            denied.eca_code(),
+                            requested_count,
                             ioid,
+                            denied.eca_code(),
                         )
                         .await?;
                     } else {
@@ -1910,13 +1924,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // CA_PROTO_READ on read denial. Pre-fix Rust
                         // silently returned, so a libca client saw a
                         // timeout instead of the C error callback.
+                        // R2-15: outer cid is `pciu->cid` per
+                        // `vsend_err` (camessage.c:160-170).
                         let audit_pv = match &entry.target {
                             ChannelTarget::SimplePv(pv) => pv.name.clone(),
                             ChannelTarget::RecordField { record, field } => {
                                 format!("{}.{}", record.read().await.name, field)
                             }
                         };
-                        send_ca_error(writer, hdr, denied.eca_code(), hdr.cid, &audit_pv).await?;
+                        send_ca_error(writer, hdr, denied.eca_code(), entry.cid, &audit_pv).await?;
                     }
                     return Ok(());
                 }
@@ -1982,17 +1998,21 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // Rust `encode_dbr` failure with `UnsupportedType`
                     // is the direct parallel of INVALID_DB_REQ —
                     // emit the error + drop the connection.
-                    if is_notify {
-                        send_cmd_error(
-                            writer,
-                            CA_PROTO_READ_NOTIFY,
-                            requested_type,
-                            ECA_BADTYPE,
-                            ioid,
-                        )
-                        .await?;
-                    } else {
-                        send_ca_error(writer, hdr, ECA_BADTYPE, hdr.cid, "bad READ data type")
+                    //
+                    // R2-6: C `read_notify_action`
+                    // (`rsrv/camessage.c:693-697`) returns
+                    // `RSRV_ERROR` on `INVALID_DB_REQ` WITHOUT
+                    // emitting any wire frame — only the deprecated
+                    // `read_action` (camessage.c:616-620) calls
+                    // `send_err(ECA_BADTYPE)` here. Pre-fix Rust
+                    // sent a CA_PROTO_READ_NOTIFY error frame for
+                    // the notify path too, an extra wire frame
+                    // before EOF that rsrv never produces. Mirror C:
+                    // notify path is silent; only the deprecated
+                    // READ path emits CA_PROTO_ERROR.
+                    // R2-15: outer cid is `pciu->cid`.
+                    if !is_notify {
+                        send_ca_error(writer, hdr, ECA_BADTYPE, entry.cid, "bad READ data type")
                             .await?;
                     }
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
@@ -2006,10 +2026,23 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // the underlying record's value count — for waveform
             // records, snapshot.value.count() can be N, which would
             // make C clients parse 40 * N bytes of body and fail.
+            //
+            // R2-13: C `read_reply` (`rsrv/camessage.c:507-571`) keeps
+            // the request count in the header and zero-fills the
+            // payload when fewer elements are returned than requested
+            // (`autosize = mp->m_count == 0` is the exception:
+            // request count 0 means "all available"; otherwise the
+            // response carries the requested count and pads with
+            // zeros). Pre-fix Rust dropped the requested count on
+            // a short array, so a `ca_array_get_callback(type,
+            // count > native, ...)` saw a shorter response from
+            // Rust than from rsrv.
+            let mut data = data;
+            let actual_count = snapshot.value.count() as u32;
             let element_count = if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
                 1
             } else {
-                snapshot.value.count() as u32
+                pad_dbr_to_requested_count(&mut data, actual_count, requested_count, requested_type)
             };
             let mut padded = data;
             padded.resize(align8(padded.len()), 0);
@@ -2093,6 +2126,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 // through the same gate as regular WRITE. Token's
                 // `require_write` returns the matching ECA code on
                 // denial.
+                let entry_cid = entry.cid;
                 let _write_grant = match state.lookup_access(sid).require_write() {
                     Ok(g) => g,
                     Err(denied) => {
@@ -2117,13 +2151,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             // like its put had succeeded — no error
                             // callback even though the value never
                             // reached the DB.
+                            // R2-15: outer cid is `pciu->cid` per C
+                            // `vsend_err` (camessage.c:160-170), not
+                            // the SID we received in `hdr.cid`.
                             let audit_pv = match &entry.target {
                                 ChannelTarget::SimplePv(pv) => pv.name.clone(),
                                 ChannelTarget::RecordField { record, field } => {
                                     format!("{}.{}", record.read().await.name, field)
                                 }
                             };
-                            send_ca_error(writer, hdr, denied.eca_code(), hdr.cid, &audit_pv)
+                            send_ca_error(writer, hdr, denied.eca_code(), entry_cid, &audit_pv)
                                 .await?;
                         }
                         return Ok(());
@@ -2167,9 +2204,62 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     let mut w = writer.lock().await;
                     w.write_all(&resp.to_bytes()).await?;
                     // flush deferred to handle_client outer loop (batched)
+                } else if let Err(e) = &result {
+                    // R2-14: deprecated CA_PROTO_WRITE for DBR_PUT_ACKT/
+                    // DBR_PUT_ACKS must surface put failure via
+                    // CA_PROTO_ERROR per C `write_action`
+                    // (`rsrv/camessage.c:781-789`). Pre-fix the
+                    // non-notify alarm-ack path silently swallowed
+                    // record-side write errors so the libca peer never
+                    // saw the failure.
+                    let audit_pv = match &entry.target {
+                        ChannelTarget::SimplePv(pv) => pv.name.clone(),
+                        ChannelTarget::RecordField { record, field } => {
+                            format!("{}.{}", record.read().await.name, field)
+                        }
+                    };
+                    let eca = e.to_eca_status();
+                    send_ca_error(writer, hdr, eca, entry_cid, &audit_pv).await?;
                 }
                 return Ok(());
             }
+
+            // R2-16: C `write_action` (`rsrv/camessage.c:735-739`) and
+            // `write_notify_action` (`camessage.c:1641-1645`) call
+            // `MPTOPCIU(mp)` BEFORE any DBR-type check, so a bad SID
+            // path goes through `logBadId` + RSRV_ERROR (silent drop)
+            // regardless of whether the type is also invalid. Pre-fix
+            // Rust ran the type check first and emitted an ECA_BADTYPE
+            // error frame for the SID+type combo where rsrv would
+            // have closed silently. Reorder to match C.
+            let entry = match state.channels.get(&sid) {
+                Some(e) => e,
+                None => {
+                    // Same C logBadId + RSRV_ERROR family as the
+                    // ACKT/ACKS branch above and the READ branch.
+                    return Err(epics_base_rs::error::CaError::Protocol(format!(
+                        "WRITE on unknown SID {} (matches C write_action logBadId + RSRV_ERROR)",
+                        sid
+                    )));
+                }
+            };
+            // R2-15: channel-scoped CA_PROTO_ERROR replies must echo
+            // `pciu->cid` (the CLIENT cid the libca peer allocated),
+            // not the server-side SID we received in `hdr.cid`. C
+            // `vsend_err` (`rsrv/camessage.c:160-170`) looks up the
+            // `channel_in_use` and uses its `cid` field for the outer
+            // error header. Captured here as a Copy so the error sites
+            // below can use it after the `entry` borrow ends.
+            let entry_cid = entry.cid;
+
+            // Resolve the audit-friendly PV name once. Cheap when audit
+            // is off because state.audit() is a single None check.
+            let audit_pv = match &entry.target {
+                ChannelTarget::SimplePv(pv) => pv.name.clone(),
+                ChannelTarget::RecordField { record, field } => {
+                    format!("{}.{}", record.read().await.name, field)
+                }
+            };
 
             let write_type = match DbFieldType::from_u16(hdr.data_type) {
                 Ok(t) => t,
@@ -2194,33 +2284,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         )
                         .await?;
                     } else {
-                        send_ca_error(writer, hdr, ECA_BADTYPE, hdr.cid, "bad data type").await?;
+                        send_ca_error(writer, hdr, ECA_BADTYPE, entry_cid, "bad data type").await?;
                     }
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "WRITE with unsupported DBR type {} (matches C write_action RSRV_ERROR)",
                         hdr.data_type
                     )));
-                }
-            };
-
-            let entry = match state.channels.get(&sid) {
-                Some(e) => e,
-                None => {
-                    // Same C logBadId + RSRV_ERROR family as the
-                    // ACKT/ACKS branch above and the READ branch.
-                    return Err(epics_base_rs::error::CaError::Protocol(format!(
-                        "WRITE on unknown SID {} (matches C write_action logBadId + RSRV_ERROR)",
-                        sid
-                    )));
-                }
-            };
-
-            // Resolve the audit-friendly PV name once. Cheap when audit
-            // is off because state.audit() is a single None check.
-            let audit_pv = match &entry.target {
-                ChannelTarget::SimplePv(pv) => pv.name.clone(),
-                ChannelTarget::RecordField { record, field } => {
-                    format!("{}.{}", record.read().await.name, field)
                 }
             };
 
@@ -2248,7 +2317,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // so a `caput` from a read-only peer looked
                         // like it had succeeded (no error callback)
                         // even though the value never reached the DB.
-                        send_ca_error(writer, hdr, denied.eca_code(), hdr.cid, &audit_pv).await?;
+                        send_ca_error(writer, hdr, denied.eca_code(), entry_cid, &audit_pv).await?;
                     }
                     state.audit("caput", &audit_pv, "", "denied").await;
                     return Ok(());
@@ -2275,8 +2344,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         )
                         .await?;
                     } else {
-                        send_ca_error(writer, hdr, ECA_BADTYPE, hdr.cid, "bad WRITE payload bytes")
-                            .await?;
+                        send_ca_error(
+                            writer,
+                            hdr,
+                            ECA_BADTYPE,
+                            entry_cid,
+                            "bad WRITE payload bytes",
+                        )
+                        .await?;
                     }
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "WRITE payload conversion failed for type {} count {} (matches C caNetConvert RSRV_ERROR)",
@@ -2319,6 +2394,23 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             state
                 .audit("caput", &audit_pv, &audit_value, audit_result)
                 .await;
+
+            // R2-14: C `write_action` (`rsrv/camessage.c:781-789`):
+            // even the deprecated fire-and-forget `CA_PROTO_WRITE`
+            // surfaces a failed `dbChannel_put` to the client via
+            // `send_err(mp, ECA_PUTFAIL, ...)`. Pre-fix Rust dropped
+            // the failure silently for the non-notify path, so a
+            // `caput` against a read-only-by-rule field that bypassed
+            // earlier access checks (e.g. record-side `PutDisabled`)
+            // looked successful to the libca peer even though the
+            // value never reached the DB. is_notify already replies
+            // via WRITE_NOTIFY below.
+            if !is_notify {
+                if let Err(e) = &write_result {
+                    let eca = e.to_eca_status();
+                    send_ca_error(writer, hdr, eca, entry_cid, &audit_pv).await?;
+                }
+            }
 
             // F1: CA_PROTO_WRITE (cmd=4) is fire-and-forget — no response
             if is_notify {
@@ -3327,6 +3419,66 @@ async fn send_cmd_error<W: AsyncWrite + Unpin + Send + 'static>(
     w.write_all(&resp.to_bytes()).await?;
     // flush deferred to handle_client outer loop (batched)
     Ok(())
+}
+
+/// Send a `no_read_access_event`-shaped reply: same wire frame as the
+/// original READ_NOTIFY / EVENT_ADD command, with `m_cid` carrying the
+/// ECA status and a `dbr_buffer_size`-sized zero payload. C
+/// `no_read_access_event` (`rsrv/camessage.c:450-480`) and `read_reply`
+/// (`camessage.c:540-557`) use this shape for READ_NOTIFY denials and
+/// dbChannel_get failures — preserving the requested count and DBR
+/// type so libca-style clients see the correct callback metadata even
+/// on the error path.
+async fn send_no_read_access_event<W: AsyncWrite + Unpin + Send + 'static>(
+    writer: &Arc<Mutex<BufWriter<W>>>,
+    cmd: u16,
+    data_type: u16,
+    count: u32,
+    available: u32,
+    eca_status: u32,
+) -> CaResult<()> {
+    let native = epics_base_rs::types::native_type_for_dbr(data_type)
+        .unwrap_or(epics_base_rs::types::DbFieldType::Char);
+    let payload_size = epics_base_rs::types::dbr_buffer_size(data_type, native, count as usize);
+    let padded_size = align8(payload_size);
+    let mut hdr = CaHeader::new(cmd);
+    hdr.set_payload_size(padded_size, count);
+    hdr.data_type = data_type;
+    hdr.cid = eca_status;
+    hdr.available = available;
+    let hdr_bytes = hdr.to_bytes_extended();
+    // Build header + zero payload as one contiguous frame so a
+    // task abort can only land at a frame boundary (same abort-
+    // safety invariant as `send_event` / `send_monitor_snapshot`).
+    let mut frame = Vec::with_capacity(hdr_bytes.len() + padded_size);
+    frame.extend_from_slice(&hdr_bytes);
+    frame.resize(frame.len() + padded_size, 0);
+    let mut w = writer.lock().await;
+    w.write_all(&frame).await?;
+    Ok(())
+}
+
+/// Zero-pad an encoded DBR payload up to the requested element count.
+/// C `read_reply` (`rsrv/camessage.c:566-571`) keeps the request-count
+/// header and pads bytes past the actual element count with zeros.
+/// Returns the header element count to use (`requested_count` when
+/// non-zero, `actual_count` when zero / autosize).
+fn pad_dbr_to_requested_count(
+    encoded: &mut Vec<u8>,
+    actual_count: u32,
+    requested_count: u32,
+    data_type: u16,
+) -> u32 {
+    if requested_count == 0 {
+        return actual_count;
+    }
+    if requested_count > actual_count {
+        if let Ok(native) = epics_base_rs::types::native_type_for_dbr(data_type) {
+            let extra = (requested_count - actual_count) as usize * native.element_size();
+            encoded.extend(std::iter::repeat_n(0u8, extra));
+        }
+    }
+    requested_count
 }
 
 /// Send a CA_PROTO_ERROR response with the original header echoed

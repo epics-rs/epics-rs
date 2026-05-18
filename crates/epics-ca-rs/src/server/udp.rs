@@ -294,6 +294,20 @@ async fn recv_loop(
                 // Capture it here so the SEARCH-reply branch can
                 // populate its VERSION echo and match
                 // `cas_send_dg_msg` byte-for-byte.
+                //
+                // R2-10: C `udp_version_action` returns RSRV_ERROR on
+                // `!CA_VSUPPORTED(m_count)` and the UDP dispatcher
+                // breaks out of the current datagram on any non-OK
+                // status. Pre-fix Rust accepted any VERSION and
+                // happily kept parsing later messages in the same
+                // datagram — a malformed VERSION-first datagram could
+                // still elicit a Rust SEARCH reply where rsrv would
+                // have dropped the rest. Mirror C: bad version
+                // breaks the per-datagram parse.
+                const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
+                if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
+                    break;
+                }
                 if hdr.data_type == 1 {
                     client_seq = Some(hdr.cid);
                 }
@@ -308,10 +322,18 @@ async fn recv_loop(
                 // different layout; emitting our V4.13 reply confuses
                 // them or worse, fabricates a usable channel they
                 // can't actually open.
+                // R2-10: C `search_reply_udp` (camessage.c:2151-2154)
+                // returns RSRV_ERROR on unsupported minor version and
+                // the UDP dispatcher breaks out of the datagram. Pre-
+                // fix Rust skipped only the offending SEARCH and kept
+                // parsing later messages in the same datagram, so a
+                // malformed SEARCH-first datagram could still elicit
+                // a Rust reply for a later message where rsrv would
+                // have dropped the rest. Match C: bad-version SEARCH
+                // ends the per-datagram parse.
                 const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
                 if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
-                    offset += msg_len;
-                    continue;
+                    break;
                 }
                 // C `search_reply_udp` (rsrv/camessage.c:2159) rejects
                 // SEARCH whose `m_postsize <= 1` ("empty PV name in UDP

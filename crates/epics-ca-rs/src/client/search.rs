@@ -897,6 +897,16 @@ fn handle_udp_response(
         return;
     }
 
+    // R2-11: C `udpiiu.cpp::postMsg` resets `lastReceivedSeqNoIsValid`
+    // and `lastReceivedSeqNo` at the start of every UDP datagram so a
+    // VERSION-bearing reply in datagram N cannot mark datagram N+1's
+    // SEARCH-only reply as fresh. Pre-fix Rust kept `last_valid_seq`
+    // across datagrams, so the same SEARCH-only reply was dropped
+    // first datagram but accepted later after an unrelated VERSION-
+    // bearing response set the marker. Reset here to keep the
+    // freshness check datagram-local.
+    state.last_valid_seq = None;
+
     let recv_time = Instant::now();
     let mut offset = 0;
 

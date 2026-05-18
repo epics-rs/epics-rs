@@ -313,6 +313,161 @@ instead of a command-specific status frame, Rust users get only the global
 exception hook. The specific `get()` / `put()` / monitor receiver can remain
 pending until timeout or miss the per-operation error that libca would deliver.
 
+### R2-18: Client channel names are not bounded before SEARCH/CREATE_CHAN framing
+
+Severity: Medium
+
+Rust: `crates/epics-ca-rs/src/client/mod.rs`, `CaClient::create_channel()`
+accepts any expanded string and immediately registers/schedules it.
+`client/search.rs::build_search_payload()` and
+`client/transport.rs::process_command(CreateChannel)` both put
+`pad_string(pv_name).len() as u16` into the CA header while appending the full
+payload.
+
+C reference: `libca/cac.cpp::createChannel()` rejects null or empty names with
+`ECA_BADSTR`. `libca/nciu.cpp::nciu()` rejects oversized channel names before
+allocating the channel, and `libca/tcpiiu.cpp::createChannelRequest()` rejects
+`postCnt >= 0xffff` with `ECA_UNAVAILINSERV` before sending
+`CA_PROTO_CREATE_CHAN`.
+
+Impact: an empty Rust channel starts a background search that can never match
+instead of failing like libca. A very long PV name truncates the header size but
+still appends the full body, producing malformed UDP SEARCH or TCP
+CREATE_CHAN frames and potentially desynchronizing the peer's CA parser. libca
+returns a client-side error before anything is put on the wire.
+
+### R2-19: Client put paths do not enforce libca count/string bounds
+
+Severity: High
+
+Rust: `crates/epics-ca-rs/src/client/mod.rs`, `put()`,
+`put_with_timeout()`, `put_nowait()`, `put_string()`,
+`put_string_nowait()`, `put_string_array()`, and
+`put_string_array_nowait()` serialize the supplied `EpicsValue` and send its
+`value.count()` without checking `count <= snap.element_count`.
+`epics-base-rs/src/types/value.rs::EpicsValue::to_bytes()` silently truncates
+DBR_STRING elements to 39 bytes.
+
+C reference: `libca/nciu.cpp::write()` and the write-callback overload reject
+`countIn > this->count` before queueing the request, and
+`nciu::stringVerify()` rejects DBR_STRING elements that exceed
+`MAX_STRING_SIZE`. `cadef.h` documents `ECA_BADCOUNT` and `ECA_STRTOBIG` as
+client-side outcomes.
+
+Impact: Rust can send writes that libca refuses synchronously. The callback
+variants surface a delayed server failure or timeout instead of the libca
+status; the nowait variants can return `Ok(())` after putting a request on the
+wire that C would reject. Long strings are silently truncated, so a Rust
+`put_string()` can write a different value than the caller supplied.
+
+### R2-20: Zero-length repeater registration bypasses the local-client gate
+
+Severity: High
+
+Rust: `crates/epics-ca-rs/src/repeater.rs`, `run_repeater_with_debug()`
+registers `len == 0` datagrams before applying the loopback check used for
+`CA_PROTO_REPEATER_REGISTER`. `fan_out()` then keeps clients by UDP port and
+skips reflection by port only.
+
+C reference: `repeater.cpp::ca_repeater()` sends both zero-length registration
+and `REPEATER_REGISTER` through `register_new_client()`.
+`register_new_client()` rejects non-AF_INET peers and requires loopback or a
+bind test proving the source address is local.
+
+Impact: a remote host that can reach the UDP repeater port can send a
+zero-length datagram and become a registered fan-out recipient. That exposes
+beacon traffic/PV presence outside the local host and can turn local beacon
+traffic into repeated outbound sends to the remote address. C applies the same
+locality rule to the legacy zero-length form.
+
+### R2-21: Client CID/IOID/subscription IDs can wrap into live identifiers
+
+Severity: Medium
+
+Rust: `crates/epics-ca-rs/src/channel.rs` uses process-global
+`AtomicU32::fetch_add()` counters for CIDs, IOIDs, and subscription IDs, with
+no zero skip, no free list, and no check against the live channel, read, write,
+or subscription maps.
+
+C reference: libca assigns network IO identifiers through owned tables such as
+`ioTable.idAssignAdd()` in `libca/cac.cpp::writeNotifyRequest()` and
+`readNotifyRequest()`, and channels through the CA context channel table
+rather than a raw wrapping global counter.
+
+Impact: long-running high-rate clients can reuse a live identifier after
+2^32 allocations. Reusing an IOID can overwrite an in-flight waiter and route a
+later READ_NOTIFY/WRITE_NOTIFY to the wrong operation or leave the original
+caller pending. Reusing a subscription ID can collide with an active monitor.
+This is reachable for process-lifetime clients; 100,000 operations/s wraps in
+about 11.9 hours.
+
+### R2-22: Send backpressure accounting can undercount pending frames
+
+Severity: Medium
+
+Rust: `crates/epics-ca-rs/src/client/transport.rs`, `send_frame()` increments
+`pending_frames` with `fetch_add()`, but `write_loop()` decrements by `load()`
+plus `store(prev.saturating_sub(drained))`.
+
+C reference: libca's send watchdog treats a stalled virtual circuit as a
+connection failure; the Rust counter is the local guard that decides when to
+close a circuit whose unbounded write queue is no longer draining.
+
+Impact: a concurrent `send_frame()` can increment between the write loop's
+`load()` and `store()`, and the store overwrites that increment. Under
+sustained producer activity the counter can drift below the real queued-frame
+count, so the `SEND_BACKPRESSURE_FRAMES` disconnect threshold is not reliable.
+A stalled TCP circuit can retain an unbounded queue longer than the guard
+intends.
+
+### R2-23: EVENT_CANCEL request/ack headers lose the subscription count
+
+Severity: Low
+
+Rust client: `crates/epics-ca-rs/src/client/transport.rs`,
+`TransportCommand::Unsubscribe` sends `CA_PROTO_EVENT_CANCEL` with
+`data_type`, `sid`, and `subid`, but leaves `count = 0`.
+
+Rust server: `crates/epics-ca-rs/src/server/tcp.rs`, the successful
+`CA_PROTO_EVENT_CANCEL` branch replies with `CA_PROTO_EVENT_ADD`,
+`count = 0`, and `cid = ECA_NORMAL`. `SubscriptionEntry` stores only the
+requested DBR type, so the server no longer has the original EVENT_ADD count
+or original channel header fields needed to echo the stored monitor request.
+
+C reference: `libca/tcpiiu.cpp::subscriptionCancelRequest()` includes the
+subscription count in the cancel request. `rsrv/camessage.c::event_cancel_reply()`
+sends the stored `pevext->msg` fields back with zero payload: original event
+DBR type, original event count, original event `m_cid`, and original
+subscription id. `libca/cac.cpp::eventAddRespAction()` ignores zero-payload
+cancel confirmations, but the frame is still byte-visible on the wire.
+
+Impact: strict CA clients or trace/replay tooling see a different cancel
+confirmation from the Rust server, and strict servers see a different cancel
+request from the Rust client. This shares the same missing-state root as
+R2-12, but affects the explicit cancel handshake instead of monitor delivery.
+
+### R2-24: EVENT_CANCEL with a bad channel id sends an error frame that rsrv does not send
+
+Severity: Medium
+
+Rust: `crates/epics-ca-rs/src/server/tcp.rs`, the `CA_PROTO_EVENT_CANCEL`
+handler checks the flat subscription map first. If the subscription id does not
+belong to the requested SID, it sends `CA_PROTO_ERROR/ECA_BADMONID` and then
+disconnects. That branch also covers an unknown SID, because the SID lookup is
+only used to choose the diagnostic CID/string after the BADMONID decision has
+already been made.
+
+C reference: `rsrv/camessage.c::event_cancel_reply()` calls `MPTOPCIU(mp)`
+first. If the request's channel id is unknown or belongs to another client,
+rsrv calls `logBadId()` and returns `RSRV_ERROR` without sending a wire error.
+Only after a valid channel is resolved does rsrv search that channel's event
+queue and send `ECA_BADMONID` for an unknown monitor id.
+
+Impact: malformed peers can distinguish an invalid SID from a valid-SID/
+invalid-monitor request against rsrv by whether an error frame is sent. The
+Rust server sends the BADMONID error in both cases, so strict clients and
+protocol tests observe an extra frame before EOF for the bad-SID case.
+
 ## Cleared During Review
 
 ### R2-2: Monitor status errors are already delivered
@@ -337,3 +492,8 @@ warn-and-dropped. Current code has `TransportEvent::MonitorStatusError` in
   R2-16 recorded.
 - 2026-05-18: Continued client CA_PROTO_ERROR dispatch audit. Finding R2-17
   recorded.
+- 2026-05-18: Continued client validation, repeater registration, identifier
+  allocation, and transport backpressure pass. Findings R2-18 through R2-22
+  recorded.
+- 2026-05-18: Continued EVENT_CANCEL request/reply parity pass. Findings R2-23
+  and R2-24 recorded.

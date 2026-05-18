@@ -1282,14 +1282,17 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     );
 }
 
-/// C `read_action` (`rsrv/camessage.c:616-620`): `INVALID_DB_REQ`
-/// (data_type > LAST_BUFFER_TYPE = 38) emits a CA_PROTO_ERROR with
-/// ECA_BADTYPE, then returns RSRV_ERROR which tears the connection
-/// down. Pre-fix Rust sent the error reply but kept the connection
-/// open.
+/// C `read_notify_action` (`rsrv/camessage.c:693-697`): `INVALID_DB_REQ`
+/// (data_type > LAST_BUFFER_TYPE = 38) returns RSRV_ERROR WITHOUT
+/// emitting any wire frame — only the deprecated `read_action`
+/// (`camessage.c:616-620`) calls `send_err(ECA_BADTYPE)` here.
+/// R2-6: pre-fix Rust sent a CA_PROTO_READ_NOTIFY error frame for
+/// the notify path too, an extra wire frame before EOF that rsrv
+/// never produces. Test asserts the silent-close behaviour: no
+/// wire frame, just connection drop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn server_read_notify_bad_type_replies_error_and_disconnects() {
+async fn server_read_notify_bad_type_closes_silently() {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -1364,35 +1367,20 @@ async fn server_read_notify_bad_type_replies_error_and_disconnects() {
     bad.available = 0xFADE_FADE; // ioid
     sock.write_all(&bad.to_bytes()).await.unwrap();
 
-    // Expect CA_PROTO_READ_NOTIFY error reply with cid = ECA_BADTYPE.
+    // R2-6: server must drop the connection WITHOUT emitting a
+    // wire frame — C `read_notify_action` returns RSRV_ERROR
+    // silently on INVALID_DB_REQ. Reading should observe EOF
+    // (n=0) directly, never any header bytes.
     let mut resp = [0u8; 64];
-    let mut total = 0;
-    while total < 16 {
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
-            .await
-            .expect("error reply timed out")
-            .expect("read error reply");
-        if n == 0 {
-            break;
-        }
-        total += n;
-    }
-    assert!(total >= 16, "expected error reply, got {total} bytes");
-    let err_hdr = CaHeader::from_bytes(&resp[..16]).expect("parse error reply");
-    assert_eq!(err_hdr.cmmd, CA_PROTO_READ_NOTIFY);
-    assert_eq!(err_hdr.cid, ECA_BADTYPE);
-    assert_eq!(err_hdr.available, 0xFADE_FADE, "ioid echoed");
-
-    // Server must disconnect after the error.
-    let mut tail = [0u8; 16];
-    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tail))
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp))
         .await
         .expect("server did not close after READ_NOTIFY bad type")
-        .expect("read after error");
+        .expect("read after bad type");
     assert_eq!(
         n, 0,
-        "server must drop after READ_NOTIFY bad type \
-         (C read_action RSRV_ERROR parity); got {n} more bytes"
+        "READ_NOTIFY bad-type must elicit a silent close (matches \
+         C read_notify_action RSRV_ERROR); got {n} bytes: {:02x?}",
+        &resp[..n]
     );
 }
 

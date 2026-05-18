@@ -215,6 +215,19 @@ struct ChannelEntry {
     /// `CA_PROTO_EVENT_ADD` so the filter chain attaches to the
     /// fresh subscriber.
     filter_suffix: Option<String>,
+    /// R2-9: per-channel WRITE_NOTIFY busy gate. C
+    /// `write_notify_action` (`rsrv/camessage.c:1660-1707`) stores
+    /// one `pciu->pPutNotify` per channel; a second
+    /// `CA_PROTO_WRITE_NOTIFY` while one is still running waits up
+    /// to 60s and on timeout cancels with `ECA_PUTCBINPROG`. Rust
+    /// rejects the second arrival immediately with the same code
+    /// (simpler than C's wait-then-cancel but preserves the
+    /// serialisation invariant — a record implementation that
+    /// relies on rsrv's per-channel ordering doesn't see reentrant
+    /// writes). Set on async completion-task spawn, cleared when
+    /// the task finishes (`Arc` so the spawned task can clear it
+    /// without re-borrowing `state.channels`).
+    put_notify_busy: Arc<AtomicBool>,
 }
 
 struct SubscriptionEntry {
@@ -1801,6 +1814,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         cid: client_cid,
                         pv_name: pv_name.clone(),
                         filter_suffix: filter_suffix.clone(),
+                        put_notify_busy: Arc::new(AtomicBool::new(false)),
                     },
                 );
                 state.channel_access.insert(sid, access_level);
@@ -2439,7 +2453,30 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     write_result.unwrap_or_default();
 
                 if let Some(rx) = completion_rx {
+                    // R2-9: per-channel WRITE_NOTIFY serialisation. C
+                    // `write_notify_action` (`rsrv/camessage.c:1660-1707`)
+                    // stores one `pciu->pPutNotify` per channel; a second
+                    // WRITE_NOTIFY while the first is still running waits
+                    // up to 60s and on timeout cancels with
+                    // ECA_PUTCBINPROG. Rust rejects the second arrival
+                    // immediately with the same code — simpler than C's
+                    // wait-then-cancel but preserves the serialisation
+                    // invariant (a record implementation that relies on
+                    // rsrv's per-channel ordering doesn't see reentrant
+                    // writes).
+                    let busy_arc = entry.put_notify_busy.clone();
+                    if busy_arc.swap(true, Ordering::AcqRel) {
+                        let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
+                        resp.data_type = write_type as u16;
+                        resp.count = write_count;
+                        resp.cid = ECA_PUTCBINPROG;
+                        resp.available = ioid;
+                        let mut w = writer.lock().await;
+                        w.write_all(&resp.to_bytes()).await?;
+                        return Ok(());
+                    }
                     let writer_c = writer.clone();
+                    let busy_for_task = busy_arc.clone();
                     let join = tokio::spawn(async move {
                         // Wait indefinitely for record processing to complete,
                         // matching C EPICS rsrv behavior. RecvError means the
@@ -2460,6 +2497,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let mut w = writer_c.lock().await;
                         let _ = w.write_all(&resp.to_bytes()).await;
                         let _ = w.flush().await;
+                        drop(w);
+                        // Clear the per-channel busy gate so the next
+                        // WRITE_NOTIFY on this channel can proceed.
+                        busy_for_task.store(false, Ordering::Release);
                     });
                     // Track for connection-scoped cleanup (CR-3): a stuck
                     // async record would otherwise pin this task and the

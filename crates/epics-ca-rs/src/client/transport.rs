@@ -1375,6 +1375,55 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     } else {
                         String::new()
                     };
+                    // R2-17: route to the in-flight operation registry
+                    // matching the echoed request command. libca
+                    // `cac::exceptionRespAction` (`cac.cpp:1081-1119`)
+                    // dispatches by original command through
+                    // `tcpExcepJumpTableCAC`; readNotifyExcep /
+                    // writeNotifyExcep use `hdr.m_available` to
+                    // complete and uninstall the pending IO callback
+                    // so the user-facing `get()` / `put()` future
+                    // surfaces the per-op error instead of timing
+                    // out. Pre-fix Rust only fired the global
+                    // exception hook here, leaving the per-op
+                    // futures pending until their own timeout.
+                    // Extract `m_available` from the echoed 16-byte
+                    // header (offset 12) — the extended annex
+                    // (postsize/count fields) is appended AFTER the
+                    // 16-byte header, so `m_available` is always at
+                    // the same position regardless of extended form.
+                    let echo_available = if actual_post >= 16 {
+                        Some(u32::from_be_bytes([
+                            accumulated[data_start + 12],
+                            accumulated[data_start + 13],
+                            accumulated[data_start + 14],
+                            accumulated[data_start + 15],
+                        ]))
+                    } else {
+                        None
+                    };
+                    if let (Some(cmd), Some(ioid)) = (orig_cmd, echo_available) {
+                        match cmd {
+                            CA_PROTO_READ_NOTIFY => {
+                                dispatch_read_error(
+                                    &in_flight,
+                                    ioid,
+                                    epics_base_rs::error::CaError::ServerError(eca_status),
+                                );
+                            }
+                            CA_PROTO_WRITE_NOTIFY => {
+                                if let Some((_, (_, reply_tx))) = in_flight.writes.remove(&ioid) {
+                                    let _ = reply_tx.send(Err(
+                                        epics_base_rs::error::CaError::ServerError(eca_status),
+                                    ));
+                                }
+                            }
+                            // EVENT_ADD errors travel through
+                            // MonitorStatusError (Bug 5 path); EVENT_CANCEL
+                            // confirmations don't have a per-op waiter.
+                            _ => {}
+                        }
+                    }
                     // C ref: modules/ca/src/client/udpiiu.cpp:exceptionRespAction —
                     // commit a352865 routes the error prefix through ERL_ERROR
                     // (ANSI-colored "Error:" on TTYs). The Rust equivalent is

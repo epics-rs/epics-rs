@@ -598,29 +598,34 @@ fn is_disconnect(e: &epics_pva_rs::error::PvaError) -> bool {
     }
 }
 
-/// Build the pvRequest for an INP+monitor link when its options
-/// require server-side negotiation (B4 `Q` / `pipeline`).
+/// BR-R43: build the pvRequest for an INP+monitor link.
 ///
-/// Returns `None` for the default monitor (no pipeline, default
-/// queue depth) so the plain `pvmonitor` fast path is kept. When a
-/// request is built it carries `record[pipeline=...,queueSize=N]`,
-/// which `epics-pva-rs` re-sends on every reconnect, mirroring pvxs
-/// `pvaLink::makeRequest` (pvalink_link.cpp:47).
+/// pvxs `pvaLink::makeRequest` (`pvalink_link.cpp:47-65`) ALWAYS
+/// emits three fields on every INP monitor request:
+///
+///   - `record._options.pipeline`  — boolean, honors `cfg.pipeline`
+///   - `record._options.atomic`    — hard-coded `true` (forces the
+///     remote QSRV/group to assemble atomic snapshots even when the
+///     local pvalink isn't part of an atomic scan batch — these are
+///     related but distinct concepts).
+///   - `record._options.queueSize` — int, defaults to 4 even when
+///     no other option requires negotiation.
+///
+/// The earlier Rust path returned `None` for the default monitor,
+/// so a no-options INP link sent no pvRequest and the remote server
+/// fell back to its own defaults — including possibly non-atomic
+/// snapshots and a different queue depth. Match pvxs by always
+/// returning a request with all three fields populated.
 fn monitor_request(config: &PvaLinkConfig) -> Option<epics_pva_rs::pv_request::PvRequestExpr> {
-    use super::config::DEFAULT_QUEUE_SIZE;
-    let needs_pipeline = config.pipeline;
-    let needs_queue = config.queue_size != DEFAULT_QUEUE_SIZE;
-    if !needs_pipeline && !needs_queue {
-        return None;
-    }
     let mut req = epics_pva_rs::pv_request::PvRequestExpr::default();
-    if needs_pipeline {
-        req.record_options
-            .push(("pipeline".to_string(), "true".to_string()));
-    }
-    // Always carry queueSize alongside pipeline (pvxs sends both in
-    // `makeRequest`); also carry it on its own when a non-default Q
-    // was requested.
+    req.record_options.push((
+        "pipeline".to_string(),
+        if config.pipeline { "true" } else { "false" }.to_string(),
+    ));
+    // pvxs `pvalink_link.cpp:64`: forced true on the remote request,
+    // independent of `cfg.atomic` (the local scan-batch flag).
+    req.record_options
+        .push(("atomic".to_string(), "true".to_string()));
     req.record_options.push((
         "queueSize".to_string(),
         config.queue_size.max(1).to_string(),
@@ -809,10 +814,33 @@ mod tests {
 
     // ---- B4: monitor_request (Q / pipeline) ----
 
+    /// BR-R43: pvxs `pvaLink::makeRequest` always emits pipeline +
+    /// atomic + queueSize even on a defaults-only INP monitor.
+    /// Regression for the prior `None`-for-defaults shortcut that
+    /// silently let the remote server fall back to its own defaults.
     #[test]
-    fn b4_monitor_request_none_for_defaults() {
+    fn b4_monitor_request_always_carries_pvxs_options() {
         let cfg = PvaLinkConfig::defaults_for("X", LinkDirection::Inp);
-        assert!(monitor_request(&cfg).is_none());
+        let req = monitor_request(&cfg).expect("BR-R43: defaults still yield a request");
+        // pipeline = false on default config; queueSize = pvxs default 4;
+        // atomic = forced true.
+        assert!(
+            req.record_options
+                .iter()
+                .any(|(k, v)| k == "pipeline" && v == "false")
+        );
+        assert!(
+            req.record_options
+                .iter()
+                .any(|(k, v)| k == "atomic" && v == "true"),
+            "BR-R43: atomic must be hard-coded true on remote pvalink monitor requests"
+        );
+        assert!(
+            req.record_options
+                .iter()
+                .any(|(k, v)| k == "queueSize" && v == "4"),
+            "BR-R43: queueSize must default to pvxs's 4 on no-options links"
+        );
     }
 
     #[test]

@@ -889,22 +889,18 @@ impl LinkSet for PvaLinkResolver {
         // P-G16: bypass the Display→string→parse round-trip for
         // ARRAYS (where Display alloc is O(N_elements * digits) and
         // pvput re-parses 25 MB strings on a 1 M-element waveform).
-        // SCALARS keep the string path because the typed
-        // PvField::Scalar doesn't carry the upstream NT-structure
-        // wrapper; encode_pv_field on a (Structure intro, Scalar
-        // value) mismatch hits the fall-through arm and emits zero
-        // bytes — a Round-6 regression caught immediately on
-        // verification of the original P-G16 fix.
-        let array_path = matches!(
-            value,
-            EpicsValue::ShortArray(_)
-                | EpicsValue::FloatArray(_)
-                | EpicsValue::EnumArray(_)
-                | EpicsValue::DoubleArray(_)
-                | EpicsValue::LongArray(_)
-                | EpicsValue::CharArray(_)
-                | EpicsValue::StringArray(_)
-        );
+        // SCALARS keep the string path so the text is coerced against
+        // the channel's introspected scalar type.
+        //
+        // MR-R23 / EX-R10: classify via `is_array_value` — an
+        // exhaustive match with no wildcard arm — so a future
+        // `EpicsValue` array variant cannot silently miss this gate.
+        // The earlier inline `matches!` over a hard-coded subset
+        // omitted `Int64Array` (never covered) and `UInt64Array`
+        // (added with `DBF_UINT64` but never wired in), routing those
+        // through the string PUT path where the bracketed `Display`
+        // text is unparseable.
+        let array_path = is_array_value(&value);
         block_in_place_or_warn(|| {
             self.handle.block_on(async {
                 let link = self
@@ -1116,6 +1112,40 @@ fn default_inp_cfg(pv_name: &str) -> PvaLinkConfig {
     PvaLinkConfig {
         monitor: true,
         ..PvaLinkConfig::defaults_for(pv_name, LinkDirection::Inp)
+    }
+}
+
+/// True iff `value` is an array `EpicsValue` variant — the pvalink
+/// OUT dispatcher routes these through the typed `PvField` write path
+/// (`crate::convert::epics_to_pv_field` → `PvaLink::write_pv_field`)
+/// instead of the scalar `Display`→string→`pvput`-parse path.
+///
+/// MR-R23 / EX-R10: this is the single classification gate for the
+/// OUT typed-array path. It is an EXHAUSTIVE match with no wildcard
+/// arm — every `EpicsValue` variant is named, so adding a future
+/// array variant to `EpicsValue` forces a compile error here until
+/// it is classified, which structurally prevents another
+/// missed-gate regression.
+fn is_array_value(value: &EpicsValue) -> bool {
+    match value {
+        EpicsValue::ShortArray(_)
+        | EpicsValue::FloatArray(_)
+        | EpicsValue::EnumArray(_)
+        | EpicsValue::DoubleArray(_)
+        | EpicsValue::LongArray(_)
+        | EpicsValue::CharArray(_)
+        | EpicsValue::Int64Array(_)
+        | EpicsValue::UInt64Array(_)
+        | EpicsValue::StringArray(_) => true,
+        EpicsValue::String(_)
+        | EpicsValue::Short(_)
+        | EpicsValue::Float(_)
+        | EpicsValue::Enum(_)
+        | EpicsValue::Char(_)
+        | EpicsValue::Long(_)
+        | EpicsValue::Double(_)
+        | EpicsValue::Int64(_)
+        | EpicsValue::UInt64(_) => false,
     }
 }
 
@@ -2356,6 +2386,108 @@ mod tests {
             LinkSet::time_stamp(&resolver, "pva://MR_R15:PV?time=true"),
             Some((1_700_000_000, 42)),
             "a time=true caller must adopt the upstream timestamp"
+        );
+    }
+
+    /// MR-R23: an OUT pvalink fed by an `EpicsValue::UInt64Array`
+    /// (from an `FTVL=UINT64` waveform) must go through the typed
+    /// `ulong[]` encoder, not the scalar string-PUT path. Pre-fix the
+    /// OUT dispatcher's hard-coded `array_path` match omitted
+    /// `UInt64Array`, so the value fell through to `value.to_string()`
+    /// — a bracketed `[1, 2]` literal the PVA array string parser
+    /// rejects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mr_r23_out_uint64_array_uses_typed_path() {
+        use epics_pva_rs::pvdata::ScalarType;
+        out_array_typed_path_case(
+            "MR_R23:PV",
+            ScalarType::ULong,
+            EpicsValue::UInt64Array(vec![1, 2, u64::MAX]),
+            // u64::MAX as the i64 bit pattern is -1; the test
+            // compares 64-bit words, so full-width u64 is preserved.
+            &[1, 2, u64::MAX as i64],
+        )
+        .await;
+    }
+
+    /// Shared body for the MR-R23 / EX-R10 OUT typed-array
+    /// regression tests. Stands up a PVA server hosting a
+    /// `long[]` / `ulong[]` PV, seeds the registry with a
+    /// pinned-client OUT `PvaLink`, and drives `LinkSet::put_value`
+    /// with `value`. The PUT must succeed and the server PV must
+    /// hold `expected` (compared as `i64` bit patterns regardless of
+    /// the wire-level signedness).
+    async fn out_array_typed_path_case(
+        pv_name: &str,
+        elem_type: epics_pva_rs::pvdata::ScalarType,
+        value: EpicsValue,
+        expected: &[i64],
+    ) {
+        use crate::pvalink::link::PvaLink;
+        use epics_pva_rs::client::PvaClient;
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarValue};
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        // PVA server hosting a `long[]` / `ulong[]`-valued PV.
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalarArray:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::ScalarArray(elem_type))],
+        };
+        let initial = PvField::Structure(epics_pva_rs::pvdata::PvStructure {
+            struct_id: "epics:nt/NTScalarArray:1.0".into(),
+            fields: vec![("value".into(), PvField::ScalarArray(vec![]))],
+        });
+        let pv = SharedPV::new();
+        pv.open(desc, initial);
+        let source = SharedSource::new();
+        source.add(pv_name, pv.clone());
+        let server =
+            PvaServer::isolated(std::sync::Arc::new(source)).expect("test PVA server starts");
+        let addr = server.tcp_addr();
+
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+
+        // Seed the registry with a pinned-client OUT link under the
+        // exact key `put_value` will look up for the bare PV name, so
+        // `get_or_open` is a cache hit and the typed PUT reaches the
+        // pinned test server.
+        let out_cfg = resolver.out_cfg_for(pv_name);
+        let client = PvaClient::builder()
+            .server_addr(addr)
+            .timeout(std::time::Duration::from_secs(3))
+            .build();
+        let link = std::sync::Arc::new(PvaLink::for_test_with_client(out_cfg.clone(), client));
+        resolver.registry.insert_for_test(&out_cfg, link);
+
+        // Drive the OUT path through the resolver's LinkSet impl.
+        let scheme_name = format!("pva://{pv_name}");
+        LinkSet::put_value(&resolver, &scheme_name, value)
+            .expect("typed array OUT write must succeed");
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let current = pv.current().expect("PV has a current value");
+        let PvField::Structure(s) = current else {
+            panic!("expected structure value");
+        };
+        let value_field = s.get_field("value").expect("value sub-field present");
+        // Compare as i64 bit patterns — a ulong[] readback is ULong,
+        // a long[] readback is Long; both carry the same 64-bit word.
+        let elem_as_i64 = |sv: &ScalarValue| -> i64 {
+            match sv {
+                ScalarValue::Long(x) => *x,
+                ScalarValue::ULong(x) => *x as i64,
+                other => panic!("expected a 64-bit element, got {other:?}"),
+            }
+        };
+        let got: Vec<i64> = match value_field {
+            PvField::ScalarArray(v) => v.iter().map(elem_as_i64).collect(),
+            PvField::ScalarArrayTyped(t) => t.to_scalar_values().iter().map(elem_as_i64).collect(),
+            other => panic!("expected an array value field, got {other:?}"),
+        };
+        assert_eq!(
+            got, expected,
+            "typed-array OUT write must land the full-width 64-bit array value"
         );
     }
 }

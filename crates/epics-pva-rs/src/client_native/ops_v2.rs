@@ -811,6 +811,40 @@ fn build_put_value_typed_for_path(
     }
 }
 
+/// Coerce a typed PUT `value` to the shape `intro` expects before
+/// encoding.
+///
+/// `op_put_value` / `op_put_value_raw` encode `value` against the
+/// server's introspection and target the `value` bit. Callers pass
+/// either a full NT structure (`pvput_typed` via
+/// `TypedNT::to_pv_field`) or a *bare leaf* value — pvalink OUT
+/// arrays go through `crate::convert::epics_to_pv_field`, which
+/// returns a bare `PvField::ScalarArray` / `PvField::Scalar`.
+///
+/// `encode_pv_field` has no `(Structure desc, bare-leaf value)` arm,
+/// so a bare leaf encoded directly against a `Structure` intro emits
+/// zero bytes and the server applies an empty value. When `intro` is
+/// a `Structure` with a `value` sub-field and `value` is not itself
+/// a `Structure`, this wraps the bare leaf at the `value` path so
+/// the encoder sees a structurally-matching value. A `value` that is
+/// already a `Structure`, or an `intro` that is itself a bare leaf,
+/// passes through unchanged.
+fn coerce_typed_put_value(intro: &FieldDesc, value: &PvField) -> PvaResult<PvField> {
+    match (intro, value) {
+        (FieldDesc::Structure { fields, .. }, v) if !matches!(v, PvField::Structure(_)) => {
+            if fields.iter().any(|(n, _)| n == "value") {
+                build_put_value_typed_for_path(intro, &["value"], value)
+            } else {
+                // No `value` sub-field to target — leave as-is; the
+                // encoder mismatch will surface as a clear "PUT
+                // failed" rather than a silent empty write.
+                Ok(value.clone())
+            }
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
 /// PUT a pre-built [`PvField`] (typed-NT path). Skips the
 /// string-form round-trip used by [`op_put`] / [`op_put_raw`] —
 /// `value` is encoded directly against the server-supplied
@@ -868,7 +902,11 @@ pub async fn op_put_value(
     changed.write_into(order, &mut payload);
     // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
     // only the fields whose bit is set. Encode consistently.
-    encode_pv_field_with_bitset(value, &intro, &changed, 0, order, &mut payload);
+    // Wrap a bare-leaf `value` at the `value` path when `intro` is a
+    // structure (MR-R23: pvalink OUT arrays arrive as a bare
+    // `ScalarArray`, which would otherwise encode to zero bytes).
+    let put_value = coerce_typed_put_value(&intro, value)?;
+    encode_pv_field_with_bitset(&put_value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();
     header.write_into(&mut frame);
@@ -947,7 +985,10 @@ pub async fn op_put_value_raw(
         changed.set(0);
     }
     changed.write_into(order, &mut payload);
-    encode_pv_field_with_bitset(value, &intro, &changed, 0, order, &mut payload);
+    // MR-R23: wrap a bare-leaf `value` (pvalink OUT arrays) at the
+    // `value` path so the encoder sees a structurally-matching value.
+    let put_value = coerce_typed_put_value(&intro, value)?;
+    encode_pv_field_with_bitset(&put_value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();
     header.write_into(&mut frame);

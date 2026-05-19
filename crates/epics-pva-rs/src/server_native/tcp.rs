@@ -515,12 +515,6 @@ pub async fn run_tcp_server_on_listener(
                 let cfg = config.clone();
                 let active_dec = active.clone();
                 let acceptor = tls_acceptor.clone();
-                // F-G7: register this connection in the peer registry
-                // so PvaServer::report() can surface it. Removed when
-                // the connection task ends.
-                let tls_in_use = acceptor.is_some();
-                let peer_entry = crate::server_native::peers::PeerEntry::new(tls_in_use);
-                peers.insert(peer, peer_entry.clone());
                 let peers_for_task = peers.clone();
                 conn_tasks.spawn(async move {
                     stream.set_nodelay(true).ok();
@@ -542,12 +536,61 @@ pub async fn run_tcp_server_on_listener(
                         let _ = sock.set_keepalive(true);
                         let _ = sock.set_tcp_keepalive(&keepalive);
                     }
-                    let result = match acceptor {
+
+                    // TLS-NAMESERVER: peek the first byte to dispatch
+                    // TLS vs plain PVA on a single port.
+                    //
+                    // TLS ClientHello record type = 0x16 — the TLS
+                    // client sends this IMMEDIATELY after TCP connect
+                    // (client-initiates). Plain PVA clients NEVER send
+                    // a first byte; the server sends SET_BYTE_ORDER first.
+                    //
+                    // Dispatch rule (pvxs uses separate listeners per
+                    // protocol via serverconn.h:193 `isTLS`; we unify):
+                    //   peek Ok(1) && byte == 0x16 → TLS path
+                    //   peek timeout (≤ 100 ms)    → plain PVA path
+                    //   peek Ok(1) && byte != 0x16  → plain PVA path
+                    //   peek Ok(0) / IO error       → drop (peer gone)
+                    //
+                    // 100 ms is enough for ClientHello to arrive (sent
+                    // immediately by TLS stack) while adding negligible
+                    // latency to plain PVA connections.
+                    const PEEK_WINDOW: Duration = Duration::from_millis(100);
+                    let is_tls_client = match acceptor.as_ref() {
+                        None => false,
+                        Some(_) => {
+                            let mut b = [0u8; 1];
+                            match tokio::time::timeout(PEEK_WINDOW, stream.peek(&mut b)).await {
+                                Ok(Ok(1)) => b[0] == 0x16,
+                                Ok(Ok(_)) => {
+                                    debug!(?peer, "peer closed before first byte");
+                                    active_dec.fetch_sub(1, Ordering::SeqCst);
+                                    return;
+                                }
+                                Ok(Err(e)) => {
+                                    debug!(?peer, "first-byte peek error: {e}");
+                                    active_dec.fetch_sub(1, Ordering::SeqCst);
+                                    return;
+                                }
+                                // Timeout → plain PVA client (server initiates).
+                                Err(_) => false,
+                            }
+                        }
+                    };
+
+                    // F-G7: register this connection in the peer registry
+                    // so PvaServer::report() can surface it. Deferred to
+                    // here (post-peek) so the `tls` flag reflects the
+                    // actual protocol, not the server config.
+                    let peer_entry = crate::server_native::peers::PeerEntry::new(is_tls_client);
+                    peers_for_task.insert(peer, peer_entry.clone());
+
+                    let result = match (acceptor, is_tls_client) {
                         // Round 8 P-G15: cap the TLS handshake — a peer
                         // that completes TCP but stalls during ClientHello
                         // would otherwise hold a `max_connections` slot
                         // until OS keepalive reaps it (~30s).
-                        Some(a) => {
+                        (Some(a), true) => {
                             match tokio::time::timeout(cfg.tls_handshake_timeout, a.accept(stream))
                                 .await
                             {
@@ -592,7 +635,9 @@ pub async fn run_tcp_server_on_listener(
                                 }
                             }
                         }
-                        None => {
+                        _ => {
+                            // Plain PVA: no TLS configured, or client sent
+                            // non-TLS bytes (name-server, plain pvxs peer).
                             let (r, w) = stream.into_split();
                             handle_connection_io(
                                 src,

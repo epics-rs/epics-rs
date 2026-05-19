@@ -64,9 +64,14 @@ pub struct PvaServerConfig {
     /// Per-monitor outbound queue depth. When exceeded, the back-pressure
     /// policy kicks in (squash to last value).
     pub monitor_queue_depth: usize,
-    /// Optional TLS server config. When `Some`, every accepted TCP
-    /// connection is upgraded to TLS via `tokio_rustls::TlsAcceptor`
-    /// before the PVA handshake begins.
+    /// Optional TLS server config. When `Some`, the accept loop peeks
+    /// the first byte of each incoming connection with a 100 ms window:
+    /// a TLS ClientHello (byte `0x16`, sent immediately by the TLS
+    /// client stack) is upgraded via `tokio_rustls::TlsAcceptor`; a
+    /// peek timeout means a plain PVA client (server sends first, so
+    /// client never sends the first byte) and is served as plain PVA.
+    /// This mixed-mode dispatch lets a single port serve both TLS and
+    /// plain clients, resolving the name-server collision.
     pub tls: Option<std::sync::Arc<crate::auth::TlsServerConfig>>,
     /// Optional override for the server's top-level access gate.
     /// When `Some`, the user source's default open gate is

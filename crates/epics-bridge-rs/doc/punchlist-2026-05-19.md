@@ -41,8 +41,9 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 - [ ] **BR-R10** — DB JSON pvalink options are reduced to only the PV name.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:299-326`
 
-- [ ] **BR-R27** — pvalink cache key drops per-link `field` and option state.
+- [x] **BR-R27** — pvalink cache key drops per-link `field` and option state.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:766-794`
+  - Done: worker B, commit `285a24e1` on `caucus/HJB9ABPH/backend`; regression `br_r27_pvalink_cache_separates_per_link_options`. Cross-crate: all three pvalink files (`link.rs`, `registry.rs`, `integration.rs`). Upstream parity: pvxs/ioc/pvalink.h:65 (per-link pvaLinkConfig); pvxs/ioc/pvalink.h:116 (channels_key_t); pvxs/ioc/pvalink_lset.cpp:49-65,99-100 (makeRequest + channel lookup key); pvxs/ioc/pvalink_link.cpp:91 (root = lchan->root[fieldName]).
 
 ### Priority 5 — Gateway typed forwarding / decoded monitor fallback
 
@@ -98,7 +99,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 17
-- Done: 0
+- Total open: 11 (was 17)
+- Done: 5 (BR-R4, BR-R21, BR-R11, BR-R10, BR-R27) — tracked on main via doc tracker commits
 - In progress: 0
 - Blocked: 0

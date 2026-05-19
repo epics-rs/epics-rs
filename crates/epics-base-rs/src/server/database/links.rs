@@ -328,6 +328,45 @@ impl PvDatabase {
         })
     }
 
+    /// Remote display / control / valueAlarm metadata for an external
+    /// (`pva://` / `ca://`) link, resolved through the registered
+    /// lset's [`LinkSet::link_metadata`] hook (BR-R24).
+    ///
+    /// This is the DB-link-API entry point that exposes the linked PV
+    /// metadata pvxs's pvalink lset surfaces through its
+    /// `pvaGetDBFtype` / `pvaGetElements` / `pvaGetControlLimits` /
+    /// `pvaGetGraphicLimits` / `pvaGetAlarmLimits` / `pvaGetPrecision`
+    /// / `pvaGetUnits` getters
+    /// (`pvxs/ioc/pvalink_lset.cpp:700`). Scheme dispatch mirrors
+    /// [`Self::external_link_alarm`]: an explicit `pva://` / `ca://`
+    /// prefix selects the lset directly, a bare name tries every
+    /// registered lset until one reports metadata.
+    ///
+    /// `None` when no lset is registered for the scheme or the lset
+    /// has no cached value for the link (not yet connected).
+    pub async fn external_link_metadata(
+        &self,
+        name: &str,
+    ) -> Option<crate::server::database::LinkMetadata> {
+        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
+            ("pva", rest)
+        } else if let Some(rest) = name.strip_prefix("ca://") {
+            ("ca", rest)
+        } else {
+            let registry = self.inner.link_sets.read().await;
+            for s in registry.schemes() {
+                if let Some(lset) = registry.get(&s) {
+                    if let Some(meta) = lset.link_metadata(name) {
+                        return Some(meta);
+                    }
+                }
+            }
+            return None;
+        };
+        let lset = self.inner.link_sets.read().await.get(scheme)?;
+        lset.link_metadata(body)
+    }
+
     /// C `dbGetLink` PP rule: if a DB input link is `ProcessPassive`
     /// and its source record is `Passive`-scanned, process the source
     /// record before its value is read so the reader sees a freshly

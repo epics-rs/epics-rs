@@ -35,6 +35,65 @@ use std::sync::Arc;
 
 use crate::types::EpicsValue;
 
+/// DBF field type a link's value maps to — the Rust counterpart of
+/// the C `DBF_*` codes pvxs `pvaGetDBFtype` returns.
+///
+/// Mirrors `pvxs/ioc/pvalink_lset.cpp:199` (`pvaGetDBFtype`), which
+/// maps the cached NT value's `TypeCode` to a `DBF_*` constant; an
+/// NT `enum_t` structure maps to `DBF_ENUM`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkDbfType {
+    Char,
+    UChar,
+    Short,
+    UShort,
+    Long,
+    ULong,
+    Int64,
+    UInt64,
+    Float,
+    Double,
+    String,
+    Enum,
+}
+
+/// Remote display / control / valueAlarm metadata snapshot for a
+/// link, as exposed by pvxs's pvalink lset metadata getters.
+///
+/// Mirrors the pvxs `pvalink_lset.cpp` metadata getter set installed
+/// at `pvxs/ioc/pvalink_lset.cpp:700`:
+/// `pvaGetDBFtype`, `pvaGetElements`, `pvaGetControlLimits`,
+/// `pvaGetGraphicLimits`, `pvaGetAlarmLimits`, `pvaGetPrecision`,
+/// `pvaGetUnits`.
+///
+/// Every field is optional: pvxs's getters read the cached NT
+/// structure with `Value::as`, which leaves the caller's buffer
+/// unchanged when the sub-field is absent. `None` here means the
+/// remote NT value carried no such metadata — the record support
+/// then keeps its local/default metadata, exactly as the C path does.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LinkMetadata {
+    /// DBF type the remote value maps to (`pvaGetDBFtype`).
+    pub dbf_type: Option<LinkDbfType>,
+    /// Element count: array length, or `1` for a scalar
+    /// (`pvaGetElements`).
+    pub element_count: Option<i64>,
+    /// `display.limitLow` / `display.limitHigh` (`pvaGetGraphicLimits`).
+    pub graphic_limits: Option<(f64, f64)>,
+    /// `control.limitLow` / `control.limitHigh` (`pvaGetControlLimits`).
+    pub control_limits: Option<(f64, f64)>,
+    /// `valueAlarm.{lowAlarmLimit,lowWarningLimit,highWarningLimit,
+    /// highAlarmLimit}` as `(lolo, lo, hi, hihi)` (`pvaGetAlarmLimits`).
+    pub alarm_limits: Option<(f64, f64, f64, f64)>,
+    /// `display.precision` (`pvaGetPrecision`).
+    pub precision: Option<i16>,
+    /// `display.units` (`pvaGetUnits`).
+    pub units: Option<String>,
+    /// `display.description` — carried so a link snapshot is complete;
+    /// pvxs exposes it through the same `fld_meta` cache.
+    pub description: Option<String>,
+}
+
 /// Pluggable backend for one URL scheme's link operations.
 ///
 /// All methods take `&self` so the implementation must use interior
@@ -87,6 +146,27 @@ pub trait LinkSet: Send + Sync {
     /// `(seconds_past_epoch, nanoseconds)` from the upstream PV's
     /// timestamp slot, when available.
     fn time_stamp(&self, _name: &str) -> Option<(i64, i32)> {
+        None
+    }
+
+    /// Remote display / control / valueAlarm metadata for `name`, as
+    /// a single snapshot.
+    ///
+    /// The Rust counterpart of pvxs's pvalink lset metadata getter
+    /// set (`pvaGetDBFtype`, `pvaGetElements`, `pvaGetControlLimits`,
+    /// `pvaGetGraphicLimits`, `pvaGetAlarmLimits`, `pvaGetPrecision`,
+    /// `pvaGetUnits` — installed at `pvxs/ioc/pvalink_lset.cpp:700`).
+    /// A structured snapshot is used instead of seven separate trait
+    /// methods so the lset reads its cache once and record support
+    /// gets every linked-metadata field together.
+    ///
+    /// `None` means the lset has no cached value for `name` (not yet
+    /// connected); a `Some(LinkMetadata)` with individual `None`
+    /// fields means the remote NT value simply did not carry that
+    /// piece of metadata — the record then keeps its local default,
+    /// matching the C getters that leave the caller's buffer
+    /// untouched on a missing sub-field. Default impl: no metadata.
+    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
         None
     }
 

@@ -523,6 +523,80 @@ impl PvaLink {
         Some((secs, nsec))
     }
 
+    /// Remote display / control / valueAlarm metadata snapshot for
+    /// this link's cached NT value.
+    ///
+    /// Mirrors the pvxs pvalink lset metadata getters
+    /// (`pvxs/ioc/pvalink_lset.cpp:199`–`:534`):
+    ///
+    /// * `dbf_type` / `element_count` derive from the value at the
+    ///   link's field path (`config.field`) — `pvaGetDBFtype` reads
+    ///   `fld_value.type()`, `pvaGetElements` reads its array length
+    ///   or `1` for a scalar.
+    /// * `graphic_limits` / `control_limits` / `alarm_limits` /
+    ///   `precision` / `units` / `description` are read from the
+    ///   *top-level* NT `display` / `control` / `valueAlarm`
+    ///   sub-structures — `pvaGetGraphicLimits` &c. read
+    ///   `fld_meta["display.limitLow"]`, etc.
+    ///
+    /// Returns `None` when no value is cached (link not connected).
+    /// Each field is `None` when the remote NT value did not carry
+    /// that metadata — the caller then keeps its local default,
+    /// exactly as the C getters leave the buffer untouched on a
+    /// missing `Value::as`.
+    pub fn link_metadata(&self) -> Option<epics_base_rs::server::database::LinkMetadata> {
+        use epics_base_rs::server::database::LinkMetadata;
+
+        let root = self.latest.lock().clone()?;
+
+        // The value at the link's field path drives DBF type and
+        // element count. `pvaGetDBFtype` uses `fld_value`; `fld_value`
+        // is the value sub-field selected by the link's field name.
+        let value_field = extract_field(&root, &self.config.field);
+
+        let dbf_type = link_dbf_type(&value_field);
+        let element_count = link_element_count(&value_field);
+
+        // display / control / valueAlarm are top-level NT children;
+        // pvxs reads them from `fld_meta` (the top-level struct).
+        let graphic_limits = limit_pair(&root, "display.limitLow", "display.limitHigh");
+        let control_limits = limit_pair(&root, "control.limitLow", "control.limitHigh");
+        let alarm_limits = {
+            let lolo = scalar_as_f64(&extract_field(&root, "valueAlarm.lowAlarmLimit"));
+            let lo = scalar_as_f64(&extract_field(&root, "valueAlarm.lowWarningLimit"));
+            let hi = scalar_as_f64(&extract_field(&root, "valueAlarm.highWarningLimit"));
+            let hihi = scalar_as_f64(&extract_field(&root, "valueAlarm.highAlarmLimit"));
+            match (lolo, lo, hi, hihi) {
+                // pvxs writes each of the four buffers independently
+                // and leaves a missing one untouched; we only surface
+                // the alarm-limit set when at least one is present,
+                // defaulting the absent ones to 0.0 to mirror a
+                // record's zero-initialised limit fields.
+                (None, None, None, None) => None,
+                (a, b, c, d) => Some((
+                    a.unwrap_or(0.0),
+                    b.unwrap_or(0.0),
+                    c.unwrap_or(0.0),
+                    d.unwrap_or(0.0),
+                )),
+            }
+        };
+        let precision = scalar_as_f64(&extract_field(&root, "display.precision")).map(|p| p as i16);
+        let units = string_field(&root, "display.units");
+        let description = string_field(&root, "display.description");
+
+        Some(LinkMetadata {
+            dbf_type,
+            element_count,
+            graphic_limits,
+            control_limits,
+            alarm_limits,
+            precision,
+            units,
+            description,
+        })
+    }
+
     /// Test-only constructor: build a [`PvaLink`] with a pre-seeded
     /// cached value and no live connection. Lets the unit tests
     /// exercise the cache-reading accessors (`link_alarm_severity`,
@@ -676,6 +750,133 @@ fn scalar_value_to_f64(v: &ScalarValue) -> f64 {
         ScalarValue::Float(x) => *x as f64,
         ScalarValue::Double(x) => *x,
         ScalarValue::String(s) => s.parse().unwrap_or(0.0),
+    }
+}
+
+/// Map the cached NT value at the link's field path to a DBF type,
+/// mirroring pvxs `pvaGetDBFtype` (`pvxs/ioc/pvalink_lset.cpp:199`).
+///
+/// An NT `enum_t` structure (an `index` integer + `choices` string
+/// array) maps to `Enum`; a scalar / scalar array maps by element
+/// type; anything else has no DBF mapping and yields `None` (the
+/// record then keeps its own field type).
+fn link_dbf_type(value_field: &PvField) -> Option<epics_base_rs::server::database::LinkDbfType> {
+    use epics_base_rs::server::database::LinkDbfType;
+
+    let from_scalar = |sv: &ScalarValue| match sv {
+        ScalarValue::Byte(_) => Some(LinkDbfType::Char),
+        ScalarValue::UByte(_) => Some(LinkDbfType::UChar),
+        ScalarValue::Short(_) => Some(LinkDbfType::Short),
+        ScalarValue::UShort(_) => Some(LinkDbfType::UShort),
+        ScalarValue::Int(_) => Some(LinkDbfType::Long),
+        ScalarValue::UInt(_) => Some(LinkDbfType::ULong),
+        ScalarValue::Long(_) => Some(LinkDbfType::Int64),
+        ScalarValue::ULong(_) => Some(LinkDbfType::UInt64),
+        ScalarValue::Float(_) => Some(LinkDbfType::Float),
+        ScalarValue::Double(_) => Some(LinkDbfType::Double),
+        ScalarValue::String(_) => Some(LinkDbfType::String),
+        // pvxs maps a boolean value through `DBF_LONG` (the
+        // `default:` arm of the `pvaGetDBFtype` switch — booleans are
+        // not a DBF type).
+        ScalarValue::Boolean(_) => Some(LinkDbfType::Long),
+    };
+
+    match value_field {
+        PvField::Scalar(sv) => from_scalar(sv),
+        PvField::ScalarArray(arr) => arr.first().and_then(from_scalar),
+        PvField::ScalarArrayTyped(arr) => {
+            use epics_pva_rs::pvdata::ScalarType;
+            Some(match arr.scalar_type() {
+                ScalarType::Byte => LinkDbfType::Char,
+                ScalarType::UByte => LinkDbfType::UChar,
+                ScalarType::Short => LinkDbfType::Short,
+                ScalarType::UShort => LinkDbfType::UShort,
+                ScalarType::Int => LinkDbfType::Long,
+                ScalarType::UInt => LinkDbfType::ULong,
+                ScalarType::Long => LinkDbfType::Int64,
+                ScalarType::ULong => LinkDbfType::UInt64,
+                ScalarType::Float => LinkDbfType::Float,
+                ScalarType::Double => LinkDbfType::Double,
+                ScalarType::String => LinkDbfType::String,
+                ScalarType::Boolean => LinkDbfType::Long,
+            })
+        }
+        PvField::Structure(s) => {
+            // NTEnum: pvxs maps a struct with an integer `index` and a
+            // `choices` string array to `DBF_ENUM`.
+            let has_index = matches!(
+                s.get_field("index"),
+                Some(PvField::Scalar(
+                    ScalarValue::Byte(_)
+                        | ScalarValue::UByte(_)
+                        | ScalarValue::Short(_)
+                        | ScalarValue::UShort(_)
+                        | ScalarValue::Int(_)
+                        | ScalarValue::UInt(_)
+                        | ScalarValue::Long(_)
+                        | ScalarValue::ULong(_)
+                ))
+            );
+            let has_choices = matches!(
+                s.get_field("choices"),
+                Some(PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_))
+            );
+            if has_index && has_choices {
+                Some(LinkDbfType::Enum)
+            } else {
+                // A struct carrying a `value` sub-field (an NT struct)
+                // — recurse into `value` so a link with an empty
+                // field path still resolves the DBF type, matching
+                // pvxs's "if fieldName empty, use top struct value".
+                s.get_field("value").and_then(link_dbf_type)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Element count for the cached NT value at the link's field path:
+/// the array length, or `1` for a scalar. Mirrors pvxs
+/// `pvaGetElements` (`pvxs/ioc/pvalink_lset.cpp:242`).
+fn link_element_count(value_field: &PvField) -> Option<i64> {
+    match value_field {
+        PvField::Scalar(_) => Some(1),
+        PvField::ScalarArray(arr) => Some(arr.len() as i64),
+        PvField::ScalarArrayTyped(arr) => Some(arr.len() as i64),
+        PvField::Structure(s) => {
+            // NTEnum / NT struct: the meaningful count is the `value`
+            // sub-field's count (scalar index → 1).
+            match s.get_field("value") {
+                Some(v) => link_element_count(v),
+                None if s.get_field("index").is_some() => Some(1),
+                None => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Read a `(lo, hi)` limit pair from two dotted NT paths. Returns
+/// `None` only when *neither* path resolves to a scalar — a missing
+/// half defaults to `0.0`, mirroring pvxs leaving an unwritten
+/// `*lo`/`*hi` buffer untouched against a record's zero-initialised
+/// limit field.
+fn limit_pair(root: &PvField, lo_path: &str, hi_path: &str) -> Option<(f64, f64)> {
+    let lo = scalar_as_f64(&extract_field(root, lo_path));
+    let hi = scalar_as_f64(&extract_field(root, hi_path));
+    match (lo, hi) {
+        (None, None) => None,
+        (l, h) => Some((l.unwrap_or(0.0), h.unwrap_or(0.0))),
+    }
+}
+
+/// Read a dotted NT path that should hold a string scalar. Empty
+/// strings are treated as "absent" so an NT value that carries an
+/// empty `display.units` does not override a record's local EGU.
+fn string_field(root: &PvField, path: &str) -> Option<String> {
+    match extract_field(root, path) {
+        PvField::Scalar(ScalarValue::String(s)) if !s.is_empty() => Some(s),
+        _ => None,
     }
 }
 
@@ -1077,5 +1278,145 @@ mod tests {
         assert!(!is_disconnect(&PvaError::InvalidValue("x".into())));
         assert!(!is_disconnect(&PvaError::Protocol("x".into())));
         assert!(!is_disconnect(&PvaError::Decode("x".into())));
+    }
+
+    // ---- BR-R24: pvalink DB-link metadata hooks ----
+
+    /// Build a numeric `display` sub-structure with limitLow/limitHigh,
+    /// units, description and precision.
+    fn nt_display(lo: f64, hi: f64, units: &str, desc: &str, prec: i32) -> PvField {
+        let mut d = PvStructure::new("");
+        d.fields
+            .push(("limitLow".into(), PvField::Scalar(ScalarValue::Double(lo))));
+        d.fields
+            .push(("limitHigh".into(), PvField::Scalar(ScalarValue::Double(hi))));
+        d.fields.push((
+            "units".into(),
+            PvField::Scalar(ScalarValue::String(units.to_string())),
+        ));
+        d.fields.push((
+            "description".into(),
+            PvField::Scalar(ScalarValue::String(desc.to_string())),
+        ));
+        d.fields
+            .push(("precision".into(), PvField::Scalar(ScalarValue::Int(prec))));
+        PvField::Structure(d)
+    }
+
+    /// Build a numeric `control` sub-structure with limitLow/limitHigh.
+    fn nt_control(lo: f64, hi: f64) -> PvField {
+        let mut c = PvStructure::new("");
+        c.fields
+            .push(("limitLow".into(), PvField::Scalar(ScalarValue::Double(lo))));
+        c.fields
+            .push(("limitHigh".into(), PvField::Scalar(ScalarValue::Double(hi))));
+        PvField::Structure(c)
+    }
+
+    /// Build a `valueAlarm` sub-structure with the four limit fields.
+    fn nt_value_alarm(lolo: f64, lo: f64, hi: f64, hihi: f64) -> PvField {
+        let mut v = PvStructure::new("");
+        v.fields.push((
+            "lowAlarmLimit".into(),
+            PvField::Scalar(ScalarValue::Double(lolo)),
+        ));
+        v.fields.push((
+            "lowWarningLimit".into(),
+            PvField::Scalar(ScalarValue::Double(lo)),
+        ));
+        v.fields.push((
+            "highWarningLimit".into(),
+            PvField::Scalar(ScalarValue::Double(hi)),
+        ));
+        v.fields.push((
+            "highAlarmLimit".into(),
+            PvField::Scalar(ScalarValue::Double(hihi)),
+        ));
+        PvField::Structure(v)
+    }
+
+    /// BR-R24: a pvalink must surface the linked PV's remote
+    /// display / control / valueAlarm metadata, DBF type and element
+    /// count through the DB-link metadata hook — the Rust counterpart
+    /// of the pvxs pvalink lset metadata getters installed at
+    /// `pvxs/ioc/pvalink_lset.cpp:700` and exercised by
+    /// `pvxs/test/testpvalink.cpp:416`.
+    ///
+    /// The cached NT value carries the same metadata shape and the
+    /// same numbers `testpvalink.cpp:416` asserts (graphic -9/9,
+    /// control -10/10, alarm -8/-7/7/8, precision 2, units "arb",
+    /// scalar element count 1). Pre-fix `PvaLink` had no
+    /// `link_metadata` accessor and `LinkSet` had no metadata hook, so
+    /// every one of these was invisible to DB link callers.
+    #[test]
+    fn br_r24_link_metadata_surfaces_remote_display_control_valuealarm() {
+        use epics_base_rs::server::database::LinkDbfType;
+
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        root.fields
+            .push(("display".into(), nt_display(-9.0, 9.0, "arb", "linked", 2)));
+        root.fields
+            .push(("control".into(), nt_control(-10.0, 10.0)));
+        root.fields
+            .push(("valueAlarm".into(), nt_value_alarm(-8.0, -7.0, 7.0, 8.0)));
+
+        let link = PvaLink::for_test(inp_cfg(SevrMode::Nms), Some(PvField::Structure(root)));
+        let meta = link
+            .link_metadata()
+            .expect("connected link must expose metadata");
+
+        assert_eq!(meta.dbf_type, Some(LinkDbfType::Double), "DBF type");
+        assert_eq!(meta.element_count, Some(1), "scalar element count");
+        assert_eq!(meta.graphic_limits, Some((-9.0, 9.0)), "graphic limits");
+        assert_eq!(meta.control_limits, Some((-10.0, 10.0)), "control limits");
+        assert_eq!(
+            meta.alarm_limits,
+            Some((-8.0, -7.0, 7.0, 8.0)),
+            "alarm limits (lolo, lo, hi, hihi)"
+        );
+        assert_eq!(meta.precision, Some(2), "display precision");
+        assert_eq!(meta.units.as_deref(), Some("arb"), "display units");
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("linked"),
+            "display description"
+        );
+    }
+
+    /// BR-R24: a not-yet-connected link (no cached value) reports no
+    /// metadata — the record then keeps its local defaults. And an
+    /// NTEnum value maps to `DBF_ENUM` with element count 1.
+    #[test]
+    fn br_r24_link_metadata_none_when_disconnected_and_enum_maps_to_dbf_enum() {
+        use epics_base_rs::server::database::LinkDbfType;
+
+        let disconnected = PvaLink::for_test(inp_cfg(SevrMode::Nms), None);
+        assert!(
+            disconnected.link_metadata().is_none(),
+            "no cached value → no metadata snapshot"
+        );
+
+        // NTEnum: `value` is a struct with an integer `index` and a
+        // `choices` string array → DBF_ENUM.
+        let mut enum_value = PvStructure::new("enum_t");
+        enum_value
+            .fields
+            .push(("index".into(), PvField::Scalar(ScalarValue::Int(1))));
+        enum_value.fields.push((
+            "choices".into(),
+            PvField::ScalarArray(vec![
+                ScalarValue::String("OFF".into()),
+                ScalarValue::String("ON".into()),
+            ]),
+        ));
+        let mut root = PvStructure::new("epics:nt/NTEnum:1.0");
+        root.fields
+            .push(("value".into(), PvField::Structure(enum_value)));
+        let link = PvaLink::for_test(inp_cfg(SevrMode::Nms), Some(PvField::Structure(root)));
+        let meta = link.link_metadata().expect("connected");
+        assert_eq!(meta.dbf_type, Some(LinkDbfType::Enum), "NTEnum → DBF_ENUM");
+        assert_eq!(meta.element_count, Some(1), "enum index element count");
     }
 }

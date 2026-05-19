@@ -578,12 +578,56 @@ async fn run_notify_forwarder(
         let Some(db_handle) = db.read().clone() else {
             continue;
         };
-        for (record, always, _order, atomic, passive_only) in targets {
+
+        // BR-R18: pvxs builds a `DBManyLock` over every atomic
+        // scan-on-update target record and holds a `DBManyLocker`
+        // across the whole atomic scan (`pvxs/ioc/pvalink_channel.cpp:386`
+        // and `:422`). Acquire the database-level multi-record epoch
+        // lock over the atomic target set *before* scanning any of
+        // them, and hold it across the whole atomic group, so a
+        // direct writer, another scan, or an atomic sibling cannot
+        // interleave between the atomic target records. Non-atomic
+        // targets are scanned individually afterwards — matching
+        // pvxs, which gives each non-atomic record its own per-record
+        // `DBLocker` rather than the shared many-lock.
+        //
+        // The atomic record set is the same for every monitor event
+        // on this PV, so it is collected from the already-sorted
+        // `targets` list. `lock_records_atomic` itself canonicalises,
+        // deduplicates and sorts, so a record bound by more than one
+        // atomic link is locked exactly once.
+        let atomic_records: Vec<String> = targets
+            .iter()
+            .filter(|(_, _, _, atomic, _)| *atomic)
+            .map(|(record, _, _, _, _)| record.clone())
+            .collect();
+
+        // The epoch guard is held only across the atomic group. pvxs
+        // scopes `DBManyLocker L(atomic_lock)` to the atomic-target
+        // loop and gives non-atomic targets their own per-record
+        // `DBLocker` afterwards — so the epoch must be dropped at the
+        // atomic→non-atomic boundary, not at the end of the batch.
+        // Held in an `Option`; `None` once dropped (or when there are
+        // no atomic targets at all).
+        let mut atomic_epoch = if atomic_records.is_empty() {
+            None
+        } else {
+            Some(db_handle.lock_records_atomic(&atomic_records).await)
+        };
+
+        for (record, always, _order, atomic, passive_only) in &targets {
+            // `targets` is sorted atomic-first; the first non-atomic
+            // target marks the end of the atomic group, so release
+            // the epoch here — exactly where pvxs's `DBManyLocker`
+            // goes out of scope before the non-atomic loop.
+            if !*atomic {
+                atomic_epoch = None;
+            }
             // pvxs: a CPP (`always=false`) link only scans when the
             // input value actually changed; CP with `always` scans
             // unconditionally. An atomic link scans whenever the
             // batch changed so atomic siblings stay consistent.
-            if !changed && !always && !atomic {
+            if !changed && !*always && !*atomic {
                 continue;
             }
             // BR-R28: `CPP` (passive_only) only fires when the owning
@@ -591,8 +635,8 @@ async fn run_notify_forwarder(
             // checks `prec->scan != 0` and skips processing; non-zero
             // SCAN (Event, IO Intr, periodic) means the record has
             // its own scan source and must not be re-fired from CPP.
-            if passive_only {
-                let is_passive = match db_handle.get_record(&record).await {
+            if *passive_only {
+                let is_passive = match db_handle.get_record(record).await {
                     Some(rec) => matches!(
                         rec.read().await.common.scan,
                         epics_base_rs::server::record::ScanType::Passive
@@ -610,11 +654,19 @@ async fn run_notify_forwarder(
             // drop the chain. Fresh `visited` set + depth 0: this is
             // the foreign-caller entry, like the scan loop and FLNK
             // dispatch.
+            //
+            // Atomic targets run while `atomic_epoch` is held; the
+            // sorted `targets` order keeps the atomic group contiguous
+            // and ahead of the non-atomic targets.
             let mut visited = std::collections::HashSet::new();
             let _ = db_handle
-                .process_record_with_links(&record, &mut visited, 0)
+                .process_record_with_links(record, &mut visited, 0)
                 .await;
         }
+
+        // Drop any still-held epoch (an all-atomic batch never hit
+        // the non-atomic boundary above).
+        drop(atomic_epoch);
     }
 }
 
@@ -778,6 +830,22 @@ impl LinkSet for PvaLinkResolver {
             return None;
         }
         link.time_stamp()
+    }
+
+    fn link_metadata(&self, name: &str) -> Option<epics_base_rs::server::database::LinkMetadata> {
+        // BR-R24: surface the remote display/control/valueAlarm
+        // metadata, DBF type and element count through the DB link
+        // API, mirroring the pvxs pvalink lset metadata getter set
+        // installed at `pvxs/ioc/pvalink_lset.cpp:700`. Reads the
+        // cached NT value — no fresh GET — exactly as the pvxs
+        // getters read `fld_meta` / `fld_value` under the channel
+        // lock.
+        let name = strip_scheme(name)?;
+        let link = block_in_place_or_warn(|| {
+            self.handle
+                .block_on(async { self.registry.get_or_open(default_inp_cfg(name)).await.ok() })
+        })?;
+        link.link_metadata()
     }
 
     fn link_names(&self) -> Vec<String> {
@@ -1649,6 +1717,148 @@ mod tests {
         assert!(
             matches!(r, Err(PvaLinkError::NotLocal(_))),
             "without a QSRV handle a non-local link must still be rejected"
+        );
+    }
+
+    /// A record whose `process()` logs its name. The first atomic
+    /// target additionally fires a `Notify` *after* logging — at that
+    /// instant the forwarder is provably inside its multi-record
+    /// epoch — so the BR-R18 regression test can release a competing
+    /// writer into a guaranteed-contended window.
+    struct SlowLoggingRecord {
+        name: &'static str,
+        log: Arc<parking_lot::Mutex<Vec<String>>>,
+        /// Fired once, from inside the epoch, by whichever record
+        /// carries it. `None` for records that should not signal.
+        epoch_entered: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl epics_base_rs::server::record::Record for SlowLoggingRecord {
+        fn record_type(&self) -> &'static str {
+            "ai"
+        }
+        fn process(
+            &mut self,
+        ) -> epics_base_rs::error::CaResult<epics_base_rs::server::record::ProcessOutcome> {
+            self.log.lock().push(self.name.to_string());
+            if let Some(n) = &self.epoch_entered {
+                // The forwarder already holds the epoch before this
+                // record's body runs; signalling here releases the
+                // competing writer into a window the epoch must
+                // exclude.
+                n.notify_one();
+            }
+            // Hold the worker briefly so a competing task on another
+            // worker thread has a genuine window to acquire an epoch
+            // lock if one is not already excluding it.
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            Ok(epics_base_rs::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, _name: &str) -> Option<EpicsValue> {
+            Some(EpicsValue::Double(0.0))
+        }
+        fn put_field(
+            &mut self,
+            _name: &str,
+            _value: EpicsValue,
+        ) -> epics_base_rs::error::CaResult<()> {
+            Ok(())
+        }
+        fn field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
+            &[]
+        }
+    }
+
+    /// BR-R18: the pvalink `atomic` scan-on-update forwarder must hold
+    /// a single locked scan epoch over the atomic target record set,
+    /// so no other writer can interleave *between* the atomic
+    /// targets. Mirrors pvxs `DBManyLocker L(atomic_lock)` held across
+    /// the atomic scan in `pvxs/ioc/pvalink_channel.cpp:422`.
+    ///
+    /// The forwarder scans an atomic group {A, B}. The first atomic
+    /// target (A) signals `epoch_entered` from inside its body — the
+    /// forwarder provably holds the multi-record epoch at that point.
+    /// Only then is a competing task — standing in for a direct
+    /// record writer or a second atomic scan — released to enter its
+    /// own epoch over record B. With the epoch held the competing
+    /// task is blocked until the *whole* atomic group has scanned, so
+    /// the observed order is `A, B, EXTERNAL`. Without the epoch the
+    /// competing writer lands between A and B.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn br_r18_atomic_scan_holds_multi_record_lock_epoch() {
+        let db = PvDatabase::new();
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let epoch_entered = Arc::new(tokio::sync::Notify::new());
+        for name in ["AT:A", "AT:B"] {
+            db.add_record(
+                name,
+                Box::new(SlowLoggingRecord {
+                    name,
+                    log: log.clone(),
+                    // Only A signals — by the time A's body runs the
+                    // epoch over {A, B} is already held.
+                    epoch_entered: (name == "AT:A").then(|| epoch_entered.clone()),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Atomic group: A (monorder 0) then B (monorder 1).
+        let mut fanout = ScanFanout::default();
+        fanout.records.push(ScanTarget {
+            record: "AT:A".into(),
+            always: true,
+            monorder: 0,
+            atomic: true,
+        });
+        fanout.records.push(ScanTarget {
+            record: "AT:B".into(),
+            always: true,
+            monorder: 1,
+            atomic: true,
+        });
+        let scan_targets: ScanTargetMap =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
+                ("SRC".to_string(), fanout),
+            ])));
+        let db_slot = Arc::new(parking_lot::RwLock::new(Some(db.clone())));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            "SRC".to_string(),
+            "value".to_string(),
+            rx,
+            scan_targets,
+            db_slot,
+        ));
+
+        // Competing party: contends for an epoch over an atomic
+        // target record (AT:B). It waits until the forwarder is
+        // provably inside the epoch (A's body fired `epoch_entered`),
+        // then attempts its own epoch and records `EXTERNAL` only
+        // once it actually owns it.
+        let competitor_log = log.clone();
+        let competitor_db = db.clone();
+        let competitor = tokio::spawn(async move {
+            epoch_entered.notified().await;
+            let _epoch = competitor_db
+                .lock_records_atomic(&["AT:B".to_string()])
+                .await;
+            competitor_log.lock().push("EXTERNAL".to_string());
+        });
+
+        tx.send(nt_scalar(1.0)).await.unwrap();
+        drop(tx);
+        forwarder.await.unwrap();
+        competitor.await.unwrap();
+
+        // The atomic group {A, B} scans as one epoch; the competing
+        // epoch can only be granted after the group completes.
+        assert_eq!(
+            *log.lock(),
+            vec!["AT:A", "AT:B", "EXTERNAL"],
+            "external writer must not interleave between atomic scan targets"
         );
     }
 }

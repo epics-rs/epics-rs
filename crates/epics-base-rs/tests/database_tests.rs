@@ -5005,3 +5005,80 @@ async fn test_pp_out_link_processes_passive_target() {
         "explicit PP OUT link must process its Passive target: {visited:?}"
     );
 }
+
+/// MR-R5 — formerly-bypassing path. A foreign full-processing entry
+/// (`process_record_with_links`, the normal scan/event/FLNK-dispatch
+/// caller) must block while a multi-record transaction holds the
+/// member record's advisory write gate via `lock_records`. Before the
+/// fix `process_record_with_links` took no gate, so a normal scan of a
+/// member could interleave with a QSRV atomic group or pvalink atomic
+/// scan epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mr_r5_foreign_process_blocks_on_held_epoch() {
+    let db = PvDatabase::new();
+    db.add_record("MR_R5_MEMBER", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Transaction owner holds the member's gate via `lock_records`.
+    let epoch = db.lock_records(["MR_R5_MEMBER"]).await;
+
+    let db2 = db.clone();
+    let processed = Arc::new(AtomicU32::new(0));
+    let processed2 = processed.clone();
+    let h = tokio::spawn(async move {
+        // Foreign full-processing entry — must block on the gate the
+        // epoch holds.
+        let mut visited = HashSet::new();
+        let _ = db2
+            .process_record_with_links("MR_R5_MEMBER", &mut visited, 0)
+            .await;
+        processed2.store(1, Ordering::SeqCst);
+    });
+
+    // Give the spawned task time to reach (and block on) the gate.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        processed.load(Ordering::SeqCst),
+        0,
+        "foreign process_record_with_links must block while a lock_records epoch holds the member gate"
+    );
+
+    drop(epoch);
+    h.await.unwrap();
+    assert_eq!(
+        processed.load(Ordering::SeqCst),
+        1,
+        "foreign process must complete once the epoch is released"
+    );
+}
+
+/// MR-R5 — owner path. A transaction owner holding a member's advisory
+/// write gate via `lock_records` processes that member through the
+/// `_already_locked` full-processing entry. The gate `Mutex` is not
+/// reentrant, so using the gate-acquiring `process_record_with_links`
+/// here would dead-lock the epoch against itself; the `_already_locked`
+/// entry must complete without blocking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mr_r5_already_locked_process_does_not_self_deadlock() {
+    let db = PvDatabase::new();
+    db.add_record("MR_R5_OWNED", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Owner holds the member gate for the whole transaction.
+    let _epoch = db.lock_records(["MR_R5_OWNED"]).await;
+
+    // Processing the member via the `_already_locked` entry while the
+    // epoch is held must NOT dead-lock — bounded by a timeout so a
+    // regression (reverting to the gate-acquiring entry) fails loudly.
+    let mut visited = HashSet::new();
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        db.process_record_with_links_already_locked("MR_R5_OWNED", &mut visited, 0),
+    )
+    .await
+    .expect("process_record_with_links_already_locked must not dead-lock under a held epoch");
+    res.expect("owner-path processing of an owned member must succeed");
+    assert!(visited.contains("MR_R5_OWNED"));
+}

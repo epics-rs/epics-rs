@@ -84,6 +84,18 @@ impl PvDatabase {
     /// Foreign-caller entry: FLNK dispatch, scan loop, scan_event, CA put,
     /// process(PROC=1) etc. Hits the PACT entry guard (mirrors C `dbProcess`
     /// at `dbAccess.c:537-559`) when the record is mid-async.
+    ///
+    /// MR-R5: this is a *foreign* full-processing entry, so it acquires
+    /// the record's advisory write gate (`dbScanLock` analogue) for the
+    /// entry record before processing. A QSRV atomic group or pvalink
+    /// atomic scan-on-update epoch that holds `lock_records` over the
+    /// same record blocks a foreign scan/event/FLNK-dispatch caller
+    /// here, and vice versa — restoring the `DBManyLock` exclusion. The
+    /// recursive FLNK / OUT / CP fan-out within one chain does NOT
+    /// re-acquire the gate (`process_record_with_links_recursive`),
+    /// mirroring C `processTarget` (`dbDbLink.c:436`) which asserts the
+    /// target's lock set is already owned by the calling thread; the
+    /// `visited` cycle guard prevents re-processing the entry record.
     pub fn process_record_with_links<'a>(
         &'a self,
         name: &'a str,
@@ -91,7 +103,48 @@ impl PvDatabase {
         depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.process_record_with_links_inner(name, visited, depth, false)
+            self.process_record_with_links_inner(name, visited, depth, false, true)
+                .await
+        })
+    }
+
+    /// MR-R5: full-processing entry for a caller that already owns the
+    /// record's advisory write gate via [`PvDatabase::lock_records`] —
+    /// the QSRV atomic group GET/PUT and the pvalink atomic
+    /// scan-on-update epoch. The advisory gate `Mutex` is not
+    /// reentrant; a transaction owner holding `lock_records` over the
+    /// member set MUST use this entry to scan a member record, or it
+    /// would deadlock against its own epoch guard. Foreign (non-owner)
+    /// callers must use [`Self::process_record_with_links`] so the gate
+    /// is taken.
+    pub fn process_record_with_links_already_locked<'a>(
+        &'a self,
+        name: &'a str,
+        visited: &'a mut HashSet<String>,
+        depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.process_record_with_links_inner(name, visited, depth, false, false)
+                .await
+        })
+    }
+
+    /// MR-R5: recursive FLNK / OUT / CP fan-out entry within a single
+    /// processing chain. Does NOT re-acquire the advisory write gate:
+    /// the chain is one transaction whose entry record's gate is
+    /// already held by the foreign entry, and C `processTarget`
+    /// (`dbDbLink.c:436`) processes a link target under the lock set
+    /// already owned by the calling thread. Re-acquiring per chain
+    /// member would also create a lock-ordering deadlock between
+    /// reverse FLNK chains.
+    pub(crate) fn process_record_with_links_recursive<'a>(
+        &'a self,
+        name: &'a str,
+        visited: &'a mut HashSet<String>,
+        depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.process_record_with_links_inner(name, visited, depth, false, false)
                 .await
         })
     }
@@ -104,6 +157,14 @@ impl PvDatabase {
     /// (which bypasses `dbProcess`). Foreign callers must still go through
     /// `process_record_with_links` so FLNK / scan / CA put cannot race
     /// during the wait window.
+    ///
+    /// MR-R5: the timer fire is a fresh task — the original cycle's
+    /// advisory gate was released when `process_record_with_links`
+    /// returned async-pending. In C, `callbackRequestDelayed` dispatches
+    /// through a callback that re-takes `dbScanLock(precord)` for the
+    /// completion `process()`. This entry therefore re-acquires the
+    /// advisory write gate, so the continuation cannot interleave with a
+    /// QSRV atomic group or another foreign scan of the same record.
     pub fn process_record_continuation<'a>(
         &'a self,
         name: &'a str,
@@ -111,7 +172,7 @@ impl PvDatabase {
         depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.process_record_with_links_inner(name, visited, depth, true)
+            self.process_record_with_links_inner(name, visited, depth, true, true)
                 .await
         })
     }
@@ -122,6 +183,7 @@ impl PvDatabase {
         visited: &mut HashSet<String>,
         depth: usize,
         is_continuation: bool,
+        acquire_gate: bool,
     ) -> CaResult<()> {
         const MAX_LINK_DEPTH: usize = 16;
         const MAX_LINK_OPS: usize = 256;
@@ -158,6 +220,26 @@ impl PvDatabase {
         let rec = match rec {
             Some(r) => r,
             None => return Err(CaError::ChannelNotFound(name.to_string())),
+        };
+
+        // MR-R5: advisory write gate (`dbScanLock(precord)` analogue).
+        // A foreign full-processing entry (scan loop, scan_event, FLNK
+        // dispatch from another chain, CA put, PINI/startup) acquires
+        // the entry record's gate so it cannot interleave with a QSRV
+        // atomic group or a pvalink atomic scan epoch holding
+        // `lock_records` over the same record. `name` is already the
+        // alias-resolved canonical name, the same key `lock_records`
+        // uses. Not acquired when `acquire_gate` is false: either a
+        // transaction owner already holds the gate via `lock_records`
+        // (`process_record_with_links_already_locked`), or this is a
+        // recursive FLNK/OUT/CP call within one chain
+        // (`process_record_with_links_recursive`) — C `processTarget`
+        // processes a link target under the lock set the caller already
+        // owns, and re-acquiring would deadlock the non-reentrant gate.
+        let _record_gate = if acquire_gate {
+            Some(self.lock_record(name).await)
+        } else {
+            None
         };
 
         // 0a. PACT entry guard — mirrors C `dbProcess` (dbAccess.c:537-559).
@@ -1637,8 +1719,10 @@ impl PvDatabase {
                     (tg.common.scan, !pact)
                 };
                 if should_process && target_scan == crate::server::record::ScanType::Passive {
+                    // MR-R5: recursive FLNK within one chain — gate
+                    // already held by the foreign entry record.
                     let _ = self
-                        .process_record_with_links(flnk, visited, depth + 1)
+                        .process_record_with_links_recursive(flnk, visited, depth + 1)
                         .await;
                 }
             }
@@ -2272,8 +2356,10 @@ impl PvDatabase {
                     (tg.common.scan, !pact)
                 };
                 if should_process && target_scan == crate::server::record::ScanType::Passive {
+                    // MR-R5: recursive FLNK within one chain — gate
+                    // already held by the foreign entry record.
                     let _ = self
-                        .process_record_with_links(flnk, visited, depth + 1)
+                        .process_record_with_links_recursive(flnk, visited, depth + 1)
                         .await;
                 }
             }
@@ -2370,8 +2456,10 @@ impl PvDatabase {
             if already_active {
                 continue;
             }
+            // MR-R5: recursive CP-target fan-out within one chain —
+            // gate already held by the foreign entry record.
             let _ = self
-                .process_record_with_links(&target, visited, depth + 1)
+                .process_record_with_links_recursive(&target, visited, depth + 1)
                 .await;
         }
     }
@@ -2618,7 +2706,14 @@ impl PvDatabase {
                     }
                 };
                 if let Some(val) = out_val {
-                    let _ = self.put_pv(&pv_name, val).await;
+                    // MR-R5: writing VAL to the SIOL target is an
+                    // internal step of this record's processing chain,
+                    // which already holds the entry record's advisory
+                    // write gate. Use the `_already_locked` write so a
+                    // SIOL that points back at a chain record cannot
+                    // dead-lock on a non-reentrant gate (same reasoning
+                    // as the OUT-link write in `write_db_link_value`).
+                    let _ = self.put_pv_already_locked(&pv_name, val).await;
                 }
 
                 let mut instance = rec.write().await;

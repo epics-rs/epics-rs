@@ -776,13 +776,27 @@ async fn run_notify_forwarder(
             // the foreign-caller entry, like the scan loop and FLNK
             // dispatch.
             //
-            // Atomic targets run while `atomic_epoch` is held; the
-            // sorted `targets` order keeps the atomic group contiguous
-            // and ahead of the non-atomic targets.
+            // MR-R5: an atomic target runs while `atomic_epoch`
+            // (`lock_records` over the atomic member set) is still
+            // held — its advisory write gate is already owned by this
+            // transaction. The gate `Mutex` is not reentrant, so an
+            // atomic target MUST process through the `_already_locked`
+            // entry; processing it via the gate-acquiring
+            // `process_record_with_links` would dead-lock the epoch
+            // against itself. A non-atomic target is reached only
+            // after the epoch was dropped at the atomic→non-atomic
+            // boundary above, so it is a genuine fresh foreign entry
+            // and takes the gate normally.
             let mut visited = std::collections::HashSet::new();
-            let _ = db_handle
-                .process_record_with_links(record, &mut visited, 0)
-                .await;
+            if *atomic {
+                let _ = db_handle
+                    .process_record_with_links_already_locked(record, &mut visited, 0)
+                    .await;
+            } else {
+                let _ = db_handle
+                    .process_record_with_links(record, &mut visited, 0)
+                    .await;
+            }
         }
 
         // Drop any still-held epoch (an all-atomic batch never hit

@@ -416,9 +416,16 @@ fn ifa_dstaddr_for_ipv4(match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
                 let in4: &libc::sockaddr_in = &*(entry.ifa_addr as *const libc::sockaddr_in);
                 let ip_octets = u32::from_be(in4.sin_addr.s_addr).to_be_bytes();
                 let if_ip = Ipv4Addr::from(ip_octets);
-                if if_ip == match_ip && !entry.ifa_dstaddr.is_null() {
-                    let dst4: &libc::sockaddr_in =
-                        &*(entry.ifa_dstaddr as *const libc::sockaddr_in);
+                // `ifa_dstaddr` on macOS/BSD; on Linux the `ifaddrs`
+                // struct carries the point-to-point destination in
+                // the `ifa_ifu` union field — `libc` exposes it by
+                // that name. Both are `*mut sockaddr`.
+                #[cfg(target_os = "linux")]
+                let dstaddr = entry.ifa_ifu;
+                #[cfg(not(target_os = "linux"))]
+                let dstaddr = entry.ifa_dstaddr;
+                if if_ip == match_ip && !dstaddr.is_null() {
+                    let dst4: &libc::sockaddr_in = &*(dstaddr as *const libc::sockaddr_in);
                     let dst_octets = u32::from_be(dst4.sin_addr.s_addr).to_be_bytes();
                     let dst_ip = Ipv4Addr::from(dst_octets);
                     if !dst_ip.is_unspecified() {

@@ -1,5 +1,68 @@
 # Changelog
 
+## v0.18.1 — 2026-05-20
+
+Regression-hardening point release on top of `v0.18.0`. Rolls up the
+`epics-pva-rs` / `epics-bridge-rs` deferred punchlists, the parallel
+gateway/QSRV/pvalink track work, and a full merge-regression review of
+the integrated branch.
+
+### Merge-regression review
+
+`docs/merge-regression-review-2026-05-19.md` audited the integrated
+branch for defects introduced while combining the punchlist tracks and
+catalogued 37 items — 25 branch-regression candidates (`MR-R1`..`MR-R25`)
+and 12 pre-existing defects observed during the review (`EX-R1`..`EX-R12`),
+plus two post-fix items (`PF-R1`, `PF-R2`). **38 fixed at root cause; one
+(`MR-R18`) verified not-reproduced.** Highlights:
+
+- **CA server** — `WRITE_NOTIFY` busy gate now runs before side effects;
+  UDP batch responder no longer reparses a stale datagram under a new
+  peer; wildcard multicast responders no longer duplicate ordinary
+  search replies; `TRAPWRITE` is reported from the matched ACF rule;
+  denied autosize monitors emit a non-zero DBR body; initial/restore
+  monitor frames pad an over-requested count.
+- **CA client** — a legitimate server migration no longer surfaces as a
+  false multiply-defined diagnostic; a write-side timeout closes the
+  circuit instead of keeping a desynchronized stream;
+  `EPICS_CA_MAX_SEARCH_PERIOD` matches the C default / lower bound.
+- **PVA server** — `SharedPV` monitor queues are no longer closed by a
+  cloned `MonitorOutbox` drop; role claims reach the QSRV ACF; GET /
+  PUT_GET honor INIT pvRequest options; `PUT_GET` / `PROCESS` data
+  phases verify the IOID's operation kind; pipeline credit is consumed
+  only by emitted frames; an unadvertised auth selection reverts the
+  connection credential to anonymous; server-side transformation
+  filters' rewritten value reaches the wire.
+- **PVA client** — `share_udp(true)` clients keep configured TCP name
+  servers; `pvget_many` warm path no longer skips its own responses or
+  leaks reusable IOIDs; `CMD_DESTROY_CHANNEL` cleans the `ioid_to_cmd`
+  map; the pvRequest string parser can carry a `_filter` JSON value.
+- **`DBF_UINT64` round-trip** — native PVA and QSRV `ulong` / `ulong[]`
+  PUTs preserve the full unsigned 64-bit range (no `i32`/`f64`
+  narrowing); the `arr` channel filter slices `UInt64Array` waveforms;
+  pvalink OUT routes `UInt64Array` / `Int64Array` through the typed
+  path; pvalink INP no longer truncates remote 64-bit values.
+- **Record lock** — every foreign full-processing and record-write
+  entry is routed through the advisory `dbScanLock`/`DBManyLock`-
+  equivalent gate, closing the atomic-group/direct-write race the
+  punchlist opened; transaction owners use `_already_locked` variants.
+- **PVA gateway** — per-credential upstream clients inherit the base
+  client's upstream address/transport; identity pools are keyed by
+  account, method, host, and authority.
+
+### Other fixes
+
+- `motor-rs` — `DHLM`/`DLLM` EGU limits are preserved when a template
+  loads `field(DHLM)` before `field(MRES)`.
+- `ad-core-rs` / `ad-plugins-rs` — `EpicsValue::UInt64`/`UInt64Array`
+  handled in NDAttribute conversion; `NdAttribute` / `NtNdArray`
+  construction realigned with the current struct shapes.
+
+Verification on the release commit: `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean,
+`cargo nextest run --workspace` 4707 passed, `cargo test --doc
+--workspace` 0 failed.
+
 ## v0.18.0 — 2026-05-18
 
 First `main` release rolling up the `review/codebase-hardening-202605`

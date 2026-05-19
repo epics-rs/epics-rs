@@ -115,6 +115,8 @@ impl WaveformRecord {
             DbFieldType::Char => (EpicsValue::CharArray(vec![0; nelm as usize]), 1), // CHAR
             DbFieldType::Short => (EpicsValue::ShortArray(vec![0; nelm as usize]), 3), // SHORT
             DbFieldType::Long => (EpicsValue::LongArray(vec![0; nelm as usize]), 5), // LONG
+            DbFieldType::Int64 => (EpicsValue::Int64Array(vec![0; nelm as usize]), 7), // INT64
+            DbFieldType::UInt64 => (EpicsValue::UInt64Array(vec![0; nelm as usize]), 8), // UINT64
             DbFieldType::Float => (EpicsValue::FloatArray(vec![0.0; nelm as usize]), 9), // FLOAT
             DbFieldType::Double => (EpicsValue::DoubleArray(vec![0.0; nelm as usize]), 10), // DOUBLE
             _ => (EpicsValue::DoubleArray(vec![0.0; nelm as usize]), 10),
@@ -138,6 +140,8 @@ impl WaveformRecord {
             1 | 2 => EpicsValue::CharArray(vec![0; n]), // CHAR, UCHAR
             3 | 4 => EpicsValue::ShortArray(vec![0; n]), // SHORT, USHORT
             5 | 6 => EpicsValue::LongArray(vec![0; n]), // LONG, ULONG
+            7 => EpicsValue::Int64Array(vec![0; n]),    // INT64
+            8 => EpicsValue::UInt64Array(vec![0; n]),   // UINT64
             9 => EpicsValue::FloatArray(vec![0.0; n]),  // FLOAT
             _ => EpicsValue::DoubleArray(vec![0.0; n]), // DOUBLE, etc.
         };
@@ -160,6 +164,7 @@ impl WaveformRecord {
             EpicsValue::ShortArray(v) => v.resize(n, 0),
             EpicsValue::LongArray(v) => v.resize(n, 0),
             EpicsValue::Int64Array(v) => v.resize(n, 0),
+            EpicsValue::UInt64Array(v) => v.resize(n, 0),
             EpicsValue::FloatArray(v) => v.resize(n, 0.0),
             EpicsValue::DoubleArray(v) => v.resize(n, 0.0),
             EpicsValue::EnumArray(v) => v.resize(n, 0),
@@ -227,6 +232,52 @@ static WAVEFORM_FIELDS_LONG: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "NELM",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "NORD",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "FTVL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+];
+
+static WAVEFORM_FIELDS_INT64: &[FieldDesc] = &[
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Int64,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "NELM",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "NORD",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "FTVL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+];
+
+static WAVEFORM_FIELDS_UINT64: &[FieldDesc] = &[
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::UInt64,
         read_only: false,
     },
     FieldDesc {
@@ -354,6 +405,16 @@ impl Record for WaveformRecord {
                         arr.resize(nelm, 0);
                         self.val = EpicsValue::LongArray(arr);
                     }
+                    EpicsValue::Int64Array(mut arr) => {
+                        self.nord = arr.len() as i32;
+                        arr.resize(nelm, 0);
+                        self.val = EpicsValue::Int64Array(arr);
+                    }
+                    EpicsValue::UInt64Array(mut arr) => {
+                        self.nord = arr.len() as i32;
+                        arr.resize(nelm, 0);
+                        self.val = EpicsValue::UInt64Array(arr);
+                    }
                     EpicsValue::FloatArray(mut arr) => {
                         self.nord = arr.len() as i32;
                         arr.resize(nelm, 0.0);
@@ -459,6 +520,8 @@ impl Record for WaveformRecord {
             1 | 2 => WAVEFORM_FIELDS_CHAR,
             3 | 4 => WAVEFORM_FIELDS_SHORT,
             5 | 6 => WAVEFORM_FIELDS_LONG,
+            7 => WAVEFORM_FIELDS_INT64,
+            8 => WAVEFORM_FIELDS_UINT64,
             9 => WAVEFORM_FIELDS_FLOAT,
             _ => WAVEFORM_FIELDS_DOUBLE,
         }
@@ -660,5 +723,66 @@ mod array_kind_tests {
         let r = WaveformRecord::with_kind(ArrayKind::Waveform);
         assert!(r.get_field("INDX").is_none());
         assert!(r.get_field("MALM").is_none());
+    }
+
+    #[test]
+    fn br_r13_waveform_ftvl_uint64_storage_and_field_type() {
+        // BR-R13: a `waveform` with `FTVL = UINT64` (menuFtype index 8)
+        // must allocate a `UInt64Array` VAL buffer and advertise VAL as
+        // `DbFieldType::UInt64`. On main FTVL 8 fell through to
+        // `DoubleArray` / `DbFieldType::Double`, so unsigned-64 waveforms
+        // were not representable.
+        let mut r = WaveformRecord::with_kind(ArrayKind::Waveform);
+        r.put_field("NELM", EpicsValue::Long(3)).unwrap();
+        r.put_field("FTVL", EpicsValue::Short(8)).unwrap(); // UINT64
+
+        // VAL buffer is a UInt64Array (NORD=0 fresh → empty, still typed).
+        match r.get_field("VAL") {
+            Some(EpicsValue::UInt64Array(_)) => {}
+            other => panic!("FTVL=UINT64 VAL must be UInt64Array, got {other:?}"),
+        }
+
+        // QSRV introspects VAL through field_list — must be UInt64.
+        let val_dbf = r
+            .field_list()
+            .iter()
+            .find(|f| f.name == "VAL")
+            .map(|f| f.dbf_type);
+        assert_eq!(val_dbf, Some(DbFieldType::UInt64));
+
+        // A value above i64::MAX round-trips without precision loss.
+        let big = u64::MAX - 9;
+        r.put_field("VAL", EpicsValue::UInt64Array(vec![big, 0, 1]))
+            .unwrap();
+        match r.get_field("VAL") {
+            Some(EpicsValue::UInt64Array(v)) => assert_eq!(v[0], big),
+            other => panic!("expected UInt64Array, got {other:?}"),
+        }
+
+        // INT64 (index 7) likewise allocates a typed Int64Array buffer.
+        let mut r2 = WaveformRecord::with_kind(ArrayKind::Waveform);
+        r2.put_field("NELM", EpicsValue::Long(2)).unwrap();
+        r2.put_field("FTVL", EpicsValue::Short(7)).unwrap(); // INT64
+        assert!(matches!(
+            r2.get_field("VAL"),
+            Some(EpicsValue::Int64Array(_))
+        ));
+        let i64_dbf = r2
+            .field_list()
+            .iter()
+            .find(|f| f.name == "VAL")
+            .map(|f| f.dbf_type);
+        assert_eq!(i64_dbf, Some(DbFieldType::Int64));
+    }
+
+    #[test]
+    fn br_r13_waveform_new_from_uint64_dbf_type() {
+        // BR-R13: `WaveformRecord::new(_, DbFieldType::UInt64)` must mint
+        // a UInt64Array VAL and FTVL index 8, not fall through to Double.
+        let r = WaveformRecord::new(4, DbFieldType::UInt64);
+        assert_eq!(r.ftvl, 8);
+        // The VAL buffer is a UInt64Array sized to NELM; `get_field`
+        // truncates to NORD (0 when fresh), so check the buffer directly.
+        assert!(matches!(&r.val, EpicsValue::UInt64Array(v) if v.len() == 4));
     }
 }

@@ -87,6 +87,8 @@ fn value_scalar_type(value: &EpicsValue) -> ScalarType {
         EpicsValue::Long(_) | EpicsValue::LongArray(_) => ScalarType::Int,
         EpicsValue::Double(_) | EpicsValue::DoubleArray(_) => ScalarType::Double,
         EpicsValue::Int64(_) | EpicsValue::Int64Array(_) => ScalarType::Long,
+        // C `DBF_UINT64` → PVA `ulong`.
+        EpicsValue::UInt64(_) | EpicsValue::UInt64Array(_) => ScalarType::ULong,
     }
 }
 
@@ -1199,6 +1201,62 @@ mod tests {
             let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
             assert!(!names.contains(&"control"));
             assert!(!names.contains(&"valueAlarm"));
+        } else {
+            panic!("expected structure descriptor");
+        }
+    }
+
+    #[test]
+    fn br_r13_uint64_array_qsrv_descriptor_uses_ulong() {
+        // BR-R13: a `waveform` with `FTVL = UINT64` must be advertised
+        // through QSRV as `ulong[]` with `uint64_t`-typed metadata limits,
+        // matching pvxs test/testqsingle.cpp:530-546. On main there was no
+        // `EpicsValue::UInt64Array`, so the value collapsed into
+        // `DoubleArray` and the descriptor advertised `double[]`.
+        let snap = test_snapshot(EpicsValue::UInt64Array(vec![
+            11111111111111111,
+            222222222222222,
+        ]));
+        let pv = snapshot_to_nt_scalar_array(&snap);
+
+        // value is a ulong array
+        match pv.get_field("value") {
+            Some(PvField::ScalarArray(vs)) => {
+                assert!(matches!(vs[0], ScalarValue::ULong(11111111111111111)));
+            }
+            other => panic!("expected ulong ScalarArray, got {other:?}"),
+        }
+
+        // display.limitLow typed as ULong, not Double
+        if let Some(PvField::Structure(disp)) = pv.get_field("display") {
+            assert!(
+                matches!(
+                    disp.get_field("limitLow"),
+                    Some(PvField::Scalar(ScalarValue::ULong(_)))
+                ),
+                "uint64 array display.limitLow must be ulong"
+            );
+        } else {
+            panic!("expected display structure");
+        }
+
+        // descriptor advertises ulong[] value and ulong limits
+        let desc = build_nt_scalar_array_desc(ScalarType::ULong);
+        if let FieldDesc::Structure { fields, .. } = &desc {
+            let value_desc = fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d);
+            assert!(matches!(
+                value_desc,
+                Some(FieldDesc::ScalarArray(ScalarType::ULong))
+            ));
+            let control = fields.iter().find(|(n, _)| n == "control").map(|(_, d)| d);
+            if let Some(FieldDesc::Structure { fields: cf, .. }) = control {
+                assert!(matches!(
+                    cf.iter().find(|(n, _)| n == "limitLow").map(|(_, d)| d),
+                    Some(FieldDesc::Scalar(ScalarType::ULong))
+                ));
+            } else {
+                panic!("expected control descriptor");
+            }
         } else {
             panic!("expected structure descriptor");
         }

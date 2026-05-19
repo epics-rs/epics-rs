@@ -354,16 +354,20 @@ impl GatewayChannelSource {
                  credentials: the pvAccess wire cannot forward this auth method/authority",
             );
         }
-        let client = Arc::new(
-            PvaClient::builder()
-                .user(ctx.account.clone())
-                .host(ctx.host.clone())
-                .asserted_identity(AssertedIdentity {
-                    downstream_method: ctx.method.clone(),
-                    downstream_authority: ctx.authority.clone(),
-                })
-                .build(),
-        );
+        // Derive the per-credential client from the gateway's base
+        // upstream client so it reaches the SAME upstream server /
+        // transport — only the asserted identity differs. Building a
+        // bare `PvaClient::builder()` here would drop the gateway's
+        // `server_addr` and the client would fall back to UDP search,
+        // never reaching a pinned or discovery-isolated upstream.
+        let client = Arc::new(self.cache.client().with_asserted_identity(
+            ctx.account.clone(),
+            ctx.host.clone(),
+            AssertedIdentity {
+                downstream_method: ctx.method.clone(),
+                downstream_authority: ctx.authority.clone(),
+            },
+        ));
         pool.insert(key, client.clone());
         client
     }

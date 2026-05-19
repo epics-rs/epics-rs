@@ -314,6 +314,45 @@ impl PvaClient {
         self.inner.asserted_identity.as_ref()
     }
 
+    /// Derive a new client that reaches the **same upstream server over
+    /// the same transport** as `self`, but presents a different
+    /// (gateway-asserted) identity.
+    ///
+    /// BR-R8 / BR-R21: a PVA gateway keeps one upstream client per
+    /// distinct downstream credential so the upstream IOC's access
+    /// security sees the real identity. Every such client must still
+    /// resolve the *same* upstream — only `user` / `host` /
+    /// `asserted_identity` change. Building a fresh
+    /// `PvaClient::builder()` instead would drop the gateway's
+    /// `server_addr` (and timeout / TLS / name-server config), so the
+    /// derived client would fall back to UDP search and never reach a
+    /// pinned or discovery-isolated upstream. This carries every
+    /// connection-config field across.
+    pub fn with_asserted_identity(
+        &self,
+        user: String,
+        host: String,
+        asserted: AssertedIdentity,
+    ) -> PvaClient {
+        let mut builder = PvaClientBuilder::new()
+            .timeout(self.inner.timeout)
+            .user(user)
+            .host(host)
+            .pipeline_size(self.inner.pipeline_size)
+            .priority(self.inner.priority)
+            .tcp_timeout(self.inner.tcp_timeout)
+            .share_udp(self.inner.share_udp)
+            .name_servers(self.inner.name_servers.clone())
+            .asserted_identity(asserted);
+        if let Some(addr) = self.inner.server_addr {
+            builder = builder.server_addr(addr);
+        }
+        if let Some(tls) = self.inner.pool.tls() {
+            builder = builder.with_tls(tls);
+        }
+        builder.build()
+    }
+
     /// Backwards-compatible: targets a specific TCP port (UDP ignored —
     /// search uses the standard port machinery).
     pub fn with_ports(_udp_port: u16, tcp_port: u16) -> Self {

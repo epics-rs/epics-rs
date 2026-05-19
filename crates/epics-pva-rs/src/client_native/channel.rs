@@ -224,6 +224,14 @@ impl ConnectionPool {
         *self.tls.lock() = tls;
     }
 
+    /// The TLS config currently in effect, if any. Used when deriving
+    /// a credential-variant client (`PvaClient::with_asserted_identity`)
+    /// so the new client reaches the same upstream over the same
+    /// transport.
+    pub fn tls(&self) -> Option<Arc<crate::auth::TlsClientConfig>> {
+        self.tls.lock().clone()
+    }
+
     pub async fn get_or_connect(
         self: &Arc<Self>,
         addr: std::net::SocketAddr,

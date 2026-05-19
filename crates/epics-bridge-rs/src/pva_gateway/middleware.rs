@@ -1409,6 +1409,7 @@ mod tests {
             method: "anonymous".into(),
             host: "host1".into(),
             authority: String::new(),
+            roles: Vec::new(),
             pv_request: None,
         }
     }

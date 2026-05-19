@@ -55,21 +55,20 @@ struct PipelineOptions {
 /// `value`/`alarm`/`timeStamp` members (NTScalar / NTNDArray shape).
 ///
 /// Currently extracts:
-/// * Scalar value (DBND filter needs an f64 comparable). Falls back
-///   to `Double(0.0)` for non-scalar values — DBND on arrays /
-///   structures is meaningless and ARR (which would slice the
-///   array) is the wire-through gap documented separately.
+/// * The value leaf as an `EpicsValue` — scalar OR array. Arrays are
+///   carried losslessly (EX-R12) so the `arr` transformation filter
+///   sees the real array to slice. Falls back to `Double(0.0)` only
+///   for shapes with no representable value leaf.
 /// * The mask is always set to `EventMask::VALUE` because PVA's
 ///   monitor stream does not carry the CA-style ALARM/PROPERTY
 ///   discriminator at this layer — the field bitset already encodes
 ///   which subfields changed.
 ///
-/// Filters that work today through this adapter: DEC, TS, SYNC,
-/// DBND (scalar VAL only). ARR is the explicit remaining gap.
+/// The transformed event is bridged back to the wire by
+/// [`apply_filter_transform`]; see EX-R12.
 fn pv_field_to_filter_event(
     value: &PvField,
 ) -> epics_base_rs::server::database::filters::FilteredMonitorEvent {
-    use crate::pvdata::ScalarValue;
     use epics_base_rs::server::database::filters::FilteredMonitorEvent;
     use epics_base_rs::server::pv::MonitorEvent;
     use epics_base_rs::server::recgbl::EventMask;
@@ -77,27 +76,7 @@ fn pv_field_to_filter_event(
     use epics_base_rs::types::EpicsValue;
     use std::time::SystemTime;
 
-    fn extract_scalar(f: &PvField) -> EpicsValue {
-        match f {
-            PvField::Scalar(ScalarValue::Double(d)) => EpicsValue::Double(*d),
-            PvField::Scalar(ScalarValue::Float(f32v)) => EpicsValue::Float(*f32v),
-            PvField::Scalar(ScalarValue::Int(i)) => EpicsValue::Long(*i),
-            PvField::Scalar(ScalarValue::Long(l)) => EpicsValue::Long(*l as i32),
-            PvField::Scalar(ScalarValue::Short(s)) => EpicsValue::Short(*s),
-            PvField::Scalar(ScalarValue::String(s)) => EpicsValue::String(s.clone()),
-            PvField::Structure(s) => {
-                // NT-style structure: look for a "value" subfield.
-                for (k, v) in &s.fields {
-                    if k == "value" {
-                        return extract_scalar(v);
-                    }
-                }
-                EpicsValue::Double(0.0)
-            }
-            _ => EpicsValue::Double(0.0),
-        }
-    }
-    let val = extract_scalar(value);
+    let val = pv_value_leaf_to_epics(value).unwrap_or(EpicsValue::Double(0.0));
     FilteredMonitorEvent::new(
         MonitorEvent {
             snapshot: Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH),
@@ -105,6 +84,188 @@ fn pv_field_to_filter_event(
         },
         EventMask::VALUE,
     )
+}
+
+/// Extract the value leaf of a PVA monitor `PvField` as an
+/// `EpicsValue`, looking through an NT-style structure's `value`
+/// member. Scalars and scalar arrays are both carried; returns
+/// `None` for shapes with no representable value leaf (EX-R12: the
+/// `arr` filter needs the real array, not a scalar fallback).
+fn pv_value_leaf_to_epics(f: &PvField) -> Option<epics_base_rs::types::EpicsValue> {
+    use crate::pvdata::ScalarValue;
+    use epics_base_rs::types::EpicsValue;
+
+    fn scalar(sv: &ScalarValue) -> Option<EpicsValue> {
+        Some(match sv {
+            ScalarValue::Double(d) => EpicsValue::Double(*d),
+            ScalarValue::Float(v) => EpicsValue::Float(*v),
+            ScalarValue::Int(i) => EpicsValue::Long(*i),
+            ScalarValue::Long(l) => EpicsValue::Int64(*l),
+            ScalarValue::ULong(u) => EpicsValue::UInt64(*u),
+            ScalarValue::Short(s) => EpicsValue::Short(*s),
+            ScalarValue::UByte(b) => EpicsValue::Char(*b),
+            ScalarValue::String(s) => EpicsValue::String(s.clone()),
+            _ => return None,
+        })
+    }
+    fn array(items: &[ScalarValue]) -> Option<EpicsValue> {
+        // Empty array — default to a Double array (the filter slice
+        // of an empty array is still empty, so the element type is
+        // irrelevant for correctness here).
+        let first = items.first();
+        Some(match first {
+            Some(ScalarValue::Double(_)) | None => EpicsValue::DoubleArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Double(d) => *d,
+                        _ => 0.0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::Float(_)) => EpicsValue::FloatArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Float(v) => *v,
+                        _ => 0.0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::Int(_)) => EpicsValue::LongArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Int(v) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::Long(_)) => EpicsValue::Int64Array(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Long(v) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::Short(_)) => EpicsValue::ShortArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Short(v) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::String(_)) => EpicsValue::StringArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::String(v) => v.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+            ),
+            _ => return None,
+        })
+    }
+    match f {
+        PvField::Scalar(sv) => scalar(sv),
+        PvField::ScalarArray(items) => array(items),
+        // Wire-decoded arrays arrive as the refcount-shared typed
+        // form; convert to the generic scalar vector so the `arr`
+        // filter sees the real array regardless of which variant the
+        // source produced.
+        PvField::ScalarArrayTyped(t) => array(&t.to_scalar_values()),
+        PvField::Structure(s) => s
+            .fields
+            .iter()
+            .find_map(|(k, v)| (k == "value").then_some(v))
+            .and_then(pv_value_leaf_to_epics),
+        _ => None,
+    }
+}
+
+/// EX-R12: bridge a filter-chain-transformed `FilteredMonitorEvent`
+/// back to the wire `PvField`. Substitutes the transformed value leaf
+/// into the original monitor `PvField` (looking through an NT-style
+/// `value` member) so transformation filters such as `arr` (array
+/// slice) and `ts` actually change the emitted payload.
+///
+/// Returns `None` when the transformed value cannot be represented
+/// in the original wire shape — the caller treats that as a filter
+/// incompatible with the negotiated monitor descriptor.
+fn apply_filter_transform(
+    original: &PvField,
+    transformed: &epics_base_rs::types::EpicsValue,
+) -> Option<PvField> {
+    let new_leaf = epics_value_to_pv_field(transformed)?;
+    substitute_value_leaf(original, new_leaf)
+}
+
+/// Convert an `EpicsValue` produced by a filter back into a PVA
+/// value-leaf `PvField` (scalar or scalar array).
+fn epics_value_to_pv_field(v: &epics_base_rs::types::EpicsValue) -> Option<PvField> {
+    use crate::pvdata::ScalarValue;
+    use epics_base_rs::types::EpicsValue;
+    Some(match v {
+        EpicsValue::Double(d) => PvField::Scalar(ScalarValue::Double(*d)),
+        EpicsValue::Float(f) => PvField::Scalar(ScalarValue::Float(*f)),
+        EpicsValue::Long(i) => PvField::Scalar(ScalarValue::Int(*i)),
+        EpicsValue::Short(s) => PvField::Scalar(ScalarValue::Short(*s)),
+        EpicsValue::Char(c) => PvField::Scalar(ScalarValue::UByte(*c)),
+        EpicsValue::Enum(e) => PvField::Scalar(ScalarValue::Int(*e as i32)),
+        EpicsValue::String(s) => PvField::Scalar(ScalarValue::String(s.clone())),
+        EpicsValue::Int64(l) => PvField::Scalar(ScalarValue::Long(*l)),
+        EpicsValue::UInt64(u) => PvField::Scalar(ScalarValue::ULong(*u)),
+        EpicsValue::DoubleArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Double(*x)).collect())
+        }
+        EpicsValue::FloatArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Float(*x)).collect())
+        }
+        EpicsValue::LongArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Int(*x)).collect())
+        }
+        EpicsValue::ShortArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Short(*x)).collect())
+        }
+        EpicsValue::CharArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::UByte(*x)).collect())
+        }
+        EpicsValue::EnumArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Int(*x as i32)).collect())
+        }
+        EpicsValue::StringArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::String(x.clone())).collect())
+        }
+        EpicsValue::Int64Array(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Long(*x)).collect())
+        }
+        EpicsValue::UInt64Array(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::ULong(*x)).collect())
+        }
+    })
+}
+
+/// Replace the value leaf of `original` with `new_leaf`. For an
+/// NT-style structure the `value` member is replaced in place;
+/// for a bare scalar/array the whole field is replaced.
+fn substitute_value_leaf(original: &PvField, new_leaf: PvField) -> Option<PvField> {
+    match original {
+        PvField::Scalar(_) | PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_) => {
+            Some(new_leaf)
+        }
+        PvField::Structure(s) => {
+            let mut out = s.clone();
+            let slot = out.fields.iter_mut().find(|(k, _)| k == "value")?;
+            slot.1 = new_leaf;
+            Some(PvField::Structure(out))
+        }
+        _ => None,
+    }
 }
 
 /// Read `record._options._filter` from a decoded pvRequest. The value
@@ -1279,6 +1440,19 @@ async fn handle_connection_io(
                         method = %cred.method,
                         "PVA client selects unadvertised auth method — replying Status::Error"
                     );
+                    // EX-R7: the client picked an auth method the
+                    // server never advertised. The handshake completes
+                    // (pvxs keeps the connection open) but the claimed
+                    // credential MUST NOT survive — the server is about
+                    // to return Status::Error rejecting it. Leaving
+                    // `cred` as the unadvertised claim would let the
+                    // `auth_complete` hook and every later ACF-gated
+                    // operation see an identity the server just
+                    // rejected: a legacy rule without a METHOD(...)
+                    // clause would still match the claimed account.
+                    // Revert to anonymous so the rejected claim never
+                    // becomes the connection identity.
+                    cred = ClientCredentials::anonymous();
                     Status::error("Client selects unadvertised auth".to_string())
                 };
                 let mut payload = Vec::new();
@@ -1681,7 +1855,26 @@ async fn handle_put_get(
     // PUT-GET data phase.
     let op = ch.ops.get(&ioid).cloned();
     let (intro, mask) = match op {
-        Some(o) => (o.intro, o.mask),
+        Some(o) => {
+            // EX-R5: the data-phase command must match the operation
+            // kind bound at INIT. pvxs `serverget.cpp:421-436` resets
+            // the connection when an IOID is driven by the wrong
+            // operation class. Without this check a client could INIT
+            // an IOID as a GET/PUT/MONITOR and then drive a dedicated
+            // PUT_GET data frame through it, performing a
+            // write/readback with a descriptor + mask the operation
+            // never negotiated as a PUT_GET. Mirror the generic
+            // handler's protocol-error policy (tcp.rs data-phase
+            // kind guard).
+            if o.kind != OpKind::PutGet {
+                return Err(PvaError::Decode(format!(
+                    "PUT_GET data-phase frame for IOID {ioid} initialised as {:?} \
+                     (pvxs serverget.cpp:421-436 protocol error)",
+                    o.kind
+                )));
+            }
+            (o.intro, o.mask)
+        }
         None => {
             send_op_error(tx, OpKind::PutGet, ioid, "operation not initialised", order).await?;
             return Ok(());
@@ -1700,6 +1893,7 @@ async fn handle_put_get(
         method: cred.method.clone(),
         host: cred.host.clone(),
         authority: cred.authority.clone(),
+        roles: cred.roles.clone(),
         pv_request: None,
     };
 
@@ -1877,16 +2071,34 @@ async fn handle_process(
     }
 
     // PROCESS data phase — no payload to decode.
-    if !ch.ops.contains_key(&ioid) {
-        send_op_error(
-            tx,
-            OpKind::Process,
-            ioid,
-            "operation not initialised",
-            order,
-        )
-        .await?;
-        return Ok(());
+    match ch.ops.get(&ioid) {
+        None => {
+            send_op_error(
+                tx,
+                OpKind::Process,
+                ioid,
+                "operation not initialised",
+                order,
+            )
+            .await?;
+            return Ok(());
+        }
+        Some(o) => {
+            // EX-R5: the data-phase command must match the operation
+            // kind bound at INIT. pvxs `serverget.cpp:421-436` resets
+            // the connection when an IOID is driven by the wrong
+            // operation class. Without this check any live IOID on
+            // the channel could be driven into record processing via
+            // a dedicated PROCESS data frame. Mirror the generic
+            // handler's protocol-error policy.
+            if o.kind != OpKind::Process {
+                return Err(PvaError::Decode(format!(
+                    "PROCESS data-phase frame for IOID {ioid} initialised as {:?} \
+                     (pvxs serverget.cpp:421-436 protocol error)",
+                    o.kind
+                )));
+            }
+        }
     }
     let pv_name = ch.name.clone();
     let ctx = crate::server_native::source::ChannelContext {
@@ -1895,6 +2107,7 @@ async fn handle_process(
         method: cred.method.clone(),
         host: cred.host.clone(),
         authority: cred.authority.clone(),
+        roles: cred.roles.clone(),
         pv_request: None,
     };
     let src = source.clone();
@@ -2655,6 +2868,11 @@ async fn handle_op(
             let cred_method = cred.method.clone();
             let cred_host = cred.host.clone();
             let cred_authority = cred.authority.clone();
+            let cred_roles = cred.roles.clone();
+            // MR-R13: forward the decoded INIT pvRequest into the GET
+            // context so QSRV group GET honors `record._options`
+            // (e.g. `atomic`). Previously dropped here as `None`.
+            let init_pv_request_t = init_pv_request.clone();
             // Abort any previous in-flight data task for this ioid
             // (e.g. double-EXEC from a misbehaving client).
             if let Some(op_mut) = ch.ops.get_mut(&ioid) {
@@ -2667,7 +2885,8 @@ async fn handle_op(
                     method: cred_method,
                     host: cred_host,
                     authority: cred_authority,
-                    pv_request: None,
+                    roles: cred_roles,
+                    pv_request: init_pv_request_t,
                 };
                 let checked = src
                     .access_gate()
@@ -2748,6 +2967,11 @@ async fn handle_op(
                 let cred_method = cred.method.clone();
                 let cred_host = cred.host.clone();
                 let cred_authority = cred.authority.clone();
+                let cred_roles = cred.roles.clone();
+                // MR-R13: forward the INIT pvRequest into the PUT
+                // readback GET context so the readback honors the
+                // same `record._options` the GET path would.
+                let init_pv_request_t = init_pv_request.clone();
                 if let Some(op_mut) = ch.ops.get_mut(&ioid) {
                     op_mut.data_task_abort = None;
                 }
@@ -2758,7 +2982,8 @@ async fn handle_op(
                         method: cred_method,
                         host: cred_host,
                         authority: cred_authority,
-                        pv_request: None,
+                        roles: cred_roles,
+                        pv_request: init_pv_request_t,
                     };
                     let checked = src
                         .access_gate()
@@ -2843,6 +3068,7 @@ async fn handle_op(
             let cred_method = cred.method.clone();
             let cred_host = cred.host.clone();
             let cred_authority = cred.authority.clone();
+            let cred_roles = cred.roles.clone();
             let init_pv_request_t = init_pv_request.clone();
             if let Some(op_mut) = ch.ops.get_mut(&ioid) {
                 op_mut.data_task_abort = None;
@@ -2854,6 +3080,7 @@ async fn handle_op(
                     method: cred_method,
                     host: cred_host,
                     authority: cred_authority,
+                    roles: cred_roles,
                     pv_request: init_pv_request_t,
                 };
                 let result = {
@@ -3008,6 +3235,7 @@ async fn handle_op(
                     method: cred.method.clone(),
                     host: cred.host.clone(),
                     authority: cred.authority.clone(),
+                    roles: cred.roles.clone(),
                     pv_request: init_pv_request.clone(),
                 };
                 // Round 42 + R49-G1: type-state MONITOR gate.
@@ -3404,13 +3632,91 @@ async fn handle_op(
                             debug!(pv = %pv_name, "monitor outbound queue drained below low watermark");
                             src.notify_watermark_low(&pv_name);
                         }
+                        // EX-R1: pause and filter suppression MUST run
+                        // before pipeline credit is consumed. Pipeline
+                        // credit accounts for monitor DATA frames sent
+                        // to the client (pvxs `servermon.cpp:192`
+                        // decrements `window` only after the frame is
+                        // enqueued). An event dropped by pause or by
+                        // the filter chain produces no wire frame, so
+                        // it must not consume a window slot — otherwise
+                        // a client with a finite pipeline window stalls
+                        // waiting to ACK frames it never received.
+                        //
+                        // P-G28: pause drops events on the floor.
+                        // Resume cleanly re-emits whatever the source
+                        // sends next; clients that need state recovery
+                        // re-issue their pvRequest after resume.
+                        if paused_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            continue;
+                        }
+                        // Server-side channel filters: skip when the
+                        // chain drops this event. Empty chain (the
+                        // default) is a no-op pass-through.
+                        //
+                        // EX-R12: a filter chain may TRANSFORM the
+                        // event (e.g. `arr` slices the array, `ts`
+                        // rewrites the value). The transformed value
+                        // from `FilterChain::apply` is bridged back
+                        // into the wire `PvField` via
+                        // `apply_filter_transform`; the monitor frame
+                        // is then built from the transformed value,
+                        // not the original. A pass/drop-only filter
+                        // (`dec`, `sync`, scalar `dbnd`) leaves the
+                        // value unchanged, so the bridge is a no-op
+                        // for it. When the transformed value cannot be
+                        // represented in the negotiated monitor
+                        // descriptor (a transformation filter whose
+                        // output type/shape does not fit this PV's
+                        // fixed wire descriptor — e.g. a `ts` mode
+                        // that changes the scalar type), the
+                        // subscription cannot honor the filter: emit a
+                        // monitor error frame and end the stream
+                        // rather than silently sending a wrong value.
+                        let value = if filters.is_empty() {
+                            value
+                        } else {
+                            let fev = pv_field_to_filter_event(&value);
+                            match filters.apply(fev) {
+                                None => continue,
+                                Some(transformed) => {
+                                    match apply_filter_transform(
+                                        &value,
+                                        &transformed.event.snapshot.value,
+                                    ) {
+                                        Some(tv)
+                                            if crate::pvdata::value_matches_descriptor(
+                                                &tv,
+                                                &intro_clone,
+                                            )
+                                            .is_ok() =>
+                                        {
+                                            tv
+                                        }
+                                        _ => {
+                                            let err = build_monitor_error(
+                                                ioid,
+                                                "server-side filter transform does not \
+                                                 fit the monitor descriptor",
+                                                order,
+                                            );
+                                            let _ = tx_clone.send(err).await;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        };
                         // P-G11: pipeline window check. When pipeline
                         // is active, wait for window > 0 before
                         // emitting. ACK frames refill the window via
                         // the dispatch path; we wake on the notify.
                         // Without a window (pipeline=false) we emit
                         // freely; mpsc backpressure remains the only
-                        // gate, matching previous behavior.
+                        // gate, matching previous behavior. This runs
+                        // after the pause/filter gates above so credit
+                        // is consumed only for events that will produce
+                        // a DATA frame.
                         if let (Some(w), Some(n)) = (window.as_ref(), window_notify.as_ref()) {
                             loop {
                                 let cur = w.load(std::sync::atomic::Ordering::Relaxed);
@@ -3443,22 +3749,6 @@ async fn handle_op(
                                     continue;
                                 }
                                 notified.await;
-                            }
-                        }
-                        // P-G28: pause drops events on the floor.
-                        // Resume cleanly re-emits whatever the source
-                        // sends next; clients that need state recovery
-                        // re-issue their pvRequest after resume.
-                        if paused_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                            continue;
-                        }
-                        // Server-side channel filters: skip when the
-                        // chain drops this event. Empty chain (the
-                        // default) is a no-op pass-through.
-                        if !filters.is_empty() {
-                            let fev = pv_field_to_filter_event(&value);
-                            if filters.apply(fev).is_none() {
-                                continue;
                             }
                         }
                         // BR-R29: for a partial-emitting source, narrow
@@ -3526,6 +3816,7 @@ async fn handle_op(
                 method: cred.method.clone(),
                 host: cred.host.clone(),
                 authority: cred.authority.clone(),
+                roles: cred.roles.clone(),
                 pv_request: None,
             };
             let join = tokio::spawn(async move {
@@ -3874,6 +4165,25 @@ fn build_monitor_finish(ioid: u32, order: ByteOrder) -> Vec<u8> {
     payload.put_u32(ioid, order);
     payload.put_u8(0x10);
     Status::ok().write_into(order, &mut payload);
+    let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
+    let mut buf = Vec::with_capacity(8 + payload.len());
+    h.write_into(&mut buf);
+    buf.extend_from_slice(&payload);
+    buf
+}
+
+/// EX-R12: build a MONITOR error frame — subcmd `0x10` (finish) plus
+/// a non-success `Status`. Used when a server-side transformation
+/// filter produces a value that cannot be represented in the
+/// monitor's negotiated wire descriptor; the stream ends with an
+/// explicit error rather than silently emitting a wrong value. pvxs
+/// `servermon.cpp:178` notes the finish frame "could be used to send
+/// an error".
+fn build_monitor_error(ioid: u32, msg: &str, order: ByteOrder) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.put_u32(ioid, order);
+    payload.put_u8(0x10);
+    Status::error(msg.to_string()).write_into(order, &mut payload);
     let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
     let mut buf = Vec::with_capacity(8 + payload.len());
     h.write_into(&mut buf);
@@ -4633,6 +4943,127 @@ mod tests {
         (get("a"), get("b"), get("c"))
     }
 
+    /// EX-R3 regression: the default `ChannelSource::put_delta_checked`
+    /// merges the sparse delta over the PV's prior value. The
+    /// prior-value read MUST run through `get_value_checked` (the
+    /// credentialed path) — not the ctx-less `get_value` — so an
+    /// access-controlled or credential-routed source resolves the
+    /// prior under the same identity as the write.
+    ///
+    /// This test source returns a WRONG prior `(0,0,0)` from the
+    /// ctx-less `get_value` and the CORRECT prior `(10,20,30)` from
+    /// the credentialed `get_value_checked`. A single-field delta PUT
+    /// marking only `b` must produce `(10,99,30)`. Before the fix the
+    /// default read the prior through `get_value`, so `a`/`c`
+    /// collapsed to `0` (the wrong-context value).
+    #[tokio::test]
+    async fn ex_r3_put_delta_default_merges_under_credentialed_read() {
+        use crate::proto::BitSet;
+        use crate::server_native::source::{
+            AccessChecked, AccessGate, ChannelContext, ChannelSource,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Source whose ctx-less `get_value` deliberately returns a
+        // different (wrong) prior than the credentialed
+        // `get_value_checked`. Records which read path the default
+        // `put_delta_checked` exercised, and stores the final value.
+        struct SplitReadSource {
+            stored: Arc<parking_lot::Mutex<Option<PvField>>>,
+            used_ctxless_get: Arc<AtomicBool>,
+        }
+        impl ChannelSource for SplitReadSource {
+            async fn list_pvs(&self) -> Vec<String> {
+                vec!["dut".into()]
+            }
+            fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+                let n = n.to_string();
+                async move { n == "dut" }
+            }
+            async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+                Some(three_field_intro())
+            }
+            // Ctx-less read — the WRONG prior. If the default
+            // put_delta_checked uses this, the merge loses a/c.
+            fn get_value(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                self.used_ctxless_get.store(true, Ordering::SeqCst);
+                async { Some(three_field_value(0, 0, 0)) }
+            }
+            // Credentialed read — the CORRECT prior.
+            async fn get_value_checked(
+                &self,
+                checked: AccessChecked,
+                _ctx: ChannelContext,
+            ) -> Option<PvField> {
+                if !checked.allows_read() {
+                    return None;
+                }
+                Some(three_field_value(10, 20, 30))
+            }
+            fn put_value(
+                &self,
+                _: &str,
+                value: PvField,
+            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+                *self.stored.lock() = Some(value);
+                async { Ok(()) }
+            }
+            async fn is_writable(&self, _: &str) -> bool {
+                true
+            }
+            async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+                None
+            }
+        }
+
+        let stored = Arc::new(parking_lot::Mutex::new(None));
+        let used_ctxless = Arc::new(AtomicBool::new(false));
+        let src = SplitReadSource {
+            stored: stored.clone(),
+            used_ctxless_get: used_ctxless.clone(),
+        };
+
+        // ReadWrite token from the default Open gate.
+        let checked = AccessGate::open()
+            .check("dut", "h", "u", "anonymous", "")
+            .await;
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "u".into(),
+            method: "anonymous".into(),
+            host: "h".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: None,
+        };
+
+        // Delta marking only field `b` (bit 2) -> 99.
+        let mut changed = BitSet::new();
+        changed.set(2);
+        let delta = three_field_value(0, 99, 0);
+
+        src.put_delta_checked(checked, three_field_intro(), changed, delta, ctx)
+            .await
+            .expect("put_delta_checked must succeed");
+
+        let final_value = stored.lock().clone().expect("a value must be stored");
+        let (a, b, c) = three_field_extract(&final_value);
+        assert_eq!(
+            (a, b, c),
+            (10, 99, 30),
+            "EX-R3: default put_delta_checked must merge the delta over the \
+             credentialed prior (10,20,30); got ({a},{b},{c})"
+        );
+        assert!(
+            !used_ctxless.load(Ordering::SeqCst),
+            "EX-R3: the prior-value read must NOT go through the ctx-less get_value"
+        );
+    }
+
     /// Regression (Defect 1): the PVA client encodes the PUT data
     /// phase as a BitSet delta — only the marked fields are present
     /// on the wire. A 3-field structure where only field `b` (bit 2)
@@ -4959,6 +5390,7 @@ mod tests {
                 method: "anonymous".into(),
                 host: "127.0.0.1".into(),
                 authority: String::new(),
+                roles: Vec::new(),
                 pv_request: None,
             };
 
@@ -5238,6 +5670,231 @@ mod tests {
             process_hits.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "process hook must NOT run when AUTHORITY does not match"
+        );
+    }
+
+    /// Build a channel whose `ioid` op was initialised as `kind`,
+    /// so an EX-R5 wrong-kind data frame can be driven against it.
+    #[cfg(test)]
+    fn primed_channels_with_kind(sid: u32, ioid: u32, kind: OpKind) -> HashMap<u32, ChannelState> {
+        let intro = three_field_intro();
+        let mask = BitSet::all_set(intro.total_bits());
+        let mut ops = HashMap::new();
+        ops.insert(ioid, non_monitor_op_state(intro.clone(), kind, mask));
+        let mut channels = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro),
+                ops,
+            },
+        );
+        channels
+    }
+
+    /// EX-R5 regression: the dedicated `handle_process` data phase must
+    /// reject a frame whose IOID was initialised as a different
+    /// operation class. Before the fix it only checked
+    /// `ch.ops.contains_key(ioid)`, so a client could INIT a GET (or
+    /// MONITOR) and then drive a PROCESS data frame through it,
+    /// triggering record processing on an op that never negotiated
+    /// PROCESS. pvxs `serverget.cpp:421-436` resets the connection on
+    /// a wrong-kind IOID.
+    #[tokio::test]
+    async fn ex_r5_process_data_rejects_get_initialised_ioid() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 600;
+        let src = AuthorityGatedSource::new();
+        let process_hits = std::sync::Arc::clone(&src.process_hits);
+        let source: DynSource = std::sync::Arc::new(src);
+
+        // IOID initialised as a GET, not a PROCESS.
+        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00);
+        let frame = synth_frame(Command::Process, order, payload);
+
+        let res = handle_process(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            peer,
+            &x509_cred("MyCA"),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "EX-R5: PROCESS data against a GET-initialised IOID must be a protocol error"
+        );
+        assert_eq!(
+            process_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "EX-R5: record processing must NOT run for a wrong-kind PROCESS frame"
+        );
+    }
+
+    /// EX-R5 regression: `handle_process` must also reject a PROCESS
+    /// data frame against a MONITOR-initialised IOID.
+    #[tokio::test]
+    async fn ex_r5_process_data_rejects_monitor_initialised_ioid() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 601;
+        let src = AuthorityGatedSource::new();
+        let process_hits = std::sync::Arc::clone(&src.process_hits);
+        let source: DynSource = std::sync::Arc::new(src);
+
+        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Monitor);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00);
+        let frame = synth_frame(Command::Process, order, payload);
+
+        let res = handle_process(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            peer,
+            &x509_cred("MyCA"),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "EX-R5: PROCESS data against a MONITOR-initialised IOID must be a protocol error"
+        );
+        assert_eq!(
+            process_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "EX-R5: record processing must NOT run for a wrong-kind PROCESS frame"
+        );
+    }
+
+    /// EX-R5 regression: the dedicated `handle_put_get` data phase must
+    /// reject a frame whose IOID was initialised as a different
+    /// operation class (here a GET). Before the fix it extracted
+    /// `(intro, mask)` from whatever op existed and performed a
+    /// write/readback the operation never negotiated as a PUT_GET.
+    #[tokio::test]
+    async fn ex_r5_put_get_data_rejects_get_initialised_ioid() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 602;
+        let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
+
+        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let intro = three_field_intro();
+
+        // PUT_GET data frame: sid + ioid + subcmd(0x00) + bitset + value.
+        let mut changed = BitSet::new();
+        changed.set(2);
+        let delta = three_field_value(0, 99, 0);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00);
+        changed.write_into(order, &mut payload);
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &delta,
+            &intro,
+            &changed,
+            0,
+            order,
+            &mut payload,
+        );
+        let frame = synth_frame(Command::PutGet, order, payload);
+
+        let res = handle_put_get(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &x509_cred("MyCA"),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "EX-R5: PUT_GET data against a GET-initialised IOID must be a protocol error"
+        );
+    }
+
+    /// EX-R5 regression: `handle_put_get` must also reject a PUT_GET
+    /// data frame against a PUT-initialised IOID.
+    #[tokio::test]
+    async fn ex_r5_put_get_data_rejects_put_initialised_ioid() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 603;
+        let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
+
+        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Put);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let intro = three_field_intro();
+
+        let mut changed = BitSet::new();
+        changed.set(2);
+        let delta = three_field_value(0, 99, 0);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00);
+        changed.write_into(order, &mut payload);
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &delta,
+            &intro,
+            &changed,
+            0,
+            order,
+            &mut payload,
+        );
+        let frame = synth_frame(Command::PutGet, order, payload);
+
+        let res = handle_put_get(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &x509_cred("MyCA"),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "EX-R5: PUT_GET data against a PUT-initialised IOID must be a protocol error"
         );
     }
 

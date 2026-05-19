@@ -70,6 +70,32 @@ impl MemSource {
             .insert(name.to_string(), pv);
     }
 
+    /// EX-R12: register an NTScalarArray PV holding a Double array.
+    async fn add_array_pv(&self, name: &str, vals: &[f64]) {
+        let pv = make_nt_double_array(vals);
+        self.inner
+            .state
+            .lock()
+            .await
+            .values
+            .insert(name.to_string(), pv);
+    }
+
+    /// Push a new Double-array value to an NTScalarArray PV.
+    async fn push_array(&self, name: &str, vals: &[f64]) {
+        let pv = make_nt_double_array(vals);
+        self.inner
+            .state
+            .lock()
+            .await
+            .values
+            .insert(name.to_string(), pv.clone());
+        let mut subs = self.inner.subs.lock().await;
+        if let Some(list) = subs.get_mut(name) {
+            list.retain(|tx| tx.try_send(pv.clone()).is_ok());
+        }
+    }
+
     async fn push(&self, name: &str, value: f64) {
         let pv = make_nt_scalar(value);
         self.inner
@@ -100,6 +126,22 @@ fn nt_scalar_desc() -> FieldDesc {
     }
 }
 
+fn make_nt_double_array(vals: &[f64]) -> PvField {
+    let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
+    s.fields.push((
+        "value".into(),
+        PvField::ScalarArray(vals.iter().map(|v| ScalarValue::Double(*v)).collect()),
+    ));
+    PvField::Structure(s)
+}
+
+fn nt_double_array_desc() -> FieldDesc {
+    FieldDesc::Structure {
+        struct_id: "epics:nt/NTScalarArray:1.0".into(),
+        fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))],
+    }
+}
+
 impl ChannelSource for MemSource {
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
         let inner = self.inner.clone();
@@ -126,10 +168,19 @@ impl ChannelSource for MemSource {
         let inner = self.inner.clone();
         let name = name.to_string();
         async move {
-            if inner.state.lock().await.values.contains_key(&name) {
-                Some(nt_scalar_desc())
-            } else {
-                None
+            // EX-R12: derive the descriptor from the stored value's
+            // shape so an NTScalarArray PV reports an array descriptor.
+            match inner.state.lock().await.values.get(&name) {
+                Some(PvField::Structure(s))
+                    if matches!(
+                        s.fields.iter().find(|(k, _)| k == "value").map(|(_, v)| v),
+                        Some(PvField::ScalarArray(_))
+                    ) =>
+                {
+                    Some(nt_double_array_desc())
+                }
+                Some(_) => Some(nt_scalar_desc()),
+                None => None,
             }
         }
     }
@@ -542,6 +593,200 @@ async fn server_side_filter_pva_dec_wire_through() {
     h.abort();
 }
 
+/// EX-R12 regression: a server-side TRANSFORMATION filter (`arr`)
+/// must actually change the emitted monitor value. Before the fix
+/// the PVA monitor emit loop called `FilterChain::apply` only to
+/// check `is_none()` for pass/drop and then built the wire payload
+/// from the ORIGINAL value, so a client requesting an array slice
+/// received the full unsliced array.
+///
+/// Here the `arr` filter selects every other element
+/// (`s=0,i=2,e=-1`) of an 8-element array. After the fix the client
+/// must receive the 4-element sliced array, not the original 8.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ex_r12_server_side_arr_filter_slices_monitor_value() {
+    use epics_pva_rs::pv_request::PvRequestBuilder;
+
+    let source = Arc::new(MemSource::new());
+    let full: Vec<f64> = (0..8).map(|i| i as f64).collect();
+    source.add_array_pv("STAB:EXR12:ARR", &full).await;
+
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::<Vec<f64>>::new()));
+    let seen_cb = seen.clone();
+
+    // `arr` slice: start 0, increment 2, end -1 → indices 0,2,4,6.
+    let req = PvRequestBuilder::new()
+        .record("_filter", r#"{"arr":{"s":0,"i":2,"e":-1}}"#)
+        .build();
+
+    let monitor_handle = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let _ = client
+                .pvmonitor_with_request("STAB:EXR12:ARR", &req, move |value| {
+                    // The wire decoder delivers arrays as the typed
+                    // refcount-shared variant.
+                    if let PvField::Structure(s) = value
+                        && let Some(arr_field) = s
+                            .fields
+                            .iter()
+                            .find_map(|(k, v)| (k == "value").then_some(v))
+                    {
+                        let arr: Vec<f64> = match arr_field {
+                            PvField::ScalarArrayTyped(t) => t
+                                .to_scalar_values()
+                                .iter()
+                                .map(|sv| match sv {
+                                    ScalarValue::Double(d) => *d,
+                                    _ => f64::NAN,
+                                })
+                                .collect(),
+                            PvField::ScalarArray(items) => items
+                                .iter()
+                                .map(|sv| match sv {
+                                    ScalarValue::Double(d) => *d,
+                                    _ => f64::NAN,
+                                })
+                                .collect(),
+                            _ => return,
+                        };
+                        seen_cb.lock().push(arr);
+                    }
+                })
+                .await;
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Push a fresh 8-element array — this event flows through the
+    // monitor emit loop where the filter chain runs.
+    source
+        .push_array(
+            "STAB:EXR12:ARR",
+            &[10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0],
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let observed = seen.lock().clone();
+    assert!(
+        observed.len() >= 2,
+        "EX-R12: expected the initial snapshot plus the pushed event, got {}",
+        observed.len()
+    );
+    // The steady-state pushed event flows through the emit loop's
+    // filter chain and MUST be the sliced array (indices 0,2,4,6 of
+    // [10..17] = [10,12,14,16]). Before the fix the wire payload was
+    // built from the original unsliced value, so this frame carried
+    // all 8 elements.
+    let pushed = observed.last().unwrap();
+    assert_eq!(
+        pushed,
+        &vec![10.0, 12.0, 14.0, 16.0],
+        "EX-R12: arr filter did not slice the emitted monitor value — got {pushed:?}"
+    );
+    assert_eq!(
+        pushed.len(),
+        4,
+        "EX-R12: arr-sliced monitor value must have 4 elements"
+    );
+
+    monitor_handle.abort();
+    h.abort();
+}
+
+/// EX-R1 regression: pipeline credit must be consumed only for
+/// monitor DATA frames actually sent to the client. A pipelined
+/// monitor (`pipeline=true,queueSize=N`) combined with a server-side
+/// `dec` filter that drops most events must still stream the events
+/// that pass the filter.
+///
+/// Before the fix the emit loop decremented the pipeline window
+/// BEFORE the pause/filter gates, so every filter-dropped event
+/// consumed a window slot without sending a frame. With queueSize=4
+/// and `dec n=3`, the first 4 events are all dropped by the filter;
+/// they exhausted the window with no DATA frame, hence no client ACK
+/// to refill it — the stream stalled and the events that should have
+/// passed the filter never arrived.
+///
+/// After the fix the window decrements only for events that produce
+/// a frame, so the passing events stream through and `last_seen`
+/// reaches the final pushed value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ex_r1_pipeline_credit_not_consumed_by_filtered_events() {
+    use epics_pva_rs::pv_request::PvRequestBuilder;
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:EXR1:PIPE", 0.0).await;
+
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    let last_seen = Arc::new(parking_lot::Mutex::new(None::<f64>));
+    let count = Arc::new(parking_lot::Mutex::new(0usize));
+    let last_cb = last_seen.clone();
+    let count_cb = count.clone();
+
+    // Pipelined monitor with a small window AND a decimate-by-3
+    // server-side filter. The filter drops ~2 of every 3 events.
+    let req = PvRequestBuilder::new()
+        .record("pipeline", "true")
+        .record("queueSize", "4")
+        .record("_filter", r#"{"dec":{"n":3}}"#)
+        .build();
+
+    let monitor_handle = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let _ = client
+                .pvmonitor_with_request("STAB:EXR1:PIPE", &req, move |value| {
+                    if let PvField::Structure(s) = value
+                        && let Some(ScalarValue::Double(v)) = s.get_value()
+                    {
+                        *last_cb.lock() = Some(*v);
+                        *count_cb.lock() += 1;
+                    }
+                })
+                .await;
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Push 30 values. With dec n=3 the filter drops far more than the
+    // 4-deep window, so a credit-on-drop bug stalls the stream within
+    // the first handful of pushes.
+    const N: i32 = 30;
+    for i in 1..=N {
+        source.push("STAB:EXR1:PIPE", i as f64).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let last = *last_seen.lock();
+    let seen = *count.lock();
+    // The stream must not have stalled: the last value the client
+    // observed must be a late push, proving credit kept flowing past
+    // the filter-dropped events.
+    assert!(
+        last.is_some_and(|v| v >= (N as f64) - 6.0),
+        "EX-R1 regression: pipelined monitor stalled — last value {last:?} \
+         (expected close to {N}); filter-dropped events consumed window credit"
+    );
+    // And more than the window's worth of frames were delivered, which
+    // is impossible if credit never refilled.
+    assert!(
+        seen > 4,
+        "EX-R1 regression: only {seen} frames delivered — window never refilled"
+    );
+
+    monitor_handle.abort();
+    h.abort();
+}
+
 /// pvxs `serverchan.cpp:269-358` parity: a single CREATE_CHANNEL
 /// frame can carry `count` (cid, name) pairs and the server must
 /// emit one reply per pair, in arrival order. Rust used to consume
@@ -804,6 +1049,116 @@ async fn auth_method_unadvertised_returns_status_error() {
     assert!(
         status.is_success(),
         "anonymous (advertised) handshake was rejected: {status:?}"
+    );
+
+    h.abort();
+}
+
+/// EX-R7 regression: when a plain-TCP client selects an auth method
+/// the server never advertised (`x509`) and includes a non-empty
+/// `user` in its auth body, the server returns `Status::Error` AND
+/// must revert the connection credential to anonymous. Before the fix
+/// the parsed `x509`/`user="alice"` claim was installed into `cred`
+/// before the advertised-method check, so the `auth_complete` hook
+/// (and every later ACF-gated operation) saw an identity the server
+/// had just rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
+    use std::io::Write;
+    use std::sync::Mutex as StdMutex;
+
+    use epics_pva_rs::codec::CMD_CONNECTION_VALIDATED;
+    use epics_pva_rs::proto::encode_string_into;
+    use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, Status, WriteExt};
+    use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+    use epics_pva_rs::server_native::PvaServerConfig;
+    use epics_pva_rs::server_native::run_pva_server;
+
+    // Capture what the auth_complete hook observed.
+    let captured: Arc<StdMutex<Option<(String, String)>>> = Arc::new(StdMutex::new(None));
+    let captured_hook = captured.clone();
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("AUTH:EXR7", 0.0).await;
+
+    let (tcp, udp) = alloc_port_pair();
+    let cfg = PvaServerConfig {
+        tcp_port: tcp,
+        udp_port: udp,
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 16,
+        max_channels_per_connection: 64,
+        monitor_queue_depth: 8,
+        auth_complete: Some(Arc::new(move |_peer, cred| {
+            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
+        })),
+        ..Default::default()
+    };
+    let h = tokio::spawn(async move {
+        let _ = run_pva_server(source, cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let mut sock = read_handshake_prelude(server_addr);
+
+    // CONNECTION_VALIDATION with method="x509" (unadvertised on plain
+    // TCP) and an auth Value structure carrying `user="alice"`.
+    let order = ByteOrder::Little;
+    let auth_desc = FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![("user".into(), FieldDesc::Scalar(ScalarType::String))],
+    };
+    let mut auth_struct = PvStructure::new("");
+    auth_struct.fields.push((
+        "user".into(),
+        PvField::Scalar(ScalarValue::String("alice".into())),
+    ));
+    let auth_val = PvField::Structure(auth_struct);
+
+    let mut payload: Vec<u8> = Vec::new();
+    payload.put_u32(87_040, order);
+    payload.put_u16(32_767, order);
+    payload.put_u16(0, order);
+    encode_string_into("x509", order, &mut payload);
+    epics_pva_rs::pvdata::encode::encode_type_desc(&auth_desc, order, &mut payload);
+    epics_pva_rs::pvdata::encode::encode_pv_field(&auth_val, &auth_desc, order, &mut payload);
+    let h_req = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut req = Vec::new();
+    h_req.write_into(&mut req);
+    req.extend_from_slice(&payload);
+    sock.write_all(&req).unwrap();
+
+    // CONNECTION_VALIDATED reply must carry Status::Error.
+    let frame = read_one_frame(&mut sock);
+    assert_eq!(
+        frame.header.command, CMD_CONNECTION_VALIDATED,
+        "expected CONNECTION_VALIDATED"
+    );
+    let mut cur = frame.cursor();
+    let status = Status::decode(&mut cur, order).expect("status");
+    assert!(
+        !status.is_success(),
+        "server accepted unadvertised x509 method: {status:?}"
+    );
+
+    // The auth_complete hook must have seen ANONYMOUS credentials —
+    // not the rejected `x509`/`alice` claim.
+    let observed = captured.lock().unwrap().clone();
+    let (method, account) = observed.expect("auth_complete hook must have fired");
+    assert_eq!(
+        method, "anonymous",
+        "EX-R7: rejected unadvertised method must not survive on the connection"
+    );
+    assert_eq!(
+        account, "anonymous",
+        "EX-R7: rejected claimed account `alice` must not survive on the connection"
     );
 
     h.abort();

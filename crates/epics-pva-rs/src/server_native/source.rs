@@ -35,6 +35,13 @@ pub struct ChannelContext {
     /// subject CommonName. Empty for non-TLS methods. ACF
     /// `AUTHORITY(...)` rule scopes match against this.
     pub authority: String,
+    /// Group / role claims advertised by the downstream peer's auth
+    /// method. MR-R11: parsed off the `ca` auth payload's
+    /// `groups`/`roles` array into `ClientCredentials::roles`, then
+    /// forwarded here so role-based ACF rules (`R member group:ops`,
+    /// `role/...` credential strings) can be enforced for native PVA
+    /// clients. Empty for methods that carry no role list.
+    pub roles: Vec<String>,
     /// Decoded INIT pvRequest value for the current operation, when
     /// the wire layer captured one. BR-R3: PVA PUT INIT carries
     /// `record._options.process`/`block`; the data-phase payload is
@@ -288,12 +295,21 @@ pub trait ChannelSource: Send + Sync + 'static {
         async move {
             // Default (non-atomic) merge for sources without a
             // contained merge primitive. Single-client correct.
-            // `put_value_checked` enforces the WRITE gate, so a
-            // denied token never reaches the merge below as a write —
-            // but read the prior unconditionally (READ is implied by
-            // a ReadWrite token; for a denied token put_value_checked
-            // rejects before the merged value is stored).
-            let merged = match self.get_value(checked.pv_name()).await {
+            //
+            // EX-R3: the prior-value read MUST run under the same
+            // authenticated identity as the write. Reading the prior
+            // through the ctx-less `get_value` would let an
+            // access-controlled or credential-routed source resolve
+            // the prior under an anonymous/default context — a denied
+            // or differently-resolved read then collapses to
+            // `None => delta`, treating the sparse data-phase value as
+            // a full value and replacing unmarked leaves with type
+            // defaults. Route the prior read through
+            // `get_value_checked` with a clone of the same `checked`
+            // token and `ctx`, so credential-aware sources merge under
+            // their own identity. `put_value_checked` below still
+            // enforces the WRITE gate.
+            let merged = match self.get_value_checked(checked.clone(), ctx.clone()).await {
                 Some(prior) => crate::pvdata::encode::fill_unmarked_from_prior(
                     &desc, &changed, 0, delta, &prior,
                 ),

@@ -1021,6 +1021,7 @@ mod tests {
             method: method.to_string(),
             host: host.to_string(),
             authority: String::new(),
+            roles: Vec::new(),
             pv_request: None,
         }
     }
@@ -1421,6 +1422,7 @@ ASG(DEFAULT) {
             method: "x509".to_string(),
             host: "ws01.lab".to_string(),
             authority: "Lab Root CA".to_string(),
+            roles: Vec::new(),
             pv_request: None,
         };
         let client = src.upstream_client_for(&ctx);

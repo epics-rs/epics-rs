@@ -155,7 +155,11 @@ fn ctx_to_creds(ctx: &epics_pva_rs::server_native::source::ChannelContext) -> Cl
         host: ctx.host.clone(),
         method: ctx.method.clone(),
         authority: ctx.authority.clone(),
-        roles: Vec::new(),
+        // MR-R11: forward the native PVA peer's parsed role/group
+        // claims so `AcfAccessControl` can evaluate role-based UAG
+        // entries (`R member group:ops`). Previously hardcoded empty,
+        // so role-scoped ACF rules denied real over-the-wire clients.
+        roles: ctx.roles.clone(),
     }
 }
 
@@ -279,8 +283,17 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 .create_channel_with_creds(&name, ctx_to_creds(&ctx))
                 .await
                 .ok()?;
+            // MR-R13: forward the decoded INIT pvRequest so QSRV group
+            // GET honors `record._options` (e.g. `atomic`). The native
+            // wire layer now threads `init_pv_request` into the GET /
+            // PUT-readback `ChannelContext`. Fall back to an empty
+            // request only when no pvRequest structure was captured.
             let empty_request = PvStructure::new("");
-            match channel.get(&empty_request).await {
+            let request = match &ctx.pv_request {
+                Some(PvField::Structure(s)) => s,
+                _ => &empty_request,
+            };
+            match channel.get(request).await {
                 Ok(pv) => Some(PvField::Structure(pv)),
                 Err(e) => {
                     tracing::debug!(
@@ -1410,6 +1423,7 @@ mod tests {
             method: "anonymous".into(),
             host: "127.0.0.1".into(),
             authority: String::new(),
+            roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
         };
 
@@ -1446,6 +1460,101 @@ mod tests {
             matches!(val1, Some(EpicsValue::Double(v)) if (v - 2.5).abs() < 1e-9),
             "post-put VAL must be 2.5, got {val1:?}"
         );
+    }
+
+    /// MR-R13 regression: `get_value_checked` must forward the INIT
+    /// pvRequest carried on `ChannelContext::pv_request` into
+    /// `channel.get(...)`. Before the fix it always passed an empty
+    /// `PvStructure::new("")`, so the request's `field` projection (and
+    /// group `record._options`) were silently dropped: a GET asking
+    /// only for `value` still received every NTScalar sub-field.
+    #[tokio::test]
+    async fn mr_r13_get_value_checked_forwards_pv_request() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_pva_rs::pvdata::{PvField, PvStructure};
+        use epics_pva_rs::server_native::ChannelSource;
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("TEST:mrr13", Box::new(AiRecord::new(1.5)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        let store = QsrvPvStore::new(provider);
+
+        // INIT pvRequest selecting ONLY the `value` field:
+        //   field { value }
+        let value_sel = PvStructure::new("");
+        let mut field_spec = PvStructure::new("");
+        field_spec
+            .fields
+            .push(("value".into(), PvField::Structure(value_sel)));
+        let mut req = PvStructure::new("");
+        req.fields
+            .push(("field".into(), PvField::Structure(field_spec)));
+
+        let checked = AccessGate::open()
+            .check("TEST:mrr13", "127.0.0.1", "anonymous", "anonymous", "")
+            .await;
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "anonymous".into(),
+            method: "anonymous".into(),
+            host: "127.0.0.1".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: Some(PvField::Structure(req)),
+        };
+
+        let got = store
+            .get_value_checked(checked, ctx)
+            .await
+            .expect("get_value_checked must return a value");
+        let PvField::Structure(s) = got else {
+            panic!("expected a structure result");
+        };
+        // The field projection must have been honored: only `value`
+        // survives. Before the fix the empty request returned the full
+        // NTScalar (value + alarm + timeStamp + display + ...).
+        assert!(
+            s.get_field("value").is_some(),
+            "projected `value` field must be present"
+        );
+        assert_eq!(
+            s.fields.len(),
+            1,
+            "pvRequest `field {{ value }}` must filter the GET to one field, got: {:?}",
+            s.fields.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+    }
+
+    /// MR-R11 regression: a native PVA peer's parsed role/group claims
+    /// must survive `ChannelContext` -> `ClientCreds` conversion so
+    /// `AcfAccessControl` can enforce role-scoped UAG rules. Before the
+    /// fix `ctx_to_creds` hardcoded `roles: Vec::new()`, so role-based
+    /// ACF rules denied every real over-the-wire client.
+    #[test]
+    fn mr_r11_ctx_to_creds_forwards_roles() {
+        use epics_pva_rs::server_native::source::ChannelContext;
+
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "alice".into(),
+            method: "ca".into(),
+            host: "ws01".into(),
+            authority: String::new(),
+            roles: vec!["operators".into(), "experts".into()],
+            pv_request: None,
+        };
+        let creds = ctx_to_creds(&ctx);
+        assert_eq!(
+            creds.roles,
+            vec!["operators".to_string(), "experts".to_string()],
+            "ctx_to_creds must forward ChannelContext.roles into ClientCreds"
+        );
+        assert_eq!(creds.user, "alice");
+        assert_eq!(creds.method, "ca");
     }
 
     /// BR-R38: PVA `PROCESS` against a QSRV-backed record actually

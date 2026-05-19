@@ -2510,6 +2510,26 @@ mod tests {
         .await;
     }
 
+    /// EX-R10: an OUT pvalink fed by an `EpicsValue::Int64Array`
+    /// (from an `FTVL=INT64` waveform) must go through the typed
+    /// `long[]` encoder. `origin/main` already had `Int64Array` but
+    /// the OUT dispatcher's `array_path` match never listed it, so a
+    /// valid int64 waveform value attempted to replay its bracketed
+    /// `Display` string as a PVA array literal the parser rejects.
+    /// The `is_array_value` helper (added with MR-R23) covers signed
+    /// and unsigned 64-bit arrays together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ex_r10_out_int64_array_uses_typed_path() {
+        use epics_pva_rs::pvdata::ScalarType;
+        out_array_typed_path_case(
+            "EX_R10:PV",
+            ScalarType::Long,
+            EpicsValue::Int64Array(vec![-3, 0, i64::MAX]),
+            &[-3, 0, i64::MAX],
+        )
+        .await;
+    }
+
     /// Shared body for the MR-R23 / EX-R10 OUT typed-array
     /// regression tests. Stands up a PVA server hosting a
     /// `long[]` / `ulong[]` PV, seeds the registry with a

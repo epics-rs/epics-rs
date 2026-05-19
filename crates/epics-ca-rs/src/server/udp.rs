@@ -8,6 +8,48 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::net::{enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket};
 use epics_base_rs::server::database::PvDatabase;
 
+/// Decide the UDP responder sockets to open: one `(bind_ip,
+/// mcast_groups)` spec per CA `casIntfAddrList` interface entry.
+///
+/// **MR-R8 invariant.** C `caservertask.c:621-668` opens exactly
+/// ONE UDP socket per `casIntfAddrList` entry — `conf->udp`, bound
+/// to that entry's address (a specific IP *or* `INADDR_ANY`) — and
+/// joins every `casMCastAddrList` group on THAT SAME socket via
+/// `IP_ADD_MEMBERSHIP`. C never opens a separate per-multicast-group
+/// socket.
+///
+/// Pre-fix Rust kept C parity for specific interfaces but, for a
+/// wildcard (`0.0.0.0`) interface, emptied the interface's group
+/// list and spawned one EXTRA `0.0.0.0:port` socket per multicast
+/// group. With `SO_REUSEADDR`/`SO_REUSEPORT` datagram fanout, an
+/// ordinary broadcast (and, on stacks without reuseport
+/// load-balancing, unicast) CA SEARCH reached the primary wildcard
+/// responder AND every extra multicast responder — each emitting
+/// its own `send_to(reply, src)`, so one request got duplicate
+/// replies. `IP_MULTICAST_ALL=0` filters only multicast group
+/// cross-talk, not unicast/broadcast.
+///
+/// This function enforces the invariant structurally: every
+/// returned spec carries the FULL multicast group list, and there
+/// is exactly one spec per interface entry — there is no code path
+/// that produces an extra group-only responder. A wildcard
+/// interface is therefore the single owner of ordinary
+/// unicast/broadcast SEARCH traffic, matching C's `conf->udp`.
+fn plan_responder_specs(
+    intf_addrs: Vec<Ipv4Addr>,
+    mcast_addrs: &[Ipv4Addr],
+) -> Vec<(Ipv4Addr, Vec<Ipv4Addr>)> {
+    let intfs = if intf_addrs.is_empty() {
+        vec![Ipv4Addr::UNSPECIFIED]
+    } else {
+        intf_addrs
+    };
+    intfs
+        .into_iter()
+        .map(|bind_ip| (bind_ip, mcast_addrs.to_vec()))
+        .collect()
+}
+
 /// Run UDP search responders bound to one or more local interfaces.
 ///
 /// Each interface gets its own task — having a dedicated socket per
@@ -24,64 +66,16 @@ pub async fn run_udp_search_responder(
     ignore_addrs: Vec<Ipv4Addr>,
     mcast_addrs: Vec<Ipv4Addr>,
 ) -> CaResult<()> {
-    let intfs = if intf_addrs.is_empty() {
-        vec![Ipv4Addr::UNSPECIFIED]
-    } else {
-        intf_addrs
-    };
+    let specs = plan_responder_specs(intf_addrs, &mcast_addrs);
+    let mut handles = Vec::with_capacity(specs.len());
 
-    // R2-75 + R2-83: split intfs into specific vs. wildcard. For
-    // specific intfs, the per-intf `run_single_responder` socket also
-    // joins each multicast group via IP_ADD_MEMBERSHIP — matching C
-    // `caservertask.c:621-668` which uses ONE socket per
-    // casIntfAddrList entry (bound to that intf IP, joining each
-    // group with `imr_interface = conf->udpAddr.ia.sin_addr`).
-    // Pre-fix Rust also spawned a separate wildcard-bound
-    // `run_multicast_responder` per group; that socket also caught
-    // unicast/broadcast traffic on the specific intf because
-    // `IP_MULTICAST_ALL=0` filters multicast only — yielding
-    // duplicate `send_to(reply, src)` outbounds per SEARCH.
-    let has_specific = intfs.iter().any(|ip| !ip.is_unspecified());
-    let mut handles =
-        Vec::with_capacity(intfs.len() + if has_specific { 0 } else { mcast_addrs.len() });
-
-    for ip in &intfs {
+    for (bind_ip, mcast_for_intf) in specs {
         let db_t = db.clone();
         let ignore_t = ignore_addrs.clone();
-        let bind_ip = *ip;
-        let mcast_for_intf = if bind_ip.is_unspecified() {
-            // Wildcard intf: skip per-intf joins; let the separate
-            // wildcard-only mcast responders below handle groups.
-            Vec::new()
-        } else {
-            mcast_addrs.clone()
-        };
         let handle = epics_base_rs::runtime::task::spawn(async move {
             run_single_responder(db_t, bind_ip, port, tcp_port, ignore_t, mcast_for_intf).await
         });
         handles.push(handle);
-    }
-
-    // Wildcard-only intfs: spawn one wildcard-bound mcast responder
-    // per group. Only happens when ALL intfs are 0.0.0.0; in the
-    // specific-intf case the per-intf sockets above own the joins.
-    if !has_specific {
-        for group in mcast_addrs {
-            let db_t = db.clone();
-            let ignore_t = ignore_addrs.clone();
-            let handle = epics_base_rs::runtime::task::spawn(async move {
-                run_multicast_responder(
-                    db_t,
-                    group,
-                    vec![Ipv4Addr::UNSPECIFIED],
-                    port,
-                    tcp_port,
-                    ignore_t,
-                )
-                .await
-            });
-            handles.push(handle);
-        }
     }
 
     // Propagate the first error, abort the rest.
@@ -112,30 +106,36 @@ async fn run_single_responder(
     mcast_groups: Vec<Ipv4Addr>,
 ) -> CaResult<()> {
     let socket = bind_responder_socket(bind_ip, port)?;
-    // R2-74 + R2-75: join each multicast group on this per-intf
-    // socket via `IP_ADD_MEMBERSHIP` with `imr_interface = bind_ip`.
-    // Source IP of replies is then deterministically `bind_ip`
-    // (C `caservertask.c:621-668` does the same). Per-(intf, group)
-    // failures are logged and skipped — `caservertask.c:659-660`
+    // R2-74 + R2-75 + MR-R8: join each multicast group on this
+    // responder's own socket via `IP_ADD_MEMBERSHIP` with
+    // `imr_interface = bind_ip`. C `caservertask.c:633-665` joins
+    // every `casMCastAddrList` group on the single `conf->udp`
+    // socket of each `casIntfAddrList` entry, regardless of whether
+    // that entry is a specific IP or `INADDR_ANY` — there is no
+    // separate per-group socket. A wildcard `0.0.0.0` `bind_ip`
+    // joins on the kernel default interface (matching C's
+    // `imr_interface = INADDR_ANY` for a wildcard `conf->udpAddr`).
+    // Joining here, on the one responder socket, keeps a single
+    // owner for ordinary unicast/broadcast SEARCH traffic so a
+    // request is answered exactly once. Per-(intf, group) failures
+    // are logged and skipped — `caservertask.c:659-660`
     // `errlogPrintf`s and continues; the IOC stays up.
-    if !bind_ip.is_unspecified() {
-        for group in &mcast_groups {
-            match socket.join_multicast_v4(*group, bind_ip) {
-                Ok(()) => tracing::debug!(
-                    target: "epics_ca_rs::server::udp",
-                    %bind_ip,
-                    group = %group,
-                    "joined multicast group on per-intf socket"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "epics_ca_rs::server::udp",
-                    %bind_ip,
-                    group = %group,
-                    error = %e,
-                    "CA server IP_ADD_MEMBERSHIP failed (per-intf) — \
-                     SEARCH on this group will not reach this NIC"
-                ),
-            }
+    for group in &mcast_groups {
+        match socket.join_multicast_v4(*group, bind_ip) {
+            Ok(()) => tracing::debug!(
+                target: "epics_ca_rs::server::udp",
+                %bind_ip,
+                group = %group,
+                "joined multicast group on responder socket"
+            ),
+            Err(e) => tracing::warn!(
+                target: "epics_ca_rs::server::udp",
+                %bind_ip,
+                group = %group,
+                error = %e,
+                "CA server IP_ADD_MEMBERSHIP failed — \
+                 SEARCH on this group will not reach this NIC"
+            ),
         }
     }
     let socket = Arc::new(socket);
@@ -254,53 +254,15 @@ fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
     Ok(socket)
 }
 
-/// R2-60: multicast responder. Binds wildcard `0.0.0.0:port`, joins
-/// `group` on every supplied interface, then runs the standard
-/// recv_loop. Mirrors C `caservertask.c:633-668` which does the same
-/// thing for each casMCastAddrList entry. We do NOT bind to the
-/// multicast IP itself — Linux rejects that with EADDRNOTAVAIL.
-async fn run_multicast_responder(
-    db: Arc<PvDatabase>,
-    group: Ipv4Addr,
-    intfs: Vec<Ipv4Addr>,
-    port: u16,
-    tcp_port: u16,
-    ignore_addrs: Vec<Ipv4Addr>,
-) -> CaResult<()> {
-    let socket = bind_responder_socket(Ipv4Addr::UNSPECIFIED, port)?;
-    let mut any_joined = false;
-    for intf in &intfs {
-        match socket.join_multicast_v4(group, *intf) {
-            Ok(()) => any_joined = true,
-            Err(e) => {
-                tracing::warn!(
-                    target: "epics_ca_rs::server::udp",
-                    %group,
-                    intf = %intf,
-                    error = %e,
-                    "CA server IP_ADD_MEMBERSHIP failed for multicast group"
-                );
-            }
-        }
-    }
-    if !any_joined {
-        // R2-74: C `caservertask.c:659-660` `errlogPrintf`s on join
-        // failures and the IOC stays up — it just won't receive
-        // multicast on that group. Mirror C: log + return Ok so the
-        // sibling-task fail-fast pattern doesn't kill the whole
-        // UDP responder tree on a single misconfigured group.
-        tracing::warn!(
-            target: "epics_ca_rs::server::udp",
-            %group,
-            "no interface accepted IP_ADD_MEMBERSHIP — multicast SEARCH \
-             on this group will not be received; continuing"
-        );
-        return Ok(());
-    }
-    let socket = Arc::new(socket);
-    let udp_rl = Arc::new(UdpRateLimiter::from_env());
-    recv_loop(socket, db, group, tcp_port, ignore_addrs, udp_rl).await
-}
+// MR-R8: the standalone `run_multicast_responder` (R2-60) was
+// removed. It bound a *second* `0.0.0.0:port` socket per multicast
+// group; with `SO_REUSEADDR`/`SO_REUSEPORT` datagram fanout that
+// extra socket also caught ordinary unicast/broadcast CA SEARCH
+// traffic and emitted duplicate replies. C `caservertask.c:633-665`
+// has no such per-group socket — it joins every `casMCastAddrList`
+// group on the single `conf->udp` socket of each interface entry.
+// `run_single_responder` now owns the joins for both specific and
+// wildcard interfaces, matching C.
 
 async fn recv_loop(
     socket: Arc<UdpSocket>,
@@ -633,11 +595,50 @@ async fn recv_loop(
             // search storm of N small same-peer datagrams yields ONE
             // outbound, not N. Different-src peeks flush the current
             // batch and start a fresh one for the new src.
-            match socket.try_recv_from(&mut peek_buf) {
-                Ok((peek_len, peek_src)) => {
-                    if peek_len < CaHeader::SIZE {
-                        continue 'parse;
+            //
+            // MR-R7: a queued datagram that is rejected (short header,
+            // ignore-list, rate limit) must NOT restart the parser
+            // over the *previous* datagram's bytes still sitting in
+            // `current_buf`, and must NOT leave `current_src` pointing
+            // at the rejected peer. C `cast_server.c` always overwrites
+            // `client->recv.buf` with `recvfrom` before `camessage()`
+            // runs, and an ignored datagram sets `status = -1` so the
+            // whole parse + `client->addr` update is skipped. Mirror
+            // that: drain-and-discard rejected datagrams in this inner
+            // loop without touching `current_src` / `current_buf`;
+            // only an accepted datagram performs the peer-change flush,
+            // replaces `current_buf`, and re-enters `'parse`.
+            let next_datagram = loop {
+                match socket.try_recv_from(&mut peek_buf) {
+                    Ok((peek_len, peek_src)) => {
+                        // C `cast_server.c` requires a full caHdr before
+                        // `camessage()` will parse anything; a short
+                        // datagram yields no SEARCH work. Discard it
+                        // and try to drain the next queued datagram —
+                        // do NOT re-parse `current_buf`.
+                        if peek_len < CaHeader::SIZE {
+                            continue;
+                        }
+                        // Ignore-list / rate-limit rejections discard
+                        // the datagram without changing peer state —
+                        // C skips `camessage()` for `casIgnoreAddrs`
+                        // hits via `status = -1`.
+                        if let SocketAddr::V4(v4) = peek_src {
+                            if ignore_addrs.contains(v4.ip()) {
+                                continue;
+                            }
+                        }
+                        if !udp_rl.allow(&peek_src) {
+                            metrics::counter!("ca_server_udp_search_drops_total").increment(1);
+                            continue;
+                        }
+                        break Some((peek_len, peek_src));
                     }
+                    Err(_) => break None, // recv queue drained
+                }
+            };
+            match next_datagram {
+                Some((peek_len, peek_src)) => {
                     if peek_src != current_src {
                         // Peer change: flush current batch to the old
                         // src, then reset batch state for the new src.
@@ -654,20 +655,15 @@ async fn recv_loop(
                         client_seq = None;
                         client_minor = None;
                     }
-                    if let SocketAddr::V4(v4) = peek_src {
-                        if ignore_addrs.contains(v4.ip()) {
-                            continue 'parse;
-                        }
-                    }
-                    if !udp_rl.allow(&peek_src) {
-                        metrics::counter!("ca_server_udp_search_drops_total").increment(1);
-                        continue 'parse;
-                    }
+                    // Replace `current_buf` with the accepted
+                    // datagram's bytes BEFORE re-entering `'parse` so
+                    // the parser never reprocesses the previous
+                    // datagram under a new `current_src` (MR-R7).
                     current_buf.clear();
                     current_buf.extend_from_slice(&peek_buf[..peek_len]);
                     continue 'parse;
                 }
-                Err(_) => break 'parse, // recv queue drained
+                None => break 'parse, // recv queue drained
             }
         } // 'parse
         // R2-48 + R2-79 + R2-80 + R2-81: flush the accumulated SEARCH
@@ -797,5 +793,73 @@ impl UdpRateLimiter {
             counts.retain(|_, (t, _)| *t >= cutoff);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod mr_r8_responder_plan_tests {
+    //! MR-R8: a wildcard interface configuration must produce exactly
+    //! one responder socket — the single owner of ordinary
+    //! unicast/broadcast SEARCH traffic — even when multicast groups
+    //! are configured. No extra per-multicast-group `0.0.0.0:port`
+    //! socket may be created.
+    use super::plan_responder_specs;
+    use std::net::Ipv4Addr;
+
+    /// Pre-fix, a wildcard interface plus N multicast groups spawned
+    /// 1 primary + N group-only responders, all bound `0.0.0.0:port`
+    /// — duplicate-reply fanout. The plan must now be a single
+    /// wildcard responder that itself carries every multicast group.
+    #[test]
+    fn mr_r8_wildcard_with_mcast_groups_yields_one_responder() {
+        let groups = vec![Ipv4Addr::new(224, 0, 0, 100), Ipv4Addr::new(224, 0, 0, 101)];
+        // Empty intf list → default wildcard interface.
+        let specs = plan_responder_specs(Vec::new(), &groups);
+        assert_eq!(
+            specs.len(),
+            1,
+            "wildcard config must produce exactly ONE responder \
+             socket, not one-per-multicast-group (MR-R8 fanout)"
+        );
+        let (bind_ip, mcast) = &specs[0];
+        assert_eq!(*bind_ip, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(
+            mcast, &groups,
+            "the single wildcard responder must own ALL multicast \
+             group joins (C `conf->udp` parity)"
+        );
+
+        // An explicit `0.0.0.0` entry behaves identically.
+        let specs2 = plan_responder_specs(vec![Ipv4Addr::UNSPECIFIED], &groups);
+        assert_eq!(specs2.len(), 1);
+        assert_eq!(specs2[0].1, groups);
+    }
+
+    /// A specific-interface configuration keeps one responder per
+    /// interface entry, each carrying the full multicast group list.
+    #[test]
+    fn mr_r8_specific_intfs_each_own_all_mcast_groups() {
+        let groups = vec![Ipv4Addr::new(224, 0, 0, 200)];
+        let intfs = vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)];
+        let specs = plan_responder_specs(intfs.clone(), &groups);
+        assert_eq!(specs.len(), 2, "one responder per interface entry");
+        for (i, (bind_ip, mcast)) in specs.iter().enumerate() {
+            assert_eq!(*bind_ip, intfs[i]);
+            assert_eq!(
+                mcast, &groups,
+                "each interface responder joins every multicast group \
+                 on its own socket (C `conf->udp` parity)"
+            );
+        }
+    }
+
+    /// No multicast groups: exactly one wildcard responder with an
+    /// empty group list — no spurious extra sockets.
+    #[test]
+    fn mr_r8_no_mcast_groups_yields_single_plain_responder() {
+        let specs = plan_responder_specs(Vec::new(), &[]);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].0, Ipv4Addr::UNSPECIFIED);
+        assert!(specs[0].1.is_empty());
     }
 }

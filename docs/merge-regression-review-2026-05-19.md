@@ -932,3 +932,122 @@ Post-merge verification on `integration/punchlist-2026-05-19`:
 - `cargo check --workspace --all-targets --all-features` — clean.
 - `cargo nextest run --workspace --no-fail-fast` — 4705 passed, 0 failed.
 - `cargo test --doc --workspace` — 0 failed.
+
+## Post-Fix Regression Review - 2026-05-20
+
+### PF-R1 - EX-R12 bridge still corrupts filtered PVA `ulong[]` monitor payloads
+
+Severity: medium-high.
+
+Evidence:
+
+- MR-R25 fixed direct `ArrayFilter` handling for `EpicsValue::UInt64Array` at
+  `crates/epics-base-rs/src/server/database/filters/arr.rs:71` through `:75`, and the direct
+  unit coverage asserts the sliced `UInt64Array` result at
+  `crates/epics-base-rs/src/server/database/filters/arr.rs:254` through `:283`.
+- The PVA monitor bridge feeds filters through `pv_value_leaf_to_epics`, whose `array` helper maps
+  `Double`, `Float`, `Int`, `Long`, `Short`, and `String` arrays but falls through to `None` for
+  `ScalarValue::ULong` at `crates/epics-pva-rs/src/server_native/tcp.rs:111` through `:172`.
+- Wire-decoded typed arrays hit that helper through `PvField::ScalarArrayTyped(t) =>
+  array(&t.to_scalar_values())` at `crates/epics-pva-rs/src/server_native/tcp.rs:174` through
+  `:181`; `TypedScalarArray::ULong` becomes `ScalarValue::ULong` at
+  `crates/epics-pva-rs/src/pvdata/typed_array.rs:216` through `:228`.
+- `pv_field_to_filter_event` converts a failed value-leaf extraction into
+  `EpicsValue::Double(0.0)` at `crates/epics-pva-rs/src/server_native/tcp.rs:79`, so a PVA
+  `ulong[]` monitor event reaches `arr` as a scalar `Double` rather than as `UInt64Array`.
+- The reverse bridge can encode `EpicsValue::UInt64Array` back to PVA at
+  `crates/epics-pva-rs/src/server_native/tcp.rs:247` through `:248`, but that path is unreachable
+  for `ulong[]` input because the pre-filter conversion has already fallen back to a scalar.
+- The monitor emit loop always bridges the returned filter event back into the wire value for any
+  non-empty filter chain at `crates/epics-pva-rs/src/server_native/tcp.rs:3683` through `:3708`.
+  For a bare scalar-array descriptor the scalar `Double` fallback can trip the descriptor check; for
+  the normal `NTScalarArray` structure path, `substitute_value_leaf` replaces only the `value` member
+  at `crates/epics-pva-rs/src/server_native/tcp.rs:253` through `:265`, while the top-level
+  descriptor check only compares the structure id at
+  `crates/epics-pva-rs/src/pvdata/value_check.rs:71` through `:85`.
+- The encoder's descriptor-driven fallback encodes a non-array value under a `ScalarArray`
+  descriptor as an empty array at `crates/epics-pva-rs/src/pvdata/encode.rs:1046` through `:1065`.
+  So an `NTScalarArray<ulong>` with any server-side filter can be emitted as an empty `ulong[]`
+  instead of the filtered original array.
+- Existing EX-R12 stability coverage uses only a `Double` array PV at
+  `crates/epics-pva-rs/tests/stability.rs:607` through `:695`; `rg` finds no PVA monitor test
+  covering `ScalarArrayTyped::ULong` / `UInt64Array` with `arr`.
+
+Impact:
+
+PVA server-side `arr` filters now transform `Double` array monitor values, and the base filter can
+slice `UInt64Array` directly, but the PVA monitor bridge still feeds PVA `ulong[]` values into the
+filter chain as scalar `Double(0.0)`. For the ordinary `NTScalarArray` monitor shape this can turn a
+filtered non-empty `ulong[]` update into an empty array payload; for a bare scalar-array monitor it
+can terminate the stream with a descriptor error. This leaves DBF_UINT64 / PVA `ulong[]` monitor
+filtering uncovered after the MR-R24/MR-R25/EX-R12 fixes.
+
+Expected fix shape:
+
+Teach `pv_value_leaf_to_epics::array` to produce `EpicsValue::UInt64Array` for
+`ScalarValue::ULong` input, and add PVA stability regressions that monitor an `NTScalarArray`
+`ulong[]` value through both a transforming filter (`arr`) and a pass/drop-only filter (`dec`), with
+at least one value above `i64::MAX`. The same helper should be audited for the other typed
+scalar-array variants that currently fall through to `None` instead of preserving the PVA array
+class.
+
+### PF-R2 - Native wire scalar-array PUTs still miss `ScalarArrayTyped` values
+
+Severity: high.
+
+Evidence:
+
+- The PVA wire decoder's scalar-array fast path is total for all 12 scalar element types at
+  `crates/epics-pva-rs/src/pvdata/encode.rs:135` through `:155`; a `ScalarType::ULong` array is
+  decoded as `TypedScalarArray::ULong` at `crates/epics-pva-rs/src/pvdata/encode.rs:217` through
+  `:224`.
+- `decode_pv_field` returns `PvField::ScalarArrayTyped(typed)` for decoded scalar arrays whenever
+  that typed fast path succeeds at `crates/epics-pva-rs/src/pvdata/encode.rs:1689` through `:1699`.
+- The native server PUT data phase decodes the client payload with
+  `decode_pv_field_with_bitset` at `crates/epics-pva-rs/src/server_native/tcp.rs:3062` through
+  `:3063`, then sends that decoded value through `put_delta_checked` at
+  `crates/epics-pva-rs/src/server_native/tcp.rs:3101` through `:3108`.
+- `ChannelSource::put_delta_checked` merges the decoded delta and forwards the merged value to
+  `put_value_checked` at `crates/epics-pva-rs/src/server_native/source.rs:287` through `:318`.
+- `PvDatabaseSource::put_value` extracts the NT `value` field and requires `pv_field_to_epics` to
+  convert it before writing the database at `crates/epics-pva-rs/src/server/native_source.rs:481`
+  through `:489`.
+- The MR-R24 fix added only a `PvField::ScalarArray(items)` / `ScalarValue::ULong` arm at
+  `crates/epics-pva-rs/src/server/native_source.rs:549` through `:607`. There is still no
+  `PvField::ScalarArrayTyped(_)` arm for any element type, so actual wire-decoded scalar-array
+  values fall through to `None` and are rejected as "PUT value not representable as EpicsValue".
+- The MR-R24 regression test bypasses the wire decoder by constructing an untyped
+  `PvField::ScalarArray` directly at `crates/epics-pva-rs/src/server/native_source.rs:1040`
+  through `:1076`; `rg` finds no native wire PUT test that exercises
+  `ScalarArrayTyped::ULong`.
+
+Impact:
+
+The documented MR-R24 source-level conversion works only for hand-built untyped arrays. A real PVA
+client sending a scalar-array PUT to `PvDatabaseSource` is decoded into `ScalarArrayTyped` before it
+reaches the database converter, so the native wire path can still reject waveform writes after the
+fix that was supposed to close the `ulong[]` regression.
+
+Expected fix shape:
+
+Teach `pv_field_to_epics` to handle `PvField::ScalarArrayTyped(TypedScalarArray::ULong(_))` as
+`EpicsValue::UInt64Array`, and add a native PVA wire-level regression for a DBF_UINT64 waveform PUT
+with values above `i64::MAX`. Cover the other `ScalarArrayTyped` variants in the same converter
+instead of adding another one-off arm.
+
+## Post-Fix Resolution — 2026-05-20
+
+Both post-fix items fixed on `integration/punchlist-2026-05-19`:
+
+- **PF-R1** — `41cbb743`: `pv_value_leaf_to_epics`'s `array` helper now maps
+  `ScalarValue::ULong -> EpicsValue::UInt64Array` (and `UByte -> CharArray`), so a PVA `ulong[]`
+  monitor value reaches the `arr` filter as `UInt64Array` instead of falling through to a scalar
+  `Double(0.0)`.
+- **PF-R2** — `34f7329b`: `pv_field_to_epics` extracted into `scalar_array_to_epics`, reached from
+  both `PvField::ScalarArray` and `PvField::ScalarArrayTyped` (via `to_scalar_values`), so a real
+  wire-decoded `ulong[]` PUT into `PvDatabaseSource` is accepted instead of rejected as "PUT value
+  not representable as EpicsValue".
+
+Both carry fail-before/pass-after regression tests (`pf_r1_*`, `pf_r2_*`). Full re-verification:
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` clean,
+`cargo nextest run --workspace` 4707 passed, `cargo test --doc --workspace` 0 failed.

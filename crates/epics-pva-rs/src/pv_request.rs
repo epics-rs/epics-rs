@@ -21,20 +21,16 @@ use crate::pvdata::{FieldDesc, PvField};
 
 /// Build a pvRequest selecting `fields` at the top level of "field(...)".
 fn build(fields: &[&str], order: ByteOrder) -> Vec<u8> {
+    // Split dotted paths (`value.index`) into nested sub-structures via
+    // `build_nested` so the server's `request_to_mask` resolves them
+    // field-by-field. A flat member literally named `"value.index"`
+    // matches no top-level field, and post-PVA-R19 the server rejects
+    // that as an empty mask ("pvRequest selected no existing fields")
+    // instead of falling back to all-fields.
+    let owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
     let inner = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: fields
-            .iter()
-            .map(|name| {
-                (
-                    name.to_string(),
-                    FieldDesc::Structure {
-                        struct_id: String::new(),
-                        fields: Vec::new(),
-                    },
-                )
-            })
-            .collect(),
+        fields: build_nested(&owned),
     };
     let pv_request = FieldDesc::Structure {
         struct_id: String::new(),
@@ -114,20 +110,11 @@ fn build_with_pipeline(fields: &[&str], queue_size: u32, order: ByteOrder) -> Ve
     //       }
     //     }
     //   }
+    // Dotted paths must nest — see `build()`.
+    let owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
     let field_struct = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: fields
-            .iter()
-            .map(|name| {
-                (
-                    name.to_string(),
-                    FieldDesc::Structure {
-                        struct_id: String::new(),
-                        fields: Vec::new(),
-                    },
-                )
-            })
-            .collect(),
+        fields: build_nested(&owned),
     };
     let options_struct = FieldDesc::Structure {
         struct_id: String::new(),
@@ -155,22 +142,9 @@ fn build_with_pipeline(fields: &[&str], queue_size: u32, order: ByteOrder) -> Ve
     };
 
     // pvRequest value (descriptor + full value per
-    // `from_wire_type_value`). Build the matching PvStructure:
-    let field_value = PvField::Structure(PvStructure {
-        struct_id: String::new(),
-        fields: fields
-            .iter()
-            .map(|name| {
-                (
-                    name.to_string(),
-                    PvField::Structure(PvStructure {
-                        struct_id: String::new(),
-                        fields: Vec::new(),
-                    }),
-                )
-            })
-            .collect(),
-    });
+    // `from_wire_type_value`). Mirror `field_struct` so a nested dotted
+    // path produces a matching nested value body.
+    let field_value = empty_struct_value(&field_struct);
     let options_value = PvField::Structure(PvStructure {
         struct_id: String::new(),
         fields: vec![
@@ -615,6 +589,24 @@ impl PvRequestExpr {
             top.fields.push((name.clone(), sub_val));
         }
         PvField::Structure(top)
+    }
+}
+
+/// Mirror a [`FieldDesc`] into an all-empty value [`PvField`]: every
+/// `Structure` becomes an empty-membered `PvStructure` (recursively),
+/// every scalar an empty string. Used to build the pvRequest value body
+/// that must structurally match a generated descriptor.
+fn empty_struct_value(desc: &FieldDesc) -> crate::pvdata::PvField {
+    use crate::pvdata::{PvField, PvStructure, ScalarValue};
+    match desc {
+        FieldDesc::Structure { struct_id, fields } => {
+            let mut s = PvStructure::new(struct_id);
+            for (name, sub) in fields {
+                s.fields.push((name.clone(), empty_struct_value(sub)));
+            }
+            PvField::Structure(s)
+        }
+        _ => PvField::Scalar(ScalarValue::String(String::new())),
     }
 }
 
@@ -1283,6 +1275,81 @@ mod tests {
         assert_eq!(
             PvRequestExpr::parse("field(a.b{c,d})").unwrap(),
             PvRequestExpr::parse("field(a.b.c,a.b.d)").unwrap()
+        );
+    }
+
+    #[test]
+    fn build_pv_request_fields_nests_dotted_paths() {
+        // Regression: build_pv_request_fields("value.index") must emit a
+        // nested `field { value { index {} } }`, not a flat member
+        // literally named "value.index". A flat name matches no
+        // top-level field and a strict server (PVA-R19) rejects the
+        // PUT INIT with EmptyMask ("pvRequest selected no existing
+        // fields") — this broke NTEnum int puts.
+        use crate::pvdata::ScalarType;
+        use std::io::Cursor;
+
+        let blob = build_pv_request_fields(&["value.index"], false);
+        let mut cur = Cursor::new(blob.as_slice());
+        let req = crate::pvdata::encode::decode_type_desc(&mut cur, ByteOrder::Little)
+            .expect("decode pvRequest descriptor");
+
+        let field = match &req {
+            FieldDesc::Structure { fields, .. } => fields
+                .iter()
+                .find(|(n, _)| n == "field")
+                .map(|(_, d)| d)
+                .expect("`field` substructure"),
+            _ => panic!("pvRequest root must be a structure"),
+        };
+        let value = match field {
+            FieldDesc::Structure { fields, .. } => {
+                assert!(
+                    fields.iter().all(|(n, _)| n != "value.index"),
+                    "dotted path must not appear as a flat member"
+                );
+                fields
+                    .iter()
+                    .find(|(n, _)| n == "value")
+                    .map(|(_, d)| d)
+                    .expect("nested `value` member")
+            }
+            _ => panic!("`field` must be a structure"),
+        };
+        match value {
+            FieldDesc::Structure { fields, .. } => {
+                assert!(
+                    fields.iter().any(|(n, _)| n == "index"),
+                    "nested `index` member"
+                );
+            }
+            _ => panic!("`value` must be a structure"),
+        }
+
+        // The server's request_to_mask must resolve it against an
+        // NTEnum-shaped value descriptor without EmptyMask.
+        let ntenum = FieldDesc::Structure {
+            struct_id: "epics:nt/NTEnum:1.0".to_string(),
+            fields: vec![
+                (
+                    "value".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: vec![("index".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+                (
+                    "alarm".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: Vec::new(),
+                    },
+                ),
+            ],
+        };
+        assert!(
+            request_to_mask(&ntenum, &req).is_ok(),
+            "request_to_mask must resolve a nested value.index path"
         );
     }
 

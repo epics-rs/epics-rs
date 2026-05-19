@@ -1166,18 +1166,16 @@ where
     // read.
     let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
     let pv_req: std::borrow::Cow<'_, [u8]> = if pipeline_size > 0 {
-        let fields_for_req: &[&str] = if refs.is_empty() {
-            // Empty field list = "send the whole structure";
-            // build_pv_request_pipeline still needs at least one
-            // entry to produce a valid `field` sub-structure. Use
-            // a single "value" — matches what most pvxs callers
-            // pass for default pipelined monitor.
-            &["value"]
-        } else {
-            &refs
-        };
+        // Empty field list → empty `field {}` sub-structure, which
+        // `request_to_mask` reads as "select the whole structure"
+        // (pv_request.rs `request_field.is_empty()`). Forcing a
+        // `field(value)` here narrowed the default monitor to the
+        // `value` leaf and broke any PV whose top-level descriptor is
+        // not a structure with a `value` member (e.g. a bare-scalar
+        // `SharedPV`): the server rejects `field(value)` with
+        // `RequestMaskError::EmptyMask`.
         std::borrow::Cow::Owned(crate::pv_request::build_pv_request_pipeline(
-            fields_for_req,
+            &refs,
             pipeline_size,
             big_endian,
         ))
@@ -1607,10 +1605,12 @@ where
     let pv_req: std::borrow::Cow<'_, [u8]> = match raw_pv_req {
         Some(b) => std::borrow::Cow::Borrowed(b),
         None if pipeline_size > 0 => {
+            // Empty field list → empty `field {}` (= whole structure);
+            // see `op_monitor_raw_frames`. Forcing `field(value)` broke
+            // bare-scalar PVs with a server-side `EmptyMask` reject.
             let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-            let fields_for_req: &[&str] = if refs.is_empty() { &["value"] } else { &refs };
             std::borrow::Cow::Owned(crate::pv_request::build_pv_request_pipeline(
-                fields_for_req,
+                &refs,
                 pipeline_size,
                 big_endian,
             ))

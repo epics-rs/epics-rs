@@ -479,3 +479,94 @@ async fn plain_connection_has_no_server_identity() {
 
     server_handle.abort();
 }
+
+/// TLS-NAMESERVER regression: a single TCP port configured with TLS must
+/// accept BOTH TLS clients and plain PVA clients (e.g. a pvxs name-server
+/// redirect). Pre-fix: the TLS-only listener rejected the plain connection
+/// with a TLS handshake error. Post-fix: first-byte peek (0x16 → TLS,
+/// else → plain) dispatches correctly and both clients GET successfully.
+#[tokio::test]
+async fn pva_tls_nameserver_mixed_mode_listener() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let (cert, key) = generate_self_signed();
+
+    let server_cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key)
+        .expect("server tls config");
+    let server_tls = Arc::new(TlsServerConfig {
+        config: Arc::new(server_cfg),
+        require_client_cert: false,
+    });
+
+    let source = Arc::new(StaticSource::new());
+    source.put("MIXED:PV", 42.0).await;
+
+    let (tcp, udp) = alloc_port_pair();
+    let cfg = PvaServerConfig {
+        tcp_port: tcp,
+        udp_port: udp,
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 16,
+        max_channels_per_connection: 64,
+        monitor_queue_depth: 8,
+        tls: Some(server_tls),
+        ..Default::default()
+    };
+    let server_handle = tokio::spawn(async move {
+        let _ = run_pva_server(source, cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+
+    // ── TLS client ────────────────────────────────────────────────────────────
+    let mut roots = RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let client_cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let client_tls = Arc::new(TlsClientConfig {
+        config: Arc::new(client_cfg),
+    });
+    let tls_client = PvaClient::builder()
+        .timeout(Duration::from_secs(3))
+        .server_addr(server_addr)
+        .with_tls(client_tls)
+        .build();
+
+    let tls_val = tokio::time::timeout(Duration::from_secs(5), tls_client.pvget("MIXED:PV"))
+        .await
+        .expect("TLS pvget timed out")
+        .expect("TLS pvget failed");
+    match tls_val {
+        PvField::Structure(s) => assert!(
+            matches!(s.get_value(), Some(ScalarValue::Double(d)) if (d - 42.0).abs() < 1e-9),
+            "TLS client: unexpected value"
+        ),
+        other => panic!("TLS client: expected NTScalar, got {other:?}"),
+    }
+
+    // ── Plain PVA client (name-server scenario) ───────────────────────────────
+    // Connects with 0xCA (PVA magic); first-byte peek routes to plain path.
+    let plain_client = PvaClient::builder()
+        .timeout(Duration::from_secs(3))
+        .server_addr(server_addr)
+        .build();
+
+    let plain_val = tokio::time::timeout(Duration::from_secs(5), plain_client.pvget("MIXED:PV"))
+        .await
+        .expect("plain pvget timed out; mixed-mode dispatch may be broken")
+        .expect("plain pvget failed; server may have rejected plain connection");
+    match plain_val {
+        PvField::Structure(s) => assert!(
+            matches!(s.get_value(), Some(ScalarValue::Double(d)) if (d - 42.0).abs() < 1e-9),
+            "plain client: unexpected value"
+        ),
+        other => panic!("plain client: expected NTScalar, got {other:?}"),
+    }
+
+    server_handle.abort();
+}

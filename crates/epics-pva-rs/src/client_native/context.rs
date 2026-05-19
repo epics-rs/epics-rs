@@ -115,7 +115,9 @@ impl PvaClientBuilder {
             tls: None,
             name_servers: crate::config::env::name_servers(),
             priority: 0,
-            tcp_timeout: Duration::from_secs(40),
+            // pvxs config.cpp:222,373-391: parse_timeout scales CONN_TMO by
+            // 4/3; enforceTimeout clamps below 2 s and defaults to 40 s.
+            tcp_timeout: super::server_conn::heartbeat_timeout(),
             share_udp: false,
             asserted_identity: None,
         }
@@ -147,17 +149,11 @@ impl PvaClientBuilder {
     }
 
     /// Configure TCP name servers — pvxs `EPICS_PVA_NAME_SERVERS`
-    /// equivalent. When UDP search yields no responder for a PV, each
-    /// name server is tried as a direct-connect candidate (gateway
-    /// self-serve case). Replaces any list parsed from env at
+    /// equivalent. The client maintains a persistent TCP connection to each
+    /// entry and sends SEARCH frames over it; SEARCH_RESPONSE can redirect
+    /// to a different server (gateway redirect case) or to the NS itself
+    /// (gateway self-serve case). Replaces any list parsed from env at
     /// `new()` time.
-    ///
-    /// Note: this is currently a fallback-only treatment. pvxs
-    /// additionally sends SEARCH frames over a persistent TCP
-    /// connection to each name server and accepts SEARCH_RESPONSE
-    /// pointing at a *different* server (redirect). For pure-gateway
-    /// scenarios (the gateway answers itself) the simpler fallback
-    /// works; redirect-style chains aren't supported yet.
     pub fn name_servers(mut self, servers: Vec<SocketAddr>) -> Self {
         self.name_servers = servers;
         self
@@ -258,16 +254,17 @@ struct ClientInner {
     channels: RwLock<HashMap<String, Arc<Channel>>>,
     /// Lazy: only spawn the search engine when we actually need to resolve.
     search: OnceLock<SearchEngine>,
-    /// TCP `EPICS_PVA_NAME_SERVERS` fallbacks — used as last-resort
-    /// direct-connect candidates when UDP search returns nothing.
+    /// TCP name servers (EPICS_PVA_NAME_SERVERS). Passed into SearchEngine
+    /// as persistent search peers; also reported by ClientReport::name_servers.
     name_servers: Vec<SocketAddr>,
     /// Operation priority hint (0..7). Stored for inspection /
     /// future TCP TOS wiring. pvxs `CommonBuilder::priority`.
     #[allow(dead_code)]
     priority: u8,
-    /// Client TCP idle timeout. Stored for inspection / future
-    /// keepalive plumbing. pvxs `Config::tcpTimeout`.
-    #[allow(dead_code)]
+    /// Client TCP idle timeout threaded through to every `ServerConn`
+    /// spawned via this client's `ConnectionPool`. Governs the heartbeat
+    /// task's inactivity threshold. pvxs `Config::tcpTimeout`
+    /// (clientconn.cpp:73-74).
     tcp_timeout: Duration,
     /// True when `build()` was told to share the process-wide search
     /// engine. Routes [`PvaClient::search_engine`] through the static
@@ -329,13 +326,16 @@ impl PvaClient {
 
     async fn search_engine(&self) -> PvaResult<&SearchEngine> {
         if self.inner.share_udp {
+            // Shared engine cannot carry per-client name_servers (different
+            // clients may have different lists). NS search runs only in the
+            // per-client engine path below.
             let engine = SHARED_SEARCH_ENGINE
-                .get_or_try_init(|| async { SearchEngine::spawn(Vec::new()).await })
+                .get_or_try_init(|| async { SearchEngine::spawn(Vec::new(), Vec::new()).await })
                 .await?;
             return Ok(engine);
         }
         if self.inner.search.get().is_none() {
-            let engine = SearchEngine::spawn(Vec::new()).await?;
+            let engine = SearchEngine::spawn(Vec::new(), self.inner.name_servers.clone()).await?;
             let _ = self.inner.search.set(engine);
         }
         Ok(self.inner.search.get().unwrap())
@@ -375,19 +375,20 @@ impl PvaClient {
                 self.inner.user.clone(),
                 self.inner.host.clone(),
                 self.inner.timeout,
+                self.inner.tcp_timeout,
                 self.inner.pool.clone(),
                 addr,
             ))
         } else {
             let search = self.search_engine().await?.clone();
-            Arc::new(Channel::new_with_name_servers(
+            Arc::new(Channel::new(
                 pv_name.to_string(),
                 self.inner.user.clone(),
                 self.inner.host.clone(),
                 self.inner.timeout,
+                self.inner.tcp_timeout,
                 self.inner.pool.clone(),
                 search,
-                self.inner.name_servers.clone(),
             ))
         };
 

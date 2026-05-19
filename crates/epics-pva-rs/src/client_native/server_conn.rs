@@ -9,9 +9,9 @@
 //! - **Writer**: drains a `mpsc<Vec<u8>>` queue and writes to the socket.
 //!   Owning a single writer task lets every channel/op share the connection
 //!   safely without holding an `AsyncMutex` across awaits.
-//! - **Heartbeat**: sends `ECHO_REQUEST` every 15 s; if no `last_rx` update
-//!   has happened in 30 s, declares the connection dead and triggers
-//!   shutdown.
+//! - **Heartbeat**: sends `ECHO_REQUEST` every `max(1, min(15, tcp_timeout×3/8))` s
+//!   (pvxs clientconn.cpp:163-165); if no `last_rx` update has happened for
+//!   `tcp_timeout`, declares the connection dead (pvxs clientconn.cpp:73-74).
 //!
 //! When any task exits (read EOF, write error, or heartbeat timeout) the
 //! cancellation token fires and the connection is torn down. Channels
@@ -145,11 +145,16 @@ type DynWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 impl ServerConn {
     /// Open a plain TCP connection, run the handshake, and start
     /// background tasks.
+    ///
+    /// `op_timeout` guards the handshake I/O; `tcp_timeout` is stored and
+    /// used by the spawned heartbeat task as the connection idle timeout
+    /// (pvxs `effective.tcpTimeout`, clientconn.cpp:73-74).
     pub async fn connect(
         target: SocketAddr,
         user: &str,
         host: &str,
         op_timeout: Duration,
+        tcp_timeout: Duration,
     ) -> PvaResult<Arc<Self>> {
         let stream = timeout(op_timeout, TcpStream::connect(target))
             .await
@@ -160,7 +165,17 @@ impl ServerConn {
         let reader: DynRead = Box::new(reader);
         let writer: DynWrite = Box::new(writer);
         // Plain `pva://` TCP — no TLS, so no server X.509 identity.
-        Self::run_handshake_and_spawn(target, reader, writer, None, user, host, op_timeout).await
+        Self::run_handshake_and_spawn(
+            target,
+            reader,
+            writer,
+            None,
+            user,
+            host,
+            op_timeout,
+            tcp_timeout,
+        )
+        .await
     }
 
     /// Open a TLS-wrapped connection (`pvas://`).
@@ -171,6 +186,7 @@ impl ServerConn {
         user: &str,
         host: &str,
         op_timeout: Duration,
+        tcp_timeout: Duration,
     ) -> PvaResult<Arc<Self>> {
         let stream = timeout(op_timeout, TcpStream::connect(target))
             .await
@@ -209,6 +225,7 @@ impl ServerConn {
             user,
             host,
             op_timeout,
+            tcp_timeout,
         )
         .await
     }
@@ -216,6 +233,7 @@ impl ServerConn {
     /// Internal: takes already-split read/write halves, runs the handshake,
     /// then spawns the reader/writer/heartbeat tasks. Used by both
     /// [`connect`] and [`connect_tls`].
+    #[allow(clippy::too_many_arguments)]
     async fn run_handshake_and_spawn(
         target: SocketAddr,
         mut reader: DynRead,
@@ -224,6 +242,7 @@ impl ServerConn {
         user: &str,
         host: &str,
         op_timeout: Duration,
+        tcp_timeout: Duration,
     ) -> PvaResult<Arc<Self>> {
         // Step 1+2: read handshake frames until we get CONNECTION_VALIDATION.
         let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
@@ -529,8 +548,11 @@ impl ServerConn {
         let writer_tx_hb = writer_tx.clone();
         let order_hb = byte_order;
         tokio::spawn(async move {
-            let hb_interval = heartbeat_interval();
-            let hb_timeout = heartbeat_timeout();
+            // pvxs clientconn.cpp:163-165: echo interval = max(1, min(15, tcpTimeout * 3/8))
+            // pvxs clientconn.cpp:73-74: socket inactivity timeout = tcpTimeout
+            let hb_interval =
+                Duration::from_secs_f64((tcp_timeout.as_secs_f64() * 3.0 / 8.0).clamp(1.0, 15.0));
+            let hb_timeout = tcp_timeout;
             let mut tick = interval(hb_interval);
             tick.tick().await; // skip first immediate tick
             loop {
@@ -1355,5 +1377,123 @@ mod tests {
         assert!(by_ioid.contains_key(&1003));
         assert!(!ioid_to_sid.contains_key(&1001));
         assert!(ioid_to_sid.contains_key(&1003));
+    }
+
+    /// PVA-R2 regression: `tcp_timeout` passed to `ServerConn::connect` must
+    /// govern the heartbeat idle timeout, not the process environment.
+    ///
+    /// Setup: a mock server completes the PVA handshake then goes silent.
+    /// With `tcp_timeout = 500ms` the heartbeat declares the connection dead
+    /// well within 4 seconds. Before the fix the heartbeat read from
+    /// `EPICS_PVA_CONN_TMO` (default → 40 s) so the connection would still
+    /// be alive at the 4 s deadline.
+    ///
+    /// pvxs upstream:
+    ///   - inactivity timeout = `tcpTimeout`     (clientconn.cpp:73-74)
+    ///   - echo interval = max(1, min(15, tcpTimeout × 3/8)) (clientconn.cpp:163-165)
+    #[tokio::test]
+    async fn pva_r2_tcp_timeout_applied() {
+        use crate::proto::encode_size_into;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Build the mock server's three handshake frames.
+        fn server_handshake_frames() -> Vec<u8> {
+            let order = ByteOrder::Little;
+            let mut buf = Vec::new();
+
+            // Frame 1: SET_BYTE_ORDER (control, server→client).
+            PvaHeader::control(true, order, ControlCommand::SetByteOrder.code(), 0)
+                .write_into(&mut buf);
+
+            // Frame 2: CONNECTION_VALIDATION request (server→client).
+            let mut payload = Vec::new();
+            payload.put_u32(87_040, order); // buffer_size
+            payload.put_u16(32_767, order); // registry_size
+            encode_size_into(1, order, &mut payload); // 1 auth method
+            encode_string_into("anonymous", order, &mut payload);
+            PvaHeader::application(
+                true,
+                order,
+                Command::ConnectionValidation.code(),
+                payload.len() as u32,
+            )
+            .write_into(&mut buf);
+            buf.extend_from_slice(&payload);
+
+            buf
+        }
+
+        fn server_validated_frame() -> Vec<u8> {
+            let order = ByteOrder::Little;
+            let mut buf = Vec::new();
+            // CONNECTION_VALIDATED with Status::ok() (single byte 0xFF).
+            let payload = vec![0xFFu8];
+            PvaHeader::application(
+                true,
+                order,
+                Command::ConnectionValidated.code(),
+                payload.len() as u32,
+            )
+            .write_into(&mut buf);
+            buf.extend_from_slice(&payload);
+            buf
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+
+        // Mock server task: complete handshake then hold the socket open
+        // without writing more bytes.
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let _ = sock.write_all(&server_handshake_frames()).await;
+                // Drain the client's CONNECTION_VALIDATION reply (a single
+                // write from the client; one read is sufficient).
+                let mut drain = [0u8; 512];
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(200), sock.read(&mut drain)).await;
+                let _ = sock.write_all(&server_validated_frame()).await;
+                // Drop the write half but keep the read half alive so TCP
+                // doesn't send FIN — the client's reader stays pending and
+                // the only exit is the heartbeat idle timeout.
+                let (reader_half, _writer_half) = sock.into_split();
+                // Hold reader_half so the OS doesn't RST the connection.
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                drop(reader_half);
+            }
+        });
+
+        // Short tcp_timeout so the heartbeat fires quickly:
+        //   hb_interval = max(1, min(15, 0.5 * 3/8)) = 1 s
+        //   hb_timeout  = 0.5 s
+        // Connection must be declared dead at the first heartbeat tick (~1 s).
+        let tcp_timeout = Duration::from_millis(500);
+        let op_timeout = Duration::from_secs(2);
+
+        let conn = ServerConn::connect(addr, "testuser", "testhost", op_timeout, tcp_timeout)
+            .await
+            .expect("handshake must succeed");
+
+        assert!(conn.is_alive(), "connection must be alive after handshake");
+
+        // Wait for the heartbeat to declare the connection dead.
+        // Deadline = 4 s; before the fix hb_timeout = 40 s (env default)
+        // so this assertion would still be true at 4 s and the timeout
+        // would fire, causing the test to fail.
+        let deadline = Duration::from_secs(4);
+        tokio::time::timeout(deadline, async {
+            loop {
+                if !conn.is_alive() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("connection must be declared dead within 4 s (tcp_timeout=500ms)");
+
+        assert!(!conn.is_alive());
     }
 }

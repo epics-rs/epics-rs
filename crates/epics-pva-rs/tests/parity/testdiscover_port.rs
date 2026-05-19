@@ -13,7 +13,9 @@ use epics_pva_rs::client_native::search_engine::{Discovered, SearchEngine};
 
 #[tokio::test]
 async fn pvxs_discover_emits_online_for_first_observed_beacon() {
-    let engine = SearchEngine::spawn(Vec::new()).await.expect("spawn");
+    let engine = SearchEngine::spawn(Vec::new(), Vec::new())
+        .await
+        .expect("spawn");
     let mut rx = engine.discover().await.expect("subscribe");
 
     let server: std::net::SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -37,7 +39,9 @@ async fn pvxs_discover_emits_online_for_first_observed_beacon() {
 
 #[tokio::test]
 async fn pvxs_discover_no_event_for_repeated_same_guid() {
-    let engine = SearchEngine::spawn(Vec::new()).await.expect("spawn");
+    let engine = SearchEngine::spawn(Vec::new(), Vec::new())
+        .await
+        .expect("spawn");
     let mut rx = engine.discover().await.expect("subscribe");
 
     let server: std::net::SocketAddr = "127.0.0.1:5076".parse().unwrap();
@@ -62,7 +66,9 @@ async fn pvxs_discover_no_event_for_repeated_same_guid() {
 
 #[tokio::test]
 async fn pvxs_discover_emits_for_guid_change_same_server() {
-    let engine = SearchEngine::spawn(Vec::new()).await.expect("spawn");
+    let engine = SearchEngine::spawn(Vec::new(), Vec::new())
+        .await
+        .expect("spawn");
     let mut rx = engine.discover().await.expect("subscribe");
 
     let server: std::net::SocketAddr = "127.0.0.1:5077".parse().unwrap();

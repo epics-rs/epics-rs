@@ -25,17 +25,33 @@ use std::time::Duration;
 
 use epics_bridge_rs::pva_gateway::{MultiTenantPvaGatewayBuilder, PvaGateway, PvaGatewayConfig};
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedPV, SharedSource};
+
+/// `epics:nt/NTScalar:1.0` descriptor wrapping a `double value` —
+/// the shape every real IOC / QSRV PV exposes. A bare top-level
+/// `Scalar` is not a valid pvRequest narrowing target (`field(value)`
+/// resolves to nothing — pvxs `request2mask` rejects it identically),
+/// so the gateway integration fixture must serve a structured PV.
+fn nt_double_desc() -> FieldDesc {
+    FieldDesc::Structure {
+        struct_id: "epics:nt/NTScalar:1.0".into(),
+        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+    }
+}
+
+fn nt_double_value(v: f64) -> PvField {
+    let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+    s.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Double(v))));
+    PvField::Structure(s)
+}
 
 /// Build a 1-PV upstream PvaServer on a random loopback port and
 /// return (server, addr, shared_pv).
 fn spawn_upstream(pv_name: &str, initial: f64) -> (PvaServer, SocketAddr, SharedPV) {
     let pv = SharedPV::new();
-    pv.open(
-        FieldDesc::Scalar(ScalarType::Double),
-        PvField::Scalar(ScalarValue::Double(initial)),
-    );
+    pv.open(nt_double_desc(), nt_double_value(initial));
     let source = SharedSource::new();
     source.add(pv_name, pv.clone());
 
@@ -206,7 +222,7 @@ async fn gateway_monitor_fans_out_to_two_clients() {
     // each one. We treat "received the last value" as success since
     // an under-loaded test runner can squash to-latest.
     for v in [1.0_f64, 2.0, 3.0] {
-        us_pv.try_post(PvField::Scalar(ScalarValue::Double(v)));
+        us_pv.try_post(nt_double_value(v));
         // tiny breather so the broadcast fan-out keeps up.
         tokio::time::sleep(Duration::from_millis(80)).await;
     }
@@ -478,11 +494,10 @@ async fn critical1_read_only_gateway_rejects_put() {
     );
 
     // The upstream PV value is untouched — the PUT never reached it.
-    match us_pv.current() {
-        Some(PvField::Scalar(ScalarValue::Double(v))) => {
-            assert_eq!(v, 7.0, "read-only gateway must not forward the PUT")
-        }
-        other => panic!("unexpected upstream value: {other:?}"),
+    let current = us_pv.current();
+    match current.as_ref().and_then(scalar_double) {
+        Some(v) => assert_eq!(v, 7.0, "read-only gateway must not forward the PUT"),
+        None => panic!("unexpected upstream value: {current:?}"),
     }
 }
 

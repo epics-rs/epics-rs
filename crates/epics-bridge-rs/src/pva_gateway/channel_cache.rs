@@ -519,7 +519,6 @@ impl ChannelCache {
                 // — pvxs `MonitorControlOp::pipeline` parity.
                 let tx_raw_inner = tx_raw_for_task.clone();
                 let pv_clone = pv_name_owned.clone();
-                let _ = tx_inner; // typed broadcast retired in raw path
                 let handle_result = client
                     .pvmonitor_raw_frames_handle(&pv_name_owned, move |desc, body, order| {
                         // BUG 2: decode EVERY monitor event into
@@ -573,6 +572,28 @@ impl ChannelCache {
                             byte_order: order,
                             type_changed: false,
                         });
+                        // Feed the typed broadcast for decoded-path
+                        // downstream subscribers — gateway monitors
+                        // that cannot ride the raw fast path because
+                        // they negotiated pipeline flow control, a
+                        // field projection, or a server-side filter
+                        // (`server_native::tcp.rs` `raw_path_eligible`).
+                        // Without this the decoded `subscribe` path
+                        // attaches to a broadcast nothing ever feeds,
+                        // so such a monitor saw only its initial
+                        // snapshot and never an update. The decode
+                        // already ran inside `apply_monitor_event` to
+                        // refresh `state.latest`, so this is just a
+                        // clone + send, skipped when no decoded
+                        // subscriber is attached. The monitor callback
+                        // is the sole writer of `state` and runs
+                        // sequentially, so `state.latest` here is
+                        // exactly the value this event produced.
+                        if outcome.decoded && tx_inner.receiver_count() > 0 {
+                            if let Some(v) = state_inner.read().latest.clone() {
+                                let _ = tx_inner.send(v);
+                            }
+                        }
                     })
                     .await;
                 // `pvmonitor_raw_frames_handle` returns immediately

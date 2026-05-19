@@ -83,6 +83,13 @@ impl<K: Eq + Hash + Clone, V> BoundedPool<K, V> {
         }
     }
 
+    /// Current cap. Authoritative — there is no separate copy of this
+    /// value elsewhere, so a diagnostic accessor that reads this can
+    /// never desync from the pool's actual eviction bound.
+    fn capacity(&self) -> usize {
+        self.max
+    }
+
     /// Look up `key` and refresh its LRU timestamp on hit.
     fn get(&mut self, key: &K) -> Option<&V> {
         if let Some((v, t)) = self.map.get_mut(key) {
@@ -151,12 +158,6 @@ pub struct GatewayChannelSource {
     /// `max_upstream_identities` is reached, so a downstream client
     /// that presents unbounded distinct accounts cannot exhaust memory.
     upstream_pool: Arc<Mutex<BoundedPool<(String, String), Arc<PvaClient>>>>,
-    /// Hard cap on the number of distinct downstream identities that
-    /// may have live upstream `PvaClient` / `ChannelCache` allocations
-    /// simultaneously. Both `upstream_pool` and `upstream_caches` are
-    /// bounded to this value; the LRU entry is evicted when the cap is
-    /// reached. Default 256.
-    pub max_upstream_identities: usize,
     /// Optional gateway-side ACF policy (round 29). When set, every
     /// downstream GET / PUT / MONITOR is gated through
     /// `check_access_method` BEFORE the upstream forward, so the
@@ -211,7 +212,6 @@ impl GatewayChannelSource {
             max_subscribers: 100_000,
             subscriber_count: Arc::new(AtomicUsize::new(0)),
             upstream_pool: Arc::new(Mutex::new(BoundedPool::new(256))),
-            max_upstream_identities: 256,
             acf,
             asg_resolver,
             gate,
@@ -420,6 +420,17 @@ impl GatewayChannelSource {
         let n = n.max(1);
         *self.upstream_pool.lock() = BoundedPool::new(n);
         *self.upstream_caches.lock() = BoundedPool::new(n);
+    }
+
+    /// MR-R6: current upstream-identity pool cap. Reads the live
+    /// `upstream_pool` capacity directly, so this accessor can never
+    /// desync from the cap actually enforced — unlike the removed
+    /// `pub max_upstream_identities` field, which `set_max_upstream_identities`
+    /// did not update. `upstream_caches` is always rebuilt with the
+    /// same `n` by the setter, so the pool's cap is authoritative for
+    /// both. Default 256.
+    pub fn max_upstream_identities(&self) -> usize {
+        self.upstream_pool.lock().capacity()
     }
 
     /// Diagnostic accessor: how many entries are currently cached.
@@ -1660,6 +1671,52 @@ ASG(DEFAULT) {
         assert_eq!(
             cache_len, 2,
             "upstream_caches must not exceed cap=2; got {cache_len}"
+        );
+    }
+
+    /// MR-R6 regression: the reported upstream-identity cap must
+    /// always reflect the cap actually enforced by the pools.
+    /// Pre-fix `max_upstream_identities` was a `pub` field that
+    /// `set_max_upstream_identities` never updated, so the reported
+    /// value desynced from the real `BoundedPool` capacity. Post-fix
+    /// the accessor reads the live pool cap directly.
+    #[tokio::test]
+    async fn mr_r6_max_upstream_identities_tracks_setter() {
+        let src = make_source();
+        // Default cap.
+        assert_eq!(
+            src.max_upstream_identities(),
+            256,
+            "default cap must be 256"
+        );
+
+        // After the setter the accessor must report the new cap, not
+        // the stale default.
+        src.set_max_upstream_identities(2);
+        assert_eq!(
+            src.max_upstream_identities(),
+            2,
+            "accessor must reflect the cap installed by set_max_upstream_identities"
+        );
+
+        // The accessor must agree with the actual pool eviction bound.
+        assert_eq!(
+            src.max_upstream_identities(),
+            src.upstream_pool.lock().capacity(),
+            "reported cap must equal upstream_pool capacity"
+        );
+        assert_eq!(
+            src.max_upstream_identities(),
+            src.upstream_caches.lock().capacity(),
+            "reported cap must equal upstream_caches capacity"
+        );
+
+        // The setter floors at 1; the accessor must reflect that too.
+        src.set_max_upstream_identities(0);
+        assert_eq!(
+            src.max_upstream_identities(),
+            1,
+            "accessor must report the floored cap of 1"
         );
     }
 }

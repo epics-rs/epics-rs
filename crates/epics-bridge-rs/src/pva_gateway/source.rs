@@ -9,9 +9,10 @@
 //! clients share one upstream subscription.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::RwLock;
@@ -62,6 +63,53 @@ fn default_asg_resolver() -> AsgResolver {
     Arc::new(|_pv| "DEFAULT".to_string())
 }
 
+/// Capacity-bounded map with LRU eviction.
+///
+/// Bounds remote-controllable resource growth: a downstream client that
+/// presents distinct `(account, method)` pairs on every connection can
+/// force at most `max` upstream connections rather than an unlimited number.
+/// When a new key would exceed the cap, the least-recently-used entry is
+/// evicted first.
+struct BoundedPool<K, V> {
+    map: HashMap<K, (V, Instant)>,
+    max: usize,
+}
+
+impl<K: Eq + Hash + Clone, V> BoundedPool<K, V> {
+    fn new(max: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            max: max.max(1),
+        }
+    }
+
+    /// Look up `key` and refresh its LRU timestamp on hit.
+    fn get(&mut self, key: &K) -> Option<&V> {
+        if let Some((v, t)) = self.map.get_mut(key) {
+            *t = Instant::now();
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    /// Insert `key → value`. If the pool is at capacity and `key` is new,
+    /// evict the least-recently-used entry first.
+    fn insert(&mut self, key: K, value: V) {
+        if !self.map.contains_key(&key) && self.map.len() >= self.max {
+            if let Some(lru) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&lru);
+            }
+        }
+        self.map.insert(key, (value, Instant::now()));
+    }
+}
+
 /// `ChannelSource` impl handed to the downstream `PvaServer`. Cheap
 /// to clone (Arc-backed cache + a couple of `Duration`s).
 #[derive(Clone)]
@@ -98,7 +146,17 @@ pub struct GatewayChannelSource {
     /// rules and audit logs see the *real* client identity, not
     /// the gateway. Empty string keys (`("", "anonymous")`) reuse
     /// the cache's shared client.
-    upstream_pool: Arc<Mutex<HashMap<(String, String), Arc<PvaClient>>>>,
+    ///
+    /// BR-R7: bounded via `BoundedPool` — evicts LRU entry when
+    /// `max_upstream_identities` is reached, so a downstream client
+    /// that presents unbounded distinct accounts cannot exhaust memory.
+    upstream_pool: Arc<Mutex<BoundedPool<(String, String), Arc<PvaClient>>>>,
+    /// Hard cap on the number of distinct downstream identities that
+    /// may have live upstream `PvaClient` / `ChannelCache` allocations
+    /// simultaneously. Both `upstream_pool` and `upstream_caches` are
+    /// bounded to this value; the LRU entry is evicted when the cap is
+    /// reached. Default 256.
+    pub max_upstream_identities: usize,
     /// Optional gateway-side ACF policy (round 29). When set, every
     /// downstream GET / PUT / MONITOR is gated through
     /// `check_access_method` BEFORE the upstream forward, so the
@@ -135,7 +193,9 @@ pub struct GatewayChannelSource {
     /// empty-account peers fall through to the shared `cache`.
     /// Parallels `upstream_pool` which already provides per-credential
     /// routing for PUT / RPC / PROCESS.
-    upstream_caches: Arc<Mutex<HashMap<(String, String), Arc<ChannelCache>>>>,
+    ///
+    /// BR-R7: bounded via `BoundedPool` (same cap as `upstream_pool`).
+    upstream_caches: Arc<Mutex<BoundedPool<(String, String), Arc<ChannelCache>>>>,
 }
 
 impl GatewayChannelSource {
@@ -150,11 +210,12 @@ impl GatewayChannelSource {
             rpc_timeout: Duration::from_secs(30),
             max_subscribers: 100_000,
             subscriber_count: Arc::new(AtomicUsize::new(0)),
-            upstream_pool: Arc::new(Mutex::new(HashMap::new())),
+            upstream_pool: Arc::new(Mutex::new(BoundedPool::new(256))),
+            max_upstream_identities: 256,
             acf,
             asg_resolver,
             gate,
-            upstream_caches: Arc::new(Mutex::new(HashMap::new())),
+            upstream_caches: Arc::new(Mutex::new(BoundedPool::new(256))),
         }
     }
 
@@ -282,12 +343,11 @@ impl GatewayChannelSource {
             return self.cache.clone();
         }
         let key = (ctx.account.clone(), ctx.method.clone());
-        // Fast path: entry already in pool.
+        // Fast path: already in pool.
         if let Some(c) = self.upstream_caches.lock().get(&key) {
             return c.clone();
         }
-        // Build outside any lock — PvaClient::builder() is pure-Rust
-        // and holding the map lock across it is unnecessary.
+        // Build outside any lock — PvaClient::builder() is pure-Rust.
         let client = self.upstream_client_for(ctx);
         let new_cache = ChannelCache::with_max_entries(
             client,
@@ -298,17 +358,29 @@ impl GatewayChannelSource {
             // the per-credential map indefinitely.
             1_024,
         );
-        // Double-checked insert: a racing caller may have won.
-        self.upstream_caches
-            .lock()
-            .entry(key)
-            .or_insert(new_cache)
-            .clone()
+        // Double-checked insert under lock: a racing caller may have won.
+        let mut pool = self.upstream_caches.lock();
+        if let Some(c) = pool.get(&key) {
+            return c.clone();
+        }
+        pool.insert(key, new_cache.clone());
+        new_cache
     }
 
     /// Cache handle — useful for the gateway's own diagnostics.
     pub fn cache(&self) -> &Arc<ChannelCache> {
         &self.cache
+    }
+
+    /// Update the upstream-identity pool cap on both `upstream_pool` and
+    /// `upstream_caches`. Takes effect immediately; clears both pools so
+    /// the next credential lookup builds fresh entries under the new cap.
+    /// All clones of this `GatewayChannelSource` share the same pools and
+    /// will see the new cap.
+    pub fn set_max_upstream_identities(&self, n: usize) {
+        let n = n.max(1);
+        *self.upstream_pool.lock() = BoundedPool::new(n);
+        *self.upstream_caches.lock() = BoundedPool::new(n);
     }
 
     /// Diagnostic accessor: how many entries are currently cached.
@@ -1265,6 +1337,78 @@ ASG(DEFAULT) {
         assert!(
             Arc::ptr_eq(&cache_anon, src.cache()),
             "anonymous/empty credentials must reuse the shared upstream gateway cache"
+        );
+    }
+
+    /// BR-R7: the upstream identity pools must be bounded. Pre-fix
+    /// `upstream_pool` and `upstream_caches` were plain `HashMap`s;
+    /// a downstream client that varied `(account, method)` on every
+    /// connection could grow them without limit. Post-fix both pools
+    /// cap at `max_upstream_identities` and evict the LRU entry.
+    ///
+    /// This test fails on main (pool.len() == 3 after 3 distinct
+    /// identities with cap=2) and passes after fix (pool.len() == 2).
+    #[tokio::test]
+    async fn br_r7_gateway_credential_pool_bounded() {
+        let src = make_source();
+        // Cap both pools at 2 so the third identity triggers eviction.
+        src.set_max_upstream_identities(2);
+
+        let alice = make_ctx("h1", "alice", "ca");
+        let bob = make_ctx("h2", "bob", "ca");
+        let charlie = make_ctx("h3", "charlie", "ca");
+
+        // Fill pool to cap.
+        src.upstream_client_for(&alice);
+        src.upstream_client_for(&bob);
+        assert_eq!(
+            src.upstream_pool.lock().map.len(),
+            2,
+            "pool must hold exactly 2 entries after 2 distinct identities"
+        );
+
+        // Access alice to make it the most-recently used.
+        src.upstream_client_for(&alice);
+
+        // Third distinct identity: must evict LRU (bob), keeping alice + charlie.
+        src.upstream_client_for(&charlie);
+        let pool_len = src.upstream_pool.lock().map.len();
+        assert_eq!(
+            pool_len, 2,
+            "pool must not exceed cap=2 after a third distinct identity; got {pool_len}"
+        );
+
+        // bob (LRU) must be gone; alice and charlie must be present.
+        {
+            let pool = src.upstream_pool.lock();
+            assert!(
+                !pool
+                    .map
+                    .contains_key(&("bob".to_string(), "ca".to_string())),
+                "bob (LRU) must be evicted"
+            );
+            assert!(
+                pool.map
+                    .contains_key(&("alice".to_string(), "ca".to_string())),
+                "alice (MRU) must be retained"
+            );
+            assert!(
+                pool.map
+                    .contains_key(&("charlie".to_string(), "ca".to_string())),
+                "charlie (newest) must be retained"
+            );
+        }
+
+        // Same cap applies to upstream_caches.
+        src.upstream_cache_for_test(&alice);
+        src.upstream_cache_for_test(&bob);
+        assert_eq!(src.upstream_caches.lock().map.len(), 2);
+        src.upstream_cache_for_test(&alice); // refresh alice
+        src.upstream_cache_for_test(&charlie);
+        let cache_len = src.upstream_caches.lock().map.len();
+        assert_eq!(
+            cache_len, 2,
+            "upstream_caches must not exceed cap=2; got {cache_len}"
         );
     }
 }

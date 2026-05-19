@@ -45,8 +45,9 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ### Priority 4 — DB pvalink / group syntax/options
 
-- [ ] **BR-R10** — DB JSON pvalink options are reduced to only the PV name.
+- [x] **BR-R10** — DB JSON pvalink options are reduced to only the PV name.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:299-326`
+  - Done: worker B, commit `dd80cdcd` on `caucus/HJB9ABPH/backend`; regressions `br_r10_json_pva_options_preserved_in_parsed_link`, `br_r10_json_pva_bare_pv_unchanged`, `br_r10_db_json_pvalink_options_preserved`. Cross-crate: epics-base-rs `extract_pv_and_opts_from_subobject` encodes all JSON keys as `?k=v&…` query string in `ParsedLink::Pva`; epics-bridge-rs adds `strip_query`, `lazy_register_inp_opts`/`lazy_register_out_opts`, and `install_pvalink_resolver` pre-scanner. Upstream parity: pvxs:ioc/pvalink_jlif.cpp:24-41 (JSON keys), :69-196 (per-key handlers), ioc/pvalink.cpp:~250 (jlink config lifetime).
 
 - [ ] **BR-R27** — pvalink cache key drops per-link `field` and option state.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:766-794`
@@ -105,7 +106,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 13 (was 17)
-- Done: 3 (BR-R4, BR-R21, BR-R11)
-- In progress: 1 (BR-R10, worker B)
+- Total open: 12 (was 17)
+- Done: 4 (BR-R4, BR-R21, BR-R11, BR-R10)
+- In progress: 0
 - Blocked: 0

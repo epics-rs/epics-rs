@@ -699,3 +699,118 @@ async fn br_r6_gateway_typed_put_passthrough() {
          (pre-fix space-join collapses to 1 element)",
     );
 }
+
+/// BR-R41: typed-subscribe fallback delivers live updates.
+///
+/// `GatewayChannelSource::subscribe` routes through `subscribe_inner`
+/// which bridges a `broadcast::Receiver<PvField>` (from `entry.subscribe()`)
+/// to an mpsc channel. Pre-fix the typed broadcast sender `tx_inner` was
+/// dropped before the `pvmonitor_raw_frames_handle` callback ran
+/// (`let _ = tx_inner; // typed broadcast retired in raw path`), so
+/// `bcast_rx.recv()` blocked forever after the initial snapshot. Downstream
+/// monitors using a pvRequest that forces the decoded fallback (masked
+/// fields, pipelined, filtered, or EPICS_PVA_GW_RAW_FRAMES=NO) received
+/// only the first value — never further updates.
+///
+/// Fails on main: `tx_inner` dropped → second value never sent → timeout.
+/// Passes after fix: `tx_inner` moves into callback, `tx_inner.send(val)`
+/// fires after each decoded event → update reaches the subscriber.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn br_r41_typed_subscribe_delivers_updates() {
+    // Upstream: Structure { value: Double } — field(value) pvRequest
+    // succeeds for this shape, so the upstream monitor starts cleanly.
+    let pv = SharedPV::new();
+    let desc = FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+    };
+    let initial = PvField::Structure({
+        let mut s = PvStructure::new("");
+        s.set("value", PvField::Scalar(ScalarValue::Double(1.0)));
+        s
+    });
+    pv.open(desc, initial);
+    let source = SharedSource::new();
+    source.add("BR:R41:PV", pv.clone());
+
+    let pick = || {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let pick_udp = || {
+        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let us_cfg = PvaServerConfig {
+        tcp_port: pick(),
+        udp_port: pick_udp(),
+        ..PvaServerConfig::isolated()
+    };
+    let us_addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        us_cfg.tcp_port,
+    );
+    let _us = PvaServer::start(Arc::new(source), us_cfg).expect("upstream start");
+
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let cache = ChannelCache::new(upstream_client, Duration::from_secs(60));
+    let mut src = GatewayChannelSource::new(cache);
+    src.connect_timeout = Duration::from_secs(2);
+
+    // subscribe() uses subscribe_inner → typed broadcast fallback path.
+    let mut rx = src
+        .subscribe("BR:R41:PV")
+        .await
+        .expect("subscribe must return Some for a known PV");
+
+    // First receive: initial snapshot from entry.snapshot().
+    let snap = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("initial snapshot must arrive within 2s")
+        .expect("channel must be open");
+    assert_eq!(
+        scalar_double(&snap),
+        Some(1.0),
+        "initial snapshot must be 1.0"
+    );
+
+    // Post an update upstream; the monitor callback fires, apply_monitor_event
+    // decodes it, and (after fix) tx_inner sends it to the typed broadcast.
+    let update_val = PvField::Structure({
+        let mut s = PvStructure::new("");
+        s.set("value", PvField::Scalar(ScalarValue::Double(42.0)));
+        s
+    });
+    pv.try_post(update_val);
+
+    // Drain until 42.0 arrives or 2 s elapses. The server's decoded
+    // path seeds new subscribers with the current value AND sends an
+    // explicit initial snapshot, so one extra 1.0 may arrive before
+    // the 42.0 update. Pre-fix: tx_inner was dropped → broadcast
+    // permanently empty → this loop times out.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let update = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let v = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .expect("update must arrive within 2s (pre-fix tx_inner dropped → blocks forever)")
+            .expect("channel must be open");
+        if scalar_double(&v) == Some(42.0) {
+            break v;
+        }
+    };
+    assert_eq!(
+        scalar_double(&update),
+        Some(42.0),
+        "typed subscribe must deliver the post-initial update",
+    );
+}

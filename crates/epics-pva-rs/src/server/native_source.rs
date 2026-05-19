@@ -602,7 +602,14 @@ fn scalar_to_epics(v: &ScalarValue) -> EpicsValue {
         ScalarValue::UByte(x) => EpicsValue::Char(*x),
         ScalarValue::UShort(x) => EpicsValue::Enum(*x),
         ScalarValue::UInt(x) => EpicsValue::Long(*x as i32),
-        ScalarValue::ULong(x) => EpicsValue::Long(*x as i32),
+        // MR-R21: PVA `ulong` is unsigned 64-bit. Narrowing it to
+        // `EpicsValue::Long` (i32) here drops the upper 32 bits before
+        // `PvDatabase::put_pv` can coerce to the target `DBF_UINT64`
+        // field. Preserve the full width as `EpicsValue::UInt64`; the
+        // database's `convert_to(DBF_UINT64)` is then a no-op
+        // (`db_field_type()` already matches), and any other target
+        // field type still coerces faithfully from the unsigned value.
+        ScalarValue::ULong(x) => EpicsValue::UInt64(*x),
         ScalarValue::Float(x) => EpicsValue::Float(*x),
         ScalarValue::Double(x) => EpicsValue::Double(*x),
         ScalarValue::String(s) => EpicsValue::String(s.clone()),
@@ -976,6 +983,42 @@ ASG(LOCKED) {
             .get_value_checked(checked_deny, make_ctx("anyhost", "intruder", "anonymous"))
             .await;
         assert!(val.is_none(), "intruder must be denied via type-state gate");
+    }
+
+    /// MR-R21 regression: a native PVA scalar `ulong` PUT into a
+    /// `DBF_UINT64`-backed PV must preserve the full unsigned 64-bit
+    /// range. Pre-fix `scalar_to_epics` collapsed `ScalarValue::ULong`
+    /// to `EpicsValue::Long(x as i32)`, discarding the upper 32 bits
+    /// before `PvDatabase::put_pv` coerced to the target field.
+    #[tokio::test]
+    async fn mr_r21_scalar_ulong_put_preserves_full_u64() {
+        let db = Arc::new(PvDatabase::new());
+        // A simple PV stores the value verbatim (`pv.set`), with no
+        // field-type coercion — so it isolates the source-layer
+        // conversion under test.
+        db.add_pv("UL:SCALAR", EpicsValue::UInt64(0)).await.unwrap();
+
+        let source = PvDatabaseSource::new(db.clone());
+
+        // A value above the signed 32-bit range that also exercises
+        // the high word: 0xDEAD_BEEF_0000_0001.
+        let big: u64 = 0xDEAD_BEEF_0000_0001;
+        source
+            .put_value_ctx(
+                "UL:SCALAR",
+                PvField::Scalar(ScalarValue::ULong(big)),
+                make_ctx("h", "anyone", "anonymous"),
+            )
+            .await
+            .expect("ulong PUT must succeed");
+
+        let snap = snapshot_for(&db, "UL:SCALAR").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::UInt64(big),
+            "scalar ulong PUT must round-trip the full u64, got {:?}",
+            snap.value,
+        );
     }
 
     /// Round-33A (R33-G4): the per-record ASL must gate `RULE(N, …)`

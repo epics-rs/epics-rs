@@ -829,27 +829,31 @@ impl GroupChannel {
             _ => crate::convert::pv_field_to_epics(pv_field),
         }
     }
-}
 
-impl super::provider::Channel for GroupChannel {
-    fn channel_name(&self) -> &str {
-        &self.def.name
-    }
-
-    async fn get(&self, request: &PvStructure) -> BridgeResult<PvStructure> {
-        if !self.access.can_read(&self.def.name) {
-            return Err(BridgeError::PutRejected(format!(
-                "read denied for group {} (user='{}' host='{}')",
-                self.def.name, self.access.user, self.access.host
-            )));
-        }
-        // BR-R16: pvRequest can override the group default atomicity.
-        let atomic = super::channel::atomic_from_pv_request(request).unwrap_or(self.def.atomic);
-        let full = self.read_group_atomic(atomic).await?;
-        Ok(pvif::filter_by_request(&full, request))
-    }
-
-    async fn put(&self, value: &PvStructure) -> BridgeResult<()> {
+    /// MR-R10: group PUT with explicit per-operation options.
+    ///
+    /// pvAccess delivers PUT options (`record._options.process`,
+    /// `record._options.atomic`, `record._options.block`) in the INIT
+    /// pvRequest, not in the data-phase value (pvxs
+    /// `groupsource.cpp:540` reads `putOperation->pvRequest()
+    /// ["record._options.atomic"]`, and `:181` runs
+    /// `setForceProcessingFlag` against `pvRequest()`). The native
+    /// wire path captures the INIT pvRequest on `ChannelContext` and
+    /// passes the parsed [`PutOptions`] plus the explicit atomic
+    /// override here. `atomic_override` is `None` when the request
+    /// did not set the option, in which case the group's configured
+    /// default (`self.def.atomic`) applies — matching pvxs's
+    /// `bool atomic = group.atomicPutGet;` initializer.
+    ///
+    /// The trait `put` delegates to this method with options derived
+    /// from the data-phase value, preserving the value-embedded-option
+    /// contract for in-process callers (gateway, tests).
+    pub async fn put_with_options(
+        &self,
+        value: &PvStructure,
+        opts: super::channel::PutOptions,
+        atomic_override: Option<bool>,
+    ) -> BridgeResult<()> {
         if !self.access.can_write(&self.def.name) {
             return Err(BridgeError::PutRejected(format!(
                 "write denied for group {} (user='{}' host='{}')",
@@ -857,13 +861,12 @@ impl super::provider::Channel for GroupChannel {
             )));
         }
 
-        let opts = super::channel::PutOptions::from_pv_request(value);
         let use_process = opts.process != super::channel::ProcessMode::Inhibit;
 
         // BR-R16: pvRequest can override the group default atomicity
         // (`record._options.atomic = true|false`). Falls back to the
         // group default when the option is absent.
-        let atomic = super::channel::atomic_from_pv_request(value).unwrap_or(self.def.atomic);
+        let atomic = atomic_override.unwrap_or(self.def.atomic);
 
         // BR-R30: only members with an explicit `+putorder` are
         // writable. pvxs sentinel `i64::MIN` (fieldconfig.h:37)
@@ -1070,6 +1073,35 @@ impl super::provider::Channel for GroupChannel {
         }
 
         Ok(())
+    }
+}
+
+impl super::provider::Channel for GroupChannel {
+    fn channel_name(&self) -> &str {
+        &self.def.name
+    }
+
+    async fn get(&self, request: &PvStructure) -> BridgeResult<PvStructure> {
+        if !self.access.can_read(&self.def.name) {
+            return Err(BridgeError::PutRejected(format!(
+                "read denied for group {} (user='{}' host='{}')",
+                self.def.name, self.access.user, self.access.host
+            )));
+        }
+        // BR-R16: pvRequest can override the group default atomicity.
+        let atomic = super::channel::atomic_from_pv_request(request).unwrap_or(self.def.atomic);
+        let full = self.read_group_atomic(atomic).await?;
+        Ok(pvif::filter_by_request(&full, request))
+    }
+
+    async fn put(&self, value: &PvStructure) -> BridgeResult<()> {
+        // MR-R10: in-process / value-embedded callers (gateway, tests)
+        // carry per-operation options inside the data-phase structure.
+        // The native PVA wire path uses `put_with_options` instead so
+        // INIT-pvRequest options are honored — see that method.
+        let opts = super::channel::PutOptions::from_pv_request(value);
+        let atomic_override = super::channel::atomic_from_pv_request(value);
+        self.put_with_options(value, opts, atomic_override).await
     }
 
     async fn get_field(&self) -> BridgeResult<FieldDesc> {

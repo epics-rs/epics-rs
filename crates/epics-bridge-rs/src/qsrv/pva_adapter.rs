@@ -322,11 +322,21 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // INIT pvRequest and reach us via `ChannelContext`. Fall
             // back to value-embedded options for callers that did not
             // come through the wire (in-process tests, gateway).
-            let opts = match ctx.pv_request {
-                Some(PvField::Structure(ref req)) => {
-                    crate::qsrv::channel::PutOptions::from_pv_request(req)
-                }
-                _ => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+            //
+            // MR-R10: the group arm previously called `other.put(&pv)`,
+            // which re-parses options from the data-phase value — so a
+            // native PVA group PUT/PUT_GET whose `record._options.atomic`
+            // lives only in the INIT pvRequest was silently ignored.
+            // Route the group through `put_with_options` with the same
+            // INIT-pvRequest-derived options, matching pvxs
+            // `groupsource.cpp:540`.
+            let init_req = match ctx.pv_request {
+                Some(PvField::Structure(ref req)) => Some(req),
+                _ => None,
+            };
+            let opts = match init_req {
+                Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
+                None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
             };
             let channel = provider
                 .create_channel_with_creds(&name, ctx_to_creds(&ctx))
@@ -337,7 +347,20 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     .put_with_options(&pv, opts)
                     .await
                     .map_err(|e| e.to_string()),
-                other => other.put(&pv).await.map_err(|e| e.to_string()),
+                crate::qsrv::AnyChannel::Group(group) => {
+                    // `atomic` lives in the INIT pvRequest on the wire
+                    // path; fall back to the value for in-process
+                    // callers, then to the group default inside
+                    // `put_with_options` when neither set it.
+                    let atomic_override = match init_req {
+                        Some(req) => crate::qsrv::channel::atomic_from_pv_request(req),
+                        None => crate::qsrv::channel::atomic_from_pv_request(&pv),
+                    };
+                    group
+                        .put_with_options(&pv, opts, atomic_override)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
             }
         }
     }
@@ -1518,6 +1541,133 @@ mod tests {
         assert!(
             err.contains("UNKNOWN:PV"),
             "error must name the PV; got: {err}"
+        );
+    }
+
+    /// MR-R10: a native PVA group PUT must honor INIT pvRequest
+    /// options. pvxs reads `record._options` from
+    /// `putOperation->pvRequest()` (`groupsource.cpp:540`,
+    /// `:181` `setForceProcessingFlag`), not from the data-phase
+    /// value. The prior bridge `put_value_checked` group arm called
+    /// `other.put(&pv)`, which re-parses options from the data-phase
+    /// value — so an INIT-only `record._options.process=false` was
+    /// silently dropped and every member record was processed anyway.
+    ///
+    /// Discriminator: a member record's `common.time` advances only
+    /// when the member is *processed* (`put_record_field_from_ca`);
+    /// `process=false` routes through `put_pv`, which writes the
+    /// field without processing. The data-phase value below carries
+    /// NO `_options` substructure (the realistic wire shape), so the
+    /// option can only reach the group through `ctx.pv_request`.
+    #[tokio::test]
+    async fn mr_r10_group_put_honors_init_pv_request_process() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::longin::LonginRecord;
+        use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+
+        const GROUP_JSON: &str = r#"{
+            "MRR10:grp": {
+                "+atomic": false,
+                "a": { "+channel": "MRR10:a.VAL", "+type": "plain", "+putorder": 0 },
+                "b": { "+channel": "MRR10:b.VAL", "+type": "plain", "+putorder": 1 }
+            }
+        }"#;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("MRR10:a", Box::new(LonginRecord::new(0)))
+            .await
+            .unwrap();
+        db.add_record("MRR10:b", Box::new(LonginRecord::new(0)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(GROUP_JSON).expect("load group");
+        let store = QsrvPvStore::new(provider);
+
+        let member_time = |db: Arc<PvDatabase>, rec_name: &'static str| async move {
+            let rec = db.get_record(rec_name).await.unwrap();
+            let inst = rec.read().await;
+            inst.common.time
+        };
+
+        let a_before = member_time(db.clone(), "MRR10:a").await;
+        let b_before = member_time(db.clone(), "MRR10:b").await;
+
+        // Sleep so a post-processing timestamp would be strictly
+        // greater than the pre-write timestamp on a coarse clock.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Data-phase group value: member fields only, NO `_options`.
+        let mut value = PvStructure::new("structure");
+        value
+            .fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Long(11))));
+        value
+            .fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Long(22))));
+
+        // INIT pvRequest: record._options.process = "false".
+        let mut opts = PvStructure::new("");
+        opts.fields.push((
+            "process".into(),
+            PvField::Scalar(ScalarValue::String("false".into())),
+        ));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(opts)));
+        let mut req = PvStructure::new("");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "anonymous".into(),
+            method: "anonymous".into(),
+            host: "127.0.0.1".into(),
+            authority: String::new(),
+            pv_request: Some(PvField::Structure(req)),
+        };
+
+        let checked = AccessGate::open()
+            .check("MRR10:grp", "127.0.0.1", "anonymous", "anonymous", "")
+            .await;
+
+        store
+            .put_value_checked(checked, PvField::Structure(value), ctx)
+            .await
+            .expect("group put_value_checked must succeed");
+
+        // The values must land regardless of the process option.
+        let a_val = {
+            let rec = db.get_record("MRR10:a").await.unwrap();
+            let inst = rec.read().await;
+            inst.snapshot_for_field("VAL").map(|s| s.value)
+        };
+        assert!(
+            matches!(a_val, Some(epics_base_rs::types::EpicsValue::Long(11))),
+            "member a VAL must be 11, got {a_val:?}"
+        );
+
+        // With `process=false` honored, neither member is processed:
+        // `put_pv` writes the field without touching `common.time`.
+        // Pre-fix the option was dropped, the members were processed,
+        // and the timestamps advanced.
+        let a_after = member_time(db.clone(), "MRR10:a").await;
+        let b_after = member_time(db.clone(), "MRR10:b").await;
+        assert_eq!(
+            a_after, a_before,
+            "member a TIME must NOT advance: process=false in the INIT \
+             pvRequest must suppress member processing (got {a_before:?} \
+             -> {a_after:?})"
+        );
+        assert_eq!(
+            b_after, b_before,
+            "member b TIME must NOT advance: process=false in the INIT \
+             pvRequest must suppress member processing (got {b_before:?} \
+             -> {b_after:?})"
         );
     }
 }

@@ -586,6 +586,21 @@ fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
                     })
                     .collect(),
             )),
+            // MR-R24: PVA `ulong[]` has no array arm here, so a
+            // `DBF_UINT64` waveform PUT fell through to `None` and was
+            // rejected as "PUT value not representable as EpicsValue".
+            // Preserve the unsigned 64-bit elements as
+            // `EpicsValue::UInt64Array`; `convert_to(DBF_UINT64)` is
+            // then a no-op and any other array target still coerces.
+            ScalarValue::ULong(_) => Some(EpicsValue::UInt64Array(
+                items
+                    .iter()
+                    .filter_map(|v| match v {
+                        ScalarValue::ULong(x) => Some(*x),
+                        _ => None,
+                    })
+                    .collect(),
+            )),
             _ => None,
         },
         _ => None,
@@ -1017,6 +1032,44 @@ ASG(LOCKED) {
             snap.value,
             EpicsValue::UInt64(big),
             "scalar ulong PUT must round-trip the full u64, got {:?}",
+            snap.value,
+        );
+    }
+
+    /// MR-R24 regression: a native PVA `ulong[]` PUT into a
+    /// `DBF_UINT64`-backed waveform must round-trip. Pre-fix
+    /// `pv_field_to_epics` had no `ScalarValue::ULong` array arm, so
+    /// the PUT fell through to `None` and was rejected as
+    /// "PUT value not representable as EpicsValue".
+    #[tokio::test]
+    async fn mr_r24_ulong_array_put_preserves_full_u64() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "UL:WF",
+            Box::new(WaveformRecord::new(4, DbFieldType::UInt64)),
+        )
+        .await
+        .unwrap();
+
+        let source = PvDatabaseSource::new(db.clone());
+
+        // Two of the four elements exceed i64::MAX, so any narrowing
+        // to a signed type would corrupt them.
+        let values: Vec<u64> = vec![1, 0xDEAD_BEEF_0000_0001, u64::MAX, 0];
+        let put = PvField::ScalarArray(values.iter().map(|v| ScalarValue::ULong(*v)).collect());
+        source
+            .put_value_ctx("UL:WF", put, make_ctx("h", "anyone", "anonymous"))
+            .await
+            .expect("ulong[] PUT must succeed");
+
+        let snap = snapshot_for(&db, "UL:WF").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::UInt64Array(values),
+            "ulong[] PUT must round-trip the full u64 elements, got {:?}",
             snap.value,
         );
     }

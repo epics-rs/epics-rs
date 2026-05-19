@@ -65,8 +65,9 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ### Priority 6 — Method/authority/roles, upstream identity, resource caps
 
-- [ ] **BR-R7** — PVA gateway upstream credential pool is unbounded and keyed by client-controlled identity.
+- [x] **BR-R7** — PVA gateway upstream credential pool is unbounded and keyed by client-controlled identity.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:226-249`
+  - Done: worker B, commit `52308402` on `caucus/HJB9ABPH/backend` (+ doc tracker `ecf055a7`); regression `br_r7_gateway_credential_pool_bounded`. `upstream_pool` + `upstream_caches` HashMap→BoundedPool with LRU eviction, cap 256; `set_max_upstream_identities(&self, n)` config knob via `Arc<Mutex<...>>` interior mutability. Single-file source.rs (+172/-17), 10m. Clean contract compliance.
 
 - [ ] **BR-R8** — PVA gateway does not preserve downstream auth method/authority upstream.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:250-273`
@@ -109,7 +110,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 9 (was 17)
-- Done: 7 (BR-R4, BR-R21, BR-R11, BR-R10, BR-R27, BR-R6, BR-R41)
-- In progress: 1 (BR-R7, worker B)
+- Total open: 8 (was 17)
+- Done: 8 (BR-R4, BR-R21, BR-R11, BR-R10, BR-R27, BR-R6, BR-R41, BR-R7)
+- In progress: 1 (BR-R8, worker B)
 - Blocked: 0

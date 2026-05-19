@@ -4665,6 +4665,127 @@ mod tests {
         (get("a"), get("b"), get("c"))
     }
 
+    /// EX-R3 regression: the default `ChannelSource::put_delta_checked`
+    /// merges the sparse delta over the PV's prior value. The
+    /// prior-value read MUST run through `get_value_checked` (the
+    /// credentialed path) — not the ctx-less `get_value` — so an
+    /// access-controlled or credential-routed source resolves the
+    /// prior under the same identity as the write.
+    ///
+    /// This test source returns a WRONG prior `(0,0,0)` from the
+    /// ctx-less `get_value` and the CORRECT prior `(10,20,30)` from
+    /// the credentialed `get_value_checked`. A single-field delta PUT
+    /// marking only `b` must produce `(10,99,30)`. Before the fix the
+    /// default read the prior through `get_value`, so `a`/`c`
+    /// collapsed to `0` (the wrong-context value).
+    #[tokio::test]
+    async fn ex_r3_put_delta_default_merges_under_credentialed_read() {
+        use crate::proto::BitSet;
+        use crate::server_native::source::{
+            AccessChecked, AccessGate, ChannelContext, ChannelSource,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Source whose ctx-less `get_value` deliberately returns a
+        // different (wrong) prior than the credentialed
+        // `get_value_checked`. Records which read path the default
+        // `put_delta_checked` exercised, and stores the final value.
+        struct SplitReadSource {
+            stored: Arc<parking_lot::Mutex<Option<PvField>>>,
+            used_ctxless_get: Arc<AtomicBool>,
+        }
+        impl ChannelSource for SplitReadSource {
+            async fn list_pvs(&self) -> Vec<String> {
+                vec!["dut".into()]
+            }
+            fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+                let n = n.to_string();
+                async move { n == "dut" }
+            }
+            async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+                Some(three_field_intro())
+            }
+            // Ctx-less read — the WRONG prior. If the default
+            // put_delta_checked uses this, the merge loses a/c.
+            fn get_value(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                self.used_ctxless_get.store(true, Ordering::SeqCst);
+                async { Some(three_field_value(0, 0, 0)) }
+            }
+            // Credentialed read — the CORRECT prior.
+            async fn get_value_checked(
+                &self,
+                checked: AccessChecked,
+                _ctx: ChannelContext,
+            ) -> Option<PvField> {
+                if !checked.allows_read() {
+                    return None;
+                }
+                Some(three_field_value(10, 20, 30))
+            }
+            fn put_value(
+                &self,
+                _: &str,
+                value: PvField,
+            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+                *self.stored.lock() = Some(value);
+                async { Ok(()) }
+            }
+            async fn is_writable(&self, _: &str) -> bool {
+                true
+            }
+            async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+                None
+            }
+        }
+
+        let stored = Arc::new(parking_lot::Mutex::new(None));
+        let used_ctxless = Arc::new(AtomicBool::new(false));
+        let src = SplitReadSource {
+            stored: stored.clone(),
+            used_ctxless_get: used_ctxless.clone(),
+        };
+
+        // ReadWrite token from the default Open gate.
+        let checked = AccessGate::open()
+            .check("dut", "h", "u", "anonymous", "")
+            .await;
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "u".into(),
+            method: "anonymous".into(),
+            host: "h".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: None,
+        };
+
+        // Delta marking only field `b` (bit 2) -> 99.
+        let mut changed = BitSet::new();
+        changed.set(2);
+        let delta = three_field_value(0, 99, 0);
+
+        src.put_delta_checked(checked, three_field_intro(), changed, delta, ctx)
+            .await
+            .expect("put_delta_checked must succeed");
+
+        let final_value = stored.lock().clone().expect("a value must be stored");
+        let (a, b, c) = three_field_extract(&final_value);
+        assert_eq!(
+            (a, b, c),
+            (10, 99, 30),
+            "EX-R3: default put_delta_checked must merge the delta over the \
+             credentialed prior (10,20,30); got ({a},{b},{c})"
+        );
+        assert!(
+            !used_ctxless.load(Ordering::SeqCst),
+            "EX-R3: the prior-value read must NOT go through the ctx-less get_value"
+        );
+    }
+
     /// Regression (Defect 1): the PVA client encodes the PUT data
     /// phase as a BitSet delta — only the marked fields are present
     /// on the wire. A 3-field structure where only field `b` (bit 2)

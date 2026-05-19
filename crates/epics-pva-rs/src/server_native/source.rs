@@ -295,12 +295,21 @@ pub trait ChannelSource: Send + Sync + 'static {
         async move {
             // Default (non-atomic) merge for sources without a
             // contained merge primitive. Single-client correct.
-            // `put_value_checked` enforces the WRITE gate, so a
-            // denied token never reaches the merge below as a write —
-            // but read the prior unconditionally (READ is implied by
-            // a ReadWrite token; for a denied token put_value_checked
-            // rejects before the merged value is stored).
-            let merged = match self.get_value(checked.pv_name()).await {
+            //
+            // EX-R3: the prior-value read MUST run under the same
+            // authenticated identity as the write. Reading the prior
+            // through the ctx-less `get_value` would let an
+            // access-controlled or credential-routed source resolve
+            // the prior under an anonymous/default context — a denied
+            // or differently-resolved read then collapses to
+            // `None => delta`, treating the sparse data-phase value as
+            // a full value and replacing unmarked leaves with type
+            // defaults. Route the prior read through
+            // `get_value_checked` with a clone of the same `checked`
+            // token and `ctx`, so credential-aware sources merge under
+            // their own identity. `put_value_checked` below still
+            // enforces the WRITE gate.
+            let merged = match self.get_value_checked(checked.clone(), ctx.clone()).await {
                 Some(prior) => crate::pvdata::encode::fill_unmarked_from_prior(
                     &desc, &changed, 0, delta, &prior,
                 ),

@@ -49,8 +49,9 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:299-326`
   - Done: worker B, commit `dd80cdcd` on `caucus/HJB9ABPH/backend`; regressions `br_r10_json_pva_options_preserved_in_parsed_link`, `br_r10_json_pva_bare_pv_unchanged`, `br_r10_db_json_pvalink_options_preserved`. Cross-crate: epics-base-rs `extract_pv_and_opts_from_subobject` encodes all JSON keys as `?k=v&…` query string in `ParsedLink::Pva`; epics-bridge-rs adds `strip_query`, `lazy_register_inp_opts`/`lazy_register_out_opts`, and `install_pvalink_resolver` pre-scanner. Upstream parity: pvxs:ioc/pvalink_jlif.cpp:24-41 (JSON keys), :69-196 (per-key handlers), ioc/pvalink.cpp:~250 (jlink config lifetime).
 
-- [ ] **BR-R27** — pvalink cache key drops per-link `field` and option state.
+- [x] **BR-R27** — pvalink cache key drops per-link `field` and option state.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:766-794`
+  - Done: worker B, commit `285a24e1` on `caucus/HJB9ABPH/backend` (+ doc tracker `686db100` on main); regression `br_r27_pvalink_cache_separates_per_link_options`. `RegistryKey` now `(pv_name, pipeline, queue_size, direction)` matching pvxs `channels_key_t`; `link_options`/`out_link_options` re-keyed by full query-bearing link string; `ScanTarget.field` added; `read_with_field` / `try_read_cached_with_field` for per-link field at read time.
 
 ### Priority 5 — Gateway typed forwarding / decoded monitor fallback
 
@@ -106,7 +107,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 12 (was 17)
-- Done: 4 (BR-R4, BR-R21, BR-R11, BR-R10)
-- In progress: 0
+- Total open: 11 (was 17)
+- Done: 5 (BR-R4, BR-R21, BR-R11, BR-R10, BR-R27)
+- In progress: 1 (BR-R6, worker B)
 - Blocked: 0

@@ -32,9 +32,10 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
   - Deferral note: `doc/critical-review-2026-05-18.md:1254-1257`
   - Done: worker A, commit `479f77c0` on `caucus/HJB9ABPH/worker`; regression `pva_r2_tcp_timeout_applied`. Upstream parity: pvxs clientconn.cpp:73-74,163-165; config.cpp:149,211-226,373-391.
 
-- [ ] **PVA-R3** (MEDIUM, architectural) — Nested Variant values lose the stream type-cache. Thread `&mut TypeCache` through `decode_pv_field` family + all op-response decoders + reader flattening.
+- [x] **PVA-R3** (MEDIUM, architectural) — Nested Variant values lose the stream type-cache. Thread `&mut TypeCache` through `decode_pv_field` family + all op-response decoders + reader flattening.
   - Spec: `doc/critical-review-2026-05-18.md:103-147`
   - Deferral note: `doc/critical-review-2026-05-18.md:1258-1260`
+  - Done: worker A, commit `cf5a0e5d` on `caucus/HJB9ABPH/worker`; regression `pva_r3_nested_variant_uses_typecache`. `decode_pv_field_at_depth` refactored to `&mut TypeCache`; new `decode_pv_field_cached` / `decode_pv_field_with_bitset_cached` entry points; RPC value decode + GET/MONITOR + PUT_GET data decode all switched to cache-aware variant. Surprisingly contained (141/19 lines, 3 files).
 
 - [x] **PVA-R4** (MEDIUM, architectural) — TCP name servers as persistent search peers (not direct-connect fallbacks). Client-side persistent name-server connection in `SearchEngine`. Server-side TCP SEARCH already cleared via R11.
   - Spec: `doc/critical-review-2026-05-18.md:148-183`
@@ -58,8 +59,8 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 2 (was 6)
-- Done: 4 (PVA-R2, PVA-R6, PVA-R4, TLS-NAMESERVER)
-- In progress: 1 (PVA-R3, worker A)
+- Total open: 1 (was 6)
+- Done: 5 (PVA-R2, PVA-R6, PVA-R4, TLS-NAMESERVER, PVA-R3)
+- In progress: 1 (PVA-R14, worker A)
 - Blocked: 0
 - Verified pre-existing main failure: `critical1_audit_layer_records_put` (tests/pva_gateway.rs:557) — separate from this round; not introduced by any worker.

@@ -785,6 +785,22 @@ impl LinkSet for PvaLinkResolver {
         link.time_stamp()
     }
 
+    fn link_metadata(&self, name: &str) -> Option<epics_base_rs::server::database::LinkMetadata> {
+        // BR-R24: surface the remote display/control/valueAlarm
+        // metadata, DBF type and element count through the DB link
+        // API, mirroring the pvxs pvalink lset metadata getter set
+        // installed at `pvxs/ioc/pvalink_lset.cpp:700`. Reads the
+        // cached NT value — no fresh GET — exactly as the pvxs
+        // getters read `fld_meta` / `fld_value` under the channel
+        // lock.
+        let name = strip_scheme(name)?;
+        let link = block_in_place_or_warn(|| {
+            self.handle
+                .block_on(async { self.registry.get_or_open(default_inp_cfg(name)).await.ok() })
+        })?;
+        link.link_metadata()
+    }
+
     fn link_names(&self) -> Vec<String> {
         // The registry is keyed on (pv_name, direction). We don't
         // currently expose iteration; skip for now and rely on

@@ -5,7 +5,11 @@ Driver-managed punchlist. **Worker contract:**
 1. Take exactly the next unchecked `[ ]` item the driver hands you. Do NOT freelance to other items.
 2. Before editing the cited line, run the **Anchor / Sites / Same defect / Distinct** audit per the global rule (see ~/.claude/CLAUDE.md "Fixes from reported defects"). Mandatory report header before edits.
 3. NEVER emit: `TODO`, `FIXME`, `unimplemented!()`, `#[allow(...)]` (to silence), `// later`, "next session", "out of scope" (unless user-scoped this round), "scope이 크다", "위험합니다", "다음에", "defer".
-4. Root cause fix at source. Comment-only "fix" = rejected. Type/API closure preferred over local patches when the global rule's "Invariant-driven fixes" section applies.
+4. **Upstream parity is the bar — no inventing semantics.** Every design decision (values, edge cases, where behaviour applies, defaults) MUST be grounded in the upstream C++ reference:
+   - pvxs:       `/Users/stevek/codes/pvxs`
+   - epics-base: `/Users/stevek/codes/epics-base`
+   Use `rg` in those trees BEFORE making decisions. Commit message and end-of-task report MUST include an **Upstream parity** section listing `pvxs:file:line` and/or `epics-base:file:line` your implementation mirrors for each behaviour. If you cannot find the upstream reference for a sub-behaviour, STOP and report — do NOT invent.
+5. Root cause fix at source. Comment-only "fix" = rejected. Type/API closure preferred over local patches when the global rule's "Invariant-driven fixes" section applies.
 5. After edits: `cargo fmt --all` → `cargo clippy -p epics-pva-rs --all-targets -- -D warnings` → `cargo nextest run -p epics-pva-rs`. If your change crosses crate boundaries, escalate to `--workspace`. Doctest changes → `cargo test --doc -p epics-pva-rs`.
 6. Add a regression test that fails on main and passes after your fix. Name it `pva_rN_<short>`.
 7. End-of-task report in the format mandated by global rules: Tested / Failed / UNFIXED / Fixed.

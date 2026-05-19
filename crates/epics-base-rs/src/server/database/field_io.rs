@@ -50,7 +50,25 @@ impl PvDatabase {
 
     /// Set a PV value or record field, notifying subscribers.
     /// Tries record put_field first, then put_common_field as fallback.
+    ///
+    /// Acquires the record's BR-R15 advisory write gate.
     pub async fn put_pv(&self, name: &str, value: EpicsValue) -> CaResult<()> {
+        self.put_pv_inner(name, value, true).await
+    }
+
+    /// BR-R15: `put_pv` variant for a caller already holding the
+    /// record's advisory write gate (QSRV atomic group PUT). See
+    /// [`Self::put_record_field_from_ca_already_locked`].
+    pub async fn put_pv_already_locked(&self, name: &str, value: EpicsValue) -> CaResult<()> {
+        self.put_pv_inner(name, value, false).await
+    }
+
+    async fn put_pv_inner(
+        &self,
+        name: &str,
+        value: EpicsValue,
+        acquire_gate: bool,
+    ) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
 
@@ -68,6 +86,15 @@ impl PvDatabase {
                 .resolve_alias(base)
                 .await
                 .unwrap_or_else(|| base.to_string());
+            // BR-R15: advisory write gate (`dbScanLock` analogue) so a
+            // plain `put_pv` to a backing record cannot interleave
+            // with an atomic group transaction holding the same gate.
+            // Skipped when the caller already owns the gate.
+            let _record_gate = if acquire_gate {
+                Some(self.lock_record(&canonical_base).await)
+            } else {
+                None
+            };
             let mut instance = rec.write().await;
 
             // Coerce value to field's native type
@@ -341,11 +368,42 @@ impl PvDatabase {
 
     /// CA client's unified entry point for record field put.
     /// Handles DISP/PROC/PACT/LCNT checks, field put, device write, and Passive process.
+    ///
+    /// Acquires the record's BR-R15 advisory write gate
+    /// (`dbScanLock` analogue) for the duration of the write.
     pub async fn put_record_field_from_ca(
         &self,
         record_name: &str,
         field: &str,
         value: EpicsValue,
+    ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
+        self.put_record_field_from_ca_inner(record_name, field, value, true)
+            .await
+    }
+
+    /// BR-R15: variant for a caller that already owns the target
+    /// record's advisory write gate — the QSRV atomic group PUT,
+    /// which acquired every member-record gate up-front via
+    /// [`Self::lock_records`]. The per-record `tokio::sync::Mutex`
+    /// gate is NOT reentrant, so the atomic group path MUST use this
+    /// `_already_locked` entry to avoid dead-locking on its own
+    /// `ManyRecordWriteGuard`.
+    pub async fn put_record_field_from_ca_already_locked(
+        &self,
+        record_name: &str,
+        field: &str,
+        value: EpicsValue,
+    ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
+        self.put_record_field_from_ca_inner(record_name, field, value, false)
+            .await
+    }
+
+    async fn put_record_field_from_ca_inner(
+        &self,
+        record_name: &str,
+        field: &str,
+        value: EpicsValue,
+        acquire_gate: bool,
     ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
         let field = field.to_ascii_uppercase();
 
@@ -367,6 +425,20 @@ impl PvDatabase {
             &canonical_owned
         } else {
             record_name
+        };
+
+        // BR-R15: take the record's advisory write gate — the
+        // `dbScanLock(precord)` analogue. While a QSRV atomic group
+        // PUT/GET holds this record's gate via `lock_records`, this
+        // plain write blocks here, so a direct backing-record write
+        // can no longer land between member writes of an atomic group
+        // transaction. Held until the function returns. Skipped when
+        // the caller (atomic group PUT) already owns the gate — the
+        // gate `Mutex` is not reentrant.
+        let _record_gate = if acquire_gate {
+            Some(self.lock_record(record_name).await)
+        } else {
+            None
         };
 
         // Special field intercepts (read lock, then drop)

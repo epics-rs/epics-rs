@@ -29,9 +29,37 @@ impl PvDatabase {
     /// Process a record by name (process_local + notify).
     /// Alias-aware (epics-base PR #336).
     pub async fn process_record(&self, name: &str) -> CaResult<()> {
+        self.process_record_inner(name, true).await
+    }
+
+    /// BR-R15: `process_record` variant for a caller that already
+    /// owns the record's advisory write gate — the QSRV atomic group
+    /// PUT applying a `+proc` member. The gate `Mutex` is not
+    /// reentrant; the atomic group path MUST use this entry. See
+    /// [`crate::server::database::PvDatabase::lock_records`].
+    pub async fn process_record_already_locked(&self, name: &str) -> CaResult<()> {
+        self.process_record_inner(name, false).await
+    }
+
+    async fn process_record_inner(&self, name: &str, acquire_gate: bool) -> CaResult<()> {
         let rec = self.get_record(name).await;
 
         if let Some(rec) = rec {
+            // BR-R15: advisory write gate (`dbScanLock` analogue). A
+            // QSRV atomic group with a `+proc` member holds this
+            // record's gate via `lock_records`; a direct
+            // `process_record` on the same backing record must block
+            // until the atomic group transaction completes. Skipped
+            // when the caller already owns the gate.
+            let _record_gate = if acquire_gate {
+                let canonical = self
+                    .resolve_alias(name)
+                    .await
+                    .unwrap_or_else(|| name.to_string());
+                Some(self.lock_record(&canonical).await)
+            } else {
+                None
+            };
             let (snapshot, alarm_posts) = {
                 let mut instance = rec.write().await;
                 instance.process_local()?

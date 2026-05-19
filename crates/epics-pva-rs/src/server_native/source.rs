@@ -468,6 +468,30 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
+    /// BR-R29: does this source emit *partial* monitor updates for
+    /// `name` — i.e. each event changes only a subset of the
+    /// structure's leaves, not the whole value?
+    ///
+    /// pvxs posts a monitor `Value` whose own marked-changed bitset
+    /// reflects exactly the leaves touched since the last `unmark()`
+    /// (`servermon.cpp:174` `to_wire_valid(R, ent, &self->pvMask)`
+    /// intersects that with the request mask). A QSRV *group* monitor
+    /// with the default `+trigger` (self-trigger) re-reads only the
+    /// triggered member on each event, so only that member's leaves
+    /// change — the wire changed-bitset must be narrowed accordingly
+    /// rather than always marking the whole request mask.
+    ///
+    /// When this returns `true` the server's decoded monitor loop
+    /// derives the per-event changed-bitset by structurally diffing
+    /// consecutive snapshots (intersected with the request mask),
+    /// matching pvxs's marked-leaf semantics. Default `false` keeps
+    /// the static-mask behaviour for single-record sources whose
+    /// every event already carries a full value.
+    fn monitor_emits_partial(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
+
     /// Notify the source that the per-connection monitor outbox for
     /// `name` just crossed UP through its high watermark. Producers
     /// can throttle their post() rate in response. Default impl is
@@ -664,6 +688,7 @@ pub trait ChannelSourceObj: Send + Sync {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    fn monitor_emits_partial(&self, name: &str) -> bool;
     fn notify_watermark_high(&self, name: &str);
     fn notify_watermark_low(&self, name: &str);
 }
@@ -859,6 +884,9 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::process_checked(self, checked, ctx))
+    }
+    fn monitor_emits_partial(&self, name: &str) -> bool {
+        <Self as ChannelSource>::monitor_emits_partial(self, name)
     }
     fn notify_watermark_high(&self, name: &str) {
         <Self as ChannelSource>::notify_watermark_high(self, name);

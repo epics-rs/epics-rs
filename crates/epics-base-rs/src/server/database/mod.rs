@@ -8,7 +8,7 @@ mod record_lock;
 mod scan_index;
 
 pub use link_set::{DynLinkSet, LinkDbfType, LinkMetadata, LinkSet, LinkSetRegistry};
-pub use record_lock::MultiRecordGuard;
+pub use record_lock::{ManyRecordWriteGuard, RecordWriteGuard};
 
 use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
@@ -213,12 +213,13 @@ struct PvDatabaseInner {
     /// interest on this before re-checking `pini_done` to avoid missing the
     /// signal (`notify_waiters` does not store a permit).
     pini_notify: tokio::sync::Notify,
-    /// Database-level multi-record epoch locks — the Rust counterpart
-    /// of the C-EPICS `dbLocker` machinery. Used by
-    /// [`PvDatabase::lock_records_atomic`] so atomic pvalink
-    /// scan-on-update target sets (and any future atomic group PUT)
-    /// get a single locked scan epoch across the whole target set.
-    record_locks: record_lock::RecordLockSet,
+    /// BR-R15 / BR-R18: per-record advisory write gates — the Rust
+    /// counterpart of the C-EPICS `dbScanLock` / `dbLocker`
+    /// machinery. Every plain CA/PVA write, the QSRV atomic group
+    /// PUT/GET, and the pvalink atomic scan-on-update epoch all
+    /// acquire these gates, so no two of them can interleave on a
+    /// shared record. See [`record_lock`].
+    record_locks: record_lock::RecordLockRegistry,
 }
 
 /// Database of all process variables hosted by this server.
@@ -354,7 +355,7 @@ impl PvDatabase {
                 scan_started: std::sync::atomic::AtomicBool::new(false),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
                 pini_notify: tokio::sync::Notify::new(),
-                record_locks: record_lock::RecordLockSet::new(),
+                record_locks: record_lock::RecordLockRegistry::default(),
             }),
         }
     }

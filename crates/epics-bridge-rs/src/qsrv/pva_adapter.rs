@@ -455,11 +455,26 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 }
                 _ => None,
             };
+            // BR-R33-RESIDUAL: resolve the per-operation negotiated
+            // monitor queue depth from the MONITOR INIT pvRequest's
+            // `record._options.queueSize` — pvxs `servermon.cpp:533`
+            // then `groupsource.cpp:359` stamps `stats.limitQueue`.
+            // A group monitor stamps this into every value's
+            // `record._options.queueSize`; single-record monitors
+            // ignore it.
+            let queue_size = match ctx.pv_request {
+                Some(PvField::Structure(ref req)) => crate::qsrv::group::negotiated_queue_size(req),
+                _ => crate::qsrv::group::GROUP_DEFAULT_QUEUE_SIZE,
+            };
             let mut monitor = match channel {
                 crate::qsrv::AnyChannel::Single(single) => {
                     single.create_monitor_with_value_mask(dbe_mask).await.ok()?
                 }
-                other => other.create_monitor().await.ok()?,
+                other => other
+                    .create_monitor()
+                    .await
+                    .ok()?
+                    .with_queue_size(queue_size),
             };
             monitor.start().await.ok()?;
             let (tx, rx) = mpsc::channel::<PvField>(64);
@@ -751,6 +766,17 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             });
             Some(rx)
         }
+    }
+
+    /// BR-R29: a QSRV *pure self-trigger* group monitor emits partial
+    /// updates — each event re-reads only the member whose record
+    /// processed, so the PVA server narrows the wire changed-bitset
+    /// by diffing consecutive snapshots. Returns `true` only for
+    /// groups whose every member uses the default `+trigger`
+    /// (self-trigger); single-record / native-PVA PVs and groups with
+    /// explicit `+trigger` members keep the full request mask.
+    fn monitor_emits_partial(&self, name: &str) -> bool {
+        self.provider.group_is_pure_self_trigger(name)
     }
 }
 

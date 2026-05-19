@@ -2489,7 +2489,6 @@ async fn handle_op(
             crate::server_native::source::MonitorOptions::default()
         };
 
-
         ch.ops.insert(
             ioid,
             OpState {
@@ -3207,6 +3206,17 @@ async fn handle_op(
                                 .store(live_v0, std::sync::atomic::Ordering::Release);
                         }
                     }
+                    // BR-R29: does this source emit *partial* monitor
+                    // updates (QSRV group monitor with a self-trigger)?
+                    // When it does, every event after the first carries
+                    // a wire changed-bitset narrowed to the leaves that
+                    // actually changed — derived by structurally
+                    // diffing consecutive snapshots, matching pvxs's
+                    // marked-leaf semantics (`servermon.cpp:174`
+                    // `to_wire_valid(R, ent, &pvMask)`). `prev_value`
+                    // holds the last emitted snapshot for that diff.
+                    let emits_partial = src.monitor_emits_partial(&pv_name);
+                    let mut prev_value: Option<PvField> = None;
                     // Emit initial snapshot via the ACF-aware path —
                     // a peer with NoAccess on the record's ASG sees
                     // nothing; legacy sources fall through to
@@ -3226,9 +3236,14 @@ async fn handle_op(
                         // and leaking unrequested leaves. Match pvxs
                         // by always queueing the first event (no
                         // change-filter here) but honouring
-                        // `mask_clone` on the wire.
+                        // `mask_clone` on the wire. The first event is
+                        // always full (pvxs builds a fresh fully-marked
+                        // Value); partial narrowing starts at event #2.
                         let payload =
                             build_monitor_payload(ioid, &intro_clone, &initial, &mask_clone, order);
+                        if emits_partial {
+                            prev_value = Some(initial);
+                        }
                         if tx_clone.send(payload).await.is_err() {
                             return;
                         }
@@ -3366,8 +3381,28 @@ async fn handle_op(
                                 continue;
                             }
                         }
-                        let payload =
-                            build_monitor_payload(ioid, &intro_clone, &value, &mask_clone, order);
+                        // BR-R29: for a partial-emitting source, narrow
+                        // the wire changed-bitset to exactly the leaves
+                        // that differ from the previously emitted
+                        // snapshot, intersected with the request mask —
+                        // pvxs `to_wire_valid(R, ent, &pvMask)`. The
+                        // first event already went out above with the
+                        // full mask; from here on `prev_value` is set.
+                        let payload = if let Some(prev) = prev_value.as_ref() {
+                            build_monitor_payload_partial(
+                                ioid,
+                                &intro_clone,
+                                &value,
+                                prev,
+                                &mask_clone,
+                                order,
+                            )
+                        } else {
+                            build_monitor_payload(ioid, &intro_clone, &value, &mask_clone, order)
+                        };
+                        if emits_partial {
+                            prev_value = Some(value.clone());
+                        }
                         if tx_clone.send(payload).await.is_err() {
                             return;
                         }
@@ -3573,6 +3608,66 @@ fn build_monitor_payload(
     // into a wire changed-bitset so a partial field filter is not
     // widened to the whole structure by a stray root/structure bit.
     let changed = crate::pvdata::encode::canonical_changed_bitset(intro, mask);
+    changed.write_into(order, &mut payload);
+    crate::pvdata::encode::encode_pv_field_with_bitset(
+        value,
+        intro,
+        &changed,
+        0,
+        order,
+        &mut payload,
+    );
+    let overrun = BitSet::new(); // no overruns
+    overrun.write_into(order, &mut payload);
+    let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
+    let mut buf = Vec::with_capacity(8 + payload.len());
+    h.write_into(&mut buf);
+    buf.extend_from_slice(&payload);
+    buf
+}
+
+/// BR-R29: build a MONITOR data frame whose wire changed-bitset is
+/// narrowed to exactly the leaves that differ between `prev` and
+/// `value`, intersected with the request `mask`.
+///
+/// This is the partial-update counterpart of [`build_monitor_payload`]
+/// — used for sources that emit partial updates (QSRV group monitor
+/// with a self-trigger). pvxs `servermon.cpp:174`
+/// `to_wire_valid(R, ent, &pvMask)` encodes the queued Value's own
+/// marked-changed bitset intersected with the request mask; here the
+/// marked set is reconstructed by structurally diffing consecutive
+/// snapshots ([`crate::pvdata::encode::diff_changed_bitset`]).
+///
+/// When the diff is empty (no leaf changed but the source still
+/// posted — e.g. an alarm-only re-post that decoded identically) the
+/// frame still carries an empty changed-bitset and no value bytes,
+/// matching pvxs posting an unmarked Value.
+fn build_monitor_payload_partial(
+    ioid: u32,
+    intro: &FieldDesc,
+    value: &PvField,
+    prev: &PvField,
+    mask: &BitSet,
+    order: ByteOrder,
+) -> Vec<u8> {
+    // Leaves that actually changed since the last emitted snapshot.
+    let diff = crate::pvdata::encode::diff_changed_bitset(intro, prev, value);
+    // Intersect the diff with the request selection mask so a client
+    // that subscribed to a field subset never sees leaves outside it
+    // (pvxs intersects with `pvMask`).
+    let mut selected = BitSet::new();
+    for bit in diff.iter() {
+        if mask.get(bit) {
+            selected.set(bit);
+        }
+    }
+
+    let mut payload = Vec::new();
+    payload.put_u32(ioid, order);
+    payload.put_u8(0x00);
+    // Canonicalize so a fully-selected subtree collapses to its
+    // structure bit exactly as `build_monitor_payload` does.
+    let changed = crate::pvdata::encode::canonical_changed_bitset(intro, &selected);
     changed.write_into(order, &mut payload);
     crate::pvdata::encode::encode_pv_field_with_bitset(
         value,
@@ -3953,6 +4048,77 @@ mod tests {
             }
             other => panic!("expected monitor data, got {other:?}"),
         }
+    }
+
+    /// BR-R29 residual regression: `build_monitor_payload_partial`
+    /// narrows the wire changed-bitset to exactly the leaves that
+    /// differ from the previous snapshot, intersected with the
+    /// request mask — pvxs `servermon.cpp:174`
+    /// `to_wire_valid(R, ent, &pvMask)`. The previous QSRV group
+    /// monitor path always sent the full request mask, so a
+    /// self-trigger update on one member wrongly marked every member
+    /// changed on the wire.
+    ///
+    /// This builds a two-member group value and an event in which
+    /// only member `a` changed; the decoded frame's changed-bitset
+    /// must mark `a`'s leaf and NOT `b`'s. The contrasting full-mask
+    /// `build_monitor_payload` marks both — proving the narrowing is
+    /// the partial builder's doing.
+    #[test]
+    fn br_r29_partial_monitor_payload_narrows_changed_bitset() {
+        let order = ByteOrder::Little;
+        let ioid = 0x29;
+        // Group structure: { a: Double, b: Double }.
+        let intro = FieldDesc::Structure {
+            struct_id: "structure".into(),
+            fields: vec![
+                ("a".into(), FieldDesc::Scalar(ScalarType::Double)),
+                ("b".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+        let mk = |a: f64, b: f64| {
+            let mut s = PvStructure::new("structure");
+            s.fields
+                .push(("a".into(), PvField::Scalar(ScalarValue::Double(a))));
+            s.fields
+                .push(("b".into(), PvField::Scalar(ScalarValue::Double(b))));
+            PvField::Structure(s)
+        };
+        // Previous emitted snapshot, then an event where only `a`
+        // changed (self-trigger on member `a`).
+        let prev = mk(1.0, 2.0);
+        let curr = mk(9.0, 2.0);
+        let mask = BitSet::all_set(intro.total_bits());
+
+        // Partial builder: changed-bitset must mark only `a` (bit 1),
+        // not `b` (bit 2).
+        let partial = build_monitor_payload_partial(ioid, &intro, &curr, &prev, &mask, order);
+        let (frame, _) = try_parse_frame(&partial).unwrap().expect("complete frame");
+        let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
+            OpResponse::Data(d) => d,
+            other => panic!("expected monitor data, got {other:?}"),
+        };
+        assert!(
+            data.changed.get(1),
+            "member `a` (bit 1) changed — must be marked"
+        );
+        assert!(
+            !data.changed.get(2),
+            "member `b` (bit 2) unchanged — must NOT be marked (BR-R29 narrowing)"
+        );
+
+        // Full builder: marks both members — confirms the old
+        // behaviour the residual gap describes.
+        let full = build_monitor_payload(ioid, &intro, &curr, &mask, order);
+        let (full_frame, _) = try_parse_frame(&full).unwrap().expect("complete frame");
+        let full_data = match decode_op_response(&full_frame, Some(&intro)).unwrap() {
+            OpResponse::Data(d) => d,
+            other => panic!("expected monitor data, got {other:?}"),
+        };
+        assert!(
+            full_data.changed.get(1) && full_data.changed.get(2),
+            "full-mask builder marks every member — the pre-fix wire shape"
+        );
     }
 
     /// pvxs `servermon.cpp:493` parity: when the client sets the

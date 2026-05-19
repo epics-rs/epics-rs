@@ -1333,6 +1333,7 @@ ASG(DEFAULT) {
             method: "x509".to_string(),
             host: "ws01.lab".to_string(),
             authority: "Lab Root CA".to_string(),
+            pv_request: None,
         };
         let client = src.upstream_client_for(&ctx);
         let asserted = client

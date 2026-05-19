@@ -593,7 +593,7 @@ async fn run_notify_forwarder(
         //
         // The atomic record set is the same for every monitor event
         // on this PV, so it is collected from the already-sorted
-        // `targets` list. `lock_records_atomic` itself canonicalises,
+        // `targets` list. `lock_records` itself alias-resolves,
         // deduplicates and sorts, so a record bound by more than one
         // atomic link is locked exactly once.
         let atomic_records: Vec<String> = targets
@@ -612,7 +612,7 @@ async fn run_notify_forwarder(
         let mut atomic_epoch = if atomic_records.is_empty() {
             None
         } else {
-            Some(db_handle.lock_records_atomic(&atomic_records).await)
+            Some(db_handle.lock_records(&atomic_records).await)
         };
 
         for (record, always, _order, atomic, passive_only) in &targets {
@@ -1811,12 +1811,14 @@ mod tests {
             always: true,
             monorder: 0,
             atomic: true,
+            passive_only: false,
         });
         fanout.records.push(ScanTarget {
             record: "AT:B".into(),
             always: true,
             monorder: 1,
             atomic: true,
+            passive_only: false,
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -1842,9 +1844,7 @@ mod tests {
         let competitor_db = db.clone();
         let competitor = tokio::spawn(async move {
             epoch_entered.notified().await;
-            let _epoch = competitor_db
-                .lock_records_atomic(&["AT:B".to_string()])
-                .await;
+            let _epoch = competitor_db.lock_records(&["AT:B".to_string()]).await;
             competitor_log.lock().push("EXTERNAL".to_string());
         });
 

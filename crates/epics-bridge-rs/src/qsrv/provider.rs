@@ -563,6 +563,23 @@ impl BridgeProvider {
         self.groups.read().contains_key(name)
     }
 
+    /// BR-R29: true iff `name` is a registered group PV whose every
+    /// member uses the default self-trigger (`+trigger` absent →
+    /// [`crate::qsrv::group_config::TriggerDef::SelfOnly`]) or
+    /// explicit silence. Such a group's monitor events are *partial*
+    /// — each event re-reads only the member that processed — so the
+    /// PVA server narrows the wire changed-bitset by diffing
+    /// consecutive snapshots. Returns `false` for non-groups and for
+    /// groups carrying any explicit `+trigger` member (see
+    /// [`GroupPvDef::is_pure_self_trigger`]).
+    pub fn group_is_pure_self_trigger(&self, name: &str) -> bool {
+        self.groups
+            .read()
+            .get(name)
+            .map(|g| g.is_pure_self_trigger())
+            .unwrap_or(false)
+    }
+
     /// Whether this provider hosts `name` as any channel — a QSRV
     /// group composite PV *or* a single-record / simple PV in the
     /// backing database. This is the same name set

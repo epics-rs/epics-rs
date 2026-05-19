@@ -77,7 +77,9 @@ impl PvaClientBuilder {
             tls: None,
             name_servers: crate::config::env::name_servers(),
             priority: 0,
-            tcp_timeout: Duration::from_secs(40),
+            // pvxs config.cpp:222,373-391: parse_timeout scales CONN_TMO by
+            // 4/3; enforceTimeout clamps below 2 s and defaults to 40 s.
+            tcp_timeout: super::server_conn::heartbeat_timeout(),
             share_udp: false,
         }
     }
@@ -210,9 +212,10 @@ struct ClientInner {
     /// future TCP TOS wiring. pvxs `CommonBuilder::priority`.
     #[allow(dead_code)]
     priority: u8,
-    /// Client TCP idle timeout. Stored for inspection / future
-    /// keepalive plumbing. pvxs `Config::tcpTimeout`.
-    #[allow(dead_code)]
+    /// Client TCP idle timeout threaded through to every `ServerConn`
+    /// spawned via this client's `ConnectionPool`. Governs the heartbeat
+    /// task's inactivity threshold. pvxs `Config::tcpTimeout`
+    /// (clientconn.cpp:73-74).
     tcp_timeout: Duration,
     /// True when `build()` was told to share the process-wide search
     /// engine. Routes [`PvaClient::search_engine`] through the static
@@ -307,6 +310,7 @@ impl PvaClient {
                 self.inner.user.clone(),
                 self.inner.host.clone(),
                 self.inner.timeout,
+                self.inner.tcp_timeout,
                 self.inner.pool.clone(),
                 addr,
             ))
@@ -317,6 +321,7 @@ impl PvaClient {
                 self.inner.user.clone(),
                 self.inner.host.clone(),
                 self.inner.timeout,
+                self.inner.tcp_timeout,
                 self.inner.pool.clone(),
                 search,
                 self.inner.name_servers.clone(),

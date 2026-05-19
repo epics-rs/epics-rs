@@ -68,6 +68,10 @@ pub struct Channel {
     user: String,
     host: String,
     op_timeout: std::time::Duration,
+    /// TCP idle timeout threaded through to `ConnectionPool::get_or_connect`
+    /// and ultimately into the per-connection heartbeat task.
+    /// pvxs `effective.tcpTimeout` (clientconn.cpp:73-74).
+    tcp_timeout: std::time::Duration,
     /// Shared connection pool (so multiple channels to the same server
     /// share a single TCP virtual circuit).
     pool: Arc<ConnectionPool>,
@@ -230,6 +234,7 @@ impl ConnectionPool {
         user: &str,
         host: &str,
         op_timeout: std::time::Duration,
+        tcp_timeout: std::time::Duration,
     ) -> PvaResult<Arc<ServerConn>> {
         // Fast path: existing alive conn.
         {
@@ -333,10 +338,11 @@ impl ConnectionPool {
                         user,
                         host,
                         op_timeout,
+                        tcp_timeout,
                     )
                     .await
                 }
-                None => ServerConn::connect(addr, user, host, op_timeout).await,
+                None => ServerConn::connect(addr, user, host, op_timeout, tcp_timeout).await,
             };
             let fresh = connect_result?;
             let mut map = self.inner.lock();
@@ -398,19 +404,31 @@ impl Channel {
         user: String,
         host: String,
         op_timeout: std::time::Duration,
+        tcp_timeout: std::time::Duration,
         pool: Arc<ConnectionPool>,
         search: SearchEngine,
     ) -> Self {
-        Self::new_with_name_servers(pv_name, user, host, op_timeout, pool, search, Vec::new())
+        Self::new_with_name_servers(
+            pv_name,
+            user,
+            host,
+            op_timeout,
+            tcp_timeout,
+            pool,
+            search,
+            Vec::new(),
+        )
     }
 
     /// Like [`Self::new`] but also accepts a TCP name-server fallback
     /// list. Pinged in order whenever UDP search yields no candidates.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_name_servers(
         pv_name: String,
         user: String,
         host: String,
         op_timeout: std::time::Duration,
+        tcp_timeout: std::time::Duration,
         pool: Arc<ConnectionPool>,
         search: SearchEngine,
         name_servers: Vec<std::net::SocketAddr>,
@@ -424,6 +442,7 @@ impl Channel {
             user,
             host,
             op_timeout,
+            tcp_timeout,
             pool,
             resolver: Resolver::Search(search),
             alternatives: parking_lot::Mutex::new(Vec::new()),
@@ -444,6 +463,7 @@ impl Channel {
         user: String,
         host: String,
         op_timeout: std::time::Duration,
+        tcp_timeout: std::time::Duration,
         pool: Arc<ConnectionPool>,
         addr: std::net::SocketAddr,
     ) -> Self {
@@ -456,6 +476,7 @@ impl Channel {
             user,
             host,
             op_timeout,
+            tcp_timeout,
             pool,
             resolver: Resolver::Direct(addr),
             alternatives: parking_lot::Mutex::new(Vec::new()),
@@ -751,7 +772,13 @@ impl Channel {
             self.set_state(ChannelState::Connecting);
             match self
                 .pool
-                .get_or_connect(*server_addr, &self.user, &self.host, self.op_timeout)
+                .get_or_connect(
+                    *server_addr,
+                    &self.user,
+                    &self.host,
+                    self.op_timeout,
+                    self.tcp_timeout,
+                )
                 .await
             {
                 Err(e) => {
@@ -913,6 +940,7 @@ mod tests {
             "u".into(),
             "h".into(),
             std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(40),
             pool,
             addr,
         )
@@ -1014,12 +1042,19 @@ mod tests {
 
         let pool = ConnectionPool::new();
         let op_timeout = Duration::from_millis(400);
+        let tcp_timeout = Duration::from_secs(40);
 
         // Two concurrent callers for the SAME addr.
         let p1 = pool.clone();
-        let c1 = tokio::spawn(async move { p1.get_or_connect(addr, "u", "h", op_timeout).await });
+        let c1 = tokio::spawn(async move {
+            p1.get_or_connect(addr, "u", "h", op_timeout, tcp_timeout)
+                .await
+        });
         let p2 = pool.clone();
-        let c2 = tokio::spawn(async move { p2.get_or_connect(addr, "u", "h", op_timeout).await });
+        let c2 = tokio::spawn(async move {
+            p2.get_or_connect(addr, "u", "h", op_timeout, tcp_timeout)
+                .await
+        });
 
         // Mid-first-dial: the gate must have blocked the second caller,
         // so only one connection has been accepted so far.
@@ -1114,7 +1149,13 @@ mod tests {
         });
 
         let res = pool
-            .get_or_connect(probe_addr, "u", "h", Duration::from_millis(300))
+            .get_or_connect(
+                probe_addr,
+                "u",
+                "h",
+                Duration::from_millis(300),
+                Duration::from_secs(40),
+            )
             .await;
         assert!(res.is_err(), "stalled handshake must fail");
         assert!(

@@ -146,36 +146,57 @@ fn cascade_smoothed_next(
     }
 }
 
-/// Normal tick cadence (1 search bucket per second).
-const NORMAL_TICK: Duration = Duration::from_secs(1);
+/// C default for `EPICS_CA_MAX_SEARCH_PERIOD`
+/// (`epics-base:modules/ca/src/client/udpiiu.h:87`,
+/// `maxSearchPeriodDefault = 5.0 * 60.0`).
+const MAX_SEARCH_PERIOD_DEFAULT_SECS: f64 = 300.0;
 
-/// R2-62: `EPICS_CA_MAX_SEARCH_PERIOD` — C
-/// (`ca/src/client/udpiiu.cpp:71-89`) reads the env var as `double`
-/// seconds, defaults 300, clamps to a lower bound of 60. The C
-/// search timer uses this to bound the per-cid exponential
-/// backoff. Rust's bucket model is structurally different — a
-/// fixed `N_SEARCH_BUCKETS = 30` ring at 1 s per bucket caps the
-/// per-cid retry at ~30 s regardless of env. Honour the env var
-/// by scaling the tick: `tick = max(period / N_BUCKETS, 1 s)`,
-/// where `period` is clamped to [60, ∞) per C. Default 300 →
-/// tick 10 s; min 60 → tick 2 s. Effectively turns the bucket
-/// ring into a tunable cap-bounded retry wheel.
-fn normal_tick() -> Duration {
-    let period_secs = epics_base_rs::runtime::env::get("EPICS_CA_MAX_SEARCH_PERIOD")
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| *v > 0.0)
-        .unwrap_or(30.0)
-        .max(30.0);
-    // If unset / <=30 we keep the historical 1s tick to preserve
-    // existing behaviour on sites that didn't set the var (Rust
-    // default ≈30 s cap). Only sites explicitly setting the var
-    // get the scaled cap.
-    if period_secs <= 30.0 {
-        NORMAL_TICK
-    } else {
-        let secs = (period_secs / N_SEARCH_BUCKETS as f64).max(1.0);
-        Duration::from_secs_f64(secs)
+/// C lower bound for `EPICS_CA_MAX_SEARCH_PERIOD`
+/// (`epics-base:modules/ca/src/client/udpiiu.h:88`,
+/// `maxSearchPeriodLowerLimit = 60.0`).
+const MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS: f64 = 60.0;
+
+/// EX-R2 / R2-62: `EPICS_CA_MAX_SEARCH_PERIOD` resolution, faithful
+/// to C `udpiiu.cpp::getMaxPeriod` (`epics-base:modules/ca/src/client/udpiiu.cpp:68-94`):
+///
+/// - env unset → the documented default of 300 s.
+/// - env set and parses as a real number → that value, clamped *up*
+///   to the 60 s lower limit if below it. C applies no upper clamp
+///   to the period itself (the upper bound is on the derived timer
+///   count, not the period).
+/// - env set but not a real number → keep the 300 s default
+///   (C's `longStatus != 0` branch).
+///
+/// C does not reject negative or zero values — they pass `parse` and
+/// are caught by the `< 60` lower-limit clamp — so this mirrors C by
+/// clamping rather than filtering.
+fn max_search_period_secs() -> f64 {
+    match epics_base_rs::runtime::env::get("EPICS_CA_MAX_SEARCH_PERIOD") {
+        Some(raw) => match raw.parse::<f64>() {
+            // Parsed: honour it, clamped up to C's 60 s lower limit.
+            Ok(v) => v.max(MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS),
+            // Not a real number: C keeps the default, no clamp.
+            Err(_) => MAX_SEARCH_PERIOD_DEFAULT_SECS,
+        },
+        // Unset: documented C default.
+        None => MAX_SEARCH_PERIOD_DEFAULT_SECS,
     }
+}
+
+/// Normal tick cadence. Rust's search model is structurally
+/// different from C's per-cid exponential-backoff timer wheel — a
+/// fixed `N_SEARCH_BUCKETS = 30` ring advancing one bucket per tick
+/// caps the per-cid retry period at `N_SEARCH_BUCKETS * tick`. To
+/// honour `EPICS_CA_MAX_SEARCH_PERIOD` we derive the tick so that
+/// one full ring revolution equals the resolved period:
+/// `tick = period / N_SEARCH_BUCKETS`.
+///
+/// With the C-faithful period (default 300 s, lower-limited at
+/// 60 s — see [`max_search_period_secs`]) the tick is always
+/// `>= 60/30 = 2 s`; the default 300 s yields a 10 s tick.
+fn normal_tick() -> Duration {
+    let period_secs = max_search_period_secs();
+    Duration::from_secs_f64(period_secs / N_SEARCH_BUCKETS as f64)
 }
 
 /// Fast-mode tick cadence after a beacon poke. One full bucket
@@ -437,7 +458,7 @@ pub(crate) async fn run_search_engine(
 
     // pvxs `client.cpp::tickSearch`: a single steady tick advances the
     // bucket cursor. fast_tick is engaged after a beacon poke for one
-    // full revolution, then we revert to NORMAL_TICK.
+    // full revolution, then we revert to the `normal_tick()` cadence.
     let mut tick = interval(normal_tick());
     tick.tick().await; // skip immediate fire
     let mut tick_is_fast = false;
@@ -1571,6 +1592,78 @@ mod tests {
         );
     }
 
+    /// EX-R2: `EPICS_CA_MAX_SEARCH_PERIOD` must follow the C
+    /// `udpiiu.cpp::getMaxPeriod` semantics — default 300 s when
+    /// unset, lower-limited at 60 s when explicitly set below it,
+    /// default kept on a non-numeric value.
+    ///
+    /// Pre-fix Rust defaulted to 30 s when unset (not the documented
+    /// C 300 s) and accepted any positive value verbatim, so a
+    /// configured `45` was honoured as 45 s instead of being clamped
+    /// up to C's 60 s lower bound. `normal_tick` is the consumer:
+    /// `tick = period / N_SEARCH_BUCKETS`.
+    #[test]
+    #[serial_test::serial]
+    fn ex_r2_max_search_period_matches_c_default_and_lower_bound() {
+        // SAFETY: serial_test::serial guarantees no concurrent env
+        // access; mutations are confined to this test.
+        let restore = std::env::var("EPICS_CA_MAX_SEARCH_PERIOD").ok();
+
+        // Unset → documented C default of 300 s (NOT the pre-fix
+        // historical Rust 30 s). tick = 300/30 = 10 s.
+        unsafe { std::env::remove_var("EPICS_CA_MAX_SEARCH_PERIOD") };
+        assert_eq!(
+            max_search_period_secs(),
+            300.0,
+            "unset env must default to C's 300 s, not the old 30 s"
+        );
+        assert_eq!(normal_tick(), Duration::from_secs(10));
+
+        // Configured value below the 60 s lower limit → clamped up
+        // to 60 s (C `maxPeriod < maxSearchPeriodLowerLimit`).
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "45") };
+        assert_eq!(
+            max_search_period_secs(),
+            60.0,
+            "a configured 45 s must clamp UP to C's 60 s lower bound"
+        );
+        assert_eq!(normal_tick(), Duration::from_secs(2));
+
+        // Configured value at/above the lower limit → honoured.
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "120") };
+        assert_eq!(max_search_period_secs(), 120.0);
+        assert_eq!(normal_tick(), Duration::from_secs(4));
+
+        // The documented C default expressed explicitly.
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "300") };
+        assert_eq!(max_search_period_secs(), 300.0);
+
+        // Non-numeric value → C keeps the default (longStatus != 0).
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "not-a-number") };
+        assert_eq!(
+            max_search_period_secs(),
+            300.0,
+            "a non-numeric value must fall back to the 300 s default"
+        );
+
+        // Negative / zero are not real-number rejections in C — they
+        // parse and are caught by the lower-bound clamp.
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "-5") };
+        assert_eq!(
+            max_search_period_secs(),
+            60.0,
+            "a negative value must clamp to the 60 s lower bound, not default"
+        );
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "0") };
+        assert_eq!(max_search_period_secs(), 60.0);
+
+        // Restore the environment for any later serial test.
+        match restore {
+            Some(v) => unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", v) },
+            None => unsafe { std::env::remove_var("EPICS_CA_MAX_SEARCH_PERIOD") },
+        }
+    }
+
     /// Reproducer for Launchpad bug #739789 (TCP nameserver send queue
     /// memory leak): a stuck/slow TCP peer caused libca's `sendQue` to
     /// grow unbounded as the UDP search agent kept pushing frames.
@@ -2094,14 +2187,28 @@ mod tests {
     /// with a sniffer socket as the only addr_list destination,
     /// submits a `Schedule { Reconnect }`, and asserts that a
     /// SEARCH packet for the right cid lands on the sniffer within
-    /// ~1.1 s — i.e. the next tick after Schedule arrival, mirroring
-    /// pvxs `Channel::disconnect` recovery timing. Without the
+    /// one tick after Schedule arrival, mirroring pvxs
+    /// `Channel::disconnect` recovery timing. Without the
     /// pvxs-parity placement the search would have been placed in a
-    /// cid-hashed bucket up to 30 s away and never fired within a
+    /// cid-hashed bucket a full ring away and never fired within a
     /// reasonable window.
+    ///
+    /// EX-R2: the production tick cadence is now `normal_tick()` =
+    /// `EPICS_CA_MAX_SEARCH_PERIOD / N_SEARCH_BUCKETS`. The test
+    /// pins the env var to C's 60 s lower limit so the tick is the
+    /// fastest the C-faithful clamp allows — 2 s — and asserts
+    /// against that, not the pre-EX-R2 1 s tick.
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn reconnect_search_broadcasts_within_one_tick() {
         use std::net::Ipv4Addr;
+
+        // EX-R2: pin the search period to C's 60 s lower bound so
+        // the tick is the minimum the clamp allows (60/30 = 2 s).
+        // SAFETY: serial_test::serial guarantees no concurrent env
+        // access; the var is restored before the test returns.
+        let restore = std::env::var("EPICS_CA_MAX_SEARCH_PERIOD").ok();
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "60") };
 
         // Sniffer on loopback ephemeral. Used as the engine's
         // ONLY addr_list destination.
@@ -2127,7 +2234,7 @@ mod tests {
         ));
 
         // Schedule a Reconnect for cid=42. Engine places it in
-        // current_bucket; the next 1-Hz tick fires the broadcast.
+        // current_bucket; the next tick fires the broadcast.
         let cid = 42u32;
         let pv = "TEST:CA:RECONNECT:PV";
         let started = std::time::Instant::now();
@@ -2140,7 +2247,7 @@ mod tests {
             .expect("schedule send");
 
         let mut buf = vec![0u8; 4096];
-        let recv_result = tokio::time::timeout(Duration::from_secs(3), async {
+        let recv_result = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let (n, _from) = sniffer.recv_from(&mut buf).await?;
                 if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
@@ -2153,22 +2260,29 @@ mod tests {
         let elapsed = started.elapsed();
         engine_handle.abort();
 
+        // Restore the environment for any later serial test.
+        match restore {
+            Some(v) => unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", v) },
+            None => unsafe { std::env::remove_var("EPICS_CA_MAX_SEARCH_PERIOD") },
+        }
+
         let n = recv_result
-            .expect("Reconnect SEARCH must arrive within 3 s")
+            .expect("Reconnect SEARCH must arrive within 5 s")
             .expect("recv_from must not error");
         assert!(
             n > 0,
             "received an empty datagram — Reconnect SEARCH path is broken"
         );
-        // Tight assertion catches the regression we're guarding
-        // against (cid-hashed 1-30 s pre-fix latency) without being
-        // flaky on a loaded CI runner. 2.5 s gives ~1.5 s slack on
-        // top of the ≤ 1.1 s pvxs-parity target.
+        // Reconnect lands in current_bucket → fires on the next
+        // tick (2 s at the pinned 60 s period). 4 s gives ~2 s slack
+        // for scheduler / mio jitter on loaded CI; the regression
+        // this guards against (cid-hashed full-ring latency) would
+        // delay the fire by up to a whole ring revolution.
         assert!(
-            elapsed < Duration::from_millis(2500),
-            "Reconnect should broadcast within ~1.1 s (one tick); \
-             took {elapsed:?} — bucket placement / tick handler may \
-             have regressed"
+            elapsed < Duration::from_millis(4000),
+            "Reconnect should broadcast within one tick (~2 s at the \
+             pinned 60 s period); took {elapsed:?} — bucket placement \
+             / tick handler may have regressed"
         );
     }
 
@@ -2179,16 +2293,25 @@ mod tests {
     /// only this test catches an accumulator drift between the
     /// pure fn and the live `current_bucket`-advancing tick loop.
     ///
-    /// Expected SEARCH arrival times (relative to Schedule submission):
-    ///   #1 at ~1 s   (first tick after Schedule lands)
-    ///   #2 at ~2 s   (idx+1, +1 cycle)
-    ///   #3 at ~4 s   (idx+(1+2)=idx+3, +2 cycles)
+    /// EX-R2: with `EPICS_CA_MAX_SEARCH_PERIOD` pinned to C's 60 s
+    /// lower bound the tick is 60/30 = 2 s. Expected SEARCH arrival
+    /// times (relative to Schedule submission):
+    ///   #1 at ~2 s   (first tick after Schedule lands)
+    ///   #2 at ~4 s   (idx+1, +1 cycle = 2 s)
+    ///   #3 at ~8 s   (idx+(1+2)=idx+3, +2 cycles = 4 s)
     ///
-    /// Slack: ±500 ms per gap to absorb scheduler / mio jitter on
-    /// loaded CI. Total runtime ~4 s.
+    /// Slack: ±1 s per gap to absorb scheduler / mio jitter on
+    /// loaded CI. Total runtime ~8 s.
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn retry_escalation_pvxs_pattern() {
         use std::net::Ipv4Addr;
+
+        // EX-R2: pin the search period to C's 60 s lower bound →
+        // 2 s tick. SAFETY: serial_test::serial guarantees no
+        // concurrent env access; restored before return.
+        let restore = std::env::var("EPICS_CA_MAX_SEARCH_PERIOD").ok();
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "60") };
 
         let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
         let sniffer_addr = sniffer
@@ -2225,7 +2348,7 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         let mut packet_times = Vec::new();
         for i in 0..3 {
-            let t = tokio::time::timeout(Duration::from_secs(8), async {
+            let t = tokio::time::timeout(Duration::from_secs(12), async {
                 loop {
                     let (n, _) = sniffer.recv_from(&mut buf).await.expect("recv");
                     if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
@@ -2234,28 +2357,35 @@ mod tests {
                 }
             })
             .await
-            .unwrap_or_else(|_| panic!("SEARCH #{} did not arrive within 8 s", i + 1));
+            .unwrap_or_else(|_| panic!("SEARCH #{} did not arrive within 12 s", i + 1));
             packet_times.push(t);
         }
 
         engine_handle.abort();
 
+        // Restore the environment for any later serial test.
+        match restore {
+            Some(v) => unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", v) },
+            None => unsafe { std::env::remove_var("EPICS_CA_MAX_SEARCH_PERIOD") },
+        }
+
         assert!(
-            packet_times[0] < Duration::from_millis(1500),
-            "first SEARCH should arrive ~1 s after Schedule; got {:?}",
+            packet_times[0] < Duration::from_millis(3000),
+            "first SEARCH should arrive ~2 s after Schedule (one tick \
+             at the pinned 60 s period); got {:?}",
             packet_times[0]
         );
         let gap_12 = packet_times[1].saturating_sub(packet_times[0]);
         let gap_23 = packet_times[2].saturating_sub(packet_times[1]);
         assert!(
-            (700..=1500).contains(&(gap_12.as_millis() as u64)),
-            "gap #1→#2 should be ~1 s (nSearch=1); got {gap_12:?}. \
-             Production retry escalation may have regressed."
+            (1500..=3000).contains(&(gap_12.as_millis() as u64)),
+            "gap #1→#2 should be ~2 s (nSearch=1, one 2 s cycle); \
+             got {gap_12:?}. Production retry escalation may have regressed."
         );
         assert!(
-            (1500..=2700).contains(&(gap_23.as_millis() as u64)),
-            "gap #2→#3 should be ~2 s (nSearch=2); got {gap_23:?}. \
-             Production retry escalation may have regressed."
+            (3000..=5400).contains(&(gap_23.as_millis() as u64)),
+            "gap #2→#3 should be ~4 s (nSearch=2, two 2 s cycles); \
+             got {gap_23:?}. Production retry escalation may have regressed."
         );
     }
 

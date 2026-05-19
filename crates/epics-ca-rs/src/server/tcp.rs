@@ -310,6 +310,14 @@ struct ClientState {
     channels: HashMap<u32, ChannelEntry>,
     subscriptions: HashMap<u32, SubscriptionEntry>,
     channel_access: HashMap<u32, AccessLevel>,
+    /// MR-R20: per-SID write-trap mask of the ACF rule that resolved
+    /// the channel's access level. Kept parallel to `channel_access`
+    /// (same key set, inserted/removed together) because the trap
+    /// flag has no `CA_PROTO_ACCESS_RIGHTS` wire representation — it
+    /// is consumed only by TRAPWRITE put-logging dispatch, never
+    /// diffed for access-rights transition frames. Mirrors C
+    /// `pasgclient->trapMask` (`asLibRoutines.c:1048`).
+    channel_trap: HashMap<u32, bool>,
     next_sid: AtomicU32,
     /// Recycled SIDs from channels destroyed via CLEAR_CHANNEL. C-G9:
     /// without recycling, `next_sid` would wrap after 2³² channel
@@ -384,6 +392,7 @@ impl ClientState {
             channels: HashMap::new(),
             subscriptions: HashMap::new(),
             channel_access: HashMap::new(),
+            channel_trap: HashMap::new(),
             next_sid: AtomicU32::new(1),
             free_sids: Vec::new(),
             hostname: String::new(),
@@ -450,13 +459,23 @@ impl ClientState {
     fn lookup_access(&self, sid: u32) -> crate::server::access_token::CaAccessChecked {
         use crate::server::access_token::CaAccessChecked;
         match self.channel_access.get(&sid).copied() {
-            Some(level) => CaAccessChecked::from_level(level),
+            Some(level) => {
+                // MR-R20: the trap mask is kept in a parallel map
+                // populated alongside `channel_access`. A missing
+                // entry means the rule carried no trap option.
+                let rule_was_trap = self.channel_trap.get(&sid).copied().unwrap_or(false);
+                CaAccessChecked::from_level(level, rule_was_trap)
+            }
             None => CaAccessChecked::denied(),
         }
     }
 
-    /// Compute access rights bits for a channel target.
-    async fn compute_access(&self, target: &ChannelTarget) -> u32 {
+    /// Compute access rights bits for a channel target, together with
+    /// the write-trap mask of the ACF rule that resolved the level
+    /// (MR-R20). The trap flag is `false` for `SimplePv`/`RecordField`
+    /// targets whose access was not resolved through a `TRAPWRITE`
+    /// rule — including the no-ACF permissive fallback.
+    async fn compute_access(&self, target: &ChannelTarget) -> (u32, bool) {
         match target {
             ChannelTarget::SimplePv(_) => {
                 let guard = self.acf.read().await;
@@ -468,20 +487,24 @@ impl ClientState {
                     // PR #641: pass auth method/authority so
                     // METHOD("x509") / AUTHORITY(<issuer>) rules
                     // can gate mTLS-authenticated peers.
-                    match acf_cfg.check_access_method(
+                    let (level, rule_was_trap) = acf_cfg.check_access_method_trap(
                         "DEFAULT",
                         &self.hostname,
                         &self.username,
                         0,
                         &self.auth_method,
                         &self.auth_authority,
-                    ) {
+                    );
+                    let bits = match level {
                         AccessLevel::ReadWrite => 3,
                         AccessLevel::Read => 1,
                         AccessLevel::NoAccess => 0,
-                    }
+                    };
+                    (bits, rule_was_trap)
                 } else {
-                    3
+                    // No ACF attached: permissive ReadWrite, no rule
+                    // resolved access, so no TRAPWRITE applies.
+                    (3, false)
                 }
             }
             ChannelTarget::RecordField { record, field: f } => {
@@ -502,7 +525,7 @@ impl ClientState {
                 // entirely. Now ACF runs first; the read-only flag
                 // only strips the WRITE bit from the result.
                 let guard = self.acf.read().await;
-                let acf_level = if let Some(ref acf_cfg) = *guard {
+                let (acf_level, rule_was_trap) = if let Some(ref acf_cfg) = *guard {
                     // Round-33A (R33-G4): thread the per-record
                     // ASL into the ACF check so `RULE(N, …)`
                     // gates correctly disable rules whose level
@@ -512,7 +535,7 @@ impl ClientState {
                     // can gate write access by issuer CA.
                     let asg = &instance.common.asg;
                     let asl = instance.common.asl;
-                    acf_cfg.check_access_method(
+                    acf_cfg.check_access_method_trap(
                         asg,
                         &self.hostname,
                         &self.username,
@@ -521,14 +544,18 @@ impl ClientState {
                         &self.auth_authority,
                     )
                 } else {
-                    AccessLevel::ReadWrite
+                    (AccessLevel::ReadWrite, false)
                 };
-                match (acf_level, is_ro) {
+                let bits = match (acf_level, is_ro) {
                     (AccessLevel::NoAccess, _) => 0,
                     (AccessLevel::Read, _) => 1,
                     (AccessLevel::ReadWrite, true) => 1,
                     (AccessLevel::ReadWrite, false) => 3,
-                }
+                };
+                // The trap mask reflects the rule that granted access;
+                // a read-only field stripping the WRITE bit does not
+                // change which rule matched.
+                (bits, rule_was_trap)
             }
         }
     }
@@ -1957,7 +1984,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     }
                 };
 
-                let access = state.compute_access(&target).await;
+                let (access, rule_was_trap) = state.compute_access(&target).await;
                 let access_level = match access {
                     3 => AccessLevel::ReadWrite,
                     1 => AccessLevel::Read,
@@ -1975,6 +2002,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     },
                 );
                 state.channel_access.insert(sid, access_level);
+                // MR-R20: keep the trap-mask map in lockstep with
+                // `channel_access` so `lookup_access` always finds a
+                // consistent pair for this SID.
+                state.channel_trap.insert(sid, rule_was_trap);
 
                 let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
                 ar.cid = client_cid;
@@ -2526,7 +2557,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // Round 44 type-state WRITE gate. `lookup_access` is
             // the only path to the cache; the witness type ensures
             // the matching ECA code reaches the wire.
-            let _write_grant = match state.lookup_access(sid).require_write() {
+            let write_grant = match state.lookup_access(sid).require_write() {
                 Ok(g) => g,
                 Err(denied) => {
                     if is_notify {
@@ -2558,6 +2589,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     return Ok(());
                 }
             };
+
+            // MR-R20: the write-trap mask of the ACF rule that
+            // authorised this write. C `asTrapWriteWithData`
+            // (`rsrv/camessage.c:768-779`) consults
+            // `pasgclient->trapMask` so a `NOTRAPWRITE` rule — or a
+            // rule with no trap option — is not reported to
+            // put-logging listeners. Pre-fix Rust hard-coded
+            // `rule_was_trap: true` for every accepted write.
+            let rule_was_trap = write_grant.rule_was_trap();
 
             // MR-R1: acquire the per-channel WRITE_NOTIFY busy gate
             // here — after the SID/type/access checks and *before* any
@@ -2692,7 +2732,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         no_elements: write_count,
                         event_id: trap_event_id,
                         status: None,
-                        rule_was_trap: true,
+                        rule_was_trap,
                     },
                 );
             }
@@ -2742,7 +2782,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         no_elements: write_count,
                         event_id: trap_event_id,
                         status: Some(audit_result),
-                        rule_was_trap: true,
+                        rule_was_trap,
                     },
                 );
             }
@@ -2829,6 +2869,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             write_type as u16,
                             write_count,
                             trap_event_id,
+                            rule_was_trap,
                         )
                     });
                     let join = tokio::spawn(async move {
@@ -2855,7 +2896,9 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // "ok" for ECA_NORMAL or the ECA-code form
                         // for anything else so listeners can filter
                         // failed puts.
-                        if let Some((pv, user, host, peer, val, dbr, ne, ev_id)) = trap_inputs {
+                        if let Some((pv, user, host, peer, val, dbr, ne, ev_id, rule_was_trap)) =
+                            trap_inputs
+                        {
                             let status_s = if final_status == ECA_NORMAL {
                                 "ok".to_string()
                             } else {
@@ -2874,7 +2917,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     no_elements: ne,
                                     event_id: ev_id,
                                     status: Some(&status_s),
-                                    rule_was_trap: true,
+                                    rule_was_trap,
                                 },
                             );
                         }
@@ -3706,6 +3749,9 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             }
             if let Some(entry) = state.channels.remove(&sid) {
                 state.channel_access.remove(&sid);
+                // MR-R20: drop the parallel trap-mask entry so a
+                // recycled SID never inherits a stale trap flag.
+                state.channel_trap.remove(&sid);
                 state.release_sid(sid);
                 if let Some(tx) = &conn_events {
                     let _ = tx.send(ServerConnectionEvent::ChannelCleared {
@@ -3885,7 +3931,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
         let mut w = writer.lock().await;
         let mut any_frame_written = false;
         for (sid, cid, target) in chan_info {
-            let new_access = state.compute_access(&target).await;
+            let (new_access, new_rule_was_trap) = state.compute_access(&target).await;
             let new_level = match new_access {
                 3 => AccessLevel::ReadWrite,
                 1 => AccessLevel::Read,
@@ -3895,6 +3941,10 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                 .channel_access
                 .insert(sid, new_level)
                 .unwrap_or(AccessLevel::NoAccess);
+            // MR-R20: an ACF reload can change which rule grants
+            // access (e.g. a new TRAPWRITE rule), so the trap mask
+            // must be refreshed alongside the level.
+            state.channel_trap.insert(sid, new_rule_was_trap);
             if old_level == new_level {
                 continue;
             }

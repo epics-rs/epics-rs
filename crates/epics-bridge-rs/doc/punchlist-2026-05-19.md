@@ -29,8 +29,9 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ### Priority 1 — ACF/identity/RPC protection
 
-- [ ] **BR-R4** — QSRV ACF adapter collapses method/authority/roles and field ASL.
+- [x] **BR-R4** — QSRV ACF adapter collapses method/authority/roles and field ASL.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:153-176`
+  - Done: worker B, commit `db9a79e4` on `caucus/HJB9ABPH/backend` (+ doc tracker commit `2a58c9d9` on main); regression `br_r4_acf_method_authority_roles_field_asl`. Cross-crate: also touched `epics-base-rs/src/server/access_security.rs` (quoted-string support in `read_brace_list`). Upstream parity: pvxs credentials.cpp:31-45; securityclient.cpp:25,42-45; epics-base asLibRoutines.c:1006; asLib_lex.l.
 
 - [ ] **BR-R21** — PVA gateway READ/MONITOR upstream authorization uses the shared cache client.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:604-632`
@@ -102,7 +103,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 17
-- Done: 0
-- In progress: 0
+- Total open: 16 (was 17)
+- Done: 1 (BR-R4)
+- In progress: 1 (BR-R21, worker B)
 - Blocked: 0

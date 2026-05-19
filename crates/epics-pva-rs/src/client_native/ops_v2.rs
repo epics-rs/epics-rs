@@ -547,6 +547,97 @@ pub async fn op_put_field(
     result
 }
 
+/// PUT a single dotted-path field using a caller-provided pvRequest.
+/// Like [`op_put_field`] but INIT uses `pv_req` bytes supplied by the
+/// caller (typically `field() record[process=..,block=..]`) instead of
+/// a derived `field(<path>)` selector. The DATA phase still targets
+/// `field_path` exclusively. `field_path` must be non-empty.
+///
+/// pvxs parity: `pvalink_channel.cpp:31-38` (putReq template carries
+/// record options) + `linkBuildPut:138` (field targeting via
+/// `top[fieldName]`).
+pub async fn op_put_field_with_request(
+    channel: &Arc<Channel>,
+    field_path: &str,
+    pv_req: &[u8],
+    value_str: &str,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let order = server.byte_order;
+    let big_endian = matches!(order, ByteOrder::Big);
+    let codec = PvaCodec { big_endian };
+    let ioid = alloc_ioid();
+
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
+    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
+    let cache = server.type_cache();
+
+    let init_req = codec.build_put_init(sid, ioid, pv_req);
+    server.send(init_req).await?;
+    let init_frame = await_frame(&mut stream, op_timeout).await?;
+    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+        OpResponse::Init(i) => i,
+        other => {
+            server.unregister_ioid(ioid);
+            return Err(PvaError::Protocol(format!(
+                "expected PUT INIT, got {other:?}"
+            )));
+        }
+    };
+    if !init.status.is_success() {
+        server.unregister_ioid(ioid);
+        return Err(PvaError::Protocol(format!(
+            "PUT INIT failed: {:?}",
+            init.status
+        )));
+    }
+    ioid_guard.arm_destroy(sid);
+    let intro = init.introspection;
+
+    let parts: Vec<&str> = field_path.split('.').filter(|s| !s.is_empty()).collect();
+    let value = build_put_value_for_path(&intro, &parts, value_str)?;
+    let bit = intro.bit_for_path(field_path).ok_or_else(|| {
+        PvaError::InvalidValue(format!(
+            "field path '{field_path}' not present in introspection"
+        ))
+    })?;
+
+    let mut payload = Vec::new();
+    payload.put_u32(sid, order);
+    payload.put_u32(ioid, order);
+    payload.put_u8(0x00);
+    let mut changed = BitSet::new();
+    changed.set(bit);
+    changed.write_into(order, &mut payload);
+    encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut payload);
+    let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
+    let mut frame = Vec::new();
+    header.write_into(&mut frame);
+    frame.extend_from_slice(&payload);
+    server.send(frame).await?;
+
+    let done_frame = await_frame(&mut stream, op_timeout).await?;
+    let result = match decode_op_response(&done_frame, Some(&intro))? {
+        OpResponse::Status(s) => {
+            if s.status.is_success() {
+                Ok(())
+            } else {
+                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+            }
+        }
+        other => Err(PvaError::Protocol(format!(
+            "expected PUT done, got {other:?}"
+        ))),
+    };
+
+    ioid_guard.disarm();
+    let destroy = codec.build_destroy_request(sid, ioid);
+    let _ = server.send(destroy).await;
+    server.unregister_ioid(ioid);
+    result
+}
+
 /// PUT a pre-built [`PvField`] (typed-NT path). Skips the
 /// string-form round-trip used by [`op_put`] / [`op_put_raw`] —
 /// `value` is encoded directly against the server-supplied
@@ -604,6 +695,85 @@ pub async fn op_put_value(
     changed.write_into(order, &mut payload);
     // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
     // only the fields whose bit is set. Encode consistently.
+    encode_pv_field_with_bitset(value, &intro, &changed, 0, order, &mut payload);
+    let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
+    let mut frame = Vec::new();
+    header.write_into(&mut frame);
+    frame.extend_from_slice(&payload);
+    server.send(frame).await?;
+
+    let done_frame = await_frame(&mut stream, op_timeout).await?;
+    let result = match decode_op_response(&done_frame, Some(&intro))? {
+        OpResponse::Status(s) => {
+            if s.status.is_success() {
+                Ok(())
+            } else {
+                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+            }
+        }
+        other => Err(PvaError::Protocol(format!(
+            "expected PUT done, got {other:?}"
+        ))),
+    };
+
+    ioid_guard.disarm();
+    let destroy = codec.build_destroy_request(sid, ioid);
+    let _ = server.send(destroy).await;
+    result
+}
+
+/// PUT a pre-built [`PvField`] with a caller-provided pvRequest.
+/// Like [`op_put_value`] but INIT uses the caller's `pv_req` bytes
+/// (for `record._options` like `process` / `block`) instead of the
+/// default `field(value)` selector. DATA still targets the `"value"`
+/// bit. pvxs `pvalink_channel.cpp:268` parity for typed OUT arrays.
+pub async fn op_put_value_raw(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    value: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let order = server.byte_order;
+    let big_endian = matches!(order, ByteOrder::Big);
+    let codec = PvaCodec { big_endian };
+    let ioid = alloc_ioid();
+
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
+    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
+    let cache = server.type_cache();
+
+    let init_req = codec.build_put_init(sid, ioid, pv_req);
+    server.send(init_req).await?;
+    let init_frame = await_frame(&mut stream, op_timeout).await?;
+    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+        OpResponse::Init(i) => i,
+        other => {
+            return Err(PvaError::Protocol(format!(
+                "expected PUT INIT, got {other:?}"
+            )));
+        }
+    };
+    if !init.status.is_success() {
+        return Err(PvaError::Protocol(format!(
+            "PUT INIT failed: {:?}",
+            init.status
+        )));
+    }
+    ioid_guard.arm_destroy(sid);
+    let intro = init.introspection;
+
+    let mut payload = Vec::new();
+    payload.put_u32(sid, order);
+    payload.put_u32(ioid, order);
+    payload.put_u8(0x00);
+    let mut changed = BitSet::new();
+    if let Some(bit) = intro.bit_for_path("value") {
+        changed.set(bit);
+    } else {
+        changed.set(0);
+    }
+    changed.write_into(order, &mut payload);
     encode_pv_field_with_bitset(value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();

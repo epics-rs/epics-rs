@@ -23,10 +23,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_bridge_rs::pva_gateway::{MultiTenantPvaGatewayBuilder, PvaGateway, PvaGatewayConfig};
+use epics_bridge_rs::pva_gateway::{
+    ChannelCache, GatewayChannelSource, MultiTenantPvaGatewayBuilder, PvaGateway, PvaGatewayConfig,
+};
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedPV, SharedSource};
+use epics_pva_rs::pvdata::{
+    FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray,
+};
+use epics_pva_rs::server_native::{
+    ChannelSource, PvaServer, PvaServerConfig, SharedPV, SharedSource,
+};
 
 /// `epics:nt/NTScalar:1.0` descriptor wrapping a `double value` —
 /// the shape every real IOC / QSRV PV exposes. A bare top-level
@@ -575,5 +581,251 @@ async fn critical1_audit_layer_records_put() {
             && *res == AuditResult::Denied),
         "Audit layer (outermost) must record the ReadOnly-denied PUT \
          for GW:AUDIT:PV as Denied; got {recorded:?}"
+    );
+}
+
+/// BR-R6: typed PUT pass-through. Pre-fix the gateway re-encoded every
+/// upstream PUT through `pvfield_to_pvput_string`; the function recursed
+/// into the "value" sub-field and joined String array elements with spaces
+/// before passing to `pvput`, which splits on commas —
+/// so `value: ["hello world", "foo bar"]` became `value: ["hello world foo bar"]`
+/// (1 element instead of 2). After fix the gateway calls `pvput_pv_field`
+/// (typed), forwarding the PvField as-is.
+///
+/// Upstream parity: pvxs/src/clientget.cpp:305 — `to_wire_valid(R, temp)`
+/// (no string encoding in the pvxs PUT path).
+///
+/// Fails on main: `pvfield_to_pvput_string` recurses to "value", space-joins
+/// the array → `pvput` → `build_put_value` splits on commas → 1 element stored.
+/// Passes after fix: `pvput_pv_field` sends the typed structure intact.
+///
+/// Calls `GatewayChannelSource::put_value` directly to avoid the
+/// per-credential upstream-client routing issue (BR-R8): when the downstream
+/// client sends "ca" auth with a non-empty OS username, `upstream_client_for`
+/// creates a new client without `server_addr`, which falls through to
+/// `Resolver::Search` and times out against the isolated test server.
+/// Testing via the source directly stays on the shared cache client
+/// (Direct resolver → always works) and still exercises the exact
+/// `put_value` code path changed by BR-R6.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn br_r6_gateway_typed_put_passthrough() {
+    // Upstream: a structure with a "value: String[]" sub-field.
+    // request_to_mask succeeds for field(value) on this shape (server
+    // finds the "value" entry), so the upstream monitor starts cleanly.
+    let pv = SharedPV::new();
+    let desc = FieldDesc::Structure {
+        struct_id: "test:strarray/1.0".to_string(),
+        fields: vec![(
+            "value".to_string(),
+            FieldDesc::ScalarArray(ScalarType::String),
+        )],
+    };
+    let initial = PvField::Structure({
+        let mut s = PvStructure::new("test:strarray/1.0");
+        s.set(
+            "value",
+            PvField::ScalarArray(vec![ScalarValue::String("init".to_string())]),
+        );
+        s
+    });
+    pv.open(desc, initial);
+    let source = SharedSource::new();
+    source.add("BR:R6:PV", pv.clone());
+
+    let pick = || {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let pick_udp = || {
+        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let us_cfg = PvaServerConfig {
+        tcp_port: pick(),
+        udp_port: pick_udp(),
+        ..PvaServerConfig::isolated()
+    };
+    let us_addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        us_cfg.tcp_port,
+    );
+    let _us = PvaServer::start(Arc::new(source), us_cfg).expect("upstream start");
+
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    // Use GatewayChannelSource directly — same put_value code path, no
+    // downstream auth layer that would route to a per-credential client.
+    let cache = ChannelCache::new(upstream_client, Duration::from_secs(60));
+    let mut src = GatewayChannelSource::new(cache);
+    src.connect_timeout = Duration::from_secs(2);
+
+    // Two strings with spaces: pvfield_to_pvput_string (main) recurses into
+    // "value", joins with spaces → "hello world foo bar", then pvput's
+    // comma-split yields 1 element. pvput_pv_field (fix) preserves both.
+    let put_value = PvField::Structure({
+        let mut s = PvStructure::new("test:strarray/1.0");
+        s.set(
+            "value",
+            PvField::ScalarArray(vec![
+                ScalarValue::String("hello world".to_string()),
+                ScalarValue::String("foo bar".to_string()),
+            ]),
+        );
+        s
+    });
+    src.put_value("BR:R6:PV", put_value)
+        .await
+        .expect("typed structure PUT through gateway source must succeed");
+
+    let stored = pv.current().expect("upstream PV must have a current value");
+    // Decode the string array from whatever PvField variant the server
+    // stores. The server decodes wire bytes into ScalarArrayTyped (Arc-backed);
+    // ScalarArray (Vec-backed) is the client-side construction form.
+    let stored_strs: Option<Vec<String>> = match stored {
+        PvField::Structure(ref s) => match s.get_field("value") {
+            Some(PvField::ScalarArrayTyped(TypedScalarArray::String(arr))) => Some(arr.to_vec()),
+            Some(PvField::ScalarArray(vals)) => Some(
+                vals.iter()
+                    .filter_map(|v| {
+                        if let ScalarValue::String(s) = v {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            ),
+            other => panic!("unexpected value shape in structure: {other:?}"),
+        },
+        other => panic!("unexpected top-level PvField: {other:?}"),
+    };
+    assert_eq!(
+        stored_strs,
+        Some(vec!["hello world".to_string(), "foo bar".to_string()]),
+        "upstream must hold both array elements intact \
+         (pre-fix space-join collapses to 1 element)",
+    );
+}
+
+/// BR-R41: typed-subscribe fallback delivers live updates.
+///
+/// `GatewayChannelSource::subscribe` routes through `subscribe_inner`
+/// which bridges a `broadcast::Receiver<PvField>` (from `entry.subscribe()`)
+/// to an mpsc channel. Pre-fix the typed broadcast sender `tx_inner` was
+/// dropped before the `pvmonitor_raw_frames_handle` callback ran
+/// (`let _ = tx_inner; // typed broadcast retired in raw path`), so
+/// `bcast_rx.recv()` blocked forever after the initial snapshot. Downstream
+/// monitors using a pvRequest that forces the decoded fallback (masked
+/// fields, pipelined, filtered, or EPICS_PVA_GW_RAW_FRAMES=NO) received
+/// only the first value — never further updates.
+///
+/// Fails on main: `tx_inner` dropped → second value never sent → timeout.
+/// Passes after fix: `tx_inner` moves into callback, `tx_inner.send(val)`
+/// fires after each decoded event → update reaches the subscriber.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn br_r41_typed_subscribe_delivers_updates() {
+    // Upstream: Structure { value: Double } — field(value) pvRequest
+    // succeeds for this shape, so the upstream monitor starts cleanly.
+    let pv = SharedPV::new();
+    let desc = FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+    };
+    let initial = PvField::Structure({
+        let mut s = PvStructure::new("");
+        s.set("value", PvField::Scalar(ScalarValue::Double(1.0)));
+        s
+    });
+    pv.open(desc, initial);
+    let source = SharedSource::new();
+    source.add("BR:R41:PV", pv.clone());
+
+    let pick = || {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let pick_udp = || {
+        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let us_cfg = PvaServerConfig {
+        tcp_port: pick(),
+        udp_port: pick_udp(),
+        ..PvaServerConfig::isolated()
+    };
+    let us_addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        us_cfg.tcp_port,
+    );
+    let _us = PvaServer::start(Arc::new(source), us_cfg).expect("upstream start");
+
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let cache = ChannelCache::new(upstream_client, Duration::from_secs(60));
+    let mut src = GatewayChannelSource::new(cache);
+    src.connect_timeout = Duration::from_secs(2);
+
+    // subscribe() uses subscribe_inner → typed broadcast fallback path.
+    let mut rx = src
+        .subscribe("BR:R41:PV")
+        .await
+        .expect("subscribe must return Some for a known PV");
+
+    // First receive: initial snapshot from entry.snapshot().
+    let snap = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("initial snapshot must arrive within 2s")
+        .expect("channel must be open");
+    assert_eq!(
+        scalar_double(&snap),
+        Some(1.0),
+        "initial snapshot must be 1.0"
+    );
+
+    // Post an update upstream; the monitor callback fires, apply_monitor_event
+    // decodes it, and (after fix) tx_inner sends it to the typed broadcast.
+    let update_val = PvField::Structure({
+        let mut s = PvStructure::new("");
+        s.set("value", PvField::Scalar(ScalarValue::Double(42.0)));
+        s
+    });
+    pv.try_post(update_val);
+
+    // Drain until 42.0 arrives or 2 s elapses. The server's decoded
+    // path seeds new subscribers with the current value AND sends an
+    // explicit initial snapshot, so one extra 1.0 may arrive before
+    // the 42.0 update. Pre-fix: tx_inner was dropped → broadcast
+    // permanently empty → this loop times out.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let update = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let v = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .expect("update must arrive within 2s (pre-fix tx_inner dropped → blocks forever)")
+            .expect("channel must be open");
+        if scalar_double(&v) == Some(42.0) {
+            break v;
+        }
+    };
+    assert_eq!(
+        scalar_double(&update),
+        Some(42.0),
+        "typed subscribe must deliver the post-initial update",
     );
 }

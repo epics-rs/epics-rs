@@ -84,6 +84,13 @@ pub struct PvaLinkResolver {
     /// defaults. Mirrors the role of pvxs `pvaLinkConfig` carried on
     /// the `jlink` for the lifetime of the link.
     link_options: Arc<parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>>,
+    /// Per-PV OUT link-option overrides (BR-R11).
+    ///
+    /// Mirrors `link_options` for the OUT direction: `put_value` uses
+    /// these to carry the operator's `proc`, `field`, `defer`, `retry`
+    /// settings to the upstream PUT, instead of building a fresh
+    /// default config on every write. Populated by [`Self::open_out_link`].
+    out_link_options: Arc<parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>>,
     /// Database handle used by the B3 scan-on-update forwarder to
     /// process owning records. `None` until [`install_pvalink_resolver`]
     /// wires it — without it, monitor events still update the cached
@@ -139,6 +146,12 @@ struct ScanTarget {
     /// SCAN being Passive (pvalink_channel.cpp:313). True here means
     /// "skip processing when the owning record's SCAN != Passive".
     passive_only: bool,
+    /// BR-R27: per-link sub-field selector. Mirrors pvxs
+    /// `pvaLink::fieldName` resolved per-link from the shared channel
+    /// root (`pvalink_link.cpp:91`). Change detection in
+    /// `run_notify_forwarder` uses this field so targets with
+    /// different sub-fields track changes independently.
+    field: String,
 }
 
 impl PvaLinkResolver {
@@ -149,6 +162,7 @@ impl PvaLinkResolver {
             reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             link_options: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            out_link_options: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             db: Arc::new(parking_lot::RwLock::new(None)),
             scan_targets: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             forwarders: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
@@ -296,9 +310,15 @@ impl PvaLinkResolver {
                 return Err(PvaLinkError::NotLocal(pv_name));
             }
         }
-        self.link_options
-            .write()
-            .insert(pv_name.clone(), cfg.clone());
+        // BR-R27: key by the full link string (scheme-stripped, including
+        // any query) so two links to the same PV with different options
+        // (field, sevr, Q, …) each have their own entry. pvxs equivalent:
+        // each `pvaLink` carries its own `pvaLinkConfig`
+        // (`pvxs/ioc/pvalink.h:65`). The bare PV name is still used as
+        // the registry key (shared channel by (pv_name, pipeline,
+        // queue_size)) per `pvxs/ioc/pvalink.h:116`.
+        let full_key = strip_scheme(link_string).unwrap_or(link_string).to_string();
+        self.link_options.write().insert(full_key, cfg.clone());
         // B3: register the scan-on-update target before opening so the
         // forwarder spawned below already sees it.
         if let Some(rec) = record {
@@ -314,6 +334,7 @@ impl PvaLinkResolver {
                         monorder: cfg.monorder,
                         atomic: cfg.atomic,
                         passive_only: cfg.scan_on_passive,
+                        field: cfg.field.clone(),
                     });
             }
         }
@@ -343,9 +364,10 @@ impl PvaLinkResolver {
         let pv_name = pv_name.to_string();
         let scan_targets = self.scan_targets.clone();
         let db = self.db.clone();
-        let field = link.config().field.clone();
+        // BR-R27: field is now per-ScanTarget (not shared across all
+        // targets). `run_notify_forwarder` reads each target's own field.
         self.handle
-            .spawn(run_notify_forwarder(pv_name, field, rx, scan_targets, db));
+            .spawn(run_notify_forwarder(pv_name, rx, scan_targets, db));
     }
 
     /// Whether `pv_name` is hosted by the attached `PvDatabase` as a
@@ -366,17 +388,66 @@ impl PvaLinkResolver {
         }
     }
 
-    /// Build the INP config for `pv_name`, applying any options
-    /// registered via [`Self::open_link`]. Falls back to the pvxs
-    /// monitor defaults (`NMS`, `Q=4`, no pipeline) when none.
-    fn inp_cfg_for(&self, pv_name: &str) -> PvaLinkConfig {
-        if let Some(cfg) = self.link_options.read().get(pv_name) {
+    /// Build the INP config for a link, applying any options registered
+    /// via [`Self::open_link`]. `full` may be a bare PV name or a
+    /// query-bearing string (`PV?field=F&proc=CPP`). Lookup order:
+    /// full string first, then bare PV name, then pvxs defaults.
+    ///
+    /// BR-R27: keying by full string ensures two links to the same PV
+    /// with different options each return their own config
+    /// (`pvxs/ioc/pvalink.h:65` per-link `pvaLinkConfig`).
+    fn inp_cfg_for(&self, full: &str) -> PvaLinkConfig {
+        let opts = self.link_options.read();
+        if let Some(cfg) = opts.get(full) {
             return PvaLinkConfig {
                 monitor: true,
                 ..cfg.clone()
             };
         }
-        default_inp_cfg(pv_name)
+        let bare = strip_query(full);
+        if bare != full {
+            if let Some(cfg) = opts.get(bare) {
+                return PvaLinkConfig {
+                    monitor: true,
+                    ..cfg.clone()
+                };
+            }
+        }
+        default_inp_cfg(bare)
+    }
+
+    /// Build the OUT config for a link. `full` may be bare or
+    /// query-bearing; lookup order matches `inp_cfg_for`.
+    ///
+    /// BR-R27: per-link config isolation for OUT links.
+    fn out_cfg_for(&self, full: &str) -> PvaLinkConfig {
+        let opts = self.out_link_options.read();
+        if let Some(cfg) = opts.get(full) {
+            return cfg.clone();
+        }
+        let bare = strip_query(full);
+        if bare != full {
+            if let Some(cfg) = opts.get(bare) {
+                return cfg.clone();
+            }
+        }
+        PvaLinkConfig::defaults_for(bare, LinkDirection::Out)
+    }
+
+    /// Open / cache an OUT link from a full `@pva://...` link string,
+    /// parsing and retaining its options (`proc`, `field`, `defer`,
+    /// `retry`, ...). The parsed [`PvaLinkConfig`] is stashed under the
+    /// bare PV name so the `put_value` resolver hot-path picks up the
+    /// operator's proc / field / defer settings on every write.
+    ///
+    /// Mirrors [`Self::open_link`] for the OUT direction. pvxs equivalent:
+    /// `pvaLinkConfig` carried on the `jlink` (pvalink_jlif.cpp).
+    pub async fn open_out_link(&self, link_string: &str) -> PvaLinkResult<Arc<PvaLink>> {
+        let cfg = PvaLinkConfig::parse(link_string, LinkDirection::Out)?;
+        // BR-R27: key by full link string (same rationale as open_link_inner).
+        let full_key = strip_scheme(link_string).unwrap_or(link_string).to_string();
+        self.out_link_options.write().insert(full_key, cfg.clone());
+        self.registry.get_or_open(cfg).await
     }
 
     /// Number of successful link reads since startup.
@@ -398,9 +469,10 @@ impl PvaLinkResolver {
     /// yet open, or links with no cached value. Mirrors pvxs
     /// `pvaGetAlarmMsg`'s severity output (pvalink_lset.cpp:544).
     pub fn link_alarm_severity(&self, pv_name: &str) -> Option<i32> {
-        let name = strip_scheme(pv_name)?;
+        let full = strip_scheme(pv_name)?;
+        let bare = strip_query(full);
         self.registry
-            .try_get(name, LinkDirection::Inp)?
+            .try_get_any(bare, LinkDirection::Inp)?
             .link_alarm_severity()
     }
 
@@ -449,7 +521,7 @@ impl PvaLinkResolver {
             // Strip optional pva:// prefix — the resolver receives the
             // bare PV name in some link forms but the prefixed form in
             // others. `ca://` is handled by libca, not pvalink — reject.
-            let name = match name.strip_prefix("pva://") {
+            let full = match name.strip_prefix("pva://") {
                 Some(stripped) => stripped,
                 None => {
                     if name.starts_with("ca://") {
@@ -458,11 +530,23 @@ impl PvaLinkResolver {
                     name
                 }
             };
+            // BR-R10/R27: strip query string; lazily register per-link
+            // options; get per-link config before the fast path so the
+            // field selector is available for `try_read_cached_with_field`.
+            let bare = strip_query(full);
+            if full != bare {
+                lazy_register_inp_opts(&resolver.link_options, full);
+            }
+            // BR-R27: cfg carries the per-link field (among other opts).
+            let cfg = resolver.inp_cfg_for(full);
 
             // Fast path: a previously-opened link with a cached
             // monitor value. No `block_on`, no async runtime touch.
-            if let Some(link) = resolver.registry.try_get(name, LinkDirection::Inp)
-                && let Some(value) = link.try_read_cached()
+            // BR-R27: `try_get_any` finds any cached link for this PV;
+            // `try_read_cached_with_field` applies the per-link field
+            // selector so two links to the same PV return their own leaf.
+            if let Some(link) = resolver.registry.try_get_any(bare, LinkDirection::Inp)
+                && let Some(value) = link.try_read_cached_with_field(&cfg.field)
             {
                 resolver
                     .reads
@@ -475,7 +559,6 @@ impl PvaLinkResolver {
             // B4: use `inp_cfg_for` so a link registered via
             // `open_link` keeps its options (`sevr`, `Q`, `pipeline`,
             // `monorder`); `default_inp_cfg` would discard them.
-            let cfg = resolver.inp_cfg_for(name);
             // The Lset external resolver is invoked from inside an
             // async context (PvDatabase::resolve_external_pv runs on a
             // tokio worker). Bare Handle::block_on panics under those
@@ -483,10 +566,12 @@ impl PvaLinkResolver {
             // the duration of the inner block_on so the runtime stays
             // healthy. Requires the multi-threaded runtime, which is
             // the only flavour our IOC binaries use.
+            let field = cfg.field.clone();
             let (link, value) = block_in_place_or_warn(|| {
                 resolver.handle.block_on(async {
                     let link = resolver.registry.get_or_open(cfg).await.ok()?;
-                    let value = link.read().await.ok()?;
+                    // BR-R27: use per-link field selector.
+                    let value = link.read_with_field(&field).await.ok()?;
                     Some((link, value))
                 })
             })?;
@@ -506,6 +591,11 @@ impl PvaLinkResolver {
 /// Registers the resolver under the `"pva"` lset scheme *and*
 /// installs the legacy [`ExternalPvResolver`] closure so callers
 /// using either dispatch path work transparently.
+///
+/// BR-R10: also pre-registers pvalink options and CP/CPP scan targets
+/// for every loaded DB record that carries a JSON-object pvalink with
+/// options. pvxs equivalent: options live on the `jlink` struct for
+/// the lifetime of the link (pvalink_jlif.cpp).
 pub async fn install_pvalink_resolver(
     db: &Arc<PvDatabase>,
     handle: tokio::runtime::Handle,
@@ -518,6 +608,30 @@ pub async fn install_pvalink_resolver(
         .await;
     db.register_link_set("pva", Arc::new(resolver.clone()))
         .await;
+
+    // BR-R10: scan all loaded records and pre-register any pvalink
+    // options encoded in the ParsedLink::Pva query string. This
+    // ensures CP/CPP scan targets are wired before the first monitor
+    // event and field/sevr/Q settings are effective from the first
+    // read/write without iocsh pre-warming.
+    use epics_base_rs::server::record::ParsedLink;
+    for record_name in db.all_record_names().await {
+        for (field_name, _raw, parsed) in db.record_link_fields(&record_name).await {
+            let ParsedLink::Pva(ref s) = parsed else {
+                continue;
+            };
+            if !s.contains('?') {
+                continue;
+            }
+            let link_str = format!("pva://{s}");
+            if field_name == "OUT" {
+                let _ = resolver.open_out_link(&link_str).await;
+            } else {
+                let _ = resolver.open_link_for_record(&link_str, &record_name).await;
+            }
+        }
+    }
+
     resolver
 }
 
@@ -539,22 +653,19 @@ type ScanTargetMap = Arc<parking_lot::RwLock<std::collections::HashMap<String, S
 /// is dropped (i.e. the link is closed).
 async fn run_notify_forwarder(
     pv_name: String,
-    field: String,
     mut rx: tokio::sync::mpsc::Receiver<PvField>,
     scan_targets: ScanTargetMap,
     db: Arc<parking_lot::RwLock<Option<PvDatabase>>>,
 ) {
-    // Last delivered leaf value, so `always=false` targets can be
-    // skipped on a no-op update (pvxs `pvaLinkConfig::always`).
-    let mut last: Option<PvField> = None;
+    // BR-R27: per-(record, field) last delivered leaf, so each target
+    // tracks changes against its own sub-field independently. Mirrors
+    // pvxs per-`pvaLink` change tracking (`pvalink_link.cpp:91`).
+    let mut last: std::collections::HashMap<(String, String), PvField> =
+        std::collections::HashMap::new();
     while let Some(value) = rx.recv().await {
-        let leaf = extract_leaf(&value, &field);
-        let changed = last.as_ref() != Some(&leaf);
-        last = Some(leaf);
-
         // Snapshot the fan-out, then order it: atomic group first,
         // then non-atomic; `monorder` within each group.
-        let mut targets: Vec<(String, bool, i32, bool, bool)> =
+        let mut targets: Vec<(String, bool, i32, bool, bool, String)> =
             match scan_targets.read().get(&pv_name) {
                 Some(fanout) => fanout
                     .records
@@ -566,6 +677,7 @@ async fn run_notify_forwarder(
                             t.monorder,
                             t.atomic,
                             t.passive_only,
+                            t.field.clone(),
                         )
                     })
                     .collect(),
@@ -573,7 +685,7 @@ async fn run_notify_forwarder(
             };
         // Sort key: (!atomic, monorder) → atomic (false sorts first),
         // then ascending monorder.
-        targets.sort_by_key(|(_, _, order, atomic, _)| (!*atomic, *order));
+        targets.sort_by_key(|(_, _, order, atomic, _, _)| (!*atomic, *order));
 
         let Some(db_handle) = db.read().clone() else {
             continue;
@@ -598,8 +710,8 @@ async fn run_notify_forwarder(
         // atomic link is locked exactly once.
         let atomic_records: Vec<String> = targets
             .iter()
-            .filter(|(_, _, _, atomic, _)| *atomic)
-            .map(|(record, _, _, _, _)| record.clone())
+            .filter(|(_, _, _, atomic, _, _)| *atomic)
+            .map(|(record, _, _, _, _, _)| record.clone())
             .collect();
 
         // The epoch guard is held only across the atomic group. pvxs
@@ -615,7 +727,7 @@ async fn run_notify_forwarder(
             Some(db_handle.lock_records(&atomic_records).await)
         };
 
-        for (record, always, _order, atomic, passive_only) in &targets {
+        for (record, always, _order, atomic, passive_only, field) in &targets {
             // `targets` is sorted atomic-first; the first non-atomic
             // target marks the end of the atomic group, so release
             // the epoch here — exactly where pvxs's `DBManyLocker`
@@ -623,10 +735,19 @@ async fn run_notify_forwarder(
             if !*atomic {
                 atomic_epoch = None;
             }
-            // pvxs: a CPP (`always=false`) link only scans when the
-            // input value actually changed; CP with `always` scans
-            // unconditionally. An atomic link scans whenever the
-            // batch changed so atomic siblings stay consistent.
+            // BR-R27: per-target change detection using each target's
+            // own field selector. pvxs `pvaLinkConfig::always` — CP
+            // scans unconditionally; atomic scans whenever any atomic
+            // sibling changed; CPP (`always=false`, non-atomic) only
+            // scans when this target's field leaf changed.
+            let changed = {
+                let leaf = extract_leaf(&value, field);
+                let key = (record.clone(), field.clone());
+                let prev = last.get(&key);
+                let did_change = prev != Some(&leaf);
+                last.insert(key, leaf);
+                did_change
+            };
             if !changed && !*always && !*atomic {
                 continue;
             }
@@ -693,10 +814,11 @@ impl LinkSet for PvaLinkResolver {
         // hot path or `pvxr` will open it lazily; any caller that
         // wants a fresh open should call `Self::open(name).await`
         // first.
-        let Some(name) = strip_scheme(name) else {
+        let Some(full) = strip_scheme(name) else {
             return false;
         };
-        match self.registry.try_get(name, LinkDirection::Inp) {
+        let bare = strip_query(full);
+        match self.registry.try_get_any(bare, LinkDirection::Inp) {
             Some(link) => link.is_connected(),
             None => false,
         }
@@ -706,11 +828,19 @@ impl LinkSet for PvaLinkResolver {
         if !self.is_enabled() {
             return None;
         }
-        let name = strip_scheme(name)?;
+        let full = strip_scheme(name)?;
+        let bare = strip_query(full);
+        // BR-R10/R27: lazily register per-link options from query
+        // string; get per-link config for field selector.
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
 
         // Fast path: cached monitor value, no async runtime touch.
-        if let Some(link) = self.registry.try_get(name, LinkDirection::Inp)
-            && let Some(value) = link.try_read_cached()
+        // BR-R27: apply per-link field selector.
+        if let Some(link) = self.registry.try_get_any(bare, LinkDirection::Inp)
+            && let Some(value) = link.try_read_cached_with_field(&cfg.field)
         {
             self.reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -721,11 +851,11 @@ impl LinkSet for PvaLinkResolver {
         // B4: use `inp_cfg_for` so a link registered via `open_link`
         // keeps its options (`sevr`, `Q`, `pipeline`, `monorder`);
         // `default_inp_cfg` would discard them.
-        let cfg = self.inp_cfg_for(name);
+        let field = cfg.field.clone();
         let value = block_in_place_or_warn(|| {
             self.handle.block_on(async {
                 let link = self.registry.get_or_open(cfg).await.ok()?;
-                link.read().await.ok()
+                link.read_with_field(&field).await.ok()
             })
         })?;
         self.reads
@@ -737,13 +867,16 @@ impl LinkSet for PvaLinkResolver {
         if !self.is_enabled() {
             return Err("pvalink disabled".into());
         }
-        let name = strip_scheme(name).ok_or_else(|| {
+        let full = strip_scheme(name).ok_or_else(|| {
             format!("pvalink rejects ca:// scheme: {name} (use the CA-link path instead)")
         })?;
-        let cfg = PvaLinkConfig {
-            process: true,
-            ..PvaLinkConfig::defaults_for(name, LinkDirection::Out)
-        };
+        let bare = strip_query(full);
+        // BR-R10/R27: lazily register per-link OUT options from query
+        // string; pass full string to out_cfg_for for per-link config.
+        if full != bare {
+            lazy_register_out_opts(&self.out_link_options, full);
+        }
+        let cfg = self.out_cfg_for(full);
         // P-G16: bypass the Display→string→parse round-trip for
         // ARRAYS (where Display alloc is O(N_elements * digits) and
         // pvput re-parses 25 MB strings on a 1 M-element waveform).
@@ -784,10 +917,11 @@ impl LinkSet for PvaLinkResolver {
     }
 
     fn alarm_message(&self, name: &str) -> Option<String> {
-        let name = strip_scheme(name)?;
+        let full = strip_scheme(name)?;
+        let bare = strip_query(full);
         let link = block_in_place_or_warn(|| {
             self.handle
-                .block_on(async { self.registry.get_or_open(default_inp_cfg(name)).await.ok() })
+                .block_on(async { self.registry.get_or_open(default_inp_cfg(bare)).await.ok() })
         })?;
         link.alarm_message()
     }
@@ -800,16 +934,21 @@ impl LinkSet for PvaLinkResolver {
         // value returned here is final — `None` means "do not
         // propagate" (NMS, or remote severity below the mode's
         // threshold, or no value cached).
-        let name = strip_scheme(name)?;
+        let full = strip_scheme(name)?;
+        let bare = strip_query(full);
         let link = block_in_place_or_warn(|| {
             self.handle
-                .block_on(async { self.registry.get_or_open(default_inp_cfg(name)).await.ok() })
+                .block_on(async { self.registry.get_or_open(default_inp_cfg(bare)).await.ok() })
         })?;
         link.link_alarm_severity()
     }
 
     fn time_stamp(&self, name: &str) -> Option<(i64, i32)> {
-        let name = strip_scheme(name)?;
+        let full = strip_scheme(name)?;
+        let bare = strip_query(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
         let link = block_in_place_or_warn(|| {
             self.handle.block_on(async {
                 // BR-R19: prefer the operator-installed link config so
@@ -817,7 +956,7 @@ impl LinkSet for PvaLinkResolver {
                 // for bare auto-resolved links (which never adopt
                 // upstream time — matching pvxs `pvaLinkConfig::time`
                 // default false).
-                let cfg = self.inp_cfg_for(name);
+                let cfg = self.inp_cfg_for(full);
                 self.registry.get_or_open(cfg).await.ok()
             })
         })?;
@@ -862,6 +1001,11 @@ impl LinkSet for PvaLinkResolver {
 /// dispatched by the CA-link path elsewhere, so an explicit `ca://`
 /// here returns `None` so the caller can short-circuit. Names with
 /// no scheme are passed through.
+///
+/// NOTE: the returned string may still contain a `?` query part when
+/// the link was parsed from a JSON object with extra options (BR-R10).
+/// Call `strip_query` on the result before using it as a registry key
+/// or a PV name lookup.
 fn strip_scheme(name: &str) -> Option<&str> {
     if let Some(stripped) = name.strip_prefix("pva://") {
         return Some(stripped);
@@ -870,6 +1014,56 @@ fn strip_scheme(name: &str) -> Option<&str> {
         return None;
     }
     Some(name)
+}
+
+/// Strip the `?key=value&…` query part that BR-R10 appends to bare PV
+/// names when a JSON `{pva: {pv: …, field: …}}` link carries options.
+/// Returns the bare PV name before the first `?`, or the whole slice
+/// if there is no `?`.
+fn strip_query(s: &str) -> &str {
+    s.split_once('?').map_or(s, |(bare, _)| bare)
+}
+
+/// Lazily register INP link options (field, sevr, proc, Q, …) from a
+/// query-string-bearing name into `link_options` so `inp_cfg_for`
+/// returns the right config on the first call for this link. `full`
+/// is the full link string including query (e.g.
+/// `"PV?field=F&proc=CPP"`). Only called when `full` contains `?`.
+///
+/// BR-R27: keyed by `full` (not bare PV name) so two links to the
+/// same PV with different options each get their own entry.
+/// pvxs parity: pvalink_jlif.cpp:24-196.
+fn lazy_register_inp_opts(
+    link_options: &parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>,
+    full: &str,
+) {
+    if link_options.read().contains_key(full) {
+        return;
+    }
+    if let Ok(cfg) = PvaLinkConfig::parse(&format!("pva://{full}"), LinkDirection::Inp) {
+        link_options.write().insert(
+            full.to_string(),
+            PvaLinkConfig {
+                monitor: true,
+                ..cfg
+            },
+        );
+    }
+}
+
+/// Lazily register OUT link options from a query-string-bearing name
+/// into `out_link_options`. Mirrors `lazy_register_inp_opts` for the
+/// OUT direction.
+fn lazy_register_out_opts(
+    out_link_options: &parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>,
+    full: &str,
+) {
+    if out_link_options.read().contains_key(full) {
+        return;
+    }
+    if let Ok(cfg) = PvaLinkConfig::parse(&format!("pva://{full}"), LinkDirection::Out) {
+        out_link_options.write().insert(full.to_string(), cfg);
+    }
 }
 
 fn default_inp_cfg(pv_name: &str) -> PvaLinkConfig {
@@ -1244,6 +1438,7 @@ mod tests {
             monorder: 0,
             atomic: false,
             passive_only: false,
+            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -1254,7 +1449,6 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
         let forwarder = tokio::spawn(run_notify_forwarder(
             "SRC".to_string(),
-            "value".to_string(),
             rx,
             scan_targets,
             db_slot,
@@ -1291,6 +1485,7 @@ mod tests {
             monorder: 0,
             atomic: false,
             passive_only: false,
+            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -1301,7 +1496,6 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
         let forwarder = tokio::spawn(run_notify_forwarder(
             "SRC".to_string(),
-            "value".to_string(),
             rx,
             scan_targets,
             db_slot,
@@ -1360,6 +1554,7 @@ mod tests {
             monorder: 0,
             atomic: false,
             passive_only: false,
+            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -1370,7 +1565,6 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
         let forwarder = tokio::spawn(run_notify_forwarder(
             "SRC".to_string(),
-            "value".to_string(),
             rx,
             scan_targets,
             db_slot,
@@ -1404,9 +1598,11 @@ mod tests {
         assert_eq!(fanout.records.len(), 1);
         assert_eq!(fanout.records[0].record, "MY:REC");
         drop(targets);
-        // Parsed options retained for the resolver hot path.
+        // BR-R27: options retained under the full query-bearing key.
         let opts = resolver.link_options.read();
-        let cfg = opts.get("SRC:PV").expect("link options retained");
+        let cfg = opts
+            .get("SRC:PV?proc=CP&sevr=MS")
+            .expect("link options retained");
         assert_eq!(cfg.sevr, SevrMode::Ms);
         assert!(cfg.scan_on_update);
     }
@@ -1423,12 +1619,14 @@ mod tests {
     }
 
     /// B2 through the resolver: `open_link` retains `sevr` so a later
-    /// bare-name `link_alarm_severity` query reflects the `MS` mode.
+    /// full-string `inp_cfg_for` query reflects the `MSI` mode.
+    /// BR-R27: key is the full query-bearing string, not the bare PV name.
     #[tokio::test]
     async fn b2_open_link_retains_sevr_mode() {
         let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
         let _ = resolver.open_link("pva://A:PV?sevr=MSI").await;
-        let cfg = resolver.inp_cfg_for("A:PV").clone();
+        // BR-R27: look up by the full link string (with query) — that is the key.
+        let cfg = resolver.inp_cfg_for("A:PV?sevr=MSI").clone();
         assert_eq!(cfg.sevr, SevrMode::Msi);
         // A PV never opened falls back to NMS default.
         assert_eq!(resolver.inp_cfg_for("UNSEEN").sevr, SevrMode::Nms);
@@ -1504,6 +1702,7 @@ mod tests {
             monorder: 1,
             atomic: false,
             passive_only: false,
+            field: String::new(),
         });
         fanout.records.push(ScanTarget {
             record: "D".into(),
@@ -1511,6 +1710,7 @@ mod tests {
             monorder: -1,
             atomic: false,
             passive_only: false,
+            field: String::new(),
         });
         // Atomic, monorder 5 / 0.
         fanout.records.push(ScanTarget {
@@ -1519,6 +1719,7 @@ mod tests {
             monorder: 5,
             atomic: true,
             passive_only: false,
+            field: String::new(),
         });
         fanout.records.push(ScanTarget {
             record: "B".into(),
@@ -1526,6 +1727,7 @@ mod tests {
             monorder: 0,
             atomic: true,
             passive_only: false,
+            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -1536,7 +1738,6 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
         let forwarder = tokio::spawn(run_notify_forwarder(
             "SRC".to_string(),
-            "value".to_string(),
             rx,
             scan_targets,
             db_slot,
@@ -1571,6 +1772,7 @@ mod tests {
             monorder: 0,
             atomic: true, // but atomic → scans anyway
             passive_only: false,
+            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -1580,7 +1782,6 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
         let forwarder = tokio::spawn(run_notify_forwarder(
             "SRC".to_string(),
-            "value".to_string(),
             rx,
             scan_targets,
             db_slot,
@@ -1701,6 +1902,160 @@ mod tests {
         );
     }
 
+    // ---- BR-R10: DB JSON pvalink options preserved ----
+
+    /// BR-R10: JSON-object pvalink options (field, proc, sevr, Q, …)
+    /// survive the parse→bridge pipeline.
+    ///
+    /// Two parts: (a) parse_link_v2 encodes JSON options as a
+    /// query string in ParsedLink::Pva, and (b) the integration layer
+    /// wires those options when open_link_for_record is called — the
+    /// same path install_pvalink_resolver's pre-scanner follows after
+    /// the parse fix.
+    ///
+    /// Fails on main: parse_link_v2 returns ParsedLink::Pva("TARGET:AI")
+    /// with no options, so the first assert immediately fails.
+    ///
+    /// Upstream parity: pvxs pvalink_jlif.cpp:24-196 (all pvalink
+    /// JSON keys parsed and stored on the jlink struct for the link's
+    /// lifetime).
+    #[tokio::test]
+    async fn br_r10_db_json_pvalink_options_preserved() {
+        use epics_base_rs::server::record::{ParsedLink, parse_link_v2};
+
+        // Part 1: parse_link_v2 must encode all options as query string.
+        let json =
+            r#"{pva: {pv: "TARGET:AI", field: "display.precision", proc: "CPP", sevr: "MS"}}"#;
+        let stored = match parse_link_v2(json) {
+            ParsedLink::Pva(s) => s,
+            other => panic!("expected Pva, got {other:?}"),
+        };
+        assert!(
+            stored.contains("field=display.precision"),
+            "field option must survive parse: {stored}"
+        );
+        assert!(stored.contains("proc=CPP"), "proc must survive: {stored}");
+        assert!(stored.contains("sevr=MS"), "sevr must survive: {stored}");
+
+        // Reconstruct config — all options must round-trip through
+        // PvaLinkConfig::parse (same code used by open_link_for_record
+        // in the pre-scanner).
+        let cfg = PvaLinkConfig::parse(&format!("pva://{stored}"), LinkDirection::Inp).unwrap();
+        assert_eq!(cfg.pv_name, "TARGET:AI");
+        assert_eq!(cfg.field, "display.precision");
+        assert!(cfg.scan_on_update, "CPP → scan_on_update");
+        assert!(cfg.scan_on_passive, "CPP → scan_on_passive");
+        assert_eq!(cfg.sevr, SevrMode::Ms);
+
+        // Part 2: the integration layer wires options when
+        // open_link_for_record is called with the query-bearing string.
+        // This is exactly what install_pvalink_resolver's pre-scanner
+        // does for each loaded record after the BR-R10 parse fix.
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let _ = resolver
+            .open_link_for_record(&format!("pva://{stored}"), "MY:RECORD")
+            .await;
+
+        // BR-R27: options are registered under the full query-bearing string.
+        let cfg = resolver.inp_cfg_for(&stored);
+        assert_eq!(
+            cfg.field, "display.precision",
+            "field option must be registered (was 'value' before fix)"
+        );
+        assert_eq!(cfg.sevr, SevrMode::Ms, "sevr option must be registered");
+        assert!(cfg.scan_on_update, "CPP scan_on_update must be registered");
+        assert!(
+            cfg.scan_on_passive,
+            "CPP scan_on_passive must be registered"
+        );
+
+        // Scan target must be registered under the bare PV name.
+        let targets = resolver.scan_targets.read();
+        let fanout = targets
+            .get("TARGET:AI")
+            .expect("CPP target must be registered");
+        assert_eq!(fanout.records[0].record, "MY:RECORD");
+        assert!(fanout.records[0].passive_only, "CPP must set passive_only");
+        // BR-R27: ScanTarget carries per-link field.
+        assert_eq!(
+            fanout.records[0].field, "display.precision",
+            "ScanTarget.field must reflect the per-link field selector"
+        );
+    }
+
+    /// BR-R27: two links to the same upstream PV with different `field`
+    /// and `proc` options must have independent cached state — no leakage
+    /// of one link's options into the other's config or scan targets.
+    ///
+    /// Fails on main: both links land in `link_options["TARGET:PV"]`
+    /// (last write wins), so the first link's config is overwritten and
+    /// the `inp_cfg_for` lookup returns the second link's field for both.
+    ///
+    /// Upstream parity:
+    ///   pvxs/ioc/pvalink.h:65    — `pvaLinkConfig` is per-link
+    ///   pvxs/ioc/pvalink.h:116   — channel key = (channelName, pvRequest)
+    ///   pvxs/ioc/pvalink_link.cpp:91 — `root = lchan->root[fieldName]`
+    #[tokio::test]
+    async fn br_r27_pvalink_cache_separates_per_link_options() {
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+
+        // Link A: read sub-field "alarm.severity", CPP (scan on passive).
+        let link_a = "pva://TARGET:PV?field=alarm.severity&proc=CPP";
+        let _ = resolver.open_link_for_record(link_a, "RECORD:A").await;
+
+        // Link B: read sub-field "value", CP (always scan).
+        let link_b = "pva://TARGET:PV?field=value&proc=CP";
+        let _ = resolver.open_link_for_record(link_b, "RECORD:B").await;
+
+        // Each link must have its own config — no cross-contamination.
+        let cfg_a = resolver.inp_cfg_for("TARGET:PV?field=alarm.severity&proc=CPP");
+        let cfg_b = resolver.inp_cfg_for("TARGET:PV?field=value&proc=CP");
+
+        assert_eq!(
+            cfg_a.field, "alarm.severity",
+            "link A field must not be overwritten by link B"
+        );
+        assert_eq!(
+            cfg_b.field, "value",
+            "link B field must retain its own value"
+        );
+        assert!(
+            cfg_a.scan_on_passive,
+            "link A CPP must set scan_on_passive; link B's CP must not clobber it"
+        );
+        assert!(
+            !cfg_b.scan_on_passive,
+            "link B CP must not be passive-only; link A must not propagate"
+        );
+
+        // ScanTargets must also be independent per-link — each record
+        // gets its own entry with its own field.
+        let targets = resolver.scan_targets.read();
+        let fanout = targets
+            .get("TARGET:PV")
+            .expect("scan targets registered for TARGET:PV");
+        let rec_a = fanout
+            .records
+            .iter()
+            .find(|t| t.record == "RECORD:A")
+            .expect("RECORD:A must be in scan targets");
+        let rec_b = fanout
+            .records
+            .iter()
+            .find(|t| t.record == "RECORD:B")
+            .expect("RECORD:B must be in scan targets");
+        assert_eq!(
+            rec_a.field, "alarm.severity",
+            "RECORD:A ScanTarget.field wrong"
+        );
+        assert_eq!(rec_b.field, "value", "RECORD:B ScanTarget.field wrong");
+        assert!(rec_a.passive_only, "RECORD:A must be CPP (passive_only)");
+        assert!(
+            !rec_b.passive_only,
+            "RECORD:B must be CP (not passive_only)"
+        );
+    }
+
     /// #2: with no QSRV provider wired (pvalink-only deployment), the
     /// `local` gate keeps its record / simple-PV behaviour — group-PV
     /// locality is simply unavailable, and a link to a non-local PV
@@ -1812,6 +2167,7 @@ mod tests {
             monorder: 0,
             atomic: true,
             passive_only: false,
+            field: "value".into(),
         });
         fanout.records.push(ScanTarget {
             record: "AT:B".into(),
@@ -1819,6 +2175,7 @@ mod tests {
             monorder: 1,
             atomic: true,
             passive_only: false,
+            field: "value".into(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -1829,7 +2186,6 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
         let forwarder = tokio::spawn(run_notify_forwarder(
             "SRC".to_string(),
-            "value".to_string(),
             rx,
             scan_targets,
             db_slot,

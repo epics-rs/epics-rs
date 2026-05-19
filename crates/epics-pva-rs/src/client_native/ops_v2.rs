@@ -1926,7 +1926,7 @@ pub async fn op_put_get(
     server.send(data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = decode_put_get_data(&resp_frame, &intro);
+    let result = decode_put_get_data(&resp_frame, &intro, &mut cache.lock());
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
@@ -1979,7 +1979,11 @@ fn decode_put_get_init(
 
 /// Decode a `PUT_GET` data response: `ioid + subcmd + status + get
 /// bitset + get value`.
-fn decode_put_get_data(frame: &super::decode::Frame, intro: &FieldDesc) -> PvaResult<PvField> {
+fn decode_put_get_data(
+    frame: &super::decode::Frame,
+    intro: &FieldDesc,
+    type_cache: &mut crate::pvdata::encode::TypeCache,
+) -> PvaResult<PvField> {
     if frame.header.command != Command::PutGet.code() {
         return Err(PvaError::Protocol(format!(
             "expected PUT_GET data, got command {}",
@@ -1998,9 +2002,10 @@ fn decode_put_get_data(frame: &super::decode::Frame, intro: &FieldDesc) -> PvaRe
         return Err(PvaError::Protocol(format!("PUT_GET: {status:?}")));
     }
     let changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
-    let value =
-        crate::pvdata::encode::decode_pv_field_with_bitset(intro, &changed, 0, &mut cur, order)
-            .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let value = crate::pvdata::encode::decode_pv_field_with_bitset_cached(
+        intro, &changed, 0, &mut cur, order, type_cache,
+    )
+    .map_err(|e| PvaError::Decode(e.to_string()))?;
     Ok(value)
 }
 

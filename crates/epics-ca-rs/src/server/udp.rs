@@ -633,11 +633,50 @@ async fn recv_loop(
             // search storm of N small same-peer datagrams yields ONE
             // outbound, not N. Different-src peeks flush the current
             // batch and start a fresh one for the new src.
-            match socket.try_recv_from(&mut peek_buf) {
-                Ok((peek_len, peek_src)) => {
-                    if peek_len < CaHeader::SIZE {
-                        continue 'parse;
+            //
+            // MR-R7: a queued datagram that is rejected (short header,
+            // ignore-list, rate limit) must NOT restart the parser
+            // over the *previous* datagram's bytes still sitting in
+            // `current_buf`, and must NOT leave `current_src` pointing
+            // at the rejected peer. C `cast_server.c` always overwrites
+            // `client->recv.buf` with `recvfrom` before `camessage()`
+            // runs, and an ignored datagram sets `status = -1` so the
+            // whole parse + `client->addr` update is skipped. Mirror
+            // that: drain-and-discard rejected datagrams in this inner
+            // loop without touching `current_src` / `current_buf`;
+            // only an accepted datagram performs the peer-change flush,
+            // replaces `current_buf`, and re-enters `'parse`.
+            let next_datagram = loop {
+                match socket.try_recv_from(&mut peek_buf) {
+                    Ok((peek_len, peek_src)) => {
+                        // C `cast_server.c` requires a full caHdr before
+                        // `camessage()` will parse anything; a short
+                        // datagram yields no SEARCH work. Discard it
+                        // and try to drain the next queued datagram —
+                        // do NOT re-parse `current_buf`.
+                        if peek_len < CaHeader::SIZE {
+                            continue;
+                        }
+                        // Ignore-list / rate-limit rejections discard
+                        // the datagram without changing peer state —
+                        // C skips `camessage()` for `casIgnoreAddrs`
+                        // hits via `status = -1`.
+                        if let SocketAddr::V4(v4) = peek_src {
+                            if ignore_addrs.contains(v4.ip()) {
+                                continue;
+                            }
+                        }
+                        if !udp_rl.allow(&peek_src) {
+                            metrics::counter!("ca_server_udp_search_drops_total").increment(1);
+                            continue;
+                        }
+                        break Some((peek_len, peek_src));
                     }
+                    Err(_) => break None, // recv queue drained
+                }
+            };
+            match next_datagram {
+                Some((peek_len, peek_src)) => {
                     if peek_src != current_src {
                         // Peer change: flush current batch to the old
                         // src, then reset batch state for the new src.
@@ -654,20 +693,15 @@ async fn recv_loop(
                         client_seq = None;
                         client_minor = None;
                     }
-                    if let SocketAddr::V4(v4) = peek_src {
-                        if ignore_addrs.contains(v4.ip()) {
-                            continue 'parse;
-                        }
-                    }
-                    if !udp_rl.allow(&peek_src) {
-                        metrics::counter!("ca_server_udp_search_drops_total").increment(1);
-                        continue 'parse;
-                    }
+                    // Replace `current_buf` with the accepted
+                    // datagram's bytes BEFORE re-entering `'parse` so
+                    // the parser never reprocesses the previous
+                    // datagram under a new `current_src` (MR-R7).
                     current_buf.clear();
                     current_buf.extend_from_slice(&peek_buf[..peek_len]);
                     continue 'parse;
                 }
-                Err(_) => break 'parse, // recv queue drained
+                None => break 'parse, // recv queue drained
             }
         } // 'parse
         // R2-48 + R2-79 + R2-80 + R2-81: flush the accumulated SEARCH

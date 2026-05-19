@@ -1361,6 +1361,144 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     );
 }
 
+/// MR-R7: the R2-79 UDP batching loop must not re-parse a stale
+/// datagram. When `try_recv_from` drains a queued datagram that is
+/// rejected (short sub-header, ignore-list, or rate-limited), pre-fix
+/// Rust `continue 'parse`d WITHOUT replacing `current_buf` — so the
+/// *previous* datagram's bytes were parsed a second time. For a
+/// short queued datagram the prior client's SEARCH was reprocessed
+/// and its reply duplicated to that same client; for an ignore/rate-
+/// limit reject the peer-change branch had already repointed
+/// `current_src`, so the reply went to the wrong address.
+///
+/// C `cast_server.c:163-281` does one `recvfrom` per loop iteration,
+/// always overwriting `client->recv.buf` before `camessage()` runs.
+/// The Rust drain loop must likewise discard a rejected queued
+/// datagram without re-parsing the old buffer.
+///
+/// Test: burst N valid SEARCHes (each with a unique client cid)
+/// interleaved with short junk datagrams so the server's
+/// `try_recv_from` peek reliably finds a queued short datagram while
+/// the prior SEARCH is still in `current_buf`. Every cid must be
+/// answered exactly once; pre-fix a re-parse duplicates a cid's
+/// SEARCH reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
+    use std::collections::HashMap as Map;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+
+    let port = {
+        let probe = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("reserve free CA UDP port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("MR7:PV", EpicsValue::Double(1.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Build a CA_PROTO_SEARCH UDP datagram for MR7:PV. The server's
+    // SEARCH reply echoes `m_available` (the client cid), so a unique
+    // cid per request lets us detect a duplicated answer.
+    let search_datagram = |cid: u32| -> Vec<u8> {
+        let pv = b"MR7:PV";
+        let mut padded = pv.to_vec();
+        padded.push(0);
+        while !padded.len().is_multiple_of(8) {
+            padded.push(0);
+        }
+        let mut h = CaHeader::new(CA_PROTO_SEARCH);
+        h.postsize = padded.len() as u16;
+        h.data_type = CA_DO_REPLY;
+        h.count = CA_MINOR_VERSION;
+        h.cid = cid;
+        h.available = cid;
+        let mut bytes = h.to_bytes().to_vec();
+        bytes.extend_from_slice(&padded);
+        bytes
+    };
+
+    let server_addr = ("127.0.0.1", port);
+    let peer = UdpSocket::bind(("127.0.0.1", 0)).await.expect("bind peer");
+
+    // Burst N (valid SEARCH, short junk) pairs from the SAME peer so
+    // they queue in the server's kernel recv buffer. The burst
+    // outpaces the server's one-datagram-per-`recv_from` processing,
+    // so when the server peeks via `try_recv_from` it finds the
+    // queued short junk datagram while the prior SEARCH is still in
+    // `current_buf`.
+    const N: u32 = 300;
+    let first_cid = 0xC000_0000u32;
+    for i in 0..N {
+        peer.send_to(&search_datagram(first_cid + i), server_addr)
+            .await
+            .expect("send SEARCH");
+        // 8-byte datagram: below the 16-byte CA header size.
+        peer.send_to(&[0u8; 8], server_addr)
+            .await
+            .expect("send short junk datagram");
+    }
+
+    // Collect every reply datagram for up to ~1.5s, walking each
+    // 16-byte header and counting SEARCH replies per echoed cid.
+    let mut counts: Map<u32, u32> = Map::new();
+    let mut rbuf = [0u8; 64 * 1024];
+    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), peer.recv_from(&mut rbuf)).await {
+            Ok(Ok((got, _from))) => {
+                let mut off = 0;
+                while off + CaHeader::SIZE <= got {
+                    let Ok(h) = CaHeader::from_bytes(&rbuf[off..off + CaHeader::SIZE]) else {
+                        break;
+                    };
+                    if h.cmmd == CA_PROTO_SEARCH {
+                        *counts.entry(h.available).or_insert(0) += 1;
+                    }
+                    off += CaHeader::SIZE + ((h.postsize as usize + 7) & !7);
+                }
+            }
+            Ok(Err(e)) => panic!("peer recv error: {e}"),
+            Err(_) => {
+                if counts.len() as u32 >= N {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Every valid SEARCH cid must be answered exactly once. A cid
+    // answered twice means the server re-parsed a stale `current_buf`
+    // after draining a rejected short datagram (MR-R7).
+    let duplicated: Vec<(u32, u32)> = counts
+        .iter()
+        .filter(|&(_, &c)| c > 1)
+        .map(|(&cid, &c)| (cid, c))
+        .collect();
+    assert!(
+        duplicated.is_empty(),
+        "MR-R7: {} SEARCH cid(s) answered more than once — stale `current_buf` \
+         reparsed after a rejected queued datagram: {:?}",
+        duplicated.len(),
+        duplicated,
+    );
+    assert_eq!(
+        counts.len() as u32,
+        N,
+        "every valid SEARCH cid must be answered exactly once \
+         (got {} distinct cids, expected {N})",
+        counts.len(),
+    );
+}
+
 /// C `read_notify_action` (`rsrv/camessage.c:693-697`): `INVALID_DB_REQ`
 /// (data_type > LAST_BUFFER_TYPE = 38) returns RSRV_ERROR WITHOUT
 /// emitting any wire frame — only the deprecated `read_action`

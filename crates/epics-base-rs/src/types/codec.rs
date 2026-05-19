@@ -73,8 +73,8 @@ fn sts_pad(native: DbFieldType) -> &'static [u8] {
         // (epicsInt32, **4 bytes** — `db_access.h:45 typedef epicsInt32
         // dbr_long_t`) between severity and value. Layout is
         // status(2)+severity(2)+RISC_pad(4)+value(8) → value at offset 8.
-        // Int64 is served over CA as DBR_DOUBLE so it shares the pad.
-        DbFieldType::Double | DbFieldType::Int64 => &[0, 0, 0, 0],
+        // Int64/UInt64 are served over CA as DBR_DOUBLE so they share the pad.
+        DbFieldType::Double | DbFieldType::Int64 | DbFieldType::UInt64 => &[0, 0, 0, 0],
         _ => &[],
     }
 }
@@ -181,9 +181,10 @@ fn serialize_gr_ctrl(
             buf.extend_from_slice(&vec![0u8; n_limits]);
             buf.push(0); // RISC_pad
         }
-        // Int64 has no CA GR/CTRL type — this arm is unreachable in normal CA paths.
-        // Use same layout as Double (precision(2)+pad(2)+units(8)+n*f64 limits).
-        DbFieldType::Int64 => {
+        // Int64/UInt64 have no CA GR/CTRL type — this arm is unreachable in
+        // normal CA paths. Use same layout as Double
+        // (precision(2)+pad(2)+units(8)+n*f64 limits).
+        DbFieldType::Int64 | DbFieldType::UInt64 => {
             buf.extend_from_slice(&[0u8; 4]); // precision + pad
             buf.extend_from_slice(&[0u8; MAX_UNITS_SIZE]);
             let n_limits = if ctrl { 8 } else { 6 };
@@ -287,8 +288,8 @@ fn encode_gr(
             encode_units_limits_u8(&mut buf, snapshot, 6);
             buf.push(0); // RISC_pad
         }
-        // Int64 has no CA GR type; use Double layout.
-        DbFieldType::Int64 => {
+        // Int64/UInt64 have no CA GR type; use Double layout.
+        DbFieldType::Int64 | DbFieldType::UInt64 => {
             encode_prec_units_limits_f64(&mut buf, snapshot, 6);
         }
     }
@@ -332,8 +333,8 @@ fn encode_ctrl(
             encode_units_limits_u8(&mut buf, snapshot, 8);
             buf.push(0); // RISC_pad
         }
-        // Int64 has no CA CTRL type; use Double layout.
-        DbFieldType::Int64 => {
+        // Int64/UInt64 have no CA CTRL type; use Double layout.
+        DbFieldType::Int64 | DbFieldType::UInt64 => {
             encode_prec_units_limits_f64(&mut buf, snapshot, 8);
         }
     }
@@ -823,8 +824,8 @@ fn decode_gr_ctrl(
                 });
             }
         }
-        // Int64 has no CA GR/CTRL type; decode as Double layout.
-        DbFieldType::Int64 => {
+        // Int64/UInt64 have no CA GR/CTRL type; decode as Double layout.
+        DbFieldType::Int64 | DbFieldType::UInt64 => {
             let precision = read_i16(data, off)?;
             off += 4; // precision(2) + pad(2)
             let units = read_string(data, off, MAX_UNITS_SIZE);

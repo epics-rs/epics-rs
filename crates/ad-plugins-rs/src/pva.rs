@@ -133,7 +133,10 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
         .map(|a| NdAttribute {
             name: a.name.clone(),
             value: attribute_value_to_scalar(&a.value),
+            tags: Vec::new(),
             descriptor: a.description.clone(),
+            alarm: NdAlarm::default(),
+            time_stamp: data_time_stamp.clone(),
             source_type: ndattr_source_type(&a.source),
             source: ndattr_source_string(&a.source),
         })
@@ -148,7 +151,6 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
         unique_id: array.unique_id,
         data_time_stamp: data_time_stamp.clone(),
         attribute,
-        descriptor: String::new(),
         alarm: NdAlarm {
             severity: 0,
             status: 0,

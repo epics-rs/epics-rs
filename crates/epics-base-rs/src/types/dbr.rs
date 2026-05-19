@@ -81,6 +81,11 @@ pub enum DbFieldType {
     /// Internal-only type for int64in/int64out records.
     /// No CA wire type 7 exists; over CA these PVs appear as Double (type 6).
     Int64 = 7,
+    /// Internal-only type for unsigned 64-bit EPICS fields (C `DBF_UINT64`,
+    /// dbStatic `dbfType` index 8). The CA wire protocol has no 64-bit
+    /// type, so over CA these PVs appear as Double (type 6); over PVA they
+    /// are served natively as `ulong`. Mirrors `Int64`'s CA handling.
+    UInt64 = 8,
 }
 
 impl DbFieldType {
@@ -104,15 +109,15 @@ impl DbFieldType {
             Self::Short | Self::Enum => 2,
             Self::Float | Self::Long => 4,
             Self::Char => 1,
-            Self::Double | Self::Int64 => 8,
+            Self::Double | Self::Int64 | Self::UInt64 => 8,
         }
     }
 
-    /// Return the wire type code as a `u16`. Int64 has no CA wire type
-    /// and is reported as `DBR_DOUBLE` (6) for over-the-wire purposes.
+    /// Return the wire type code as a `u16`. Int64/UInt64 have no CA wire
+    /// type and are reported as `DBR_DOUBLE` (6) for over-the-wire purposes.
     fn ca_wire_type(&self) -> u16 {
         match self {
-            Self::Int64 => Self::Double as u16,
+            Self::Int64 | Self::UInt64 => Self::Double as u16,
             other => *other as u16,
         }
     }
@@ -174,11 +179,11 @@ pub fn dbr_buffer_size(dbr_type: u16, native_type: DbFieldType, count: usize) ->
             //   sts_char:   +RISC_pad(1)  → meta 5
             //   sts_double: +RISC_pad(4)  → meta 8 (dbr_long_t)
             //   others:     no pad        → meta 4
-            // Int64 is served over CA as DBR_DOUBLE so it shares the
-            // double pad.
+            // Int64/UInt64 are served over CA as DBR_DOUBLE so they share
+            // the double pad.
             match native_type {
                 DbFieldType::Char => 5,
-                DbFieldType::Double | DbFieldType::Int64 => 8,
+                DbFieldType::Double | DbFieldType::Int64 | DbFieldType::UInt64 => 8,
                 _ => 4,
             }
         }

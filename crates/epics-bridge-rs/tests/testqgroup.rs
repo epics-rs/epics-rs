@@ -290,6 +290,117 @@ async fn group_get_carries_record_options_queue_size_and_atomic() {
     }
 }
 
+/// BR-R33-RESIDUAL: a group monitor stamps the *per-operation
+/// negotiated* `record._options.queueSize` — the value resolved
+/// from the MONITOR INIT pvRequest — not a hardcoded constant.
+/// pvxs `servermon.cpp:533-540` parses `record._options.queueSize`
+/// (kept iff >= 2) into `op->limit`, then `groupsource.cpp:359`
+/// stamps `stats.limitQueue` into the monitor value.
+#[tokio::test]
+async fn br_r33_group_monitor_stamps_negotiated_queue_size() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_bridge_rs::qsrv::group::{
+        GROUP_DEFAULT_QUEUE_SIZE, GroupMonitor, negotiated_queue_size,
+    };
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::time::Duration;
+
+    // Build a MONITOR INIT pvRequest carrying
+    // `record._options.queueSize = 32`.
+    let mk_request = |qsize: i32| {
+        let mut opts = PvStructure::new("");
+        opts.fields
+            .push(("queueSize".into(), PvField::Scalar(ScalarValue::Int(qsize))));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(opts)));
+        let mut req = PvStructure::new("epics:nt/NTRequest:1.0");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+        req
+    };
+
+    // Negotiation rule (pvxs `servermon.cpp:533`): >= 2 honoured.
+    assert_eq!(negotiated_queue_size(&mk_request(32)), 32);
+    // < 2 → default kept.
+    assert_eq!(
+        negotiated_queue_size(&mk_request(1)),
+        GROUP_DEFAULT_QUEUE_SIZE
+    );
+    // Absent `record._options.queueSize` → default.
+    assert_eq!(
+        negotiated_queue_size(&empty_request()),
+        GROUP_DEFAULT_QUEUE_SIZE
+    );
+
+    // The monitor stamps the negotiated value into its snapshots.
+    let queue_size_in_snapshot =
+        |def: epics_bridge_rs::qsrv::GroupPvDef, db: Arc<PvDatabase>, negotiated: i32| async move {
+            let mut mon = GroupMonitor::new(db.clone(), def).with_queue_size(negotiated);
+            mon.start().await.expect("start");
+            for rec_name in ["TEST:level", "TEST:count"] {
+                let rec = db.get_record(rec_name).await.expect("rec exists");
+                rec.read().await.notify_field("VAL", EventMask::VALUE);
+            }
+            let snap = tokio::time::timeout(Duration::from_secs(2), mon.poll())
+                .await
+                .expect("priming snapshot within 2s")
+                .expect("snapshot");
+            mon.stop().await;
+            let record = match snap
+                .fields
+                .iter()
+                .find(|(n, _)| n == "record")
+                .map(|(_, v)| v)
+            {
+                Some(PvField::Structure(s)) => s.clone(),
+                other => panic!("record sub-structure missing: {other:?}"),
+            };
+            let options = match record
+                .fields
+                .iter()
+                .find(|(n, _)| n == "_options")
+                .map(|(_, v)| v)
+            {
+                Some(PvField::Structure(s)) => s.clone(),
+                other => panic!("record._options missing: {other:?}"),
+            };
+            match options
+                .fields
+                .iter()
+                .find(|(n, _)| n == "queueSize")
+                .map(|(_, v)| v)
+            {
+                Some(PvField::Scalar(ScalarValue::Int(n))) => *n,
+                other => panic!("queueSize missing: {other:?}"),
+            }
+        };
+
+    // Negotiated 32 → snapshot carries 32.
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider.groups().get("TEST:grp").cloned().expect("grp");
+    let qs = queue_size_in_snapshot(def, db, negotiated_queue_size(&mk_request(32))).await;
+    assert_eq!(
+        qs, 32,
+        "monitor must stamp the negotiated queueSize (32), not a hardcoded default"
+    );
+
+    // No negotiation → default GROUP_DEFAULT_QUEUE_SIZE.
+    let db2 = make_db().await;
+    let provider2 = Arc::new(BridgeProvider::new(db2.clone()));
+    provider2.load_group_config(GROUP_JSON).expect("load");
+    let def2 = provider2.groups().get("TEST:grp").cloned().expect("grp");
+    let qs_default =
+        queue_size_in_snapshot(def2, db2, negotiated_queue_size(&empty_request())).await;
+    assert_eq!(
+        qs_default, GROUP_DEFAULT_QUEUE_SIZE,
+        "absent queueSize → monitor stamps the default"
+    );
+}
+
 /// BR-R17: a per-member ACF denial fails the group PUT even when the
 /// group PV itself is writable. Mirrors pvxs's per-field
 /// SecurityClient gating (groupsource.cpp:161 + 515) — "any

@@ -13,7 +13,9 @@ use tokio::sync::{RwLock, mpsc};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure};
 
-use super::provider::{AnyChannel, BridgeProvider, Channel, ChannelProvider, PvaMonitor};
+use super::provider::{
+    AnyChannel, BridgeProvider, Channel, ChannelProvider, ClientCreds, PvaMonitor,
+};
 
 /// Handle for a native PVA PV: latest snapshot + subscriber list +
 /// (optional) canonical introspection descriptor.
@@ -141,6 +143,26 @@ fn root_kind_name_desc(d: &FieldDesc) -> &'static str {
     }
 }
 
+/// Convert a native-PVA [`ChannelContext`] to a [`ClientCreds`] for
+/// `BridgeProvider::create_channel_with_creds`.
+///
+/// Carries method/authority/roles through so `AcfAccessControl` can
+/// evaluate METHOD/AUTHORITY rules and role-based UAG entries — fixing the
+/// BR-R4 defect where these were hardcoded to `"anonymous"` / `""`.
+fn ctx_to_creds(ctx: &epics_pva_rs::server_native::source::ChannelContext) -> ClientCreds {
+    ClientCreds {
+        user: ctx.account.clone(),
+        host: ctx.host.clone(),
+        method: ctx.method.clone(),
+        authority: ctx.authority.clone(),
+        // MR-R11: forward the native PVA peer's parsed role/group
+        // claims so `AcfAccessControl` can evaluate role-based UAG
+        // entries (`R member group:ops`). Previously hardcoded empty,
+        // so role-scoped ACF rules denied real over-the-wire clients.
+        roles: ctx.roles.clone(),
+    }
+}
+
 /// PvStore implementation backed by a qsrv [`BridgeProvider`].
 ///
 /// Handles single-record PVs, group composite PVs, and native PVA PVs
@@ -258,11 +280,20 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 return Some(value);
             }
             let channel = provider
-                .create_channel_for(&name, &ctx.account, &ctx.host)
+                .create_channel_with_creds(&name, ctx_to_creds(&ctx))
                 .await
                 .ok()?;
+            // MR-R13: forward the decoded INIT pvRequest so QSRV group
+            // GET honors `record._options` (e.g. `atomic`). The native
+            // wire layer now threads `init_pv_request` into the GET /
+            // PUT-readback `ChannelContext`. Fall back to an empty
+            // request only when no pvRequest structure was captured.
             let empty_request = PvStructure::new("");
-            match channel.get(&empty_request).await {
+            let request = match &ctx.pv_request {
+                Some(PvField::Structure(s)) => s,
+                _ => &empty_request,
+            };
+            match channel.get(request).await {
                 Ok(pv) => Some(PvField::Structure(pv)),
                 Err(e) => {
                     tracing::debug!(
@@ -304,14 +335,24 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // INIT pvRequest and reach us via `ChannelContext`. Fall
             // back to value-embedded options for callers that did not
             // come through the wire (in-process tests, gateway).
-            let opts = match ctx.pv_request {
-                Some(PvField::Structure(ref req)) => {
-                    crate::qsrv::channel::PutOptions::from_pv_request(req)
-                }
-                _ => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+            //
+            // MR-R10: the group arm previously called `other.put(&pv)`,
+            // which re-parses options from the data-phase value — so a
+            // native PVA group PUT/PUT_GET whose `record._options.atomic`
+            // lives only in the INIT pvRequest was silently ignored.
+            // Route the group through `put_with_options` with the same
+            // INIT-pvRequest-derived options, matching pvxs
+            // `groupsource.cpp:540`.
+            let init_req = match ctx.pv_request {
+                Some(PvField::Structure(ref req)) => Some(req),
+                _ => None,
+            };
+            let opts = match init_req {
+                Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
+                None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
             };
             let channel = provider
-                .create_channel_for(&name, &ctx.account, &ctx.host)
+                .create_channel_with_creds(&name, ctx_to_creds(&ctx))
                 .await
                 .map_err(|e| e.to_string())?;
             match channel {
@@ -319,7 +360,20 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     .put_with_options(&pv, opts)
                     .await
                     .map_err(|e| e.to_string()),
-                other => other.put(&pv).await.map_err(|e| e.to_string()),
+                crate::qsrv::AnyChannel::Group(group) => {
+                    // `atomic` lives in the INIT pvRequest on the wire
+                    // path; fall back to the value for in-process
+                    // callers, then to the group default inside
+                    // `put_with_options` when neither set it.
+                    let atomic_override = match init_req {
+                        Some(req) => crate::qsrv::channel::atomic_from_pv_request(req),
+                        None => crate::qsrv::channel::atomic_from_pv_request(&pv),
+                    };
+                    group
+                        .put_with_options(&pv, opts, atomic_override)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
             }
         }
     }
@@ -441,7 +495,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 return Some(rx);
             }
             let channel = provider
-                .create_channel_for(&name, &ctx.account, &ctx.host)
+                .create_channel_with_creds(&name, ctx_to_creds(&ctx))
                 .await
                 .ok()?;
             // BR-R5: honor `record._options.DBE` from the MONITOR INIT
@@ -455,11 +509,26 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 }
                 _ => None,
             };
+            // BR-R33-RESIDUAL: resolve the per-operation negotiated
+            // monitor queue depth from the MONITOR INIT pvRequest's
+            // `record._options.queueSize` — pvxs `servermon.cpp:533`
+            // then `groupsource.cpp:359` stamps `stats.limitQueue`.
+            // A group monitor stamps this into every value's
+            // `record._options.queueSize`; single-record monitors
+            // ignore it.
+            let queue_size = match ctx.pv_request {
+                Some(PvField::Structure(ref req)) => crate::qsrv::group::negotiated_queue_size(req),
+                _ => crate::qsrv::group::GROUP_DEFAULT_QUEUE_SIZE,
+            };
             let mut monitor = match channel {
                 crate::qsrv::AnyChannel::Single(single) => {
                     single.create_monitor_with_value_mask(dbe_mask).await.ok()?
                 }
-                other => other.create_monitor().await.ok()?,
+                other => other
+                    .create_monitor()
+                    .await
+                    .ok()?
+                    .with_queue_size(queue_size),
             };
             monitor.start().await.ok()?;
             let (tx, rx) = mpsc::channel::<PvField>(64);
@@ -751,6 +820,17 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             });
             Some(rx)
         }
+    }
+
+    /// BR-R29: a QSRV *pure self-trigger* group monitor emits partial
+    /// updates — each event re-reads only the member whose record
+    /// processed, so the PVA server narrows the wire changed-bitset
+    /// by diffing consecutive snapshots. Returns `true` only for
+    /// groups whose every member uses the default `+trigger`
+    /// (self-trigger); single-record / native-PVA PVs and groups with
+    /// explicit `+trigger` members keep the full request mask.
+    fn monitor_emits_partial(&self, name: &str) -> bool {
+        self.provider.group_is_pure_self_trigger(name)
     }
 }
 
@@ -1366,6 +1446,7 @@ mod tests {
             method: "anonymous".into(),
             host: "127.0.0.1".into(),
             authority: String::new(),
+            roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
         };
 
@@ -1402,6 +1483,101 @@ mod tests {
             matches!(val1, Some(EpicsValue::Double(v)) if (v - 2.5).abs() < 1e-9),
             "post-put VAL must be 2.5, got {val1:?}"
         );
+    }
+
+    /// MR-R13 regression: `get_value_checked` must forward the INIT
+    /// pvRequest carried on `ChannelContext::pv_request` into
+    /// `channel.get(...)`. Before the fix it always passed an empty
+    /// `PvStructure::new("")`, so the request's `field` projection (and
+    /// group `record._options`) were silently dropped: a GET asking
+    /// only for `value` still received every NTScalar sub-field.
+    #[tokio::test]
+    async fn mr_r13_get_value_checked_forwards_pv_request() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_pva_rs::pvdata::{PvField, PvStructure};
+        use epics_pva_rs::server_native::ChannelSource;
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("TEST:mrr13", Box::new(AiRecord::new(1.5)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        let store = QsrvPvStore::new(provider);
+
+        // INIT pvRequest selecting ONLY the `value` field:
+        //   field { value }
+        let value_sel = PvStructure::new("");
+        let mut field_spec = PvStructure::new("");
+        field_spec
+            .fields
+            .push(("value".into(), PvField::Structure(value_sel)));
+        let mut req = PvStructure::new("");
+        req.fields
+            .push(("field".into(), PvField::Structure(field_spec)));
+
+        let checked = AccessGate::open()
+            .check("TEST:mrr13", "127.0.0.1", "anonymous", "anonymous", "")
+            .await;
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "anonymous".into(),
+            method: "anonymous".into(),
+            host: "127.0.0.1".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: Some(PvField::Structure(req)),
+        };
+
+        let got = store
+            .get_value_checked(checked, ctx)
+            .await
+            .expect("get_value_checked must return a value");
+        let PvField::Structure(s) = got else {
+            panic!("expected a structure result");
+        };
+        // The field projection must have been honored: only `value`
+        // survives. Before the fix the empty request returned the full
+        // NTScalar (value + alarm + timeStamp + display + ...).
+        assert!(
+            s.get_field("value").is_some(),
+            "projected `value` field must be present"
+        );
+        assert_eq!(
+            s.fields.len(),
+            1,
+            "pvRequest `field {{ value }}` must filter the GET to one field, got: {:?}",
+            s.fields.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+    }
+
+    /// MR-R11 regression: a native PVA peer's parsed role/group claims
+    /// must survive `ChannelContext` -> `ClientCreds` conversion so
+    /// `AcfAccessControl` can enforce role-scoped UAG rules. Before the
+    /// fix `ctx_to_creds` hardcoded `roles: Vec::new()`, so role-based
+    /// ACF rules denied every real over-the-wire client.
+    #[test]
+    fn mr_r11_ctx_to_creds_forwards_roles() {
+        use epics_pva_rs::server_native::source::ChannelContext;
+
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "alice".into(),
+            method: "ca".into(),
+            host: "ws01".into(),
+            authority: String::new(),
+            roles: vec!["operators".into(), "experts".into()],
+            pv_request: None,
+        };
+        let creds = ctx_to_creds(&ctx);
+        assert_eq!(
+            creds.roles,
+            vec!["operators".to_string(), "experts".to_string()],
+            "ctx_to_creds must forward ChannelContext.roles into ClientCreds"
+        );
+        assert_eq!(creds.user, "alice");
+        assert_eq!(creds.method, "ca");
     }
 
     /// BR-R38: PVA `PROCESS` against a QSRV-backed record actually
@@ -1474,6 +1650,134 @@ mod tests {
         assert!(
             err.contains("UNKNOWN:PV"),
             "error must name the PV; got: {err}"
+        );
+    }
+
+    /// MR-R10: a native PVA group PUT must honor INIT pvRequest
+    /// options. pvxs reads `record._options` from
+    /// `putOperation->pvRequest()` (`groupsource.cpp:540`,
+    /// `:181` `setForceProcessingFlag`), not from the data-phase
+    /// value. The prior bridge `put_value_checked` group arm called
+    /// `other.put(&pv)`, which re-parses options from the data-phase
+    /// value — so an INIT-only `record._options.process=false` was
+    /// silently dropped and every member record was processed anyway.
+    ///
+    /// Discriminator: a member record's `common.time` advances only
+    /// when the member is *processed* (`put_record_field_from_ca`);
+    /// `process=false` routes through `put_pv`, which writes the
+    /// field without processing. The data-phase value below carries
+    /// NO `_options` substructure (the realistic wire shape), so the
+    /// option can only reach the group through `ctx.pv_request`.
+    #[tokio::test]
+    async fn mr_r10_group_put_honors_init_pv_request_process() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::longin::LonginRecord;
+        use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+
+        const GROUP_JSON: &str = r#"{
+            "MRR10:grp": {
+                "+atomic": false,
+                "a": { "+channel": "MRR10:a.VAL", "+type": "plain", "+putorder": 0 },
+                "b": { "+channel": "MRR10:b.VAL", "+type": "plain", "+putorder": 1 }
+            }
+        }"#;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("MRR10:a", Box::new(LonginRecord::new(0)))
+            .await
+            .unwrap();
+        db.add_record("MRR10:b", Box::new(LonginRecord::new(0)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(GROUP_JSON).expect("load group");
+        let store = QsrvPvStore::new(provider);
+
+        let member_time = |db: Arc<PvDatabase>, rec_name: &'static str| async move {
+            let rec = db.get_record(rec_name).await.unwrap();
+            let inst = rec.read().await;
+            inst.common.time
+        };
+
+        let a_before = member_time(db.clone(), "MRR10:a").await;
+        let b_before = member_time(db.clone(), "MRR10:b").await;
+
+        // Sleep so a post-processing timestamp would be strictly
+        // greater than the pre-write timestamp on a coarse clock.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Data-phase group value: member fields only, NO `_options`.
+        let mut value = PvStructure::new("structure");
+        value
+            .fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Long(11))));
+        value
+            .fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Long(22))));
+
+        // INIT pvRequest: record._options.process = "false".
+        let mut opts = PvStructure::new("");
+        opts.fields.push((
+            "process".into(),
+            PvField::Scalar(ScalarValue::String("false".into())),
+        ));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(opts)));
+        let mut req = PvStructure::new("");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "anonymous".into(),
+            method: "anonymous".into(),
+            host: "127.0.0.1".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: Some(PvField::Structure(req)),
+        };
+
+        let checked = AccessGate::open()
+            .check("MRR10:grp", "127.0.0.1", "anonymous", "anonymous", "")
+            .await;
+
+        store
+            .put_value_checked(checked, PvField::Structure(value), ctx)
+            .await
+            .expect("group put_value_checked must succeed");
+
+        // The values must land regardless of the process option.
+        let a_val = {
+            let rec = db.get_record("MRR10:a").await.unwrap();
+            let inst = rec.read().await;
+            inst.snapshot_for_field("VAL").map(|s| s.value)
+        };
+        assert!(
+            matches!(a_val, Some(epics_base_rs::types::EpicsValue::Long(11))),
+            "member a VAL must be 11, got {a_val:?}"
+        );
+
+        // With `process=false` honored, neither member is processed:
+        // `put_pv` writes the field without touching `common.time`.
+        // Pre-fix the option was dropped, the members were processed,
+        // and the timestamps advanced.
+        let a_after = member_time(db.clone(), "MRR10:a").await;
+        let b_after = member_time(db.clone(), "MRR10:b").await;
+        assert_eq!(
+            a_after, a_before,
+            "member a TIME must NOT advance: process=false in the INIT \
+             pvRequest must suppress member processing (got {a_before:?} \
+             -> {a_after:?})"
+        );
+        assert_eq!(
+            b_after, b_before,
+            "member b TIME must NOT advance: process=false in the INIT \
+             pvRequest must suppress member processing (got {b_before:?} \
+             -> {b_after:?})"
         );
     }
 }

@@ -1277,6 +1277,74 @@ pub fn canonical_changed_bitset(
     out
 }
 
+/// BR-R29: structural diff of two `PvField` snapshots against their
+/// shared `desc`, producing the per-event **changed bitset** — the
+/// leaves whose value differs between `prev` and `curr`.
+///
+/// pvxs posts a monitor `Value` whose marked bitset reflects exactly
+/// the leaves a source touched since the last `unmark()`
+/// (`servermon.cpp:174` then intersects with the request mask). A
+/// QSRV group monitor with the default self-trigger re-reads only the
+/// triggered member, so consecutive group snapshots differ in only
+/// that member's leaves — diffing them reproduces pvxs's marked-leaf
+/// set without the source having to track marks itself.
+///
+/// Bit numbering matches the rest of this module (pvData spec §5.4):
+/// root structure is bit 0, fields numbered depth-first in
+/// declaration order. Only **leaf** bits are set; structure bits stay
+/// clear so [`canonical_changed_bitset`] / the encoder treat the
+/// result as a partial update.
+///
+/// A leaf present in `desc` but missing from either snapshot is
+/// treated as changed (defensive: a shape mismatch must not silently
+/// drop the field from the wire delta).
+pub fn diff_changed_bitset(
+    desc: &FieldDesc,
+    prev: &PvField,
+    curr: &PvField,
+) -> crate::proto::BitSet {
+    fn walk(
+        desc: &FieldDesc,
+        bit_offset: usize,
+        prev: Option<&PvField>,
+        curr: Option<&PvField>,
+        out: &mut crate::proto::BitSet,
+    ) {
+        match desc {
+            FieldDesc::Structure { fields, .. } => {
+                let mut child_bit = bit_offset + 1;
+                for (name, child_desc) in fields {
+                    let prev_child = match prev {
+                        Some(PvField::Structure(s)) => s.get_field(name),
+                        _ => None,
+                    };
+                    let curr_child = match curr {
+                        Some(PvField::Structure(s)) => s.get_field(name),
+                        _ => None,
+                    };
+                    walk(child_desc, child_bit, prev_child, curr_child, out);
+                    child_bit += child_desc.total_bits();
+                }
+            }
+            _ => {
+                // Leaf node: mark changed when the values differ, or
+                // when either snapshot lacks the leaf entirely.
+                let changed = match (prev, curr) {
+                    (Some(p), Some(c)) => p != c,
+                    _ => true,
+                };
+                if changed {
+                    out.set(bit_offset);
+                }
+            }
+        }
+    }
+
+    let mut out = crate::proto::BitSet::new();
+    walk(desc, 0, Some(prev), Some(curr), &mut out);
+    out
+}
+
 /// Encode the value bytes for `value` consulting `bitset` to know which
 /// fields to emit. Mirrors pvxs `to_wire_valid(buf, value)`.
 ///
@@ -1436,6 +1504,67 @@ pub fn decode_pv_field_with_bitset(
     }
 }
 
+/// Like [`decode_pv_field_with_bitset`] but threads `cache` through leaf
+/// decodes so that 0xFD/0xFE markers inside Variant/VariantArray payloads
+/// resolve against the connection-scope cache.
+pub fn decode_pv_field_with_bitset_cached(
+    desc: &FieldDesc,
+    bitset: &crate::proto::BitSet,
+    bit_offset: usize,
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+    cache: &mut TypeCache,
+) -> Result<PvField, DecodeError> {
+    fn any_descendant_set(
+        bitset: &crate::proto::BitSet,
+        pos: usize,
+        desc_local: &FieldDesc,
+    ) -> bool {
+        let total = desc_local.total_bits();
+        for i in 0..total {
+            if bitset.get(pos + i) {
+                return true;
+            }
+        }
+        false
+    }
+
+    match desc {
+        FieldDesc::Scalar(_)
+        | FieldDesc::ScalarArray(_)
+        | FieldDesc::Variant
+        | FieldDesc::VariantArray
+        | FieldDesc::BoundedString(_)
+        | FieldDesc::Union { .. }
+        | FieldDesc::UnionArray { .. }
+        | FieldDesc::StructureArray { .. } => {
+            if bitset.get(bit_offset) {
+                decode_pv_field_cached(desc, cur, order, cache)
+            } else {
+                Ok(default_value_for(desc))
+            }
+        }
+        FieldDesc::Structure { struct_id, fields } => {
+            if bitset.get(bit_offset) {
+                return decode_pv_field_cached(desc, cur, order, cache);
+            }
+            if !any_descendant_set(bitset, bit_offset, desc) {
+                return Ok(default_value_for(desc));
+            }
+            let mut s = PvStructure::new(struct_id);
+            let mut child_bit = bit_offset + 1;
+            for (name, child) in fields {
+                let v = decode_pv_field_with_bitset_cached(
+                    child, bitset, child_bit, cur, order, cache,
+                )?;
+                s.fields.push((name.clone(), v));
+                child_bit += child.total_bits();
+            }
+            Ok(PvField::Structure(s))
+        }
+    }
+}
+
 /// pvxs cc5d382 (2022-11) "monitor yield 'complete' updates":
 /// merge a freshly-decoded sparse `decoded` value with a previously
 /// captured `prior` "complete" snapshot, so the result has every leaf
@@ -1526,13 +1655,28 @@ pub fn decode_pv_field(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
 ) -> Result<PvField, DecodeError> {
-    decode_pv_field_at_depth(desc, cur, order, 0)
+    let mut empty = TypeCache::new();
+    decode_pv_field_at_depth(desc, cur, order, &mut empty, 0)
+}
+
+/// Like [`decode_pv_field`] but threads `cache` through Variant and
+/// VariantArray decode so that 0xFD/0xFE type-cache markers inside
+/// Variant payloads resolve against the connection-scope cache.
+/// Mirrors pvxs `dataencode.cpp::from_wire_full(buf, ctxt, fld)`.
+pub fn decode_pv_field_cached(
+    desc: &FieldDesc,
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+    cache: &mut TypeCache,
+) -> Result<PvField, DecodeError> {
+    decode_pv_field_at_depth(desc, cur, order, cache, 0)
 }
 
 fn decode_pv_field_at_depth(
     desc: &FieldDesc,
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
+    cache: &mut TypeCache,
     depth: u32,
 ) -> Result<PvField, DecodeError> {
     if depth > MAX_FIELD_DEPTH {
@@ -1563,7 +1707,7 @@ fn decode_pv_field_at_depth(
         FieldDesc::Structure { struct_id, fields } => {
             let mut s = PvStructure::new(struct_id);
             for (name, child_desc) in fields {
-                let v = decode_pv_field_at_depth(child_desc, cur, order, depth + 1)?;
+                let v = decode_pv_field_at_depth(child_desc, cur, order, cache, depth + 1)?;
                 s.fields.push((name.clone(), v));
             }
             PvField::Structure(s)
@@ -1588,7 +1732,7 @@ fn decode_pv_field_at_depth(
                             fields: fields.clone(),
                         };
                         if let PvField::Structure(s) =
-                            decode_pv_field_at_depth(&element_desc, cur, order, depth + 1)?
+                            decode_pv_field_at_depth(&element_desc, cur, order, cache, depth + 1)?
                         {
                             out.push(s);
                         }
@@ -1619,7 +1763,7 @@ fn decode_pv_field_at_depth(
                         .get(sel as usize)
                         .ok_or_else(|| decode_err!("union selector {sel} out of range"))?
                         .clone();
-                    let value = decode_pv_field_at_depth(&vdesc, cur, order, depth + 1)?;
+                    let value = decode_pv_field_at_depth(&vdesc, cur, order, cache, depth + 1)?;
                     PvField::Union {
                         selector: sel,
                         variant_name,
@@ -1659,7 +1803,8 @@ fn decode_pv_field_at_depth(
                                     decode_err!("union array selector {sel} out of range")
                                 })?
                                 .clone();
-                            let value = decode_pv_field_at_depth(&vdesc, cur, order, depth + 1)?;
+                            let value =
+                                decode_pv_field_at_depth(&vdesc, cur, order, cache, depth + 1)?;
                             items.push(UnionItem {
                                 selector: sel,
                                 variant_name,
@@ -1693,8 +1838,8 @@ fn decode_pv_field_at_depth(
                 // Rust stack frame. R-2: cap the recursion via the
                 // depth counter so an adversary can't blow the
                 // per-task stack with chained Variant tags.
-                let inner = decode_type_desc(cur, order)?;
-                let value = decode_pv_field_at_depth(&inner, cur, order, depth + 1)?;
+                let inner = decode_type_desc_cached(cur, order, cache)?;
+                let value = decode_pv_field_at_depth(&inner, cur, order, cache, depth + 1)?;
                 PvField::Variant(Box::new(VariantValue {
                     desc: Some(inner),
                     value,
@@ -1732,8 +1877,8 @@ fn decode_pv_field_at_depth(
                         }
                         let pos = cur.position();
                         cur.set_position(pos - 1);
-                        let inner = decode_type_desc(cur, order)?;
-                        let value = decode_pv_field_at_depth(&inner, cur, order, depth + 1)?;
+                        let inner = decode_type_desc_cached(cur, order, cache)?;
+                        let value = decode_pv_field_at_depth(&inner, cur, order, cache, depth + 1)?;
                         items.push(VariantValue {
                             desc: Some(inner),
                             value,
@@ -2558,6 +2703,41 @@ mod tests {
         }
     }
 
+    /// BR-R29: `diff_changed_bitset` marks exactly the leaf bits
+    /// whose value differs between two snapshots, and leaves
+    /// structure bits clear. Bit numbering for `nested_alarm_desc`:
+    /// root=0, value=1, alarm(struct)=2, alarm.severity=3,
+    /// alarm.status=4.
+    #[test]
+    fn br_r29_diff_changed_bitset_marks_only_changed_leaves() {
+        let desc = nested_alarm_desc();
+
+        // Only `value` changed (1.0 → 9.0); alarm identical.
+        let prev = nested_alarm_value(1.0, 7, 3);
+        let curr = nested_alarm_value(9.0, 7, 3);
+        let diff = diff_changed_bitset(&desc, &prev, &curr);
+        assert!(diff.get(1), "value leaf changed → bit 1 set");
+        assert!(!diff.get(0), "root structure bit must stay clear");
+        assert!(!diff.get(2), "alarm structure bit must stay clear");
+        assert!(!diff.get(3), "alarm.severity unchanged → clear");
+        assert!(!diff.get(4), "alarm.status unchanged → clear");
+        assert_eq!(diff.count(), 1, "exactly one leaf changed");
+
+        // Only a nested leaf changed (severity 7 → 2).
+        let prev2 = nested_alarm_value(5.0, 7, 3);
+        let curr2 = nested_alarm_value(5.0, 2, 3);
+        let diff2 = diff_changed_bitset(&desc, &prev2, &curr2);
+        assert!(diff2.get(3), "alarm.severity changed → bit 3 set");
+        assert!(!diff2.get(1), "value unchanged → clear");
+        assert!(!diff2.get(4), "alarm.status unchanged → clear");
+        assert_eq!(diff2.count(), 1);
+
+        // Identical snapshots → empty diff.
+        let same = nested_alarm_value(5.0, 1, 1);
+        let diff3 = diff_changed_bitset(&desc, &same, &same.clone());
+        assert_eq!(diff3.count(), 0, "no change → empty changed-bitset");
+    }
+
     /// Root bit set → the entire value (every leaf) is emitted and
     /// consumed, regardless of descendant bits.
     #[test]
@@ -2664,5 +2844,43 @@ mod tests {
             }
             assert_eq!(cur.remaining(), 0);
         }
+    }
+
+    /// PVA-R3 regression: a Variant whose inner descriptor is a 0xFE
+    /// back-reference must resolve against the connection-scope cache, not
+    /// a fresh empty cache. Wire layout:
+    ///   peek(0xFE) != 0xFF → push back → decode_type_desc_cached reads
+    ///   0xFE + u16 slot key → cache lookup → Int descriptor → Int value.
+    #[test]
+    fn pva_r3_nested_variant_uses_typecache() {
+        // Simulate a connection-scope cache already populated by an earlier
+        // frame: slot 5 = Int (the 0xFD define arrived in a prior message).
+        let mut cache = TypeCache::new();
+        cache.insert(5, FieldDesc::Scalar(ScalarType::Int));
+
+        // Variant wire bytes: 0xFE (backref), slot=5 (LE u16), Int value=42 (LE i32).
+        let buf: &[u8] = &[0xFEu8, 0x05, 0x00, 0x2A, 0x00, 0x00, 0x00];
+        let desc = FieldDesc::Variant;
+
+        // With shared cache: 0xFE resolves to Int, value decodes to 42.
+        let mut cur = Cursor::new(buf);
+        let got = decode_pv_field_cached(&desc, &mut cur, ByteOrder::Little, &mut cache).unwrap();
+        match got {
+            PvField::Variant(vv) => {
+                assert_eq!(vv.desc, Some(FieldDesc::Scalar(ScalarType::Int)));
+                assert!(matches!(vv.value, PvField::Scalar(ScalarValue::Int(42))));
+            }
+            other => panic!("expected Variant, got {other:?}"),
+        }
+        assert_eq!(cur.remaining(), 0);
+
+        // Without shared cache: decode_pv_field creates an empty cache internally,
+        // so the 0xFE reference to slot 5 is a cache miss → error.
+        let mut cur2 = Cursor::new(buf);
+        let err = decode_pv_field(&desc, &mut cur2, ByteOrder::Little);
+        assert!(
+            err.is_err(),
+            "must fail: 0xFE ref without prior 0xFD define in same call"
+        );
     }
 }

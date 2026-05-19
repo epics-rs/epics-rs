@@ -28,6 +28,11 @@ pub enum AccessLevel {
 pub struct AccessChecked {
     pv_name: String,
     level: AccessLevel,
+    /// Write-trap mask of the rule that resolved `level`. C
+    /// `asComputePvt` stores this as `pasgclient->trapMask`
+    /// (`asLibRoutines.c:1048`); put-logging listeners consult it
+    /// to honour `TRAPWRITE` / `NOTRAPWRITE`.
+    rule_was_trap: bool,
     // Private nominal type; external crates cannot construct
     // `AccessSeal` and therefore cannot fabricate `AccessChecked`
     // via struct literal.
@@ -56,6 +61,16 @@ impl AccessChecked {
     /// True iff the level grants WRITE.
     pub fn allows_write(&self) -> bool {
         matches!(self.level, AccessLevel::ReadWrite)
+    }
+
+    /// True iff the ACF rule that resolved this access level carried
+    /// the `TRAPWRITE` option. Mirrors C `pasgclient->trapMask`
+    /// (`asLibRoutines.c:1048`) — `false` for `NOTRAPWRITE`, for a
+    /// rule with no trap option, and for a denied (`NoAccess`)
+    /// resolution. CA put-logging dispatch sets
+    /// [`TrapWriteMessage::rule_was_trap`] from this value.
+    pub fn rule_was_trap(&self) -> bool {
+        self.rule_was_trap
     }
 }
 
@@ -245,15 +260,18 @@ impl AccessGate {
         authority: &str,
     ) -> AccessChecked {
         let pv_name = pv_name.into();
-        let level = match &self.inner {
-            AccessGateInner::Open => AccessLevel::ReadWrite,
+        // An `Open` gate and an unattached ACF cell both grant
+        // `ReadWrite`; neither resolved through an ACF rule, so the
+        // trap mask is `false` (no `TRAPWRITE` rule applied).
+        let (level, rule_was_trap) = match &self.inner {
+            AccessGateInner::Open => (AccessLevel::ReadWrite, false),
             AccessGateInner::Required { acf, resolver } => {
                 let guard = acf.read().await;
                 match *guard {
-                    None => AccessLevel::ReadWrite,
+                    None => (AccessLevel::ReadWrite, false),
                     Some(ref cfg) => {
                         let (asg, asl) = resolver(pv_name.clone()).await;
-                        cfg.check_access_method(&asg, host, user, asl, method, authority)
+                        cfg.check_access_method_trap(&asg, host, user, asl, method, authority)
                     }
                 }
             }
@@ -261,6 +279,7 @@ impl AccessGate {
         AccessChecked {
             pv_name,
             level,
+            rule_was_trap,
             _seal: AccessSeal,
         }
     }
@@ -454,6 +473,35 @@ impl AccessSecurityConfig {
         method: &str,
         authority: &str,
     ) -> AccessLevel {
+        self.check_access_method_trap(asg_name, host, user, record_asl, method, authority)
+            .0
+    }
+
+    /// Method/authority-aware access check that also returns the
+    /// write-trap mask of the rule that resolved the access level.
+    ///
+    /// Mirrors C `asComputePvt` (`asLibRoutines.c:983-1048`): the
+    /// function tracks `trapMask` alongside `access`, and on every
+    /// rule that *raises* the access level it copies that rule's
+    /// `trapMask` (`asLibRoutines.c:1041-1042`). The final
+    /// `pasgclient->trapMask` (`:1048`) is therefore the trap flag of
+    /// the last rule that set the granted access — exactly the value
+    /// `asTrapWriteWithData` (`rsrv/camessage.c:768-779`) consults to
+    /// decide whether to invoke put-logging listeners.
+    ///
+    /// Returns `(level, rule_was_trap)`. `rule_was_trap` is `false`
+    /// when access stays `NoAccess` (no rule matched), when the
+    /// matching rule carried `NOTRAPWRITE`, and when it carried no
+    /// trap option at all.
+    pub fn check_access_method_trap(
+        &self,
+        asg_name: &str,
+        host: &str,
+        user: &str,
+        record_asl: u8,
+        method: &str,
+        authority: &str,
+    ) -> (AccessLevel, bool) {
         // C `asAddMemberPvt` (asLibRoutines.c:893-928): a member whose
         // ASG name is not present in the parsed config is silently
         // reassigned to `DEFAULT`. `asInitialize` (asLibRoutines.c:107)
@@ -469,7 +517,7 @@ impl AccessSecurityConfig {
                 // C-2 fix: never grant ReadWrite on an ASG-lookup
                 // miss. C resolves every miss to the always-present
                 // empty `DEFAULT` ⇒ `asNOACCESS`.
-                None => return AccessLevel::NoAccess,
+                None => return (AccessLevel::NoAccess, false),
             },
         };
         // C `asComputePvt` (asLibRoutines.c:983) initialises
@@ -485,7 +533,12 @@ impl AccessSecurityConfig {
         // unconditionally — it naturally denies a `("", "")` peer for
         // any UAG/HAG-scoped rule while still honouring an
         // unconditional `RULE(0, READ)`.
+        // C `asComputePvt` initialises `trapMask = 0` and copies the
+        // matching rule's `trapMask` only on the lines that also raise
+        // `access` (`asLibRoutines.c:986`, `:1042`). A `NoAccess`
+        // outcome therefore always carries `trap = false`.
         let mut access = AccessLevel::NoAccess;
+        let mut trap = false;
         for rule in &asg.rules {
             // C `asComputePvt`: a rule disabled by `asAsgRuleDisable`
             // (unsupported keyword / un-evaluable CALC) is skipped.
@@ -543,9 +596,14 @@ impl AccessSecurityConfig {
             if !authority_match {
                 continue;
             }
+            // C `asLibRoutines.c:1041-1042`: a matching rule sets
+            // both `access` and `trapMask` together. The trap mask of
+            // the last access-raising rule is the one the put-logging
+            // hook consults.
             access = rule_access(rule);
+            trap = rule.trap;
         }
-        access
+        (access, trap)
     }
 
     /// Check access taking the per-record ASL into account.
@@ -1192,7 +1250,41 @@ fn read_brace_list(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult
                     current.clear();
                 }
             }
-            Some(&c) if c.is_alphanumeric() || c == '_' || c == '.' || c == '-' => {
+            // Quoted string: asLib_lex.l `{doublequote}({stringchar}|{escape})*{doublequote}`
+            // where stringchar is [^"\n\\]. Allows '/' so "role/groupname" entries work.
+            // pvxs/documentation/ioc.rst shows: UAG(special) { someone, "role/op" }
+            Some(&'"') => {
+                chars.next(); // consume opening '"'
+                if !current.is_empty() {
+                    items.push(current.clone());
+                    current.clear();
+                }
+                let mut quoted = String::new();
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => {
+                            if let Some(esc) = chars.next() {
+                                quoted.push(esc);
+                            }
+                        }
+                        Some('\n') | None => {
+                            return Err(CaError::Protocol(
+                                "ACF: unterminated quoted string".into(),
+                            ));
+                        }
+                        Some(c) => quoted.push(c),
+                    }
+                }
+                if !quoted.is_empty() {
+                    items.push(quoted);
+                }
+            }
+            // Unquoted name: asLib_lex.l `name [a-zA-Z0-9_\-+:.\[\]<>;]`
+            Some(&c)
+                if c.is_alphanumeric()
+                    || matches!(c, '_' | '.' | '-' | '+' | ':' | '[' | ']' | '<' | '>' | ';') =>
+            {
                 current.push(c);
                 chars.next();
             }
@@ -2174,6 +2266,77 @@ ASG(C) {
     #[test]
     fn rule_bad_log_option_is_rejected() {
         assert!(parse_acf("ASG(T) { RULE(1, WRITE, BOGUS) }").is_err());
+    }
+
+    // MR-R20: `check_access_method_trap` must return the trap mask of
+    // the rule that resolved the access level — not a hard-coded
+    // `true`. Mirrors C `asComputePvt`/`pasgclient->trapMask`
+    // (`asLibRoutines.c:986`, `:1041-1042`, `:1048`).
+    #[test]
+    fn mr_r20_trap_mask_reflects_matched_rule() {
+        // Three ASGs, one per trap-option shape, each granting WRITE
+        // to the same `(host, user)`.
+        let cfg = parse_acf(
+            r#"
+ASG(TRAPPED)   { RULE(0, WRITE, TRAPWRITE) }
+ASG(UNTRAPPED) { RULE(0, WRITE, NOTRAPWRITE) }
+ASG(PLAIN)     { RULE(0, WRITE) }
+ASG(LOCKED)    { }
+"#,
+        )
+        .unwrap();
+
+        // TRAPWRITE rule → granted WRITE with trap == true.
+        let (lvl, trap) = cfg.check_access_method_trap("TRAPPED", "h", "u", 0, "", "");
+        assert_eq!(lvl, AccessLevel::ReadWrite);
+        assert!(trap, "a TRAPWRITE rule must resolve rule_was_trap = true");
+
+        // NOTRAPWRITE rule → granted WRITE but trap == false.
+        let (lvl, trap) = cfg.check_access_method_trap("UNTRAPPED", "h", "u", 0, "", "");
+        assert_eq!(lvl, AccessLevel::ReadWrite);
+        assert!(
+            !trap,
+            "a NOTRAPWRITE rule must resolve rule_was_trap = false"
+        );
+
+        // Rule with no trap option → granted WRITE, trap == false.
+        let (lvl, trap) = cfg.check_access_method_trap("PLAIN", "h", "u", 0, "", "");
+        assert_eq!(lvl, AccessLevel::ReadWrite);
+        assert!(
+            !trap,
+            "a rule with no trap option must resolve rule_was_trap = false"
+        );
+
+        // Denied (no matching rule) → trap == false, never true.
+        let (lvl, trap) = cfg.check_access_method_trap("LOCKED", "h", "u", 0, "", "");
+        assert_eq!(lvl, AccessLevel::NoAccess);
+        assert!(
+            !trap,
+            "a denied resolution must carry rule_was_trap = false"
+        );
+    }
+
+    // MR-R20: when several rules raise access, the trap mask must be
+    // the option of the *last* rule that set the level — C
+    // `asComputePvt` copies `trapMask` together with `access` on
+    // every raise (`asLibRoutines.c:1041-1042`).
+    #[test]
+    fn mr_r20_trap_mask_follows_last_access_raising_rule() {
+        // READ (no trap) then WRITE (TRAPWRITE): WRITE is the last
+        // raise, so the trap mask is the WRITE rule's.
+        let cfg = parse_acf("ASG(M) { RULE(0, READ) RULE(0, WRITE, TRAPWRITE) }").unwrap();
+        let (lvl, trap) = cfg.check_access_method_trap("M", "h", "u", 0, "", "");
+        assert_eq!(lvl, AccessLevel::ReadWrite);
+        assert!(
+            trap,
+            "trap mask must follow the WRITE rule that raised access"
+        );
+
+        // READ (no trap) then WRITE (NOTRAPWRITE): same, trap false.
+        let cfg = parse_acf("ASG(N) { RULE(0, READ) RULE(0, WRITE, NOTRAPWRITE) }").unwrap();
+        let (lvl, trap) = cfg.check_access_method_trap("N", "h", "u", 0, "", "");
+        assert_eq!(lvl, AccessLevel::ReadWrite);
+        assert!(!trap, "NOTRAPWRITE on the access-raising rule must win");
     }
 
     // ----- H-3: CALC clause gates (or disables) the rule -----

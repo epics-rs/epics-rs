@@ -12,9 +12,58 @@ use tokio::sync::Notify;
 use super::config::{LinkDirection, PvaLinkConfig};
 use super::link::{PvaLink, PvaLinkResult};
 
-type RegistryKey = (String, LinkDirection);
+/// Registry cache key.
+///
+/// The first four members — `(pv_name, pipeline, queue_size,
+/// direction)` — mirror pvxs's `channels_key_t = (channelName,
+/// pvRequest)` where pvRequest encodes `pipeline` and `queueSize`
+/// (`pvxs/ioc/pvalink_lset.cpp:49-65`, `pvxs/ioc/pvalink.h:116`).
+///
+/// MR-R14: `out_opts` carries the per-link OUT behavior options
+/// (`field`, `process`, `defer`, `retry`). The earlier key excluded
+/// these, so two OUT links to the same remote PV with different
+/// query options collapsed onto one cached [`PvaLink`] and the later
+/// link silently inherited the first link's `field` / `proc` /
+/// `defer` / `retry`. pvxs keeps a per-link `pvaLinkConfig`
+/// (`pvxs/ioc/pvalink.h:65`); including the OUT options in the key
+/// restores that per-link isolation — two OUT links with different
+/// behavior options now resolve to distinct cache entries.
+///
+/// For INP links `out_opts` is always `None`, so INP keying is
+/// unchanged (INP per-link `field` / `sevr` / `time` divergence is
+/// handled at the getter level, see `integration.rs`).
+type RegistryKey = (String, bool, usize, LinkDirection, Option<OutOpts>);
 
-/// Cached PvaLink. Returns the same `Arc<PvaLink>` for repeated `(pv, direction)` pairs.
+/// Behavior-changing OUT-link options that must not be shared across
+/// links — see [`RegistryKey`]. `field` selects the remote sub-field,
+/// `process` requests a remote `process()`, `defer` queues the Put,
+/// `retry` replays a Put across a disconnect.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OutOpts {
+    field: String,
+    process: bool,
+    defer: bool,
+    retry: bool,
+}
+
+impl OutOpts {
+    /// Extract the OUT behavior options from a config, or `None` for
+    /// an INP link (INP links never key on these).
+    fn from_config(config: &PvaLinkConfig) -> Option<Self> {
+        match config.direction {
+            LinkDirection::Out => Some(Self {
+                field: config.field.clone(),
+                process: config.process,
+                defer: config.defer,
+                retry: config.retry,
+            }),
+            LinkDirection::Inp => None,
+        }
+    }
+}
+
+/// Cached PvaLink. Returns the same `Arc<PvaLink>` for repeated
+/// `(pv_name, pipeline, queue_size, direction)` tuples.
 #[derive(Default)]
 pub struct PvaLinkRegistry {
     map: RwLock<HashMap<RegistryKey, Arc<PvaLink>>>,
@@ -35,15 +84,29 @@ impl PvaLinkRegistry {
         Self::default()
     }
 
-    /// Synchronous lookup of an already-open link. Returns `None`
-    /// if no link with the given `(pv_name, direction)` has been
-    /// opened yet. Used by the record-link hot path to skip the
-    /// async runtime when the link is already cached.
-    pub fn try_get(&self, pv_name: &str, direction: LinkDirection) -> Option<Arc<PvaLink>> {
+    /// Exact lookup for the full config's [`RegistryKey`]. Returns
+    /// `None` when no link with that exact key has been opened.
+    pub fn try_get(&self, config: &PvaLinkConfig) -> Option<Arc<PvaLink>> {
+        let key: RegistryKey = (
+            config.pv_name.clone(),
+            config.pipeline,
+            config.queue_size,
+            config.direction,
+            OutOpts::from_config(config),
+        );
+        self.map.read().get(&key).cloned()
+    }
+
+    /// Return the first cached link for `(pv_name, direction)` regardless
+    /// of `pipeline` / `queue_size`. Used by hot paths that only want
+    /// "any cached value" (fast-path read, connected check, alarm
+    /// severity) and don't care about which monitor variant they land on.
+    pub fn try_get_any(&self, pv_name: &str, direction: LinkDirection) -> Option<Arc<PvaLink>> {
         self.map
             .read()
-            .get(&(pv_name.to_string(), direction))
-            .cloned()
+            .iter()
+            .find(|((name, _, _, dir, _), _)| name == pv_name && *dir == direction)
+            .map(|(_, link)| link.clone())
     }
 
     /// Get an existing link or open a new one. Concurrent calls
@@ -51,7 +114,13 @@ impl PvaLinkRegistry {
     /// the second caller awaits via `pending` and reads the
     /// winner's cached entry.
     pub async fn get_or_open(&self, config: PvaLinkConfig) -> PvaLinkResult<Arc<PvaLink>> {
-        let key: RegistryKey = (config.pv_name.clone(), config.direction);
+        let key: RegistryKey = (
+            config.pv_name.clone(),
+            config.pipeline,
+            config.queue_size,
+            config.direction,
+            OutOpts::from_config(&config),
+        );
 
         // Fast path: already cached.
         if let Some(existing) = self.map.read().get(&key).cloned() {
@@ -170,6 +239,23 @@ impl PvaLinkRegistry {
         self.pending.write().clear();
     }
 
+    /// Test-only: insert a pre-built [`PvaLink`] under its config's
+    /// [`RegistryKey`]. Lets a test seed a cached link (e.g. an INP
+    /// link with a pre-populated value) without standing up a PVA
+    /// server, so the resolver getter paths can be exercised against
+    /// a known cache state.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&self, config: &PvaLinkConfig, link: Arc<PvaLink>) {
+        let key: RegistryKey = (
+            config.pv_name.clone(),
+            config.pipeline,
+            config.queue_size,
+            config.direction,
+            OutOpts::from_config(config),
+        );
+        self.map.write().insert(key, link);
+    }
+
     pub fn len(&self) -> usize {
         self.map.read().len()
     }
@@ -191,5 +277,81 @@ mod tests {
         assert!(reg.is_empty());
         reg.close_all();
         assert_eq!(reg.len(), 0);
+    }
+
+    /// MR-R14: two OUT links to the same remote PV with different
+    /// behavior-changing query options (`field`, `proc`, `defer`,
+    /// `retry`) must resolve to *distinct* cached [`PvaLink`]s, each
+    /// owning its own config. Pre-fix the registry key was
+    /// `(pv_name, pipeline, queue_size, direction)` — it excluded the
+    /// OUT options, so the second `get_or_open` returned the first
+    /// link and silently inherited its `field` / `proc` / `defer` /
+    /// `retry`.
+    ///
+    /// OUT-link `PvaLink::open` does no network I/O (it only builds a
+    /// `PvaClient`), so this exercises the real registry path without
+    /// a PVA server. pvxs `pvaLinkConfig` is per-link
+    /// (`pvxs/ioc/pvalink.h:65`).
+    #[tokio::test]
+    async fn mr_r14_out_links_keep_own_options() {
+        let reg = PvaLinkRegistry::new();
+
+        let cfg_a = PvaLinkConfig {
+            field: "fieldA".to_string(),
+            process: false,
+            defer: false,
+            retry: false,
+            ..PvaLinkConfig::defaults_for("MR_R14:PV", LinkDirection::Out)
+        };
+        let cfg_b = PvaLinkConfig {
+            field: "fieldB".to_string(),
+            process: true,
+            defer: true,
+            retry: true,
+            ..PvaLinkConfig::defaults_for("MR_R14:PV", LinkDirection::Out)
+        };
+
+        let link_a = reg.get_or_open(cfg_a).await.expect("open OUT link A");
+        let link_b = reg.get_or_open(cfg_b).await.expect("open OUT link B");
+
+        assert!(
+            !Arc::ptr_eq(&link_a, &link_b),
+            "OUT links with different options must not share one PvaLink"
+        );
+        assert_eq!(
+            link_a.config().field,
+            "fieldA",
+            "link A keeps its own field"
+        );
+        assert_eq!(
+            link_b.config().field,
+            "fieldB",
+            "link B must not inherit link A's field"
+        );
+        assert!(
+            !link_a.config().process && !link_a.config().defer && !link_a.config().retry,
+            "link A keeps its own proc/defer/retry"
+        );
+        assert!(
+            link_b.config().process && link_b.config().defer && link_b.config().retry,
+            "link B must not inherit link A's proc/defer/retry"
+        );
+
+        // A second open of link A's exact config returns the same
+        // cached Arc — connection sharing for identical options is
+        // preserved.
+        let cfg_a2 = PvaLinkConfig {
+            field: "fieldA".to_string(),
+            process: false,
+            defer: false,
+            retry: false,
+            ..PvaLinkConfig::defaults_for("MR_R14:PV", LinkDirection::Out)
+        };
+        let link_a2 = reg.get_or_open(cfg_a2).await.expect("re-open OUT link A");
+        assert!(
+            Arc::ptr_eq(&link_a, &link_a2),
+            "identical OUT options must share one cached PvaLink"
+        );
+        assert_eq!(reg.len(), 2, "two distinct OUT links cached");
     }
 }

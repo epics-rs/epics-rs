@@ -370,12 +370,24 @@ impl BridgeChannel {
             got: value.struct_id.to_string(),
         })?;
 
-        // Use typed conversion to match the bound field's actual DBF type
+        // Use typed conversion to match the bound field's actual DBF
+        // type. MR-R22: `UInt64`/`Int64` MUST be in this scalar arm.
+        // `pv_structure_to_epics` now preserves a scalar PVA `ulong`
+        // as `EpicsValue::UInt64` (and `long` as `Int64`) instead of
+        // folding it into `Double`; routing it back through
+        // `epics_to_scalar` recovers `ScalarValue::ULong`/`Long`, so
+        // `scalar_to_epics_typed` sees the original 64-bit scalar and
+        // retypes it to the bound field's DBF without an `f64`
+        // round-trip. Omitting them here would (a) skip retyping for a
+        // `ulong` PUT into a non-`UINT64` field and (b) — before the
+        // `scalar_to_epics` fix — still see a precision-lost `Double`.
         let epics_val = match &raw_val {
             EpicsValue::Double(_)
             | EpicsValue::Float(_)
             | EpicsValue::Short(_)
             | EpicsValue::Long(_)
+            | EpicsValue::Int64(_)
+            | EpicsValue::UInt64(_)
             | EpicsValue::Char(_)
             | EpicsValue::Enum(_)
             | EpicsValue::String(_) => {

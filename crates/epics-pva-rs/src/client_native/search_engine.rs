@@ -24,7 +24,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::net::AsyncUdpV4;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::interval;
 use tracing::{debug, warn};
@@ -32,7 +33,8 @@ use tracing::{debug, warn};
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
-    Command, PvaHeader, ReadExt, decode_size, decode_string, ip_from_bytes_allow_unspec,
+    ByteOrder, Command, ControlCommand, PvaHeader, ReadExt, WriteExt, decode_size, decode_string,
+    encode_string_into, ip_from_bytes_allow_unspec,
 };
 
 use super::beacon_throttle::BeaconTracker;
@@ -181,7 +183,10 @@ pub struct SearchEngine {
 impl SearchEngine {
     /// Spawn the engine. Returns a handle that channels use to issue
     /// `find()` requests.
-    pub async fn spawn(mut extra_targets: Vec<SocketAddr>) -> PvaResult<Self> {
+    pub async fn spawn(
+        mut extra_targets: Vec<SocketAddr>,
+        name_servers: Vec<SocketAddr>,
+    ) -> PvaResult<Self> {
         let beacons = BeaconTracker::new();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>(256);
 
@@ -297,6 +302,7 @@ impl SearchEngine {
             beacon_socket_v6,
             extra_targets,
             beacons_clone,
+            name_servers,
         ));
 
         Ok(Self { cmd_tx, beacons })
@@ -725,6 +731,7 @@ fn cascade_smoothed_next(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_engine(
     mut cmd_rx: mpsc::Receiver<SearchCommand>,
     search_socket: AsyncUdpV4,
@@ -733,6 +740,7 @@ async fn run_engine(
     beacon_socket_v6: Option<Arc<UdpSocket>>,
     extra_targets: Vec<SocketAddr>,
     beacons: Arc<BeaconTracker>,
+    name_servers: Vec<SocketAddr>,
 ) {
     static NEXT_SEARCH_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -769,6 +777,18 @@ async fn run_engine(
     // uses different (reconnect-throttle) semantics so we de-dup here.
     let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
         std::collections::HashSet::new();
+
+    // pvxs client.cpp:651-667 startNS(): one persistent TCP connection per
+    // EPICS_PVA_NAME_SERVERS entry. Each ns_task handles connect/reconnect;
+    // ns_senders receives SEARCH frame bytes to forward over the connection.
+    let (ns_response_tx, mut ns_response_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
+    let mut ns_senders: Vec<mpsc::Sender<Vec<u8>>> = Vec::with_capacity(name_servers.len());
+    for ns_addr in name_servers {
+        let (search_tx, search_rx) = mpsc::channel::<Vec<u8>>(64);
+        ns_senders.push(search_tx);
+        let resp_tx = ns_response_tx.clone();
+        tokio::spawn(ns_task(ns_addr, search_rx, resp_tx));
+    }
 
     let mut tick = interval(Duration::from_secs(1));
     // Periodic beacon-tracker cleanup: every BEACON_CLEAN_INTERVAL we
@@ -857,6 +877,15 @@ async fn run_engine(
                             p.last_attempt = Instant::now();
                             let pkt = codec.build_search(0, sid, &p.pv_name, [0,0,0,0], response_port, false);
                             broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
+                            // pvxs client.cpp:1193-1196: also SEARCH over each TCP
+                            // name-server connection. unicast bit=0x80, port=0 (NS
+                            // replies on the same TCP connection).
+                            if !ns_senders.is_empty() {
+                                let ns_pkt = codec.build_search(0, sid, &p.pv_name, [0, 0, 0, 0], 0, true);
+                                for tx in &ns_senders {
+                                    let _ = tx.try_send(ns_pkt.clone());
+                                }
+                            }
                         }
                     }
                 }
@@ -890,6 +919,12 @@ async fn run_engine(
                             p.last_attempt = Instant::now();
                             let pkt = codec.build_search(0, sid, &p.pv_name, [0,0,0,0], response_port, false);
                             broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
+                            if !ns_senders.is_empty() {
+                                let ns_pkt = codec.build_search(0, sid, &p.pv_name, [0, 0, 0, 0], 0, true);
+                                for tx in &ns_senders {
+                                    let _ = tx.try_send(ns_pkt.clone());
+                                }
+                            }
                         }
                     }
                 }
@@ -1033,7 +1068,7 @@ async fn run_engine(
                     while pos < n {
                         let consumed = handle_search_response(
                             &search_buf[pos..n],
-                            &mut pending, &mut by_name, &beacons, &ignore_guids, peer,
+                            &mut pending, &mut by_name, &beacons, &ignore_guids, peer, false,
                         );
                         if consumed == 0 {
                             break;
@@ -1052,7 +1087,7 @@ async fn run_engine(
                     while pos < n {
                         let consumed = handle_search_response(
                             &search_buf_v6[pos..n],
-                            &mut pending, &mut by_name, &beacons, &ignore_guids, peer,
+                            &mut pending, &mut by_name, &beacons, &ignore_guids, peer, false,
                         );
                         if consumed == 0 {
                             break;
@@ -1124,6 +1159,16 @@ async fn run_engine(
                     announced.remove(&(server, guid));
                     let evt = Discovered::Timeout { server, guid };
                     subscribers.retain(|tx| tx.try_send(evt.clone()).is_ok());
+                }
+            }
+
+            ns_rsp = ns_response_rx.recv() => {
+                // SEARCH_RESPONSE received over a TCP name-server connection.
+                // pvxs client.cpp:984-995: procSearchReply with istcp=true.
+                if let Some((bytes, ns_addr)) = ns_rsp {
+                    handle_search_response(
+                        &bytes, &mut pending, &mut by_name, &beacons, &ignore_guids, ns_addr, true,
+                    );
                 }
             }
 
@@ -1243,6 +1288,14 @@ async fn run_engine(
                         // search_buckets borrow we need below.
                         if let Some(p) = pending.get(&sid) {
                             let attempt = p.attempt;
+                            // pvxs client.cpp:1193-1196: TCP name-server SEARCH.
+                            // unicast bit=0x80, port=0 (replies on same TCP connection).
+                            if !ns_senders.is_empty() {
+                                let ns_pkt = codec.build_search(0, sid, &p.pv_name, [0, 0, 0, 0], 0, true);
+                                for tx in &ns_senders {
+                                    let _ = tx.try_send(ns_pkt.clone());
+                                }
+                            }
                             let bucket_sizes = |idx: usize| search_buckets[idx].len();
                             let next = cascade_smoothed_next(
                                 current_bucket,
@@ -1441,6 +1494,8 @@ fn flush_expired_pending(
 
 /// Returns bytes consumed from `bytes` so the caller can advance to
 /// the next chained message in the same datagram (P-G10).
+/// `is_tcp`: true when the response arrived on a TCP name-server connection;
+/// enables pvxs procSearchReply port-0 rule (client.cpp:828-846).
 fn handle_search_response(
     bytes: &[u8],
     pending: &mut HashMap<u32, Pending>,
@@ -1448,6 +1503,7 @@ fn handle_search_response(
     _beacons: &Arc<BeaconTracker>,
     ignore_guids: &std::collections::HashSet<[u8; 12]>,
     peer: SocketAddr,
+    is_tcp: bool,
 ) -> usize {
     // Server-originated UDP — enforce direction bit (pvxs `conn.cpp:160`).
     let Ok(Some((frame, consumed))) = try_parse_frame_role(bytes, PeerRole::Client) else {
@@ -1476,7 +1532,12 @@ fn handle_search_response(
         return consumed;
     }
     for cid in resp.cids {
-        let server = rewrite_loopback(resp.server_addr, peer);
+        let mut server = rewrite_loopback(resp.server_addr, peer);
+        // pvxs client.cpp:828-846: TCP NS with port=0 → use the NS connection port.
+        // Covers the gateway self-serve case where the NS IS the data server.
+        if is_tcp && server.port() == 0 {
+            server.set_port(peer.port());
+        }
         let Some(entry) = pending.get_mut(&cid) else {
             continue;
         };
@@ -1622,6 +1683,182 @@ fn rewrite_loopback(addr: SocketAddr, peer: SocketAddr) -> SocketAddr {
     } else {
         addr
     }
+}
+
+// ── TCP name-server tasks ───────────────────────────────────────────────
+
+/// Long-running task for one EPICS_PVA_NAME_SERVERS entry.
+/// Loops forever: connect, handshake, forward SEARCHes / receive responses,
+/// reconnect after 10 s on any failure. pvxs client.cpp:651-667 + 1295-1305.
+async fn ns_task(
+    ns_addr: SocketAddr,
+    mut search_rx: mpsc::Receiver<Vec<u8>>,
+    response_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+) {
+    // pvxs client.cpp:68: tcpNSCheckInterval = 10s.
+    const RECONNECT_INTERVAL: Duration = Duration::from_secs(10);
+    loop {
+        if let Err(e) = ns_run_once(ns_addr, &mut search_rx, &response_tx).await {
+            debug!(
+                target: "epics_pva_rs::client",
+                "NS {ns_addr} disconnected: {e}; reconnecting in {RECONNECT_INTERVAL:?}"
+            );
+        }
+        tokio::time::sleep(RECONNECT_INTERVAL).await;
+    }
+}
+
+/// One connection attempt to `ns_addr`: TCP connect → PVA handshake → forward
+/// SEARCH frames and route SEARCH_RESPONSE bytes back to the engine.
+async fn ns_run_once(
+    ns_addr: SocketAddr,
+    search_rx: &mut mpsc::Receiver<Vec<u8>>,
+    response_tx: &mpsc::Sender<(Vec<u8>, SocketAddr)>,
+) -> std::io::Result<()> {
+    let stream = TcpStream::connect(ns_addr).await?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+    let mut rx_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+
+    // ── Handshake: wait for SET_BYTE_ORDER + CONNECTION_VALIDATION request ──
+    let mut byte_order = ByteOrder::Little;
+    loop {
+        let n = reader.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "NS closed during handshake",
+            ));
+        }
+        rx_buf.extend_from_slice(&tmp[..n]);
+        let mut pos = 0;
+        let mut got_validation_req = false;
+        while rx_buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
+            let Ok(hdr) = PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[pos..])) else {
+                break;
+            };
+            let frame_end = pos + PvaHeader::SIZE + hdr.payload_length as usize;
+            if rx_buf.len() < frame_end {
+                break;
+            }
+            if hdr.flags.is_control() {
+                if hdr.command == ControlCommand::SetByteOrder.code() {
+                    byte_order = hdr.flags.byte_order();
+                }
+            } else if hdr.command == Command::ConnectionValidation.code() {
+                got_validation_req = true;
+            }
+            pos = frame_end;
+        }
+        rx_buf.drain(..pos);
+        if got_validation_req {
+            break;
+        }
+    }
+
+    // ── Send anonymous CONNECTION_VALIDATION reply ───────────────────────────
+    // pvxs clientconn.cpp:163-174: NS only needs SEARCH routing, not channel
+    // ops — anonymous auth is sufficient.
+    writer
+        .write_all(&build_ns_connection_validation(byte_order))
+        .await?;
+
+    // ── Wait for CONNECTION_VALIDATED ────────────────────────────────────────
+    loop {
+        let n = reader.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "NS closed before validated",
+            ));
+        }
+        rx_buf.extend_from_slice(&tmp[..n]);
+        let mut pos = 0;
+        let mut validated = false;
+        while rx_buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
+            let Ok(hdr) = PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[pos..])) else {
+                break;
+            };
+            let frame_end = pos + PvaHeader::SIZE + hdr.payload_length as usize;
+            if rx_buf.len() < frame_end {
+                break;
+            }
+            if !hdr.flags.is_control() && hdr.command == Command::ConnectionValidated.code() {
+                validated = true;
+            }
+            pos = frame_end;
+        }
+        rx_buf.drain(..pos);
+        if validated {
+            break;
+        }
+    }
+
+    // ── Main loop: forward SEARCH frames out; route SEARCH_RESPONSE back ────
+    loop {
+        tokio::select! {
+            pkt = search_rx.recv() => {
+                match pkt {
+                    Some(bytes) => writer.write_all(&bytes).await?,
+                    // Engine dropped the sender — shut down cleanly.
+                    None => return Ok(()),
+                }
+            }
+            res = reader.read(&mut tmp) => {
+                let n = res?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "NS closed",
+                    ));
+                }
+                rx_buf.extend_from_slice(&tmp[..n]);
+                let mut pos = 0;
+                while rx_buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
+                    let Ok(hdr) =
+                        PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[pos..]))
+                    else {
+                        break;
+                    };
+                    let frame_end = pos + PvaHeader::SIZE + hdr.payload_length as usize;
+                    if rx_buf.len() < frame_end {
+                        break;
+                    }
+                    if !hdr.flags.is_control()
+                        && hdr.command == Command::SearchResponse.code()
+                    {
+                        let frame_bytes = rx_buf[pos..frame_end].to_vec();
+                        let _ = response_tx.try_send((frame_bytes, ns_addr));
+                    }
+                    pos = frame_end;
+                }
+                rx_buf.drain(..pos);
+            }
+        }
+    }
+}
+
+/// Minimal CONNECTION_VALIDATION payload for anonymous NS connections.
+/// pvxs clientconn.cpp:163-174: buffer_size=1MiB, registry=0x7FFF, QOS=0,
+/// auth="anonymous", null variant (0xFF).
+fn build_ns_connection_validation(order: ByteOrder) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.put_u32(1024 * 1024, order);
+    payload.put_u16(0x7FFF, order);
+    payload.put_u16(0, order);
+    encode_string_into("anonymous", order, &mut payload);
+    payload.push(0xFF); // null variant
+    let h = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut out = Vec::with_capacity(PvaHeader::SIZE + payload.len());
+    h.write_into(&mut out);
+    out.extend_from_slice(&payload);
+    out
 }
 
 #[allow(dead_code)]
@@ -1834,7 +2071,9 @@ mod tests {
             std::env::set_var("EPICS_PVA_ADDR_LIST", "");
         }
 
-        let engine = SearchEngine::spawn(Vec::new()).await.expect("spawn engine");
+        let engine = SearchEngine::spawn(Vec::new(), Vec::new())
+            .await
+            .expect("spawn engine");
 
         let started = std::time::Instant::now();
         let res = tokio::time::timeout(
@@ -1887,7 +2126,7 @@ mod tests {
             .copied()
             .expect("sniffer local_addr");
 
-        let engine = SearchEngine::spawn(vec![sniffer_addr])
+        let engine = SearchEngine::spawn(vec![sniffer_addr], Vec::new())
             .await
             .expect("spawn engine");
 
@@ -1965,7 +2204,9 @@ mod tests {
             std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
             std::env::set_var("EPICS_PVA_ADDR_LIST", "");
         }
-        let engine = SearchEngine::spawn(Vec::new()).await.expect("spawn engine");
+        let engine = SearchEngine::spawn(Vec::new(), Vec::new())
+            .await
+            .expect("spawn engine");
 
         // Race the find against a 1.5 s sleep. The bucket fire is
         // expected at ~1 s (one tick after the Find lands), but no
@@ -2048,7 +2289,7 @@ mod tests {
             .copied()
             .expect("sniffer local_addr");
 
-        let engine = SearchEngine::spawn(vec![sniffer_addr])
+        let engine = SearchEngine::spawn(vec![sniffer_addr], Vec::new())
             .await
             .expect("spawn engine");
         let pv = "TEST:HURRYUP:PV";
@@ -2138,7 +2379,7 @@ mod tests {
             .first()
             .copied()
             .expect("sniffer addr");
-        let engine = SearchEngine::spawn(vec![sniffer_addr])
+        let engine = SearchEngine::spawn(vec![sniffer_addr], Vec::new())
             .await
             .expect("spawn");
 
@@ -2244,7 +2485,7 @@ mod tests {
             0,
             0,
         ));
-        let engine = SearchEngine::spawn(vec![v6_target])
+        let engine = SearchEngine::spawn(vec![v6_target], Vec::new())
             .await
             .expect("spawn engine");
 
@@ -2341,7 +2582,9 @@ mod tests {
             std::env::set_var("EPICS_PVA_ADDR_LIST", "");
         }
 
-        let engine = SearchEngine::spawn(Vec::new()).await.expect("spawn engine");
+        let engine = SearchEngine::spawn(Vec::new(), Vec::new())
+            .await
+            .expect("spawn engine");
         // Give the engine a moment to bind sockets and enter its
         // select loop.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2412,5 +2655,199 @@ mod tests {
              v6 recv arm in run_engine may be broken",
         );
         assert_eq!(observed, guid, "tracker must record the exact GUID");
+    }
+
+    /// PVA-R4 regression: TCP name servers must resolve PVs via persistent
+    /// SEARCH/SEARCH_RESPONSE, not merely as direct-connect fallbacks.
+    ///
+    /// Spawns a mock TCP name-server that performs the full PVA handshake
+    /// (SET_BYTE_ORDER → CONNECTION_VALIDATION → CONNECTION_VALIDATED) then
+    /// replies to any SEARCH frame with a SEARCH_RESPONSE containing the
+    /// matching search_id. With EPICS_PVA_AUTO_ADDR_LIST=NO the only
+    /// resolution path is the TCP NS — pre-fix find() would time out because
+    /// the NS was never wired into the search path; post-fix it resolves
+    /// within the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pva_r4_tcp_nameserver_persistent_peer() {
+        use std::io::Cursor as IoCursor;
+        use tokio::net::TcpListener;
+
+        // Bind mock NS before spawning engine so the port is known.
+        let ns_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock NS listener bind");
+        let ns_addr = ns_listener.local_addr().unwrap();
+
+        unsafe {
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        }
+
+        let ns_handle = tokio::spawn(async move {
+            let (mut stream, _peer) = ns_listener.accept().await.expect("mock NS: accept");
+            let order = ByteOrder::Little;
+
+            // ── Step 1: SET_BYTE_ORDER ─────────────────────────────────────────
+            {
+                let mut buf = Vec::with_capacity(PvaHeader::SIZE);
+                PvaHeader::control(true, order, ControlCommand::SetByteOrder.code(), 0)
+                    .write_into(&mut buf);
+                stream.write_all(&buf).await.expect("mock NS: write SBO");
+            }
+
+            // ── Step 2: CONNECTION_VALIDATION request (server→client) ──────────
+            {
+                let mut payload = Vec::new();
+                payload.put_u32(87_040, order); // buffer_size
+                payload.put_u16(32_767, order); // registry_size
+                payload.push(1u8); // auth_methods count (size-encoded, 1 < 254)
+                encode_string_into("anonymous", order, &mut payload);
+                let h = PvaHeader::application(
+                    true,
+                    order,
+                    Command::ConnectionValidation.code(),
+                    payload.len() as u32,
+                );
+                let mut frame = Vec::new();
+                h.write_into(&mut frame);
+                frame.extend_from_slice(&payload);
+                stream
+                    .write_all(&frame)
+                    .await
+                    .expect("mock NS: write val req");
+            }
+
+            // ── Step 3: drain client CONNECTION_VALIDATION reply ───────────────
+            {
+                let mut buf = Vec::<u8>::new();
+                let mut tmp = [0u8; 4096];
+                'drain_val: loop {
+                    let n = stream
+                        .read(&mut tmp)
+                        .await
+                        .expect("mock NS: read val reply");
+                    assert!(n > 0, "mock NS: client closed before validation");
+                    buf.extend_from_slice(&tmp[..n]);
+                    let mut pos = 0usize;
+                    while buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
+                        let Ok(hdr) = PvaHeader::decode(&mut IoCursor::new(&buf[pos..])) else {
+                            break;
+                        };
+                        let frame_end = pos + PvaHeader::SIZE + hdr.payload_length as usize;
+                        if buf.len() < frame_end {
+                            break;
+                        }
+                        if !hdr.flags.is_control()
+                            && hdr.command == Command::ConnectionValidation.code()
+                        {
+                            break 'drain_val;
+                        }
+                        pos = frame_end;
+                    }
+                }
+            }
+
+            // ── Step 4: CONNECTION_VALIDATED ───────────────────────────────────
+            {
+                // Status::OkNoMsg wire encoding = 0xFF (proto/status.rs:143-144).
+                let payload = vec![0xFFu8];
+                let h = PvaHeader::application(
+                    true,
+                    order,
+                    Command::ConnectionValidated.code(),
+                    payload.len() as u32,
+                );
+                let mut frame = Vec::new();
+                h.write_into(&mut frame);
+                frame.extend_from_slice(&payload);
+                stream
+                    .write_all(&frame)
+                    .await
+                    .expect("mock NS: write validated");
+            }
+
+            // ── Step 5: read SEARCH frames, reply with SEARCH_RESPONSE ─────────
+            // SEARCH payload offsets (codec.rs:88-102, LE byte order):
+            //   seq(4) + flags(1) + reserved(3) + addr(16) + port(2)
+            //   + proto_count(1) + "tcp"(1+3) + ch_count(2) = 33 bytes
+            //   → search_id at payload[33..37].
+            let mut buf = Vec::<u8>::new();
+            let mut tmp = [0u8; 4096];
+            let mut responded = false;
+            loop {
+                let n = stream.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                let mut pos = 0usize;
+                while buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
+                    let Ok(hdr) = PvaHeader::decode(&mut IoCursor::new(&buf[pos..])) else {
+                        break;
+                    };
+                    let frame_end = pos + PvaHeader::SIZE + hdr.payload_length as usize;
+                    if buf.len() < frame_end {
+                        break;
+                    }
+                    if !hdr.flags.is_control()
+                        && hdr.command == Command::Search.code()
+                        && !responded
+                    {
+                        let pl = &buf[pos + PvaHeader::SIZE..frame_end];
+                        if pl.len() >= 37 {
+                            let search_id = u32::from_le_bytes(pl[33..37].try_into().unwrap());
+                            let guid = [0x42u8; 12];
+                            let resp = crate::server_native::udp::build_search_response_proto(
+                                guid,
+                                0,
+                                ns_addr.port(),
+                                &[search_id],
+                                order,
+                                "tcp",
+                            );
+                            stream
+                                .write_all(&resp)
+                                .await
+                                .expect("mock NS: write SEARCH_RESPONSE");
+                            responded = true;
+                        }
+                    }
+                    pos = frame_end;
+                }
+                buf.drain(..pos);
+            }
+        });
+
+        // Engine with only this NS — no UDP broadcast.
+        let engine = SearchEngine::spawn(Vec::new(), vec![ns_addr])
+            .await
+            .expect("spawn engine");
+
+        // find() must resolve via the TCP NS within 5 s.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.find("TEST:NS:PV", SearchReason::Initial),
+        )
+        .await;
+
+        unsafe {
+            std::env::remove_var("EPICS_PVA_AUTO_ADDR_LIST");
+            std::env::remove_var("EPICS_PVA_ADDR_LIST");
+        }
+        ns_handle.abort();
+
+        let resolved = result
+            .expect("find() must complete within 5 s; TCP NS search path may be broken")
+            .expect("find() must succeed; handle_search_response may not route TCP responses");
+        assert_eq!(
+            resolved.port(),
+            ns_addr.port(),
+            "resolved port must match what the NS advertised in SEARCH_RESPONSE"
+        );
+        assert_eq!(
+            resolved.ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "resolved IP must be 127.0.0.1 (rewrite_loopback from unspecified)"
+        );
     }
 }

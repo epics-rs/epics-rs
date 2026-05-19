@@ -86,6 +86,6 @@ pub mod pva_gateway;
 #[cfg(feature = "qsrv")]
 pub use qsrv::{
     AccessContext, AccessControl, AllowAllAccess, AnyChannel, AnyMonitor, BridgeChannel,
-    BridgeMonitor, BridgeProvider, Channel, ChannelProvider, FieldMapping, GroupChannel,
-    GroupMonitor, GroupPvDef, NtType, ProcessMode, PutOptions, PvaMonitor,
+    BridgeMonitor, BridgeProvider, Channel, ChannelProvider, ClientCreds, FieldMapping,
+    GroupChannel, GroupMonitor, GroupPvDef, NtType, ProcessMode, PutOptions, PvaMonitor,
 };

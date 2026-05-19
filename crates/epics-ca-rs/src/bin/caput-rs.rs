@@ -504,6 +504,13 @@ fn parse_array(
             }
             Ok(EpicsValue::Int64Array(arr))
         }
+        DT::UInt64 => {
+            let mut arr = Vec::with_capacity(tokens.len());
+            for t in tokens {
+                arr.push(t.parse::<u64>().map_err(|e| e.to_string())?);
+            }
+            Ok(EpicsValue::UInt64Array(arr))
+        }
         DT::Char => Ok(EpicsValue::CharArray(
             tokens
                 .iter()

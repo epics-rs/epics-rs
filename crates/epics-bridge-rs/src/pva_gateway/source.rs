@@ -9,9 +9,10 @@
 //! clients share one upstream subscription.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::RwLock;
@@ -22,12 +23,12 @@ use epics_base_rs::server::access_security::AccessSecurityConfig;
 // introspection helper, so the import is gated to match.
 #[cfg(test)]
 use epics_base_rs::server::access_security::AccessLevel;
-use epics_pva_rs::client::PvaClient;
+use epics_pva_rs::client::{AssertedIdentity, PvaClient};
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server::native_source::AcfCell;
 use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource};
 
-use super::channel_cache::ChannelCache;
+use super::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL};
 
 /// F-G12: raw upstream MONITOR DATA body bytes flowing through the
 /// per-entry broadcast channel. `body` is the wire-format
@@ -62,6 +63,95 @@ fn default_asg_resolver() -> AsgResolver {
     Arc::new(|_pv| "DEFAULT".to_string())
 }
 
+/// MR-R16: identity key for the per-credential upstream `PvaClient`
+/// and `ChannelCache` pools.
+///
+/// Every field that the gateway forwards into the asserted upstream
+/// identity must be part of this key. `upstream_client_for` builds the
+/// upstream client from `account` + `host` and records `method` +
+/// `authority` in the `AssertedIdentity`. Keying only on
+/// `(account, method)` let two downstream peers with the same account
+/// and method but different `host` / `authority` share the first
+/// peer's upstream client and cache — the upstream IOC would then see
+/// stale host / certificate-authority data for audit and ACF, and
+/// cached GET/MONITOR state could be reused under the wrong identity.
+///
+/// Invariant: a pool entry is reused for a `ChannelContext` only when
+/// every upstream-identity field matches. Adding a new identity field
+/// to the asserted upstream credential MUST add it here too.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct UpstreamIdentityKey {
+    account: String,
+    method: String,
+    host: String,
+    authority: String,
+}
+
+impl UpstreamIdentityKey {
+    fn from_ctx(ctx: &ChannelContext) -> Self {
+        Self {
+            account: ctx.account.clone(),
+            method: ctx.method.clone(),
+            host: ctx.host.clone(),
+            authority: ctx.authority.clone(),
+        }
+    }
+}
+
+/// Capacity-bounded map with LRU eviction.
+///
+/// Bounds remote-controllable resource growth: a downstream client that
+/// presents distinct identity keys on every connection can force at
+/// most `max` upstream connections rather than an unlimited number.
+/// When a new key would exceed the cap, the least-recently-used entry is
+/// evicted first.
+struct BoundedPool<K, V> {
+    map: HashMap<K, (V, Instant)>,
+    max: usize,
+}
+
+impl<K: Eq + Hash + Clone, V> BoundedPool<K, V> {
+    fn new(max: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            max: max.max(1),
+        }
+    }
+
+    /// Current cap. Authoritative — there is no separate copy of this
+    /// value elsewhere, so a diagnostic accessor that reads this can
+    /// never desync from the pool's actual eviction bound.
+    fn capacity(&self) -> usize {
+        self.max
+    }
+
+    /// Look up `key` and refresh its LRU timestamp on hit.
+    fn get(&mut self, key: &K) -> Option<&V> {
+        if let Some((v, t)) = self.map.get_mut(key) {
+            *t = Instant::now();
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    /// Insert `key → value`. If the pool is at capacity and `key` is new,
+    /// evict the least-recently-used entry first.
+    fn insert(&mut self, key: K, value: V) {
+        if !self.map.contains_key(&key) && self.map.len() >= self.max {
+            if let Some(lru) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&lru);
+            }
+        }
+        self.map.insert(key, (value, Instant::now()));
+    }
+}
+
 /// `ChannelSource` impl handed to the downstream `PvaServer`. Cheap
 /// to clone (Arc-backed cache + a couple of `Duration`s).
 #[derive(Clone)]
@@ -91,14 +181,21 @@ pub struct GatewayChannelSource {
     /// the count across the multiple `Arc<dyn ChannelSourceObj>`
     /// handles the runtime holds.
     subscriber_count: Arc<AtomicUsize>,
-    /// Per-(account, method) upstream PvaClient pool (PG-G10). When
-    /// the downstream peer authenticates as `(alice, ca)` the
-    /// gateway reuses (or builds) a client whose CONNECTION_VALIDATION
-    /// to upstream advertises that same identity, so upstream ASG
-    /// rules and audit logs see the *real* client identity, not
-    /// the gateway. Empty string keys (`("", "anonymous")`) reuse
-    /// the cache's shared client.
-    upstream_pool: Arc<Mutex<HashMap<(String, String), Arc<PvaClient>>>>,
+    /// Per-`UpstreamIdentityKey` upstream PvaClient pool (PG-G10).
+    /// When the downstream peer authenticates as `(alice, ca)` from a
+    /// given host/authority the gateway reuses (or builds) a client
+    /// whose CONNECTION_VALIDATION to upstream advertises that same
+    /// identity, so upstream ASG rules and audit logs see the *real*
+    /// client identity, not the gateway. Anonymous / empty-account
+    /// peers reuse the cache's shared client.
+    ///
+    /// MR-R16: keyed by account, method, host, AND authority — see
+    /// [`UpstreamIdentityKey`].
+    ///
+    /// BR-R7: bounded via `BoundedPool` — evicts LRU entry when
+    /// `max_upstream_identities` is reached, so a downstream client
+    /// that presents unbounded distinct accounts cannot exhaust memory.
+    upstream_pool: Arc<Mutex<BoundedPool<UpstreamIdentityKey, Arc<PvaClient>>>>,
     /// Optional gateway-side ACF policy (round 29). When set, every
     /// downstream GET / PUT / MONITOR is gated through
     /// `check_access_method` BEFORE the upstream forward, so the
@@ -127,6 +224,20 @@ pub struct GatewayChannelSource {
     /// site policy on the gateway is expected to use UAG/HAG
     /// gating rather than per-record ASL.
     gate: epics_base_rs::server::access_security::AccessGate,
+    /// BR-R21: per-`UpstreamIdentityKey` upstream ChannelCache pool.
+    /// When a credentialed downstream peer issues a GET/MONITOR, the
+    /// gateway routes through a cache backed by a per-credential
+    /// PvaClient — so the upstream IOC sees the real downstream
+    /// identity when evaluating its own ACF rules. Anonymous /
+    /// empty-account peers fall through to the shared `cache`.
+    /// Parallels `upstream_pool` which already provides per-credential
+    /// routing for PUT / RPC / PROCESS.
+    ///
+    /// MR-R16: keyed by account, method, host, AND authority — see
+    /// [`UpstreamIdentityKey`].
+    ///
+    /// BR-R7: bounded via `BoundedPool` (same cap as `upstream_pool`).
+    upstream_caches: Arc<Mutex<BoundedPool<UpstreamIdentityKey, Arc<ChannelCache>>>>,
 }
 
 impl GatewayChannelSource {
@@ -141,10 +252,11 @@ impl GatewayChannelSource {
             rpc_timeout: Duration::from_secs(30),
             max_subscribers: 100_000,
             subscriber_count: Arc::new(AtomicUsize::new(0)),
-            upstream_pool: Arc::new(Mutex::new(HashMap::new())),
+            upstream_pool: Arc::new(Mutex::new(BoundedPool::new(256))),
             acf,
             asg_resolver,
             gate,
+            upstream_caches: Arc::new(Mutex::new(BoundedPool::new(256))),
         }
     }
 
@@ -243,28 +355,123 @@ impl GatewayChannelSource {
     /// pair gets its own connection so upstream ASG rules see the
     /// real client identity. Empty/anonymous credentials fall through
     /// to the cache's shared client (no new connection allocated).
+    ///
+    /// BR-R8: the pvAccess CONNECTION_VALIDATION handshake carries
+    /// only the `ca` / `anonymous` auth methods, and the `ca`
+    /// credential carries solely `user` + `host` (pvxs
+    /// `clientconn.cpp:217-305` — `handle_CONNECTION_VALIDATION`
+    /// selects only `"ca"` / `"anonymous"`; the `ca` cred sets only
+    /// `cred["user"]` and `cred["host"]`). There is no wire method
+    /// that forwards an `x509` downstream method or its certificate
+    /// `AUTHORITY` upstream, so a PVA-to-PVA gateway *cannot* be
+    /// transparent for non-`ca` methods — it converts the downstream
+    /// identity into a CA-style assertion.
+    ///
+    /// To make that conversion explicit rather than silently
+    /// indistinguishable from a first-party `ca` login, the upstream
+    /// client is built with [`AssertedIdentity`] recording the real
+    /// downstream `method` + certificate `authority`, and a non-`ca`
+    /// downstream method is logged at `info` so the gateway's
+    /// identity-assertion trust boundary is visible in audit output.
     fn upstream_client_for(&self, ctx: &ChannelContext) -> Arc<PvaClient> {
         if ctx.account.is_empty() || ctx.method == "anonymous" {
             return self.cache.client().clone();
         }
-        let key = (ctx.account.clone(), ctx.method.clone());
+        let key = UpstreamIdentityKey::from_ctx(ctx);
         let mut pool = self.upstream_pool.lock();
         if let Some(c) = pool.get(&key) {
             return c.clone();
         }
-        let client = Arc::new(
-            PvaClient::builder()
-                .user(ctx.account.clone())
-                .host(ctx.host.clone())
-                .build(),
-        );
+        // BR-R8: a downstream method other than `ca` cannot be
+        // forwarded verbatim — the upstream `ca` credential is a
+        // gateway assertion. Make that explicit in audit output.
+        if ctx.method != "ca" {
+            tracing::info!(
+                downstream_account = %ctx.account,
+                downstream_method = %ctx.method,
+                downstream_authority = %ctx.authority,
+                downstream_host = %ctx.host,
+                "PVA gateway asserting downstream identity upstream as CA-style \
+                 credentials: the pvAccess wire cannot forward this auth method/authority",
+            );
+        }
+        // Derive the per-credential client from the gateway's base
+        // upstream client so it reaches the SAME upstream server /
+        // transport — only the asserted identity differs. Building a
+        // bare `PvaClient::builder()` here would drop the gateway's
+        // `server_addr` and the client would fall back to UDP search,
+        // never reaching a pinned or discovery-isolated upstream.
+        let client = Arc::new(self.cache.client().with_asserted_identity(
+            ctx.account.clone(),
+            ctx.host.clone(),
+            AssertedIdentity {
+                downstream_method: ctx.method.clone(),
+                downstream_authority: ctx.authority.clone(),
+            },
+        ));
         pool.insert(key, client.clone());
         client
+    }
+
+    /// BR-R21: look up (or lazily build) the upstream ChannelCache for
+    /// `ctx`. Credentialed peers get a per-(account, method) cache backed
+    /// by their own upstream PvaClient; anonymous peers reuse the shared
+    /// `cache`. Parallels `upstream_client_for` which does the same for
+    /// PUT/RPC/PROCESS.
+    fn upstream_cache_for(&self, ctx: &ChannelContext) -> Arc<ChannelCache> {
+        if ctx.account.is_empty() || ctx.method == "anonymous" {
+            return self.cache.clone();
+        }
+        let key = UpstreamIdentityKey::from_ctx(ctx);
+        // Fast path: already in pool.
+        if let Some(c) = self.upstream_caches.lock().get(&key) {
+            return c.clone();
+        }
+        // Build outside any lock — PvaClient::builder() is pure-Rust.
+        let client = self.upstream_client_for(ctx);
+        let new_cache = ChannelCache::with_max_entries(
+            client,
+            DEFAULT_CLEANUP_INTERVAL,
+            // Per-credential ceiling: a single downstream identity is
+            // unlikely to monitor more than this many PVs concurrently.
+            // Bounded to prevent a single misbehaving peer from filling
+            // the per-credential map indefinitely.
+            1_024,
+        );
+        // Double-checked insert under lock: a racing caller may have won.
+        let mut pool = self.upstream_caches.lock();
+        if let Some(c) = pool.get(&key) {
+            return c.clone();
+        }
+        pool.insert(key, new_cache.clone());
+        new_cache
     }
 
     /// Cache handle — useful for the gateway's own diagnostics.
     pub fn cache(&self) -> &Arc<ChannelCache> {
         &self.cache
+    }
+
+    /// Update the upstream-identity pool cap on both `upstream_pool` and
+    /// `upstream_caches`. Takes effect immediately; clears both pools so
+    /// the next credential lookup builds fresh entries under the new cap.
+    /// All clones of this `GatewayChannelSource` share the same pools and
+    /// will see the new cap.
+    pub fn set_max_upstream_identities(&self, n: usize) {
+        let n = n.max(1);
+        *self.upstream_pool.lock() = BoundedPool::new(n);
+        *self.upstream_caches.lock() = BoundedPool::new(n);
+    }
+
+    /// MR-R6: current upstream-identity pool cap. Reads the live
+    /// `upstream_pool` capacity directly, so this accessor can never
+    /// desync from the cap actually enforced — unlike the removed
+    /// `pub max_upstream_identities` field, which `set_max_upstream_identities`
+    /// did not update. `upstream_caches` is always rebuilt with the
+    /// same `n` by the setter, so the pool's cap is authoritative for
+    /// both. Default 256.
+    pub fn max_upstream_identities(&self) -> usize {
+        self.upstream_pool.lock().capacity()
     }
 
     /// Diagnostic accessor: how many entries are currently cached.
@@ -275,6 +482,142 @@ impl GatewayChannelSource {
     /// Diagnostic: live subscribe-bridge tasks.
     pub fn live_subscribers(&self) -> usize {
         self.subscriber_count.load(Ordering::Relaxed)
+    }
+
+    /// BR-R21 test accessor: returns the upstream cache that would be
+    /// selected for `ctx`. Exposed so tests can verify per-credential
+    /// cache separation without a live upstream IOC.
+    #[cfg(test)]
+    fn upstream_cache_for_test(&self, ctx: &ChannelContext) -> Arc<ChannelCache> {
+        self.upstream_cache_for(ctx)
+    }
+
+    /// Internal raw-subscribe helper. Routes `subscribe_raw` and
+    /// `subscribe_raw_checked` through a caller-supplied cache so
+    /// credentialed peers get per-credential upstream entries (BR-R21).
+    async fn subscribe_raw_inner(
+        &self,
+        cache: Arc<ChannelCache>,
+        name: &str,
+    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
+        // F-G12 default ON — opt out via EPICS_PVA_GW_RAW_FRAMES=NO.
+        if let Some(v) = epics_base_rs::runtime::env::get("EPICS_PVA_GW_RAW_FRAMES") {
+            if v.eq_ignore_ascii_case("NO") || v.eq_ignore_ascii_case("FALSE") || v == "0" {
+                return None;
+            }
+        }
+        // R49-G4: bump counter before spawning forwarder.
+        let prev = self.subscriber_count.fetch_add(1, Ordering::Relaxed);
+        if prev >= self.max_subscribers {
+            self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
+            tracing::warn!(
+                pv = %name,
+                live = prev,
+                cap = self.max_subscribers,
+                "pva-gateway: raw subscriber cap reached, refusing"
+            );
+            return None;
+        }
+        let entry = match cache.lookup(name, self.connect_timeout).await {
+            Ok(e) => e,
+            Err(_) => {
+                self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        let mut bcast = entry.subscribe_raw();
+        let (mpsc_tx, mpsc_rx) =
+            mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);
+        let counter = self.subscriber_count.clone();
+        tokio::spawn(async move {
+            struct CounterGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for CounterGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            let _guard = CounterGuard(counter);
+            loop {
+                match bcast.recv().await {
+                    Ok(ev) => {
+                        let type_changed = ev.type_changed;
+                        let out = epics_pva_rs::server_native::RawMonitorEvent {
+                            body_bytes: ev.body,
+                            byte_order: ev.byte_order,
+                            type_changed,
+                        };
+                        if mpsc_tx.send(out).await.is_err() {
+                            return;
+                        }
+                        // BR-R42: type-change marker is end-of-stream.
+                        if type_changed {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Some(mpsc_rx)
+    }
+
+    /// Internal typed-subscribe helper. Routes `subscribe` and
+    /// `subscribe_checked` through a caller-supplied cache (BR-R21).
+    async fn subscribe_inner(
+        &self,
+        cache: Arc<ChannelCache>,
+        name: &str,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        // Gateway-wide subscriber cap (PG-G3).
+        let prev = self.subscriber_count.fetch_add(1, Ordering::Relaxed);
+        if prev >= self.max_subscribers {
+            self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
+            tracing::warn!(
+                pv = %name,
+                live = prev,
+                cap = self.max_subscribers,
+                "pva-gateway: subscriber cap reached, refusing"
+            );
+            return None;
+        }
+        let entry = match cache.lookup(name, self.connect_timeout).await {
+            Ok(e) => e,
+            Err(_) => {
+                self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        let mut bcast_rx = entry.subscribe();
+        let initial = entry.snapshot();
+        let (mpsc_tx, mpsc_rx) = mpsc::channel(self.subscriber_queue);
+        let counter = self.subscriber_count.clone();
+        tokio::spawn(async move {
+            struct CounterGuard(Arc<AtomicUsize>);
+            impl Drop for CounterGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            let _guard = CounterGuard(counter);
+            if let Some(v) = initial {
+                if mpsc_tx.send(v).await.is_err() {
+                    return;
+                }
+            }
+            loop {
+                match bcast_rx.recv().await {
+                    Ok(v) => {
+                        if mpsc_tx.send(v).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Some(mpsc_rx)
     }
 }
 
@@ -334,11 +677,13 @@ impl ChannelSource for GatewayChannelSource {
             .lookup(name, self.connect_timeout)
             .await
             .map_err(|e| e.to_string())?;
-        let value_str = pvfield_to_pvput_string(&value)
-            .ok_or_else(|| "unsupported PvField shape for upstream PUT".to_string())?;
+        // BR-R6: typed pass-through — forward the PvField as-is without
+        // re-encoding through string form. pvxs serialises the PUT value
+        // with to_wire_valid(R, temp) (pvxs/src/clientget.cpp:305) — no
+        // string round-trip in the reference implementation.
         self.cache
             .client()
-            .pvput(name, &value_str)
+            .pvput_pv_field(name, &value)
             .await
             .map_err(|e| e.to_string())
     }
@@ -380,8 +725,6 @@ impl ChannelSource for GatewayChannelSource {
             .lookup(name, self.connect_timeout)
             .await
             .map_err(|e| e.to_string())?;
-        let value_str = pvfield_to_pvput_string(&value)
-            .ok_or_else(|| "unsupported PvField shape for upstream PUT".to_string())?;
         let client = self.upstream_client_for(&ctx);
         tracing::debug!(
             pv = %name,
@@ -389,8 +732,9 @@ impl ChannelSource for GatewayChannelSource {
             method = %ctx.method,
             "pva-gateway: forwarding PUT with downstream credentials"
         );
+        // BR-R6: typed pass-through (see put_value for rationale).
         client
-            .pvput(name, &value_str)
+            .pvput_pv_field(name, &value)
             .await
             .map_err(|e| e.to_string())
     }
@@ -550,160 +894,124 @@ impl ChannelSource for GatewayChannelSource {
         &self,
         name: &str,
     ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
-        // F-G12 fast path: hand the server pre-encoded raw bodies so
-        // its dispatch can write them onto downstream sockets without
-        // re-running encode_pv_field. The cache spawns the upstream
-        // monitor task (one decode per upstream event) and broadcasts
-        // the encoded body to N receivers — N atomic refcount bumps,
-        // not N encodes.
-        //
-        // F-G12 default ON — raw forwarding is the production
-        // gateway path. Operators can opt out via
-        // `EPICS_PVA_GW_RAW_FRAMES=NO` if they hit a regression and
-        // want the legacy decode-then-encode path while issues are
-        // diagnosed.
-        if let Some(v) = epics_base_rs::runtime::env::get("EPICS_PVA_GW_RAW_FRAMES") {
-            if v.eq_ignore_ascii_case("NO") || v.eq_ignore_ascii_case("FALSE") || v == "0" {
-                return None;
-            }
-        }
-        // R49-G4: bump the gateway-wide subscriber count BEFORE
-        // spawning the forwarder. Pre-fix the raw path skipped the
-        // increment but the spawned CounterGuard's Drop still
-        // performed the decrement, underflowing the counter on
-        // every raw subscription teardown; subsequent decoded
-        // subscribes would then read the wrapped-around `usize` and
-        // refuse new subscribers under a false "cap reached"
-        // warning. Mirror the decoded subscribe's cap check + RAII
-        // decrement here too so raw subscriptions count against
-        // the same ceiling.
-        let prev = self.subscriber_count.fetch_add(1, Ordering::Relaxed);
-        if prev >= self.max_subscribers {
-            self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
-            tracing::warn!(
-                pv = %name,
-                live = prev,
-                cap = self.max_subscribers,
-                "pva-gateway: raw subscriber cap reached, refusing"
-            );
-            return None;
-        }
-        let entry = match self.cache.lookup(name, self.connect_timeout).await {
-            Ok(e) => e,
-            Err(_) => {
-                self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
-                return None;
-            }
-        };
-        let mut bcast = entry.subscribe_raw();
-        let (mpsc_tx, mpsc_rx) =
-            mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);
-        let counter = self.subscriber_count.clone();
-        tokio::spawn(async move {
-            struct CounterGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-            impl Drop for CounterGuard {
-                fn drop(&mut self) {
-                    self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            let _guard = CounterGuard(counter);
-            loop {
-                match bcast.recv().await {
-                    Ok(ev) => {
-                        let type_changed = ev.type_changed;
-                        let out = epics_pva_rs::server_native::RawMonitorEvent {
-                            body_bytes: ev.body,
-                            byte_order: ev.byte_order,
-                            type_changed,
-                        };
-                        if mpsc_tx.send(out).await.is_err() {
-                            return;
-                        }
-                        // BR-R42: the type-change marker is end-of-stream
-                        // for this raw subscription — close the mpsc so
-                        // the downstream wire layer emits MONITOR FINISH
-                        // and the client knows to reopen.
-                        if type_changed {
-                            return;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
-            }
-        });
-        Some(mpsc_rx)
+        self.subscribe_raw_inner(self.cache.clone(), name).await
     }
 
     async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
-        // Gateway-wide subscriber cap (PG-G3). The underlying
-        // PvaServer enforces a per-connection channel cap; this is
-        // the global ceiling that defends against a coordinated
-        // burst of N peers each requesting M monitors.
-        let prev = self.subscriber_count.fetch_add(1, Ordering::Relaxed);
-        if prev >= self.max_subscribers {
-            self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
+        self.subscribe_inner(self.cache.clone(), name).await
+    }
+
+    /// BR-R21: route GET through per-credential upstream cache so the
+    /// upstream IOC sees the real downstream identity. Pre-fix the
+    /// default trait impl called `self.get_value(name)` which used the
+    /// shared cache regardless of downstream credentials.
+    async fn get_value_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<PvField> {
+        if !checked.allows_read() {
+            return None;
+        }
+        let cache = self.upstream_cache_for(&ctx);
+        let entry = cache
+            .lookup(checked.pv_name(), self.connect_timeout)
+            .await
+            .ok()?;
+        entry.snapshot()
+    }
+
+    /// BR-R21: route MONITOR through per-credential upstream cache.
+    async fn subscribe_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        if !checked.allows_read() {
+            return None;
+        }
+        self.subscribe_inner(self.upstream_cache_for(&ctx), checked.pv_name())
+            .await
+    }
+
+    /// BR-R21: route raw MONITOR through per-credential upstream cache.
+    async fn subscribe_raw_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
+        if !checked.allows_read() {
+            return None;
+        }
+        self.subscribe_raw_inner(self.upstream_cache_for(&ctx), checked.pv_name())
+            .await
+    }
+
+    /// BR-R14: decoded MONITOR with the downstream's event-affecting
+    /// pvRequest options.
+    ///
+    /// The gateway fans **one** upstream monitor — opened with the
+    /// gateway's default pvRequest — out to every downstream
+    /// subscriber for a PV name (`channel_cache::spawn_upstream_monitor`
+    /// keys the cache by PV name only). Field projection, `pipeline`,
+    /// and `queueSize` are downstream-local — the gateway terminates
+    /// them on its own downstream connection / outbox — and are
+    /// transparent. A server-side `_filter` chain (pvxs
+    /// `servermon.cpp:521-555`), by contrast, changes *upstream event
+    /// production* and cannot be honored across the shared upstream
+    /// monitor: serving such a subscription from the default fanout
+    /// would deliver an event stream that differs from a direct
+    /// upstream monitor.
+    ///
+    /// This source is a documented cache/fanout gateway, so the
+    /// parity-correct behaviour is to **reject** an unsupported
+    /// option set (return `None`) rather than silently serve diverging
+    /// events. A subscription with no event-affecting option delegates
+    /// to the normal ACF-gated `subscribe_checked` path.
+    async fn subscribe_checked_opts(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        if opts.affects_upstream_events() {
             tracing::warn!(
-                pv = %name,
-                live = prev,
-                cap = self.max_subscribers,
-                "pva-gateway: subscriber cap reached, refusing"
+                pv = %checked.pv_name(),
+                account = %ctx.account,
+                pipeline = opts.pipeline,
+                queue_size = ?opts.queue_size,
+                server_filter = opts.server_filter,
+                "pva-gateway: rejecting MONITOR — event-affecting pvRequest \
+                 options cannot be honored transparently across the gateway's \
+                 single fanout upstream monitor",
             );
             return None;
         }
+        self.subscribe_checked(checked, ctx).await
+    }
 
-        let entry = match self.cache.lookup(name, self.connect_timeout).await {
-            Ok(e) => e,
-            Err(_) => {
-                self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
-                return None;
-            }
-        };
-        let mut bcast_rx = entry.subscribe();
-        // pvxs sends one event per subscribe so the downstream sees
-        // the current value immediately; emit our cached snapshot the
-        // same way.
-        let initial = entry.snapshot();
-
-        let (mpsc_tx, mpsc_rx) = mpsc::channel(self.subscriber_queue);
-        let counter = self.subscriber_count.clone();
-        tokio::spawn(async move {
-            // RAII: ensure the counter is always decremented even on
-            // panic / early-return paths.
-            struct CounterGuard(Arc<AtomicUsize>);
-            impl Drop for CounterGuard {
-                fn drop(&mut self) {
-                    self.0.fetch_sub(1, Ordering::Relaxed);
-                }
-            }
-            let _guard = CounterGuard(counter);
-
-            if let Some(v) = initial {
-                if mpsc_tx.send(v).await.is_err() {
-                    return;
-                }
-            }
-            loop {
-                match bcast_rx.recv().await {
-                    Ok(v) => {
-                        if mpsc_tx.send(v).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Slow consumer; broadcast dropped some
-                        // events. Swallow and keep going — next event
-                        // resyncs the cache.
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
-            }
-        });
-
-        Some(mpsc_rx)
+    /// BR-R14 raw-path counterpart of [`Self::subscribe_checked_opts`].
+    /// Same reject-on-unsupported-option contract.
+    async fn subscribe_raw_checked_opts(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
+        if opts.affects_upstream_events() {
+            tracing::warn!(
+                pv = %checked.pv_name(),
+                account = %ctx.account,
+                pipeline = opts.pipeline,
+                queue_size = ?opts.queue_size,
+                server_filter = opts.server_filter,
+                "pva-gateway: rejecting raw MONITOR — event-affecting pvRequest \
+                 options cannot be honored transparently across the gateway's \
+                 single fanout upstream monitor",
+            );
+            return None;
+        }
+        self.subscribe_raw_checked(checked, ctx).await
     }
 
     /// Forward downstream-to-gateway backpressure into upstream
@@ -752,74 +1060,6 @@ impl ChannelSource for GatewayChannelSource {
     }
 }
 
-/// Convert a `PvField` into the string form pvput accepts. Covers:
-/// * `Scalar` / `ScalarArray` directly
-/// * `Structure` containing a `.value` field (NTScalar / NTScalarArray /
-///   NTEnum index — anything where the put target is the canonical
-///   `value` subfield)
-/// * `Variant` and `Union` by recursively unwrapping the inner field
-///
-/// Returns `None` for shapes pvput cannot represent in string form
-/// (e.g. nested structures with no `value` field). Callers surface
-/// the `None` to the downstream client as a typed error so the user
-/// gets a clear "unsupported PvField shape" message instead of a
-/// silent drop. Without `pvput_field` (typed PUT through the client
-/// API) on `PvaClient` this is the best the gateway can do today;
-/// see review §3d for the longer-term plan.
-fn pvfield_to_pvput_string(v: &PvField) -> Option<String> {
-    match v {
-        PvField::Scalar(sv) => Some(scalar_to_string(sv)),
-        PvField::ScalarArray(items) => {
-            // pvput accepts space-separated values for arrays.
-            let parts: Vec<String> = items.iter().map(scalar_to_string).collect();
-            Some(parts.join(" "))
-        }
-        PvField::Structure(s) => {
-            for (name, field) in &s.fields {
-                if name == "value" {
-                    return pvfield_to_pvput_string(field);
-                }
-            }
-            None
-        }
-        PvField::Variant(boxed) => pvfield_to_pvput_string(&boxed.value),
-        PvField::Union {
-            selector, value, ..
-        } => {
-            if *selector < 0 {
-                None
-            } else {
-                pvfield_to_pvput_string(value)
-            }
-        }
-        _ => None,
-    }
-}
-
-fn scalar_to_string(sv: &epics_pva_rs::pvdata::ScalarValue) -> String {
-    use epics_pva_rs::pvdata::ScalarValue::*;
-    match sv {
-        Boolean(b) => {
-            if *b {
-                "1".into()
-            } else {
-                "0".into()
-            }
-        }
-        Byte(x) => x.to_string(),
-        UByte(x) => x.to_string(),
-        Short(x) => x.to_string(),
-        UShort(x) => x.to_string(),
-        Int(x) => x.to_string(),
-        UInt(x) => x.to_string(),
-        Long(x) => x.to_string(),
-        ULong(x) => x.to_string(),
-        Float(x) => x.to_string(),
-        Double(x) => x.to_string(),
-        String(s) => s.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,6 +1073,7 @@ mod tests {
             method: method.to_string(),
             host: host.to_string(),
             authority: String::new(),
+            roles: Vec::new(),
             pv_request: None,
         }
     }
@@ -1207,6 +1448,387 @@ ASG(DEFAULT) {
         assert!(
             rx.is_none(),
             "raw subscribe must be denied for a NoAccess peer"
+        );
+    }
+
+    /// BR-R8: a downstream peer authenticating with `x509` cannot be
+    /// forwarded verbatim — the pvAccess CONNECTION_VALIDATION wire
+    /// has no `x509` method and the `ca` credential carries only
+    /// `user`/`host` (pvxs `clientconn.cpp:217-305`). The gateway
+    /// must convert the identity into a CA-style assertion *and make
+    /// that conversion explicit*: the upstream `PvaClient` it builds
+    /// must carry an `AssertedIdentity` recording the real downstream
+    /// method + certificate authority.
+    ///
+    /// Pre-fix the upstream client was built with only
+    /// `.user(account).host(host)` — `asserted_identity()` returned
+    /// `None`, indistinguishable from a first-party `ca` login.
+    #[tokio::test]
+    async fn br_r8_x509_downstream_recorded_as_asserted_identity() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let src = make_source();
+        let ctx = ChannelContext {
+            peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+            account: "alice".to_string(),
+            method: "x509".to_string(),
+            host: "ws01.lab".to_string(),
+            authority: "Lab Root CA".to_string(),
+            roles: Vec::new(),
+            pv_request: None,
+        };
+        let client = src.upstream_client_for(&ctx);
+        let asserted = client
+            .asserted_identity()
+            .expect("x509 downstream must be recorded as a gateway-asserted identity");
+        assert_eq!(
+            asserted.downstream_method, "x509",
+            "the real downstream auth method must be preserved for audit",
+        );
+        assert_eq!(
+            asserted.downstream_authority, "Lab Root CA",
+            "the downstream certificate authority must be preserved for audit",
+        );
+    }
+
+    /// BR-R8 companion: a first-party `ca` downstream is forwarded
+    /// verbatim — the wire carries the same `ca` method + `user`/
+    /// `host` — so the recorded `AssertedIdentity` reports `ca` with
+    /// no authority. This documents that the assertion record is not
+    /// a divergence for the wire-faithful case.
+    #[tokio::test]
+    async fn br_r8_ca_downstream_records_ca_method() {
+        let src = make_source();
+        let ctx = make_ctx("ws02.lab", "bob", "ca");
+        let client = src.upstream_client_for(&ctx);
+        let asserted = client
+            .asserted_identity()
+            .expect("per-credential upstream client must record the downstream identity");
+        assert_eq!(asserted.downstream_method, "ca");
+        assert_eq!(asserted.downstream_authority, "");
+    }
+
+    /// BR-R14: the gateway fans one upstream monitor (opened with the
+    /// gateway's default pvRequest) out to N downstream subscribers.
+    /// A downstream MONITOR pvRequest carrying a server-side `_filter`
+    /// chain (pvxs `servermon.cpp:521-555`) changes *upstream event
+    /// production* and cannot be honored transparently across that
+    /// shared monitor, so the gateway must reject it (return `None`)
+    /// rather than serve fanout events that differ from a direct
+    /// upstream monitor.
+    ///
+    /// `pipeline` / `queueSize`, by contrast, are downstream
+    /// client↔gateway flow control the gateway terminates on its own
+    /// downstream connection / outbox, so they must NOT be rejected:
+    /// every default-configured PVA client enables pipeline, and
+    /// rejecting it would make the gateway's monitor feature unusable.
+    #[tokio::test]
+    async fn br_r14_server_filter_monitor_rejected_by_gateway() {
+        use epics_pva_rs::server_native::MonitorOptions;
+
+        let src = make_source();
+        let ctx = make_ctx("ws03.lab", "carol", "anonymous");
+
+        // pipeline + queueSize are downstream-local flow control —
+        // transparent through the fanout gateway, NOT rejected.
+        let pipeline_opts = MonitorOptions {
+            pipeline: true,
+            queue_size: Some(16),
+            server_filter: false,
+        };
+        assert!(
+            !pipeline_opts.affects_upstream_events(),
+            "pipeline / queueSize are downstream-local and must not be \
+             treated as upstream-event-affecting",
+        );
+
+        // A server-side `_filter` chain DOES change upstream event
+        // production and must be rejected on both the decoded and the
+        // raw fast path. The reject returns immediately — no upstream
+        // lookup — so this does not block on connect_timeout.
+        let filter_opts = MonitorOptions {
+            pipeline: false,
+            queue_size: None,
+            server_filter: true,
+        };
+        assert!(
+            filter_opts.affects_upstream_events(),
+            "a server-side _filter chain must count as event-affecting",
+        );
+        let token = check(&src, "some:pv", &ctx).await;
+        let rx = src
+            .subscribe_checked_opts(token, ctx.clone(), filter_opts.clone())
+            .await;
+        assert!(
+            rx.is_none(),
+            "gateway must reject a decoded MONITOR carrying a \
+             server-side _filter chain",
+        );
+
+        let raw_token = check(&src, "some:pv", &ctx).await;
+        let raw_rx = src
+            .subscribe_raw_checked_opts(raw_token, ctx, filter_opts)
+            .await;
+        assert!(
+            raw_rx.is_none(),
+            "gateway must reject a raw MONITOR carrying a server-side \
+             _filter chain",
+        );
+    }
+
+    /// BR-R14 companion: an option set with no event-affecting option
+    /// (`affects_upstream_events() == false`) is transparent through
+    /// the gateway — the gateway does not reject it on the basis of
+    /// options. (It still goes through the normal ACF + upstream
+    /// lookup path.)
+    #[test]
+    fn br_r14_field_projection_is_not_event_affecting() {
+        use epics_pva_rs::server_native::MonitorOptions;
+
+        // The default `MonitorOptions` — what a plain `pvmonitor`
+        // produces (field projection is captured as a separate
+        // BitSet mask, not here) — must not be flagged as
+        // event-affecting.
+        let plain = MonitorOptions::default();
+        assert!(
+            !plain.affects_upstream_events(),
+            "a plain monitor (no pipeline / queueSize / filter) must be \
+             transparent through the gateway",
+        );
+    }
+
+    /// BR-R21: GET/MONITOR must route through per-credential upstream
+    /// caches so the upstream IOC's ACF sees the real downstream
+    /// identity. Pre-fix the default trait impls for `get_value_checked`,
+    /// `subscribe_checked`, and `subscribe_raw_checked` called the
+    /// ctx-less `get_value`/`subscribe`/`subscribe_raw` which all used
+    /// the single shared cache regardless of credentials.
+    ///
+    /// Upstream parity: pvxs p2pApp gateway source files (gw.cpp,
+    /// gwserver.cpp, gwprov.cpp) are not present in this pvxs checkout
+    /// (noted in doc/pvxs-functional-security-review-2026-05-18.md:27),
+    /// but the wire-compatible expectation is stated in the spec:
+    /// "the chosen trust boundary must be explicit" — the gateway must
+    /// not silently conflate per-client upstream authorization into a
+    /// single shared-client authorization.
+    #[tokio::test]
+    async fn br_r21_gateway_monitor_credential_scoping() {
+        let src = make_source();
+
+        let alice = make_ctx("host1", "alice", "x509");
+        let bob = make_ctx("host2", "bob", "ca");
+
+        // Two different credentials must route to SEPARATE upstream caches.
+        // Each cache is backed by its own PvaClient, so the upstream IOC
+        // sees the real downstream identity when applying ACF rules.
+        let cache_alice = src.upstream_cache_for_test(&alice);
+        let cache_bob = src.upstream_cache_for_test(&bob);
+        assert!(
+            !Arc::ptr_eq(&cache_alice, &cache_bob),
+            "alice (x509) and bob (ca) must use distinct upstream caches \
+             for per-credential upstream routing"
+        );
+
+        // Same credential must pool-share — no redundant upstream connections.
+        let cache_alice2 = src.upstream_cache_for_test(&alice);
+        assert!(
+            Arc::ptr_eq(&cache_alice, &cache_alice2),
+            "second call for same credential must reuse the existing upstream cache"
+        );
+
+        // Anonymous / empty credentials fall through to the shared gateway cache.
+        let anon = make_ctx("host3", "", "anonymous");
+        let cache_anon = src.upstream_cache_for_test(&anon);
+        assert!(
+            Arc::ptr_eq(&cache_anon, src.cache()),
+            "anonymous/empty credentials must reuse the shared upstream gateway cache"
+        );
+    }
+
+    /// MR-R16 regression: the upstream-identity pools must be keyed
+    /// by host and authority too, not only `(account, method)`.
+    /// Pre-fix two downstream peers with the same account+method but
+    /// different host (or x509 certificate authority) collided on the
+    /// `(account, method)` key and shared the first peer's upstream
+    /// PvaClient and ChannelCache — so the upstream IOC saw stale
+    /// host / asserted-authority data for audit and ACF.
+    #[tokio::test]
+    async fn mr_r16_identity_pools_keyed_by_host_and_authority() {
+        // Build a ChannelContext with an explicit authority — the
+        // `make_ctx` helper always leaves authority empty.
+        fn ctx_with(host: &str, account: &str, method: &str, authority: &str) -> ChannelContext {
+            let mut c = make_ctx(host, account, method);
+            c.authority = authority.to_string();
+            c
+        }
+
+        let src = make_source();
+
+        // Same account + method, different host.
+        let alice_h1 = ctx_with("host-1", "alice", "ca", "");
+        let alice_h2 = ctx_with("host-2", "alice", "ca", "");
+
+        let client_h1 = src.upstream_client_for(&alice_h1);
+        let client_h2 = src.upstream_client_for(&alice_h2);
+        assert!(
+            !Arc::ptr_eq(&client_h1, &client_h2),
+            "same account/method from different hosts must get distinct \
+             upstream clients"
+        );
+        let cache_h1 = src.upstream_cache_for_test(&alice_h1);
+        let cache_h2 = src.upstream_cache_for_test(&alice_h2);
+        assert!(
+            !Arc::ptr_eq(&cache_h1, &cache_h2),
+            "same account/method from different hosts must get distinct \
+             upstream caches"
+        );
+
+        // Same account + method + host, different x509 authority.
+        let alice_ca_a = ctx_with("host-x", "alice", "x509", "Authority-A");
+        let alice_ca_b = ctx_with("host-x", "alice", "x509", "Authority-B");
+
+        let client_a = src.upstream_client_for(&alice_ca_a);
+        let client_b = src.upstream_client_for(&alice_ca_b);
+        assert!(
+            !Arc::ptr_eq(&client_a, &client_b),
+            "same account/method/host with different certificate \
+             authorities must get distinct upstream clients"
+        );
+        let cache_a = src.upstream_cache_for_test(&alice_ca_a);
+        let cache_b = src.upstream_cache_for_test(&alice_ca_b);
+        assert!(
+            !Arc::ptr_eq(&cache_a, &cache_b),
+            "same account/method/host with different certificate \
+             authorities must get distinct upstream caches"
+        );
+
+        // Fully identical identity must still pool-share.
+        let client_h1_again = src.upstream_client_for(&alice_h1);
+        assert!(
+            Arc::ptr_eq(&client_h1, &client_h1_again),
+            "an identical identity (account, method, host, authority) \
+             must reuse the pooled upstream client"
+        );
+        let cache_h1_again = src.upstream_cache_for_test(&alice_h1);
+        assert!(
+            Arc::ptr_eq(&cache_h1, &cache_h1_again),
+            "an identical identity must reuse the pooled upstream cache"
+        );
+    }
+
+    /// BR-R7: the upstream identity pools must be bounded. Pre-fix
+    /// `upstream_pool` and `upstream_caches` were plain `HashMap`s;
+    /// a downstream client that varied `(account, method)` on every
+    /// connection could grow them without limit. Post-fix both pools
+    /// cap at `max_upstream_identities` and evict the LRU entry.
+    ///
+    /// This test fails on main (pool.len() == 3 after 3 distinct
+    /// identities with cap=2) and passes after fix (pool.len() == 2).
+    #[tokio::test]
+    async fn br_r7_gateway_credential_pool_bounded() {
+        let src = make_source();
+        // Cap both pools at 2 so the third identity triggers eviction.
+        src.set_max_upstream_identities(2);
+
+        let alice = make_ctx("h1", "alice", "ca");
+        let bob = make_ctx("h2", "bob", "ca");
+        let charlie = make_ctx("h3", "charlie", "ca");
+
+        // Fill pool to cap.
+        src.upstream_client_for(&alice);
+        src.upstream_client_for(&bob);
+        assert_eq!(
+            src.upstream_pool.lock().map.len(),
+            2,
+            "pool must hold exactly 2 entries after 2 distinct identities"
+        );
+
+        // Access alice to make it the most-recently used.
+        src.upstream_client_for(&alice);
+
+        // Third distinct identity: must evict LRU (bob), keeping alice + charlie.
+        src.upstream_client_for(&charlie);
+        let pool_len = src.upstream_pool.lock().map.len();
+        assert_eq!(
+            pool_len, 2,
+            "pool must not exceed cap=2 after a third distinct identity; got {pool_len}"
+        );
+
+        // bob (LRU) must be gone; alice and charlie must be present.
+        {
+            let pool = src.upstream_pool.lock();
+            assert!(
+                !pool.map.contains_key(&UpstreamIdentityKey::from_ctx(&bob)),
+                "bob (LRU) must be evicted"
+            );
+            assert!(
+                pool.map
+                    .contains_key(&UpstreamIdentityKey::from_ctx(&alice)),
+                "alice (MRU) must be retained"
+            );
+            assert!(
+                pool.map
+                    .contains_key(&UpstreamIdentityKey::from_ctx(&charlie)),
+                "charlie (newest) must be retained"
+            );
+        }
+
+        // Same cap applies to upstream_caches.
+        src.upstream_cache_for_test(&alice);
+        src.upstream_cache_for_test(&bob);
+        assert_eq!(src.upstream_caches.lock().map.len(), 2);
+        src.upstream_cache_for_test(&alice); // refresh alice
+        src.upstream_cache_for_test(&charlie);
+        let cache_len = src.upstream_caches.lock().map.len();
+        assert_eq!(
+            cache_len, 2,
+            "upstream_caches must not exceed cap=2; got {cache_len}"
+        );
+    }
+
+    /// MR-R6 regression: the reported upstream-identity cap must
+    /// always reflect the cap actually enforced by the pools.
+    /// Pre-fix `max_upstream_identities` was a `pub` field that
+    /// `set_max_upstream_identities` never updated, so the reported
+    /// value desynced from the real `BoundedPool` capacity. Post-fix
+    /// the accessor reads the live pool cap directly.
+    #[tokio::test]
+    async fn mr_r6_max_upstream_identities_tracks_setter() {
+        let src = make_source();
+        // Default cap.
+        assert_eq!(
+            src.max_upstream_identities(),
+            256,
+            "default cap must be 256"
+        );
+
+        // After the setter the accessor must report the new cap, not
+        // the stale default.
+        src.set_max_upstream_identities(2);
+        assert_eq!(
+            src.max_upstream_identities(),
+            2,
+            "accessor must reflect the cap installed by set_max_upstream_identities"
+        );
+
+        // The accessor must agree with the actual pool eviction bound.
+        assert_eq!(
+            src.max_upstream_identities(),
+            src.upstream_pool.lock().capacity(),
+            "reported cap must equal upstream_pool capacity"
+        );
+        assert_eq!(
+            src.max_upstream_identities(),
+            src.upstream_caches.lock().capacity(),
+            "reported cap must equal upstream_caches capacity"
+        );
+
+        // The setter floors at 1; the accessor must reflect that too.
+        src.set_max_upstream_identities(0);
+        assert_eq!(
+            src.max_upstream_identities(),
+            1,
+            "accessor must report the floored cap of 1"
         );
     }
 }

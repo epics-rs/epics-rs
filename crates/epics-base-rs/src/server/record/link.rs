@@ -237,15 +237,18 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
             }
         }
         "ca" | "pva" => {
-            // Form: { ca: { pv: "name", proc: ... } } — extract pv
-            // value via a permissive substring scan. Full JSON parser
-            // would be cleaner but pulls in pv-name validation that
-            // belongs at parse_db level.
-            let pv = extract_pv_from_subobject(rest)?;
+            // Form: { pva: { pv: "name", field: "F", proc: "CP", ... } }
+            // For CA: only the PV name is needed (CA links bypass pvalink).
+            // For PVA: preserve all pvxs JSON options as a query string so
+            // the pvalink bridge can reconstruct the full PvaLinkConfig.
+            // pvxs parity: pvalink_jlif.cpp:24-41, :69-196.
+            let (pv, query) = extract_pv_and_opts_from_subobject(rest)?;
             if key == "ca" {
                 Some(ParsedLink::Ca(pv))
-            } else {
+            } else if query.is_empty() {
                 Some(ParsedLink::Pva(pv))
+            } else {
+                Some(ParsedLink::Pva(format!("{pv}?{query}")))
             }
         }
         "calc" => {
@@ -296,29 +299,49 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
     }
 }
 
-/// Extract `pv: "name"` from a sub-object's body. Permissive: accepts
-/// quoted/unquoted keys, single or double quotes around the value.
-fn extract_pv_from_subobject(body: &str) -> Option<String> {
+/// Extract the `pv` name and all other key-value options from a
+/// JSON-ish sub-object body. Returns `(pv_name, query_string)` where
+/// `query_string` encodes every non-pv key as `k=v&…` (empty when
+/// there are no extra options). Accepts unquoted keys, single or
+/// double quotes around values.
+///
+/// pvxs parity: pvalink_jlif.cpp:24-41 (supported keys),
+/// :69-196 (per-key parsing). Key case is preserved so
+/// `PvaLinkConfig::parse` can parse `Q` (uppercase).
+fn extract_pv_and_opts_from_subobject(body: &str) -> Option<(String, String)> {
     let body = body.trim_start_matches('{').trim_end_matches('}').trim();
+    let mut pv: Option<String> = None;
+    let mut opts: Vec<String> = Vec::new();
     for entry in body.split(',') {
         let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // split_once splits at the FIRST ':' — PV names like "REC:AI"
+        // have ':' inside the quoted value, but since we split on the
+        // key separator `:` first (before the opening `"`) the colon
+        // inside the quoted value survives (it's the second or later
+        // colon in the entry string).
         let (k, v) = entry.split_once(':')?;
-        let k = k.trim().trim_matches('"').trim_matches('\'');
-        if k.eq_ignore_ascii_case("pv") {
-            let v = v
-                .trim()
-                .trim_matches(',')
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_string();
-            if v.is_empty() {
-                return None;
-            }
-            return Some(v);
+        let k_raw = k.trim().trim_matches('"').trim_matches('\'');
+        let v_raw = v
+            .trim()
+            .trim_matches(',')
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'');
+        if v_raw.is_empty() {
+            continue;
+        }
+        if k_raw.eq_ignore_ascii_case("pv") {
+            pv = Some(v_raw.to_string());
+        } else {
+            // Preserve original key case for PvaLinkConfig::parse
+            // (which is case-sensitive for keys like `Q`).
+            opts.push(format!("{k_raw}={v_raw}"));
         }
     }
-    None
+    Some((pv?, opts.join("&")))
 }
 
 /// Recognize a hardware (`@dev …` / `#Cn Sn`) link. Mirrors epics-base
@@ -771,6 +794,40 @@ mod json_link_tests {
         // the letters "ca".
         assert_eq!(link_field_type("camera.VAL"), LinkType::Db);
         assert_eq!(link_field_type("REC.VAL PP"), LinkType::Db);
+    }
+
+    /// BR-R10: JSON pvalink options survive parse_link_v2.
+    /// Upstream parity: pvxs pvalink_jlif.cpp:24-41, :69-196.
+    #[test]
+    fn br_r10_json_pva_options_preserved_in_parsed_link() {
+        // All options present: field, proc (CPP), sevr (MS), Q, pipeline.
+        let link = parse_link_v2(
+            r#"{pva: {pv: "TARGET:AI", field: "display.precision", proc: "CPP", sevr: "MS", Q: 8}}"#,
+        );
+        let stored = match link {
+            ParsedLink::Pva(ref s) => s.as_str(),
+            other => panic!("expected Pva, got {other:?}"),
+        };
+        assert!(
+            stored.starts_with("TARGET:AI?"),
+            "options must be encoded as query: {stored}"
+        );
+        assert!(
+            stored.contains("field=display.precision"),
+            "field option lost: {stored}"
+        );
+        assert!(stored.contains("proc=CPP"), "proc option lost: {stored}");
+        assert!(stored.contains("sevr=MS"), "sevr option lost: {stored}");
+        assert!(stored.contains("Q=8"), "Q option lost: {stored}");
+    }
+
+    /// BR-R10: bare pvalink JSON with no extra options is unchanged.
+    #[test]
+    fn br_r10_json_pva_bare_pv_unchanged() {
+        assert_eq!(
+            parse_link_v2(r#"{pva: { pv: "FOO:bar" }}"#),
+            ParsedLink::Pva("FOO:bar".to_string())
+        );
     }
 
     #[test]

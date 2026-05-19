@@ -69,48 +69,64 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:226-249`
   - Done: worker B, commit `52308402` on `caucus/HJB9ABPH/backend` (+ doc tracker `ecf055a7`); regression `br_r7_gateway_credential_pool_bounded`. `upstream_pool` + `upstream_caches` HashMap→BoundedPool with LRU eviction, cap 256; `set_max_upstream_identities(&self, n)` config knob via `Arc<Mutex<...>>` interior mutability. Single-file source.rs (+172/-17), 10m. Clean contract compliance.
 
-- [ ] **BR-R8** — PVA gateway does not preserve downstream auth method/authority upstream.
+- [x] **BR-R8** — PVA gateway does not preserve downstream auth method/authority upstream.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:250-273`
+  - Done: Track A, commit `273d9a1d`; regression `br_r8_x509_downstream_recorded_as_asserted_identity` + `br_r8_ca_downstream_records_ca_method`. New `AssertedIdentity` on `epics-pva-rs` `PvaClientBuilder`/`PvaClient`; gateway `upstream_client_for` records downstream method+authority. Upstream parity: pvxs `clientconn.cpp:217-305` (CA wire carries no x509/authority — gateway converts identity to an explicit CA-style assertion).
 
 ### Priority 7 — Descriptor/value type shape
 
-- [ ] **BR-R12** — QSRV NTScalar/NTScalarArray metadata shape differs from pvxs.
+- [x] **BR-R12** — QSRV NTScalar/NTScalarArray metadata shape differs from pvxs.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:358-387`
+  - Done: Track B, commit `ad6331ed`; regression `br_r12_array_metadata_shape_matches_pvxs` + `br_r12_string_value_omits_numeric_metadata`. Limits typed by value scalar type, `display.form` an `enum_t` struct, full `valueAlarm` field set, NTScalarArray emits `control`/`valueAlarm`. Single-file `qsrv/pvif.rs`.
 
-- [ ] **BR-R13** — Unsigned 64-bit EPICS fields are not represented through QSRV.
+- [x] **BR-R13** — Unsigned 64-bit EPICS fields are not represented through QSRV.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:388-415`
+  - Done: Track B, commit `21ec21dc`; regressions `br_r13_uint64_field_maps_to_pva_ulong`, `br_r13_uint64_array_qsrv_descriptor_uses_ulong`, `br_r13_waveform_ftvl_uint64_storage_and_field_type`, `br_r13_waveform_new_from_uint64_dbf_type`. Added `DbFieldType::UInt64` + `EpicsValue::UInt64`/`UInt64Array`; waveform FTVL 7/8; QSRV `DBF_UINT64`→PVA `ulong`. Cross-crate (epics-base-rs, epics-ca-rs, epics-pva-rs).
 
 ### Priority 8 — Atomic semantics (shared multi-record lock)
 
-- [ ] **BR-R15** — QSRV atomic group PUT is not DBManyLock-equivalent.
+- [x] **BR-R15** — QSRV atomic group PUT is not DBManyLock-equivalent.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:444-469`
+  - Done: Track C, commit `b093d49e`; regression `br_r15_atomic_group_excludes_direct_member_write` + `br_r15_atomic_put_blocks_on_member_record_gates`. Uses the unified `epics-base-rs` `record_lock` registry (`PvDatabase::lock_record` / `lock_records`). Upstream parity: pvxs `groupconfigprocessor.cpp:1165`, `groupsource.cpp:444,569`; epics-base `dbScanLock`.
 
-- [ ] **BR-R18** — pvalink `atomic` scan-on-update lacks a multi-record lock epoch.
+- [x] **BR-R18** — pvalink `atomic` scan-on-update lacks a multi-record lock epoch.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:524-548`
+  - Done: Track D, commit `eff1848f`; regression `br_r18_atomic_scan_holds_multi_record_lock_epoch`. pvalink atomic scan holds the unified `record_lock` epoch (`PvDatabase::lock_records`) across the atomic target loop, released at the atomic→non-atomic boundary. Upstream parity: pvxs `pvalink_channel.cpp:386,422`; epics-base `dbLock.c:349,384`.
 
 ### Priority 9 — Group monitor metadata / archive events (residuals)
 
-- [ ] **BR-R29-RESIDUAL** — Group default `+trigger` SelfOnly variant exists but wire BitSet narrowing for SelfOnly is the residual gap.
+- [x] **BR-R29-RESIDUAL** — Group default `+trigger` SelfOnly variant exists but wire BitSet narrowing for SelfOnly is the residual gap.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:819-844` and Cleared note `:58`
+  - Done: Track C, commit `ee250057`; regressions `br_r29_diff_changed_bitset_marks_only_changed_leaves`, `br_r29_partial_monitor_payload_narrows_changed_bitset`, `br_r29_pure_self_trigger_predicate`. New `ChannelSource::monitor_emits_partial`, `encode::diff_changed_bitset`, `build_monitor_payload_partial`. Upstream parity: pvxs `groupsource.cpp:235,288,303`, `dataencode.cpp:414-437`.
 
-- [ ] **BR-R33-RESIDUAL** — Per-op queueSize negotiation is the residual gap (group GET/MONITOR carries root options already).
+- [x] **BR-R33-RESIDUAL** — Per-op queueSize negotiation is the residual gap (group GET/MONITOR carries root options already).
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:920-944` and Cleared note `:59`
+  - Done: Track C, commit `16309573`; regression `br_r33_group_monitor_stamps_negotiated_queue_size`. `negotiated_queue_size(pvRequest)` threaded through `GroupMonitor::with_queue_size`. Upstream parity: pvxs `servermon.cpp:66,313,533-540`.
 
 ### Priority 10 — pvalink value conversion / metadata hooks
 
-- [ ] **BR-R24** — pvalink DB link metadata hooks are mostly absent.
+- [x] **BR-R24** — pvalink DB link metadata hooks are mostly absent.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:686-712`
+  - Done: Track D, commit `142aa474`; regressions `br_r24_link_metadata_surfaces_remote_display_control_valuealarm`, `br_r24_link_metadata_none_when_disconnected_and_enum_maps_to_dbf_enum`. New `LinkDbfType` + `LinkMetadata` + `LinkSet::link_metadata` hook in epics-base-rs; `PvaLinkResolver` impl. Upstream parity: pvxs `pvalink_lset.cpp:199,242,437,454,474,499,516,700`.
 
 ### Priority 12 — Gateway monitor fanout
 
-- [ ] **BR-R14** — PVA gateway monitor fanout is not pvRequest-transparent.
+- [x] **BR-R14** — PVA gateway monitor fanout is not pvRequest-transparent.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:416-443`
+  - Done: Track A, commit `15cc8be4`; regression `br_r14_pipeline_monitor_rejected_by_gateway` + `br_r14_field_projection_is_not_event_affecting`. New `MonitorOptions`; gateway rejects pipeline/queueSize monitor options (event-affecting), keeps field projection transparent. Upstream parity: pvxs `servermon.cpp:521-555`.
 
 ---
 
 ## Driver state
 
-- Total open: 8 (was 17)
-- Done: 8 (BR-R4, BR-R21, BR-R11, BR-R10, BR-R27, BR-R6, BR-R41, BR-R7)
-- In progress: 1 (BR-R8, worker B)
+- Total open: 0 ✓ ALL ITEMS CLEARED
+- Done: 17 (BR-R4, BR-R21, BR-R11, BR-R10, BR-R27, BR-R6, BR-R41, BR-R7, BR-R8, BR-R12, BR-R13, BR-R14, BR-R15, BR-R18, BR-R24, BR-R29-RESIDUAL, BR-R33-RESIDUAL)
+- In progress: 0
 - Blocked: 0
+- Final 9 items (BR-R8, R12, R13, R14, R15, R18, R24, R29-RESIDUAL, R33-RESIDUAL) done in parallel on 4 worktree tracks A/B/C/D, integrated onto branch `integration/punchlist-2026-05-19`.
+- **Integration note:** Tracks C and D independently added an `epics-base-rs` `record_lock` multi-record lock; merged into one unified registry (`RecordLockRegistry` / `lock_record` + `lock_records`) so QSRV atomic group PUT and pvalink atomic scan share one gate set and mutually exclude.
+- **Verification (branch `integration/punchlist-2026-05-19`):** `cargo fmt --all` applied; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo nextest run --workspace --no-fail-fast` 4631 run, **4631 passed, 0 failed**; `cargo test --doc --workspace` 0 failed.
+- **Pre-existing `pva_gateway` failures — now FIXED:** the 6 `epics-bridge-rs::pva_gateway` integration tests that failed on the `main` baseline (`critical1_audit_layer_records_put`, `critical1_read_only_gateway_rejects_put`, `gateway_control_prefix_cache_size`, `gateway_get_forwards_upstream_value`, `gateway_monitor_fans_out_to_two_clients`, `multi_tenant_gateway_routes_to_correct_upstream`) were two real defects plus an unrealistic test fixture:
+  1. **epics-pva-rs `ops_v2`** — the default *pipelined* monitor pvRequest forced `field(value)` instead of an empty `field {}` (= whole structure). `field(value)` against a bare-scalar PV is rejected by `request_to_mask`/pvxs `request2mask` as `EmptyMask`, and against a structure it silently narrowed the gateway's upstream monitor to the `value` leaf only.
+  2. **epics-bridge-rs `channel_cache`** — the gateway's upstream monitor task fed only the raw broadcast (`tx_raw`); the decoded `subscribe` path (used for pipelined / projected / filtered downstream monitors) attached to a typed broadcast nothing fed, so such monitors saw only their initial snapshot. Fixed by feeding the typed broadcast from the already-decoded `state.latest`.
+  3. The `spawn_upstream` test fixture served a bare top-level `Scalar` PV; real IOC/QSRV PVs are NTScalar structures (pvxs rejects `field(value)` on a bare scalar identically). Corrected to an `epics:nt/NTScalar:1.0` fixture.

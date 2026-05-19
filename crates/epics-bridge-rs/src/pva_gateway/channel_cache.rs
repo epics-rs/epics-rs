@@ -101,14 +101,15 @@ struct EntryState {
 }
 
 /// Result of folding one upstream monitor event into [`EntryState`].
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 struct MonitorEventOutcome {
     /// This was the first event — `first_event` waiters should wake.
     was_first: bool,
     /// The upstream introspection changed vs. the cached descriptor.
     type_changed: bool,
-    /// The body decoded successfully and `latest` was updated.
-    decoded: bool,
+    /// The merged value after decode+merge, read under the state write lock.
+    /// `None` when the body could not be decoded.
+    value: Option<PvField>,
 }
 
 /// Decode one upstream raw monitor frame and fold it into `state`.
@@ -160,10 +161,13 @@ fn apply_monitor_event(
         }
         _ => s.latest = Some(v),
     }
+    // Read merged value while still holding the write lock so callers
+    // receive the exact value that was stored — no separate re-acquisition.
+    let value = s.latest.clone();
     MonitorEventOutcome {
         was_first,
         type_changed,
-        decoded: true,
+        value,
     }
 }
 
@@ -519,20 +523,14 @@ impl ChannelCache {
                 // — pvxs `MonitorControlOp::pipeline` parity.
                 let tx_raw_inner = tx_raw_for_task.clone();
                 let pv_clone = pv_name_owned.clone();
-                let _ = tx_inner; // typed broadcast retired in raw path
+                // BR-R41: tx_inner moves into the callback so decoded
+                // events fan out to typed subscribers (subscribe_inner /
+                // subscribe_checked fallback path). Pre-fix this sender
+                // was dropped here before the closure captured it, so
+                // bcast_rx.recv() in subscribe_inner blocked forever
+                // after the initial snapshot.
                 let handle_result = client
                     .pvmonitor_raw_frames_handle(&pv_name_owned, move |desc, body, order| {
-                        // BUG 2: decode EVERY monitor event into
-                        // `state.latest`, not just the first. A
-                        // gateway GET (`get_value` / `snapshot()`)
-                        // must return the CURRENT upstream value —
-                        // pre-fix only the first event was decoded,
-                        // so a downstream `pvget` against the gateway
-                        // returned a frozen first value forever after
-                        // the first monitor event. `apply_monitor_event`
-                        // owns the decode + delta-merge; the raw bytes
-                        // still fan out through `tx_raw` with no
-                        // re-encode.
                         let outcome = apply_monitor_event(&state_inner, desc, &body, order);
                         use crate::pva_gateway::source::RawEvent;
                         if outcome.type_changed {
@@ -566,6 +564,20 @@ impl ChannelCache {
                         }
                         if outcome.was_first {
                             first_event_inner.notify_waiters();
+                        }
+                        // BR-R41: fan out decoded value to typed subscribers
+                        // (subscribe/subscribe_checked fallback path).
+                        // Guard: skip the initial event (`was_first`) because
+                        // subscribe_inner always delivers it via snapshot().
+                        // Broadcasting it races with bcast_rx creation and
+                        // produces a duplicate first value in the mpsc.
+                        // `outcome.value` was read under the state write lock,
+                        // so it is the exact merged value — no separate
+                        // state_inner.read() re-acquisition needed.
+                        if !outcome.was_first {
+                            if let Some(val) = outcome.value {
+                                let _ = tx_inner.send(val);
+                            }
                         }
                         // Fan out raw body — refcount only, no copy.
                         let _ = tx_raw_inner.send(RawEvent {
@@ -780,7 +792,7 @@ mod tests {
         // First event: value = 1.0.
         let body1 = encode_body(&desc, &PvField::Scalar(ScalarValue::Double(1.0)), &[0]);
         let o1 = apply_monitor_event(&state, &desc, &body1, ByteOrder::Little);
-        assert!(o1.was_first && o1.decoded && !o1.type_changed);
+        assert!(o1.was_first && o1.value.is_some() && !o1.type_changed);
         assert_eq!(
             state.read().latest,
             Some(PvField::Scalar(ScalarValue::Double(1.0)))
@@ -885,7 +897,10 @@ mod tests {
             o3.type_changed,
             "introspection change must be flagged for the BR-R42 marker path"
         );
-        assert!(o3.decoded, "the new-descriptor body still decodes cleanly");
+        assert!(
+            o3.value.is_some(),
+            "the new-descriptor body still decodes cleanly"
+        );
     }
 
     /// Smoke test: we can build an entry standalone (no cache, no

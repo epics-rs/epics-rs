@@ -119,6 +119,8 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         EpicsValue::Enum(v) => PvField::Scalar(ScalarValue::Int(*v as i32)),
         EpicsValue::String(s) => PvField::Scalar(ScalarValue::String(s.clone())),
         EpicsValue::Int64(v) => PvField::Scalar(ScalarValue::Long(*v)),
+        // C `DBF_UINT64` → PVA `ulong` (native unsigned 64-bit).
+        EpicsValue::UInt64(v) => PvField::Scalar(ScalarValue::ULong(*v)),
         EpicsValue::DoubleArray(v) => {
             PvField::ScalarArray(v.iter().map(|x| ScalarValue::Double(*x)).collect())
         }
@@ -142,6 +144,9 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         }
         EpicsValue::Int64Array(v) => {
             PvField::ScalarArray(v.iter().map(|x| ScalarValue::Long(*x)).collect())
+        }
+        EpicsValue::UInt64Array(v) => {
+            PvField::ScalarArray(v.iter().map(|x| ScalarValue::ULong(*x)).collect())
         }
     };
 
@@ -175,6 +180,7 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         EpicsValue::Enum(_) => (FieldDesc::Scalar(ScalarType::Int), false),
         EpicsValue::String(_) => (FieldDesc::Scalar(ScalarType::String), false),
         EpicsValue::Int64(_) => (FieldDesc::Scalar(ScalarType::Long), false),
+        EpicsValue::UInt64(_) => (FieldDesc::Scalar(ScalarType::ULong), false),
         EpicsValue::DoubleArray(_) => (FieldDesc::ScalarArray(ScalarType::Double), true),
         EpicsValue::FloatArray(_) => (FieldDesc::ScalarArray(ScalarType::Float), true),
         EpicsValue::LongArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
@@ -183,6 +189,7 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         EpicsValue::EnumArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
         EpicsValue::StringArray(_) => (FieldDesc::ScalarArray(ScalarType::String), true),
         EpicsValue::Int64Array(_) => (FieldDesc::ScalarArray(ScalarType::Long), true),
+        EpicsValue::UInt64Array(_) => (FieldDesc::ScalarArray(ScalarType::ULong), true),
     };
     let struct_id = if is_array {
         "epics:nt/NTScalarArray:1.0"
@@ -542,45 +549,74 @@ impl ChannelSource for PvDatabaseSource {
 fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
     match field {
         PvField::Scalar(sv) => Some(scalar_to_epics(sv)),
-        PvField::ScalarArray(items) if !items.is_empty() => match &items[0] {
-            ScalarValue::Double(_) => Some(EpicsValue::DoubleArray(
-                items
-                    .iter()
-                    .filter_map(|v| match v {
-                        ScalarValue::Double(x) => Some(*x),
-                        _ => None,
-                    })
-                    .collect(),
-            )),
-            ScalarValue::Int(_) => Some(EpicsValue::LongArray(
-                items
-                    .iter()
-                    .filter_map(|v| match v {
-                        ScalarValue::Int(x) => Some(*x),
-                        _ => None,
-                    })
-                    .collect(),
-            )),
-            ScalarValue::Long(_) => Some(EpicsValue::Int64Array(
-                items
-                    .iter()
-                    .filter_map(|v| match v {
-                        ScalarValue::Long(x) => Some(*x),
-                        _ => None,
-                    })
-                    .collect(),
-            )),
-            ScalarValue::Float(_) => Some(EpicsValue::FloatArray(
-                items
-                    .iter()
-                    .filter_map(|v| match v {
-                        ScalarValue::Float(x) => Some(*x),
-                        _ => None,
-                    })
-                    .collect(),
-            )),
-            _ => None,
-        },
+        PvField::ScalarArray(items) => scalar_array_to_epics(items),
+        // PF-R2: the PVA wire decoder delivers a decoded scalar array
+        // as the refcount-shared `ScalarArrayTyped` form, not the
+        // generic `ScalarArray`. The MR-R24 arm only matched
+        // `ScalarArray`, so a real wire `ulong[]` (or any typed
+        // array) PUT fell through to `None` and was rejected. Route
+        // the typed form through the same converter.
+        PvField::ScalarArrayTyped(t) => scalar_array_to_epics(&t.to_scalar_values()),
+        _ => None,
+    }
+}
+
+fn scalar_array_to_epics(items: &[ScalarValue]) -> Option<EpicsValue> {
+    if items.is_empty() {
+        return None;
+    }
+    match &items[0] {
+        ScalarValue::Double(_) => Some(EpicsValue::DoubleArray(
+            items
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::Double(x) => Some(*x),
+                    _ => None,
+                })
+                .collect(),
+        )),
+        ScalarValue::Int(_) => Some(EpicsValue::LongArray(
+            items
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::Int(x) => Some(*x),
+                    _ => None,
+                })
+                .collect(),
+        )),
+        ScalarValue::Long(_) => Some(EpicsValue::Int64Array(
+            items
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::Long(x) => Some(*x),
+                    _ => None,
+                })
+                .collect(),
+        )),
+        ScalarValue::Float(_) => Some(EpicsValue::FloatArray(
+            items
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::Float(x) => Some(*x),
+                    _ => None,
+                })
+                .collect(),
+        )),
+        // MR-R24: PVA `ulong[]` has no array arm here, so a
+        // `DBF_UINT64` waveform PUT fell through to `None` and was
+        // rejected as "PUT value not representable as EpicsValue".
+        // Preserve the unsigned 64-bit elements as
+        // `EpicsValue::UInt64Array`; `convert_to(DBF_UINT64)` is
+        // then a no-op and any other array target still coerces.
+        ScalarValue::ULong(_) => Some(EpicsValue::UInt64Array(
+            items
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::ULong(x) => Some(*x),
+                    _ => None,
+                })
+                .collect(),
+        )),
         _ => None,
     }
 }
@@ -595,7 +631,14 @@ fn scalar_to_epics(v: &ScalarValue) -> EpicsValue {
         ScalarValue::UByte(x) => EpicsValue::Char(*x),
         ScalarValue::UShort(x) => EpicsValue::Enum(*x),
         ScalarValue::UInt(x) => EpicsValue::Long(*x as i32),
-        ScalarValue::ULong(x) => EpicsValue::Long(*x as i32),
+        // MR-R21: PVA `ulong` is unsigned 64-bit. Narrowing it to
+        // `EpicsValue::Long` (i32) here drops the upper 32 bits before
+        // `PvDatabase::put_pv` can coerce to the target `DBF_UINT64`
+        // field. Preserve the full width as `EpicsValue::UInt64`; the
+        // database's `convert_to(DBF_UINT64)` is then a no-op
+        // (`db_field_type()` already matches), and any other target
+        // field type still coerces faithfully from the unsigned value.
+        ScalarValue::ULong(x) => EpicsValue::UInt64(*x),
         ScalarValue::Float(x) => EpicsValue::Float(*x),
         ScalarValue::Double(x) => EpicsValue::Double(*x),
         ScalarValue::String(s) => EpicsValue::String(s.clone()),
@@ -621,6 +664,7 @@ mod tests {
             method: method.to_string(),
             host: host.to_string(),
             authority: String::new(),
+            roles: Vec::new(),
             pv_request: None,
         }
     }
@@ -969,6 +1013,119 @@ ASG(LOCKED) {
             .get_value_checked(checked_deny, make_ctx("anyhost", "intruder", "anonymous"))
             .await;
         assert!(val.is_none(), "intruder must be denied via type-state gate");
+    }
+
+    /// MR-R21 regression: a native PVA scalar `ulong` PUT into a
+    /// `DBF_UINT64`-backed PV must preserve the full unsigned 64-bit
+    /// range. Pre-fix `scalar_to_epics` collapsed `ScalarValue::ULong`
+    /// to `EpicsValue::Long(x as i32)`, discarding the upper 32 bits
+    /// before `PvDatabase::put_pv` coerced to the target field.
+    #[tokio::test]
+    async fn mr_r21_scalar_ulong_put_preserves_full_u64() {
+        let db = Arc::new(PvDatabase::new());
+        // A simple PV stores the value verbatim (`pv.set`), with no
+        // field-type coercion — so it isolates the source-layer
+        // conversion under test.
+        db.add_pv("UL:SCALAR", EpicsValue::UInt64(0)).await.unwrap();
+
+        let source = PvDatabaseSource::new(db.clone());
+
+        // A value above the signed 32-bit range that also exercises
+        // the high word: 0xDEAD_BEEF_0000_0001.
+        let big: u64 = 0xDEAD_BEEF_0000_0001;
+        source
+            .put_value_ctx(
+                "UL:SCALAR",
+                PvField::Scalar(ScalarValue::ULong(big)),
+                make_ctx("h", "anyone", "anonymous"),
+            )
+            .await
+            .expect("ulong PUT must succeed");
+
+        let snap = snapshot_for(&db, "UL:SCALAR").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::UInt64(big),
+            "scalar ulong PUT must round-trip the full u64, got {:?}",
+            snap.value,
+        );
+    }
+
+    /// MR-R24 regression: a native PVA `ulong[]` PUT into a
+    /// `DBF_UINT64`-backed waveform must round-trip. Pre-fix
+    /// `pv_field_to_epics` had no `ScalarValue::ULong` array arm, so
+    /// the PUT fell through to `None` and was rejected as
+    /// "PUT value not representable as EpicsValue".
+    #[tokio::test]
+    async fn mr_r24_ulong_array_put_preserves_full_u64() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "UL:WF",
+            Box::new(WaveformRecord::new(4, DbFieldType::UInt64)),
+        )
+        .await
+        .unwrap();
+
+        let source = PvDatabaseSource::new(db.clone());
+
+        // Two of the four elements exceed i64::MAX, so any narrowing
+        // to a signed type would corrupt them.
+        let values: Vec<u64> = vec![1, 0xDEAD_BEEF_0000_0001, u64::MAX, 0];
+        let put = PvField::ScalarArray(values.iter().map(|v| ScalarValue::ULong(*v)).collect());
+        source
+            .put_value_ctx("UL:WF", put, make_ctx("h", "anyone", "anonymous"))
+            .await
+            .expect("ulong[] PUT must succeed");
+
+        let snap = snapshot_for(&db, "UL:WF").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::UInt64Array(values),
+            "ulong[] PUT must round-trip the full u64 elements, got {:?}",
+            snap.value,
+        );
+    }
+
+    /// PF-R2: a real PVA wire `ulong[]` PUT decodes to
+    /// `PvField::ScalarArrayTyped`, not the hand-built untyped
+    /// `ScalarArray` that `mr_r24` used. Before the fix
+    /// `pv_field_to_epics` had only a `ScalarArray` arm, so the
+    /// wire-decoded form fell through to `None` and the PUT was
+    /// rejected as "PUT value not representable as EpicsValue".
+    #[tokio::test]
+    async fn pf_r2_wire_typed_ulong_array_put_preserves_full_u64() {
+        use crate::pvdata::TypedScalarArray;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "UL:WFT",
+            Box::new(WaveformRecord::new(4, DbFieldType::UInt64)),
+        )
+        .await
+        .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+
+        let values: Vec<u64> = vec![1, 0xDEAD_BEEF_0000_0001, u64::MAX, 0];
+        // Wire-decoded shape: `decode_pv_field` produces the typed,
+        // refcount-shared array — not `PvField::ScalarArray`.
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::ULong(Arc::from(values.as_slice())));
+        source
+            .put_value_ctx("UL:WFT", put, make_ctx("h", "anyone", "anonymous"))
+            .await
+            .expect("wire-decoded ulong[] PUT must succeed");
+
+        let snap = snapshot_for(&db, "UL:WFT").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::UInt64Array(values),
+            "wire-decoded ulong[] PUT must round-trip the full u64 elements, got {:?}",
+            snap.value,
+        );
     }
 
     /// Round-33A (R33-G4): the per-record ASL must gate `RULE(N, …)`

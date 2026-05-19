@@ -4,9 +4,11 @@ pub mod filters;
 mod link_set;
 mod links;
 mod processing;
+mod record_lock;
 mod scan_index;
 
-pub use link_set::{DynLinkSet, LinkSet, LinkSetRegistry};
+pub use link_set::{DynLinkSet, LinkDbfType, LinkMetadata, LinkSet, LinkSetRegistry};
+pub use record_lock::{ManyRecordWriteGuard, RecordWriteGuard};
 
 use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
@@ -211,6 +213,13 @@ struct PvDatabaseInner {
     /// interest on this before re-checking `pini_done` to avoid missing the
     /// signal (`notify_waiters` does not store a permit).
     pini_notify: tokio::sync::Notify,
+    /// BR-R15 / BR-R18: per-record advisory write gates — the Rust
+    /// counterpart of the C-EPICS `dbScanLock` / `dbLocker`
+    /// machinery. Every plain CA/PVA write, the QSRV atomic group
+    /// PUT/GET, and the pvalink atomic scan-on-update epoch all
+    /// acquire these gates, so no two of them can interleave on a
+    /// shared record. See [`record_lock`].
+    record_locks: record_lock::RecordLockRegistry,
 }
 
 /// Database of all process variables hosted by this server.
@@ -346,6 +355,7 @@ impl PvDatabase {
                 scan_started: std::sync::atomic::AtomicBool::new(false),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
                 pini_notify: tokio::sync::Notify::new(),
+                record_locks: record_lock::RecordLockRegistry::default(),
             }),
         }
     }

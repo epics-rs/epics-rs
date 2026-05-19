@@ -528,6 +528,7 @@ mod tests {
             method: method.into(),
             host: "localhost".into(),
             authority: String::new(),
+            roles: Vec::new(),
             pv_request: None,
         }
     }

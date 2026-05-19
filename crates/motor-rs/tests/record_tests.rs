@@ -2328,6 +2328,10 @@ fn test_mres_change_preserves_raw_limits() {
     assert!((rec.limits.rhlm - 10_000.0).abs() < 1e-6);
     assert!((rec.limits.rllm + 10_000.0).abs() < 1e-6);
 
+    // init_record establishes the limit invariant — only after this does a
+    // runtime MRES change keep RHLM/RLLM invariant and rescale DHLM/DLLM.
+    rec.init_record(1).unwrap();
+
     // Change MRES: raw stays, dial rescales
     rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
     assert!((rec.limits.rhlm - 10_000.0).abs() < 1e-6);
@@ -2342,10 +2346,59 @@ fn test_negative_mres_swaps_dial_limit_pair() {
     rec.conv.mres = 1.0;
     rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.init_record(1).unwrap();
     // Now switch MRES to negative
     rec.put_field("MRES", EpicsValue::Double(-1.0)).unwrap();
     // C: fd808eb2 — dial pair must keep DHLM >= DLLM
     assert!(rec.limits.dhlm >= rec.limits.dllm);
+}
+
+#[test]
+fn test_template_load_dhlm_before_mres_preserves_egu_limits() {
+    // Reproduces the standard motor.template field order — field(DHLM),
+    // field(DLLM) then field(MRES) — all applied through put_field by
+    // dbLoadRecords::apply_fields, followed by init_record. The DHLM=100
+    // engineering-unit limit must survive: it must NOT be rescaled to 0.1
+    // by the MRES cascade running mid-load (regression: ophyd EpicsMotor
+    // saw ctrl limits [-0.1, 0.1] and rejected every real scan).
+    let mut rec = MotorRecord::new();
+    rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert!(
+        (rec.limits.dhlm - 100.0).abs() < 1e-9,
+        "DHLM={}",
+        rec.limits.dhlm
+    );
+    assert!(
+        (rec.limits.dllm + 100.0).abs() < 1e-9,
+        "DLLM={}",
+        rec.limits.dllm
+    );
+    assert!(
+        (rec.limits.hlm - 100.0).abs() < 1e-9,
+        "HLM={}",
+        rec.limits.hlm
+    );
+    assert!(
+        (rec.limits.llm + 100.0).abs() < 1e-9,
+        "LLM={}",
+        rec.limits.llm
+    );
+    // Raw limits derived from the dial limits at the final MRES.
+    assert!(
+        (rec.limits.rhlm - 100_000.0).abs() < 1e-3,
+        "RHLM={}",
+        rec.limits.rhlm
+    );
+    assert!(
+        (rec.limits.rllm + 100_000.0).abs() < 1e-3,
+        "RLLM={}",
+        rec.limits.rllm
+    );
 }
 
 // --- RSTM (C: 2906f3d8, PR #160) ---

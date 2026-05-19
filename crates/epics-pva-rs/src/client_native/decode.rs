@@ -454,8 +454,9 @@ pub fn decode_op_response_cached(
         }
         let resp_desc = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
             .map_err(|e| PvaError::Decode(e.to_string()))?;
-        let resp_value = crate::pvdata::encode::decode_pv_field(&resp_desc, &mut cur, order)
-            .map_err(|e| PvaError::Decode(e.to_string()))?;
+        let resp_value =
+            crate::pvdata::encode::decode_pv_field_cached(&resp_desc, &mut cur, order, type_cache)
+                .map_err(|e| PvaError::Decode(e.to_string()))?;
         let mut all = BitSet::new();
         all.set(0);
         return Ok(OpResponse::Data(OpDataResponse {
@@ -480,9 +481,10 @@ pub fn decode_op_response_cached(
         Status::ok()
     };
     let changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
-    let value =
-        crate::pvdata::encode::decode_pv_field_with_bitset(intro, &changed, 0, &mut cur, order)
-            .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let value = crate::pvdata::encode::decode_pv_field_with_bitset_cached(
+        intro, &changed, 0, &mut cur, order, type_cache,
+    )
+    .map_err(|e| PvaError::Decode(e.to_string()))?;
     // MONITOR data carries the overrun BitSet after the partial value.
     if cmd == Command::Monitor {
         let _overrun =

@@ -42,6 +42,39 @@ pub struct PvGetResult {
     pub server_addr: SocketAddr,
 }
 
+/// Records that this `PvaClient`'s upstream credentials are a
+/// gateway-asserted identity derived from a *downstream* connection
+/// that authenticated with a method this client cannot forward
+/// verbatim on the wire.
+///
+/// BR-R8: the pvAccess CONNECTION_VALIDATION handshake only carries
+/// the `ca` / `anonymous` auth methods (pvxs `clientconn.cpp:217-305`
+/// — `handle_CONNECTION_VALIDATION` selects only `"ca"` / `"anonymous"`
+/// and the `ca` credential carries solely `user` + `host`). There is
+/// no wire method that forwards an `x509` method or its certificate
+/// `AUTHORITY` upstream. A PVA-to-PVA gateway therefore cannot be
+/// transparent for those: it converts the downstream identity into a
+/// CA-style assertion (`user` = downstream account).
+///
+/// This struct makes that conversion *explicit and visible* instead
+/// of silently indistinguishable from a native `ca` client: it pins
+/// the original downstream `method` and certificate `authority` to
+/// the client so audit/diagnostic output records that the upstream
+/// `ca` credentials are a gateway assertion, not a first-party `ca`
+/// login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertedIdentity {
+    /// The auth method the downstream peer actually used
+    /// (`"x509"`, `"ca"`, `"anonymous"`, ...). When this differs
+    /// from `"ca"` the upstream `ca` credential is an assertion,
+    /// not a verbatim forward.
+    pub downstream_method: String,
+    /// The certificate authority CommonName for an `x509` downstream
+    /// method (ACF `AUTHORITY(...)` scope). Empty for non-TLS
+    /// downstream methods.
+    pub downstream_authority: String,
+}
+
 /// Builder for [`PvaClient`].
 pub struct PvaClientBuilder {
     timeout: Duration,
@@ -64,6 +97,11 @@ pub struct PvaClientBuilder {
     /// holding multiple UDP search sockets when the user wires up
     /// per-purpose Contexts.
     share_udp: bool,
+    /// BR-R8: set by a gateway when this client's `user`/`host`
+    /// credentials are an assertion derived from a downstream peer
+    /// whose auth method (e.g. `x509`) cannot be forwarded verbatim
+    /// on the pvAccess wire. `None` for first-party clients.
+    asserted_identity: Option<AssertedIdentity>,
 }
 
 impl PvaClientBuilder {
@@ -77,8 +115,11 @@ impl PvaClientBuilder {
             tls: None,
             name_servers: crate::config::env::name_servers(),
             priority: 0,
-            tcp_timeout: Duration::from_secs(40),
+            // pvxs config.cpp:222,373-391: parse_timeout scales CONN_TMO by
+            // 4/3; enforceTimeout clamps below 2 s and defaults to 40 s.
+            tcp_timeout: super::server_conn::heartbeat_timeout(),
             share_udp: false,
+            asserted_identity: None,
         }
     }
 
@@ -108,17 +149,11 @@ impl PvaClientBuilder {
     }
 
     /// Configure TCP name servers — pvxs `EPICS_PVA_NAME_SERVERS`
-    /// equivalent. When UDP search yields no responder for a PV, each
-    /// name server is tried as a direct-connect candidate (gateway
-    /// self-serve case). Replaces any list parsed from env at
+    /// equivalent. The client maintains a persistent TCP connection to each
+    /// entry and sends SEARCH frames over it; SEARCH_RESPONSE can redirect
+    /// to a different server (gateway redirect case) or to the NS itself
+    /// (gateway self-serve case). Replaces any list parsed from env at
     /// `new()` time.
-    ///
-    /// Note: this is currently a fallback-only treatment. pvxs
-    /// additionally sends SEARCH frames over a persistent TCP
-    /// connection to each name server and accepts SEARCH_RESPONSE
-    /// pointing at a *different* server (redirect). For pure-gateway
-    /// scenarios (the gateway answers itself) the simpler fallback
-    /// works; redirect-style chains aren't supported yet.
     pub fn name_servers(mut self, servers: Vec<SocketAddr>) -> Self {
         self.name_servers = servers;
         self
@@ -152,6 +187,21 @@ impl PvaClientBuilder {
         self
     }
 
+    /// BR-R8: declare that this client's `user`/`host` credentials are
+    /// a gateway assertion derived from a downstream peer that
+    /// authenticated with `downstream_method`. When the downstream
+    /// method is not `"ca"` the upstream `ca` credential cannot be a
+    /// verbatim forward — the pvAccess wire has no method for `x509`
+    /// or its certificate `AUTHORITY` (pvxs `clientconn.cpp:217-305`).
+    /// The recorded identity is surfaced through
+    /// [`PvaClient::asserted_identity`] for audit/diagnostic output so
+    /// the conversion is explicit, not silently indistinguishable from
+    /// a first-party `ca` login.
+    pub fn asserted_identity(mut self, id: AssertedIdentity) -> Self {
+        self.asserted_identity = Some(id);
+        self
+    }
+
     /// Override the monitor pipeline size (default 4 — one ack per 4 events).
     /// Set to 0 to disable pipelining.
     pub fn pipeline_size(mut self, n: u32) -> Self {
@@ -182,6 +232,7 @@ impl PvaClientBuilder {
                 priority: self.priority,
                 tcp_timeout: self.tcp_timeout,
                 share_udp: self.share_udp,
+                asserted_identity: self.asserted_identity,
             }),
         }
     }
@@ -203,21 +254,26 @@ struct ClientInner {
     channels: RwLock<HashMap<String, Arc<Channel>>>,
     /// Lazy: only spawn the search engine when we actually need to resolve.
     search: OnceLock<SearchEngine>,
-    /// TCP `EPICS_PVA_NAME_SERVERS` fallbacks — used as last-resort
-    /// direct-connect candidates when UDP search returns nothing.
+    /// TCP name servers (EPICS_PVA_NAME_SERVERS). Passed into SearchEngine
+    /// as persistent search peers; also reported by ClientReport::name_servers.
     name_servers: Vec<SocketAddr>,
     /// Operation priority hint (0..7). Stored for inspection /
     /// future TCP TOS wiring. pvxs `CommonBuilder::priority`.
     #[allow(dead_code)]
     priority: u8,
-    /// Client TCP idle timeout. Stored for inspection / future
-    /// keepalive plumbing. pvxs `Config::tcpTimeout`.
-    #[allow(dead_code)]
+    /// Client TCP idle timeout threaded through to every `ServerConn`
+    /// spawned via this client's `ConnectionPool`. Governs the heartbeat
+    /// task's inactivity threshold. pvxs `Config::tcpTimeout`
+    /// (clientconn.cpp:73-74).
     tcp_timeout: Duration,
     /// True when `build()` was told to share the process-wide search
     /// engine. Routes [`PvaClient::search_engine`] through the static
     /// `SHARED_SEARCH_ENGINE` instead of spawning per-client.
     share_udp: bool,
+    /// BR-R8: present when this client's credentials are a gateway
+    /// assertion of a downstream identity. Surfaced through
+    /// [`PvaClient::asserted_identity`].
+    asserted_identity: Option<AssertedIdentity>,
 }
 
 /// Process-wide singleton SearchEngine for `share_udp(true)` clients.
@@ -249,6 +305,54 @@ impl PvaClient {
         Ok(Self::builder().build())
     }
 
+    /// BR-R8: the gateway-asserted downstream identity behind this
+    /// client's credentials, if any. `None` for a first-party client.
+    /// `Some` means the client's `ca` `user`/`host` are an assertion
+    /// the gateway made on behalf of a downstream peer whose auth
+    /// method could not be forwarded verbatim on the pvAccess wire.
+    pub fn asserted_identity(&self) -> Option<&AssertedIdentity> {
+        self.inner.asserted_identity.as_ref()
+    }
+
+    /// Derive a new client that reaches the **same upstream server over
+    /// the same transport** as `self`, but presents a different
+    /// (gateway-asserted) identity.
+    ///
+    /// BR-R8 / BR-R21: a PVA gateway keeps one upstream client per
+    /// distinct downstream credential so the upstream IOC's access
+    /// security sees the real identity. Every such client must still
+    /// resolve the *same* upstream — only `user` / `host` /
+    /// `asserted_identity` change. Building a fresh
+    /// `PvaClient::builder()` instead would drop the gateway's
+    /// `server_addr` (and timeout / TLS / name-server config), so the
+    /// derived client would fall back to UDP search and never reach a
+    /// pinned or discovery-isolated upstream. This carries every
+    /// connection-config field across.
+    pub fn with_asserted_identity(
+        &self,
+        user: String,
+        host: String,
+        asserted: AssertedIdentity,
+    ) -> PvaClient {
+        let mut builder = PvaClientBuilder::new()
+            .timeout(self.inner.timeout)
+            .user(user)
+            .host(host)
+            .pipeline_size(self.inner.pipeline_size)
+            .priority(self.inner.priority)
+            .tcp_timeout(self.inner.tcp_timeout)
+            .share_udp(self.inner.share_udp)
+            .name_servers(self.inner.name_servers.clone())
+            .asserted_identity(asserted);
+        if let Some(addr) = self.inner.server_addr {
+            builder = builder.server_addr(addr);
+        }
+        if let Some(tls) = self.inner.pool.tls() {
+            builder = builder.with_tls(tls);
+        }
+        builder.build()
+    }
+
     /// Backwards-compatible: targets a specific TCP port (UDP ignored —
     /// search uses the standard port machinery).
     pub fn with_ports(_udp_port: u16, tcp_port: u16) -> Self {
@@ -260,14 +364,23 @@ impl PvaClient {
     }
 
     async fn search_engine(&self) -> PvaResult<&SearchEngine> {
-        if self.inner.share_udp {
+        // The process-wide shared engine is a single `OnceCell` and cannot
+        // carry per-client name_servers (different clients may have
+        // different lists). pvxs keeps `nameServers` per-Context regardless
+        // of `overrideShareUDP` — shareUDP only shares the UDP socket. To
+        // match that and avoid silently dropping configured TCP name
+        // servers, a client that has name servers configured always uses
+        // its own per-client engine (which carries the name-server list),
+        // even when `share_udp(true)` was requested. share_udp still saves
+        // the UDP socket for clients that have no name servers.
+        if self.inner.share_udp && self.inner.name_servers.is_empty() {
             let engine = SHARED_SEARCH_ENGINE
-                .get_or_try_init(|| async { SearchEngine::spawn(Vec::new()).await })
+                .get_or_try_init(|| async { SearchEngine::spawn(Vec::new(), Vec::new()).await })
                 .await?;
             return Ok(engine);
         }
         if self.inner.search.get().is_none() {
-            let engine = SearchEngine::spawn(Vec::new()).await?;
+            let engine = SearchEngine::spawn(Vec::new(), self.inner.name_servers.clone()).await?;
             let _ = self.inner.search.set(engine);
         }
         Ok(self.inner.search.get().unwrap())
@@ -307,19 +420,20 @@ impl PvaClient {
                 self.inner.user.clone(),
                 self.inner.host.clone(),
                 self.inner.timeout,
+                self.inner.tcp_timeout,
                 self.inner.pool.clone(),
                 addr,
             ))
         } else {
             let search = self.search_engine().await?.clone();
-            Arc::new(Channel::new_with_name_servers(
+            Arc::new(Channel::new(
                 pv_name.to_string(),
                 self.inner.user.clone(),
                 self.inner.host.clone(),
                 self.inner.timeout,
+                self.inner.tcp_timeout,
                 self.inner.pool.clone(),
                 search,
-                self.inner.name_servers.clone(),
             ))
         };
 
@@ -735,6 +849,91 @@ impl PvaClient {
         );
         let bytes = request.encode(big_endian);
         crate::client_native::ops_v2::op_put_raw(&ch, &bytes, value_str, self.inner.timeout).await
+    }
+
+    /// PUT a dotted-path sub-field using a custom pvRequest. Combines
+    /// the record-options of `pvput_with_request` with the field-targeting
+    /// of `pvput_field`. `field_path` must be non-empty.
+    ///
+    /// pvxs `pvalink_channel.cpp:31-38 + 138` parity: INIT carries
+    /// `field() record[process=..,block=..]`, DATA targets `field_path`.
+    pub async fn pvput_field_with_request(
+        &self,
+        pv_name: &str,
+        field_path: &str,
+        request: &crate::pv_request::PvRequestExpr,
+        value_str: &str,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        let big_endian = matches!(
+            ch.ensure_active().await?.0.byte_order,
+            crate::proto::ByteOrder::Big
+        );
+        let bytes = request.encode(big_endian);
+        crate::client_native::ops_v2::op_put_field_with_request(
+            &ch,
+            field_path,
+            &bytes,
+            value_str,
+            self.inner.timeout,
+        )
+        .await
+    }
+
+    /// PUT a pre-built [`PvField`] with a custom pvRequest. Like
+    /// `pvput_pv_field` but INIT carries the caller's record options
+    /// (`process`, `block`). DATA still targets `"value"`.
+    ///
+    /// pvxs `pvalink_channel.cpp:268` parity for typed OUT arrays.
+    pub async fn pvput_pv_field_with_request(
+        &self,
+        pv_name: &str,
+        request: &crate::pv_request::PvRequestExpr,
+        value: &crate::pvdata::PvField,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        let big_endian = matches!(
+            ch.ensure_active().await?.0.byte_order,
+            crate::proto::ByteOrder::Big
+        );
+        let bytes = request.encode(big_endian);
+        crate::client_native::ops_v2::op_put_value_raw(&ch, &bytes, value, self.inner.timeout).await
+    }
+
+    /// PUT a pre-built [`PvField`] into a single dotted-path sub-field
+    /// using a caller-provided pvRequest. Combines the typed-value
+    /// path of [`Self::pvput_pv_field_with_request`] with the
+    /// field-targeting of [`Self::pvput_field_with_request`]: the
+    /// typed value is placed at `field_path` (drilling into a leaf
+    /// `value` sub-field when the target is an NT-style struct), and
+    /// only that path's bit is marked changed. `field_path` must be
+    /// non-empty.
+    ///
+    /// Used by pvalink OUT links carrying `field=<subfield>` together
+    /// with a typed array/scalar value. pvxs `pvalink_channel.cpp:127`
+    /// (`linkBuildPut`) parity for typed PUTs into the link's
+    /// `fieldName` target.
+    pub async fn pvput_pv_field_field_with_request(
+        &self,
+        pv_name: &str,
+        field_path: &str,
+        request: &crate::pv_request::PvRequestExpr,
+        value: &crate::pvdata::PvField,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        let big_endian = matches!(
+            ch.ensure_active().await?.0.byte_order,
+            crate::proto::ByteOrder::Big
+        );
+        let bytes = request.encode(big_endian);
+        crate::client_native::ops_v2::op_put_value_field_with_request(
+            &ch,
+            field_path,
+            &bytes,
+            value,
+            self.inner.timeout,
+        )
+        .await
     }
 
     pub async fn pvmonitor<F>(&self, pv_name: &str, mut callback: F) -> PvaResult<()>
@@ -1182,9 +1381,17 @@ impl PvaClient {
                 }
             }
         }
+        // EX-R4: Phase-2 send failures must be tracked in their own set,
+        // keyed by `warm_reqs` index. The result vector is initialized to
+        // `Err(PvaError::Timeout)` for every slot, so using
+        // `results[idx].is_err()` as the Phase-3 skip predicate skipped
+        // EVERY warm request, not just the failed sends. A successfully
+        // sent warm request would never have its response awaited.
+        let mut failed_warm: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for addr in &failed_servers {
             if let Some(indices) = by_server.get(addr) {
                 for &wi in indices {
+                    failed_warm.insert(wi);
                     let req = &warm_reqs[wi];
                     req.warm.slot.lock().take();
                     // PVA-R27: the cached warm GET this `warm` was
@@ -1212,7 +1419,7 @@ impl PvaClient {
         // futures-util as a dep.
         use super::decode::OpResponse;
         let op_timeout = self.inner.timeout;
-        for req in warm_reqs {
+        for (wi, req) in warm_reqs.into_iter().enumerate() {
             let WarmReq {
                 idx,
                 channel,
@@ -1220,11 +1427,15 @@ impl PvaClient {
                 rx,
                 intro,
             } = req;
-            // PVA-R27: skip await + DO NOT restore cache for already-
-            // failed warm reqs. Pre-fix restored the cache after
-            // Phase-2 send failure, so the next pvget_many call
-            // reused the (sid, ioid) that just failed.
-            if results[idx].is_err() {
+            // EX-R4 / PVA-R27: skip await + DO NOT restore cache only for
+            // warm reqs whose Phase-2 send actually failed. The skip
+            // predicate is the dedicated `failed_warm` set — using
+            // `results[idx].is_err()` here would skip every warm request
+            // because the result vector starts as `Err(Timeout)`.
+            // Phase-2 already cleared the oneshot slot and unregistered
+            // the IOID for these failed reqs, so the cache is correctly
+            // not restored (the `warm` is dropped here).
+            if failed_warm.contains(&wi) {
                 continue;
             }
             let frame_res = tokio::time::timeout(op_timeout, rx).await;
@@ -1453,5 +1664,55 @@ impl Drop for ConnectHandle {
         if let Some(t) = self.task.take() {
             t.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // MR-R9 regression: a client built with both `share_udp(true)` and a
+    // non-empty `name_servers` list must NOT be routed through the
+    // process-wide `SHARED_SEARCH_ENGINE` singleton — that singleton is
+    // spawned with an empty name-server list and would silently drop the
+    // configured TCP name servers. Such a client must fall back to its
+    // own per-client engine, which carries the name-server list.
+    #[tokio::test]
+    async fn mr_r9_share_udp_with_name_servers_uses_per_client_engine() {
+        let ns: SocketAddr = "127.0.0.1:5099".parse().unwrap();
+        let client = PvaClient::builder()
+            .share_udp(true)
+            .name_servers(vec![ns])
+            .build();
+
+        // Resolving the engine must spawn a per-client engine, not the
+        // shared singleton.
+        let _engine = client.search_engine().await.expect("engine spawn");
+
+        assert!(
+            SHARED_SEARCH_ENGINE.get().is_none(),
+            "share_udp(true) + name_servers must use the per-client engine, \
+             not the shared singleton that drops name servers"
+        );
+        assert!(
+            client.inner.search.get().is_some(),
+            "per-client engine must be populated"
+        );
+    }
+
+    // Control: `share_udp(true)` with no name servers still shares the
+    // process-wide engine — share_udp continues to save the UDP socket.
+    #[tokio::test]
+    async fn mr_r9_share_udp_without_name_servers_uses_shared_engine() {
+        let client = PvaClient::builder().share_udp(true).build();
+        let _engine = client.search_engine().await.expect("engine spawn");
+        assert!(
+            SHARED_SEARCH_ENGINE.get().is_some(),
+            "share_udp(true) with no name servers must use the shared engine"
+        );
+        assert!(
+            client.inner.search.get().is_none(),
+            "shared-engine path must not spawn a per-client engine"
+        );
     }
 }

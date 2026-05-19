@@ -200,6 +200,61 @@ enum ChannelTarget {
     },
 }
 
+/// RAII gate for a per-channel `CA_PROTO_WRITE_NOTIFY` in flight.
+///
+/// C `write_notify_action` (`rsrv/camessage.c:1660-1729`) sets
+/// `pciu->pPutNotify->busy = TRUE` *before* `caNetConvert`,
+/// `asTrapWriteWithData`, and `dbProcessNotify` run — i.e. before any
+/// payload conversion, trap-write `BeforeWrite` dispatch, or the
+/// actual `dbProcessNotify` side effect. The flag is cleared in the
+/// completion callback (`putNotifyCompletion`) or by the timeout/
+/// cancel branch (`camessage.c:1691`). MR-R1: Rust must acquire the
+/// gate on the same boundary so a second same-channel WRITE_NOTIFY
+/// arriving while the first is pending cannot mutate the PV/device
+/// or alarm-ack state and then be told it was rejected.
+///
+/// The guard clears the flag on `Drop` — covering every early
+/// return (`?`), pre-write error, and panic after acquisition.
+/// `defuse()` transfers clearing responsibility to the async
+/// completion task; that task holds its own guard so an
+/// `abort()` from `CA_PROTO_CLEAR_CHANNEL` still releases the gate
+/// (C parity: `rsrvFreePutNotify` releases per-channel notify state
+/// on channel teardown).
+struct PutNotifyBusyGuard {
+    flag: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl PutNotifyBusyGuard {
+    /// Acquire the per-channel WRITE_NOTIFY gate. Returns `None` when
+    /// another WRITE_NOTIFY on the same channel is already in flight;
+    /// the caller must reply `ECA_PUTCBINPROG` in that case.
+    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        if flag.swap(true, Ordering::AcqRel) {
+            None
+        } else {
+            Some(Self {
+                flag: flag.clone(),
+                armed: true,
+            })
+        }
+    }
+
+    /// Stop the guard from clearing the flag on `Drop`. Used when the
+    /// async completion task takes ownership of releasing the gate.
+    fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PutNotifyBusyGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(false, Ordering::Release);
+        }
+    }
+}
+
 struct ChannelEntry {
     target: ChannelTarget,
     cid: u32,
@@ -255,6 +310,14 @@ struct ClientState {
     channels: HashMap<u32, ChannelEntry>,
     subscriptions: HashMap<u32, SubscriptionEntry>,
     channel_access: HashMap<u32, AccessLevel>,
+    /// MR-R20: per-SID write-trap mask of the ACF rule that resolved
+    /// the channel's access level. Kept parallel to `channel_access`
+    /// (same key set, inserted/removed together) because the trap
+    /// flag has no `CA_PROTO_ACCESS_RIGHTS` wire representation — it
+    /// is consumed only by TRAPWRITE put-logging dispatch, never
+    /// diffed for access-rights transition frames. Mirrors C
+    /// `pasgclient->trapMask` (`asLibRoutines.c:1048`).
+    channel_trap: HashMap<u32, bool>,
     next_sid: AtomicU32,
     /// Recycled SIDs from channels destroyed via CLEAR_CHANNEL. C-G9:
     /// without recycling, `next_sid` would wrap after 2³² channel
@@ -329,6 +392,7 @@ impl ClientState {
             channels: HashMap::new(),
             subscriptions: HashMap::new(),
             channel_access: HashMap::new(),
+            channel_trap: HashMap::new(),
             next_sid: AtomicU32::new(1),
             free_sids: Vec::new(),
             hostname: String::new(),
@@ -395,13 +459,23 @@ impl ClientState {
     fn lookup_access(&self, sid: u32) -> crate::server::access_token::CaAccessChecked {
         use crate::server::access_token::CaAccessChecked;
         match self.channel_access.get(&sid).copied() {
-            Some(level) => CaAccessChecked::from_level(level),
+            Some(level) => {
+                // MR-R20: the trap mask is kept in a parallel map
+                // populated alongside `channel_access`. A missing
+                // entry means the rule carried no trap option.
+                let rule_was_trap = self.channel_trap.get(&sid).copied().unwrap_or(false);
+                CaAccessChecked::from_level(level, rule_was_trap)
+            }
             None => CaAccessChecked::denied(),
         }
     }
 
-    /// Compute access rights bits for a channel target.
-    async fn compute_access(&self, target: &ChannelTarget) -> u32 {
+    /// Compute access rights bits for a channel target, together with
+    /// the write-trap mask of the ACF rule that resolved the level
+    /// (MR-R20). The trap flag is `false` for `SimplePv`/`RecordField`
+    /// targets whose access was not resolved through a `TRAPWRITE`
+    /// rule — including the no-ACF permissive fallback.
+    async fn compute_access(&self, target: &ChannelTarget) -> (u32, bool) {
         match target {
             ChannelTarget::SimplePv(_) => {
                 let guard = self.acf.read().await;
@@ -413,20 +487,24 @@ impl ClientState {
                     // PR #641: pass auth method/authority so
                     // METHOD("x509") / AUTHORITY(<issuer>) rules
                     // can gate mTLS-authenticated peers.
-                    match acf_cfg.check_access_method(
+                    let (level, rule_was_trap) = acf_cfg.check_access_method_trap(
                         "DEFAULT",
                         &self.hostname,
                         &self.username,
                         0,
                         &self.auth_method,
                         &self.auth_authority,
-                    ) {
+                    );
+                    let bits = match level {
                         AccessLevel::ReadWrite => 3,
                         AccessLevel::Read => 1,
                         AccessLevel::NoAccess => 0,
-                    }
+                    };
+                    (bits, rule_was_trap)
                 } else {
-                    3
+                    // No ACF attached: permissive ReadWrite, no rule
+                    // resolved access, so no TRAPWRITE applies.
+                    (3, false)
                 }
             }
             ChannelTarget::RecordField { record, field: f } => {
@@ -447,7 +525,7 @@ impl ClientState {
                 // entirely. Now ACF runs first; the read-only flag
                 // only strips the WRITE bit from the result.
                 let guard = self.acf.read().await;
-                let acf_level = if let Some(ref acf_cfg) = *guard {
+                let (acf_level, rule_was_trap) = if let Some(ref acf_cfg) = *guard {
                     // Round-33A (R33-G4): thread the per-record
                     // ASL into the ACF check so `RULE(N, …)`
                     // gates correctly disable rules whose level
@@ -457,7 +535,7 @@ impl ClientState {
                     // can gate write access by issuer CA.
                     let asg = &instance.common.asg;
                     let asl = instance.common.asl;
-                    acf_cfg.check_access_method(
+                    acf_cfg.check_access_method_trap(
                         asg,
                         &self.hostname,
                         &self.username,
@@ -466,14 +544,18 @@ impl ClientState {
                         &self.auth_authority,
                     )
                 } else {
-                    AccessLevel::ReadWrite
+                    (AccessLevel::ReadWrite, false)
                 };
-                match (acf_level, is_ro) {
+                let bits = match (acf_level, is_ro) {
                     (AccessLevel::NoAccess, _) => 0,
                     (AccessLevel::Read, _) => 1,
                     (AccessLevel::ReadWrite, true) => 1,
                     (AccessLevel::ReadWrite, false) => 3,
-                }
+                };
+                // The trap mask reflects the rule that granted access;
+                // a read-only field stripping the WRITE bit does not
+                // change which rule matched.
+                (bits, rule_was_trap)
             }
         }
     }
@@ -1902,7 +1984,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     }
                 };
 
-                let access = state.compute_access(&target).await;
+                let (access, rule_was_trap) = state.compute_access(&target).await;
                 let access_level = match access {
                     3 => AccessLevel::ReadWrite,
                     1 => AccessLevel::Read,
@@ -1920,6 +2002,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     },
                 );
                 state.channel_access.insert(sid, access_level);
+                // MR-R20: keep the trap-mask map in lockstep with
+                // `channel_access` so `lookup_access` always finds a
+                // consistent pair for this SID.
+                state.channel_trap.insert(sid, rule_was_trap);
 
                 let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
                 ar.cid = client_cid;
@@ -2319,6 +2405,33 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 } else {
                     "ACKS"
                 };
+                // MR-R1: DBR_PUT_ACKT/ACKS WRITE_NOTIFY travels C
+                // `write_notify_action`, so it is subject to the same
+                // per-channel busy gate as a regular WRITE_NOTIFY. The
+                // alarm-ack write below mutates ACKT/ACKS record state;
+                // acquire the gate *before* that side effect so a
+                // second concurrent put-notify on the channel cannot
+                // mutate alarm state and then be told it was rejected.
+                // The non-notify deprecated CA_PROTO_WRITE path is
+                // fire-and-forget in C `write_action` and not gated.
+                let ackt_busy_guard = if is_notify {
+                    match PutNotifyBusyGuard::try_acquire(&entry.put_notify_busy) {
+                        Some(g) => Some(g),
+                        None => {
+                            send_put_notify_response(
+                                writer,
+                                hdr.data_type,
+                                hdr.actual_count(),
+                                ECA_PUTCBINPROG,
+                                ioid,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    None
+                };
                 let result = match &entry.target {
                     ChannelTarget::RecordField { record, .. } => {
                         let name = record.read().await.name.clone();
@@ -2341,6 +2454,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     };
                     send_put_notify_response(writer, hdr.data_type, hdr.actual_count(), eca, ioid)
                         .await?;
+                    // MR-R1: alarm-ack PUT_ACKT/ACKS completes
+                    // synchronously; release the per-channel
+                    // WRITE_NOTIFY gate now that the reply is on the
+                    // wire so the next put-notify on this channel can
+                    // proceed.
+                    drop(ackt_busy_guard);
                 } else if let Err(e) = &result {
                     // R2-14: deprecated CA_PROTO_WRITE for DBR_PUT_ACKT/
                     // DBR_PUT_ACKS must surface put failure via
@@ -2438,7 +2557,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // Round 44 type-state WRITE gate. `lookup_access` is
             // the only path to the cache; the witness type ensures
             // the matching ECA code reaches the wire.
-            let _write_grant = match state.lookup_access(sid).require_write() {
+            let write_grant = match state.lookup_access(sid).require_write() {
                 Ok(g) => g,
                 Err(denied) => {
                     if is_notify {
@@ -2469,6 +2588,54 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     state.audit("caput", &audit_pv, "", "denied").await;
                     return Ok(());
                 }
+            };
+
+            // MR-R20: the write-trap mask of the ACF rule that
+            // authorised this write. C `asTrapWriteWithData`
+            // (`rsrv/camessage.c:768-779`) consults
+            // `pasgclient->trapMask` so a `NOTRAPWRITE` rule — or a
+            // rule with no trap option — is not reported to
+            // put-logging listeners. Pre-fix Rust hard-coded
+            // `rule_was_trap: true` for every accepted write.
+            let rule_was_trap = write_grant.rule_was_trap();
+
+            // MR-R1: acquire the per-channel WRITE_NOTIFY busy gate
+            // here — after the SID/type/access checks and *before* any
+            // side effect (payload conversion, trap-write `BeforeWrite`
+            // dispatch, the database/PV write, or the async device
+            // kickoff). C `write_notify_action`
+            // (`rsrv/camessage.c:1660-1729`) sets
+            // `pciu->pPutNotify->busy = TRUE` on exactly this boundary
+            // — after `rsrvCheckPut` and before `caNetConvert` /
+            // `asTrapWriteWithData` / `dbProcessNotify`. Pre-fix Rust
+            // acquired the gate only after the write had already run,
+            // so a second concurrent WRITE_NOTIFY could mutate the
+            // PV/device or alarm state and then receive
+            // ECA_PUTCBINPROG as if it had been rejected; a second
+            // write that completed synchronously bypassed the gate
+            // entirely. The guard clears the flag on every early
+            // return below (`?` on payload parse / response write)
+            // and is `defuse()`d when the async completion task takes
+            // ownership of clearing it. The deprecated fire-and-forget
+            // CA_PROTO_WRITE path is not gated (C `write_action` has
+            // no `pPutNotify` serialisation).
+            let mut put_notify_guard = if is_notify {
+                match PutNotifyBusyGuard::try_acquire(&entry.put_notify_busy) {
+                    Some(g) => Some(g),
+                    None => {
+                        send_put_notify_response(
+                            writer,
+                            write_type as u16,
+                            hdr.actual_count(),
+                            ECA_PUTCBINPROG,
+                            ioid,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
             };
 
             let count = hdr.actual_count() as usize;
@@ -2565,7 +2732,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         no_elements: write_count,
                         event_id: trap_event_id,
                         status: None,
-                        rule_was_trap: true,
+                        rule_was_trap,
                     },
                 );
             }
@@ -2615,7 +2782,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         no_elements: write_count,
                         event_id: trap_event_id,
                         status: Some(audit_result),
-                        rule_was_trap: true,
+                        rule_was_trap,
                     },
                 );
             }
@@ -2652,31 +2819,35 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     write_result.unwrap_or_default();
 
                 if let Some(rx) = completion_rx {
-                    // R2-9: per-channel WRITE_NOTIFY serialisation. C
-                    // `write_notify_action` (`rsrv/camessage.c:1660-1707`)
-                    // stores one `pciu->pPutNotify` per channel; a second
-                    // WRITE_NOTIFY while the first is still running waits
-                    // up to 60s and on timeout cancels with
-                    // ECA_PUTCBINPROG. Rust rejects the second arrival
-                    // immediately with the same code — simpler than C's
-                    // wait-then-cancel but preserves the serialisation
-                    // invariant (a record implementation that relies on
-                    // rsrv's per-channel ordering doesn't see reentrant
-                    // writes).
-                    let busy_arc = entry.put_notify_busy.clone();
-                    if busy_arc.swap(true, Ordering::AcqRel) {
-                        send_put_notify_response(
-                            writer,
-                            write_type as u16,
-                            write_count,
-                            ECA_PUTCBINPROG,
-                            ioid,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
+                    // MR-R1: the per-channel WRITE_NOTIFY busy gate was
+                    // already acquired above, before any side effect.
+                    // The async device kickoff has now produced a
+                    // completion receiver, so ownership of clearing the
+                    // gate moves to the spawned completion task. Defuse
+                    // the request-scoped guard and hand the task its
+                    // own guard: a `Drop` on the task — whether from
+                    // normal completion or an `abort()` issued by
+                    // `CA_PROTO_CLEAR_CHANNEL` — releases the gate (C
+                    // parity: `rsrvFreePutNotify` releases per-channel
+                    // notify state on channel teardown).
+                    let task_busy_guard = match put_notify_guard.take() {
+                        Some(g) => {
+                            let flag = g.flag.clone();
+                            g.defuse();
+                            PutNotifyBusyGuard { flag, armed: true }
+                        }
+                        None => {
+                            // Unreachable: `is_notify` is true on this
+                            // branch and the guard is always `Some` for
+                            // `is_notify`. Treat a logic regression as a
+                            // protocol error rather than silently
+                            // leaving the gate state ambiguous.
+                            return Err(epics_base_rs::error::CaError::Protocol(
+                                "WRITE_NOTIFY async path reached without a busy guard".to_string(),
+                            ));
+                        }
+                    };
                     let writer_c = writer.clone();
-                    let busy_for_task = busy_arc.clone();
                     // R2-84: snapshot the trap-dispatch inputs so the
                     // async task can fire AfterWrite at *real*
                     // completion time (matches C
@@ -2698,9 +2869,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             write_type as u16,
                             write_count,
                             trap_event_id,
+                            rule_was_trap,
                         )
                     });
                     let join = tokio::spawn(async move {
+                        // MR-R1: own the per-channel WRITE_NOTIFY busy
+                        // gate for the lifetime of this completion
+                        // task. Its `Drop` clears the gate on every
+                        // exit — normal completion, `rx` sender drop,
+                        // or an `abort()` from `CA_PROTO_CLEAR_CHANNEL`
+                        // — so the next WRITE_NOTIFY on this channel
+                        // can always proceed and the flag never leaks.
+                        let _busy_guard = task_busy_guard;
                         // Wait indefinitely for record processing to complete,
                         // matching C EPICS rsrv behavior. RecvError means the
                         // Sender was dropped without firing — typically because
@@ -2716,7 +2896,9 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // "ok" for ECA_NORMAL or the ECA-code form
                         // for anything else so listeners can filter
                         // failed puts.
-                        if let Some((pv, user, host, peer, val, dbr, ne, ev_id)) = trap_inputs {
+                        if let Some((pv, user, host, peer, val, dbr, ne, ev_id, rule_was_trap)) =
+                            trap_inputs
+                        {
                             let status_s = if final_status == ECA_NORMAL {
                                 "ok".to_string()
                             } else {
@@ -2735,7 +2917,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     no_elements: ne,
                                     event_id: ev_id,
                                     status: Some(&status_s),
-                                    rule_was_trap: true,
+                                    rule_was_trap,
                                 },
                             );
                         }
@@ -2751,9 +2933,8 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let mut w = writer_c.lock().await;
                         let _ = w.flush().await;
                         drop(w);
-                        // Clear the per-channel busy gate so the next
-                        // WRITE_NOTIFY on this channel can proceed.
-                        busy_for_task.store(false, Ordering::Release);
+                        // `_busy_guard` drops here, clearing the
+                        // per-channel WRITE_NOTIFY gate (MR-R1).
                     });
                     // Track for connection-scoped cleanup (CR-3): a stuck
                     // async record would otherwise pin this task and the
@@ -2950,29 +3131,54 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // routes denial through `no_read_access_event`,
                         // `rsrv/camessage.c:529-534`).
                         if access_denied {
+                            // EX-R6: an autosize (`count == 0`) request
+                            // must be normalised to the target's live
+                            // element count before sizing the zero-
+                            // filled denial payload. C `read_reply`
+                            // (`camessage.c:507-509`) maps `m_count==0`
+                            // to `paddr->no_elements`; the denial frame
+                            // must match so it carries a nonzero DBR
+                            // body. A zero-payload `CA_PROTO_EVENT_ADD`
+                            // is indistinguishable from the historical
+                            // cancel-ack no-op and is silently dropped
+                            // by the client before the `ECA_NORDACCESS`
+                            // status is read (`cac.cpp` eventRespAction
+                            // returns on `m_postsize == 0`).
+                            let denied_count = no_read_access_count(
+                                requested_count,
+                                pv.snapshot().await.value.count(),
+                            );
                             send_no_read_access_event(
                                 writer,
                                 CA_PROTO_EVENT_ADD,
                                 requested_type,
-                                requested_count,
+                                denied_count,
                                 sub_id,
                                 ECA_NORDACCESS,
                             )
                             .await?;
                         } else {
-                            let mut snap = pv.snapshot().await;
-                            // R2-12 refinement: initial event honours
-                            // the EVENT_ADD request count (C
-                            // `read_reply` parity). Pre-truncate the
-                            // snapshot value when the request asks
-                            // for fewer elements than the live PV;
-                            // the producer task already truncates
-                            // future updates via send_event's
-                            // `data_count` parameter.
-                            if requested_count > 0 && requested_count < snap.value.count() {
-                                snap.value.truncate(requested_count as usize);
-                            }
-                            send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
+                            let snap = pv.snapshot().await;
+                            // EX-R9: the initial event honours the
+                            // EVENT_ADD request count for BOTH
+                            // directions — `send_monitor_snapshot`
+                            // now pads when `requested_count` exceeds
+                            // the live element count and truncates
+                            // when it is smaller, via
+                            // `pad_dbr_to_requested_count` (C
+                            // `read_reply` parity). The producer task
+                            // already pads/truncates future updates
+                            // through the same helper, so the initial
+                            // frame and later frames now share one
+                            // shape.
+                            send_monitor_snapshot(
+                                writer,
+                                sub_id,
+                                requested_type,
+                                requested_count,
+                                &snap,
+                            )
+                            .await?;
                         }
 
                         let task = spawn_monitor_sender(
@@ -3056,6 +3262,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // no_read_access_event when denied. Drop the
                         // instance write lock before await on the
                         // writer so the producer task can pick it up.
+                        //
+                        // EX-R6: even on the denied path we must read
+                        // the field's live element count under the
+                        // lock, so an autosize (`count == 0`) denial
+                        // frame can be sized to a nonzero DBR body
+                        // instead of the zero-payload cancel-ack shape.
                         let initial_snap = if access_denied {
                             None
                         } else {
@@ -3067,24 +3279,52 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 snap
                             })
                         };
+                        // EX-R6: derive the field's element count for
+                        // the autosize-denial frame. `snapshot_for_field`
+                        // is the same accessor the granted path uses,
+                        // so the denial count matches what a granted
+                        // monitor on the same field would carry.
+                        let denied_field_count = if access_denied {
+                            instance
+                                .snapshot_for_field(field)
+                                .map(|snap| snap.value.count())
+                                .unwrap_or(1)
+                        } else {
+                            0
+                        };
                         drop(instance);
                         if access_denied {
+                            // EX-R6: normalise autosize before sizing
+                            // the zero-filled denial payload. See the
+                            // SimplePv branch above for the C
+                            // `read_reply` (`camessage.c:507-509`)
+                            // parity rationale.
+                            let denied_count =
+                                no_read_access_count(requested_count, denied_field_count);
                             send_no_read_access_event(
                                 writer,
                                 CA_PROTO_EVENT_ADD,
                                 requested_type,
-                                requested_count,
+                                denied_count,
                                 sub_id,
                                 ECA_NORDACCESS,
                             )
                             .await?;
-                        } else if let Some(mut snap) = initial_snap {
-                            // R2-12 refinement: initial event honours
-                            // the EVENT_ADD request count.
-                            if requested_count > 0 && requested_count < snap.value.count() {
-                                snap.value.truncate(requested_count as usize);
-                            }
-                            send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
+                        } else if let Some(snap) = initial_snap {
+                            // EX-R9: initial event honours the
+                            // EVENT_ADD request count in both
+                            // directions — `send_monitor_snapshot`
+                            // pads an over-requested count and
+                            // truncates an under-requested one via
+                            // `pad_dbr_to_requested_count`.
+                            send_monitor_snapshot(
+                                writer,
+                                sub_id,
+                                requested_type,
+                                requested_count,
+                                &snap,
+                            )
+                            .await?;
                         }
 
                         let writer_clone = writer.clone();
@@ -3568,6 +3808,9 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             }
             if let Some(entry) = state.channels.remove(&sid) {
                 state.channel_access.remove(&sid);
+                // MR-R20: drop the parallel trap-mask entry so a
+                // recycled SID never inherits a stale trap flag.
+                state.channel_trap.remove(&sid);
                 state.release_sid(sid);
                 if let Some(tx) = &conn_events {
                     let _ = tx.send(ServerConnectionEvent::ChannelCleared {
@@ -3661,21 +3904,48 @@ async fn get_full_snapshot(
     }
 }
 
+/// Send an initial / access-restore monitor snapshot as a
+/// `CA_PROTO_EVENT_ADD` frame.
+///
+/// EX-R9: `requested_count` is the element count from the originating
+/// `CA_PROTO_EVENT_ADD` request. The encoded DBR payload is routed
+/// through [`pad_dbr_to_requested_count`] so a request count *larger*
+/// than the live element count is zero-padded to the requested shape
+/// — and a smaller count is truncated — exactly as the READ path and
+/// the steady-state monitor producer already do. Without this the
+/// first monitor frame (and the access-restore frame) was framed at
+/// `snapshot.value.count()`, so a client requesting more elements
+/// than the PV currently holds saw a count/size discontinuity
+/// between the initial frame and later padded updates. C `read_reply`
+/// frames non-autosize monitor events at the requested count and
+/// zero-fills missing elements (`rsrv/camessage.c:507-571`).
+///
+/// `requested_count == 0` is autosize: the frame keeps the live
+/// element count.
 async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
     writer: &Arc<Mutex<BufWriter<W>>>,
     sub_id: u32,
     data_type: u16,
+    requested_count: u32,
     snapshot: &epics_base_rs::server::snapshot::Snapshot,
 ) -> CaResult<()> {
     let data = encode_dbr(data_type, snapshot)?;
     // CA-268: DBR_CLASS_NAME wire payload is always one 40-byte
-    // string regardless of underlying value count.
+    // string regardless of underlying value count — and is never
+    // padded/truncated to a requested element count.
+    let mut padded = data;
     let element_count = if data_type == epics_base_rs::types::DBR_CLASS_NAME {
         1
     } else {
-        snapshot.value.count() as u32
+        // EX-R9: pad (or truncate) the encoded DBR to the requested
+        // element count before the 8-byte alignment resize, so the
+        // header count and payload shape match a non-autosize
+        // request. `pad_dbr_to_requested_count` returns the header
+        // element count to use (`requested_count` when non-zero,
+        // the live `actual_count` for autosize).
+        let actual_count = snapshot.value.count() as u32;
+        pad_dbr_to_requested_count(&mut padded, actual_count, requested_count, data_type)
     };
-    let mut padded = data;
     padded.resize(align8(padded.len()), 0);
 
     let mut resp = CaHeader::new(CA_PROTO_EVENT_ADD);
@@ -3747,7 +4017,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
         let mut w = writer.lock().await;
         let mut any_frame_written = false;
         for (sid, cid, target) in chan_info {
-            let new_access = state.compute_access(&target).await;
+            let (new_access, new_rule_was_trap) = state.compute_access(&target).await;
             let new_level = match new_access {
                 3 => AccessLevel::ReadWrite,
                 1 => AccessLevel::Read,
@@ -3757,6 +4027,10 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                 .channel_access
                 .insert(sid, new_level)
                 .unwrap_or(AccessLevel::NoAccess);
+            // MR-R20: an ACF reload can change which rule grants
+            // access (e.g. a new TRAPWRITE rule), so the trap mask
+            // must be refreshed alongside the level.
+            state.channel_trap.insert(sid, new_rule_was_trap);
             if old_level == new_level {
                 continue;
             }
@@ -3801,18 +4075,40 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
             // so the wire frame matches C byte-for-byte (the stored
             // request count drives the zero-fill).
             for sub_id in &affected {
-                let Some(sub) = state.subscriptions.get(sub_id) else {
-                    continue;
+                let (data_type, sub_id_v, data_count, target) = {
+                    let Some(sub) = state.subscriptions.get(sub_id) else {
+                        continue;
+                    };
+                    sub.denied.store(true, Ordering::Release);
+                    (
+                        sub.data_type,
+                        sub.sub_id,
+                        sub.data_count,
+                        sub.target.clone(),
+                    )
                 };
-                sub.denied.store(true, Ordering::Release);
-                let data_type = sub.data_type;
-                let sub_id_v = sub.sub_id;
-                let data_count = sub.data_count;
+                // EX-R6: an autosize (`data_count == 0`) subscription
+                // revoked here must also be normalised to the live
+                // element count, otherwise the access-revoked
+                // notification is the same zero-payload
+                // `CA_PROTO_EVENT_ADD` the client drops as a
+                // cancel-ack. Same C `read_reply` autosize parity
+                // (`camessage.c:507-509`) as the initial EVENT_ADD
+                // denial path.
+                let denied_count = if data_count == 0 {
+                    let actual = get_full_snapshot(&target)
+                        .await
+                        .map(|snap| snap.value.count())
+                        .unwrap_or(1);
+                    no_read_access_count(data_count, actual)
+                } else {
+                    data_count
+                };
                 send_no_read_access_event(
                     writer,
                     CA_PROTO_EVENT_ADD,
                     data_type,
-                    data_count,
+                    denied_count,
                     sub_id_v,
                     ECA_NORDACCESS,
                 )
@@ -3828,12 +4124,17 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
             // event the moment access comes back (rather than
             // waiting for the next natural update).
             //
-            // R2-1 refinement: truncate the restore snapshot to
-            // `data_count` (matches the EVENT_ADD request)
-            // instead of sending the full live native count.
-            // C `read_reply` always honours the stored request
-            // count; pre-fix Rust used `send_monitor_snapshot`
-            // which always uses live `snapshot.value.count()`.
+            // EX-R9: the restore snapshot honours the stored
+            // EVENT_ADD request count in BOTH directions.
+            // `send_monitor_snapshot` pads when the request asked
+            // for more elements than the PV currently holds and
+            // truncates when it asked for fewer, via
+            // `pad_dbr_to_requested_count` — so the access-restore
+            // frame matches the request shape and later padded
+            // updates. C `read_reply` always honours the stored
+            // request count; pre-fix Rust framed the restore event
+            // at the live `snapshot.value.count()`, only truncating
+            // and never padding.
             for sub_id in &affected {
                 let (target, data_type, data_count, sub_id_val) = {
                     let Some(sub) = state.subscriptions.get(sub_id) else {
@@ -3847,11 +4148,8 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                         sub.sub_id,
                     )
                 };
-                if let Some(mut snap) = get_full_snapshot(&target).await {
-                    if data_count > 0 && data_count < snap.value.count() {
-                        snap.value.truncate(data_count as usize);
-                    }
-                    send_monitor_snapshot(writer, sub_id_val, data_type, &snap).await?;
+                if let Some(snap) = get_full_snapshot(&target).await {
+                    send_monitor_snapshot(writer, sub_id_val, data_type, data_count, &snap).await?;
                 }
             }
         }
@@ -3910,6 +4208,33 @@ async fn send_put_notify_response<W: AsyncWrite + Unpin + Send + 'static>(
     Ok(())
 }
 
+/// EX-R6: normalise an EVENT_ADD request count for a no-read-access
+/// denial frame. C `read_reply` (`rsrv/camessage.c:507-509`) treats a
+/// zero element count as autosize and substitutes `paddr->no_elements`
+/// — the target's live element count. The `no_read_access_event`
+/// denial path must do the same, otherwise a `count == 0` monitor on
+/// a plain DBR type (`DBR_DOUBLE`, …) produces a zero-payload
+/// `CA_PROTO_EVENT_ADD`. That shape is the historical
+/// subscription-cancel-confirmation no-op: the CA client drops it
+/// before reading the `ECA_NORDACCESS` status (C `cac.cpp`
+/// eventRespAction returns on `m_postsize == 0`; this port's
+/// `client/transport.rs` mirrors that), so the denied monitor would
+/// silently appear to hang.
+///
+/// A non-zero request count is returned unchanged (explicit counts
+/// are already framed at the requested shape). `actual_count` is the
+/// target's live element count, used only for the autosize case.
+fn no_read_access_count(requested_count: u32, actual_count: u32) -> u32 {
+    if requested_count == 0 {
+        // Autosize: at least one element so the denial frame carries
+        // a nonzero DBR body. A target reporting zero live elements
+        // still gets a single-element zero-filled payload.
+        actual_count.max(1)
+    } else {
+        requested_count
+    }
+}
+
 /// Send a `no_read_access_event`-shaped reply: same wire frame as the
 /// original READ_NOTIFY / EVENT_ADD command, with `m_cid` carrying the
 /// ECA status and a `dbr_buffer_size`-sized zero payload. C
@@ -3918,6 +4243,10 @@ async fn send_put_notify_response<W: AsyncWrite + Unpin + Send + 'static>(
 /// dbChannel_get failures — preserving the requested count and DBR
 /// type so libca-style clients see the correct callback metadata even
 /// on the error path.
+///
+/// EX-R6: callers on the EVENT_ADD denial path must pass a `count`
+/// already normalised through [`no_read_access_count`] so an autosize
+/// (`count == 0`) request does not produce a zero-payload frame.
 async fn send_no_read_access_event<W: AsyncWrite + Unpin + Send + 'static>(
     writer: &Arc<Mutex<BufWriter<W>>>,
     cmd: u16,
@@ -4172,6 +4501,87 @@ mod write_notify_drain_tests {
 
         // Cleanup the still-live task.
         live_probe.abort();
+    }
+}
+
+#[cfg(test)]
+mod mr_r1_put_notify_gate_tests {
+    //! MR-R1: the per-channel `CA_PROTO_WRITE_NOTIFY` busy gate must
+    //! be acquired *before* any side effect and reject a concurrent
+    //! WRITE_NOTIFY on the same channel.
+    use super::PutNotifyBusyGuard;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A second acquire while the first guard is live must fail, so
+    /// the dispatcher replies `ECA_PUTCBINPROG` instead of running a
+    /// reentrant write. Releasing the first guard re-opens the gate.
+    #[test]
+    fn mr_r1_concurrent_acquire_is_rejected() {
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let first = PutNotifyBusyGuard::try_acquire(&flag)
+            .expect("first WRITE_NOTIFY must acquire the idle gate");
+        assert!(
+            flag.load(Ordering::Acquire),
+            "gate flag set while in flight"
+        );
+
+        // A second WRITE_NOTIFY arriving while the first is pending
+        // must be refused — the dispatcher turns this `None` into an
+        // ECA_PUTCBINPROG reply without touching PV/device state.
+        assert!(
+            PutNotifyBusyGuard::try_acquire(&flag).is_none(),
+            "second concurrent WRITE_NOTIFY must be rejected, not run a \
+             reentrant write"
+        );
+
+        drop(first);
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "gate must clear once the in-flight WRITE_NOTIFY guard drops"
+        );
+
+        // After release the next WRITE_NOTIFY may proceed.
+        assert!(
+            PutNotifyBusyGuard::try_acquire(&flag).is_some(),
+            "gate must re-open after the prior WRITE_NOTIFY completes"
+        );
+    }
+
+    /// `defuse()` transfers gate-clearing ownership to the async
+    /// completion task: the request-scoped guard must NOT clear the
+    /// flag, and a transferred guard's `Drop` (normal completion or an
+    /// `abort()` from `CA_PROTO_CLEAR_CHANNEL`) must clear it. A leak
+    /// here would wedge the channel — every later WRITE_NOTIFY would
+    /// be falsely rejected with ECA_PUTCBINPROG.
+    #[test]
+    fn mr_r1_defuse_transfers_release_to_async_task() {
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let request_guard = PutNotifyBusyGuard::try_acquire(&flag)
+            .expect("WRITE_NOTIFY acquires the gate before the write");
+
+        // Async device kickoff produced a completion receiver: hand a
+        // fresh guard to the task and defuse the request-scoped one.
+        let task_flag = request_guard.flag.clone();
+        request_guard.defuse();
+        let task_guard = PutNotifyBusyGuard {
+            flag: task_flag,
+            armed: true,
+        };
+        assert!(
+            flag.load(Ordering::Acquire),
+            "defused request guard must NOT clear the gate — the async \
+             task still owns it"
+        );
+
+        // Task completes (or is aborted): its guard drops, gate clears.
+        drop(task_guard);
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "async completion task's guard Drop must release the gate"
+        );
     }
 }
 
@@ -4865,7 +5275,8 @@ mod single_write_all_framing_tests {
             std::time::SystemTime::UNIX_EPOCH,
         );
 
-        send_monitor_snapshot(&writer, 9, DBR_LONG, &snapshot)
+        // requested_count 0 = autosize: frame the live element count.
+        send_monitor_snapshot(&writer, 9, DBR_LONG, 0, &snapshot)
             .await
             .expect("send_monitor_snapshot succeeds");
 
@@ -4878,5 +5289,176 @@ mod single_write_all_framing_tests {
             batches.len(),
             batches.iter().map(|b| b.len()).collect::<Vec<_>>(),
         );
+    }
+
+    /// EX-R9: an initial monitor snapshot for an EVENT_ADD whose
+    /// request count exceeds the live element count must be framed at
+    /// the requested count with a zero-padded payload — the same
+    /// shape the READ path and later monitor updates use. Pre-fix the
+    /// initial frame was framed at `snapshot.value.count()`, so a
+    /// client saw a count/size discontinuity inside one subscription.
+    #[tokio::test]
+    async fn ex_r9_initial_snapshot_pads_over_requested_count() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::{DBR_LONG, DbFieldType, EpicsValue};
+
+        // Live PV holds 3 LONG elements; the client requested 8.
+        let snapshot = Snapshot::new(
+            EpicsValue::LongArray(vec![10, 20, 30]),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let requested_count = 8u32;
+
+        let writer = recording_writer();
+        send_monitor_snapshot(&writer, 9, DBR_LONG, requested_count, &snapshot)
+            .await
+            .expect("send_monitor_snapshot succeeds");
+
+        let guard = writer.lock().await;
+        let batches = &guard.get_ref().batches;
+        assert_eq!(batches.len(), 1, "exactly one contiguous frame");
+        let frame = &batches[0];
+
+        // Standard 16-byte CA header: count 8 and the resulting
+        // payload both fit under the 0xFFFF extended-form threshold.
+        let postsize = u16::from_be_bytes([frame[2], frame[3]]) as usize;
+        let count = u16::from_be_bytes([frame[6], frame[7]]) as u32;
+        assert_eq!(
+            count, requested_count,
+            "EX-R9: the initial monitor frame must carry the REQUESTED \
+             element count (8), not the live count (3)"
+        );
+
+        // DBR_LONG is a plain type (no metadata); the payload must
+        // hold the requested element count of value bytes, zero-
+        // padded for the elements the PV does not have.
+        let elem = DbFieldType::Long.element_size();
+        let value_bytes = requested_count as usize * elem;
+        assert!(
+            postsize >= value_bytes,
+            "EX-R9: payload ({postsize}) must be padded to at least the \
+             requested {requested_count} elements ({value_bytes} bytes)"
+        );
+        // The three live elements come first, then zero padding.
+        let body = &frame[16..16 + postsize];
+        assert_eq!(&body[0..4], &10i32.to_be_bytes(), "element 0 preserved");
+        assert_eq!(&body[8..12], &30i32.to_be_bytes(), "element 2 preserved");
+        assert!(
+            body[3 * elem..value_bytes].iter().all(|&b| b == 0),
+            "EX-R9: over-requested elements must be zero-filled"
+        );
+    }
+
+    /// EX-R9: a request count SMALLER than the live element count
+    /// still truncates — `send_monitor_snapshot` must own both
+    /// directions of the count contract.
+    #[tokio::test]
+    async fn ex_r9_initial_snapshot_truncates_under_requested_count() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::{DBR_LONG, EpicsValue};
+
+        let snapshot = Snapshot::new(
+            EpicsValue::LongArray(vec![1, 2, 3, 4, 5]),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let writer = recording_writer();
+        send_monitor_snapshot(&writer, 9, DBR_LONG, 2, &snapshot)
+            .await
+            .expect("send_monitor_snapshot succeeds");
+
+        let guard = writer.lock().await;
+        let frame = &guard.get_ref().batches[0];
+        let count = u16::from_be_bytes([frame[6], frame[7]]) as u32;
+        assert_eq!(count, 2, "EX-R9: under-requested count must truncate to 2");
+    }
+
+    /// EX-R9: `requested_count == 0` is autosize — the frame keeps the
+    /// live element count, unchanged behaviour.
+    #[tokio::test]
+    async fn ex_r9_autosize_keeps_live_count() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::{DBR_LONG, EpicsValue};
+
+        let snapshot = Snapshot::new(
+            EpicsValue::LongArray(vec![7, 8, 9, 10]),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let writer = recording_writer();
+        send_monitor_snapshot(&writer, 9, DBR_LONG, 0, &snapshot)
+            .await
+            .expect("send_monitor_snapshot succeeds");
+
+        let guard = writer.lock().await;
+        let frame = &guard.get_ref().batches[0];
+        let count = u16::from_be_bytes([frame[6], frame[7]]) as u32;
+        assert_eq!(count, 4, "EX-R9: autosize (count==0) keeps the live count");
+    }
+}
+
+#[cfg(test)]
+mod ex_r6_no_read_access_count_tests {
+    //! EX-R6: an autosize (`count == 0`) no-read-access EVENT_ADD
+    //! denial must be sized to a nonzero DBR body. A zero-payload
+    //! `CA_PROTO_EVENT_ADD` is the historical subscription-cancel
+    //! confirmation no-op; the CA client drops it before reading the
+    //! `ECA_NORDACCESS` status, so a denied autosize monitor would
+    //! silently appear to hang.
+    use super::no_read_access_count;
+    use epics_base_rs::types::{DbFieldType, dbr_buffer_size};
+
+    /// Autosize (`requested_count == 0`) must normalise to the
+    /// target's live element count — mirrors C `read_reply`
+    /// substituting `paddr->no_elements` (`camessage.c:507-509`).
+    #[test]
+    fn ex_r6_autosize_normalises_to_actual_count() {
+        assert_eq!(no_read_access_count(0, 7), 7);
+        // A scalar (1 element) autosize denial still gets a body.
+        assert_eq!(no_read_access_count(0, 1), 1);
+        // A target reporting zero live elements is floored at one so
+        // the frame is never zero-payload.
+        assert_eq!(no_read_access_count(0, 0), 1);
+    }
+
+    /// An explicit non-zero request count is framed unchanged — the
+    /// caller already asked for a definite shape.
+    #[test]
+    fn ex_r6_explicit_count_passes_through() {
+        assert_eq!(no_read_access_count(3, 7), 3);
+        assert_eq!(no_read_access_count(1, 100), 1);
+    }
+
+    /// The defect proof: with the pre-fix raw `count == 0`, the
+    /// `dbr_buffer_size` of a plain DBR type (`DBR_DOUBLE`) is zero,
+    /// producing the cancel-ack-shaped frame. After normalisation the
+    /// payload is strictly positive, so the client's status-error
+    /// path runs. `DBR_DOUBLE == 6` is a plain (non-STS) type, so its
+    /// metadata size is zero — the value bytes are the whole payload.
+    #[test]
+    fn ex_r6_normalised_count_yields_nonzero_plain_dbr_payload() {
+        const DBR_DOUBLE: u16 = 6;
+        // Pre-fix shape: raw autosize count 0 → zero-payload frame
+        // (indistinguishable from an EVENT_CANCEL ack).
+        assert_eq!(
+            dbr_buffer_size(DBR_DOUBLE, DbFieldType::Double, 0),
+            0,
+            "regression baseline: a raw count==0 plain-DBR denial is \
+             zero-payload — the cancel-ack shape EX-R6 fixes"
+        );
+        // After EX-R6 normalisation the denial frame carries a real
+        // DBR body, so the client sees the ECA_NORDACCESS status.
+        let normalised = no_read_access_count(0, 4) as usize;
+        let payload = dbr_buffer_size(DBR_DOUBLE, DbFieldType::Double, normalised);
+        assert!(
+            payload > 0,
+            "EX-R6: a normalised autosize denial must have a nonzero \
+             DBR payload so the client does not drop it as a cancel-ack"
+        );
+        assert_eq!(payload, 4 * DbFieldType::Double.element_size());
     }
 }

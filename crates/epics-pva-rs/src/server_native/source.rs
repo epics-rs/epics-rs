@@ -35,6 +35,13 @@ pub struct ChannelContext {
     /// subject CommonName. Empty for non-TLS methods. ACF
     /// `AUTHORITY(...)` rule scopes match against this.
     pub authority: String,
+    /// Group / role claims advertised by the downstream peer's auth
+    /// method. MR-R11: parsed off the `ca` auth payload's
+    /// `groups`/`roles` array into `ClientCredentials::roles`, then
+    /// forwarded here so role-based ACF rules (`R member group:ops`,
+    /// `role/...` credential strings) can be enforced for native PVA
+    /// clients. Empty for methods that carry no role list.
+    pub roles: Vec<String>,
     /// Decoded INIT pvRequest value for the current operation, when
     /// the wire layer captured one. BR-R3: PVA PUT INIT carries
     /// `record._options.process`/`block`; the data-phase payload is
@@ -46,6 +53,64 @@ pub struct ChannelContext {
     /// or when the wire decoder could not parse it. Sources that
     /// don't need per-op options can ignore the field.
     pub pv_request: Option<PvField>,
+}
+
+/// Event-affecting options decoded from a downstream MONITOR INIT
+/// pvRequest, surfaced to [`ChannelSource`] implementors that need to
+/// reason about whether they can honor them.
+///
+/// BR-R14: a PVA-to-PVA gateway fans one upstream monitor out to N
+/// downstream subscribers. The upstream monitor is opened with the
+/// gateway's *default* pvRequest, so any downstream option that
+/// changes *upstream event production* — pvxs `record._options`
+/// `pipeline` / `queueSize` / `ackAny` (`servermon.cpp:521-555`) — is
+/// not transparent through the fanout. A source that cannot honor a
+/// given option must be able to see it and reject the subscription
+/// rather than silently serving fanout events that differ from a
+/// direct upstream monitor.
+///
+/// Field projection (the pvRequest field mask) is intentionally NOT
+/// represented here: it is pure downstream-local masking the server
+/// applies after fanout, and is transparent through a gateway.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MonitorOptions {
+    /// `record._options.pipeline` — the client requested the
+    /// flow-controlled credit/ACK monitor sub-protocol. This is flow
+    /// control between the client and *its* server, not a change to
+    /// which events are produced: a fanout gateway terminates the
+    /// downstream pipeline on its own downstream connection and
+    /// propagates backpressure upstream via the per-PV `Pauser`
+    /// (PG-G9). It therefore does NOT make a monitor non-transparent.
+    pub pipeline: bool,
+    /// `record._options.queueSize` when the client set it explicitly
+    /// (pvxs default 4). `None` means the client did not request a
+    /// specific queue depth. Like `pipeline`, this is a downstream
+    /// buffer-depth request the gateway honors on its per-downstream
+    /// outbox; it does not change upstream event production.
+    pub queue_size: Option<u32>,
+    /// True when the downstream pvRequest carried a server-side
+    /// `record._options._filter` chain. A stateful filter (e.g.
+    /// deadband) changes which events are *produced*; running it at a
+    /// fanout gateway on a shared upstream stream is not equivalent to
+    /// the upstream server running it per subscription.
+    pub server_filter: bool,
+}
+
+impl MonitorOptions {
+    /// True when an option here changes *upstream event production*
+    /// and therefore cannot be honored transparently by a fanout
+    /// gateway that shares one upstream monitor across downstreams.
+    ///
+    /// Only a server-side `_filter` chain qualifies. `pipeline` and
+    /// `queueSize` are downstream client↔gateway flow control the
+    /// gateway terminates locally (see the field docs), so they are
+    /// transparent and must NOT trigger a fanout-gateway rejection —
+    /// rejecting them would make every default-configured PVA client
+    /// (which enables pipeline by default) unable to monitor through
+    /// the gateway.
+    pub fn affects_upstream_events(&self) -> bool {
+        self.server_filter
+    }
 }
 
 /// A backend that can answer pvAccess GET / PUT / MONITOR requests for a
@@ -230,12 +295,21 @@ pub trait ChannelSource: Send + Sync + 'static {
         async move {
             // Default (non-atomic) merge for sources without a
             // contained merge primitive. Single-client correct.
-            // `put_value_checked` enforces the WRITE gate, so a
-            // denied token never reaches the merge below as a write —
-            // but read the prior unconditionally (READ is implied by
-            // a ReadWrite token; for a denied token put_value_checked
-            // rejects before the merged value is stored).
-            let merged = match self.get_value(checked.pv_name()).await {
+            //
+            // EX-R3: the prior-value read MUST run under the same
+            // authenticated identity as the write. Reading the prior
+            // through the ctx-less `get_value` would let an
+            // access-controlled or credential-routed source resolve
+            // the prior under an anonymous/default context — a denied
+            // or differently-resolved read then collapses to
+            // `None => delta`, treating the sparse data-phase value as
+            // a full value and replacing unmarked leaves with type
+            // defaults. Route the prior read through
+            // `get_value_checked` with a clone of the same `checked`
+            // token and `ctx`, so credential-aware sources merge under
+            // their own identity. `put_value_checked` below still
+            // enforces the WRITE gate.
+            let merged = match self.get_value_checked(checked.clone(), ctx.clone()).await {
                 Some(prior) => crate::pvdata::encode::fill_unmarked_from_prior(
                     &desc, &changed, 0, delta, &prior,
                 ),
@@ -307,6 +381,39 @@ pub trait ChannelSource: Send + Sync + 'static {
             }
             self.subscribe_raw(checked.pv_name()).await
         }
+    }
+
+    /// BR-R14: MONITOR with the downstream's event-affecting pvRequest
+    /// options. The default impl ignores `opts` and delegates to
+    /// [`Self::subscribe_checked`] — correct for any source that owns
+    /// the record directly, since it applies pipeline / filter
+    /// semantics itself on the same stream.
+    ///
+    /// A fanout source (the PVA gateway) overrides this to reject a
+    /// subscription whose options cannot be honored transparently
+    /// across a shared upstream monitor, instead of silently serving
+    /// fanout events that diverge from a direct upstream monitor.
+    fn subscribe_checked_opts(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        let _ = opts;
+        self.subscribe_checked(checked, ctx)
+    }
+
+    /// BR-R14 raw-path counterpart of [`Self::subscribe_checked_opts`].
+    /// Default impl ignores `opts` and delegates to
+    /// [`Self::subscribe_raw_checked`].
+    fn subscribe_raw_checked_opts(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+        let _ = opts;
+        self.subscribe_raw_checked(checked, ctx)
     }
 
     /// Dispatch an RPC. The default impl returns "RPC not supported";
@@ -387,6 +494,30 @@ pub trait ChannelSource: Send + Sync + 'static {
             }
             self.process(checked.pv_name()).await
         }
+    }
+
+    /// BR-R29: does this source emit *partial* monitor updates for
+    /// `name` — i.e. each event changes only a subset of the
+    /// structure's leaves, not the whole value?
+    ///
+    /// pvxs posts a monitor `Value` whose own marked-changed bitset
+    /// reflects exactly the leaves touched since the last `unmark()`
+    /// (`servermon.cpp:174` `to_wire_valid(R, ent, &self->pvMask)`
+    /// intersects that with the request mask). A QSRV *group* monitor
+    /// with the default `+trigger` (self-trigger) re-reads only the
+    /// triggered member on each event, so only that member's leaves
+    /// change — the wire changed-bitset must be narrowed accordingly
+    /// rather than always marking the whole request mask.
+    ///
+    /// When this returns `true` the server's decoded monitor loop
+    /// derives the per-event changed-bitset by structurally diffing
+    /// consecutive snapshots (intersected with the request mask),
+    /// matching pvxs's marked-leaf semantics. Default `false` keeps
+    /// the static-mask behaviour for single-record sources whose
+    /// every event already carries a full value.
+    fn monitor_emits_partial(&self, name: &str) -> bool {
+        let _ = name;
+        false
     }
 
     /// Notify the source that the per-connection monitor outbox for
@@ -539,6 +670,24 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
     >;
+    /// BR-R14: dyn forwarder for MONITOR with event-affecting options.
+    fn subscribe_checked_opts<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+    >;
+    /// BR-R14: dyn forwarder for raw MONITOR with event-affecting options.
+    fn subscribe_raw_checked_opts<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+    >;
     fn rpc<'a>(
         &'a self,
         name: &'a str,
@@ -567,6 +716,7 @@ pub trait ChannelSourceObj: Send + Sync {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    fn monitor_emits_partial(&self, name: &str) -> bool;
     fn notify_watermark_high(&self, name: &str);
     fn notify_watermark_low(&self, name: &str);
 }
@@ -694,6 +844,30 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
             self, checked, ctx,
         ))
     }
+    fn subscribe_checked_opts<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::subscribe_checked_opts(
+            self, checked, ctx, opts,
+        ))
+    }
+    fn subscribe_raw_checked_opts<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::subscribe_raw_checked_opts(
+            self, checked, ctx, opts,
+        ))
+    }
     fn rpc<'a>(
         &'a self,
         name: &'a str,
@@ -738,6 +912,9 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::process_checked(self, checked, ctx))
+    }
+    fn monitor_emits_partial(&self, name: &str) -> bool {
+        <Self as ChannelSource>::monitor_emits_partial(self, name)
     }
     fn notify_watermark_high(&self, name: &str) {
         <Self as ChannelSource>::notify_watermark_high(self, name);

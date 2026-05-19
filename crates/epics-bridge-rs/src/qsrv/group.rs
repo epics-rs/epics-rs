@@ -122,22 +122,84 @@ pub fn get_nested_field<'a>(pv: &'a PvStructure, path: &str) -> Option<Cow<'a, P
     None
 }
 
-/// BR-R33: pvxs default monitor queue depth for groups
-/// (`groupsource.cpp:359` uses the per-op negotiated value; in the
-/// absence of per-op negotiation today, expose pvxs's documented
-/// default so the field is present and stable).
-const GROUP_DEFAULT_QUEUE_SIZE: i32 = 4;
+/// BR-R33: pvxs default monitor queue depth for groups — pvxs
+/// `MonitorOp::limit` defaults to `4u` (`servermon.cpp:66`), and a
+/// `record._options.queueSize` that fails to parse or is `< 2` leaves
+/// that default in place (`servermon.cpp:533-540`). Used for the GET
+/// path (no queue to negotiate) and as the monitor fallback when the
+/// MONITOR INIT pvRequest carries no usable `queueSize`.
+pub const GROUP_DEFAULT_QUEUE_SIZE: i32 = 4;
+
+/// BR-R33-RESIDUAL: resolve the *negotiated* monitor queue size from a
+/// MONITOR INIT pvRequest's `record._options.queueSize`.
+///
+/// pvxs `servermon.cpp:533-540`: `uint32_t qSize = op->limit;` then
+/// `op->limit = qSize` only when `queueSize` parses AND `qSize >= 2`;
+/// otherwise the default `op->limit` (4) is kept. The group source
+/// then stamps `stats.limitQueue` (= `op->limit`) into the monitor
+/// value (`groupsource.cpp:359`). This mirrors that negotiation so a
+/// group monitor reports the queue depth the client actually
+/// requested, not a hardcoded constant.
+pub fn negotiated_queue_size(pv_request: &PvStructure) -> i32 {
+    use epics_pva_rs::pvdata::ScalarValue;
+    let parsed = pv_request
+        .fields
+        .iter()
+        .find_map(|(k, v)| (k == "record").then_some(v))
+        .and_then(|v| match v {
+            PvField::Structure(s) => Some(s),
+            _ => None,
+        })
+        .and_then(|rec| {
+            rec.fields
+                .iter()
+                .find_map(|(k, v)| (k == "_options").then_some(v))
+        })
+        .and_then(|v| match v {
+            PvField::Structure(s) => Some(s),
+            _ => None,
+        })
+        .and_then(|opt| {
+            opt.fields
+                .iter()
+                .find_map(|(k, v)| (k == "queueSize").then_some(v))
+        })
+        .and_then(|v| match v {
+            // Same scalar shapes the native PVA server accepts in
+            // `monitor_pipeline_options` — typed-builder INT/UINT/…
+            // and the `record[queueSize=N]` STRING form.
+            PvField::Scalar(ScalarValue::String(s)) => s.parse::<i32>().ok(),
+            PvField::Scalar(ScalarValue::Byte(i)) => Some(i32::from(*i)),
+            PvField::Scalar(ScalarValue::UByte(i)) => Some(i32::from(*i)),
+            PvField::Scalar(ScalarValue::Short(i)) => Some(i32::from(*i)),
+            PvField::Scalar(ScalarValue::UShort(i)) => Some(i32::from(*i)),
+            PvField::Scalar(ScalarValue::Int(i)) => Some(*i),
+            PvField::Scalar(ScalarValue::UInt(i)) => i32::try_from(*i).ok(),
+            PvField::Scalar(ScalarValue::Long(l)) => i32::try_from(*l).ok(),
+            PvField::Scalar(ScalarValue::ULong(l)) => i32::try_from(*l).ok(),
+            _ => None,
+        });
+    // pvxs keeps the default unless the request value is >= 2.
+    match parsed {
+        Some(n) if n >= 2 => n,
+        _ => GROUP_DEFAULT_QUEUE_SIZE,
+    }
+}
 
 /// BR-R33: stamp `record._options.queueSize` (int) and
 /// `record._options.atomic` (boolean) onto a group GET / MONITOR
 /// value. Adds them at the root, replacing the previous values if
 /// `_options` already exists (e.g. composed by an earlier read).
-pub fn push_record_options(pv: &mut PvStructure, atomic: bool) {
+///
+/// `queue_size` is the negotiated monitor queue depth (see
+/// [`negotiated_queue_size`]); the GET path passes
+/// [`GROUP_DEFAULT_QUEUE_SIZE`] since a GET has no subscription queue.
+pub fn push_record_options(pv: &mut PvStructure, atomic: bool, queue_size: i32) {
     use epics_pva_rs::pvdata::ScalarValue;
     let mut options = PvStructure::new("");
     options.fields.push((
         "queueSize".into(),
-        PvField::Scalar(ScalarValue::Int(GROUP_DEFAULT_QUEUE_SIZE)),
+        PvField::Scalar(ScalarValue::Int(queue_size)),
     ));
     options.fields.push((
         "atomic".into(),
@@ -383,6 +445,34 @@ async fn lock_group_records_read(
     guards
 }
 
+/// BR-R15: collect the **canonical** record names backing a group's
+/// writable members, for the `DBManyLock`-equivalent write gate.
+///
+/// pvxs builds `group.value.lock` (a `DBManyLock`) over every member
+/// record (`groupconfigprocessor.cpp:1165`) and takes a `DBManyLocker`
+/// across the whole atomic PUT loop (`groupsource.cpp:569`). The Rust
+/// equivalent is [`PvDatabase::lock_records`] over the same record
+/// set. Names are resolved through the alias map so the gate key
+/// matches the one a direct CA/PVA write would take in
+/// `put_record_field_from_ca` / `put_pv` / `process_record`.
+async fn group_member_record_names(db: &PvDatabase, members: &[GroupMember]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for m in members {
+        if m.channel.is_empty() {
+            continue; // Structure / Const — no backing record
+        }
+        let (rec, _) = epics_base_rs::server::database::parse_pv_name(&m.channel);
+        let canonical = db
+            .resolve_alias(rec)
+            .await
+            .unwrap_or_else(|| rec.to_string());
+        names.push(canonical);
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 // ---------------------------------------------------------------------------
 // GroupChannel
 // ---------------------------------------------------------------------------
@@ -392,6 +482,12 @@ pub struct GroupChannel {
     db: Arc<PvDatabase>,
     def: GroupPvDef,
     access: super::provider::AccessContext,
+    /// BR-R33-RESIDUAL: negotiated monitor queue depth stamped into
+    /// `record._options.queueSize`. `None` for the GET path (a GET
+    /// has no subscription queue → [`GROUP_DEFAULT_QUEUE_SIZE`]);
+    /// `Some(n)` when a `GroupMonitor` built this channel from the
+    /// MONITOR INIT pvRequest's negotiated `queueSize`.
+    monitor_queue_size: Option<i32>,
 }
 
 impl GroupChannel {
@@ -400,12 +496,22 @@ impl GroupChannel {
             db,
             def,
             access: super::provider::AccessContext::allow_all(),
+            monitor_queue_size: None,
         }
     }
 
     /// Inject an access control context (for [`super::provider::BridgeProvider`]).
     pub fn with_access(mut self, access: super::provider::AccessContext) -> Self {
         self.access = access;
+        self
+    }
+
+    /// BR-R33-RESIDUAL: set the negotiated monitor queue depth this
+    /// channel stamps into `record._options.queueSize`. Called by
+    /// `GroupMonitor::start` with the value resolved from the MONITOR
+    /// INIT pvRequest.
+    pub fn with_monitor_queue_size(mut self, queue_size: i32) -> Self {
+        self.monitor_queue_size = Some(queue_size);
         self
     }
 
@@ -475,16 +581,21 @@ impl GroupChannel {
 
         // BR-R33: pvxs `groupsource.cpp:359` stamps
         // `record._options.queueSize` (negotiated monitor queue depth)
-        // and `record._options.atomic` (operation atomicity) into
-        // every group GET / MONITOR value. Clients that introspect
-        // these branches — strict pvRequest matchers, archiver
-        // appliances tracking the negotiated queue — would otherwise
-        // see the structure-shape mismatch and reject the operation.
-        // Without per-op negotiation today, expose the configured
-        // group default queue depth (DEFAULT_MONITOR_QUEUE_DEPTH
-        // matches the wire-side server default) so the field is
-        // present and stable.
-        push_record_options(&mut pv, atomic);
+        // and `record._options.atomic` (operation atomicity) into the
+        // group monitor value. Clients that introspect these branches
+        // — strict pvRequest matchers, archiver appliances tracking
+        // the negotiated queue — would otherwise see a structure-shape
+        // mismatch and reject the operation.
+        //
+        // BR-R33-RESIDUAL: `queueSize` is now the *per-operation
+        // negotiated* depth. A `GroupMonitor` resolves it from the
+        // MONITOR INIT pvRequest (`negotiated_queue_size`,
+        // mirroring pvxs `servermon.cpp:533-540`) and threads it in
+        // via `with_monitor_queue_size`. The GET path keeps
+        // `GROUP_DEFAULT_QUEUE_SIZE` — a GET has no subscription
+        // queue, matching pvxs's monitor-only `limitQueue`.
+        let queue_size = self.monitor_queue_size.unwrap_or(GROUP_DEFAULT_QUEUE_SIZE);
+        push_record_options(&mut pv, atomic, queue_size);
 
         Ok(pv)
     }
@@ -718,27 +829,31 @@ impl GroupChannel {
             _ => crate::convert::pv_field_to_epics(pv_field),
         }
     }
-}
 
-impl super::provider::Channel for GroupChannel {
-    fn channel_name(&self) -> &str {
-        &self.def.name
-    }
-
-    async fn get(&self, request: &PvStructure) -> BridgeResult<PvStructure> {
-        if !self.access.can_read(&self.def.name) {
-            return Err(BridgeError::PutRejected(format!(
-                "read denied for group {} (user='{}' host='{}')",
-                self.def.name, self.access.user, self.access.host
-            )));
-        }
-        // BR-R16: pvRequest can override the group default atomicity.
-        let atomic = super::channel::atomic_from_pv_request(request).unwrap_or(self.def.atomic);
-        let full = self.read_group_atomic(atomic).await?;
-        Ok(pvif::filter_by_request(&full, request))
-    }
-
-    async fn put(&self, value: &PvStructure) -> BridgeResult<()> {
+    /// MR-R10: group PUT with explicit per-operation options.
+    ///
+    /// pvAccess delivers PUT options (`record._options.process`,
+    /// `record._options.atomic`, `record._options.block`) in the INIT
+    /// pvRequest, not in the data-phase value (pvxs
+    /// `groupsource.cpp:540` reads `putOperation->pvRequest()
+    /// ["record._options.atomic"]`, and `:181` runs
+    /// `setForceProcessingFlag` against `pvRequest()`). The native
+    /// wire path captures the INIT pvRequest on `ChannelContext` and
+    /// passes the parsed [`PutOptions`] plus the explicit atomic
+    /// override here. `atomic_override` is `None` when the request
+    /// did not set the option, in which case the group's configured
+    /// default (`self.def.atomic`) applies — matching pvxs's
+    /// `bool atomic = group.atomicPutGet;` initializer.
+    ///
+    /// The trait `put` delegates to this method with options derived
+    /// from the data-phase value, preserving the value-embedded-option
+    /// contract for in-process callers (gateway, tests).
+    pub async fn put_with_options(
+        &self,
+        value: &PvStructure,
+        opts: super::channel::PutOptions,
+        atomic_override: Option<bool>,
+    ) -> BridgeResult<()> {
         if !self.access.can_write(&self.def.name) {
             return Err(BridgeError::PutRejected(format!(
                 "write denied for group {} (user='{}' host='{}')",
@@ -746,13 +861,12 @@ impl super::provider::Channel for GroupChannel {
             )));
         }
 
-        let opts = super::channel::PutOptions::from_pv_request(value);
         let use_process = opts.process != super::channel::ProcessMode::Inhibit;
 
         // BR-R16: pvRequest can override the group default atomicity
         // (`record._options.atomic = true|false`). Falls back to the
         // group default when the option is absent.
-        let atomic = super::channel::atomic_from_pv_request(value).unwrap_or(self.def.atomic);
+        let atomic = atomic_override.unwrap_or(self.def.atomic);
 
         // BR-R30: only members with an explicit `+putorder` are
         // writable. pvxs sentinel `i64::MIN` (fieldconfig.h:37)
@@ -813,28 +927,39 @@ impl super::provider::Channel for GroupChannel {
         }
 
         if atomic {
-            // Atomic put. C++ QSRV holds every member record's lock
-            // simultaneously via `DBManyLocker` for the whole write.
-            // `epics-base-rs` exposes no multi-record write lock, and
-            // the per-record write lock is taken *inside*
-            // `put_record_field_from_ca` / `process_record` — so the
-            // gateway cannot hold `write_owned()` guards across the
-            // member loop without deadlocking those helpers.
+            // BR-R15: atomic PUT — `DBManyLock`-equivalent exclusion.
             //
-            // Instead we serialize on the group's shared
-            // `atomic_write_lock`: holding it across the whole member
-            // loop guarantees two PUTs to the *same atomic group*
-            // cannot interleave, so a downstream client never observes
-            // a group half-applied by a concurrent group PUT. Each
-            // member write still `.await`s, but no other atomic-group
-            // PUT can run a member write in between.
+            // pvxs builds a `DBManyLock` over every group-member
+            // record (`groupconfigprocessor.cpp:1165`
+            // `initialiseDbLocker`) and takes a `DBManyLocker` across
+            // the whole atomic PUT member loop
+            // (`groupsource.cpp:569`). Because `DBManyLock` locks the
+            // same `dbCommon::lock` mutexes that a plain `dbPutField`
+            // takes via `dbScanLock`, a direct CA/PVA write to a
+            // backing member record cannot interleave with the
+            // atomic group transaction.
             //
-            // Residual limitation (documented on `atomic_write_lock`):
-            // a non-group writer — a plain CA/PVA PUT addressed to a
-            // record that also backs a group member — is not gated by
-            // this lock and can still land between member writes.
-            // Closing that needs multi-record write locking in
-            // `epics-base-rs`.
+            // The Rust equivalent: `PvDatabase::lock_records` over
+            // every member record acquires the per-record advisory
+            // write gates (`dbScanLock` analogue) in canonical sorted
+            // order. The plain write path
+            // (`put_record_field_from_ca` / `put_pv` /
+            // `process_record`) takes the same gate, so a direct
+            // backing-record write now blocks until this atomic PUT
+            // completes — closing the gap the previous
+            // `atomic_write_lock`-only design left open.
+            //
+            // The member writes below MUST use the `_already_locked`
+            // helper variants: this transaction already owns every
+            // member-record gate, and the per-record gate `Mutex` is
+            // not reentrant.
+            let member_records = group_member_record_names(&self.db, &self.def.members).await;
+            let _many_guard = self.db.lock_records(&member_records).await;
+
+            // `atomic_write_lock` is retained as an internal aid so
+            // two PUTs through the *same* group PV also serialize
+            // even before either reaches `lock_records` (e.g. the
+            // up-front value-conversion phase).
             let _atomic_guard = self.def.atomic_write_lock.lock().await;
 
             // Convert all values up-front (DBF-typed), then perform the
@@ -871,19 +996,28 @@ impl super::provider::Channel for GroupChannel {
                     epics_base_rs::server::database::parse_pv_name(&member.channel);
 
                 if member.mapping == FieldMapping::Proc {
+                    // BR-R15: `_already_locked` — this atomic PUT owns
+                    // every member-record gate via `lock_records`.
                     self.db
-                        .process_record(record_name)
+                        .process_record_already_locked(record_name)
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                 } else if let Some(epics_val) = val {
                     if use_process {
                         self.db
-                            .put_record_field_from_ca(record_name, field_name, epics_val)
+                            .put_record_field_from_ca_already_locked(
+                                record_name,
+                                field_name,
+                                epics_val,
+                            )
                             .await
                             .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     } else {
                         self.db
-                            .put_pv(&format!("{record_name}.{field_name}"), epics_val)
+                            .put_pv_already_locked(
+                                &format!("{record_name}.{field_name}"),
+                                epics_val,
+                            )
                             .await
                             .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     }
@@ -939,6 +1073,35 @@ impl super::provider::Channel for GroupChannel {
         }
 
         Ok(())
+    }
+}
+
+impl super::provider::Channel for GroupChannel {
+    fn channel_name(&self) -> &str {
+        &self.def.name
+    }
+
+    async fn get(&self, request: &PvStructure) -> BridgeResult<PvStructure> {
+        if !self.access.can_read(&self.def.name) {
+            return Err(BridgeError::PutRejected(format!(
+                "read denied for group {} (user='{}' host='{}')",
+                self.def.name, self.access.user, self.access.host
+            )));
+        }
+        // BR-R16: pvRequest can override the group default atomicity.
+        let atomic = super::channel::atomic_from_pv_request(request).unwrap_or(self.def.atomic);
+        let full = self.read_group_atomic(atomic).await?;
+        Ok(pvif::filter_by_request(&full, request))
+    }
+
+    async fn put(&self, value: &PvStructure) -> BridgeResult<()> {
+        // MR-R10: in-process / value-embedded callers (gateway, tests)
+        // carry per-operation options inside the data-phase structure.
+        // The native PVA wire path uses `put_with_options` instead so
+        // INIT-pvRequest options are honored — see that method.
+        let opts = super::channel::PutOptions::from_pv_request(value);
+        let atomic_override = super::channel::atomic_from_pv_request(value);
+        self.put_with_options(value, opts, atomic_override).await
     }
 
     async fn get_field(&self) -> BridgeResult<FieldDesc> {
@@ -1086,6 +1249,13 @@ pub struct GroupMonitor {
     priming: Vec<FieldPrimingState>,
     /// Whether the priming phase has completed.
     events_primed: bool,
+    /// BR-R33-RESIDUAL: negotiated monitor queue depth, resolved from
+    /// the MONITOR INIT pvRequest's `record._options.queueSize`
+    /// ([`negotiated_queue_size`]). Stamped into every monitor
+    /// value's `record._options.queueSize` via the internal
+    /// `GroupChannel`. Defaults to [`GROUP_DEFAULT_QUEUE_SIZE`] when
+    /// the pvRequest carries no usable `queueSize`.
+    monitor_queue_size: i32,
 }
 
 impl GroupMonitor {
@@ -1132,12 +1302,23 @@ impl GroupMonitor {
             access: super::provider::AccessContext::allow_all(),
             priming,
             events_primed: false,
+            monitor_queue_size: GROUP_DEFAULT_QUEUE_SIZE,
         }
     }
 
     /// Inject an access control context. Called by `GroupChannel::create_monitor`.
     pub fn with_access(mut self, access: super::provider::AccessContext) -> Self {
         self.access = access;
+        self
+    }
+
+    /// BR-R33-RESIDUAL: set the per-operation negotiated monitor queue
+    /// depth, resolved from the MONITOR INIT pvRequest by the QSRV
+    /// adapter ([`negotiated_queue_size`]). Threaded into the internal
+    /// `GroupChannel` so every monitor value reports the depth the
+    /// client actually requested instead of a hardcoded default.
+    pub fn with_queue_size(mut self, queue_size: i32) -> Self {
+        self.monitor_queue_size = queue_size;
         self
     }
 }
@@ -1260,8 +1441,14 @@ impl super::provider::PvaMonitor for GroupMonitor {
         // Create a reusable GroupChannel once (instead of per-event in poll).
         // Propagate the same access context so any subsequent reads triggered
         // by trigger evaluation also honor read enforcement.
-        let group_channel =
-            GroupChannel::new(self.db.clone(), self.def.clone()).with_access(self.access.clone());
+        //
+        // BR-R33-RESIDUAL: thread the per-operation negotiated monitor
+        // queue depth so every monitor value stamps
+        // `record._options.queueSize` with the client-requested depth
+        // (pvxs `groupsource.cpp:359` `stats.limitQueue`).
+        let group_channel = GroupChannel::new(self.db.clone(), self.def.clone())
+            .with_access(self.access.clone())
+            .with_monitor_queue_size(self.monitor_queue_size);
 
         // Check if all members are already primed (e.g., all Const/Structure).
         let all_primed = self
@@ -1336,18 +1523,21 @@ impl super::provider::PvaMonitor for GroupMonitor {
 
             match &member.triggers {
                 TriggerDef::None => continue,
-                // BR-R29: SelfOnly (the default for missing
-                // `+trigger`) still re-reads + posts the full group
-                // structure here — pvxs `groupsource.cpp:303`
-                // posts `currentValue` which holds every field. The
-                // wire-level changed-bitset narrowing that
-                // `testqgroup.cpp:220` exercises (only `value.index`
-                // set on a VAL update) requires per-trigger BitSet
-                // plumbing into `build_monitor_payload`; until that
-                // lands, SelfOnly behaves like All on the wire but
-                // is semantically distinct from the prior unconditional
-                // collapse. See doc/pvxs-functional-security-review-2026-05-18.md
-                // for the remaining-gap entry on the BitSet plumbing.
+                // `poll()` re-reads + posts the full group structure
+                // here — pvxs `groupsource.cpp:303` likewise posts
+                // `currentValue` which holds every field.
+                //
+                // BR-R29 (residual closed): the *wire* changed-bitset
+                // narrowing that `testqgroup.cpp:220` exercises (only
+                // `value.index` set on a self-triggered VAL update)
+                // now happens server-side. `QsrvPvStore`'s
+                // `monitor_emits_partial` flags a pure self-trigger
+                // group, and the PVA decoded monitor loop derives the
+                // per-event changed-bitset by structurally diffing
+                // consecutive snapshots — reproducing pvxs's
+                // marked-leaf set without per-trigger plumbing into
+                // this loop. SelfOnly therefore no longer behaves
+                // like All on the wire.
                 TriggerDef::SelfOnly | TriggerDef::All | TriggerDef::Fields(_) => {
                     return group_channel.read_group().await.ok();
                 }
@@ -1396,6 +1586,21 @@ impl super::provider::PvaMonitor for GroupMonitor {
 pub enum AnyMonitor {
     Single(Box<BridgeMonitor>),
     Group(Box<GroupMonitor>),
+}
+
+impl AnyMonitor {
+    /// BR-R33-RESIDUAL: apply the per-operation negotiated monitor
+    /// queue depth (resolved from the MONITOR INIT pvRequest's
+    /// `record._options.queueSize`). Only a group monitor stamps
+    /// `record._options.queueSize` into its values — a single-record
+    /// monitor has no group-style `record._options` branch, so this
+    /// is a no-op for the `Single` variant.
+    pub fn with_queue_size(self, queue_size: i32) -> Self {
+        match self {
+            Self::Group(m) => Self::Group(Box::new(m.with_queue_size(queue_size))),
+            single => single,
+        }
+    }
 }
 
 impl super::provider::PvaMonitor for AnyMonitor {
@@ -2125,6 +2330,114 @@ mod tests {
                     "atomic group must not be half-applied: a={va} b={vb}"
                 );
                 assert!(va == 1.0 || va == 2.0);
+            }
+            other => panic!("unexpected member values: {other:?}"),
+        }
+    }
+
+    // ---- BR-R15: atomic group PUT is DBManyLock-equivalent ----
+
+    /// BR-R15 regression: a QSRV atomic group PUT must exclude a
+    /// *direct* CA/PVA write to a backing member record for the whole
+    /// member-write loop — pvxs holds a `DBManyLocker`
+    /// (`groupsource.cpp:569`) over the same per-record locks a plain
+    /// `dbPutField` takes. Pre-fix the atomic PUT only held the
+    /// per-group `atomic_write_lock`, which a non-group writer never
+    /// consults, so a direct backing-record write could land between
+    /// member writes and leave the group observably half-applied.
+    ///
+    /// This test holds the `DBManyLock`-equivalent gate set
+    /// (`PvDatabase::lock_records`) over the member records — exactly
+    /// what `GroupChannel::put`'s atomic branch acquires — and proves
+    /// a direct `put_record_field_from_ca` to a member record blocks
+    /// until that gate set is released. On `main` `lock_records` does
+    /// not exist and `put_record_field_from_ca` takes no such gate,
+    /// so this fix-defining behaviour is absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn br_r15_atomic_group_excludes_direct_member_write() {
+        let (db, _def) = atomic_group_fixture().await;
+
+        // Hold the member-record write gates — the in-flight atomic
+        // group PUT's `DBManyLocker` equivalent.
+        let many = db.lock_records(["A:rec", "B:rec"]).await;
+
+        // A direct CA write to a member record must block on the same
+        // gate (`put_record_field_from_ca` takes `lock_record`).
+        let db_w = db.clone();
+        let direct = tokio::spawn(async move {
+            db_w.put_record_field_from_ca(
+                "A:rec",
+                "VAL",
+                epics_base_rs::types::EpicsValue::Double(99.0),
+            )
+            .await
+            .unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_millis(150), async {})
+            .await
+            .ok();
+        assert!(
+            !direct.is_finished(),
+            "direct member write must block while the atomic group's \
+             DBManyLock-equivalent gates are held"
+        );
+
+        // Release the gate set: the direct write now proceeds.
+        drop(many);
+        tokio::time::timeout(Duration::from_secs(5), direct)
+            .await
+            .expect("direct write must complete once gates are released")
+            .expect("direct write task panicked");
+
+        match db.get_pv("A:rec.VAL").await.unwrap() {
+            epics_base_rs::types::EpicsValue::Double(v) => assert_eq!(v, 99.0),
+            other => panic!("unexpected A:rec.VAL: {other:?}"),
+        }
+    }
+
+    /// BR-R15 regression: the real `GroupChannel::put` atomic path
+    /// itself acquires the member-record gate set. Holding the gates
+    /// externally must block an atomic group PUT from entering its
+    /// member-write loop, and the PUT must complete once released.
+    /// This proves the atomic PUT uses `lock_records`, not only the
+    /// per-group `atomic_write_lock`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn br_r15_atomic_put_blocks_on_member_record_gates() {
+        let (db, def) = atomic_group_fixture().await;
+        let channel = GroupChannel::new(db.clone(), def.clone());
+
+        // Hold one member record's gate. The atomic group PUT must
+        // block trying to acquire it via `lock_records`.
+        let held = db.lock_record("B:rec").await;
+
+        let put = tokio::spawn(async move {
+            channel.put(&atomic_put_value(5.0, 6.0)).await.unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_millis(150), async {})
+            .await
+            .ok();
+        assert!(
+            !put.is_finished(),
+            "atomic group PUT must block while a member-record gate is held"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), put)
+            .await
+            .expect("atomic PUT must complete once the member gate is free")
+            .expect("atomic PUT task panicked");
+
+        let a = db.get_pv("A:rec.VAL").await.unwrap();
+        let b = db.get_pv("B:rec.VAL").await.unwrap();
+        match (a, b) {
+            (
+                epics_base_rs::types::EpicsValue::Double(va),
+                epics_base_rs::types::EpicsValue::Double(vb),
+            ) => {
+                assert_eq!(va, 5.0);
+                assert_eq!(vb, 6.0);
             }
             other => panic!("unexpected member values: {other:?}"),
         }

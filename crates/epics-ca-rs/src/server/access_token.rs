@@ -44,6 +44,12 @@ use crate::protocol::{ECA_NORDACCESS, ECA_NOWTACCESS};
 #[derive(Debug, Clone, Copy)]
 pub struct CaAccessChecked {
     level: AccessLevel,
+    /// MR-R20: write-trap mask of the ACF rule that resolved `level`.
+    /// Threaded into [`WriteGranted`] so TRAPWRITE put-logging
+    /// dispatch can honour `TRAPWRITE` / `NOTRAPWRITE` instead of
+    /// hard-coding every accepted write as trapped. Mirrors C
+    /// `pasgclient->trapMask` (`asLibRoutines.c:1048`).
+    rule_was_trap: bool,
     _seal: AccessSeal,
 }
 
@@ -61,7 +67,21 @@ pub struct ReadGranted {
 /// Witness type returned by [`CaAccessChecked::require_write`].
 #[derive(Debug, Clone, Copy)]
 pub struct WriteGranted {
+    /// MR-R20: write-trap mask of the ACF rule that authorised this
+    /// write. The CA write handler sets
+    /// `TrapWriteMessage::rule_was_trap` from this value so a
+    /// `NOTRAPWRITE` rule (or a rule with no trap option) is not
+    /// reported to put-logging listeners as trapped.
+    rule_was_trap: bool,
     _seal: AccessSeal,
+}
+
+impl WriteGranted {
+    /// True iff the ACF rule that authorised this write carried the
+    /// `TRAPWRITE` option.
+    pub fn rule_was_trap(&self) -> bool {
+        self.rule_was_trap
+    }
 }
 
 /// Denial reason carrying the matching ECA wire code. Op handlers
@@ -91,17 +111,20 @@ impl CaAccessChecked {
     /// (via `ClientState::lookup_access`). External callers cannot
     /// produce a `CaAccessChecked` and therefore cannot fabricate
     /// `ReadGranted` / `WriteGranted` witnesses.
-    pub(crate) fn from_level(level: AccessLevel) -> Self {
+    pub(crate) fn from_level(level: AccessLevel, rule_was_trap: bool) -> Self {
         Self {
             level,
+            rule_was_trap,
             _seal: AccessSeal,
         }
     }
 
     /// "Denied" token used when no channel_access cache entry
-    /// exists. Surfaces NoRead / NoWrite on require_*.
+    /// exists. Surfaces NoRead / NoWrite on require_*. A denied
+    /// channel never reaches the write path, so the trap mask is
+    /// `false`.
     pub(crate) fn denied() -> Self {
-        Self::from_level(AccessLevel::NoAccess)
+        Self::from_level(AccessLevel::NoAccess, false)
     }
 
     /// Returns `Ok(ReadGranted)` iff the level grants at least
@@ -118,7 +141,10 @@ impl CaAccessChecked {
     /// else `Err(NoWrite)` carrying `ECA_NOWTACCESS`.
     pub fn require_write(&self) -> Result<WriteGranted, AccessDenied> {
         if matches!(self.level, AccessLevel::ReadWrite) {
-            Ok(WriteGranted { _seal: AccessSeal })
+            Ok(WriteGranted {
+                rule_was_trap: self.rule_was_trap,
+                _seal: AccessSeal,
+            })
         } else {
             Err(AccessDenied::NoWrite)
         }
@@ -138,23 +164,35 @@ mod tests {
 
     #[test]
     fn no_access_denies_read_and_write() {
-        let c = CaAccessChecked::from_level(AccessLevel::NoAccess);
+        let c = CaAccessChecked::from_level(AccessLevel::NoAccess, false);
         assert!(matches!(c.require_read(), Err(AccessDenied::NoRead)));
         assert!(matches!(c.require_write(), Err(AccessDenied::NoWrite)));
     }
 
     #[test]
     fn read_grants_read_denies_write() {
-        let c = CaAccessChecked::from_level(AccessLevel::Read);
+        let c = CaAccessChecked::from_level(AccessLevel::Read, false);
         assert!(c.require_read().is_ok());
         assert!(matches!(c.require_write(), Err(AccessDenied::NoWrite)));
     }
 
     #[test]
     fn read_write_grants_both() {
-        let c = CaAccessChecked::from_level(AccessLevel::ReadWrite);
+        let c = CaAccessChecked::from_level(AccessLevel::ReadWrite, false);
         assert!(c.require_read().is_ok());
         assert!(c.require_write().is_ok());
+    }
+
+    #[test]
+    fn mr_r20_write_granted_carries_trap_mask() {
+        // A `TRAPWRITE` rule resolves a ReadWrite token whose
+        // `WriteGranted` witness reports `rule_was_trap == true`.
+        let trapped = CaAccessChecked::from_level(AccessLevel::ReadWrite, true);
+        assert!(trapped.require_write().unwrap().rule_was_trap());
+        // A `NOTRAPWRITE` / no-option rule resolves the same access
+        // level but the witness must report `false`.
+        let untrapped = CaAccessChecked::from_level(AccessLevel::ReadWrite, false);
+        assert!(!untrapped.require_write().unwrap().rule_was_trap());
     }
 
     #[test]

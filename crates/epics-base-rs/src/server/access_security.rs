@@ -1211,7 +1211,9 @@ fn read_brace_list(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult
                             }
                         }
                         Some('\n') | None => {
-                            return Err(CaError::Protocol("ACF: unterminated quoted string".into()));
+                            return Err(CaError::Protocol(
+                                "ACF: unterminated quoted string".into(),
+                            ));
                         }
                         Some(c) => quoted.push(c),
                     }

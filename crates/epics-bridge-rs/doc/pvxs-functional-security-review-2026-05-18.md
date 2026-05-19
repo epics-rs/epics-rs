@@ -62,10 +62,11 @@ message.
 - BR-R42 (commit fad743a) — gateway raw monitor signals upstream descriptor change as a subscription boundary; downstream gets MONITOR FINISH instead of bytes encoded for the new (incompatible) descriptor.
 - BR-R43 (commit fc59c1f) — pvalink monitor pvRequest always sends `pipeline` + `atomic=true` + `queueSize` (matches pvxs `pvaLink::makeRequest`).
 - BR-R44 (commit 8e67167) — gateway raw monitor reencodes on byte-order mismatch instead of silently dropping every event.
+- BR-R4 (commit db9a79e4) — QSRV ACF adapter carries method/authority/roles/field ASL; `AcfAccessControl` builds pvxs-style credential list; `read_brace_list` extended with quoted-string support for `"role/groupname"` UAG entries.
 
-Remaining open: BR-R4, R6, R7, R8, R10, R11, R12, R13, R14, R15,
+Remaining open: R6, R7, R8, R10, R11, R12, R13, R14, R15,
 R18, R21, R24, R27, R41, the BR-R29 wire BitSet narrowing for
-SelfOnly, the BR-R33 per-op queueSize negotiation (15 findings).
+SelfOnly, the BR-R33 per-op queueSize negotiation (14 findings).
 
 ## Findings
 

@@ -33,8 +33,9 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:153-176`
   - Done: worker B, commit `db9a79e4` on `caucus/HJB9ABPH/backend` (+ doc tracker commit `2a58c9d9` on main); regression `br_r4_acf_method_authority_roles_field_asl`. Cross-crate: also touched `epics-base-rs/src/server/access_security.rs` (quoted-string support in `read_brace_list`). Upstream parity: pvxs credentials.cpp:31-45; securityclient.cpp:25,42-45; epics-base asLibRoutines.c:1006; asLib_lex.l.
 
-- [ ] **BR-R21** — PVA gateway READ/MONITOR upstream authorization uses the shared cache client.
+- [x] **BR-R21** — PVA gateway READ/MONITOR upstream authorization uses the shared cache client.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:604-632`
+  - Done: worker B, commit `6f9d26c6` on `caucus/HJB9ABPH/backend`; regression `br_r21_gateway_monitor_credential_scoping`. New field `upstream_caches` + `upstream_cache_for` in `GatewayChannelSource`; extracted `subscribe_raw_inner`/`subscribe_inner` helpers; overrode `get_value_checked`, `subscribe_checked`, `subscribe_raw_checked` to route through per-credential cache. Upstream parity: pvxs security-review spec "the gateway MUST NOT silently conflate per-client upstream authorization into a single shared-client authorization" (doc:604-632); mirrors `upstream_client_for`/PUT/RPC/PROCESS path (PG-G10).
 
 ### Priority 3 — Field addressing & PUT/scan processing
 
@@ -103,7 +104,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 16 (was 17)
-- Done: 1 (BR-R4)
-- In progress: 1 (BR-R21, worker B)
+- Total open: 15 (was 17)
+- Done: 2 (BR-R4, BR-R21)
+- In progress: 0
 - Blocked: 0

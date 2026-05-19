@@ -997,14 +997,31 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Lex a per-field / record option *value*. Unlike an identifier,
-    /// an option value may contain `:` (`abs:1.0`, `1:3`), so this
-    /// scans a run of value characters: alphanumerics, `_`, `.`, `:`,
-    /// `-`, `+`. Leading whitespace is skipped; the run ends at the
-    /// first delimiter (`,`, `]`, `)`, `}`, whitespace). An empty run
-    /// is an error — `key=` with no value is malformed.
+    /// Lex a per-field / record option *value*.
+    ///
+    /// Two forms are accepted:
+    ///
+    /// 1. **Bare run** — alphanumerics, `_`, `.`, `:`, `-`, `+`. An
+    ///    option value may contain `:` (`abs:1.0`, `1:3`) and signed
+    ///    numbers carry `-`/`+`. The run ends at the first delimiter
+    ///    (`,`, `]`, `)`, `}`, whitespace). Used for the common
+    ///    `deadband=abs:1.0` / `pipeline=true` shapes.
+    ///
+    /// 2. **Quoted string** — when the value starts with `"`, scan to
+    ///    the matching closing `"`, with `\"`, `\\`, `\n`, `\t`, `\r`
+    ///    escapes. This is what lets a record option carry a JSON
+    ///    payload such as `record[_filter="{\"dbnd\":{\"d\":0.5}}"]` —
+    ///    the bare run rejects `{`, `}`, `,`, and `"` before the JSON
+    ///    can be read. The returned string is the unescaped content
+    ///    between the quotes.
+    ///
+    /// An empty bare run is an error — `key=` with no value is
+    /// malformed. An empty quoted string (`key=""`) is valid.
     fn lex_value(&mut self) -> Result<String, PvRequestParseError> {
         self.skip_whitespace();
+        if self.peek_char() == Some('"') {
+            return self.lex_quoted_value();
+        }
         let start = self.pos;
         while let Some(c) = self.peek_char() {
             if is_value_char(c) {
@@ -1024,6 +1041,62 @@ impl<'a> Parser<'a> {
             });
         }
         Ok(self.input[start..self.pos].to_string())
+    }
+
+    /// Lex a double-quoted option value. The opening `"` is expected
+    /// at the current position. Recognises `\"`, `\\`, `\n`, `\t`,
+    /// `\r` escapes; any other `\x` is a parse error. An unterminated
+    /// quote (EOF before the closing `"`) is an error.
+    fn lex_quoted_value(&mut self) -> Result<String, PvRequestParseError> {
+        // Consume the opening quote.
+        debug_assert_eq!(self.peek_char(), Some('"'));
+        self.advance('"'.len_utf8());
+        let mut out = String::new();
+        loop {
+            match self.peek_char() {
+                None => {
+                    return Err(PvRequestParseError::Unterminated { pos: self.pos });
+                }
+                Some('"') => {
+                    self.advance('"'.len_utf8());
+                    return Ok(out);
+                }
+                Some('\\') => {
+                    self.advance('\\'.len_utf8());
+                    match self.peek_char() {
+                        Some(esc @ ('"' | '\\')) => {
+                            out.push(esc);
+                            self.advance(esc.len_utf8());
+                        }
+                        Some('n') => {
+                            out.push('\n');
+                            self.advance(1);
+                        }
+                        Some('t') => {
+                            out.push('\t');
+                            self.advance(1);
+                        }
+                        Some('r') => {
+                            out.push('\r');
+                            self.advance(1);
+                        }
+                        Some(other) => {
+                            return Err(PvRequestParseError::UnexpectedChar {
+                                pos: self.pos,
+                                chr: format!("invalid escape \\{other}"),
+                            });
+                        }
+                        None => {
+                            return Err(PvRequestParseError::Unterminated { pos: self.pos });
+                        }
+                    }
+                }
+                Some(c) => {
+                    out.push(c);
+                    self.advance(c.len_utf8());
+                }
+            }
+        }
     }
 
     /// Parse the body of a `{ ... }` member group whose opening `{` has
@@ -1542,5 +1615,84 @@ mod tests {
         let be = expr.encode(true);
         assert!(!le.is_empty() && le[0] == 0x80);
         assert!(!be.is_empty() && be[0] == 0x80);
+    }
+
+    /// EX-R11 regression: the pvRequest string parser must be able to
+    /// express the `record._options._filter` JSON carrier the PVA
+    /// server expects. The bare value lexer accepts only
+    /// alphanumerics plus `_ . : - +`, so it rejects `{`, `}`, `,`,
+    /// and `"` before a JSON value can be read. A quoted option value
+    /// closes that gap.
+    #[test]
+    fn ex_r11_record_filter_json_via_quoted_value() {
+        let json = r#"{"dbnd":{"d":0.5},"dec":{"n":3}}"#;
+        // The JSON's inner double quotes are escaped at the
+        // pvRequest-string layer with `\"`.
+        let escaped = json.replace('"', "\\\"");
+        let req = format!("record[_filter=\"{escaped}\"]");
+        let expr = PvRequestExpr::parse(&req).expect("quoted _filter must parse");
+        assert_eq!(
+            expr.record_options,
+            [("_filter".to_string(), json.to_string())],
+            "the unescaped JSON must reach record_options verbatim"
+        );
+
+        // Round-trip through encode: the JSON bytes must appear in the
+        // wire-format value half (encode emits the option string value
+        // via to_pv_field).
+        let wire = expr.encode(false);
+        assert!(
+            wire.windows(json.len()).any(|w| w == json.as_bytes()),
+            "the _filter JSON must survive into the encoded wire body"
+        );
+    }
+
+    /// A `_filter` quoted value also works in the per-field option
+    /// bracket, since both option surfaces lex through `lex_value`.
+    #[test]
+    fn ex_r11_quoted_value_in_field_option_bracket() {
+        let expr = PvRequestExpr::parse(r#"field(value[note="a,b}c"])"#)
+            .expect("quoted per-field option must parse");
+        assert_eq!(
+            expr.field_options[0].1,
+            [("note".to_string(), "a,b}c".to_string())],
+            "delimiters inside quotes must be carried literally"
+        );
+    }
+
+    /// Backslash escapes inside a quoted option value.
+    #[test]
+    fn ex_r11_quoted_value_escapes() {
+        let expr = PvRequestExpr::parse(r#"record[k="x\\y\"z"]"#).unwrap();
+        assert_eq!(
+            expr.record_options,
+            [("k".to_string(), "x\\y\"z".to_string())]
+        );
+        // Empty quoted value is valid.
+        let empty = PvRequestExpr::parse(r#"record[k=""]"#).unwrap();
+        assert_eq!(empty.record_options, [("k".to_string(), String::new())]);
+    }
+
+    /// An unterminated quote and an invalid escape are parse errors.
+    #[test]
+    fn ex_r11_malformed_quoted_value_is_error() {
+        // No closing quote before end of input.
+        assert!(PvRequestExpr::parse(r#"record[_filter="{abc]"#).is_err());
+        // Unknown escape sequence `\q`.
+        assert!(PvRequestExpr::parse(r#"record[k="bad\q"]"#).is_err());
+    }
+
+    /// The bare (unquoted) value form is untouched — existing
+    /// `deadband=abs:1.0` style options still parse exactly as before.
+    #[test]
+    fn ex_r11_bare_value_form_unchanged() {
+        let expr = PvRequestExpr::parse("record[deadband=abs:1.0,pipeline=true]").unwrap();
+        assert_eq!(
+            expr.record_options,
+            [
+                ("deadband".to_string(), "abs:1.0".to_string()),
+                ("pipeline".to_string(), "true".to_string()),
+            ]
+        );
     }
 }

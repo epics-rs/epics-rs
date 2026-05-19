@@ -88,6 +88,31 @@ pub struct GroupMember {
     pub nsec_mask: u32,
 }
 
+impl GroupPvDef {
+    /// BR-R29: true iff this is a *pure self-trigger* group — every
+    /// member with a backing channel uses the default `+trigger`
+    /// (self-trigger, [`TriggerDef::SelfOnly`]) or explicit silence
+    /// ([`TriggerDef::None`]).
+    ///
+    /// For such a group each monitor event re-reads only the member
+    /// whose record processed, so the wire changed-bitset can be
+    /// narrowed to that member's leaves by structurally diffing
+    /// consecutive snapshots — exactly the leaf set pvxs marks via
+    /// `IOCSource::get` for a self-triggered field
+    /// (`groupsource.cpp:288`). A group containing an explicit
+    /// `+trigger:"*"` ([`TriggerDef::All`]) or named-field
+    /// ([`TriggerDef::Fields`]) member is excluded: pvxs marks the
+    /// whole *triggered target set* there (assigned-not-changed
+    /// semantics, `dataencode.cpp:425` `store[bit].valid`), which a
+    /// value-diff would under-mark, so those groups keep the full
+    /// request mask on the wire.
+    pub fn is_pure_self_trigger(&self) -> bool {
+        self.members.iter().all(|m| {
+            m.channel.is_empty() || matches!(m.triggers, TriggerDef::SelfOnly | TriggerDef::None)
+        })
+    }
+}
+
 /// Defines which group fields are updated when a member's source record changes.
 #[derive(Debug, Clone)]
 pub enum TriggerDef {
@@ -532,6 +557,53 @@ mod tests {
         // BR-R30: missing `+putorder` → `None` (not putable),
         // mirroring pvxs `fieldconfig.h:37` sentinel.
         assert_eq!(m.put_order, None);
+    }
+
+    /// BR-R29 residual: a group whose members all use the default
+    /// `+trigger` (self-trigger) is a *pure self-trigger* group — the
+    /// PVA server may narrow its monitor changed-bitset. A group with
+    /// any explicit `+trigger:"*"` or named-field member is NOT, so
+    /// it keeps the full request mask.
+    #[test]
+    fn br_r29_pure_self_trigger_predicate() {
+        // All members default `+trigger` → pure self-trigger.
+        let pure = parse_group_config(
+            r#"{ "GRP:pure": {
+                "a": {"+channel": "R:a"},
+                "b": {"+channel": "R:b"}
+            }}"#,
+        )
+        .unwrap();
+        assert!(
+            pure[0].is_pure_self_trigger(),
+            "all-default-trigger group must be pure self-trigger"
+        );
+
+        // One member with explicit `+trigger:"*"` → NOT pure.
+        let with_star = parse_group_config(
+            r#"{ "GRP:star": {
+                "a": {"+channel": "R:a"},
+                "b": {"+channel": "R:b", "+trigger": "*"}
+            }}"#,
+        )
+        .unwrap();
+        assert!(
+            !with_star[0].is_pure_self_trigger(),
+            "a group with an explicit +trigger:* member must NOT be pure self-trigger"
+        );
+
+        // One member with named `+trigger` → NOT pure.
+        let with_fields = parse_group_config(
+            r#"{ "GRP:fields": {
+                "a": {"+channel": "R:a", "+trigger": "a,b"},
+                "b": {"+channel": "R:b"}
+            }}"#,
+        )
+        .unwrap();
+        assert!(
+            !with_fields[0].is_pure_self_trigger(),
+            "a group with a named +trigger member must NOT be pure self-trigger"
+        );
     }
 
     /// BR-R29: an explicit `+trigger:"*"` is still parsed as `All`

@@ -752,6 +752,17 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             Some(rx)
         }
     }
+
+    /// BR-R29: a QSRV *pure self-trigger* group monitor emits partial
+    /// updates — each event re-reads only the member whose record
+    /// processed, so the PVA server narrows the wire changed-bitset
+    /// by diffing consecutive snapshots. Returns `true` only for
+    /// groups whose every member uses the default `+trigger`
+    /// (self-trigger); single-record / native-PVA PVs and groups with
+    /// explicit `+trigger` members keep the full request mask.
+    fn monitor_emits_partial(&self, name: &str) -> bool {
+        self.provider.group_is_pure_self_trigger(name)
+    }
 }
 
 // ---------------------------------------------------------------------------

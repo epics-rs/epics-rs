@@ -1384,18 +1384,21 @@ impl super::provider::PvaMonitor for GroupMonitor {
 
             match &member.triggers {
                 TriggerDef::None => continue,
-                // BR-R29: SelfOnly (the default for missing
-                // `+trigger`) still re-reads + posts the full group
-                // structure here — pvxs `groupsource.cpp:303`
-                // posts `currentValue` which holds every field. The
-                // wire-level changed-bitset narrowing that
-                // `testqgroup.cpp:220` exercises (only `value.index`
-                // set on a VAL update) requires per-trigger BitSet
-                // plumbing into `build_monitor_payload`; until that
-                // lands, SelfOnly behaves like All on the wire but
-                // is semantically distinct from the prior unconditional
-                // collapse. See doc/pvxs-functional-security-review-2026-05-18.md
-                // for the remaining-gap entry on the BitSet plumbing.
+                // `poll()` re-reads + posts the full group structure
+                // here — pvxs `groupsource.cpp:303` likewise posts
+                // `currentValue` which holds every field.
+                //
+                // BR-R29 (residual closed): the *wire* changed-bitset
+                // narrowing that `testqgroup.cpp:220` exercises (only
+                // `value.index` set on a self-triggered VAL update)
+                // now happens server-side. `QsrvPvStore`'s
+                // `monitor_emits_partial` flags a pure self-trigger
+                // group, and the PVA decoded monitor loop derives the
+                // per-event changed-bitset by structurally diffing
+                // consecutive snapshots — reproducing pvxs's
+                // marked-leaf set without per-trigger plumbing into
+                // this loop. SelfOnly therefore no longer behaves
+                // like All on the wire.
                 TriggerDef::SelfOnly | TriggerDef::All | TriggerDef::Fields(_) => {
                     return group_channel.read_group().await.ok();
                 }

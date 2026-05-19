@@ -1279,6 +1279,19 @@ async fn handle_connection_io(
                         method = %cred.method,
                         "PVA client selects unadvertised auth method — replying Status::Error"
                     );
+                    // EX-R7: the client picked an auth method the
+                    // server never advertised. The handshake completes
+                    // (pvxs keeps the connection open) but the claimed
+                    // credential MUST NOT survive — the server is about
+                    // to return Status::Error rejecting it. Leaving
+                    // `cred` as the unadvertised claim would let the
+                    // `auth_complete` hook and every later ACF-gated
+                    // operation see an identity the server just
+                    // rejected: a legacy rule without a METHOD(...)
+                    // clause would still match the claimed account.
+                    // Revert to anonymous so the rejected claim never
+                    // becomes the connection identity.
+                    cred = ClientCredentials::anonymous();
                     Status::error("Client selects unadvertised auth".to_string())
                 };
                 let mut payload = Vec::new();

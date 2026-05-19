@@ -897,3 +897,113 @@ async fn auth_method_unadvertised_returns_status_error() {
 
     h.abort();
 }
+
+/// EX-R7 regression: when a plain-TCP client selects an auth method
+/// the server never advertised (`x509`) and includes a non-empty
+/// `user` in its auth body, the server returns `Status::Error` AND
+/// must revert the connection credential to anonymous. Before the fix
+/// the parsed `x509`/`user="alice"` claim was installed into `cred`
+/// before the advertised-method check, so the `auth_complete` hook
+/// (and every later ACF-gated operation) saw an identity the server
+/// had just rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
+    use std::io::Write;
+    use std::sync::Mutex as StdMutex;
+
+    use epics_pva_rs::codec::CMD_CONNECTION_VALIDATED;
+    use epics_pva_rs::proto::encode_string_into;
+    use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, Status, WriteExt};
+    use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+    use epics_pva_rs::server_native::PvaServerConfig;
+    use epics_pva_rs::server_native::run_pva_server;
+
+    // Capture what the auth_complete hook observed.
+    let captured: Arc<StdMutex<Option<(String, String)>>> = Arc::new(StdMutex::new(None));
+    let captured_hook = captured.clone();
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("AUTH:EXR7", 0.0).await;
+
+    let (tcp, udp) = alloc_port_pair();
+    let cfg = PvaServerConfig {
+        tcp_port: tcp,
+        udp_port: udp,
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 16,
+        max_channels_per_connection: 64,
+        monitor_queue_depth: 8,
+        auth_complete: Some(Arc::new(move |_peer, cred| {
+            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
+        })),
+        ..Default::default()
+    };
+    let h = tokio::spawn(async move {
+        let _ = run_pva_server(source, cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let mut sock = read_handshake_prelude(server_addr);
+
+    // CONNECTION_VALIDATION with method="x509" (unadvertised on plain
+    // TCP) and an auth Value structure carrying `user="alice"`.
+    let order = ByteOrder::Little;
+    let auth_desc = FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![("user".into(), FieldDesc::Scalar(ScalarType::String))],
+    };
+    let mut auth_struct = PvStructure::new("");
+    auth_struct.fields.push((
+        "user".into(),
+        PvField::Scalar(ScalarValue::String("alice".into())),
+    ));
+    let auth_val = PvField::Structure(auth_struct);
+
+    let mut payload: Vec<u8> = Vec::new();
+    payload.put_u32(87_040, order);
+    payload.put_u16(32_767, order);
+    payload.put_u16(0, order);
+    encode_string_into("x509", order, &mut payload);
+    epics_pva_rs::pvdata::encode::encode_type_desc(&auth_desc, order, &mut payload);
+    epics_pva_rs::pvdata::encode::encode_pv_field(&auth_val, &auth_desc, order, &mut payload);
+    let h_req = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut req = Vec::new();
+    h_req.write_into(&mut req);
+    req.extend_from_slice(&payload);
+    sock.write_all(&req).unwrap();
+
+    // CONNECTION_VALIDATED reply must carry Status::Error.
+    let frame = read_one_frame(&mut sock);
+    assert_eq!(
+        frame.header.command, CMD_CONNECTION_VALIDATED,
+        "expected CONNECTION_VALIDATED"
+    );
+    let mut cur = frame.cursor();
+    let status = Status::decode(&mut cur, order).expect("status");
+    assert!(
+        !status.is_success(),
+        "server accepted unadvertised x509 method: {status:?}"
+    );
+
+    // The auth_complete hook must have seen ANONYMOUS credentials —
+    // not the rejected `x509`/`alice` claim.
+    let observed = captured.lock().unwrap().clone();
+    let (method, account) = observed.expect("auth_complete hook must have fired");
+    assert_eq!(
+        method, "anonymous",
+        "EX-R7: rejected unadvertised method must not survive on the connection"
+    );
+    assert_eq!(
+        account, "anonymous",
+        "EX-R7: rejected claimed account `alice` must not survive on the connection"
+    );
+
+    h.abort();
+}

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.18.2 — 2026-05-20
+
+Follow-up to `v0.18.1` (which was tagged but not published to
+crates.io). Carries everything in the `v0.18.1` section below plus:
+
+- `epics-pva-rs` — the pvRequest builder no longer flattens dotted
+  field paths. `field(a.b.c)` now nests `a { b { c {} } }` in the
+  request structure instead of emitting a single literal `a.b.c`
+  member, so `request2mask` resolves the intended leaf.
+
 ## v0.18.1 — 2026-05-20
 
 Regression-hardening point release on top of `v0.18.0`. Rolls up the

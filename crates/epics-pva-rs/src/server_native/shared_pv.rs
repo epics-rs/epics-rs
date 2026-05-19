@@ -25,7 +25,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use parking_lot::Mutex;
@@ -112,10 +112,23 @@ struct MonitorQueueShared {
     /// Set in MonitorInbox::drop; post() checks this to decide whether to remove
     /// the outbox from the subscriber list.
     receiver_dropped: AtomicBool,
+    /// Live `MonitorOutbox` endpoints for this queue. MR-R2: closure
+    /// (`producer_done`) must be tied to the *last* producer endpoint
+    /// disappearing, not to any single cloned endpoint dropping. A
+    /// temporary clone made for a lock-free post (e.g. `put_delta`'s
+    /// `g.subscribers.clone()`) keeps this count above 1 while the
+    /// canonical outbox lives, so its drop never closes the inbox.
+    producer_count: AtomicUsize,
 }
 
 /// Sender half of a per-subscriber queue. Held by `SharedPV::subscribers`.
-#[derive(Clone)]
+///
+/// MR-R2: `Clone` is implemented by hand (not derived) so each clone
+/// increments `producer_count`. The invariant — "a monitor queue
+/// becomes `producer_done` only when its *last* `MonitorOutbox`
+/// endpoint drops" — is enforced structurally here and in `Drop`,
+/// so a transient clone used for lock-free delivery cannot close the
+/// subscriber's inbox.
 pub struct MonitorOutbox {
     shared: Arc<MonitorQueueShared>,
 }
@@ -135,6 +148,8 @@ fn make_monitor_queue(limit: usize) -> (MonitorOutbox, MonitorInbox) {
         }),
         notify: tokio::sync::Notify::new(),
         receiver_dropped: AtomicBool::new(false),
+        // Exactly one producer endpoint exists at creation.
+        producer_count: AtomicUsize::new(1),
     });
     (
         MonitorOutbox {
@@ -176,11 +191,28 @@ impl MonitorOutbox {
     }
 }
 
+impl Clone for MonitorOutbox {
+    fn clone(&self) -> Self {
+        // MR-R2: every live endpoint counts. A clone made for a
+        // lock-free post is a producer endpoint until it drops.
+        self.shared.producer_count.fetch_add(1, Ordering::AcqRel);
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
 impl Drop for MonitorOutbox {
     fn drop(&mut self) {
-        // Signal inbox that no more data will arrive (producer_done = true).
-        self.shared.inner.lock().producer_done = true;
-        self.shared.notify.notify_waiters();
+        // MR-R2: signal `producer_done` only when the *last* producer
+        // endpoint for this queue drops. A transient clone (e.g. the
+        // `put_delta` snapshot) drops first while the canonical outbox
+        // held in `SharedPV::subscribers` is still alive, so the
+        // subscriber's inbox is not closed by an internal clone.
+        if self.shared.producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.inner.lock().producer_done = true;
+            self.shared.notify.notify_waiters();
+        }
     }
 }
 
@@ -1104,6 +1136,74 @@ mod tests {
         pv.set_low_watermark(8);
         pv.set_high_watermark(128);
         assert_eq!(pv.watermarks(), (8, 128));
+    }
+
+    /// MR-R2 regression: a no-handler `put_delta` to a `SharedPV` with
+    /// a live subscriber clones `g.subscribers` for a lock-free post.
+    /// Before the fix, the cloned `MonitorOutbox` vector dropped at
+    /// function exit and each clone's `Drop` set `producer_done = true`,
+    /// terminating the subscriber inbox even though the receiver was
+    /// never dropped. After the fix, only the *last* producer endpoint
+    /// drop closes the queue, so the subscriber survives `put_delta`
+    /// and keeps receiving posts.
+    #[tokio::test]
+    async fn mr_r2_put_delta_clone_drop_keeps_subscriber_alive() {
+        use crate::proto::BitSet;
+
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        let mut rx = pv.subscribe(8).expect("subscribe");
+        // Drain the initial value.
+        let _ = rx.recv().await.expect("initial value");
+
+        // Delta PUT marking the `value` leaf (field index 1: 0 is the
+        // structure root, 1 is the first leaf).
+        let desc = nt_scalar_int_desc();
+        let mut changed = BitSet::new();
+        changed.set(1);
+        pv.put_delta(&desc, &changed, nt_scalar_int_value(11))
+            .expect("first put_delta");
+
+        // After put_delta, the temporary subscriber clone has dropped.
+        // The subscriber inbox MUST still be open and deliver the value.
+        let v1 = rx.recv().await;
+        assert!(
+            v1.is_some(),
+            "subscriber inbox must survive put_delta's clone drop"
+        );
+        assert_eq!(extract_int(&v1.unwrap()), 11);
+
+        // A second put_delta must also be delivered — the queue is not
+        // producer-done.
+        let mut changed2 = BitSet::new();
+        changed2.set(1);
+        pv.put_delta(&desc, &changed2, nt_scalar_int_value(22))
+            .expect("second put_delta");
+        let v2 = rx.recv().await;
+        assert!(
+            v2.is_some(),
+            "subscriber inbox must keep receiving after repeated put_delta"
+        );
+        assert_eq!(extract_int(&v2.unwrap()), 22);
+    }
+
+    /// MR-R2: explicit `close()` must still terminate the subscriber
+    /// inbox — closure is an owner action, and the invariant only
+    /// forbids *internal clone drops* from closing the queue.
+    #[tokio::test]
+    async fn mr_r2_close_still_terminates_subscriber() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        let mut rx = pv.subscribe(8).expect("subscribe");
+        let _ = rx.recv().await.expect("initial value");
+        pv.close();
+        // close() drops the canonical outbox (last producer endpoint),
+        // so the inbox drains to `None`.
+        let after = rx.recv().await;
+        assert!(
+            after.is_none(),
+            "close() must terminate the subscriber inbox"
+        );
     }
 
     #[tokio::test]

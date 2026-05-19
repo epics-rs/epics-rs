@@ -174,6 +174,28 @@ impl AcfAccessControl {
         use epics_base_rs::server::access_security::AccessLevel;
         let (asg, asl) = self.resolve_asg_and_asl_blocking(channel);
         let cred_strings = Self::credential_strings(creds);
+        // MR-R12: a QSRV access context built through the legacy
+        // no-method constructors (`AccessContext::anonymous`,
+        // `with_identity`, `create_channel`/`create_channel_for`, or
+        // the 3-arg `AccessControl::can_read`/`can_write`) carries an
+        // empty `method`. pvxs never produces an empty method — an
+        // unauthenticated client gets `method = "anonymous"`
+        // (`serverconn.cpp:78`, `:230`). An empty method cannot match
+        // a `METHOD("anonymous")` rule (`check_access_method` matches
+        // METHOD lists by literal comparison), so an ACF that scopes
+        // anonymous read access through such a rule would silently
+        // deny the legacy path. Normalize an empty method to
+        // `"anonymous"` for the rule check, matching the
+        // `check_access_method(.., "anonymous", ..)` call origin/main
+        // used for the legacy path. The account string passed for
+        // UAG matching keeps `credential_strings`' empty-method
+        // (plain-account) form, so UAG entries listing a bare
+        // username still match.
+        let method = if creds.method.is_empty() {
+            "anonymous"
+        } else {
+            creds.method.as_str()
+        };
         let mut best = AccessLevelLite::None;
         for cred_user in &cred_strings {
             let lvl = self.cfg.check_access_method(
@@ -181,7 +203,7 @@ impl AcfAccessControl {
                 &creds.host,
                 cred_user,
                 asl,
-                &creds.method,
+                method,
                 &creds.authority,
             );
             let lit = match lvl {
@@ -1405,6 +1427,78 @@ ASG(ROLE_GATED) {
         assert!(
             err.contains("monitor read denied"),
             "expected start denial, got: {err}"
+        );
+    }
+
+    /// MR-R12: a QSRV access context built through the legacy
+    /// no-method path (`AccessContext::anonymous`, `with_identity`,
+    /// the 3-arg `AccessControl::can_read`/`can_write`) carries an
+    /// empty `method`. pvxs sets an unauthenticated client's method
+    /// to `"anonymous"` (`serverconn.cpp:78`), so an ACF that grants
+    /// anonymous access through a `METHOD("anonymous")`-scoped rule
+    /// must still apply on that path. The branch passed an empty
+    /// method, which `check_access_method` cannot match against a
+    /// `METHOD("anonymous")` list — silently denying the legacy path.
+    ///
+    /// Fails before the fix (empty method → no rule match → denied),
+    /// passes after (`level_for_creds` normalizes empty → `anonymous`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mr_r12_legacy_path_matches_method_anonymous_rule() {
+        use epics_base_rs::server::access_security::parse_acf;
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        // The ASG grants READ *only* through a METHOD("anonymous")
+        // rule. A legacy/anonymous QSRV context must match it.
+        let acf_text = r#"
+ASG(ANON_GATED) {
+    RULE(1, READ) { METHOD("anonymous") }
+}
+"#;
+        let cfg = parse_acf(acf_text).unwrap();
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:ANON", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        {
+            let rec = db.get_record("AI:ANON").await.unwrap();
+            rec.write().await.common.asg = "ANON_GATED".to_string();
+        }
+        let acl = AcfAccessControl::new(db.clone(), cfg);
+
+        // Legacy 3-arg path (create_channel / create_channel_for
+        // funnel through these). Empty method on the branch.
+        assert!(
+            acl.can_read("AI:ANON", "alice", "h"),
+            "legacy can_read must match METHOD(\"anonymous\") rule"
+        );
+
+        // Explicit-identity context: also a no-method legacy path.
+        let id_creds = ClientCreds {
+            user: "alice".to_string(),
+            host: "h".to_string(),
+            method: String::new(),
+            authority: String::new(),
+            roles: Vec::new(),
+        };
+        assert!(
+            acl.can_read_creds("AI:ANON", &id_creds),
+            "empty-method ClientCreds must match METHOD(\"anonymous\") rule"
+        );
+
+        // A real authenticated method (e.g. ca) must NOT be coerced
+        // into anonymous — the normalization only fills an *empty*
+        // method, so a ca client still fails the anonymous-only rule.
+        let ca_creds = ClientCreds {
+            user: "alice".to_string(),
+            host: "h".to_string(),
+            method: "ca".to_string(),
+            authority: String::new(),
+            roles: Vec::new(),
+        };
+        assert!(
+            !acl.can_read_creds("AI:ANON", &ca_creds),
+            "an explicit 'ca' method must NOT match a METHOD(\"anonymous\")-only rule"
         );
     }
 }

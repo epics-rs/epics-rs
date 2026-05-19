@@ -54,6 +54,78 @@ impl NtType {
 }
 
 // ---------------------------------------------------------------------------
+// Scalar-type classification
+// ---------------------------------------------------------------------------
+
+/// `display.form.choices` — the fixed seven-entry menu pvxs publishes for
+/// every numeric NTScalar / NTScalarArray (`Q:form` info-tag menu).
+///
+/// Mirrors pvxs `ioc/iocsource.cpp:43-51` (`IOCSource::initialize`).
+const FORM_CHOICES: [&str; 7] = [
+    "Default",
+    "String",
+    "Binary",
+    "Decimal",
+    "Hex",
+    "Exponential",
+    "Engineering",
+];
+
+/// Derive the PVA scalar type of an `EpicsValue`, taking the element type
+/// for array variants. This is the Rust equivalent of pvxs
+/// `TypeCode::scalarOf()` applied to the NTScalar `value` member: metadata
+/// limit fields (`display`, `control`, `valueAlarm`) are typed with this
+/// scalar type, not hard-coded `double`.
+fn value_scalar_type(value: &EpicsValue) -> ScalarType {
+    match value {
+        EpicsValue::String(_) | EpicsValue::StringArray(_) => ScalarType::String,
+        EpicsValue::Short(_) | EpicsValue::ShortArray(_) => ScalarType::Short,
+        EpicsValue::Float(_) | EpicsValue::FloatArray(_) => ScalarType::Float,
+        EpicsValue::Enum(_) | EpicsValue::EnumArray(_) => ScalarType::UShort,
+        // DBF_CHAR ↔ pvByte (signed), matching `convert::dbf_to_scalar_type`.
+        EpicsValue::Char(_) | EpicsValue::CharArray(_) => ScalarType::Byte,
+        EpicsValue::Long(_) | EpicsValue::LongArray(_) => ScalarType::Int,
+        EpicsValue::Double(_) | EpicsValue::DoubleArray(_) => ScalarType::Double,
+        EpicsValue::Int64(_) | EpicsValue::Int64Array(_) => ScalarType::Long,
+    }
+}
+
+/// True for PVA scalar types that pvxs treats as numeric
+/// (`Kind::Integer || Kind::Real`). pvxs only emits `display` limit
+/// fields, `control`, and `valueAlarm` for numeric NTScalar values; a
+/// string `value` carries `display = {description, units}` only.
+///
+/// Mirrors pvxs `src/nt.cpp:55` (`const bool isnumeric = ...`).
+fn is_numeric_scalar(t: ScalarType) -> bool {
+    !matches!(t, ScalarType::String)
+}
+
+/// Build a metadata limit `ScalarValue` of the value's scalar type from a
+/// stored `f64` limit. pvxs types `display`/`control`/`valueAlarm` limits
+/// with `value.scalarOf()`, so an `int32_t[]` waveform gets `int32_t`
+/// limits and a `uint64_t` field gets `uint64_t` limits.
+///
+/// Mirrors pvxs `src/nt.cpp:61-104` (`Member(scalar, "limit*")`).
+fn limit_scalar(t: ScalarType, v: f64) -> ScalarValue {
+    match t {
+        ScalarType::Boolean => ScalarValue::Boolean(v != 0.0),
+        ScalarType::Byte => ScalarValue::Byte(v as i8),
+        ScalarType::Short => ScalarValue::Short(v as i16),
+        ScalarType::Int => ScalarValue::Int(v as i32),
+        ScalarType::Long => ScalarValue::Long(v as i64),
+        ScalarType::UByte => ScalarValue::UByte(v as u8),
+        ScalarType::UShort => ScalarValue::UShort(v as u16),
+        ScalarType::UInt => ScalarValue::UInt(v as u32),
+        ScalarType::ULong => ScalarValue::ULong(v as u64),
+        ScalarType::Float => ScalarValue::Float(v as f32),
+        ScalarType::Double => ScalarValue::Double(v),
+        // String values are non-numeric and never reach the limit
+        // builders; fall back to the textual rendering for completeness.
+        ScalarType::String => ScalarValue::String(v.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot → PvStructure conversion
 // ---------------------------------------------------------------------------
 
@@ -68,6 +140,11 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
     // scalar — `epics_to_scalar` will fall back to 0/0.0/"". Surface that as
     // INVALID/UDF so clients don't treat the placeholder as a valid reading.
     let empty_array = is_empty_array(&snapshot.value);
+
+    // BR-R12: metadata limit fields take the value's scalar type, and the
+    // metadata field *set* depends on whether that type is numeric.
+    let scalar_type = value_scalar_type(&snapshot.value);
+    let numeric = is_numeric_scalar(scalar_type);
 
     // value
     pv.fields.push((
@@ -92,22 +169,30 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
 
     // display
     if let Some(ref disp) = snapshot.display {
-        pv.fields
-            .push(("display".into(), PvField::Structure(build_display(disp))));
-    }
-
-    // control
-    if let Some(ref ctrl) = snapshot.control {
-        pv.fields
-            .push(("control".into(), PvField::Structure(build_control(ctrl))));
-    }
-
-    // valueAlarm (alarm thresholds from display limits)
-    if let Some(ref disp) = snapshot.display {
         pv.fields.push((
-            "valueAlarm".into(),
-            PvField::Structure(build_value_alarm(disp)),
+            "display".into(),
+            PvField::Structure(build_display(disp, scalar_type, numeric)),
         ));
+    }
+
+    // control — pvxs emits this only for numeric values (src/nt.cpp:87).
+    if numeric {
+        if let Some(ref ctrl) = snapshot.control {
+            pv.fields.push((
+                "control".into(),
+                PvField::Structure(build_control(ctrl, scalar_type)),
+            ));
+        }
+    }
+
+    // valueAlarm — pvxs emits this only for numeric values (src/nt.cpp:97).
+    if numeric {
+        if let Some(ref disp) = snapshot.display {
+            pv.fields.push((
+                "valueAlarm".into(),
+                PvField::Structure(build_value_alarm(disp, scalar_type)),
+            ));
+        }
     }
 
     pv
@@ -161,9 +246,18 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
 /// Convert a Snapshot into an NTScalarArray PvStructure.
 ///
 /// Structure ID: `epics:nt/NTScalarArray:1.0`
-/// Fields: value[], alarm, timeStamp, display (optional)
+/// Fields: value[], alarm, timeStamp, display, control, valueAlarm.
+///
+/// BR-R12: pvxs builds NTScalarArray with the *same* `NTScalar` builder as
+/// the scalar case — `value.isarray()` only flips the struct id — so a
+/// numeric array carries `control` and `valueAlarm` just like a scalar
+/// (pvxs `src/nt.cpp:44-112`, confirmed by `test/testqsingle.cpp:354-397`).
 pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
     let mut pv = PvStructure::new("epics:nt/NTScalarArray:1.0");
+
+    // BR-R12: array metadata limits take the element scalar type.
+    let scalar_type = value_scalar_type(&snapshot.value);
+    let numeric = is_numeric_scalar(scalar_type);
 
     // value (array)
     pv.fields
@@ -181,8 +275,30 @@ pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
 
     // display
     if let Some(ref disp) = snapshot.display {
-        pv.fields
-            .push(("display".into(), PvField::Structure(build_display(disp))));
+        pv.fields.push((
+            "display".into(),
+            PvField::Structure(build_display(disp, scalar_type, numeric)),
+        ));
+    }
+
+    // control — numeric arrays only (pvxs src/nt.cpp:87).
+    if numeric {
+        if let Some(ref ctrl) = snapshot.control {
+            pv.fields.push((
+                "control".into(),
+                PvField::Structure(build_control(ctrl, scalar_type)),
+            ));
+        }
+    }
+
+    // valueAlarm — numeric arrays only (pvxs src/nt.cpp:97).
+    if numeric {
+        if let Some(ref disp) = snapshot.display {
+            pv.fields.push((
+                "valueAlarm".into(),
+                PvField::Structure(build_value_alarm(disp, scalar_type)),
+            ));
+        }
     }
 
     pv
@@ -312,17 +428,25 @@ fn filter_by_spec(pv: &PvStructure, spec: &PvStructure) -> PvStructure {
 // ---------------------------------------------------------------------------
 
 /// Build a PVA FieldDesc for an NTScalar with the given scalar type.
+///
+/// BR-R12: `display`/`control`/`valueAlarm` limits take `scalar_type`, and
+/// `control`/`valueAlarm` are omitted for non-numeric (string) values —
+/// matching pvxs `NTScalar::build` (`src/nt.cpp:37-114`).
 pub fn build_nt_scalar_desc(scalar_type: ScalarType) -> FieldDesc {
+    let numeric = is_numeric_scalar(scalar_type);
+    let mut fields = vec![
+        ("value".into(), FieldDesc::Scalar(scalar_type)),
+        ("alarm".into(), alarm_desc()),
+        ("timeStamp".into(), timestamp_desc()),
+        ("display".into(), display_desc(scalar_type, numeric)),
+    ];
+    if numeric {
+        fields.push(("control".into(), control_desc(scalar_type)));
+        fields.push(("valueAlarm".into(), value_alarm_desc(scalar_type)));
+    }
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalar:1.0".into(),
-        fields: vec![
-            ("value".into(), FieldDesc::Scalar(scalar_type)),
-            ("alarm".into(), alarm_desc()),
-            ("timeStamp".into(), timestamp_desc()),
-            ("display".into(), display_desc()),
-            ("control".into(), control_desc()),
-            ("valueAlarm".into(), value_alarm_desc()),
-        ],
+        fields,
     }
 }
 
@@ -348,15 +472,25 @@ pub fn build_nt_enum_desc() -> FieldDesc {
 }
 
 /// Build a PVA FieldDesc for an NTScalarArray with the given element type.
+///
+/// BR-R12: pvxs reuses the `NTScalar` builder for arrays, so a numeric
+/// array descriptor carries `control` and `valueAlarm` with element-typed
+/// limits (pvxs `src/nt.cpp:44-112`, `test/testqsingle.cpp:354-397`).
 pub fn build_nt_scalar_array_desc(element_type: ScalarType) -> FieldDesc {
+    let numeric = is_numeric_scalar(element_type);
+    let mut fields = vec![
+        ("value".into(), FieldDesc::ScalarArray(element_type)),
+        ("alarm".into(), alarm_desc()),
+        ("timeStamp".into(), timestamp_desc()),
+        ("display".into(), display_desc(element_type, numeric)),
+    ];
+    if numeric {
+        fields.push(("control".into(), control_desc(element_type)));
+        fields.push(("valueAlarm".into(), value_alarm_desc(element_type)));
+    }
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalarArray:1.0".into(),
-        fields: vec![
-            ("value".into(), FieldDesc::ScalarArray(element_type)),
-            ("alarm".into(), alarm_desc()),
-            ("timeStamp".into(), timestamp_desc()),
-            ("display".into(), display_desc()),
-        ],
+        fields,
     }
 }
 
@@ -469,16 +603,48 @@ fn build_timestamp(time: SystemTime, user_tag: i32) -> PvStructure {
     ts
 }
 
-fn build_display(disp: &DisplayInfo) -> PvStructure {
+/// Build the `enum_t` sub-structure for `display.form`.
+///
+/// BR-R12: pvxs models `display.form` as an `enum_t` (`{int32 index,
+/// string[] choices}`), not a scalar `int`. `index` is the `Q:form` info
+/// tag value; `choices` is the fixed seven-entry menu.
+/// Mirrors pvxs `src/nt.cpp:71-74` and `ioc/iocsource.cpp:42-62`.
+fn build_form(form: i16) -> PvStructure {
+    let mut f = PvStructure::new("enum_t");
+    f.fields.push((
+        "index".into(),
+        PvField::Scalar(ScalarValue::Int(form as i32)),
+    ));
+    f.fields.push((
+        "choices".into(),
+        PvField::ScalarArray(
+            FORM_CHOICES
+                .iter()
+                .map(|s| ScalarValue::String((*s).to_string()))
+                .collect(),
+        ),
+    ));
+    f
+}
+
+/// Build the `display` sub-structure.
+///
+/// BR-R12: for numeric values pvxs emits `{limitLow, limitHigh,
+/// description, units, precision, form}` with limits typed as the value's
+/// scalar type and `form` as an `enum_t`; for non-numeric (string) values
+/// only `{description, units}` is emitted (pvxs `src/nt.cpp:58-85`).
+fn build_display(disp: &DisplayInfo, scalar_type: ScalarType, numeric: bool) -> PvStructure {
     let mut d = PvStructure::new("display_t");
-    d.fields.push((
-        "limitLow".into(),
-        PvField::Scalar(ScalarValue::Double(disp.lower_disp_limit)),
-    ));
-    d.fields.push((
-        "limitHigh".into(),
-        PvField::Scalar(ScalarValue::Double(disp.upper_disp_limit)),
-    ));
+    if numeric {
+        d.fields.push((
+            "limitLow".into(),
+            PvField::Scalar(limit_scalar(scalar_type, disp.lower_disp_limit)),
+        ));
+        d.fields.push((
+            "limitHigh".into(),
+            PvField::Scalar(limit_scalar(scalar_type, disp.upper_disp_limit)),
+        ));
+    }
     d.fields.push((
         "description".into(),
         PvField::Scalar(ScalarValue::String(disp.description.clone())),
@@ -487,29 +653,31 @@ fn build_display(disp: &DisplayInfo) -> PvStructure {
         "units".into(),
         PvField::Scalar(ScalarValue::String(disp.units.clone())),
     ));
-    d.fields.push((
-        "precision".into(),
-        PvField::Scalar(ScalarValue::Int(disp.precision as i32)),
-    ));
-    d.fields.push((
-        "form".into(),
-        PvField::Scalar(ScalarValue::Int(disp.form as i32)),
-    ));
+    if numeric {
+        d.fields.push((
+            "precision".into(),
+            PvField::Scalar(ScalarValue::Int(disp.precision as i32)),
+        ));
+        d.fields
+            .push(("form".into(), PvField::Structure(build_form(disp.form))));
+    }
     d
 }
 
-fn build_control(ctrl: &ControlInfo) -> PvStructure {
+fn build_control(ctrl: &ControlInfo, scalar_type: ScalarType) -> PvStructure {
     let mut c = PvStructure::new("control_t");
     c.fields.push((
         "limitLow".into(),
-        PvField::Scalar(ScalarValue::Double(ctrl.lower_ctrl_limit)),
+        PvField::Scalar(limit_scalar(scalar_type, ctrl.lower_ctrl_limit)),
     ));
     c.fields.push((
         "limitHigh".into(),
-        PvField::Scalar(ScalarValue::Double(ctrl.upper_ctrl_limit)),
+        PvField::Scalar(limit_scalar(scalar_type, ctrl.upper_ctrl_limit)),
     ));
-    c.fields
-        .push(("minStep".into(), PvField::Scalar(ScalarValue::Double(0.0))));
+    c.fields.push((
+        "minStep".into(),
+        PvField::Scalar(limit_scalar(scalar_type, 0.0)),
+    ));
     c
 }
 
@@ -538,72 +706,127 @@ fn timestamp_desc() -> FieldDesc {
     }
 }
 
-fn display_desc() -> FieldDesc {
+/// FieldDesc for `display.form` — an `enum_t` (`{int32 index, string[]
+/// choices}`). Mirrors pvxs `src/nt.cpp:71-74`.
+fn form_desc() -> FieldDesc {
     FieldDesc::Structure {
-        struct_id: "display_t".into(),
+        struct_id: "enum_t".into(),
         fields: vec![
-            ("limitLow".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ("limitHigh".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ("description".into(), FieldDesc::Scalar(ScalarType::String)),
-            ("units".into(), FieldDesc::Scalar(ScalarType::String)),
-            ("precision".into(), FieldDesc::Scalar(ScalarType::Int)),
-            ("form".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ("index".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ("choices".into(), FieldDesc::ScalarArray(ScalarType::String)),
         ],
     }
 }
 
-fn control_desc() -> FieldDesc {
+fn display_desc(scalar_type: ScalarType, numeric: bool) -> FieldDesc {
+    let mut fields: Vec<(String, FieldDesc)> = Vec::new();
+    if numeric {
+        fields.push(("limitLow".into(), FieldDesc::Scalar(scalar_type)));
+        fields.push(("limitHigh".into(), FieldDesc::Scalar(scalar_type)));
+    }
+    fields.push(("description".into(), FieldDesc::Scalar(ScalarType::String)));
+    fields.push(("units".into(), FieldDesc::Scalar(ScalarType::String)));
+    if numeric {
+        fields.push(("precision".into(), FieldDesc::Scalar(ScalarType::Int)));
+        fields.push(("form".into(), form_desc()));
+    }
+    FieldDesc::Structure {
+        struct_id: "display_t".into(),
+        fields,
+    }
+}
+
+fn control_desc(scalar_type: ScalarType) -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "control_t".into(),
         fields: vec![
-            ("limitLow".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ("limitHigh".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ("minStep".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ("limitLow".into(), FieldDesc::Scalar(scalar_type)),
+            ("limitHigh".into(), FieldDesc::Scalar(scalar_type)),
+            ("minStep".into(), FieldDesc::Scalar(scalar_type)),
         ],
     }
 }
 
-fn build_value_alarm(disp: &DisplayInfo) -> PvStructure {
+/// Build the `valueAlarm` sub-structure.
+///
+/// BR-R12: pvxs `valueAlarm` carries the full field set — `active` (bool),
+/// the four alarm/warning limits typed as the value's scalar type, the
+/// four `*Severity` fields (int32), and `hysteresis` (float64). The four
+/// `*Severity` fields and `active`/`hysteresis` are not represented in the
+/// EPICS `DisplayInfo` metadata, so they default to 0 / false / 0.0 — the
+/// same values pvxs emits when QSRV does not populate them
+/// (`test/testqsingle.cpp:116-127`). Mirrors pvxs `src/nt.cpp:97-112`.
+fn build_value_alarm(disp: &DisplayInfo, scalar_type: ScalarType) -> PvStructure {
     let mut va = PvStructure::new("valueAlarm_t");
     va.fields.push((
+        "active".into(),
+        PvField::Scalar(ScalarValue::Boolean(false)),
+    ));
+    va.fields.push((
         "lowAlarmLimit".into(),
-        PvField::Scalar(ScalarValue::Double(disp.lower_alarm_limit)),
+        PvField::Scalar(limit_scalar(scalar_type, disp.lower_alarm_limit)),
     ));
     va.fields.push((
         "lowWarningLimit".into(),
-        PvField::Scalar(ScalarValue::Double(disp.lower_warning_limit)),
+        PvField::Scalar(limit_scalar(scalar_type, disp.lower_warning_limit)),
     ));
     va.fields.push((
         "highWarningLimit".into(),
-        PvField::Scalar(ScalarValue::Double(disp.upper_warning_limit)),
+        PvField::Scalar(limit_scalar(scalar_type, disp.upper_warning_limit)),
     ));
     va.fields.push((
         "highAlarmLimit".into(),
-        PvField::Scalar(ScalarValue::Double(disp.upper_alarm_limit)),
+        PvField::Scalar(limit_scalar(scalar_type, disp.upper_alarm_limit)),
+    ));
+    va.fields.push((
+        "lowAlarmSeverity".into(),
+        PvField::Scalar(ScalarValue::Int(0)),
+    ));
+    va.fields.push((
+        "lowWarningSeverity".into(),
+        PvField::Scalar(ScalarValue::Int(0)),
+    ));
+    va.fields.push((
+        "highWarningSeverity".into(),
+        PvField::Scalar(ScalarValue::Int(0)),
+    ));
+    va.fields.push((
+        "highAlarmSeverity".into(),
+        PvField::Scalar(ScalarValue::Int(0)),
+    ));
+    va.fields.push((
+        "hysteresis".into(),
+        PvField::Scalar(ScalarValue::Double(0.0)),
     ));
     va
 }
 
-fn value_alarm_desc() -> FieldDesc {
+fn value_alarm_desc(scalar_type: ScalarType) -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "valueAlarm_t".into(),
         fields: vec![
+            ("active".into(), FieldDesc::Scalar(ScalarType::Boolean)),
+            ("lowAlarmLimit".into(), FieldDesc::Scalar(scalar_type)),
+            ("lowWarningLimit".into(), FieldDesc::Scalar(scalar_type)),
+            ("highWarningLimit".into(), FieldDesc::Scalar(scalar_type)),
+            ("highAlarmLimit".into(), FieldDesc::Scalar(scalar_type)),
             (
-                "lowAlarmLimit".into(),
-                FieldDesc::Scalar(ScalarType::Double),
+                "lowAlarmSeverity".into(),
+                FieldDesc::Scalar(ScalarType::Int),
             ),
             (
-                "lowWarningLimit".into(),
-                FieldDesc::Scalar(ScalarType::Double),
+                "lowWarningSeverity".into(),
+                FieldDesc::Scalar(ScalarType::Int),
             ),
             (
-                "highWarningLimit".into(),
-                FieldDesc::Scalar(ScalarType::Double),
+                "highWarningSeverity".into(),
+                FieldDesc::Scalar(ScalarType::Int),
             ),
             (
-                "highAlarmLimit".into(),
-                FieldDesc::Scalar(ScalarType::Double),
+                "highAlarmSeverity".into(),
+                FieldDesc::Scalar(ScalarType::Int),
             ),
+            ("hysteresis".into(), FieldDesc::Scalar(ScalarType::Double)),
         ],
     }
 }
@@ -853,6 +1076,131 @@ mod tests {
             assert_eq!(alarm.fields[0].0, "severity");
         } else {
             panic!("expected alarm structure");
+        }
+    }
+
+    #[test]
+    fn br_r12_array_metadata_shape_matches_pvxs() {
+        // BR-R12: an int32 NTScalarArray must carry `control` and
+        // `valueAlarm` (pvxs reuses the NTScalar builder for arrays —
+        // src/nt.cpp:44-112, test/testqsingle.cpp:354-397), the
+        // display/control/valueAlarm limits must be typed as the element
+        // scalar type (Int, not Double), and `display.form` must be an
+        // `enum_t` sub-structure, not a scalar int.
+        let snap = test_snapshot(EpicsValue::LongArray(vec![4, 5, 6, 7]));
+        let pv = snapshot_to_nt_scalar_array(&snap);
+
+        // control + valueAlarm present on the array
+        let control = pv.get_field("control").expect("array must carry control");
+        let value_alarm = pv
+            .get_field("valueAlarm")
+            .expect("array must carry valueAlarm");
+
+        // display.limitLow typed as Int (element scalar type), not Double
+        if let Some(PvField::Structure(disp)) = pv.get_field("display") {
+            assert!(
+                matches!(
+                    disp.get_field("limitLow"),
+                    Some(PvField::Scalar(ScalarValue::Int(_)))
+                ),
+                "display.limitLow must be Int for an int32 array"
+            );
+            // display.form must be an enum_t structure with index + choices
+            match disp.get_field("form") {
+                Some(PvField::Structure(form)) => {
+                    assert_eq!(form.struct_id, "enum_t");
+                    assert!(matches!(
+                        form.get_field("index"),
+                        Some(PvField::Scalar(ScalarValue::Int(_)))
+                    ));
+                    if let Some(PvField::ScalarArray(choices)) = form.get_field("choices") {
+                        assert_eq!(choices.len(), 7, "form.choices is the fixed 7-entry menu");
+                    } else {
+                        panic!("display.form.choices must be a string array");
+                    }
+                }
+                _ => panic!("display.form must be an enum_t structure"),
+            }
+        } else {
+            panic!("expected display structure");
+        }
+
+        // control.limitLow typed as Int
+        if let PvField::Structure(c) = control {
+            assert!(matches!(
+                c.get_field("limitLow"),
+                Some(PvField::Scalar(ScalarValue::Int(_)))
+            ));
+        } else {
+            panic!("expected control structure");
+        }
+
+        // valueAlarm full field set: active, 4 limits (Int), 4 severities, hysteresis
+        if let PvField::Structure(va) = value_alarm {
+            assert!(matches!(
+                va.get_field("active"),
+                Some(PvField::Scalar(ScalarValue::Boolean(false)))
+            ));
+            assert!(matches!(
+                va.get_field("lowAlarmLimit"),
+                Some(PvField::Scalar(ScalarValue::Int(_)))
+            ));
+            assert!(va.get_field("lowAlarmSeverity").is_some());
+            assert!(va.get_field("highAlarmSeverity").is_some());
+            assert!(matches!(
+                va.get_field("hysteresis"),
+                Some(PvField::Scalar(ScalarValue::Double(_)))
+            ));
+        } else {
+            panic!("expected valueAlarm structure");
+        }
+
+        // Descriptor must mirror the same shape.
+        let desc = build_nt_scalar_array_desc(ScalarType::Int);
+        if let FieldDesc::Structure { fields, .. } = &desc {
+            let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+            assert!(names.contains(&"control"), "array desc must carry control");
+            assert!(
+                names.contains(&"valueAlarm"),
+                "array desc must carry valueAlarm"
+            );
+        } else {
+            panic!("expected structure descriptor");
+        }
+    }
+
+    #[test]
+    fn br_r12_string_value_omits_numeric_metadata() {
+        // BR-R12: a non-numeric (string) NTScalar carries only
+        // `display = {description, units}` — no limits, no form, no
+        // control, no valueAlarm (pvxs src/nt.cpp:78-85).
+        let snap = test_snapshot(EpicsValue::String("Analog input".into()));
+        let pv = snapshot_to_nt_scalar(&snap);
+
+        assert!(
+            pv.get_field("control").is_none(),
+            "string value must not carry control"
+        );
+        assert!(
+            pv.get_field("valueAlarm").is_none(),
+            "string value must not carry valueAlarm"
+        );
+        if let Some(PvField::Structure(disp)) = pv.get_field("display") {
+            assert!(disp.get_field("limitLow").is_none());
+            assert!(disp.get_field("form").is_none());
+            assert!(disp.get_field("description").is_some());
+            assert!(disp.get_field("units").is_some());
+        } else {
+            panic!("expected display structure");
+        }
+
+        let desc = build_nt_scalar_desc(ScalarType::String);
+        if let FieldDesc::Structure { fields, .. } = &desc {
+            let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+            assert!(!names.contains(&"control"));
+            assert!(!names.contains(&"valueAlarm"));
+        } else {
+            panic!("expected structure descriptor");
         }
     }
 

@@ -394,6 +394,12 @@ struct OpState {
     /// letting sources like the QSRV bridge honor process/block
     /// without re-parsing the value (where they no longer live).
     pv_request: Option<PvField>,
+    /// BR-R14: event-affecting MONITOR pvRequest options
+    /// (`pipeline` / `queueSize` / `_filter`) decoded at INIT. Passed
+    /// to the source's `subscribe_*_checked_opts` at START so a
+    /// fanout source (PVA gateway) can reject options it cannot honor
+    /// transparently across a shared upstream monitor.
+    monitor_options: crate::server_native::source::MonitorOptions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1409,6 +1415,7 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
         monitor_filters: Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
         put_auto_exec: true,
         pv_request: None,
+        monitor_options: crate::server_native::source::MonitorOptions::default(),
     }
 }
 
@@ -2407,7 +2414,7 @@ async fn handle_op(
         // incompatible" but accepts the operation).
         let pipeline_initial_nack = parse_monitor_init_nack(kind, subcmd, &mut cur, order);
         let (monitor_window, monitor_window_notify) = if kind == OpKind::Monitor
-            && let Some(opt) = pipeline_opt
+            && let Some(opt) = pipeline_opt.as_ref()
         {
             let initial = pipeline_initial_nack.unwrap_or(opt.queue_size);
             debug!(
@@ -2464,6 +2471,25 @@ async fn handle_op(
             _ => None,
         };
 
+        // BR-R14: capture the event-affecting MONITOR pvRequest
+        // options so the START path can hand them to the source's
+        // `subscribe_*_checked_opts`. `pipeline_opt` was already
+        // filtered to `enabled`; `queue_size` is recorded only when
+        // the client requested pipeline mode (pvxs `servermon.cpp:533`
+        // only honours `queueSize` for pipeline subscriptions).
+        // `server_filter` reflects whether a non-empty `_filter`
+        // chain was present.
+        let monitor_options = if kind == OpKind::Monitor {
+            crate::server_native::source::MonitorOptions {
+                pipeline: pipeline_opt.is_some(),
+                queue_size: pipeline_opt.as_ref().map(|o| o.queue_size),
+                server_filter: !monitor_filters.is_empty(),
+            }
+        } else {
+            crate::server_native::source::MonitorOptions::default()
+        };
+
+
         ch.ops.insert(
             ioid,
             OpState {
@@ -2478,6 +2504,7 @@ async fn handle_op(
                 monitor_filters,
                 put_auto_exec,
                 pv_request: stashed_pv_request,
+                monitor_options,
             },
         );
 
@@ -2943,7 +2970,10 @@ async fn handle_op(
                     .await;
                 // Snapshot the window + notify so the spawned task can
                 // share state with this dispatch path's ACK handler.
-                let (window, window_notify, paused_flag, filters) = ch
+                // BR-R14: also lift the event-affecting monitor
+                // options so they reach the source's
+                // `subscribe_*_checked_opts`.
+                let (window, window_notify, paused_flag, filters, monitor_options) = ch
                     .ops
                     .get(&ioid)
                     .map(|s| {
@@ -2952,6 +2982,7 @@ async fn handle_op(
                             s.monitor_window_notify.clone(),
                             s.monitor_paused.clone(),
                             s.monitor_filters.clone(),
+                            s.monitor_options.clone(),
                         )
                     })
                     .unwrap_or_else(|| {
@@ -2960,6 +2991,7 @@ async fn handle_op(
                             None,
                             Arc::new(std::sync::atomic::AtomicBool::new(false)),
                             Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
+                            crate::server_native::source::MonitorOptions::default(),
                         )
                     });
                 let total_bits = intro_clone.total_bits();
@@ -2995,7 +3027,11 @@ async fn handle_op(
                     // and will likewise return None.
                     if raw_path_eligible
                         && let Some(mut rx_raw) = src
-                            .subscribe_raw_checked(mon_checked.clone(), mon_ctx.clone())
+                            .subscribe_raw_checked_opts(
+                                mon_checked.clone(),
+                                mon_ctx.clone(),
+                                monitor_options.clone(),
+                            )
                             .await
                     {
                         // R49-G1: revalidate ACL BEFORE sending the
@@ -3137,7 +3173,11 @@ async fn handle_op(
                     }
 
                     let Some(mut rx) = src
-                        .subscribe_checked(mon_checked.clone(), mon_ctx.clone())
+                        .subscribe_checked_opts(
+                            mon_checked.clone(),
+                            mon_ctx.clone(),
+                            monitor_options.clone(),
+                        )
                         .await
                     else {
                         return;
@@ -3812,6 +3852,7 @@ mod tests {
                 ),
                 put_auto_exec: true,
                 pv_request: None,
+                monitor_options: crate::server_native::source::MonitorOptions::default(),
             },
         );
         channels.insert(
@@ -5074,6 +5115,7 @@ mod tests {
                 ),
                 put_auto_exec: true,
                 pv_request: None,
+                monitor_options: crate::server_native::source::MonitorOptions::default(),
             },
         );
         channels.insert(

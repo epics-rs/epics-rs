@@ -14,4 +14,6 @@ pub use peers::{PeerEntry, PeerRegistry, PeerSnapshot};
 pub use runtime::{PvaServer, PvaServerConfig, run_pva_server};
 pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource};
 pub use shared_pv::{SharedPV, SharedSource};
-pub use source::{ChannelContext, ChannelSource, ChannelSourceObj, DynSource, RawMonitorEvent};
+pub use source::{
+    ChannelContext, ChannelSource, ChannelSourceObj, DynSource, MonitorOptions, RawMonitorEvent,
+};

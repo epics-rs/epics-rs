@@ -48,6 +48,52 @@ pub struct ChannelContext {
     pub pv_request: Option<PvField>,
 }
 
+/// Event-affecting options decoded from a downstream MONITOR INIT
+/// pvRequest, surfaced to [`ChannelSource`] implementors that need to
+/// reason about whether they can honor them.
+///
+/// BR-R14: a PVA-to-PVA gateway fans one upstream monitor out to N
+/// downstream subscribers. The upstream monitor is opened with the
+/// gateway's *default* pvRequest, so any downstream option that
+/// changes *upstream event production* — pvxs `record._options`
+/// `pipeline` / `queueSize` / `ackAny` (`servermon.cpp:521-555`) — is
+/// not transparent through the fanout. A source that cannot honor a
+/// given option must be able to see it and reject the subscription
+/// rather than silently serving fanout events that differ from a
+/// direct upstream monitor.
+///
+/// Field projection (the pvRequest field mask) is intentionally NOT
+/// represented here: it is pure downstream-local masking the server
+/// applies after fanout, and is transparent through a gateway.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MonitorOptions {
+    /// `record._options.pipeline` — the client requested the
+    /// flow-controlled credit/ACK monitor sub-protocol. The negotiated
+    /// queue/window is a property of the *upstream* monitor, so a
+    /// fanout gateway cannot provide per-downstream pipeline
+    /// semantics.
+    pub pipeline: bool,
+    /// `record._options.queueSize` when the client set it explicitly
+    /// (pvxs default 4). `None` means the client did not request a
+    /// specific upstream queue depth.
+    pub queue_size: Option<u32>,
+    /// True when the downstream pvRequest carried a server-side
+    /// `record._options._filter` chain. A stateful filter (e.g.
+    /// deadband) changes which events are *produced*; running it at a
+    /// fanout gateway on a shared upstream stream is not equivalent to
+    /// the upstream server running it per subscription.
+    pub server_filter: bool,
+}
+
+impl MonitorOptions {
+    /// True when any option here changes *upstream event production*
+    /// and therefore cannot be honored transparently by a fanout
+    /// gateway that shares one upstream monitor across downstreams.
+    pub fn affects_upstream_events(&self) -> bool {
+        self.pipeline || self.queue_size.is_some() || self.server_filter
+    }
+}
+
 /// A backend that can answer pvAccess GET / PUT / MONITOR requests for a
 /// set of named PVs.
 pub trait ChannelSource: Send + Sync + 'static {
@@ -309,6 +355,39 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
+    /// BR-R14: MONITOR with the downstream's event-affecting pvRequest
+    /// options. The default impl ignores `opts` and delegates to
+    /// [`Self::subscribe_checked`] — correct for any source that owns
+    /// the record directly, since it applies pipeline / filter
+    /// semantics itself on the same stream.
+    ///
+    /// A fanout source (the PVA gateway) overrides this to reject a
+    /// subscription whose options cannot be honored transparently
+    /// across a shared upstream monitor, instead of silently serving
+    /// fanout events that diverge from a direct upstream monitor.
+    fn subscribe_checked_opts(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        let _ = opts;
+        self.subscribe_checked(checked, ctx)
+    }
+
+    /// BR-R14 raw-path counterpart of [`Self::subscribe_checked_opts`].
+    /// Default impl ignores `opts` and delegates to
+    /// [`Self::subscribe_raw_checked`].
+    fn subscribe_raw_checked_opts(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+        let _ = opts;
+        self.subscribe_raw_checked(checked, ctx)
+    }
+
     /// Dispatch an RPC. The default impl returns "RPC not supported";
     /// implementors can override to provide actual RPC behaviour.
     ///
@@ -539,6 +618,24 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
     >;
+    /// BR-R14: dyn forwarder for MONITOR with event-affecting options.
+    fn subscribe_checked_opts<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+    >;
+    /// BR-R14: dyn forwarder for raw MONITOR with event-affecting options.
+    fn subscribe_raw_checked_opts<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+    >;
     fn rpc<'a>(
         &'a self,
         name: &'a str,
@@ -692,6 +789,30 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     > {
         Box::pin(<Self as ChannelSource>::subscribe_raw_checked(
             self, checked, ctx,
+        ))
+    }
+    fn subscribe_checked_opts<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::subscribe_checked_opts(
+            self, checked, ctx, opts,
+        ))
+    }
+    fn subscribe_raw_checked_opts<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::subscribe_raw_checked_opts(
+            self, checked, ctx, opts,
         ))
     }
     fn rpc<'a>(

@@ -42,6 +42,39 @@ pub struct PvGetResult {
     pub server_addr: SocketAddr,
 }
 
+/// Records that this `PvaClient`'s upstream credentials are a
+/// gateway-asserted identity derived from a *downstream* connection
+/// that authenticated with a method this client cannot forward
+/// verbatim on the wire.
+///
+/// BR-R8: the pvAccess CONNECTION_VALIDATION handshake only carries
+/// the `ca` / `anonymous` auth methods (pvxs `clientconn.cpp:217-305`
+/// — `handle_CONNECTION_VALIDATION` selects only `"ca"` / `"anonymous"`
+/// and the `ca` credential carries solely `user` + `host`). There is
+/// no wire method that forwards an `x509` method or its certificate
+/// `AUTHORITY` upstream. A PVA-to-PVA gateway therefore cannot be
+/// transparent for those: it converts the downstream identity into a
+/// CA-style assertion (`user` = downstream account).
+///
+/// This struct makes that conversion *explicit and visible* instead
+/// of silently indistinguishable from a native `ca` client: it pins
+/// the original downstream `method` and certificate `authority` to
+/// the client so audit/diagnostic output records that the upstream
+/// `ca` credentials are a gateway assertion, not a first-party `ca`
+/// login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertedIdentity {
+    /// The auth method the downstream peer actually used
+    /// (`"x509"`, `"ca"`, `"anonymous"`, ...). When this differs
+    /// from `"ca"` the upstream `ca` credential is an assertion,
+    /// not a verbatim forward.
+    pub downstream_method: String,
+    /// The certificate authority CommonName for an `x509` downstream
+    /// method (ACF `AUTHORITY(...)` scope). Empty for non-TLS
+    /// downstream methods.
+    pub downstream_authority: String,
+}
+
 /// Builder for [`PvaClient`].
 pub struct PvaClientBuilder {
     timeout: Duration,
@@ -64,6 +97,11 @@ pub struct PvaClientBuilder {
     /// holding multiple UDP search sockets when the user wires up
     /// per-purpose Contexts.
     share_udp: bool,
+    /// BR-R8: set by a gateway when this client's `user`/`host`
+    /// credentials are an assertion derived from a downstream peer
+    /// whose auth method (e.g. `x509`) cannot be forwarded verbatim
+    /// on the pvAccess wire. `None` for first-party clients.
+    asserted_identity: Option<AssertedIdentity>,
 }
 
 impl PvaClientBuilder {
@@ -79,6 +117,7 @@ impl PvaClientBuilder {
             priority: 0,
             tcp_timeout: Duration::from_secs(40),
             share_udp: false,
+            asserted_identity: None,
         }
     }
 
@@ -152,6 +191,21 @@ impl PvaClientBuilder {
         self
     }
 
+    /// BR-R8: declare that this client's `user`/`host` credentials are
+    /// a gateway assertion derived from a downstream peer that
+    /// authenticated with `downstream_method`. When the downstream
+    /// method is not `"ca"` the upstream `ca` credential cannot be a
+    /// verbatim forward — the pvAccess wire has no method for `x509`
+    /// or its certificate `AUTHORITY` (pvxs `clientconn.cpp:217-305`).
+    /// The recorded identity is surfaced through
+    /// [`PvaClient::asserted_identity`] for audit/diagnostic output so
+    /// the conversion is explicit, not silently indistinguishable from
+    /// a first-party `ca` login.
+    pub fn asserted_identity(mut self, id: AssertedIdentity) -> Self {
+        self.asserted_identity = Some(id);
+        self
+    }
+
     /// Override the monitor pipeline size (default 4 — one ack per 4 events).
     /// Set to 0 to disable pipelining.
     pub fn pipeline_size(mut self, n: u32) -> Self {
@@ -182,6 +236,7 @@ impl PvaClientBuilder {
                 priority: self.priority,
                 tcp_timeout: self.tcp_timeout,
                 share_udp: self.share_udp,
+                asserted_identity: self.asserted_identity,
             }),
         }
     }
@@ -218,6 +273,10 @@ struct ClientInner {
     /// engine. Routes [`PvaClient::search_engine`] through the static
     /// `SHARED_SEARCH_ENGINE` instead of spawning per-client.
     share_udp: bool,
+    /// BR-R8: present when this client's credentials are a gateway
+    /// assertion of a downstream identity. Surfaced through
+    /// [`PvaClient::asserted_identity`].
+    asserted_identity: Option<AssertedIdentity>,
 }
 
 /// Process-wide singleton SearchEngine for `share_udp(true)` clients.
@@ -247,6 +306,15 @@ impl PvaClient {
 
     pub fn new() -> PvaResult<Self> {
         Ok(Self::builder().build())
+    }
+
+    /// BR-R8: the gateway-asserted downstream identity behind this
+    /// client's credentials, if any. `None` for a first-party client.
+    /// `Some` means the client's `ca` `user`/`host` are an assertion
+    /// the gateway made on behalf of a downstream peer whose auth
+    /// method could not be forwarded verbatim on the pvAccess wire.
+    pub fn asserted_identity(&self) -> Option<&AssertedIdentity> {
+        self.inner.asserted_identity.as_ref()
     }
 
     /// Backwards-compatible: targets a specific TCP port (UDP ignored —

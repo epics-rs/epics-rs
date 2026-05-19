@@ -22,7 +22,7 @@ use epics_base_rs::server::access_security::AccessSecurityConfig;
 // introspection helper, so the import is gated to match.
 #[cfg(test)]
 use epics_base_rs::server::access_security::AccessLevel;
-use epics_pva_rs::client::PvaClient;
+use epics_pva_rs::client::{AssertedIdentity, PvaClient};
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server::native_source::AcfCell;
 use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource};
@@ -243,6 +243,24 @@ impl GatewayChannelSource {
     /// pair gets its own connection so upstream ASG rules see the
     /// real client identity. Empty/anonymous credentials fall through
     /// to the cache's shared client (no new connection allocated).
+    ///
+    /// BR-R8: the pvAccess CONNECTION_VALIDATION handshake carries
+    /// only the `ca` / `anonymous` auth methods, and the `ca`
+    /// credential carries solely `user` + `host` (pvxs
+    /// `clientconn.cpp:217-305` — `handle_CONNECTION_VALIDATION`
+    /// selects only `"ca"` / `"anonymous"`; the `ca` cred sets only
+    /// `cred["user"]` and `cred["host"]`). There is no wire method
+    /// that forwards an `x509` downstream method or its certificate
+    /// `AUTHORITY` upstream, so a PVA-to-PVA gateway *cannot* be
+    /// transparent for non-`ca` methods — it converts the downstream
+    /// identity into a CA-style assertion.
+    ///
+    /// To make that conversion explicit rather than silently
+    /// indistinguishable from a first-party `ca` login, the upstream
+    /// client is built with [`AssertedIdentity`] recording the real
+    /// downstream `method` + certificate `authority`, and a non-`ca`
+    /// downstream method is logged at `info` so the gateway's
+    /// identity-assertion trust boundary is visible in audit output.
     fn upstream_client_for(&self, ctx: &ChannelContext) -> Arc<PvaClient> {
         if ctx.account.is_empty() || ctx.method == "anonymous" {
             return self.cache.client().clone();
@@ -252,10 +270,27 @@ impl GatewayChannelSource {
         if let Some(c) = pool.get(&key) {
             return c.clone();
         }
+        // BR-R8: a downstream method other than `ca` cannot be
+        // forwarded verbatim — the upstream `ca` credential is a
+        // gateway assertion. Make that explicit in audit output.
+        if ctx.method != "ca" {
+            tracing::info!(
+                downstream_account = %ctx.account,
+                downstream_method = %ctx.method,
+                downstream_authority = %ctx.authority,
+                downstream_host = %ctx.host,
+                "PVA gateway asserting downstream identity upstream as CA-style \
+                 credentials: the pvAccess wire cannot forward this auth method/authority",
+            );
+        }
         let client = Arc::new(
             PvaClient::builder()
                 .user(ctx.account.clone())
                 .host(ctx.host.clone())
+                .asserted_identity(AssertedIdentity {
+                    downstream_method: ctx.method.clone(),
+                    downstream_authority: ctx.authority.clone(),
+                })
                 .build(),
         );
         pool.insert(key, client.clone());
@@ -704,6 +739,71 @@ impl ChannelSource for GatewayChannelSource {
         });
 
         Some(mpsc_rx)
+    }
+
+    /// BR-R14: decoded MONITOR with the downstream's event-affecting
+    /// pvRequest options.
+    ///
+    /// The gateway fans **one** upstream monitor — opened with the
+    /// gateway's default pvRequest — out to every downstream
+    /// subscriber for a PV name (`channel_cache::spawn_upstream_monitor`
+    /// keys the cache by PV name only). Field projection is applied
+    /// downstream-locally and is transparent, but options that change
+    /// *upstream event production* — `record._options.pipeline` /
+    /// `queueSize` / `_filter` (pvxs `servermon.cpp:521-555`) — cannot
+    /// be honored across the shared upstream monitor. Serving such a
+    /// subscription from the default fanout would deliver an event
+    /// stream that differs from a direct upstream monitor.
+    ///
+    /// This source is a documented cache/fanout gateway, so the
+    /// parity-correct behaviour is to **reject** an unsupported
+    /// option set (return `None`) rather than silently serve diverging
+    /// events. A subscription with no event-affecting option delegates
+    /// to the normal ACF-gated `subscribe_checked` path.
+    async fn subscribe_checked_opts(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        if opts.affects_upstream_events() {
+            tracing::warn!(
+                pv = %checked.pv_name(),
+                account = %ctx.account,
+                pipeline = opts.pipeline,
+                queue_size = ?opts.queue_size,
+                server_filter = opts.server_filter,
+                "pva-gateway: rejecting MONITOR — event-affecting pvRequest \
+                 options cannot be honored transparently across the gateway's \
+                 single fanout upstream monitor",
+            );
+            return None;
+        }
+        self.subscribe_checked(checked, ctx).await
+    }
+
+    /// BR-R14 raw-path counterpart of [`Self::subscribe_checked_opts`].
+    /// Same reject-on-unsupported-option contract.
+    async fn subscribe_raw_checked_opts(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
+        if opts.affects_upstream_events() {
+            tracing::warn!(
+                pv = %checked.pv_name(),
+                account = %ctx.account,
+                pipeline = opts.pipeline,
+                queue_size = ?opts.queue_size,
+                server_filter = opts.server_filter,
+                "pva-gateway: rejecting raw MONITOR — event-affecting pvRequest \
+                 options cannot be honored transparently across the gateway's \
+                 single fanout upstream monitor",
+            );
+            return None;
+        }
+        self.subscribe_raw_checked(checked, ctx).await
     }
 
     /// Forward downstream-to-gateway backpressure into upstream
@@ -1207,6 +1307,142 @@ ASG(DEFAULT) {
         assert!(
             rx.is_none(),
             "raw subscribe must be denied for a NoAccess peer"
+        );
+    }
+
+    /// BR-R8: a downstream peer authenticating with `x509` cannot be
+    /// forwarded verbatim — the pvAccess CONNECTION_VALIDATION wire
+    /// has no `x509` method and the `ca` credential carries only
+    /// `user`/`host` (pvxs `clientconn.cpp:217-305`). The gateway
+    /// must convert the identity into a CA-style assertion *and make
+    /// that conversion explicit*: the upstream `PvaClient` it builds
+    /// must carry an `AssertedIdentity` recording the real downstream
+    /// method + certificate authority.
+    ///
+    /// Pre-fix the upstream client was built with only
+    /// `.user(account).host(host)` — `asserted_identity()` returned
+    /// `None`, indistinguishable from a first-party `ca` login.
+    #[tokio::test]
+    async fn br_r8_x509_downstream_recorded_as_asserted_identity() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let src = make_source();
+        let ctx = ChannelContext {
+            peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+            account: "alice".to_string(),
+            method: "x509".to_string(),
+            host: "ws01.lab".to_string(),
+            authority: "Lab Root CA".to_string(),
+        };
+        let client = src.upstream_client_for(&ctx);
+        let asserted = client
+            .asserted_identity()
+            .expect("x509 downstream must be recorded as a gateway-asserted identity");
+        assert_eq!(
+            asserted.downstream_method, "x509",
+            "the real downstream auth method must be preserved for audit",
+        );
+        assert_eq!(
+            asserted.downstream_authority, "Lab Root CA",
+            "the downstream certificate authority must be preserved for audit",
+        );
+    }
+
+    /// BR-R8 companion: a first-party `ca` downstream is forwarded
+    /// verbatim — the wire carries the same `ca` method + `user`/
+    /// `host` — so the recorded `AssertedIdentity` reports `ca` with
+    /// no authority. This documents that the assertion record is not
+    /// a divergence for the wire-faithful case.
+    #[tokio::test]
+    async fn br_r8_ca_downstream_records_ca_method() {
+        let src = make_source();
+        let ctx = make_ctx("ws02.lab", "bob", "ca");
+        let client = src.upstream_client_for(&ctx);
+        let asserted = client
+            .asserted_identity()
+            .expect("per-credential upstream client must record the downstream identity");
+        assert_eq!(asserted.downstream_method, "ca");
+        assert_eq!(asserted.downstream_authority, "");
+    }
+
+    /// BR-R14: the gateway fans one upstream monitor (opened with the
+    /// gateway's default pvRequest) out to N downstream subscribers.
+    /// A downstream MONITOR pvRequest carrying an option that affects
+    /// *upstream event production* — `record._options.pipeline` /
+    /// `queueSize` / `_filter` (pvxs `servermon.cpp:521-555`) — cannot
+    /// be honored transparently across that shared monitor. The
+    /// gateway must reject such a subscription (return `None`) rather
+    /// than silently serve fanout events that differ from a direct
+    /// upstream monitor.
+    ///
+    /// Pre-fix `subscribe_checked_opts` did not exist; the server had
+    /// no way to surface the downstream pvRequest options to the
+    /// gateway, so a pipeline/`_filter` monitor was silently served
+    /// from the default fanout.
+    #[tokio::test]
+    async fn br_r14_pipeline_monitor_rejected_by_gateway() {
+        use epics_pva_rs::server_native::MonitorOptions;
+
+        let src = make_source();
+        let ctx = make_ctx("ws03.lab", "carol", "anonymous");
+
+        // pipeline=true must be rejected (returns immediately — no
+        // upstream lookup, so this does not block on connect_timeout).
+        let token = check(&src, "some:pv", &ctx).await;
+        let pipeline_opts = MonitorOptions {
+            pipeline: true,
+            queue_size: Some(16),
+            server_filter: false,
+        };
+        assert!(
+            pipeline_opts.affects_upstream_events(),
+            "pipeline must count as an upstream-event-affecting option",
+        );
+        let rx = src
+            .subscribe_checked_opts(token, ctx.clone(), pipeline_opts)
+            .await;
+        assert!(
+            rx.is_none(),
+            "gateway must reject a pipeline MONITOR — fanout cannot \
+             provide per-downstream upstream pipeline semantics",
+        );
+
+        // A server-side `_filter` chain is likewise event-affecting
+        // and must be rejected on the raw fast path too.
+        let raw_token = check(&src, "some:pv", &ctx).await;
+        let filter_opts = MonitorOptions {
+            pipeline: false,
+            queue_size: None,
+            server_filter: true,
+        };
+        let raw_rx = src
+            .subscribe_raw_checked_opts(raw_token, ctx, filter_opts)
+            .await;
+        assert!(
+            raw_rx.is_none(),
+            "gateway must reject a raw MONITOR carrying a server-side \
+             _filter chain",
+        );
+    }
+
+    /// BR-R14 companion: an option set with no event-affecting option
+    /// (`affects_upstream_events() == false`) is transparent through
+    /// the gateway — the gateway does not reject it on the basis of
+    /// options. (It still goes through the normal ACF + upstream
+    /// lookup path.)
+    #[test]
+    fn br_r14_field_projection_is_not_event_affecting() {
+        use epics_pva_rs::server_native::MonitorOptions;
+
+        // The default `MonitorOptions` — what a plain `pvmonitor`
+        // produces (field projection is captured as a separate
+        // BitSet mask, not here) — must not be flagged as
+        // event-affecting.
+        let plain = MonitorOptions::default();
+        assert!(
+            !plain.affects_upstream_events(),
+            "a plain monitor (no pipeline / queueSize / filter) must be \
+             transparent through the gateway",
         );
     }
 }

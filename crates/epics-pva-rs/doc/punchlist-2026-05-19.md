@@ -36,9 +36,10 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
   - Spec: `doc/critical-review-2026-05-18.md:103-147`
   - Deferral note: `doc/critical-review-2026-05-18.md:1258-1260`
 
-- [ ] **PVA-R4** (MEDIUM, architectural) — TCP name servers as persistent search peers (not direct-connect fallbacks). Client-side persistent name-server connection in `SearchEngine`. Server-side TCP SEARCH already cleared via R11.
+- [x] **PVA-R4** (MEDIUM, architectural) — TCP name servers as persistent search peers (not direct-connect fallbacks). Client-side persistent name-server connection in `SearchEngine`. Server-side TCP SEARCH already cleared via R11.
   - Spec: `doc/critical-review-2026-05-18.md:148-183`
   - Deferral note: `doc/critical-review-2026-05-18.md:1261-1267`
+  - Done: worker A, commit `7dfe5de6` on `caucus/HJB9ABPH/worker` (commit subject typo says `BR-R4`, content is PVA-R4); regression `pva_r4_tcp_nameserver_persistent_peer`. `SearchEngine::spawn` now takes `name_servers: Vec<SocketAddr>`, spawns persistent `ns_task` per entry with full PVA TCP handshake + bidirectional SEARCH relay, reconnects every 10s; `Channel` NS fallback path removed. Upstream parity: pvxs `tcpNSCheckInterval`; client.cpp:828-846 (port-0 fixup).
 
 - [x] **PVA-R6** (MEDIUM, architectural) — `SharedPV` drops the newest update when a subscriber queue is full. Implement squash-to-tail semantics via `Mutex<VecDeque>+Notify` or `tokio::sync::watch` (tokio::mpsc has no sender-side drop-oldest).
   - Spec: `doc/critical-review-2026-05-18.md:259-294`
@@ -56,8 +57,8 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 4 (was 6)
-- Done: 2 (PVA-R2, PVA-R6)
-- In progress: 1 (PVA-R4, worker A)
+- Total open: 3 (was 6)
+- Done: 3 (PVA-R2, PVA-R6, PVA-R4)
+- In progress: 1 (TLS-NAMESERVER, worker A)
 - Blocked: 0
 - Verified pre-existing main failure: `critical1_audit_layer_records_put` (tests/pva_gateway.rs:557) — separate from this round; not introduced by any worker.

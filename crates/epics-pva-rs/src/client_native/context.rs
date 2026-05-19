@@ -894,6 +894,42 @@ impl PvaClient {
         crate::client_native::ops_v2::op_put_value_raw(&ch, &bytes, value, self.inner.timeout).await
     }
 
+    /// PUT a pre-built [`PvField`] into a single dotted-path sub-field
+    /// using a caller-provided pvRequest. Combines the typed-value
+    /// path of [`Self::pvput_pv_field_with_request`] with the
+    /// field-targeting of [`Self::pvput_field_with_request`]: the
+    /// typed value is placed at `field_path` (drilling into a leaf
+    /// `value` sub-field when the target is an NT-style struct), and
+    /// only that path's bit is marked changed. `field_path` must be
+    /// non-empty.
+    ///
+    /// Used by pvalink OUT links carrying `field=<subfield>` together
+    /// with a typed array/scalar value. pvxs `pvalink_channel.cpp:127`
+    /// (`linkBuildPut`) parity for typed PUTs into the link's
+    /// `fieldName` target.
+    pub async fn pvput_pv_field_field_with_request(
+        &self,
+        pv_name: &str,
+        field_path: &str,
+        request: &crate::pv_request::PvRequestExpr,
+        value: &crate::pvdata::PvField,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        let big_endian = matches!(
+            ch.ensure_active().await?.0.byte_order,
+            crate::proto::ByteOrder::Big
+        );
+        let bytes = request.encode(big_endian);
+        crate::client_native::ops_v2::op_put_value_field_with_request(
+            &ch,
+            field_path,
+            &bytes,
+            value,
+            self.inner.timeout,
+        )
+        .await
+    }
+
     pub async fn pvmonitor<F>(&self, pv_name: &str, mut callback: F) -> PvaResult<()>
     where
         F: FnMut(&PvField) + Send,

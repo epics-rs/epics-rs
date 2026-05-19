@@ -146,36 +146,57 @@ fn cascade_smoothed_next(
     }
 }
 
-/// Normal tick cadence (1 search bucket per second).
-const NORMAL_TICK: Duration = Duration::from_secs(1);
+/// C default for `EPICS_CA_MAX_SEARCH_PERIOD`
+/// (`epics-base:modules/ca/src/client/udpiiu.h:87`,
+/// `maxSearchPeriodDefault = 5.0 * 60.0`).
+const MAX_SEARCH_PERIOD_DEFAULT_SECS: f64 = 300.0;
 
-/// R2-62: `EPICS_CA_MAX_SEARCH_PERIOD` — C
-/// (`ca/src/client/udpiiu.cpp:71-89`) reads the env var as `double`
-/// seconds, defaults 300, clamps to a lower bound of 60. The C
-/// search timer uses this to bound the per-cid exponential
-/// backoff. Rust's bucket model is structurally different — a
-/// fixed `N_SEARCH_BUCKETS = 30` ring at 1 s per bucket caps the
-/// per-cid retry at ~30 s regardless of env. Honour the env var
-/// by scaling the tick: `tick = max(period / N_BUCKETS, 1 s)`,
-/// where `period` is clamped to [60, ∞) per C. Default 300 →
-/// tick 10 s; min 60 → tick 2 s. Effectively turns the bucket
-/// ring into a tunable cap-bounded retry wheel.
-fn normal_tick() -> Duration {
-    let period_secs = epics_base_rs::runtime::env::get("EPICS_CA_MAX_SEARCH_PERIOD")
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| *v > 0.0)
-        .unwrap_or(30.0)
-        .max(30.0);
-    // If unset / <=30 we keep the historical 1s tick to preserve
-    // existing behaviour on sites that didn't set the var (Rust
-    // default ≈30 s cap). Only sites explicitly setting the var
-    // get the scaled cap.
-    if period_secs <= 30.0 {
-        NORMAL_TICK
-    } else {
-        let secs = (period_secs / N_SEARCH_BUCKETS as f64).max(1.0);
-        Duration::from_secs_f64(secs)
+/// C lower bound for `EPICS_CA_MAX_SEARCH_PERIOD`
+/// (`epics-base:modules/ca/src/client/udpiiu.h:88`,
+/// `maxSearchPeriodLowerLimit = 60.0`).
+const MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS: f64 = 60.0;
+
+/// EX-R2 / R2-62: `EPICS_CA_MAX_SEARCH_PERIOD` resolution, faithful
+/// to C `udpiiu.cpp::getMaxPeriod` (`epics-base:modules/ca/src/client/udpiiu.cpp:68-94`):
+///
+/// - env unset → the documented default of 300 s.
+/// - env set and parses as a real number → that value, clamped *up*
+///   to the 60 s lower limit if below it. C applies no upper clamp
+///   to the period itself (the upper bound is on the derived timer
+///   count, not the period).
+/// - env set but not a real number → keep the 300 s default
+///   (C's `longStatus != 0` branch).
+///
+/// C does not reject negative or zero values — they pass `parse` and
+/// are caught by the `< 60` lower-limit clamp — so this mirrors C by
+/// clamping rather than filtering.
+fn max_search_period_secs() -> f64 {
+    match epics_base_rs::runtime::env::get("EPICS_CA_MAX_SEARCH_PERIOD") {
+        Some(raw) => match raw.parse::<f64>() {
+            // Parsed: honour it, clamped up to C's 60 s lower limit.
+            Ok(v) => v.max(MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS),
+            // Not a real number: C keeps the default, no clamp.
+            Err(_) => MAX_SEARCH_PERIOD_DEFAULT_SECS,
+        },
+        // Unset: documented C default.
+        None => MAX_SEARCH_PERIOD_DEFAULT_SECS,
     }
+}
+
+/// Normal tick cadence. Rust's search model is structurally
+/// different from C's per-cid exponential-backoff timer wheel — a
+/// fixed `N_SEARCH_BUCKETS = 30` ring advancing one bucket per tick
+/// caps the per-cid retry period at `N_SEARCH_BUCKETS * tick`. To
+/// honour `EPICS_CA_MAX_SEARCH_PERIOD` we derive the tick so that
+/// one full ring revolution equals the resolved period:
+/// `tick = period / N_SEARCH_BUCKETS`.
+///
+/// With the C-faithful period (default 300 s, lower-limited at
+/// 60 s — see [`max_search_period_secs`]) the tick is always
+/// `>= 60/30 = 2 s`; the default 300 s yields a 10 s tick.
+fn normal_tick() -> Duration {
+    let period_secs = max_search_period_secs();
+    Duration::from_secs_f64(period_secs / N_SEARCH_BUCKETS as f64)
 }
 
 /// Fast-mode tick cadence after a beacon poke. One full bucket
@@ -437,7 +458,7 @@ pub(crate) async fn run_search_engine(
 
     // pvxs `client.cpp::tickSearch`: a single steady tick advances the
     // bucket cursor. fast_tick is engaged after a beacon poke for one
-    // full revolution, then we revert to NORMAL_TICK.
+    // full revolution, then we revert to the `normal_tick()` cadence.
     let mut tick = interval(normal_tick());
     tick.tick().await; // skip immediate fire
     let mut tick_is_fast = false;
@@ -468,11 +489,7 @@ pub(crate) async fn run_search_engine(
                 }
                 // Drain any additional queued requests so a burst of
                 // Schedule messages all land before the next tick.
-                while let Ok(req) = request_rx.try_recv() {
-                    if let Some(cid) = handle_request_or_addr(&mut state, &mut addr_list, req) {
-                        immediate.push(cid);
-                    }
-                }
+                drain_pending_requests(&mut state, &mut addr_list, &mut request_rx, &mut immediate);
                 // pvxs `clientdiscover.cpp` parity: send the first SEARCH
                 // packet right now instead of waiting up to one tick for
                 // the bucket to come around. The bucket placement still
@@ -484,6 +501,24 @@ pub(crate) async fn run_search_engine(
 
             result = socket.recv_with_meta_with_drops(&mut recv_buf) => {
                 let Ok((meta, drops)) = result else { continue };
+                // MR-R3: drain any queued `SearchRequest` before parsing
+                // this datagram. A `Schedule{Reconnect}` enqueued by the
+                // coordinator (mod.rs ServerDisconnect / TcpClosed paths)
+                // invalidates the `resolved` multiply-defined tracker via
+                // `remove_channel`. `tokio::select!` picks a ready arm at
+                // random, so without this drain a SEARCH reply for a
+                // legitimately-migrated PV could be parsed while the
+                // stale `resolved` entry still names the old server,
+                // emitting a false `ECA_DBLCHNL`. libca processes the
+                // circuit teardown and the SEARCH reply on one thread
+                // under one mutex (`cac.cpp:591-661`), so the disconnect
+                // is always observed first; this drain restores that
+                // ordering for the decoupled search-engine task.
+                let mut immediate: Vec<u32> = Vec::new();
+                drain_pending_requests(&mut state, &mut addr_list, &mut request_rx, &mut immediate);
+                if !immediate.is_empty() {
+                    fire_searches(&mut state, &immediate, &addr_list, &socket, &nameserver_send_txs).await;
+                }
                 // Surface per-NIC kernel drop transitions — pvxs
                 // `udp_collector.cpp:55-67` logs at debug on
                 // `prev != current && current != 0`.
@@ -502,6 +537,15 @@ pub(crate) async fn run_search_engine(
 
             tcp_dgram = tcp_response_rx.recv() => {
                 let Some((bytes, src)) = tcp_dgram else { continue };
+                // MR-R3: same ordering guarantee as the UDP arm — drain
+                // queued `SearchRequest`s (notably `Schedule{Reconnect}`)
+                // so a stale `resolved` entry cannot survive into the
+                // multiply-defined check for this nameserver reply.
+                let mut immediate: Vec<u32> = Vec::new();
+                drain_pending_requests(&mut state, &mut addr_list, &mut request_rx, &mut immediate);
+                if !immediate.is_empty() {
+                    fire_searches(&mut state, &immediate, &addr_list, &socket, &nameserver_send_txs).await;
+                }
                 // R2-26: TCP nameserver path uses the libca-equivalent
                 // SEARCH-reply contract (no per-reply VERSION header).
                 handle_tcp_response(&mut state, &bytes, src, &response_tx);
@@ -830,6 +874,32 @@ fn handle_request_or_addr(
             None
         }
         other => handle_request(state, other),
+    }
+}
+
+/// MR-R3: drain every `SearchRequest` already queued on `request_rx`
+/// into `state`, appending any cid that needs an immediate first-attempt
+/// SEARCH to `immediate`.
+///
+/// Called both from the request-handling `select!` arm (so a burst of
+/// `Schedule` messages all land before the next tick) and at the top of
+/// the UDP / TCP response arms. The latter use is the MR-R3 fix: it
+/// guarantees a `Schedule{Reconnect}` — which invalidates the
+/// `resolved` multiply-defined tracker through `remove_channel` — is
+/// applied before a SEARCH reply for the same cid is parsed, so a
+/// legitimate server migration cannot surface as a false `ECA_DBLCHNL`.
+/// This restores libca's single-threaded ordering (`cac.cpp:591-661`),
+/// where circuit teardown and SEARCH-reply handling share one mutex.
+fn drain_pending_requests(
+    state: &mut SearchEngineState,
+    addr_list: &mut Vec<super::AddrEntry>,
+    request_rx: &mut mpsc::UnboundedReceiver<SearchRequest>,
+    immediate: &mut Vec<u32>,
+) {
+    while let Ok(req) = request_rx.try_recv() {
+        if let Some(cid) = handle_request_or_addr(state, addr_list, req) {
+            immediate.push(cid);
+        }
     }
 }
 
@@ -1522,6 +1592,78 @@ mod tests {
         );
     }
 
+    /// EX-R2: `EPICS_CA_MAX_SEARCH_PERIOD` must follow the C
+    /// `udpiiu.cpp::getMaxPeriod` semantics — default 300 s when
+    /// unset, lower-limited at 60 s when explicitly set below it,
+    /// default kept on a non-numeric value.
+    ///
+    /// Pre-fix Rust defaulted to 30 s when unset (not the documented
+    /// C 300 s) and accepted any positive value verbatim, so a
+    /// configured `45` was honoured as 45 s instead of being clamped
+    /// up to C's 60 s lower bound. `normal_tick` is the consumer:
+    /// `tick = period / N_SEARCH_BUCKETS`.
+    #[test]
+    #[serial_test::serial]
+    fn ex_r2_max_search_period_matches_c_default_and_lower_bound() {
+        // SAFETY: serial_test::serial guarantees no concurrent env
+        // access; mutations are confined to this test.
+        let restore = std::env::var("EPICS_CA_MAX_SEARCH_PERIOD").ok();
+
+        // Unset → documented C default of 300 s (NOT the pre-fix
+        // historical Rust 30 s). tick = 300/30 = 10 s.
+        unsafe { std::env::remove_var("EPICS_CA_MAX_SEARCH_PERIOD") };
+        assert_eq!(
+            max_search_period_secs(),
+            300.0,
+            "unset env must default to C's 300 s, not the old 30 s"
+        );
+        assert_eq!(normal_tick(), Duration::from_secs(10));
+
+        // Configured value below the 60 s lower limit → clamped up
+        // to 60 s (C `maxPeriod < maxSearchPeriodLowerLimit`).
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "45") };
+        assert_eq!(
+            max_search_period_secs(),
+            60.0,
+            "a configured 45 s must clamp UP to C's 60 s lower bound"
+        );
+        assert_eq!(normal_tick(), Duration::from_secs(2));
+
+        // Configured value at/above the lower limit → honoured.
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "120") };
+        assert_eq!(max_search_period_secs(), 120.0);
+        assert_eq!(normal_tick(), Duration::from_secs(4));
+
+        // The documented C default expressed explicitly.
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "300") };
+        assert_eq!(max_search_period_secs(), 300.0);
+
+        // Non-numeric value → C keeps the default (longStatus != 0).
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "not-a-number") };
+        assert_eq!(
+            max_search_period_secs(),
+            300.0,
+            "a non-numeric value must fall back to the 300 s default"
+        );
+
+        // Negative / zero are not real-number rejections in C — they
+        // parse and are caught by the lower-bound clamp.
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "-5") };
+        assert_eq!(
+            max_search_period_secs(),
+            60.0,
+            "a negative value must clamp to the 60 s lower bound, not default"
+        );
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "0") };
+        assert_eq!(max_search_period_secs(), 60.0);
+
+        // Restore the environment for any later serial test.
+        match restore {
+            Some(v) => unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", v) },
+            None => unsafe { std::env::remove_var("EPICS_CA_MAX_SEARCH_PERIOD") },
+        }
+    }
+
     /// Reproducer for Launchpad bug #739789 (TCP nameserver send queue
     /// memory leak): a stuck/slow TCP peer caused libca's `sendQue` to
     /// grow unbounded as the UDP search agent kept pushing frames.
@@ -2045,14 +2187,28 @@ mod tests {
     /// with a sniffer socket as the only addr_list destination,
     /// submits a `Schedule { Reconnect }`, and asserts that a
     /// SEARCH packet for the right cid lands on the sniffer within
-    /// ~1.1 s — i.e. the next tick after Schedule arrival, mirroring
-    /// pvxs `Channel::disconnect` recovery timing. Without the
+    /// one tick after Schedule arrival, mirroring pvxs
+    /// `Channel::disconnect` recovery timing. Without the
     /// pvxs-parity placement the search would have been placed in a
-    /// cid-hashed bucket up to 30 s away and never fired within a
+    /// cid-hashed bucket a full ring away and never fired within a
     /// reasonable window.
+    ///
+    /// EX-R2: the production tick cadence is now `normal_tick()` =
+    /// `EPICS_CA_MAX_SEARCH_PERIOD / N_SEARCH_BUCKETS`. The test
+    /// pins the env var to C's 60 s lower limit so the tick is the
+    /// fastest the C-faithful clamp allows — 2 s — and asserts
+    /// against that, not the pre-EX-R2 1 s tick.
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn reconnect_search_broadcasts_within_one_tick() {
         use std::net::Ipv4Addr;
+
+        // EX-R2: pin the search period to C's 60 s lower bound so
+        // the tick is the minimum the clamp allows (60/30 = 2 s).
+        // SAFETY: serial_test::serial guarantees no concurrent env
+        // access; the var is restored before the test returns.
+        let restore = std::env::var("EPICS_CA_MAX_SEARCH_PERIOD").ok();
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "60") };
 
         // Sniffer on loopback ephemeral. Used as the engine's
         // ONLY addr_list destination.
@@ -2078,7 +2234,7 @@ mod tests {
         ));
 
         // Schedule a Reconnect for cid=42. Engine places it in
-        // current_bucket; the next 1-Hz tick fires the broadcast.
+        // current_bucket; the next tick fires the broadcast.
         let cid = 42u32;
         let pv = "TEST:CA:RECONNECT:PV";
         let started = std::time::Instant::now();
@@ -2091,7 +2247,7 @@ mod tests {
             .expect("schedule send");
 
         let mut buf = vec![0u8; 4096];
-        let recv_result = tokio::time::timeout(Duration::from_secs(3), async {
+        let recv_result = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let (n, _from) = sniffer.recv_from(&mut buf).await?;
                 if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
@@ -2104,22 +2260,29 @@ mod tests {
         let elapsed = started.elapsed();
         engine_handle.abort();
 
+        // Restore the environment for any later serial test.
+        match restore {
+            Some(v) => unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", v) },
+            None => unsafe { std::env::remove_var("EPICS_CA_MAX_SEARCH_PERIOD") },
+        }
+
         let n = recv_result
-            .expect("Reconnect SEARCH must arrive within 3 s")
+            .expect("Reconnect SEARCH must arrive within 5 s")
             .expect("recv_from must not error");
         assert!(
             n > 0,
             "received an empty datagram — Reconnect SEARCH path is broken"
         );
-        // Tight assertion catches the regression we're guarding
-        // against (cid-hashed 1-30 s pre-fix latency) without being
-        // flaky on a loaded CI runner. 2.5 s gives ~1.5 s slack on
-        // top of the ≤ 1.1 s pvxs-parity target.
+        // Reconnect lands in current_bucket → fires on the next
+        // tick (2 s at the pinned 60 s period). 4 s gives ~2 s slack
+        // for scheduler / mio jitter on loaded CI; the regression
+        // this guards against (cid-hashed full-ring latency) would
+        // delay the fire by up to a whole ring revolution.
         assert!(
-            elapsed < Duration::from_millis(2500),
-            "Reconnect should broadcast within ~1.1 s (one tick); \
-             took {elapsed:?} — bucket placement / tick handler may \
-             have regressed"
+            elapsed < Duration::from_millis(4000),
+            "Reconnect should broadcast within one tick (~2 s at the \
+             pinned 60 s period); took {elapsed:?} — bucket placement \
+             / tick handler may have regressed"
         );
     }
 
@@ -2130,16 +2293,25 @@ mod tests {
     /// only this test catches an accumulator drift between the
     /// pure fn and the live `current_bucket`-advancing tick loop.
     ///
-    /// Expected SEARCH arrival times (relative to Schedule submission):
-    ///   #1 at ~1 s   (first tick after Schedule lands)
-    ///   #2 at ~2 s   (idx+1, +1 cycle)
-    ///   #3 at ~4 s   (idx+(1+2)=idx+3, +2 cycles)
+    /// EX-R2: with `EPICS_CA_MAX_SEARCH_PERIOD` pinned to C's 60 s
+    /// lower bound the tick is 60/30 = 2 s. Expected SEARCH arrival
+    /// times (relative to Schedule submission):
+    ///   #1 at ~2 s   (first tick after Schedule lands)
+    ///   #2 at ~4 s   (idx+1, +1 cycle = 2 s)
+    ///   #3 at ~8 s   (idx+(1+2)=idx+3, +2 cycles = 4 s)
     ///
-    /// Slack: ±500 ms per gap to absorb scheduler / mio jitter on
-    /// loaded CI. Total runtime ~4 s.
+    /// Slack: ±1 s per gap to absorb scheduler / mio jitter on
+    /// loaded CI. Total runtime ~8 s.
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn retry_escalation_pvxs_pattern() {
         use std::net::Ipv4Addr;
+
+        // EX-R2: pin the search period to C's 60 s lower bound →
+        // 2 s tick. SAFETY: serial_test::serial guarantees no
+        // concurrent env access; restored before return.
+        let restore = std::env::var("EPICS_CA_MAX_SEARCH_PERIOD").ok();
+        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "60") };
 
         let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
         let sniffer_addr = sniffer
@@ -2176,7 +2348,7 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         let mut packet_times = Vec::new();
         for i in 0..3 {
-            let t = tokio::time::timeout(Duration::from_secs(8), async {
+            let t = tokio::time::timeout(Duration::from_secs(12), async {
                 loop {
                     let (n, _) = sniffer.recv_from(&mut buf).await.expect("recv");
                     if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
@@ -2185,28 +2357,161 @@ mod tests {
                 }
             })
             .await
-            .unwrap_or_else(|_| panic!("SEARCH #{} did not arrive within 8 s", i + 1));
+            .unwrap_or_else(|_| panic!("SEARCH #{} did not arrive within 12 s", i + 1));
             packet_times.push(t);
         }
 
         engine_handle.abort();
 
+        // Restore the environment for any later serial test.
+        match restore {
+            Some(v) => unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", v) },
+            None => unsafe { std::env::remove_var("EPICS_CA_MAX_SEARCH_PERIOD") },
+        }
+
         assert!(
-            packet_times[0] < Duration::from_millis(1500),
-            "first SEARCH should arrive ~1 s after Schedule; got {:?}",
+            packet_times[0] < Duration::from_millis(3000),
+            "first SEARCH should arrive ~2 s after Schedule (one tick \
+             at the pinned 60 s period); got {:?}",
             packet_times[0]
         );
         let gap_12 = packet_times[1].saturating_sub(packet_times[0]);
         let gap_23 = packet_times[2].saturating_sub(packet_times[1]);
         assert!(
-            (700..=1500).contains(&(gap_12.as_millis() as u64)),
-            "gap #1→#2 should be ~1 s (nSearch=1); got {gap_12:?}. \
-             Production retry escalation may have regressed."
+            (1500..=3000).contains(&(gap_12.as_millis() as u64)),
+            "gap #1→#2 should be ~2 s (nSearch=1, one 2 s cycle); \
+             got {gap_12:?}. Production retry escalation may have regressed."
         );
         assert!(
-            (1500..=2700).contains(&(gap_23.as_millis() as u64)),
-            "gap #2→#3 should be ~2 s (nSearch=2); got {gap_23:?}. \
-             Production retry escalation may have regressed."
+            (3000..=5400).contains(&(gap_23.as_millis() as u64)),
+            "gap #2→#3 should be ~4 s (nSearch=2, two 2 s cycles); \
+             got {gap_23:?}. Production retry escalation may have regressed."
+        );
+    }
+
+    /// Build a single-message CA_PROTO_SEARCH reply datagram naming
+    /// `server` as the host of client-cid `cid`. Mirrors the wire
+    /// shape parsed by `handle_search_response`: `data_type` carries
+    /// the server port, `cid` carries the server IPv4 (big-endian),
+    /// `available` carries the client cid, and an 8-byte payload holds
+    /// the minor version.
+    fn search_reply(cid: u32, server: SocketAddr) -> Vec<u8> {
+        let ip = match server.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(_) => unreachable!("test uses IPv4 only"),
+        };
+        let mut hdr = CaHeader::new(CA_PROTO_SEARCH);
+        hdr.data_type = server.port();
+        hdr.cid = u32::from_be_bytes(ip.octets());
+        hdr.available = cid;
+        hdr.set_payload_size(8, 1);
+        let mut buf = hdr.to_bytes().to_vec();
+        buf.extend_from_slice(&(CA_MINOR_VERSION).to_be_bytes());
+        buf.extend_from_slice(&[0u8; 6]); // pad to 8-byte payload
+        buf
+    }
+
+    /// MR-R3 regression: after a channel connected to server A is torn
+    /// down (ServerDisconnect / TcpClosed) and re-searched, a SEARCH
+    /// reply from a legitimately-different server B must resolve as a
+    /// normal `Found`, NOT a false `MultiplyDefined` (`ECA_DBLCHNL`).
+    ///
+    /// The coordinator enqueues `Schedule{Reconnect}` on disconnect;
+    /// the search-engine task and the coordinator are decoupled, and
+    /// `tokio::select!` can pick a ready UDP/TCP reply arm before the
+    /// queued request arm. The fix drains `request_rx` (via
+    /// `drain_pending_requests`) at the top of every reply arm so the
+    /// `Schedule{Reconnect}` — which invalidates `resolved` through
+    /// `remove_channel` — is always applied before the reply is
+    /// parsed, matching libca's single-thread ordering
+    /// (`cac.cpp:591-661`).
+    ///
+    /// Pre-fix (reply parsed before the drain), the stale `resolved`
+    /// entry for server A is still present, so the server-B reply
+    /// trips the `prev_addr != server_addr` branch and emits
+    /// `MultiplyDefined`.
+    #[test]
+    fn mr_r3_reconnect_to_new_server_no_false_multiply_defined() {
+        let server_a: SocketAddr = "10.0.0.1:5064".parse().unwrap();
+        let server_b: SocketAddr = "10.0.0.2:5064".parse().unwrap();
+        let src_b: SocketAddr = "10.0.0.2:5064".parse().unwrap();
+        let cid = 1u32;
+        let pv = "MR:R3:PV";
+
+        let mut state = SearchEngineState::new();
+        let mut addr_list: Vec<super::super::AddrEntry> = Vec::new();
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<SearchResponse>();
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<SearchRequest>();
+
+        // 1. Channel finds server A and connects.
+        schedule_initial(&mut state, cid, pv);
+        handle_tcp_response(&mut state, &search_reply(cid, server_a), server_a, &resp_tx);
+        match resp_rx.try_recv() {
+            Ok(SearchResponse::Found { server_addr, .. }) => {
+                assert_eq!(server_addr, server_a);
+            }
+            Ok(SearchResponse::MultiplyDefined { .. }) => {
+                panic!("first reply must resolve as Found, not MultiplyDefined")
+            }
+            Err(e) => panic!("expected Found from server A, got recv error {e:?}"),
+        }
+        handle_request(
+            &mut state,
+            SearchRequest::ConnectResult {
+                cid,
+                success: true,
+                server_addr: server_a,
+            },
+        );
+        assert!(
+            state.resolved.contains_key(&cid),
+            "resolved entry kept past ConnectResult{{success}} (R2-66)"
+        );
+
+        // 2. Server A disconnects — coordinator enqueues a reconnect
+        //    Schedule. It sits on `req_rx` until the engine drains it.
+        req_tx
+            .send(SearchRequest::Schedule {
+                cid,
+                pv_name: pv.into(),
+                reason: SearchReason::Reconnect,
+            })
+            .expect("reconnect schedule send");
+
+        // 3. A SEARCH reply from the NEW server B is ready at the same
+        //    time. The fix drains queued requests before parsing it.
+        let mut immediate: Vec<u32> = Vec::new();
+        drain_pending_requests(&mut state, &mut addr_list, &mut req_rx, &mut immediate);
+        assert!(
+            !state.resolved.contains_key(&cid),
+            "Schedule{{Reconnect}} must invalidate the stale resolved \
+             entry before the server-B reply is parsed"
+        );
+        handle_tcp_response(&mut state, &search_reply(cid, server_b), src_b, &resp_tx);
+
+        // 4. The server-B reply must resolve as Found, never as a
+        //    false MultiplyDefined.
+        match resp_rx.try_recv() {
+            Ok(SearchResponse::Found { server_addr, .. }) => {
+                assert_eq!(
+                    server_addr, server_b,
+                    "reconnect must resolve to the new server B"
+                );
+            }
+            Ok(SearchResponse::MultiplyDefined {
+                prev_addr,
+                new_addr,
+                ..
+            }) => panic!(
+                "false ECA_DBLCHNL after legitimate server migration: \
+                 prev={prev_addr} new={new_addr} — the reconnect Schedule \
+                 was not drained before the reply was parsed"
+            ),
+            Err(e) => panic!("expected Found from server B, got recv error {e:?}"),
+        }
+        assert!(
+            resp_rx.try_recv().is_err(),
+            "no further responses expected after the single Found"
         );
     }
 }

@@ -22,7 +22,7 @@ use epics_base_rs::server::access_security::AccessSecurityConfig;
 // introspection helper, so the import is gated to match.
 #[cfg(test)]
 use epics_base_rs::server::access_security::AccessLevel;
-use epics_pva_rs::client::PvaClient;
+use epics_pva_rs::client::{AssertedIdentity, PvaClient};
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server::native_source::AcfCell;
 use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource};
@@ -236,6 +236,24 @@ impl GatewayChannelSource {
     /// pair gets its own connection so upstream ASG rules see the
     /// real client identity. Empty/anonymous credentials fall through
     /// to the cache's shared client (no new connection allocated).
+    ///
+    /// BR-R8: the pvAccess CONNECTION_VALIDATION handshake carries
+    /// only the `ca` / `anonymous` auth methods, and the `ca`
+    /// credential carries solely `user` + `host` (pvxs
+    /// `clientconn.cpp:217-305` — `handle_CONNECTION_VALIDATION`
+    /// selects only `"ca"` / `"anonymous"`; the `ca` cred sets only
+    /// `cred["user"]` and `cred["host"]`). There is no wire method
+    /// that forwards an `x509` downstream method or its certificate
+    /// `AUTHORITY` upstream, so a PVA-to-PVA gateway *cannot* be
+    /// transparent for non-`ca` methods — it converts the downstream
+    /// identity into a CA-style assertion.
+    ///
+    /// To make that conversion explicit rather than silently
+    /// indistinguishable from a first-party `ca` login, the upstream
+    /// client is built with [`AssertedIdentity`] recording the real
+    /// downstream `method` + certificate `authority`, and a non-`ca`
+    /// downstream method is logged at `info` so the gateway's
+    /// identity-assertion trust boundary is visible in audit output.
     fn upstream_client_for(&self, ctx: &ChannelContext) -> Arc<PvaClient> {
         if ctx.account.is_empty() || ctx.method == "anonymous" {
             return self.cache.client().clone();
@@ -245,10 +263,27 @@ impl GatewayChannelSource {
         if let Some(c) = pool.get(&key) {
             return c.clone();
         }
+        // BR-R8: a downstream method other than `ca` cannot be
+        // forwarded verbatim — the upstream `ca` credential is a
+        // gateway assertion. Make that explicit in audit output.
+        if ctx.method != "ca" {
+            tracing::info!(
+                downstream_account = %ctx.account,
+                downstream_method = %ctx.method,
+                downstream_authority = %ctx.authority,
+                downstream_host = %ctx.host,
+                "PVA gateway asserting downstream identity upstream as CA-style \
+                 credentials: the pvAccess wire cannot forward this auth method/authority",
+            );
+        }
         let client = Arc::new(
             PvaClient::builder()
                 .user(ctx.account.clone())
                 .host(ctx.host.clone())
+                .asserted_identity(AssertedIdentity {
+                    downstream_method: ctx.method.clone(),
+                    downstream_authority: ctx.authority.clone(),
+                })
                 .build(),
         );
         pool.insert(key, client.clone());
@@ -1191,5 +1226,60 @@ ASG(DEFAULT) {
             rx.is_none(),
             "raw subscribe must be denied for a NoAccess peer"
         );
+    }
+
+    /// BR-R8: a downstream peer authenticating with `x509` cannot be
+    /// forwarded verbatim — the pvAccess CONNECTION_VALIDATION wire
+    /// has no `x509` method and the `ca` credential carries only
+    /// `user`/`host` (pvxs `clientconn.cpp:217-305`). The gateway
+    /// must convert the identity into a CA-style assertion *and make
+    /// that conversion explicit*: the upstream `PvaClient` it builds
+    /// must carry an `AssertedIdentity` recording the real downstream
+    /// method + certificate authority.
+    ///
+    /// Pre-fix the upstream client was built with only
+    /// `.user(account).host(host)` — `asserted_identity()` returned
+    /// `None`, indistinguishable from a first-party `ca` login.
+    #[tokio::test]
+    async fn br_r8_x509_downstream_recorded_as_asserted_identity() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let src = make_source();
+        let ctx = ChannelContext {
+            peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+            account: "alice".to_string(),
+            method: "x509".to_string(),
+            host: "ws01.lab".to_string(),
+            authority: "Lab Root CA".to_string(),
+        };
+        let client = src.upstream_client_for(&ctx);
+        let asserted = client
+            .asserted_identity()
+            .expect("x509 downstream must be recorded as a gateway-asserted identity");
+        assert_eq!(
+            asserted.downstream_method, "x509",
+            "the real downstream auth method must be preserved for audit",
+        );
+        assert_eq!(
+            asserted.downstream_authority, "Lab Root CA",
+            "the downstream certificate authority must be preserved for audit",
+        );
+    }
+
+    /// BR-R8 companion: a first-party `ca` downstream is forwarded
+    /// verbatim — the wire carries the same `ca` method + `user`/
+    /// `host` — so the recorded `AssertedIdentity` reports `ca` with
+    /// no authority. This documents that the assertion record is not
+    /// a divergence for the wire-faithful case.
+    #[tokio::test]
+    async fn br_r8_ca_downstream_records_ca_method() {
+        let src = make_source();
+        let ctx = make_ctx("ws02.lab", "bob", "ca");
+        let client = src.upstream_client_for(&ctx);
+        let asserted = client
+            .asserted_identity()
+            .expect("per-credential upstream client must record the downstream identity");
+        assert_eq!(asserted.downstream_method, "ca");
+        assert_eq!(asserted.downstream_authority, "");
     }
 }

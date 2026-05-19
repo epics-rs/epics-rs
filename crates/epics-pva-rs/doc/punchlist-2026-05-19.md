@@ -23,9 +23,10 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Items
 
-- [ ] **PVA-R2** (MEDIUM, architectural) — `PvaClientBuilder::tcp_timeout()` is stored but not applied. Plumb `tcp_timeout` through `ConnectionPool::get_or_connect` + `ServerConn::connect` + spawned heartbeat task. Multi-layer signature change.
+- [x] **PVA-R2** (MEDIUM, architectural) — `PvaClientBuilder::tcp_timeout()` is stored but not applied. Plumb `tcp_timeout` through `ConnectionPool::get_or_connect` + `ServerConn::connect` + spawned heartbeat task. Multi-layer signature change.
   - Spec: `doc/critical-review-2026-05-18.md:68-102`
   - Deferral note: `doc/critical-review-2026-05-18.md:1254-1257`
+  - Done: commit 479f77c0; test `pva_r2_tcp_timeout_applied` (server_conn.rs:1395)
 
 - [ ] **PVA-R3** (MEDIUM, architectural) — Nested Variant values lose the stream type-cache. Thread `&mut TypeCache` through `decode_pv_field` family + all op-response decoders + reader flattening.
   - Spec: `doc/critical-review-2026-05-18.md:103-147`
@@ -50,7 +51,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 6
-- Done: 0
+- Total open: 5
+- Done: 1 (PVA-R2)
 - In progress: 0
 - Blocked: 0

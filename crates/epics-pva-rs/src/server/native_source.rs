@@ -628,6 +628,7 @@ mod tests {
             method: method.to_string(),
             host: host.to_string(),
             authority: String::new(),
+            roles: Vec::new(),
             pv_request: None,
         }
     }

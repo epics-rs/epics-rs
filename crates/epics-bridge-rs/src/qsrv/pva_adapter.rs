@@ -155,7 +155,11 @@ fn ctx_to_creds(ctx: &epics_pva_rs::server_native::source::ChannelContext) -> Cl
         host: ctx.host.clone(),
         method: ctx.method.clone(),
         authority: ctx.authority.clone(),
-        roles: Vec::new(),
+        // MR-R11: forward the native PVA peer's parsed role/group
+        // claims so `AcfAccessControl` can evaluate role-based UAG
+        // entries (`R member group:ops`). Previously hardcoded empty,
+        // so role-scoped ACF rules denied real over-the-wire clients.
+        roles: ctx.roles.clone(),
     }
 }
 
@@ -1410,6 +1414,7 @@ mod tests {
             method: "anonymous".into(),
             host: "127.0.0.1".into(),
             authority: String::new(),
+            roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
         };
 
@@ -1446,6 +1451,34 @@ mod tests {
             matches!(val1, Some(EpicsValue::Double(v)) if (v - 2.5).abs() < 1e-9),
             "post-put VAL must be 2.5, got {val1:?}"
         );
+    }
+
+    /// MR-R11 regression: a native PVA peer's parsed role/group claims
+    /// must survive `ChannelContext` -> `ClientCreds` conversion so
+    /// `AcfAccessControl` can enforce role-scoped UAG rules. Before the
+    /// fix `ctx_to_creds` hardcoded `roles: Vec::new()`, so role-based
+    /// ACF rules denied every real over-the-wire client.
+    #[test]
+    fn mr_r11_ctx_to_creds_forwards_roles() {
+        use epics_pva_rs::server_native::source::ChannelContext;
+
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "alice".into(),
+            method: "ca".into(),
+            host: "ws01".into(),
+            authority: String::new(),
+            roles: vec!["operators".into(), "experts".into()],
+            pv_request: None,
+        };
+        let creds = ctx_to_creds(&ctx);
+        assert_eq!(
+            creds.roles,
+            vec!["operators".to_string(), "experts".to_string()],
+            "ctx_to_creds must forward ChannelContext.roles into ClientCreds"
+        );
+        assert_eq!(creds.user, "alice");
+        assert_eq!(creds.method, "ca");
     }
 
     /// BR-R38: PVA `PROCESS` against a QSRV-backed record actually

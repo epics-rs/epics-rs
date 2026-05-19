@@ -35,6 +35,13 @@ pub struct ChannelContext {
     /// subject CommonName. Empty for non-TLS methods. ACF
     /// `AUTHORITY(...)` rule scopes match against this.
     pub authority: String,
+    /// Group / role claims advertised by the downstream peer's auth
+    /// method. MR-R11: parsed off the `ca` auth payload's
+    /// `groups`/`roles` array into `ClientCredentials::roles`, then
+    /// forwarded here so role-based ACF rules (`R member group:ops`,
+    /// `role/...` credential strings) can be enforced for native PVA
+    /// clients. Empty for methods that carry no role list.
+    pub roles: Vec<String>,
     /// Decoded INIT pvRequest value for the current operation, when
     /// the wire layer captured one. BR-R3: PVA PUT INIT carries
     /// `record._options.process`/`block`; the data-phase payload is

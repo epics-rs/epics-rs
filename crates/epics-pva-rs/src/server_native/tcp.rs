@@ -1700,6 +1700,7 @@ async fn handle_put_get(
         method: cred.method.clone(),
         host: cred.host.clone(),
         authority: cred.authority.clone(),
+        roles: cred.roles.clone(),
         pv_request: None,
     };
 
@@ -1895,6 +1896,7 @@ async fn handle_process(
         method: cred.method.clone(),
         host: cred.host.clone(),
         authority: cred.authority.clone(),
+        roles: cred.roles.clone(),
         pv_request: None,
     };
     let src = source.clone();
@@ -2655,6 +2657,7 @@ async fn handle_op(
             let cred_method = cred.method.clone();
             let cred_host = cred.host.clone();
             let cred_authority = cred.authority.clone();
+            let cred_roles = cred.roles.clone();
             // Abort any previous in-flight data task for this ioid
             // (e.g. double-EXEC from a misbehaving client).
             if let Some(op_mut) = ch.ops.get_mut(&ioid) {
@@ -2667,6 +2670,7 @@ async fn handle_op(
                     method: cred_method,
                     host: cred_host,
                     authority: cred_authority,
+                    roles: cred_roles,
                     pv_request: None,
                 };
                 let checked = src
@@ -2748,6 +2752,7 @@ async fn handle_op(
                 let cred_method = cred.method.clone();
                 let cred_host = cred.host.clone();
                 let cred_authority = cred.authority.clone();
+                let cred_roles = cred.roles.clone();
                 if let Some(op_mut) = ch.ops.get_mut(&ioid) {
                     op_mut.data_task_abort = None;
                 }
@@ -2758,6 +2763,7 @@ async fn handle_op(
                         method: cred_method,
                         host: cred_host,
                         authority: cred_authority,
+                        roles: cred_roles,
                         pv_request: None,
                     };
                     let checked = src
@@ -2843,6 +2849,7 @@ async fn handle_op(
             let cred_method = cred.method.clone();
             let cred_host = cred.host.clone();
             let cred_authority = cred.authority.clone();
+            let cred_roles = cred.roles.clone();
             let init_pv_request_t = init_pv_request.clone();
             if let Some(op_mut) = ch.ops.get_mut(&ioid) {
                 op_mut.data_task_abort = None;
@@ -2854,6 +2861,7 @@ async fn handle_op(
                     method: cred_method,
                     host: cred_host,
                     authority: cred_authority,
+                    roles: cred_roles,
                     pv_request: init_pv_request_t,
                 };
                 let result = {
@@ -3008,6 +3016,7 @@ async fn handle_op(
                     method: cred.method.clone(),
                     host: cred.host.clone(),
                     authority: cred.authority.clone(),
+                    roles: cred.roles.clone(),
                     pv_request: init_pv_request.clone(),
                 };
                 // Round 42 + R49-G1: type-state MONITOR gate.
@@ -3526,6 +3535,7 @@ async fn handle_op(
                 method: cred.method.clone(),
                 host: cred.host.clone(),
                 authority: cred.authority.clone(),
+                roles: cred.roles.clone(),
                 pv_request: None,
             };
             let join = tokio::spawn(async move {
@@ -4959,6 +4969,7 @@ mod tests {
                 method: "anonymous".into(),
                 host: "127.0.0.1".into(),
                 authority: String::new(),
+                roles: Vec::new(),
                 pv_request: None,
             };
 

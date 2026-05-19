@@ -12,9 +12,15 @@ use tokio::sync::Notify;
 use super::config::{LinkDirection, PvaLinkConfig};
 use super::link::{PvaLink, PvaLinkResult};
 
-type RegistryKey = (String, LinkDirection);
+/// `(pv_name, pipeline, queue_size, direction)` — mirrors pvxs's
+/// `channels_key_t = (channelName, pvRequest)` where pvRequest encodes
+/// `pipeline` and `queueSize` (`pvxs/ioc/pvalink_lset.cpp:49-65`,
+/// `pvxs/ioc/pvalink.h:116`). `field` is per-link, not in the channel
+/// key — see `PvaLink::read_with_field` / `try_read_cached_with_field`.
+type RegistryKey = (String, bool, usize, LinkDirection);
 
-/// Cached PvaLink. Returns the same `Arc<PvaLink>` for repeated `(pv, direction)` pairs.
+/// Cached PvaLink. Returns the same `Arc<PvaLink>` for repeated
+/// `(pv_name, pipeline, queue_size, direction)` tuples.
 #[derive(Default)]
 pub struct PvaLinkRegistry {
     map: RwLock<HashMap<RegistryKey, Arc<PvaLink>>>,
@@ -35,15 +41,31 @@ impl PvaLinkRegistry {
         Self::default()
     }
 
-    /// Synchronous lookup of an already-open link. Returns `None`
-    /// if no link with the given `(pv_name, direction)` has been
-    /// opened yet. Used by the record-link hot path to skip the
-    /// async runtime when the link is already cached.
-    pub fn try_get(&self, pv_name: &str, direction: LinkDirection) -> Option<Arc<PvaLink>> {
+    /// Exact lookup: `(pv_name, pipeline, queue_size, direction)`. Returns
+    /// `None` when no link with that exact key has been opened.
+    pub fn try_get(
+        &self,
+        pv_name: &str,
+        pipeline: bool,
+        queue_size: usize,
+        direction: LinkDirection,
+    ) -> Option<Arc<PvaLink>> {
         self.map
             .read()
-            .get(&(pv_name.to_string(), direction))
+            .get(&(pv_name.to_string(), pipeline, queue_size, direction))
             .cloned()
+    }
+
+    /// Return the first cached link for `(pv_name, direction)` regardless
+    /// of `pipeline` / `queue_size`. Used by hot paths that only want
+    /// "any cached value" (fast-path read, connected check, alarm
+    /// severity) and don't care about which monitor variant they land on.
+    pub fn try_get_any(&self, pv_name: &str, direction: LinkDirection) -> Option<Arc<PvaLink>> {
+        self.map
+            .read()
+            .iter()
+            .find(|((name, _, _, dir), _)| name == pv_name && *dir == direction)
+            .map(|(_, link)| link.clone())
     }
 
     /// Get an existing link or open a new one. Concurrent calls
@@ -51,7 +73,12 @@ impl PvaLinkRegistry {
     /// the second caller awaits via `pending` and reads the
     /// winner's cached entry.
     pub async fn get_or_open(&self, config: PvaLinkConfig) -> PvaLinkResult<Arc<PvaLink>> {
-        let key: RegistryKey = (config.pv_name.clone(), config.direction);
+        let key: RegistryKey = (
+            config.pv_name.clone(),
+            config.pipeline,
+            config.queue_size,
+            config.direction,
+        );
 
         // Fast path: already cached.
         if let Some(existing) = self.map.read().get(&key).cloned() {

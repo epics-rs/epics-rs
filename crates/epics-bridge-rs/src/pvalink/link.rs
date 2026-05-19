@@ -237,16 +237,25 @@ impl PvaLink {
     /// In monitor mode this returns the cached latest value; otherwise it
     /// triggers a fresh GET.
     pub async fn read(&self) -> PvaLinkResult<PvField> {
+        self.read_with_field(&self.config.field.clone()).await
+    }
+
+    /// Like [`Self::read`] but selects `field` instead of
+    /// `self.config.field`. Lets the resolver pass a per-link field
+    /// selector when multiple DB links share a cached upstream channel
+    /// but differ in which sub-field they target (pvxs
+    /// `pvalink_link.cpp:91` — `root = lchan->root[fieldName]`).
+    pub async fn read_with_field(&self, field: &str) -> PvaLinkResult<PvField> {
         if matches!(self.config.direction, LinkDirection::Out) {
             return Err(PvaLinkError::NotReadable);
         }
         if self.config.monitor
             && let Some(v) = self.latest.lock().clone()
         {
-            return Ok(extract_field(&v, &self.config.field));
+            return Ok(extract_field(&v, field));
         }
         let result = self.client.pvget_full(&self.config.pv_name).await?;
-        Ok(extract_field(&result.value, &self.config.field))
+        Ok(extract_field(&result.value, field))
     }
 
     /// Synchronous fast-path read: return the cached field if the
@@ -259,11 +268,18 @@ impl PvaLink {
     /// populated the cache. Mirrors pvxs `pvalink_lset.cpp::pvaLoadValue`
     /// (sync read of cached `current` slot).
     pub fn try_read_cached(&self) -> Option<PvField> {
+        self.try_read_cached_with_field(&self.config.field.clone())
+    }
+
+    /// Like [`Self::try_read_cached`] but selects `field` instead of
+    /// `self.config.field`. Mirrors the per-link field override path
+    /// (`pvxs pvalink_link.cpp:91`).
+    pub fn try_read_cached_with_field(&self, field: &str) -> Option<PvField> {
         if matches!(self.config.direction, LinkDirection::Out) || !self.config.monitor {
             return None;
         }
         let v = self.latest.lock().clone()?;
-        Some(extract_field(&v, &self.config.field))
+        Some(extract_field(&v, field))
     }
 
     /// Convenience: read the value as f64.

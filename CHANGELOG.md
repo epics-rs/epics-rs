@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.18.3 — 2026-05-20
+
+Build fix for non-macOS targets. `v0.18.2` is yanked from crates.io.
+
+- `epics-ca-rs` — `addr_list.rs` read the point-to-point destination
+  address through `libc::ifaddrs::ifa_dstaddr`, a field that exists
+  only on macOS/BSD. The Linux `ifaddrs` struct carries the
+  `dstaddr`/`broadaddr` union as a single `ifa_ifu` field, so
+  `v0.18.2` failed to compile on Linux. The lookup is now
+  `cfg`-selected (`ifa_ifu` on Linux, `ifa_dstaddr` elsewhere); the
+  enclosing `ifa_dstaddr_for_ipv4` walk is already `#[cfg(unix)]`, so
+  Windows is unaffected. Verified with `cargo check` for
+  `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`.
+
 ## v0.18.2 — 2026-05-20
 
 Follow-up to `v0.18.1` (which was tagged but not published to

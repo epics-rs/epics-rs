@@ -678,9 +678,9 @@ impl RecordInstance {
             "DTYP" => Some(EpicsValue::String(self.common.dtyp.clone())),
             "TSE" => Some(EpicsValue::Short(self.common.tse)),
             "TSEL" => Some(EpicsValue::String(self.common.tsel.clone())),
-            // C `UTAG` is DBF_UINT64 — modelled as Int64 (no
-            // unsigned-64 scalar in the Rust value model).
-            "UTAG" => Some(EpicsValue::Int64(self.common.utag as i64)),
+            // C `UTAG` is DBF_UINT64 — exposed natively as the unsigned
+            // 64-bit value variant so values above i64::MAX round-trip.
+            "UTAG" => Some(EpicsValue::UInt64(self.common.utag)),
             "ASG" => Some(EpicsValue::String(self.common.asg.clone())),
             "ASL" => Some(EpicsValue::Char(self.common.asl)),
             "DESC" => Some(EpicsValue::String(self.common.desc.clone())),
@@ -953,6 +953,7 @@ impl RecordInstance {
                 // C UTAG is DBF_UINT64 — accept any integer-shaped
                 // value and store the unsigned 64-bit tag.
                 match value {
+                    EpicsValue::UInt64(v) => self.common.utag = v,
                     EpicsValue::Int64(v) => self.common.utag = v as u64,
                     EpicsValue::Long(v) => self.common.utag = v as u64,
                     EpicsValue::Short(v) => self.common.utag = v as u64,

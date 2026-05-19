@@ -295,6 +295,11 @@ pub fn value_to_save_str(value: &EpicsValue) -> String {
             let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
             format!("[{}]", parts.join(","))
         }
+        EpicsValue::UInt64(v) => v.to_string(),
+        EpicsValue::UInt64Array(arr) => {
+            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
+            format!("[{}]", parts.join(","))
+        }
         EpicsValue::StringArray(arr) => {
             let parts: Vec<_> = arr
                 .iter()
@@ -351,6 +356,8 @@ pub fn value_to_save_str_c(value: &EpicsValue) -> String {
         EpicsValue::ShortArray(arr) => c_array(arr.iter()),
         EpicsValue::EnumArray(arr) => c_array(arr.iter()),
         EpicsValue::Int64Array(arr) => c_array(arr.iter()),
+        EpicsValue::UInt64(v) => v.to_string(),
+        EpicsValue::UInt64Array(arr) => c_array(arr.iter()),
         EpicsValue::StringArray(arr) => c_array(arr.iter().cloned()),
     }
 }
@@ -372,6 +379,7 @@ pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
         EpicsValue::Float(_) => s.parse::<f32>().ok().map(EpicsValue::Float),
         EpicsValue::Long(_) => s.parse::<i32>().ok().map(EpicsValue::Long),
         EpicsValue::Int64(_) => s.parse::<i64>().ok().map(EpicsValue::Int64),
+        EpicsValue::UInt64(_) => s.parse::<u64>().ok().map(EpicsValue::UInt64),
         EpicsValue::Short(_) => s.parse::<i16>().ok().map(EpicsValue::Short),
         EpicsValue::Enum(_) => s.parse::<u16>().ok().map(EpicsValue::Enum),
         EpicsValue::Char(_) => s.parse::<u8>().ok().map(EpicsValue::Char),
@@ -395,6 +403,9 @@ pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
         }
         EpicsValue::Int64Array(_) => {
             parse_array_str(s, |v| v.parse::<i64>().ok()).map(EpicsValue::Int64Array)
+        }
+        EpicsValue::UInt64Array(_) => {
+            parse_array_str(s, |v| v.parse::<u64>().ok()).map(EpicsValue::UInt64Array)
         }
         EpicsValue::StringArray(_) => {
             let inner = s.trim_start_matches('[').trim_end_matches(']');

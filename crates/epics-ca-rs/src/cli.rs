@@ -144,6 +144,7 @@ pub fn format_value(
         EpicsValue::Short(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::Long(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::Int64(n) => format_int_i64(*n, fmt.int_style),
+        EpicsValue::UInt64(n) => format_int_u64(*n, fmt.int_style),
         EpicsValue::Char(n) => format_int_i64((*n as i8) as i64, fmt.int_style),
         EpicsValue::Enum(idx) => format_enum(*idx as i64, fmt, enum_strings),
         EpicsValue::Float(x) => format_float(*x as f64, fmt),
@@ -165,6 +166,13 @@ pub fn format_value(
         EpicsValue::Int64Array(arr) => {
             render_array_int(arr.iter().copied(), arr.len(), fmt, sep, req_elems_present)
         }
+        EpicsValue::UInt64Array(arr) => render_array_iter(
+            arr.iter().map(|&n| format_int_u64(n, fmt.int_style)),
+            arr.len(),
+            fmt,
+            sep,
+            req_elems_present,
+        ),
         EpicsValue::EnumArray(arr) => {
             let mut parts = Vec::with_capacity(arr.len() + 1);
             if req_elems_present || arr.len() > 1 {
@@ -274,6 +282,18 @@ fn format_int_i64(n: i64, style: IntStyle) -> String {
         IntStyle::Hex => format!("0x{:x}", n as u64),
         IntStyle::Oct => format!("0o{:o}", n as u64),
         IntStyle::Bin => format!("0b{:b}", n as u64),
+    }
+}
+
+/// Format a `DBF_UINT64` value. Unlike `format_int_i64`, the decimal
+/// rendering keeps the full unsigned range — a value above `i64::MAX`
+/// must print as a positive integer, not a negative one.
+fn format_int_u64(n: u64, style: IntStyle) -> String {
+    match style {
+        IntStyle::Dec => n.to_string(),
+        IntStyle::Hex => format!("0x{n:x}"),
+        IntStyle::Oct => format!("0o{n:o}"),
+        IntStyle::Bin => format!("0b{n:b}"),
     }
 }
 

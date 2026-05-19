@@ -119,6 +119,8 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         EpicsValue::Enum(v) => PvField::Scalar(ScalarValue::Int(*v as i32)),
         EpicsValue::String(s) => PvField::Scalar(ScalarValue::String(s.clone())),
         EpicsValue::Int64(v) => PvField::Scalar(ScalarValue::Long(*v)),
+        // C `DBF_UINT64` → PVA `ulong` (native unsigned 64-bit).
+        EpicsValue::UInt64(v) => PvField::Scalar(ScalarValue::ULong(*v)),
         EpicsValue::DoubleArray(v) => {
             PvField::ScalarArray(v.iter().map(|x| ScalarValue::Double(*x)).collect())
         }
@@ -142,6 +144,9 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         }
         EpicsValue::Int64Array(v) => {
             PvField::ScalarArray(v.iter().map(|x| ScalarValue::Long(*x)).collect())
+        }
+        EpicsValue::UInt64Array(v) => {
+            PvField::ScalarArray(v.iter().map(|x| ScalarValue::ULong(*x)).collect())
         }
     };
 
@@ -175,6 +180,7 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         EpicsValue::Enum(_) => (FieldDesc::Scalar(ScalarType::Int), false),
         EpicsValue::String(_) => (FieldDesc::Scalar(ScalarType::String), false),
         EpicsValue::Int64(_) => (FieldDesc::Scalar(ScalarType::Long), false),
+        EpicsValue::UInt64(_) => (FieldDesc::Scalar(ScalarType::ULong), false),
         EpicsValue::DoubleArray(_) => (FieldDesc::ScalarArray(ScalarType::Double), true),
         EpicsValue::FloatArray(_) => (FieldDesc::ScalarArray(ScalarType::Float), true),
         EpicsValue::LongArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
@@ -183,6 +189,7 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         EpicsValue::EnumArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
         EpicsValue::StringArray(_) => (FieldDesc::ScalarArray(ScalarType::String), true),
         EpicsValue::Int64Array(_) => (FieldDesc::ScalarArray(ScalarType::Long), true),
+        EpicsValue::UInt64Array(_) => (FieldDesc::ScalarArray(ScalarType::ULong), true),
     };
     let struct_id = if is_array {
         "epics:nt/NTScalarArray:1.0"

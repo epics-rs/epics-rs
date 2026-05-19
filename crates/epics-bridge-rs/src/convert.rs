@@ -16,6 +16,8 @@ pub fn dbf_to_scalar_type(dbf: DbFieldType) -> ScalarType {
         DbFieldType::Long => ScalarType::Int,
         DbFieldType::Double => ScalarType::Double,
         DbFieldType::Int64 => ScalarType::Long,
+        // C `DBF_UINT64` → PVA `ulong` (native unsigned 64-bit).
+        DbFieldType::UInt64 => ScalarType::ULong,
     }
 }
 
@@ -33,6 +35,7 @@ pub fn epics_to_scalar(val: &EpicsValue) -> ScalarValue {
         EpicsValue::Long(v) => ScalarValue::Int(*v),
         EpicsValue::Double(v) => ScalarValue::Double(*v),
         EpicsValue::Int64(v) => ScalarValue::Long(*v),
+        EpicsValue::UInt64(v) => ScalarValue::ULong(*v),
         // Arrays: take first element or default
         EpicsValue::ShortArray(a) => ScalarValue::Short(a.first().copied().unwrap_or(0)),
         EpicsValue::FloatArray(a) => ScalarValue::Float(a.first().copied().unwrap_or(0.0)),
@@ -42,6 +45,7 @@ pub fn epics_to_scalar(val: &EpicsValue) -> ScalarValue {
         EpicsValue::CharArray(a) => ScalarValue::Byte(a.first().copied().unwrap_or(0) as i8),
         EpicsValue::StringArray(a) => ScalarValue::String(a.first().cloned().unwrap_or_default()),
         EpicsValue::Int64Array(a) => ScalarValue::Long(a.first().copied().unwrap_or(0)),
+        EpicsValue::UInt64Array(a) => ScalarValue::ULong(a.first().copied().unwrap_or(0)),
     }
 }
 
@@ -79,6 +83,7 @@ pub fn scalar_to_epics_typed(val: &ScalarValue, target: DbFieldType) -> EpicsVal
         DbFieldType::Float => EpicsValue::Float(scalar_to_f64(val) as f32),
         DbFieldType::Long => EpicsValue::Long(scalar_to_i64(val) as i32),
         DbFieldType::Int64 => EpicsValue::Int64(scalar_to_i64(val)),
+        DbFieldType::UInt64 => EpicsValue::UInt64(scalar_to_u64(val)),
         DbFieldType::Short => EpicsValue::Short(scalar_to_i64(val) as i16),
         DbFieldType::Char => EpicsValue::Char(scalar_to_i64(val) as u8),
         DbFieldType::Enum => EpicsValue::Enum(scalar_to_i64(val) as u16),
@@ -137,6 +142,33 @@ fn scalar_to_i64(val: &ScalarValue) -> i64 {
     }
 }
 
+/// Extract u64 from any ScalarValue, preserving the full unsigned range
+/// when the source is itself an unsigned 64-bit value. Used for
+/// `DBF_UINT64` PUT conversion — routing through `scalar_to_i64` would
+/// reject `ulong` values above `i64::MAX`.
+fn scalar_to_u64(val: &ScalarValue) -> u64 {
+    match val {
+        ScalarValue::ULong(v) => *v,
+        ScalarValue::Long(v) => *v as u64,
+        ScalarValue::Int(v) => *v as u64,
+        ScalarValue::Short(v) => *v as u64,
+        ScalarValue::Byte(v) => *v as u64,
+        ScalarValue::UByte(v) => *v as u64,
+        ScalarValue::UShort(v) => *v as u64,
+        ScalarValue::UInt(v) => *v as u64,
+        ScalarValue::Double(v) => *v as u64,
+        ScalarValue::Float(v) => *v as u64,
+        ScalarValue::Boolean(v) => {
+            if *v {
+                1
+            } else {
+                0
+            }
+        }
+        ScalarValue::String(s) => s.parse().unwrap_or(0),
+    }
+}
+
 /// Resolve an enum string to its index using a list of choice strings.
 ///
 /// Corresponds to C++ dbf_copy.cpp enum string → index reverse lookup.
@@ -179,6 +211,9 @@ pub fn epics_to_pv_field(val: &EpicsValue) -> PvField {
         }
         EpicsValue::Int64Array(a) => {
             PvField::ScalarArray(a.iter().map(|v| ScalarValue::Long(*v)).collect())
+        }
+        EpicsValue::UInt64Array(a) => {
+            PvField::ScalarArray(a.iter().map(|v| ScalarValue::ULong(*v)).collect())
         }
         other => PvField::Scalar(epics_to_scalar(other)),
     }
@@ -233,6 +268,11 @@ pub fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
                         })
                         .collect(),
                 )),
+                // PVA `ulong[]` ↔ C `DBF_UINT64[]` — preserve the full
+                // unsigned range instead of folding into DoubleArray.
+                ScalarValue::ULong(_) => Some(EpicsValue::UInt64Array(
+                    arr.iter().map(scalar_to_u64).collect(),
+                )),
                 _ => Some(EpicsValue::DoubleArray(
                     arr.iter().map(scalar_to_f64).collect(),
                 )),
@@ -256,6 +296,38 @@ pub fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn br_r13_uint64_field_maps_to_pva_ulong() {
+        // BR-R13: a C `DBF_UINT64` field must map to PVA `ulong`, and a
+        // value above `i64::MAX` must survive conversion in both
+        // directions. On main `DbFieldType::UInt64` / `EpicsValue::UInt64`
+        // did not exist, so unsigned-64 fields could not be represented.
+        let big: u64 = u64::MAX - 7; // well above i64::MAX
+
+        // DBF type → PVA scalar type
+        assert_eq!(dbf_to_scalar_type(DbFieldType::UInt64), ScalarType::ULong);
+
+        // EpicsValue::UInt64 → ScalarValue::ULong, full range preserved
+        let sv = epics_to_scalar(&EpicsValue::UInt64(big));
+        assert_eq!(sv, ScalarValue::ULong(big));
+
+        // PUT path: ScalarValue::ULong → EpicsValue::UInt64 (typed)
+        let ev = scalar_to_epics_typed(&ScalarValue::ULong(big), DbFieldType::UInt64);
+        assert_eq!(ev, EpicsValue::UInt64(big));
+
+        // Array path: UInt64Array ↔ ulong[] round-trip, full range
+        let arr = EpicsValue::UInt64Array(vec![0, big, i64::MAX as u64 + 1]);
+        let pf = epics_to_pv_field(&arr);
+        match &pf {
+            PvField::ScalarArray(vs) => {
+                assert!(matches!(vs[1], ScalarValue::ULong(v) if v == big));
+            }
+            other => panic!("expected ScalarArray, got {other:?}"),
+        }
+        let back = pv_field_to_epics(&pf).unwrap();
+        assert_eq!(back, arr);
+    }
 
     #[test]
     fn roundtrip_double() {

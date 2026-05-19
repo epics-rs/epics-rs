@@ -92,10 +92,6 @@ pub struct Channel {
     /// Consecutive connect failures since the last successful Active
     /// transition. Used to scale `holdoff_until`.
     connect_fail_count: std::sync::atomic::AtomicU32,
-    /// TCP `EPICS_PVA_NAME_SERVERS` fallbacks. Tried in order when UDP
-    /// search yields no candidates. Empty for direct-mode and for
-    /// channels created without name-server config.
-    name_servers: Vec<std::net::SocketAddr>,
     /// Set to true by `ServerConn::route_frame` when a server-initiated
     /// `CMD_DESTROY_CHANNEL` arrives for this channel's current SID.
     /// `is_active` consults the flag so the next `ensure_active` falls
@@ -408,31 +404,6 @@ impl Channel {
         pool: Arc<ConnectionPool>,
         search: SearchEngine,
     ) -> Self {
-        Self::new_with_name_servers(
-            pv_name,
-            user,
-            host,
-            op_timeout,
-            tcp_timeout,
-            pool,
-            search,
-            Vec::new(),
-        )
-    }
-
-    /// Like [`Self::new`] but also accepts a TCP name-server fallback
-    /// list. Pinged in order whenever UDP search yields no candidates.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_name_servers(
-        pv_name: String,
-        user: String,
-        host: String,
-        op_timeout: std::time::Duration,
-        tcp_timeout: std::time::Duration,
-        pool: Arc<ConnectionPool>,
-        search: SearchEngine,
-        name_servers: Vec<std::net::SocketAddr>,
-    ) -> Self {
         Self {
             pv_name,
             cid: NEXT_CID.fetch_add(1, Ordering::Relaxed),
@@ -448,7 +419,6 @@ impl Channel {
             alternatives: parking_lot::Mutex::new(Vec::new()),
             holdoff_until: parking_lot::Mutex::new(None),
             connect_fail_count: std::sync::atomic::AtomicU32::new(0),
-            name_servers,
             server_destroyed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             server_destroyed_notify: Arc::new(Notify::new()),
             last_close_registration: parking_lot::Mutex::new(None),
@@ -482,7 +452,6 @@ impl Channel {
             alternatives: parking_lot::Mutex::new(Vec::new()),
             holdoff_until: parking_lot::Mutex::new(None),
             connect_fail_count: std::sync::atomic::AtomicU32::new(0),
-            name_servers: Vec::new(),
             server_destroyed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             server_destroyed_notify: Arc::new(Notify::new()),
             last_close_registration: parking_lot::Mutex::new(None),
@@ -662,7 +631,7 @@ impl Channel {
                 Some(std::mem::take(&mut *alts))
             }
         };
-        let mut candidates = match cached {
+        let candidates = match cached {
             Some(list) => list,
             None => {
                 self.set_state(ChannelState::Searching);
@@ -741,26 +710,6 @@ impl Channel {
                 }
             }
         };
-
-        // Append TCP name servers as final fallback candidates. pvxs
-        // sends real SEARCH frames over a persistent TCP connection to
-        // each name server (clientconn.cpp). For the common gateway-
-        // self-serve case (gateway answers for any PV it proxies)
-        // direct-connect to the name server's TCP port works
-        // identically. Redirect-style chains aren't supported.
-        //
-        // pvxs 4d12da87205e: skip the name-server fallback entirely
-        // once the parent `PvaClient::close` (i.e. ConnectionPool
-        // shutdown flag) has been called. Otherwise an operation
-        // tearing down can still spawn fresh TCP dials to the
-        // name servers, leaking work past shutdown.
-        if !self.name_servers.is_empty() && !self.pool.is_shutdown() {
-            for ns in &self.name_servers {
-                if !candidates.contains(ns) {
-                    candidates.push(*ns);
-                }
-            }
-        }
 
         if candidates.is_empty() {
             return Err(PvaError::Protocol("no servers found for PV".into()));

@@ -216,7 +216,7 @@ async fn query_server(
 
 /// Discovery mode — passive beacon listen + optional active ping.
 async fn discover_mode(args: &Args) {
-    let engine = match SearchEngine::spawn(Vec::new()).await {
+    let engine = match SearchEngine::spawn(Vec::new(), Vec::new()).await {
         Ok(e) => e,
         Err(e) => {
             eprintln!("pvlist-rs: failed to spawn search engine: {e}");

@@ -1452,11 +1452,8 @@ mod tests {
                 // Drain the client's CONNECTION_VALIDATION reply (a single
                 // write from the client; one read is sufficient).
                 let mut drain = [0u8; 512];
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(200),
-                    sock.read(&mut drain),
-                )
-                .await;
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(200), sock.read(&mut drain)).await;
                 let _ = sock.write_all(&server_validated_frame()).await;
                 // Drop the write half but keep the read half alive so TCP
                 // doesn't send FIN — the client's reader stays pending and

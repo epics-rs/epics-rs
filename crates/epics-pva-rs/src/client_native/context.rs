@@ -737,6 +737,55 @@ impl PvaClient {
         crate::client_native::ops_v2::op_put_raw(&ch, &bytes, value_str, self.inner.timeout).await
     }
 
+    /// PUT a dotted-path sub-field using a custom pvRequest. Combines
+    /// the record-options of `pvput_with_request` with the field-targeting
+    /// of `pvput_field`. `field_path` must be non-empty.
+    ///
+    /// pvxs `pvalink_channel.cpp:31-38 + 138` parity: INIT carries
+    /// `field() record[process=..,block=..]`, DATA targets `field_path`.
+    pub async fn pvput_field_with_request(
+        &self,
+        pv_name: &str,
+        field_path: &str,
+        request: &crate::pv_request::PvRequestExpr,
+        value_str: &str,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        let big_endian = matches!(
+            ch.ensure_active().await?.0.byte_order,
+            crate::proto::ByteOrder::Big
+        );
+        let bytes = request.encode(big_endian);
+        crate::client_native::ops_v2::op_put_field_with_request(
+            &ch,
+            field_path,
+            &bytes,
+            value_str,
+            self.inner.timeout,
+        )
+        .await
+    }
+
+    /// PUT a pre-built [`PvField`] with a custom pvRequest. Like
+    /// `pvput_pv_field` but INIT carries the caller's record options
+    /// (`process`, `block`). DATA still targets `"value"`.
+    ///
+    /// pvxs `pvalink_channel.cpp:268` parity for typed OUT arrays.
+    pub async fn pvput_pv_field_with_request(
+        &self,
+        pv_name: &str,
+        request: &crate::pv_request::PvRequestExpr,
+        value: &crate::pvdata::PvField,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        let big_endian = matches!(
+            ch.ensure_active().await?.0.byte_order,
+            crate::proto::ByteOrder::Big
+        );
+        let bytes = request.encode(big_endian);
+        crate::client_native::ops_v2::op_put_value_raw(&ch, &bytes, value, self.inner.timeout).await
+    }
+
     pub async fn pvmonitor<F>(&self, pv_name: &str, mut callback: F) -> PvaResult<()>
     where
         F: FnMut(&PvField) + Send,

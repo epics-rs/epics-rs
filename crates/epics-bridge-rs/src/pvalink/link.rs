@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use epics_pva_rs::client::PvaClient;
+use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
 use super::config::{LinkDirection, PvaLinkConfig};
@@ -279,7 +280,17 @@ impl PvaLink {
     /// because the upstream is unreachable is queued for replay
     /// instead of surfacing an error. Mirrors pvxs `pvaPutValue`
     /// (pvalink_lset.cpp:647 `if(!self->defer) lchan->put()`).
+    ///
+    /// BR-R11: delegates to [`Self::write_with_block`] with `block=false`.
     pub async fn write(&self, value_str: &str) -> PvaLinkResult<()> {
+        self.write_with_block(value_str, false).await
+    }
+
+    /// Like [`Self::write`] but passes `block` through to the PUT
+    /// pvRequest (`record._options.block`). Mirrors pvxs
+    /// `pvaPutValueX(wait)` → `block = !after_put.empty()`
+    /// (`pvalink_lset.cpp:647`, `pvalink_channel.cpp:223`).
+    pub async fn write_with_block(&self, value_str: &str, block: bool) -> PvaLinkResult<()> {
         if matches!(self.config.direction, LinkDirection::Inp) {
             return Err(PvaLinkError::NotWritable);
         }
@@ -291,7 +302,17 @@ impl PvaLink {
         if self.config.defer {
             return self.enqueue_put(QueuedPut::Str(value_str.to_string()));
         }
-        match self.client.pvput(&self.config.pv_name, value_str).await {
+        let req = build_put_request(self.config.process, block);
+        let result = if is_subfield(&self.config.field) {
+            self.client
+                .pvput_field_with_request(&self.config.pv_name, &self.config.field, &req, value_str)
+                .await
+        } else {
+            self.client
+                .pvput_with_request(&self.config.pv_name, &req, value_str)
+                .await
+        };
+        match result {
             Ok(()) => Ok(()),
             Err(e) if self.config.retry && is_disconnect(&e) => {
                 self.enqueue_put(QueuedPut::Str(value_str.to_string()))
@@ -306,18 +327,33 @@ impl PvaLink {
     /// Used by the pvalink OUT path on EpicsValue array variants.
     ///
     /// B4: same `defer` / `retry` semantics as [`Self::write`].
+    ///
+    /// BR-R11: delegates to [`Self::write_pv_field_with_block`] with
+    /// `block=false`.
     pub async fn write_pv_field(&self, value: &PvField) -> PvaLinkResult<()> {
+        self.write_pv_field_with_block(value, false).await
+    }
+
+    /// Like [`Self::write_pv_field`] but passes `block` through to the
+    /// PUT pvRequest. Mirrors pvxs `pvaPutValueX` for typed values
+    /// (`pvalink_channel.cpp:268`).
+    pub async fn write_pv_field_with_block(
+        &self,
+        value: &PvField,
+        block: bool,
+    ) -> PvaLinkResult<()> {
         if matches!(self.config.direction, LinkDirection::Inp) {
             return Err(PvaLinkError::NotWritable);
         }
         if self.config.defer {
             return self.enqueue_put(QueuedPut::Field(value.clone()));
         }
-        match self
+        let req = build_put_request(self.config.process, block);
+        let result = self
             .client
-            .pvput_pv_field(&self.config.pv_name, value)
-            .await
-        {
+            .pvput_pv_field_with_request(&self.config.pv_name, &req, value)
+            .await;
+        match result {
             Ok(()) => Ok(()),
             Err(e) if self.config.retry && is_disconnect(&e) => {
                 self.enqueue_put(QueuedPut::Field(value.clone()))
@@ -359,13 +395,34 @@ impl PvaLink {
         let queued: Vec<QueuedPut> = std::mem::take(&mut *self.put_queue.lock());
         let mut sent = 0usize;
         for (idx, value) in queued.iter().enumerate() {
-            // Replay each queued Put through the SAME path the
-            // immediate Put would have used: a string Put goes
-            // through `pvput` (text coerced to the channel's native
-            // type), a typed Put through `pvput_pv_field`.
+            // Replay each queued Put through the same pvRequest path the
+            // immediate Put would have used (BR-R11: include process/block
+            // options, honor field targeting). block=false for deferred
+            // replay — the caller did not request a blocking wait at
+            // queue time and there is no caller to signal completion to.
+            let req = build_put_request(self.config.process, false);
             let put_result = match value {
-                QueuedPut::Str(s) => self.client.pvput(&self.config.pv_name, s).await,
-                QueuedPut::Field(f) => self.client.pvput_pv_field(&self.config.pv_name, f).await,
+                QueuedPut::Str(s) => {
+                    if is_subfield(&self.config.field) {
+                        self.client
+                            .pvput_field_with_request(
+                                &self.config.pv_name,
+                                &self.config.field,
+                                &req,
+                                s,
+                            )
+                            .await
+                    } else {
+                        self.client
+                            .pvput_with_request(&self.config.pv_name, &req, s)
+                            .await
+                    }
+                }
+                QueuedPut::Field(f) => {
+                    self.client
+                        .pvput_pv_field_with_request(&self.config.pv_name, &req, f)
+                        .await
+                }
             };
             match put_result {
                 Ok(()) => sent += 1,
@@ -596,6 +653,38 @@ fn is_disconnect(e: &epics_pva_rs::error::PvaError) -> bool {
         }
         PvaError::InvalidValue(_) | PvaError::Decode(_) => false,
     }
+}
+
+/// Build the pvRequest for an OUT PUT operation from the link's `process`
+/// flag and the caller's `block` argument. Mirrors pvxs
+/// `pvalink_channel.cpp:28-47` (putReq template) + `220-263` (runtime
+/// process/block computation):
+///   - `process=false` → `"passive"` (pvxs Default proc)
+///   - `process=true`  → `"true"`    (pvxs PP / CP / CPP)
+///   - `block`         → `"true"` / `"false"` (pvxs `wait` parameter)
+fn build_put_request(process: bool, block: bool) -> PvRequestExpr {
+    PvRequestExpr {
+        fields: vec![],
+        record_options: vec![
+            (
+                "process".to_string(),
+                if process { "true" } else { "passive" }.to_string(),
+            ),
+            (
+                "block".to_string(),
+                if block { "true" } else { "false" }.to_string(),
+            ),
+        ],
+        field_options: vec![],
+    }
+}
+
+/// True iff `field` names a non-default sub-field (not `""` or `"value"`).
+/// When true, PUT must use `pvput_field_with_request` to target that
+/// specific field in the DATA phase. Mirrors pvxs `linkBuildPut:138`:
+/// `top[fieldName]` when `fieldName` is non-empty.
+fn is_subfield(field: &str) -> bool {
+    !field.is_empty() && field != "value"
 }
 
 /// BR-R43: build the pvRequest for an INP+monitor link.
@@ -1077,5 +1166,88 @@ mod tests {
         assert!(!is_disconnect(&PvaError::InvalidValue("x".into())));
         assert!(!is_disconnect(&PvaError::Protocol("x".into())));
         assert!(!is_disconnect(&PvaError::Decode("x".into())));
+    }
+
+    /// BR-R11: pvalink OUT writes must carry proc/block/field options in
+    /// the PUT pvRequest.
+    ///
+    /// On main: `build_put_request` did not exist — no pvRequest was built
+    /// and `record._options.process` / `block` never reached the server.
+    /// After fix: `build_put_request` produces the correct pvRequest, and
+    /// `is_subfield` gates field-targeted vs. value-targeted dispatch.
+    ///
+    /// pvxs parity:
+    ///   pvalink_channel.cpp:31-38 (putReq template)
+    ///   pvalink_channel.cpp:220-263 (runtime process/block computation)
+    ///   pvalink_channel.cpp:138 (field targeting via top[fieldName])
+    #[test]
+    fn br_r11_pvalink_out_options_preserved() {
+        // proc=PP → process="true"
+        let req = build_put_request(true, false);
+        assert!(
+            req.record_options
+                .iter()
+                .any(|(k, v)| k == "process" && v == "true"),
+            "proc=PP must produce process=true in pvRequest"
+        );
+
+        // proc=Default/NPP → process="passive"
+        let req = build_put_request(false, false);
+        assert!(
+            req.record_options
+                .iter()
+                .any(|(k, v)| k == "process" && v == "passive"),
+            "proc=Default must produce process=passive in pvRequest"
+        );
+
+        // block=true must appear in pvRequest
+        let req = build_put_request(true, true);
+        assert!(
+            req.record_options
+                .iter()
+                .any(|(k, v)| k == "block" && v == "true"),
+            "block=true must appear in pvRequest"
+        );
+
+        // block=false must appear in pvRequest
+        let req = build_put_request(false, false);
+        assert!(
+            req.record_options
+                .iter()
+                .any(|(k, v)| k == "block" && v == "false"),
+            "block=false must appear in pvRequest"
+        );
+
+        // field="" and field="value" are NOT sub-fields (use pvput_with_request)
+        assert!(!is_subfield(""), "empty field is not a sub-field");
+        assert!(!is_subfield("value"), "\"value\" is not a sub-field");
+
+        // field="DESC" IS a sub-field (use pvput_field_with_request)
+        assert!(
+            is_subfield("DESC"),
+            "\"DESC\" must be treated as a sub-field"
+        );
+        assert!(is_subfield("alarm.severity"), "dotted path is a sub-field");
+
+        // A deferred write with field="DESC" and proc=PP queues the
+        // value; when flushed the replay uses build_put_request.
+        // Verify the defer path still enqueues (does not bypass).
+        let cfg = PvaLinkConfig {
+            field: "DESC".to_string(),
+            process: true,
+            defer: true,
+            ..PvaLinkConfig::defaults_for("BR11:PV", LinkDirection::Out)
+        };
+        let link = PvaLink::for_test(cfg, None);
+        // Deferred write queues without hitting the network.
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                link.write_with_block("hello", true)
+                    .await
+                    .expect("deferred write_with_block must enqueue");
+            });
+        assert_eq!(link.pending_put_count(), 1, "one entry queued");
     }
 }

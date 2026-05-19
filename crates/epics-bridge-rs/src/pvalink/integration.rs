@@ -84,6 +84,13 @@ pub struct PvaLinkResolver {
     /// defaults. Mirrors the role of pvxs `pvaLinkConfig` carried on
     /// the `jlink` for the lifetime of the link.
     link_options: Arc<parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>>,
+    /// Per-PV OUT link-option overrides (BR-R11).
+    ///
+    /// Mirrors `link_options` for the OUT direction: `put_value` uses
+    /// these to carry the operator's `proc`, `field`, `defer`, `retry`
+    /// settings to the upstream PUT, instead of building a fresh
+    /// default config on every write. Populated by [`Self::open_out_link`].
+    out_link_options: Arc<parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>>,
     /// Database handle used by the B3 scan-on-update forwarder to
     /// process owning records. `None` until [`install_pvalink_resolver`]
     /// wires it — without it, monitor events still update the cached
@@ -149,6 +156,7 @@ impl PvaLinkResolver {
             reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             link_options: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            out_link_options: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             db: Arc::new(parking_lot::RwLock::new(None)),
             scan_targets: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             forwarders: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
@@ -377,6 +385,33 @@ impl PvaLinkResolver {
             };
         }
         default_inp_cfg(pv_name)
+    }
+
+    /// Build the OUT config for `pv_name`, applying any options registered
+    /// via [`Self::open_out_link`]. Falls back to pvxs OUT defaults when
+    /// none are registered. Mirrors `inp_cfg_for` for the OUT direction.
+    fn out_cfg_for(&self, pv_name: &str) -> PvaLinkConfig {
+        if let Some(cfg) = self.out_link_options.read().get(pv_name) {
+            return cfg.clone();
+        }
+        PvaLinkConfig::defaults_for(pv_name, LinkDirection::Out)
+    }
+
+    /// Open / cache an OUT link from a full `@pva://...` link string,
+    /// parsing and retaining its options (`proc`, `field`, `defer`,
+    /// `retry`, ...). The parsed [`PvaLinkConfig`] is stashed under the
+    /// bare PV name so the `put_value` resolver hot-path picks up the
+    /// operator's proc / field / defer settings on every write.
+    ///
+    /// Mirrors [`Self::open_link`] for the OUT direction. pvxs equivalent:
+    /// `pvaLinkConfig` carried on the `jlink` (pvalink_jlif.cpp).
+    pub async fn open_out_link(&self, link_string: &str) -> PvaLinkResult<Arc<PvaLink>> {
+        let cfg = PvaLinkConfig::parse(link_string, LinkDirection::Out)?;
+        let pv_name = cfg.pv_name.clone();
+        self.out_link_options
+            .write()
+            .insert(pv_name.clone(), cfg.clone());
+        self.registry.get_or_open(cfg).await
     }
 
     /// Number of successful link reads since startup.
@@ -688,10 +723,7 @@ impl LinkSet for PvaLinkResolver {
         let name = strip_scheme(name).ok_or_else(|| {
             format!("pvalink rejects ca:// scheme: {name} (use the CA-link path instead)")
         })?;
-        let cfg = PvaLinkConfig {
-            process: true,
-            ..PvaLinkConfig::defaults_for(name, LinkDirection::Out)
-        };
+        let cfg = self.out_cfg_for(name);
         // P-G16: bypass the Display→string→parse round-trip for
         // ARRAYS (where Display alloc is O(N_elements * digits) and
         // pvput re-parses 25 MB strings on a 1 M-element waveform).

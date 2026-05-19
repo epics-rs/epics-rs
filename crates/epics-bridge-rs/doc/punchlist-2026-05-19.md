@@ -105,7 +105,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 14 (was 15)
+- Total open: 13 (was 17)
 - Done: 3 (BR-R4, BR-R21, BR-R11)
-- In progress: 0
+- In progress: 1 (BR-R10, worker B)
 - Blocked: 0

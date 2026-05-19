@@ -404,8 +404,10 @@ impl PvDatabase {
             let is_passive =
                 src.read().await.common.scan == crate::server::record::ScanType::Passive;
             if is_passive {
+                // MR-R5: recursive INP-link source processing within
+                // one chain — gate held by the foreign entry record.
                 let _ = self
-                    .process_record_with_links(&db.record, visited, depth + 1)
+                    .process_record_with_links_recursive(&db.record, visited, depth + 1)
                     .await;
             }
         }
@@ -481,7 +483,15 @@ impl PvDatabase {
         } else {
             format!("{}.{}", link.record, link.field)
         };
-        let _ = self.put_pv(&target_name, value).await;
+        // MR-R5: an OUT-link write-back is an internal step of the
+        // processing chain that already holds the entry record's
+        // advisory write gate (`dbScanLock` analogue). It must use the
+        // `_already_locked` write so it does not re-acquire a gate: a
+        // self-referencing OUT link (`SELF PP`) would otherwise
+        // dead-lock on the entry record's own non-reentrant gate. C
+        // `dbDbPutValue` writes the OUT-link target under the same
+        // lock set the chain already owns.
+        let _ = self.put_pv_already_locked(&target_name, value).await;
 
         if link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
             // Alias-aware lookup: the link's target may be the alias
@@ -503,8 +513,10 @@ impl PvDatabase {
                     (tg.common.scan, !pact)
                 };
                 if should_process && target_scan == ScanType::Passive {
+                    // MR-R5: recursive OUT-link target processing within
+                    // one chain — gate held by the foreign entry record.
                     let _ = self
-                        .process_record_with_links(&link.record, visited, depth + 1)
+                        .process_record_with_links_recursive(&link.record, visited, depth + 1)
                         .await;
                 }
             }
@@ -961,8 +973,15 @@ impl PvDatabase {
                                 (tg.common.scan, !pact)
                             };
                             if should_process && target_scan == ScanType::Passive {
+                                // MR-R5: recursive link-target processing
+                                // within one chain — gate held by the
+                                // foreign entry record.
                                 let _ = self
-                                    .process_record_with_links(&db.record, visited, depth + 1)
+                                    .process_record_with_links_recursive(
+                                        &db.record,
+                                        visited,
+                                        depth + 1,
+                                    )
                                     .await;
                             }
                         }

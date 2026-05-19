@@ -72,6 +72,7 @@ impl SubscriptionFilter for ArrayFilter {
             EpicsValue::ShortArray(v) => EpicsValue::ShortArray(slice_with(v, cfg)),
             EpicsValue::LongArray(v) => EpicsValue::LongArray(slice_with(v, cfg)),
             EpicsValue::Int64Array(v) => EpicsValue::Int64Array(slice_with(v, cfg)),
+            EpicsValue::UInt64Array(v) => EpicsValue::UInt64Array(slice_with(v, cfg)),
             EpicsValue::FloatArray(v) => EpicsValue::FloatArray(slice_with(v, cfg)),
             EpicsValue::DoubleArray(v) => EpicsValue::DoubleArray(slice_with(v, cfg)),
             EpicsValue::EnumArray(v) => EpicsValue::EnumArray(slice_with(v, cfg)),
@@ -248,6 +249,39 @@ mod tests {
         ev.mask = EventMask::ALARM;
         let out = f.apply(ev).unwrap();
         assert_eq!(unpack(out), vec![1.0]);
+    }
+
+    /// MR-R25: a `UInt64Array` waveform must be sliced like every other
+    /// `*Array` variant. Before the fix the match had no `UInt64Array`
+    /// arm, so DBF_UINT64 waveforms hit the scalar passthrough and the
+    /// client received the full array. The values are above `i64::MAX`
+    /// to prove the slice keeps both the element type and the full
+    /// unsigned range.
+    #[test]
+    fn mr_r25_uint64_array_is_sliced() {
+        let big = u64::MAX; // > i64::MAX, must survive the slice
+        let f = ArrayFilter::new(ArrayFilterConfig {
+            start: 1,
+            incr: 1,
+            end: 2,
+        });
+        let ev = FilteredMonitorEvent::new(
+            MonitorEvent {
+                snapshot: Snapshot::new(
+                    EpicsValue::UInt64Array(vec![0, big, big - 1, 7]),
+                    0,
+                    0,
+                    SystemTime::UNIX_EPOCH,
+                ),
+                origin: 0,
+            },
+            EventMask::VALUE,
+        );
+        let out = f.apply(ev).unwrap();
+        match out.event.snapshot.value {
+            EpicsValue::UInt64Array(v) => assert_eq!(v, vec![big, big - 1]),
+            other => panic!("expected sliced UInt64Array, got {other:?}"),
+        }
     }
 
     /// Out-of-range start (greater than `len-1`) clamps to `len` per

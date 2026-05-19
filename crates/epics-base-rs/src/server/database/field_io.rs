@@ -243,6 +243,21 @@ impl PvDatabase {
         }
 
         if let Some(rec) = self.get_record(base).await {
+            // MR-R5: `put_pv_and_post` is a public record-write API —
+            // it must take the same advisory write gate
+            // (`dbScanLock` analogue) as `put_pv` /
+            // `put_record_field_from_ca`, or a gateway/sequencer
+            // write through this helper can still land between the
+            // member writes of a QSRV atomic group or a pvalink
+            // atomic scan epoch holding `lock_records`. `base` is
+            // alias-resolved to the canonical record name so an alias
+            // and its target share one gate. Held until return.
+            let canonical_base: String = self
+                .resolve_alias(base)
+                .await
+                .unwrap_or_else(|| base.to_string());
+            let _record_gate = self.lock_record(&canonical_base).await;
+
             let mut instance = rec.write().await;
 
             // Type coercion
@@ -484,8 +499,14 @@ impl PvDatabase {
                     }
                 }
                 let mut visited = HashSet::new();
+                // MR-R5: this PROC trigger already holds `record_name`'s
+                // advisory write gate — either `_record_gate` above, or
+                // the QSRV atomic group's `lock_records` epoch when
+                // entered via `put_record_field_from_ca_already_locked`.
+                // The gate `Mutex` is not reentrant, so the processing
+                // call MUST use the `_already_locked` variant.
                 let _ = self
-                    .process_record_with_links(record_name, &mut visited, 0)
+                    .process_record_with_links_already_locked(record_name, &mut visited, 0)
                     .await;
                 let pending = {
                     let rec = self.inner.records.read().await;
@@ -725,8 +746,14 @@ impl PvDatabase {
         // Process the record after field put.
         {
             let mut visited = HashSet::new();
+            // MR-R5: `record_name`'s advisory write gate is already
+            // held by this `put` (the `_record_gate` taken above, or
+            // the QSRV atomic group's `lock_records` epoch via
+            // `put_record_field_from_ca_already_locked`). The gate
+            // `Mutex` is not reentrant — use the `_already_locked`
+            // processing entry.
             let _ = self
-                .process_record_with_links(record_name, &mut visited, 0)
+                .process_record_with_links_already_locked(record_name, &mut visited, 0)
                 .await;
         }
 
@@ -781,6 +808,19 @@ impl PvDatabase {
 
         // Records — alias-aware (epics-base PR #336).
         if let Some(rec) = self.get_record(base).await {
+            // MR-R5: `put_pv_no_process` is a public record-write API
+            // (autosave restore). It must take the advisory write gate
+            // (`dbScanLock` analogue) so an autosave restore cannot
+            // land between the member writes of a QSRV atomic group or
+            // a pvalink atomic scan epoch holding `lock_records`.
+            // `base` is alias-resolved so an alias and its target
+            // share one gate. Held until return.
+            let canonical_base: String = self
+                .resolve_alias(base)
+                .await
+                .unwrap_or_else(|| base.to_string());
+            let _record_gate = self.lock_record(&canonical_base).await;
+
             let mut instance = rec.write().await;
             let prev_value = instance.record.get_field(&field);
             match instance.record.put_field(&field, value.clone()) {

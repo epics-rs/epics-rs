@@ -157,6 +157,29 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
         self.inner.subscribe_raw_checked(checked, ctx).await
     }
+    // BR-R14: forward the event-affecting-options MONITOR variants to
+    // the inner. Without these the trait default drops `opts` and
+    // routes through `subscribe_checked`, so the gateway source never
+    // sees the options it must reject. A read-only gateway places no
+    // extra constraint on a (read) MONITOR — pure pass-through.
+    async fn subscribe_checked_opts(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        self.inner.subscribe_checked_opts(checked, ctx, opts).await
+    }
+    async fn subscribe_raw_checked_opts(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+        self.inner
+            .subscribe_raw_checked_opts(checked, ctx, opts)
+            .await
+    }
     async fn rpc(
         &self,
         name: &str,
@@ -452,6 +475,32 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
             return None;
         }
         self.inner.subscribe_raw_checked(checked, ctx).await
+    }
+    // BR-R14: forward the event-affecting-options MONITOR variants,
+    // applying the same ACL deny-list gate as `subscribe_*_checked`.
+    async fn subscribe_checked_opts(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        if !self.config.allowed(checked.pv_name()) {
+            return None;
+        }
+        self.inner.subscribe_checked_opts(checked, ctx, opts).await
+    }
+    async fn subscribe_raw_checked_opts(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+        if !self.config.allowed(checked.pv_name()) {
+            return None;
+        }
+        self.inner
+            .subscribe_raw_checked_opts(checked, ctx, opts)
+            .await
     }
     async fn rpc(
         &self,
@@ -973,6 +1022,57 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         let user = ctx.account.clone();
         let host = ctx.host.clone();
         let result = self.inner.subscribe_raw_checked(checked, ctx).await;
+        if self.audit_subscribe {
+            let outcome: Result<(), String> = if result.is_some() {
+                Ok(())
+            } else {
+                Err(format!("PV '{pv}' not subscribable (raw)"))
+            };
+            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
+            ev.event = AuditEventKind::Subscribe;
+            self.sink.record(ev);
+        }
+        result
+    }
+    // BR-R14: forward the event-affecting-options MONITOR variants,
+    // recording the same Subscribe audit row as `subscribe_*_checked`.
+    // The audit layer is outermost, so it records the attempt even
+    // when the inner gateway source rejects an unsupported option.
+    async fn subscribe_checked_opts(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self.inner.subscribe_checked_opts(checked, ctx, opts).await;
+        if self.audit_subscribe {
+            let outcome: Result<(), String> = if result.is_some() {
+                Ok(())
+            } else {
+                Err(format!("PV '{pv}' not subscribable"))
+            };
+            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
+            ev.event = AuditEventKind::Subscribe;
+            self.sink.record(ev);
+        }
+        result
+    }
+    async fn subscribe_raw_checked_opts(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self
+            .inner
+            .subscribe_raw_checked_opts(checked, ctx, opts)
+            .await;
         if self.audit_subscribe {
             let outcome: Result<(), String> = if result.is_some() {
                 Ok(())
@@ -1652,5 +1752,96 @@ mod tests {
         let recorded = events.lock().unwrap();
         assert_eq!(recorded[0].event, AuditEventKind::Process);
         assert_eq!(recorded[0].result, AuditResult::Denied);
+    }
+
+    /// BR-R14 regression: minimal source that records whether its
+    /// event-affecting-options MONITOR variant was reached.
+    struct OptsRecordingSource {
+        opts_reached: Arc<AtomicBool>,
+    }
+
+    impl ChannelSource for OptsRecordingSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["X".into()]
+        }
+        async fn has_pv(&self, _name: &str) -> bool {
+            true
+        }
+        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            Some(FieldDesc::Scalar(ScalarType::Double))
+        }
+        async fn get_value(&self, _name: &str) -> Option<PvField> {
+            Some(PvField::Scalar(ScalarValue::Double(0.0)))
+        }
+        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
+            Ok(())
+        }
+        async fn is_writable(&self, _name: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            None
+        }
+        async fn subscribe_checked_opts(
+            &self,
+            _checked: AccessChecked,
+            _ctx: ChannelContext,
+            _opts: epics_pva_rs::server_native::MonitorOptions,
+        ) -> Option<mpsc::Receiver<PvField>> {
+            self.opts_reached.store(true, Ordering::SeqCst);
+            None
+        }
+        async fn subscribe_raw_checked_opts(
+            &self,
+            _checked: AccessChecked,
+            _ctx: ChannelContext,
+            _opts: epics_pva_rs::server_native::MonitorOptions,
+        ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+            self.opts_reached.store(true, Ordering::SeqCst);
+            None
+        }
+    }
+
+    /// BR-R14: the `Audit` / `ReadOnly` / `Acl` middleware wrappers
+    /// must forward `subscribe_checked_opts` /
+    /// `subscribe_raw_checked_opts` to the inner source. Pre-fix the
+    /// wrappers inherited the trait default, which drops `opts` and
+    /// routes through `subscribe_checked` — so the gateway source (the
+    /// innermost layer) never saw the downstream's event-affecting
+    /// monitor options and could not reject an unsupported set.
+    #[tokio::test]
+    async fn middleware_layers_forward_subscribe_opts_to_inner() {
+        use epics_pva_rs::server_native::MonitorOptions;
+
+        for raw in [false, true] {
+            let opts_reached = Arc::new(AtomicBool::new(false));
+            let inner = OptsRecordingSource {
+                opts_reached: opts_reached.clone(),
+            };
+            // Production gateway stack shape: Audit( ReadOnly( Acl( inner ) ) ).
+            let acl = AclLayer::new(AclConfig::default()).layer(inner);
+            let read_only = ReadOnlyLayer.layer(acl);
+            let layered = AuditLayer::new(NoopAudit).layer(read_only);
+
+            let opts = MonitorOptions {
+                pipeline: false,
+                queue_size: None,
+                server_filter: true,
+            };
+            if raw {
+                let _ = layered
+                    .subscribe_raw_checked_opts(checked_for("X").await, test_ctx(), opts)
+                    .await;
+            } else {
+                let _ = layered
+                    .subscribe_checked_opts(checked_for("X").await, test_ctx(), opts)
+                    .await;
+            }
+            assert!(
+                opts_reached.load(Ordering::SeqCst),
+                "middleware stack must forward subscribe{}_checked_opts to the inner source",
+                if raw { "_raw" } else { "" },
+            );
+        }
     }
 }

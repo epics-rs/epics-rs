@@ -68,14 +68,18 @@ pub struct ChannelContext {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MonitorOptions {
     /// `record._options.pipeline` — the client requested the
-    /// flow-controlled credit/ACK monitor sub-protocol. The negotiated
-    /// queue/window is a property of the *upstream* monitor, so a
-    /// fanout gateway cannot provide per-downstream pipeline
-    /// semantics.
+    /// flow-controlled credit/ACK monitor sub-protocol. This is flow
+    /// control between the client and *its* server, not a change to
+    /// which events are produced: a fanout gateway terminates the
+    /// downstream pipeline on its own downstream connection and
+    /// propagates backpressure upstream via the per-PV `Pauser`
+    /// (PG-G9). It therefore does NOT make a monitor non-transparent.
     pub pipeline: bool,
     /// `record._options.queueSize` when the client set it explicitly
     /// (pvxs default 4). `None` means the client did not request a
-    /// specific upstream queue depth.
+    /// specific queue depth. Like `pipeline`, this is a downstream
+    /// buffer-depth request the gateway honors on its per-downstream
+    /// outbox; it does not change upstream event production.
     pub queue_size: Option<u32>,
     /// True when the downstream pvRequest carried a server-side
     /// `record._options._filter` chain. A stateful filter (e.g.
@@ -86,11 +90,19 @@ pub struct MonitorOptions {
 }
 
 impl MonitorOptions {
-    /// True when any option here changes *upstream event production*
+    /// True when an option here changes *upstream event production*
     /// and therefore cannot be honored transparently by a fanout
     /// gateway that shares one upstream monitor across downstreams.
+    ///
+    /// Only a server-side `_filter` chain qualifies. `pipeline` and
+    /// `queueSize` are downstream client↔gateway flow control the
+    /// gateway terminates locally (see the field docs), so they are
+    /// transparent and must NOT trigger a fanout-gateway rejection —
+    /// rejecting them would make every default-configured PVA client
+    /// (which enables pipeline by default) unable to monitor through
+    /// the gateway.
     pub fn affects_upstream_events(&self) -> bool {
-        self.pipeline || self.queue_size.is_some() || self.server_filter
+        self.server_filter
     }
 }
 

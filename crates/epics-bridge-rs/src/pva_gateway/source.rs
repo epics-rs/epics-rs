@@ -747,13 +747,15 @@ impl ChannelSource for GatewayChannelSource {
     /// The gateway fans **one** upstream monitor — opened with the
     /// gateway's default pvRequest — out to every downstream
     /// subscriber for a PV name (`channel_cache::spawn_upstream_monitor`
-    /// keys the cache by PV name only). Field projection is applied
-    /// downstream-locally and is transparent, but options that change
-    /// *upstream event production* — `record._options.pipeline` /
-    /// `queueSize` / `_filter` (pvxs `servermon.cpp:521-555`) — cannot
-    /// be honored across the shared upstream monitor. Serving such a
-    /// subscription from the default fanout would deliver an event
-    /// stream that differs from a direct upstream monitor.
+    /// keys the cache by PV name only). Field projection, `pipeline`,
+    /// and `queueSize` are downstream-local — the gateway terminates
+    /// them on its own downstream connection / outbox — and are
+    /// transparent. A server-side `_filter` chain (pvxs
+    /// `servermon.cpp:521-555`), by contrast, changes *upstream event
+    /// production* and cannot be honored across the shared upstream
+    /// monitor: serving such a subscription from the default fanout
+    /// would deliver an event stream that differs from a direct
+    /// upstream monitor.
     ///
     /// This source is a documented cache/fanout gateway, so the
     /// parity-correct behaviour is to **reject** an unsupported
@@ -1368,54 +1370,62 @@ ASG(DEFAULT) {
 
     /// BR-R14: the gateway fans one upstream monitor (opened with the
     /// gateway's default pvRequest) out to N downstream subscribers.
-    /// A downstream MONITOR pvRequest carrying an option that affects
-    /// *upstream event production* — `record._options.pipeline` /
-    /// `queueSize` / `_filter` (pvxs `servermon.cpp:521-555`) — cannot
-    /// be honored transparently across that shared monitor. The
-    /// gateway must reject such a subscription (return `None`) rather
-    /// than silently serve fanout events that differ from a direct
+    /// A downstream MONITOR pvRequest carrying a server-side `_filter`
+    /// chain (pvxs `servermon.cpp:521-555`) changes *upstream event
+    /// production* and cannot be honored transparently across that
+    /// shared monitor, so the gateway must reject it (return `None`)
+    /// rather than serve fanout events that differ from a direct
     /// upstream monitor.
     ///
-    /// Pre-fix `subscribe_checked_opts` did not exist; the server had
-    /// no way to surface the downstream pvRequest options to the
-    /// gateway, so a pipeline/`_filter` monitor was silently served
-    /// from the default fanout.
+    /// `pipeline` / `queueSize`, by contrast, are downstream
+    /// client↔gateway flow control the gateway terminates on its own
+    /// downstream connection / outbox, so they must NOT be rejected:
+    /// every default-configured PVA client enables pipeline, and
+    /// rejecting it would make the gateway's monitor feature unusable.
     #[tokio::test]
-    async fn br_r14_pipeline_monitor_rejected_by_gateway() {
+    async fn br_r14_server_filter_monitor_rejected_by_gateway() {
         use epics_pva_rs::server_native::MonitorOptions;
 
         let src = make_source();
         let ctx = make_ctx("ws03.lab", "carol", "anonymous");
 
-        // pipeline=true must be rejected (returns immediately — no
-        // upstream lookup, so this does not block on connect_timeout).
-        let token = check(&src, "some:pv", &ctx).await;
+        // pipeline + queueSize are downstream-local flow control —
+        // transparent through the fanout gateway, NOT rejected.
         let pipeline_opts = MonitorOptions {
             pipeline: true,
             queue_size: Some(16),
             server_filter: false,
         };
         assert!(
-            pipeline_opts.affects_upstream_events(),
-            "pipeline must count as an upstream-event-affecting option",
-        );
-        let rx = src
-            .subscribe_checked_opts(token, ctx.clone(), pipeline_opts)
-            .await;
-        assert!(
-            rx.is_none(),
-            "gateway must reject a pipeline MONITOR — fanout cannot \
-             provide per-downstream upstream pipeline semantics",
+            !pipeline_opts.affects_upstream_events(),
+            "pipeline / queueSize are downstream-local and must not be \
+             treated as upstream-event-affecting",
         );
 
-        // A server-side `_filter` chain is likewise event-affecting
-        // and must be rejected on the raw fast path too.
-        let raw_token = check(&src, "some:pv", &ctx).await;
+        // A server-side `_filter` chain DOES change upstream event
+        // production and must be rejected on both the decoded and the
+        // raw fast path. The reject returns immediately — no upstream
+        // lookup — so this does not block on connect_timeout.
         let filter_opts = MonitorOptions {
             pipeline: false,
             queue_size: None,
             server_filter: true,
         };
+        assert!(
+            filter_opts.affects_upstream_events(),
+            "a server-side _filter chain must count as event-affecting",
+        );
+        let token = check(&src, "some:pv", &ctx).await;
+        let rx = src
+            .subscribe_checked_opts(token, ctx.clone(), filter_opts.clone())
+            .await;
+        assert!(
+            rx.is_none(),
+            "gateway must reject a decoded MONITOR carrying a \
+             server-side _filter chain",
+        );
+
+        let raw_token = check(&src, "some:pv", &ctx).await;
         let raw_rx = src
             .subscribe_raw_checked_opts(raw_token, ctx, filter_opts)
             .await;

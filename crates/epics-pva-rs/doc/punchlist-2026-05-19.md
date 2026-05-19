@@ -40,9 +40,10 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
   - Spec: `doc/critical-review-2026-05-18.md:148-183`
   - Deferral note: `doc/critical-review-2026-05-18.md:1261-1267`
 
-- [ ] **PVA-R6** (MEDIUM, architectural) — `SharedPV` drops the newest update when a subscriber queue is full. Implement squash-to-tail semantics via `Mutex<VecDeque>+Notify` or `tokio::sync::watch` (tokio::mpsc has no sender-side drop-oldest).
+- [x] **PVA-R6** (MEDIUM, architectural) — `SharedPV` drops the newest update when a subscriber queue is full. Implement squash-to-tail semantics via `Mutex<VecDeque>+Notify` or `tokio::sync::watch` (tokio::mpsc has no sender-side drop-oldest).
   - Spec: `doc/critical-review-2026-05-18.md:259-294`
   - Deferral note: `doc/critical-review-2026-05-18.md:1268-1271`
+  - Done: worker A, commit `c4bb773a` on `caucus/HJB9ABPH/worker`; regression `pva_r6_squash_to_tail`. New `MonitorOutbox`/`MonitorInbox` types with `Mutex<VecDeque>+Notify`; queue default 64 → 4. Upstream parity: pvxs servermon.cpp:66 (default queue limit), :283-286 (squash-to-tail).
 
 - [ ] **PVA-R14** (MEDIUM, architectural) — Decouple server source calls from per-connection read loop. Operation-state-machine restructure so source futures don't head-of-line-block the socket parser.
   - Spec: `doc/critical-review-2026-05-18.md:513-556`
@@ -55,7 +56,8 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 5 (was 6)
-- Done: 1 (PVA-R2)
-- In progress: 1 (PVA-R6, worker A)
+- Total open: 4 (was 6)
+- Done: 2 (PVA-R2, PVA-R6)
+- In progress: 1 (PVA-R4, worker A)
 - Blocked: 0
+- Verified pre-existing main failure: `critical1_audit_layer_records_put` (tests/pva_gateway.rs:557) — separate from this round; not introduced by any worker.

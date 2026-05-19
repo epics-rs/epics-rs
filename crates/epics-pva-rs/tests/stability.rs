@@ -70,6 +70,32 @@ impl MemSource {
             .insert(name.to_string(), pv);
     }
 
+    /// EX-R12: register an NTScalarArray PV holding a Double array.
+    async fn add_array_pv(&self, name: &str, vals: &[f64]) {
+        let pv = make_nt_double_array(vals);
+        self.inner
+            .state
+            .lock()
+            .await
+            .values
+            .insert(name.to_string(), pv);
+    }
+
+    /// Push a new Double-array value to an NTScalarArray PV.
+    async fn push_array(&self, name: &str, vals: &[f64]) {
+        let pv = make_nt_double_array(vals);
+        self.inner
+            .state
+            .lock()
+            .await
+            .values
+            .insert(name.to_string(), pv.clone());
+        let mut subs = self.inner.subs.lock().await;
+        if let Some(list) = subs.get_mut(name) {
+            list.retain(|tx| tx.try_send(pv.clone()).is_ok());
+        }
+    }
+
     async fn push(&self, name: &str, value: f64) {
         let pv = make_nt_scalar(value);
         self.inner
@@ -100,6 +126,22 @@ fn nt_scalar_desc() -> FieldDesc {
     }
 }
 
+fn make_nt_double_array(vals: &[f64]) -> PvField {
+    let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
+    s.fields.push((
+        "value".into(),
+        PvField::ScalarArray(vals.iter().map(|v| ScalarValue::Double(*v)).collect()),
+    ));
+    PvField::Structure(s)
+}
+
+fn nt_double_array_desc() -> FieldDesc {
+    FieldDesc::Structure {
+        struct_id: "epics:nt/NTScalarArray:1.0".into(),
+        fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))],
+    }
+}
+
 impl ChannelSource for MemSource {
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
         let inner = self.inner.clone();
@@ -126,10 +168,19 @@ impl ChannelSource for MemSource {
         let inner = self.inner.clone();
         let name = name.to_string();
         async move {
-            if inner.state.lock().await.values.contains_key(&name) {
-                Some(nt_scalar_desc())
-            } else {
-                None
+            // EX-R12: derive the descriptor from the stored value's
+            // shape so an NTScalarArray PV reports an array descriptor.
+            match inner.state.lock().await.values.get(&name) {
+                Some(PvField::Structure(s))
+                    if matches!(
+                        s.fields.iter().find(|(k, _)| k == "value").map(|(_, v)| v),
+                        Some(PvField::ScalarArray(_))
+                    ) =>
+                {
+                    Some(nt_double_array_desc())
+                }
+                Some(_) => Some(nt_scalar_desc()),
+                None => None,
             }
         }
     }
@@ -536,6 +587,111 @@ async fn server_side_filter_pva_dec_wire_through() {
     assert!(
         !observed.is_empty(),
         "filter dropped every event — chain misconfigured"
+    );
+
+    monitor_handle.abort();
+    h.abort();
+}
+
+/// EX-R12 regression: a server-side TRANSFORMATION filter (`arr`)
+/// must actually change the emitted monitor value. Before the fix
+/// the PVA monitor emit loop called `FilterChain::apply` only to
+/// check `is_none()` for pass/drop and then built the wire payload
+/// from the ORIGINAL value, so a client requesting an array slice
+/// received the full unsliced array.
+///
+/// Here the `arr` filter selects every other element
+/// (`s=0,i=2,e=-1`) of an 8-element array. After the fix the client
+/// must receive the 4-element sliced array, not the original 8.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ex_r12_server_side_arr_filter_slices_monitor_value() {
+    use epics_pva_rs::pv_request::PvRequestBuilder;
+
+    let source = Arc::new(MemSource::new());
+    let full: Vec<f64> = (0..8).map(|i| i as f64).collect();
+    source.add_array_pv("STAB:EXR12:ARR", &full).await;
+
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::<Vec<f64>>::new()));
+    let seen_cb = seen.clone();
+
+    // `arr` slice: start 0, increment 2, end -1 → indices 0,2,4,6.
+    let req = PvRequestBuilder::new()
+        .record("_filter", r#"{"arr":{"s":0,"i":2,"e":-1}}"#)
+        .build();
+
+    let monitor_handle = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let _ = client
+                .pvmonitor_with_request("STAB:EXR12:ARR", &req, move |value| {
+                    // The wire decoder delivers arrays as the typed
+                    // refcount-shared variant.
+                    if let PvField::Structure(s) = value
+                        && let Some(arr_field) = s
+                            .fields
+                            .iter()
+                            .find_map(|(k, v)| (k == "value").then_some(v))
+                    {
+                        let arr: Vec<f64> = match arr_field {
+                            PvField::ScalarArrayTyped(t) => t
+                                .to_scalar_values()
+                                .iter()
+                                .map(|sv| match sv {
+                                    ScalarValue::Double(d) => *d,
+                                    _ => f64::NAN,
+                                })
+                                .collect(),
+                            PvField::ScalarArray(items) => items
+                                .iter()
+                                .map(|sv| match sv {
+                                    ScalarValue::Double(d) => *d,
+                                    _ => f64::NAN,
+                                })
+                                .collect(),
+                            _ => return,
+                        };
+                        seen_cb.lock().push(arr);
+                    }
+                })
+                .await;
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Push a fresh 8-element array — this event flows through the
+    // monitor emit loop where the filter chain runs.
+    source
+        .push_array(
+            "STAB:EXR12:ARR",
+            &[10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0],
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let observed = seen.lock().clone();
+    assert!(
+        observed.len() >= 2,
+        "EX-R12: expected the initial snapshot plus the pushed event, got {}",
+        observed.len()
+    );
+    // The steady-state pushed event flows through the emit loop's
+    // filter chain and MUST be the sliced array (indices 0,2,4,6 of
+    // [10..17] = [10,12,14,16]). Before the fix the wire payload was
+    // built from the original unsliced value, so this frame carried
+    // all 8 elements.
+    let pushed = observed.last().unwrap();
+    assert_eq!(
+        pushed,
+        &vec![10.0, 12.0, 14.0, 16.0],
+        "EX-R12: arr filter did not slice the emitted monitor value — got {pushed:?}"
+    );
+    assert_eq!(
+        pushed.len(),
+        4,
+        "EX-R12: arr-sliced monitor value must have 4 elements"
     );
 
     monitor_handle.abort();

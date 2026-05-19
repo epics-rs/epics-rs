@@ -55,21 +55,20 @@ struct PipelineOptions {
 /// `value`/`alarm`/`timeStamp` members (NTScalar / NTNDArray shape).
 ///
 /// Currently extracts:
-/// * Scalar value (DBND filter needs an f64 comparable). Falls back
-///   to `Double(0.0)` for non-scalar values — DBND on arrays /
-///   structures is meaningless and ARR (which would slice the
-///   array) is the wire-through gap documented separately.
+/// * The value leaf as an `EpicsValue` — scalar OR array. Arrays are
+///   carried losslessly (EX-R12) so the `arr` transformation filter
+///   sees the real array to slice. Falls back to `Double(0.0)` only
+///   for shapes with no representable value leaf.
 /// * The mask is always set to `EventMask::VALUE` because PVA's
 ///   monitor stream does not carry the CA-style ALARM/PROPERTY
 ///   discriminator at this layer — the field bitset already encodes
 ///   which subfields changed.
 ///
-/// Filters that work today through this adapter: DEC, TS, SYNC,
-/// DBND (scalar VAL only). ARR is the explicit remaining gap.
+/// The transformed event is bridged back to the wire by
+/// [`apply_filter_transform`]; see EX-R12.
 fn pv_field_to_filter_event(
     value: &PvField,
 ) -> epics_base_rs::server::database::filters::FilteredMonitorEvent {
-    use crate::pvdata::ScalarValue;
     use epics_base_rs::server::database::filters::FilteredMonitorEvent;
     use epics_base_rs::server::pv::MonitorEvent;
     use epics_base_rs::server::recgbl::EventMask;
@@ -77,27 +76,7 @@ fn pv_field_to_filter_event(
     use epics_base_rs::types::EpicsValue;
     use std::time::SystemTime;
 
-    fn extract_scalar(f: &PvField) -> EpicsValue {
-        match f {
-            PvField::Scalar(ScalarValue::Double(d)) => EpicsValue::Double(*d),
-            PvField::Scalar(ScalarValue::Float(f32v)) => EpicsValue::Float(*f32v),
-            PvField::Scalar(ScalarValue::Int(i)) => EpicsValue::Long(*i),
-            PvField::Scalar(ScalarValue::Long(l)) => EpicsValue::Long(*l as i32),
-            PvField::Scalar(ScalarValue::Short(s)) => EpicsValue::Short(*s),
-            PvField::Scalar(ScalarValue::String(s)) => EpicsValue::String(s.clone()),
-            PvField::Structure(s) => {
-                // NT-style structure: look for a "value" subfield.
-                for (k, v) in &s.fields {
-                    if k == "value" {
-                        return extract_scalar(v);
-                    }
-                }
-                EpicsValue::Double(0.0)
-            }
-            _ => EpicsValue::Double(0.0),
-        }
-    }
-    let val = extract_scalar(value);
+    let val = pv_value_leaf_to_epics(value).unwrap_or(EpicsValue::Double(0.0));
     FilteredMonitorEvent::new(
         MonitorEvent {
             snapshot: Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH),
@@ -105,6 +84,188 @@ fn pv_field_to_filter_event(
         },
         EventMask::VALUE,
     )
+}
+
+/// Extract the value leaf of a PVA monitor `PvField` as an
+/// `EpicsValue`, looking through an NT-style structure's `value`
+/// member. Scalars and scalar arrays are both carried; returns
+/// `None` for shapes with no representable value leaf (EX-R12: the
+/// `arr` filter needs the real array, not a scalar fallback).
+fn pv_value_leaf_to_epics(f: &PvField) -> Option<epics_base_rs::types::EpicsValue> {
+    use crate::pvdata::ScalarValue;
+    use epics_base_rs::types::EpicsValue;
+
+    fn scalar(sv: &ScalarValue) -> Option<EpicsValue> {
+        Some(match sv {
+            ScalarValue::Double(d) => EpicsValue::Double(*d),
+            ScalarValue::Float(v) => EpicsValue::Float(*v),
+            ScalarValue::Int(i) => EpicsValue::Long(*i),
+            ScalarValue::Long(l) => EpicsValue::Int64(*l),
+            ScalarValue::ULong(u) => EpicsValue::UInt64(*u),
+            ScalarValue::Short(s) => EpicsValue::Short(*s),
+            ScalarValue::UByte(b) => EpicsValue::Char(*b),
+            ScalarValue::String(s) => EpicsValue::String(s.clone()),
+            _ => return None,
+        })
+    }
+    fn array(items: &[ScalarValue]) -> Option<EpicsValue> {
+        // Empty array — default to a Double array (the filter slice
+        // of an empty array is still empty, so the element type is
+        // irrelevant for correctness here).
+        let first = items.first();
+        Some(match first {
+            Some(ScalarValue::Double(_)) | None => EpicsValue::DoubleArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Double(d) => *d,
+                        _ => 0.0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::Float(_)) => EpicsValue::FloatArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Float(v) => *v,
+                        _ => 0.0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::Int(_)) => EpicsValue::LongArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Int(v) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::Long(_)) => EpicsValue::Int64Array(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Long(v) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::Short(_)) => EpicsValue::ShortArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Short(v) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::String(_)) => EpicsValue::StringArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::String(v) => v.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+            ),
+            _ => return None,
+        })
+    }
+    match f {
+        PvField::Scalar(sv) => scalar(sv),
+        PvField::ScalarArray(items) => array(items),
+        // Wire-decoded arrays arrive as the refcount-shared typed
+        // form; convert to the generic scalar vector so the `arr`
+        // filter sees the real array regardless of which variant the
+        // source produced.
+        PvField::ScalarArrayTyped(t) => array(&t.to_scalar_values()),
+        PvField::Structure(s) => s
+            .fields
+            .iter()
+            .find_map(|(k, v)| (k == "value").then_some(v))
+            .and_then(pv_value_leaf_to_epics),
+        _ => None,
+    }
+}
+
+/// EX-R12: bridge a filter-chain-transformed `FilteredMonitorEvent`
+/// back to the wire `PvField`. Substitutes the transformed value leaf
+/// into the original monitor `PvField` (looking through an NT-style
+/// `value` member) so transformation filters such as `arr` (array
+/// slice) and `ts` actually change the emitted payload.
+///
+/// Returns `None` when the transformed value cannot be represented
+/// in the original wire shape — the caller treats that as a filter
+/// incompatible with the negotiated monitor descriptor.
+fn apply_filter_transform(
+    original: &PvField,
+    transformed: &epics_base_rs::types::EpicsValue,
+) -> Option<PvField> {
+    let new_leaf = epics_value_to_pv_field(transformed)?;
+    substitute_value_leaf(original, new_leaf)
+}
+
+/// Convert an `EpicsValue` produced by a filter back into a PVA
+/// value-leaf `PvField` (scalar or scalar array).
+fn epics_value_to_pv_field(v: &epics_base_rs::types::EpicsValue) -> Option<PvField> {
+    use crate::pvdata::ScalarValue;
+    use epics_base_rs::types::EpicsValue;
+    Some(match v {
+        EpicsValue::Double(d) => PvField::Scalar(ScalarValue::Double(*d)),
+        EpicsValue::Float(f) => PvField::Scalar(ScalarValue::Float(*f)),
+        EpicsValue::Long(i) => PvField::Scalar(ScalarValue::Int(*i)),
+        EpicsValue::Short(s) => PvField::Scalar(ScalarValue::Short(*s)),
+        EpicsValue::Char(c) => PvField::Scalar(ScalarValue::UByte(*c)),
+        EpicsValue::Enum(e) => PvField::Scalar(ScalarValue::Int(*e as i32)),
+        EpicsValue::String(s) => PvField::Scalar(ScalarValue::String(s.clone())),
+        EpicsValue::Int64(l) => PvField::Scalar(ScalarValue::Long(*l)),
+        EpicsValue::UInt64(u) => PvField::Scalar(ScalarValue::ULong(*u)),
+        EpicsValue::DoubleArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Double(*x)).collect())
+        }
+        EpicsValue::FloatArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Float(*x)).collect())
+        }
+        EpicsValue::LongArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Int(*x)).collect())
+        }
+        EpicsValue::ShortArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Short(*x)).collect())
+        }
+        EpicsValue::CharArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::UByte(*x)).collect())
+        }
+        EpicsValue::EnumArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Int(*x as i32)).collect())
+        }
+        EpicsValue::StringArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::String(x.clone())).collect())
+        }
+        EpicsValue::Int64Array(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Long(*x)).collect())
+        }
+        EpicsValue::UInt64Array(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::ULong(*x)).collect())
+        }
+    })
+}
+
+/// Replace the value leaf of `original` with `new_leaf`. For an
+/// NT-style structure the `value` member is replaced in place;
+/// for a bare scalar/array the whole field is replaced.
+fn substitute_value_leaf(original: &PvField, new_leaf: PvField) -> Option<PvField> {
+    match original {
+        PvField::Scalar(_) | PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_) => {
+            Some(new_leaf)
+        }
+        PvField::Structure(s) => {
+            let mut out = s.clone();
+            let slot = out.fields.iter_mut().find(|(k, _)| k == "value")?;
+            slot.1 = new_leaf;
+            Some(PvField::Structure(out))
+        }
+        _ => None,
+    }
 }
 
 /// Read `record._options._filter` from a decoded pvRequest. The value
@@ -3492,12 +3653,60 @@ async fn handle_op(
                         // Server-side channel filters: skip when the
                         // chain drops this event. Empty chain (the
                         // default) is a no-op pass-through.
-                        if !filters.is_empty() {
+                        //
+                        // EX-R12: a filter chain may TRANSFORM the
+                        // event (e.g. `arr` slices the array, `ts`
+                        // rewrites the value). The transformed value
+                        // from `FilterChain::apply` is bridged back
+                        // into the wire `PvField` via
+                        // `apply_filter_transform`; the monitor frame
+                        // is then built from the transformed value,
+                        // not the original. A pass/drop-only filter
+                        // (`dec`, `sync`, scalar `dbnd`) leaves the
+                        // value unchanged, so the bridge is a no-op
+                        // for it. When the transformed value cannot be
+                        // represented in the negotiated monitor
+                        // descriptor (a transformation filter whose
+                        // output type/shape does not fit this PV's
+                        // fixed wire descriptor — e.g. a `ts` mode
+                        // that changes the scalar type), the
+                        // subscription cannot honor the filter: emit a
+                        // monitor error frame and end the stream
+                        // rather than silently sending a wrong value.
+                        let value = if filters.is_empty() {
+                            value
+                        } else {
                             let fev = pv_field_to_filter_event(&value);
-                            if filters.apply(fev).is_none() {
-                                continue;
+                            match filters.apply(fev) {
+                                None => continue,
+                                Some(transformed) => {
+                                    match apply_filter_transform(
+                                        &value,
+                                        &transformed.event.snapshot.value,
+                                    ) {
+                                        Some(tv)
+                                            if crate::pvdata::value_matches_descriptor(
+                                                &tv,
+                                                &intro_clone,
+                                            )
+                                            .is_ok() =>
+                                        {
+                                            tv
+                                        }
+                                        _ => {
+                                            let err = build_monitor_error(
+                                                ioid,
+                                                "server-side filter transform does not \
+                                                 fit the monitor descriptor",
+                                                order,
+                                            );
+                                            let _ = tx_clone.send(err).await;
+                                            return;
+                                        }
+                                    }
+                                }
                             }
-                        }
+                        };
                         // P-G11: pipeline window check. When pipeline
                         // is active, wait for window > 0 before
                         // emitting. ACK frames refill the window via
@@ -3956,6 +4165,25 @@ fn build_monitor_finish(ioid: u32, order: ByteOrder) -> Vec<u8> {
     payload.put_u32(ioid, order);
     payload.put_u8(0x10);
     Status::ok().write_into(order, &mut payload);
+    let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
+    let mut buf = Vec::with_capacity(8 + payload.len());
+    h.write_into(&mut buf);
+    buf.extend_from_slice(&payload);
+    buf
+}
+
+/// EX-R12: build a MONITOR error frame — subcmd `0x10` (finish) plus
+/// a non-success `Status`. Used when a server-side transformation
+/// filter produces a value that cannot be represented in the
+/// monitor's negotiated wire descriptor; the stream ends with an
+/// explicit error rather than silently emitting a wrong value. pvxs
+/// `servermon.cpp:178` notes the finish frame "could be used to send
+/// an error".
+fn build_monitor_error(ioid: u32, msg: &str, order: ByteOrder) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.put_u32(ioid, order);
+    payload.put_u8(0x10);
+    Status::error(msg.to_string()).write_into(order, &mut payload);
     let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
     let mut buf = Vec::with_capacity(8 + payload.len());
     h.write_into(&mut buf);

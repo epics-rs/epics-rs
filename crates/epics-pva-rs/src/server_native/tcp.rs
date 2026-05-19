@@ -2658,6 +2658,10 @@ async fn handle_op(
             let cred_host = cred.host.clone();
             let cred_authority = cred.authority.clone();
             let cred_roles = cred.roles.clone();
+            // MR-R13: forward the decoded INIT pvRequest into the GET
+            // context so QSRV group GET honors `record._options`
+            // (e.g. `atomic`). Previously dropped here as `None`.
+            let init_pv_request_t = init_pv_request.clone();
             // Abort any previous in-flight data task for this ioid
             // (e.g. double-EXEC from a misbehaving client).
             if let Some(op_mut) = ch.ops.get_mut(&ioid) {
@@ -2671,7 +2675,7 @@ async fn handle_op(
                     host: cred_host,
                     authority: cred_authority,
                     roles: cred_roles,
-                    pv_request: None,
+                    pv_request: init_pv_request_t,
                 };
                 let checked = src
                     .access_gate()
@@ -2753,6 +2757,10 @@ async fn handle_op(
                 let cred_host = cred.host.clone();
                 let cred_authority = cred.authority.clone();
                 let cred_roles = cred.roles.clone();
+                // MR-R13: forward the INIT pvRequest into the PUT
+                // readback GET context so the readback honors the
+                // same `record._options` the GET path would.
+                let init_pv_request_t = init_pv_request.clone();
                 if let Some(op_mut) = ch.ops.get_mut(&ioid) {
                     op_mut.data_task_abort = None;
                 }
@@ -2764,7 +2772,7 @@ async fn handle_op(
                         host: cred_host,
                         authority: cred_authority,
                         roles: cred_roles,
-                        pv_request: None,
+                        pv_request: init_pv_request_t,
                     };
                     let checked = src
                         .access_gate()

@@ -39,8 +39,9 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ### Priority 3 — Field addressing & PUT/scan processing
 
-- [ ] **BR-R11** — pvalink OUT writes do not preserve `field`, `proc`, `block`, or deferred option semantics from the DB link.
+- [x] **BR-R11** — pvalink OUT writes do not preserve `field`, `proc`, `block`, or deferred option semantics from the DB link.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:327-357`
+  - Done: worker B, commit `a198da48` on `caucus/HJB9ABPH/backend`; regression `br_r11_pvalink_out_options_preserved`. Cross-crate: also touched `epics-pva-rs` (added `op_put_field_with_request`, `op_put_value_raw`, `pvput_field_with_request`, `pvput_pv_field_with_request`). Upstream parity: pvxs pvalink_channel.cpp:28-47 (putReq template), :138 (field targeting), :220-263 (process computation), :223 (block), :268 (PUT); pvalink_lset.cpp:647 (defer/wait).
 
 ### Priority 4 — DB pvalink / group syntax/options
 
@@ -104,7 +105,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 15 (was 17)
-- Done: 2 (BR-R4, BR-R21)
+- Total open: 14 (was 15)
+- Done: 3 (BR-R4, BR-R21, BR-R11)
 - In progress: 0
 - Blocked: 0

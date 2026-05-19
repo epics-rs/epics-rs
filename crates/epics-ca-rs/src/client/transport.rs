@@ -841,16 +841,33 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     pending_frames: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    // R2-40: send watchdog deadline. C `tcpSendWatchdog`
+    // R2-40 / MR-R17: send watchdog deadline. C `tcpSendWatchdog`
     // (`libca/tcpSendWatchdog.cpp:43-64`) fires after `connTMO`
     // (`EPICS_CA_CONN_TMO`, default 30 s) and calls
-    // `iiu.sendTimeoutNotify` → `unresponsiveCircuitNotify`; the
-    // TCP socket is kept and a recv probe is started. Pre-fix Rust
-    // used 2x ECHO_TIMEOUT_SECS (10 s) and converted any write
-    // timeout to `TcpClosed`, forcing a full search/connect cycle
-    // for a slow-but-live server. Match C: use the configured
-    // CONN_TMO and signal CircuitUnresponsive (not TcpClosed) on
-    // write timeout so the read path's echo probe can recover.
+    // `iiu.sendTimeoutNotify` → `unresponsiveCircuitNotify`. The
+    // critical detail is that C's send is a *blocking* `::send`
+    // (`tcpiiu.cpp:232`, `flushToWire`): the watchdog runs as a
+    // separate liveness probe alongside a send that is never
+    // abandoned mid-frame — `flushToWire` either completes a whole
+    // `comBuf` or fails. C therefore never leaves a truncated CA
+    // frame on the wire and then keeps writing.
+    //
+    // Tokio's `timeout(send_timeout, write_all(&batch))` is NOT
+    // equivalent: when the timeout fires the `write_all` future is
+    // *cancelled*, possibly after a prefix of a CA frame has already
+    // reached the socket. Continuing to write later batches on the
+    // same stream would append after that truncated frame and
+    // desynchronize the server's parser. R2-40 changed this arm to
+    // emit `CircuitUnresponsive` and keep the socket — that is only
+    // safe for the read-side echo watchdog, where no bytes were
+    // corrupted, not for a cancelled write. So on write timeout we
+    // close the circuit (`TcpClosed`), exactly as `origin/main` did:
+    // `handle_disconnect` then drains the pending read/write waiters
+    // (no silently-dropped frames) and the reconnect path rebuilds a
+    // clean stream. This mirrors C's send-error path, where a
+    // `flushToWire` failure makes `sendThreadFlush` return false →
+    // the send thread breaks and `shutdown(sock, SHUT_WR)` tears the
+    // circuit down (`tcpiiu.cpp:168-176`, `:1684-1690`).
     let send_timeout = echo_idle();
     let mut batch = Vec::with_capacity(4096);
     while let Some(frame) = rx.recv().await {
@@ -901,20 +918,22 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
                 return;
             }
             Err(_) => {
-                // R2-40: write-side timeout (server stalled) →
-                // signal unresponsive instead of close. The read
-                // loop's echo watchdog will follow if the server
-                // truly died; if the server recovers, the recv
-                // probe converts back to CircuitResponsive
-                // (matches C `tcpSendWatchdog::sendTimeoutNotify`
-                // → `unresponsiveCircuitNotify` flow). Keep the
-                // socket alive; partial-write state is
-                // unrecoverable, but tokio's `write_all` cancel
-                // after timeout doesn't tear down the socket.
-                let _ = event_tx.send(TransportEvent::CircuitUnresponsive { server_addr });
-                // Drop this frame and continue draining — the
-                // recv watchdog now owns the recovery decision.
-                batch.clear();
+                // MR-R17: write-side timeout. `write_all` was
+                // cancelled by `timeout`, so a prefix of a CA frame
+                // may already be on the wire. The TCP stream is no
+                // longer a clean message boundary — keeping it and
+                // writing later batches would concatenate after a
+                // truncated frame and desync the server parser.
+                // Close the circuit: `handle_disconnect` (mod.rs)
+                // drains the pending read/write waiters so callers
+                // get a deterministic failure instead of hanging,
+                // and the reconnect path rebuilds a clean stream.
+                // The per-connection `pending_frames` backpressure
+                // counter is discarded with the dropped
+                // `ServerConnection`, so the stale count cannot
+                // leak into a future circuit.
+                let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                return;
             }
         }
     }
@@ -2153,5 +2172,126 @@ mod malformed_header_close_tests {
         // Clean EOF resolves the loop.
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+}
+
+#[cfg(test)]
+mod write_loop_timeout_tests {
+    //! MR-R17: a write-side timeout in `write_loop` must close the
+    //! circuit (`TcpClosed`) rather than emit `CircuitUnresponsive`
+    //! and keep writing on the same TCP stream. `tokio`'s
+    //! `timeout(.., write_all(&batch))` cancels the `write_all`
+    //! future on expiry, possibly after a prefix of a CA frame has
+    //! already reached the socket; reusing that stream would
+    //! concatenate later batches after a truncated frame and desync
+    //! the server parser. Closing forces the reconnect path to
+    //! rebuild a clean stream and lets `handle_disconnect` drain
+    //! the pending waiters with a deterministic failure.
+    use super::*;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tokio::io::AsyncWrite;
+
+    /// Mock writer that accepts a partial first write (simulating a
+    /// CA-frame prefix landing on the socket) and then stalls
+    /// forever — every later `poll_write` returns `Pending`. This is
+    /// exactly the condition `write_all` cannot complete, so the
+    /// `timeout` in `write_loop` fires.
+    struct PartialThenStallWriter {
+        first_write: Arc<AtomicUsize>,
+    }
+
+    impl AsyncWrite for PartialThenStallWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            // First poll_write accepts a 4-byte prefix of the frame;
+            // all subsequent ones stall (Pending) forever.
+            if self.first_write.swap(1, Ordering::SeqCst) == 0 {
+                let n = buf.len().min(4);
+                Poll::Ready(Ok(n))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:5064".parse().unwrap()
+    }
+
+    /// MR-R17 regression: a stalled write that has already accepted a
+    /// partial frame must make `write_loop` emit `TcpClosed` and
+    /// exit — NOT `CircuitUnresponsive` while keeping the socket.
+    ///
+    /// Pre-fix the timeout arm sent `CircuitUnresponsive`, cleared
+    /// `batch`, and looped to drain the next frame on the same
+    /// (now desynchronized) stream, silently dropping the timed-out
+    /// frame and leaving the `pending_frames` counter inflated.
+    #[tokio::test(start_paused = true)]
+    async fn mr_r17_write_timeout_closes_circuit() {
+        let server_addr = test_addr();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let pending_frames = Arc::new(AtomicUsize::new(0));
+        let writer = PartialThenStallWriter {
+            first_write: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let task = tokio::spawn(write_loop(
+            writer,
+            write_rx,
+            server_addr,
+            event_tx,
+            pending_frames.clone(),
+        ));
+
+        // Queue a CA frame. `send_frame` would have incremented
+        // pending_frames; mirror that so we can assert the counter
+        // is not stranded after the timeout.
+        pending_frames.fetch_add(1, Ordering::SeqCst);
+        write_tx
+            .send(vec![0xAAu8; 32])
+            .expect("frame enqueue must succeed");
+
+        // The writer accepts 4 bytes then stalls; `echo_idle()`
+        // (default CONN_TMO 30 s) elapses on the paused clock and
+        // the timeout arm fires.
+        let evt = tokio::time::timeout(Duration::from_secs(60), event_rx.recv())
+            .await
+            .expect("write_loop must emit an event before 60 s")
+            .expect("event channel must not be closed");
+
+        match evt {
+            TransportEvent::TcpClosed { server_addr: a } => assert_eq!(a, server_addr),
+            TransportEvent::CircuitUnresponsive { .. } => panic!(
+                "write timeout must CLOSE the circuit (TcpClosed): the \
+                 cancelled write_all may have left a partial CA frame on \
+                 the wire — keeping the socket desyncs the server parser"
+            ),
+            _ => panic!("write timeout must emit TcpClosed, got a different event"),
+        }
+
+        // The write loop must have returned (not looped to drain the
+        // next frame on the dead stream).
+        let joined = tokio::time::timeout(Duration::from_secs(2), task).await;
+        assert!(
+            joined.is_ok(),
+            "write_loop must exit after a write-timeout close, not \
+             continue writing on the desynchronized circuit"
+        );
     }
 }

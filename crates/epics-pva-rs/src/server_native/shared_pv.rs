@@ -10,20 +10,23 @@
 //! Many SharedPVs can be plugged into a single server via
 //! [`SharedSource`] (collection mapping name → SharedPV).
 //!
-//! Flow control: the per-monitor `mpsc::Sender` is bounded; `try_post`
-//! never blocks but may drop updates when the consumer is slow.
-//! Tokio `mpsc` exposes no "drop oldest" primitive, so an over-budget
-//! subscriber sees its event lost — the next `try_post` will deliver
-//! the freshest value, which is the standard mailbox-on-channel
-//! degradation when the consumer cannot keep up.
+//! Flow control: each subscriber owns a bounded [`MonitorInbox`] backed
+//! by `Mutex<VecDeque>+Notify`. When the queue is full, a normal post
+//! replaces the tail entry with the newest value (squash-to-tail;
+//! pvxs `servermon.cpp:283-286`). A `maybe` post is silently dropped.
+//! This matches pvxs semantics: slow subscribers converge to the latest
+//! posted state after congestion clears.
 //!
 //! Watermarks (low/high) are advisory hints stored on the SharedPV and
 //! consulted by op_monitor when it decides whether to acknowledge a
 //! pipeline window. We don't yet wire them into the wire-level
 //! ackCount but the API is in place for callers to set them.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -94,15 +97,133 @@ pub type LifecycleFn = Arc<dyn Fn(&SharedPV) + Send + Sync>;
 /// ```
 pub type WatermarkFn = Arc<dyn Fn(&SharedPV) + Send + Sync>;
 
+// ── Per-subscriber bounded queue with squash-to-tail semantics ──────────────
+
+struct MonitorQueueInner {
+    items: VecDeque<PvField>,
+    limit: usize,
+    /// True once the producer side (SharedPV) signals no more data.
+    producer_done: bool,
+}
+
+struct MonitorQueueShared {
+    inner: Mutex<MonitorQueueInner>,
+    notify: tokio::sync::Notify,
+    /// Set in MonitorInbox::drop; post() checks this to decide whether to remove
+    /// the outbox from the subscriber list.
+    receiver_dropped: AtomicBool,
+}
+
+/// Sender half of a per-subscriber queue. Held by `SharedPV::subscribers`.
+#[derive(Clone)]
+pub struct MonitorOutbox {
+    shared: Arc<MonitorQueueShared>,
+}
+
+/// Receiver half of a per-subscriber queue. Returned by `SharedPV::subscribe`.
+pub struct MonitorInbox {
+    shared: Arc<MonitorQueueShared>,
+}
+
+fn make_monitor_queue(limit: usize) -> (MonitorOutbox, MonitorInbox) {
+    let limit = limit.max(1);
+    let shared = Arc::new(MonitorQueueShared {
+        inner: Mutex::new(MonitorQueueInner {
+            items: VecDeque::with_capacity(limit),
+            limit,
+            producer_done: false,
+        }),
+        notify: tokio::sync::Notify::new(),
+        receiver_dropped: AtomicBool::new(false),
+    });
+    (
+        MonitorOutbox {
+            shared: Arc::clone(&shared),
+        },
+        MonitorInbox { shared },
+    )
+}
+
+impl MonitorOutbox {
+    /// Post a value. `maybe=false`: full queue → squash tail (pvxs servermon.cpp:283-286).
+    /// `maybe=true`: full queue → drop silently.
+    /// Returns `false` when the receiver has been dropped (caller should remove this outbox).
+    fn post(&self, value: PvField, maybe: bool) -> bool {
+        if self.shared.receiver_dropped.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut inner = self.shared.inner.lock();
+        if inner.producer_done {
+            // Producer already closed; keep outbox alive so Drop delivers the signal.
+            return true;
+        }
+        if inner.items.len() < inner.limit {
+            inner.items.push_back(value);
+        } else if !maybe {
+            // pvxs servermon.cpp:283-286: queue.back().assign(val) — squash tail
+            if let Some(tail) = inner.items.back_mut() {
+                *tail = value;
+            }
+        }
+        // maybe+full: drop silently — same as pvxs "nope" branch (servermon.cpp:287)
+        drop(inner);
+        self.shared.notify.notify_one();
+        !self.shared.receiver_dropped.load(Ordering::Relaxed)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.shared.receiver_dropped.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for MonitorOutbox {
+    fn drop(&mut self) {
+        // Signal inbox that no more data will arrive (producer_done = true).
+        self.shared.inner.lock().producer_done = true;
+        self.shared.notify.notify_waiters();
+    }
+}
+
+impl Drop for MonitorInbox {
+    fn drop(&mut self) {
+        self.shared.receiver_dropped.store(true, Ordering::Relaxed);
+    }
+}
+
+impl MonitorInbox {
+    /// Async receive. Returns `None` when the producer closed and the queue is drained.
+    pub async fn recv(&mut self) -> Option<PvField> {
+        loop {
+            let notified = self.shared.notify.notified();
+            tokio::pin!(notified);
+            // Register the waiter before checking so a concurrent notify_one()
+            // fired between check and await is captured (same Notify::enable()
+            // pattern as channel.rs wait_until_inactive).
+            notified.as_mut().enable();
+            {
+                let mut inner = self.shared.inner.lock();
+                if let Some(v) = inner.items.pop_front() {
+                    return Some(v);
+                }
+                if inner.producer_done {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Per-PV state stored inside [`SharedPV`].
 struct Inner {
     /// Type descriptor declared at open() — None when not opened.
     desc: Option<FieldDesc>,
     /// Most recent value (defaulted from desc on open).
     value: Option<PvField>,
-    /// Open subscribers. Each slot holds a Sender for the per-monitor
-    /// channel; callers post by sending one PvField per update.
-    subscribers: Vec<mpsc::Sender<PvField>>,
+    /// Open subscribers. Each slot holds a MonitorOutbox for squash-to-tail delivery.
+    subscribers: Vec<MonitorOutbox>,
     /// Optional flow-control watermark: monitor stream sends MORE
     /// only when its outbox depth crosses below `low_watermark`.
     /// Currently advisory; preserved here for op_monitor to consult.
@@ -256,23 +377,19 @@ impl SharedPV {
             }
         }
         g.value = Some(value.clone());
-        let mut delivered = 0;
-        g.subscribers.retain(|tx| match tx.try_send(value.clone()) {
-            Ok(()) => {
-                delivered += 1;
-                true
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => true, // keep, drop update
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        });
-        Ok(delivered)
+        // pvxs servermon.cpp:283-286: normal post squashes tail when queue full.
+        g.subscribers.retain(|tx| tx.post(value.clone(), false));
+        Ok(g.subscribers.len())
     }
 
-    /// Add a subscriber. The returned Receiver yields every successful
-    /// post; the channel depth is capped at `monitor_queue_depth`.
-    /// Drops on the receiver side translate to subscriber removal on
-    /// the next post().
-    pub fn subscribe(&self, monitor_queue_depth: usize) -> Option<mpsc::Receiver<PvField>> {
+    /// Add a subscriber. Returns a [`MonitorInbox`] that yields posted values
+    /// with squash-to-tail semantics (pvxs `servermon.cpp:283-286`) when the
+    /// `limit`-deep queue is full. Drops on the receiver side translate to
+    /// outbox removal on the next post.
+    ///
+    /// `limit` is the maximum number of unread events; pvxs default is 4
+    /// (`servermon.cpp:66`). Values ≥ 1 are accepted; 0 is clamped to 1.
+    pub fn subscribe(&self, limit: usize) -> Option<MonitorInbox> {
         // Latch onFirstConnect callback to run *after* releasing the
         // lock — handlers may call back into post() / current() and we
         // can't recurse on parking_lot Mutex.
@@ -281,19 +398,19 @@ impl SharedPV {
             if !g.is_open {
                 return None;
             }
-            let depth = monitor_queue_depth.max(1);
-            let (tx, rx) = mpsc::channel(depth);
+            let (outbox, inbox) = make_monitor_queue(limit);
             if let Some(v) = &g.value {
-                let _ = tx.try_send(v.clone());
+                // Initial value: queue is empty so limit not yet reached.
+                outbox.post(v.clone(), false);
             }
             let was_empty = g.subscribers.is_empty();
-            g.subscribers.push(tx);
+            g.subscribers.push(outbox);
             let cb = if was_empty {
                 g.on_first_connect.clone()
             } else {
                 None
             };
-            (rx, cb)
+            (inbox, cb)
         };
         if let Some(f) = cb.1 {
             f(self);
@@ -356,7 +473,7 @@ impl SharedPV {
             // post the merged value to these subscribers.
             Posted {
                 value: PvField,
-                subscribers: Vec<mpsc::Sender<PvField>>,
+                subscribers: Vec<MonitorOutbox>,
             },
             // on_put handler installed: run it with the merged value.
             Handler {
@@ -415,13 +532,10 @@ impl SharedPV {
                 value,
                 mut subscribers,
             } => {
-                subscribers.retain(|tx| match tx.try_send(value.clone()) {
-                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-                    Err(mpsc::error::TrySendError::Closed(_)) => false,
-                });
-                // Reconcile the subscriber set: drop the ones whose
-                // receiver closed. Re-lock briefly; new subscribers
-                // that joined between phase 1 and here are preserved.
+                // pvxs servermon.cpp:283-286: squash-to-tail for normal post.
+                subscribers.retain(|tx| tx.post(value.clone(), false));
+                // Reconcile the canonical subscriber set: drop receivers that
+                // closed between the phase-1 snapshot and now.
                 let mut g = self.inner.lock();
                 g.subscribers.retain(|tx| !tx.is_closed());
                 Ok(())
@@ -797,7 +911,22 @@ impl super::source::ChannelSource for SharedSource {
         name: &str,
     ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
-        async move { pv.and_then(|p| p.subscribe(64)) }
+        async move {
+            // pvxs servermon.cpp:66: default queue limit = 4.
+            let inbox = pv.and_then(|p| p.subscribe(4))?;
+            // Bridge MonitorInbox → mpsc::Receiver so the ChannelSource trait
+            // signature stays stable; squash-to-tail semantics live in inbox.
+            let (tx, rx) = mpsc::channel::<PvField>(1);
+            tokio::spawn(async move {
+                let mut inbox = inbox;
+                while let Some(v) = inbox.recv().await {
+                    if tx.send(v).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Some(rx)
+        }
     }
 
     fn rpc(
@@ -912,6 +1041,60 @@ mod tests {
         pv.close();
         assert!(!pv.is_open());
         assert_eq!(pv.try_post(nt_scalar_int_value(1)), 0);
+    }
+
+    fn extract_int(v: &PvField) -> i32 {
+        match v {
+            PvField::Structure(s) => match s.get_field("value") {
+                Some(PvField::Scalar(ScalarValue::Int(n))) => *n,
+                other => panic!("unexpected field: {other:?}"),
+            },
+            other => panic!("not a structure: {other:?}"),
+        }
+    }
+
+    /// PVA-R6 regression: when a subscriber's queue is full, a normal post
+    /// must replace the queue TAIL (squash-to-tail, pvxs servermon.cpp:283-286),
+    /// NOT drop the new value.
+    ///
+    /// Setup: subscribe with limit=2, drain initial. Post 4 updates without
+    /// consuming. Expected queue contents (squash-to-tail):
+    ///   post(1) → [1]
+    ///   post(2) → [1, 2]  (full)
+    ///   post(3) → [1, 3]  (tail 2 → 3)
+    ///   post(4) → [1, 4]  (tail 3 → 4)
+    /// Consumer sees 1, 4 — NOT 1, 2 (the drop-newest behaviour before the fix).
+    ///
+    /// Before fix: try_send returned TrySendError::Full for posts 3 and 4, so
+    /// consumer saw [1, 2] and the assertion v2 == 4 failed.
+    #[tokio::test]
+    async fn pva_r6_squash_to_tail() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        let mut rx = pv.subscribe(2).expect("subscribe"); // queue limit = 2
+
+        // Drain the initial value so the queue is empty.
+        let _ = rx.recv().await.expect("initial value");
+
+        // Post 4 updates while not consuming (simulates slow subscriber).
+        pv.try_post(nt_scalar_int_value(1)); // queue: [1]
+        pv.try_post(nt_scalar_int_value(2)); // queue: [1, 2] — full
+        pv.try_post(nt_scalar_int_value(3)); // squash: [1, 3]
+        pv.try_post(nt_scalar_int_value(4)); // squash: [1, 4]
+
+        let v1 = rx.recv().await.expect("update 1");
+        let v2 = rx.recv().await.expect("update 2 (squashed tail)");
+
+        assert_eq!(extract_int(&v1), 1, "first in-order item must be 1");
+        assert_eq!(
+            extract_int(&v2),
+            4,
+            "squash-to-tail: newest value (4) must survive"
+        );
+
+        // Queue is now empty — no more posts were made.
+        let empty = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(empty.is_err(), "queue must be empty after squash drain");
     }
 
     #[test]

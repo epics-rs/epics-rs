@@ -1807,7 +1807,7 @@ async fn handle_put_get(
                 return Ok(());
             }
         };
-        let _req_value = decode_pv_field(&req_desc, &mut cur, order).ok();
+        let req_value = decode_pv_field(&req_desc, &mut cur, order).ok();
         // PVA-R19: empty mask is an INIT error.
         let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
             Ok(m) => m,
@@ -1824,10 +1824,14 @@ async fn handle_put_get(
             }
         };
 
-        ch.ops.insert(
-            ioid,
-            non_monitor_op_state(intro.clone(), OpKind::PutGet, mask),
-        );
+        // MR-R10: stash the INIT pvRequest so the data phase can
+        // forward `record._options` (process/block, group `atomic`)
+        // through `ChannelContext.pv_request` to the source. The
+        // dedicated PUT_GET path otherwise dropped it, so QSRV group
+        // PUT_GET could not honor INIT options on the native wire.
+        let mut put_get_op = non_monitor_op_state(intro.clone(), OpKind::PutGet, mask);
+        put_get_op.pv_request = req_value;
+        ch.ops.insert(ioid, put_get_op);
 
         // INIT response: ioid + subcmd + status + putIF + getIF.
         // pvxs `serverget.cpp` emits two type descriptors for PUT_GET
@@ -1854,7 +1858,7 @@ async fn handle_put_get(
 
     // PUT-GET data phase.
     let op = ch.ops.get(&ioid).cloned();
-    let (intro, mask) = match op {
+    let (intro, mask, init_pv_request) = match op {
         Some(o) => {
             // EX-R5: the data-phase command must match the operation
             // kind bound at INIT. pvxs `serverget.cpp:421-436` resets
@@ -1873,7 +1877,7 @@ async fn handle_put_get(
                     o.kind
                 )));
             }
-            (o.intro, o.mask)
+            (o.intro, o.mask, o.pv_request)
         }
         None => {
             send_op_error(tx, OpKind::PutGet, ioid, "operation not initialised", order).await?;
@@ -1894,7 +1898,7 @@ async fn handle_put_get(
         host: cred.host.clone(),
         authority: cred.authority.clone(),
         roles: cred.roles.clone(),
-        pv_request: None,
+        pv_request: init_pv_request,
     };
 
     let src = source.clone();

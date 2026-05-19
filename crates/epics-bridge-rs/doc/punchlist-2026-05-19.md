@@ -51,8 +51,9 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:201-225`
   - Done: worker B, commit `4b7c87eb` on `caucus/HJB9ABPH/backend`; regression `br_r6_gateway_typed_put_passthrough`. Both `put_value` and `put_value_checked` in `source.rs` switched from `pvfield_to_pvput_string` + `pvput` to `pvput_pv_field`. Dead helpers `pvfield_to_pvput_string` and `scalar_to_string` removed. Upstream parity: pvxs/src/clientget.cpp:305 (`to_wire_valid(R, temp)` — no string round-trip).
 
-- [ ] **BR-R41** — PVA gateway decoded monitor fallback emits only the initial snapshot.
+- [x] **BR-R41** — PVA gateway decoded monitor fallback emits only the initial snapshot.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:1120-1144`
+  - Done: worker B, commit `e314bb8a` on `caucus/HJB9ABPH/backend`; regression `br_r41_typed_subscribe_delivers_updates`. `tx_inner` moved into `pvmonitor_raw_frames_handle` callback closure; `!outcome.was_first` guard prevents duplicate broadcast of initial snapshot. `MonitorEventOutcome.decoded: bool` replaced by `value: Option<PvField>` read under write lock. Upstream parity: pvxs/src/client.cpp — `MonitorImpl::notify()` delivers every monitor event to every subscriber after first `TypeChange`.
 
 ### Priority 6 — Method/authority/roles, upstream identity, resource caps
 
@@ -100,7 +101,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 10 (was 17)
-- Done: 6 (BR-R4, BR-R21, BR-R11, BR-R10, BR-R27, BR-R6) — tracked on main via doc tracker commits
+- Total open: 9 (was 17)
+- Done: 7 (BR-R4, BR-R21, BR-R11, BR-R10, BR-R27, BR-R6, BR-R41) — tracked on main via doc tracker commits
 - In progress: 0
 - Blocked: 0

@@ -1737,6 +1737,7 @@ mod tests {
             method: "anonymous".into(),
             host: "127.0.0.1".into(),
             authority: String::new(),
+            roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
         };
 

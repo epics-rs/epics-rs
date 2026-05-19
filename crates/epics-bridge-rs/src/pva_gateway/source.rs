@@ -63,11 +63,46 @@ fn default_asg_resolver() -> AsgResolver {
     Arc::new(|_pv| "DEFAULT".to_string())
 }
 
+/// MR-R16: identity key for the per-credential upstream `PvaClient`
+/// and `ChannelCache` pools.
+///
+/// Every field that the gateway forwards into the asserted upstream
+/// identity must be part of this key. `upstream_client_for` builds the
+/// upstream client from `account` + `host` and records `method` +
+/// `authority` in the `AssertedIdentity`. Keying only on
+/// `(account, method)` let two downstream peers with the same account
+/// and method but different `host` / `authority` share the first
+/// peer's upstream client and cache — the upstream IOC would then see
+/// stale host / certificate-authority data for audit and ACF, and
+/// cached GET/MONITOR state could be reused under the wrong identity.
+///
+/// Invariant: a pool entry is reused for a `ChannelContext` only when
+/// every upstream-identity field matches. Adding a new identity field
+/// to the asserted upstream credential MUST add it here too.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct UpstreamIdentityKey {
+    account: String,
+    method: String,
+    host: String,
+    authority: String,
+}
+
+impl UpstreamIdentityKey {
+    fn from_ctx(ctx: &ChannelContext) -> Self {
+        Self {
+            account: ctx.account.clone(),
+            method: ctx.method.clone(),
+            host: ctx.host.clone(),
+            authority: ctx.authority.clone(),
+        }
+    }
+}
+
 /// Capacity-bounded map with LRU eviction.
 ///
 /// Bounds remote-controllable resource growth: a downstream client that
-/// presents distinct `(account, method)` pairs on every connection can
-/// force at most `max` upstream connections rather than an unlimited number.
+/// presents distinct identity keys on every connection can force at
+/// most `max` upstream connections rather than an unlimited number.
 /// When a new key would exceed the cap, the least-recently-used entry is
 /// evicted first.
 struct BoundedPool<K, V> {
@@ -81,6 +116,13 @@ impl<K: Eq + Hash + Clone, V> BoundedPool<K, V> {
             map: HashMap::new(),
             max: max.max(1),
         }
+    }
+
+    /// Current cap. Authoritative — there is no separate copy of this
+    /// value elsewhere, so a diagnostic accessor that reads this can
+    /// never desync from the pool's actual eviction bound.
+    fn capacity(&self) -> usize {
+        self.max
     }
 
     /// Look up `key` and refresh its LRU timestamp on hit.
@@ -139,24 +181,21 @@ pub struct GatewayChannelSource {
     /// the count across the multiple `Arc<dyn ChannelSourceObj>`
     /// handles the runtime holds.
     subscriber_count: Arc<AtomicUsize>,
-    /// Per-(account, method) upstream PvaClient pool (PG-G10). When
-    /// the downstream peer authenticates as `(alice, ca)` the
-    /// gateway reuses (or builds) a client whose CONNECTION_VALIDATION
-    /// to upstream advertises that same identity, so upstream ASG
-    /// rules and audit logs see the *real* client identity, not
-    /// the gateway. Empty string keys (`("", "anonymous")`) reuse
-    /// the cache's shared client.
+    /// Per-`UpstreamIdentityKey` upstream PvaClient pool (PG-G10).
+    /// When the downstream peer authenticates as `(alice, ca)` from a
+    /// given host/authority the gateway reuses (or builds) a client
+    /// whose CONNECTION_VALIDATION to upstream advertises that same
+    /// identity, so upstream ASG rules and audit logs see the *real*
+    /// client identity, not the gateway. Anonymous / empty-account
+    /// peers reuse the cache's shared client.
+    ///
+    /// MR-R16: keyed by account, method, host, AND authority — see
+    /// [`UpstreamIdentityKey`].
     ///
     /// BR-R7: bounded via `BoundedPool` — evicts LRU entry when
     /// `max_upstream_identities` is reached, so a downstream client
     /// that presents unbounded distinct accounts cannot exhaust memory.
-    upstream_pool: Arc<Mutex<BoundedPool<(String, String), Arc<PvaClient>>>>,
-    /// Hard cap on the number of distinct downstream identities that
-    /// may have live upstream `PvaClient` / `ChannelCache` allocations
-    /// simultaneously. Both `upstream_pool` and `upstream_caches` are
-    /// bounded to this value; the LRU entry is evicted when the cap is
-    /// reached. Default 256.
-    pub max_upstream_identities: usize,
+    upstream_pool: Arc<Mutex<BoundedPool<UpstreamIdentityKey, Arc<PvaClient>>>>,
     /// Optional gateway-side ACF policy (round 29). When set, every
     /// downstream GET / PUT / MONITOR is gated through
     /// `check_access_method` BEFORE the upstream forward, so the
@@ -185,7 +224,7 @@ pub struct GatewayChannelSource {
     /// site policy on the gateway is expected to use UAG/HAG
     /// gating rather than per-record ASL.
     gate: epics_base_rs::server::access_security::AccessGate,
-    /// BR-R21: per-(account, method) upstream ChannelCache pool.
+    /// BR-R21: per-`UpstreamIdentityKey` upstream ChannelCache pool.
     /// When a credentialed downstream peer issues a GET/MONITOR, the
     /// gateway routes through a cache backed by a per-credential
     /// PvaClient — so the upstream IOC sees the real downstream
@@ -194,8 +233,11 @@ pub struct GatewayChannelSource {
     /// Parallels `upstream_pool` which already provides per-credential
     /// routing for PUT / RPC / PROCESS.
     ///
+    /// MR-R16: keyed by account, method, host, AND authority — see
+    /// [`UpstreamIdentityKey`].
+    ///
     /// BR-R7: bounded via `BoundedPool` (same cap as `upstream_pool`).
-    upstream_caches: Arc<Mutex<BoundedPool<(String, String), Arc<ChannelCache>>>>,
+    upstream_caches: Arc<Mutex<BoundedPool<UpstreamIdentityKey, Arc<ChannelCache>>>>,
 }
 
 impl GatewayChannelSource {
@@ -211,7 +253,6 @@ impl GatewayChannelSource {
             max_subscribers: 100_000,
             subscriber_count: Arc::new(AtomicUsize::new(0)),
             upstream_pool: Arc::new(Mutex::new(BoundedPool::new(256))),
-            max_upstream_identities: 256,
             acf,
             asg_resolver,
             gate,
@@ -336,7 +377,7 @@ impl GatewayChannelSource {
         if ctx.account.is_empty() || ctx.method == "anonymous" {
             return self.cache.client().clone();
         }
-        let key = (ctx.account.clone(), ctx.method.clone());
+        let key = UpstreamIdentityKey::from_ctx(ctx);
         let mut pool = self.upstream_pool.lock();
         if let Some(c) = pool.get(&key) {
             return c.clone();
@@ -381,7 +422,7 @@ impl GatewayChannelSource {
         if ctx.account.is_empty() || ctx.method == "anonymous" {
             return self.cache.clone();
         }
-        let key = (ctx.account.clone(), ctx.method.clone());
+        let key = UpstreamIdentityKey::from_ctx(ctx);
         // Fast path: already in pool.
         if let Some(c) = self.upstream_caches.lock().get(&key) {
             return c.clone();
@@ -420,6 +461,17 @@ impl GatewayChannelSource {
         let n = n.max(1);
         *self.upstream_pool.lock() = BoundedPool::new(n);
         *self.upstream_caches.lock() = BoundedPool::new(n);
+    }
+
+    /// MR-R6: current upstream-identity pool cap. Reads the live
+    /// `upstream_pool` capacity directly, so this accessor can never
+    /// desync from the cap actually enforced — unlike the removed
+    /// `pub max_upstream_identities` field, which `set_max_upstream_identities`
+    /// did not update. `upstream_caches` is always rebuilt with the
+    /// same `n` by the setter, so the pool's cap is authoritative for
+    /// both. Default 256.
+    pub fn max_upstream_identities(&self) -> usize {
+        self.upstream_pool.lock().capacity()
     }
 
     /// Diagnostic accessor: how many entries are currently cached.
@@ -1593,6 +1645,77 @@ ASG(DEFAULT) {
         );
     }
 
+    /// MR-R16 regression: the upstream-identity pools must be keyed
+    /// by host and authority too, not only `(account, method)`.
+    /// Pre-fix two downstream peers with the same account+method but
+    /// different host (or x509 certificate authority) collided on the
+    /// `(account, method)` key and shared the first peer's upstream
+    /// PvaClient and ChannelCache — so the upstream IOC saw stale
+    /// host / asserted-authority data for audit and ACF.
+    #[tokio::test]
+    async fn mr_r16_identity_pools_keyed_by_host_and_authority() {
+        // Build a ChannelContext with an explicit authority — the
+        // `make_ctx` helper always leaves authority empty.
+        fn ctx_with(host: &str, account: &str, method: &str, authority: &str) -> ChannelContext {
+            let mut c = make_ctx(host, account, method);
+            c.authority = authority.to_string();
+            c
+        }
+
+        let src = make_source();
+
+        // Same account + method, different host.
+        let alice_h1 = ctx_with("host-1", "alice", "ca", "");
+        let alice_h2 = ctx_with("host-2", "alice", "ca", "");
+
+        let client_h1 = src.upstream_client_for(&alice_h1);
+        let client_h2 = src.upstream_client_for(&alice_h2);
+        assert!(
+            !Arc::ptr_eq(&client_h1, &client_h2),
+            "same account/method from different hosts must get distinct \
+             upstream clients"
+        );
+        let cache_h1 = src.upstream_cache_for_test(&alice_h1);
+        let cache_h2 = src.upstream_cache_for_test(&alice_h2);
+        assert!(
+            !Arc::ptr_eq(&cache_h1, &cache_h2),
+            "same account/method from different hosts must get distinct \
+             upstream caches"
+        );
+
+        // Same account + method + host, different x509 authority.
+        let alice_ca_a = ctx_with("host-x", "alice", "x509", "Authority-A");
+        let alice_ca_b = ctx_with("host-x", "alice", "x509", "Authority-B");
+
+        let client_a = src.upstream_client_for(&alice_ca_a);
+        let client_b = src.upstream_client_for(&alice_ca_b);
+        assert!(
+            !Arc::ptr_eq(&client_a, &client_b),
+            "same account/method/host with different certificate \
+             authorities must get distinct upstream clients"
+        );
+        let cache_a = src.upstream_cache_for_test(&alice_ca_a);
+        let cache_b = src.upstream_cache_for_test(&alice_ca_b);
+        assert!(
+            !Arc::ptr_eq(&cache_a, &cache_b),
+            "same account/method/host with different certificate \
+             authorities must get distinct upstream caches"
+        );
+
+        // Fully identical identity must still pool-share.
+        let client_h1_again = src.upstream_client_for(&alice_h1);
+        assert!(
+            Arc::ptr_eq(&client_h1, &client_h1_again),
+            "an identical identity (account, method, host, authority) \
+             must reuse the pooled upstream client"
+        );
+        let cache_h1_again = src.upstream_cache_for_test(&alice_h1);
+        assert!(
+            Arc::ptr_eq(&cache_h1, &cache_h1_again),
+            "an identical identity must reuse the pooled upstream cache"
+        );
+    }
+
     /// BR-R7: the upstream identity pools must be bounded. Pre-fix
     /// `upstream_pool` and `upstream_caches` were plain `HashMap`s;
     /// a downstream client that varied `(account, method)` on every
@@ -1635,19 +1758,17 @@ ASG(DEFAULT) {
         {
             let pool = src.upstream_pool.lock();
             assert!(
-                !pool
-                    .map
-                    .contains_key(&("bob".to_string(), "ca".to_string())),
+                !pool.map.contains_key(&UpstreamIdentityKey::from_ctx(&bob)),
                 "bob (LRU) must be evicted"
             );
             assert!(
                 pool.map
-                    .contains_key(&("alice".to_string(), "ca".to_string())),
+                    .contains_key(&UpstreamIdentityKey::from_ctx(&alice)),
                 "alice (MRU) must be retained"
             );
             assert!(
                 pool.map
-                    .contains_key(&("charlie".to_string(), "ca".to_string())),
+                    .contains_key(&UpstreamIdentityKey::from_ctx(&charlie)),
                 "charlie (newest) must be retained"
             );
         }
@@ -1662,6 +1783,52 @@ ASG(DEFAULT) {
         assert_eq!(
             cache_len, 2,
             "upstream_caches must not exceed cap=2; got {cache_len}"
+        );
+    }
+
+    /// MR-R6 regression: the reported upstream-identity cap must
+    /// always reflect the cap actually enforced by the pools.
+    /// Pre-fix `max_upstream_identities` was a `pub` field that
+    /// `set_max_upstream_identities` never updated, so the reported
+    /// value desynced from the real `BoundedPool` capacity. Post-fix
+    /// the accessor reads the live pool cap directly.
+    #[tokio::test]
+    async fn mr_r6_max_upstream_identities_tracks_setter() {
+        let src = make_source();
+        // Default cap.
+        assert_eq!(
+            src.max_upstream_identities(),
+            256,
+            "default cap must be 256"
+        );
+
+        // After the setter the accessor must report the new cap, not
+        // the stale default.
+        src.set_max_upstream_identities(2);
+        assert_eq!(
+            src.max_upstream_identities(),
+            2,
+            "accessor must reflect the cap installed by set_max_upstream_identities"
+        );
+
+        // The accessor must agree with the actual pool eviction bound.
+        assert_eq!(
+            src.max_upstream_identities(),
+            src.upstream_pool.lock().capacity(),
+            "reported cap must equal upstream_pool capacity"
+        );
+        assert_eq!(
+            src.max_upstream_identities(),
+            src.upstream_caches.lock().capacity(),
+            "reported cap must equal upstream_caches capacity"
+        );
+
+        // The setter floors at 1; the accessor must reflect that too.
+        src.set_max_upstream_identities(0);
+        assert_eq!(
+            src.max_upstream_identities(),
+            1,
+            "accessor must report the floored cap of 1"
         );
     }
 }

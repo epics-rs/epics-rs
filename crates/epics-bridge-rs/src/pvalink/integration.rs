@@ -433,9 +433,10 @@ impl PvaLinkResolver {
     /// yet open, or links with no cached value. Mirrors pvxs
     /// `pvaGetAlarmMsg`'s severity output (pvalink_lset.cpp:544).
     pub fn link_alarm_severity(&self, pv_name: &str) -> Option<i32> {
-        let name = strip_scheme(pv_name)?;
+        let full = strip_scheme(pv_name)?;
+        let bare = strip_query(full);
         self.registry
-            .try_get(name, LinkDirection::Inp)?
+            .try_get(bare, LinkDirection::Inp)?
             .link_alarm_severity()
     }
 
@@ -484,7 +485,7 @@ impl PvaLinkResolver {
             // Strip optional pva:// prefix — the resolver receives the
             // bare PV name in some link forms but the prefixed form in
             // others. `ca://` is handled by libca, not pvalink — reject.
-            let name = match name.strip_prefix("pva://") {
+            let full = match name.strip_prefix("pva://") {
                 Some(stripped) => stripped,
                 None => {
                     if name.starts_with("ca://") {
@@ -493,6 +494,13 @@ impl PvaLinkResolver {
                     name
                 }
             };
+            // BR-R10: strip query string (present when link was parsed
+            // from a JSON object with options). Lazily register options.
+            let bare = strip_query(full);
+            if full != bare {
+                lazy_register_inp_opts(&resolver.link_options, bare, full);
+            }
+            let name = bare;
 
             // Fast path: a previously-opened link with a cached
             // monitor value. No `block_on`, no async runtime touch.
@@ -541,6 +549,11 @@ impl PvaLinkResolver {
 /// Registers the resolver under the `"pva"` lset scheme *and*
 /// installs the legacy [`ExternalPvResolver`] closure so callers
 /// using either dispatch path work transparently.
+///
+/// BR-R10: also pre-registers pvalink options and CP/CPP scan targets
+/// for every loaded DB record that carries a JSON-object pvalink with
+/// options. pvxs equivalent: options live on the `jlink` struct for
+/// the lifetime of the link (pvalink_jlif.cpp).
 pub async fn install_pvalink_resolver(
     db: &Arc<PvDatabase>,
     handle: tokio::runtime::Handle,
@@ -553,6 +566,30 @@ pub async fn install_pvalink_resolver(
         .await;
     db.register_link_set("pva", Arc::new(resolver.clone()))
         .await;
+
+    // BR-R10: scan all loaded records and pre-register any pvalink
+    // options encoded in the ParsedLink::Pva query string. This
+    // ensures CP/CPP scan targets are wired before the first monitor
+    // event and field/sevr/Q settings are effective from the first
+    // read/write without iocsh pre-warming.
+    use epics_base_rs::server::record::ParsedLink;
+    for record_name in db.all_record_names().await {
+        for (field_name, _raw, parsed) in db.record_link_fields(&record_name).await {
+            let ParsedLink::Pva(ref s) = parsed else {
+                continue;
+            };
+            if !s.contains('?') {
+                continue;
+            }
+            let link_str = format!("pva://{s}");
+            if field_name == "OUT" {
+                let _ = resolver.open_out_link(&link_str).await;
+            } else {
+                let _ = resolver.open_link_for_record(&link_str, &record_name).await;
+            }
+        }
+    }
+
     resolver
 }
 
@@ -676,10 +713,11 @@ impl LinkSet for PvaLinkResolver {
         // hot path or `pvxr` will open it lazily; any caller that
         // wants a fresh open should call `Self::open(name).await`
         // first.
-        let Some(name) = strip_scheme(name) else {
+        let Some(full) = strip_scheme(name) else {
             return false;
         };
-        match self.registry.try_get(name, LinkDirection::Inp) {
+        let bare = strip_query(full);
+        match self.registry.try_get(bare, LinkDirection::Inp) {
             Some(link) => link.is_connected(),
             None => false,
         }
@@ -689,10 +727,17 @@ impl LinkSet for PvaLinkResolver {
         if !self.is_enabled() {
             return None;
         }
-        let name = strip_scheme(name)?;
+        let full = strip_scheme(name)?;
+        let bare = strip_query(full);
+        // BR-R10: lazily register INP options parsed from the JSON
+        // link's query string so `inp_cfg_for` returns the correct
+        // config (field, sevr, Q, proc, …) even on the first call.
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, bare, full);
+        }
 
         // Fast path: cached monitor value, no async runtime touch.
-        if let Some(link) = self.registry.try_get(name, LinkDirection::Inp)
+        if let Some(link) = self.registry.try_get(bare, LinkDirection::Inp)
             && let Some(value) = link.try_read_cached()
         {
             self.reads
@@ -704,7 +749,7 @@ impl LinkSet for PvaLinkResolver {
         // B4: use `inp_cfg_for` so a link registered via `open_link`
         // keeps its options (`sevr`, `Q`, `pipeline`, `monorder`);
         // `default_inp_cfg` would discard them.
-        let cfg = self.inp_cfg_for(name);
+        let cfg = self.inp_cfg_for(bare);
         let value = block_in_place_or_warn(|| {
             self.handle.block_on(async {
                 let link = self.registry.get_or_open(cfg).await.ok()?;
@@ -720,9 +765,16 @@ impl LinkSet for PvaLinkResolver {
         if !self.is_enabled() {
             return Err("pvalink disabled".into());
         }
-        let name = strip_scheme(name).ok_or_else(|| {
+        let full = strip_scheme(name).ok_or_else(|| {
             format!("pvalink rejects ca:// scheme: {name} (use the CA-link path instead)")
         })?;
+        let bare = strip_query(full);
+        // BR-R10: lazily register OUT options from the JSON link's
+        // query string (field, proc, defer, retry, …).
+        if full != bare {
+            lazy_register_out_opts(&self.out_link_options, bare, full);
+        }
+        let name = bare;
         let cfg = self.out_cfg_for(name);
         // P-G16: bypass the Display→string→parse round-trip for
         // ARRAYS (where Display alloc is O(N_elements * digits) and
@@ -764,10 +816,11 @@ impl LinkSet for PvaLinkResolver {
     }
 
     fn alarm_message(&self, name: &str) -> Option<String> {
-        let name = strip_scheme(name)?;
+        let full = strip_scheme(name)?;
+        let bare = strip_query(full);
         let link = block_in_place_or_warn(|| {
             self.handle
-                .block_on(async { self.registry.get_or_open(default_inp_cfg(name)).await.ok() })
+                .block_on(async { self.registry.get_or_open(default_inp_cfg(bare)).await.ok() })
         })?;
         link.alarm_message()
     }
@@ -780,16 +833,21 @@ impl LinkSet for PvaLinkResolver {
         // value returned here is final — `None` means "do not
         // propagate" (NMS, or remote severity below the mode's
         // threshold, or no value cached).
-        let name = strip_scheme(name)?;
+        let full = strip_scheme(name)?;
+        let bare = strip_query(full);
         let link = block_in_place_or_warn(|| {
             self.handle
-                .block_on(async { self.registry.get_or_open(default_inp_cfg(name)).await.ok() })
+                .block_on(async { self.registry.get_or_open(default_inp_cfg(bare)).await.ok() })
         })?;
         link.link_alarm_severity()
     }
 
     fn time_stamp(&self, name: &str) -> Option<(i64, i32)> {
-        let name = strip_scheme(name)?;
+        let full = strip_scheme(name)?;
+        let bare = strip_query(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, bare, full);
+        }
         let link = block_in_place_or_warn(|| {
             self.handle.block_on(async {
                 // BR-R19: prefer the operator-installed link config so
@@ -797,7 +855,7 @@ impl LinkSet for PvaLinkResolver {
                 // for bare auto-resolved links (which never adopt
                 // upstream time — matching pvxs `pvaLinkConfig::time`
                 // default false).
-                let cfg = self.inp_cfg_for(name);
+                let cfg = self.inp_cfg_for(bare);
                 self.registry.get_or_open(cfg).await.ok()
             })
         })?;
@@ -826,6 +884,11 @@ impl LinkSet for PvaLinkResolver {
 /// dispatched by the CA-link path elsewhere, so an explicit `ca://`
 /// here returns `None` so the caller can short-circuit. Names with
 /// no scheme are passed through.
+///
+/// NOTE: the returned string may still contain a `?` query part when
+/// the link was parsed from a JSON object with extra options (BR-R10).
+/// Call `strip_query` on the result before using it as a registry key
+/// or a PV name lookup.
 fn strip_scheme(name: &str) -> Option<&str> {
     if let Some(stripped) = name.strip_prefix("pva://") {
         return Some(stripped);
@@ -834,6 +897,54 @@ fn strip_scheme(name: &str) -> Option<&str> {
         return None;
     }
     Some(name)
+}
+
+/// Strip the `?key=value&…` query part that BR-R10 appends to bare PV
+/// names when a JSON `{pva: {pv: …, field: …}}` link carries options.
+/// Returns the bare PV name before the first `?`, or the whole slice
+/// if there is no `?`.
+fn strip_query(s: &str) -> &str {
+    s.split_once('?').map_or(s, |(bare, _)| bare)
+}
+
+/// Lazily register INP link options (field, sevr, proc, Q, …) from a
+/// query-string-bearing name into `link_options` so `inp_cfg_for`
+/// returns the right config on the first call for this PV. Only
+/// called when `name` contains `?` (has options). `bare` is the PV
+/// name before `?`. pvxs parity: pvalink_jlif.cpp:24-196.
+fn lazy_register_inp_opts(
+    link_options: &parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>,
+    bare: &str,
+    full: &str,
+) {
+    if link_options.read().contains_key(bare) {
+        return;
+    }
+    if let Ok(cfg) = PvaLinkConfig::parse(&format!("pva://{full}"), LinkDirection::Inp) {
+        link_options.write().insert(
+            bare.to_string(),
+            PvaLinkConfig {
+                monitor: true,
+                ..cfg
+            },
+        );
+    }
+}
+
+/// Lazily register OUT link options from a query-string-bearing name
+/// into `out_link_options`. Mirrors `lazy_register_inp_opts` for the
+/// OUT direction.
+fn lazy_register_out_opts(
+    out_link_options: &parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>,
+    bare: &str,
+    full: &str,
+) {
+    if out_link_options.read().contains_key(bare) {
+        return;
+    }
+    if let Ok(cfg) = PvaLinkConfig::parse(&format!("pva://{full}"), LinkDirection::Out) {
+        out_link_options.write().insert(bare.to_string(), cfg);
+    }
 }
 
 fn default_inp_cfg(pv_name: &str) -> PvaLinkConfig {
@@ -1663,6 +1774,82 @@ mod tests {
             "local link to a remote-only PV must still be rejected, got err {:?}",
             remote.err()
         );
+    }
+
+    // ---- BR-R10: DB JSON pvalink options preserved ----
+
+    /// BR-R10: JSON-object pvalink options (field, proc, sevr, Q, …)
+    /// survive the parse→bridge pipeline.
+    ///
+    /// Two parts: (a) parse_link_v2 encodes JSON options as a
+    /// query string in ParsedLink::Pva, and (b) the integration layer
+    /// wires those options when open_link_for_record is called — the
+    /// same path install_pvalink_resolver's pre-scanner follows after
+    /// the parse fix.
+    ///
+    /// Fails on main: parse_link_v2 returns ParsedLink::Pva("TARGET:AI")
+    /// with no options, so the first assert immediately fails.
+    ///
+    /// Upstream parity: pvxs pvalink_jlif.cpp:24-196 (all pvalink
+    /// JSON keys parsed and stored on the jlink struct for the link's
+    /// lifetime).
+    #[tokio::test]
+    async fn br_r10_db_json_pvalink_options_preserved() {
+        use epics_base_rs::server::record::{ParsedLink, parse_link_v2};
+
+        // Part 1: parse_link_v2 must encode all options as query string.
+        let json =
+            r#"{pva: {pv: "TARGET:AI", field: "display.precision", proc: "CPP", sevr: "MS"}}"#;
+        let stored = match parse_link_v2(json) {
+            ParsedLink::Pva(s) => s,
+            other => panic!("expected Pva, got {other:?}"),
+        };
+        assert!(
+            stored.contains("field=display.precision"),
+            "field option must survive parse: {stored}"
+        );
+        assert!(stored.contains("proc=CPP"), "proc must survive: {stored}");
+        assert!(stored.contains("sevr=MS"), "sevr must survive: {stored}");
+
+        // Reconstruct config — all options must round-trip through
+        // PvaLinkConfig::parse (same code used by open_link_for_record
+        // in the pre-scanner).
+        let cfg = PvaLinkConfig::parse(&format!("pva://{stored}"), LinkDirection::Inp).unwrap();
+        assert_eq!(cfg.pv_name, "TARGET:AI");
+        assert_eq!(cfg.field, "display.precision");
+        assert!(cfg.scan_on_update, "CPP → scan_on_update");
+        assert!(cfg.scan_on_passive, "CPP → scan_on_passive");
+        assert_eq!(cfg.sevr, SevrMode::Ms);
+
+        // Part 2: the integration layer wires options when
+        // open_link_for_record is called with the query-bearing string.
+        // This is exactly what install_pvalink_resolver's pre-scanner
+        // does for each loaded record after the BR-R10 parse fix.
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let _ = resolver
+            .open_link_for_record(&format!("pva://{stored}"), "MY:RECORD")
+            .await;
+
+        // Options must be registered under the bare PV name.
+        let cfg = resolver.inp_cfg_for("TARGET:AI");
+        assert_eq!(
+            cfg.field, "display.precision",
+            "field option must be registered (was 'value' before fix)"
+        );
+        assert_eq!(cfg.sevr, SevrMode::Ms, "sevr option must be registered");
+        assert!(cfg.scan_on_update, "CPP scan_on_update must be registered");
+        assert!(
+            cfg.scan_on_passive,
+            "CPP scan_on_passive must be registered"
+        );
+
+        // Scan target must be registered under the bare PV name.
+        let targets = resolver.scan_targets.read();
+        let fanout = targets
+            .get("TARGET:AI")
+            .expect("CPP target must be registered");
+        assert_eq!(fanout.records[0].record, "MY:RECORD");
+        assert!(fanout.records[0].passive_only, "CPP must set passive_only");
     }
 
     /// #2: with no QSRV provider wired (pvalink-only deployment), the

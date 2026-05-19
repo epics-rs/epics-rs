@@ -239,6 +239,23 @@ impl PvaLinkRegistry {
         self.pending.write().clear();
     }
 
+    /// Test-only: insert a pre-built [`PvaLink`] under its config's
+    /// [`RegistryKey`]. Lets a test seed a cached link (e.g. an INP
+    /// link with a pre-populated value) without standing up a PVA
+    /// server, so the resolver getter paths can be exercised against
+    /// a known cache state.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&self, config: &PvaLinkConfig, link: Arc<PvaLink>) {
+        let key: RegistryKey = (
+            config.pv_name.clone(),
+            config.pipeline,
+            config.queue_size,
+            config.direction,
+            OutOpts::from_config(config),
+        );
+        self.map.write().insert(key, link);
+    }
+
     pub fn len(&self) -> usize {
         self.map.read().len()
     }

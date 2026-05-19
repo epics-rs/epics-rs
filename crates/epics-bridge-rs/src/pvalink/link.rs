@@ -548,8 +548,23 @@ impl PvaLink {
     /// gate that propagates `snap_severity` into `LINK_ALARM` only
     /// when `(sevr==MS && sev!=NO_ALARM) || (sevr==MSI && sev==INVALID)`.
     pub fn link_alarm_severity(&self) -> Option<i32> {
+        self.link_alarm_severity_with(self.config.sevr)
+    }
+
+    /// Like [`Self::link_alarm_severity`] but gates on a
+    /// caller-supplied `sevr` mode instead of this link's
+    /// `self.config.sevr`.
+    ///
+    /// MR-R15: the registry can return a cached INP `PvaLink` whose
+    /// `config.sevr` belongs to whichever caller opened it first.
+    /// Two INP links to the same remote PV with different `sevr`
+    /// options would otherwise share one link's `MS`/`NMS`/`MSI`
+    /// gate. The resolver passes the caller's own parsed `sevr` so
+    /// each link applies its own maximize-severity mode (pvxs
+    /// `pvaLinkConfig::sevr` is per-link, `pvxs/ioc/pvalink.h:65`).
+    pub fn link_alarm_severity_with(&self, sevr: super::config::SevrMode) -> Option<i32> {
         let sev = self.remote_alarm_severity()?;
-        if self.config.sevr.propagates(sev) {
+        if sevr.propagates(sev) {
             Some(sev)
         } else {
             None
@@ -572,9 +587,19 @@ impl PvaLink {
     /// the severity does propagate, a synthetic message is returned so
     /// the alarm is still observable.
     pub fn alarm_message(&self) -> Option<String> {
+        self.alarm_message_with(self.config.sevr)
+    }
+
+    /// Like [`Self::alarm_message`] but gates on a caller-supplied
+    /// `sevr` mode instead of this link's `self.config.sevr`.
+    ///
+    /// MR-R15: same rationale as [`Self::link_alarm_severity_with`] —
+    /// the alarm-message gate must use the caller's per-link `sevr`,
+    /// not whichever cached link's mode happens to be shared.
+    pub fn alarm_message_with(&self, sevr: super::config::SevrMode) -> Option<String> {
         // Severity gate first — NMS / sub-threshold links report
         // nothing.
-        let sev = self.link_alarm_severity()?;
+        let sev = self.link_alarm_severity_with(sevr)?;
         let v = self.latest.lock().clone()?;
         let PvField::Structure(s) = v else {
             return None;
@@ -646,6 +671,24 @@ impl PvaLink {
     /// exactly as the C getters leave the buffer untouched on a
     /// missing `Value::as`.
     pub fn link_metadata(&self) -> Option<epics_base_rs::server::database::LinkMetadata> {
+        self.link_metadata_with(&self.config.field)
+    }
+
+    /// Like [`Self::link_metadata`] but derives DBF type and element
+    /// count from a caller-supplied `field` path instead of this
+    /// link's `self.config.field`.
+    ///
+    /// MR-R15: the registry can return a cached INP `PvaLink` whose
+    /// `config.field` belongs to whichever caller opened it first, so
+    /// two INP links to the same remote PV with different `field`
+    /// options would otherwise report the same DBF type / element
+    /// count. The resolver passes the caller's own parsed `field`
+    /// (pvxs `pvaGetDBFtype` reads the per-link `fld_value`,
+    /// `pvxs/ioc/pvalink_lset.cpp:199`).
+    pub fn link_metadata_with(
+        &self,
+        field: &str,
+    ) -> Option<epics_base_rs::server::database::LinkMetadata> {
         use epics_base_rs::server::database::LinkMetadata;
 
         let root = self.latest.lock().clone()?;
@@ -653,7 +696,7 @@ impl PvaLink {
         // The value at the link's field path drives DBF type and
         // element count. `pvaGetDBFtype` uses `fld_value`; `fld_value`
         // is the value sub-field selected by the link's field name.
-        let value_field = extract_field(&root, &self.config.field);
+        let value_field = extract_field(&root, field);
 
         let dbf_type = link_dbf_type(&value_field);
         let element_count = link_element_count(&value_field);

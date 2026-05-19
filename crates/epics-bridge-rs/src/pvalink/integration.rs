@@ -469,11 +469,20 @@ impl PvaLinkResolver {
     /// yet open, or links with no cached value. Mirrors pvxs
     /// `pvaGetAlarmMsg`'s severity output (pvalink_lset.cpp:544).
     pub fn link_alarm_severity(&self, pv_name: &str) -> Option<i32> {
+        // MR-R15: apply the caller's own parsed `sevr` mode. Pre-fix
+        // this called `link_alarm_severity()` on whichever cached INP
+        // link `try_get_any` returned first — that link's
+        // `config.sevr` belongs to an arbitrary other caller. pvxs
+        // `pvaLinkConfig::sevr` is per-link (`pvxs/ioc/pvalink.h:65`).
         let full = strip_scheme(pv_name)?;
         let bare = strip_query(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let sevr = self.inp_cfg_for(full).sevr;
         self.registry
             .try_get_any(bare, LinkDirection::Inp)?
-            .link_alarm_severity()
+            .link_alarm_severity_with(sevr)
     }
 
     /// Wait until the link for `pv_name` has received at least one
@@ -917,30 +926,46 @@ impl LinkSet for PvaLinkResolver {
     }
 
     fn alarm_message(&self, name: &str) -> Option<String> {
+        // MR-R15: parse the caller's full link config and apply the
+        // caller's own `sevr` mode — `get_or_open` may return a
+        // previously cached INP link whose `config.sevr` belongs to a
+        // different caller, so `default_inp_cfg(bare)` would discard
+        // this caller's `?sevr=` option. pvxs `pvaLinkConfig::sevr`
+        // is per-link (`pvxs/ioc/pvalink.h:65`).
         let full = strip_scheme(name)?;
         let bare = strip_query(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
+        let sevr = cfg.sevr;
         let link = block_in_place_or_warn(|| {
             self.handle
-                .block_on(async { self.registry.get_or_open(default_inp_cfg(bare)).await.ok() })
+                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
         })?;
-        link.alarm_message()
+        link.alarm_message_with(sevr)
     }
 
     fn alarm_severity(&self, name: &str) -> Option<i32> {
         // B2: surface the gated link-alarm severity so the owning
         // record's `LINK_ALARM` actually reflects the remote PV's
-        // alarm. `PvaLink::link_alarm_severity` already applies the
-        // link's `MS`/`NMS`/`MSI` maximize-severity mode, so the
-        // value returned here is final — `None` means "do not
-        // propagate" (NMS, or remote severity below the mode's
-        // threshold, or no value cached).
+        // alarm. The `MS`/`NMS`/`MSI` gate is applied here.
+        //
+        // MR-R15: apply the caller's own `sevr` mode (parsed from the
+        // caller's full link config), not the cached link's shared
+        // `config.sevr`.
         let full = strip_scheme(name)?;
         let bare = strip_query(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
+        let sevr = cfg.sevr;
         let link = block_in_place_or_warn(|| {
             self.handle
-                .block_on(async { self.registry.get_or_open(default_inp_cfg(bare)).await.ok() })
+                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
         })?;
-        link.link_alarm_severity()
+        link.link_alarm_severity_with(sevr)
     }
 
     fn time_stamp(&self, name: &str) -> Option<(i64, i32)> {
@@ -949,23 +974,30 @@ impl LinkSet for PvaLinkResolver {
         if full != bare {
             lazy_register_inp_opts(&self.link_options, full);
         }
+        // BR-R19: prefer the operator-installed link config so
+        // `?time=true` gates the lookup; fall back to defaults for
+        // bare auto-resolved links (which never adopt upstream time —
+        // matching pvxs `pvaLinkConfig::time` default false).
+        //
+        // MR-R15: gate on the caller's own parsed `cfg.time`, not the
+        // cached link's `link.config().time`. `get_or_open` can
+        // return a previously cached INP link whose `time` flag
+        // belongs to a different caller; reading `link.config().time`
+        // would adopt or drop the upstream timestamp based on the
+        // wrong link's option. pvxs `pvaLinkConfig::time` is per-link.
+        let cfg = self.inp_cfg_for(full);
+        let want_time = cfg.time;
         let link = block_in_place_or_warn(|| {
-            self.handle.block_on(async {
-                // BR-R19: prefer the operator-installed link config so
-                // `?time=true` gates the lookup; fall back to defaults
-                // for bare auto-resolved links (which never adopt
-                // upstream time — matching pvxs `pvaLinkConfig::time`
-                // default false).
-                let cfg = self.inp_cfg_for(full);
-                self.registry.get_or_open(cfg).await.ok()
-            })
+            self.handle
+                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
         })?;
-        // BR-R19: only adopt the upstream timestamp when the link was
-        // configured with `time=true`. pvxs `pvalink_lset.cpp:427`
-        // copies the latched remote NT timestamp into the owning
-        // record only when this flag is set; otherwise the owning
-        // record keeps its locally-stamped processing time.
-        if !link.config().time {
+        // BR-R19: only adopt the upstream timestamp when this caller's
+        // link was configured with `time=true`. pvxs
+        // `pvalink_lset.cpp:427` copies the latched remote NT
+        // timestamp into the owning record only when this flag is
+        // set; otherwise the owning record keeps its locally-stamped
+        // processing time.
+        if !want_time {
             return None;
         }
         link.time_stamp()
@@ -979,12 +1011,26 @@ impl LinkSet for PvaLinkResolver {
         // cached NT value — no fresh GET — exactly as the pvxs
         // getters read `fld_meta` / `fld_value` under the channel
         // lock.
-        let name = strip_scheme(name)?;
+        //
+        // MR-R15: strip the query from the remote PV name (a
+        // query-bearing name would otherwise be opened as a literal
+        // PV name including `?...`) and apply the caller's own parsed
+        // `field` so DBF type / element count come from this link's
+        // sub-field, not whichever cached INP link is shared. pvxs
+        // `pvaGetDBFtype` reads the per-link `fld_value`
+        // (`pvxs/ioc/pvalink_lset.cpp:199`).
+        let full = strip_scheme(name)?;
+        let bare = strip_query(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
+        let field = cfg.field.clone();
         let link = block_in_place_or_warn(|| {
             self.handle
-                .block_on(async { self.registry.get_or_open(default_inp_cfg(name)).await.ok() })
+                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
         })?;
-        link.link_metadata()
+        link.link_metadata_with(&field)
     }
 
     fn link_names(&self) -> Vec<String> {
@@ -2215,6 +2261,101 @@ mod tests {
             *log.lock(),
             vec!["AT:A", "AT:B", "EXTERNAL"],
             "external writer must not interleave between atomic scan targets"
+        );
+    }
+
+    /// MR-R15: the alarm / time / metadata getters must apply the
+    /// *caller's* per-link `sevr` / `time` / `field` options, not the
+    /// shared cached `PvaLink`'s config.
+    ///
+    /// The registry caches one INP `PvaLink` per
+    /// `(pv_name, pipeline, queue_size, direction)` — `sevr` / `time`
+    /// / `field` are not in the key. Pre-fix the getters either used
+    /// `default_inp_cfg` (discarding the caller's options) or read
+    /// the cached link's `config.*`, so a second caller with
+    /// different options got the first caller's behavior.
+    ///
+    /// Here the cached INP link is configured `sevr=NMS` (default),
+    /// `time=false`, `field="value"`, with a remote value carrying a
+    /// MAJOR alarm and a timeStamp. A caller asking for `?sevr=MS` /
+    /// `?time=true` must observe its own options against that shared
+    /// cached link. pvxs `pvaLinkConfig` is per-link
+    /// (`pvxs/ioc/pvalink.h:65`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mr_r15_getters_use_caller_options_not_shared_link() {
+        use crate::pvalink::link::PvaLink;
+        use epics_pva_rs::pvdata::PvField;
+
+        // Remote NT value: MAJOR alarm + a timeStamp.
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(2))));
+        alarm.fields.push((
+            "message".into(),
+            PvField::Scalar(ScalarValue::String("HIGH".into())),
+        ));
+        let mut ts = PvStructure::new("time_t");
+        ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(1_700_000_000)),
+        ));
+        ts.fields
+            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(42))));
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(3.0))));
+        root.fields
+            .push(("alarm".into(), PvField::Structure(alarm)));
+        root.fields
+            .push(("timeStamp".into(), PvField::Structure(ts)));
+        let cached = PvField::Structure(root);
+
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+
+        // Seed the registry with a cached INP link whose own config
+        // is the bare default: NMS, time=false, field="value".
+        let shared_cfg = default_inp_cfg("MR_R15:PV");
+        let shared_link = std::sync::Arc::new(PvaLink::for_test(shared_cfg.clone(), Some(cached)));
+        resolver.registry.insert_for_test(&shared_cfg, shared_link);
+
+        // The shared cached link is NMS → its own gate reports no
+        // alarm. A caller asking for `?sevr=MS` must still see the
+        // MAJOR severity propagate.
+        let nms_name = "pva://MR_R15:PV";
+        assert_eq!(
+            LinkSet::alarm_severity(&resolver, nms_name),
+            None,
+            "an NMS caller must not propagate the remote alarm"
+        );
+        let ms_name = "pva://MR_R15:PV?sevr=MS";
+        assert_eq!(
+            LinkSet::alarm_severity(&resolver, ms_name),
+            Some(2),
+            "an MS caller must see MAJOR even though the cached link is NMS"
+        );
+        assert_eq!(
+            LinkSet::alarm_message(&resolver, ms_name),
+            Some("HIGH".to_string()),
+            "an MS caller must get the remote alarm message"
+        );
+        assert_eq!(
+            resolver.link_alarm_severity(ms_name),
+            Some(2),
+            "resolver-level link_alarm_severity must use the caller's MS mode"
+        );
+
+        // The shared cached link is time=false → a bare caller adopts
+        // no timestamp. A caller asking `?time=true` must adopt it.
+        assert_eq!(
+            LinkSet::time_stamp(&resolver, nms_name),
+            None,
+            "a time=false caller must not adopt the upstream timestamp"
+        );
+        assert_eq!(
+            LinkSet::time_stamp(&resolver, "pva://MR_R15:PV?time=true"),
+            Some((1_700_000_000, 42)),
+            "a time=true caller must adopt the upstream timestamp"
         );
     }
 }

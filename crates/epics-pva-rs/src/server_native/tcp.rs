@@ -168,6 +168,29 @@ fn pv_value_leaf_to_epics(f: &PvField) -> Option<epics_base_rs::types::EpicsValu
                     })
                     .collect(),
             ),
+            // PF-R1: a PVA `ulong[]` monitor value must reach the
+            // `arr` filter as `UInt64Array` (mirrors the `scalar`
+            // helper's `ULong -> UInt64`); without this arm a filtered
+            // `DBF_UINT64` waveform fell through to a scalar `Double`
+            // and was emitted as an empty `ulong[]` payload.
+            Some(ScalarValue::ULong(_)) => EpicsValue::UInt64Array(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::ULong(v) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::UByte(_)) => EpicsValue::CharArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::UByte(v) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
             _ => return None,
         })
     }
@@ -4208,6 +4231,29 @@ mod tests {
     use super::*;
     use crate::client_native::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
+
+    /// PF-R1: a PVA `ulong[]` monitor value must reach the `arr`
+    /// server-side filter as `EpicsValue::UInt64Array`. Before the
+    /// fix `pv_value_leaf_to_epics`'s `array` helper had no `ULong`
+    /// arm, so a wire-decoded `ScalarArrayTyped::ULong` fell through
+    /// to `None`; `pv_field_to_filter_event` then substituted a
+    /// scalar `Double(0.0)`, and a filtered `DBF_UINT64` waveform was
+    /// emitted as an empty `ulong[]` payload.
+    #[test]
+    fn pf_r1_ulong_array_monitor_value_reaches_filter_as_uint64array() {
+        use crate::pvdata::TypedScalarArray;
+        use epics_base_rs::types::EpicsValue;
+
+        let big = (i64::MAX as u64) + 5;
+        let typed = PvField::ScalarArrayTyped(TypedScalarArray::ULong(std::sync::Arc::from(
+            vec![big, 2u64].as_slice(),
+        )));
+        assert_eq!(
+            pv_value_leaf_to_epics(&typed),
+            Some(EpicsValue::UInt64Array(vec![big, 2])),
+            "ulong[] monitor value must convert to UInt64Array, not fall through to None",
+        );
+    }
 
     /// PVA-R20: server pipeline parser accepts the typed-bool /
     /// typed-int shape pvxs `Context::request().record("pipeline",

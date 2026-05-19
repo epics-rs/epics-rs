@@ -898,3 +898,37 @@ The PVA monitor path needs either a real `PvField` transformation bridge from `F
 ## Untracked Files
 
 - `.caucus/` was present before this review and was not touched.
+
+## Resolution — 2026-05-20
+
+All 37 items addressed on `integration/punchlist-2026-05-19`: **36 fixed at root cause, 1 not reproduced.**
+Fixed by 8 parallel file-domain tracks (isolated worktrees), each item one commit with a
+fail-before/pass-after regression test, then merged back. Wire/protocol fixes are grounded in the
+pvxs / epics-base C reference and cite `pvxs:file:line` / `epics-base:file:line` in their commit
+messages.
+
+| Track | Items | Commits |
+|-------|-------|---------|
+| A — CA server | MR-R1, MR-R7, MR-R8, MR-R20, EX-R6, EX-R9 | `5cc9f9e4` `e223850a` `a9a84625` `8695cf97` `aae0a063` `f5e3bf9e` |
+| B — CA client | MR-R3, MR-R17, EX-R2 | `46692a4d` `f93a5f08` `19ab861b` |
+| C — PVA server native | MR-R2, MR-R11, MR-R13, EX-R1, EX-R3, EX-R5, EX-R7, EX-R12 | `d17fd495` `89c50352` `f45ffe1e` `9a53035d` `0b66ee7d` `79f4a895` `29683d71` `37d3929e` |
+| D — PVA client native | MR-R9, MR-R19, EX-R4, EX-R11 | `8cf33a83` `c1dbfa04` `2ea2dc34` `5c74851e` |
+| E — epics-base | MR-R5, MR-R25 | `54fbf7e9` `b2520673` |
+| F — QSRV bridge | MR-R10, MR-R12, MR-R22 | `145e6139` `cbfc4fcf` `c246a2e9` |
+| G — pvalink bridge | MR-R4, MR-R14, MR-R15, MR-R23, EX-R8, EX-R10 | `579bfe14` `b077304a` `2ca83fc5` `e2e00fac` `1d21fcc9` `a8cb81bd` |
+| H — native source / gateway | MR-R6, MR-R16, MR-R21, MR-R24 | `f094ff96` `06a73b10` `c19d3ff6` `24984d72` |
+
+- **MR-R10** also required the dedicated `handle_put_get` native-wire path to stash and forward the
+  INIT pvRequest (Track F covered only the QSRV bridge side); closed in follow-up `eee53565`.
+- **MR-R18** — **not reproduced.** Commit `add08dd2` (PVA-R27 warm-GET cleanup) is already an
+  ancestor of HEAD and re-adds the `cached_get` restore on a successful DATA response plus IOID
+  teardown on failure; the observed symptom was downstream of the EX-R4 sentinel bug and is gone
+  once EX-R4 is fixed. No separate defect exists; no fix was invented.
+
+Post-merge verification on `integration/punchlist-2026-05-19`:
+
+- `cargo fmt --all` — applied.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo check --workspace --all-targets --all-features` — clean.
+- `cargo nextest run --workspace --no-fail-fast` — 4705 passed, 0 failed.
+- `cargo test --doc --workspace` — 0 failed.

@@ -42,12 +42,16 @@ pub struct GroupPvDef {
     /// map entry, so they share the same lock instance.
     ///
     /// This closes the group-vs-group interleave: two atomic PUTs to
-    /// the same group run strictly serially. It does NOT close a
-    /// non-group writer (a plain CA/PVA PUT to a record that also
-    /// backs an atomic-group member) interleaving between member
-    /// writes — that would require multi-record write locking the
-    /// `epics-base-rs` database layer does not expose. See
-    /// `GroupChannel::put`.
+    /// the same group run strictly serially even during the up-front
+    /// value-conversion phase before either reaches `lock_records`.
+    ///
+    /// BR-R15: the non-group writer gap — a plain CA/PVA PUT to a
+    /// record that also backs an atomic-group member interleaving
+    /// between member writes — is now closed by the
+    /// `DBManyLock`-equivalent `PvDatabase::lock_records` advisory
+    /// write gates the atomic PUT acquires over every member record.
+    /// This `Mutex` remains only as an internal group-vs-group
+    /// serialization aid. See `GroupChannel::put`.
     pub atomic_write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 

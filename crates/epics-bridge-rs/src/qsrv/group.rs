@@ -383,6 +383,34 @@ async fn lock_group_records_read(
     guards
 }
 
+/// BR-R15: collect the **canonical** record names backing a group's
+/// writable members, for the `DBManyLock`-equivalent write gate.
+///
+/// pvxs builds `group.value.lock` (a `DBManyLock`) over every member
+/// record (`groupconfigprocessor.cpp:1165`) and takes a `DBManyLocker`
+/// across the whole atomic PUT loop (`groupsource.cpp:569`). The Rust
+/// equivalent is [`PvDatabase::lock_records`] over the same record
+/// set. Names are resolved through the alias map so the gate key
+/// matches the one a direct CA/PVA write would take in
+/// `put_record_field_from_ca` / `put_pv` / `process_record`.
+async fn group_member_record_names(db: &PvDatabase, members: &[GroupMember]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for m in members {
+        if m.channel.is_empty() {
+            continue; // Structure / Const — no backing record
+        }
+        let (rec, _) = epics_base_rs::server::database::parse_pv_name(&m.channel);
+        let canonical = db
+            .resolve_alias(rec)
+            .await
+            .unwrap_or_else(|| rec.to_string());
+        names.push(canonical);
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 // ---------------------------------------------------------------------------
 // GroupChannel
 // ---------------------------------------------------------------------------
@@ -813,28 +841,39 @@ impl super::provider::Channel for GroupChannel {
         }
 
         if atomic {
-            // Atomic put. C++ QSRV holds every member record's lock
-            // simultaneously via `DBManyLocker` for the whole write.
-            // `epics-base-rs` exposes no multi-record write lock, and
-            // the per-record write lock is taken *inside*
-            // `put_record_field_from_ca` / `process_record` — so the
-            // gateway cannot hold `write_owned()` guards across the
-            // member loop without deadlocking those helpers.
+            // BR-R15: atomic PUT — `DBManyLock`-equivalent exclusion.
             //
-            // Instead we serialize on the group's shared
-            // `atomic_write_lock`: holding it across the whole member
-            // loop guarantees two PUTs to the *same atomic group*
-            // cannot interleave, so a downstream client never observes
-            // a group half-applied by a concurrent group PUT. Each
-            // member write still `.await`s, but no other atomic-group
-            // PUT can run a member write in between.
+            // pvxs builds a `DBManyLock` over every group-member
+            // record (`groupconfigprocessor.cpp:1165`
+            // `initialiseDbLocker`) and takes a `DBManyLocker` across
+            // the whole atomic PUT member loop
+            // (`groupsource.cpp:569`). Because `DBManyLock` locks the
+            // same `dbCommon::lock` mutexes that a plain `dbPutField`
+            // takes via `dbScanLock`, a direct CA/PVA write to a
+            // backing member record cannot interleave with the
+            // atomic group transaction.
             //
-            // Residual limitation (documented on `atomic_write_lock`):
-            // a non-group writer — a plain CA/PVA PUT addressed to a
-            // record that also backs a group member — is not gated by
-            // this lock and can still land between member writes.
-            // Closing that needs multi-record write locking in
-            // `epics-base-rs`.
+            // The Rust equivalent: `PvDatabase::lock_records` over
+            // every member record acquires the per-record advisory
+            // write gates (`dbScanLock` analogue) in canonical sorted
+            // order. The plain write path
+            // (`put_record_field_from_ca` / `put_pv` /
+            // `process_record`) takes the same gate, so a direct
+            // backing-record write now blocks until this atomic PUT
+            // completes — closing the gap the previous
+            // `atomic_write_lock`-only design left open.
+            //
+            // The member writes below MUST use the `_already_locked`
+            // helper variants: this transaction already owns every
+            // member-record gate, and the per-record gate `Mutex` is
+            // not reentrant.
+            let member_records = group_member_record_names(&self.db, &self.def.members).await;
+            let _many_guard = self.db.lock_records(&member_records).await;
+
+            // `atomic_write_lock` is retained as an internal aid so
+            // two PUTs through the *same* group PV also serialize
+            // even before either reaches `lock_records` (e.g. the
+            // up-front value-conversion phase).
             let _atomic_guard = self.def.atomic_write_lock.lock().await;
 
             // Convert all values up-front (DBF-typed), then perform the
@@ -871,19 +910,28 @@ impl super::provider::Channel for GroupChannel {
                     epics_base_rs::server::database::parse_pv_name(&member.channel);
 
                 if member.mapping == FieldMapping::Proc {
+                    // BR-R15: `_already_locked` — this atomic PUT owns
+                    // every member-record gate via `lock_records`.
                     self.db
-                        .process_record(record_name)
+                        .process_record_already_locked(record_name)
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                 } else if let Some(epics_val) = val {
                     if use_process {
                         self.db
-                            .put_record_field_from_ca(record_name, field_name, epics_val)
+                            .put_record_field_from_ca_already_locked(
+                                record_name,
+                                field_name,
+                                epics_val,
+                            )
                             .await
                             .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     } else {
                         self.db
-                            .put_pv(&format!("{record_name}.{field_name}"), epics_val)
+                            .put_pv_already_locked(
+                                &format!("{record_name}.{field_name}"),
+                                epics_val,
+                            )
                             .await
                             .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     }
@@ -2125,6 +2173,114 @@ mod tests {
                     "atomic group must not be half-applied: a={va} b={vb}"
                 );
                 assert!(va == 1.0 || va == 2.0);
+            }
+            other => panic!("unexpected member values: {other:?}"),
+        }
+    }
+
+    // ---- BR-R15: atomic group PUT is DBManyLock-equivalent ----
+
+    /// BR-R15 regression: a QSRV atomic group PUT must exclude a
+    /// *direct* CA/PVA write to a backing member record for the whole
+    /// member-write loop — pvxs holds a `DBManyLocker`
+    /// (`groupsource.cpp:569`) over the same per-record locks a plain
+    /// `dbPutField` takes. Pre-fix the atomic PUT only held the
+    /// per-group `atomic_write_lock`, which a non-group writer never
+    /// consults, so a direct backing-record write could land between
+    /// member writes and leave the group observably half-applied.
+    ///
+    /// This test holds the `DBManyLock`-equivalent gate set
+    /// (`PvDatabase::lock_records`) over the member records — exactly
+    /// what `GroupChannel::put`'s atomic branch acquires — and proves
+    /// a direct `put_record_field_from_ca` to a member record blocks
+    /// until that gate set is released. On `main` `lock_records` does
+    /// not exist and `put_record_field_from_ca` takes no such gate,
+    /// so this fix-defining behaviour is absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn br_r15_atomic_group_excludes_direct_member_write() {
+        let (db, _def) = atomic_group_fixture().await;
+
+        // Hold the member-record write gates — the in-flight atomic
+        // group PUT's `DBManyLocker` equivalent.
+        let many = db.lock_records(["A:rec", "B:rec"]).await;
+
+        // A direct CA write to a member record must block on the same
+        // gate (`put_record_field_from_ca` takes `lock_record`).
+        let db_w = db.clone();
+        let direct = tokio::spawn(async move {
+            db_w.put_record_field_from_ca(
+                "A:rec",
+                "VAL",
+                epics_base_rs::types::EpicsValue::Double(99.0),
+            )
+            .await
+            .unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_millis(150), async {})
+            .await
+            .ok();
+        assert!(
+            !direct.is_finished(),
+            "direct member write must block while the atomic group's \
+             DBManyLock-equivalent gates are held"
+        );
+
+        // Release the gate set: the direct write now proceeds.
+        drop(many);
+        tokio::time::timeout(Duration::from_secs(5), direct)
+            .await
+            .expect("direct write must complete once gates are released")
+            .expect("direct write task panicked");
+
+        match db.get_pv("A:rec.VAL").await.unwrap() {
+            epics_base_rs::types::EpicsValue::Double(v) => assert_eq!(v, 99.0),
+            other => panic!("unexpected A:rec.VAL: {other:?}"),
+        }
+    }
+
+    /// BR-R15 regression: the real `GroupChannel::put` atomic path
+    /// itself acquires the member-record gate set. Holding the gates
+    /// externally must block an atomic group PUT from entering its
+    /// member-write loop, and the PUT must complete once released.
+    /// This proves the atomic PUT uses `lock_records`, not only the
+    /// per-group `atomic_write_lock`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn br_r15_atomic_put_blocks_on_member_record_gates() {
+        let (db, def) = atomic_group_fixture().await;
+        let channel = GroupChannel::new(db.clone(), def.clone());
+
+        // Hold one member record's gate. The atomic group PUT must
+        // block trying to acquire it via `lock_records`.
+        let held = db.lock_record("B:rec").await;
+
+        let put = tokio::spawn(async move {
+            channel.put(&atomic_put_value(5.0, 6.0)).await.unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_millis(150), async {})
+            .await
+            .ok();
+        assert!(
+            !put.is_finished(),
+            "atomic group PUT must block while a member-record gate is held"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), put)
+            .await
+            .expect("atomic PUT must complete once the member gate is free")
+            .expect("atomic PUT task panicked");
+
+        let a = db.get_pv("A:rec.VAL").await.unwrap();
+        let b = db.get_pv("B:rec.VAL").await.unwrap();
+        match (a, b) {
+            (
+                epics_base_rs::types::EpicsValue::Double(va),
+                epics_base_rs::types::EpicsValue::Double(vb),
+            ) => {
+                assert_eq!(va, 5.0);
+                assert_eq!(vb, 6.0);
             }
             other => panic!("unexpected member values: {other:?}"),
         }

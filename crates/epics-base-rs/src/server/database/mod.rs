@@ -4,6 +4,7 @@ pub mod filters;
 mod link_set;
 mod links;
 mod processing;
+mod record_lock;
 mod scan_index;
 
 pub use link_set::{DynLinkSet, LinkSet, LinkSetRegistry};
@@ -211,6 +212,12 @@ struct PvDatabaseInner {
     /// interest on this before re-checking `pini_done` to avoid missing the
     /// signal (`notify_waiters` does not store a permit).
     pini_notify: tokio::sync::Notify,
+    /// BR-R15: per-record advisory write gates — the `DBManyLock`
+    /// equivalent. Both the plain CA/PVA write path and the QSRV
+    /// atomic group PUT/GET acquire these so a direct backing-record
+    /// write cannot interleave with an atomic group transaction.
+    /// See [`record_lock`].
+    record_locks: record_lock::RecordLockRegistry,
 }
 
 /// Database of all process variables hosted by this server.
@@ -346,6 +353,7 @@ impl PvDatabase {
                 scan_started: std::sync::atomic::AtomicBool::new(false),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
                 pini_notify: tokio::sync::Notify::new(),
+                record_locks: record_lock::RecordLockRegistry::default(),
             }),
         }
     }

@@ -40,9 +40,10 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
   - Spec: `doc/critical-review-2026-05-18.md:259-294`
   - Deferral note: `doc/critical-review-2026-05-18.md:1268-1271`
 
-- [ ] **PVA-R14** (MEDIUM, architectural) — Decouple server source calls from per-connection read loop. Operation-state-machine restructure so source futures don't head-of-line-block the socket parser.
+- [x] **PVA-R14** (MEDIUM, architectural) — Decouple server source calls from per-connection read loop. Operation-state-machine restructure so source futures don't head-of-line-block the socket parser.
   - Spec: `doc/critical-review-2026-05-18.md:513-556`
   - Deferral note: `doc/critical-review-2026-05-18.md:1272-1275`
+  - Done: commit 601a568f; test `pva_r14_source_calls_no_head_of_line_block` (tcp.rs r14_tests)
 
 - [ ] **TLS-NAMESERVER** (MEDIUM, architectural) — TLS via name-server (mixed-mode listener). TCP accept loop peeks the first byte and dispatches to plain handshake or `TlsAcceptor`. Refactor of `server_native/tcp.rs:460-590`.
   - Spec/Deferral note: `doc/critical-review-2026-05-18.md:1290-1298`
@@ -51,7 +52,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 5
-- Done: 1 (PVA-R2)
+- Total open: 4
+- Done: 3 (PVA-R2, PVA-R3, PVA-R14)
 - In progress: 0
 - Blocked: 0

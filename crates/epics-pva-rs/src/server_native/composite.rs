@@ -463,6 +463,57 @@ impl ChannelSource for CompositeSource {
         }
     }
 
+    /// BR-R14: forward the downstream monitor options to the matched
+    /// inner source. A composite over a gateway source must carry
+    /// `opts` through so the gateway can reject options it cannot
+    /// honor across a fanout monitor.
+    fn subscribe_checked_opts(
+        &self,
+        checked: AccessChecked,
+        ctx: crate::server_native::source::ChannelContext,
+        opts: crate::server_native::source::MonitorOptions,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    let inner_checked = src
+                        .access_gate()
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
+                        .await;
+                    return src.subscribe_checked_opts(inner_checked, ctx, opts).await;
+                }
+            }
+            None
+        }
+    }
+
+    /// BR-R14 raw-path counterpart of [`Self::subscribe_checked_opts`].
+    fn subscribe_raw_checked_opts(
+        &self,
+        checked: AccessChecked,
+        ctx: crate::server_native::source::ChannelContext,
+        opts: crate::server_native::source::MonitorOptions,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    let inner_checked = src
+                        .access_gate()
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
+                        .await;
+                    return src
+                        .subscribe_raw_checked_opts(inner_checked, ctx, opts)
+                        .await;
+                }
+            }
+            None
+        }
+    }
+
     fn rpc_checked(
         &self,
         checked: AccessChecked,

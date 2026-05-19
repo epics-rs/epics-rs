@@ -50,15 +50,16 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
   - Spec: `doc/critical-review-2026-05-18.md:513-556`
   - Deferral note: `doc/critical-review-2026-05-18.md:1272-1275`
 
-- [ ] **TLS-NAMESERVER** (MEDIUM, architectural) — TLS via name-server (mixed-mode listener). TCP accept loop peeks the first byte and dispatches to plain handshake or `TlsAcceptor`. Refactor of `server_native/tcp.rs:460-590`.
+- [x] **TLS-NAMESERVER** (MEDIUM, architectural) — TLS via name-server (mixed-mode listener). TCP accept loop peeks the first byte and dispatches to plain handshake or `TlsAcceptor`. Refactor of `server_native/tcp.rs:460-590`.
   - Spec/Deferral note: `doc/critical-review-2026-05-18.md:1290-1298`
+  - Done: worker A, commit `2d30aebc` on `caucus/HJB9ABPH/worker`; regression `pva_tls_nameserver_mixed_mode_listener` + 3 existing TLS tests + 404/404 full suite. Peek dispatch in `run_tcp_server_on_listener` (100 ms peek window), `PeerEntry.tls` flag determined post-peek.
 
 ---
 
 ## Driver state
 
-- Total open: 3 (was 6)
-- Done: 3 (PVA-R2, PVA-R6, PVA-R4)
-- In progress: 1 (TLS-NAMESERVER, worker A)
+- Total open: 2 (was 6)
+- Done: 4 (PVA-R2, PVA-R6, PVA-R4, TLS-NAMESERVER)
+- In progress: 1 (PVA-R3, worker A)
 - Blocked: 0
 - Verified pre-existing main failure: `critical1_audit_layer_records_put` (tests/pva_gateway.rs:557) — separate from this round; not introduced by any worker.

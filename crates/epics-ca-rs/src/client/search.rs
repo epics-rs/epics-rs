@@ -468,11 +468,7 @@ pub(crate) async fn run_search_engine(
                 }
                 // Drain any additional queued requests so a burst of
                 // Schedule messages all land before the next tick.
-                while let Ok(req) = request_rx.try_recv() {
-                    if let Some(cid) = handle_request_or_addr(&mut state, &mut addr_list, req) {
-                        immediate.push(cid);
-                    }
-                }
+                drain_pending_requests(&mut state, &mut addr_list, &mut request_rx, &mut immediate);
                 // pvxs `clientdiscover.cpp` parity: send the first SEARCH
                 // packet right now instead of waiting up to one tick for
                 // the bucket to come around. The bucket placement still
@@ -484,6 +480,24 @@ pub(crate) async fn run_search_engine(
 
             result = socket.recv_with_meta_with_drops(&mut recv_buf) => {
                 let Ok((meta, drops)) = result else { continue };
+                // MR-R3: drain any queued `SearchRequest` before parsing
+                // this datagram. A `Schedule{Reconnect}` enqueued by the
+                // coordinator (mod.rs ServerDisconnect / TcpClosed paths)
+                // invalidates the `resolved` multiply-defined tracker via
+                // `remove_channel`. `tokio::select!` picks a ready arm at
+                // random, so without this drain a SEARCH reply for a
+                // legitimately-migrated PV could be parsed while the
+                // stale `resolved` entry still names the old server,
+                // emitting a false `ECA_DBLCHNL`. libca processes the
+                // circuit teardown and the SEARCH reply on one thread
+                // under one mutex (`cac.cpp:591-661`), so the disconnect
+                // is always observed first; this drain restores that
+                // ordering for the decoupled search-engine task.
+                let mut immediate: Vec<u32> = Vec::new();
+                drain_pending_requests(&mut state, &mut addr_list, &mut request_rx, &mut immediate);
+                if !immediate.is_empty() {
+                    fire_searches(&mut state, &immediate, &addr_list, &socket, &nameserver_send_txs).await;
+                }
                 // Surface per-NIC kernel drop transitions — pvxs
                 // `udp_collector.cpp:55-67` logs at debug on
                 // `prev != current && current != 0`.
@@ -502,6 +516,15 @@ pub(crate) async fn run_search_engine(
 
             tcp_dgram = tcp_response_rx.recv() => {
                 let Some((bytes, src)) = tcp_dgram else { continue };
+                // MR-R3: same ordering guarantee as the UDP arm — drain
+                // queued `SearchRequest`s (notably `Schedule{Reconnect}`)
+                // so a stale `resolved` entry cannot survive into the
+                // multiply-defined check for this nameserver reply.
+                let mut immediate: Vec<u32> = Vec::new();
+                drain_pending_requests(&mut state, &mut addr_list, &mut request_rx, &mut immediate);
+                if !immediate.is_empty() {
+                    fire_searches(&mut state, &immediate, &addr_list, &socket, &nameserver_send_txs).await;
+                }
                 // R2-26: TCP nameserver path uses the libca-equivalent
                 // SEARCH-reply contract (no per-reply VERSION header).
                 handle_tcp_response(&mut state, &bytes, src, &response_tx);
@@ -830,6 +853,32 @@ fn handle_request_or_addr(
             None
         }
         other => handle_request(state, other),
+    }
+}
+
+/// MR-R3: drain every `SearchRequest` already queued on `request_rx`
+/// into `state`, appending any cid that needs an immediate first-attempt
+/// SEARCH to `immediate`.
+///
+/// Called both from the request-handling `select!` arm (so a burst of
+/// `Schedule` messages all land before the next tick) and at the top of
+/// the UDP / TCP response arms. The latter use is the MR-R3 fix: it
+/// guarantees a `Schedule{Reconnect}` — which invalidates the
+/// `resolved` multiply-defined tracker through `remove_channel` — is
+/// applied before a SEARCH reply for the same cid is parsed, so a
+/// legitimate server migration cannot surface as a false `ECA_DBLCHNL`.
+/// This restores libca's single-threaded ordering (`cac.cpp:591-661`),
+/// where circuit teardown and SEARCH-reply handling share one mutex.
+fn drain_pending_requests(
+    state: &mut SearchEngineState,
+    addr_list: &mut Vec<super::AddrEntry>,
+    request_rx: &mut mpsc::UnboundedReceiver<SearchRequest>,
+    immediate: &mut Vec<u32>,
+) {
+    while let Ok(req) = request_rx.try_recv() {
+        if let Some(cid) = handle_request_or_addr(state, addr_list, req) {
+            immediate.push(cid);
+        }
     }
 }
 
@@ -2207,6 +2256,132 @@ mod tests {
             (1500..=2700).contains(&(gap_23.as_millis() as u64)),
             "gap #2→#3 should be ~2 s (nSearch=2); got {gap_23:?}. \
              Production retry escalation may have regressed."
+        );
+    }
+
+    /// Build a single-message CA_PROTO_SEARCH reply datagram naming
+    /// `server` as the host of client-cid `cid`. Mirrors the wire
+    /// shape parsed by `handle_search_response`: `data_type` carries
+    /// the server port, `cid` carries the server IPv4 (big-endian),
+    /// `available` carries the client cid, and an 8-byte payload holds
+    /// the minor version.
+    fn search_reply(cid: u32, server: SocketAddr) -> Vec<u8> {
+        let ip = match server.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(_) => unreachable!("test uses IPv4 only"),
+        };
+        let mut hdr = CaHeader::new(CA_PROTO_SEARCH);
+        hdr.data_type = server.port();
+        hdr.cid = u32::from_be_bytes(ip.octets());
+        hdr.available = cid;
+        hdr.set_payload_size(8, 1);
+        let mut buf = hdr.to_bytes().to_vec();
+        buf.extend_from_slice(&(CA_MINOR_VERSION).to_be_bytes());
+        buf.extend_from_slice(&[0u8; 6]); // pad to 8-byte payload
+        buf
+    }
+
+    /// MR-R3 regression: after a channel connected to server A is torn
+    /// down (ServerDisconnect / TcpClosed) and re-searched, a SEARCH
+    /// reply from a legitimately-different server B must resolve as a
+    /// normal `Found`, NOT a false `MultiplyDefined` (`ECA_DBLCHNL`).
+    ///
+    /// The coordinator enqueues `Schedule{Reconnect}` on disconnect;
+    /// the search-engine task and the coordinator are decoupled, and
+    /// `tokio::select!` can pick a ready UDP/TCP reply arm before the
+    /// queued request arm. The fix drains `request_rx` (via
+    /// `drain_pending_requests`) at the top of every reply arm so the
+    /// `Schedule{Reconnect}` — which invalidates `resolved` through
+    /// `remove_channel` — is always applied before the reply is
+    /// parsed, matching libca's single-thread ordering
+    /// (`cac.cpp:591-661`).
+    ///
+    /// Pre-fix (reply parsed before the drain), the stale `resolved`
+    /// entry for server A is still present, so the server-B reply
+    /// trips the `prev_addr != server_addr` branch and emits
+    /// `MultiplyDefined`.
+    #[test]
+    fn mr_r3_reconnect_to_new_server_no_false_multiply_defined() {
+        let server_a: SocketAddr = "10.0.0.1:5064".parse().unwrap();
+        let server_b: SocketAddr = "10.0.0.2:5064".parse().unwrap();
+        let src_b: SocketAddr = "10.0.0.2:5064".parse().unwrap();
+        let cid = 1u32;
+        let pv = "MR:R3:PV";
+
+        let mut state = SearchEngineState::new();
+        let mut addr_list: Vec<super::super::AddrEntry> = Vec::new();
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<SearchResponse>();
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<SearchRequest>();
+
+        // 1. Channel finds server A and connects.
+        schedule_initial(&mut state, cid, pv);
+        handle_tcp_response(&mut state, &search_reply(cid, server_a), server_a, &resp_tx);
+        match resp_rx.try_recv() {
+            Ok(SearchResponse::Found { server_addr, .. }) => {
+                assert_eq!(server_addr, server_a);
+            }
+            Ok(SearchResponse::MultiplyDefined { .. }) => {
+                panic!("first reply must resolve as Found, not MultiplyDefined")
+            }
+            Err(e) => panic!("expected Found from server A, got recv error {e:?}"),
+        }
+        handle_request(
+            &mut state,
+            SearchRequest::ConnectResult {
+                cid,
+                success: true,
+                server_addr: server_a,
+            },
+        );
+        assert!(
+            state.resolved.contains_key(&cid),
+            "resolved entry kept past ConnectResult{{success}} (R2-66)"
+        );
+
+        // 2. Server A disconnects — coordinator enqueues a reconnect
+        //    Schedule. It sits on `req_rx` until the engine drains it.
+        req_tx
+            .send(SearchRequest::Schedule {
+                cid,
+                pv_name: pv.into(),
+                reason: SearchReason::Reconnect,
+            })
+            .expect("reconnect schedule send");
+
+        // 3. A SEARCH reply from the NEW server B is ready at the same
+        //    time. The fix drains queued requests before parsing it.
+        let mut immediate: Vec<u32> = Vec::new();
+        drain_pending_requests(&mut state, &mut addr_list, &mut req_rx, &mut immediate);
+        assert!(
+            !state.resolved.contains_key(&cid),
+            "Schedule{{Reconnect}} must invalidate the stale resolved \
+             entry before the server-B reply is parsed"
+        );
+        handle_tcp_response(&mut state, &search_reply(cid, server_b), src_b, &resp_tx);
+
+        // 4. The server-B reply must resolve as Found, never as a
+        //    false MultiplyDefined.
+        match resp_rx.try_recv() {
+            Ok(SearchResponse::Found { server_addr, .. }) => {
+                assert_eq!(
+                    server_addr, server_b,
+                    "reconnect must resolve to the new server B"
+                );
+            }
+            Ok(SearchResponse::MultiplyDefined {
+                prev_addr,
+                new_addr,
+                ..
+            }) => panic!(
+                "false ECA_DBLCHNL after legitimate server migration: \
+                 prev={prev_addr} new={new_addr} — the reconnect Schedule \
+                 was not drained before the reply was parsed"
+            ),
+            Err(e) => panic!("expected Found from server B, got recv error {e:?}"),
+        }
+        assert!(
+            resp_rx.try_recv().is_err(),
+            "no further responses expected after the single Found"
         );
     }
 }

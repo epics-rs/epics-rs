@@ -59,8 +59,9 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:201-225`
   - Done: worker B, commit `4b7c87eb` on `caucus/HJB9ABPH/backend` (+ doc tracker `2eabe05f`); regression `br_r6_gateway_typed_put_passthrough`. Gateway source.rs typed pass-through replaces string `pvput` round-trip. 51m+ debug cycle (context compacted) but landed clean.
 
-- [ ] **BR-R41** — PVA gateway decoded monitor fallback emits only the initial snapshot.
+- [x] **BR-R41** — PVA gateway decoded monitor fallback emits only the initial snapshot.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:1120-1144`
+  - Done: worker B, commit `e314bb8a` on `caucus/HJB9ABPH/backend` (+ doc tracker `fcd4ff0e`); regression `br_r41_typed_subscribe_delivers_updates`. Three root causes fixed: (1) `tx_inner` dropped before `pvmonitor_raw_frames_handle` closure captured it; (2) `MonitorEventOutcome.value` re-acquisition race (now `Option<PvField>` read under write lock); (3) initial-event duplicate broadcast guarded by `!outcome.was_first`. 1h33m debug cycle (context compacted twice — contract drift cost).
 
 ### Priority 6 — Method/authority/roles, upstream identity, resource caps
 
@@ -108,7 +109,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 11 (was 17)
-- Done: 5 (BR-R4, BR-R21, BR-R11, BR-R10, BR-R27)
-- In progress: 1 (BR-R6, worker B)
+- Total open: 9 (was 17)
+- Done: 7 (BR-R4, BR-R21, BR-R11, BR-R10, BR-R27, BR-R6, BR-R41)
+- In progress: 1 (BR-R7, worker B)
 - Blocked: 0

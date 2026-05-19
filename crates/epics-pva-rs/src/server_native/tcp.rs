@@ -1681,7 +1681,26 @@ async fn handle_put_get(
     // PUT-GET data phase.
     let op = ch.ops.get(&ioid).cloned();
     let (intro, mask) = match op {
-        Some(o) => (o.intro, o.mask),
+        Some(o) => {
+            // EX-R5: the data-phase command must match the operation
+            // kind bound at INIT. pvxs `serverget.cpp:421-436` resets
+            // the connection when an IOID is driven by the wrong
+            // operation class. Without this check a client could INIT
+            // an IOID as a GET/PUT/MONITOR and then drive a dedicated
+            // PUT_GET data frame through it, performing a
+            // write/readback with a descriptor + mask the operation
+            // never negotiated as a PUT_GET. Mirror the generic
+            // handler's protocol-error policy (tcp.rs data-phase
+            // kind guard).
+            if o.kind != OpKind::PutGet {
+                return Err(PvaError::Decode(format!(
+                    "PUT_GET data-phase frame for IOID {ioid} initialised as {:?} \
+                     (pvxs serverget.cpp:421-436 protocol error)",
+                    o.kind
+                )));
+            }
+            (o.intro, o.mask)
+        }
         None => {
             send_op_error(tx, OpKind::PutGet, ioid, "operation not initialised", order).await?;
             return Ok(());
@@ -1878,16 +1897,34 @@ async fn handle_process(
     }
 
     // PROCESS data phase — no payload to decode.
-    if !ch.ops.contains_key(&ioid) {
-        send_op_error(
-            tx,
-            OpKind::Process,
-            ioid,
-            "operation not initialised",
-            order,
-        )
-        .await?;
-        return Ok(());
+    match ch.ops.get(&ioid) {
+        None => {
+            send_op_error(
+                tx,
+                OpKind::Process,
+                ioid,
+                "operation not initialised",
+                order,
+            )
+            .await?;
+            return Ok(());
+        }
+        Some(o) => {
+            // EX-R5: the data-phase command must match the operation
+            // kind bound at INIT. pvxs `serverget.cpp:421-436` resets
+            // the connection when an IOID is driven by the wrong
+            // operation class. Without this check any live IOID on
+            // the channel could be driven into record processing via
+            // a dedicated PROCESS data frame. Mirror the generic
+            // handler's protocol-error policy.
+            if o.kind != OpKind::Process {
+                return Err(PvaError::Decode(format!(
+                    "PROCESS data-phase frame for IOID {ioid} initialised as {:?} \
+                     (pvxs serverget.cpp:421-436 protocol error)",
+                    o.kind
+                )));
+            }
+        }
     }
     let pv_name = ch.name.clone();
     let ctx = crate::server_native::source::ChannelContext {
@@ -5392,6 +5429,231 @@ mod tests {
             process_hits.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "process hook must NOT run when AUTHORITY does not match"
+        );
+    }
+
+    /// Build a channel whose `ioid` op was initialised as `kind`,
+    /// so an EX-R5 wrong-kind data frame can be driven against it.
+    #[cfg(test)]
+    fn primed_channels_with_kind(sid: u32, ioid: u32, kind: OpKind) -> HashMap<u32, ChannelState> {
+        let intro = three_field_intro();
+        let mask = BitSet::all_set(intro.total_bits());
+        let mut ops = HashMap::new();
+        ops.insert(ioid, non_monitor_op_state(intro.clone(), kind, mask));
+        let mut channels = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro),
+                ops,
+            },
+        );
+        channels
+    }
+
+    /// EX-R5 regression: the dedicated `handle_process` data phase must
+    /// reject a frame whose IOID was initialised as a different
+    /// operation class. Before the fix it only checked
+    /// `ch.ops.contains_key(ioid)`, so a client could INIT a GET (or
+    /// MONITOR) and then drive a PROCESS data frame through it,
+    /// triggering record processing on an op that never negotiated
+    /// PROCESS. pvxs `serverget.cpp:421-436` resets the connection on
+    /// a wrong-kind IOID.
+    #[tokio::test]
+    async fn ex_r5_process_data_rejects_get_initialised_ioid() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 600;
+        let src = AuthorityGatedSource::new();
+        let process_hits = std::sync::Arc::clone(&src.process_hits);
+        let source: DynSource = std::sync::Arc::new(src);
+
+        // IOID initialised as a GET, not a PROCESS.
+        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00);
+        let frame = synth_frame(Command::Process, order, payload);
+
+        let res = handle_process(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            peer,
+            &x509_cred("MyCA"),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "EX-R5: PROCESS data against a GET-initialised IOID must be a protocol error"
+        );
+        assert_eq!(
+            process_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "EX-R5: record processing must NOT run for a wrong-kind PROCESS frame"
+        );
+    }
+
+    /// EX-R5 regression: `handle_process` must also reject a PROCESS
+    /// data frame against a MONITOR-initialised IOID.
+    #[tokio::test]
+    async fn ex_r5_process_data_rejects_monitor_initialised_ioid() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 601;
+        let src = AuthorityGatedSource::new();
+        let process_hits = std::sync::Arc::clone(&src.process_hits);
+        let source: DynSource = std::sync::Arc::new(src);
+
+        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Monitor);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00);
+        let frame = synth_frame(Command::Process, order, payload);
+
+        let res = handle_process(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            peer,
+            &x509_cred("MyCA"),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "EX-R5: PROCESS data against a MONITOR-initialised IOID must be a protocol error"
+        );
+        assert_eq!(
+            process_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "EX-R5: record processing must NOT run for a wrong-kind PROCESS frame"
+        );
+    }
+
+    /// EX-R5 regression: the dedicated `handle_put_get` data phase must
+    /// reject a frame whose IOID was initialised as a different
+    /// operation class (here a GET). Before the fix it extracted
+    /// `(intro, mask)` from whatever op existed and performed a
+    /// write/readback the operation never negotiated as a PUT_GET.
+    #[tokio::test]
+    async fn ex_r5_put_get_data_rejects_get_initialised_ioid() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 602;
+        let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
+
+        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let intro = three_field_intro();
+
+        // PUT_GET data frame: sid + ioid + subcmd(0x00) + bitset + value.
+        let mut changed = BitSet::new();
+        changed.set(2);
+        let delta = three_field_value(0, 99, 0);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00);
+        changed.write_into(order, &mut payload);
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &delta,
+            &intro,
+            &changed,
+            0,
+            order,
+            &mut payload,
+        );
+        let frame = synth_frame(Command::PutGet, order, payload);
+
+        let res = handle_put_get(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &x509_cred("MyCA"),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "EX-R5: PUT_GET data against a GET-initialised IOID must be a protocol error"
+        );
+    }
+
+    /// EX-R5 regression: `handle_put_get` must also reject a PUT_GET
+    /// data frame against a PUT-initialised IOID.
+    #[tokio::test]
+    async fn ex_r5_put_get_data_rejects_put_initialised_ioid() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 603;
+        let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
+
+        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Put);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let intro = three_field_intro();
+
+        let mut changed = BitSet::new();
+        changed.set(2);
+        let delta = three_field_value(0, 99, 0);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00);
+        changed.write_into(order, &mut payload);
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &delta,
+            &intro,
+            &changed,
+            0,
+            order,
+            &mut payload,
+        );
+        let frame = synth_frame(Command::PutGet, order, payload);
+
+        let res = handle_put_get(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &x509_cred("MyCA"),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "EX-R5: PUT_GET data against a PUT-initialised IOID must be a protocol error"
         );
     }
 

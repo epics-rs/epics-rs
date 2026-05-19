@@ -59,7 +59,14 @@ pub fn scalar_to_epics(val: &ScalarValue) -> EpicsValue {
         ScalarValue::Float(v) => EpicsValue::Float(*v),
         ScalarValue::Double(v) => EpicsValue::Double(*v),
         ScalarValue::Int(v) => EpicsValue::Long(*v),
-        ScalarValue::Long(v) => EpicsValue::Double(*v as f64),
+        // MR-R22: `Long`/`ULong` are 64-bit; folding them into
+        // `EpicsValue::Double` loses integer precision above the exact
+        // `f64` integer range (2^53). `EpicsValue::Int64`/`UInt64`
+        // exist now, so preserve the full 64-bit range — this is the
+        // exact inverse of `epics_to_scalar` (`Int64 -> Long`,
+        // `UInt64 -> ULong`) and matches the array path, which already
+        // maps `Long[]`/`ULong[]` to `Int64Array`/`UInt64Array`.
+        ScalarValue::Long(v) => EpicsValue::Int64(*v),
         // C qsrv: DBF_CHAR is signed (pvByte). Bit-preserving cast keeps
         // the storage byte identical; legacy UByte input still accepted
         // — we widen to Short to avoid clipping the unsigned 128..255 range.
@@ -67,7 +74,7 @@ pub fn scalar_to_epics(val: &ScalarValue) -> EpicsValue {
         ScalarValue::UByte(v) => EpicsValue::Short(*v as i16),
         ScalarValue::UShort(v) => EpicsValue::Enum(*v),
         ScalarValue::UInt(v) => EpicsValue::Long(*v as i32),
-        ScalarValue::ULong(v) => EpicsValue::Double(*v as f64),
+        ScalarValue::ULong(v) => EpicsValue::UInt64(*v),
         ScalarValue::Boolean(v) => EpicsValue::Short(if *v { 1 } else { 0 }),
     }
 }
@@ -436,5 +443,76 @@ mod tests {
         let sv = ScalarValue::UByte(200);
         let ev = scalar_to_epics(&sv);
         assert_eq!(ev, EpicsValue::Short(200));
+    }
+
+    /// MR-R22: a scalar PVA `ulong` extracted through the context-free
+    /// fallback `scalar_to_epics` must preserve the full unsigned
+    /// 64-bit range. The branch folded `ScalarValue::ULong` into
+    /// `EpicsValue::Double(v as f64)`, losing integer precision above
+    /// `2^53`. `EpicsValue::UInt64` exists now, so the conversion must
+    /// keep it — symmetric with `epics_to_scalar` (`UInt64 -> ULong`)
+    /// and with the array path (`ULong[] -> UInt64Array`).
+    #[test]
+    fn mr_r22_scalar_to_epics_preserves_ulong_precision() {
+        // Above the exact-integer range of f64 (2^53).
+        let big: u64 = u64::MAX - 7;
+        assert!(big > (1u64 << 53), "test value must exceed f64 precision");
+
+        let ev = scalar_to_epics(&ScalarValue::ULong(big));
+        assert_eq!(
+            ev,
+            EpicsValue::UInt64(big),
+            "ScalarValue::ULong must convert to EpicsValue::UInt64, not a \
+             precision-lost Double"
+        );
+
+        // Signed 64-bit sibling: ScalarValue::Long must preserve i64
+        // precision the same way (was also folded into Double).
+        let big_i: i64 = i64::MAX - 3;
+        let ev_i = scalar_to_epics(&ScalarValue::Long(big_i));
+        assert_eq!(ev_i, EpicsValue::Int64(big_i));
+    }
+
+    /// MR-R22: the single-record QSRV PUT conversion chain. A native
+    /// PVA client sends an NTScalar carrying a `ulong` value;
+    /// `BridgeChannel::put_with_options` extracts it via
+    /// `pv_structure_to_epics`, then re-types it against the bound
+    /// field's DBF with `epics_to_scalar` + `scalar_to_epics_typed`.
+    /// Before the fix `pv_structure_to_epics` produced a precision-lost
+    /// `Double`, and `UInt64` was not in the channel's scalar retype
+    /// arm — so a `u64` above `2^53` could not round-trip. This drives
+    /// the exact chain (`pv_structure_to_epics` was the untested path
+    /// per the review) and asserts full-range preservation.
+    #[test]
+    fn mr_r22_ntscalar_ulong_put_chain_preserves_precision() {
+        use crate::qsrv::pvif::pv_structure_to_epics;
+        use epics_pva_rs::pvdata::PvStructure;
+
+        let big: u64 = u64::MAX - 7;
+
+        // Realistic wire shape: an NTScalar whose `value` is a ulong.
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::ULong(big))));
+
+        // Step 1: BridgeChannel::put_with_options' `raw_val` extraction.
+        let raw_val = pv_structure_to_epics(&nt).expect("extract value");
+        assert_eq!(
+            raw_val,
+            EpicsValue::UInt64(big),
+            "pv_structure_to_epics must preserve a scalar ulong as UInt64"
+        );
+
+        // Step 2: the channel's scalar retype arm for a DBF_UINT64
+        // bound field — `epics_to_scalar` then `scalar_to_epics_typed`.
+        let sv = epics_to_scalar(&raw_val);
+        assert_eq!(sv, ScalarValue::ULong(big));
+        let typed = scalar_to_epics_typed(&sv, DbFieldType::UInt64);
+        assert_eq!(
+            typed,
+            EpicsValue::UInt64(big),
+            "the full single-record PUT conversion chain must round-trip \
+             the submitted u64 without an f64 precision loss"
+        );
     }
 }

@@ -542,6 +542,95 @@ async fn server_side_filter_pva_dec_wire_through() {
     h.abort();
 }
 
+/// EX-R1 regression: pipeline credit must be consumed only for
+/// monitor DATA frames actually sent to the client. A pipelined
+/// monitor (`pipeline=true,queueSize=N`) combined with a server-side
+/// `dec` filter that drops most events must still stream the events
+/// that pass the filter.
+///
+/// Before the fix the emit loop decremented the pipeline window
+/// BEFORE the pause/filter gates, so every filter-dropped event
+/// consumed a window slot without sending a frame. With queueSize=4
+/// and `dec n=3`, the first 4 events are all dropped by the filter;
+/// they exhausted the window with no DATA frame, hence no client ACK
+/// to refill it — the stream stalled and the events that should have
+/// passed the filter never arrived.
+///
+/// After the fix the window decrements only for events that produce
+/// a frame, so the passing events stream through and `last_seen`
+/// reaches the final pushed value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ex_r1_pipeline_credit_not_consumed_by_filtered_events() {
+    use epics_pva_rs::pv_request::PvRequestBuilder;
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:EXR1:PIPE", 0.0).await;
+
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    let last_seen = Arc::new(parking_lot::Mutex::new(None::<f64>));
+    let count = Arc::new(parking_lot::Mutex::new(0usize));
+    let last_cb = last_seen.clone();
+    let count_cb = count.clone();
+
+    // Pipelined monitor with a small window AND a decimate-by-3
+    // server-side filter. The filter drops ~2 of every 3 events.
+    let req = PvRequestBuilder::new()
+        .record("pipeline", "true")
+        .record("queueSize", "4")
+        .record("_filter", r#"{"dec":{"n":3}}"#)
+        .build();
+
+    let monitor_handle = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let _ = client
+                .pvmonitor_with_request("STAB:EXR1:PIPE", &req, move |value| {
+                    if let PvField::Structure(s) = value
+                        && let Some(ScalarValue::Double(v)) = s.get_value()
+                    {
+                        *last_cb.lock() = Some(*v);
+                        *count_cb.lock() += 1;
+                    }
+                })
+                .await;
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Push 30 values. With dec n=3 the filter drops far more than the
+    // 4-deep window, so a credit-on-drop bug stalls the stream within
+    // the first handful of pushes.
+    const N: i32 = 30;
+    for i in 1..=N {
+        source.push("STAB:EXR1:PIPE", i as f64).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let last = *last_seen.lock();
+    let seen = *count.lock();
+    // The stream must not have stalled: the last value the client
+    // observed must be a late push, proving credit kept flowing past
+    // the filter-dropped events.
+    assert!(
+        last.is_some_and(|v| v >= (N as f64) - 6.0),
+        "EX-R1 regression: pipelined monitor stalled — last value {last:?} \
+         (expected close to {N}); filter-dropped events consumed window credit"
+    );
+    // And more than the window's worth of frames were delivered, which
+    // is impossible if credit never refilled.
+    assert!(
+        seen > 4,
+        "EX-R1 regression: only {seen} frames delivered — window never refilled"
+    );
+
+    monitor_handle.abort();
+    h.abort();
+}
+
 /// pvxs `serverchan.cpp:269-358` parity: a single CREATE_CHANNEL
 /// frame can carry `count` (cid, name) pairs and the server must
 /// emit one reply per pair, in arrival order. Rust used to consume

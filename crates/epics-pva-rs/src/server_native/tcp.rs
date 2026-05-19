@@ -3421,13 +3421,43 @@ async fn handle_op(
                             debug!(pv = %pv_name, "monitor outbound queue drained below low watermark");
                             src.notify_watermark_low(&pv_name);
                         }
+                        // EX-R1: pause and filter suppression MUST run
+                        // before pipeline credit is consumed. Pipeline
+                        // credit accounts for monitor DATA frames sent
+                        // to the client (pvxs `servermon.cpp:192`
+                        // decrements `window` only after the frame is
+                        // enqueued). An event dropped by pause or by
+                        // the filter chain produces no wire frame, so
+                        // it must not consume a window slot — otherwise
+                        // a client with a finite pipeline window stalls
+                        // waiting to ACK frames it never received.
+                        //
+                        // P-G28: pause drops events on the floor.
+                        // Resume cleanly re-emits whatever the source
+                        // sends next; clients that need state recovery
+                        // re-issue their pvRequest after resume.
+                        if paused_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            continue;
+                        }
+                        // Server-side channel filters: skip when the
+                        // chain drops this event. Empty chain (the
+                        // default) is a no-op pass-through.
+                        if !filters.is_empty() {
+                            let fev = pv_field_to_filter_event(&value);
+                            if filters.apply(fev).is_none() {
+                                continue;
+                            }
+                        }
                         // P-G11: pipeline window check. When pipeline
                         // is active, wait for window > 0 before
                         // emitting. ACK frames refill the window via
                         // the dispatch path; we wake on the notify.
                         // Without a window (pipeline=false) we emit
                         // freely; mpsc backpressure remains the only
-                        // gate, matching previous behavior.
+                        // gate, matching previous behavior. This runs
+                        // after the pause/filter gates above so credit
+                        // is consumed only for events that will produce
+                        // a DATA frame.
                         if let (Some(w), Some(n)) = (window.as_ref(), window_notify.as_ref()) {
                             loop {
                                 let cur = w.load(std::sync::atomic::Ordering::Relaxed);
@@ -3460,22 +3490,6 @@ async fn handle_op(
                                     continue;
                                 }
                                 notified.await;
-                            }
-                        }
-                        // P-G28: pause drops events on the floor.
-                        // Resume cleanly re-emits whatever the source
-                        // sends next; clients that need state recovery
-                        // re-issue their pvRequest after resume.
-                        if paused_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                            continue;
-                        }
-                        // Server-side channel filters: skip when the
-                        // chain drops this event. Empty chain (the
-                        // default) is a no-op pass-through.
-                        if !filters.is_empty() {
-                            let fev = pv_field_to_filter_event(&value);
-                            if filters.apply(fev).is_none() {
-                                continue;
                             }
                         }
                         // BR-R29: for a partial-emitting source, narrow

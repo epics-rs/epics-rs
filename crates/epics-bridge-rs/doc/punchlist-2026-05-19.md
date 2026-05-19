@@ -1,0 +1,104 @@
+# epics-bridge-rs Deferred/Remaining Punchlist — 2026-05-19
+
+Driver-managed punchlist. **Worker contract:**
+
+1. Take exactly the next unchecked `[ ]` item the driver hands you. Do NOT freelance to other items.
+2. Before editing the cited line, run the **Anchor / Sites / Same defect / Distinct** audit per the global rule (see ~/.claude/CLAUDE.md "Fixes from reported defects"). Mandatory report header before edits.
+3. NEVER emit: `TODO`, `FIXME`, `unimplemented!()`, `#[allow(...)]` (to silence), `// later`, "next session", "out of scope" (unless user-scoped this round), "scope이 크다", "위험합니다", "다음에", "defer".
+4. Root cause fix at source. Comment-only "fix" = rejected. Type/API closure preferred over local patches when the global rule's "Invariant-driven fixes" section applies.
+5. After edits: `cargo fmt --all` → `cargo clippy -p epics-bridge-rs --all-targets -- -D warnings` → `cargo nextest run -p epics-bridge-rs`. If your change crosses crate boundaries, escalate to `--workspace`. Doctest changes → `cargo test --doc -p epics-bridge-rs`.
+6. Add a regression test that fails on main and passes after your fix. Name it `br_rN_<short>`.
+7. End-of-task report in the format mandated by global rules: Tested / Failed / UNFIXED / Fixed.
+8. Commit per item (one item = one commit). No bundled commits. No `git push` without explicit user confirmation. No `Co-Authored-By` lines.
+
+Driver (main session) verifies after each item:
+- `rg "(TODO|FIXME|unimplemented!|#\[allow|// later)"` over your diff → must be zero new hits.
+- Banned phrases in your panel output → rejection + correction.
+- All three cargo commands recorded as passing.
+- Regression test exists and exercises the cited defect.
+
+When all items checked, run full-workspace `cargo clippy --workspace --all-targets -- -D warnings` + `cargo nextest run --workspace` + `cargo test --doc --workspace` before reporting done.
+
+---
+
+## Items (ordered by review-doc priority block)
+
+### Priority 1 — ACF/identity/RPC protection
+
+- [ ] **BR-R4** — QSRV ACF adapter collapses method/authority/roles and field ASL.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:153-176`
+
+- [ ] **BR-R21** — PVA gateway READ/MONITOR upstream authorization uses the shared cache client.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:604-632`
+
+### Priority 3 — Field addressing & PUT/scan processing
+
+- [ ] **BR-R11** — pvalink OUT writes do not preserve `field`, `proc`, `block`, or deferred option semantics from the DB link.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:327-357`
+
+### Priority 4 — DB pvalink / group syntax/options
+
+- [ ] **BR-R10** — DB JSON pvalink options are reduced to only the PV name.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:299-326`
+
+- [ ] **BR-R27** — pvalink cache key drops per-link `field` and option state.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:766-794`
+
+### Priority 5 — Gateway typed forwarding / decoded monitor fallback
+
+- [ ] **BR-R6** — PVA gateway reserializes downstream PUTs through string `pvput`.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:201-225`
+
+- [ ] **BR-R41** — PVA gateway decoded monitor fallback emits only the initial snapshot.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:1120-1144`
+
+### Priority 6 — Method/authority/roles, upstream identity, resource caps
+
+- [ ] **BR-R7** — PVA gateway upstream credential pool is unbounded and keyed by client-controlled identity.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:226-249`
+
+- [ ] **BR-R8** — PVA gateway does not preserve downstream auth method/authority upstream.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:250-273`
+
+### Priority 7 — Descriptor/value type shape
+
+- [ ] **BR-R12** — QSRV NTScalar/NTScalarArray metadata shape differs from pvxs.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:358-387`
+
+- [ ] **BR-R13** — Unsigned 64-bit EPICS fields are not represented through QSRV.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:388-415`
+
+### Priority 8 — Atomic semantics (shared multi-record lock)
+
+- [ ] **BR-R15** — QSRV atomic group PUT is not DBManyLock-equivalent.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:444-469`
+
+- [ ] **BR-R18** — pvalink `atomic` scan-on-update lacks a multi-record lock epoch.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:524-548`
+
+### Priority 9 — Group monitor metadata / archive events (residuals)
+
+- [ ] **BR-R29-RESIDUAL** — Group default `+trigger` SelfOnly variant exists but wire BitSet narrowing for SelfOnly is the residual gap.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:819-844` and Cleared note `:58`
+
+- [ ] **BR-R33-RESIDUAL** — Per-op queueSize negotiation is the residual gap (group GET/MONITOR carries root options already).
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:920-944` and Cleared note `:59`
+
+### Priority 10 — pvalink value conversion / metadata hooks
+
+- [ ] **BR-R24** — pvalink DB link metadata hooks are mostly absent.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:686-712`
+
+### Priority 12 — Gateway monitor fanout
+
+- [ ] **BR-R14** — PVA gateway monitor fanout is not pvRequest-transparent.
+  - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:416-443`
+
+---
+
+## Driver state
+
+- Total open: 17
+- Done: 0
+- In progress: 0
+- Blocked: 0

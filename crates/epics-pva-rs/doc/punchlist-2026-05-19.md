@@ -1,0 +1,56 @@
+# epics-pva-rs Deferred/Remaining Punchlist — 2026-05-19
+
+Driver-managed punchlist. **Worker contract:**
+
+1. Take exactly the next unchecked `[ ]` item the driver hands you. Do NOT freelance to other items.
+2. Before editing the cited line, run the **Anchor / Sites / Same defect / Distinct** audit per the global rule (see ~/.claude/CLAUDE.md "Fixes from reported defects"). Mandatory report header before edits.
+3. NEVER emit: `TODO`, `FIXME`, `unimplemented!()`, `#[allow(...)]` (to silence), `// later`, "next session", "out of scope" (unless user-scoped this round), "scope이 크다", "위험합니다", "다음에", "defer".
+4. Root cause fix at source. Comment-only "fix" = rejected. Type/API closure preferred over local patches when the global rule's "Invariant-driven fixes" section applies.
+5. After edits: `cargo fmt --all` → `cargo clippy -p epics-pva-rs --all-targets -- -D warnings` → `cargo nextest run -p epics-pva-rs`. If your change crosses crate boundaries, escalate to `--workspace`. Doctest changes → `cargo test --doc -p epics-pva-rs`.
+6. Add a regression test that fails on main and passes after your fix. Name it `pva_rN_<short>`.
+7. End-of-task report in the format mandated by global rules: Tested / Failed / UNFIXED / Fixed.
+8. Commit per item (one item = one commit). No bundled commits. No `git push` without explicit user confirmation. No `Co-Authored-By` lines.
+
+Driver (main session) verifies after each item:
+- `rg "(TODO|FIXME|unimplemented!|#\[allow|// later)"` over your diff → must be zero new hits.
+- Banned phrases in your panel output → rejection + correction.
+- All three cargo commands recorded as passing.
+- Regression test exists and exercises the cited defect.
+
+When all items checked, run full-workspace `cargo clippy --workspace --all-targets -- -D warnings` + `cargo nextest run --workspace` + `cargo test --doc --workspace` before reporting done.
+
+---
+
+## Items
+
+- [ ] **PVA-R2** (MEDIUM, architectural) — `PvaClientBuilder::tcp_timeout()` is stored but not applied. Plumb `tcp_timeout` through `ConnectionPool::get_or_connect` + `ServerConn::connect` + spawned heartbeat task. Multi-layer signature change.
+  - Spec: `doc/critical-review-2026-05-18.md:68-102`
+  - Deferral note: `doc/critical-review-2026-05-18.md:1254-1257`
+
+- [ ] **PVA-R3** (MEDIUM, architectural) — Nested Variant values lose the stream type-cache. Thread `&mut TypeCache` through `decode_pv_field` family + all op-response decoders + reader flattening.
+  - Spec: `doc/critical-review-2026-05-18.md:103-147`
+  - Deferral note: `doc/critical-review-2026-05-18.md:1258-1260`
+
+- [ ] **PVA-R4** (MEDIUM, architectural) — TCP name servers as persistent search peers (not direct-connect fallbacks). Client-side persistent name-server connection in `SearchEngine`. Server-side TCP SEARCH already cleared via R11.
+  - Spec: `doc/critical-review-2026-05-18.md:148-183`
+  - Deferral note: `doc/critical-review-2026-05-18.md:1261-1267`
+
+- [ ] **PVA-R6** (MEDIUM, architectural) — `SharedPV` drops the newest update when a subscriber queue is full. Implement squash-to-tail semantics via `Mutex<VecDeque>+Notify` or `tokio::sync::watch` (tokio::mpsc has no sender-side drop-oldest).
+  - Spec: `doc/critical-review-2026-05-18.md:259-294`
+  - Deferral note: `doc/critical-review-2026-05-18.md:1268-1271`
+
+- [ ] **PVA-R14** (MEDIUM, architectural) — Decouple server source calls from per-connection read loop. Operation-state-machine restructure so source futures don't head-of-line-block the socket parser.
+  - Spec: `doc/critical-review-2026-05-18.md:513-556`
+  - Deferral note: `doc/critical-review-2026-05-18.md:1272-1275`
+
+- [ ] **TLS-NAMESERVER** (MEDIUM, architectural) — TLS via name-server (mixed-mode listener). TCP accept loop peeks the first byte and dispatches to plain handshake or `TlsAcceptor`. Refactor of `server_native/tcp.rs:460-590`.
+  - Spec/Deferral note: `doc/critical-review-2026-05-18.md:1290-1298`
+
+---
+
+## Driver state
+
+- Total open: 6
+- Done: 0
+- In progress: 0
+- Blocked: 0

@@ -122,22 +122,84 @@ pub fn get_nested_field<'a>(pv: &'a PvStructure, path: &str) -> Option<Cow<'a, P
     None
 }
 
-/// BR-R33: pvxs default monitor queue depth for groups
-/// (`groupsource.cpp:359` uses the per-op negotiated value; in the
-/// absence of per-op negotiation today, expose pvxs's documented
-/// default so the field is present and stable).
-const GROUP_DEFAULT_QUEUE_SIZE: i32 = 4;
+/// BR-R33: pvxs default monitor queue depth for groups — pvxs
+/// `MonitorOp::limit` defaults to `4u` (`servermon.cpp:66`), and a
+/// `record._options.queueSize` that fails to parse or is `< 2` leaves
+/// that default in place (`servermon.cpp:533-540`). Used for the GET
+/// path (no queue to negotiate) and as the monitor fallback when the
+/// MONITOR INIT pvRequest carries no usable `queueSize`.
+pub const GROUP_DEFAULT_QUEUE_SIZE: i32 = 4;
+
+/// BR-R33-RESIDUAL: resolve the *negotiated* monitor queue size from a
+/// MONITOR INIT pvRequest's `record._options.queueSize`.
+///
+/// pvxs `servermon.cpp:533-540`: `uint32_t qSize = op->limit;` then
+/// `op->limit = qSize` only when `queueSize` parses AND `qSize >= 2`;
+/// otherwise the default `op->limit` (4) is kept. The group source
+/// then stamps `stats.limitQueue` (= `op->limit`) into the monitor
+/// value (`groupsource.cpp:359`). This mirrors that negotiation so a
+/// group monitor reports the queue depth the client actually
+/// requested, not a hardcoded constant.
+pub fn negotiated_queue_size(pv_request: &PvStructure) -> i32 {
+    use epics_pva_rs::pvdata::ScalarValue;
+    let parsed = pv_request
+        .fields
+        .iter()
+        .find_map(|(k, v)| (k == "record").then_some(v))
+        .and_then(|v| match v {
+            PvField::Structure(s) => Some(s),
+            _ => None,
+        })
+        .and_then(|rec| {
+            rec.fields
+                .iter()
+                .find_map(|(k, v)| (k == "_options").then_some(v))
+        })
+        .and_then(|v| match v {
+            PvField::Structure(s) => Some(s),
+            _ => None,
+        })
+        .and_then(|opt| {
+            opt.fields
+                .iter()
+                .find_map(|(k, v)| (k == "queueSize").then_some(v))
+        })
+        .and_then(|v| match v {
+            // Same scalar shapes the native PVA server accepts in
+            // `monitor_pipeline_options` — typed-builder INT/UINT/…
+            // and the `record[queueSize=N]` STRING form.
+            PvField::Scalar(ScalarValue::String(s)) => s.parse::<i32>().ok(),
+            PvField::Scalar(ScalarValue::Byte(i)) => Some(i32::from(*i)),
+            PvField::Scalar(ScalarValue::UByte(i)) => Some(i32::from(*i)),
+            PvField::Scalar(ScalarValue::Short(i)) => Some(i32::from(*i)),
+            PvField::Scalar(ScalarValue::UShort(i)) => Some(i32::from(*i)),
+            PvField::Scalar(ScalarValue::Int(i)) => Some(*i),
+            PvField::Scalar(ScalarValue::UInt(i)) => i32::try_from(*i).ok(),
+            PvField::Scalar(ScalarValue::Long(l)) => i32::try_from(*l).ok(),
+            PvField::Scalar(ScalarValue::ULong(l)) => i32::try_from(*l).ok(),
+            _ => None,
+        });
+    // pvxs keeps the default unless the request value is >= 2.
+    match parsed {
+        Some(n) if n >= 2 => n,
+        _ => GROUP_DEFAULT_QUEUE_SIZE,
+    }
+}
 
 /// BR-R33: stamp `record._options.queueSize` (int) and
 /// `record._options.atomic` (boolean) onto a group GET / MONITOR
 /// value. Adds them at the root, replacing the previous values if
 /// `_options` already exists (e.g. composed by an earlier read).
-pub fn push_record_options(pv: &mut PvStructure, atomic: bool) {
+///
+/// `queue_size` is the negotiated monitor queue depth (see
+/// [`negotiated_queue_size`]); the GET path passes
+/// [`GROUP_DEFAULT_QUEUE_SIZE`] since a GET has no subscription queue.
+pub fn push_record_options(pv: &mut PvStructure, atomic: bool, queue_size: i32) {
     use epics_pva_rs::pvdata::ScalarValue;
     let mut options = PvStructure::new("");
     options.fields.push((
         "queueSize".into(),
-        PvField::Scalar(ScalarValue::Int(GROUP_DEFAULT_QUEUE_SIZE)),
+        PvField::Scalar(ScalarValue::Int(queue_size)),
     ));
     options.fields.push((
         "atomic".into(),
@@ -420,6 +482,12 @@ pub struct GroupChannel {
     db: Arc<PvDatabase>,
     def: GroupPvDef,
     access: super::provider::AccessContext,
+    /// BR-R33-RESIDUAL: negotiated monitor queue depth stamped into
+    /// `record._options.queueSize`. `None` for the GET path (a GET
+    /// has no subscription queue → [`GROUP_DEFAULT_QUEUE_SIZE`]);
+    /// `Some(n)` when a `GroupMonitor` built this channel from the
+    /// MONITOR INIT pvRequest's negotiated `queueSize`.
+    monitor_queue_size: Option<i32>,
 }
 
 impl GroupChannel {
@@ -428,12 +496,22 @@ impl GroupChannel {
             db,
             def,
             access: super::provider::AccessContext::allow_all(),
+            monitor_queue_size: None,
         }
     }
 
     /// Inject an access control context (for [`super::provider::BridgeProvider`]).
     pub fn with_access(mut self, access: super::provider::AccessContext) -> Self {
         self.access = access;
+        self
+    }
+
+    /// BR-R33-RESIDUAL: set the negotiated monitor queue depth this
+    /// channel stamps into `record._options.queueSize`. Called by
+    /// `GroupMonitor::start` with the value resolved from the MONITOR
+    /// INIT pvRequest.
+    pub fn with_monitor_queue_size(mut self, queue_size: i32) -> Self {
+        self.monitor_queue_size = Some(queue_size);
         self
     }
 
@@ -503,16 +581,21 @@ impl GroupChannel {
 
         // BR-R33: pvxs `groupsource.cpp:359` stamps
         // `record._options.queueSize` (negotiated monitor queue depth)
-        // and `record._options.atomic` (operation atomicity) into
-        // every group GET / MONITOR value. Clients that introspect
-        // these branches — strict pvRequest matchers, archiver
-        // appliances tracking the negotiated queue — would otherwise
-        // see the structure-shape mismatch and reject the operation.
-        // Without per-op negotiation today, expose the configured
-        // group default queue depth (DEFAULT_MONITOR_QUEUE_DEPTH
-        // matches the wire-side server default) so the field is
-        // present and stable.
-        push_record_options(&mut pv, atomic);
+        // and `record._options.atomic` (operation atomicity) into the
+        // group monitor value. Clients that introspect these branches
+        // — strict pvRequest matchers, archiver appliances tracking
+        // the negotiated queue — would otherwise see a structure-shape
+        // mismatch and reject the operation.
+        //
+        // BR-R33-RESIDUAL: `queueSize` is now the *per-operation
+        // negotiated* depth. A `GroupMonitor` resolves it from the
+        // MONITOR INIT pvRequest (`negotiated_queue_size`,
+        // mirroring pvxs `servermon.cpp:533-540`) and threads it in
+        // via `with_monitor_queue_size`. The GET path keeps
+        // `GROUP_DEFAULT_QUEUE_SIZE` — a GET has no subscription
+        // queue, matching pvxs's monitor-only `limitQueue`.
+        let queue_size = self.monitor_queue_size.unwrap_or(GROUP_DEFAULT_QUEUE_SIZE);
+        push_record_options(&mut pv, atomic, queue_size);
 
         Ok(pv)
     }
@@ -1134,6 +1217,13 @@ pub struct GroupMonitor {
     priming: Vec<FieldPrimingState>,
     /// Whether the priming phase has completed.
     events_primed: bool,
+    /// BR-R33-RESIDUAL: negotiated monitor queue depth, resolved from
+    /// the MONITOR INIT pvRequest's `record._options.queueSize`
+    /// ([`negotiated_queue_size`]). Stamped into every monitor
+    /// value's `record._options.queueSize` via the internal
+    /// `GroupChannel`. Defaults to [`GROUP_DEFAULT_QUEUE_SIZE`] when
+    /// the pvRequest carries no usable `queueSize`.
+    monitor_queue_size: i32,
 }
 
 impl GroupMonitor {
@@ -1180,12 +1270,23 @@ impl GroupMonitor {
             access: super::provider::AccessContext::allow_all(),
             priming,
             events_primed: false,
+            monitor_queue_size: GROUP_DEFAULT_QUEUE_SIZE,
         }
     }
 
     /// Inject an access control context. Called by `GroupChannel::create_monitor`.
     pub fn with_access(mut self, access: super::provider::AccessContext) -> Self {
         self.access = access;
+        self
+    }
+
+    /// BR-R33-RESIDUAL: set the per-operation negotiated monitor queue
+    /// depth, resolved from the MONITOR INIT pvRequest by the QSRV
+    /// adapter ([`negotiated_queue_size`]). Threaded into the internal
+    /// `GroupChannel` so every monitor value reports the depth the
+    /// client actually requested instead of a hardcoded default.
+    pub fn with_queue_size(mut self, queue_size: i32) -> Self {
+        self.monitor_queue_size = queue_size;
         self
     }
 }
@@ -1308,8 +1409,14 @@ impl super::provider::PvaMonitor for GroupMonitor {
         // Create a reusable GroupChannel once (instead of per-event in poll).
         // Propagate the same access context so any subsequent reads triggered
         // by trigger evaluation also honor read enforcement.
-        let group_channel =
-            GroupChannel::new(self.db.clone(), self.def.clone()).with_access(self.access.clone());
+        //
+        // BR-R33-RESIDUAL: thread the per-operation negotiated monitor
+        // queue depth so every monitor value stamps
+        // `record._options.queueSize` with the client-requested depth
+        // (pvxs `groupsource.cpp:359` `stats.limitQueue`).
+        let group_channel = GroupChannel::new(self.db.clone(), self.def.clone())
+            .with_access(self.access.clone())
+            .with_monitor_queue_size(self.monitor_queue_size);
 
         // Check if all members are already primed (e.g., all Const/Structure).
         let all_primed = self
@@ -1447,6 +1554,21 @@ impl super::provider::PvaMonitor for GroupMonitor {
 pub enum AnyMonitor {
     Single(Box<BridgeMonitor>),
     Group(Box<GroupMonitor>),
+}
+
+impl AnyMonitor {
+    /// BR-R33-RESIDUAL: apply the per-operation negotiated monitor
+    /// queue depth (resolved from the MONITOR INIT pvRequest's
+    /// `record._options.queueSize`). Only a group monitor stamps
+    /// `record._options.queueSize` into its values — a single-record
+    /// monitor has no group-style `record._options` branch, so this
+    /// is a no-op for the `Single` variant.
+    pub fn with_queue_size(self, queue_size: i32) -> Self {
+        match self {
+            Self::Group(m) => Self::Group(Box::new(m.with_queue_size(queue_size))),
+            single => single,
+        }
+    }
 }
 
 impl super::provider::PvaMonitor for AnyMonitor {

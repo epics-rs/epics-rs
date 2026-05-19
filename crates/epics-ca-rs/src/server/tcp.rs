@@ -3158,19 +3158,27 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             )
                             .await?;
                         } else {
-                            let mut snap = pv.snapshot().await;
-                            // R2-12 refinement: initial event honours
-                            // the EVENT_ADD request count (C
-                            // `read_reply` parity). Pre-truncate the
-                            // snapshot value when the request asks
-                            // for fewer elements than the live PV;
-                            // the producer task already truncates
-                            // future updates via send_event's
-                            // `data_count` parameter.
-                            if requested_count > 0 && requested_count < snap.value.count() {
-                                snap.value.truncate(requested_count as usize);
-                            }
-                            send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
+                            let snap = pv.snapshot().await;
+                            // EX-R9: the initial event honours the
+                            // EVENT_ADD request count for BOTH
+                            // directions — `send_monitor_snapshot`
+                            // now pads when `requested_count` exceeds
+                            // the live element count and truncates
+                            // when it is smaller, via
+                            // `pad_dbr_to_requested_count` (C
+                            // `read_reply` parity). The producer task
+                            // already pads/truncates future updates
+                            // through the same helper, so the initial
+                            // frame and later frames now share one
+                            // shape.
+                            send_monitor_snapshot(
+                                writer,
+                                sub_id,
+                                requested_type,
+                                requested_count,
+                                &snap,
+                            )
+                            .await?;
                         }
 
                         let task = spawn_monitor_sender(
@@ -3302,13 +3310,21 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 ECA_NORDACCESS,
                             )
                             .await?;
-                        } else if let Some(mut snap) = initial_snap {
-                            // R2-12 refinement: initial event honours
-                            // the EVENT_ADD request count.
-                            if requested_count > 0 && requested_count < snap.value.count() {
-                                snap.value.truncate(requested_count as usize);
-                            }
-                            send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
+                        } else if let Some(snap) = initial_snap {
+                            // EX-R9: initial event honours the
+                            // EVENT_ADD request count in both
+                            // directions — `send_monitor_snapshot`
+                            // pads an over-requested count and
+                            // truncates an under-requested one via
+                            // `pad_dbr_to_requested_count`.
+                            send_monitor_snapshot(
+                                writer,
+                                sub_id,
+                                requested_type,
+                                requested_count,
+                                &snap,
+                            )
+                            .await?;
                         }
 
                         let writer_clone = writer.clone();
@@ -3888,21 +3904,48 @@ async fn get_full_snapshot(
     }
 }
 
+/// Send an initial / access-restore monitor snapshot as a
+/// `CA_PROTO_EVENT_ADD` frame.
+///
+/// EX-R9: `requested_count` is the element count from the originating
+/// `CA_PROTO_EVENT_ADD` request. The encoded DBR payload is routed
+/// through [`pad_dbr_to_requested_count`] so a request count *larger*
+/// than the live element count is zero-padded to the requested shape
+/// — and a smaller count is truncated — exactly as the READ path and
+/// the steady-state monitor producer already do. Without this the
+/// first monitor frame (and the access-restore frame) was framed at
+/// `snapshot.value.count()`, so a client requesting more elements
+/// than the PV currently holds saw a count/size discontinuity
+/// between the initial frame and later padded updates. C `read_reply`
+/// frames non-autosize monitor events at the requested count and
+/// zero-fills missing elements (`rsrv/camessage.c:507-571`).
+///
+/// `requested_count == 0` is autosize: the frame keeps the live
+/// element count.
 async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
     writer: &Arc<Mutex<BufWriter<W>>>,
     sub_id: u32,
     data_type: u16,
+    requested_count: u32,
     snapshot: &epics_base_rs::server::snapshot::Snapshot,
 ) -> CaResult<()> {
     let data = encode_dbr(data_type, snapshot)?;
     // CA-268: DBR_CLASS_NAME wire payload is always one 40-byte
-    // string regardless of underlying value count.
+    // string regardless of underlying value count — and is never
+    // padded/truncated to a requested element count.
+    let mut padded = data;
     let element_count = if data_type == epics_base_rs::types::DBR_CLASS_NAME {
         1
     } else {
-        snapshot.value.count() as u32
+        // EX-R9: pad (or truncate) the encoded DBR to the requested
+        // element count before the 8-byte alignment resize, so the
+        // header count and payload shape match a non-autosize
+        // request. `pad_dbr_to_requested_count` returns the header
+        // element count to use (`requested_count` when non-zero,
+        // the live `actual_count` for autosize).
+        let actual_count = snapshot.value.count() as u32;
+        pad_dbr_to_requested_count(&mut padded, actual_count, requested_count, data_type)
     };
-    let mut padded = data;
     padded.resize(align8(padded.len()), 0);
 
     let mut resp = CaHeader::new(CA_PROTO_EVENT_ADD);
@@ -4081,12 +4124,17 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
             // event the moment access comes back (rather than
             // waiting for the next natural update).
             //
-            // R2-1 refinement: truncate the restore snapshot to
-            // `data_count` (matches the EVENT_ADD request)
-            // instead of sending the full live native count.
-            // C `read_reply` always honours the stored request
-            // count; pre-fix Rust used `send_monitor_snapshot`
-            // which always uses live `snapshot.value.count()`.
+            // EX-R9: the restore snapshot honours the stored
+            // EVENT_ADD request count in BOTH directions.
+            // `send_monitor_snapshot` pads when the request asked
+            // for more elements than the PV currently holds and
+            // truncates when it asked for fewer, via
+            // `pad_dbr_to_requested_count` — so the access-restore
+            // frame matches the request shape and later padded
+            // updates. C `read_reply` always honours the stored
+            // request count; pre-fix Rust framed the restore event
+            // at the live `snapshot.value.count()`, only truncating
+            // and never padding.
             for sub_id in &affected {
                 let (target, data_type, data_count, sub_id_val) = {
                     let Some(sub) = state.subscriptions.get(sub_id) else {
@@ -4100,11 +4148,8 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                         sub.sub_id,
                     )
                 };
-                if let Some(mut snap) = get_full_snapshot(&target).await {
-                    if data_count > 0 && data_count < snap.value.count() {
-                        snap.value.truncate(data_count as usize);
-                    }
-                    send_monitor_snapshot(writer, sub_id_val, data_type, &snap).await?;
+                if let Some(snap) = get_full_snapshot(&target).await {
+                    send_monitor_snapshot(writer, sub_id_val, data_type, data_count, &snap).await?;
                 }
             }
         }
@@ -5230,7 +5275,8 @@ mod single_write_all_framing_tests {
             std::time::SystemTime::UNIX_EPOCH,
         );
 
-        send_monitor_snapshot(&writer, 9, DBR_LONG, &snapshot)
+        // requested_count 0 = autosize: frame the live element count.
+        send_monitor_snapshot(&writer, 9, DBR_LONG, 0, &snapshot)
             .await
             .expect("send_monitor_snapshot succeeds");
 
@@ -5243,6 +5289,115 @@ mod single_write_all_framing_tests {
             batches.len(),
             batches.iter().map(|b| b.len()).collect::<Vec<_>>(),
         );
+    }
+
+    /// EX-R9: an initial monitor snapshot for an EVENT_ADD whose
+    /// request count exceeds the live element count must be framed at
+    /// the requested count with a zero-padded payload — the same
+    /// shape the READ path and later monitor updates use. Pre-fix the
+    /// initial frame was framed at `snapshot.value.count()`, so a
+    /// client saw a count/size discontinuity inside one subscription.
+    #[tokio::test]
+    async fn ex_r9_initial_snapshot_pads_over_requested_count() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::{DBR_LONG, DbFieldType, EpicsValue};
+
+        // Live PV holds 3 LONG elements; the client requested 8.
+        let snapshot = Snapshot::new(
+            EpicsValue::LongArray(vec![10, 20, 30]),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let requested_count = 8u32;
+
+        let writer = recording_writer();
+        send_monitor_snapshot(&writer, 9, DBR_LONG, requested_count, &snapshot)
+            .await
+            .expect("send_monitor_snapshot succeeds");
+
+        let guard = writer.lock().await;
+        let batches = &guard.get_ref().batches;
+        assert_eq!(batches.len(), 1, "exactly one contiguous frame");
+        let frame = &batches[0];
+
+        // Standard 16-byte CA header: count 8 and the resulting
+        // payload both fit under the 0xFFFF extended-form threshold.
+        let postsize = u16::from_be_bytes([frame[2], frame[3]]) as usize;
+        let count = u16::from_be_bytes([frame[6], frame[7]]) as u32;
+        assert_eq!(
+            count, requested_count,
+            "EX-R9: the initial monitor frame must carry the REQUESTED \
+             element count (8), not the live count (3)"
+        );
+
+        // DBR_LONG is a plain type (no metadata); the payload must
+        // hold the requested element count of value bytes, zero-
+        // padded for the elements the PV does not have.
+        let elem = DbFieldType::Long.element_size();
+        let value_bytes = requested_count as usize * elem;
+        assert!(
+            postsize >= value_bytes,
+            "EX-R9: payload ({postsize}) must be padded to at least the \
+             requested {requested_count} elements ({value_bytes} bytes)"
+        );
+        // The three live elements come first, then zero padding.
+        let body = &frame[16..16 + postsize];
+        assert_eq!(&body[0..4], &10i32.to_be_bytes(), "element 0 preserved");
+        assert_eq!(&body[8..12], &30i32.to_be_bytes(), "element 2 preserved");
+        assert!(
+            body[3 * elem..value_bytes].iter().all(|&b| b == 0),
+            "EX-R9: over-requested elements must be zero-filled"
+        );
+    }
+
+    /// EX-R9: a request count SMALLER than the live element count
+    /// still truncates — `send_monitor_snapshot` must own both
+    /// directions of the count contract.
+    #[tokio::test]
+    async fn ex_r9_initial_snapshot_truncates_under_requested_count() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::{DBR_LONG, EpicsValue};
+
+        let snapshot = Snapshot::new(
+            EpicsValue::LongArray(vec![1, 2, 3, 4, 5]),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let writer = recording_writer();
+        send_monitor_snapshot(&writer, 9, DBR_LONG, 2, &snapshot)
+            .await
+            .expect("send_monitor_snapshot succeeds");
+
+        let guard = writer.lock().await;
+        let frame = &guard.get_ref().batches[0];
+        let count = u16::from_be_bytes([frame[6], frame[7]]) as u32;
+        assert_eq!(count, 2, "EX-R9: under-requested count must truncate to 2");
+    }
+
+    /// EX-R9: `requested_count == 0` is autosize — the frame keeps the
+    /// live element count, unchanged behaviour.
+    #[tokio::test]
+    async fn ex_r9_autosize_keeps_live_count() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::{DBR_LONG, EpicsValue};
+
+        let snapshot = Snapshot::new(
+            EpicsValue::LongArray(vec![7, 8, 9, 10]),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let writer = recording_writer();
+        send_monitor_snapshot(&writer, 9, DBR_LONG, 0, &snapshot)
+            .await
+            .expect("send_monitor_snapshot succeeds");
+
+        let guard = writer.lock().await;
+        let frame = &guard.get_ref().batches[0];
+        let count = u16::from_be_bytes([frame[6], frame[7]]) as u32;
+        assert_eq!(count, 4, "EX-R9: autosize (count==0) keeps the live count");
     }
 }
 

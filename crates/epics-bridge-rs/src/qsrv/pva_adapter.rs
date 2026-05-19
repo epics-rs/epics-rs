@@ -13,7 +13,9 @@ use tokio::sync::{RwLock, mpsc};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure};
 
-use super::provider::{AnyChannel, BridgeProvider, Channel, ChannelProvider, PvaMonitor};
+use super::provider::{
+    AnyChannel, BridgeProvider, Channel, ChannelProvider, ClientCreds, PvaMonitor,
+};
 
 /// Handle for a native PVA PV: latest snapshot + subscriber list +
 /// (optional) canonical introspection descriptor.
@@ -141,6 +143,22 @@ fn root_kind_name_desc(d: &FieldDesc) -> &'static str {
     }
 }
 
+/// Convert a native-PVA [`ChannelContext`] to a [`ClientCreds`] for
+/// `BridgeProvider::create_channel_with_creds`.
+///
+/// Carries method/authority/roles through so `AcfAccessControl` can
+/// evaluate METHOD/AUTHORITY rules and role-based UAG entries — fixing the
+/// BR-R4 defect where these were hardcoded to `"anonymous"` / `""`.
+fn ctx_to_creds(ctx: &epics_pva_rs::server_native::source::ChannelContext) -> ClientCreds {
+    ClientCreds {
+        user: ctx.account.clone(),
+        host: ctx.host.clone(),
+        method: ctx.method.clone(),
+        authority: ctx.authority.clone(),
+        roles: Vec::new(),
+    }
+}
+
 /// PvStore implementation backed by a qsrv [`BridgeProvider`].
 ///
 /// Handles single-record PVs, group composite PVs, and native PVA PVs
@@ -258,7 +276,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 return Some(value);
             }
             let channel = provider
-                .create_channel_for(&name, &ctx.account, &ctx.host)
+                .create_channel_with_creds(&name, ctx_to_creds(&ctx))
                 .await
                 .ok()?;
             let empty_request = PvStructure::new("");
@@ -311,7 +329,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 _ => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
             };
             let channel = provider
-                .create_channel_for(&name, &ctx.account, &ctx.host)
+                .create_channel_with_creds(&name, ctx_to_creds(&ctx))
                 .await
                 .map_err(|e| e.to_string())?;
             match channel {
@@ -441,7 +459,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 return Some(rx);
             }
             let channel = provider
-                .create_channel_for(&name, &ctx.account, &ctx.host)
+                .create_channel_with_creds(&name, ctx_to_creds(&ctx))
                 .await
                 .ok()?;
             // BR-R5: honor `record._options.DBE` from the MONITOR INIT

@@ -23,6 +23,33 @@ use crate::error::{BridgeError, BridgeResult};
 // Access control
 // ---------------------------------------------------------------------------
 
+/// Full client credential set for method/authority/roles-aware ACF checks.
+///
+/// Mirrors the pvxs `Credentials` shape built in `pvxs/ioc/credentials.cpp`:
+/// account (or method-prefixed form), host, auth method, certificate
+/// authority, and roles. `AccessControl::can_read_creds` /
+/// `can_write_creds` receive this so `AcfAccessControl` can pass the
+/// correct values to `check_access_method` instead of the former
+/// hardcoded `0` / `"anonymous"` / `""`.
+#[derive(Debug, Clone, Default)]
+pub struct ClientCreds {
+    /// Account name (e.g. "alice", "CN=alice" for x509).
+    pub user: String,
+    /// Client host name (reverse-resolved or empty).
+    pub host: String,
+    /// Auth method ("anonymous", "ca", "x509", …).
+    /// pvxs `ClientCredentials::method`
+    /// (pvxs/include/pvxs/srvcommon.h:43).
+    pub method: String,
+    /// Root CA subject CN for the x509 method. Empty for non-TLS methods.
+    /// ACF `AUTHORITY(...)` rules match against this.
+    pub authority: String,
+    /// Group/role claims. ACF UAG entries of the form `role/name` match
+    /// against this list. pvxs `ClientCredentials::roles()`
+    /// (pvxs/include/pvxs/srvcommon.h:55).
+    pub roles: Vec<String>,
+}
+
 /// Access control interface for PVA channels.
 ///
 /// Corresponds to C++ QSRV's per-channel ASCLIENT checks.
@@ -36,6 +63,21 @@ pub trait AccessControl: Send + Sync {
     /// Check if the client can write to this channel.
     fn can_write(&self, _channel: &str, _user: &str, _host: &str) -> bool {
         true
+    }
+
+    /// Method/authority/roles-aware read check.
+    ///
+    /// Default forwards to `can_read(channel, creds.user, creds.host)` so
+    /// impls that do not need method/authority/roles need not override.
+    /// `AcfAccessControl` overrides to pass the full credential set to
+    /// `check_access_method`.
+    fn can_read_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
+        self.can_read(channel, &creds.user, &creds.host)
+    }
+
+    /// Method/authority/roles-aware write check.
+    fn can_write_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
+        self.can_write(channel, &creds.user, &creds.host)
     }
 }
 
@@ -68,46 +110,93 @@ impl AcfAccessControl {
         }
     }
 
-    fn level_for(&self, channel: &str, user: &str, host: &str) -> AccessLevelLite {
-        // qsrv's AccessControl is sync; resolve the record's ASG via
-        // the runtime's current handle. We're on a tokio worker (the
-        // PVA server task pool) so block_in_place + block_on is
-        // safe; for callers outside a runtime, fall back to DEFAULT.
-        let asg = self.resolve_asg_blocking(channel);
-        let level = self
-            .cfg
-            .check_access_method(&asg, host, user, 0, "anonymous", "");
-        match level {
-            epics_base_rs::server::access_security::AccessLevel::ReadWrite => {
-                AccessLevelLite::ReadWrite
-            }
-            epics_base_rs::server::access_security::AccessLevel::Read => AccessLevelLite::Read,
-            _ => AccessLevelLite::None,
-        }
-    }
-
-    fn resolve_asg_blocking(&self, channel: &str) -> String {
+    /// Resolve (ASG name, field ASL) for a channel from the backing database.
+    ///
+    /// Mirrors pvxs `ioc/securityclient.cpp:25` — `asAddClient` is passed
+    /// `dbChannelFldDes(ch)->as_level` as the ASL. Our Rust model stores a
+    /// per-record `common.asl` (same approach as
+    /// `epics-ca-rs/src/server/tcp.rs:459`).
+    fn resolve_asg_and_asl_blocking(&self, channel: &str) -> (String, u8) {
         let (record_name, _field) = epics_base_rs::server::database::parse_pv_name(channel);
         let db = self.db.clone();
         let name = record_name.to_string();
         let lookup = async move {
             if let Some(rec) = db.get_record(&name).await {
                 let inst = rec.read().await;
-                if !inst.common.asg.is_empty() {
-                    return inst.common.asg.clone();
-                }
+                let asg = if inst.common.asg.is_empty() {
+                    "DEFAULT".to_string()
+                } else {
+                    inst.common.asg.clone()
+                };
+                return (asg, inst.common.asl);
             }
-            "DEFAULT".to_string()
+            ("DEFAULT".to_string(), 0u8)
         };
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => match handle.runtime_flavor() {
                 tokio::runtime::RuntimeFlavor::MultiThread => {
                     tokio::task::block_in_place(|| handle.block_on(lookup))
                 }
-                _ => "DEFAULT".to_string(),
+                _ => ("DEFAULT".to_string(), 0u8),
             },
-            Err(_) => "DEFAULT".to_string(),
+            Err(_) => ("DEFAULT".to_string(), 0u8),
         }
+    }
+
+    /// Build pvxs-style credential strings from `ClientCreds`.
+    ///
+    /// Mirrors `pvxs/ioc/credentials.cpp:31-45`:
+    /// - "ca" method (or no method): plain account name, path-suffix stripped.
+    /// - other methods: `"method/account"`.
+    /// - each role: `"role/rolename"`.
+    fn credential_strings(creds: &ClientCreds) -> Vec<String> {
+        let mut v = Vec::new();
+        let primary = if creds.method == "ca" || creds.method.is_empty() {
+            let pos = creds.user.rfind('/').map(|p| p + 1).unwrap_or(0);
+            creds.user[pos..].to_string()
+        } else {
+            format!("{}/{}", creds.method, creds.user)
+        };
+        v.push(primary);
+        for role in &creds.roles {
+            v.push(format!("role/{role}"));
+        }
+        v
+    }
+
+    /// Full credential/method/ASL-aware access level check.
+    ///
+    /// Resolves (ASG, ASL) from the database, builds pvxs-style credential
+    /// strings, then calls `check_access_method` for each. Access is the
+    /// maximum level across all credentials — mirrors `SecurityClient::canWrite`
+    /// `any_of` semantics (`pvxs/ioc/securityclient.cpp:42-45`).
+    fn level_for_creds(&self, channel: &str, creds: &ClientCreds) -> AccessLevelLite {
+        use epics_base_rs::server::access_security::AccessLevel;
+        let (asg, asl) = self.resolve_asg_and_asl_blocking(channel);
+        let cred_strings = Self::credential_strings(creds);
+        let mut best = AccessLevelLite::None;
+        for cred_user in &cred_strings {
+            let lvl = self.cfg.check_access_method(
+                &asg,
+                &creds.host,
+                cred_user,
+                asl,
+                &creds.method,
+                &creds.authority,
+            );
+            let lit = match lvl {
+                AccessLevel::ReadWrite => AccessLevelLite::ReadWrite,
+                AccessLevel::Read => AccessLevelLite::Read,
+                _ => AccessLevelLite::None,
+            };
+            if lit == AccessLevelLite::ReadWrite {
+                return lit;
+            }
+            if lit == AccessLevelLite::Read && best == AccessLevelLite::None {
+                best = lit;
+            }
+        }
+        best
     }
 }
 
@@ -120,42 +209,93 @@ enum AccessLevelLite {
 
 impl AccessControl for AcfAccessControl {
     fn can_read(&self, channel: &str, user: &str, host: &str) -> bool {
-        self.level_for(channel, user, host) != AccessLevelLite::None
+        self.can_read_creds(
+            channel,
+            &ClientCreds {
+                user: user.to_string(),
+                host: host.to_string(),
+                ..Default::default()
+            },
+        )
     }
 
     fn can_write(&self, channel: &str, user: &str, host: &str) -> bool {
-        self.level_for(channel, user, host) == AccessLevelLite::ReadWrite
+        self.can_write_creds(
+            channel,
+            &ClientCreds {
+                user: user.to_string(),
+                host: host.to_string(),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn can_read_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
+        self.level_for_creds(channel, creds) != AccessLevelLite::None
+    }
+
+    fn can_write_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
+        self.level_for_creds(channel, creds) == AccessLevelLite::ReadWrite
     }
 }
 
 /// Per-channel client identity used for access enforcement.
 ///
-/// Carries the access control policy plus the user/host of whichever
-/// downstream client opened this channel. The PVA server is expected to
-/// fill in `user`/`host` from the connection's authentication context;
-/// when no PVA server is wired up yet, both fields are empty strings,
-/// in which case [`AccessControl`] implementations should fall back to
-/// their default (typically permit-all).
+/// Carries the access control policy plus the full credential set of
+/// whichever downstream client opened this channel. The PVA server fills
+/// in all fields from the connection's authentication context; when no
+/// PVA server is wired (tests, in-process), all credential fields are
+/// empty and `AccessControl` implementations fall back to their defaults.
 #[derive(Clone)]
 pub struct AccessContext {
     pub access: Arc<dyn AccessControl>,
     pub user: String,
     pub host: String,
+    /// Auth method. pvxs `ClientCredentials::method`
+    /// (pvxs/include/pvxs/srvcommon.h:43).
+    pub method: String,
+    /// Root CA subject CN for the x509 method; empty for others.
+    pub authority: String,
+    /// Role claims for UAG `role/…` entries.
+    /// pvxs `ClientCredentials::roles()` (pvxs/include/pvxs/srvcommon.h:55).
+    pub roles: Vec<String>,
 }
 
 impl AccessContext {
-    /// Construct a context for an unauthenticated request (empty user/host).
+    /// Construct a context for an unauthenticated request (empty credentials).
     pub fn anonymous(access: Arc<dyn AccessControl>) -> Self {
         Self {
             access,
             user: String::new(),
             host: String::new(),
+            method: String::new(),
+            authority: String::new(),
+            roles: Vec::new(),
         }
     }
 
-    /// Construct a context with explicit credentials.
+    /// Construct a context with explicit user/host (method defaults to empty).
     pub fn with_identity(access: Arc<dyn AccessControl>, user: String, host: String) -> Self {
-        Self { access, user, host }
+        Self {
+            access,
+            user,
+            host,
+            method: String::new(),
+            authority: String::new(),
+            roles: Vec::new(),
+        }
+    }
+
+    /// Construct a context with the full [`ClientCreds`] set.
+    pub fn with_creds(access: Arc<dyn AccessControl>, creds: ClientCreds) -> Self {
+        Self {
+            access,
+            user: creds.user,
+            host: creds.host,
+            method: creds.method,
+            authority: creds.authority,
+            roles: creds.roles,
+        }
     }
 
     /// Allow-all context (used by tests and the default `BridgeProvider`).
@@ -164,11 +304,22 @@ impl AccessContext {
     }
 
     pub fn can_read(&self, channel: &str) -> bool {
-        self.access.can_read(channel, &self.user, &self.host)
+        self.access.can_read_creds(channel, &self.to_client_creds())
     }
 
     pub fn can_write(&self, channel: &str) -> bool {
-        self.access.can_write(channel, &self.user, &self.host)
+        self.access
+            .can_write_creds(channel, &self.to_client_creds())
+    }
+
+    fn to_client_creds(&self) -> ClientCreds {
+        ClientCreds {
+            user: self.user.clone(),
+            host: self.host.clone(),
+            method: self.method.clone(),
+            authority: self.authority.clone(),
+            roles: self.roles.clone(),
+        }
     }
 }
 
@@ -349,6 +500,12 @@ impl AccessControl for LiveAccessProxy {
     }
     fn can_write(&self, channel: &str, user: &str, host: &str) -> bool {
         self.cell.read().can_write(channel, user, host)
+    }
+    fn can_read_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
+        self.cell.read().can_read_creds(channel, creds)
+    }
+    fn can_write_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
+        self.cell.read().can_write_creds(channel, creds)
     }
 }
 
@@ -692,20 +849,42 @@ impl ChannelProvider for BridgeProvider {
 }
 
 impl BridgeProvider {
-    /// Create a channel with explicit client identity for access control.
+    /// Create a channel with explicit user/host (method defaults to empty).
     ///
     /// Used by the PVA server when it knows the connecting client's
     /// authenticated user/host. The trait method [`ChannelProvider::create_channel`]
-    /// delegates to this with empty identity (anonymous mode).
+    /// delegates to this with empty identity (anonymous mode). For full
+    /// credential pass-through (method/authority/roles) use
+    /// [`create_channel_with_creds`].
     pub async fn create_channel_for(
         &self,
         name: &str,
         user: &str,
         host: &str,
     ) -> BridgeResult<AnyChannel> {
+        self.create_channel_with_creds(
+            name,
+            ClientCreds {
+                user: user.to_string(),
+                host: host.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Create a channel with the full [`ClientCreds`] set.
+    ///
+    /// Carries method, authority, and roles into the channel's
+    /// [`AccessContext`] so `AcfAccessControl` can evaluate
+    /// METHOD/AUTHORITY rules and role-based UAG entries.
+    pub async fn create_channel_with_creds(
+        &self,
+        name: &str,
+        creds: ClientCreds,
+    ) -> BridgeResult<AnyChannel> {
         self.note_channel_created();
-        let access_ctx =
-            AccessContext::with_identity(self.live_access(), user.to_string(), host.to_string());
+        let access_ctx = AccessContext::with_creds(self.live_access(), creds);
 
         // Check group PVs first
         if let Some(def) = self.groups.read().get(name).cloned() {
@@ -833,6 +1012,170 @@ ASG(SECURE) {
         // Only admin can write.
         assert!(acl.can_write("AI:SEC", "admin", "anywhere"));
         assert!(!acl.can_write("AI:SEC", "guest", "anywhere"));
+    }
+
+    /// BR-R4 regression: AcfAccessControl must honor method, authority,
+    /// roles, and field ASL on all four axes independently.
+    ///
+    /// Upstream parity:
+    /// - credential building: pvxs/ioc/credentials.cpp:31-45
+    /// - field ASL: pvxs/ioc/securityclient.cpp:25 (`dbChannelFldDes(ch)->as_level`)
+    /// - any_of semantics: pvxs/ioc/securityclient.cpp:42-45
+    /// - ASL rule comparison: epics-base/modules/libcom/src/as/asLibRoutines.c:1006
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn br_r4_acf_method_authority_roles_field_asl() {
+        use epics_base_rs::server::access_security::parse_acf;
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let acf_text = r#"
+UAG(writers)   { alice }
+UAG(ops_role)  { "role/ops" }
+ASG(ASL_GATED) {
+    RULE(1, READ)
+    RULE(0, WRITE) { UAG(writers) }
+}
+ASG(METHOD_GATED) {
+    RULE(1, READ)
+    RULE(1, WRITE) { METHOD("x509") }
+}
+ASG(AUTHORITY_GATED) {
+    RULE(1, READ)
+    RULE(1, WRITE) { AUTHORITY("Trusted Root") }
+}
+ASG(ROLE_GATED) {
+    RULE(1, READ)
+    RULE(1, WRITE) { UAG(ops_role) }
+}
+"#;
+        let cfg = parse_acf(acf_text).unwrap();
+        let db = Arc::new(PvDatabase::new());
+
+        for name in &["AI:ASL0", "AI:ASL1", "AI:METH", "AI:AUTH", "AI:ROLE"] {
+            db.add_record(name, Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        }
+
+        // Axis 4 — field ASL:
+        //   AI:ASL0 has asl=0; RULE(0, WRITE) applies → alice can write.
+        //   AI:ASL1 has asl=1; RULE(0, WRITE) is skipped (1 > 0) → alice CANNOT write.
+        //   Pre-fix: hardcoded asl=0 caused AI:ASL1 write to return true (WRONG).
+        {
+            let rec = db.get_record("AI:ASL0").await.unwrap();
+            let mut w = rec.write().await;
+            w.common.asg = "ASL_GATED".to_string();
+            w.common.asl = 0;
+        }
+        {
+            let rec = db.get_record("AI:ASL1").await.unwrap();
+            let mut w = rec.write().await;
+            w.common.asg = "ASL_GATED".to_string();
+            w.common.asl = 1;
+        }
+        {
+            let rec = db.get_record("AI:METH").await.unwrap();
+            rec.write().await.common.asg = "METHOD_GATED".to_string();
+        }
+        {
+            let rec = db.get_record("AI:AUTH").await.unwrap();
+            rec.write().await.common.asg = "AUTHORITY_GATED".to_string();
+        }
+        {
+            let rec = db.get_record("AI:ROLE").await.unwrap();
+            rec.write().await.common.asg = "ROLE_GATED".to_string();
+        }
+
+        let acl = AcfAccessControl::new(db.clone(), cfg);
+
+        // ── Axis 4: field ASL ────────────────────────────────────────────
+        // ASL=0 record: RULE(0, WRITE) applies.
+        assert!(
+            acl.can_write("AI:ASL0", "alice", "h"),
+            "ASL=0: alice should be allowed to write"
+        );
+        // ASL=1 record: RULE(0, WRITE) is skipped (epics-base asLibRoutines.c:1006:
+        // `if(pasgclient->level > pasgrule->level) goto next_rule`).
+        assert!(
+            !acl.can_write("AI:ASL1", "alice", "h"),
+            "ASL=1: RULE(0,WRITE) must be skipped → write denied"
+        );
+
+        // ── Axis 1: method ───────────────────────────────────────────────
+        // x509 client: METHOD("x509") rule matches → write allowed.
+        // Pre-fix: hardcoded method="anonymous" caused x509 clients to be denied.
+        let x509_creds = ClientCreds {
+            user: "alice".to_string(),
+            host: "h".to_string(),
+            method: "x509".to_string(),
+            authority: String::new(),
+            roles: Vec::new(),
+        };
+        assert!(
+            acl.can_write_creds("AI:METH", &x509_creds),
+            "x509 client must match METHOD(\"x509\") rule"
+        );
+        let ca_creds = ClientCreds {
+            user: "alice".to_string(),
+            host: "h".to_string(),
+            method: "ca".to_string(),
+            authority: String::new(),
+            roles: Vec::new(),
+        };
+        assert!(
+            !acl.can_write_creds("AI:METH", &ca_creds),
+            "ca client must NOT match METHOD(\"x509\")-only rule"
+        );
+
+        // ── Axis 2: authority ────────────────────────────────────────────
+        let trusted_creds = ClientCreds {
+            user: "alice".to_string(),
+            host: "h".to_string(),
+            method: "x509".to_string(),
+            authority: "Trusted Root".to_string(),
+            roles: Vec::new(),
+        };
+        assert!(
+            acl.can_write_creds("AI:AUTH", &trusted_creds),
+            "correct authority must match AUTHORITY(\"Trusted Root\")"
+        );
+        let other_ca_creds = ClientCreds {
+            user: "alice".to_string(),
+            host: "h".to_string(),
+            method: "x509".to_string(),
+            authority: "Other CA".to_string(),
+            roles: Vec::new(),
+        };
+        assert!(
+            !acl.can_write_creds("AI:AUTH", &other_ca_creds),
+            "wrong authority must NOT match"
+        );
+
+        // ── Axis 3: roles ────────────────────────────────────────────────
+        // "role/ops" credential string matches UAG(ops_role) { role/ops }.
+        // Pre-fix: roles were not built into credential strings at all.
+        let ops_creds = ClientCreds {
+            user: "bob".to_string(),
+            host: "h".to_string(),
+            method: "ca".to_string(),
+            authority: String::new(),
+            roles: vec!["ops".to_string()],
+        };
+        assert!(
+            acl.can_write_creds("AI:ROLE", &ops_creds),
+            "client with role 'ops' must match UAG entry 'role/ops'"
+        );
+        let no_role_creds = ClientCreds {
+            user: "bob".to_string(),
+            host: "h".to_string(),
+            method: "ca".to_string(),
+            authority: String::new(),
+            roles: Vec::new(),
+        };
+        assert!(
+            !acl.can_write_creds("AI:ROLE", &no_role_creds),
+            "client without 'ops' role must NOT write to ROLE_GATED"
+        );
     }
 
     #[test]

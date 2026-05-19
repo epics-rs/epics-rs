@@ -1192,7 +1192,39 @@ fn read_brace_list(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult
                     current.clear();
                 }
             }
-            Some(&c) if c.is_alphanumeric() || c == '_' || c == '.' || c == '-' => {
+            // Quoted string: asLib_lex.l `{doublequote}({stringchar}|{escape})*{doublequote}`
+            // where stringchar is [^"\n\\]. Allows '/' so "role/groupname" entries work.
+            // pvxs/documentation/ioc.rst shows: UAG(special) { someone, "role/op" }
+            Some(&'"') => {
+                chars.next(); // consume opening '"'
+                if !current.is_empty() {
+                    items.push(current.clone());
+                    current.clear();
+                }
+                let mut quoted = String::new();
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => {
+                            if let Some(esc) = chars.next() {
+                                quoted.push(esc);
+                            }
+                        }
+                        Some('\n') | None => {
+                            return Err(CaError::Protocol("ACF: unterminated quoted string".into()));
+                        }
+                        Some(c) => quoted.push(c),
+                    }
+                }
+                if !quoted.is_empty() {
+                    items.push(quoted);
+                }
+            }
+            // Unquoted name: asLib_lex.l `name [a-zA-Z0-9_\-+:.\[\]<>;]`
+            Some(&c)
+                if c.is_alphanumeric()
+                    || matches!(c, '_' | '.' | '-' | '+' | ':' | '[' | ']' | '<' | '>' | ';') =>
+            {
                 current.push(c);
                 chars.next();
             }

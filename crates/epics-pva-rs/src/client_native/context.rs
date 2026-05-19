@@ -364,10 +364,16 @@ impl PvaClient {
     }
 
     async fn search_engine(&self) -> PvaResult<&SearchEngine> {
-        if self.inner.share_udp {
-            // Shared engine cannot carry per-client name_servers (different
-            // clients may have different lists). NS search runs only in the
-            // per-client engine path below.
+        // The process-wide shared engine is a single `OnceCell` and cannot
+        // carry per-client name_servers (different clients may have
+        // different lists). pvxs keeps `nameServers` per-Context regardless
+        // of `overrideShareUDP` — shareUDP only shares the UDP socket. To
+        // match that and avoid silently dropping configured TCP name
+        // servers, a client that has name servers configured always uses
+        // its own per-client engine (which carries the name-server list),
+        // even when `share_udp(true)` was requested. share_udp still saves
+        // the UDP socket for clients that have no name servers.
+        if self.inner.share_udp && self.inner.name_servers.is_empty() {
             let engine = SHARED_SEARCH_ENGINE
                 .get_or_try_init(|| async { SearchEngine::spawn(Vec::new(), Vec::new()).await })
                 .await?;
@@ -1339,9 +1345,17 @@ impl PvaClient {
                 }
             }
         }
+        // EX-R4: Phase-2 send failures must be tracked in their own set,
+        // keyed by `warm_reqs` index. The result vector is initialized to
+        // `Err(PvaError::Timeout)` for every slot, so using
+        // `results[idx].is_err()` as the Phase-3 skip predicate skipped
+        // EVERY warm request, not just the failed sends. A successfully
+        // sent warm request would never have its response awaited.
+        let mut failed_warm: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for addr in &failed_servers {
             if let Some(indices) = by_server.get(addr) {
                 for &wi in indices {
+                    failed_warm.insert(wi);
                     let req = &warm_reqs[wi];
                     req.warm.slot.lock().take();
                     // PVA-R27: the cached warm GET this `warm` was
@@ -1369,7 +1383,7 @@ impl PvaClient {
         // futures-util as a dep.
         use super::decode::OpResponse;
         let op_timeout = self.inner.timeout;
-        for req in warm_reqs {
+        for (wi, req) in warm_reqs.into_iter().enumerate() {
             let WarmReq {
                 idx,
                 channel,
@@ -1377,11 +1391,15 @@ impl PvaClient {
                 rx,
                 intro,
             } = req;
-            // PVA-R27: skip await + DO NOT restore cache for already-
-            // failed warm reqs. Pre-fix restored the cache after
-            // Phase-2 send failure, so the next pvget_many call
-            // reused the (sid, ioid) that just failed.
-            if results[idx].is_err() {
+            // EX-R4 / PVA-R27: skip await + DO NOT restore cache only for
+            // warm reqs whose Phase-2 send actually failed. The skip
+            // predicate is the dedicated `failed_warm` set — using
+            // `results[idx].is_err()` here would skip every warm request
+            // because the result vector starts as `Err(Timeout)`.
+            // Phase-2 already cleared the oneshot slot and unregistered
+            // the IOID for these failed reqs, so the cache is correctly
+            // not restored (the `warm` is dropped here).
+            if failed_warm.contains(&wi) {
                 continue;
             }
             let frame_res = tokio::time::timeout(op_timeout, rx).await;
@@ -1610,5 +1628,55 @@ impl Drop for ConnectHandle {
         if let Some(t) = self.task.take() {
             t.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // MR-R9 regression: a client built with both `share_udp(true)` and a
+    // non-empty `name_servers` list must NOT be routed through the
+    // process-wide `SHARED_SEARCH_ENGINE` singleton — that singleton is
+    // spawned with an empty name-server list and would silently drop the
+    // configured TCP name servers. Such a client must fall back to its
+    // own per-client engine, which carries the name-server list.
+    #[tokio::test]
+    async fn mr_r9_share_udp_with_name_servers_uses_per_client_engine() {
+        let ns: SocketAddr = "127.0.0.1:5099".parse().unwrap();
+        let client = PvaClient::builder()
+            .share_udp(true)
+            .name_servers(vec![ns])
+            .build();
+
+        // Resolving the engine must spawn a per-client engine, not the
+        // shared singleton.
+        let _engine = client.search_engine().await.expect("engine spawn");
+
+        assert!(
+            SHARED_SEARCH_ENGINE.get().is_none(),
+            "share_udp(true) + name_servers must use the per-client engine, \
+             not the shared singleton that drops name servers"
+        );
+        assert!(
+            client.inner.search.get().is_some(),
+            "per-client engine must be populated"
+        );
+    }
+
+    // Control: `share_udp(true)` with no name servers still shares the
+    // process-wide engine — share_udp continues to save the UDP socket.
+    #[tokio::test]
+    async fn mr_r9_share_udp_without_name_servers_uses_shared_engine() {
+        let client = PvaClient::builder().share_udp(true).build();
+        let _engine = client.search_engine().await.expect("engine spawn");
+        assert!(
+            SHARED_SEARCH_ENGINE.get().is_some(),
+            "share_udp(true) with no name servers must use the shared engine"
+        );
+        assert!(
+            client.inner.search.get().is_none(),
+            "shared-engine path must not spawn a per-client engine"
+        );
     }
 }

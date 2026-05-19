@@ -1163,3 +1163,78 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
 
     h.abort();
 }
+
+/// EX-R4 regression: PVA `pvget_many` warm path.
+///
+/// `pvget_many` initializes every result slot to `Err(PvaError::Timeout)`.
+/// The first call per channel pays the cold INIT+GET cost and warms the
+/// `cached_get` slot. The second call takes the warm path: it sends a
+/// single GET frame per channel and awaits the response.
+///
+/// The bug: Phase 3 used `results[idx].is_err()` as the skip predicate.
+/// Because the slot is still the initial `Err(Timeout)`, EVERY warm
+/// request was skipped — the function sent valid warm GET frames and
+/// then ignored its own response receivers, returning timeout errors
+/// even though the server replied.
+///
+/// Before the fix the second `pvget_many` call returns `Err` for the
+/// warm PVs; after the fix it returns `Ok` with the current value.
+#[tokio::test]
+async fn ex_r4_pvget_many_warm_path_returns_responses() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("EXR4:A", 1.0).await;
+    source.add_pv("EXR4:B", 2.0).await;
+
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    // First call: cold path warms each channel's cached_get slot.
+    let first = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.pvget_many(&["EXR4:A", "EXR4:B"]),
+    )
+    .await
+    .expect("first pvget_many timed out");
+    assert!(first[0].is_ok(), "first EXR4:A: {:?}", first[0]);
+    assert!(first[1].is_ok(), "first EXR4:B: {:?}", first[1]);
+
+    // Mutate the source so the warm GET must actually read fresh data.
+    source.push("EXR4:A", 11.0).await;
+    source.push("EXR4:B", 22.0).await;
+
+    // Second call: warm path. The fix makes Phase 3 await every
+    // successfully sent warm request instead of skipping all of them.
+    let second = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.pvget_many(&["EXR4:A", "EXR4:B"]),
+    )
+    .await
+    .expect("second pvget_many timed out");
+
+    let val_a = second[0]
+        .as_ref()
+        .unwrap_or_else(|e| panic!("warm EXR4:A returned error: {e}"));
+    let val_b = second[1]
+        .as_ref()
+        .unwrap_or_else(|e| panic!("warm EXR4:B returned error: {e}"));
+
+    fn scalar_double(f: &PvField) -> f64 {
+        match f {
+            PvField::Structure(s) => {
+                for (name, sub) in &s.fields {
+                    if name == "value"
+                        && let PvField::Scalar(ScalarValue::Double(d)) = sub
+                    {
+                        return *d;
+                    }
+                }
+                panic!("no double `value` field");
+            }
+            _ => panic!("expected NTScalar structure"),
+        }
+    }
+    assert_eq!(scalar_double(val_a), 11.0, "warm EXR4:A read stale value");
+    assert_eq!(scalar_double(val_b), 22.0, "warm EXR4:B read stale value");
+
+    h.abort();
+}

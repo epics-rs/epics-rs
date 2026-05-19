@@ -907,8 +907,17 @@ fn route_frame(
                 .map(|r| *r.key())
                 .collect();
             for ioid in &matching {
+                // MR-R19: CMD_DESTROY_CHANNEL cleanup is the same owner
+                // boundary as `unregister_ioid` and must remove ALL three
+                // IOID maps. Leaving `ioid_to_cmd` behind leaks a stale
+                // command expectation for the connection's lifetime, and
+                // a late frame on a destroyed IOID would hit the
+                // command-mismatch gate (line ~966) and cancel the whole
+                // connection before discovering that no dispatch slot
+                // exists.
                 ioid_to_sid.remove(ioid);
                 by_ioid.remove(ioid);
+                ioid_to_cmd.remove(ioid);
                 dropped_ioids += 1;
             }
             // Fire the close signal.
@@ -1377,6 +1386,85 @@ mod tests {
         assert!(by_ioid.contains_key(&1003));
         assert!(!ioid_to_sid.contains_key(&1001));
         assert!(ioid_to_sid.contains_key(&1003));
+    }
+
+    /// MR-R19 regression: `CMD_DESTROY_CHANNEL` cleanup must remove ALL
+    /// three IOID maps — `by_ioid`, `ioid_to_sid`, AND `ioid_to_cmd` —
+    /// for every IOID belonging to the destroyed sid, the same owner
+    /// boundary as `unregister_ioid`.
+    ///
+    /// Before the fix the destroy branch removed only `by_ioid` and
+    /// `ioid_to_sid`, leaking the `ioid_to_cmd` command expectation for
+    /// the connection's lifetime. A late frame on a destroyed IOID
+    /// would then hit the command-mismatch gate (which consults
+    /// `ioid_to_cmd` before the `by_ioid` lookup) and cancel the whole
+    /// TCP connection if its command differed from the stale entry.
+    #[test]
+    fn destroy_channel_drops_ioid_to_cmd_entries() {
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, writer_tx, cancel) =
+            fresh_router();
+        let sid = 42u32;
+        let other_sid = 99u32;
+
+        // Register ops on the destroyed sid + one on another sid, each
+        // with a command expectation in `ioid_to_cmd` exactly as
+        // `register_ioid_twoshot` / `register_ioid_reusable` do.
+        let (tx_a, _rx_a) = mpsc::unbounded_channel::<Frame>();
+        let (tx_b, _rx_b) = mpsc::unbounded_channel::<Frame>();
+        let (tx_c, _rx_c) = mpsc::unbounded_channel::<Frame>();
+        by_ioid.insert(2001, IoidSlot::Stream(tx_a));
+        ioid_to_sid.insert(2001, sid);
+        ioid_to_cmd.insert(2001, Command::Get.code());
+        by_ioid.insert(2002, IoidSlot::Stream(tx_b));
+        ioid_to_sid.insert(2002, sid);
+        ioid_to_cmd.insert(2002, Command::Monitor.code());
+        by_ioid.insert(2003, IoidSlot::Stream(tx_c));
+        ioid_to_sid.insert(2003, other_sid);
+        ioid_to_cmd.insert(2003, Command::Get.code());
+        by_sid_close.insert(
+            sid,
+            (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(tokio::sync::Notify::new()),
+            ),
+        );
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, ByteOrder::Little);
+        let header = PvaHeader::application(
+            true,
+            ByteOrder::Little,
+            Command::DestroyChannel.code(),
+            payload.len() as u32,
+        );
+        route_frame(
+            Frame { header, payload },
+            &by_ioid,
+            &by_cid,
+            &by_sid_close,
+            &ioid_to_sid,
+            &ioid_to_cmd,
+            &writer_tx,
+            ByteOrder::Little,
+            &cancel,
+        );
+
+        // All three maps cleared for the destroyed sid's IOIDs.
+        for ioid in [2001u32, 2002u32] {
+            assert!(!by_ioid.contains_key(&ioid), "by_ioid leaked {ioid}");
+            assert!(
+                !ioid_to_sid.contains_key(&ioid),
+                "ioid_to_sid leaked {ioid}"
+            );
+            assert!(
+                !ioid_to_cmd.contains_key(&ioid),
+                "ioid_to_cmd leaked {ioid} — stale command expectation"
+            );
+        }
+        // The other sid's IOID is untouched in all three maps.
+        assert!(by_ioid.contains_key(&2003));
+        assert!(ioid_to_sid.contains_key(&2003));
+        assert!(ioid_to_cmd.contains_key(&2003));
     }
 
     /// PVA-R2 regression: `tcp_timeout` passed to `ServerConn::connect` must

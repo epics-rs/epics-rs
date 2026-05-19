@@ -514,11 +514,13 @@ impl ChannelSource for GatewayChannelSource {
             .lookup(name, self.connect_timeout)
             .await
             .map_err(|e| e.to_string())?;
-        let value_str = pvfield_to_pvput_string(&value)
-            .ok_or_else(|| "unsupported PvField shape for upstream PUT".to_string())?;
+        // BR-R6: typed pass-through — forward the PvField as-is without
+        // re-encoding through string form. pvxs serialises the PUT value
+        // with to_wire_valid(R, temp) (pvxs/src/clientget.cpp:305) — no
+        // string round-trip in the reference implementation.
         self.cache
             .client()
-            .pvput(name, &value_str)
+            .pvput_pv_field(name, &value)
             .await
             .map_err(|e| e.to_string())
     }
@@ -560,8 +562,6 @@ impl ChannelSource for GatewayChannelSource {
             .lookup(name, self.connect_timeout)
             .await
             .map_err(|e| e.to_string())?;
-        let value_str = pvfield_to_pvput_string(&value)
-            .ok_or_else(|| "unsupported PvField shape for upstream PUT".to_string())?;
         let client = self.upstream_client_for(&ctx);
         tracing::debug!(
             pv = %name,
@@ -569,8 +569,9 @@ impl ChannelSource for GatewayChannelSource {
             method = %ctx.method,
             "pva-gateway: forwarding PUT with downstream credentials"
         );
+        // BR-R6: typed pass-through (see put_value for rationale).
         client
-            .pvput(name, &value_str)
+            .pvput_pv_field(name, &value)
             .await
             .map_err(|e| e.to_string())
     }
@@ -826,74 +827,6 @@ impl ChannelSource for GatewayChannelSource {
                 }
             }
         });
-    }
-}
-
-/// Convert a `PvField` into the string form pvput accepts. Covers:
-/// * `Scalar` / `ScalarArray` directly
-/// * `Structure` containing a `.value` field (NTScalar / NTScalarArray /
-///   NTEnum index — anything where the put target is the canonical
-///   `value` subfield)
-/// * `Variant` and `Union` by recursively unwrapping the inner field
-///
-/// Returns `None` for shapes pvput cannot represent in string form
-/// (e.g. nested structures with no `value` field). Callers surface
-/// the `None` to the downstream client as a typed error so the user
-/// gets a clear "unsupported PvField shape" message instead of a
-/// silent drop. Without `pvput_field` (typed PUT through the client
-/// API) on `PvaClient` this is the best the gateway can do today;
-/// see review §3d for the longer-term plan.
-fn pvfield_to_pvput_string(v: &PvField) -> Option<String> {
-    match v {
-        PvField::Scalar(sv) => Some(scalar_to_string(sv)),
-        PvField::ScalarArray(items) => {
-            // pvput accepts space-separated values for arrays.
-            let parts: Vec<String> = items.iter().map(scalar_to_string).collect();
-            Some(parts.join(" "))
-        }
-        PvField::Structure(s) => {
-            for (name, field) in &s.fields {
-                if name == "value" {
-                    return pvfield_to_pvput_string(field);
-                }
-            }
-            None
-        }
-        PvField::Variant(boxed) => pvfield_to_pvput_string(&boxed.value),
-        PvField::Union {
-            selector, value, ..
-        } => {
-            if *selector < 0 {
-                None
-            } else {
-                pvfield_to_pvput_string(value)
-            }
-        }
-        _ => None,
-    }
-}
-
-fn scalar_to_string(sv: &epics_pva_rs::pvdata::ScalarValue) -> String {
-    use epics_pva_rs::pvdata::ScalarValue::*;
-    match sv {
-        Boolean(b) => {
-            if *b {
-                "1".into()
-            } else {
-                "0".into()
-            }
-        }
-        Byte(x) => x.to_string(),
-        UByte(x) => x.to_string(),
-        Short(x) => x.to_string(),
-        UShort(x) => x.to_string(),
-        Int(x) => x.to_string(),
-        UInt(x) => x.to_string(),
-        Long(x) => x.to_string(),
-        ULong(x) => x.to_string(),
-        Float(x) => x.to_string(),
-        Double(x) => x.to_string(),
-        String(s) => s.clone(),
     }
 }
 

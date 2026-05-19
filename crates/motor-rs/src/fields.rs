@@ -353,4 +353,13 @@ pub struct InternalFields {
     /// driver actually followed the retarget and, if not, replans once
     /// independent of retry settings. Cleared after the check.
     pub verify_retarget_on_completion: bool,
+    /// Set once `init_record` has established the limit invariant
+    /// (RHLM/RLLM derived from the loaded DHLM/DLLM at the final MRES).
+    ///
+    /// Until then — i.e. while `dbLoadRecords` is still applying `field()`
+    /// entries through `put_field` — an MRES change must NOT rescale the
+    /// dial limits: the standard `motor.template` lists `field(DHLM,…)`
+    /// before `field(MRES,…)`, so cascading mid-load would rescale a
+    /// freshly-loaded DHLM against the pre-MRES default resolution.
+    pub limit_invariant_synced: bool,
 }

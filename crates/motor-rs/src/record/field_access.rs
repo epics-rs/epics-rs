@@ -1574,23 +1574,67 @@ fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
     if rec.conv.mres == 0.0 {
         return;
     }
-    // Seed raw limits from the dial limits the first time MRES changes after
-    // init: RHLM/RLLM default to 0. Once any HLM/LLM/DHLM/DLLM/RHLM/RLLM put
-    // has run, rhlm/rllm hold a meaningful value and seeding is skipped.
-    //
-    // Invariant: every put that can leave rhlm==rllm==0 also leaves
-    // dhlm==dllm==0 (HLM/LLM/DHLM/DLLM/RHLM/RLLM handlers always update the
-    // raw/dial pair together). So when raw_unset is true, dhlm/dllm are 0 too
-    // and the seed below is a 0->0 no-op. 0/0 is the "limits disabled"
-    // convention (see check_soft_limits), never an active limit pair.
-    let raw_unset = rec.limits.rhlm == 0.0 && rec.limits.rllm == 0.0;
-    if raw_unset && old_mres != 0.0 {
-        rec.limits.rhlm = rec.limits.dhlm / old_mres;
-        rec.limits.rllm = rec.limits.dllm / old_mres;
+    // The dial/user limit rescale only applies to a *runtime* MRES change.
+    // During `dbLoadRecords` the limit invariant is not yet established:
+    // `apply_fields` feeds every `field()` through `put_field` (unlike C,
+    // which applies `field()` as raw struct writes), so `field(MRES,…)`
+    // may run after `field(DHLM,…)`. Rescaling here would scale the
+    // freshly-loaded DHLM against the pre-MRES default resolution.
+    // `motor_sync_limits_at_init` re-derives the raw limits from DHLM/DLLM
+    // once loading completes (C set_dial_highlimit/set_dial_lowlimit).
+    if rec.internal.limit_invariant_synced {
+        // Seed raw limits from the dial limits the first time MRES changes
+        // after init: RHLM/RLLM default to 0. Once any
+        // HLM/LLM/DHLM/DLLM/RHLM/RLLM put has run, rhlm/rllm hold a
+        // meaningful value and seeding is skipped.
+        //
+        // Invariant: every put that can leave rhlm==rllm==0 also leaves
+        // dhlm==dllm==0 (HLM/LLM/DHLM/DLLM/RHLM/RLLM handlers always update
+        // the raw/dial pair together). So when raw_unset is true, dhlm/dllm
+        // are 0 too and the seed below is a 0->0 no-op. 0/0 is the "limits
+        // disabled" convention (see check_soft_limits), never an active
+        // limit pair.
+        let raw_unset = rec.limits.rhlm == 0.0 && rec.limits.rllm == 0.0;
+        if raw_unset && old_mres != 0.0 {
+            rec.limits.rhlm = rec.limits.dhlm / old_mres;
+            rec.limits.rllm = rec.limits.dllm / old_mres;
+        }
+        // Raw is invariant — recompute dial.
+        rec.limits.dhlm = rec.limits.rhlm * rec.conv.mres;
+        rec.limits.dllm = rec.limits.rllm * rec.conv.mres;
+        normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
+        let (hlm, llm) = crate::coordinate::dial_limits_to_user(
+            rec.limits.dhlm,
+            rec.limits.dllm,
+            rec.conv.dir,
+            rec.pos.off,
+        );
+        rec.limits.hlm = hlm;
+        rec.limits.llm = llm;
     }
-    // Raw is invariant — recompute dial.
-    rec.limits.dhlm = rec.limits.rhlm * rec.conv.mres;
-    rec.limits.dllm = rec.limits.rllm * rec.conv.mres;
+    // C: special() calls enforceMinRetryDeadband on MRES change.
+    rec.enforce_min_retry_deadband();
+}
+
+/// Establish the limit invariant at IOC init — the load-time counterpart of
+/// [`apply_mres_cascade`].
+///
+/// C `init_record` calls `set_dial_highlimit`/`set_dial_lowlimit`, which take
+/// the dial limits DHLM/DLLM loaded by `dbLoadRecords` as authoritative and
+/// derive the raw limits (RHLM/RLLM = DHLM/DLLM ÷ MRES) and user limits
+/// (HLM/LLM) from them. From this point on a runtime MRES change keeps
+/// RHLM/RLLM invariant and rescales DHLM/DLLM (C PR #193,
+/// [`apply_mres_cascade`]).
+///
+/// This must run after all `field()` values are applied: it repairs the
+/// RHLM/RLLM that the DHLM/DLLM `put_field` handlers computed against
+/// whatever MRES happened to be in effect at the time (the default 1.0 when
+/// `field(DHLM,…)` precedes `field(MRES,…)`, as in `motor.template`).
+pub(crate) fn motor_sync_limits_at_init(rec: &mut MotorRecord) {
+    if rec.conv.mres != 0.0 {
+        rec.limits.rhlm = rec.limits.dhlm / rec.conv.mres;
+        rec.limits.rllm = rec.limits.dllm / rec.conv.mres;
+    }
     normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
     let (hlm, llm) = crate::coordinate::dial_limits_to_user(
         rec.limits.dhlm,
@@ -1600,8 +1644,7 @@ fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
     );
     rec.limits.hlm = hlm;
     rec.limits.llm = llm;
-    // C: special() calls enforceMinRetryDeadband on MRES change.
-    rec.enforce_min_retry_deadband();
+    rec.internal.limit_invariant_synced = true;
 }
 
 /// Re-evaluate LVIO after a soft-limit put.

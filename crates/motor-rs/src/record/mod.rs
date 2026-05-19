@@ -239,6 +239,17 @@ impl Record for MotorRecord {
         field_access::FIELDS
     }
 
+    /// C `init_record`: on pass 1, once all `field()` values have been
+    /// applied, establish the limit invariant from the loaded DHLM/DLLM
+    /// (C `set_dial_highlimit`/`set_dial_lowlimit`). See
+    /// [`field_access::motor_sync_limits_at_init`].
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 1 {
+            field_access::motor_sync_limits_at_init(self);
+        }
+        Ok(())
+    }
+
     fn primary_field(&self) -> &'static str {
         "VAL"
     }

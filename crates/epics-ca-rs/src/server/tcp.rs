@@ -3131,11 +3131,28 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // routes denial through `no_read_access_event`,
                         // `rsrv/camessage.c:529-534`).
                         if access_denied {
+                            // EX-R6: an autosize (`count == 0`) request
+                            // must be normalised to the target's live
+                            // element count before sizing the zero-
+                            // filled denial payload. C `read_reply`
+                            // (`camessage.c:507-509`) maps `m_count==0`
+                            // to `paddr->no_elements`; the denial frame
+                            // must match so it carries a nonzero DBR
+                            // body. A zero-payload `CA_PROTO_EVENT_ADD`
+                            // is indistinguishable from the historical
+                            // cancel-ack no-op and is silently dropped
+                            // by the client before the `ECA_NORDACCESS`
+                            // status is read (`cac.cpp` eventRespAction
+                            // returns on `m_postsize == 0`).
+                            let denied_count = no_read_access_count(
+                                requested_count,
+                                pv.snapshot().await.value.count(),
+                            );
                             send_no_read_access_event(
                                 writer,
                                 CA_PROTO_EVENT_ADD,
                                 requested_type,
-                                requested_count,
+                                denied_count,
                                 sub_id,
                                 ECA_NORDACCESS,
                             )
@@ -3237,6 +3254,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // no_read_access_event when denied. Drop the
                         // instance write lock before await on the
                         // writer so the producer task can pick it up.
+                        //
+                        // EX-R6: even on the denied path we must read
+                        // the field's live element count under the
+                        // lock, so an autosize (`count == 0`) denial
+                        // frame can be sized to a nonzero DBR body
+                        // instead of the zero-payload cancel-ack shape.
                         let initial_snap = if access_denied {
                             None
                         } else {
@@ -3248,13 +3271,33 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 snap
                             })
                         };
+                        // EX-R6: derive the field's element count for
+                        // the autosize-denial frame. `snapshot_for_field`
+                        // is the same accessor the granted path uses,
+                        // so the denial count matches what a granted
+                        // monitor on the same field would carry.
+                        let denied_field_count = if access_denied {
+                            instance
+                                .snapshot_for_field(field)
+                                .map(|snap| snap.value.count())
+                                .unwrap_or(1)
+                        } else {
+                            0
+                        };
                         drop(instance);
                         if access_denied {
+                            // EX-R6: normalise autosize before sizing
+                            // the zero-filled denial payload. See the
+                            // SimplePv branch above for the C
+                            // `read_reply` (`camessage.c:507-509`)
+                            // parity rationale.
+                            let denied_count =
+                                no_read_access_count(requested_count, denied_field_count);
                             send_no_read_access_event(
                                 writer,
                                 CA_PROTO_EVENT_ADD,
                                 requested_type,
-                                requested_count,
+                                denied_count,
                                 sub_id,
                                 ECA_NORDACCESS,
                             )
@@ -3989,18 +4032,40 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
             // so the wire frame matches C byte-for-byte (the stored
             // request count drives the zero-fill).
             for sub_id in &affected {
-                let Some(sub) = state.subscriptions.get(sub_id) else {
-                    continue;
+                let (data_type, sub_id_v, data_count, target) = {
+                    let Some(sub) = state.subscriptions.get(sub_id) else {
+                        continue;
+                    };
+                    sub.denied.store(true, Ordering::Release);
+                    (
+                        sub.data_type,
+                        sub.sub_id,
+                        sub.data_count,
+                        sub.target.clone(),
+                    )
                 };
-                sub.denied.store(true, Ordering::Release);
-                let data_type = sub.data_type;
-                let sub_id_v = sub.sub_id;
-                let data_count = sub.data_count;
+                // EX-R6: an autosize (`data_count == 0`) subscription
+                // revoked here must also be normalised to the live
+                // element count, otherwise the access-revoked
+                // notification is the same zero-payload
+                // `CA_PROTO_EVENT_ADD` the client drops as a
+                // cancel-ack. Same C `read_reply` autosize parity
+                // (`camessage.c:507-509`) as the initial EVENT_ADD
+                // denial path.
+                let denied_count = if data_count == 0 {
+                    let actual = get_full_snapshot(&target)
+                        .await
+                        .map(|snap| snap.value.count())
+                        .unwrap_or(1);
+                    no_read_access_count(data_count, actual)
+                } else {
+                    data_count
+                };
                 send_no_read_access_event(
                     writer,
                     CA_PROTO_EVENT_ADD,
                     data_type,
-                    data_count,
+                    denied_count,
                     sub_id_v,
                     ECA_NORDACCESS,
                 )
@@ -4098,6 +4163,33 @@ async fn send_put_notify_response<W: AsyncWrite + Unpin + Send + 'static>(
     Ok(())
 }
 
+/// EX-R6: normalise an EVENT_ADD request count for a no-read-access
+/// denial frame. C `read_reply` (`rsrv/camessage.c:507-509`) treats a
+/// zero element count as autosize and substitutes `paddr->no_elements`
+/// — the target's live element count. The `no_read_access_event`
+/// denial path must do the same, otherwise a `count == 0` monitor on
+/// a plain DBR type (`DBR_DOUBLE`, …) produces a zero-payload
+/// `CA_PROTO_EVENT_ADD`. That shape is the historical
+/// subscription-cancel-confirmation no-op: the CA client drops it
+/// before reading the `ECA_NORDACCESS` status (C `cac.cpp`
+/// eventRespAction returns on `m_postsize == 0`; this port's
+/// `client/transport.rs` mirrors that), so the denied monitor would
+/// silently appear to hang.
+///
+/// A non-zero request count is returned unchanged (explicit counts
+/// are already framed at the requested shape). `actual_count` is the
+/// target's live element count, used only for the autosize case.
+fn no_read_access_count(requested_count: u32, actual_count: u32) -> u32 {
+    if requested_count == 0 {
+        // Autosize: at least one element so the denial frame carries
+        // a nonzero DBR body. A target reporting zero live elements
+        // still gets a single-element zero-filled payload.
+        actual_count.max(1)
+    } else {
+        requested_count
+    }
+}
+
 /// Send a `no_read_access_event`-shaped reply: same wire frame as the
 /// original READ_NOTIFY / EVENT_ADD command, with `m_cid` carrying the
 /// ECA status and a `dbr_buffer_size`-sized zero payload. C
@@ -4106,6 +4198,10 @@ async fn send_put_notify_response<W: AsyncWrite + Unpin + Send + 'static>(
 /// dbChannel_get failures — preserving the requested count and DBR
 /// type so libca-style clients see the correct callback metadata even
 /// on the error path.
+///
+/// EX-R6: callers on the EVENT_ADD denial path must pass a `count`
+/// already normalised through [`no_read_access_count`] so an autosize
+/// (`count == 0`) request does not produce a zero-payload frame.
 async fn send_no_read_access_event<W: AsyncWrite + Unpin + Send + 'static>(
     writer: &Arc<Mutex<BufWriter<W>>>,
     cmd: u16,
@@ -5147,5 +5243,67 @@ mod single_write_all_framing_tests {
             batches.len(),
             batches.iter().map(|b| b.len()).collect::<Vec<_>>(),
         );
+    }
+}
+
+#[cfg(test)]
+mod ex_r6_no_read_access_count_tests {
+    //! EX-R6: an autosize (`count == 0`) no-read-access EVENT_ADD
+    //! denial must be sized to a nonzero DBR body. A zero-payload
+    //! `CA_PROTO_EVENT_ADD` is the historical subscription-cancel
+    //! confirmation no-op; the CA client drops it before reading the
+    //! `ECA_NORDACCESS` status, so a denied autosize monitor would
+    //! silently appear to hang.
+    use super::no_read_access_count;
+    use epics_base_rs::types::{DbFieldType, dbr_buffer_size};
+
+    /// Autosize (`requested_count == 0`) must normalise to the
+    /// target's live element count — mirrors C `read_reply`
+    /// substituting `paddr->no_elements` (`camessage.c:507-509`).
+    #[test]
+    fn ex_r6_autosize_normalises_to_actual_count() {
+        assert_eq!(no_read_access_count(0, 7), 7);
+        // A scalar (1 element) autosize denial still gets a body.
+        assert_eq!(no_read_access_count(0, 1), 1);
+        // A target reporting zero live elements is floored at one so
+        // the frame is never zero-payload.
+        assert_eq!(no_read_access_count(0, 0), 1);
+    }
+
+    /// An explicit non-zero request count is framed unchanged — the
+    /// caller already asked for a definite shape.
+    #[test]
+    fn ex_r6_explicit_count_passes_through() {
+        assert_eq!(no_read_access_count(3, 7), 3);
+        assert_eq!(no_read_access_count(1, 100), 1);
+    }
+
+    /// The defect proof: with the pre-fix raw `count == 0`, the
+    /// `dbr_buffer_size` of a plain DBR type (`DBR_DOUBLE`) is zero,
+    /// producing the cancel-ack-shaped frame. After normalisation the
+    /// payload is strictly positive, so the client's status-error
+    /// path runs. `DBR_DOUBLE == 6` is a plain (non-STS) type, so its
+    /// metadata size is zero — the value bytes are the whole payload.
+    #[test]
+    fn ex_r6_normalised_count_yields_nonzero_plain_dbr_payload() {
+        const DBR_DOUBLE: u16 = 6;
+        // Pre-fix shape: raw autosize count 0 → zero-payload frame
+        // (indistinguishable from an EVENT_CANCEL ack).
+        assert_eq!(
+            dbr_buffer_size(DBR_DOUBLE, DbFieldType::Double, 0),
+            0,
+            "regression baseline: a raw count==0 plain-DBR denial is \
+             zero-payload — the cancel-ack shape EX-R6 fixes"
+        );
+        // After EX-R6 normalisation the denial frame carries a real
+        // DBR body, so the client sees the ECA_NORDACCESS status.
+        let normalised = no_read_access_count(0, 4) as usize;
+        let payload = dbr_buffer_size(DBR_DOUBLE, DbFieldType::Double, normalised);
+        assert!(
+            payload > 0,
+            "EX-R6: a normalised autosize denial must have a nonzero \
+             DBR payload so the client does not drop it as a cancel-ack"
+        );
+        assert_eq!(payload, 4 * DbFieldType::Double.element_size());
     }
 }

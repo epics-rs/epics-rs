@@ -365,10 +365,25 @@ impl PvaLink {
             return self.enqueue_put(QueuedPut::Field(value.clone()));
         }
         let req = build_put_request(self.config.process, block);
-        let result = self
-            .client
-            .pvput_pv_field_with_request(&self.config.pv_name, &req, value)
-            .await;
+        // MR-R4: a typed write to a query-bearing OUT link
+        // (`pva://PV?field=someArray`) must target the selected
+        // sub-field, not the root `value`. Mirrors pvxs `linkBuildPut`
+        // (`pvalink_channel.cpp:138`): `top[fieldName]` when
+        // `fieldName` is non-empty.
+        let result = if is_subfield(&self.config.field) {
+            self.client
+                .pvput_pv_field_field_with_request(
+                    &self.config.pv_name,
+                    &self.config.field,
+                    &req,
+                    value,
+                )
+                .await
+        } else {
+            self.client
+                .pvput_pv_field_with_request(&self.config.pv_name, &req, value)
+                .await
+        };
         match result {
             Ok(()) => Ok(()),
             Err(e) if self.config.retry && is_disconnect(&e) => {
@@ -435,9 +450,22 @@ impl PvaLink {
                     }
                 }
                 QueuedPut::Field(f) => {
-                    self.client
-                        .pvput_pv_field_with_request(&self.config.pv_name, &req, f)
-                        .await
+                    // MR-R4: replay typed field writes to the selected
+                    // sub-field, same targeting as the immediate path.
+                    if is_subfield(&self.config.field) {
+                        self.client
+                            .pvput_pv_field_field_with_request(
+                                &self.config.pv_name,
+                                &self.config.field,
+                                &req,
+                                f,
+                            )
+                            .await
+                    } else {
+                        self.client
+                            .pvput_pv_field_with_request(&self.config.pv_name, &req, f)
+                            .await
+                    }
                 }
             };
             match put_result {
@@ -520,8 +548,23 @@ impl PvaLink {
     /// gate that propagates `snap_severity` into `LINK_ALARM` only
     /// when `(sevr==MS && sev!=NO_ALARM) || (sevr==MSI && sev==INVALID)`.
     pub fn link_alarm_severity(&self) -> Option<i32> {
+        self.link_alarm_severity_with(self.config.sevr)
+    }
+
+    /// Like [`Self::link_alarm_severity`] but gates on a
+    /// caller-supplied `sevr` mode instead of this link's
+    /// `self.config.sevr`.
+    ///
+    /// MR-R15: the registry can return a cached INP `PvaLink` whose
+    /// `config.sevr` belongs to whichever caller opened it first.
+    /// Two INP links to the same remote PV with different `sevr`
+    /// options would otherwise share one link's `MS`/`NMS`/`MSI`
+    /// gate. The resolver passes the caller's own parsed `sevr` so
+    /// each link applies its own maximize-severity mode (pvxs
+    /// `pvaLinkConfig::sevr` is per-link, `pvxs/ioc/pvalink.h:65`).
+    pub fn link_alarm_severity_with(&self, sevr: super::config::SevrMode) -> Option<i32> {
         let sev = self.remote_alarm_severity()?;
-        if self.config.sevr.propagates(sev) {
+        if sevr.propagates(sev) {
             Some(sev)
         } else {
             None
@@ -544,9 +587,19 @@ impl PvaLink {
     /// the severity does propagate, a synthetic message is returned so
     /// the alarm is still observable.
     pub fn alarm_message(&self) -> Option<String> {
+        self.alarm_message_with(self.config.sevr)
+    }
+
+    /// Like [`Self::alarm_message`] but gates on a caller-supplied
+    /// `sevr` mode instead of this link's `self.config.sevr`.
+    ///
+    /// MR-R15: same rationale as [`Self::link_alarm_severity_with`] —
+    /// the alarm-message gate must use the caller's per-link `sevr`,
+    /// not whichever cached link's mode happens to be shared.
+    pub fn alarm_message_with(&self, sevr: super::config::SevrMode) -> Option<String> {
         // Severity gate first — NMS / sub-threshold links report
         // nothing.
-        let sev = self.link_alarm_severity()?;
+        let sev = self.link_alarm_severity_with(sevr)?;
         let v = self.latest.lock().clone()?;
         let PvField::Structure(s) = v else {
             return None;
@@ -618,6 +671,24 @@ impl PvaLink {
     /// exactly as the C getters leave the buffer untouched on a
     /// missing `Value::as`.
     pub fn link_metadata(&self) -> Option<epics_base_rs::server::database::LinkMetadata> {
+        self.link_metadata_with(&self.config.field)
+    }
+
+    /// Like [`Self::link_metadata`] but derives DBF type and element
+    /// count from a caller-supplied `field` path instead of this
+    /// link's `self.config.field`.
+    ///
+    /// MR-R15: the registry can return a cached INP `PvaLink` whose
+    /// `config.field` belongs to whichever caller opened it first, so
+    /// two INP links to the same remote PV with different `field`
+    /// options would otherwise report the same DBF type / element
+    /// count. The resolver passes the caller's own parsed `field`
+    /// (pvxs `pvaGetDBFtype` reads the per-link `fld_value`,
+    /// `pvxs/ioc/pvalink_lset.cpp:199`).
+    pub fn link_metadata_with(
+        &self,
+        field: &str,
+    ) -> Option<epics_base_rs::server::database::LinkMetadata> {
         use epics_base_rs::server::database::LinkMetadata;
 
         let root = self.latest.lock().clone()?;
@@ -625,7 +696,7 @@ impl PvaLink {
         // The value at the link's field path drives DBF type and
         // element count. `pvaGetDBFtype` uses `fld_value`; `fld_value`
         // is the value sub-field selected by the link's field name.
-        let value_field = extract_field(&root, &self.config.field);
+        let value_field = extract_field(&root, field);
 
         let dbf_type = link_dbf_type(&value_field);
         let element_count = link_element_count(&value_field);
@@ -683,6 +754,24 @@ impl PvaLink {
             config,
             client,
             latest: Arc::new(Mutex::new(cached)),
+            monitor_connected: None,
+            notify_rx: Mutex::new(None),
+            put_queue: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Test-only constructor: build a [`PvaLink`] around a
+    /// caller-supplied [`PvaClient`] (typically one pinned at a test
+    /// `PvaServer` address). Lets a server-backed test exercise the
+    /// real `write` / `write_pv_field` wire paths without UDP
+    /// discovery.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_client(config: PvaLinkConfig, client: PvaClient) -> Self {
+        Self {
+            _monitor_abort: None,
+            config,
+            client,
+            latest: Arc::new(Mutex::new(None)),
             monitor_connected: None,
             notify_rx: Mutex::new(None),
             put_queue: Mutex::new(Vec::new()),
@@ -1606,5 +1695,104 @@ mod tests {
                     .expect("deferred write_with_block must enqueue");
             });
         assert_eq!(link.pending_put_count(), 1, "one entry queued");
+    }
+
+    /// MR-R4: a typed (`PvField`) OUT write to a query-bearing link
+    /// `pva://PV?field=<subfield>` must land the typed value on the
+    /// selected sub-field, not on the root `value`. Pre-fix
+    /// `write_pv_field` always routed through `pvput_pv_field_*`
+    /// (root-targeted), so a typed array write clobbered `value` and
+    /// left the requested sub-field untouched. pvxs `linkBuildPut`
+    /// (`pvalink_channel.cpp:138`) targets `top[fieldName]`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mr_r4_typed_field_put_targets_subfield() {
+        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        // Structure PV with a root `value` array and an `aux` array
+        // sub-field. The default SharedPV has no on_put handler, so
+        // an inbound PUT lands directly in `current()`.
+        let desc = FieldDesc::Structure {
+            struct_id: "structure".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::ScalarArray(ScalarType::Long)),
+                ("aux".into(), FieldDesc::ScalarArray(ScalarType::Long)),
+            ],
+        };
+        let initial = PvField::Structure(PvStructure {
+            struct_id: "structure".into(),
+            fields: vec![
+                (
+                    "value".into(),
+                    PvField::ScalarArray(vec![ScalarValue::Long(1), ScalarValue::Long(2)]),
+                ),
+                (
+                    "aux".into(),
+                    PvField::ScalarArray(vec![ScalarValue::Long(7), ScalarValue::Long(8)]),
+                ),
+            ],
+        });
+        let pv = SharedPV::new();
+        pv.open(desc, initial);
+        let source = SharedSource::new();
+        source.add("MR_R4:PV", pv.clone());
+        let server = PvaServer::isolated(Arc::new(source)).expect("test PVA server must start");
+        let addr = server.tcp_addr();
+
+        let client = PvaClient::builder()
+            .server_addr(addr)
+            .timeout(Duration::from_secs(3))
+            .build();
+        let cfg = PvaLinkConfig {
+            field: "aux".to_string(),
+            ..PvaLinkConfig::defaults_for("MR_R4:PV", LinkDirection::Out)
+        };
+        let link = PvaLink::for_test_with_client(cfg, client);
+
+        // Typed OUT write of a Long array to the `aux` sub-field.
+        link.write_pv_field(&PvField::ScalarArray(vec![
+            ScalarValue::Long(100),
+            ScalarValue::Long(200),
+            ScalarValue::Long(300),
+        ]))
+        .await
+        .expect("typed field-targeted write must succeed");
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let current = pv.current().expect("PV has a current value");
+        let PvField::Structure(s) = current else {
+            panic!("expected structure value");
+        };
+        // Normalize an array field to `Vec<i64>` — the wire
+        // round-trip may yield `ScalarArrayTyped`, logically equal to
+        // a `ScalarArray` of the same elements.
+        fn longs(field: &PvField) -> Vec<i64> {
+            let scalars = match field {
+                PvField::ScalarArray(v) => v.clone(),
+                PvField::ScalarArrayTyped(t) => t.to_scalar_values(),
+                other => panic!("expected an array field, got {other:?}"),
+            };
+            scalars
+                .into_iter()
+                .map(|sv| match sv {
+                    ScalarValue::Long(x) => x,
+                    other => panic!("expected Long element, got {other:?}"),
+                })
+                .collect()
+        }
+
+        let aux = s.get_field("aux").expect("aux sub-field present");
+        assert_eq!(
+            longs(aux),
+            vec![100, 200, 300],
+            "typed write must update the `aux` sub-field"
+        );
+        let value = s.get_field("value").expect("value sub-field present");
+        assert_eq!(
+            longs(value),
+            vec![1, 2],
+            "root `value` must be untouched by a field-targeted write"
+        );
     }
 }

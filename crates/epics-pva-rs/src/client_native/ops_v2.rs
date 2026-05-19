@@ -638,6 +638,213 @@ pub async fn op_put_field_with_request(
     result
 }
 
+/// PUT a pre-built [`PvField`] into a single dotted-path field of the
+/// channel's structure, using a caller-provided pvRequest. Combines
+/// the typed-value path of [`op_put_value_raw`] with the
+/// field-targeting of [`op_put_field_with_request`]: the typed
+/// `value` is placed at `field_path` and only that path's bit is set
+/// in the changed BitSet.
+///
+/// `field_path` must be non-empty. If the introspected leaf at
+/// `field_path` is itself an NT-style structure with a `value`
+/// sub-field, the typed `value` is placed at `<field_path>.value` —
+/// mirroring pvxs `linkBuildPut` (`pvalink_channel.cpp:138-143`):
+/// `auto value(top[fieldName]); if(struct) value = value["value"]`.
+///
+/// pvxs parity: `pvalink_channel.cpp:127-180` typed array/scalar PUT
+/// into the link's `fieldName` target.
+pub async fn op_put_value_field_with_request(
+    channel: &Arc<Channel>,
+    field_path: &str,
+    pv_req: &[u8],
+    value: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let order = server.byte_order;
+    let big_endian = matches!(order, ByteOrder::Big);
+    let codec = PvaCodec { big_endian };
+    let ioid = alloc_ioid();
+
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
+    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
+    let cache = server.type_cache();
+
+    let init_req = codec.build_put_init(sid, ioid, pv_req);
+    server.send(init_req).await?;
+    let init_frame = await_frame(&mut stream, op_timeout).await?;
+    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+        OpResponse::Init(i) => i,
+        other => {
+            server.unregister_ioid(ioid);
+            return Err(PvaError::Protocol(format!(
+                "expected PUT INIT, got {other:?}"
+            )));
+        }
+    };
+    if !init.status.is_success() {
+        server.unregister_ioid(ioid);
+        return Err(PvaError::Protocol(format!(
+            "PUT INIT failed: {:?}",
+            init.status
+        )));
+    }
+    ioid_guard.arm_destroy(sid);
+    let intro = init.introspection;
+
+    // Resolve the effective leaf path: if the introspected field at
+    // `field_path` is an NT-style struct carrying a `value` child,
+    // drill one level deeper so the typed value lands on the actual
+    // scalar/array leaf (pvxs `linkBuildPut:138-143`).
+    let effective_path = effective_typed_put_path(&intro, field_path);
+    let parts: Vec<&str> = effective_path
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let put_value = build_put_value_typed_for_path(&intro, &parts, value)?;
+    let bit = intro.bit_for_path(&effective_path).ok_or_else(|| {
+        PvaError::InvalidValue(format!(
+            "field path '{effective_path}' not present in introspection"
+        ))
+    })?;
+
+    let mut payload = Vec::new();
+    payload.put_u32(sid, order);
+    payload.put_u32(ioid, order);
+    payload.put_u8(0x00);
+    let mut changed = BitSet::new();
+    changed.set(bit);
+    changed.write_into(order, &mut payload);
+    encode_pv_field_with_bitset(&put_value, &intro, &changed, 0, order, &mut payload);
+    let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
+    let mut frame = Vec::new();
+    header.write_into(&mut frame);
+    frame.extend_from_slice(&payload);
+    server.send(frame).await?;
+
+    let done_frame = await_frame(&mut stream, op_timeout).await?;
+    let result = match decode_op_response(&done_frame, Some(&intro))? {
+        OpResponse::Status(s) => {
+            if s.status.is_success() {
+                Ok(())
+            } else {
+                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+            }
+        }
+        other => Err(PvaError::Protocol(format!(
+            "expected PUT done, got {other:?}"
+        ))),
+    };
+
+    ioid_guard.disarm();
+    let destroy = codec.build_destroy_request(sid, ioid);
+    let _ = server.send(destroy).await;
+    server.unregister_ioid(ioid);
+    result
+}
+
+/// Resolve the effective leaf path for a typed field-targeted PUT.
+/// If the field at `field_path` is an NT-style structure that has a
+/// `value` sub-field, returns `<field_path>.value`; otherwise returns
+/// `field_path` unchanged. Mirrors pvxs `linkBuildPut:138-143`.
+fn effective_typed_put_path(intro: &FieldDesc, field_path: &str) -> String {
+    let parts: Vec<&str> = field_path.split('.').filter(|s| !s.is_empty()).collect();
+    let mut cursor = intro;
+    for seg in &parts {
+        match cursor {
+            FieldDesc::Structure { fields, .. } => match fields.iter().find(|(n, _)| n == seg) {
+                Some((_, child)) => cursor = child,
+                None => return field_path.to_string(),
+            },
+            _ => return field_path.to_string(),
+        }
+    }
+    if let FieldDesc::Structure { fields, .. } = cursor {
+        if fields.iter().any(|(n, _)| n == "value") {
+            return format!("{field_path}.value");
+        }
+    }
+    field_path.to_string()
+}
+
+/// Like [`build_put_value_for_path`] but places a pre-built typed
+/// [`PvField`] at the leaf instead of parsing a string. Every field
+/// off the target path is filled with its default value so the
+/// encoded structure matches the introspection layout; only the
+/// path's bit is set in the changed BitSet by the caller.
+fn build_put_value_typed_for_path(
+    desc: &FieldDesc,
+    field_path: &[&str],
+    value: &PvField,
+) -> PvaResult<PvField> {
+    if field_path.is_empty() {
+        return Ok(value.clone());
+    }
+    match desc {
+        FieldDesc::Structure { fields, struct_id } => {
+            let head = field_path[0];
+            let tail = &field_path[1..];
+            if !fields.iter().any(|(n, _)| n == head) {
+                return Err(PvaError::InvalidValue(format!(
+                    "field '{head}' not present in target structure"
+                )));
+            }
+            let mut s = PvStructure::new(struct_id);
+            for (name, child) in fields {
+                if name == head {
+                    s.fields.push((
+                        name.clone(),
+                        build_put_value_typed_for_path(child, tail, value)?,
+                    ));
+                } else {
+                    s.fields.push((
+                        name.clone(),
+                        crate::pvdata::encode::default_value_for(child),
+                    ));
+                }
+            }
+            Ok(PvField::Structure(s))
+        }
+        _ => Err(PvaError::InvalidValue(format!(
+            "cannot navigate path through {desc} (remaining: {field_path:?})"
+        ))),
+    }
+}
+
+/// Coerce a typed PUT `value` to the shape `intro` expects before
+/// encoding.
+///
+/// `op_put_value` / `op_put_value_raw` encode `value` against the
+/// server's introspection and target the `value` bit. Callers pass
+/// either a full NT structure (`pvput_typed` via
+/// `TypedNT::to_pv_field`) or a *bare leaf* value — pvalink OUT
+/// arrays go through `crate::convert::epics_to_pv_field`, which
+/// returns a bare `PvField::ScalarArray` / `PvField::Scalar`.
+///
+/// `encode_pv_field` has no `(Structure desc, bare-leaf value)` arm,
+/// so a bare leaf encoded directly against a `Structure` intro emits
+/// zero bytes and the server applies an empty value. When `intro` is
+/// a `Structure` with a `value` sub-field and `value` is not itself
+/// a `Structure`, this wraps the bare leaf at the `value` path so
+/// the encoder sees a structurally-matching value. A `value` that is
+/// already a `Structure`, or an `intro` that is itself a bare leaf,
+/// passes through unchanged.
+fn coerce_typed_put_value(intro: &FieldDesc, value: &PvField) -> PvaResult<PvField> {
+    match (intro, value) {
+        (FieldDesc::Structure { fields, .. }, v) if !matches!(v, PvField::Structure(_)) => {
+            if fields.iter().any(|(n, _)| n == "value") {
+                build_put_value_typed_for_path(intro, &["value"], value)
+            } else {
+                // No `value` sub-field to target — leave as-is; the
+                // encoder mismatch will surface as a clear "PUT
+                // failed" rather than a silent empty write.
+                Ok(value.clone())
+            }
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
 /// PUT a pre-built [`PvField`] (typed-NT path). Skips the
 /// string-form round-trip used by [`op_put`] / [`op_put_raw`] —
 /// `value` is encoded directly against the server-supplied
@@ -695,7 +902,11 @@ pub async fn op_put_value(
     changed.write_into(order, &mut payload);
     // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
     // only the fields whose bit is set. Encode consistently.
-    encode_pv_field_with_bitset(value, &intro, &changed, 0, order, &mut payload);
+    // Wrap a bare-leaf `value` at the `value` path when `intro` is a
+    // structure (MR-R23: pvalink OUT arrays arrive as a bare
+    // `ScalarArray`, which would otherwise encode to zero bytes).
+    let put_value = coerce_typed_put_value(&intro, value)?;
+    encode_pv_field_with_bitset(&put_value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();
     header.write_into(&mut frame);
@@ -774,7 +985,10 @@ pub async fn op_put_value_raw(
         changed.set(0);
     }
     changed.write_into(order, &mut payload);
-    encode_pv_field_with_bitset(value, &intro, &changed, 0, order, &mut payload);
+    // MR-R23: wrap a bare-leaf `value` (pvalink OUT arrays) at the
+    // `value` path so the encoder sees a structurally-matching value.
+    let put_value = coerce_typed_put_value(&intro, value)?;
+    encode_pv_field_with_bitset(&put_value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();
     header.write_into(&mut frame);

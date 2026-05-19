@@ -469,11 +469,20 @@ impl PvaLinkResolver {
     /// yet open, or links with no cached value. Mirrors pvxs
     /// `pvaGetAlarmMsg`'s severity output (pvalink_lset.cpp:544).
     pub fn link_alarm_severity(&self, pv_name: &str) -> Option<i32> {
+        // MR-R15: apply the caller's own parsed `sevr` mode. Pre-fix
+        // this called `link_alarm_severity()` on whichever cached INP
+        // link `try_get_any` returned first — that link's
+        // `config.sevr` belongs to an arbitrary other caller. pvxs
+        // `pvaLinkConfig::sevr` is per-link (`pvxs/ioc/pvalink.h:65`).
         let full = strip_scheme(pv_name)?;
         let bare = strip_query(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let sevr = self.inp_cfg_for(full).sevr;
         self.registry
             .try_get_any(bare, LinkDirection::Inp)?
-            .link_alarm_severity()
+            .link_alarm_severity_with(sevr)
     }
 
     /// Wait until the link for `pv_name` has received at least one
@@ -894,22 +903,18 @@ impl LinkSet for PvaLinkResolver {
         // P-G16: bypass the Display→string→parse round-trip for
         // ARRAYS (where Display alloc is O(N_elements * digits) and
         // pvput re-parses 25 MB strings on a 1 M-element waveform).
-        // SCALARS keep the string path because the typed
-        // PvField::Scalar doesn't carry the upstream NT-structure
-        // wrapper; encode_pv_field on a (Structure intro, Scalar
-        // value) mismatch hits the fall-through arm and emits zero
-        // bytes — a Round-6 regression caught immediately on
-        // verification of the original P-G16 fix.
-        let array_path = matches!(
-            value,
-            EpicsValue::ShortArray(_)
-                | EpicsValue::FloatArray(_)
-                | EpicsValue::EnumArray(_)
-                | EpicsValue::DoubleArray(_)
-                | EpicsValue::LongArray(_)
-                | EpicsValue::CharArray(_)
-                | EpicsValue::StringArray(_)
-        );
+        // SCALARS keep the string path so the text is coerced against
+        // the channel's introspected scalar type.
+        //
+        // MR-R23 / EX-R10: classify via `is_array_value` — an
+        // exhaustive match with no wildcard arm — so a future
+        // `EpicsValue` array variant cannot silently miss this gate.
+        // The earlier inline `matches!` over a hard-coded subset
+        // omitted `Int64Array` (never covered) and `UInt64Array`
+        // (added with `DBF_UINT64` but never wired in), routing those
+        // through the string PUT path where the bracketed `Display`
+        // text is unparseable.
+        let array_path = is_array_value(&value);
         block_in_place_or_warn(|| {
             self.handle.block_on(async {
                 let link = self
@@ -931,30 +936,46 @@ impl LinkSet for PvaLinkResolver {
     }
 
     fn alarm_message(&self, name: &str) -> Option<String> {
+        // MR-R15: parse the caller's full link config and apply the
+        // caller's own `sevr` mode — `get_or_open` may return a
+        // previously cached INP link whose `config.sevr` belongs to a
+        // different caller, so `default_inp_cfg(bare)` would discard
+        // this caller's `?sevr=` option. pvxs `pvaLinkConfig::sevr`
+        // is per-link (`pvxs/ioc/pvalink.h:65`).
         let full = strip_scheme(name)?;
         let bare = strip_query(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
+        let sevr = cfg.sevr;
         let link = block_in_place_or_warn(|| {
             self.handle
-                .block_on(async { self.registry.get_or_open(default_inp_cfg(bare)).await.ok() })
+                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
         })?;
-        link.alarm_message()
+        link.alarm_message_with(sevr)
     }
 
     fn alarm_severity(&self, name: &str) -> Option<i32> {
         // B2: surface the gated link-alarm severity so the owning
         // record's `LINK_ALARM` actually reflects the remote PV's
-        // alarm. `PvaLink::link_alarm_severity` already applies the
-        // link's `MS`/`NMS`/`MSI` maximize-severity mode, so the
-        // value returned here is final — `None` means "do not
-        // propagate" (NMS, or remote severity below the mode's
-        // threshold, or no value cached).
+        // alarm. The `MS`/`NMS`/`MSI` gate is applied here.
+        //
+        // MR-R15: apply the caller's own `sevr` mode (parsed from the
+        // caller's full link config), not the cached link's shared
+        // `config.sevr`.
         let full = strip_scheme(name)?;
         let bare = strip_query(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
+        let sevr = cfg.sevr;
         let link = block_in_place_or_warn(|| {
             self.handle
-                .block_on(async { self.registry.get_or_open(default_inp_cfg(bare)).await.ok() })
+                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
         })?;
-        link.link_alarm_severity()
+        link.link_alarm_severity_with(sevr)
     }
 
     fn time_stamp(&self, name: &str) -> Option<(i64, i32)> {
@@ -963,23 +984,30 @@ impl LinkSet for PvaLinkResolver {
         if full != bare {
             lazy_register_inp_opts(&self.link_options, full);
         }
+        // BR-R19: prefer the operator-installed link config so
+        // `?time=true` gates the lookup; fall back to defaults for
+        // bare auto-resolved links (which never adopt upstream time —
+        // matching pvxs `pvaLinkConfig::time` default false).
+        //
+        // MR-R15: gate on the caller's own parsed `cfg.time`, not the
+        // cached link's `link.config().time`. `get_or_open` can
+        // return a previously cached INP link whose `time` flag
+        // belongs to a different caller; reading `link.config().time`
+        // would adopt or drop the upstream timestamp based on the
+        // wrong link's option. pvxs `pvaLinkConfig::time` is per-link.
+        let cfg = self.inp_cfg_for(full);
+        let want_time = cfg.time;
         let link = block_in_place_or_warn(|| {
-            self.handle.block_on(async {
-                // BR-R19: prefer the operator-installed link config so
-                // `?time=true` gates the lookup; fall back to defaults
-                // for bare auto-resolved links (which never adopt
-                // upstream time — matching pvxs `pvaLinkConfig::time`
-                // default false).
-                let cfg = self.inp_cfg_for(full);
-                self.registry.get_or_open(cfg).await.ok()
-            })
+            self.handle
+                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
         })?;
-        // BR-R19: only adopt the upstream timestamp when the link was
-        // configured with `time=true`. pvxs `pvalink_lset.cpp:427`
-        // copies the latched remote NT timestamp into the owning
-        // record only when this flag is set; otherwise the owning
-        // record keeps its locally-stamped processing time.
-        if !link.config().time {
+        // BR-R19: only adopt the upstream timestamp when this caller's
+        // link was configured with `time=true`. pvxs
+        // `pvalink_lset.cpp:427` copies the latched remote NT
+        // timestamp into the owning record only when this flag is
+        // set; otherwise the owning record keeps its locally-stamped
+        // processing time.
+        if !want_time {
             return None;
         }
         link.time_stamp()
@@ -993,12 +1021,26 @@ impl LinkSet for PvaLinkResolver {
         // cached NT value — no fresh GET — exactly as the pvxs
         // getters read `fld_meta` / `fld_value` under the channel
         // lock.
-        let name = strip_scheme(name)?;
+        //
+        // MR-R15: strip the query from the remote PV name (a
+        // query-bearing name would otherwise be opened as a literal
+        // PV name including `?...`) and apply the caller's own parsed
+        // `field` so DBF type / element count come from this link's
+        // sub-field, not whichever cached INP link is shared. pvxs
+        // `pvaGetDBFtype` reads the per-link `fld_value`
+        // (`pvxs/ioc/pvalink_lset.cpp:199`).
+        let full = strip_scheme(name)?;
+        let bare = strip_query(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
+        let field = cfg.field.clone();
         let link = block_in_place_or_warn(|| {
             self.handle
-                .block_on(async { self.registry.get_or_open(default_inp_cfg(name)).await.ok() })
+                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
         })?;
-        link.link_metadata()
+        link.link_metadata_with(&field)
     }
 
     fn link_names(&self) -> Vec<String> {
@@ -1087,6 +1129,40 @@ fn default_inp_cfg(pv_name: &str) -> PvaLinkConfig {
     }
 }
 
+/// True iff `value` is an array `EpicsValue` variant — the pvalink
+/// OUT dispatcher routes these through the typed `PvField` write path
+/// (`crate::convert::epics_to_pv_field` → `PvaLink::write_pv_field`)
+/// instead of the scalar `Display`→string→`pvput`-parse path.
+///
+/// MR-R23 / EX-R10: this is the single classification gate for the
+/// OUT typed-array path. It is an EXHAUSTIVE match with no wildcard
+/// arm — every `EpicsValue` variant is named, so adding a future
+/// array variant to `EpicsValue` forces a compile error here until
+/// it is classified, which structurally prevents another
+/// missed-gate regression.
+fn is_array_value(value: &EpicsValue) -> bool {
+    match value {
+        EpicsValue::ShortArray(_)
+        | EpicsValue::FloatArray(_)
+        | EpicsValue::EnumArray(_)
+        | EpicsValue::DoubleArray(_)
+        | EpicsValue::LongArray(_)
+        | EpicsValue::CharArray(_)
+        | EpicsValue::Int64Array(_)
+        | EpicsValue::UInt64Array(_)
+        | EpicsValue::StringArray(_) => true,
+        EpicsValue::String(_)
+        | EpicsValue::Short(_)
+        | EpicsValue::Float(_)
+        | EpicsValue::Enum(_)
+        | EpicsValue::Char(_)
+        | EpicsValue::Long(_)
+        | EpicsValue::Double(_)
+        | EpicsValue::Int64(_)
+        | EpicsValue::UInt64(_) => false,
+    }
+}
+
 /// Best-effort conversion. We coerce scalar values and 1-D scalar arrays;
 /// structures collapse to their `value` field. Returns `None` for
 /// unsupported shapes — callers fall back to `None` in the resolver
@@ -1148,11 +1224,14 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                         })
                         .collect(),
                 )),
-                ScalarValue::Long(_) => Some(EpicsValue::LongArray(
+                // EX-R8: a remote `long[]` is 64-bit per element;
+                // preserve the full width as `Int64Array` instead of
+                // truncating each element to i32.
+                ScalarValue::Long(_) => Some(EpicsValue::Int64Array(
                     arr.iter()
                         .filter_map(|s| {
                             if let ScalarValue::Long(l) = s {
-                                Some(*l as i32)
+                                Some(*l)
                             } else {
                                 None
                             }
@@ -1181,12 +1260,32 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                         })
                         .collect(),
                 )),
-                ScalarValue::UInt(_) | ScalarValue::ULong(_) => Some(EpicsValue::LongArray(
+                // A remote `uint[]` is 32-bit; `EpicsValue` has no
+                // unsigned-32 array variant, so it keeps the existing
+                // `LongArray` (i32) mapping — width-preserving, only
+                // a sign reinterpretation.
+                ScalarValue::UInt(_) => Some(EpicsValue::LongArray(
                     arr.iter()
-                        .filter_map(|s| match s {
-                            ScalarValue::UInt(v) => Some(*v as i32),
-                            ScalarValue::ULong(v) => Some(*v as i32),
-                            _ => None,
+                        .filter_map(|s| {
+                            if let ScalarValue::UInt(v) = s {
+                                Some(*v as i32)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+                // EX-R8: a remote `ulong[]` is 64-bit per element;
+                // preserve the full width as `UInt64Array` instead of
+                // truncating each element to i32.
+                ScalarValue::ULong(_) => Some(EpicsValue::UInt64Array(
+                    arr.iter()
+                        .filter_map(|s| {
+                            if let ScalarValue::ULong(v) = s {
+                                Some(*v)
+                            } else {
+                                None
+                            }
                         })
                         .collect(),
                 )),
@@ -1252,9 +1351,9 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                 TypedScalarArray::Double(a) => Some(EpicsValue::DoubleArray(a.to_vec())),
                 TypedScalarArray::Float(a) => Some(EpicsValue::FloatArray(a.to_vec())),
                 TypedScalarArray::Int(a) => Some(EpicsValue::LongArray(a.to_vec())),
-                TypedScalarArray::Long(a) => {
-                    Some(EpicsValue::LongArray(a.iter().map(|v| *v as i32).collect()))
-                }
+                // EX-R8: a remote `long[]` is 64-bit per element;
+                // preserve the full width as `Int64Array`.
+                TypedScalarArray::Long(a) => Some(EpicsValue::Int64Array(a.to_vec())),
                 TypedScalarArray::Short(a) => Some(EpicsValue::ShortArray(a.to_vec())),
                 TypedScalarArray::UShort(a) => Some(EpicsValue::ShortArray(
                     a.iter().map(|v| *v as i16).collect(),
@@ -1262,9 +1361,9 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                 TypedScalarArray::UInt(a) => {
                     Some(EpicsValue::LongArray(a.iter().map(|v| *v as i32).collect()))
                 }
-                TypedScalarArray::ULong(a) => {
-                    Some(EpicsValue::LongArray(a.iter().map(|v| *v as i32).collect()))
-                }
+                // EX-R8: a remote `ulong[]` is 64-bit per element;
+                // preserve the full width as `UInt64Array`.
+                TypedScalarArray::ULong(a) => Some(EpicsValue::UInt64Array(a.to_vec())),
                 TypedScalarArray::Byte(a) => Some(EpicsValue::ShortArray(
                     a.iter().map(|v| *v as i16).collect(),
                 )),
@@ -1283,11 +1382,20 @@ fn scalar_to_epics(sv: &ScalarValue) -> EpicsValue {
     match sv {
         ScalarValue::Double(v) => EpicsValue::Double(*v),
         ScalarValue::Float(v) => EpicsValue::Float(*v),
-        ScalarValue::Long(v) => EpicsValue::Long(*v as i32),
+        // EX-R8: a remote PVA `long` / `ulong` is 64-bit. Mapping it
+        // to `EpicsValue::Long` (i32) silently drops the upper 32
+        // bits before the local database can coerce it to the
+        // destination field type. Preserve the full width as
+        // `EpicsValue::Int64` / `EpicsValue::UInt64` — the same
+        // typed-conversion contract QSRV uses (`convert.rs`
+        // `DbFieldType::Int64 => EpicsValue::Int64`,
+        // `DbFieldType::UInt64 => EpicsValue::UInt64`). The owning
+        // record's coercion then narrows if its field is 32-bit.
+        ScalarValue::Long(v) => EpicsValue::Int64(*v),
         ScalarValue::Int(v) => EpicsValue::Long(*v),
         ScalarValue::Short(v) => EpicsValue::Short(*v),
         ScalarValue::Byte(v) => EpicsValue::Char(*v as u8),
-        ScalarValue::ULong(v) => EpicsValue::Long(*v as i32),
+        ScalarValue::ULong(v) => EpicsValue::UInt64(*v),
         ScalarValue::UInt(v) => EpicsValue::Long(*v as i32),
         ScalarValue::UShort(v) => EpicsValue::Short(*v as i16),
         // F9: DBF_CHAR is signed (pvByte). Widen UByte to Short so the
@@ -1315,7 +1423,9 @@ mod tests {
         s.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Long(42))));
         let f = PvField::Structure(s);
-        assert_eq!(pvfield_to_epics_value(&f), Some(EpicsValue::Long(42)));
+        // EX-R8: a remote PVA `long` is 64-bit — it now maps to
+        // `EpicsValue::Int64`, not a truncated `EpicsValue::Long`.
+        assert_eq!(pvfield_to_epics_value(&f), Some(EpicsValue::Int64(42)));
     }
 
     /// BR-R23: string / float / short / char / typed-array shapes the
@@ -1382,6 +1492,72 @@ mod tests {
                 vec![1u8, 2, 3].into()
             ))),
             Some(EpicsValue::CharArray(vec![1, 2, 3]))
+        );
+    }
+
+    /// EX-R8: a remote PVA `long` / `ulong` scalar or array carries
+    /// 64 bits. The pvalink INP conversion previously collapsed it to
+    /// `EpicsValue::Long` / `LongArray` (i32), dropping the upper 32
+    /// bits before the local database could coerce the value. It must
+    /// now preserve the full width as `Int64` / `UInt64` /
+    /// `Int64Array` / `UInt64Array` — the same typed-conversion
+    /// contract QSRV uses.
+    #[test]
+    fn ex_r8_inp_long_ulong_preserve_full_width() {
+        use epics_pva_rs::pvdata::TypedScalarArray;
+
+        // A `ulong` value whose upper 32 bits are non-zero — i32
+        // truncation would lose it entirely.
+        let big_u: u64 = 0x1234_5678_9ABC_DEF0;
+        let big_i: i64 = -0x0123_4567_89AB_CDEF;
+
+        // Scalar `ulong` → `UInt64` (full width).
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::Scalar(ScalarValue::ULong(big_u))),
+            Some(EpicsValue::UInt64(big_u)),
+            "remote ulong scalar must keep all 64 bits"
+        );
+        // Scalar `long` → `Int64` (full width).
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::Scalar(ScalarValue::Long(big_i))),
+            Some(EpicsValue::Int64(big_i)),
+            "remote long scalar must keep all 64 bits"
+        );
+
+        // Untyped `ulong[]` → `UInt64Array`.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArray(vec![
+                ScalarValue::ULong(big_u),
+                ScalarValue::ULong(1),
+            ])),
+            Some(EpicsValue::UInt64Array(vec![big_u, 1])),
+            "remote ulong[] must keep all 64 bits per element"
+        );
+        // Untyped `long[]` → `Int64Array`.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArray(vec![
+                ScalarValue::Long(big_i),
+                ScalarValue::Long(-1),
+            ])),
+            Some(EpicsValue::Int64Array(vec![big_i, -1])),
+            "remote long[] must keep all 64 bits per element"
+        );
+
+        // Typed-fast-path `ulong[]` → `UInt64Array`.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::ULong(
+                vec![big_u, 2].into()
+            ))),
+            Some(EpicsValue::UInt64Array(vec![big_u, 2])),
+            "typed remote ulong[] must keep all 64 bits per element"
+        );
+        // Typed-fast-path `long[]` → `Int64Array`.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::Long(
+                vec![big_i, -2].into()
+            ))),
+            Some(EpicsValue::Int64Array(vec![big_i, -2])),
+            "typed remote long[] must keep all 64 bits per element"
         );
     }
 
@@ -2229,6 +2405,223 @@ mod tests {
             *log.lock(),
             vec!["AT:A", "AT:B", "EXTERNAL"],
             "external writer must not interleave between atomic scan targets"
+        );
+    }
+
+    /// MR-R15: the alarm / time / metadata getters must apply the
+    /// *caller's* per-link `sevr` / `time` / `field` options, not the
+    /// shared cached `PvaLink`'s config.
+    ///
+    /// The registry caches one INP `PvaLink` per
+    /// `(pv_name, pipeline, queue_size, direction)` — `sevr` / `time`
+    /// / `field` are not in the key. Pre-fix the getters either used
+    /// `default_inp_cfg` (discarding the caller's options) or read
+    /// the cached link's `config.*`, so a second caller with
+    /// different options got the first caller's behavior.
+    ///
+    /// Here the cached INP link is configured `sevr=NMS` (default),
+    /// `time=false`, `field="value"`, with a remote value carrying a
+    /// MAJOR alarm and a timeStamp. A caller asking for `?sevr=MS` /
+    /// `?time=true` must observe its own options against that shared
+    /// cached link. pvxs `pvaLinkConfig` is per-link
+    /// (`pvxs/ioc/pvalink.h:65`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mr_r15_getters_use_caller_options_not_shared_link() {
+        use crate::pvalink::link::PvaLink;
+        use epics_pva_rs::pvdata::PvField;
+
+        // Remote NT value: MAJOR alarm + a timeStamp.
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(2))));
+        alarm.fields.push((
+            "message".into(),
+            PvField::Scalar(ScalarValue::String("HIGH".into())),
+        ));
+        let mut ts = PvStructure::new("time_t");
+        ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(1_700_000_000)),
+        ));
+        ts.fields
+            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(42))));
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(3.0))));
+        root.fields
+            .push(("alarm".into(), PvField::Structure(alarm)));
+        root.fields
+            .push(("timeStamp".into(), PvField::Structure(ts)));
+        let cached = PvField::Structure(root);
+
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+
+        // Seed the registry with a cached INP link whose own config
+        // is the bare default: NMS, time=false, field="value".
+        let shared_cfg = default_inp_cfg("MR_R15:PV");
+        let shared_link = std::sync::Arc::new(PvaLink::for_test(shared_cfg.clone(), Some(cached)));
+        resolver.registry.insert_for_test(&shared_cfg, shared_link);
+
+        // The shared cached link is NMS → its own gate reports no
+        // alarm. A caller asking for `?sevr=MS` must still see the
+        // MAJOR severity propagate.
+        let nms_name = "pva://MR_R15:PV";
+        assert_eq!(
+            LinkSet::alarm_severity(&resolver, nms_name),
+            None,
+            "an NMS caller must not propagate the remote alarm"
+        );
+        let ms_name = "pva://MR_R15:PV?sevr=MS";
+        assert_eq!(
+            LinkSet::alarm_severity(&resolver, ms_name),
+            Some(2),
+            "an MS caller must see MAJOR even though the cached link is NMS"
+        );
+        assert_eq!(
+            LinkSet::alarm_message(&resolver, ms_name),
+            Some("HIGH".to_string()),
+            "an MS caller must get the remote alarm message"
+        );
+        assert_eq!(
+            resolver.link_alarm_severity(ms_name),
+            Some(2),
+            "resolver-level link_alarm_severity must use the caller's MS mode"
+        );
+
+        // The shared cached link is time=false → a bare caller adopts
+        // no timestamp. A caller asking `?time=true` must adopt it.
+        assert_eq!(
+            LinkSet::time_stamp(&resolver, nms_name),
+            None,
+            "a time=false caller must not adopt the upstream timestamp"
+        );
+        assert_eq!(
+            LinkSet::time_stamp(&resolver, "pva://MR_R15:PV?time=true"),
+            Some((1_700_000_000, 42)),
+            "a time=true caller must adopt the upstream timestamp"
+        );
+    }
+
+    /// MR-R23: an OUT pvalink fed by an `EpicsValue::UInt64Array`
+    /// (from an `FTVL=UINT64` waveform) must go through the typed
+    /// `ulong[]` encoder, not the scalar string-PUT path. Pre-fix the
+    /// OUT dispatcher's hard-coded `array_path` match omitted
+    /// `UInt64Array`, so the value fell through to `value.to_string()`
+    /// — a bracketed `[1, 2]` literal the PVA array string parser
+    /// rejects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mr_r23_out_uint64_array_uses_typed_path() {
+        use epics_pva_rs::pvdata::ScalarType;
+        out_array_typed_path_case(
+            "MR_R23:PV",
+            ScalarType::ULong,
+            EpicsValue::UInt64Array(vec![1, 2, u64::MAX]),
+            // u64::MAX as the i64 bit pattern is -1; the test
+            // compares 64-bit words, so full-width u64 is preserved.
+            &[1, 2, u64::MAX as i64],
+        )
+        .await;
+    }
+
+    /// EX-R10: an OUT pvalink fed by an `EpicsValue::Int64Array`
+    /// (from an `FTVL=INT64` waveform) must go through the typed
+    /// `long[]` encoder. `origin/main` already had `Int64Array` but
+    /// the OUT dispatcher's `array_path` match never listed it, so a
+    /// valid int64 waveform value attempted to replay its bracketed
+    /// `Display` string as a PVA array literal the parser rejects.
+    /// The `is_array_value` helper (added with MR-R23) covers signed
+    /// and unsigned 64-bit arrays together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ex_r10_out_int64_array_uses_typed_path() {
+        use epics_pva_rs::pvdata::ScalarType;
+        out_array_typed_path_case(
+            "EX_R10:PV",
+            ScalarType::Long,
+            EpicsValue::Int64Array(vec![-3, 0, i64::MAX]),
+            &[-3, 0, i64::MAX],
+        )
+        .await;
+    }
+
+    /// Shared body for the MR-R23 / EX-R10 OUT typed-array
+    /// regression tests. Stands up a PVA server hosting a
+    /// `long[]` / `ulong[]` PV, seeds the registry with a
+    /// pinned-client OUT `PvaLink`, and drives `LinkSet::put_value`
+    /// with `value`. The PUT must succeed and the server PV must
+    /// hold `expected` (compared as `i64` bit patterns regardless of
+    /// the wire-level signedness).
+    async fn out_array_typed_path_case(
+        pv_name: &str,
+        elem_type: epics_pva_rs::pvdata::ScalarType,
+        value: EpicsValue,
+        expected: &[i64],
+    ) {
+        use crate::pvalink::link::PvaLink;
+        use epics_pva_rs::client::PvaClient;
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarValue};
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        // PVA server hosting a `long[]` / `ulong[]`-valued PV.
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalarArray:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::ScalarArray(elem_type))],
+        };
+        let initial = PvField::Structure(epics_pva_rs::pvdata::PvStructure {
+            struct_id: "epics:nt/NTScalarArray:1.0".into(),
+            fields: vec![("value".into(), PvField::ScalarArray(vec![]))],
+        });
+        let pv = SharedPV::new();
+        pv.open(desc, initial);
+        let source = SharedSource::new();
+        source.add(pv_name, pv.clone());
+        let server =
+            PvaServer::isolated(std::sync::Arc::new(source)).expect("test PVA server starts");
+        let addr = server.tcp_addr();
+
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+
+        // Seed the registry with a pinned-client OUT link under the
+        // exact key `put_value` will look up for the bare PV name, so
+        // `get_or_open` is a cache hit and the typed PUT reaches the
+        // pinned test server.
+        let out_cfg = resolver.out_cfg_for(pv_name);
+        let client = PvaClient::builder()
+            .server_addr(addr)
+            .timeout(std::time::Duration::from_secs(3))
+            .build();
+        let link = std::sync::Arc::new(PvaLink::for_test_with_client(out_cfg.clone(), client));
+        resolver.registry.insert_for_test(&out_cfg, link);
+
+        // Drive the OUT path through the resolver's LinkSet impl.
+        let scheme_name = format!("pva://{pv_name}");
+        LinkSet::put_value(&resolver, &scheme_name, value)
+            .expect("typed array OUT write must succeed");
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let current = pv.current().expect("PV has a current value");
+        let PvField::Structure(s) = current else {
+            panic!("expected structure value");
+        };
+        let value_field = s.get_field("value").expect("value sub-field present");
+        // Compare as i64 bit patterns — a ulong[] readback is ULong,
+        // a long[] readback is Long; both carry the same 64-bit word.
+        let elem_as_i64 = |sv: &ScalarValue| -> i64 {
+            match sv {
+                ScalarValue::Long(x) => *x,
+                ScalarValue::ULong(x) => *x as i64,
+                other => panic!("expected a 64-bit element, got {other:?}"),
+            }
+        };
+        let got: Vec<i64> = match value_field {
+            PvField::ScalarArray(v) => v.iter().map(elem_as_i64).collect(),
+            PvField::ScalarArrayTyped(t) => t.to_scalar_values().iter().map(elem_as_i64).collect(),
+            other => panic!("expected an array value field, got {other:?}"),
+        };
+        assert_eq!(
+            got, expected,
+            "typed-array OUT write must land the full-width 64-bit array value"
         );
     }
 }

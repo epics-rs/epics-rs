@@ -1210,11 +1210,14 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                         })
                         .collect(),
                 )),
-                ScalarValue::Long(_) => Some(EpicsValue::LongArray(
+                // EX-R8: a remote `long[]` is 64-bit per element;
+                // preserve the full width as `Int64Array` instead of
+                // truncating each element to i32.
+                ScalarValue::Long(_) => Some(EpicsValue::Int64Array(
                     arr.iter()
                         .filter_map(|s| {
                             if let ScalarValue::Long(l) = s {
-                                Some(*l as i32)
+                                Some(*l)
                             } else {
                                 None
                             }
@@ -1243,12 +1246,32 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                         })
                         .collect(),
                 )),
-                ScalarValue::UInt(_) | ScalarValue::ULong(_) => Some(EpicsValue::LongArray(
+                // A remote `uint[]` is 32-bit; `EpicsValue` has no
+                // unsigned-32 array variant, so it keeps the existing
+                // `LongArray` (i32) mapping — width-preserving, only
+                // a sign reinterpretation.
+                ScalarValue::UInt(_) => Some(EpicsValue::LongArray(
                     arr.iter()
-                        .filter_map(|s| match s {
-                            ScalarValue::UInt(v) => Some(*v as i32),
-                            ScalarValue::ULong(v) => Some(*v as i32),
-                            _ => None,
+                        .filter_map(|s| {
+                            if let ScalarValue::UInt(v) = s {
+                                Some(*v as i32)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+                // EX-R8: a remote `ulong[]` is 64-bit per element;
+                // preserve the full width as `UInt64Array` instead of
+                // truncating each element to i32.
+                ScalarValue::ULong(_) => Some(EpicsValue::UInt64Array(
+                    arr.iter()
+                        .filter_map(|s| {
+                            if let ScalarValue::ULong(v) = s {
+                                Some(*v)
+                            } else {
+                                None
+                            }
                         })
                         .collect(),
                 )),
@@ -1314,9 +1337,9 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                 TypedScalarArray::Double(a) => Some(EpicsValue::DoubleArray(a.to_vec())),
                 TypedScalarArray::Float(a) => Some(EpicsValue::FloatArray(a.to_vec())),
                 TypedScalarArray::Int(a) => Some(EpicsValue::LongArray(a.to_vec())),
-                TypedScalarArray::Long(a) => {
-                    Some(EpicsValue::LongArray(a.iter().map(|v| *v as i32).collect()))
-                }
+                // EX-R8: a remote `long[]` is 64-bit per element;
+                // preserve the full width as `Int64Array`.
+                TypedScalarArray::Long(a) => Some(EpicsValue::Int64Array(a.to_vec())),
                 TypedScalarArray::Short(a) => Some(EpicsValue::ShortArray(a.to_vec())),
                 TypedScalarArray::UShort(a) => Some(EpicsValue::ShortArray(
                     a.iter().map(|v| *v as i16).collect(),
@@ -1324,9 +1347,9 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                 TypedScalarArray::UInt(a) => {
                     Some(EpicsValue::LongArray(a.iter().map(|v| *v as i32).collect()))
                 }
-                TypedScalarArray::ULong(a) => {
-                    Some(EpicsValue::LongArray(a.iter().map(|v| *v as i32).collect()))
-                }
+                // EX-R8: a remote `ulong[]` is 64-bit per element;
+                // preserve the full width as `UInt64Array`.
+                TypedScalarArray::ULong(a) => Some(EpicsValue::UInt64Array(a.to_vec())),
                 TypedScalarArray::Byte(a) => Some(EpicsValue::ShortArray(
                     a.iter().map(|v| *v as i16).collect(),
                 )),
@@ -1345,11 +1368,20 @@ fn scalar_to_epics(sv: &ScalarValue) -> EpicsValue {
     match sv {
         ScalarValue::Double(v) => EpicsValue::Double(*v),
         ScalarValue::Float(v) => EpicsValue::Float(*v),
-        ScalarValue::Long(v) => EpicsValue::Long(*v as i32),
+        // EX-R8: a remote PVA `long` / `ulong` is 64-bit. Mapping it
+        // to `EpicsValue::Long` (i32) silently drops the upper 32
+        // bits before the local database can coerce it to the
+        // destination field type. Preserve the full width as
+        // `EpicsValue::Int64` / `EpicsValue::UInt64` — the same
+        // typed-conversion contract QSRV uses (`convert.rs`
+        // `DbFieldType::Int64 => EpicsValue::Int64`,
+        // `DbFieldType::UInt64 => EpicsValue::UInt64`). The owning
+        // record's coercion then narrows if its field is 32-bit.
+        ScalarValue::Long(v) => EpicsValue::Int64(*v),
         ScalarValue::Int(v) => EpicsValue::Long(*v),
         ScalarValue::Short(v) => EpicsValue::Short(*v),
         ScalarValue::Byte(v) => EpicsValue::Char(*v as u8),
-        ScalarValue::ULong(v) => EpicsValue::Long(*v as i32),
+        ScalarValue::ULong(v) => EpicsValue::UInt64(*v),
         ScalarValue::UInt(v) => EpicsValue::Long(*v as i32),
         ScalarValue::UShort(v) => EpicsValue::Short(*v as i16),
         // F9: DBF_CHAR is signed (pvByte). Widen UByte to Short so the
@@ -1377,7 +1409,9 @@ mod tests {
         s.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Long(42))));
         let f = PvField::Structure(s);
-        assert_eq!(pvfield_to_epics_value(&f), Some(EpicsValue::Long(42)));
+        // EX-R8: a remote PVA `long` is 64-bit — it now maps to
+        // `EpicsValue::Int64`, not a truncated `EpicsValue::Long`.
+        assert_eq!(pvfield_to_epics_value(&f), Some(EpicsValue::Int64(42)));
     }
 
     /// BR-R23: string / float / short / char / typed-array shapes the
@@ -1444,6 +1478,72 @@ mod tests {
                 vec![1u8, 2, 3].into()
             ))),
             Some(EpicsValue::CharArray(vec![1, 2, 3]))
+        );
+    }
+
+    /// EX-R8: a remote PVA `long` / `ulong` scalar or array carries
+    /// 64 bits. The pvalink INP conversion previously collapsed it to
+    /// `EpicsValue::Long` / `LongArray` (i32), dropping the upper 32
+    /// bits before the local database could coerce the value. It must
+    /// now preserve the full width as `Int64` / `UInt64` /
+    /// `Int64Array` / `UInt64Array` — the same typed-conversion
+    /// contract QSRV uses.
+    #[test]
+    fn ex_r8_inp_long_ulong_preserve_full_width() {
+        use epics_pva_rs::pvdata::TypedScalarArray;
+
+        // A `ulong` value whose upper 32 bits are non-zero — i32
+        // truncation would lose it entirely.
+        let big_u: u64 = 0x1234_5678_9ABC_DEF0;
+        let big_i: i64 = -0x0123_4567_89AB_CDEF;
+
+        // Scalar `ulong` → `UInt64` (full width).
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::Scalar(ScalarValue::ULong(big_u))),
+            Some(EpicsValue::UInt64(big_u)),
+            "remote ulong scalar must keep all 64 bits"
+        );
+        // Scalar `long` → `Int64` (full width).
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::Scalar(ScalarValue::Long(big_i))),
+            Some(EpicsValue::Int64(big_i)),
+            "remote long scalar must keep all 64 bits"
+        );
+
+        // Untyped `ulong[]` → `UInt64Array`.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArray(vec![
+                ScalarValue::ULong(big_u),
+                ScalarValue::ULong(1),
+            ])),
+            Some(EpicsValue::UInt64Array(vec![big_u, 1])),
+            "remote ulong[] must keep all 64 bits per element"
+        );
+        // Untyped `long[]` → `Int64Array`.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArray(vec![
+                ScalarValue::Long(big_i),
+                ScalarValue::Long(-1),
+            ])),
+            Some(EpicsValue::Int64Array(vec![big_i, -1])),
+            "remote long[] must keep all 64 bits per element"
+        );
+
+        // Typed-fast-path `ulong[]` → `UInt64Array`.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::ULong(
+                vec![big_u, 2].into()
+            ))),
+            Some(EpicsValue::UInt64Array(vec![big_u, 2])),
+            "typed remote ulong[] must keep all 64 bits per element"
+        );
+        // Typed-fast-path `long[]` → `Int64Array`.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::Long(
+                vec![big_i, -2].into()
+            ))),
+            Some(EpicsValue::Int64Array(vec![big_i, -2])),
+            "typed remote long[] must keep all 64 bits per element"
         );
     }
 

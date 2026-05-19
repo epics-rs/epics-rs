@@ -47,9 +47,10 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
   - Deferral note: `doc/critical-review-2026-05-18.md:1268-1271`
   - Done: worker A, commit `c4bb773a` on `caucus/HJB9ABPH/worker`; regression `pva_r6_squash_to_tail`. New `MonitorOutbox`/`MonitorInbox` types with `Mutex<VecDeque>+Notify`; queue default 64 → 4. Upstream parity: pvxs servermon.cpp:66 (default queue limit), :283-286 (squash-to-tail).
 
-- [ ] **PVA-R14** (MEDIUM, architectural) — Decouple server source calls from per-connection read loop. Operation-state-machine restructure so source futures don't head-of-line-block the socket parser.
+- [x] **PVA-R14** (MEDIUM, architectural) — Decouple server source calls from per-connection read loop. Operation-state-machine restructure so source futures don't head-of-line-block the socket parser.
   - Spec: `doc/critical-review-2026-05-18.md:513-556`
   - Deferral note: `doc/critical-review-2026-05-18.md:1272-1275`
+  - Done: worker A, commit `601a568f` on `caucus/HJB9ABPH/worker` (commit subject typo says `BR-R14`, content is PVA-R14 — same label error as PVA-R4); regression `pva_r14_source_calls_no_head_of_line_block`. Massive single-file restructure of `server_native/tcp.rs` (660/484 lines): GET/PUT/RPC/PUT_GET/PROCESS/GET_FIELD all spawn source futures; payload decoded inline before spawn; `OpState.data_task_abort: Option<Arc<AbortOnDrop>>` aborts in-flight tasks on DESTROY. 7 test assertions changed from `try_recv()` to `recv().await` for spawned data-phase responses.
 
 - [x] **TLS-NAMESERVER** (MEDIUM, architectural) — TLS via name-server (mixed-mode listener). TCP accept loop peeks the first byte and dispatches to plain handshake or `TlsAcceptor`. Refactor of `server_native/tcp.rs:460-590`.
   - Spec/Deferral note: `doc/critical-review-2026-05-18.md:1290-1298`
@@ -59,8 +60,9 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ## Driver state
 
-- Total open: 1 (was 6)
-- Done: 5 (PVA-R2, PVA-R6, PVA-R4, TLS-NAMESERVER, PVA-R3)
-- In progress: 1 (PVA-R14, worker A)
+- **Total open: 0** ✓ ALL DEFERRED ITEMS CLEARED
+- Done: 6 (PVA-R2, PVA-R6, PVA-R4, TLS-NAMESERVER, PVA-R3, PVA-R14)
+- In progress: 0 (worker A on standby for pre-push workspace verification)
 - Blocked: 0
 - Verified pre-existing main failure: `critical1_audit_layer_records_put` (tests/pva_gateway.rs:557) — separate from this round; not introduced by any worker.
+- **Pre-push owed:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace`, `cargo test --doc --workspace`. Worker A's branch `caucus/HJB9ABPH/worker` carries all 6 pva-rs fixes (sequential commits 479f77c0 → 601a568f).

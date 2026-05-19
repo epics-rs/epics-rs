@@ -55,8 +55,9 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ### Priority 5 — Gateway typed forwarding / decoded monitor fallback
 
-- [ ] **BR-R6** — PVA gateway reserializes downstream PUTs through string `pvput`.
+- [x] **BR-R6** — PVA gateway reserializes downstream PUTs through string `pvput`.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:201-225`
+  - Done: worker B, commit `4b7c87eb` on `caucus/HJB9ABPH/backend` (+ doc tracker `2eabe05f`); regression `br_r6_gateway_typed_put_passthrough`. Gateway source.rs typed pass-through replaces string `pvput` round-trip. 51m+ debug cycle (context compacted) but landed clean.
 
 - [ ] **BR-R41** — PVA gateway decoded monitor fallback emits only the initial snapshot.
   - Spec: `doc/pvxs-functional-security-review-2026-05-18.md:1120-1144`

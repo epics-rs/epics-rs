@@ -2148,6 +2148,16 @@ impl CaChannel {
     /// Subscribe with client-side deadband filtering.
     /// Events where |new - old| < deadband are suppressed (scalar values only).
     pub async fn subscribe_with_deadband(&self, deadband: f64) -> CaResult<MonitorHandle> {
+        self.subscribe_with_mask(deadband, DBE_VALUE | DBE_LOG | DBE_ALARM)
+            .await
+    }
+
+    /// Subscribe with an explicit `DBE_*` event mask (CA-FR-4: `camonitor
+    /// -m`). The server queues an EVENT only when `mask & post_select`
+    /// is non-zero, so e.g. `DBE_ALARM` alone delivers only alarm
+    /// transitions. `deadband` applies client-side deadband filtering as
+    /// in [`Self::subscribe_with_deadband`].
+    pub async fn subscribe_with_mask(&self, deadband: f64, mask: u16) -> CaResult<MonitorHandle> {
         let env = epics_base_rs::runtime::env::get("EPICS_CA_MONITOR_QUEUE")
             .and_then(|s| s.parse::<usize>().ok());
         let queue_size = resolve_monitor_queue_size(env);
@@ -2157,7 +2167,7 @@ impl CaChannel {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.coord_tx.send(CoordRequest::Subscribe {
             cid: self.cid,
-            mask: DBE_VALUE | DBE_LOG | DBE_ALARM,
+            mask,
             deadband,
             callback_tx,
             coalesce_slot: coalesce_slot.clone(),

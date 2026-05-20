@@ -144,9 +144,6 @@ async fn main() {
     if args.priority.is_some() {
         eprintln!("camonitor-rs: -p (priority) is accepted for parity but not yet honoured");
     }
-    if args.event_mask.is_some() {
-        eprintln!("camonitor-rs: -m (event mask) is accepted for parity but not yet honoured");
-    }
     if let Some(k) = &args.timestamp_key
         && !k.contains('s')
     {
@@ -169,6 +166,8 @@ async fn main() {
     // prefix on `reqElems || nElems > 1`; `reqElems` is non-zero iff
     // the user passed `-#`.
     let req_elems_present = args.max_elements.is_some();
+    // CA-FR-4: resolve the `-m <msk>` DBE_* mask once for all PVs.
+    let mask = parse_event_mask(args.event_mask.as_deref());
 
     let mut handles = Vec::new();
     for (i, pv_name) in args.pv_names.iter().enumerate() {
@@ -177,7 +176,7 @@ async fn main() {
         let flag = connected_flags[i].clone();
         let fmt = fmt.clone();
         handles.push(tokio::spawn(async move {
-            monitor_pv(channel, pv, flag, fmt, req_elems_present).await;
+            monitor_pv(channel, pv, flag, fmt, req_elems_present, mask).await;
         }));
     }
 
@@ -267,6 +266,7 @@ async fn monitor_pv(
     connected_flag: Arc<AtomicBool>,
     fmt: Arc<ValueFormat>,
     req_elems_present: bool,
+    mask: u16,
 ) {
     let mut conn_rx = channel.connection_events();
     let pv = pv_name.clone();
@@ -299,7 +299,8 @@ async fn monitor_pv(
         }
     });
 
-    let Ok(mut monitor) = channel.subscribe().await else {
+    // CA-FR-4: honour `-m <msk>` via the caller-resolved DBE_* mask.
+    let Ok(mut monitor) = channel.subscribe_with_mask(0.0, mask).await else {
         return;
     };
     while let Some(result) = monitor.recv().await {
@@ -332,5 +333,49 @@ async fn monitor_pv(
                 eprintln!("{pv_name}: {e}");
             }
         }
+    }
+}
+
+/// CA-FR-4: parse a `camonitor -m <msk>` mask string into `DBE_*` bits.
+/// Letters: `v` value, `a` alarm, `l` log/archive, `p` property
+/// (epics-base `camonitor.c:285-303`). `None`/empty/unrecognised → the
+/// default value+log+alarm mask (matches the pre-`-m` subscription).
+fn parse_event_mask(m: Option<&str>) -> u16 {
+    const DBE_VALUE: u16 = 1;
+    const DBE_LOG: u16 = 2;
+    const DBE_ALARM: u16 = 4;
+    const DBE_PROPERTY: u16 = 8;
+    const DEFAULT: u16 = DBE_VALUE | DBE_LOG | DBE_ALARM;
+    let Some(s) = m else { return DEFAULT };
+    let mut mask = 0u16;
+    for c in s.chars() {
+        match c {
+            'v' => mask |= DBE_VALUE,
+            'a' => mask |= DBE_ALARM,
+            'l' => mask |= DBE_LOG,
+            'p' => mask |= DBE_PROPERTY,
+            _ => {}
+        }
+    }
+    if mask == 0 { DEFAULT } else { mask }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_event_mask;
+
+    #[test]
+    fn mask_defaults_when_absent_or_unrecognised() {
+        assert_eq!(parse_event_mask(None), 1 | 2 | 4);
+        assert_eq!(parse_event_mask(Some("")), 1 | 2 | 4);
+        assert_eq!(parse_event_mask(Some("xyz")), 1 | 2 | 4);
+    }
+
+    #[test]
+    fn mask_parses_dbe_letters() {
+        assert_eq!(parse_event_mask(Some("a")), 4, "alarm-only");
+        assert_eq!(parse_event_mask(Some("v")), 1, "value-only");
+        assert_eq!(parse_event_mask(Some("p")), 8, "property-only");
+        assert_eq!(parse_event_mask(Some("val")), 1 | 4 | 2, "value+alarm+log");
     }
 }

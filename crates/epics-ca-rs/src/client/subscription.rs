@@ -17,10 +17,11 @@ use super::types::TransportCommand;
 /// Producer routing decision for a value snapshot, computed
 /// atomically against the pause flag (see [`CoalesceSlot::route_value`]).
 pub(crate) enum ValueRoute {
-    /// Held in the value slot (overflow coalesce, or paused). No
-    /// channel write happens; the value is invisible to flow control.
+    /// Coalesced into a slot cell (active overflow into `ready`, or a
+    /// during-pause hold into `held`). No channel write — invisible to
+    /// flow control.
     Slotted,
-    /// Slot empty and not paused — the caller should try the bounded
+    /// `ready` empty and not paused — the caller should try the bounded
     /// channel (and fall back to [`CoalesceSlot::put_value`] on full).
     /// Boxed so this large variant doesn't bloat the others; the
     /// snapshot is already heap-backed.
@@ -30,41 +31,42 @@ pub(crate) enum ValueRoute {
 /// Per-subscription overflow/pause buffer shared between the
 /// coordinator (producer) and the [`MonitorHandle`] (consumer).
 ///
-/// # Invariants
+/// # Invariants (structurally enforced by the three distinct cells)
 ///
-/// - **Flow control (I1).** `pending_deliveries` and the per-circuit
-///   `EVENTS_OFF` accounting count ONLY items in the bounded channel.
-///   Everything in this slot — held value, overflow value, or error —
-///   is *out of band*: writing to or reading from it never touches
-///   flow control. (A client-side pause must not trip the wire-level
-///   `EVENTS_OFF` and freeze sibling subscriptions on the circuit.)
-/// - **Error preservation (I2).** A pending error lives in its OWN
-///   slot (`error`), separate from `value`. A value never overwrites
-///   or hides a pending error; errors bypass pause and are delivered
-///   first.
-/// - **Pause scope (I3).** A value buffered *before* `pause()`
-///   (overflow backlog) stays deliverable while paused
-///   (`value_deliverable_while_paused == true`). Only values that
-///   arrive *during* the pause are withheld until `resume`.
+/// - **I1 — flow control counts the channel only.** `pending_deliveries`
+///   and the per-circuit `EVENTS_OFF` accounting count ONLY items in the
+///   bounded channel. Every cell here is out of band: writing or reading
+///   it never touches flow control. (A client-side pause must not trip
+///   the wire-level `EVENTS_OFF` and freeze sibling subscriptions.)
+/// - **I2 — error preservation.** The `error` cell is separate from the
+///   value cells. A value can never overwrite or hide a pending error;
+///   errors bypass pause and are delivered first.
+/// - **I3 — pause scope.** A value buffered *before* `pause()` lives in
+///   `ready` and stays deliverable while paused. A value arriving
+///   *during* the pause lives in `held` (a SEPARATE cell) and is
+///   withheld until `resume`; it can never overwrite the pre-pause
+///   `ready` value.
 ///
-/// The pause flag and both slots live under one mutex so the
-/// producer's "decide vs pause + write" and the consumer's "check
-/// pause + take" are each atomic against `resume`'s "flip + notify" —
-/// no window where a value written just-before-resume is never woken.
+/// All cells + the pause flag live under one mutex, so the producer's
+/// "decide vs pause + write" and the consumer's "check pause + take"
+/// are each atomic against `resume`'s "collapse + flip + notify" — no
+/// window where a held value written just-before-resume is stranded.
 pub(crate) struct CoalesceSlot {
     inner: StdMutex<CoalesceInner>,
     notify: Notify,
 }
 
 struct CoalesceInner {
-    /// Pending error — sticky, bypasses pause, never overwritten by a
-    /// value (I2). Latest error wins among errors.
+    /// Pending error — sticky, bypasses pause, delivered first (I2).
+    /// Latest error wins among errors. Never touched by value writes.
     error: Option<CaError>,
-    /// Pending value (Ok snapshot) — overflow-coalesced or pause-held.
-    value: Option<Snapshot>,
-    /// Whether `value` may be delivered while paused: `true` if it was
-    /// buffered before the pause (I3), `false` if it arrived during it.
-    value_deliverable_while_paused: bool,
+    /// Latest value deliverable now: active overflow, or the value
+    /// frozen at the pause boundary (I3 pre-pause backlog).
+    ready: Option<Snapshot>,
+    /// Latest value that arrived DURING a pause — withheld from the
+    /// consumer until `resume` collapses it into `ready` (I3 hold).
+    /// A separate cell so it can never clobber a pre-pause `ready`.
+    held: Option<Snapshot>,
     paused: bool,
 }
 
@@ -73,8 +75,8 @@ impl CoalesceSlot {
         Arc::new(Self {
             inner: StdMutex::new(CoalesceInner {
                 error: None,
-                value: None,
-                value_deliverable_while_paused: false,
+                ready: None,
+                held: None,
                 paused: false,
             }),
             notify: Notify::new(),
@@ -82,22 +84,21 @@ impl CoalesceSlot {
     }
 
     /// Route a value snapshot atomically against the pause flag.
-    /// Slot writes are out of flow control (I1).
+    /// Out of flow control (I1).
     pub fn route_value(&self, snapshot: Snapshot) -> ValueRoute {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
         if g.paused {
-            // I3: arrived during pause → held, not deliverable while
-            // paused. No notify (recv is gated; resume() wakes it).
-            g.value = Some(snapshot);
-            g.value_deliverable_while_paused = false;
+            // I3: during-pause value → `held` (separate cell). The
+            // pre-pause `ready` value is untouched and stays
+            // deliverable. No notify — recv is gated for `held`;
+            // resume() collapses + wakes.
+            g.held = Some(snapshot);
             ValueRoute::Slotted
-        } else if g.value.is_some() {
-            // Overflow coalesce while active — replace in place
-            // (order-preservation: a fresh value must not jump ahead
-            // of an older slotted one via the channel). Buffered while
-            // active → deliverable even if a pause begins later (I3).
-            g.value = Some(snapshot);
-            g.value_deliverable_while_paused = true;
+        } else if g.ready.is_some() {
+            // Active overflow — coalesce into `ready` (order-preserving:
+            // a fresh value must not jump ahead of an older slotted one
+            // via the channel).
+            g.ready = Some(snapshot);
             drop(g);
             self.notify.notify_one();
             ValueRoute::Slotted
@@ -106,20 +107,22 @@ impl CoalesceSlot {
         }
     }
 
-    /// Overflow fallback after a full channel: store the value in the
-    /// slot. Marked deliverable-while-paused unless a pause has begun
-    /// in the meantime. Out of flow control (I1).
+    /// Overflow fallback after a full channel: coalesce into `ready`
+    /// (active) or `held` (if a pause raced in). Out of flow control.
     fn put_value(&self, snapshot: Snapshot) {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
-        g.value_deliverable_while_paused = !g.paused;
-        g.value = Some(snapshot);
-        drop(g);
-        self.notify.notify_one();
+        if g.paused {
+            g.held = Some(snapshot);
+            // gated — no notify
+        } else {
+            g.ready = Some(snapshot);
+            drop(g);
+            self.notify.notify_one();
+        }
     }
 
-    /// Store an error in the dedicated error slot (I2). Latest error
-    /// wins; never touches `value`. Bypasses pause. Out of flow
-    /// control (I1).
+    /// Store an error in the dedicated error cell (I2). Latest error
+    /// wins; never touches the value cells. Bypasses pause.
     fn put_error(&self, err: CaError) {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
         g.error = Some(err);
@@ -127,35 +130,41 @@ impl CoalesceSlot {
         self.notify.notify_one();
     }
 
-    /// Take the next deliverable item, if any. Errors take priority
-    /// and bypass pause (I2). A value is delivered when not paused, or
-    /// while paused only if it was buffered before the pause (I3).
+    /// Take the next deliverable item. Errors first (bypass pause, I2),
+    /// then the `ready` value. The `held` value is never delivered
+    /// directly — it only becomes deliverable when `resume` collapses
+    /// it into `ready` (I3), so the pause gate is enforced purely by
+    /// routing, not by a runtime check here.
     pub fn take_deliverable(&self) -> Option<CaResult<Snapshot>> {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
         if let Some(err) = g.error.take() {
             return Some(Err(err));
         }
-        if g.value.is_some() && (!g.paused || g.value_deliverable_while_paused) {
-            return g.value.take().map(Ok);
-        }
-        None
+        g.ready.take().map(Ok)
     }
 
-    /// Future that resolves on the next `notify` (deliverable slot
-    /// write or `resume`).
+    /// Future that resolves on the next `notify` (deliverable write or
+    /// `resume`).
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
     }
 
     /// Set/clear the pause flag. Returns the previous value. On a
-    /// true→false transition wakes `recv` so it can flush the held
-    /// value. Atomic with the producer/consumer slot operations.
+    /// true→false transition (resume) it collapses any `held` value
+    /// into `ready` (latest-wins) so it becomes deliverable, and wakes
+    /// `recv`. Atomic with the producer/consumer slot operations.
     pub fn set_paused(&self, paused: bool) -> bool {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
         let prev = g.paused;
         g.paused = paused;
+        let resumed = prev && !paused;
+        if resumed && g.held.is_some() {
+            // The during-pause value supersedes the pre-pause `ready`
+            // (latest-wins coalesce), now deliverable.
+            g.ready = g.held.take();
+        }
         drop(g);
-        if prev && !paused {
+        if resumed {
             self.notify.notify_one();
         }
         prev
@@ -168,25 +177,28 @@ impl CoalesceSlot {
             .paused
     }
 
-    /// Drop any pending value AND error regardless of pause state.
-    /// Used on disconnect so a stale snapshot/error can't outlive the
-    /// circuit.
+    /// Drop both value cells (ready + held) AND the error regardless of
+    /// pause state. Used on disconnect so a stale snapshot/error can't
+    /// outlive the circuit.
     fn clear(&self) {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
         g.error = None;
-        g.value = None;
-        g.value_deliverable_while_paused = false;
+        g.ready = None;
+        g.held = None;
     }
 
-    /// Test-only: unconditional drain (error first, then value),
-    /// ignoring pause and the deliverable flag.
+    /// Test-only: unconditional drain — error, then `ready`, then
+    /// `held`, ignoring pause.
     #[cfg(test)]
     fn take_raw(&self) -> Option<CaResult<Snapshot>> {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
         if let Some(err) = g.error.take() {
             return Some(Err(err));
         }
-        g.value.take().map(Ok)
+        if let Some(v) = g.ready.take() {
+            return Some(Ok(v));
+        }
+        g.held.take().map(Ok)
     }
 }
 
@@ -373,35 +385,38 @@ impl SubscriptionRegistry {
     /// Pre-fix Rust silently flipped `needs_restore = true` and waited
     /// for reconnect, so a libca-style `MonitorHandle::recv()` saw
     /// nothing when the circuit died.
+    /// Returns a structured flow-control delta: per-circuit map of how
+    /// many bounded-channel items were "forgotten" (abandoned for
+    /// flow-control purposes) so the coordinator can decrement the
+    /// circuit's outstanding count. Every disconnect path MUST apply
+    /// this delta (the F3 fix).
+    ///
+    /// The disconnect error goes ALWAYS into the error cell (never the
+    /// bounded channel), so it never bumps `pending` — this keeps the
+    /// flow-control owner single (channel send/recv only, I1) and the
+    /// returned delta unambiguous (no "did the error land in the
+    /// channel?" case to reconcile).
     pub fn mark_disconnected(&mut self, cids: &[u32]) -> HashMap<SocketAddr, usize> {
         const ECA_DISCONN: u32 = 192; // protocol::ECA_DISCONN
         let mut cleared = HashMap::new();
         for rec in self.subscriptions.values_mut() {
             if cids.contains(&rec.cid) {
                 rec.needs_restore = true;
+                // Forget the bounded-channel items for flow control:
+                // they stay in the channel for the consumer to drain
+                // (R2-37), but draining them won't re-decrement
+                // outstanding because `pending` is now 0
+                // (`mark_consumed` returns `None`).
                 let old_pending = rec.pending_deliveries;
                 rec.pending_deliveries = 0;
-                // Drop any stale snapshot/error first so the disconnect
-                // error becomes the next thing the consumer reads — a
-                // pre-disconnect value would mask it.
+                // Drop stale value cells, then park ECA_DISCONN in the
+                // error cell. It is delivered with priority and bypasses
+                // pause; being out of band it leaves `pending` at 0.
                 rec.coalesce_slot.clear();
-                // Route the disconnect through `try_deliver_err` so the
-                // bounded-channel-full case coalesces ECA_DISCONN into
-                // the slot rather than silently dropping it. Matches
-                // the `on_monitor_error` path's contract.
-                let server_addr = rec.server_addr;
-                let _ = try_deliver_err(rec, CaError::ServerError(ECA_DISCONN), server_addr);
-                // Net flow-control delta: `old_pending` was the count
-                // already accounted for via earlier
-                // `flow_control_note_queued` calls. We cleared all of
-                // them and replaced with at most one outstanding
-                // DISCONN delivery (now in `pending_deliveries`,
-                // typically 1). Subtract the new outstanding so the
-                // coordinator's `flow_control_note_consumed` call
-                // decrements outstanding by the right net amount.
-                let net = old_pending.saturating_sub(rec.pending_deliveries);
-                if net > 0 {
-                    *cleared.entry(server_addr).or_insert(0) += net;
+                rec.coalesce_slot
+                    .put_error(CaError::ServerError(ECA_DISCONN));
+                if old_pending > 0 {
+                    *cleared.entry(rec.server_addr).or_insert(0) += old_pending;
                 }
             }
         }
@@ -911,6 +926,71 @@ mod tests {
             slot.take_deliverable().is_none(),
             "during-pause value is withheld until resume"
         );
+    }
+
+    /// This-round F1 / I3 (the precise repro): a pre-pause `ready` value
+    /// and a during-pause value coexist. The during-pause value must
+    /// land in the SEPARATE `held` cell, NOT overwrite `ready`.
+    /// take_deliverable yields the pre-pause value; the during-pause one
+    /// surfaces only after resume.
+    #[test]
+    fn prepause_ready_not_clobbered_by_concurrent_during_pause_value() {
+        let slot = CoalesceSlot::new();
+        slot.put_value(long_snap(11)); // pre-pause ready
+        slot.set_paused(true);
+        // During pause a new value arrives — must NOT overwrite ready.
+        assert!(matches!(
+            slot.route_value(long_snap(22)),
+            ValueRoute::Slotted
+        ));
+        // While still paused, the deliverable item is the PRE-PAUSE 11.
+        let v = slot
+            .take_deliverable()
+            .expect("pre-pause value still deliverable");
+        assert_eq!(
+            v.expect("Ok").value,
+            EpicsValue::Long(11),
+            "during-pause 22 must not clobber pre-pause 11"
+        );
+        // 22 stays gated until resume, then surfaces.
+        assert!(slot.take_deliverable().is_none(), "22 gated while paused");
+        slot.set_paused(false);
+        assert_eq!(
+            slot.take_deliverable()
+                .expect("22 after resume")
+                .expect("Ok")
+                .value,
+            EpicsValue::Long(22),
+        );
+    }
+
+    /// F2 boundary: `mark_disconnected` with `old_pending == 0` (no
+    /// channel items) yields no flow-control delta and never bumps
+    /// `pending` — the DISCONN goes to the error cell only, never the
+    /// channel.
+    #[test]
+    fn mark_disconnected_old_pending_zero_yields_no_delta() {
+        let mut reg = SubscriptionRegistry::new();
+        let (callback_tx, mut rx) = mpsc::channel::<CaResult<Snapshot>>(4);
+        let coalesce_slot = CoalesceSlot::new();
+        reg.add(slotted_record(coalesce_slot.clone(), callback_tx));
+        assert_eq!(reg.get(1).expect("rec").pending_deliveries, 0);
+
+        let cleared = reg.mark_disconnected(&[100]);
+        assert!(
+            cleared.is_empty(),
+            "no channel items → empty flow-control delta"
+        );
+        assert_eq!(
+            reg.get(1).expect("rec").pending_deliveries,
+            0,
+            "DISCONN parks in the error cell; pending never bumped",
+        );
+        assert!(rx.try_recv().is_err(), "DISCONN did NOT go to the channel");
+        match coalesce_slot.take_raw().expect("DISCONN in error cell") {
+            Err(CaError::ServerError(192)) => {}
+            other => panic!("expected ECA_DISCONN, got {other:?}"),
+        }
     }
 
     /// A′ error policy: errors bypass pause — `take_deliverable` yields

@@ -2137,13 +2137,9 @@ impl CaChannel {
     /// Events where |new - old| < deadband are suppressed (scalar values only).
     pub async fn subscribe_with_deadband(&self, deadband: f64) -> CaResult<MonitorHandle> {
         let subid = alloc_subid();
-        // Bounded queue prevents unbounded memory growth on slow consumers.
-        // EVENTS_OFF will fire when outstanding hits FLOW_CONTROL_OFF_THRESHOLD,
-        // but the queue gives the application a buffer before drops kick in.
-        let queue_size = epics_base_rs::runtime::env::get("EPICS_CA_MONITOR_QUEUE")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(256)
-            .max(8);
+        let env = epics_base_rs::runtime::env::get("EPICS_CA_MONITOR_QUEUE")
+            .and_then(|s| s.parse::<usize>().ok());
+        let queue_size = resolve_monitor_queue_size(env);
         let (callback_tx, callback_rx) = mpsc::channel(queue_size);
         let coalesce_slot = subscription::CoalesceSlot::new();
 
@@ -2427,6 +2423,16 @@ impl Drop for EventWatcher {
 // --- Coordinator ---
 
 const FLOW_CONTROL_OFF_THRESHOLD: usize = 10;
+
+/// Resolve the per-subscription bounded-queue size from the optional
+/// `EPICS_CA_MONITOR_QUEUE` value. Defaults to 256 and is clamped to at
+/// least [`FLOW_CONTROL_OFF_THRESHOLD`] (F4): slot overflow is out of
+/// flow control (I1), so a queue smaller than the threshold could fill
+/// and coalesce forever without a lone subscription ever tripping
+/// `EVENTS_OFF`.
+fn resolve_monitor_queue_size(env: Option<usize>) -> usize {
+    env.unwrap_or(256).max(FLOW_CONTROL_OFF_THRESHOLD)
+}
 const FLOW_CONTROL_ON_THRESHOLD: usize = 5;
 
 #[derive(Default)]
@@ -3319,7 +3325,21 @@ async fn run_coordinator(
                         if !affected_cids.is_empty() {
                             let cid_set: HashSet<u32> = affected_cids.iter().copied().collect();
                             drain_waiters_for_cids(&cid_set, &in_flight);
-                            let _ = subscriptions.mark_disconnected(&affected_cids);
+                            // F3: apply the flow-control delta. Earlier
+                            // this discarded the returned map, so the
+                            // forgotten channel items left the circuit
+                            // outstanding count high — EVENTS_ON could
+                            // stay stuck. Every disconnect path must
+                            // decrement by the cleared delta.
+                            let cleared = subscriptions.mark_disconnected(&affected_cids);
+                            for (addr, count) in cleared {
+                                flow_control_note_consumed(
+                                    &mut flow_control,
+                                    addr,
+                                    count,
+                                    &transport_tx,
+                                );
+                            }
                         }
                     }
                     TransportEvent::CircuitResponsive { server_addr } => {
@@ -4638,6 +4658,31 @@ mod monitor_pause_tests {
             .expect("Some")
             .expect("Ok");
         assert_eq!(v2.value, EpicsValue::Long(2), "held latest after resume");
+    }
+
+    /// F4: a configured queue smaller than FLOW_CONTROL_OFF_THRESHOLD is
+    /// clamped up so a lone subscription's full channel can still reach
+    /// the threshold and trip EVENTS_OFF (slot overflow is out of flow
+    /// control, so an unclamped small queue would coalesce forever).
+    #[test]
+    fn monitor_queue_clamped_to_flow_control_threshold() {
+        // Below threshold → clamped up.
+        assert_eq!(
+            resolve_monitor_queue_size(Some(5)),
+            FLOW_CONTROL_OFF_THRESHOLD
+        );
+        assert_eq!(
+            resolve_monitor_queue_size(Some(9)),
+            FLOW_CONTROL_OFF_THRESHOLD
+        );
+        // At/above threshold → unchanged.
+        assert_eq!(
+            resolve_monitor_queue_size(Some(FLOW_CONTROL_OFF_THRESHOLD)),
+            FLOW_CONTROL_OFF_THRESHOLD
+        );
+        assert_eq!(resolve_monitor_queue_size(Some(1000)), 1000);
+        // Unset → default 256 (well above the threshold).
+        assert_eq!(resolve_monitor_queue_size(None), 256);
     }
 
     /// A′ error policy end-to-end: an error arriving during pause is

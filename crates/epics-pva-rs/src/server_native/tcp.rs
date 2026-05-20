@@ -1953,10 +1953,11 @@ async fn handle_put_get(
         let put_result = {
             let checked = src
                 .access_gate()
-                .check(
+                .check_with_roles(
                     &pv_name,
                     &ctx.host,
                     &ctx.account,
+                    &ctx.roles,
                     &ctx.method,
                     &ctx.authority,
                 )
@@ -1978,10 +1979,11 @@ async fn handle_put_get(
         // GET leg — READ-gated.
         let read_checked = src
             .access_gate()
-            .check(
+            .check_with_roles(
                 &pv_name,
                 &ctx.host,
                 &ctx.account,
+                &ctx.roles,
                 &ctx.method,
                 &ctx.authority,
             )
@@ -2160,10 +2162,11 @@ async fn handle_process(
     let join = tokio::spawn(async move {
         let checked = src
             .access_gate()
-            .check(
+            .check_with_roles(
                 &pv_name,
                 &ctx.host,
                 &ctx.account,
+                &ctx.roles,
                 &ctx.method,
                 &ctx.authority,
             )
@@ -2936,10 +2939,11 @@ async fn handle_op(
                 };
                 let checked = src
                     .access_gate()
-                    .check(
+                    .check_with_roles(
                         &pv_name,
                         &ctx.host,
                         &ctx.account,
+                        &ctx.roles,
                         &ctx.method,
                         &ctx.authority,
                     )
@@ -3033,10 +3037,11 @@ async fn handle_op(
                     };
                     let checked = src
                         .access_gate()
-                        .check(
+                        .check_with_roles(
                             &pv_name,
                             &ctx.host,
                             &ctx.account,
+                            &ctx.roles,
                             &ctx.method,
                             &ctx.authority,
                         )
@@ -3132,10 +3137,11 @@ async fn handle_op(
                 let result = {
                     let checked = src
                         .access_gate()
-                        .check(
+                        .check_with_roles(
                             &pv_name,
                             &ctx.host,
                             &ctx.account,
+                            &ctx.roles,
                             &ctx.method,
                             &ctx.authority,
                         )
@@ -3161,10 +3167,11 @@ async fn handle_op(
                             // bitset instead of truncating the wire.
                             let read_checked = src
                                 .access_gate()
-                                .check(
+                                .check_with_roles(
                                     &pv_name,
                                     &ctx.host,
                                     &ctx.account,
+                                    &ctx.roles,
                                     &ctx.method,
                                     &ctx.authority,
                                 )
@@ -3365,10 +3372,11 @@ async fn handle_op(
                     );
                     let mon_checked = src
                         .access_gate()
-                        .check(
+                        .check_with_roles(
                             &pv_name,
                             &mon_ctx.host,
                             &mon_ctx.account,
+                            &mon_ctx.roles,
                             &mon_ctx.method,
                             &mon_ctx.authority,
                         )
@@ -3932,10 +3940,11 @@ async fn handle_op(
             let join = tokio::spawn(async move {
                 let rpc_checked = src
                     .access_gate()
-                    .check(
+                    .check_with_roles(
                         &pv_name,
                         &rpc_ctx_val.host,
                         &rpc_ctx_val.account,
+                        &rpc_ctx_val.roles,
                         &rpc_ctx_val.method,
                         &rpc_ctx_val.authority,
                     )

@@ -191,10 +191,13 @@ pub trait ChannelSource: Send + Sync + 'static {
         let account = ctx.account.clone();
         let method = ctx.method.clone();
         let authority = ctx.authority.clone();
+        // PVA-FR-3: forward the peer's role claims so `role/<name>` UAG
+        // members can match.
+        let roles = ctx.roles.clone();
         let name = pv_name.to_string();
         async move {
             let checked = gate
-                .check(&name, &host, &account, &method, &authority)
+                .check_with_roles(&name, &host, &account, &roles, &method, &authority)
                 .await;
             if checked.allows_read() {
                 Some(checked)

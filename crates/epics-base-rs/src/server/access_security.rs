@@ -150,7 +150,14 @@ pub type AsgAslResolver = std::sync::Arc<
 /// the input is unresolvable / disconnected (bad input → the CALC-gated
 /// rule denies). Installed on an [`AccessGate`] by the owning server so
 /// `check` can evaluate `RULE(...) { CALC(...) }` against live values.
-pub type InpResolver = std::sync::Arc<dyn Fn(&str) -> Option<f64> + Send + Sync>;
+/// Async because the value typically lives behind the server's async
+/// database lock; [`AccessGate::check_with_roles`] resolves the ASG's
+/// links up front, then evaluates the (sync) expression.
+pub type InpResolver = std::sync::Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<f64>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 enum AccessGateInner {
@@ -312,31 +319,46 @@ impl AccessGate {
                     None => (AccessLevel::ReadWrite, false),
                     Some(ref cfg) => {
                         let (asg, asl) = resolver(pv_name.clone()).await;
-                        // CA-FR-1: evaluate a CALC clause against the
-                        // ASG's resolved INP* links. Any bad input, a
-                        // false result, or a missing resolver denies.
-                        let inp_resolver = self.inp_resolver.clone();
-                        let calc_ok = |expr: &str| -> bool {
-                            let Some(ref res) = inp_resolver else {
-                                return false;
-                            };
-                            let Some(group) = cfg.asg.get(&asg).or_else(|| cfg.asg.get("DEFAULT"))
-                            else {
-                                return false;
-                            };
-                            let mut inputs = crate::calc::NumericInputs::new();
-                            for inp in &group.inp {
-                                let idx = inp.index as usize;
-                                if idx >= crate::calc::CALC_NARGS {
-                                    continue;
-                                }
-                                match res(&inp.link) {
-                                    Some(v) => inputs.vars[idx] = v,
-                                    None => return false,
+                        // CA-FR-1: pre-resolve the ASG's INP* links up
+                        // front — the resolver is async (it reads the
+                        // server DB). `Some(inputs)` when every declared
+                        // link resolved; `None` when there is no resolver
+                        // or any input is bad/disconnected → CALC fails
+                        // closed. Each rule's expression is then evaluated
+                        // synchronously in `compute_rules`.
+                        let inp_values: Option<crate::calc::NumericInputs> = match self.inp_resolver
+                        {
+                            None => None,
+                            Some(ref res) => {
+                                match cfg.asg.get(&asg).or_else(|| cfg.asg.get("DEFAULT")) {
+                                    None => None,
+                                    Some(group) => {
+                                        let mut inputs = crate::calc::NumericInputs::new();
+                                        let mut ok = true;
+                                        for inp in &group.inp {
+                                            let idx = inp.index as usize;
+                                            if idx >= crate::calc::CALC_NARGS {
+                                                continue;
+                                            }
+                                            match res(inp.link.clone()).await {
+                                                Some(v) => inputs.vars[idx] = v,
+                                                None => {
+                                                    ok = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        ok.then_some(inputs)
+                                    }
                                 }
                             }
+                        };
+                        let calc_ok = |expr: &str| -> bool {
+                            let Some(ref inputs) = inp_values else {
+                                return false;
+                            };
                             match crate::calc::compile(expr) {
-                                Ok(c) => crate::calc::eval(&c, &mut inputs)
+                                Ok(c) => crate::calc::eval(&c, &mut inputs.clone())
                                     .map(|r| r != 0.0)
                                     .unwrap_or(false),
                                 Err(_) => false,
@@ -2507,22 +2529,24 @@ ASG(LOCKED)    { }
         let asg_resolver: AsgAslResolver =
             Arc::new(|_name| Box::pin(async { ("OPS".to_string(), 0u8) }));
 
-        let grant = AccessGate::required(cell.clone(), asg_resolver.clone())
-            .with_inp_resolver(Arc::new(|link: &str| (link == "permit.VAL").then_some(1.0)));
+        let grant = AccessGate::required(cell.clone(), asg_resolver.clone()).with_inp_resolver(
+            Arc::new(|link: String| Box::pin(async move { (link == "permit.VAL").then_some(1.0) })),
+        );
         assert!(
             grant.check("x", "h", "u", "ca", "").await.allows_write(),
             "CALC A=1 with permit=1 grants WRITE"
         );
 
-        let deny = AccessGate::required(cell.clone(), asg_resolver.clone())
-            .with_inp_resolver(Arc::new(|link: &str| (link == "permit.VAL").then_some(0.0)));
+        let deny = AccessGate::required(cell.clone(), asg_resolver.clone()).with_inp_resolver(
+            Arc::new(|link: String| Box::pin(async move { (link == "permit.VAL").then_some(0.0) })),
+        );
         assert!(
             !deny.check("x", "h", "u", "ca", "").await.allows_write(),
             "CALC A=1 with permit=0 denies WRITE"
         );
 
         let bad = AccessGate::required(cell.clone(), asg_resolver.clone())
-            .with_inp_resolver(Arc::new(|_link: &str| None));
+            .with_inp_resolver(Arc::new(|_link: String| Box::pin(async move { None })));
         assert!(
             !bad.check("x", "h", "u", "ca", "").await.allows_write(),
             "a bad/disconnected INP denies the CALC-gated rule"

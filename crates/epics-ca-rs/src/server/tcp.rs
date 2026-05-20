@@ -342,6 +342,9 @@ struct ClientState {
     /// Empty for plaintext peers.
     auth_authority: String,
     acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
+    /// CA-FR-1: record database, for resolving ACF `INP*` links to live
+    /// values when evaluating CALC-gated rules in `compute_access`.
+    db: Arc<PvDatabase>,
     tcp_port: u16,
     client_minor_version: u16,
     flow_control: Arc<FlowControlGate>,
@@ -387,7 +390,11 @@ struct ClientState {
 }
 
 impl ClientState {
-    fn new(acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>, tcp_port: u16) -> Self {
+    fn new(
+        acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
+        tcp_port: u16,
+        db: Arc<PvDatabase>,
+    ) -> Self {
         Self {
             channels: HashMap::new(),
             subscriptions: HashMap::new(),
@@ -400,6 +407,7 @@ impl ClientState {
             auth_method: String::new(),
             auth_authority: String::new(),
             acf,
+            db,
             tcp_port,
             client_minor_version: 0,
             flow_control: Arc::new(FlowControlGate::default()),
@@ -475,6 +483,67 @@ impl ClientState {
     /// (MR-R20). The trap flag is `false` for `SimplePv`/`RecordField`
     /// targets whose access was not resolved through a `TRAPWRITE`
     /// rule — including the no-ACF permissive fallback.
+    /// CA-FR-1: resolve an ASG's `INP*` links to live numeric values
+    /// (A..U) from the record database. `None` when a declared link is
+    /// unresolvable / bad — the CALC-gated rule then fails closed.
+    /// Caller must NOT hold a record read-guard that a link could point
+    /// back to (would re-read the same lock).
+    async fn calc_inputs(
+        &self,
+        cfg: &AccessSecurityConfig,
+        asg_name: &str,
+    ) -> Option<epics_base_rs::calc::NumericInputs> {
+        let group = cfg.asg.get(asg_name).or_else(|| cfg.asg.get("DEFAULT"))?;
+        let mut inputs = epics_base_rs::calc::NumericInputs::new();
+        for inp in &group.inp {
+            let idx = inp.index as usize;
+            if idx >= epics_base_rs::calc::CALC_NARGS {
+                continue;
+            }
+            let (base, field) = parse_pv_name(&inp.link);
+            let field = if field.is_empty() { "VAL" } else { field };
+            let rec = self.db.get_record(base).await?;
+            let inst = rec.read().await;
+            match inst.resolve_field(field).and_then(|v| v.to_f64()) {
+                Some(v) => inputs.vars[idx] = v,
+                None => return None,
+            }
+        }
+        Some(inputs)
+    }
+
+    /// CA-FR-1: evaluate `cfg`'s rules for `asg_name`, with CALC clauses
+    /// gated against the resolved `INP*` values.
+    async fn access_for_asg(
+        &self,
+        cfg: &AccessSecurityConfig,
+        asg_name: &str,
+        asl: u8,
+    ) -> (AccessLevel, bool) {
+        let calc_inputs = self.calc_inputs(cfg, asg_name).await;
+        let calc_ok = |expr: &str| -> bool {
+            match calc_inputs {
+                Some(ref i) => match epics_base_rs::calc::compile(expr) {
+                    Ok(c) => epics_base_rs::calc::eval(&c, &mut i.clone())
+                        .map(|r| r != 0.0)
+                        .unwrap_or(false),
+                    Err(_) => false,
+                },
+                None => false,
+            }
+        };
+        cfg.compute_for_name(
+            asg_name,
+            &self.hostname,
+            &self.username,
+            &[],
+            asl,
+            &self.auth_method,
+            &self.auth_authority,
+            &calc_ok,
+        )
+    }
+
     async fn compute_access(&self, target: &ChannelTarget) -> (u32, bool) {
         match target {
             ChannelTarget::SimplePv(_) => {
@@ -486,15 +555,9 @@ impl ClientState {
                     // names that never went through `dbAddMember`.
                     // PR #641: pass auth method/authority so
                     // METHOD("x509") / AUTHORITY(<issuer>) rules
-                    // can gate mTLS-authenticated peers.
-                    let (level, rule_was_trap) = acf_cfg.check_access_method_trap(
-                        "DEFAULT",
-                        &self.hostname,
-                        &self.username,
-                        0,
-                        &self.auth_method,
-                        &self.auth_authority,
-                    );
+                    // can gate mTLS-authenticated peers. CA-FR-1: CALC
+                    // rules are evaluated against resolved INP* links.
+                    let (level, rule_was_trap) = self.access_for_asg(acf_cfg, "DEFAULT", 0).await;
                     let bits = match level {
                         AccessLevel::ReadWrite => 3,
                         AccessLevel::Read => 1,
@@ -508,14 +571,21 @@ impl ClientState {
                 }
             }
             ChannelTarget::RecordField { record, field: f } => {
-                let instance = record.read().await;
-                let is_ro = instance
-                    .record
-                    .field_list()
-                    .iter()
-                    .find(|fd| fd.name == f.as_str())
-                    .map(|fd| fd.read_only)
-                    .unwrap_or(false);
+                // CA-FR-1: extract is_ro/asg/asl and DROP the record
+                // read-guard before resolving ACF INP* links, so a CALC
+                // input pointing back at this record can't re-acquire the
+                // same lock.
+                let (is_ro, asg, asl) = {
+                    let instance = record.read().await;
+                    let is_ro = instance
+                        .record
+                        .field_list()
+                        .iter()
+                        .find(|fd| fd.name == f.as_str())
+                        .map(|fd| fd.read_only)
+                        .unwrap_or(false);
+                    (is_ro, instance.common.asg.clone(), instance.common.asl)
+                };
                 // R48-G2 (Round 48): read-only field-ness must AND
                 // with ACF, never replace it. Pre-fix the read-only
                 // branch returned `Read`(1) unconditionally — a
@@ -526,23 +596,11 @@ impl ClientState {
                 // only strips the WRITE bit from the result.
                 let guard = self.acf.read().await;
                 let (acf_level, rule_was_trap) = if let Some(ref acf_cfg) = *guard {
-                    // Round-33A (R33-G4): thread the per-record
-                    // ASL into the ACF check so `RULE(N, …)`
-                    // gates correctly disable rules whose level
-                    // is below the record's ASL.
-                    // PR #641: pass auth method/authority so
-                    // mTLS-only rules (METHOD("x509"), AUTHORITY(...))
-                    // can gate write access by issuer CA.
-                    let asg = &instance.common.asg;
-                    let asl = instance.common.asl;
-                    acf_cfg.check_access_method_trap(
-                        asg,
-                        &self.hostname,
-                        &self.username,
-                        asl,
-                        &self.auth_method,
-                        &self.auth_authority,
-                    )
+                    // Round-33A (R33-G4): thread the per-record ASL so
+                    // `RULE(N, …)` gates correctly. PR #641: method/
+                    // authority for mTLS rules. CA-FR-1: CALC rules are
+                    // evaluated against resolved INP* links.
+                    self.access_for_asg(acf_cfg, &asg, asl).await
                 } else {
                     (AccessLevel::ReadWrite, false)
                 };
@@ -1104,7 +1162,7 @@ where
     // responses; 64 KB covers the common bulk_caget(100) case with
     // headroom for follow-on monitor events queued in the same tick.
     let writer = Arc::new(Mutex::new(BufWriter::with_capacity(64 * 1024, writer)));
-    let mut state = ClientState::new(acf, tcp_port);
+    let mut state = ClientState::new(acf, tcp_port, db.clone());
     #[cfg(feature = "cap-tokens")]
     {
         state.cap_token_verifier = cap_token_verifier;

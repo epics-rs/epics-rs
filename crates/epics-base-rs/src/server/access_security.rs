@@ -592,7 +592,7 @@ impl AccessSecurityConfig {
     /// rules with the given `roles` and CALC `calc_ok`. The single entry
     /// the role-/CALC-aware [`AccessGate::check_with_roles`] uses.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn compute_for_name(
+    pub fn compute_for_name(
         &self,
         asg_name: &str,
         host: &str,

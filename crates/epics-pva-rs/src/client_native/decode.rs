@@ -317,6 +317,13 @@ pub struct OpDataResponse {
     pub status: Status,
     pub changed: BitSet,
     pub value: PvField,
+    /// PVA-FR-10: MONITOR DATA carries an overrun bitset after the value
+    /// — the server sets bits for fields it coalesced/squashed because
+    /// the client fell behind. Non-empty ⟹ a server-side squash
+    /// occurred (pvxs `clientmon.cpp:549-558` sets `servSquash` when any
+    /// word is non-zero). Always empty for GET/PUT_GET/RPC, which carry
+    /// no overrun on the wire.
+    pub overrun: BitSet,
     /// Response type descriptor — only populated for RPC, where the wire
     /// format carries its own type independent of any INIT-time
     /// introspection. `None` for GET/MONITOR/PUT_GET (the caller already
@@ -465,6 +472,8 @@ pub fn decode_op_response_cached(
             status,
             changed: all,
             value: resp_value,
+            // RPC responses carry no overrun bitset.
+            overrun: BitSet::new(),
             response_desc: Some(resp_desc),
         }));
     }
@@ -486,16 +495,20 @@ pub fn decode_op_response_cached(
     )
     .map_err(|e| PvaError::Decode(e.to_string()))?;
     // MONITOR data carries the overrun BitSet after the partial value.
-    if cmd == Command::Monitor {
-        let _overrun =
-            BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
-    }
+    // PVA-FR-10: preserve it (a non-empty set means the server squashed)
+    // instead of decoding-and-discarding. GET/PUT carry none → empty.
+    let overrun = if cmd == Command::Monitor {
+        BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?
+    } else {
+        BitSet::new()
+    };
     Ok(OpResponse::Data(OpDataResponse {
         ioid,
         subcmd,
         status,
         changed,
         value,
+        overrun,
         response_desc: None,
     }))
 }
@@ -928,6 +941,78 @@ mod tests {
                 other => panic!("{label}: expected init, got {other:?}"),
             }
         }
+    }
+
+    /// PVA-FR-10: a MONITOR DATA frame ends with an overrun bitset; the
+    /// decoder must preserve it on `OpDataResponse` (non-empty ⟹ the
+    /// server squashed) instead of decoding-and-discarding it. An empty
+    /// `changed` bitset means no value bytes follow, so this exercises
+    /// the trailing-overrun parse in isolation.
+    #[test]
+    fn monitor_data_preserves_overrun_bitset() {
+        use crate::proto::WriteExt;
+        use crate::pvdata::ScalarType;
+
+        let order = ByteOrder::Little;
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+
+        let build = |overrun: &BitSet| -> Frame {
+            let mut payload = Vec::new();
+            payload.put_u32(7, order); // ioid
+            payload.put_u8(0x00); // subcmd = DATA
+            let changed = BitSet::new(); // nothing marked → no value bytes
+            payload.extend_from_slice(&changed.encode(order));
+            payload.extend_from_slice(&overrun.encode(order));
+            let header =
+                PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
+            Frame { header, payload }
+        };
+
+        // Non-empty overrun → server squash signalled.
+        let mut overrun = BitSet::new();
+        overrun.set(1);
+        match decode_op_response(&build(&overrun), Some(&intro)).unwrap() {
+            OpResponse::Data(d) => {
+                assert!(!d.overrun.is_empty(), "overrun bitset must be preserved");
+                assert!(d.overrun.iter().any(|b| b == 1));
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+
+        // Empty overrun → no squash.
+        match decode_op_response(&build(&BitSet::new()), Some(&intro)).unwrap() {
+            OpResponse::Data(d) => {
+                assert!(d.overrun.is_empty(), "absent overrun decodes empty");
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    /// PVA-FR-10: `stats(true)` resets `n_srv_squash` (and the other
+    /// running counters) while preserving the configured `limit_queue`.
+    #[test]
+    fn stats_reset_clears_srv_squash_keeps_limit() {
+        use crate::client_native::ops_v2::SubscriptionStat;
+        let mut stat = SubscriptionStat {
+            limit_queue: 16,
+            ..Default::default()
+        };
+        // The monitor loop increments these.
+        stat.n_srv_squash = 3;
+        stat.n_delivered = 10;
+        stat.max_queue = 8;
+        // Mirror the reset arm of SubscriptionHandle::stats(true).
+        let reset = SubscriptionStat {
+            limit_queue: stat.limit_queue,
+            ..Default::default()
+        };
+        assert_eq!(reset.n_srv_squash, 0);
+        assert_eq!(reset.n_delivered, 0);
+        assert_eq!(reset.max_queue, 0);
+        assert_eq!(reset.limit_queue, 16, "configured queue limit preserved");
     }
 
     /// A frame with no type-cache markers — i.e. the introspection

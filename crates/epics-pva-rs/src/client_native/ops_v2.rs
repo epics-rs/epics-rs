@@ -1694,6 +1694,14 @@ where
         if let Some(s) = &state {
             let mut st = s.stats.lock();
             st.n_delivered += 1;
+            // PVA-FR-10: this raw forwarding path's contract is to relay
+            // the body (changed | value | overrun) downstream WITHOUT an
+            // intermediate decode, so it does not parse the trailing
+            // overrun bitset and `n_srv_squash` is not derived here.
+            // The overrun travels intact in `body` and is decoded by the
+            // downstream consumer; the typed `run_monitor_loop` path
+            // populates `n_srv_squash`. Adding a full value decode purely
+            // to read the overrun would defeat this path's purpose.
             if events_since_ack > st.max_queue {
                 st.max_queue = events_since_ack;
             }
@@ -2091,6 +2099,10 @@ where
         };
         match decode_op_response(&frame, Some(&intro)) {
             Ok(OpResponse::Data(d)) => {
+                // PVA-FR-10: a non-empty overrun bitset means the server
+                // coalesced updates because we fell behind. Capture it
+                // before `d.value` is moved below.
+                let srv_squash = !d.overrun.is_empty();
                 let value = if let Some(prev) = prior.as_ref() {
                     crate::pvdata::encode::fill_unmarked_from_prior(
                         &intro, &d.changed, 0, d.value, prev,
@@ -2104,6 +2116,9 @@ where
                 if let Some(s) = &state {
                     let mut st = s.stats.lock();
                     st.n_delivered += 1;
+                    if srv_squash {
+                        st.n_srv_squash += 1;
+                    }
                     if events_since_ack > st.max_queue {
                         st.max_queue = events_since_ack;
                     }

@@ -53,11 +53,6 @@ async fn main() {
     if args.priority.is_some() {
         eprintln!("cainfo-rs: -p (priority) is accepted for parity but not yet honoured");
     }
-    if args.stat_level.is_some() {
-        eprintln!(
-            "cainfo-rs: -s (interest level) is accepted for parity; use --diag for the Rust client's diagnostics"
-        );
-    }
 
     let client = CaClient::new().await.expect("failed to create CA client");
     let timeout = epics_ca_rs::cli::timeout_duration(
@@ -115,7 +110,10 @@ async fn main() {
         }
     }
 
-    if args.diag || args.pv_names.is_empty() {
+    // CA-FR-4: `-s <level>` is the `ca_client_status(level)` analog —
+    // emit the client diagnostics (the Rust equivalent), as `--diag`
+    // does, and without requiring PV names.
+    if args.diag || args.stat_level.is_some() || args.pv_names.is_empty() {
         if !args.pv_names.is_empty() {
             println!();
         }

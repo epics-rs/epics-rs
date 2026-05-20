@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -289,15 +289,200 @@ impl ReadWaiter {
 /// The `cid` field stored alongside each reply lets the disconnect-
 /// cleanup path filter pending ops by channel when a server's
 /// virtual circuit dies (Phase D).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct InFlightOps {
     pub(crate) reads: Arc<DashMap<u32, ReadWaiter>>,
     pub(crate) writes: Arc<DashMap<u32, (u32, WriteReplyTx)>>,
+    /// CA-FR-2: monotonic `ioid` source owned by the same registry
+    /// that holds the live ids. Keeping the counter here (rather than
+    /// a process-global static) lets [`Self::alloc_ioid`] probe
+    /// `reads`/`writes` so a counter that wraps through 2^32 cannot
+    /// reissue an id whose read/write is still pending. Shared across
+    /// `InFlightOps` clones (it is `Arc`), so the coordinator and all
+    /// channels of one client draw from a single id space.
+    next_ioid: Arc<AtomicU32>,
 }
 
 impl InFlightOps {
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            reads: Arc::new(DashMap::new()),
+            writes: Arc::new(DashMap::new()),
+            next_ioid: Arc::new(AtomicU32::new(1)),
+        }
+    }
+
+    /// Allocate an `ioid` that is not currently live in either
+    /// in-flight table. CA-FR-2: the monotonic counter alone can wrap
+    /// onto an id whose operation is still pending (≈11.9 h at 100k
+    /// ops/s); a late response for the stale op would then wake the
+    /// wrong waiter. Probing `reads`/`writes` skips any live id. Two
+    /// concurrent allocations never collide because the counter is
+    /// monotonic, so the probe only guards against prior-wrap
+    /// survivors.
+    pub(crate) fn alloc_ioid(&self) -> u32 {
+        crate::channel::alloc_nonzero_probe(&self.next_ioid, |v| {
+            self.reads.contains_key(&v) || self.writes.contains_key(&v)
+        })
+    }
+
+    /// Test-only: seed the next-ioid counter to drive the wrap path
+    /// deterministically.
+    #[cfg(test)]
+    pub(crate) fn seed_next_ioid(&self, v: u32) {
+        self.next_ioid.store(v, Ordering::Relaxed);
+    }
+}
+
+// --- cid allocator (CA-FR-2) ---
+
+/// `cid` allocator with a live-set. Unlike `ioid`/`subid` — whose
+/// owning tables are reachable where they are allocated — the cid is
+/// minted in [`super::CaClient::create_channel`], which is synchronous
+/// and uses the cid immediately (search schedule + lifecycle handle),
+/// so it cannot be allocated inside the coordinator. This shared
+/// allocator therefore owns the live-set directly: [`Self::allocate`]
+/// reserves an id, skipping any cid still live after a 2^32 wrap, and
+/// the coordinator calls [`Self::release`] at its single channel-
+/// removal site (`CoordRequest::DropChannel`).
+///
+/// Invariant: the live-set mirrors the coordinator's `channels` map
+/// keyed by cid — reserved at `create_channel`, released at
+/// `DropChannel`. Disconnect keeps a channel's entry (it will
+/// reconnect), and `DropChannel` is the one and only place a cid leaves
+/// `channels`, so the two views never disagree on which cids are live.
+#[derive(Clone)]
+pub(crate) struct CidAllocator {
+    next: Arc<AtomicU32>,
+    live: Arc<DashMap<u32, ()>>,
+}
+
+impl CidAllocator {
+    pub(crate) fn new() -> Self {
+        Self {
+            next: Arc::new(AtomicU32::new(1)),
+            live: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Reserve a fresh non-zero cid not currently live. The monotonic
+    /// counter guarantees two concurrent allocations never receive the
+    /// same value, so the probe only has to guard against a prior-wrap
+    /// survivor; the subsequent insert records the reservation for
+    /// future probes and for [`Self::release`].
+    pub(crate) fn allocate(&self) -> u32 {
+        let cid = crate::channel::alloc_nonzero_probe(&self.next, |v| self.live.contains_key(&v));
+        self.live.insert(cid, ());
+        cid
+    }
+
+    /// Release a cid at channel teardown (`DropChannel`). Idempotent —
+    /// a missing entry (already released) is a no-op.
+    pub(crate) fn release(&self, cid: u32) {
+        self.live.remove(&cid);
+    }
+
+    /// Test-only view of the current live-set size.
+    #[cfg(test)]
+    pub(crate) fn live_len(&self) -> usize {
+        self.live.len()
+    }
+
+    /// Test-only: seed the next-cid counter to drive the wrap path
+    /// deterministically.
+    #[cfg(test)]
+    pub(crate) fn seed_next(&self, v: u32) {
+        self.next.store(v, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod id_alloc_tests {
+    use super::*;
+
+    #[test]
+    fn ioid_alloc_is_monotonic_and_distinct() {
+        let f = InFlightOps::new();
+        let a = f.alloc_ioid();
+        let b = f.alloc_ioid();
+        assert_ne!(a, b);
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+    }
+
+    #[test]
+    fn ioid_alloc_skips_live_id_on_wrap() {
+        let f = InFlightOps::new();
+        // Park a live read waiter at ioid 1.
+        f.reads.insert(
+            1,
+            ReadWaiter::Warm {
+                cid: 1,
+                mode: ReadReplyMode::Plain,
+                slot: Arc::new(parking_lot::Mutex::new(None)),
+            },
+        );
+        // Force the counter to wrap back onto the live id.
+        f.seed_next_ioid(1);
+        let id = f.alloc_ioid();
+        assert_ne!(
+            id, 1,
+            "must not reissue an ioid whose read is still in flight"
+        );
+        assert!(!f.reads.contains_key(&id) && !f.writes.contains_key(&id));
+    }
+
+    #[test]
+    fn ioid_alloc_skips_live_write_on_wrap() {
+        let f = InFlightOps::new();
+        let (tx, _rx) = oneshot::channel();
+        f.writes.insert(2, (7, tx));
+        f.seed_next_ioid(2);
+        let id = f.alloc_ioid();
+        assert_ne!(
+            id, 2,
+            "must not reissue an ioid whose write is still in flight"
+        );
+    }
+
+    #[test]
+    fn cid_allocator_reserves_distinct_and_releases() {
+        let a = CidAllocator::new();
+        let c1 = a.allocate();
+        let c2 = a.allocate();
+        assert_ne!(c1, c2);
+        assert_ne!(c1, 0);
+        assert_eq!(a.live_len(), 2);
+        a.release(c1);
+        assert_eq!(a.live_len(), 1);
+        // Idempotent: releasing an absent cid is a no-op.
+        a.release(c1);
+        assert_eq!(a.live_len(), 1);
+    }
+
+    #[test]
+    fn cid_allocator_skips_live_cid_on_wrap() {
+        let a = CidAllocator::new();
+        let live = a.allocate();
+        // Force the counter to wrap back onto the still-live cid.
+        a.seed_next(live);
+        let again = a.allocate();
+        assert_ne!(
+            again, live,
+            "must not reissue a cid whose channel is still live"
+        );
+        assert_eq!(a.live_len(), 2);
+    }
+
+    #[test]
+    fn cid_allocator_reuses_released_cid_only_after_release() {
+        let a = CidAllocator::new();
+        let c1 = a.allocate();
+        a.release(c1);
+        // After release the id is free; a wrap onto it may reuse it.
+        a.seed_next(c1);
+        let c2 = a.allocate();
+        assert_eq!(c2, c1, "a released cid is reusable on wrap");
     }
 }
 

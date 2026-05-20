@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicU32;
 use std::time::SystemTime;
 
 use epics_base_rs::runtime::sync::mpsc;
@@ -285,13 +286,40 @@ pub(crate) struct SubscriptionRecord {
 
 pub(crate) struct SubscriptionRegistry {
     subscriptions: HashMap<u32, SubscriptionRecord>,
+    /// CA-FR-2: monotonic `subid` source owned by the registry that
+    /// holds the live subscriptions. [`Self::alloc_subid`] probes
+    /// `subscriptions` so a counter wrapping through 2^32 cannot
+    /// reissue a subid that an active subscription still uses — a
+    /// stale `EVENT_ADD`/`EVENT_CANCEL` for the old subscription would
+    /// otherwise be routed to the wrong record.
+    next_subid: AtomicU32,
 }
 
 impl SubscriptionRegistry {
     pub fn new() -> Self {
         Self {
             subscriptions: HashMap::new(),
+            next_subid: AtomicU32::new(1),
         }
+    }
+
+    /// Allocate a `subid` not currently held by any live subscription.
+    /// CA-FR-2 owner-side allocation: the coordinator (sole mutator of
+    /// this registry) calls this when registering a new subscription,
+    /// so the live-table probe and the subsequent [`Self::add`] happen
+    /// in the same single-threaded context with no other allocator.
+    pub fn alloc_subid(&self) -> u32 {
+        crate::channel::alloc_nonzero_probe(&self.next_subid, |v| {
+            self.subscriptions.contains_key(&v)
+        })
+    }
+
+    /// Test-only: seed the next-subid counter to drive the wrap path
+    /// deterministically.
+    #[cfg(test)]
+    pub fn seed_next_subid(&self, v: u32) {
+        self.next_subid
+            .store(v, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn add(&mut self, rec: SubscriptionRecord) {
@@ -638,6 +666,34 @@ mod tests {
             Ok(_) => panic!("expected Subscribe command, got a different TransportCommand"),
             Err(e) => panic!("expected Subscribe command, channel error: {e:?}"),
         }
+    }
+
+    /// CA-FR-2: a subid counter that wraps onto a still-live
+    /// subscription must skip it, or a stale `EVENT_ADD`/`EVENT_CANCEL`
+    /// for the wrapped id would be routed to the wrong record.
+    #[test]
+    fn alloc_subid_skips_live_subscription_on_wrap() {
+        let mut reg = SubscriptionRegistry::new();
+        let (rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
+        reg.add(rec);
+        // Force the counter back onto the live subid.
+        reg.seed_next_subid(1);
+        let next = reg.alloc_subid();
+        assert_ne!(
+            next, 1,
+            "must not reissue a subid held by a live subscription"
+        );
+        assert!(reg.get(next).is_none(), "allocated subid must be free");
+    }
+
+    /// Fresh registry hands out distinct, non-zero subids.
+    #[test]
+    fn alloc_subid_is_distinct_and_nonzero() {
+        let reg = SubscriptionRegistry::new();
+        let a = reg.alloc_subid();
+        let b = reg.alloc_subid();
+        assert_ne!(a, b);
+        assert_ne!(a, 0);
     }
 
     /// An auto-derived subscription must re-derive `data_type`/`count`

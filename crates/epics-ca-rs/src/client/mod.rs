@@ -19,7 +19,7 @@ use std::time::Duration;
 use epics_base_rs::runtime::sync::{broadcast, mpsc, oneshot};
 use parking_lot::Mutex;
 
-use crate::channel::{AccessRights, ChannelInfo, alloc_cid, alloc_ioid, alloc_subid};
+use crate::channel::{AccessRights, ChannelInfo};
 use crate::protocol::*;
 use crate::repeater;
 use epics_base_rs::error::{CaError, CaResult};
@@ -249,6 +249,11 @@ pub struct CaClient {
     /// here directly; the per-server read loop removes and fulfils
     /// them on response arrival without a coordinator round-trip.
     in_flight: InFlightOps,
+    /// CA-FR-2: cid allocator with a live-set. `create_channel`
+    /// reserves; the coordinator releases at `DropChannel`. Shared
+    /// (cloned) into the coordinator task so both sides draw from /
+    /// retire to one id space.
+    cid_alloc: CidAllocator,
     /// Per-channel snapshot sidecar (Option C, Phase B). Coordinator
     /// publishes channel state on every lifecycle change; CaChannel
     /// hot paths read directly without a `GetChannelInfo` round-trip.
@@ -299,12 +304,14 @@ enum CoordRequest {
     },
     Subscribe {
         cid: u32,
-        subid: u32,
         mask: u16,
         deadband: f64,
         callback_tx: mpsc::Sender<CaResult<Snapshot>>,
         coalesce_slot: std::sync::Arc<subscription::CoalesceSlot>,
-        reply: oneshot::Sender<CaResult<()>>,
+        /// CA-FR-2: the coordinator owns the `subid` table, so it
+        /// allocates the id (probing live subscriptions) and returns
+        /// it here rather than accepting one minted at the call site.
+        reply: oneshot::Sender<CaResult<u32>>,
     },
     Unsubscribe {
         subid: u32,
@@ -610,6 +617,7 @@ impl CaClient {
         });
 
         let in_flight = InFlightOps::new();
+        let cid_alloc = CidAllocator::new();
         let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
         let server_writers: DirectServerWriters = Arc::new(dashmap::DashMap::new());
         let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
@@ -653,6 +661,7 @@ impl CaClient {
             search_tx.clone(),
             transport_tx.clone(),
             in_flight.clone(),
+            cid_alloc.clone(),
             snapshots.clone(),
             last_rx_at,
             diagnostics.clone(),
@@ -672,6 +681,7 @@ impl CaClient {
             coord_tx,
             one_shot_channels: Mutex::new(OneShotChannelCache::default()),
             in_flight,
+            cid_alloc,
             snapshots,
             server_writers,
             diagnostics,
@@ -757,7 +767,9 @@ impl CaClient {
     }
 
     fn create_channel_expanded(&self, pv_name: String) -> CaChannel {
-        let cid = alloc_cid();
+        // CA-FR-2: reserve the cid against the live-set. Released by the
+        // coordinator at `DropChannel` (the single channel-removal site).
+        let cid = self.cid_alloc.allocate();
         let (conn_tx, _) = broadcast::channel(16);
 
         // R2-18: C `cac::createChannel` rejects empty names with
@@ -1591,7 +1603,7 @@ impl CaChannel {
                 };
                 (frame, kind)
             } else {
-                let ioid = alloc_ioid();
+                let ioid = ch.in_flight.alloc_ioid();
                 ch.in_flight.reads.insert(
                     ioid,
                     ReadWaiter::OneShot {
@@ -1760,7 +1772,7 @@ impl CaChannel {
                         // and register a persistent Warm waiter. Loser
                         // of any concurrent install race drops its
                         // entry to avoid a leaked DashMap row.
-                        let warm_ioid = alloc_ioid();
+                        let warm_ioid = in_flight.alloc_ioid();
                         let slot: types::WarmReplySlot = Arc::new(parking_lot::Mutex::new(None));
                         in_flight.reads.insert(
                             warm_ioid,
@@ -1830,7 +1842,7 @@ impl CaChannel {
     pub async fn get_with_timeout(&self, timeout: Duration) -> CaResult<(DbFieldType, EpicsValue)> {
         let snap = self.snapshot()?;
 
-        let ioid = alloc_ioid();
+        let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
         // Direct registry insert (Option C Phase A) — bypasses the
         // coordinator. `transport::read_loop` removes the entry and
@@ -1914,7 +1926,7 @@ impl CaChannel {
             DbrClass::Plain => native.to_dbr_type() as u16,
         };
 
-        let ioid = alloc_ioid();
+        let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
         // Direct registry insert (Option C Phase A); see ch.get
         // for drop-semantics commentary.
@@ -1959,7 +1971,7 @@ impl CaChannel {
         validate_put_count(&snap, value.count())?;
         validate_put_strings(value)?;
 
-        let ioid = alloc_ioid();
+        let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
         // Direct registry insert (Option C Phase A).
         self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
@@ -1990,7 +2002,7 @@ impl CaChannel {
         validate_put_count(&snap, value.count())?;
         validate_put_strings(value)?;
 
-        let ioid = alloc_ioid();
+        let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
         // Direct registry insert (Option C Phase A).
         self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
@@ -2045,7 +2057,7 @@ impl CaChannel {
         validate_put_count(&snap, 1)?;
         validate_string_length(value)?;
 
-        let ioid = alloc_ioid();
+        let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
         self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
 
@@ -2094,7 +2106,7 @@ impl CaChannel {
             validate_string_length(s)?;
         }
 
-        let ioid = alloc_ioid();
+        let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
         self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
 
@@ -2136,7 +2148,6 @@ impl CaChannel {
     /// Subscribe with client-side deadband filtering.
     /// Events where |new - old| < deadband are suppressed (scalar values only).
     pub async fn subscribe_with_deadband(&self, deadband: f64) -> CaResult<MonitorHandle> {
-        let subid = alloc_subid();
         let env = epics_base_rs::runtime::env::get("EPICS_CA_MONITOR_QUEUE")
             .and_then(|s| s.parse::<usize>().ok());
         let queue_size = resolve_monitor_queue_size(env);
@@ -2146,7 +2157,6 @@ impl CaChannel {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.coord_tx.send(CoordRequest::Subscribe {
             cid: self.cid,
-            subid,
             mask: DBE_VALUE | DBE_LOG | DBE_ALARM,
             deadband,
             callback_tx,
@@ -2154,7 +2164,9 @@ impl CaChannel {
             reply: reply_tx,
         });
 
-        reply_rx.await.map_err(|_| CaError::Shutdown)??;
+        // CA-FR-2: the coordinator allocates the subid against its live
+        // subscription table and returns it on success.
+        let subid = reply_rx.await.map_err(|_| CaError::Shutdown)??;
 
         Ok(MonitorHandle {
             subid,
@@ -2484,6 +2496,7 @@ async fn run_coordinator(
     search_tx: mpsc::UnboundedSender<SearchRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
     in_flight: types::InFlightOps,
+    cid_alloc: types::CidAllocator,
     snapshots: ChannelSnapshots,
     last_rx_at: ServerLastRxAt,
     diag: Arc<CaDiagnostics>,
@@ -2557,7 +2570,7 @@ async fn run_coordinator(
                                 .push(reply);
                         }
                     }
-                    CoordRequest::Subscribe { cid, subid, mask, deadband, callback_tx, coalesce_slot, reply } => {
+                    CoordRequest::Subscribe { cid, mask, deadband, callback_tx, coalesce_slot, reply } => {
                         if let Some(ch) = channels.get(&cid) {
                             let server_addr = ch.server_addr.unwrap_or_else(|| {
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
@@ -2567,6 +2580,13 @@ async fn run_coordinator(
                             // consistency with the rest of the codebase.
                             let data_type = ch.native_type.map(|t| t.time_dbr_type());
                             let count = ch.native_type.map(|_| ch.element_count);
+
+                            // CA-FR-2: allocate the subid here, where the
+                            // live subscription table lives, so the wrap
+                            // probe sees every active subscription. The
+                            // immutable `alloc_subid` borrow ends before
+                            // the `add` mutable borrow below.
+                            let subid = subscriptions.alloc_subid();
 
                             subscriptions.add(subscription::SubscriptionRecord {
                                 subid,
@@ -2599,7 +2619,7 @@ async fn run_coordinator(
                                     server_addr,
                                 });
                             }
-                            let _ = reply.send(Ok(()));
+                            let _ = reply.send(Ok(subid));
                         } else {
                             let _ = reply.send(Err(CaError::Disconnected));
                         }
@@ -2692,6 +2712,11 @@ async fn run_coordinator(
                             }
                         }
                         channels.remove(&cid);
+                        // CA-FR-2: release the cid back to the allocator at
+                        // the single channel-removal site, in lockstep with
+                        // `channels.remove`, so the live-set never lags the
+                        // authoritative table.
+                        cid_alloc.release(cid);
                         snapshots.remove(&cid);
                         // Drop any in-flight read/write entries for this
                         // cid. Normally `self.in_flight.reads/writes
@@ -3382,7 +3407,7 @@ async fn run_coordinator(
                                                         sid: ch.sid,
                                                         data_type,
                                                         count: rec.count.unwrap_or(0),
-                                                        ioid: alloc_ioid(),
+                                                        ioid: in_flight.alloc_ioid(),
                                                         server_addr: addr,
                                                     });
                                             }

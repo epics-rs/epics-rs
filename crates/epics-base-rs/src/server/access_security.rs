@@ -123,6 +123,11 @@ pub struct AccessGate {
     ///   tcp.rs's monitor loop compared against that stale value,
     ///   missing every inner reload.
     acl_version: AclVersionSource,
+    /// CA-FR-1: optional `INP*`-link value resolver. When present,
+    /// [`Self::check`] evaluates CALC-gated rules against live values;
+    /// when absent, CALC rules fail closed (deny). Installed by the
+    /// owning server via [`Self::with_inp_resolver`].
+    inp_resolver: Option<InpResolver>,
 }
 
 #[derive(Clone)]
@@ -139,6 +144,13 @@ pub type AsgAslResolver = std::sync::Arc<
         + Send
         + Sync,
 >;
+
+/// CA-FR-1: resolves an ASG `INP*` link string (typically a
+/// `record.field` PV name) to its current numeric value, or `None` when
+/// the input is unresolvable / disconnected (bad input → the CALC-gated
+/// rule denies). Installed on an [`AccessGate`] by the owning server so
+/// `check` can evaluate `RULE(...) { CALC(...) }` against live values.
+pub type InpResolver = std::sync::Arc<dyn Fn(&str) -> Option<f64> + Send + Sync>;
 
 #[derive(Clone)]
 enum AccessGateInner {
@@ -186,7 +198,17 @@ impl AccessGate {
         Self {
             inner: AccessGateInner::Required { acf, resolver },
             acl_version: AclVersionSource::Atomic(acl_version),
+            inp_resolver: None,
         }
+    }
+
+    /// CA-FR-1: attach an `INP*`-link value resolver so CALC-gated ACF
+    /// rules are evaluated against live values instead of failing
+    /// closed. The owning server installs one backed by its PV value
+    /// registry.
+    pub fn with_inp_resolver(mut self, resolver: InpResolver) -> Self {
+        self.inp_resolver = Some(resolver);
+        self
     }
 
     /// Build a gate that grants `ReadWrite` to everyone. Used for
@@ -198,6 +220,7 @@ impl AccessGate {
             acl_version: AclVersionSource::Atomic(std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(0),
             )),
+            inp_resolver: None,
         }
     }
 
@@ -221,6 +244,7 @@ impl AccessGate {
         Self {
             inner: AccessGateInner::Open,
             acl_version: AclVersionSource::Aggregator(f),
+            inp_resolver: None,
         }
     }
 
@@ -259,6 +283,23 @@ impl AccessGate {
         method: &str,
         authority: &str,
     ) -> AccessChecked {
+        self.check_with_roles(pv_name, host, user, &[], method, authority)
+            .await
+    }
+
+    /// PVA-FR-3 / CA-FR-1: like [`Self::check`] but with the client's
+    /// `roles` (QSRV local-group-derived credentials) so a `role/<name>`
+    /// UAG member can match, and with CALC-gated rules evaluated against
+    /// the installed [`InpResolver`] (fail closed when none is set).
+    pub async fn check_with_roles(
+        &self,
+        pv_name: impl Into<String>,
+        host: &str,
+        user: &str,
+        roles: &[String],
+        method: &str,
+        authority: &str,
+    ) -> AccessChecked {
         let pv_name = pv_name.into();
         // An `Open` gate and an unattached ACF cell both grant
         // `ReadWrite`; neither resolved through an ACF rule, so the
@@ -271,7 +312,39 @@ impl AccessGate {
                     None => (AccessLevel::ReadWrite, false),
                     Some(ref cfg) => {
                         let (asg, asl) = resolver(pv_name.clone()).await;
-                        cfg.check_access_method_trap(&asg, host, user, asl, method, authority)
+                        // CA-FR-1: evaluate a CALC clause against the
+                        // ASG's resolved INP* links. Any bad input, a
+                        // false result, or a missing resolver denies.
+                        let inp_resolver = self.inp_resolver.clone();
+                        let calc_ok = |expr: &str| -> bool {
+                            let Some(ref res) = inp_resolver else {
+                                return false;
+                            };
+                            let Some(group) = cfg.asg.get(&asg).or_else(|| cfg.asg.get("DEFAULT"))
+                            else {
+                                return false;
+                            };
+                            let mut inputs = crate::calc::NumericInputs::new();
+                            for inp in &group.inp {
+                                let idx = inp.index as usize;
+                                if idx >= crate::calc::CALC_NARGS {
+                                    continue;
+                                }
+                                match res(&inp.link) {
+                                    Some(v) => inputs.vars[idx] = v,
+                                    None => return false,
+                                }
+                            }
+                            match crate::calc::compile(expr) {
+                                Ok(c) => crate::calc::eval(&c, &mut inputs)
+                                    .map(|r| r != 0.0)
+                                    .unwrap_or(false),
+                                Err(_) => false,
+                            }
+                        };
+                        cfg.compute_for_name(
+                            &asg, host, user, roles, asl, method, authority, &calc_ok,
+                        )
                     }
                 }
             }
@@ -493,6 +566,33 @@ impl AccessSecurityConfig {
     /// when access stays `NoAccess` (no rule matched), when the
     /// matching rule carried `NOTRAPWRITE`, and when it carried no
     /// trap option at all.
+    /// Resolve `asg_name` (falling back to `DEFAULT`) and evaluate its
+    /// rules with the given `roles` and CALC `calc_ok`. The single entry
+    /// the role-/CALC-aware [`AccessGate::check_with_roles`] uses.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compute_for_name(
+        &self,
+        asg_name: &str,
+        host: &str,
+        user: &str,
+        roles: &[String],
+        record_asl: u8,
+        method: &str,
+        authority: &str,
+        calc_ok: &dyn Fn(&str) -> bool,
+    ) -> (AccessLevel, bool) {
+        let asg = match self.asg.get(asg_name) {
+            Some(a) => a,
+            None => match self.asg.get("DEFAULT") {
+                Some(a) => a,
+                None => return (AccessLevel::NoAccess, false),
+            },
+        };
+        self.compute_rules(
+            asg, host, user, roles, record_asl, method, authority, calc_ok,
+        )
+    }
+
     pub fn check_access_method_trap(
         &self,
         asg_name: &str,
@@ -537,11 +637,37 @@ impl AccessSecurityConfig {
         // matching rule's `trapMask` only on the lines that also raise
         // `access` (`asLibRoutines.c:986`, `:1042`). A `NoAccess`
         // outcome therefore always carries `trap = false`.
+        self.compute_rules(asg, host, user, &[], record_asl, method, authority, &|_| {
+            false
+        })
+    }
+
+    /// CA-FR-1 / PVA-FR-3: the single rule-matching loop, parameterised
+    /// by the client's `roles` (for `role/<name>` UAG members, QSRV
+    /// `documentation/ioc.rst:181-188`) and a `calc_ok(expr)` evaluator
+    /// — a CALC-gated rule grants only when it returns true.
+    /// [`Self::check_access_method_trap`] passes no roles and a
+    /// fail-closed calc evaluator (so the sync path stays closed when no
+    /// INP* resolver is installed); [`AccessGate::check`] supplies the
+    /// real roles and an INP*-resolving evaluator.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compute_rules(
+        &self,
+        asg: &AccessSecurityGroup,
+        host: &str,
+        user: &str,
+        roles: &[String],
+        record_asl: u8,
+        method: &str,
+        authority: &str,
+        calc_ok: &dyn Fn(&str) -> bool,
+    ) -> (AccessLevel, bool) {
         let mut access = AccessLevel::NoAccess;
         let mut trap = false;
         for rule in &asg.rules {
             // C `asComputePvt`: a rule disabled by `asAsgRuleDisable`
-            // (unsupported keyword / un-evaluable CALC) is skipped.
+            // (unsupported keyword) is skipped. A CALC clause no longer
+            // forces `ignore`; it is gated by `calc_ok` below.
             if rule.ignore {
                 continue;
             }
@@ -559,11 +685,19 @@ impl AccessSecurityConfig {
             }
             // UAG: only consulted when the rule scopes one. An empty
             // UAG list means "any user" — including an empty username.
+            // PVA-FR-3: a `role/<name>` member matches when the client
+            // holds that role (QSRV local-group-derived credentials);
+            // a plain member matches the account string.
             let user_match = rule.uag.is_empty()
                 || rule.uag.iter().any(|g| {
                     self.uag
                         .get(g)
-                        .map(|members| members.iter().any(|m| m == user))
+                        .map(|members| {
+                            members.iter().any(|m| match m.strip_prefix("role/") {
+                                Some(role) => roles.iter().any(|r| r == role),
+                                None => m == user,
+                            })
+                        })
                         .unwrap_or(false)
                 });
             if !user_match {
@@ -595,6 +729,17 @@ impl AccessSecurityConfig {
                     .any(|a| a.eq_ignore_ascii_case(authority));
             if !authority_match {
                 continue;
+            }
+            // CA-FR-1: a CALC-gated rule grants only while its expression
+            // evaluates true against the resolved INP* link values. C
+            // `asLibRoutines.c:957-1042` evaluates `calcPerform()` and
+            // grants on a true result with good inputs. `calc_ok` returns
+            // false when the expression is false, an input is bad, or no
+            // INP* resolver is installed (fail closed).
+            if let Some(ref expr) = rule.calc {
+                if !calc_ok(expr) {
+                    continue;
+                }
             }
             // C `asLibRoutines.c:1041-1042`: a matching rule sets
             // both `access` and `trapMask` together. The trap mask of
@@ -1539,32 +1684,18 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     // here so a syntactically broken CALC is rejected exactly as C's
     // `postfix()` rejects it in `asAsgRuleCalc`.
     if let Some(ref expr) = calc {
-        match crate::calc::compile(expr) {
-            Ok(_) => {
-                // BR-R32: warn at parse time so operators know that a
-                // CALC-gated ASG rule has been disabled by this crate
-                // (no INP* link resolution → CALC cannot be
-                // evaluated). C IOC + pvxs evaluate the expression
-                // and grant matching access; we fail closed instead.
-                // Loud warning beats silent divergence — operators
-                // running mixed-IOC sites must see this in the
-                // server log to know access decisions will differ.
-                tracing::warn!(
-                    target: "epics_base_rs::access_security",
-                    calc = %expr,
-                    "ACF: CALC-gated RULE disabled (no INP* link \
-                     resolution in this crate; rule fails CLOSED — \
-                     access decisions will diverge from EPICS Base / \
-                     pvxs which would evaluate the expression \
-                     dynamically). See BR-R32."
-                );
-                ignore = true;
-            }
-            Err(e) => {
-                return Err(CaError::Protocol(format!(
-                    "ACF: bad CALC expression '{expr}': {e}"
-                )));
-            }
+        // CA-FR-1: validate the CALC expression at parse (C `postfix()`
+        // rejects a broken one in `asAsgRuleCalc`). The rule is NOT
+        // forced inert anymore: it is conditionally active and gated at
+        // access-check time by `compute_rules`'s `calc_ok`, which
+        // resolves the ASG's INP* links and evaluates the expression.
+        // When no INP* resolver is installed the evaluator returns false
+        // (fail closed), preserving the previous deny behaviour without
+        // hard-disabling the rule.
+        if let Err(e) = crate::calc::compile(expr) {
+            return Err(CaError::Protocol(format!(
+                "ACF: bad CALC expression '{expr}': {e}"
+            )));
         }
     }
 
@@ -2345,18 +2476,86 @@ ASG(LOCKED)    { }
     /// This crate cannot resolve INP* link values, so a CALC rule is
     /// disabled (fail closed) — it grants nothing.
     #[test]
-    fn calc_rule_is_disabled_when_unevaluable() {
+    fn calc_rule_is_conditionally_active_and_fails_closed_without_resolver() {
         let config = parse_acf(r#"ASG(G) { INPA("ref") RULE(1, WRITE) { CALC("A=1") } }"#).unwrap();
         let rule = &config.asg["G"].rules[0];
         assert!(rule.calc.is_some(), "CALC clause must be parsed and stored");
+        // CA-FR-1: a CALC rule is no longer hard-disabled — it is
+        // conditionally active and gated at check time.
         assert!(
-            rule.ignore,
-            "an unevaluable CALC rule must be disabled, not unconditional"
+            !rule.ignore,
+            "a CALC rule is conditionally active, not unconditionally ignored"
         );
+        // The sync `check_access` path supplies no INP* resolver, so the
+        // CALC rule still fails CLOSED (must not silently grant WRITE).
         assert_eq!(
             config.check_access("G", "host", "user"),
             AccessLevel::NoAccess,
-            "CALC rule must not silently grant WRITE"
+            "CALC rule with no resolver must not grant WRITE"
+        );
+    }
+
+    /// CA-FR-1: with an `INP*` resolver installed, a CALC-gated rule
+    /// grants when the expression is true, denies when false, denies on
+    /// a bad input, and denies when no resolver is installed.
+    #[tokio::test]
+    async fn calc_gated_rule_evaluates_against_inp_resolver() {
+        use std::sync::Arc;
+        let cfg =
+            parse_acf(r#"ASG(OPS) { INPA("permit.VAL") RULE(1, WRITE) { CALC("A=1") } }"#).unwrap();
+        let cell = Arc::new(tokio::sync::RwLock::new(Some(cfg)));
+        let asg_resolver: AsgAslResolver =
+            Arc::new(|_name| Box::pin(async { ("OPS".to_string(), 0u8) }));
+
+        let grant = AccessGate::required(cell.clone(), asg_resolver.clone())
+            .with_inp_resolver(Arc::new(|link: &str| (link == "permit.VAL").then_some(1.0)));
+        assert!(
+            grant.check("x", "h", "u", "ca", "").await.allows_write(),
+            "CALC A=1 with permit=1 grants WRITE"
+        );
+
+        let deny = AccessGate::required(cell.clone(), asg_resolver.clone())
+            .with_inp_resolver(Arc::new(|link: &str| (link == "permit.VAL").then_some(0.0)));
+        assert!(
+            !deny.check("x", "h", "u", "ca", "").await.allows_write(),
+            "CALC A=1 with permit=0 denies WRITE"
+        );
+
+        let bad = AccessGate::required(cell.clone(), asg_resolver.clone())
+            .with_inp_resolver(Arc::new(|_link: &str| None));
+        assert!(
+            !bad.check("x", "h", "u", "ca", "").await.allows_write(),
+            "a bad/disconnected INP denies the CALC-gated rule"
+        );
+
+        let none = AccessGate::required(cell, asg_resolver);
+        assert!(
+            !none.check("x", "h", "u", "ca", "").await.allows_write(),
+            "no INP resolver installed → CALC rule fails closed"
+        );
+    }
+
+    /// PVA-FR-3: a `role/<name>` UAG member matches a client that holds
+    /// that role; a client without it does not match.
+    #[test]
+    fn uag_role_member_matches_client_role() {
+        let cfg =
+            parse_acf(r#"UAG(special) { "role/op" } ASG(G) { RULE(1, WRITE) { UAG(special) } }"#)
+                .unwrap();
+        let (lvl, _) =
+            cfg.compute_for_name("G", "h", "acct", &["op".to_string()], 0, "ca", "", &|_| {
+                false
+            });
+        assert_eq!(
+            lvl,
+            AccessLevel::ReadWrite,
+            "role/op member matches a client holding role 'op'"
+        );
+        let (lvl_none, _) = cfg.compute_for_name("G", "h", "acct", &[], 0, "ca", "", &|_| false);
+        assert_eq!(
+            lvl_none,
+            AccessLevel::NoAccess,
+            "a client without role 'op' must not match role/op"
         );
     }
 

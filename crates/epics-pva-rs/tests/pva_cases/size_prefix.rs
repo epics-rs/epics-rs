@@ -1,16 +1,17 @@
-//! pvxs `Size` encoding boundary contract — the 1-byte / 5-byte
-//! wire form transition is where wire-encoder regressions love to
-//! hide. A writer that uses `0xFF` as a sentinel desyncs a pvxs
-//! peer at exactly the boundary covered here.
+//! pvxs `Size` encoding boundary contract.
 //!
-//! pvxs reference: `pvaproto.h` `to_wire(Size)` / `from_wire(Size)`:
+//! pvxs reference: `src/pvaproto.h:266` `to_wire(Size)`:
+//!   - `0..=253`        → single byte (raw value)
+//!   - `254..=u32::MAX` → `0xFE` + `u32` in negotiated byte order
+//!   - null sentinel    → `0xFF` (nullable strings / unselected variant)
 //!
-//! - `0..=253`        → single byte (raw value)
-//! - `254..=u32::MAX` → `0xFE` + `u32` in negotiated byte order
-//! - null sentinel    → `0xFF` (nullable strings / unselected variant)
+//! Expected bytes come from `tools/pvxs-golden-capture/fixtures.txt`
+//! (captured from pvxs's own `to_wire(Size{n})` at run time).
 
 use epics_pva_rs::proto::ByteOrder;
 use epics_pva_rs::proto::size::encode_size;
+
+use super::pvxs_fixtures::golden;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
@@ -18,42 +19,58 @@ fn hex(bytes: &[u8]) -> String {
 
 #[test]
 fn golden_pvxs_size_0() {
-    // Single 0x00; endian-invariant in the 1-byte form.
-    assert_eq!(hex(&encode_size(0, ByteOrder::Big)), "00");
-    assert_eq!(hex(&encode_size(0, ByteOrder::Little)), "00");
+    assert_eq!(hex(&encode_size(0, ByteOrder::Big)), golden("size_0_be"));
+    assert_eq!(hex(&encode_size(0, ByteOrder::Little)), golden("size_0_le"));
 }
 
 #[test]
 fn golden_pvxs_size_253_last_single_byte() {
-    // Last value that still fits in the single-byte form.
-    assert_eq!(hex(&encode_size(253, ByteOrder::Big)), "fd");
-    assert_eq!(hex(&encode_size(253, ByteOrder::Little)), "fd");
+    assert_eq!(
+        hex(&encode_size(253, ByteOrder::Big)),
+        golden("size_253_be")
+    );
+    assert_eq!(
+        hex(&encode_size(253, ByteOrder::Little)),
+        golden("size_253_le")
+    );
 }
 
 #[test]
 fn golden_pvxs_size_254_extended_be() {
-    // First length to use the 5-byte extended form: 0xFE + u32_be.
-    assert_eq!(hex(&encode_size(254, ByteOrder::Big)), "fe000000fe");
+    assert_eq!(
+        hex(&encode_size(254, ByteOrder::Big)),
+        golden("size_254_be")
+    );
 }
 
 #[test]
 fn golden_pvxs_size_254_extended_le() {
-    // Same value, little-endian u32: FE FE 00 00 00.
-    assert_eq!(hex(&encode_size(254, ByteOrder::Little)), "fefe000000");
+    assert_eq!(
+        hex(&encode_size(254, ByteOrder::Little)),
+        golden("size_254_le")
+    );
 }
 
 #[test]
 fn golden_pvxs_size_65535_be() {
-    assert_eq!(hex(&encode_size(65535, ByteOrder::Big)), "fe0000ffff");
+    assert_eq!(
+        hex(&encode_size(65535, ByteOrder::Big)),
+        golden("size_65535_be")
+    );
 }
 
 #[test]
 fn golden_pvxs_size_65536_be() {
-    assert_eq!(hex(&encode_size(65536, ByteOrder::Big)), "fe00010000");
+    assert_eq!(
+        hex(&encode_size(65536, ByteOrder::Big)),
+        golden("size_65536_be")
+    );
 }
 
 #[test]
 fn golden_pvxs_size_max_u31_be() {
-    // 0x7FFF_FFFF — exercises the high bit clearance in the u32 path.
-    assert_eq!(hex(&encode_size(0x7FFF_FFFF, ByteOrder::Big)), "fe7fffffff");
+    assert_eq!(
+        hex(&encode_size(0x7FFF_FFFF, ByteOrder::Big)),
+        golden("size_max_u31_be")
+    );
 }

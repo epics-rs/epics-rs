@@ -1,63 +1,24 @@
 //! Scalar `encode_pv_field` byte shapes — the baseline pvxs
 //! contract that R13 / R10 family rely on.
 //!
-//! pvxs reference: `src/dataencode.cpp::to_wire_field` (lines
-//! ~110-340 for scalar arms). The wire output of a scalar is
-//! exactly the type-natural in-memory layout in the negotiated
-//! byte order — no per-value header, no presence byte, no
-//! padding. These golden tests pin that contract.
+//! pvxs reference: `src/dataencode.cpp::to_wire_field` (scalar arms,
+//! ~lines 110-340). Wire output of a scalar is the type-natural
+//! in-memory layout in the negotiated byte order — no per-value
+//! header, no presence byte, no padding.
+//!
+//! Expected bytes come from `tools/pvxs-golden-capture/fixtures.txt`
+//! (captured from pvxs's own `to_wire` at run time, not derived by
+//! reading dataencode.cpp).
 
 use epics_pva_rs::proto::ByteOrder;
 use epics_pva_rs::pvdata::encode::encode_pv_field;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue};
 
+use super::pvxs_fixtures::golden;
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
-
-#[test]
-fn golden_pvxs_scalar_int_be() {
-    // pvxs to_wire_field(Int32) — 4-byte big-endian.
-    let v = PvField::Scalar(ScalarValue::Int(0x0123_4567));
-    let desc = FieldDesc::Scalar(ScalarType::Int);
-    let mut out = Vec::new();
-    encode_pv_field(&v, &desc, ByteOrder::Big, &mut out);
-    assert_eq!(hex(&out), "01234567", "Int BE");
-}
-
-#[test]
-fn golden_pvxs_scalar_int_le() {
-    let v = PvField::Scalar(ScalarValue::Int(0x0123_4567));
-    let desc = FieldDesc::Scalar(ScalarType::Int);
-    let mut out = Vec::new();
-    encode_pv_field(&v, &desc, ByteOrder::Little, &mut out);
-    assert_eq!(hex(&out), "67452301", "Int LE");
-}
-
-#[test]
-fn golden_pvxs_scalar_double_be() {
-    // 1.0 = 0x3FF0_0000_0000_0000.
-    let v = PvField::Scalar(ScalarValue::Double(1.0));
-    let desc = FieldDesc::Scalar(ScalarType::Double);
-    let mut out = Vec::new();
-    encode_pv_field(&v, &desc, ByteOrder::Big, &mut out);
-    assert_eq!(hex(&out), "3ff0000000000000", "Double 1.0 BE");
-}
-
-#[test]
-fn golden_pvxs_scalar_string_be() {
-    // pvxs `to_wire(string)`: Size-prefix (1 byte for len < 254)
-    // + raw bytes, no NUL.
-    let v = PvField::Scalar(ScalarValue::String("hi".into()));
-    let desc = FieldDesc::Scalar(ScalarType::String);
-    let mut out = Vec::new();
-    encode_pv_field(&v, &desc, ByteOrder::Big, &mut out);
-    // 02 68 69 — Size(2) + 'h' + 'i'.
-    assert_eq!(hex(&out), "026869", "String 'hi' BE");
-}
-
-// ── extended scalar coverage (every ScalarType, both byte orders
-//    where applicable) ───────────────────────────────────────────────
 
 fn encode(value: PvField, desc: FieldDesc, order: ByteOrder) -> String {
     let mut out = Vec::new();
@@ -65,16 +26,67 @@ fn encode(value: PvField, desc: FieldDesc, order: ByteOrder) -> String {
     hex(&out)
 }
 
+// ── ints ──────────────────────────────────────────────────────────
+
+#[test]
+fn golden_pvxs_scalar_int_be() {
+    assert_eq!(
+        encode(
+            PvField::Scalar(ScalarValue::Int(0x0123_4567)),
+            FieldDesc::Scalar(ScalarType::Int),
+            ByteOrder::Big,
+        ),
+        golden("scalar_int_be"),
+    );
+}
+
+#[test]
+fn golden_pvxs_scalar_int_le() {
+    assert_eq!(
+        encode(
+            PvField::Scalar(ScalarValue::Int(0x0123_4567)),
+            FieldDesc::Scalar(ScalarType::Int),
+            ByteOrder::Little,
+        ),
+        golden("scalar_int_le"),
+    );
+}
+
+#[test]
+fn golden_pvxs_scalar_double_be() {
+    assert_eq!(
+        encode(
+            PvField::Scalar(ScalarValue::Double(1.0)),
+            FieldDesc::Scalar(ScalarType::Double),
+            ByteOrder::Big,
+        ),
+        golden("scalar_double_be"),
+    );
+}
+
+#[test]
+fn golden_pvxs_scalar_string_be() {
+    assert_eq!(
+        encode(
+            PvField::Scalar(ScalarValue::String("hi".into())),
+            FieldDesc::Scalar(ScalarType::String),
+            ByteOrder::Big,
+        ),
+        golden("scalar_string_hi_be"),
+    );
+}
+
+// ── full scalar type coverage ─────────────────────────────────────
+
 #[test]
 fn golden_pvxs_scalar_bool_true() {
-    // pvxs Boolean = single byte (0 or 1); endian-invariant.
     assert_eq!(
         encode(
             PvField::Scalar(ScalarValue::Boolean(true)),
             FieldDesc::Scalar(ScalarType::Boolean),
             ByteOrder::Big,
         ),
-        "01"
+        golden("scalar_bool_true"),
     );
 }
 
@@ -86,20 +98,19 @@ fn golden_pvxs_scalar_bool_false() {
             FieldDesc::Scalar(ScalarType::Boolean),
             ByteOrder::Big,
         ),
-        "00"
+        golden("scalar_bool_false"),
     );
 }
 
 #[test]
 fn golden_pvxs_scalar_byte_neg1() {
-    // i8 -1 = 0xFF (endian-invariant).
     assert_eq!(
         encode(
             PvField::Scalar(ScalarValue::Byte(-1)),
             FieldDesc::Scalar(ScalarType::Byte),
             ByteOrder::Big,
         ),
-        "ff"
+        golden("scalar_byte_neg1"),
     );
 }
 
@@ -111,7 +122,7 @@ fn golden_pvxs_scalar_ubyte() {
             FieldDesc::Scalar(ScalarType::UByte),
             ByteOrder::Big,
         ),
-        "ab"
+        golden("scalar_ubyte_0xab"),
     );
 }
 
@@ -123,7 +134,7 @@ fn golden_pvxs_scalar_short_be() {
             FieldDesc::Scalar(ScalarType::Short),
             ByteOrder::Big,
         ),
-        "1234"
+        golden("scalar_short_be"),
     );
 }
 
@@ -135,7 +146,7 @@ fn golden_pvxs_scalar_short_le() {
             FieldDesc::Scalar(ScalarType::Short),
             ByteOrder::Little,
         ),
-        "3412"
+        golden("scalar_short_le"),
     );
 }
 
@@ -147,7 +158,7 @@ fn golden_pvxs_scalar_ushort_be() {
             FieldDesc::Scalar(ScalarType::UShort),
             ByteOrder::Big,
         ),
-        "abcd"
+        golden("scalar_ushort_be"),
     );
 }
 
@@ -159,7 +170,7 @@ fn golden_pvxs_scalar_uint_be() {
             FieldDesc::Scalar(ScalarType::UInt),
             ByteOrder::Big,
         ),
-        "deadbeef"
+        golden("scalar_uint_be"),
     );
 }
 
@@ -171,20 +182,19 @@ fn golden_pvxs_scalar_uint_le() {
             FieldDesc::Scalar(ScalarType::UInt),
             ByteOrder::Little,
         ),
-        "efbeadde"
+        golden("scalar_uint_le"),
     );
 }
 
 #[test]
 fn golden_pvxs_scalar_long_be() {
-    // i64 0x0102030405060708 BE.
     assert_eq!(
         encode(
             PvField::Scalar(ScalarValue::Long(0x0102_0304_0506_0708)),
             FieldDesc::Scalar(ScalarType::Long),
             ByteOrder::Big,
         ),
-        "0102030405060708"
+        golden("scalar_long_be"),
     );
 }
 
@@ -196,33 +206,32 @@ fn golden_pvxs_scalar_long_le() {
             FieldDesc::Scalar(ScalarType::Long),
             ByteOrder::Little,
         ),
-        "0807060504030201"
+        golden("scalar_long_le"),
     );
 }
 
 #[test]
 fn golden_pvxs_scalar_ulong_be() {
-    // MR-R25: DBF_UINT64 round-trip. pvxs encodes ULong as u64 BE.
+    // MR-R25 territory: DBF_UINT64 round-trip locked here.
     assert_eq!(
         encode(
             PvField::Scalar(ScalarValue::ULong(0xFFEE_DDCC_BBAA_9988)),
             FieldDesc::Scalar(ScalarType::ULong),
             ByteOrder::Big,
         ),
-        "ffeeddccbbaa9988"
+        golden("scalar_ulong_be"),
     );
 }
 
 #[test]
 fn golden_pvxs_scalar_float_be() {
-    // IEEE 754 binary32, 1.0 = 0x3F800000.
     assert_eq!(
         encode(
             PvField::Scalar(ScalarValue::Float(1.0)),
             FieldDesc::Scalar(ScalarType::Float),
             ByteOrder::Big,
         ),
-        "3f800000"
+        golden("scalar_float_be"),
     );
 }
 
@@ -234,65 +243,58 @@ fn golden_pvxs_scalar_float_le() {
             FieldDesc::Scalar(ScalarType::Float),
             ByteOrder::Little,
         ),
-        "0000803f"
+        golden("scalar_float_le"),
     );
 }
 
 #[test]
 fn golden_pvxs_scalar_double_le() {
-    // 1.0 LE = 00 00 00 00 00 00 F0 3F.
     assert_eq!(
         encode(
             PvField::Scalar(ScalarValue::Double(1.0)),
             FieldDesc::Scalar(ScalarType::Double),
             ByteOrder::Little,
         ),
-        "000000000000f03f"
+        golden("scalar_double_le"),
     );
 }
 
 #[test]
 fn golden_pvxs_scalar_string_empty() {
-    // pvxs string(""): Size(0) = single 0x00; no data bytes.
     assert_eq!(
         encode(
             PvField::Scalar(ScalarValue::String(String::new())),
             FieldDesc::Scalar(ScalarType::String),
             ByteOrder::Big,
         ),
-        "00"
+        golden("scalar_string_empty"),
     );
 }
 
 #[test]
 fn golden_pvxs_scalar_string_253_last_single_byte_size() {
-    // 253-byte string: Size still fits in 1 byte (0xFD).
+    // 253-byte string: last length to fit in the 1-byte Size form.
     let s = "x".repeat(253);
-    let mut expected = String::from("fd");
-    expected.push_str(&"78".repeat(253));
     assert_eq!(
         encode(
             PvField::Scalar(ScalarValue::String(s)),
             FieldDesc::Scalar(ScalarType::String),
             ByteOrder::Big,
         ),
-        expected
+        golden("scalar_string_253"),
     );
 }
 
 #[test]
 fn golden_pvxs_scalar_string_254_extended_size_be() {
-    // 254-byte string: first length to use the 5-byte extended form.
-    // Size = 0xFE + u32_be(254) = "fe000000fe".
+    // 254-byte string: first length to use the 5-byte extended Size.
     let s = "x".repeat(254);
-    let mut expected = String::from("fe000000fe");
-    expected.push_str(&"78".repeat(254));
     assert_eq!(
         encode(
             PvField::Scalar(ScalarValue::String(s)),
             FieldDesc::Scalar(ScalarType::String),
             ByteOrder::Big,
         ),
-        expected
+        golden("scalar_string_254_be"),
     );
 }

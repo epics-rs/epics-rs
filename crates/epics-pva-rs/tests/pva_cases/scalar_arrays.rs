@@ -214,3 +214,20 @@ fn golden_pvxs_scalar_array_string() {
         golden("scalar_array_string"),
     );
 }
+
+#[test]
+fn golden_pvxs_scalar_array_string_utf8() {
+    // ["a", "안"] — mixed ASCII + 3-byte UTF-8. The per-element
+    // Size counts bytes, not characters.
+    assert_eq!(
+        encode_array(
+            vec![
+                ScalarValue::String("a".into()),
+                ScalarValue::String("안".into()),
+            ],
+            ScalarType::String,
+            ByteOrder::Big,
+        ),
+        golden("scalar_array_string_utf8"),
+    );
+}

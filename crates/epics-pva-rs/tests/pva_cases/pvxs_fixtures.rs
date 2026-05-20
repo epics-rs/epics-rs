@@ -26,10 +26,10 @@ const FIXTURES: &str = include_str!("../../tools/pvxs-golden-capture/fixtures.tx
 /// always-pass.
 pub fn golden(key: &str) -> &'static str {
     for line in FIXTURES.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            if k == key {
-                return v;
-            }
+        if let Some((k, v)) = line.split_once('=')
+            && k == key
+        {
+            return v;
         }
     }
     panic!(

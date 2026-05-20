@@ -298,3 +298,67 @@ fn golden_pvxs_scalar_string_254_extended_size_be() {
         golden("scalar_string_254_be"),
     );
 }
+
+// ── floating-point special values ────────────────────────────────
+
+#[test]
+fn golden_pvxs_scalar_float_nan_be() {
+    // f32::NAN may use a different bit pattern across compilers;
+    // use the canonical quiet-NaN bits explicitly so the assertion
+    // matches pvxs's 0x7FC00000.
+    let v = f32::from_bits(0x7FC0_0000);
+    assert!(v.is_nan());
+    assert_eq!(
+        encode(
+            PvField::Scalar(ScalarValue::Float(v)),
+            FieldDesc::Scalar(ScalarType::Float),
+            ByteOrder::Big,
+        ),
+        golden("scalar_float_nan_be"),
+    );
+}
+
+#[test]
+fn golden_pvxs_scalar_float_inf_be() {
+    assert_eq!(
+        encode(
+            PvField::Scalar(ScalarValue::Float(f32::INFINITY)),
+            FieldDesc::Scalar(ScalarType::Float),
+            ByteOrder::Big,
+        ),
+        golden("scalar_float_inf_be"),
+    );
+}
+
+#[test]
+fn golden_pvxs_scalar_double_neg_zero_be() {
+    let v = f64::from_bits(0x8000_0000_0000_0000);
+    assert!(v == 0.0 && v.is_sign_negative());
+    assert_eq!(
+        encode(
+            PvField::Scalar(ScalarValue::Double(v)),
+            FieldDesc::Scalar(ScalarType::Double),
+            ByteOrder::Big,
+        ),
+        golden("scalar_double_neg_zero_be"),
+    );
+}
+
+// ── UTF-8 multibyte strings ──────────────────────────────────────
+
+#[test]
+fn golden_pvxs_scalar_string_utf8_korean() {
+    // "안녕" — 6 bytes UTF-8 (3 bytes per char). pvxs Size is
+    // byte count, not char count; an ASCII-assuming encoder would
+    // emit Size(2) and 4 stray bytes.
+    let s = "안녕".to_string();
+    assert_eq!(s.len(), 6, "test premise: 6 UTF-8 bytes");
+    assert_eq!(
+        encode(
+            PvField::Scalar(ScalarValue::String(s)),
+            FieldDesc::Scalar(ScalarType::String),
+            ByteOrder::Big,
+        ),
+        golden("scalar_string_utf8_korean"),
+    );
+}

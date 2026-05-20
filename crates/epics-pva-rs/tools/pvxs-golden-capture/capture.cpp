@@ -16,6 +16,8 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <vector>
 #include <string>
 #include <utility>
@@ -24,6 +26,7 @@
 #include <pvxs/data.h>
 #include <pvxs/nt.h>
 
+#include "bitmask.h"
 #include "dataimpl.h"
 #include "pvaproto.h"
 
@@ -330,6 +333,183 @@ int main() {
         auto raw = capture(true, [&holder](Buffer& b){ to_wire_valid(b, holder); });
         emit("variant_array_present_int", strip_bitset(raw));
     }
+
+    // ---- Status (pvaproto.h:441 to_wire(Status&)) ----
+    // 0xFF when Ok && empty msg && empty trace; otherwise
+    // `code` byte + Size-prefixed msg + Size-prefixed trace.
+    emit("status_ok_no_msg", capture(true, [](Buffer& b){
+        Status s{Status::Ok, "", ""};
+        to_wire(b, s);
+    }));
+    emit("status_ok_with_msg", capture(true, [](Buffer& b){
+        Status s{Status::Ok, "ok", "trace"};
+        to_wire(b, s);
+    }));
+    emit("status_warning", capture(true, [](Buffer& b){
+        Status s{Status::Warn, "be careful", ""};
+        to_wire(b, s);
+    }));
+    emit("status_error", capture(true, [](Buffer& b){
+        Status s{Status::Error, "oh no", ""};
+        to_wire(b, s);
+    }));
+    emit("status_fatal", capture(true, [](Buffer& b){
+        Status s{Status::Fatal, "boom", "stack"};
+        to_wire(b, s);
+    }));
+
+    // ---- PvaHeader (pvaproto.h:665 to_wire(Header&)) ----
+    // Layout: 0xCA, version, flags, cmd, u32 len (in byte order).
+    // pvxs sets `flags |= MSB` automatically when buf.be is true.
+    emit("header_app_get_be", capture(true, [](Buffer& b){
+        Header h{pva_app_msg_t::CMD_GET, 0u, 42u};
+        to_wire(b, h);
+    }));
+    emit("header_app_get_le", capture(false, [](Buffer& b){
+        Header h{pva_app_msg_t::CMD_GET, 0u, 42u};
+        to_wire(b, h);
+    }));
+    emit("header_control_marker_be", capture(true, [](Buffer& b){
+        Header h{pva_ctrl_msg::SetMarker, pva_flags::Control, 0u};
+        to_wire(b, h);
+    }));
+    emit("header_seg_first_be", capture(true, [](Buffer& b){
+        Header h{pva_app_msg_t::CMD_MONITOR, pva_flags::SegFirst, 8u};
+        to_wire(b, h);
+    }));
+    emit("header_server_app_be", capture(true, [](Buffer& b){
+        Header h{pva_app_msg_t::CMD_CONNECTION_VALIDATION, pva_flags::Server, 0u};
+        to_wire(b, h);
+    }));
+
+    // ---- BitMask (bitmask.h:257 to_wire(BitMask&)) ----
+    // pvxs emits Size(byte_count) + LSB-first byte stream;
+    // boundary bits (7→8, 63→64) exercise the multi-byte path.
+    emit("bitmask_empty_be", capture(true, [](Buffer& b){
+        BitMask m;
+        to_wire(b, m);
+    }));
+    emit("bitmask_bit0_be", capture(true, [](Buffer& b){
+        BitMask m({0u}); to_wire(b, m);
+    }));
+    emit("bitmask_bit7_be", capture(true, [](Buffer& b){
+        BitMask m({7u}); to_wire(b, m);
+    }));
+    emit("bitmask_bit8_be", capture(true, [](Buffer& b){
+        BitMask m({8u}); to_wire(b, m);
+    }));
+    emit("bitmask_bit64_be", capture(true, [](Buffer& b){
+        BitMask m({64u}); to_wire(b, m);
+    }));
+
+    // ---- compound-array edges (null elements, present/null mix,
+    //      empty arrays) ----
+    {
+        // 3-element struct[] with all elements left null.
+        auto holder = TypeDef(TypeCode::Struct, {
+            Member(TypeCode::StructA, "s", "", {
+                Member(TypeCode::Int32, "v"),
+            }),
+        }).create();
+        auto fld = holder["s"];
+        shared_array<Value> arr(3);
+        // leave all three slots null
+        fld = arr.freeze().castTo<const void>();
+        holder["s"].mark();
+        auto raw = capture(true, [&holder](Buffer& b){ to_wire_valid(b, holder); });
+        emit("struct_array_all_null", strip_bitset(raw));
+    }
+    {
+        // [present, null, present] struct[]
+        auto holder = TypeDef(TypeCode::Struct, {
+            Member(TypeCode::StructA, "s", "", {
+                Member(TypeCode::Int32, "v"),
+            }),
+        }).create();
+        auto fld = holder["s"];
+        shared_array<Value> arr(3);
+        arr[0] = fld.allocMember();
+        arr[0]["v"] = int32_t(1);
+        // arr[1] stays null
+        arr[2] = fld.allocMember();
+        arr[2]["v"] = int32_t(3);
+        fld = arr.freeze().castTo<const void>();
+        auto raw = capture(true, [&holder](Buffer& b){ to_wire_valid(b, holder); });
+        emit("struct_array_present_null_present", strip_bitset(raw));
+    }
+    {
+        // 1-element union[] with the lone element left null.
+        auto holder = TypeDef(TypeCode::Struct, {
+            Member(TypeCode::UnionA, "u", "", {
+                Member(TypeCode::Int32, "i"),
+            }),
+        }).create();
+        auto fld = holder["u"];
+        shared_array<Value> arr(1);
+        // arr[0] stays null
+        fld = arr.freeze().castTo<const void>();
+        holder["u"].mark();
+        auto raw = capture(true, [&holder](Buffer& b){ to_wire_valid(b, holder); });
+        emit("union_array_null_element", strip_bitset(raw));
+    }
+    {
+        // 1-element any[] with null descriptor.
+        auto holder = TypeDef(TypeCode::Struct, {
+            Member(TypeCode::AnyA, "a"),
+        }).create();
+        auto fld = holder["a"];
+        shared_array<Value> arr(1);
+        // arr[0] stays null
+        fld = arr.freeze().castTo<const void>();
+        holder["a"].mark();
+        auto raw = capture(true, [&holder](Buffer& b){ to_wire_valid(b, holder); });
+        emit("variant_array_null_descriptor", strip_bitset(raw));
+    }
+    {
+        // Empty union[] — Size(0) only.
+        auto holder = TypeDef(TypeCode::Struct, {
+            Member(TypeCode::UnionA, "u", "", {
+                Member(TypeCode::Int32, "i"),
+            }),
+        }).create();
+        auto fld = holder["u"];
+        shared_array<Value> arr(0);
+        fld = arr.freeze().castTo<const void>();
+        holder["u"].mark();
+        auto raw = capture(true, [&holder](Buffer& b){ to_wire_valid(b, holder); });
+        emit("union_array_empty", strip_bitset(raw));
+    }
+
+    // ---- floating-point special values ----
+    emit("scalar_float_nan_be", capture(true, [](Buffer& b){
+        // Canonical quiet NaN. Bit-encode to avoid compiler NaN
+        // canonicalisation differences.
+        union { uint32_t i; float f; } u; u.i = 0x7FC00000u;
+        to_wire(b, u.f);
+    }));
+    emit("scalar_float_inf_be", capture(true, [](Buffer& b){
+        float v = std::numeric_limits<float>::infinity();
+        to_wire(b, v);
+    }));
+    emit("scalar_double_neg_zero_be", capture(true, [](Buffer& b){
+        union { uint64_t i; double f; } u; u.i = 0x8000000000000000ULL;
+        to_wire(b, u.f);
+    }));
+
+    // ---- UTF-8 multibyte strings — Size is in BYTES, not chars ----
+    emit("scalar_string_utf8_korean", capture(true, [](Buffer& b){
+        // "안녕" = 6 UTF-8 bytes.
+        std::string s = "\xec\x95\x88\xeb\x85\x95";
+        to_wire(b, s);
+    }));
+    emit("scalar_array_string_utf8", capture(true, [](Buffer& b){
+        // ["a", "안"] — element 1 is 3 UTF-8 bytes.
+        shared_array<const std::string> arr({
+            std::string("a"),
+            std::string("\xec\x95\x88"),
+        });
+        to_wire<typename decltype(arr)::value_type>(b, arr.castTo<const void>());
+    }));
 
     return 0;
 }

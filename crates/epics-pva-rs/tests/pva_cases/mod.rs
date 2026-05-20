@@ -7,6 +7,7 @@ pub mod compound_basic;
 pub mod compound_edge;
 pub mod headers;
 pub mod monitor_data;
+pub mod nt_descriptors;
 pub mod pvxs_fixtures;
 pub mod scalar_arrays;
 pub mod scalars;

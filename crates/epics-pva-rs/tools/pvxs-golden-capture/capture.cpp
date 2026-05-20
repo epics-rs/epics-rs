@@ -511,5 +511,34 @@ int main() {
         to_wire<typename decltype(arr)::value_type>(b, arr.castTo<const void>());
     }));
 
+    // ---- NormativeType type descriptors via to_wire(FieldDesc*) ----
+    // Defaults (no display/control/valueAlarm) match pvxs nt.cpp
+    // NTScalar::build. Locks the schema bytes so a Rust NT builder
+    // refactor can't silently drift away from pvxs.
+    {
+        auto val = nt::NTScalar{TypeCode::Int32}.build().create();
+        emit("nt_scalar_int32_desc", capture(true, [&val](Buffer& b){
+            to_wire(b, Value::Helper::desc(val));
+        }));
+    }
+    {
+        auto val = nt::NTScalar{TypeCode::Float64A}.build().create();
+        emit("nt_scalar_array_double_desc", capture(true, [&val](Buffer& b){
+            to_wire(b, Value::Helper::desc(val));
+        }));
+    }
+    {
+        auto val = nt::NTEnum{}.build().create();
+        emit("nt_enum_desc", capture(true, [&val](Buffer& b){
+            to_wire(b, Value::Helper::desc(val));
+        }));
+    }
+    {
+        auto val = nt::NTNDArray{}.build().create();
+        emit("nt_ndarray_desc", capture(true, [&val](Buffer& b){
+            to_wire(b, Value::Helper::desc(val));
+        }));
+    }
+
     return 0;
 }

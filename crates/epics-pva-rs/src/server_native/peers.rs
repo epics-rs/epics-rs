@@ -45,6 +45,14 @@ pub struct PeerEntry {
     /// Whether TLS is in effect for this connection (recorded at
     /// accept). pvxs surfaces `secure` similarly.
     pub tls: bool,
+    /// PVA-FR-2: peer credentials `(account, method)` once the
+    /// connection-validation handshake establishes them. pvxs
+    /// `Server::report` includes `ReportInfo`/credentials per peer.
+    pub(crate) credentials: parking_lot::Mutex<Option<(String, String)>>,
+    /// PVA-FR-2: live PV names of the channels currently open on this
+    /// connection, mirrored from the per-connection channel table on
+    /// every create/destroy so the report carries per-channel detail.
+    pub(crate) channel_names: parking_lot::Mutex<Vec<String>>,
 }
 
 impl PeerEntry {
@@ -58,6 +66,8 @@ impl PeerEntry {
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
             tls,
+            credentials: parking_lot::Mutex::new(None),
+            channel_names: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -68,6 +78,19 @@ impl PeerEntry {
 
     pub(crate) fn touch_tx(&self, n: usize) {
         self.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// PVA-FR-2: record the validated peer credentials (set once at
+    /// connection validation).
+    pub(crate) fn set_credentials(&self, account: &str, method: &str) {
+        *self.credentials.lock() = Some((account.to_string(), method.to_string()));
+    }
+
+    /// PVA-FR-2: mirror the connection's current open-channel PV names
+    /// (the per-connection channel table is the source of truth; this
+    /// snapshot is read by the report).
+    pub(crate) fn set_channel_names(&self, names: Vec<String>) {
+        *self.channel_names.lock() = names;
     }
 
     pub(crate) fn channel_added(&self) {
@@ -109,9 +132,24 @@ impl PeerRegistry {
     /// Cloned out so the caller doesn't hold the read lock across
     /// further work.
     pub fn snapshot(&self) -> Vec<(SocketAddr, PeerSnapshot)> {
+        self.snapshot_zeroed(false)
+    }
+
+    /// PVA-FR-2: snapshot, then optionally zero each peer's byte
+    /// counters (pvxs `Server::report(bool zero)` — the next report
+    /// returns deltas since this one). `connected_at`, channel counts,
+    /// and credentials are NOT reset; only the byte counters.
+    pub fn snapshot_zeroed(&self, zero: bool) -> Vec<(SocketAddr, PeerSnapshot)> {
         let g = self.inner.read();
         g.iter()
-            .map(|(addr, e)| (*addr, PeerSnapshot::from(e.as_ref())))
+            .map(|(addr, e)| {
+                let snap = PeerSnapshot::from(e.as_ref());
+                if zero {
+                    e.bytes_in.store(0, Ordering::Relaxed);
+                    e.bytes_out.store(0, Ordering::Relaxed);
+                }
+                (*addr, snap)
+            })
             .collect()
     }
 
@@ -136,6 +174,11 @@ pub struct PeerSnapshot {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub tls: bool,
+    /// PVA-FR-2: validated peer credentials `(account, method)`, or
+    /// `None` before the connection-validation handshake completes.
+    pub credentials: Option<(String, String)>,
+    /// PVA-FR-2: PV names of the channels currently open on this peer.
+    pub channel_names: Vec<String>,
 }
 
 impl From<&PeerEntry> for PeerSnapshot {
@@ -149,6 +192,8 @@ impl From<&PeerEntry> for PeerSnapshot {
             bytes_in: e.bytes_in.load(Ordering::Relaxed),
             bytes_out: e.bytes_out.load(Ordering::Relaxed),
             tls: e.tls,
+            credentials: e.credentials.lock().clone(),
+            channel_names: e.channel_names.lock().clone(),
         }
     }
 }
@@ -181,5 +226,47 @@ mod tests {
         assert_eq!(s.bytes_in, 64);
         reg.remove(addr);
         assert!(reg.is_empty());
+    }
+
+    /// PVA-FR-2: the snapshot carries per-peer credentials and live
+    /// channel names, and `snapshot_zeroed(true)` resets only the byte
+    /// counters (not channels/credentials) so the next report is a delta.
+    #[test]
+    fn snapshot_carries_credentials_channels_and_zeroes_bytes() {
+        let reg = PeerRegistry::new();
+        let addr: SocketAddr = "127.0.0.1:5076".parse().unwrap();
+        let e = PeerEntry::new(true);
+        e.set_credentials("op", "ca");
+        e.channel_added();
+        e.set_channel_names(vec!["X:PV".into(), "Y:PV".into()]);
+        e.touch_rx(100);
+        e.touch_tx(40);
+        reg.insert(addr, e);
+
+        // report(false): credentials + channel names + non-zero bytes.
+        let s = &reg.snapshot()[0].1;
+        assert_eq!(s.credentials, Some(("op".into(), "ca".into())));
+        assert_eq!(
+            s.channel_names,
+            vec!["X:PV".to_string(), "Y:PV".to_string()]
+        );
+        assert_eq!((s.bytes_in, s.bytes_out), (100, 40));
+        assert_eq!(s.channels, 1);
+
+        // report(true): byte counters reset; channels/credentials kept.
+        let s = &reg.snapshot_zeroed(true)[0].1;
+        assert_eq!((s.bytes_in, s.bytes_out), (100, 40), "snapshot is pre-zero");
+        let s = &reg.snapshot()[0].1;
+        assert_eq!(
+            (s.bytes_in, s.bytes_out),
+            (0, 0),
+            "next report sees zeroed bytes"
+        );
+        assert_eq!(s.channels, 1, "channel count not reset");
+        assert_eq!(
+            s.credentials,
+            Some(("op".into(), "ca".into())),
+            "creds not reset"
+        );
     }
 }

@@ -1297,6 +1297,9 @@ async fn handle_connection_io(
                             ops: HashMap::new(),
                         });
                         peer_entry.channel_added();
+                        // PVA-FR-2: mirror live channel names for the report.
+                        peer_entry
+                            .set_channel_names(channels.values().map(|c| c.name.clone()).collect());
                     } else {
                         payload.put_u32(0u32, order);
                         Status::error(format!("unknown PV: {}", cc.name))
@@ -1499,6 +1502,9 @@ async fn handle_connection_io(
                 buf.extend_from_slice(&payload);
                 let _ = tx.send(buf).await;
                 handshake_complete = true;
+                // PVA-FR-2: record the validated credentials for the
+                // per-peer report.
+                peer_entry.set_credentials(&cred.account, &cred.method);
                 // Fire user-installed `auth_complete` hook (pvxs
                 // serverconn.cpp:181 parity) once we've accepted the
                 // peer's identity claim. Hook signature mirrors pvxs
@@ -1541,6 +1547,9 @@ async fn handle_connection_io(
                 handle_destroy_channel(&frame, &tx, &mut channels, order).await?;
                 if channels.len() < before {
                     peer_entry.channel_removed();
+                    // PVA-FR-2: keep the report's channel-name mirror current.
+                    peer_entry
+                        .set_channel_names(channels.values().map(|c| c.name.clone()).collect());
                 }
             }
             Some(Command::Get) => {

@@ -694,6 +694,15 @@ impl PvaServer {
     /// level. Per-peer / per-channel counters require book-keeping the
     /// TCP loop doesn't yet maintain; surface what we have today.
     pub fn report(&self) -> ServerReport {
+        self.report_zeroed(false)
+    }
+
+    /// PVA-FR-2: like [`Self::report`] but, when `zero` is true, resets
+    /// each peer's byte counters after the snapshot — pvxs
+    /// `Server::report(bool zero)`, so a subsequent report returns the
+    /// deltas since this one. Channel counts and credentials are not
+    /// reset.
+    pub fn report_zeroed(&self, zero: bool) -> ServerReport {
         ServerReport {
             tcp_port: self.bound_tcp_port,
             udp_port: self.effective_config.udp_port,
@@ -715,7 +724,7 @@ impl PvaServer {
                 .as_ref()
                 .map(|h| !h.is_finished())
                 .unwrap_or(false),
-            peers: self.peers.snapshot(),
+            peers: self.peers.snapshot_zeroed(zero),
             peer_count: self.peers.len(),
         }
     }

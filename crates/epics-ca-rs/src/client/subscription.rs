@@ -18,8 +18,8 @@ use super::types::TransportCommand;
 /// atomically against the pause flag (see [`CoalesceSlot::route_value`]).
 pub(crate) enum ValueRoute {
     /// Coalesced into a slot cell (active overflow into `ready`, or a
-    /// during-pause hold into `held`). No channel write — invisible to
-    /// flow control.
+    /// during-pause arrival into `gated`). No channel write — invisible
+    /// to flow control.
     Slotted,
     /// `ready` empty and not paused — the caller should try the bounded
     /// channel (and fall back to [`CoalesceSlot::put_value`] on full).
@@ -235,8 +235,9 @@ impl CoalesceSlot {
 pub(crate) enum MonitorDeliveryOutcome {
     /// Written to the bounded channel — counts toward flow control.
     Queued(SocketAddr),
-    /// Buffered in the coalesce slot (overflow value, pause-held value,
-    /// or overflow error). Out of flow control — diagnostic only.
+    /// Buffered in the coalesce slot (overflow `ready`, during-pause
+    /// `gated`, or overflow error). Out of flow control — diagnostic
+    /// only.
     Slotted(SocketAddr),
     /// Dropped because the consumer channel is closed (the application
     /// dropped its `MonitorHandle`). The only remaining drop case.
@@ -273,7 +274,7 @@ pub(crate) struct SubscriptionRecord {
     pub last_value: Option<f64>,
     /// Number of monitor updates in the bounded channel awaiting
     /// consumption. Invariant I1: this counts ONLY channel items —
-    /// coalesce-slot entries (overflow/held/error) are out of band and
+    /// coalesce-slot entries (ready/gated/error) are out of band and
     /// never bump it, so a client-side pause can't trip the per-circuit
     /// `EVENTS_OFF`.
     pub pending_deliveries: usize,
@@ -898,7 +899,7 @@ mod tests {
         // An error parks in the error slot (channel-full path).
         slot.put_error(CaError::ServerError(192)); // ECA_DISCONN
         slot.set_paused(true);
-        // A value arrives during pause → value slot (held). Separate slot.
+        // A value arrives during pause → `gated` cell (separate from error).
         assert!(matches!(
             slot.route_value(long_snap(5)),
             ValueRoute::Slotted
@@ -951,11 +952,11 @@ mod tests {
         );
     }
 
-    /// This-round F1 / I3 (the precise repro): a pre-pause `ready` value
-    /// and a during-pause value coexist. The during-pause value must
-    /// land in the SEPARATE `held` cell, NOT overwrite `ready`.
-    /// take_deliverable yields the pre-pause value; the during-pause one
-    /// surfaces only after resume.
+    /// I3 (the precise repro): a pre-pause `ready` value and a
+    /// during-pause value coexist. The during-pause value must land in
+    /// the SEPARATE `gated` cell, NOT overwrite `ready`. take_deliverable
+    /// yields the pre-pause value; the during-pause one surfaces only
+    /// after resume.
     #[test]
     fn prepause_ready_not_clobbered_by_concurrent_during_pause_value() {
         let slot = CoalesceSlot::new();
@@ -1118,18 +1119,20 @@ mod tests {
         assert!(slot.take_deliverable().is_none());
     }
 
-    /// This-round finding: a value made deliverable by a PRIOR resume
-    /// is pre-(this-)pause backlog and must stay deliverable across a
-    /// second pause. Pause ENTRY collapses it into `ready`, so it is no
-    /// longer gated.
+    /// A value made deliverable by a PRIOR resume is pre-(this-)pause
+    /// backlog and must stay deliverable across a second pause. Because
+    /// resume promotes `gated` into `ready`, the value sits in `ready`
+    /// (never gated) and a later pause leaves it alone — the invariant
+    /// `gated.is_some() ⟹ paused` makes re-gating structurally
+    /// impossible.
     #[test]
     fn held_backlog_stays_deliverable_across_second_pause() {
         let slot = CoalesceSlot::new();
         slot.set_paused(true); // pause 1
-        slot.route_value(long_snap(1)); // held = 1 (during pause 1)
-        slot.set_paused(false); // resume 1 → held=1 now deliverable
-        // No recv. Pause again BEFORE draining held=1.
-        slot.set_paused(true); // pause 2 entry → collapse held(1) → ready
+        slot.route_value(long_snap(1)); // gated = 1 (during pause 1)
+        slot.set_paused(false); // resume 1 → gated promoted into ready = 1
+        // No recv. Pause again; ready=1 is untouched (gated is empty).
+        slot.set_paused(true); // pause 2 (gated empty)
         let v = slot
             .take_deliverable()
             .expect("post-resume backlog must survive a new pause (I3)");
@@ -1137,17 +1140,17 @@ mod tests {
     }
 
     /// Multi-cycle bound: across pause/resume cycles the deliverable
-    /// backlog coalesces to the latest at each pause entry (it never
-    /// grows past ready+held). Older intermediate values are dropped as
-    /// designed (latest-wins), the newest survives.
+    /// backlog coalesces to the latest at each resume (it never grows
+    /// past one `ready` + one `gated`). Older intermediate values are
+    /// dropped as designed (uniform latest-wins); the newest survives.
     #[test]
     fn repeated_pause_cycles_coalesce_to_latest() {
         let slot = CoalesceSlot::new();
         slot.put_value(long_snap(11)); // ready = 11 (active)
-        slot.set_paused(true); // pause1 entry (held empty → ready stays 11)
-        slot.route_value(long_snap(22)); // held = 22 (during pause1)
-        slot.set_paused(false); // resume1 → ready=11, held=22
-        slot.set_paused(true); // pause2 entry → collapse: ready = 22 (latest)
+        slot.set_paused(true); // pause1 (gated empty → ready stays 11)
+        slot.route_value(long_snap(22)); // gated = 22 (during pause1)
+        slot.set_paused(false); // resume1 → ready = 22 (11 coalesced away)
+        slot.set_paused(true); // pause2 (gated empty, ready stays 22)
         // 11 was the older backlog — coalesced away; 22 is deliverable.
         let v = slot.take_deliverable().expect("latest backlog deliverable");
         assert_eq!(v.expect("Ok").value, EpicsValue::Long(22));

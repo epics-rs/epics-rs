@@ -303,6 +303,7 @@ enum CoordRequest {
         mask: u16,
         deadband: f64,
         callback_tx: mpsc::Sender<CaResult<Snapshot>>,
+        coalesce_slot: std::sync::Arc<subscription::CoalesceSlot>,
         reply: oneshot::Sender<CaResult<()>>,
     },
     Unsubscribe {
@@ -2144,6 +2145,7 @@ impl CaChannel {
             .unwrap_or(256)
             .max(8);
         let (callback_tx, callback_rx) = mpsc::channel(queue_size);
+        let coalesce_slot = subscription::CoalesceSlot::new();
 
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.coord_tx.send(CoordRequest::Subscribe {
@@ -2152,6 +2154,7 @@ impl CaChannel {
             mask: DBE_VALUE | DBE_LOG | DBE_ALARM,
             deadband,
             callback_tx,
+            coalesce_slot: coalesce_slot.clone(),
             reply: reply_tx,
         });
 
@@ -2160,6 +2163,7 @@ impl CaChannel {
         Ok(MonitorHandle {
             subid,
             callback_rx,
+            coalesce_slot,
             coord_tx: self.coord_tx.clone(),
         })
     }
@@ -2271,18 +2275,67 @@ impl CaChannel {
 pub struct MonitorHandle {
     subid: u32,
     callback_rx: mpsc::Receiver<CaResult<Snapshot>>,
+    /// Shared coalesce slot — drained after the bounded `callback_rx`
+    /// is empty so the latest under-pressure snapshot is always
+    /// delivered. See [`subscription::CoalesceSlot`].
+    coalesce_slot: std::sync::Arc<subscription::CoalesceSlot>,
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
 }
 
 impl MonitorHandle {
+    /// Receive the next monitor update.
+    ///
+    /// Order of preference:
+    /// 1. Anything buffered in the bounded channel (preserves FIFO
+    ///    under normal load).
+    /// 2. The coalesce slot, populated when the channel was full
+    ///    at delivery time (`SubscriptionRecord::coalesce_slot`).
+    /// 3. Block until either a new channel item lands or the
+    ///    producer signals the slot via `Notify`.
+    ///
+    /// `None` means the producer side closed (subscription cancelled
+    /// or coordinator shut down).
     pub async fn recv(&mut self) -> Option<CaResult<Snapshot>> {
-        let result = self.callback_rx.recv().await;
-        if result.is_some() {
-            let _ = self
-                .coord_tx
-                .send(CoordRequest::MonitorConsumed { subid: self.subid });
+        use tokio::sync::mpsc::error::TryRecvError;
+        loop {
+            // 1. Drain the bounded channel first.
+            match self.callback_rx.try_recv() {
+                Ok(msg) => {
+                    let _ = self
+                        .coord_tx
+                        .send(CoordRequest::MonitorConsumed { subid: self.subid });
+                    return Some(msg);
+                }
+                Err(TryRecvError::Disconnected) => return None,
+                Err(TryRecvError::Empty) => {}
+            }
+            // 2. Channel empty — check the coalesce slot.
+            if let Some(msg) = self.coalesce_slot.take() {
+                let _ = self
+                    .coord_tx
+                    .send(CoordRequest::MonitorConsumed { subid: self.subid });
+                return Some(msg);
+            }
+            // 3. Both empty — wait for whichever fires first.
+            let notified = self.coalesce_slot.notified();
+            tokio::pin!(notified);
+            tokio::select! {
+                msg = self.callback_rx.recv() => {
+                    if msg.is_some() {
+                        let _ = self
+                            .coord_tx
+                            .send(CoordRequest::MonitorConsumed { subid: self.subid });
+                    }
+                    return msg;
+                }
+                _ = &mut notified => {
+                    // Loop and recheck — the slot/channel may have
+                    // been populated; another consumer of the same
+                    // `Notify` can't exist (each subscription has
+                    // its own slot) but a spurious wake is harmless.
+                }
+            }
         }
-        result
     }
 }
 
@@ -2449,7 +2502,7 @@ async fn run_coordinator(
                                 .push(reply);
                         }
                     }
-                    CoordRequest::Subscribe { cid, subid, mask, deadband, callback_tx, reply } => {
+                    CoordRequest::Subscribe { cid, subid, mask, deadband, callback_tx, coalesce_slot, reply } => {
                         if let Some(ch) = channels.get(&cid) {
                             let server_addr = ch.server_addr.unwrap_or_else(|| {
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
@@ -2474,9 +2527,11 @@ async fn run_coordinator(
                                 server_addr,
                                 deadband,
                                 callback_tx,
+                                coalesce_slot,
                                 needs_restore: !connected,
                                 last_value: None,
                                 pending_deliveries: 0,
+                                nreplace: 0,
                             });
 
                             if connected {
@@ -2943,16 +2998,42 @@ async fn run_coordinator(
                     TransportEvent::MonitorData { subid, data_type, count, data } => {
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_data(subid, data_type, count, &data) {
-                            MonitorDeliveryOutcome::Queued(server_addr) => {
+                            MonitorDeliveryOutcome::Queued(server_addr)
+                            | MonitorDeliveryOutcome::Coalesced(server_addr) => {
+                                // `Coalesced` means the bounded channel was full
+                                // and the snapshot landed in the coalesce slot
+                                // for the first time (slot was empty). Like
+                                // `Queued` it adds one to the per-circuit
+                                // outstanding count, which the existing
+                                // EVENTS_OFF emission already gates on.
                                 flow_control_note_queued(
                                     &mut flow_control,
                                     server_addr,
                                     &transport_tx,
                                 );
                             }
+                            MonitorDeliveryOutcome::Replaced(_server_addr) => {
+                                // Slot already held a coalesced value;
+                                // the new snapshot overwrote it in place.
+                                // Net pending unchanged → no flow-control
+                                // change (mirrors C `nreplace++` without a
+                                // queue-depth bump).
+                                metrics::counter!(
+                                    "ca_client_coalesced_monitors_total"
+                                )
+                                .increment(1);
+                            }
                             MonitorDeliveryOutcome::Dropped(_server_addr) => {
+                                // With the coalesce slot, this is reachable
+                                // only when the consumer channel is closed —
+                                // i.e. the application dropped the
+                                // `MonitorHandle`. Bumping the counter is
+                                // still useful as a stale-handle signal.
                                 diag.dropped_monitors.fetch_add(1, Ordering::Relaxed);
-                                tracing::warn!(subid, "monitor dropped (consumer queue full)");
+                                tracing::warn!(
+                                    subid,
+                                    "monitor dropped (consumer handle closed)"
+                                );
                                 metrics::counter!("ca_client_dropped_monitors_total").increment(1);
                             }
                             MonitorDeliveryOutcome::Filtered
@@ -2977,6 +3058,18 @@ async fn run_coordinator(
                                 diag.dropped_monitors.fetch_add(1, Ordering::Relaxed);
                                 metrics::counter!(
                                     "ca_client_monitor_error_drops_total"
+                                )
+                                .increment(1);
+                            }
+                            MonitorDeliveryOutcome::Coalesced(_)
+                            | MonitorDeliveryOutcome::Replaced(_) => {
+                                // Status frame landed in the coalesce
+                                // slot (channel was full). The consumer
+                                // will still see it on the next `recv`
+                                // — count it for visibility but treat
+                                // as success.
+                                metrics::counter!(
+                                    "ca_client_coalesced_monitors_total"
                                 )
                                 .increment(1);
                             }

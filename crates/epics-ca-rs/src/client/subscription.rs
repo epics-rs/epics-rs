@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::SystemTime;
 
 use epics_base_rs::runtime::sync::mpsc;
+use tokio::sync::Notify;
 use tokio::sync::mpsc::error::TrySendError;
 
 use epics_base_rs::error::CaResult;
@@ -11,14 +14,86 @@ use epics_base_rs::types::{DbFieldType, EpicsValue, decode_dbr};
 
 use super::types::TransportCommand;
 
+/// Per-subscription "latest pending" slot used when the bounded
+/// callback channel is full. Mirrors the
+/// `db_post_events`/`dbEvent.c:813-823` replace-last behaviour of
+/// the C IOC's ring buffer: when no space remains, the new event
+/// overwrites the last pending value for the same subscription
+/// rather than being silently dropped. The next
+/// [`MonitorHandle::recv`] drains the slot after the channel is
+/// empty, so the latest value is always delivered.
+///
+/// Combined with the existing per-circuit `EVENTS_OFF` emission
+/// (see `flow_control_note_queued` / `flow_control_note_consumed`
+/// in `mod.rs`), this gives the same two-layer back-pressure the C
+/// reference implements: server-side coalesce + protocol-level
+/// `EVENTS_OFF` when a slow consumer can't keep up.
+pub(crate) struct CoalesceSlot {
+    latest: StdMutex<Option<CaResult<Snapshot>>>,
+    notify: Notify,
+}
+
+impl CoalesceSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            latest: StdMutex::new(None),
+            notify: Notify::new(),
+        })
+    }
+
+    /// Replace the slot with `snap`. Returns `true` when the slot
+    /// transitioned from empty → present (the producer should bump
+    /// the per-circuit outstanding-event count), `false` when the
+    /// new value just overwrote a prior coalesced entry.
+    fn put(&self, snap: CaResult<Snapshot>) -> bool {
+        let mut guard = self.latest.lock().expect("CoalesceSlot mutex poisoned");
+        let was_empty = guard.is_none();
+        *guard = Some(snap);
+        drop(guard);
+        self.notify.notify_one();
+        was_empty
+    }
+
+    /// Take the current slot value, if any. Called by
+    /// `MonitorHandle::recv` after the bounded channel is drained.
+    pub fn take(&self) -> Option<CaResult<Snapshot>> {
+        self.latest
+            .lock()
+            .expect("CoalesceSlot mutex poisoned")
+            .take()
+    }
+
+    /// Future that resolves when the next `put` happens.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
+    /// Drop any pending coalesced value (called when a subscription
+    /// is disconnected so a stale snapshot can't outlive the circuit).
+    fn clear(&self) -> Option<CaResult<Snapshot>> {
+        self.take()
+    }
+}
+
 /// Outcome of `on_monitor_data` — lets the coordinator decide whether to
 /// bump flow control or the dropped counter.
 pub(crate) enum MonitorDeliveryOutcome {
     /// Snapshot was queued to the application; caller should increment
     /// per-server flow control outstanding count.
     Queued(SocketAddr),
-    /// Snapshot was dropped (queue full or callback closed). Caller should
-    /// bump the dropped counter and ideally request EVENTS_OFF.
+    /// Bounded channel was full; the snapshot was placed in the
+    /// per-subscription coalesce slot for the first time (slot was
+    /// empty before). Caller should increment flow control just
+    /// like `Queued` — the consumer will see it on the next `recv`.
+    Coalesced(SocketAddr),
+    /// Bounded channel was full and the coalesce slot already held
+    /// a prior value, which has been overwritten. Net pending count
+    /// is unchanged, so the caller MUST NOT bump flow control.
+    /// Matches `dbEvent.c::nreplace++` book-keeping.
+    Replaced(SocketAddr),
+    /// Snapshot was dropped because the consumer channel is closed.
+    /// (With the coalesce slot in place this is the only remaining
+    /// drop case; "queue full → silent drop" is no longer reachable.)
     Dropped(SocketAddr),
     /// Filtered by client-side deadband (no action).
     Filtered,
@@ -41,13 +116,21 @@ pub(crate) struct SubscriptionRecord {
     pub mask: u16,
     pub server_addr: SocketAddr,
     pub callback_tx: mpsc::Sender<CaResult<Snapshot>>,
+    /// "Latest pending" slot — see [`CoalesceSlot`]. Shared with the
+    /// [`MonitorHandle`] so the consumer drains it after the bounded
+    /// channel empties.
+    pub coalesce_slot: Arc<CoalesceSlot>,
     pub needs_restore: bool,
     /// Client-side deadband: suppress callback if |new - old| < deadband.
     pub deadband: f64,
     /// Last delivered scalar value (for deadband filtering).
     pub last_value: Option<f64>,
     /// Number of monitor updates queued to the application but not yet consumed.
+    /// Includes both the bounded-channel items and a single coalesce-slot entry.
     pub pending_deliveries: usize,
+    /// Diagnostic counter — number of overflow-coalesce events for
+    /// this subscription. Mirrors `dbEvent.c::pevent->nreplace`.
+    pub nreplace: u64,
 }
 
 pub(crate) struct SubscriptionRegistry {
@@ -137,7 +220,24 @@ impl SubscriptionRegistry {
                 rec.pending_deliveries += 1;
                 MonitorDeliveryOutcome::Queued(server_addr)
             }
-            Err(TrySendError::Full(_)) => MonitorDeliveryOutcome::Dropped(server_addr),
+            Err(TrySendError::Full(rejected)) => {
+                // Bounded channel full — instead of silently dropping
+                // (the pre-fix behaviour, which lost terminal
+                // transitions like DMOV 1→0 under load), place the
+                // new snapshot in the per-subscription coalesce slot.
+                // `MonitorHandle::recv` drains the slot after the
+                // channel empties so the latest value is always
+                // delivered. Mirrors C `dbEvent.c::db_post_events`
+                // replace-last semantics.
+                rec.nreplace = rec.nreplace.saturating_add(1);
+                let first_coalesce = rec.coalesce_slot.put(rejected);
+                if first_coalesce {
+                    rec.pending_deliveries += 1;
+                    MonitorDeliveryOutcome::Coalesced(server_addr)
+                } else {
+                    MonitorDeliveryOutcome::Replaced(server_addr)
+                }
+            }
             Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(server_addr),
         }
     }
@@ -164,6 +264,10 @@ impl SubscriptionRegistry {
                     *cleared.entry(rec.server_addr).or_insert(0) += rec.pending_deliveries;
                 }
                 rec.pending_deliveries = 0;
+                // Drop any coalesced snapshot — the disconnect error
+                // below is the next thing the consumer should see;
+                // a stale pre-disconnect value would mask it.
+                let _ = rec.coalesce_slot.clear();
                 // Best-effort: a closed receiver silently drops, same
                 // as `try_deliver_err`. We don't return this through
                 // MonitorDeliveryOutcome because the caller is the
@@ -304,7 +408,19 @@ fn try_deliver_err(
             rec.pending_deliveries += 1;
             MonitorDeliveryOutcome::Queued(server_addr)
         }
-        Err(_) => MonitorDeliveryOutcome::Dropped(server_addr),
+        Err(TrySendError::Full(rejected)) => {
+            // Same coalesce path as a normal value: keep the latest
+            // status for the consumer rather than dropping silently.
+            rec.nreplace = rec.nreplace.saturating_add(1);
+            let first_coalesce = rec.coalesce_slot.put(rejected);
+            if first_coalesce {
+                rec.pending_deliveries += 1;
+                MonitorDeliveryOutcome::Coalesced(server_addr)
+            } else {
+                MonitorDeliveryOutcome::Replaced(server_addr)
+            }
+        }
+        Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(server_addr),
     }
 }
 
@@ -334,10 +450,12 @@ mod tests {
             mask: 1,
             server_addr: addr(),
             callback_tx,
+            coalesce_slot: CoalesceSlot::new(),
             needs_restore: true,
             deadband: 0.0,
             last_value: None,
             pending_deliveries: 0,
+            nreplace: 0,
         };
         (rec, rx)
     }
@@ -396,6 +514,105 @@ mod tests {
         assert_eq!(restored, 1);
         // User-supplied type/count survive the native-type change.
         assert_eq!(drained_type(&mut rx), (19, 2));
+    }
+
+    /// Regression: pre-fix `on_monitor_data` did `try_send → drop` on a
+    /// full callback channel, losing terminal transitions like DMOV
+    /// 1→0 under burst load (ophyd MoveStatus stuck forever). The fix
+    /// coalesces the latest pending snapshot into [`CoalesceSlot`] and
+    /// [`MonitorHandle::recv`] drains it after the bounded channel
+    /// empties.
+    #[test]
+    fn coalesce_on_overflow_preserves_latest_dmov_transition() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::{EpicsValue, encode_dbr};
+        use std::time::SystemTime;
+
+        const DBR_TIME_LONG: u16 = 19;
+
+        let mut reg = SubscriptionRegistry::new();
+        // Channel of size 2 so the third update is forced into the
+        // coalesce slot — exercises the overflow path deterministically.
+        let (callback_tx, mut rx) = mpsc::channel::<CaResult<Snapshot>>(2);
+        let coalesce_slot = CoalesceSlot::new();
+
+        let rec = SubscriptionRecord {
+            subid: 1,
+            cid: 100,
+            data_type: Some(DBR_TIME_LONG),
+            count: Some(1),
+            type_user_supplied: true,
+            mask: 1,
+            server_addr: addr(),
+            callback_tx,
+            coalesce_slot: coalesce_slot.clone(),
+            needs_restore: false,
+            deadband: 0.0,
+            last_value: None,
+            pending_deliveries: 0,
+            nreplace: 0,
+        };
+        reg.add(rec);
+
+        // Burst [1, 2, 3, 4, 0] — the trailing 0 stands in for a DMOV
+        // 1→0 transition that the pre-fix encoder dropped.
+        let values = [1_i32, 2, 3, 4, 0];
+        for (i, v) in values.iter().enumerate() {
+            let snap = Snapshot::new(EpicsValue::Long(*v), 0, 0, SystemTime::now());
+            let bytes = encode_dbr(DBR_TIME_LONG, &snap).expect("encode_dbr");
+            let outcome = reg.on_monitor_data(1, DBR_TIME_LONG, 1, &bytes);
+            match (i, &outcome) {
+                (0..=1, MonitorDeliveryOutcome::Queued(_)) => {}
+                (2, MonitorDeliveryOutcome::Coalesced(_)) => {}
+                (3..=4, MonitorDeliveryOutcome::Replaced(_)) => {}
+                _ => panic!("unexpected outcome at i={i}"),
+            }
+        }
+
+        // C `dbEvent.c::nreplace` parity — 3 overflow events.
+        assert_eq!(reg.get(1).expect("rec").nreplace, 3);
+
+        // Bounded channel has the first two values (FIFO preserved).
+        let first = rx.try_recv().expect("first").expect("Ok");
+        assert_eq!(first.value, EpicsValue::Long(1));
+        let second = rx.try_recv().expect("second").expect("Ok");
+        assert_eq!(second.value, EpicsValue::Long(2));
+        assert!(
+            rx.try_recv().is_err(),
+            "bounded channel should be drained after 2 reads"
+        );
+
+        // Slot holds the LATEST value (the DMOV transition); 3 and 4
+        // were intermediate-coalesced-away as designed.
+        let last = coalesce_slot.take().expect("slot non-empty").expect("Ok");
+        assert_eq!(
+            last.value,
+            EpicsValue::Long(0),
+            "the terminal DMOV 1→0 transition must survive overflow",
+        );
+        assert!(
+            coalesce_slot.take().is_none(),
+            "slot is single-entry; subsequent takes return None",
+        );
+    }
+
+    /// `CoalesceSlot::put` returns true on empty→present so the caller
+    /// (the producer in `on_monitor_data`) knows whether to bump the
+    /// per-circuit outstanding-event count.
+    #[test]
+    fn coalesce_slot_put_signals_was_empty() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::EpicsValue;
+        use std::time::SystemTime;
+
+        let slot = CoalesceSlot::new();
+        let snap1 = Snapshot::new(EpicsValue::Long(1), 0, 0, SystemTime::now());
+        assert!(slot.put(Ok(snap1)), "empty → present");
+        let snap2 = Snapshot::new(EpicsValue::Long(2), 0, 0, SystemTime::now());
+        assert!(!slot.put(Ok(snap2)), "present → present (replace)");
+
+        let latest = slot.take().expect("slot non-empty").expect("Ok");
+        assert_eq!(latest.value, EpicsValue::Long(2), "latest wins");
     }
 
     /// Without a native-type change, an auto-derived type stays locked

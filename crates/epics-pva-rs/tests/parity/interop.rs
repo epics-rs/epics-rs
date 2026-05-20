@@ -678,7 +678,9 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
     match s.get_field("dimension") {
         Some(PvField::StructureArray(dims)) => {
             assert_eq!(dims.len(), 1);
-            if let Some(PvField::Scalar(ScalarValue::Int(sz))) = dims[0].get_field("size") {
+            if let Some(PvField::Scalar(ScalarValue::Int(sz))) =
+                dims[0].as_ref().unwrap().get_field("size")
+            {
                 assert_eq!(*sz, 1024);
             } else {
                 panic!("dim[0].size missing");
@@ -691,11 +693,12 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
     match s.get_field("attribute") {
         Some(PvField::StructureArray(attrs)) => {
             assert_eq!(attrs.len(), 1);
-            if let Some(PvField::Scalar(ScalarValue::String(name))) = attrs[0].get_field("name") {
+            let attr0 = attrs[0].as_ref().unwrap();
+            if let Some(PvField::Scalar(ScalarValue::String(name))) = attr0.get_field("name") {
                 assert_eq!(name, "Test");
             }
             // value is a Variant carrying Double(3.14)
-            match attrs[0].get_field("value") {
+            match attr0.get_field("value") {
                 Some(PvField::Variant(v)) => match &v.value {
                     PvField::Scalar(ScalarValue::Double(d)) => {
                         assert!((d - 3.14).abs() < 1e-6, "got {d}")

@@ -1012,11 +1012,11 @@ mod tests {
                 ("as_double".into(), FieldDesc::Scalar(ScalarType::Double)),
             ],
         };
-        let value = PvField::UnionArray(vec![UnionItem {
+        let value = PvField::UnionArray(vec![Some(UnionItem {
             selector: 0,
             variant_name: "as_int".into(),
             value: PvField::Scalar(ScalarValue::Int(7)),
-        }]);
+        })]);
 
         let latest = Arc::new(parking_lot::Mutex::new(Some(value)));
         let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -1041,11 +1041,11 @@ mod tests {
         let provider = Arc::new(BridgeProvider::new(db));
         let store = QsrvPvStore::new(provider);
 
-        let value = PvField::UnionArray(vec![UnionItem {
+        let value = PvField::UnionArray(vec![Some(UnionItem {
             selector: 0,
             variant_name: "as_int".into(),
             value: PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(7)),
-        }]);
+        })]);
         let latest = Arc::new(parking_lot::Mutex::new(Some(value)));
         let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
         store
@@ -1367,11 +1367,11 @@ mod tests {
                 ("as_double".into(), FieldDesc::Scalar(ScalarType::Double)),
             ],
         };
-        let value = PvField::UnionArray(vec![UnionItem {
+        let value = PvField::UnionArray(vec![Some(UnionItem {
             selector: 0,
             variant_name: "as_int".into(),
             value: PvField::Scalar(ScalarValue::Int(7)),
-        }]);
+        })]);
         store
             .register_pva_pv(
                 "TEST:WIRE:UARR",

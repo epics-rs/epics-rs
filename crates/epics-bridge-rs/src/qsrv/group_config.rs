@@ -455,22 +455,27 @@ fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvFie
                 Ok(PvField::ScalarArray(scalars))
             } else if !elems.is_empty() && elems.iter().all(|e| matches!(e, PvField::Structure(_)))
             {
+                // PVA-FR-1: JSON array elements are all present, so each
+                // maps to a `Some` element.
                 let structs = elems
                     .into_iter()
                     .map(|e| match e {
-                        PvField::Structure(s) => s,
+                        PvField::Structure(s) => Some(s),
                         _ => unreachable!("checked all-structure above"),
                     })
                     .collect();
                 Ok(PvField::StructureArray(structs))
             } else {
                 // Nested arrays, null elements, or mixed kinds — keep
-                // each element verbatim inside a Variant.
+                // each element verbatim inside a Variant. All present
+                // (`Some`) here; JSON `null` is handled elsewhere.
                 let items = elems
                     .into_iter()
-                    .map(|e| VariantValue {
-                        desc: Some(e.descriptor()),
-                        value: e,
+                    .map(|e| {
+                        Some(VariantValue {
+                            desc: Some(e.descriptor()),
+                            value: e,
+                        })
                     })
                     .collect();
                 Ok(PvField::VariantArray(items))
@@ -1002,7 +1007,7 @@ mod tests {
             Some(PvField::VariantArray(items)) => {
                 assert_eq!(items.len(), 2, "two nested rows");
                 assert!(
-                    matches!(items[0].value, PvField::ScalarArray(_)),
+                    matches!(items[0].as_ref().unwrap().value, PvField::ScalarArray(_)),
                     "each nested element is a scalar array"
                 );
             }
@@ -1027,7 +1032,7 @@ mod tests {
         match &m.const_value {
             Some(PvField::StructureArray(items)) => {
                 assert_eq!(items.len(), 2);
-                assert_eq!(items[0].fields[0].0, "a");
+                assert_eq!(items[0].as_ref().unwrap().fields[0].0, "a");
             }
             other => panic!("expected StructureArray, got {other:?}"),
         }
@@ -1093,7 +1098,7 @@ mod tests {
         match &m.const_value {
             Some(PvField::VariantArray(items)) => {
                 assert_eq!(items.len(), 3);
-                assert!(matches!(items[1].value, PvField::Null));
+                assert!(matches!(items[1].as_ref().unwrap().value, PvField::Null));
             }
             other => panic!("expected VariantArray with a Null element, got {other:?}"),
         }

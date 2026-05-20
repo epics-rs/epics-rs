@@ -22,7 +22,11 @@ pub enum PvField {
     /// [`PvField::scalar_array_double`], `_float`, `_int`, etc.
     ScalarArrayTyped(TypedScalarArray),
     Structure(PvStructure),
-    StructureArray(Vec<PvStructure>),
+    /// Structure array. PVA-FR-1: each element is `Option` — `None` is a
+    /// pvxs `0x00` null element (absent), `Some(s)` a `0x01`-present
+    /// element. This is distinct from a *present* element whose body is
+    /// empty; overloading an inner sentinel could not express that.
+    StructureArray(Vec<Option<PvStructure>>),
     /// A union value — `selector >= 0` and `value` is the chosen variant's
     /// concrete `PvField`. `selector == -1` indicates a null union (no
     /// variant selected).
@@ -31,11 +35,18 @@ pub enum PvField {
         variant_name: String,
         value: Box<PvField>,
     },
-    UnionArray(Vec<UnionItem>),
+    /// Union array. PVA-FR-1: `None` is a `0x00` null element (absent);
+    /// `Some(item)` is a present element, which may itself carry a
+    /// null-selector union (`selector == -1`) — a distinct state from an
+    /// absent element.
+    UnionArray(Vec<Option<UnionItem>>),
     /// "Any" — variant carries its own [`FieldDesc`]. Empty descriptor +
     /// null value indicates "no value".
     Variant(Box<VariantValue>),
-    VariantArray(Vec<VariantValue>),
+    /// Variant ("any") array. PVA-FR-1: `None` is a `0x00` null element
+    /// (absent); `Some(v)` is a present element, which may itself carry a
+    /// descriptor-less empty value — a distinct state from absent.
+    VariantArray(Vec<Option<VariantValue>>),
     /// Explicit empty value (used by null union / null variant).
     Null,
 }
@@ -78,7 +89,10 @@ impl fmt::Display for PvField {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{s}")?;
+                    match s {
+                        Some(s) => write!(f, "{s}")?,
+                        None => write!(f, "(null)")?,
+                    }
                 }
                 write!(f, "]")
             }
@@ -99,10 +113,12 @@ impl fmt::Display for PvField {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    if it.selector < 0 {
-                        write!(f, "(null)")?;
-                    } else {
-                        write!(f, "{}={}", it.variant_name, it.value)?;
+                    match it {
+                        // `None` = absent element; a present item with
+                        // `selector < 0` = present null-selector union.
+                        None => write!(f, "(null)")?,
+                        Some(it) if it.selector < 0 => write!(f, "(null)")?,
+                        Some(it) => write!(f, "{}={}", it.variant_name, it.value)?,
                     }
                 }
                 write!(f, "]")
@@ -114,7 +130,10 @@ impl fmt::Display for PvField {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", it.value)?;
+                    match it {
+                        Some(it) => write!(f, "{}", it.value)?,
+                        None => write!(f, "(null)")?,
+                    }
                 }
                 write!(f, "]")
             }
@@ -196,8 +215,12 @@ impl PvField {
                     .collect(),
             },
             Self::StructureArray(arr) => {
+                // Recover the element schema from the first PRESENT
+                // element; null (`None`) elements carry no schema.
                 let (struct_id, fields) = arr
-                    .first()
+                    .iter()
+                    .flatten()
+                    .next()
                     .map(|s| {
                         (
                             s.struct_id.clone(),
@@ -266,7 +289,9 @@ impl PvField {
                 }
             }
             Self::StructureArray(arr) => {
-                let first = arr.first()?;
+                // Wire-faithful schema needs a present element to read
+                // it from; an all-null (or empty) array cannot supply one.
+                let first = arr.iter().flatten().next()?;
                 let mut fields = Vec::with_capacity(first.fields.len());
                 for (n, f) in &first.fields {
                     fields.push((n.clone(), f.wire_descriptor()?));

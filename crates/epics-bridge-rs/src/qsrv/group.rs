@@ -91,7 +91,9 @@ pub fn get_nested_field<'a>(pv: &'a PvStructure, path: &str) -> Option<Cow<'a, P
                 // StructureArray. Index into the Vec<PvStructure> and
                 // continue navigating.
                 if let PvField::StructureArray(items) = field {
-                    let element = items.get(idx as usize)?;
+                    // PVA-FR-1: a null (`None`) element has no struct to
+                    // navigate into — treat as not-found.
+                    let element = items.get(idx as usize)?.as_ref()?;
                     current_struct = element;
                     continue;
                 }
@@ -104,7 +106,8 @@ pub fn get_nested_field<'a>(pv: &'a PvStructure, path: &str) -> Option<Cow<'a, P
                     Some(Cow::Owned(PvField::Scalar(sv)))
                 }
                 PvField::StructureArray(items) => {
-                    let element = items.get(idx as usize)?.clone();
+                    // A null element resolves to no value.
+                    let element = items.get(idx as usize)?.clone()?;
                     Some(Cow::Owned(PvField::Structure(element)))
                 }
                 _ => None,
@@ -1980,7 +1983,7 @@ mod tests {
         let mut pv = PvStructure::new("test");
         pv.fields.push((
             "entries".into(),
-            PvField::StructureArray(vec![elem0, elem1]),
+            PvField::StructureArray(vec![Some(elem0), Some(elem1)]),
         ));
 
         match get_nested_field(&pv, "entries[1].name").as_deref() {

@@ -2638,11 +2638,11 @@ fn build_put_value(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
                         selector,
                         variant_name,
                         value,
-                    } => items.push(UnionItem {
+                    } => items.push(Some(UnionItem {
                         selector,
                         variant_name,
                         value: *value,
-                    }),
+                    })),
                     other => {
                         return Err(PvaError::InvalidValue(format!(
                             "internal: build_put_union yielded {other:?}"
@@ -2662,7 +2662,7 @@ fn build_put_value(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
                 .filter(|s| !s.is_empty())
             {
                 match build_put_variant(tok)? {
-                    PvField::Variant(vv) => items.push(*vv),
+                    PvField::Variant(vv) => items.push(Some(*vv)),
                     other => {
                         return Err(PvaError::InvalidValue(format!(
                             "internal: build_put_variant yielded {other:?}"
@@ -2689,7 +2689,7 @@ fn build_put_value(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
                     fields: fields.clone(),
                 };
                 match build_put_struct_element(&element_desc, tok)? {
-                    PvField::Structure(s) => items.push(s),
+                    PvField::Structure(s) => items.push(Some(s)),
                     other => {
                         return Err(PvaError::InvalidValue(format!(
                             "internal: structure-array element built as {other:?}"
@@ -2985,7 +2985,7 @@ mod tests {
             PvField::StructureArray(items) => {
                 assert_eq!(items.len(), 3);
                 assert_eq!(
-                    items[1].get_field("value"),
+                    items[1].as_ref().unwrap().get_field("value"),
                     Some(&PvField::Scalar(ScalarValue::Int(20)))
                 );
             }
@@ -3017,11 +3017,11 @@ mod tests {
             PvField::StructureArray(items) => {
                 assert_eq!(items.len(), 2);
                 assert_eq!(
-                    items[0].get_field("n"),
+                    items[0].as_ref().unwrap().get_field("n"),
                     Some(&PvField::Scalar(ScalarValue::Int(5)))
                 );
                 assert_eq!(
-                    items[1].get_field("n"),
+                    items[1].as_ref().unwrap().get_field("n"),
                     Some(&PvField::Scalar(ScalarValue::Int(6)))
                 );
             }
@@ -3054,9 +3054,13 @@ mod tests {
         match &v {
             PvField::UnionArray(items) => {
                 assert_eq!(items.len(), 3);
-                assert_eq!(items[0].selector, 0);
-                assert_eq!(items[1].selector, 1);
-                assert_eq!(items[2].selector, 0, "bare '2' matches Int variant");
+                assert_eq!(items[0].as_ref().unwrap().selector, 0);
+                assert_eq!(items[1].as_ref().unwrap().selector, 1);
+                assert_eq!(
+                    items[2].as_ref().unwrap().selector,
+                    0,
+                    "bare '2' matches Int variant"
+                );
             }
             other => panic!("expected union array, got {other:?}"),
         }
@@ -3070,9 +3074,18 @@ mod tests {
         match &v {
             PvField::VariantArray(items) => {
                 assert_eq!(items.len(), 3);
-                assert_eq!(items[0].desc, Some(FieldDesc::Scalar(ScalarType::Long)));
-                assert_eq!(items[1].desc, Some(FieldDesc::Scalar(ScalarType::Double)));
-                assert_eq!(items[2].desc, Some(FieldDesc::Scalar(ScalarType::String)));
+                assert_eq!(
+                    items[0].as_ref().unwrap().desc,
+                    Some(FieldDesc::Scalar(ScalarType::Long))
+                );
+                assert_eq!(
+                    items[1].as_ref().unwrap().desc,
+                    Some(FieldDesc::Scalar(ScalarType::Double))
+                );
+                assert_eq!(
+                    items[2].as_ref().unwrap().desc,
+                    Some(FieldDesc::Scalar(ScalarType::String))
+                );
             }
             other => panic!("expected variant array, got {other:?}"),
         }

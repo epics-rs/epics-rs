@@ -169,7 +169,11 @@ fn struct_array_points() -> (FieldDesc, PvField) {
         struct_id: "test:points:1.0".into(),
         fields: vec![(
             "points".into(),
-            PvField::StructureArray(vec![make(1, "alpha"), make(2, "beta"), make(3, "gamma")]),
+            PvField::StructureArray(vec![
+                Some(make(1, "alpha")),
+                Some(make(2, "beta")),
+                Some(make(3, "gamma")),
+            ]),
         )],
     });
     (desc, root)

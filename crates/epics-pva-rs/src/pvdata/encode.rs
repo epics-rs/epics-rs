@@ -902,15 +902,21 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
         }
         (FieldDesc::StructureArray { fields, .. }, PvField::StructureArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
-            // Each element is preceded by a presence byte: 0x01 = element
-            // follows, 0x00 = null. We always emit non-null.
+            // PVA-FR-1: each element is preceded by a presence byte —
+            // 0x00 for a null (absent) element, 0x01 followed by the
+            // body for a present one (pvxs dataencode.cpp:354-365).
             for s in items {
-                out.put_u8(0x01);
-                let element_desc = FieldDesc::Structure {
-                    struct_id: s.struct_id.clone(),
-                    fields: fields.clone(),
-                };
-                encode_pv_field(&PvField::Structure(s.clone()), &element_desc, order, out);
+                match s {
+                    None => out.put_u8(0x00),
+                    Some(s) => {
+                        out.put_u8(0x01);
+                        let element_desc = FieldDesc::Structure {
+                            struct_id: s.struct_id.clone(),
+                            fields: fields.clone(),
+                        };
+                        encode_pv_field(&PvField::Structure(s.clone()), &element_desc, order, out);
+                    }
+                }
             }
         }
         (
@@ -936,28 +942,29 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
         }
         (FieldDesc::UnionArray { variants, .. }, PvField::UnionArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
-            // PVA-R13: pvxs `dataencode.cpp:368-378` encodes UnionA
-            // elements as a per-element presence byte (`0x00` for
-            // null, `0x01` followed by the union body for present).
-            // The union body is itself `selector + value`, where the
-            // selector may carry pvxs's Size-null sentinel `0xFF`.
-            // Pre-fix Rust skipped the outer presence byte entirely
-            // and emitted the selector (with `0xFF` for null) — a
-            // pvxs peer reads the `0xFF` as the presence byte (≠ 0/1
-            // → protocol fault). We don't model element-null in
-            // `UnionItem`, so we always emit `0x01` here and route
-            // out-of-range selectors through the inner Size-null.
+            // pvxs `dataencode.cpp:368-378` encodes UnionA elements as a
+            // per-element presence byte (`0x00` null/absent, `0x01`
+            // followed by the union body for present). PVA-FR-1: a
+            // `None` element is the absent (`0x00`) case; a present
+            // element's union body is `selector + value`, where an
+            // out-of-range/`-1` selector routes through the inner
+            // Size-null sentinel (`0xFF`) — distinct from element-absent.
             for it in items {
-                out.put_u8(0x01);
-                match usize::try_from(it.selector)
-                    .ok()
-                    .and_then(|idx| variants.get(idx).map(|v| (idx, v)))
-                {
-                    Some((idx, (_, vdesc))) => {
-                        encode_size_into(idx as u32, order, out);
-                        encode_pv_field(&it.value, vdesc, order, out);
+                match it {
+                    None => out.put_u8(0x00),
+                    Some(it) => {
+                        out.put_u8(0x01);
+                        match usize::try_from(it.selector)
+                            .ok()
+                            .and_then(|idx| variants.get(idx).map(|v| (idx, v)))
+                        {
+                            Some((idx, (_, vdesc))) => {
+                                encode_size_into(idx as u32, order, out);
+                                encode_pv_field(&it.value, vdesc, order, out);
+                            }
+                            None => out.put_u8(0xFF),
+                        }
                     }
-                    None => out.put_u8(0xFF),
                 }
             }
         }
@@ -970,28 +977,24 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
         },
         (FieldDesc::VariantArray, PvField::VariantArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
-            // PVA-R13: pvxs `dataencode.cpp:382-393` encodes AnyA as
-            // a presence byte (`0x00` for null, `0x01 + descriptor +
-            // value` for present). Pre-fix Rust used `0xFF` to mean
-            // "null descriptor", which a pvxs peer reads as the
-            // presence byte (`≠ 0/1` → protocol fault). We don't
-            // model element-null in `VariantValue`, so always emit
-            // `0x01` here.
+            // pvxs `dataencode.cpp:382-393` encodes AnyA as a presence
+            // byte (`0x00` null/absent, `0x01 + descriptor + value` for
+            // present). PVA-FR-1: a `None` element is the absent (`0x00`)
+            // case; a present element whose descriptor is `None` is the
+            // present-but-empty "any" shape, emitted as `0x01` + the
+            // Null type tag (`0xFF`) — distinct from element-absent.
             for it in items {
-                out.put_u8(0x01);
-                match &it.desc {
-                    None => {
-                        // Defensive: a `VariantValue { desc: None }`
-                        // is the closest we have to a null element.
-                        // Re-encode as the present-but-empty shape
-                        // (descriptor `0xFF`) so the wire stays well-
-                        // formed; pvxs reads this as a Null type tag
-                        // and skips the value body.
-                        out.put_u8(0xFF);
-                    }
-                    Some(d) => {
-                        encode_type_desc(d, order, out);
-                        encode_pv_field(&it.value, d, order, out);
+                match it {
+                    None => out.put_u8(0x00),
+                    Some(it) => {
+                        out.put_u8(0x01);
+                        match &it.desc {
+                            None => out.put_u8(0xFF),
+                            Some(d) => {
+                                encode_type_desc(d, order, out);
+                                encode_pv_field(&it.value, d, order, out);
+                            }
+                        }
                     }
                 }
             }
@@ -1736,8 +1739,11 @@ fn decode_pv_field_at_depth(
                 // protocol violation.
                 let presence = cur.get_u8()?;
                 match presence {
+                    // PVA-FR-1: 0x00 is a null (absent) element — push
+                    // `None`, not an empty struct, so the absent-vs-
+                    // present-empty distinction survives the round trip.
                     0x00 => {
-                        out.push(PvStructure::new(struct_id));
+                        out.push(None);
                     }
                     0x01 => {
                         let element_desc = FieldDesc::Structure {
@@ -1747,7 +1753,7 @@ fn decode_pv_field_at_depth(
                         if let PvField::Structure(s) =
                             decode_pv_field_at_depth(&element_desc, cur, order, cache, depth + 1)?
                         {
-                            out.push(s);
+                            out.push(Some(s));
                         }
                     }
                     other => {
@@ -1797,17 +1803,17 @@ fn decode_pv_field_at_depth(
                 // value). Pre-fix Rust read the selector directly.
                 let presence = cur.get_u8()?;
                 match presence {
-                    0x00 => items.push(UnionItem {
-                        selector: -1,
-                        variant_name: String::new(),
-                        value: PvField::Null,
-                    }),
+                    // PVA-FR-1: 0x00 = null (absent) element → `None`.
+                    0x00 => items.push(None),
+                    // 0x01 = present; the union body may still carry a
+                    // null selector (`-1`) — a present null-selector
+                    // union, distinct from an absent element.
                     0x01 => match decode_size(cur, order)? {
-                        None => items.push(UnionItem {
+                        None => items.push(Some(UnionItem {
                             selector: -1,
                             variant_name: String::new(),
                             value: PvField::Null,
-                        }),
+                        })),
                         Some(sel_u32) => {
                             let sel = sel_u32 as i32;
                             let (variant_name, vdesc) = variants
@@ -1818,11 +1824,11 @@ fn decode_pv_field_at_depth(
                                 .clone();
                             let value =
                                 decode_pv_field_at_depth(&vdesc, cur, order, cache, depth + 1)?;
-                            items.push(UnionItem {
+                            items.push(Some(UnionItem {
                                 selector: sel,
                                 variant_name,
                                 value,
-                            });
+                            }));
                         }
                     },
                     other => {
@@ -1873,29 +1879,28 @@ fn decode_pv_field_at_depth(
                 // protocol fault).
                 let presence = cur.get_u8()?;
                 match presence {
-                    0x00 => items.push(VariantValue {
-                        desc: None,
-                        value: PvField::Null,
-                    }),
+                    // PVA-FR-1: 0x00 = null (absent) element → `None`.
+                    0x00 => items.push(None),
                     0x01 => {
-                        // Inner descriptor — may itself be the null
-                        // type tag `0xFF` (an empty AnyA element).
+                        // Present element. Inner descriptor may itself be
+                        // the null type tag `0xFF` (a present-but-empty
+                        // AnyA element) — distinct from element-absent.
                         let peek = cur.get_u8()?;
                         if peek == 0xFF {
-                            items.push(VariantValue {
+                            items.push(Some(VariantValue {
                                 desc: None,
                                 value: PvField::Null,
-                            });
+                            }));
                             continue;
                         }
                         let pos = cur.position();
                         cur.set_position(pos - 1);
                         let inner = decode_type_desc_cached(cur, order, cache)?;
                         let value = decode_pv_field_at_depth(&inner, cur, order, cache, depth + 1)?;
-                        items.push(VariantValue {
+                        items.push(Some(VariantValue {
                             desc: Some(inner),
                             value,
-                        });
+                        }));
                     }
                     other => {
                         return Err(decode_err!(
@@ -1972,11 +1977,11 @@ mod tests {
         for lossy in [
             PvField::StructureArray(Vec::new()),
             PvField::UnionArray(Vec::new()),
-            PvField::UnionArray(vec![UnionItem {
+            PvField::UnionArray(vec![Some(UnionItem {
                 selector: 0,
                 variant_name: "i".into(),
                 value: PvField::Scalar(ScalarValue::Int(7)),
-            }]),
+            })]),
             PvField::ScalarArray(Vec::new()),
         ] {
             let mut out = Vec::new();
@@ -2019,11 +2024,11 @@ mod tests {
         };
         let value = PvField::Variant(Box::new(VariantValue {
             desc: Some(union_desc.clone()),
-            value: PvField::UnionArray(vec![UnionItem {
+            value: PvField::UnionArray(vec![Some(UnionItem {
                 selector: 0,
                 variant_name: "i".into(),
                 value: PvField::Scalar(ScalarValue::Int(7)),
-            }]),
+            })]),
         }));
         let mut out = Vec::new();
         encode_pv_field(&value, &FieldDesc::Variant, ByteOrder::Big, &mut out);

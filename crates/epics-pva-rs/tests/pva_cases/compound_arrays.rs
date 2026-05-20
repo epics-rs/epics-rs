@@ -34,20 +34,20 @@ fn golden_pvxs_struct_array_two_present() {
         fields: vec![("v".to_string(), FieldDesc::Scalar(ScalarType::Int))],
     };
     let arr = PvField::StructureArray(vec![
-        PvStructure {
+        Some(PvStructure {
             struct_id: String::new(),
             fields: vec![(
                 "v".to_string(),
                 PvField::Scalar(ScalarValue::Int(0x0102_0304)),
             )],
-        },
-        PvStructure {
+        }),
+        Some(PvStructure {
             struct_id: String::new(),
             fields: vec![(
                 "v".to_string(),
                 PvField::Scalar(ScalarValue::Int(0x0506_0708)),
             )],
-        },
+        }),
     ]);
     let mut out = Vec::new();
     encode_pv_field(&arr, &desc, ByteOrder::Big, &mut out);
@@ -66,11 +66,11 @@ fn golden_pvxs_union_array_present_int_selector() {
             ("f".to_string(), FieldDesc::Scalar(ScalarType::Double)),
         ],
     };
-    let arr = PvField::UnionArray(vec![UnionItem {
+    let arr = PvField::UnionArray(vec![Some(UnionItem {
         selector: 0,
         variant_name: "i".to_string(),
         value: PvField::Scalar(ScalarValue::Int(7)),
-    }]);
+    })]);
     let mut out = Vec::new();
     encode_pv_field(&arr, &desc, ByteOrder::Big, &mut out);
     // pvxs emits: Size(1) + presence(0x01) + Size(0=selector) + Int(7) BE.
@@ -81,10 +81,10 @@ fn golden_pvxs_union_array_present_int_selector() {
 fn golden_pvxs_variant_array_present_int() {
     // 1-element VariantArray (pvxs AnyA) carrying an int32 = 0x09.
     let desc = FieldDesc::VariantArray;
-    let arr = PvField::VariantArray(vec![VariantValue {
+    let arr = PvField::VariantArray(vec![Some(VariantValue {
         desc: Some(FieldDesc::Scalar(ScalarType::Int)),
         value: PvField::Scalar(ScalarValue::Int(9)),
-    }]);
+    })]);
     let mut out = Vec::new();
     encode_pv_field(&arr, &desc, ByteOrder::Big, &mut out);
     // pvxs emits: Size(1) + presence(0x01) + type_code(0x22 = Int) + Int(9) BE.

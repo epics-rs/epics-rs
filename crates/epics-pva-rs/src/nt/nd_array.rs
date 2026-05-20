@@ -435,7 +435,7 @@ fn dimension_value(dims: &[NdDimension]) -> PvField {
                     "reverse".into(),
                     PvField::Scalar(ScalarValue::Boolean(d.reverse)),
                 ));
-                s
+                Some(s)
             })
             .collect(),
     )
@@ -482,7 +482,7 @@ fn attribute_value(attrs: &[NdAttribute]) -> PvField {
                     "source".into(),
                     PvField::Scalar(ScalarValue::String(a.source.clone())),
                 ));
-                s
+                Some(s)
             })
             .collect(),
     )

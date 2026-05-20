@@ -208,6 +208,11 @@ fn write_raw_field(out: &mut String, name: &str, desc: &FieldDesc, value: &PvFie
             };
             let _ = writeln!(out, "{indent}{id}[] {name}");
             for s in items {
+                // PVA-FR-1: a `None` element is a null (absent) element.
+                let Some(s) = s else {
+                    let _ = writeln!(out, "{indent}    (null)");
+                    continue;
+                };
                 let _ = writeln!(out, "{indent}    {id} ");
                 for (n, child_desc) in fields {
                     if let Some(child_val) = s.get_field(n) {
@@ -408,17 +413,36 @@ fn value_to_json(value: &PvField) -> String {
         }
         PvField::Structure(s) => structure_to_json(s),
         PvField::StructureArray(items) => {
-            let parts: Vec<String> = items.iter().map(structure_to_json).collect();
+            // PVA-FR-1: a `None` element renders as JSON `null`.
+            let parts: Vec<String> = items
+                .iter()
+                .map(|s| match s {
+                    Some(s) => structure_to_json(s),
+                    None => "null".to_string(),
+                })
+                .collect();
             format!("[{}]", parts.join(","))
         }
         PvField::Union { value, .. } => value_to_json(value),
         PvField::UnionArray(items) => {
-            let parts: Vec<String> = items.iter().map(|it| value_to_json(&it.value)).collect();
+            let parts: Vec<String> = items
+                .iter()
+                .map(|it| match it {
+                    Some(it) => value_to_json(&it.value),
+                    None => "null".to_string(),
+                })
+                .collect();
             format!("[{}]", parts.join(","))
         }
         PvField::Variant(v) => value_to_json(&v.value),
         PvField::VariantArray(items) => {
-            let parts: Vec<String> = items.iter().map(|it| value_to_json(&it.value)).collect();
+            let parts: Vec<String> = items
+                .iter()
+                .map(|it| match it {
+                    Some(it) => value_to_json(&it.value),
+                    None => "null".to_string(),
+                })
+                .collect();
             format!("[{}]", parts.join(","))
         }
         PvField::Null => "null".to_string(),

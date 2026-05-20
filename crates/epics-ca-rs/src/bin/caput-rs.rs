@@ -166,9 +166,6 @@ async fn main() {
     if args.priority.is_some() {
         eprintln!("caput-rs: -p (priority) is accepted for parity but not yet honoured");
     }
-    if args.long_string {
-        eprintln!("caput-rs: -S (long-string put) is accepted for parity but not yet honoured");
-    }
     // -n / -s steer ENUM scalar handling below (force_numeric =
     // interpret as index; force_string = always send DBR_STRING for
     // server-side menu resolution). For non-ENUM channels they have
@@ -315,6 +312,18 @@ async fn main() {
                 }
             }
         }
+    };
+
+    // CA-FR-4: `-S` long-string put — write the value as a `DBR_CHAR`
+    // array with a terminating NUL (C `caput -S`, `caput.c:543-550`),
+    // overriding the type-derived value built above.
+    let parsed_value = if args.long_string {
+        let joined = args.values.join(" ");
+        let mut bytes: Vec<u8> = joined.into_bytes();
+        bytes.push(0);
+        WriteValue::Typed(epics_ca_rs::EpicsValue::CharArray(bytes))
+    } else {
+        parsed_value
     };
 
     let result = match &parsed_value {

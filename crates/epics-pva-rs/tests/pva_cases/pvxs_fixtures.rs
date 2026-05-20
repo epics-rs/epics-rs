@@ -18,6 +18,10 @@
 //! ```
 //!
 //! A diff in `fixtures.txt` is the wire-shape change report.
+//!
+//! Before adding a fixture, apply the golden rule (captured-not-
+//! derived + distinct-coverage) in
+//! `tools/pvxs-golden-capture/README.md`.
 
 const FIXTURES: &str = include_str!("../../tools/pvxs-golden-capture/fixtures.txt");
 

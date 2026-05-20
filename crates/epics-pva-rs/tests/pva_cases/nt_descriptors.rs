@@ -10,7 +10,7 @@
 //! valueAlarm sub-structures); pvxs builds the same shape.
 
 use epics_pva_rs::nt::nd_array;
-use epics_pva_rs::nt::{NTEnum, NTScalar};
+use epics_pva_rs::nt::{NTEnum, NTScalar, NTTable, NTURI};
 use epics_pva_rs::proto::ByteOrder;
 use epics_pva_rs::pvdata::FieldDesc;
 use epics_pva_rs::pvdata::ScalarType;
@@ -53,4 +53,28 @@ fn golden_pvxs_nt_enum_desc() {
 fn golden_pvxs_nt_ndarray_desc() {
     let d = nd_array::nt_nd_array_desc();
     assert_eq!(encode(&d, ByteOrder::Big), golden("nt_ndarray_desc"));
+}
+
+#[test]
+fn golden_pvxs_nt_table_desc() {
+    // pvxs capture: NTTable{}.add_column(Int32,"A").add_column(String,"B").
+    // Locks labels(string[]) + value{Int32A A, StringA B} + descriptor +
+    // alarm_t + time_t — the sub-structures are where a builder refactor
+    // would silently drift.
+    let d = NTTable::new()
+        .add_column(ScalarType::Int, "A", None)
+        .add_column(ScalarType::String, "B", None)
+        .build();
+    assert_eq!(encode(&d, ByteOrder::Big), golden("nt_table_desc"));
+}
+
+#[test]
+fn golden_pvxs_nt_uri_desc() {
+    // pvxs capture: NTURI{ UInt32("arg1"), String("arg2") } — scheme/
+    // authority/path strings + query{uint32 arg1, string arg2}.
+    let d = NTURI::new()
+        .arg_scalar("arg1", ScalarType::UInt)
+        .arg_scalar("arg2", ScalarType::String)
+        .build();
+    assert_eq!(encode(&d, ByteOrder::Big), golden("nt_uri_desc"));
 }

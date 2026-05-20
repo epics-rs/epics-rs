@@ -539,6 +539,27 @@ int main() {
             to_wire(b, Value::Helper::desc(val));
         }));
     }
+    {
+        // NTTable: labels(string[]), value{<col arrays>}, descriptor,
+        // alarm_t, time_t. Columns are stored arrayOf() in build().
+        nt::NTTable tbl;
+        tbl.add_column(TypeCode::Int32, "A");
+        tbl.add_column(TypeCode::String, "B");
+        auto val = tbl.build().create();
+        emit("nt_table_desc", capture(true, [&val](Buffer& b){
+            to_wire(b, Value::Helper::desc(val));
+        }));
+    }
+    {
+        // NTURI: scheme/authority/path strings + query{<args>}.
+        auto val = nt::NTURI{
+            members::UInt32("arg1"),
+            members::String("arg2"),
+        }.build().create();
+        emit("nt_uri_desc", capture(true, [&val](Buffer& b){
+            to_wire(b, Value::Helper::desc(val));
+        }));
+    }
 
     return 0;
 }

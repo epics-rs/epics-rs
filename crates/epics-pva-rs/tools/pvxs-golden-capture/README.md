@@ -8,6 +8,37 @@ indirection is **provenance**: a golden hex value derived by reading
 (both can be wrong the same way). A byte that came out of pvxs's
 own encoder at run time can't.
 
+## The golden rule
+
+A PVA wire fixture earns a place in this suite **only** when both
+halves hold:
+
+1. **Provenance — captured, never derived.** The expected bytes MUST
+   come out of pvxs's own encoder at run time (`capture.cpp` →
+   `fixtures.txt`, read via `golden(key)`). Never hand-derive a hex
+   value by reading `dataencode.cpp` / `pvaproto.cpp` and never read
+   bytes off a Rust round-trip — both can share the encoder's blind
+   spot. If pvxs has no clean single call that emits the bytes
+   (`to_wire`, `to_wire_valid`, or an `nt::*` builder), the fixture
+   fails this half: hand-writing builder code on both sides
+   reintroduces exactly the shared-mistake risk the suite exists to
+   kill. Such a case stays an inline Rust assertion in its own test
+   module (see *What's not captured*), not a `golden(...)` fixture.
+
+2. **Distinct coverage.** The fixture must lock a wire shape no
+   existing fixture or parity test already pins. A variant that only
+   re-exercises a shape another test owns is not added — e.g. extra
+   Cached TypeID permutations are already covered by
+   `tests/parity/testxcode_port.rs::pvxs_typestore_*`, so they are
+   not duplicated here.
+
+A corollary on builders likely to diverge (NTTable, NTURI, and other
+multi-substructure `nt::*` builders): the pvxs-side setup is involved
+and the two ports drift easily, so the first capture usually surfaces
+a real encoder finding rather than a clean lock. Treat that finding as
+its own fix — separate PR, out of a golden-*expansion* PR's scope —
+and add the fixture only once the encoder agrees with pvxs.
+
 ## Files
 
 - `capture.cpp` — single-binary harness; one `emit(...)` call per

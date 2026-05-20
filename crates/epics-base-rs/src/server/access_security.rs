@@ -715,9 +715,19 @@ impl AccessSecurityConfig {
                     self.uag
                         .get(g)
                         .map(|members| {
-                            members.iter().any(|m| match m.strip_prefix("role/") {
-                                Some(role) => roles.iter().any(|r| r == role),
-                                None => m == user,
+                            members.iter().any(|m| {
+                                // PVA-FR-3: a member matches the account
+                                // string exactly (this also covers a
+                                // caller that pre-expands roles into
+                                // synthesised `role/<name>` credential
+                                // strings and passes them as `user`), OR
+                                // a `role/<name>` member matches when the
+                                // client's `roles` slice carries that role.
+                                m == user
+                                    || matches!(
+                                        m.strip_prefix("role/"),
+                                        Some(role) if roles.iter().any(|r| r == role)
+                                    )
                             })
                         })
                         .unwrap_or(false)

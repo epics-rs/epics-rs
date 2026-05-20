@@ -443,6 +443,45 @@ async fn pva_fr_8_pause_holds_latest_then_resume_delivers() {
     h.abort();
 }
 
+/// PVA-FR-2: the client report lists each live server connection with
+/// its byte counters, and `report_zeroed(true)` resets them so the next
+/// report is a delta (pvxs `Context::report(bool zero)`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pva_fr_2_client_report_has_connection_byte_counters() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:REP", 1.5).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    // A GET establishes a connection and moves bytes both ways.
+    let _ = tokio::time::timeout(Duration::from_secs(3), client.pvget("STAB:REP"))
+        .await
+        .expect("get did not time out");
+
+    let r = client.report();
+    assert_eq!(r.connections.len(), 1, "one server connection after a GET");
+    let c = &r.connections[0];
+    assert!(
+        c.bytes_rx > 0 && c.bytes_tx > 0,
+        "bytes flowed on the connection (rx={}, tx={})",
+        c.bytes_rx,
+        c.bytes_tx
+    );
+
+    // report(true) zeros the counters; the next report shows a delta
+    // strictly smaller than the GET traffic just cleared.
+    let _ = client.report_zeroed(true);
+    let after = client.report();
+    assert!(
+        after.connections[0].bytes_rx < c.bytes_rx,
+        "report_zeroed(true) must reset the rx counter (was {}, now {})",
+        c.bytes_rx,
+        after.connections[0].bytes_rx
+    );
+
+    h.abort();
+}
+
 /// Regression: P-G11 (commit c3f286c) added a server-side pipeline
 /// credit window unconditionally for every Monitor op, but pvxs only
 /// applies flow control when the client's pvRequest explicitly

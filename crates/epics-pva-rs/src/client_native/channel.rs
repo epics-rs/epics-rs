@@ -224,6 +224,24 @@ impl ConnectionPool {
         *self.tls.lock() = tls;
     }
 
+    /// PVA-FR-2: per-connection `(peer, bytes_rx, bytes_tx, alive)`
+    /// snapshot for `PvaClient::report`. When `zero` is true each
+    /// connection's byte counters are reset after the read (pvxs
+    /// `report(bool zero)` delta semantics).
+    pub fn connection_byte_reports(
+        &self,
+        zero: bool,
+    ) -> Vec<(std::net::SocketAddr, u64, u64, bool)> {
+        self.inner
+            .lock()
+            .iter()
+            .map(|(addr, c)| {
+                let (rx, tx) = c.byte_counters(zero);
+                (*addr, rx, tx, c.is_alive())
+            })
+            .collect()
+    }
+
     /// The TLS config currently in effect, if any. Used when deriving
     /// a credential-variant client (`PvaClient::with_asserted_identity`)
     /// so the new client reaches the same upstream over the same

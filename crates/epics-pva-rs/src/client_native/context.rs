@@ -1227,6 +1227,14 @@ impl PvaClient {
     /// level. Per-channel detail (peer, RX/TX bytes) isn't surfaced
     /// here yet; pvxs's full Report is heavier than most callers need.
     pub fn report(&self) -> ClientReport {
+        self.report_zeroed(false)
+    }
+
+    /// PVA-FR-2: like [`Self::report`] but, when `zero` is true, resets
+    /// each connection's byte counters after the snapshot — pvxs
+    /// `Context::report(bool zero)`, so a subsequent report returns the
+    /// per-connection deltas since this one.
+    pub fn report_zeroed(&self, zero: bool) -> ClientReport {
         let channels = self.inner.channels.read();
         let mut active = 0usize;
         let mut searching = 0usize;
@@ -1255,6 +1263,18 @@ impl PvaClient {
                 super::channel::ChannelState::Idle => {}
             }
         }
+        let connections = self
+            .inner
+            .pool
+            .connection_byte_reports(zero)
+            .into_iter()
+            .map(|(peer, bytes_rx, bytes_tx, alive)| ConnReport {
+                peer,
+                bytes_rx,
+                bytes_tx,
+                alive,
+            })
+            .collect();
         ClientReport {
             channels_total: channels.len(),
             channels_active: active,
@@ -1263,6 +1283,7 @@ impl PvaClient {
             channels_closed: closed,
             name_servers: self.inner.name_servers.len(),
             direct_mode: self.inner.server_addr.is_some(),
+            connections,
         }
     }
 
@@ -1551,6 +1572,24 @@ pub struct ClientReport {
     pub name_servers: usize,
     /// True when the client is in direct-server mode (no UDP search).
     pub direct_mode: bool,
+    /// PVA-FR-2: live per-server-connection byte counters. pvxs
+    /// `Context::report` parity at the "connection list" level.
+    pub connections: Vec<ConnReport>,
+}
+
+/// PVA-FR-2: one entry in [`ClientReport::connections`] — a live
+/// connection to a PVA server with its byte counters.
+#[derive(Debug, Clone)]
+pub struct ConnReport {
+    /// Server endpoint this connection talks to.
+    pub peer: std::net::SocketAddr,
+    /// Bytes read off this connection's socket (since the last
+    /// `report_zeroed(true)`).
+    pub bytes_rx: u64,
+    /// Bytes written to this connection's socket.
+    pub bytes_tx: u64,
+    /// Whether the connection is currently alive.
+    pub alive: bool,
 }
 
 /// Callback type for [`ConnectBuilder::on_connect`] /

@@ -102,6 +102,11 @@ pub struct ServerConn {
     cancel: CancellationToken,
     alive: Arc<AtomicBool>,
     last_rx_nanos: Arc<AtomicU64>,
+    /// PVA-FR-2: total bytes read off / written to this connection's
+    /// socket, for `PvaClient::report`. Shared with the reader/writer
+    /// tasks.
+    bytes_rx: Arc<AtomicU64>,
+    bytes_tx: Arc<AtomicU64>,
     /// Per-IOID routing: DashMap for lock-free access.
     by_ioid: Arc<DashMap<u32, IoidSlot>>,
     /// CREATE_CHANNEL response routing by CID.
@@ -280,6 +285,8 @@ impl ServerConn {
         let cancel = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
         let last_rx_nanos = Arc::new(AtomicU64::new(now_nanos()));
+        let bytes_rx = Arc::new(AtomicU64::new(0));
+        let bytes_tx = Arc::new(AtomicU64::new(0));
         let by_ioid: Arc<DashMap<u32, IoidSlot>> = Arc::new(DashMap::new());
         let by_cid: Arc<DashMap<u32, oneshot::Sender<Frame>>> = Arc::new(DashMap::new());
         let by_sid_close: Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>> =
@@ -290,6 +297,7 @@ impl ServerConn {
         // Writer task
         let cancel_writer = cancel.clone();
         let alive_writer = alive.clone();
+        let bytes_tx_writer = bytes_tx.clone();
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(8192);
             loop {
@@ -304,6 +312,9 @@ impl ServerConn {
                             if writer_owned.write_all(&batch).await.is_err() {
                                 break;
                             }
+                            // PVA-FR-2: count bytes written to the socket.
+                            bytes_tx_writer
+                                .fetch_add(batch.len() as u64, Ordering::Relaxed);
                             batch.clear();
                         }
                         None => break,
@@ -318,6 +329,7 @@ impl ServerConn {
         let cancel_reader = cancel.clone();
         let alive_reader = alive.clone();
         let last_rx_reader = last_rx_nanos.clone();
+        let bytes_rx_reader = bytes_rx.clone();
         let by_ioid_reader = by_ioid.clone();
         let by_cid_reader = by_cid.clone();
         let by_sid_close_reader = by_sid_close.clone();
@@ -359,6 +371,8 @@ impl ServerConn {
                         Ok(n) => {
                             buf.extend_from_slice(&chunk[..n]);
                             last_rx_reader.store(now_nanos(), Ordering::SeqCst);
+                            // PVA-FR-2: count bytes read off the socket.
+                            bytes_rx_reader.fetch_add(n as u64, Ordering::Relaxed);
                             // Peek the header once we have 8 bytes — drop
                             // the connection if the announced payload
                             // exceeds MAX_MESSAGE_SIZE. Defends against a
@@ -588,6 +602,8 @@ impl ServerConn {
             cancel,
             alive,
             last_rx_nanos,
+            bytes_rx,
+            bytes_tx,
             by_ioid,
             by_cid,
             by_sid_close,
@@ -599,6 +615,19 @@ impl ServerConn {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    /// PVA-FR-2: snapshot `(bytes_rx, bytes_tx)` for this connection,
+    /// optionally zeroing them after the read (pvxs `report(bool zero)`
+    /// delta semantics).
+    pub fn byte_counters(&self, zero: bool) -> (u64, u64) {
+        let rx = self.bytes_rx.load(Ordering::Relaxed);
+        let tx = self.bytes_tx.load(Ordering::Relaxed);
+        if zero {
+            self.bytes_rx.store(0, Ordering::Relaxed);
+            self.bytes_tx.store(0, Ordering::Relaxed);
+        }
+        (rx, tx)
     }
 
     /// The server peer's verified X.509 identity, or `None` for a

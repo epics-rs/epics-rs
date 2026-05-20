@@ -3460,7 +3460,24 @@ async fn handle_op(
                                 return;
                             }
                         }
-                        while let Some(ev) = rx_raw.recv().await {
+                        // PVA-FR-8: raw fast path honors the pause gate
+                        // through the same owner as the decoded path.
+                        // `held_raw` carries the latest squashed event
+                        // across a pause; `type_changed` is a boundary
+                        // that the owner yields immediately even while
+                        // paused (it tears the stream down — it must not
+                        // be held behind a later descriptor-incompatible
+                        // event).
+                        let mut held_raw: Option<crate::server_native::RawMonitorEvent> = None;
+                        while let Some(ev) = next_monitor_event(
+                            &mut rx_raw,
+                            &mut held_raw,
+                            &paused_flag,
+                            &resume_notify,
+                            |ev| ev.type_changed,
+                        )
+                        .await
+                        {
                             // BR-R42: an upstream descriptor change
                             // arrives as a `type_changed=true` marker
                             // event. The body bytes are encoded for
@@ -3508,6 +3525,17 @@ async fn handle_op(
                                 // the new policy.
                                 mon_acl_version_at_subscribe_cell
                                     .store(live_v, std::sync::atomic::Ordering::Release);
+                            }
+                            // PVA-FR-8: a pause that began after the
+                            // owner handed back this event (during the
+                            // ACL revalidation await above) must HOLD it
+                            // — squash to latest and resume-flush —
+                            // exactly as the decoded path does once a
+                            // value is already in hand. Producing no
+                            // wire frame consumes no pipeline credit.
+                            if paused_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                held_raw = Some(ev);
+                                continue;
                             }
                             // BR-R44: on byte-order mismatch we must
                             // decode the raw event under the upstream
@@ -3637,27 +3665,26 @@ async fn handle_op(
                     // resume. `None` between batches.
                     let mut held: Option<crate::pvdata::PvField> = None;
                     loop {
-                        // Acquire the next value to consider emitting. A
-                        // value held from a pause takes priority once
-                        // resumed; while paused we keep receiving and
-                        // squash to the latest without emitting, waking on
-                        // resume to flush it (pvxs queues posts while Idle
-                        // and drains on START).
-                        let mut value = if paused_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                            tokio::select! {
-                                ev = rx.recv() => match ev {
-                                    Some(v) => { held = Some(v); continue; }
-                                    None => break,
-                                },
-                                _ = resume_notify.notified() => continue,
-                            }
-                        } else if let Some(v) = held.take() {
-                            v
-                        } else {
-                            match rx.recv().await {
-                                Some(v) => v,
-                                None => break,
-                            }
+                        // Acquire the next value to consider emitting
+                        // through the shared pause owner: a value held
+                        // from a pause takes priority once resumed; while
+                        // paused we keep receiving and squash to the
+                        // latest without emitting, waking on resume to
+                        // flush it (pvxs queues posts while Idle and
+                        // drains on START). The decoded path has no
+                        // subscription-boundary event, so nothing is
+                        // yielded early while paused (`|_| false`).
+                        let mut value = match next_monitor_event(
+                            &mut rx,
+                            &mut held,
+                            &paused_flag,
+                            &resume_notify,
+                            |_| false,
+                        )
+                        .await
+                        {
+                            Some(v) => v,
+                            None => break,
                         };
                         // R48-G3: ACL re-check on policy reload (same
                         // shape as the raw-fast-path branch above).
@@ -4102,6 +4129,49 @@ async fn send_op_error(
 use crate::proto::ReadExt;
 const _: u8 = PVA_VERSION;
 
+/// PVA-FR-8: single owner of the monitor pause/hold/squash transition.
+///
+/// Both the decoded and the raw-frame monitor forward loops acquire
+/// their next event through this helper so the pause gate is enforced
+/// in exactly one place. Semantics (mirroring pvxs keeping posts in the
+/// monitor queue while Idle and draining on START):
+///
+/// - **Not paused**: a value held from a prior pause is returned first
+///   (drain-on-resume), otherwise the next `rx.recv()` is awaited.
+/// - **Paused**: keep receiving and squash to the latest into `*held`
+///   without returning (no wire frame is produced), waking on
+///   `resume.notified()` to flush the held value on the next iteration.
+/// - **Boundary**: an event for which `is_boundary` is true is returned
+///   immediately even while paused — a subscription boundary (raw
+///   `type_changed` descriptor change) must tear the stream down rather
+///   than be squashed behind a later, descriptor-incompatible event.
+///
+/// Returns `None` when the source channel closes (caller breaks/ends).
+async fn next_monitor_event<T>(
+    rx: &mut mpsc::Receiver<T>,
+    held: &mut Option<T>,
+    paused: &std::sync::atomic::AtomicBool,
+    resume: &tokio::sync::Notify,
+    is_boundary: impl Fn(&T) -> bool,
+) -> Option<T> {
+    loop {
+        if paused.load(Ordering::Relaxed) {
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Some(v) if is_boundary(&v) => return Some(v),
+                    Some(v) => *held = Some(v),
+                    None => return None,
+                },
+                _ = resume.notified() => {}
+            }
+        } else if let Some(v) = held.take() {
+            return Some(v);
+        } else {
+            return rx.recv().await;
+        }
+    }
+}
+
 /// Build a complete MONITOR data frame (header + payload) for a single value
 /// emission. Pulled out so the back-pressure squashing loop can call it.
 fn build_monitor_payload(
@@ -4345,6 +4415,124 @@ mod tests {
             Some(EpicsValue::UInt64Array(vec![big, 2])),
             "ulong[] monitor value must convert to UInt64Array, not fall through to None",
         );
+    }
+
+    /// PVA-FR-8 owner: invariant boundaries of [`next_monitor_event`],
+    /// the single owner of the monitor pause/hold/squash transition that
+    /// both the decoded and the raw-frame forward loops acquire through.
+    /// Tested by boundary (paused vs not, held empty vs set, boundary vs
+    /// not, channel open vs closed), not by narrative scenario.
+    mod next_monitor_event_owner {
+        use super::*;
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::Notify;
+
+        /// Not paused, nothing held → the next received value is yielded.
+        #[tokio::test]
+        async fn not_paused_yields_next_recv() {
+            let (tx, mut rx) = mpsc::channel::<u32>(8);
+            let paused = AtomicBool::new(false);
+            let resume = Notify::new();
+            let mut held: Option<u32> = None;
+            tx.send(7).await.unwrap();
+            let got = next_monitor_event(&mut rx, &mut held, &paused, &resume, |_| false).await;
+            assert_eq!(got, Some(7));
+        }
+
+        /// Not paused, a value held from a prior pause → the held value
+        /// drains first (resume flush) before any new recv.
+        #[tokio::test]
+        async fn not_paused_drains_held_first() {
+            let (tx, mut rx) = mpsc::channel::<u32>(8);
+            let paused = AtomicBool::new(false);
+            let resume = Notify::new();
+            let mut held: Option<u32> = Some(42);
+            // A fresher value is queued, but the held one must win.
+            tx.send(99).await.unwrap();
+            let got = next_monitor_event(&mut rx, &mut held, &paused, &resume, |_| false).await;
+            assert_eq!(got, Some(42), "held value drains before fresh recv");
+            assert!(held.is_none(), "held is consumed once drained");
+        }
+
+        /// Paused → events squash to the latest into `held` without
+        /// returning; resume flushes only the latest (no per-event frame).
+        #[tokio::test]
+        async fn paused_squashes_to_latest_then_resume_flushes() {
+            let (tx, mut rx) = mpsc::channel::<u32>(8);
+            let paused = Arc::new(AtomicBool::new(true));
+            let resume = Arc::new(Notify::new());
+            let p2 = paused.clone();
+            let r2 = resume.clone();
+            let task = tokio::spawn(async move {
+                let mut held: Option<u32> = None;
+                next_monitor_event(&mut rx, &mut held, &p2, &r2, |_| false).await
+            });
+            // Feed while paused; each yield lets the owner squash the
+            // sent value into `held` and park again in the select.
+            for v in [1u32, 2, 3] {
+                tx.send(v).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            paused.store(false, Ordering::Relaxed);
+            resume.notify_one();
+            assert_eq!(
+                task.await.unwrap(),
+                Some(3),
+                "paused squash yields only the latest value on resume"
+            );
+        }
+
+        /// Paused + a boundary event → the boundary is yielded
+        /// immediately (not squashed behind a later, descriptor-
+        /// incompatible event). A non-boundary that arrived first is
+        /// squashed into `held`.
+        #[tokio::test]
+        async fn paused_yields_boundary_immediately() {
+            use crate::proto::ByteOrder;
+            use crate::server_native::RawMonitorEvent;
+
+            let (tx, mut rx) = mpsc::channel::<RawMonitorEvent>(8);
+            let paused = AtomicBool::new(true);
+            let resume = Notify::new();
+            let mut held: Option<RawMonitorEvent> = None;
+            tx.send(RawMonitorEvent {
+                body_bytes: bytes::Bytes::from_static(b"stale"),
+                byte_order: ByteOrder::Little,
+                type_changed: false,
+            })
+            .await
+            .unwrap();
+            tx.send(RawMonitorEvent {
+                body_bytes: bytes::Bytes::new(),
+                byte_order: ByteOrder::Little,
+                type_changed: true,
+            })
+            .await
+            .unwrap();
+            let got =
+                next_monitor_event(&mut rx, &mut held, &paused, &resume, |ev| ev.type_changed)
+                    .await;
+            assert!(
+                got.is_some_and(|e| e.type_changed),
+                "boundary event must be yielded immediately even while paused"
+            );
+            assert!(
+                held.is_some_and(|e| !e.type_changed),
+                "the pre-boundary non-boundary event was squashed into held"
+            );
+        }
+
+        /// Source channel closed → `None` (caller ends the stream).
+        #[tokio::test]
+        async fn closed_channel_yields_none() {
+            let (tx, mut rx) = mpsc::channel::<u32>(1);
+            let paused = AtomicBool::new(false);
+            let resume = Notify::new();
+            let mut held: Option<u32> = None;
+            drop(tx);
+            let got = next_monitor_event(&mut rx, &mut held, &paused, &resume, |_| false).await;
+            assert_eq!(got, None);
+        }
     }
 
     /// PVA-R20: server pipeline parser accepts the typed-bool /

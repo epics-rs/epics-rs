@@ -143,10 +143,16 @@ impl PeerRegistry {
         let g = self.inner.read();
         g.iter()
             .map(|(addr, e)| {
-                let snap = PeerSnapshot::from(e.as_ref());
+                let mut snap = PeerSnapshot::from(e.as_ref());
                 if zero {
-                    e.bytes_in.store(0, Ordering::Relaxed);
-                    e.bytes_out.store(0, Ordering::Relaxed);
+                    // `swap(0)` captures the exact pre-reset byte counts
+                    // and clears them atomically; the snapshot reports the
+                    // swapped values so an increment that `touch_rx` /
+                    // `touch_tx` lands between the snapshot read and the
+                    // reset is neither lost nor double-counted. A `store(0)`
+                    // after the `From` load would drop it.
+                    snap.bytes_in = e.bytes_in.swap(0, Ordering::Relaxed);
+                    snap.bytes_out = e.bytes_out.swap(0, Ordering::Relaxed);
                 }
                 (*addr, snap)
             })
@@ -268,5 +274,45 @@ mod tests {
             Some(("op".into(), "ca".into())),
             "creds not reset"
         );
+    }
+
+    /// PVA-FR-2: `snapshot_zeroed(true)` must not lose a byte increment
+    /// that lands concurrently with the reset. Summing every drained
+    /// delta against a writer thread must equal the total written —
+    /// `swap(0)` guarantees this; a `load` then `store(0)` would drop the
+    /// increments arriving between the read and the store.
+    #[test]
+    fn snapshot_zeroed_loses_no_concurrent_bytes() {
+        use std::thread;
+        let reg = PeerRegistry::new();
+        let addr: SocketAddr = "127.0.0.1:5099".parse().unwrap();
+        let e = PeerEntry::new(false);
+        reg.insert(addr, e.clone());
+
+        const N: u64 = 200_000;
+        let writer = {
+            let e = e.clone();
+            thread::spawn(move || {
+                for _ in 0..N {
+                    e.touch_tx(1);
+                }
+            })
+        };
+
+        let mut drained = 0u64;
+        loop {
+            for (_, snap) in reg.snapshot_zeroed(true) {
+                drained += snap.bytes_out;
+            }
+            if writer.is_finished() {
+                break;
+            }
+        }
+        writer.join().unwrap();
+        // Final drain for bytes written after the last in-loop snapshot.
+        for (_, snap) in reg.snapshot_zeroed(true) {
+            drained += snap.bytes_out;
+        }
+        assert_eq!(drained, N, "no concurrent byte increment may be lost");
     }
 }

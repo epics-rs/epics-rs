@@ -621,13 +621,22 @@ impl ServerConn {
     /// optionally zeroing them after the read (pvxs `report(bool zero)`
     /// delta semantics).
     pub fn byte_counters(&self, zero: bool) -> (u64, u64) {
-        let rx = self.bytes_rx.load(Ordering::Relaxed);
-        let tx = self.bytes_tx.load(Ordering::Relaxed);
         if zero {
-            self.bytes_rx.store(0, Ordering::Relaxed);
-            self.bytes_tx.store(0, Ordering::Relaxed);
+            // `swap(0)` reads the exact pre-reset count and clears it in
+            // one atomic step. A `load` then `store(0)` would drop any
+            // increment the reader/writer IO tasks `fetch_add` between
+            // the read and the store — neither reported in this delta nor
+            // carried into the next.
+            (
+                self.bytes_rx.swap(0, Ordering::Relaxed),
+                self.bytes_tx.swap(0, Ordering::Relaxed),
+            )
+        } else {
+            (
+                self.bytes_rx.load(Ordering::Relaxed),
+                self.bytes_tx.load(Ordering::Relaxed),
+            )
         }
-        (rx, tx)
     }
 
     /// The server peer's verified X.509 identity, or `None` for a

@@ -53,9 +53,9 @@ pub struct PvaOperation<T: Send + 'static> {
     /// final-result policy). A timeout/interrupt does NOT set this.
     done: bool,
     /// Pulsed by [`Self::interrupt`]; `wait*` selects on this and
-    /// returns `PvaError::Timeout` (the closest existing variant) so
-    /// callers can distinguish operator-driven wake-up from a real
-    /// timeout via the surrounding context.
+    /// returns `PvaError::Interrupted` (PVA-FR-9) — a distinct variant
+    /// from `PvaError::Timeout` so callers can tell an operator-driven
+    /// wake-up from a real deadline.
     interrupt: Arc<Notify>,
     /// One-shot cancellation flag. When set, `wait*` short-circuits
     /// returning the abort error and the spawned task is aborted.
@@ -89,8 +89,10 @@ impl<T: Send + 'static> PvaOperation<T> {
     /// Block until the operation completes (matching pvxs
     /// `Operation::wait()`). Times out per-call: pass `None` to wait
     /// forever, or `Some(d)` for a deadline. Returns
-    /// `PvaError::Timeout` on either (a) the deadline expiring or (b)
-    /// an [`Self::interrupt`] wake-up.
+    /// `PvaError::Timeout` when the deadline expires and the distinct
+    /// `PvaError::Interrupted` when woken by [`Self::interrupt`]
+    /// (PVA-FR-9). Neither consumes the result — a later `wait` can
+    /// still collect it.
     pub async fn wait(&mut self, timeout: Option<Duration>) -> PvaResult<T> {
         if self.done {
             return Err(PvaError::Protocol(
@@ -132,7 +134,8 @@ impl<T: Send + 'static> PvaOperation<T> {
                 r
             }
             // Interrupt/timeout do not consume; a later `wait` retries.
-            WaitOutcome::Interrupted => Err(PvaError::Timeout),
+            // PVA-FR-9: interrupt is its own variant, not Timeout.
+            WaitOutcome::Interrupted => Err(PvaError::Interrupted),
             WaitOutcome::Cancelled => Err(PvaError::Protocol("Operation cancelled".into())),
             WaitOutcome::Aborted => Err(PvaError::Protocol("Operation aborted".into())),
         }
@@ -148,8 +151,8 @@ impl<T: Send + 'static> PvaOperation<T> {
     }
 
     /// Wake a pending [`Self::wait`] without cancelling the operation
-    /// — the wait returns `PvaError::Timeout` and the underlying op
-    /// keeps running. Mirrors pvxs `Operation::interrupt`.
+    /// — the wait returns `PvaError::Interrupted` (PVA-FR-9) and the
+    /// underlying op keeps running. Mirrors pvxs `Operation::interrupt`.
     pub fn interrupt(&self) {
         self.interrupt.notify_waiters();
     }
@@ -209,12 +212,46 @@ mod tests {
             interrupter.notify_waiters();
         });
         let r = op.wait(Some(Duration::from_secs(5))).await;
-        assert!(matches!(r, Err(PvaError::Timeout)));
+        // PVA-FR-9: interrupt is its own variant, not Timeout.
+        assert!(matches!(r, Err(PvaError::Interrupted)));
+        assert!(
+            !matches!(r, Err(PvaError::Timeout)),
+            "interrupt must not be reported as a deadline timeout"
+        );
         // PVA-FR-7: interrupt does NOT consume the result. The op
         // completes and a second wait still collects its value.
         let v = op.wait(Some(Duration::from_secs(1))).await.unwrap();
         assert_eq!(v, 7);
         assert!(op.is_done());
+    }
+
+    /// PVA-FR-9: a real deadline expiry and an explicit interrupt must
+    /// surface as distinct variants so timeout-specific caller logic
+    /// does not match an interrupt.
+    #[tokio::test]
+    async fn timeout_and_interrupt_are_distinct_variants() {
+        // Real deadline: op never completes within the window.
+        let mut slow = PvaOperation::<()>::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        });
+        let deadline = slow.wait(Some(Duration::from_millis(30))).await;
+        assert!(matches!(deadline, Err(PvaError::Timeout)));
+        assert!(!matches!(deadline, Err(PvaError::Interrupted)));
+
+        // Interrupt path: woken before completion.
+        let mut op = PvaOperation::<i32>::spawn(async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(1)
+        });
+        let interrupter = op.interrupt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            interrupter.notify_waiters();
+        });
+        let interrupted = op.wait(Some(Duration::from_secs(5))).await;
+        assert!(matches!(interrupted, Err(PvaError::Interrupted)));
+        assert!(!matches!(interrupted, Err(PvaError::Timeout)));
     }
 
     #[tokio::test]

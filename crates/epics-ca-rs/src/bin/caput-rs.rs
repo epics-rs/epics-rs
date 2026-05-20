@@ -220,109 +220,22 @@ async fn main() {
         }
     };
 
-    // Parse the value(s) according to the array/scalar mode.
-    let parsed_value = if args.array_mode {
-        // C `caput -a` (caput.c:413-418): after the PV name it skips
-        // the count token (`optind++`) and uses ALL remaining values
-        // (`count = argc - optind`) — the count number is informational
-        // only. Match that: ignore it for sizing, keep it solely for a
-        // mismatch warning. `values[0]` is the count token, `[1..]` the
-        // actual values.
-        let tokens = &args.values[1..];
-        if let Ok(want) = args.values[0].parse::<usize>() {
-            if want != tokens.len() {
-                eprintln!(
-                    "caput-rs: warning: -a count {} differs from {} values supplied; \
-                     using all {} (C-parity)",
-                    want,
-                    tokens.len(),
-                    tokens.len()
-                );
-            }
-        } else {
-            // C does not parse the count token at all — a non-numeric
-            // token is silently skipped. Mirror that, no hard error.
-            eprintln!(
-                "caput-rs: warning: -a count token '{}' is not a number; \
-                 ignored (C-parity)",
-                args.values[0]
-            );
-        }
-        if tokens.is_empty() {
-            eprintln!("caput-rs: -a requires at least one value after the count token");
+    // CA-FR-4: build the value to write in C's precedence order — `-S`
+    // (long string) resolved before any native-type parse. See
+    // `build_write_value`.
+    let parsed_value = match build_write_value(
+        &args.values,
+        native_type,
+        args.force_numeric,
+        args.force_string,
+        args.long_string,
+        args.array_mode,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
             std::process::exit(1);
         }
-        // ENUM waveform special-casing, parallel to the scalar path:
-        // unless `-n` forces numeric, route to a DBR_STRING array for
-        // server-side menu resolution when `-s` is set or any element
-        // is not a plain integer index. C `caput -a` resolves each ENUM
-        // element string-or-numeric; sending the whole waveform as
-        // DBR_STRING achieves the same — the server parses an
-        // integer-looking element with no matching menu name as an
-        // index (the same documented divergence as the scalar path).
-        let enum_by_name = native_type == epics_ca_rs::DbFieldType::Enum
-            && !args.force_numeric
-            && (args.force_string || tokens.iter().any(|t| parse_plain_integer(t).is_none()));
-        if enum_by_name {
-            WriteValue::EnumStringArray(tokens.to_vec())
-        } else {
-            match parse_array(native_type, tokens) {
-                Ok(v) => WriteValue::Typed(v),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-    } else {
-        // Scalar: C `caput` joins extra positionals with single
-        // spaces (legacy convention). Modern usage is one value but
-        // operators occasionally write `caput PV "alpha beta"`.
-        let joined = args.values.join(" ");
-
-        // ENUM special treatment. Close to C `caput.c:455-510` but not
-        // a strict mirror — C fetches `DBR_GR_ENUM`, matches the value
-        // against the IOC's menu strings client-side, and only then
-        // chooses string vs numeric. We do not fetch the menu; we let
-        // the server classify:
-        //
-        // * `-n` (force_numeric / enumAsNr): interpret as a number.
-        // * `-s` (force_string / enumAsString): always send the value
-        //   as DBR_STRING and let the SERVER resolve the menu string.
-        // * default: a plain integer index goes through the numeric
-        //   path; anything else is sent as DBR_STRING for server-side
-        //   menu resolution. Divergence from C: a menu choice literally
-        //   named e.g. "2" is sent as a numeric index, and invalid input
-        //   is rejected by the server rather than locally. The client
-        //   has no access to site-custom menu definitions, so deferring
-        //   to the server is the only way to write them by name.
-        let is_plain_integer = parse_plain_integer(&joined).is_some();
-        if native_type == epics_ca_rs::DbFieldType::Enum
-            && !args.force_numeric
-            && (args.force_string || !is_plain_integer)
-        {
-            WriteValue::EnumString(joined)
-        } else {
-            match epics_ca_rs::EpicsValue::parse(native_type, &joined) {
-                Ok(v) => WriteValue::Typed(v),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-    };
-
-    // CA-FR-4: `-S` long-string put — write the value as a `DBR_CHAR`
-    // array with a terminating NUL (C `caput -S`, `caput.c:543-550`),
-    // overriding the type-derived value built above.
-    let parsed_value = if args.long_string {
-        let joined = args.values.join(" ");
-        let mut bytes: Vec<u8> = joined.into_bytes();
-        bytes.push(0);
-        WriteValue::Typed(epics_ca_rs::EpicsValue::CharArray(bytes))
-    } else {
-        parsed_value
     };
 
     let result = match &parsed_value {
@@ -448,6 +361,96 @@ impl WriteValue {
     }
 }
 
+/// Build the value to write, in C `caput`'s precedence order. The single
+/// owner of that precedence — `-S` (long string / charArrAsStr) is
+/// resolved FIRST, before any native-type parse, mirroring C handling
+/// charArrAsStr ahead of normal string conversion (`caput.c:514`).
+/// Otherwise `caput -S PV hello` against a native DBF_CHAR would die
+/// parsing "hello" as a numeric char: the old code parsed the native type
+/// up front and exited on the parse error before ever applying `-S`.
+/// Non-fatal `-a` count-token mismatches warn on stderr; fatal cases
+/// return `Err` with the full message for the caller to print.
+fn build_write_value(
+    values: &[String],
+    native_type: epics_ca_rs::DbFieldType,
+    force_numeric: bool,
+    force_string: bool,
+    long_string: bool,
+    array_mode: bool,
+) -> Result<WriteValue, String> {
+    // `-S` long-string put: bytes as a NUL-terminated DBR_CHAR array.
+    // Highest precedence — no native-type parse on this path.
+    if long_string {
+        let joined = values.join(" ");
+        let mut bytes: Vec<u8> = joined.into_bytes();
+        bytes.push(0);
+        return Ok(WriteValue::Typed(epics_ca_rs::EpicsValue::CharArray(bytes)));
+    }
+
+    if array_mode {
+        // C `caput -a` (caput.c:413-418): after the PV name it skips the
+        // count token (`optind++`) and uses ALL remaining values — the
+        // count number is informational only. `values[0]` is the count
+        // token, `[1..]` the actual values.
+        let tokens = &values[1..];
+        if let Ok(want) = values[0].parse::<usize>() {
+            if want != tokens.len() {
+                eprintln!(
+                    "caput-rs: warning: -a count {} differs from {} values supplied; \
+                     using all {} (C-parity)",
+                    want,
+                    tokens.len(),
+                    tokens.len()
+                );
+            }
+        } else {
+            // C does not parse the count token at all — a non-numeric
+            // token is silently skipped. Mirror that, no hard error.
+            eprintln!(
+                "caput-rs: warning: -a count token '{}' is not a number; \
+                 ignored (C-parity)",
+                values[0]
+            );
+        }
+        if tokens.is_empty() {
+            return Err("caput-rs: -a requires at least one value after the count token".into());
+        }
+        // ENUM waveform special-casing, parallel to the scalar path:
+        // unless `-n` forces numeric, route to a DBR_STRING array for
+        // server-side menu resolution when `-s` is set or any element is
+        // not a plain integer index (the same documented divergence as
+        // the scalar path).
+        let enum_by_name = native_type == epics_ca_rs::DbFieldType::Enum
+            && !force_numeric
+            && (force_string || tokens.iter().any(|t| parse_plain_integer(t).is_none()));
+        if enum_by_name {
+            return Ok(WriteValue::EnumStringArray(tokens.to_vec()));
+        }
+        return parse_array(native_type, tokens)
+            .map(WriteValue::Typed)
+            .map_err(|e| format!("error: {e}"));
+    }
+
+    // Scalar: C `caput` joins extra positionals with single spaces.
+    let joined = values.join(" ");
+    // ENUM special treatment (C `caput.c:455-510`, not a strict mirror —
+    // we don't fetch the menu, we let the server classify):
+    // * `-n` (force_numeric): interpret as a number.
+    // * `-s` (force_string): always DBR_STRING; server resolves the menu.
+    // * default: a plain integer index goes numeric; anything else is
+    //   sent as DBR_STRING for server-side menu resolution.
+    let is_plain_integer = parse_plain_integer(&joined).is_some();
+    if native_type == epics_ca_rs::DbFieldType::Enum
+        && !force_numeric
+        && (force_string || !is_plain_integer)
+    {
+        return Ok(WriteValue::EnumString(joined));
+    }
+    epics_ca_rs::EpicsValue::parse(native_type, &joined)
+        .map(WriteValue::Typed)
+        .map_err(|e| format!("error: {e}"))
+}
+
 /// Parse a plain integer index — decimal, optionally signed, no radix
 /// prefix and no surrounding garbage. C `caput` treats anything that
 /// is not a clean number as an ENUM menu string. Returns `Some` only
@@ -526,5 +529,84 @@ fn parse_array(
                 .collect(),
         )),
         DT::String => Ok(EpicsValue::StringArray(tokens.to_vec())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WriteValue, build_write_value};
+    use epics_ca_rs::{DbFieldType, EpicsValue};
+
+    fn vals(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn long_string_takes_precedence_over_char_parse() {
+        // `caput -S PV hello` against a native DBF_CHAR must send the
+        // bytes as a NUL-terminated DBR_CHAR array, NOT parse "hello" as a
+        // numeric char. The old order parsed first and exited on the parse
+        // error before `-S` was ever applied.
+        let r = build_write_value(
+            &vals(&["hello"]),
+            DbFieldType::Char,
+            false,
+            false,
+            true,
+            false,
+        );
+        match r {
+            Ok(WriteValue::Typed(EpicsValue::CharArray(bytes))) => {
+                assert_eq!(bytes, b"hello\0", "NUL-terminated long string bytes");
+            }
+            _ => panic!("expected Ok(CharArray) for -S on a CHAR PV"),
+        }
+    }
+
+    #[test]
+    fn long_string_precedence_holds_for_every_native_type() {
+        // `-S` is type-independent: it never reaches the native-type
+        // parse, so no native type can make it fail.
+        for nt in [
+            DbFieldType::Char,
+            DbFieldType::Double,
+            DbFieldType::Enum,
+            DbFieldType::Long,
+            DbFieldType::String,
+        ] {
+            let r = build_write_value(&vals(&["not a number"]), nt, false, false, true, false);
+            assert!(
+                matches!(r, Ok(WriteValue::Typed(EpicsValue::CharArray(_)))),
+                "-S must yield CharArray for native type {nt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_char_without_long_string_still_parses_numeric() {
+        // Without `-S`, a native CHAR scalar parses the token as a number;
+        // a non-numeric token is an error, exactly as before the fix.
+        assert!(
+            build_write_value(
+                &vals(&["65"]),
+                DbFieldType::Char,
+                false,
+                false,
+                false,
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            build_write_value(
+                &vals(&["hello"]),
+                DbFieldType::Char,
+                false,
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
     }
 }

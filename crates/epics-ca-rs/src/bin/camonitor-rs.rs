@@ -45,9 +45,11 @@ struct Args {
     #[arg(short = 'p', long)]
     priority: Option<u8>,
 
-    /// Timestamp rendering: `s`=server (default), `n`=none,
-    /// `r`=relative since program start, `i`=incremental across all
-    /// channels, `I`=incremental per channel.
+    /// Timestamp source(s) and kind. Sources: `s`=CA server/remote
+    /// (default), `c`=CA client/local receive time (shown in `()`).
+    /// Kind: `n`=none, `r`=relative since program start, `i`=incremental
+    /// across all channels, `I`=incremental per channel. `r`/`i`/`I`
+    /// require `s` or `c`. Sources combine, e.g. `-t sc`, `-t cr`.
     #[arg(short = 't', long = "timestamp", value_name = "KEY")]
     timestamp_key: Option<String>,
 
@@ -162,9 +164,12 @@ async fn main() {
     // once for all PVs. `prev_all`/`start` back the relative and
     // incremental timestamp renderings.
     let mask = parse_event_mask(args.event_mask.as_deref());
-    let tmode = parse_timestamp_mode(args.timestamp_key.as_deref());
+    let spec = parse_timestamp_spec(args.timestamp_key.as_deref());
     let start = SystemTime::now();
-    let prev_all = Arc::new(std::sync::Mutex::new(None::<SystemTime>));
+    // `i` (incremental across ALL channels) shares the previous-event
+    // time across PVs; one slot per source.
+    let prev_all_server = Arc::new(std::sync::Mutex::new(None::<SystemTime>));
+    let prev_all_client = Arc::new(std::sync::Mutex::new(None::<SystemTime>));
 
     let mut handles = Vec::new();
     for (i, pv_name) in args.pv_names.iter().enumerate() {
@@ -172,7 +177,8 @@ async fn main() {
         let pv = pv_name.clone();
         let flag = connected_flags[i].clone();
         let fmt = fmt.clone();
-        let prev_all = prev_all.clone();
+        let prev_all_server = prev_all_server.clone();
+        let prev_all_client = prev_all_client.clone();
         handles.push(tokio::spawn(async move {
             monitor_pv(
                 channel,
@@ -181,9 +187,10 @@ async fn main() {
                 fmt,
                 req_elems_present,
                 mask,
-                tmode,
+                spec,
                 start,
-                prev_all,
+                prev_all_server,
+                prev_all_client,
             )
             .await;
         }));
@@ -277,12 +284,14 @@ async fn monitor_pv(
     fmt: Arc<ValueFormat>,
     req_elems_present: bool,
     mask: u16,
-    tmode: TimestampMode,
+    spec: TimestampSpec,
     start: SystemTime,
-    prev_all: Arc<std::sync::Mutex<Option<SystemTime>>>,
+    prev_all_server: Arc<std::sync::Mutex<Option<SystemTime>>>,
+    prev_all_client: Arc<std::sync::Mutex<Option<SystemTime>>>,
 ) {
-    // Per-channel previous timestamp for `-t I`.
-    let mut prev_chan: Option<SystemTime> = None;
+    // Per-channel previous timestamps for `-t I`, one per source.
+    let mut prev_chan_server: Option<SystemTime> = None;
+    let mut prev_chan_client: Option<SystemTime> = None;
     let mut conn_rx = channel.connection_events();
     let pv = pv_name.clone();
     let flag = connected_flag.clone();
@@ -321,14 +330,26 @@ async fn monitor_pv(
     while let Some(result) = monitor.recv().await {
         match result {
             Ok(snap) => {
-                // CA-FR-4: `-t` selects the timestamp column rendering.
-                // `IncrAll` shares state across channels; `IncrChan`/the
-                // others use the per-channel slot.
-                let time_seg = if tmode == TimestampMode::IncrAll {
-                    let mut p = prev_all.lock().unwrap();
-                    render_timestamp(tmode, snap.timestamp, start, &mut p)
+                // CA-FR-4: capture the client receive time as close to
+                // arrival as possible — this is the `c` (client) source,
+                // distinct from the server-supplied `snap.timestamp`.
+                let recv_time = SystemTime::now();
+                // `-t` selects source(s) + rendering kind. `IncrAll`
+                // shares the previous-event time across channels;
+                // `IncrChan`/the others use the per-channel slots.
+                let time_seg = if spec.kind == TimestampKind::IncrAll {
+                    let mut ps = prev_all_server.lock().unwrap();
+                    let mut pc = prev_all_client.lock().unwrap();
+                    render_timestamp(spec, snap.timestamp, recv_time, start, &mut ps, &mut pc)
                 } else {
-                    render_timestamp(tmode, snap.timestamp, start, &mut prev_chan)
+                    render_timestamp(
+                        spec,
+                        snap.timestamp,
+                        recv_time,
+                        start,
+                        &mut prev_chan_server,
+                        &mut prev_chan_client,
+                    )
                 }
                 .map(|ts| format!("{ts}{sep}"))
                 .unwrap_or_default();
@@ -385,14 +406,12 @@ fn parse_event_mask(m: Option<&str>) -> u16 {
     if mask == 0 { DEFAULT } else { mask }
 }
 
-/// CA-FR-4: `camonitor -t <key>` timestamp rendering mode
-/// (`camonitor.c:235-253`).
+/// CA-FR-4: `camonitor -t <key>` rendering KIND — orthogonal to the
+/// timestamp SOURCE (`camonitor.c:235-253`). C keys this off `tsType`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TimestampMode {
-    /// Server timestamp (default).
-    Server,
-    /// `n` — no timestamp column.
-    None,
+enum TimestampKind {
+    /// Absolute wall-clock timestamp (default).
+    Absolute,
     /// `r` — seconds relative to program start.
     Relative,
     /// `i` — seconds since the previous event on ANY channel.
@@ -401,24 +420,48 @@ enum TimestampMode {
     IncrChan,
 }
 
-/// Parse a `-t <key>` value. The recognised mode is the last source
-/// letter present (`n`/`r`/`i`/`I`); anything else (incl. server `s`)
-/// keeps the server timestamp. `None` → server default.
-fn parse_timestamp_mode(k: Option<&str>) -> TimestampMode {
+/// CA-FR-4: a `-t` spec is two orthogonal axes — which SOURCE(s) to show
+/// (`s` = CA server / remote stamp, `c` = CA client / local receive time,
+/// shown in `()`), and the rendering KIND. C carries these as the
+/// independent `tsSrcServer` / `tsSrcClient` flags plus `tsType`; the
+/// earlier single-enum model dropped the source axis, so `-t cr` rendered
+/// a relative time off the SERVER stamp instead of the receive time.
+#[derive(Clone, Copy)]
+struct TimestampSpec {
+    server: bool,
+    client: bool,
+    kind: TimestampKind,
+}
+
+/// Parse a `-t <key>`. C `case 't'` resets both sources to 0 then sets
+/// them from the letters; `s`/`c` pick source(s), `r`/`i`/`I` pick the
+/// kind, `n` and unknown letters are no-ops (a kind with no source prints
+/// nothing — the usage note "'r','i','I' require 's' or 'c'"). With no
+/// `-t` at all the C globals default to server + absolute.
+fn parse_timestamp_spec(k: Option<&str>) -> TimestampSpec {
     let Some(k) = k else {
-        return TimestampMode::Server;
+        return TimestampSpec {
+            server: true,
+            client: false,
+            kind: TimestampKind::Absolute,
+        };
     };
-    let mut mode = TimestampMode::Server;
+    let mut spec = TimestampSpec {
+        server: false,
+        client: false,
+        kind: TimestampKind::Absolute,
+    };
     for c in k.chars() {
         match c {
-            'n' => mode = TimestampMode::None,
-            'r' => mode = TimestampMode::Relative,
-            'i' => mode = TimestampMode::IncrAll,
-            'I' => mode = TimestampMode::IncrChan,
-            _ => {}
+            's' => spec.server = true,
+            'c' => spec.client = true,
+            'r' => spec.kind = TimestampKind::Relative,
+            'i' => spec.kind = TimestampKind::IncrAll,
+            'I' => spec.kind = TimestampKind::IncrChan,
+            _ => {} // 'n' and unknown letters: no-op (matches C)
         }
     }
-    mode
+    spec
 }
 
 /// Render the timestamp column for one event under `mode`. `prev` holds
@@ -426,32 +469,50 @@ fn parse_timestamp_mode(k: Option<&str>) -> TimestampMode {
 /// `i`, per-channel for `I`); it is updated in place. Returns `None`
 /// when no time column should be printed (`-t n`).
 fn render_timestamp(
-    mode: TimestampMode,
-    ts: SystemTime,
+    spec: TimestampSpec,
+    server_ts: SystemTime,
+    client_ts: SystemTime,
     start: SystemTime,
-    prev: &mut Option<SystemTime>,
+    prev_server: &mut Option<SystemTime>,
+    prev_client: &mut Option<SystemTime>,
 ) -> Option<String> {
-    let secs_between = |a: SystemTime, b: SystemTime| -> f64 {
+    fn secs_between(a: SystemTime, b: SystemTime) -> f64 {
         a.duration_since(b)
             .or_else(|_| b.duration_since(a))
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0)
-    };
-    match mode {
-        TimestampMode::Server => Some(format_server_timestamp(ts)),
-        TimestampMode::None => Option::None,
-        TimestampMode::Relative => Some(format!("{:.6}", secs_between(ts, start))),
-        TimestampMode::IncrAll | TimestampMode::IncrChan => {
-            let delta = prev.map(|p| secs_between(ts, p)).unwrap_or(0.0);
-            *prev = Some(ts);
-            Some(format!("{delta:.6}"))
-        }
     }
+    let render_one = |ts: SystemTime, prev: &mut Option<SystemTime>| -> String {
+        match spec.kind {
+            TimestampKind::Absolute => format_server_timestamp(ts),
+            TimestampKind::Relative => format!("{:.6}", secs_between(ts, start)),
+            TimestampKind::IncrAll | TimestampKind::IncrChan => {
+                let delta = prev.map(|p| secs_between(ts, p)).unwrap_or(0.0);
+                *prev = Some(ts);
+                format!("{delta:.6}")
+            }
+        }
+    };
+    // C `print_time_val_sts` prints the server stamp, then the client
+    // stamp wrapped in `()`, back to back. Either may be absent.
+    let mut out = String::new();
+    if spec.server {
+        out.push_str(&render_one(server_ts, prev_server));
+    }
+    if spec.client {
+        let c = render_one(client_ts, prev_client);
+        out.push('(');
+        out.push_str(&c);
+        out.push(')');
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TimestampMode, parse_event_mask, parse_timestamp_mode, render_timestamp};
+    use super::{
+        TimestampKind, TimestampSpec, parse_event_mask, parse_timestamp_spec, render_timestamp,
+    };
     use std::time::{Duration, SystemTime};
 
     #[test]
@@ -470,53 +531,105 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_mode_parses_keys() {
-        assert!(matches!(parse_timestamp_mode(None), TimestampMode::Server));
+    fn timestamp_spec_parses_keys() {
+        let s = parse_timestamp_spec(None);
+        assert!(s.server && !s.client && matches!(s.kind, TimestampKind::Absolute));
+        let s = parse_timestamp_spec(Some("s"));
+        assert!(s.server && !s.client);
+        let s = parse_timestamp_spec(Some("c"));
+        assert!(!s.server && s.client);
+        let s = parse_timestamp_spec(Some("sc"));
+        assert!(s.server && s.client);
+        // 'n' (and unknown letters) select no source → no column.
+        let s = parse_timestamp_spec(Some("n"));
+        assert!(!s.server && !s.client, "n selects no source");
+        let s = parse_timestamp_spec(Some("cr"));
+        assert!(!s.server && s.client && matches!(s.kind, TimestampKind::Relative));
         assert!(matches!(
-            parse_timestamp_mode(Some("s")),
-            TimestampMode::Server
+            parse_timestamp_spec(Some("i")).kind,
+            TimestampKind::IncrAll
         ));
         assert!(matches!(
-            parse_timestamp_mode(Some("n")),
-            TimestampMode::None
-        ));
-        assert!(matches!(
-            parse_timestamp_mode(Some("r")),
-            TimestampMode::Relative
-        ));
-        assert!(matches!(
-            parse_timestamp_mode(Some("i")),
-            TimestampMode::IncrAll
-        ));
-        assert!(matches!(
-            parse_timestamp_mode(Some("I")),
-            TimestampMode::IncrChan
+            parse_timestamp_spec(Some("I")).kind,
+            TimestampKind::IncrChan
         ));
     }
 
     #[test]
-    fn timestamp_render_modes() {
+    fn timestamp_render_server_kinds() {
         let start = SystemTime::UNIX_EPOCH;
         let t1 = start + Duration::from_secs(10);
         let t2 = start + Duration::from_secs(13);
-        // None → no column.
-        let mut p = None;
-        assert!(render_timestamp(TimestampMode::None, t1, start, &mut p).is_none());
-        // Relative → seconds since start.
-        let mut p = None;
+        let srv = |kind| TimestampSpec {
+            server: true,
+            client: false,
+            kind,
+        };
+        // No source → no column.
+        let none = TimestampSpec {
+            server: false,
+            client: false,
+            kind: TimestampKind::Absolute,
+        };
+        let (mut ps, mut pc) = (None, None);
+        assert!(render_timestamp(none, t1, t1, start, &mut ps, &mut pc).is_none());
+        // Server relative → seconds since start.
+        let (mut ps, mut pc) = (None, None);
         assert_eq!(
-            render_timestamp(TimestampMode::Relative, t1, start, &mut p).as_deref(),
+            render_timestamp(
+                srv(TimestampKind::Relative),
+                t1,
+                t1,
+                start,
+                &mut ps,
+                &mut pc
+            )
+            .as_deref(),
             Some("10.000000")
         );
-        // Incremental → first is 0, then the delta; prev advances.
-        let mut p = None;
+        // Server incremental → first 0, then the delta; prev advances.
+        let (mut ps, mut pc) = (None, None);
         assert_eq!(
-            render_timestamp(TimestampMode::IncrAll, t1, start, &mut p).as_deref(),
+            render_timestamp(srv(TimestampKind::IncrAll), t1, t1, start, &mut ps, &mut pc)
+                .as_deref(),
             Some("0.000000")
         );
         assert_eq!(
-            render_timestamp(TimestampMode::IncrAll, t2, start, &mut p).as_deref(),
+            render_timestamp(srv(TimestampKind::IncrAll), t2, t2, start, &mut ps, &mut pc)
+                .as_deref(),
             Some("3.000000")
+        );
+    }
+
+    #[test]
+    fn timestamp_client_source_uses_receive_time() {
+        // `-t cr`: the relative time must be computed from the CLIENT
+        // (receive) time, NOT the server stamp. A server_ts == start would
+        // render "0.000000"; the client_ts == start+10 must drive output.
+        let start = SystemTime::UNIX_EPOCH;
+        let client_ts = start + Duration::from_secs(10);
+        let cr = TimestampSpec {
+            server: false,
+            client: true,
+            kind: TimestampKind::Relative,
+        };
+        let (mut ps, mut pc) = (None, None);
+        assert_eq!(
+            render_timestamp(cr, start, client_ts, start, &mut ps, &mut pc).as_deref(),
+            Some("(10.000000)"),
+            "client source uses receive time, shown in parens"
+        );
+        // Both sources render independently: server then (client).
+        let server_ts = start + Duration::from_secs(5);
+        let both = TimestampSpec {
+            server: true,
+            client: true,
+            kind: TimestampKind::Relative,
+        };
+        let (mut ps, mut pc) = (None, None);
+        assert_eq!(
+            render_timestamp(both, server_ts, client_ts, start, &mut ps, &mut pc).as_deref(),
+            Some("5.000000(10.000000)")
         );
     }
 }

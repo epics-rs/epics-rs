@@ -435,6 +435,23 @@ async fn main() {
 /// `caget -d` family selection (`caget.c:175-187`).
 fn parse_dbr_class(s: &str) -> Option<DbrClass> {
     let up = s.trim().to_ascii_uppercase();
+    // C `caget.c:418` `sscanf(optarg, "%d")` first: a numeric DBR id
+    // selects the metadata class by its db_access.h band, NOT plain
+    // unconditionally. Value 0-6, STS 7-13, TIME 14-20, GR 21-27,
+    // CTRL 28-34. Ids with no value-class analogue here — PUT_ACKT/S
+    // (35/36), STSACK/CLASS_NAME (37/38), or out of range — request the
+    // plain class, mirroring C's `format = plain` revert for an
+    // unusable `-d` type. So `-d 20` → DBR_TIME_DOUBLE (Time), not plain.
+    if let Ok(id) = up.parse::<u32>() {
+        return Some(match id {
+            0..=6 => DbrClass::Plain,
+            7..=13 => DbrClass::Sts,
+            14..=20 => DbrClass::Time,
+            21..=27 => DbrClass::Gr,
+            28..=34 => DbrClass::Ctrl,
+            _ => DbrClass::Plain,
+        });
+    }
     let fam = up.strip_prefix("DBR_").unwrap_or(&up);
     if fam.starts_with("CTRL") {
         Some(DbrClass::Ctrl)
@@ -447,8 +464,8 @@ fn parse_dbr_class(s: &str) -> Option<DbrClass> {
     } else if fam.is_empty() {
         None
     } else {
-        // Plain value type (STRING/SHORT/INT/FLOAT/ENUM/CHAR/LONG/DOUBLE)
-        // or a numeric DBR id — request the plain value class.
+        // Named plain value type (STRING/SHORT/INT/FLOAT/ENUM/CHAR/LONG/
+        // DOUBLE) — request the plain value class.
         Some(DbrClass::Plain)
     }
 }
@@ -470,7 +487,30 @@ mod tests {
         assert!(matches!(parse_dbr_class("DBR_GR_LONG"), Some(DbrClass::Gr)));
         assert!(matches!(parse_dbr_class("STS_INT"), Some(DbrClass::Sts)));
         assert!(matches!(parse_dbr_class("DOUBLE"), Some(DbrClass::Plain)));
-        assert!(matches!(parse_dbr_class("6"), Some(DbrClass::Plain)));
         assert!(parse_dbr_class("").is_none());
+    }
+
+    #[test]
+    fn dbr_class_numeric_ids_map_by_band() {
+        // db_access.h DBR id bands: value 0-6, STS 7-13, TIME 14-20,
+        // GR 21-27, CTRL 28-34.
+        assert!(matches!(parse_dbr_class("0"), Some(DbrClass::Plain)));
+        assert!(
+            matches!(parse_dbr_class("6"), Some(DbrClass::Plain)),
+            "DBR_DOUBLE = 6 is plain value class"
+        );
+        assert!(matches!(parse_dbr_class("13"), Some(DbrClass::Sts)));
+        assert!(
+            matches!(parse_dbr_class("20"), Some(DbrClass::Time)),
+            "DBR_TIME_DOUBLE = 20"
+        );
+        assert!(matches!(parse_dbr_class("21"), Some(DbrClass::Gr)));
+        assert!(
+            matches!(parse_dbr_class("34"), Some(DbrClass::Ctrl)),
+            "DBR_CTRL_DOUBLE = 34"
+        );
+        // No value-class analogue / out of range → plain (C revert).
+        assert!(matches!(parse_dbr_class("35"), Some(DbrClass::Plain)));
+        assert!(matches!(parse_dbr_class("999"), Some(DbrClass::Plain)));
     }
 }

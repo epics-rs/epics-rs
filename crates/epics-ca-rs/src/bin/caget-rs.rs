@@ -57,8 +57,8 @@ struct Args {
     wide: bool,
 
     /// Request a specific DBR type by name (e.g. `DOUBLE`,
-    /// `DBR_TIME_DOUBLE`) or numeric DBR id. Currently accepted for
-    /// parity; the request is delegated to the channel default.
+    /// `DBR_TIME_DOUBLE`) or numeric DBR id. The named family selects
+    /// the GET request class (STS/TIME/GR/CTRL or plain value).
     #[arg(short = 'd', long = "dbr-type")]
     dbr_type: Option<String>,
 
@@ -230,9 +230,6 @@ async fn main() {
     if args.priority.is_some() {
         eprintln!("caget-rs: -p (priority) is accepted for parity but not yet honoured");
     }
-    if args.dbr_type.is_some() {
-        eprintln!("caget-rs: -d (dbr type) is accepted for parity but not yet honoured");
-    }
     if args.string_format {
         eprintln!("caget-rs: -s (string format) is accepted for parity but not yet honoured");
     }
@@ -260,6 +257,7 @@ async fn main() {
         let name = name.clone();
         let t = timeout;
         let ch = ch.clone();
+        let dbr_class = args.dbr_type.clone();
         handles.push(tokio::spawn(async move {
             let connect = ch.wait_connected(t).await;
             if connect.is_err() {
@@ -270,19 +268,36 @@ async fn main() {
             // response in the same `Ok` variant. The plain path stays
             // on `get_with_timeout` because it doesn't pay for the
             // bigger DBR_TIME response.
-            let outcome = if want_time {
-                match tokio::time::timeout(t, ch.get_with_metadata(DbrClass::Time)).await {
-                    Ok(Ok(snap)) => Ok(GetResult::Time(Box::new(snap))),
+            // CA-FR-4: `-d <type>` selects the DBR request class
+            // (STS/TIME/GR/CTRL or plain value); `-a` forces TIME.
+            // Routing the GET through the chosen class makes the wire
+            // request type honour `-d` instead of always using the
+            // channel default.
+            let req_class = if want_time {
+                Some(DbrClass::Time)
+            } else {
+                dbr_class.as_deref().and_then(parse_dbr_class)
+            };
+            let outcome = match req_class {
+                Some(DbrClass::Time) => {
+                    match tokio::time::timeout(t, ch.get_with_metadata(DbrClass::Time)).await {
+                        Ok(Ok(snap)) => Ok(GetResult::Time(Box::new(snap))),
+                        Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
+                        Ok(Err(e)) => Err(format!("{e}")),
+                        Err(_) => Err("timeout".to_string()),
+                    }
+                }
+                Some(class) => match tokio::time::timeout(t, ch.get_with_metadata(class)).await {
+                    Ok(Ok(snap)) => Ok(GetResult::Plain(snap.value)),
                     Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
                     Ok(Err(e)) => Err(format!("{e}")),
                     Err(_) => Err("timeout".to_string()),
-                }
-            } else {
-                match ch.get_with_timeout(t).await {
+                },
+                None => match ch.get_with_timeout(t).await {
                     Ok((_dbr, value)) => Ok(GetResult::Plain(value)),
                     Err(CaError::Timeout) => Err("timeout".to_string()),
                     Err(e) => Err(format!("{e}")),
-                }
+                },
             };
             (name, outcome)
         }));
@@ -404,5 +419,53 @@ async fn main() {
     }
     if failed {
         std::process::exit(1);
+    }
+}
+
+/// CA-FR-4: map a `caget -d <type>` request to the DBR metadata class
+/// to fetch. Recognises `DBR_`-prefixed or bare family names; a plain
+/// value type (e.g. `DOUBLE`, `STRING`) or numeric id requests the
+/// `Plain` value class. Returns `None` for an unrecognised token so the
+/// caller falls back to the channel-default GET. Mirrors the C
+/// `caget -d` family selection (`caget.c:175-187`).
+fn parse_dbr_class(s: &str) -> Option<DbrClass> {
+    let up = s.trim().to_ascii_uppercase();
+    let fam = up.strip_prefix("DBR_").unwrap_or(&up);
+    if fam.starts_with("CTRL") {
+        Some(DbrClass::Ctrl)
+    } else if fam.starts_with("GR") {
+        Some(DbrClass::Gr)
+    } else if fam.starts_with("TIME") {
+        Some(DbrClass::Time)
+    } else if fam.starts_with("STS") {
+        Some(DbrClass::Sts)
+    } else if fam.is_empty() {
+        None
+    } else {
+        // Plain value type (STRING/SHORT/INT/FLOAT/ENUM/CHAR/LONG/DOUBLE)
+        // or a numeric DBR id — request the plain value class.
+        Some(DbrClass::Plain)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DbrClass, parse_dbr_class};
+
+    #[test]
+    fn dbr_class_families() {
+        assert!(matches!(
+            parse_dbr_class("DBR_TIME_DOUBLE"),
+            Some(DbrClass::Time)
+        ));
+        assert!(matches!(
+            parse_dbr_class("ctrl_double"),
+            Some(DbrClass::Ctrl)
+        ));
+        assert!(matches!(parse_dbr_class("DBR_GR_LONG"), Some(DbrClass::Gr)));
+        assert!(matches!(parse_dbr_class("STS_INT"), Some(DbrClass::Sts)));
+        assert!(matches!(parse_dbr_class("DOUBLE"), Some(DbrClass::Plain)));
+        assert!(matches!(parse_dbr_class("6"), Some(DbrClass::Plain)));
+        assert!(parse_dbr_class("").is_none());
     }
 }

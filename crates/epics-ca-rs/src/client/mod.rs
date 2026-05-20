@@ -2295,10 +2295,17 @@ impl MonitorHandle {
     ///
     /// `None` means the producer side closed (subscription cancelled
     /// or coordinator shut down).
+    ///
+    /// While the subscription is [paused](Self::pause) the bounded
+    /// channel backlog (pre-pause values) and any bypassing errors
+    /// (e.g. `ECA_DISCONN`) are still delivered, but the held latest
+    /// value in the coalesce slot is withheld until [`Self::resume`].
     pub async fn recv(&mut self) -> Option<CaResult<Snapshot>> {
         use tokio::sync::mpsc::error::TryRecvError;
         loop {
-            // 1. Drain the bounded channel first.
+            // 1. Drain the bounded channel first. The channel carries
+            //    pre-pause backlog (3a) and pause-bypassing errors, so
+            //    it is always readable regardless of pause state.
             match self.callback_rx.try_recv() {
                 Ok(msg) => {
                     let _ = self
@@ -2309,14 +2316,22 @@ impl MonitorHandle {
                 Err(TryRecvError::Disconnected) => return None,
                 Err(TryRecvError::Empty) => {}
             }
-            // 2. Channel empty — check the coalesce slot.
-            if let Some(msg) = self.coalesce_slot.take() {
+            // 2. Channel empty — take the coalesce slot only if it is
+            //    deliverable now. `take_if_deliverable` withholds a
+            //    held *value* while paused (recv-side gate) but lets an
+            //    `Err` through (errors bypass pause). Atomic against
+            //    `resume`.
+            if let Some(msg) = self.coalesce_slot.take_if_deliverable() {
                 let _ = self
                     .coord_tx
                     .send(CoordRequest::MonitorConsumed { subid: self.subid });
                 return Some(msg);
             }
-            // 3. Both empty — wait for whichever fires first.
+            // 3. Nothing deliverable — wait. `notified` fires on a
+            //    non-paused slot write, an error write, or `resume`.
+            //    On a value arriving during pause the producer holds it
+            //    in the slot WITHOUT notifying, so we correctly stay
+            //    parked until resume or an error.
             let notified = self.coalesce_slot.notified();
             tokio::pin!(notified);
             tokio::select! {
@@ -2329,13 +2344,46 @@ impl MonitorHandle {
                     return msg;
                 }
                 _ = &mut notified => {
-                    // Loop and recheck — the slot/channel may have
-                    // been populated; another consumer of the same
-                    // `Notify` can't exist (each subscription has
-                    // its own slot) but a spurious wake is harmless.
+                    // Loop and recheck — slot/channel/pause state may
+                    // have changed. Each subscription owns its slot, so
+                    // a spurious wake is harmless.
                 }
             }
         }
+    }
+
+    /// Pause value-monitor delivery — client-side only, **no CA wire
+    /// message** (so wire compatibility is preserved). While paused:
+    ///
+    /// - new value updates coalesce into the latest slot and are NOT
+    ///   yielded by [`Self::recv`] (semantic 2a);
+    /// - the bounded-channel backlog captured before the pause stays
+    ///   readable and drains normally on `recv` (semantic 3a);
+    /// - connection/terminal errors (`ECA_DISCONN`, monitor status
+    ///   errors) bypass the pause and are delivered immediately.
+    ///
+    /// On [`Self::resume`] the channel backlog drains first, then the
+    /// single held latest value is delivered.
+    ///
+    /// This is the option-1 virtual pause. A wire-level
+    /// `EVENT_CANCEL`/`EVENT_ADD` pause (option 2) has different
+    /// semantics — round-trip, re-subscribe, event gap, subid
+    /// lifecycle — and is intentionally NOT folded into this method;
+    /// it would be a separate `pause_server`-style API.
+    pub fn pause(&self) {
+        self.coalesce_slot.set_paused(true);
+    }
+
+    /// Resume a [paused](Self::pause) subscription. Wakes a parked
+    /// [`Self::recv`] so the held latest value is flushed after the
+    /// channel backlog. No-op (and no wake) if not currently paused.
+    pub fn resume(&self) {
+        self.coalesce_slot.set_paused(false);
+    }
+
+    /// Whether the subscription is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.coalesce_slot.is_paused()
     }
 }
 
@@ -4536,5 +4584,104 @@ mod typed_string_put_tests {
             "string-array put must wire DBR_STRING (0)"
         );
         assert_eq!(hdr.count, 3, "count must be the element count");
+    }
+}
+
+#[cfg(test)]
+mod monitor_pause_tests {
+    use super::*;
+    use epics_base_rs::server::snapshot::Snapshot;
+    use epics_base_rs::types::EpicsValue;
+    use std::time::{Duration, SystemTime};
+
+    fn snap(v: i32) -> Snapshot {
+        Snapshot::new(EpicsValue::Long(v), 0, 0, SystemTime::now())
+    }
+
+    /// A′ end-to-end recv-side gate:
+    /// 1. pre-pause channel backlog is delivered even while paused (3a);
+    /// 2. a value arriving during pause is held — `recv` blocks (2a);
+    /// 3. `resume` releases the held latest, in order after the backlog.
+    #[tokio::test]
+    async fn pause_holds_value_resume_releases_after_backlog() {
+        let (callback_tx, callback_rx) = mpsc::channel::<CaResult<Snapshot>>(4);
+        let (coord_tx, _coord_rx) = mpsc::unbounded_channel();
+        let coalesce_slot = subscription::CoalesceSlot::new();
+        let mut handle = MonitorHandle {
+            subid: 1,
+            callback_rx,
+            coalesce_slot: coalesce_slot.clone(),
+            coord_tx,
+        };
+
+        // Pre-pause backlog: value 1 already in the channel.
+        callback_tx.try_send(Ok(snap(1))).expect("enqueue backlog");
+
+        handle.pause();
+
+        // A value arrives DURING pause → producer holds it in the slot
+        // (route_value Held path).
+        assert!(matches!(
+            coalesce_slot.route_value(Ok(snap(2))),
+            subscription::ValueRoute::Held { was_empty: true }
+        ));
+
+        // (3a) The pre-pause backlog is still delivered while paused.
+        let v1 = tokio::time::timeout(Duration::from_millis(200), handle.recv())
+            .await
+            .expect("backlog should deliver promptly")
+            .expect("Some")
+            .expect("Ok");
+        assert_eq!(v1.value, EpicsValue::Long(1), "pre-pause backlog (1)");
+
+        // (2a) The held value (2) must NOT be delivered while paused —
+        // recv blocks.
+        let blocked = tokio::time::timeout(Duration::from_millis(150), handle.recv()).await;
+        assert!(
+            blocked.is_err(),
+            "held value must stay withheld while paused (recv-side gate)"
+        );
+
+        // resume → the held latest is released.
+        handle.resume();
+        let v2 = tokio::time::timeout(Duration::from_millis(200), handle.recv())
+            .await
+            .expect("held value should deliver after resume")
+            .expect("Some")
+            .expect("Ok");
+        assert_eq!(v2.value, EpicsValue::Long(2), "held latest after resume");
+    }
+
+    /// A′ error policy end-to-end: an error arriving during pause is
+    /// delivered immediately (bypasses the gate), without waiting for
+    /// resume.
+    #[tokio::test]
+    async fn pause_does_not_hide_errors() {
+        let (callback_tx, callback_rx) = mpsc::channel::<CaResult<Snapshot>>(4);
+        let (coord_tx, _coord_rx) = mpsc::unbounded_channel();
+        let coalesce_slot = subscription::CoalesceSlot::new();
+        let mut handle = MonitorHandle {
+            subid: 1,
+            callback_rx,
+            coalesce_slot,
+            coord_tx,
+        };
+
+        handle.pause();
+
+        // An error reaches the channel (errors bypass pause; they do
+        // not go through the value-only `route_value` gate).
+        callback_tx
+            .try_send(Err(CaError::ServerError(192))) // ECA_DISCONN
+            .expect("enqueue error");
+
+        let got = tokio::time::timeout(Duration::from_millis(200), handle.recv())
+            .await
+            .expect("error must deliver while paused")
+            .expect("Some");
+        assert!(
+            matches!(got, Err(CaError::ServerError(192))),
+            "ECA_DISCONN must bypass pause"
+        );
     }
 }

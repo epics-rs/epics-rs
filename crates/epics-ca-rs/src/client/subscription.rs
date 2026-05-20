@@ -14,62 +14,117 @@ use epics_base_rs::types::{DbFieldType, EpicsValue, decode_dbr};
 
 use super::types::TransportCommand;
 
-/// Per-subscription "latest pending" slot used when the bounded
-/// callback channel is full. Mirrors the
-/// `db_post_events`/`dbEvent.c:813-823` replace-last behaviour of
-/// the C IOC's ring buffer: when no space remains, the new event
-/// overwrites the last pending value for the same subscription
-/// rather than being silently dropped. The next
-/// [`MonitorHandle::recv`] drains the slot after the channel is
-/// empty, so the latest value is always delivered.
+/// Producer routing decision for a value snapshot, computed
+/// atomically against the pause flag (see [`CoalesceSlot::route_value`]).
+pub(crate) enum ValueRoute {
+    /// Subscription is paused — the value was held in the latest slot
+    /// (option-1 virtual pause, semantic 2a). `was_empty` reports the
+    /// empty→present transition for pending-count accounting.
+    Held { was_empty: bool },
+    /// Not paused, slot was already occupied (overflow) — the value
+    /// replaced the prior coalesced entry in place. No pending change.
+    Replaced,
+    /// Not paused, slot empty — the caller should try the bounded
+    /// channel (and fall back to [`CoalesceSlot::put`] on full).
+    /// Boxed so this (large) variant doesn't bloat the others; the
+    /// snapshot is already heap-backed, so the extra indirection is
+    /// negligible next to its own allocations.
+    TryChannel(Box<CaResult<Snapshot>>),
+}
+
+/// Per-subscription "latest pending" slot + pause flag. Shared between
+/// the coordinator (producer) and the [`MonitorHandle`] (consumer).
 ///
-/// Combined with the existing per-circuit `EVENTS_OFF` emission
-/// (see `flow_control_note_queued` / `flow_control_note_consumed`
-/// in `mod.rs`), this gives the same two-layer back-pressure the C
-/// reference implements: server-side coalesce + protocol-level
-/// `EVENTS_OFF` when a slow consumer can't keep up.
+/// Two roles:
+///
+/// 1. **Overflow coalesce.** When the bounded callback channel is full
+///    a new value replaces the slot rather than being dropped. Mirrors
+///    `db_post_events`/`dbEvent.c:813-823`. `recv` drains the slot
+///    after the channel empties, so the latest value always lands.
+///
+/// 2. **Virtual pause (option 1, semantics 2a/3a).** While `paused`,
+///    new *value* monitors coalesce into the slot only — never the
+///    channel — and `recv`'s gate withholds the slot until `resume`.
+///    Pre-pause channel backlog (3a) is untouched and drains first;
+///    the held latest follows. *Errors* (`Err(..)`, e.g. `ECA_DISCONN`)
+///    bypass pause entirely: they continue to the channel/slot and
+///    `recv` delivers them even while paused.
+///
+/// The pause flag lives **inside** the same mutex as `latest` so the
+/// producer's "check paused + write slot" and the consumer's
+/// "check paused + take slot" are each atomic against `resume`'s
+/// "flip paused + notify". A split atomic flag would leave a window
+/// where a value written just-before-resume is never woken — a stuck
+/// value.
 pub(crate) struct CoalesceSlot {
-    latest: StdMutex<Option<CaResult<Snapshot>>>,
+    inner: StdMutex<CoalesceInner>,
     notify: Notify,
+}
+
+struct CoalesceInner {
+    latest: Option<CaResult<Snapshot>>,
+    paused: bool,
 }
 
 impl CoalesceSlot {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            latest: StdMutex::new(None),
+            inner: StdMutex::new(CoalesceInner {
+                latest: None,
+                paused: false,
+            }),
             notify: Notify::new(),
         })
     }
 
-    /// Replace the slot with `snap`. Returns `true` when the slot
-    /// transitioned from empty → present (the producer should bump
-    /// the per-circuit outstanding-event count), `false` when the
-    /// new value just overwrote a prior coalesced entry.
+    /// Replace the slot with `snap`. Returns `true` on empty→present
+    /// (caller bumps the per-circuit outstanding count). Always
+    /// notifies — used by the overflow fallback after a full channel.
     fn put(&self, snap: CaResult<Snapshot>) -> bool {
-        let mut guard = self.latest.lock().expect("CoalesceSlot mutex poisoned");
-        let was_empty = guard.is_none();
-        *guard = Some(snap);
-        drop(guard);
+        let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
+        let was_empty = g.latest.is_none();
+        g.latest = Some(snap);
+        drop(g);
         self.notify.notify_one();
         was_empty
     }
 
-    /// Atomic "coalesce iff already occupied". Returns `None` after a
-    /// successful in-place replace (caller treats as `Replaced` — no
-    /// pending-count change). Returns `Some(item)` when the slot was
-    /// empty so the caller can fall back to the bounded channel.
-    ///
-    /// Critical: the `is_empty? + try_send + put` sequence MUST stay
-    /// atomic with respect to the consumer's `take`. If the consumer
-    /// takes between an unlocked check and a later `put`, the
-    /// "was_empty" signal flips meaning under us and the `Replaced` /
-    /// `Coalesced` accounting drifts. This method holds the lock
-    /// across the check + replace so no consumer drain can slip in.
+    /// Route a *value* snapshot atomically against the pause flag.
+    /// See [`ValueRoute`]. The pause check + slot write happen under
+    /// one lock so no concurrent `resume` can strand a held value.
+    pub fn route_value(&self, item: CaResult<Snapshot>) -> ValueRoute {
+        let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
+        if g.paused {
+            // 2a: held in slot, no channel, no notify (recv is gated;
+            // resume() will wake it). Latest-wins replace.
+            let was_empty = g.latest.is_none();
+            g.latest = Some(item);
+            ValueRoute::Held { was_empty }
+        } else if g.latest.is_some() {
+            // Overflow coalesce — order-preservation short-circuit
+            // (a fresh value must not jump ahead of an older slotted
+            // one via the channel).
+            g.latest = Some(item);
+            drop(g);
+            self.notify.notify_one();
+            ValueRoute::Replaced
+        } else {
+            ValueRoute::TryChannel(Box::new(item))
+        }
+    }
+
+    /// Atomic "coalesce iff already occupied", **ignoring** the pause
+    /// flag. The error path uses this (errors bypass pause): if the
+    /// slot already holds something, replace it in place so the error
+    /// can't jump ahead of an older slotted item via the channel;
+    /// otherwise return the item so the caller falls back to the
+    /// channel. Notifies on replace so a gated `recv` wakes —
+    /// `take_if_deliverable` lets an `Err` through even while paused.
     fn put_if_occupied(&self, item: CaResult<Snapshot>) -> Option<CaResult<Snapshot>> {
-        let mut guard = self.latest.lock().expect("CoalesceSlot mutex poisoned");
-        if guard.is_some() {
-            *guard = Some(item);
-            drop(guard);
+        let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
+        if g.latest.is_some() {
+            g.latest = Some(item);
+            drop(g);
             self.notify.notify_one();
             None
         } else {
@@ -77,18 +132,54 @@ impl CoalesceSlot {
         }
     }
 
-    /// Take the current slot value, if any. Called by
-    /// `MonitorHandle::recv` after the bounded channel is drained.
-    pub fn take(&self) -> Option<CaResult<Snapshot>> {
-        self.latest
-            .lock()
-            .expect("CoalesceSlot mutex poisoned")
-            .take()
+    /// Take the slot value only if it is *deliverable now*: always when
+    /// not paused; while paused only if it holds an `Err` (errors
+    /// bypass pause). Held values stay until `resume`. Atomic against
+    /// the pause flag.
+    pub fn take_if_deliverable(&self) -> Option<CaResult<Snapshot>> {
+        let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
+        if g.paused && !matches!(g.latest, Some(Err(_))) {
+            None
+        } else {
+            g.latest.take()
+        }
     }
 
-    /// Future that resolves when the next `put` happens.
+    /// Future that resolves on the next `notify` (slot write while not
+    /// paused, error write, or `resume`).
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
+    }
+
+    /// Set/clear the pause flag. Returns the previous value. On a
+    /// true→false transition wakes `recv` so it can flush the held
+    /// latest. Atomic with the producer/consumer slot operations.
+    pub fn set_paused(&self, paused: bool) -> bool {
+        let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
+        let prev = g.paused;
+        g.paused = paused;
+        drop(g);
+        if prev && !paused {
+            self.notify.notify_one();
+        }
+        prev
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("CoalesceSlot mutex poisoned")
+            .paused
+    }
+
+    /// Unconditional take — drops any pending value/error regardless of
+    /// pause state. Used by `clear` on disconnect and by tests.
+    fn take(&self) -> Option<CaResult<Snapshot>> {
+        self.inner
+            .lock()
+            .expect("CoalesceSlot mutex poisoned")
+            .latest
+            .take()
     }
 
     /// Drop any pending coalesced value (called when a subscription
@@ -238,49 +329,50 @@ impl SubscriptionRegistry {
             }
         }
 
-        // Order-preservation invariant: once the coalesce slot is
-        // occupied, the subscription is in overflow mode and every
-        // subsequent event must continue to coalesce into the slot.
-        // Routing a fresh event through the bounded channel while an
-        // older value sits in the slot would let the consumer see the
-        // new value first (channel-drain-then-slot order), inverting
-        // FIFO. C `dbEvent.c::pevent->pLastLog` doesn't have this
-        // failure mode because it replaces the in-queue entry in
-        // place; the slot model needs an explicit short-circuit.
-        let item = match rec.coalesce_slot.put_if_occupied(Ok(snapshot)) {
-            None => {
+        // Value routing, computed atomically against the pause flag:
+        //   - paused      → held in the slot (2a), never the channel;
+        //   - overflow    → slot already occupied, replace in place
+        //                   (order-preservation short-circuit — a fresh
+        //                   value must not jump ahead of an older
+        //                   slotted one via the channel);
+        //   - normal      → slot empty, try the bounded channel.
+        match rec.coalesce_slot.route_value(Ok(snapshot)) {
+            ValueRoute::Held { was_empty } => {
+                if was_empty {
+                    rec.pending_deliveries += 1;
+                    MonitorDeliveryOutcome::Coalesced(server_addr)
+                } else {
+                    rec.nreplace = rec.nreplace.saturating_add(1);
+                    MonitorDeliveryOutcome::Replaced(server_addr)
+                }
+            }
+            ValueRoute::Replaced => {
                 rec.nreplace = rec.nreplace.saturating_add(1);
-                return MonitorDeliveryOutcome::Replaced(server_addr);
+                MonitorDeliveryOutcome::Replaced(server_addr)
             }
-            Some(item) => item,
-        };
-
-        match rec.callback_tx.try_send(item) {
-            Ok(()) => {
-                rec.pending_deliveries += 1;
-                MonitorDeliveryOutcome::Queued(server_addr)
-            }
-            Err(TrySendError::Full(rejected)) => {
-                // Bounded channel full — instead of silently dropping
-                // (the pre-fix behaviour, which lost terminal
-                // transitions like DMOV 1→0 under load), place the
-                // new snapshot in the per-subscription coalesce slot.
-                // `MonitorHandle::recv` drains the slot after the
-                // channel empties so the latest value is always
-                // delivered. Mirrors C `dbEvent.c::db_post_events`
-                // replace-last semantics.
-                rec.nreplace = rec.nreplace.saturating_add(1);
-                let first_coalesce = rec.coalesce_slot.put(rejected);
-                debug_assert!(
-                    first_coalesce,
-                    "put_if_occupied returned empty just above; the slot \
-                     can only have been filled by a concurrent producer, \
-                     but this Registry is single-producer (coordinator task)",
-                );
-                rec.pending_deliveries += 1;
-                MonitorDeliveryOutcome::Coalesced(server_addr)
-            }
-            Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(server_addr),
+            ValueRoute::TryChannel(item) => match rec.callback_tx.try_send(*item) {
+                Ok(()) => {
+                    rec.pending_deliveries += 1;
+                    MonitorDeliveryOutcome::Queued(server_addr)
+                }
+                Err(TrySendError::Full(rejected)) => {
+                    // Bounded channel full — coalesce into the slot
+                    // instead of the pre-fix silent drop (which lost
+                    // terminal transitions like DMOV 1→0 under load).
+                    // Mirrors C `dbEvent.c::db_post_events` replace-last.
+                    rec.nreplace = rec.nreplace.saturating_add(1);
+                    let first_coalesce = rec.coalesce_slot.put(rejected);
+                    debug_assert!(
+                        first_coalesce,
+                        "route_value returned TryChannel only when the slot \
+                         was empty; this Registry is single-producer so the \
+                         slot cannot have been filled concurrently",
+                    );
+                    rec.pending_deliveries += 1;
+                    MonitorDeliveryOutcome::Coalesced(server_addr)
+                }
+                Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(server_addr),
+            },
         }
     }
 
@@ -808,6 +900,78 @@ mod tests {
             }
             other => panic!("expected ECA_DISCONN, got {other:?}"),
         }
+    }
+
+    /// A′ (2a): while paused, `route_value` holds the value in the
+    /// slot — never returns `TryChannel` — and the recv-side gate
+    /// (`take_if_deliverable`) withholds it.
+    #[test]
+    fn paused_value_held_and_gated() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::EpicsValue;
+        use std::time::SystemTime;
+
+        let slot = CoalesceSlot::new();
+        slot.set_paused(true);
+
+        let snap = Snapshot::new(EpicsValue::Long(7), 0, 0, SystemTime::now());
+        assert!(
+            matches!(
+                slot.route_value(Ok(snap)),
+                ValueRoute::Held { was_empty: true }
+            ),
+            "paused value must be held in slot, not routed to channel"
+        );
+        // Gate withholds the held value while paused.
+        assert!(
+            slot.take_if_deliverable().is_none(),
+            "recv-side gate must not yield a held value while paused"
+        );
+        // Resume releases it.
+        assert!(slot.set_paused(false), "was paused");
+        let released = slot.take_if_deliverable().expect("released after resume");
+        assert_eq!(released.expect("Ok").value, EpicsValue::Long(7));
+    }
+
+    /// A′ error policy: errors bypass pause — `take_if_deliverable`
+    /// yields an `Err` from the slot even while paused.
+    #[test]
+    fn paused_error_bypasses_gate() {
+        use epics_base_rs::error::CaError;
+
+        let slot = CoalesceSlot::new();
+        slot.set_paused(true);
+        // An error reaches the slot via the (pause-agnostic) put path.
+        slot.put(Err(CaError::ServerError(192))); // ECA_DISCONN
+        let got = slot.take_if_deliverable().expect("error must bypass pause");
+        assert!(
+            matches!(got, Err(CaError::ServerError(192))),
+            "ECA_DISCONN delivered while paused"
+        );
+    }
+
+    /// `route_value` when not paused: empty → TryChannel, occupied →
+    /// Replaced (the order-preservation short-circuit).
+    #[test]
+    fn route_value_not_paused_channel_then_replace() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::EpicsValue;
+        use std::time::SystemTime;
+
+        let slot = CoalesceSlot::new();
+        let s1 = Snapshot::new(EpicsValue::Long(1), 0, 0, SystemTime::now());
+        assert!(
+            matches!(slot.route_value(Ok(s1)), ValueRoute::TryChannel(_)),
+            "empty slot, not paused → caller tries the channel"
+        );
+        // Occupy the slot.
+        let s2 = Snapshot::new(EpicsValue::Long(2), 0, 0, SystemTime::now());
+        assert!(slot.put(Ok(s2)));
+        let s3 = Snapshot::new(EpicsValue::Long(3), 0, 0, SystemTime::now());
+        assert!(
+            matches!(slot.route_value(Ok(s3)), ValueRoute::Replaced),
+            "occupied slot, not paused → replace in place (no channel jump-ahead)"
+        );
     }
 
     /// `CoalesceSlot::put` returns true on empty→present so the caller

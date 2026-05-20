@@ -3537,7 +3537,15 @@ async fn handle_op(
                     else {
                         return;
                     };
-                    let mut over_high = false;
+                    // Diagnostic-only outbound-queue-depth crossing flag.
+                    let mut queue_over_high = false;
+                    // PVA-FR-4: per-PV pipeline-window watermark levels
+                    // `(low, high)` in credit units, and the hysteresis
+                    // flag for firing the SharedPV callbacks off the
+                    // window (not server-queue occupancy). `None` when
+                    // the source exposes no per-PV levels.
+                    let wm_levels = src.monitor_watermarks(&pv_name);
+                    let mut wm_over_high = false;
                     // R49-G1 + R50 audit-3: revalidate ACL BEFORE
                     // sending the initial snapshot on the decoded
                     // path. The re-check is routed through
@@ -3679,31 +3687,25 @@ async fn handle_op(
                             debug!(pv = %pv_name, squashed, "monitor squashed events");
                             squashing = false;
                         }
-                        // Watermark crossing diagnostics + producer
-                        // notification. pvxs fires `onHighMark` /
-                        // `onLowMark` callbacks at these transitions so
-                        // sources can throttle/un-throttle their post()
-                        // rate; we mirror that via
-                        // `ChannelSource::notify_watermark_{high,low}`.
-                        // The default trait impl is a no-op; SharedSource
-                        // overrides it to dispatch the per-PV callback
-                        // registered via `SharedPv::set_on_high_mark`.
-                        // Counter is max_capacity - capacity since mpsc
-                        // doesn't expose len directly.
+                        // PVA-FR-4: outbound-queue depth is a SERVER
+                        // diagnostic only — it is no longer used to fire
+                        // the SharedPV watermark callbacks. pvxs ties
+                        // `onHighMark`/`onLowMark` to the pipeline flow-
+                        // control window, which we now do at the credit
+                        // gate below. Counter is max_capacity - capacity
+                        // since mpsc doesn't expose len directly.
                         let pending = tx_clone.max_capacity() - tx_clone.capacity();
-                        if pending >= high_watermark && !over_high {
-                            over_high = true;
+                        if pending >= high_watermark && !queue_over_high {
+                            queue_over_high = true;
                             warn!(
                                 pv = %pv_name,
                                 pending,
                                 high_watermark,
                                 "monitor outbound queue crossed high watermark"
                             );
-                            src.notify_watermark_high(&pv_name);
-                        } else if pending == 0 && over_high {
-                            over_high = false;
-                            debug!(pv = %pv_name, "monitor outbound queue drained below low watermark");
-                            src.notify_watermark_low(&pv_name);
+                        } else if pending == 0 && queue_over_high {
+                            queue_over_high = false;
+                            debug!(pv = %pv_name, "monitor outbound queue drained");
                         }
                         // EX-R1: pause and filter suppression MUST run
                         // before pipeline credit is consumed. Pipeline
@@ -3795,6 +3797,18 @@ async fn handle_op(
                         // is consumed only for events that will produce
                         // a DATA frame.
                         if let (Some(w), Some(n)) = (window.as_ref(), window_notify.as_ref()) {
+                            // PVA-FR-4: HIGH fires when the window — refilled
+                            // by client ACKs — stands above `high` before we
+                            // consume a credit (pvxs onHighMark on the ACK
+                            // refill). Hysteresis (`wm_over_high`) fires it
+                            // once per crossing.
+                            if let Some((_lo, hi)) = wm_levels {
+                                let w_now = w.load(std::sync::atomic::Ordering::Relaxed) as usize;
+                                if w_now > hi && !wm_over_high {
+                                    wm_over_high = true;
+                                    src.notify_watermark_high(&pv_name);
+                                }
+                            }
                             loop {
                                 let cur = w.load(std::sync::atomic::Ordering::Relaxed);
                                 if cur > 0 {
@@ -3826,6 +3840,16 @@ async fn handle_op(
                                     continue;
                                 }
                                 notified.await;
+                            }
+                            // PVA-FR-4: LOW fires when emitting this DATA
+                            // frame drained the window to `<= low` (pvxs
+                            // onLowMark as credit is consumed).
+                            if let Some((lo, _hi)) = wm_levels {
+                                let w_after = w.load(std::sync::atomic::Ordering::Relaxed) as usize;
+                                if w_after <= lo && wm_over_high {
+                                    wm_over_high = false;
+                                    src.notify_watermark_low(&pv_name);
+                                }
                             }
                         }
                         // BR-R29: for a partial-emitting source, narrow

@@ -536,6 +536,20 @@ pub trait ChannelSource: Send + Sync + 'static {
     fn notify_watermark_low(&self, name: &str) {
         let _ = name;
     }
+
+    /// PVA-FR-4: the per-PV pipeline-window watermark levels `(low,
+    /// high)` for `name`, in window-credit units. The monitor loop
+    /// fires [`Self::notify_watermark_high`] when an ACK refills the
+    /// window above `high` and [`Self::notify_watermark_low`] when a
+    /// DATA emission drains it to `<= low` — pvxs `servermon.cpp`
+    /// flow-control semantics, not server-queue occupancy. Default
+    /// `None` (no per-PV levels);
+    /// [`crate::server_native::shared_pv::SharedSource`] overrides to
+    /// return its `SharedPV` levels.
+    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+        let _ = name;
+        None
+    }
 }
 
 /// One MONITOR DATA event in **raw wire form** — the bytes the
@@ -719,6 +733,7 @@ pub trait ChannelSourceObj: Send + Sync {
     fn monitor_emits_partial(&self, name: &str) -> bool;
     fn notify_watermark_high(&self, name: &str);
     fn notify_watermark_low(&self, name: &str);
+    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)>;
 }
 
 impl<T: ChannelSource + 'static> ChannelSourceObj for T {
@@ -921,5 +936,8 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn notify_watermark_low(&self, name: &str) {
         <Self as ChannelSource>::notify_watermark_low(self, name);
+    }
+    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+        <Self as ChannelSource>::monitor_watermarks(self, name)
     }
 }

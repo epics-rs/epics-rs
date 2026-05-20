@@ -63,7 +63,7 @@ fn convert_and_serialize(native: DbFieldType, value: &EpicsValue) -> CaResult<Ve
 }
 
 /// RISC alignment padding bytes required between metadata header and value.
-fn sts_pad(native: DbFieldType) -> &'static [u8] {
+pub(crate) fn sts_pad(native: DbFieldType) -> &'static [u8] {
     match native {
         // status(2)+severity(2) = 4 → short/enum need 0 pad.
         // `dbr_sts_char` (db_access.h:218-223): `dbr_char_t RISC_pad`
@@ -80,7 +80,7 @@ fn sts_pad(native: DbFieldType) -> &'static [u8] {
 }
 
 /// RISC alignment padding bytes for TIME structs (after 12-byte metadata header).
-fn time_pad(native: DbFieldType) -> &'static [u8] {
+pub(crate) fn time_pad(native: DbFieldType) -> &'static [u8] {
     match native {
         // 12 bytes header → short/enum need 2-pad, char needs 2+1=3 pad
         DbFieldType::Short | DbFieldType::Enum => &[0, 0],
@@ -88,6 +88,72 @@ fn time_pad(native: DbFieldType) -> &'static [u8] {
         // double: 12 → pad 4 to reach 16-byte boundary for 8-byte double
         DbFieldType::Double => &[0, 0, 0, 0],
         _ => &[],
+    }
+}
+
+/// Metadata byte count that precedes `value[0]` for a GR (`ctrl=false`)
+/// or CTRL (`ctrl=true`) DBR struct. CA-FR-7: this is the single source
+/// of truth shared with [`serialize_gr_ctrl`] / [`encode_gr`] /
+/// [`encode_ctrl`] — every component below is the exact byte sequence
+/// those writers emit before the value, so the sizer cannot drift from
+/// the encoder. `n_limits` is 6 for GR (display/alarm limits) and 8 for
+/// CTRL (plus upper/lower control limits).
+fn gr_ctrl_meta_size(native: DbFieldType, ctrl: bool) -> usize {
+    let n_limits = if ctrl { 8 } else { 6 };
+    // status(2) + severity(2) is common to every GR/CTRL struct.
+    let head = 4;
+    match native {
+        // "not implemented; use dbr_sts_string" — only the common head.
+        DbFieldType::String => head + sts_pad(native).len(),
+        // no_str(u16) + char[MAX_ENUM_STATES][MAX_ENUM_STRING_SIZE].
+        DbFieldType::Enum => head + 2 + MAX_ENUM_STATES * MAX_ENUM_STRING_SIZE,
+        // precision(2) + RISC_pad(2) + units[8] + n limits (f32).
+        DbFieldType::Float => head + 4 + MAX_UNITS_SIZE + n_limits * 4,
+        // precision(2) + RISC_pad(2) + units[8] + n limits (f64). Int64/
+        // UInt64 have no CA GR/CTRL type and reuse the Double layout.
+        DbFieldType::Double | DbFieldType::Int64 | DbFieldType::UInt64 => {
+            head + 4 + MAX_UNITS_SIZE + n_limits * 8
+        }
+        // units[8] + n limits (i16).
+        DbFieldType::Short => head + MAX_UNITS_SIZE + n_limits * 2,
+        // units[8] + n limits (i32).
+        DbFieldType::Long => head + MAX_UNITS_SIZE + n_limits * 4,
+        // units[8] + n limits (u8) + RISC_pad(1).
+        DbFieldType::Char => head + MAX_UNITS_SIZE + n_limits + 1,
+    }
+}
+
+/// Number of metadata bytes that precede `value[0]` for a DBR type —
+/// the single size owner mirrored from the serializers in this module.
+/// CA-FR-7: `dbr_buffer_size` derives payload sizing from this so the
+/// explicit-count pad/truncate and no-read-access frame paths match the
+/// bytes the encoder actually writes (C `dbr_size_n` parity), instead of
+/// a parallel table that drifted on TIME/GR/CTRL layouts.
+///
+/// `DBR_CLASS_NAME` (38) is intentionally not handled here — it carries
+/// no `value[]` array and is sized as a flat 40-byte string by the
+/// caller. Returns the value-preceding metadata length for everything
+/// in the plain/STS/TIME/GR/CTRL ranges plus the alarm-ack variants.
+pub(crate) fn dbr_meta_size(dbr_type: u16, native: DbFieldType) -> usize {
+    match dbr_type {
+        // Plain value, no metadata.
+        0..=6 => 0,
+        // STS: status(2) + severity(2) + per-type RISC pad.
+        7..=13 => 4 + sts_pad(native).len(),
+        // TIME: status(2) + severity(2) + stamp(8) + per-type RISC pad.
+        14..=20 => 12 + time_pad(native).len(),
+        // GR: display/alarm limits.
+        21..=27 => gr_ctrl_meta_size(native, false),
+        // CTRL: GR plus control limits.
+        28..=34 => gr_ctrl_meta_size(native, true),
+        // PUT_ACKT / PUT_ACKS carry only a bare u16 value (no metadata);
+        // the server emits them with `Ok(val_bytes)`.
+        super::DBR_PUT_ACKT | super::DBR_PUT_ACKS => 0,
+        // STSACK_STRING: status(2) + severity(2) + ackt(2) + acks(2)
+        // before the 40-byte value string.
+        super::DBR_STSACK_STRING => 8,
+        // CLASS_NAME and anything else: no value-preceding metadata model.
+        _ => 0,
     }
 }
 
@@ -881,6 +947,100 @@ fn decode_enum_metadata(data: &[u8], off: usize) -> CaResult<(EnumInfo, usize)> 
 #[cfg(test)]
 mod wire_format_tests {
     use super::*;
+    use crate::types::dbr::{
+        DBR_CTRL_DOUBLE, DBR_DOUBLE, DBR_GR_DOUBLE, DBR_STS_DOUBLE, DBR_TIME_DOUBLE,
+        dbr_buffer_size,
+    };
+
+    /// CA-FR-7 structural invariant: the encoded DBR length must equal
+    /// `dbr_buffer_size` for every (dbr_type, native, count). This pins
+    /// the sizer ([`dbr_meta_size`]) to the bytes the serializer
+    /// actually writes, so the two can never drift again. Covers plain /
+    /// STS / TIME / GR / CTRL layers for all seven CA native types, at
+    /// scalar and multi-element counts.
+    #[test]
+    fn metadata_matches_encoded_length() {
+        // (native, scalar value, 3-element array value)
+        let cases: &[(DbFieldType, EpicsValue, EpicsValue)] = &[
+            (
+                DbFieldType::String,
+                EpicsValue::String("x".into()),
+                EpicsValue::StringArray(vec!["x".into(), "y".into(), "z".into()]),
+            ),
+            (
+                DbFieldType::Short,
+                EpicsValue::Short(7),
+                EpicsValue::ShortArray(vec![1, 2, 3]),
+            ),
+            (
+                DbFieldType::Float,
+                EpicsValue::Float(1.5),
+                EpicsValue::FloatArray(vec![1.0, 2.0, 3.0]),
+            ),
+            (
+                DbFieldType::Enum,
+                EpicsValue::Enum(2),
+                EpicsValue::EnumArray(vec![0, 1, 2]),
+            ),
+            (
+                DbFieldType::Char,
+                EpicsValue::Char(9),
+                EpicsValue::CharArray(vec![1, 2, 3]),
+            ),
+            (
+                DbFieldType::Long,
+                EpicsValue::Long(11),
+                EpicsValue::LongArray(vec![1, 2, 3]),
+            ),
+            (
+                DbFieldType::Double,
+                EpicsValue::Double(2.5),
+                EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
+            ),
+        ];
+        let now = SystemTime::now();
+        for (native, scalar, array) in cases {
+            let base = *native as u16;
+            // layer 0=plain, 1=STS, 2=TIME, 3=GR, 4=CTRL
+            for layer in 0u16..=4 {
+                let dbr_type = base + 7 * layer;
+                for (value, count) in [(scalar, 1usize), (array, 3usize)] {
+                    let encoded = serialize_dbr(dbr_type, value, 0, 0, now)
+                        .expect("serialize_dbr")
+                        .len();
+                    let sized = dbr_buffer_size(dbr_type, *native, count);
+                    assert_eq!(
+                        encoded, sized,
+                        "len mismatch dbr_type={dbr_type} native={native:?} count={count}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The server-driven `encode_dbr` path (real metadata) must size the
+    /// same as `dbr_buffer_size` — proving both encoders share the one
+    /// `dbr_meta_size` owner, not just the zeroed `serialize_dbr` path.
+    #[test]
+    fn encode_dbr_length_matches_sizer() {
+        use crate::server::snapshot::Snapshot;
+        let layers = [
+            DBR_DOUBLE,
+            DBR_STS_DOUBLE,
+            DBR_TIME_DOUBLE,
+            DBR_GR_DOUBLE,
+            DBR_CTRL_DOUBLE,
+        ];
+        let snap = Snapshot::new(EpicsValue::Double(3.25), 0, 0, SystemTime::now());
+        for dbr_type in layers {
+            let encoded = encode_dbr(dbr_type, &snap).expect("encode_dbr").len();
+            let sized = dbr_buffer_size(dbr_type, DbFieldType::Double, 1);
+            assert_eq!(
+                encoded, sized,
+                "encode_dbr len mismatch dbr_type={dbr_type}"
+            );
+        }
+    }
 
     /// C-1: `DBR_STS_DOUBLE` (type 13) wire layout is
     /// `status(2) + severity(2) + RISC_pad(4) + value(8)` — the

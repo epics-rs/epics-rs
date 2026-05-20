@@ -161,58 +161,26 @@ impl DbFieldType {
     }
 }
 
-/// Calculate buffer size for a DBR type including metadata.
-/// dbr_type 0-6: value only
-/// dbr_type 7-13 (STS): +4 bytes (status + severity)
-/// dbr_type 14-20 (TIME): +12 bytes (status + severity + stamp)
-/// dbr_type 21-27 (GR): variable (includes limits, units, precision)
-/// dbr_type 28-34 (CTRL): variable (includes control limits)
-/// dbr_type 38 (CLASS_NAME): one fixed 40-byte string
+/// Calculate buffer size for a DBR type including metadata, matching C
+/// `dbr_size_n(TYPE, COUNT) = dbr_size[TYPE] + (COUNT-1)*dbr_value_size[TYPE]`.
+///
+/// CA-FR-7: the metadata length is taken from
+/// [`crate::types::codec::dbr_meta_size`] — the single owner that the
+/// serializers (`serialize_dbr` / `encode_dbr`) emit against — so the
+/// explicit-count pad/truncate and no-read-access frame paths size
+/// TIME / GR / CTRL bodies exactly as the encoder writes them. A
+/// `metadata_matches_encoded_length` test pins `encoded_len ==
+/// dbr_buffer_size` across the whole (dbr_type, native) matrix, so the
+/// sizer can no longer drift from the encoder.
 pub fn dbr_buffer_size(dbr_type: u16, native_type: DbFieldType, count: usize) -> usize {
-    let value_size = native_type.element_size() * count;
-    let meta_size = match dbr_type / 7 {
-        0 => 0, // Plain
-        1 => {
-            // STS: status(2) + severity(2), plus the per-type RISC
-            // alignment pad that sits before `value` in the C
-            // `dbr_sts_*` structs (db_access.h:192-240):
-            //   sts_char:   +RISC_pad(1)  → meta 5
-            //   sts_double: +RISC_pad(4)  → meta 8 (dbr_long_t)
-            //   others:     no pad        → meta 4
-            // Int64/UInt64 are served over CA as DBR_DOUBLE so they share
-            // the double pad.
-            match native_type {
-                DbFieldType::Char => 5,
-                DbFieldType::Double | DbFieldType::Int64 | DbFieldType::UInt64 => 8,
-                _ => 4,
-            }
-        }
-        2 => 12, // TIME: status(2) + severity(2) + stamp(8)
-        3 => {
-            // GR: varies by type
-            match native_type {
-                DbFieldType::String => 4,
-                DbFieldType::Enum => 4 + 16 * 26, // status + enum strings
-                _ => 4 + 8 + 16 + 8 * 6,          // status + precision + units + 6 limits
-            }
-        }
-        4 => {
-            // CTRL: varies by type
-            match native_type {
-                DbFieldType::String => 4,
-                DbFieldType::Enum => 4 + 16 * 26,
-                _ => 4 + 8 + 16 + 8 * 8, // status + precision + units + 8 limits
-            }
-        }
-        _ => 0,
-    };
     // DBR_CLASS_NAME (38) is always one MAX_STRING_SIZE (40) string,
-    // regardless of `count` or `native_type`. Use the inverse path so
-    // buffer-sizing callers don't accidentally over-allocate.
+    // regardless of `count` or `native_type` — it carries no value[]
+    // array, so the generic meta+value formula does not apply.
     if dbr_type == DBR_CLASS_NAME {
         return 40;
     }
-    meta_size + value_size
+    let value_size = native_type.element_size() * count;
+    crate::types::codec::dbr_meta_size(dbr_type, native_type) + value_size
 }
 
 /// Extract the native DBF type index (0-6) from any DBR type code.
@@ -275,13 +243,59 @@ mod buffer_size_tests {
         assert_eq!(dbr_buffer_size(DBR_STS_FLOAT, DbFieldType::Float, 1), 8);
     }
 
-    /// Plain and TIME layers are unaffected by the STS pad fix.
+    /// Plain values carry no metadata.
     #[test]
-    fn plain_and_time_unchanged() {
+    fn plain_value_size_only() {
         assert_eq!(dbr_buffer_size(DBR_DOUBLE, DbFieldType::Double, 3), 24);
+    }
+
+    /// CA-FR-7: TIME structs carry a per-type RISC pad before `value[0]`
+    /// (C `dbr_time_*`, db_access.h:250-300). The pre-fix flat 12-byte
+    /// TIME meta truncated double/short/enum/char bodies.
+    #[test]
+    fn time_meta_includes_risc_pad() {
+        // double: 12 + RISC_pad(4) + value(8) = 24 (was wrongly 20).
+        assert_eq!(dbr_buffer_size(DBR_TIME_DOUBLE, DbFieldType::Double, 1), 24);
+        // short/enum: 12 + pad(2) + value(2) = 16.
+        assert_eq!(dbr_buffer_size(DBR_TIME_SHORT, DbFieldType::Short, 1), 16);
+        assert_eq!(dbr_buffer_size(DBR_TIME_ENUM, DbFieldType::Enum, 1), 16);
+        // char: 12 + pad(3) + value(1) = 16.
+        assert_eq!(dbr_buffer_size(DBR_TIME_CHAR, DbFieldType::Char, 1), 16);
+        // float/long: no pad (value already 4-aligned at offset 12).
+        assert_eq!(dbr_buffer_size(DBR_TIME_FLOAT, DbFieldType::Float, 1), 16);
+        assert_eq!(dbr_buffer_size(DBR_TIME_LONG, DbFieldType::Long, 1), 16);
+        // Explicit count scales the value array after the pad.
         assert_eq!(
-            dbr_buffer_size(DBR_TIME_DOUBLE, DbFieldType::Double, 1),
-            12 + 8
+            dbr_buffer_size(DBR_TIME_DOUBLE, DbFieldType::Double, 4),
+            16 + 8 * 4
         );
+    }
+
+    /// CA-FR-7: GR/CTRL metadata is per native type (the pre-fix single
+    /// broad formula over-padded short/char/float/long and dropped the
+    /// enum `no_str` word).
+    #[test]
+    fn gr_ctrl_meta_is_per_type() {
+        // GR (6 limits): head(4) + layout.
+        assert_eq!(dbr_buffer_size(DBR_GR_SHORT, DbFieldType::Short, 1), 24 + 2);
+        assert_eq!(dbr_buffer_size(DBR_GR_FLOAT, DbFieldType::Float, 1), 40 + 4);
+        assert_eq!(
+            dbr_buffer_size(DBR_GR_DOUBLE, DbFieldType::Double, 1),
+            64 + 8
+        );
+        assert_eq!(dbr_buffer_size(DBR_GR_CHAR, DbFieldType::Char, 1), 19 + 1);
+        assert_eq!(dbr_buffer_size(DBR_GR_LONG, DbFieldType::Long, 1), 36 + 4);
+        // Enum: head(4) + no_str(2) + 16*26 strings = 422, value(2).
+        assert_eq!(dbr_buffer_size(DBR_GR_ENUM, DbFieldType::Enum, 1), 422 + 2);
+        // CTRL adds two control limits.
+        assert_eq!(
+            dbr_buffer_size(DBR_CTRL_DOUBLE, DbFieldType::Double, 1),
+            80 + 8
+        );
+        assert_eq!(
+            dbr_buffer_size(DBR_CTRL_SHORT, DbFieldType::Short, 1),
+            28 + 2
+        );
+        assert_eq!(dbr_buffer_size(DBR_CTRL_CHAR, DbFieldType::Char, 1), 21 + 1);
     }
 }

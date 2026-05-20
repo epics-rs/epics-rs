@@ -7,7 +7,7 @@ mod sync_group;
 mod transport;
 mod types;
 
-pub use sync_group::{SyncGroup, SyncGroupResults};
+pub use sync_group::{SyncGroup, SyncGroupResults, SyncGroupStat, SyncGroupStatus};
 
 pub use circuit_breaker::{BreakerConfig, BreakerState};
 

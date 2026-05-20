@@ -54,6 +54,29 @@ impl CoalesceSlot {
         was_empty
     }
 
+    /// Atomic "coalesce iff already occupied". Returns `None` after a
+    /// successful in-place replace (caller treats as `Replaced` — no
+    /// pending-count change). Returns `Some(item)` when the slot was
+    /// empty so the caller can fall back to the bounded channel.
+    ///
+    /// Critical: the `is_empty? + try_send + put` sequence MUST stay
+    /// atomic with respect to the consumer's `take`. If the consumer
+    /// takes between an unlocked check and a later `put`, the
+    /// "was_empty" signal flips meaning under us and the `Replaced` /
+    /// `Coalesced` accounting drifts. This method holds the lock
+    /// across the check + replace so no consumer drain can slip in.
+    fn put_if_occupied(&self, item: CaResult<Snapshot>) -> Option<CaResult<Snapshot>> {
+        let mut guard = self.latest.lock().expect("CoalesceSlot mutex poisoned");
+        if guard.is_some() {
+            *guard = Some(item);
+            drop(guard);
+            self.notify.notify_one();
+            None
+        } else {
+            Some(item)
+        }
+    }
+
     /// Take the current slot value, if any. Called by
     /// `MonitorHandle::recv` after the bounded channel is drained.
     pub fn take(&self) -> Option<CaResult<Snapshot>> {
@@ -215,7 +238,24 @@ impl SubscriptionRegistry {
             }
         }
 
-        match rec.callback_tx.try_send(Ok(snapshot)) {
+        // Order-preservation invariant: once the coalesce slot is
+        // occupied, the subscription is in overflow mode and every
+        // subsequent event must continue to coalesce into the slot.
+        // Routing a fresh event through the bounded channel while an
+        // older value sits in the slot would let the consumer see the
+        // new value first (channel-drain-then-slot order), inverting
+        // FIFO. C `dbEvent.c::pevent->pLastLog` doesn't have this
+        // failure mode because it replaces the in-queue entry in
+        // place; the slot model needs an explicit short-circuit.
+        let item = match rec.coalesce_slot.put_if_occupied(Ok(snapshot)) {
+            None => {
+                rec.nreplace = rec.nreplace.saturating_add(1);
+                return MonitorDeliveryOutcome::Replaced(server_addr);
+            }
+            Some(item) => item,
+        };
+
+        match rec.callback_tx.try_send(item) {
             Ok(()) => {
                 rec.pending_deliveries += 1;
                 MonitorDeliveryOutcome::Queued(server_addr)
@@ -231,12 +271,14 @@ impl SubscriptionRegistry {
                 // replace-last semantics.
                 rec.nreplace = rec.nreplace.saturating_add(1);
                 let first_coalesce = rec.coalesce_slot.put(rejected);
-                if first_coalesce {
-                    rec.pending_deliveries += 1;
-                    MonitorDeliveryOutcome::Coalesced(server_addr)
-                } else {
-                    MonitorDeliveryOutcome::Replaced(server_addr)
-                }
+                debug_assert!(
+                    first_coalesce,
+                    "put_if_occupied returned empty just above; the slot \
+                     can only have been filled by a concurrent producer, \
+                     but this Registry is single-producer (coordinator task)",
+                );
+                rec.pending_deliveries += 1;
+                MonitorDeliveryOutcome::Coalesced(server_addr)
             }
             Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(server_addr),
         }
@@ -260,21 +302,30 @@ impl SubscriptionRegistry {
         for rec in self.subscriptions.values_mut() {
             if cids.contains(&rec.cid) {
                 rec.needs_restore = true;
-                if rec.pending_deliveries > 0 {
-                    *cleared.entry(rec.server_addr).or_insert(0) += rec.pending_deliveries;
-                }
+                let old_pending = rec.pending_deliveries;
                 rec.pending_deliveries = 0;
-                // Drop any coalesced snapshot — the disconnect error
-                // below is the next thing the consumer should see;
-                // a stale pre-disconnect value would mask it.
+                // Drop any stale snapshot first so the disconnect error
+                // becomes the next thing the consumer reads — a
+                // pre-disconnect value would mask it.
                 let _ = rec.coalesce_slot.clear();
-                // Best-effort: a closed receiver silently drops, same
-                // as `try_deliver_err`. We don't return this through
-                // MonitorDeliveryOutcome because the caller is the
-                // disconnect bookkeeping path, not a per-frame router.
-                let _ = rec
-                    .callback_tx
-                    .try_send(Err(CaError::ServerError(ECA_DISCONN)));
+                // Route the disconnect through `try_deliver_err` so the
+                // bounded-channel-full case coalesces ECA_DISCONN into
+                // the slot rather than silently dropping it. Matches
+                // the `on_monitor_error` path's contract.
+                let server_addr = rec.server_addr;
+                let _ = try_deliver_err(rec, CaError::ServerError(ECA_DISCONN), server_addr);
+                // Net flow-control delta: `old_pending` was the count
+                // already accounted for via earlier
+                // `flow_control_note_queued` calls. We cleared all of
+                // them and replaced with at most one outstanding
+                // DISCONN delivery (now in `pending_deliveries`,
+                // typically 1). Subtract the new outstanding so the
+                // coordinator's `flow_control_note_consumed` call
+                // decrements outstanding by the right net amount.
+                let net = old_pending.saturating_sub(rec.pending_deliveries);
+                if net > 0 {
+                    *cleared.entry(server_addr).or_insert(0) += net;
+                }
             }
         }
         cleared
@@ -403,22 +454,31 @@ fn try_deliver_err(
     err: epics_base_rs::error::CaError,
     server_addr: SocketAddr,
 ) -> MonitorDeliveryOutcome {
-    match rec.callback_tx.try_send(Err(err)) {
+    // Same order-preservation short-circuit as `on_monitor_data`:
+    // if the slot is already occupied, the error must continue to
+    // coalesce there rather than landing fresh in the channel.
+    let item = match rec.coalesce_slot.put_if_occupied(Err(err)) {
+        None => {
+            rec.nreplace = rec.nreplace.saturating_add(1);
+            return MonitorDeliveryOutcome::Replaced(server_addr);
+        }
+        Some(item) => item,
+    };
+
+    match rec.callback_tx.try_send(item) {
         Ok(()) => {
             rec.pending_deliveries += 1;
             MonitorDeliveryOutcome::Queued(server_addr)
         }
         Err(TrySendError::Full(rejected)) => {
-            // Same coalesce path as a normal value: keep the latest
-            // status for the consumer rather than dropping silently.
             rec.nreplace = rec.nreplace.saturating_add(1);
             let first_coalesce = rec.coalesce_slot.put(rejected);
-            if first_coalesce {
-                rec.pending_deliveries += 1;
-                MonitorDeliveryOutcome::Coalesced(server_addr)
-            } else {
-                MonitorDeliveryOutcome::Replaced(server_addr)
-            }
+            debug_assert!(
+                first_coalesce,
+                "single-producer registry: slot can only be empty here",
+            );
+            rec.pending_deliveries += 1;
+            MonitorDeliveryOutcome::Coalesced(server_addr)
         }
         Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(server_addr),
     }
@@ -594,6 +654,160 @@ mod tests {
             coalesce_slot.take().is_none(),
             "slot is single-entry; subsequent takes return None",
         );
+    }
+
+    /// F1 regression: a new event MUST NOT enter the bounded channel
+    /// while the coalesce slot is occupied — otherwise the consumer
+    /// (which drains channel first, then slot) sees the newer value
+    /// before the older slotted one. Order inversion.
+    #[test]
+    fn coalesce_preserves_order_under_partial_drain() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::{EpicsValue, encode_dbr};
+        use std::time::SystemTime;
+
+        const DBR_TIME_LONG: u16 = 19;
+
+        let mut reg = SubscriptionRegistry::new();
+        let (callback_tx, mut rx) = mpsc::channel::<CaResult<Snapshot>>(2);
+        let coalesce_slot = CoalesceSlot::new();
+        reg.add(SubscriptionRecord {
+            subid: 1,
+            cid: 100,
+            data_type: Some(DBR_TIME_LONG),
+            count: Some(1),
+            type_user_supplied: true,
+            mask: 1,
+            server_addr: addr(),
+            callback_tx,
+            coalesce_slot: coalesce_slot.clone(),
+            needs_restore: false,
+            deadband: 0.0,
+            last_value: None,
+            pending_deliveries: 0,
+            nreplace: 0,
+        });
+
+        let post = |reg: &mut SubscriptionRegistry, v: i32| {
+            let snap = Snapshot::new(EpicsValue::Long(v), 0, 0, SystemTime::now());
+            let bytes = encode_dbr(DBR_TIME_LONG, &snap).expect("encode");
+            reg.on_monitor_data(1, DBR_TIME_LONG, 1, &bytes)
+        };
+
+        // Fill channel + drop one into the slot.
+        assert!(matches!(
+            post(&mut reg, 1),
+            MonitorDeliveryOutcome::Queued(_)
+        ));
+        assert!(matches!(
+            post(&mut reg, 2),
+            MonitorDeliveryOutcome::Queued(_)
+        ));
+        assert!(matches!(
+            post(&mut reg, 3),
+            MonitorDeliveryOutcome::Coalesced(_)
+        ));
+
+        // Consumer drains ONE channel item — channel now has 1 free
+        // slot, but the coalesce slot is still occupied.
+        let v1 = rx.try_recv().expect("v1").expect("Ok");
+        assert_eq!(v1.value, EpicsValue::Long(1));
+
+        // A fresh event MUST go to the slot (replace 3 with 4), NOT to
+        // the now-free channel — otherwise the consumer would read t4
+        // before t3 from the slot.
+        assert!(
+            matches!(post(&mut reg, 4), MonitorDeliveryOutcome::Replaced(_)),
+            "slot-occupied invariant violated — event leaked into channel"
+        );
+
+        // Drain the rest. Expected order: 2 (from channel), 4 (from
+        // slot; the old 3 was coalesced away by the latest-wins replace).
+        let v2 = rx.try_recv().expect("v2").expect("Ok");
+        assert_eq!(v2.value, EpicsValue::Long(2));
+        assert!(rx.try_recv().is_err(), "channel drained");
+
+        let v_slot = coalesce_slot.take().expect("slot").expect("Ok");
+        assert_eq!(
+            v_slot.value,
+            EpicsValue::Long(4),
+            "slot must hold latest (4), not stale 3"
+        );
+
+        // Net replace counter — t3→t4 was 1 replace; the initial
+        // t3 coalesce was first-time (counted by Coalesced outcome,
+        // also bumps nreplace).
+        assert_eq!(reg.get(1).expect("rec").nreplace, 2);
+    }
+
+    /// F2 regression: when the bounded channel is full at disconnect
+    /// time, `ECA_DISCONN` must coalesce into the freshly-cleared slot
+    /// — not silently drop. Otherwise the consumer never learns the
+    /// circuit died.
+    #[test]
+    fn disconnect_error_coalesces_when_channel_full() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::{EpicsValue, encode_dbr};
+        use std::time::SystemTime;
+
+        const DBR_TIME_LONG: u16 = 19;
+
+        let mut reg = SubscriptionRegistry::new();
+        let (callback_tx, mut rx) = mpsc::channel::<CaResult<Snapshot>>(2);
+        let coalesce_slot = CoalesceSlot::new();
+        reg.add(SubscriptionRecord {
+            subid: 1,
+            cid: 100,
+            data_type: Some(DBR_TIME_LONG),
+            count: Some(1),
+            type_user_supplied: true,
+            mask: 1,
+            server_addr: addr(),
+            callback_tx,
+            coalesce_slot: coalesce_slot.clone(),
+            needs_restore: false,
+            deadband: 0.0,
+            last_value: None,
+            pending_deliveries: 0,
+            nreplace: 0,
+        });
+
+        // Fill channel (capacity 2) without consuming.
+        for v in [1, 2, 3] {
+            let snap = Snapshot::new(EpicsValue::Long(v), 0, 0, SystemTime::now());
+            let bytes = encode_dbr(DBR_TIME_LONG, &snap).expect("encode");
+            reg.on_monitor_data(1, DBR_TIME_LONG, 1, &bytes);
+        }
+        // State: channel=[1,2], slot=Some(3).
+
+        // Disconnect this cid. The slot must be cleared then ECA_DISCONN
+        // must land somewhere — channel is still full, so the only path
+        // to delivery is the coalesce slot.
+        let cleared = reg.mark_disconnected(&[100]);
+        // Net cleared = (old_pending 3 - new_pending 1 for DISCONN) = 2.
+        assert_eq!(*cleared.get(&addr()).expect("server addr"), 2);
+        assert_eq!(
+            reg.get(1).expect("rec").pending_deliveries,
+            1,
+            "exactly one pending delivery — the ECA_DISCONN error itself",
+        );
+
+        // Drain. Channel still has the in-flight data values (those
+        // were already enqueued before disconnect — pre-disconnect
+        // data the application may still want to observe). Slot holds
+        // the ECA_DISCONN.
+        let _v1 = rx.try_recv().expect("v1");
+        let _v2 = rx.try_recv().expect("v2");
+        assert!(rx.try_recv().is_err(), "channel drained");
+
+        // The disconnect signal MUST be visible.
+        let disconn = coalesce_slot.take().expect("slot has DISCONN");
+        match disconn {
+            Err(epics_base_rs::error::CaError::ServerError(code)) => {
+                assert_eq!(code, 192, "ECA_DISCONN");
+            }
+            other => panic!("expected ECA_DISCONN, got {other:?}"),
+        }
     }
 
     /// `CoalesceSlot::put` returns true on empty→present so the caller

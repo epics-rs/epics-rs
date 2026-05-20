@@ -3054,6 +3054,31 @@ async fn run_coordinator(
                         // exception-callback semantics.
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_error(subid, eca_status) {
+                            // Mirror the data-path flow-control accounting:
+                            // each newly-pending delivery (`Queued` for the
+                            // channel, `Coalesced` for an empty slot
+                            // transitioning to occupied) bumps the
+                            // per-circuit outstanding count. Without this,
+                            // the consumer's `MonitorConsumed` decrement
+                            // had no matching increment and outstanding
+                            // drifted low — EVENTS_ON fired too early.
+                            MonitorDeliveryOutcome::Queued(server_addr)
+                            | MonitorDeliveryOutcome::Coalesced(server_addr) => {
+                                flow_control_note_queued(
+                                    &mut flow_control,
+                                    server_addr,
+                                    &transport_tx,
+                                );
+                            }
+                            MonitorDeliveryOutcome::Replaced(_) => {
+                                // Slot already held a prior error/value
+                                // and we overwrote in place. Net pending
+                                // unchanged → no flow-control change.
+                                metrics::counter!(
+                                    "ca_client_coalesced_monitors_total"
+                                )
+                                .increment(1);
+                            }
                             MonitorDeliveryOutcome::Dropped(_) => {
                                 diag.dropped_monitors.fetch_add(1, Ordering::Relaxed);
                                 metrics::counter!(
@@ -3061,20 +3086,7 @@ async fn run_coordinator(
                                 )
                                 .increment(1);
                             }
-                            MonitorDeliveryOutcome::Coalesced(_)
-                            | MonitorDeliveryOutcome::Replaced(_) => {
-                                // Status frame landed in the coalesce
-                                // slot (channel was full). The consumer
-                                // will still see it on the next `recv`
-                                // — count it for visibility but treat
-                                // as success.
-                                metrics::counter!(
-                                    "ca_client_coalesced_monitors_total"
-                                )
-                                .increment(1);
-                            }
-                            MonitorDeliveryOutcome::Queued(_)
-                            | MonitorDeliveryOutcome::Filtered
+                            MonitorDeliveryOutcome::Filtered
                             | MonitorDeliveryOutcome::NotFound => {}
                         }
                     }

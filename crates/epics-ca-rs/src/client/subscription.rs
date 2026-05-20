@@ -41,12 +41,15 @@ pub(crate) enum ValueRoute {
 /// - **I2 — error preservation.** The `error` cell is separate from the
 ///   value cells. A value can never overwrite or hide a pending error;
 ///   errors bypass pause and are delivered first.
-/// - **I3 — pause scope.** A value buffered *before* `pause()` lives in
-///   `ready` and stays deliverable while paused. A value arriving
-///   *during* the pause lives in `held` (a SEPARATE cell), gated by the
-///   `take_deliverable` priority order; it can never overwrite the
-///   older `ready` value, and `resume` does not move it (no destructive
-///   collapse) — `take_deliverable` simply yields `ready` then `held`.
+/// - **I3 — pause scope.** Everything deliverable at the instant
+///   `pause()` is called stays deliverable: pause ENTRY collapses the
+///   backlog into a single latest `ready` value, and `ready` is never
+///   gated. Only values arriving *during* the pause land in `held`
+///   (gated by the `take_deliverable` order) — and because pause entry
+///   emptied `held`, it means exactly "arrived during THIS pause", so a
+///   value made deliverable by a prior resume can't be re-gated by a
+///   later pause. `resume` moves nothing (no destructive collapse);
+///   `take_deliverable` simply yields `ready` then `held`.
 ///
 /// All cells + the pause flag live under one mutex, so the producer's
 /// "decide vs pause + write" and the consumer's "check pause + take"
@@ -173,15 +176,29 @@ impl CoalesceSlot {
         self.notify.notified()
     }
 
-    /// Set/clear the pause flag. Returns the previous value. On resume
-    /// it ONLY flips the flag and wakes `recv` — it does NOT move any
-    /// value between cells (the previous collapse could overwrite an
-    /// undrained pre-pause `ready`). After resume, `take_deliverable`
-    /// naturally yields `ready` then `held`.
+    /// Set/clear the pause flag. Returns the previous value.
+    ///
+    /// On pause ENTRY it freezes the currently-deliverable backlog into
+    /// a single latest value in `ready` (collapsing `held`, which is the
+    /// newer of the two, into it) and leaves `held` empty. This is what
+    /// keeps `held` meaning exactly "arrived during THIS pause": a value
+    /// that became deliverable after a PRIOR resume is pre-(this-)pause
+    /// backlog and must stay deliverable (I3), so it is promoted to
+    /// `ready` rather than re-gated by the new pause.
+    ///
+    /// On RESUME it does NOT move any value (the old resume-time collapse
+    /// could overwrite an undrained pre-pause `ready`); it only flips the
+    /// flag and wakes `recv`, which then yields `ready` then `held`.
     pub fn set_paused(&self, paused: bool) -> bool {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
         let prev = g.paused;
         g.paused = paused;
+        if !prev && paused && g.held.is_some() {
+            // Entering pause: collapse the deliverable backlog to its
+            // latest (`held` wins over the older `ready`) so `held`
+            // becomes free for genuinely-during-this-pause arrivals.
+            g.ready = g.held.take();
+        }
         drop(g);
         if prev && !paused {
             self.notify.notify_one();
@@ -1116,6 +1133,45 @@ mod tests {
             "tail coalesced to latest (22 superseded by 33)",
         );
         assert!(slot.take_deliverable().is_none());
+    }
+
+    /// This-round finding: a value made deliverable by a PRIOR resume
+    /// is pre-(this-)pause backlog and must stay deliverable across a
+    /// second pause. Pause ENTRY collapses it into `ready`, so it is no
+    /// longer gated.
+    #[test]
+    fn held_backlog_stays_deliverable_across_second_pause() {
+        let slot = CoalesceSlot::new();
+        slot.set_paused(true); // pause 1
+        slot.route_value(long_snap(1)); // held = 1 (during pause 1)
+        slot.set_paused(false); // resume 1 → held=1 now deliverable
+        // No recv. Pause again BEFORE draining held=1.
+        slot.set_paused(true); // pause 2 entry → collapse held(1) → ready
+        let v = slot
+            .take_deliverable()
+            .expect("post-resume backlog must survive a new pause (I3)");
+        assert_eq!(v.expect("Ok").value, EpicsValue::Long(1));
+    }
+
+    /// Multi-cycle bound: across pause/resume cycles the deliverable
+    /// backlog coalesces to the latest at each pause entry (it never
+    /// grows past ready+held). Older intermediate values are dropped as
+    /// designed (latest-wins), the newest survives.
+    #[test]
+    fn repeated_pause_cycles_coalesce_to_latest() {
+        let slot = CoalesceSlot::new();
+        slot.put_value(long_snap(11)); // ready = 11 (active)
+        slot.set_paused(true); // pause1 entry (held empty → ready stays 11)
+        slot.route_value(long_snap(22)); // held = 22 (during pause1)
+        slot.set_paused(false); // resume1 → ready=11, held=22
+        slot.set_paused(true); // pause2 entry → collapse: ready = 22 (latest)
+        // 11 was the older backlog — coalesced away; 22 is deliverable.
+        let v = slot.take_deliverable().expect("latest backlog deliverable");
+        assert_eq!(v.expect("Ok").value, EpicsValue::Long(22));
+        assert!(
+            slot.take_deliverable().is_none(),
+            "only the latest survived the cycle"
+        );
     }
 
     /// A′ error policy: errors bypass pause — `take_deliverable` yields

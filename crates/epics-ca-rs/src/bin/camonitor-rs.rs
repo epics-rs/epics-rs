@@ -40,7 +40,8 @@ struct Args {
     #[arg(short = 'm', long, value_name = "MASK")]
     event_mask: Option<String>,
 
-    /// CA priority (0-99). Accepted for parity.
+    /// CA priority (0-99). Opens the channel on the matching priority
+    /// virtual circuit (libca `ca_create_channel` priority parameter).
     #[arg(short = 'p', long)]
     priority: Option<u8>,
 
@@ -138,14 +139,13 @@ async fn main() {
         return;
     }
 
-    if args.priority.is_some() {
-        eprintln!("camonitor-rs: -p (priority) is accepted for parity but not yet honoured");
-    }
     if args.string_format {
         eprintln!("camonitor-rs: -s (string format) is accepted for parity but not yet honoured");
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");
+    // CA-FR-3/CA-FR-4: -p selects the priority virtual circuit.
+    let priority = args.priority.unwrap_or(0);
 
     let connected_flags: Vec<Arc<AtomicBool>> = args
         .pv_names
@@ -168,7 +168,7 @@ async fn main() {
 
     let mut handles = Vec::new();
     for (i, pv_name) in args.pv_names.iter().enumerate() {
-        let channel = client.create_channel(pv_name);
+        let channel = client.create_channel_with_priority(pv_name, priority);
         let pv = pv_name.clone();
         let flag = connected_flags[i].clone();
         let fmt = fmt.clone();

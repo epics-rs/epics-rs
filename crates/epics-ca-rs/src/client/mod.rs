@@ -101,7 +101,8 @@ impl OneShotChannelCache {
             return channel.clone();
         }
 
-        let channel = client.create_channel_expanded(pv_name.clone());
+        // Legacy one-shot API has no priority knob — default (0).
+        let channel = client.create_channel_expanded(pv_name.clone(), 0);
         self.channels.insert(pv_name.clone(), channel.clone());
         self.order.push_back(pv_name);
 
@@ -296,6 +297,10 @@ enum CoordRequest {
     RegisterChannel {
         cid: u32,
         pv_name: String,
+        /// CA-FR-3: CA priority the channel was created at; stored on
+        /// the coordinator's `ChannelInner` and threaded into every
+        /// `TransportCommand` the coordinator builds for this channel.
+        priority: u8,
         conn_tx: broadcast::Sender<ConnectionEvent>,
     },
     WaitConnected {
@@ -762,11 +767,29 @@ impl CaClient {
     }
 
     /// Create a persistent channel. Returns immediately (starts searching in background).
+    ///
+    /// Uses CA `priorityDefault` (0). To request a specific virtual-circuit
+    /// priority, use [`Self::create_channel_with_priority`].
     pub fn create_channel(&self, name: &str) -> CaChannel {
-        self.create_channel_expanded(expand_pv_name(name))
+        self.create_channel_expanded(expand_pv_name(name), 0)
     }
 
-    fn create_channel_expanded(&self, pv_name: String) -> CaChannel {
+    /// Create a persistent channel at a specific CA priority (`0..=99`,
+    /// libca `cacChannel::priorityMax`).
+    ///
+    /// CA-FR-3: priority is part of the virtual-circuit identity. Two
+    /// channels to the same IOC at different priorities open independent
+    /// TCP circuits (libca `ca_create_channel` priority parameter,
+    /// `cadef.h:498-508`), so bulk and latency-sensitive traffic can be
+    /// isolated. The priority is sent to the server in the
+    /// `CA_PROTO_VERSION` message's data-type field. Values above 99 are
+    /// clamped to 99 to match libca's range check
+    /// (`cac.cpp:512-520`).
+    pub fn create_channel_with_priority(&self, name: &str, priority: u8) -> CaChannel {
+        self.create_channel_expanded(expand_pv_name(name), priority.min(99))
+    }
+
+    fn create_channel_expanded(&self, pv_name: String, priority: u8) -> CaChannel {
         // CA-FR-2: reserve the cid against the live-set. Released by the
         // coordinator at `DropChannel` (the single channel-removal site).
         let cid = self.cid_alloc.allocate();
@@ -804,6 +827,7 @@ impl CaClient {
         let _ = self.coord_tx.send(CoordRequest::RegisterChannel {
             cid,
             pv_name: pv_name.clone(),
+            priority,
             conn_tx: conn_tx.clone(),
         });
 
@@ -823,6 +847,7 @@ impl CaClient {
         CaChannel {
             cid,
             pv_name: channel_pv_name,
+            priority,
             coord_tx: self.coord_tx.clone(),
             transport_tx: self.transport_tx.clone(),
             in_flight: self.in_flight.clone(),
@@ -1224,6 +1249,11 @@ fn validate_put_strings(value: &EpicsValue) -> CaResult<()> {
 pub struct CaChannel {
     cid: u32,
     pv_name: Arc<str>,
+    /// CA-FR-3: CA priority (0..=99) this channel was created at. With
+    /// the channel's resolved `server_addr` it forms the
+    /// [`types::CircuitKey`] every hot-path `TransportCommand` targets,
+    /// and the key the `server_writers` sidecar is looked up by.
+    priority: u8,
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
     /// Shared in-flight registry for reads and writes (Option C
@@ -1311,7 +1341,13 @@ impl CaChannel {
     }
 
     fn direct_writer(&self, server_addr: SocketAddr) -> Option<DirectServerWriter> {
-        self.server_writers.get(&server_addr).map(|w| w.clone())
+        // CA-FR-3: the writer sidecar is keyed by circuit, so look up
+        // this channel's `(server_addr, priority)` — a sibling channel
+        // to the same server at another priority owns a different
+        // circuit and writer.
+        self.server_writers
+            .get(&(server_addr, self.priority))
+            .map(|w| w.clone())
     }
 
     fn build_read_notify_frame(sid: u32, data_type: u16, count: u32, ioid: u32) -> Vec<u8> {
@@ -1404,6 +1440,7 @@ impl CaChannel {
                 count,
                 ioid,
                 server_addr: snap.server_addr,
+                priority: self.priority,
             })
             .map_err(|_| CaError::Shutdown)
     }
@@ -1447,6 +1484,7 @@ impl CaChannel {
                 ioid,
                 payload,
                 server_addr: snap.server_addr,
+                priority: self.priority,
             })
             .map_err(|_| CaError::Shutdown)
     }
@@ -1488,6 +1526,7 @@ impl CaChannel {
                 count,
                 payload,
                 server_addr: snap.server_addr,
+                priority: self.priority,
             })
             .map_err(|_| CaError::Shutdown)
     }
@@ -1548,7 +1587,11 @@ impl CaChannel {
 
         let mut results: Vec<Option<CaResult<(DbFieldType, EpicsValue)>>> =
             (0..channels.len()).map(|_| None).collect();
-        let mut groups: HashMap<SocketAddr, BulkReadGroup> = HashMap::new();
+        // CA-FR-3: batch by circuit `(server_addr, priority)`, not by
+        // server alone — channels to the same IOC at different
+        // priorities ride independent circuits with independent writers,
+        // so their READ_NOTIFY frames must not be coalesced onto one.
+        let mut groups: HashMap<types::CircuitKey, BulkReadGroup> = HashMap::new();
         let mut pending: Vec<Pending> = Vec::new();
 
         for (index, ch) in channels.iter().enumerate() {
@@ -1639,7 +1682,7 @@ impl CaChannel {
 
             if let Some(writer) = ch.direct_writer(snap.server_addr) {
                 let group = groups
-                    .entry(snap.server_addr)
+                    .entry((snap.server_addr, ch.priority))
                     .or_insert_with(|| BulkReadGroup {
                         writer,
                         frame: Vec::new(),
@@ -2464,37 +2507,45 @@ struct FlowControlState {
 }
 
 fn flow_control_note_queued(
-    flow_control: &mut HashMap<SocketAddr, FlowControlState>,
-    server_addr: SocketAddr,
+    flow_control: &mut HashMap<types::CircuitKey, FlowControlState>,
+    circuit: types::CircuitKey,
     transport_tx: &mpsc::UnboundedSender<TransportCommand>,
 ) {
-    let state = flow_control.entry(server_addr).or_default();
+    let (server_addr, priority) = circuit;
+    let state = flow_control.entry(circuit).or_default();
     state.outstanding = state.outstanding.saturating_add(1);
     if !state.active && state.outstanding >= FLOW_CONTROL_OFF_THRESHOLD {
-        let _ = transport_tx.send(TransportCommand::EventsOff { server_addr });
+        let _ = transport_tx.send(TransportCommand::EventsOff {
+            server_addr,
+            priority,
+        });
         state.active = true;
     }
 }
 
 fn flow_control_note_consumed(
-    flow_control: &mut HashMap<SocketAddr, FlowControlState>,
-    server_addr: SocketAddr,
+    flow_control: &mut HashMap<types::CircuitKey, FlowControlState>,
+    circuit: types::CircuitKey,
     count: usize,
     transport_tx: &mpsc::UnboundedSender<TransportCommand>,
 ) {
     if count == 0 {
         return;
     }
-    let Some(state) = flow_control.get_mut(&server_addr) else {
+    let (server_addr, priority) = circuit;
+    let Some(state) = flow_control.get_mut(&circuit) else {
         return;
     };
     state.outstanding = state.outstanding.saturating_sub(count);
     if state.active && state.outstanding <= FLOW_CONTROL_ON_THRESHOLD {
-        let _ = transport_tx.send(TransportCommand::EventsOn { server_addr });
+        let _ = transport_tx.send(TransportCommand::EventsOn {
+            server_addr,
+            priority,
+        });
         state.active = false;
     }
     if !state.active && state.outstanding == 0 {
-        flow_control.remove(&server_addr);
+        flow_control.remove(&circuit);
     }
 }
 
@@ -2518,21 +2569,26 @@ async fn run_coordinator(
     let mut pending_wait_connected: HashMap<u32, Vec<oneshot::Sender<()>>> = HashMap::new();
     let mut pending_found: HashMap<u32, SocketAddr> = HashMap::new();
     let mut subscriptions = SubscriptionRegistry::new();
-    // Reverse index: server_addr -> set of cids last seen on that server.
-    // Keep disconnected channels indexed so beacon anomalies can trigger
-    // immediate re-search for the affected IOC.
-    let mut server_channels: HashMap<SocketAddr, HashSet<u32>> = HashMap::new();
-    let mut flow_control: HashMap<SocketAddr, FlowControlState> = HashMap::new();
-    // Per-server CA minor protocol version, populated from
+    // Reverse index: circuit `(server_addr, priority)` -> set of cids
+    // last seen on that circuit. Keep disconnected channels indexed so
+    // beacon anomalies can trigger immediate re-search for the affected
+    // IOC. CA-FR-3: keyed by circuit so tearing down one priority
+    // circuit only re-searches its own channels.
+    let mut server_channels: HashMap<types::CircuitKey, HashSet<u32>> = HashMap::new();
+    // CA-FR-3: per-circuit flow control. EVENTS_OFF/ON is a per-tcpiiu
+    // CA message, so the outstanding-event count and the on/off gate
+    // are tracked per `(server_addr, priority)`.
+    let mut flow_control: HashMap<types::CircuitKey, FlowControlState> = HashMap::new();
+    // Per-circuit CA minor protocol version, populated from
     // CA_PROTO_VERSION on TCP handshake. Powers `host_minor_protocol`.
-    let mut server_minor_version: HashMap<SocketAddr, u16> = HashMap::new();
+    let mut server_minor_version: HashMap<types::CircuitKey, u16> = HashMap::new();
 
     loop {
         tokio::select! {
             req = coord_rx.recv() => {
                 let Some(req) = req else { return };
                 match req {
-                    CoordRequest::RegisterChannel { cid, pv_name, conn_tx } => {
+                    CoordRequest::RegisterChannel { cid, pv_name, priority, conn_tx } => {
                         // Drain any waiters that arrived before registration.
                         let early_waiters = pending_wait_connected
                             .remove(&cid)
@@ -2540,6 +2596,7 @@ async fn run_coordinator(
                         channels.insert(cid, ChannelInner {
                             cid,
                             pv_name: pv_name.clone(),
+                            priority,
                             state: ChannelState::Searching,
                             sid: 0,
                             native_type: None,
@@ -2556,11 +2613,12 @@ async fn run_coordinator(
                             let ch = channels.get_mut(&cid).unwrap();
                             ch.state = ChannelState::Connecting;
                             ch.server_addr = Some(server_addr);
-                            server_channels.entry(server_addr).or_default().insert(cid);
+                            server_channels.entry((server_addr, priority)).or_default().insert(cid);
                             let _ = transport_tx.send(TransportCommand::CreateChannel {
                                 cid,
                                 pv_name,
                                 server_addr,
+                                priority,
                             });
                         }
                     }
@@ -2585,6 +2643,7 @@ async fn run_coordinator(
                             let server_addr = ch.server_addr.unwrap_or_else(|| {
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
                             });
+                            let priority = ch.priority;
                             let connected = ch.state == ChannelState::Connected;
                             // `time_dbr_type()` (not `as u16 + 14`) for
                             // consistency with the rest of the codebase.
@@ -2610,6 +2669,7 @@ async fn run_coordinator(
                                 type_user_supplied: false,
                                 mask,
                                 server_addr,
+                                priority,
                                 deadband,
                                 callback_tx,
                                 coalesce_slot,
@@ -2627,6 +2687,7 @@ async fn run_coordinator(
                                     subid,
                                     mask,
                                     server_addr,
+                                    priority,
                                 });
                             }
                             let _ = reply.send(Ok(subid));
@@ -2646,6 +2707,7 @@ async fn run_coordinator(
                                             data_type,
                                             count: rec.count.unwrap_or(0),
                                             server_addr: ch.server_addr.unwrap(),
+                                            priority: ch.priority,
                                         });
                                     }
                                 }
@@ -2654,17 +2716,17 @@ async fn run_coordinator(
                         if let Some(rec) = subscriptions.remove(subid) {
                             flow_control_note_consumed(
                                 &mut flow_control,
-                                rec.server_addr,
+                                (rec.server_addr, rec.priority),
                                 rec.pending_deliveries,
                                 &transport_tx,
                             );
                         }
                     }
                     CoordRequest::MonitorConsumed { subid } => {
-                        if let Some(server_addr) = subscriptions.mark_consumed(subid) {
+                        if let Some(circuit) = subscriptions.mark_consumed(subid) {
                             flow_control_note_consumed(
                                 &mut flow_control,
-                                server_addr,
+                                circuit,
                                 1,
                                 &transport_tx,
                             );
@@ -2684,6 +2746,7 @@ async fn run_coordinator(
                                                 data_type,
                                                 count: rec.count.unwrap_or(0),
                                                 server_addr: ch.server_addr.unwrap(),
+                                                priority: ch.priority,
                                             });
                                         }
                                     }
@@ -2692,7 +2755,7 @@ async fn run_coordinator(
                             if let Some(rec) = subscriptions.remove(subid) {
                                 flow_control_note_consumed(
                                     &mut flow_control,
-                                    rec.server_addr,
+                                    (rec.server_addr, rec.priority),
                                     rec.pending_deliveries,
                                     &transport_tx,
                                 );
@@ -2706,6 +2769,7 @@ async fn run_coordinator(
                                     cid,
                                     sid: ch.sid,
                                     server_addr: ch.server_addr.unwrap(),
+                                    priority: ch.priority,
                                 });
                             }
                             // Cancel search for any non-connected state
@@ -2718,7 +2782,7 @@ async fn run_coordinator(
                                 _ => {}
                             }
                             if let Some(addr) = ch.server_addr {
-                                remove_server_channel(&mut server_channels, addr, cid);
+                                remove_server_channel(&mut server_channels, (addr, ch.priority), cid);
                             }
                         }
                         channels.remove(&cid);
@@ -2745,7 +2809,7 @@ async fn run_coordinator(
                                 return None;
                             }
                             let addr = ch.server_addr?;
-                            last_rx_at.get(&addr).map(|e| e.value().elapsed())
+                            last_rx_at.get(&(addr, ch.priority)).map(|e| e.value().elapsed())
                         });
                         let _ = reply.send(delay);
                     }
@@ -2755,7 +2819,7 @@ async fn run_coordinator(
                                 return None;
                             }
                             let addr = ch.server_addr?;
-                            server_minor_version.get(&addr).copied()
+                            server_minor_version.get(&(addr, ch.priority)).copied()
                         });
                         let _ = reply.send(v);
                     }
@@ -2782,6 +2846,7 @@ async fn run_coordinator(
                                         cid: ch.cid,
                                         sid: ch.sid,
                                         server_addr: addr,
+                                        priority: ch.priority,
                                     });
                                 }
                             }
@@ -2877,16 +2942,18 @@ async fn run_coordinator(
                     SearchResponse::Found { cid, server_addr } => {
                         if let Some(ch) = channels.get_mut(&cid) {
                             if ch.state == ChannelState::Searching || ch.state == ChannelState::Disconnected {
+                                let priority = ch.priority;
                                 if let Some(old_addr) = ch.server_addr {
-                                    remove_server_channel(&mut server_channels, old_addr, cid);
+                                    remove_server_channel(&mut server_channels, (old_addr, priority), cid);
                                 }
                                 ch.state = ChannelState::Connecting;
                                 ch.server_addr = Some(server_addr);
-                                server_channels.entry(server_addr).or_default().insert(cid);
+                                server_channels.entry((server_addr, priority)).or_default().insert(cid);
                                 let _ = transport_tx.send(TransportCommand::CreateChannel {
                                     cid,
                                     pv_name: ch.pv_name.to_string(),
                                     server_addr,
+                                    priority,
                                 });
                             }
                         } else {
@@ -2931,7 +2998,7 @@ async fn run_coordinator(
                 // trip through this match (Option C, Phase A/D). This
                 // arm therefore no longer touches `last_rx_at`.
                 match evt {
-                    TransportEvent::ChannelCreated { cid, sid, data_type, element_count, access, server_addr } => {
+                    TransportEvent::ChannelCreated { cid, sid, data_type, element_count, access, server_addr, priority } => {
                         if let Some(ch) = channels.get_mut(&cid) {
                             let was_disconnected = matches!(ch.state, ChannelState::Disconnected);
                             let dbr_type = DbFieldType::from_u16(data_type).ok();
@@ -3082,24 +3149,25 @@ async fn run_coordinator(
                                 cid,
                                 sid,
                                 server_addr,
+                                priority,
                             });
                         }
                     }
                     TransportEvent::MonitorData { subid, data_type, count, data } => {
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_data(subid, data_type, count, &data) {
-                            MonitorDeliveryOutcome::Queued(server_addr) => {
+                            MonitorDeliveryOutcome::Queued(circuit) => {
                                 // Only a bounded-channel write feeds flow
                                 // control (invariant I1) — the single gate
                                 // that bumps the per-circuit outstanding
                                 // count.
                                 flow_control_note_queued(
                                     &mut flow_control,
-                                    server_addr,
+                                    circuit,
                                     &transport_tx,
                                 );
                             }
-                            MonitorDeliveryOutcome::Slotted(_server_addr) => {
+                            MonitorDeliveryOutcome::Slotted(_circuit) => {
                                 // Coalesced into the slot (overflow or
                                 // pause-held). Out of flow control (I1) so
                                 // a client-side pause can't trip EVENTS_OFF
@@ -3143,10 +3211,10 @@ async fn run_coordinator(
                             // Only a bounded-channel write feeds flow
                             // control (invariant I1). An error parked in
                             // the (out-of-band) error slot is `Slotted`.
-                            MonitorDeliveryOutcome::Queued(server_addr) => {
+                            MonitorDeliveryOutcome::Queued(circuit) => {
                                 flow_control_note_queued(
                                     &mut flow_control,
-                                    server_addr,
+                                    circuit,
                                     &transport_tx,
                                 );
                             }
@@ -3236,17 +3304,18 @@ async fn run_coordinator(
                             },
                         );
                     }
-                    TransportEvent::TcpClosed { server_addr } => {
+                    TransportEvent::TcpClosed { server_addr, priority } => {
+                        let circuit = (server_addr, priority);
                         let n_affected = server_channels
-                            .get(&server_addr)
+                            .get(&circuit)
                             .map(|s| s.len())
                             .unwrap_or(0);
-                        tracing::warn!(server = %server_addr, channels = n_affected, "TCP circuit closed");
+                        tracing::warn!(server = %server_addr, priority, channels = n_affected, "TCP circuit closed");
                         metrics::counter!("ca_client_tcp_closed_total", "server" => server_addr.to_string()).increment(1);
-                        flow_control.remove(&server_addr);
-                        last_rx_at.remove(&server_addr);
-                        server_minor_version.remove(&server_addr);
-                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, server_addr, &diag, &in_flight, &snapshots);
+                        flow_control.remove(&circuit);
+                        last_rx_at.remove(&circuit);
+                        server_minor_version.remove(&circuit);
+                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, circuit, &diag, &in_flight, &snapshots);
                     }
                     TransportEvent::ServerDisconnect { cid, server_addr } => {
                         // Single channel disconnect (CA_PROTO_SERVER_DISCONN).
@@ -3270,10 +3339,10 @@ async fn run_coordinator(
                                 let pv_name = ch.pv_name.to_string();
                                 let cids = vec![cid];
                                 let cleared = subscriptions.mark_disconnected(&cids);
-                                for (addr, count) in cleared {
+                                for (circuit, count) in cleared {
                                     flow_control_note_consumed(
                                         &mut flow_control,
-                                        addr,
+                                        circuit,
                                         count,
                                         &transport_tx,
                                     );
@@ -3305,10 +3374,10 @@ async fn run_coordinator(
                             }
                         }
                     }
-                    TransportEvent::CircuitUnresponsive { server_addr } => {
+                    TransportEvent::CircuitUnresponsive { server_addr, priority } => {
                         diag.unresponsive_events.fetch_add(1, Ordering::Relaxed);
                         diag.record(DiagEvent::Unresponsive { server: server_addr });
-                        tracing::warn!(server = %server_addr, "circuit unresponsive (echo timeout)");
+                        tracing::warn!(server = %server_addr, priority, "circuit unresponsive (echo timeout)");
                         metrics::counter!("ca_client_unresponsive_total", "server" => server_addr.to_string()).increment(1);
                         // R2-38: C `tcpiiu::unresponsiveCircuitNotify`
                         // (`libca/tcpiiu.cpp:899-941`) fires the global
@@ -3337,6 +3406,7 @@ async fn run_coordinator(
                         let mut affected_cids: Vec<u32> = Vec::new();
                         for ch in channels.values_mut() {
                             if ch.server_addr == Some(server_addr)
+                                && ch.priority == priority
                                 && ch.state == ChannelState::Connected
                             {
                                 ch.state = ChannelState::Unresponsive;
@@ -3367,19 +3437,19 @@ async fn run_coordinator(
                             // stay stuck. Every disconnect path must
                             // decrement by the cleared delta.
                             let cleared = subscriptions.mark_disconnected(&affected_cids);
-                            for (addr, count) in cleared {
+                            for (circuit, count) in cleared {
                                 flow_control_note_consumed(
                                     &mut flow_control,
-                                    addr,
+                                    circuit,
                                     count,
                                     &transport_tx,
                                 );
                             }
                         }
                     }
-                    TransportEvent::CircuitResponsive { server_addr } => {
+                    TransportEvent::CircuitResponsive { server_addr, priority } => {
                         diag.record(DiagEvent::Responsive { server: server_addr });
-                        tracing::info!(server = %server_addr, "circuit responsive again");
+                        tracing::info!(server = %server_addr, priority, "circuit responsive again");
                         // R2-39: C `tcpiiu::responsiveCircuitNotify`
                         // (`libca/tcpiiu.cpp:861-877`) walks every
                         // formerly-unresponsive channel, calls
@@ -3394,6 +3464,7 @@ async fn run_coordinator(
                         let mut recovered_cids: Vec<u32> = Vec::new();
                         for ch in channels.values_mut() {
                             if ch.server_addr == Some(server_addr)
+                                && ch.priority == priority
                                 && ch.state == ChannelState::Unresponsive
                             {
                                 ch.state = ChannelState::Connected;
@@ -3419,6 +3490,7 @@ async fn run_coordinator(
                                                         count: rec.count.unwrap_or(0),
                                                         ioid: in_flight.alloc_ioid(),
                                                         server_addr: addr,
+                                                        priority: ch.priority,
                                                     });
                                             }
                                         }
@@ -3427,13 +3499,13 @@ async fn run_coordinator(
                             }
                         }
                     }
-                    TransportEvent::ServerVersion { server_addr, minor_version } => {
+                    TransportEvent::ServerVersion { server_addr, priority, minor_version } => {
                         // libca exposes this via `ca_host_minor_protocol`
                         // (BUG_ARCHAEOLOGY d763541): used by gateways /
                         // nameservers to report the connected server's
                         // CA wire version. Read from CA_PROTO_VERSION
                         // during TCP handshake; cleared on TcpClosed.
-                        server_minor_version.insert(server_addr, minor_version);
+                        server_minor_version.insert((server_addr, priority), minor_version);
                     }
                     TransportEvent::ServerConnected { server_addr } => {
                         // libca bhe-on-connect parity: tell the beacon
@@ -3458,18 +3530,23 @@ async fn run_coordinator(
 fn handle_disconnect(
     channels: &mut HashMap<u32, ChannelInner>,
     subscriptions: &mut SubscriptionRegistry,
-    server_channels: &mut HashMap<SocketAddr, HashSet<u32>>,
+    server_channels: &mut HashMap<types::CircuitKey, HashSet<u32>>,
     search_tx: &mpsc::UnboundedSender<SearchRequest>,
-    server_addr: SocketAddr,
+    circuit: types::CircuitKey,
     diag: &CaDiagnostics,
     in_flight: &types::InFlightOps,
     snapshots: &ChannelSnapshots,
 ) {
+    let (server_addr, priority) = circuit;
     let mut affected_cids = Vec::new();
     let now = std::time::Instant::now();
 
+    // CA-FR-3: only channels on THIS circuit `(server_addr, priority)`
+    // are torn down — a sibling circuit to the same server at another
+    // priority keeps its channels connected.
     for ch in channels.values_mut() {
         if ch.server_addr == Some(server_addr)
+            && ch.priority == priority
             && (ch.state.is_operational() || ch.state == ChannelState::Connecting)
         {
             ch.state = ChannelState::Disconnected;
@@ -3517,7 +3594,7 @@ fn handle_disconnect(
     }
     // Clean up stale server_channels entries so beacon anomaly
     // lookups don't reference disconnected channels.
-    server_channels.remove(&server_addr);
+    server_channels.remove(&circuit);
     let _ = subscriptions.mark_disconnected(&affected_cids);
 
     // Fail pending read/write waiters for affected channels so callers
@@ -3620,14 +3697,14 @@ where
 }
 
 fn remove_server_channel(
-    server_channels: &mut HashMap<SocketAddr, HashSet<u32>>,
-    server_addr: SocketAddr,
+    server_channels: &mut HashMap<types::CircuitKey, HashSet<u32>>,
+    circuit: types::CircuitKey,
     cid: u32,
 ) {
-    if let Some(set) = server_channels.get_mut(&server_addr) {
+    if let Some(set) = server_channels.get_mut(&circuit) {
         set.remove(&cid);
         if set.is_empty() {
-            server_channels.remove(&server_addr);
+            server_channels.remove(&circuit);
         }
     }
 }

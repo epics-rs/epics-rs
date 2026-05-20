@@ -13,7 +13,7 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue, decode_dbr};
 
-use super::types::TransportCommand;
+use super::types::{CircuitKey, TransportCommand};
 
 /// Producer routing decision for a value snapshot, computed
 /// atomically against the pause flag (see [`CoalesceSlot::route_value`]).
@@ -235,14 +235,16 @@ impl CoalesceSlot {
 /// and decrements on the matching channel-drain `MonitorConsumed`.
 pub(crate) enum MonitorDeliveryOutcome {
     /// Written to the bounded channel — counts toward flow control.
-    Queued(SocketAddr),
+    /// CA-FR-3: the [`CircuitKey`] identifies the priority circuit so
+    /// the coordinator bumps the right per-circuit outstanding count.
+    Queued(CircuitKey),
     /// Buffered in the coalesce slot (overflow `ready`, during-pause
     /// `gated`, or overflow error). Out of flow control — diagnostic
     /// only.
-    Slotted(SocketAddr),
+    Slotted(CircuitKey),
     /// Dropped because the consumer channel is closed (the application
     /// dropped its `MonitorHandle`). The only remaining drop case.
-    Dropped(SocketAddr),
+    Dropped(CircuitKey),
     /// Filtered by client-side deadband (no action).
     Filtered,
     /// Subscription not found.
@@ -263,6 +265,11 @@ pub(crate) struct SubscriptionRecord {
     pub type_user_supplied: bool,
     pub mask: u16,
     pub server_addr: SocketAddr,
+    /// CA-FR-3: the CA priority of the channel this subscription rides.
+    /// Fixed at channel creation and preserved across reconnects (only
+    /// `server_addr` can change). `(server_addr, priority)` is the
+    /// circuit this subscription's flow control accounts against.
+    pub priority: u8,
     pub callback_tx: mpsc::Sender<CaResult<Snapshot>>,
     /// "Latest pending" slot — see [`CoalesceSlot`]. Shared with the
     /// [`MonitorHandle`] so the consumer drains it after the bounded
@@ -339,11 +346,11 @@ impl SubscriptionRegistry {
         let Some(rec) = self.subscriptions.get_mut(&subid) else {
             return MonitorDeliveryOutcome::NotFound;
         };
-        let server_addr = rec.server_addr;
+        let circuit = (rec.server_addr, rec.priority);
         try_deliver_err(
             rec,
             epics_base_rs::error::CaError::ServerError(eca_status),
-            server_addr,
+            circuit,
         )
     }
 
@@ -357,26 +364,26 @@ impl SubscriptionRegistry {
         let Some(rec) = self.subscriptions.get_mut(&subid) else {
             return MonitorDeliveryOutcome::NotFound;
         };
-        let server_addr = rec.server_addr;
+        let circuit = (rec.server_addr, rec.priority);
 
         let snapshot = if data_type <= 6 {
             let dbr_type = match DbFieldType::from_u16(data_type) {
                 Ok(t) => t,
                 Err(e) => {
-                    return try_deliver_err(rec, e, server_addr);
+                    return try_deliver_err(rec, e, circuit);
                 }
             };
             match EpicsValue::from_bytes_array(dbr_type, data, count as usize) {
                 Ok(value) => Snapshot::new(value, 0, 0, SystemTime::now()),
                 Err(e) => {
-                    return try_deliver_err(rec, e, server_addr);
+                    return try_deliver_err(rec, e, circuit);
                 }
             }
         } else {
             match decode_dbr(data_type, data, count as usize) {
                 Ok(s) => s,
                 Err(e) => {
-                    return try_deliver_err(rec, e, server_addr);
+                    return try_deliver_err(rec, e, circuit);
                 }
             }
         };
@@ -401,12 +408,12 @@ impl SubscriptionRegistry {
             // either way the value is in the slot, not the channel.
             ValueRoute::Slotted => {
                 rec.nreplace = rec.nreplace.saturating_add(1);
-                MonitorDeliveryOutcome::Slotted(server_addr)
+                MonitorDeliveryOutcome::Slotted(circuit)
             }
             ValueRoute::TryChannel(snapshot) => match rec.callback_tx.try_send(Ok(*snapshot)) {
                 Ok(()) => {
                     rec.pending_deliveries += 1;
-                    MonitorDeliveryOutcome::Queued(server_addr)
+                    MonitorDeliveryOutcome::Queued(circuit)
                 }
                 Err(TrySendError::Full(rejected)) => {
                     // Bounded channel full — coalesce into the slot
@@ -419,9 +426,9 @@ impl SubscriptionRegistry {
                     rec.nreplace = rec.nreplace.saturating_add(1);
                     let snap = rejected.expect("route_value only boxes Ok values");
                     rec.coalesce_slot.put_value(snap);
-                    MonitorDeliveryOutcome::Slotted(server_addr)
+                    MonitorDeliveryOutcome::Slotted(circuit)
                 }
-                Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(server_addr),
+                Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(circuit),
             },
         }
     }
@@ -448,7 +455,7 @@ impl SubscriptionRegistry {
     /// flow-control owner single (channel send/recv only, I1) and the
     /// returned delta unambiguous (no "did the error land in the
     /// channel?" case to reconcile).
-    pub fn mark_disconnected(&mut self, cids: &[u32]) -> HashMap<SocketAddr, usize> {
+    pub fn mark_disconnected(&mut self, cids: &[u32]) -> HashMap<CircuitKey, usize> {
         const ECA_DISCONN: u32 = 192; // protocol::ECA_DISCONN
         let mut cleared = HashMap::new();
         for rec in self.subscriptions.values_mut() {
@@ -468,7 +475,7 @@ impl SubscriptionRegistry {
                 rec.coalesce_slot
                     .put_error(CaError::ServerError(ECA_DISCONN));
                 if old_pending > 0 {
-                    *cleared.entry(rec.server_addr).or_insert(0) += old_pending;
+                    *cleared.entry((rec.server_addr, rec.priority)).or_insert(0) += old_pending;
                 }
             }
         }
@@ -533,6 +540,7 @@ impl SubscriptionRegistry {
                     subid: rec.subid,
                     mask: rec.mask,
                     server_addr,
+                    priority: rec.priority,
                 });
                 restored += 1;
             }
@@ -570,13 +578,13 @@ impl SubscriptionRegistry {
         self.subscriptions.get(&subid)
     }
 
-    pub fn mark_consumed(&mut self, subid: u32) -> Option<SocketAddr> {
+    pub fn mark_consumed(&mut self, subid: u32) -> Option<CircuitKey> {
         let rec = self.subscriptions.get_mut(&subid)?;
         if rec.pending_deliveries == 0 {
             return None;
         }
         rec.pending_deliveries -= 1;
-        Some(rec.server_addr)
+        Some((rec.server_addr, rec.priority))
     }
 
     /// Get all subscriptions for a given cid
@@ -598,12 +606,12 @@ impl SubscriptionRegistry {
 fn try_deliver_err(
     rec: &mut SubscriptionRecord,
     err: CaError,
-    server_addr: SocketAddr,
+    circuit: CircuitKey,
 ) -> MonitorDeliveryOutcome {
     match rec.callback_tx.try_send(Err(err)) {
         Ok(()) => {
             rec.pending_deliveries += 1;
-            MonitorDeliveryOutcome::Queued(server_addr)
+            MonitorDeliveryOutcome::Queued(circuit)
         }
         Err(TrySendError::Full(rejected)) => {
             // Channel full — park the error in its own slot. Out of
@@ -614,9 +622,9 @@ fn try_deliver_err(
                 Ok(_) => unreachable!("we just sent an Err"),
             };
             rec.coalesce_slot.put_error(e);
-            MonitorDeliveryOutcome::Slotted(server_addr)
+            MonitorDeliveryOutcome::Slotted(circuit)
         }
-        Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(server_addr),
+        Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(circuit),
     }
 }
 
@@ -645,6 +653,7 @@ mod tests {
             type_user_supplied,
             mask: 1,
             server_addr: addr(),
+            priority: 0,
             callback_tx,
             coalesce_slot: CoalesceSlot::new(),
             needs_restore: true,
@@ -760,6 +769,7 @@ mod tests {
             type_user_supplied: true,
             mask: 1,
             server_addr: addr(),
+            priority: 0,
             callback_tx,
             coalesce_slot,
             needs_restore: false,
@@ -904,7 +914,7 @@ mod tests {
         let cleared = reg.mark_disconnected(&[100]);
         // Net cleared = old channel pending (2) - new pending (0; DISCONN
         // went to the error slot because the channel was full) = 2.
-        assert_eq!(*cleared.get(&addr()).expect("server addr"), 2);
+        assert_eq!(*cleared.get(&(addr(), 0)).expect("circuit key"), 2);
         assert_eq!(
             reg.get(1).expect("rec").pending_deliveries,
             0,

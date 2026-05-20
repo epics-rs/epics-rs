@@ -28,7 +28,8 @@ struct Args {
     #[arg(short = 's', long = "stat-level", value_name = "LEVEL")]
     stat_level: Option<u8>,
 
-    /// CA priority (0-99). Accepted for parity.
+    /// CA priority (0-99). Opens the channel on the matching priority
+    /// virtual circuit (libca `ca_create_channel` priority parameter).
     #[arg(short = 'p', long)]
     priority: Option<u8>,
 
@@ -50,19 +51,17 @@ async fn main() {
         return;
     }
 
-    if args.priority.is_some() {
-        eprintln!("cainfo-rs: -p (priority) is accepted for parity but not yet honoured");
-    }
-
     let client = CaClient::new().await.expect("failed to create CA client");
     let timeout = epics_ca_rs::cli::timeout_duration(
         args.timeout
             .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
     );
 
+    // CA-FR-3/CA-FR-4: -p selects the priority virtual circuit.
+    let priority = args.priority.unwrap_or(0);
     let mut failed = false;
     for pv_name in &args.pv_names {
-        let ch = client.create_channel(pv_name);
+        let ch = client.create_channel_with_priority(pv_name, priority);
         match ch.wait_connected(timeout).await {
             Ok(()) => match ch.info().await {
                 Ok(info) => {

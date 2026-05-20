@@ -106,7 +106,8 @@ struct Args {
     #[arg(short = 'c', long = "callback")]
     callback: bool,
 
-    /// CA priority (0-99). Accepted for parity.
+    /// CA priority (0-99). Opens the channel on the matching priority
+    /// virtual circuit (libca `ca_create_channel` priority parameter).
     #[arg(short = 'p', long)]
     priority: Option<u8>,
 
@@ -163,9 +164,6 @@ async fn main() {
         return;
     }
 
-    if args.priority.is_some() {
-        eprintln!("caput-rs: -p (priority) is accepted for parity but not yet honoured");
-    }
     // -n / -s steer ENUM scalar handling below (force_numeric =
     // interpret as index; force_string = always send DBR_STRING for
     // server-side menu resolution). For non-ENUM channels they have
@@ -185,7 +183,8 @@ async fn main() {
             .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
     );
 
-    let ch = client.create_channel(&pv_name);
+    // CA-FR-3/CA-FR-4: -p selects the priority virtual circuit.
+    let ch = client.create_channel_with_priority(&pv_name, args.priority.unwrap_or(0));
     if let Err(e) = ch.wait_connected(timeout).await {
         eprintln!("error: {e}");
         std::process::exit(1);

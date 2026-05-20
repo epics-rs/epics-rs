@@ -43,8 +43,8 @@ struct Args {
     #[arg(short = 'c', long)]
     callback: bool,
 
-    /// CA priority (0-99). Accepted for parity; not yet plumbed into
-    /// channel creation.
+    /// CA priority (0-99). Opens the channel on the matching priority
+    /// virtual circuit (libca `ca_create_channel` priority parameter).
     #[arg(short = 'p', long)]
     priority: Option<u8>,
 
@@ -227,9 +227,6 @@ async fn main() {
     // Acknowledge parity-only flags so the user knows we accepted but
     // are no-oping. Routed via stderr to avoid corrupting tool output
     // pipelines.
-    if args.priority.is_some() {
-        eprintln!("caget-rs: -p (priority) is accepted for parity but not yet honoured");
-    }
     if args.string_format {
         eprintln!("caget-rs: -s (string format) is accepted for parity but not yet honoured");
     }
@@ -243,10 +240,18 @@ async fn main() {
             .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
     );
 
+    // CA-FR-3/CA-FR-4: route -p into the priority circuit (libca
+    // `tool_lib.c` passes `caPriority` to `ca_create_channel`).
+    let priority = args.priority.unwrap_or(0);
     let channels: Vec<_> = args
         .pv_names
         .iter()
-        .map(|name| (name.clone(), client.create_channel(name)))
+        .map(|name| {
+            (
+                name.clone(),
+                client.create_channel_with_priority(name, priority),
+            )
+        })
         .collect();
 
     // Connect + read all PVs in parallel within single timeout window

@@ -13,8 +13,8 @@ use crate::channel::AccessRights;
 use crate::protocol::*;
 
 use super::types::{
-    DirectServerWriter, DirectServerWriters, InFlightOps, ReadReply, ReadReplyMode, ReadWaiter,
-    SEND_BACKPRESSURE_FRAMES, TransportCommand, TransportEvent, WarmReplySlot,
+    CircuitKey, DirectServerWriter, DirectServerWriters, InFlightOps, ReadReply, ReadReplyMode,
+    ReadWaiter, SEND_BACKPRESSURE_FRAMES, TransportCommand, TransportEvent, WarmReplySlot,
 };
 
 fn dispatch_read_reply_with<F>(in_flight: &InFlightOps, ioid: u32, make_result: F)
@@ -199,23 +199,26 @@ pub(crate) async fn run_transport_manager(
     // literal. Empty when no name servers were given by hostname.
     #[cfg(feature = "experimental-rust-tls")] sni_overrides: HashMap<SocketAddr, String>,
 ) {
-    let mut connections: HashMap<SocketAddr, ServerConnection> = HashMap::new();
+    // CA-FR-3: circuits are keyed by `(SocketAddr, priority)`, so two
+    // channels to the same IOC at different priorities own independent
+    // TCP circuits (libca `caServerID`).
+    let mut connections: HashMap<CircuitKey, ServerConnection> = HashMap::new();
     // Pending connect_server tasks. Spawning each connect into a
     // JoinSet (rather than `.await`-ing inline) is what lets a
-    // slow TCP/TLS handshake on server A stop blocking unrelated
+    // slow TCP/TLS handshake on circuit A stop blocking unrelated
     // commands: BeaconArrivalNotify for already-connected
-    // circuits, fast-path CreateChannel for server B, etc. The
-    // task returns its `server_addr` alongside the result so
+    // circuits, fast-path CreateChannel for circuit B, etc. The
+    // task returns its `CircuitKey` alongside the result so
     // `join_next` can pair completion with the right state.
-    let mut pending_connects: tokio::task::JoinSet<(SocketAddr, Option<ServerConnection>)> =
+    let mut pending_connects: tokio::task::JoinSet<(CircuitKey, Option<ServerConnection>)> =
         tokio::task::JoinSet::new();
-    // Commands waiting on a pending connect. Keyed by the
-    // command's target server. CreateChannel is the only command
-    // that *causes* a connect to start; subsequent CreateChannels
-    // for the same server (and any non-CreateChannel commands that
-    // happen to arrive before connect completes) all queue here
-    // and get drained when the connect resolves.
-    let mut queued_per_server: HashMap<SocketAddr, Vec<TransportCommand>> = HashMap::new();
+    // Commands waiting on a pending connect. Keyed by the command's
+    // target circuit. CreateChannel is the only command that *causes*
+    // a connect to start; subsequent CreateChannels for the same
+    // circuit (and any non-CreateChannel commands that happen to
+    // arrive before connect completes) all queue here and get drained
+    // when the connect resolves.
+    let mut queued_per_server: HashMap<CircuitKey, Vec<TransportCommand>> = HashMap::new();
 
     // Helper: resolve the right SNI / cert-verification name for a
     // particular target address. Lookup order:
@@ -243,15 +246,23 @@ pub(crate) async fn run_transport_manager(
         tokio::select! {
             cmd = command_rx.recv() => {
                 let Some(cmd) = cmd else { return };
-                let server_addr = cmd_server_addr(&cmd);
 
-                // If a connect to this server is already in
-                // flight, queue. Per-server FIFO is preserved
-                // because we push at the tail and drain at
-                // completion.
-                if queued_per_server.contains_key(&server_addr) {
+                // BeaconArrivalNotify is a per-server UDP signal, not
+                // tied to one priority circuit — fan it out to every
+                // circuit for the server immediately (process_command
+                // handles the fan-out). It never starts or waits on a
+                // connect, so it skips the per-circuit queue entirely.
+                let Some(circuit) = cmd_circuit_key(&cmd) else {
+                    process_command(cmd, &mut connections, &server_writers, &event_tx);
+                    continue;
+                };
+
+                // If a connect to this circuit is already in flight,
+                // queue. Per-circuit FIFO is preserved because we push
+                // at the tail and drain at completion.
+                if queued_per_server.contains_key(&circuit) {
                     queued_per_server
-                        .get_mut(&server_addr)
+                        .get_mut(&circuit)
                         .expect("just checked contains_key")
                         .push(cmd);
                     continue;
@@ -264,7 +275,7 @@ pub(crate) async fn run_transport_manager(
                 // case where a command races a circuit teardown.
                 if matches!(&cmd, TransportCommand::CreateChannel { .. }) {
                     let alive = connections
-                        .get(&server_addr)
+                        .get(&circuit)
                         .map(|c| !c._read_task.is_finished() && !c._write_task.is_finished())
                         .unwrap_or(false);
                     if !alive {
@@ -272,11 +283,12 @@ pub(crate) async fn run_transport_manager(
                         // stale entry whose tasks are already
                         // dead. Abort the dead pair before
                         // spawning a fresh connect.
-                        if let Some(old) = connections.remove(&server_addr) {
-                            server_writers.remove(&server_addr);
+                        if let Some(old) = connections.remove(&circuit) {
+                            server_writers.remove(&circuit);
                             old._read_task.abort();
                             old._write_task.abort();
                         }
+                        let (server_addr, priority) = circuit;
                         let event_tx_clone = event_tx.clone();
                         #[cfg(feature = "experimental-rust-tls")]
                         let tls_clone = tls.clone();
@@ -288,6 +300,7 @@ pub(crate) async fn run_transport_manager(
                             #[cfg(feature = "experimental-rust-tls")]
                             let conn = connect_server(
                                 server_addr,
+                                priority,
                                 event_tx_clone,
                                 in_flight_clone,
                                 last_rx_clone,
@@ -298,20 +311,21 @@ pub(crate) async fn run_transport_manager(
                             #[cfg(not(feature = "experimental-rust-tls"))]
                             let conn = connect_server(
                                 server_addr,
+                                priority,
                                 event_tx_clone,
                                 in_flight_clone,
                                 last_rx_clone,
                             )
                             .await;
-                            (server_addr, conn)
+                            (circuit, conn)
                         });
                         // Queue this CreateChannel so its
                         // CREATE_CHAN frame goes out once the
                         // connection is up. Subsequent commands
-                        // for this server will hit the
+                        // for this circuit will hit the
                         // `queued_per_server.contains_key` guard
                         // above and join the same queue.
-                        queued_per_server.insert(server_addr, vec![cmd]);
+                        queued_per_server.insert(circuit, vec![cmd]);
                         continue;
                     }
                 }
@@ -319,7 +333,7 @@ pub(crate) async fn run_transport_manager(
                 process_command(cmd, &mut connections, &server_writers, &event_tx);
             }
             Some(joined) = pending_connects.join_next() => {
-                let (server_addr, result) = match joined {
+                let (circuit, result) = match joined {
                     Ok(v) => v,
                     // Task panicked or was aborted before
                     // returning. Treat as "no result" — drop the
@@ -327,17 +341,18 @@ pub(crate) async fn run_transport_manager(
                     // we can't recover from here) and continue.
                     Err(_) => continue,
                 };
-                let queued = queued_per_server.remove(&server_addr).unwrap_or_default();
+                let (server_addr, priority) = circuit;
+                let queued = queued_per_server.remove(&circuit).unwrap_or_default();
                 match result {
                     Some(conn) => {
                         server_writers.insert(
-                            server_addr,
+                            circuit,
                             DirectServerWriter {
                                 write_tx: conn.write_tx.clone(),
                                 pending_frames: conn.pending_frames.clone(),
                             },
                         );
-                        connections.insert(server_addr, conn);
+                        connections.insert(circuit, conn);
                         // libca bhe-on-connect parity: announce the
                         // fresh circuit so the coordinator can ask the
                         // beacon monitor to reset its per-server EMA.
@@ -355,20 +370,20 @@ pub(crate) async fn run_transport_manager(
                         }
                     }
                     None => {
-                        server_writers.remove(&server_addr);
+                        server_writers.remove(&circuit);
                         // Connect failed. Surface
                         // ChannelCreateFailed for each queued
                         // CreateChannel so the coordinator knows
                         // the channel can't progress on this
-                        // server, and a single TcpClosed so the
+                        // circuit, and a single TcpClosed so the
                         // coordinator can clear any other state
-                        // it kept on this server_addr.
+                        // it kept on this circuit.
                         for queued_cmd in queued {
                             if let TransportCommand::CreateChannel { cid, .. } = queued_cmd {
                                 let _ = event_tx.send(TransportEvent::ChannelCreateFailed { cid });
                             }
                         }
-                        let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                        let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
                     }
                 }
             }
@@ -376,21 +391,60 @@ pub(crate) async fn run_transport_manager(
     }
 }
 
-/// Extract the target server address from any `TransportCommand`.
-/// Used by `run_transport_manager` to decide whether a command
-/// needs to be queued behind a pending connect for that server.
-fn cmd_server_addr(cmd: &TransportCommand) -> SocketAddr {
+/// Extract the target virtual-circuit key `(server_addr, priority)` from
+/// any `TransportCommand`. Used by `run_transport_manager` to decide
+/// whether a command needs to be queued behind a pending connect for
+/// that circuit.
+///
+/// Returns `None` for `BeaconArrivalNotify`, which is a per-server UDP
+/// signal that fans out to every priority circuit for the server rather
+/// than targeting one — see the main loop and `process_command`.
+fn cmd_circuit_key(cmd: &TransportCommand) -> Option<CircuitKey> {
     match cmd {
-        TransportCommand::CreateChannel { server_addr, .. }
-        | TransportCommand::ReadNotify { server_addr, .. }
-        | TransportCommand::Write { server_addr, .. }
-        | TransportCommand::WriteNotify { server_addr, .. }
-        | TransportCommand::Subscribe { server_addr, .. }
-        | TransportCommand::Unsubscribe { server_addr, .. }
-        | TransportCommand::ClearChannel { server_addr, .. }
-        | TransportCommand::BeaconArrivalNotify { server_addr, .. }
-        | TransportCommand::EventsOff { server_addr }
-        | TransportCommand::EventsOn { server_addr } => *server_addr,
+        TransportCommand::CreateChannel {
+            server_addr,
+            priority,
+            ..
+        }
+        | TransportCommand::ReadNotify {
+            server_addr,
+            priority,
+            ..
+        }
+        | TransportCommand::Write {
+            server_addr,
+            priority,
+            ..
+        }
+        | TransportCommand::WriteNotify {
+            server_addr,
+            priority,
+            ..
+        }
+        | TransportCommand::Subscribe {
+            server_addr,
+            priority,
+            ..
+        }
+        | TransportCommand::Unsubscribe {
+            server_addr,
+            priority,
+            ..
+        }
+        | TransportCommand::ClearChannel {
+            server_addr,
+            priority,
+            ..
+        }
+        | TransportCommand::EventsOff {
+            server_addr,
+            priority,
+        }
+        | TransportCommand::EventsOn {
+            server_addr,
+            priority,
+        } => Some((*server_addr, *priority)),
+        TransportCommand::BeaconArrivalNotify { .. } => None,
     }
 }
 
@@ -404,7 +458,7 @@ fn cmd_server_addr(cmd: &TransportCommand) -> SocketAddr {
 /// watchdog channel.
 fn process_command(
     cmd: TransportCommand,
-    connections: &mut HashMap<SocketAddr, ServerConnection>,
+    connections: &mut HashMap<CircuitKey, ServerConnection>,
     server_writers: &DirectServerWriters,
     event_tx: &mpsc::UnboundedSender<TransportEvent>,
 ) {
@@ -413,6 +467,7 @@ fn process_command(
             cid,
             pv_name,
             server_addr,
+            priority,
         } => {
             let pv_payload = pad_string(&pv_name);
             let mut create_hdr = CaHeader::new(CA_PROTO_CREATE_CHAN);
@@ -421,7 +476,13 @@ fn process_command(
             create_hdr.available = CA_MINOR_VERSION as u32;
             let mut frame = create_hdr.to_bytes().to_vec();
             frame.extend_from_slice(&pv_payload);
-            send_frame(connections, server_writers, server_addr, frame, event_tx);
+            send_frame(
+                connections,
+                server_writers,
+                (server_addr, priority),
+                frame,
+                event_tx,
+            );
         }
         TransportCommand::ReadNotify {
             sid,
@@ -429,6 +490,7 @@ fn process_command(
             count,
             ioid,
             server_addr,
+            priority,
         } => {
             let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
             hdr.data_type = data_type;
@@ -445,7 +507,7 @@ fn process_command(
             send_frame(
                 connections,
                 server_writers,
-                server_addr,
+                (server_addr, priority),
                 hdr.to_bytes_extended(),
                 event_tx,
             );
@@ -456,6 +518,7 @@ fn process_command(
             count,
             payload,
             server_addr,
+            priority,
         } => {
             let padded_len = align8(payload.len());
             let mut padded = payload;
@@ -468,7 +531,13 @@ fn process_command(
 
             let mut frame = hdr.to_bytes_extended();
             frame.extend_from_slice(&padded);
-            send_frame(connections, server_writers, server_addr, frame, event_tx);
+            send_frame(
+                connections,
+                server_writers,
+                (server_addr, priority),
+                frame,
+                event_tx,
+            );
         }
         TransportCommand::WriteNotify {
             sid,
@@ -477,6 +546,7 @@ fn process_command(
             ioid,
             payload,
             server_addr,
+            priority,
         } => {
             let padded_len = align8(payload.len());
             let mut padded = payload;
@@ -490,7 +560,13 @@ fn process_command(
 
             let mut frame = hdr.to_bytes_extended();
             frame.extend_from_slice(&padded);
-            send_frame(connections, server_writers, server_addr, frame, event_tx);
+            send_frame(
+                connections,
+                server_writers,
+                (server_addr, priority),
+                frame,
+                event_tx,
+            );
         }
         TransportCommand::Subscribe {
             sid,
@@ -499,6 +575,7 @@ fn process_command(
             subid,
             mask,
             server_addr,
+            priority,
         } => {
             let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
             hdr.postsize = 16;
@@ -518,7 +595,13 @@ fn process_command(
 
             let mut frame = hdr.to_bytes_extended();
             frame.extend_from_slice(&mask_payload);
-            send_frame(connections, server_writers, server_addr, frame, event_tx);
+            send_frame(
+                connections,
+                server_writers,
+                (server_addr, priority),
+                frame,
+                event_tx,
+            );
         }
         TransportCommand::Unsubscribe {
             sid,
@@ -526,6 +609,7 @@ fn process_command(
             data_type,
             count,
             server_addr,
+            priority,
         } => {
             let mut hdr = CaHeader::new(CA_PROTO_EVENT_CANCEL);
             hdr.data_type = data_type;
@@ -544,7 +628,7 @@ fn process_command(
             send_frame(
                 connections,
                 server_writers,
-                server_addr,
+                (server_addr, priority),
                 hdr.to_bytes_extended(),
                 event_tx,
             );
@@ -553,6 +637,7 @@ fn process_command(
             cid,
             sid,
             server_addr,
+            priority,
         } => {
             let mut hdr = CaHeader::new(CA_PROTO_CLEAR_CHANNEL);
             hdr.cid = sid;
@@ -560,7 +645,7 @@ fn process_command(
             send_frame(
                 connections,
                 server_writers,
-                server_addr,
+                (server_addr, priority),
                 hdr.to_bytes().to_vec(),
                 event_tx,
             );
@@ -576,26 +661,39 @@ fn process_command(
             // `beaconAnomalyNotify`) so the watchdog expires on
             // its own schedule and probes the circuit then,
             // rather than firing an immediate probe under load.
-            if let Some(conn) = connections.get(&server_addr) {
-                let _ = conn.beacon_arrival_tx.send(anomaly);
+            //
+            // CA-FR-3: one UDP beacon pets every priority circuit to
+            // that server — fan out to all circuits whose key matches
+            // `server_addr` (libca delivers `beaconArrivalNotify` to
+            // each tcpiiu on the bhe's circuit list).
+            for (key, conn) in connections.iter() {
+                if key.0 == server_addr {
+                    let _ = conn.beacon_arrival_tx.send(anomaly);
+                }
             }
         }
-        TransportCommand::EventsOff { server_addr } => {
+        TransportCommand::EventsOff {
+            server_addr,
+            priority,
+        } => {
             let hdr = CaHeader::new(CA_PROTO_EVENTS_OFF);
             send_frame(
                 connections,
                 server_writers,
-                server_addr,
+                (server_addr, priority),
                 hdr.to_bytes().to_vec(),
                 event_tx,
             );
         }
-        TransportCommand::EventsOn { server_addr } => {
+        TransportCommand::EventsOn {
+            server_addr,
+            priority,
+        } => {
             let hdr = CaHeader::new(CA_PROTO_EVENTS_ON);
             send_frame(
                 connections,
                 server_writers,
-                server_addr,
+                (server_addr, priority),
                 hdr.to_bytes().to_vec(),
                 event_tx,
             );
@@ -604,13 +702,14 @@ fn process_command(
 }
 
 fn send_frame(
-    connections: &mut HashMap<SocketAddr, ServerConnection>,
+    connections: &mut HashMap<CircuitKey, ServerConnection>,
     server_writers: &DirectServerWriters,
-    server_addr: SocketAddr,
+    circuit: CircuitKey,
     frame: Vec<u8>,
     event_tx: &mpsc::UnboundedSender<TransportEvent>,
 ) {
-    let failed = if let Some(conn) = connections.get(&server_addr) {
+    let (server_addr, priority) = circuit;
+    let failed = if let Some(conn) = connections.get(&circuit) {
         let pending = conn
             .pending_frames
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -626,14 +725,72 @@ fn send_frame(
         false
     };
     if failed {
-        connections.remove(&server_addr);
-        server_writers.remove(&server_addr);
-        let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+        connections.remove(&circuit);
+        server_writers.remove(&circuit);
+        let _ = event_tx.send(TransportEvent::TcpClosed {
+            server_addr,
+            priority,
+        });
     }
 }
 
+/// Build the three-frame CA client handshake (VERSION, CLIENT_NAME,
+/// HOST_NAME) for a circuit at `priority`.
+///
+/// C `tcpiiu` constructor (`modules/ca/src/client/tcpiiu.cpp:755-762`)
+/// queues messages in this exact order:
+///   1. versionMessage           → CA_PROTO_VERSION
+///   2. userNameSetRequest       → CA_PROTO_CLIENT_NAME
+///   3. hostNameSetRequest       → CA_PROTO_HOST_NAME
+///
+/// Pre-fix Rust emitted VERSION → HOST_NAME → CLIENT_NAME (the last two
+/// swapped). Server `host_name_action` / `client_name_action` accept
+/// either order in isolation, but ACF rules that consult both fields and
+/// frame-byte-exact wire captures (Wireshark CA dissector, fuzzers)
+/// diverge.
+///
+/// CA-FR-3: the VERSION message carries the requested CA priority in its
+/// `m_dataType` field — libca `tcpiiu::versionMessage`
+/// (`tcpiiu.cpp:1393-1397`) passes `priority` as the dataType and
+/// `CA_MINOR_PROTOCOL_REVISION` as the count. Pre-fix Rust left dataType
+/// at 0 (priorityDefault), so a server could not see the client's
+/// requested priority.
+fn build_client_handshake(priority: u8) -> Vec<u8> {
+    let mut handshake = Vec::new();
+    let mut version_hdr = CaHeader::new(CA_PROTO_VERSION);
+    version_hdr.count = CA_MINOR_VERSION;
+    version_hdr.data_type = priority as u16;
+    handshake.extend_from_slice(&version_hdr.to_bytes());
+    let username = epics_base_rs::runtime::env::get("USER")
+        .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
+        .unwrap_or_else(|| "unknown".to_string());
+    // R2-28: C `libca/tcpiiu.cpp::userNameSetRequest` and
+    // `hostNameSetRequest` route through `comQueSend::
+    // insertRequestHeader` which emits the extended annex when
+    // the payload exceeds 16 bits. Pre-fix Rust truncated the
+    // postsize via `as u16` while still writing the full payload,
+    // so an unusually large USER/USERNAME env value or hostname
+    // produced a frame the server parses as if the excess bytes
+    // were the next CA header — desynchronising the circuit
+    // before channel creation.
+    let user_payload = pad_string(&username);
+    let mut user_hdr = CaHeader::new(CA_PROTO_CLIENT_NAME);
+    user_hdr.set_payload_size(user_payload.len(), 0);
+    handshake.extend_from_slice(&user_hdr.to_bytes_extended());
+    handshake.extend_from_slice(&user_payload);
+    let hostname = epics_base_rs::runtime::env::hostname();
+    let host_payload = pad_string(&hostname);
+    let mut host_hdr = CaHeader::new(CA_PROTO_HOST_NAME);
+    host_hdr.set_payload_size(host_payload.len(), 0);
+    handshake.extend_from_slice(&host_hdr.to_bytes_extended());
+    handshake.extend_from_slice(&host_payload);
+    handshake
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn connect_server(
     server_addr: SocketAddr,
+    priority: u8,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     in_flight: super::types::InFlightOps,
     last_rx_at: super::types::ServerLastRxAt,
@@ -676,45 +833,7 @@ async fn connect_server(
     let (beacon_arrival_tx, beacon_arrival_rx) = mpsc::unbounded_channel::<bool>();
 
     // Build initial CA handshake.
-    //
-    // C `tcpiiu` constructor (`modules/ca/src/client/tcpiiu.cpp:755-762`)
-    // queues messages in this exact order:
-    //   1. versionMessage           → CA_PROTO_VERSION
-    //   2. userNameSetRequest       → CA_PROTO_CLIENT_NAME
-    //   3. hostNameSetRequest       → CA_PROTO_HOST_NAME
-    //
-    // Pre-fix Rust emitted VERSION → HOST_NAME → CLIENT_NAME (the
-    // last two swapped). Server `host_name_action` /
-    // `client_name_action` accept either order in isolation, but
-    // ACF rules that consult both fields and frame-byte-exact wire
-    // captures (Wireshark CA dissector, fuzzers) diverge.
-    let mut handshake = Vec::new();
-    let mut version_hdr = CaHeader::new(CA_PROTO_VERSION);
-    version_hdr.count = CA_MINOR_VERSION;
-    handshake.extend_from_slice(&version_hdr.to_bytes());
-    let username = epics_base_rs::runtime::env::get("USER")
-        .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
-        .unwrap_or_else(|| "unknown".to_string());
-    // R2-28: C `libca/tcpiiu.cpp::userNameSetRequest` and
-    // `hostNameSetRequest` route through `comQueSend::
-    // insertRequestHeader` which emits the extended annex when
-    // the payload exceeds 16 bits. Pre-fix Rust truncated the
-    // postsize via `as u16` while still writing the full payload,
-    // so an unusually large USER/USERNAME env value or hostname
-    // produced a frame the server parses as if the excess bytes
-    // were the next CA header — desynchronising the circuit
-    // before channel creation.
-    let user_payload = pad_string(&username);
-    let mut user_hdr = CaHeader::new(CA_PROTO_CLIENT_NAME);
-    user_hdr.set_payload_size(user_payload.len(), 0);
-    handshake.extend_from_slice(&user_hdr.to_bytes_extended());
-    handshake.extend_from_slice(&user_payload);
-    let hostname = epics_base_rs::runtime::env::hostname();
-    let host_payload = pad_string(&hostname);
-    let mut host_hdr = CaHeader::new(CA_PROTO_HOST_NAME);
-    host_hdr.set_payload_size(host_payload.len(), 0);
-    handshake.extend_from_slice(&host_hdr.to_bytes_extended());
-    handshake.extend_from_slice(&host_payload);
+    let handshake = build_client_handshake(priority);
     pending_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _ = write_tx.send(handshake);
 
@@ -769,12 +888,14 @@ async fn connect_server(
             writer,
             write_rx,
             server_addr,
+            priority,
             event_tx.clone(),
             pending_frames.clone(),
         ));
         let read_task = epics_base_rs::runtime::task::spawn(read_loop(
             reader,
             server_addr,
+            priority,
             event_tx,
             write_tx.clone(),
             beacon_arrival_rx,
@@ -788,12 +909,14 @@ async fn connect_server(
             writer,
             write_rx,
             server_addr,
+            priority,
             event_tx.clone(),
             pending_frames.clone(),
         ));
         let read_task = epics_base_rs::runtime::task::spawn(read_loop(
             reader,
             server_addr,
+            priority,
             event_tx,
             write_tx.clone(),
             beacon_arrival_rx,
@@ -810,12 +933,14 @@ async fn connect_server(
             writer,
             write_rx,
             server_addr,
+            priority,
             event_tx.clone(),
             pending_frames.clone(),
         ));
         let read_task = epics_base_rs::runtime::task::spawn(read_loop(
             reader,
             server_addr,
+            priority,
             event_tx,
             write_tx.clone(),
             beacon_arrival_rx,
@@ -838,6 +963,7 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     mut writer: W,
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
     server_addr: SocketAddr,
+    priority: u8,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     pending_frames: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
@@ -914,7 +1040,10 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
             Ok(Err(_)) => {
                 // True socket error (write_all returned Err) — circuit
                 // is dead, signal close.
-                let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                let _ = event_tx.send(TransportEvent::TcpClosed {
+                    server_addr,
+                    priority,
+                });
                 return;
             }
             Err(_) => {
@@ -932,16 +1061,21 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
                 // counter is discarded with the dropped
                 // `ServerConnection`, so the stale count cannot
                 // leak into a future circuit.
-                let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                let _ = event_tx.send(TransportEvent::TcpClosed {
+                    server_addr,
+                    priority,
+                });
                 return;
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
     server_addr: SocketAddr,
+    priority: u8,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     mut beacon_arrival_rx: mpsc::UnboundedReceiver<bool>,
@@ -1104,10 +1238,11 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 let suspend_wake = wall_skip >= suspend_threshold;
                 if echo_pending {
                     if !unresponsive_notified {
-                        let _ = event_tx.send(TransportEvent::CircuitUnresponsive { server_addr });
+                        let _ = event_tx
+                            .send(TransportEvent::CircuitUnresponsive { server_addr, priority });
                         unresponsive_notified = true;
                         if send_echo(&write_tx, server_minor_version).is_err() {
-                            let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                            let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
                             return;
                         }
                         let probe = if suspend_wake {
@@ -1120,7 +1255,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         continue;
                     }
                     // Second echo timeout — truly dead.
-                    let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                    let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
                     return;
                 }
                 // Idle expired — send echo heartbeat. The deadline
@@ -1133,7 +1268,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 // long enough for it to expire on the schedule it
                 // would have had without any beacons at all.
                 if send_echo(&write_tx, server_minor_version).is_err() {
-                    let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                    let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
                     return;
                 }
                 echo_pending = true;
@@ -1155,7 +1290,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             read_result = reader.read(&mut buf) => {
                 match read_result {
                     Ok(0) | Err(_) => {
-                        let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                        let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
                         return;
                     }
                     Ok(n) => n,
@@ -1173,10 +1308,13 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // protocol parsing so that even ECHO replies and frames the
         // parser later rejects still count as proof of liveness.
         // Read by `ca_receive_watchdog_delay` via the coordinator.
-        last_rx_at.insert(server_addr, std::time::Instant::now());
+        last_rx_at.insert((server_addr, priority), std::time::Instant::now());
         if unresponsive_notified {
             unresponsive_notified = false;
-            let _ = event_tx.send(TransportEvent::CircuitResponsive { server_addr });
+            let _ = event_tx.send(TransportEvent::CircuitResponsive {
+                server_addr,
+                priority,
+            });
         }
 
         // Automatic CA flow control is intentionally disabled here. The
@@ -1192,7 +1330,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             eprintln!(
                 "CA: {server_addr}: accumulated TCP buffer exceeded {accum_cap} bytes, closing"
             );
-            let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+            let _ = event_tx.send(TransportEvent::TcpClosed {
+                server_addr,
+                priority,
+            });
             return;
         }
 
@@ -1263,7 +1404,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         }
                     } else {
                         eprintln!("CA: {server_addr}: malformed TCP header ({e}), closing");
-                        let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                        let _ = event_tx.send(TransportEvent::TcpClosed {
+                            server_addr,
+                            priority,
+                        });
                         return;
                     }
                 }
@@ -1283,7 +1427,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 eprintln!(
                     "CA: {server_addr}: misaligned payload (postsize={actual_post}), closing"
                 );
-                let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                let _ = event_tx.send(TransportEvent::TcpClosed {
+                    server_addr,
+                    priority,
+                });
                 return;
             }
             let msg_len = hdr_size + actual_post;
@@ -1307,6 +1454,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     server_minor_version = hdr.count;
                     let _ = event_tx.send(TransportEvent::ServerVersion {
                         server_addr,
+                        priority,
                         minor_version: hdr.count,
                     });
                 }
@@ -1396,6 +1544,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         element_count: hdr.actual_count(),
                         access,
                         server_addr,
+                        priority,
                     });
                 }
                 CA_PROTO_READ_NOTIFY => {
@@ -1714,7 +1863,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         "unknown TCP response opcode; closing circuit (C badTCPRespAction parity)"
                     );
                     metrics::counter!("ca_client_bad_tcp_response_total").increment(1);
-                    let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                    let _ = event_tx.send(TransportEvent::TcpClosed {
+                        server_addr,
+                        priority,
+                    });
                     return;
                 }
             }
@@ -1768,6 +1920,7 @@ mod read_loop_tests {
         let task = tokio::spawn(read_loop(
             client_end,
             test_addr(),
+            0,
             event_tx,
             write_tx,
             beacon_rx,
@@ -2090,6 +2243,7 @@ mod malformed_header_close_tests {
         let loop_handle = tokio::spawn(read_loop(
             server_io,
             server_addr,
+            0,
             event_tx,
             write_tx,
             ba_rx,
@@ -2142,6 +2296,7 @@ mod malformed_header_close_tests {
         let loop_handle = tokio::spawn(read_loop(
             server_io,
             server_addr,
+            0,
             event_tx,
             write_tx,
             ba_rx,
@@ -2255,6 +2410,7 @@ mod write_loop_timeout_tests {
             writer,
             write_rx,
             server_addr,
+            0,
             event_tx,
             pending_frames.clone(),
         ));
@@ -2276,7 +2432,7 @@ mod write_loop_timeout_tests {
             .expect("event channel must not be closed");
 
         match evt {
-            TransportEvent::TcpClosed { server_addr: a } => assert_eq!(a, server_addr),
+            TransportEvent::TcpClosed { server_addr: a, .. } => assert_eq!(a, server_addr),
             TransportEvent::CircuitUnresponsive { .. } => panic!(
                 "write timeout must CLOSE the circuit (TcpClosed): the \
                  cancelled write_all may have left a partial CA frame on \
@@ -2293,5 +2449,285 @@ mod write_loop_timeout_tests {
             "write_loop must exit after a write-timeout close, not \
              continue writing on the desynchronized circuit"
         );
+    }
+}
+
+#[cfg(test)]
+mod priority_circuit_tests {
+    //! CA-FR-3: priority is part of the virtual-circuit identity. Two
+    //! channels to the same IOC at different priorities open independent
+    //! TCP circuits (libca `caServerID = (addr, priority)`), the VERSION
+    //! message carries the priority in its `m_dataType` field, and
+    //! tearing one priority circuit down leaves the other connected.
+    use super::*;
+    use crate::client::types::{InFlightOps, ServerLastRxAt};
+    use crate::protocol::{CA_PROTO_VERSION, CaHeader};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Test 2 (deterministic, no sockets): the VERSION frame the client
+    /// emits puts the requested priority in `m_dataType` and the minor
+    /// version in `m_count` — exactly libca's `versionMessage` layout.
+    #[test]
+    fn version_message_carries_priority_in_data_type() {
+        for pri in [0u8, 1, 7, 99] {
+            let hs = build_client_handshake(pri);
+            let hdr = CaHeader::from_bytes(&hs[..16]).expect("parse VERSION header");
+            assert_eq!(
+                hdr.cmmd, CA_PROTO_VERSION,
+                "first frame is CA_PROTO_VERSION"
+            );
+            assert_eq!(
+                hdr.data_type, pri as u16,
+                "VERSION m_dataType must equal the requested priority"
+            );
+            assert_eq!(
+                hdr.count, CA_MINOR_VERSION,
+                "VERSION m_count must still carry the minor protocol version"
+            );
+        }
+    }
+
+    /// Spawn a transport manager wired to fresh channels; return its
+    /// command sender, event receiver, and the (observable) per-circuit
+    /// writer registry.
+    fn spawn_manager() -> (
+        mpsc::UnboundedSender<TransportCommand>,
+        mpsc::UnboundedReceiver<TransportEvent>,
+        DirectServerWriters,
+    ) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let in_flight = InFlightOps::new();
+        let server_writers: DirectServerWriters = Arc::new(dashmap::DashMap::new());
+        let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
+        let observable = server_writers.clone();
+        #[cfg(not(feature = "experimental-rust-tls"))]
+        tokio::spawn(run_transport_manager(
+            cmd_rx,
+            event_tx,
+            in_flight,
+            server_writers,
+            last_rx_at,
+        ));
+        #[cfg(feature = "experimental-rust-tls")]
+        tokio::spawn(run_transport_manager(
+            cmd_rx,
+            event_tx,
+            in_flight,
+            server_writers,
+            last_rx_at,
+            None,
+            None,
+            HashMap::new(),
+        ));
+        (cmd_tx, event_rx, observable)
+    }
+
+    /// Read the client's full handshake off a freshly accepted server
+    /// socket and return the VERSION priority. Draining the whole
+    /// handshake (its exact length is `build_client_handshake(pri).len()`
+    /// because the test shares this process's USER/host env) leaves the
+    /// socket positioned at the next frame, so a later read observes
+    /// genuinely new traffic rather than buffered handshake bytes.
+    async fn drain_handshake(stream: &mut TcpStream) -> u8 {
+        let mut head = [0u8; 16];
+        stream
+            .read_exact(&mut head)
+            .await
+            .expect("read VERSION header");
+        let hdr = CaHeader::from_bytes(&head).expect("parse VERSION");
+        assert_eq!(hdr.cmmd, CA_PROTO_VERSION);
+        let pri = hdr.data_type as u8;
+        let total = build_client_handshake(pri).len();
+        let mut rest = vec![0u8; total - 16];
+        stream
+            .read_exact(&mut rest)
+            .await
+            .expect("drain handshake tail");
+        pri
+    }
+
+    async fn wait_for_writers(sw: &DirectServerWriters, n: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while sw.len() < n {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected {n} circuit writers, saw {}",
+                sw.len()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Test 1: two channels to the same server at different priorities
+    /// open two independent transport circuit entries, and the server
+    /// sees both priorities on the wire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_priorities_open_two_circuits() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let priorities = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let kept = Arc::new(tokio::sync::Mutex::new(Vec::<TcpStream>::new()));
+        let pri_log = priorities.clone();
+        let keep = kept.clone();
+        let acceptor = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let pri = drain_handshake(&mut s).await;
+                pri_log.lock().await.push(pri);
+                keep.lock().await.push(s); // hold the socket so the circuit stays up
+            }
+        });
+
+        let (cmd_tx, _event_rx, sw) = spawn_manager();
+        cmd_tx
+            .send(TransportCommand::CreateChannel {
+                cid: 1,
+                pv_name: "X".into(),
+                server_addr: addr,
+                priority: 0,
+            })
+            .unwrap();
+        cmd_tx
+            .send(TransportCommand::CreateChannel {
+                cid: 2,
+                pv_name: "Y".into(),
+                server_addr: addr,
+                priority: 7,
+            })
+            .unwrap();
+
+        wait_for_writers(&sw, 2).await;
+        assert!(
+            sw.contains_key(&(addr, 0)),
+            "priority-0 circuit writer missing"
+        );
+        assert!(
+            sw.contains_key(&(addr, 7)),
+            "priority-7 circuit writer missing"
+        );
+        assert_eq!(
+            sw.len(),
+            2,
+            "two priorities to one server must yield two independent circuits"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), acceptor).await;
+        let mut seen = priorities.lock().await.clone();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![0u8, 7],
+            "server observed both priorities on the wire"
+        );
+    }
+
+    /// Test 3: dropping one priority circuit closes only that circuit;
+    /// the sibling circuit at another priority stays connected and keeps
+    /// carrying frames.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_one_priority_circuit_leaves_the_other() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (sock_tx, mut sock_rx) = mpsc::unbounded_channel::<(u8, TcpStream)>();
+        let acceptor = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let pri = drain_handshake(&mut s).await;
+                let _ = sock_tx.send((pri, s));
+            }
+        });
+
+        let (cmd_tx, mut event_rx, sw) = spawn_manager();
+        cmd_tx
+            .send(TransportCommand::CreateChannel {
+                cid: 1,
+                pv_name: "X".into(),
+                server_addr: addr,
+                priority: 0,
+            })
+            .unwrap();
+        cmd_tx
+            .send(TransportCommand::CreateChannel {
+                cid: 2,
+                pv_name: "Y".into(),
+                server_addr: addr,
+                priority: 5,
+            })
+            .unwrap();
+
+        // Collect both server-side sockets, keyed by the priority each
+        // negotiated.
+        let mut socks: HashMap<u8, TcpStream> = HashMap::new();
+        for _ in 0..2 {
+            let (pri, s) = tokio::time::timeout(Duration::from_secs(5), sock_rx.recv())
+                .await
+                .expect("accept timed out")
+                .expect("acceptor closed early");
+            socks.insert(pri, s);
+        }
+        wait_for_writers(&sw, 2).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), acceptor).await;
+
+        // Tear down the priority-0 circuit by closing its server socket.
+        drop(socks.remove(&0).expect("priority-0 server socket"));
+
+        // The client must report TcpClosed for priority 0 — and NEVER for
+        // priority 5.
+        let mut saw_zero_closed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !saw_zero_closed {
+            match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
+                Ok(Some(TransportEvent::TcpClosed {
+                    server_addr,
+                    priority,
+                })) => {
+                    assert_eq!(server_addr, addr);
+                    assert_ne!(
+                        priority, 5,
+                        "priority-5 circuit must not close when priority-0 is dropped"
+                    );
+                    if priority == 0 {
+                        saw_zero_closed = true;
+                    }
+                }
+                Ok(Some(_)) => {} // ServerConnected / ServerVersion / etc.
+                Ok(None) => break,
+                Err(_) => {} // 200ms tick, keep polling until the deadline
+            }
+        }
+        assert!(
+            saw_zero_closed,
+            "dropping the priority-0 server socket must emit TcpClosed{{priority:0}}"
+        );
+
+        // The priority-5 circuit is still alive: its writer remains, and a
+        // fresh frame sent on it actually reaches the server socket.
+        assert!(
+            sw.contains_key(&(addr, 5)),
+            "priority-5 circuit writer must survive the priority-0 teardown"
+        );
+        cmd_tx
+            .send(TransportCommand::ClearChannel {
+                cid: 2,
+                sid: 0,
+                server_addr: addr,
+                priority: 5,
+            })
+            .unwrap();
+        let mut s5 = socks.remove(&5).expect("priority-5 server socket");
+        let mut frame = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(5), s5.read_exact(&mut frame)).await;
+        assert!(
+            read.is_ok() && read.unwrap().is_ok(),
+            "surviving priority-5 circuit must still carry frames after the sibling closed"
+        );
+        let _ = s5.shutdown().await;
     }
 }

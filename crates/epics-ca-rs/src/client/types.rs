@@ -11,7 +11,25 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 use crate::channel::AccessRights;
 use crate::client::state::ChannelState;
 
-// --- Per-server last-RX timestamp sidecar (Option C, Phase D) ---
+// --- Virtual-circuit identity (CA-FR-3) ---
+
+/// Identity of one CA virtual circuit: the server address paired with
+/// the CA priority the channel was created at. libca keys its circuit
+/// table (`caServerID`, `caServerID.h:28-38`) on exactly this pair —
+/// `(sockaddr_in, ca_uint8_t pri)` — so two channels to the same IOC at
+/// different priorities open independent TCP circuits. The Rust client
+/// mirrors that: every map that used to be keyed by `SocketAddr`
+/// (`connections`, `DirectServerWriters`, `ServerLastRxAt`, the
+/// coordinator's `server_channels`, the per-circuit flow-control state)
+/// is keyed by `CircuitKey`, and every `TransportCommand` carries the
+/// `priority` so the transport manager can route to the right circuit.
+///
+/// `priority` is the libca CA priority (`0..=99`, `cacChannel::priorityMax`);
+/// `0` is `priorityDefault` and reproduces the historical single-circuit
+/// behaviour.
+pub(crate) type CircuitKey = (SocketAddr, u8);
+
+// --- Per-circuit last-RX timestamp sidecar (Option C, Phase D) ---
 
 /// Last instant a frame was received from each server. Bumped by the
 /// per-server transport `read_loop` whenever any TCP frame arrives —
@@ -25,7 +43,11 @@ use crate::client::state::ChannelState;
 /// frames are arriving every millisecond. The sidecar lets the
 /// transport keep the stamp current and the coordinator (which is
 /// the one answering `ca_receive_watchdog_delay`) read it directly.
-pub(crate) type ServerLastRxAt = Arc<DashMap<SocketAddr, Instant>>;
+///
+/// CA-FR-3: keyed by [`CircuitKey`] so each priority circuit to one
+/// server keeps an independent receive timestamp — libca's
+/// `tcpRecvWatchdog` is per-circuit.
+pub(crate) type ServerLastRxAt = Arc<DashMap<CircuitKey, Instant>>;
 
 // --- Direct per-server writer sidecar (Option C, Phase E) ---
 
@@ -82,7 +104,11 @@ impl DirectServerWriter {
 
 /// Shared server-writer registry. Transport manager publishes; channel hot
 /// paths read.
-pub(crate) type DirectServerWriters = Arc<DashMap<SocketAddr, DirectServerWriter>>;
+///
+/// CA-FR-3: keyed by [`CircuitKey`]. A channel's hot path looks up its
+/// writer by `(server_addr, priority)`, so two priorities to one server
+/// write to their own circuits.
+pub(crate) type DirectServerWriters = Arc<DashMap<CircuitKey, DirectServerWriter>>;
 
 // --- Channel snapshot sidecar (Option C, Phase B) ---
 
@@ -568,6 +594,7 @@ pub(crate) enum TransportCommand {
         cid: u32,
         pv_name: String,
         server_addr: SocketAddr,
+        priority: u8,
     },
     ReadNotify {
         sid: u32,
@@ -575,6 +602,7 @@ pub(crate) enum TransportCommand {
         count: u32,
         ioid: u32,
         server_addr: SocketAddr,
+        priority: u8,
     },
     Write {
         sid: u32,
@@ -582,6 +610,7 @@ pub(crate) enum TransportCommand {
         count: u32,
         payload: Vec<u8>,
         server_addr: SocketAddr,
+        priority: u8,
     },
     WriteNotify {
         sid: u32,
@@ -590,6 +619,7 @@ pub(crate) enum TransportCommand {
         ioid: u32,
         payload: Vec<u8>,
         server_addr: SocketAddr,
+        priority: u8,
     },
     Subscribe {
         sid: u32,
@@ -598,6 +628,7 @@ pub(crate) enum TransportCommand {
         subid: u32,
         mask: u16,
         server_addr: SocketAddr,
+        priority: u8,
     },
     Unsubscribe {
         sid: u32,
@@ -611,11 +642,13 @@ pub(crate) enum TransportCommand {
         /// libca-equivalent frame.
         count: u32,
         server_addr: SocketAddr,
+        priority: u8,
     },
     ClearChannel {
         cid: u32,
         sid: u32,
         server_addr: SocketAddr,
+        priority: u8,
     },
     /// Beacon arrival routed from the beacon monitor to the per-circuit
     /// receive watchdog. `anomaly = false` for healthy beacons (mirrors
@@ -627,15 +660,21 @@ pub(crate) enum TransportCommand {
     /// idle watchdog expire on its own schedule rather than firing an
     /// immediate echo probe — under load that immediate probe was the
     /// trigger for spurious 5-s echo timeouts and reconnect storms.
+    ///
+    /// CA-FR-3: a beacon is a per-server UDP signal, but the watchdog it
+    /// pets lives on each circuit, so the notify fans out to every
+    /// priority circuit for `server_addr` (see `process_command`).
     BeaconArrivalNotify {
         server_addr: SocketAddr,
         anomaly: bool,
     },
     EventsOff {
         server_addr: SocketAddr,
+        priority: u8,
     },
     EventsOn {
         server_addr: SocketAddr,
+        priority: u8,
     },
 }
 
@@ -647,6 +686,10 @@ pub(crate) enum TransportEvent {
         element_count: u32,
         access: AccessRights,
         server_addr: SocketAddr,
+        /// CA-FR-3: priority of the circuit the CREATE_CH_RESP arrived
+        /// on. Lets the coordinator clear a late response for an
+        /// already-dropped cid on the right circuit.
+        priority: u8,
     },
     MonitorData {
         subid: u32,
@@ -688,6 +731,10 @@ pub(crate) enum TransportEvent {
     },
     TcpClosed {
         server_addr: SocketAddr,
+        /// CA-FR-3: which priority circuit closed. Only channels on
+        /// `(server_addr, priority)` are torn down; sibling circuits to
+        /// the same server at other priorities are untouched.
+        priority: u8,
     },
     ServerDisconnect {
         cid: u32,
@@ -696,16 +743,19 @@ pub(crate) enum TransportEvent {
     /// Echo timed out once — circuit may be unresponsive but TCP is still up.
     CircuitUnresponsive {
         server_addr: SocketAddr,
+        priority: u8,
     },
     /// Data received after unresponsive state — circuit recovered.
     CircuitResponsive {
         server_addr: SocketAddr,
+        priority: u8,
     },
     /// Server's CA minor protocol version, parsed from CA_PROTO_VERSION
     /// during TCP handshake. Mirrors libca `tcpiiu::minorProtocolVersion`
     /// (BUG_ARCHAEOLOGY d763541 / `ca_host_minor_protocol`).
     ServerVersion {
         server_addr: SocketAddr,
+        priority: u8,
         minor_version: u16,
     },
     /// A fresh TCP circuit was just inserted into the connections map.

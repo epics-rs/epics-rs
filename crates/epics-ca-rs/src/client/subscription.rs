@@ -31,47 +31,57 @@ pub(crate) enum ValueRoute {
 /// Per-subscription overflow/pause buffer shared between the
 /// coordinator (producer) and the [`MonitorHandle`] (consumer).
 ///
-/// # Invariants (structurally enforced by the three distinct cells)
+/// # State machine
 ///
-/// - **I1 — flow control counts the channel only.** `pending_deliveries`
-///   and the per-circuit `EVENTS_OFF` accounting count ONLY items in the
-///   bounded channel. Every cell here is out of band: writing or reading
-///   it never touches flow control. (A client-side pause must not trip
-///   the wire-level `EVENTS_OFF` and freeze sibling subscriptions.)
-/// - **I2 — error preservation.** The `error` cell is separate from the
-///   value cells. A value can never overwrite or hide a pending error;
-///   errors bypass pause and are delivered first.
-/// - **I3 — pause scope.** Everything deliverable at the instant
-///   `pause()` is called stays deliverable: pause ENTRY collapses the
-///   backlog into a single latest `ready` value, and `ready` is never
-///   gated. Only values arriving *during* the pause land in `held`
-///   (gated by the `take_deliverable` order) — and because pause entry
-///   emptied `held`, it means exactly "arrived during THIS pause", so a
-///   value made deliverable by a prior resume can't be re-gated by a
-///   later pause. `resume` moves nothing (no destructive collapse);
-///   `take_deliverable` simply yields `ready` then `held`.
+/// Three value-holding cells, written by exactly one method
+/// (`coalesce_value_locked` for values, `put_error` for errors) and
+/// read by exactly one (`take_deliverable`):
 ///
-/// All cells + the pause flag live under one mutex, so the producer's
-/// "decide vs pause + write" and the consumer's "check pause + take"
-/// are each atomic against `resume`'s "flip + notify" — no window where
-/// a value written just-before-resume is stranded.
+/// - `error` — pending error; highest priority; bypasses pause.
+/// - `ready` — the single latest value that is deliverable NOW.
+/// - `gated` — the single latest value that arrived during the current
+///   pause; withheld until resume.
+///
+/// # Invariants (each maintained by construction)
+///
+/// - **I1 — flow control counts the channel only.** Every cell here is
+///   out of band: writing/reading it never touches `pending_deliveries`
+///   or the per-circuit `EVENTS_OFF` accounting. A client-side pause
+///   therefore cannot trip the wire-level flow control and freeze
+///   sibling subscriptions.
+/// - **I2 — error priority.** `error` is its own cell; a value can never
+///   overwrite or hide it, and `take_deliverable` yields it first.
+/// - **I3 — pause gating is structural, not conditional.** The sole
+///   invariant `gated.is_some() ⟹ paused` holds by construction:
+///   `gated` is written only while paused (`coalesce_value_locked`),
+///   and `resume` empties it by coalescing into `ready`. Consequently
+///   `take_deliverable` needs NO pause check — it just yields `error`
+///   then `ready`; `gated` is unreachable to the consumer until resume
+///   promotes it. A value buffered before a pause sits in `ready` and
+///   stays deliverable throughout the pause; a value that becomes
+///   deliverable after a resume is already in `ready`, so a later pause
+///   can never re-gate it. There is no "held survives resume" dual
+///   meaning, hence no multi-pause edge cases.
+///
+/// Coalescing is uniform: when the consumer falls behind, only the
+/// latest value survives — including across a pause boundary. (During a
+/// pause the pre-pause `ready` value is still deliverable, so a consumer
+/// that recv()s during the pause sees it; a consumer that does not is,
+/// by definition, behind and gets the latest on resume — standard
+/// monitor latest-value semantics.)
+///
+/// All cells + the pause flag live under one mutex, so producer and
+/// consumer operations are each atomic against `resume`.
 pub(crate) struct CoalesceSlot {
     inner: StdMutex<CoalesceInner>,
     notify: Notify,
 }
 
 struct CoalesceInner {
-    /// Pending error — sticky, bypasses pause, delivered first (I2).
-    /// Latest error wins among errors. Never touched by value writes.
     error: Option<CaError>,
-    /// The OLDER of up to two pending values — delivered after `error`
-    /// and always deliverable, even while paused (I3 pre-pause backlog).
     ready: Option<Snapshot>,
-    /// The NEWER (latest) pending value, coalesced. Delivered after
-    /// `ready`, but only while NOT paused (2a: a value that arrived
-    /// during the pause stays here, gated, until resume). A separate
-    /// cell so it can never clobber the older `ready` value.
-    held: Option<Snapshot>,
+    /// INVARIANT: `Some` ⟹ `paused`.
+    gated: Option<Snapshot>,
     paused: bool,
 }
 
@@ -81,44 +91,41 @@ impl CoalesceSlot {
             inner: StdMutex::new(CoalesceInner {
                 error: None,
                 ready: None,
-                held: None,
+                gated: None,
                 paused: false,
             }),
             notify: Notify::new(),
         })
     }
 
-    /// Coalesce a value into the slot's value tail (caller holds the
-    /// lock). The tail is `held` when a second pending value already
-    /// exists; otherwise `ready` (the first/only pending value). During
-    /// pause the latest value always lands in `held` so the pause gate
-    /// in `take_deliverable` withholds it. This is the SOLE writer of
-    /// the value cells, so the "older stays in ready, newer in held"
-    /// shape is structural.
+    /// The SOLE writer of the value cells. While paused the latest value
+    /// coalesces into `gated` (maintaining `gated.is_some() ⟹ paused`);
+    /// otherwise into `ready`. Caller holds the lock.
     fn coalesce_value_locked(inner: &mut CoalesceInner, snapshot: Snapshot) {
-        if inner.paused || inner.held.is_some() {
-            inner.held = Some(snapshot);
+        if inner.paused {
+            inner.gated = Some(snapshot);
         } else {
             inner.ready = Some(snapshot);
         }
     }
 
     /// Route a value snapshot. Goes to the bounded channel ONLY when the
-    /// slot is entirely empty AND not paused; any pending cell — error,
-    /// ready, or held — means the value must coalesce into the slot
-    /// rather than jump ahead via the channel. Including a pending
-    /// `error` (F1: a value must never overtake a buffered error).
-    /// Out of flow control (I1).
+    /// slot is entirely empty AND not paused; any pending `error` or
+    /// `ready` (or being paused) means the value must coalesce into the
+    /// slot rather than jump ahead via the channel — F1: a value must
+    /// never overtake a buffered error, and order is preserved.
+    /// (`gated` is empty when not paused by the invariant.) Out of flow
+    /// control (I1).
     pub fn route_value(&self, snapshot: Snapshot) -> ValueRoute {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
-        if !g.paused && g.error.is_none() && g.ready.is_none() && g.held.is_none() {
+        if !g.paused && g.error.is_none() && g.ready.is_none() {
             return ValueRoute::TryChannel(Box::new(snapshot));
         }
         let paused = g.paused;
         Self::coalesce_value_locked(&mut g, snapshot);
         drop(g);
-        // A value written while paused goes to `held` (gated); recv
-        // can't take it, so no wake. Otherwise it's deliverable now.
+        // A value written while paused goes to `gated` (not deliverable
+        // until resume), so no wake. Otherwise it's deliverable now.
         if !paused {
             self.notify.notify_one();
         }
@@ -126,7 +133,7 @@ impl CoalesceSlot {
     }
 
     /// Overflow fallback after a full channel: coalesce the value into
-    /// the slot tail. Out of flow control (I1).
+    /// the slot. Out of flow control (I1).
     fn put_value(&self, snapshot: Snapshot) {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
         let paused = g.paused;
@@ -146,28 +153,16 @@ impl CoalesceSlot {
         self.notify.notify_one();
     }
 
-    /// The SOLE owner of delivery priority. Takes, in order:
-    ///   1. `error` — bypasses pause, always first (I2).
-    ///   2. `ready` — the older value, deliverable even while paused
-    ///      (I3 pre-pause backlog).
-    ///   3. `held` — the newer value, ONLY when not paused (2a gate).
-    ///
-    /// `resume` does not move values between cells, so an undrained
-    /// `ready` is never overwritten; the gate lives here alone.
+    /// The SOLE reader of delivery priority: `error` then `ready`.
+    /// There is NO pause check and NO `gated` branch — the gate is
+    /// structural (I3): `gated` is unreachable here, and `resume`
+    /// promotes it into `ready` when the pause ends.
     pub fn take_deliverable(&self) -> Option<CaResult<Snapshot>> {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
         if let Some(err) = g.error.take() {
             return Some(Err(err));
         }
-        if let Some(v) = g.ready.take() {
-            return Some(Ok(v));
-        }
-        if !g.paused {
-            if let Some(v) = g.held.take() {
-                return Some(Ok(v));
-            }
-        }
-        None
+        g.ready.take().map(Ok)
     }
 
     /// Future that resolves on the next `notify` (deliverable write or
@@ -178,29 +173,22 @@ impl CoalesceSlot {
 
     /// Set/clear the pause flag. Returns the previous value.
     ///
-    /// On pause ENTRY it freezes the currently-deliverable backlog into
-    /// a single latest value in `ready` (collapsing `held`, which is the
-    /// newer of the two, into it) and leaves `held` empty. This is what
-    /// keeps `held` meaning exactly "arrived during THIS pause": a value
-    /// that became deliverable after a PRIOR resume is pre-(this-)pause
-    /// backlog and must stay deliverable (I3), so it is promoted to
-    /// `ready` rather than re-gated by the new pause.
-    ///
-    /// On RESUME it does NOT move any value (the old resume-time collapse
-    /// could overwrite an undrained pre-pause `ready`); it only flips the
-    /// flag and wakes `recv`, which then yields `ready` then `held`.
+    /// RESUME promotes any `gated` value into `ready` (coalesce: the
+    /// during-pause value is the latest and supersedes an undrained
+    /// pre-pause `ready`) and wakes `recv`. This is the SOLE place
+    /// `gated` is emptied, so the invariant `gated.is_some() ⟹ paused`
+    /// holds. Pause ENTRY needs no special handling — `gated` is already
+    /// empty by the invariant.
     pub fn set_paused(&self, paused: bool) -> bool {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
         let prev = g.paused;
         g.paused = paused;
-        if !prev && paused && g.held.is_some() {
-            // Entering pause: collapse the deliverable backlog to its
-            // latest (`held` wins over the older `ready`) so `held`
-            // becomes free for genuinely-during-this-pause arrivals.
-            g.ready = g.held.take();
+        let resuming = prev && !paused;
+        if resuming && g.gated.is_some() {
+            g.ready = g.gated.take();
         }
         drop(g);
-        if prev && !paused {
+        if resuming {
             self.notify.notify_one();
         }
         prev
@@ -213,18 +201,17 @@ impl CoalesceSlot {
             .paused
     }
 
-    /// Drop both value cells (ready + held) AND the error regardless of
-    /// pause state. Used on disconnect so a stale snapshot/error can't
-    /// outlive the circuit.
+    /// Drop all three cells regardless of pause state. Used on disconnect
+    /// so a stale snapshot/error can't outlive the circuit.
     fn clear(&self) {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
         g.error = None;
         g.ready = None;
-        g.held = None;
+        g.gated = None;
     }
 
     /// Test-only: unconditional drain — error, then `ready`, then
-    /// `held`, ignoring pause.
+    /// `gated`, ignoring pause.
     #[cfg(test)]
     fn take_raw(&self) -> Option<CaResult<Snapshot>> {
         let mut g = self.inner.lock().expect("CoalesceSlot mutex poisoned");
@@ -234,7 +221,7 @@ impl CoalesceSlot {
         if let Some(v) = g.ready.take() {
             return Some(Ok(v));
         }
-        g.held.take().map(Ok)
+        g.gated.take().map(Ok)
     }
 }
 
@@ -1082,55 +1069,51 @@ mod tests {
         );
     }
 
-    /// New-finding F2: resume must NOT overwrite an undrained pre-pause
-    /// `ready` with the during-pause `held` value. After resume,
-    /// take_deliverable yields `ready` (11) then `held` (22), in order.
+    /// Resume coalesces an UNDRAINED pre-pause `ready` with the
+    /// during-pause `gated` value (uniform latest-wins). The older value
+    /// is superseded — standard monitor latest-value semantics for a
+    /// consumer that didn't drain during the pause. (A consumer that
+    /// DOES recv during the pause gets 11 — see
+    /// `prepause_ready_not_clobbered_by_concurrent_during_pause_value`.)
     #[test]
-    fn resume_does_not_overwrite_undrained_ready() {
+    fn resume_coalesces_undrained_ready_to_latest() {
         let slot = CoalesceSlot::new();
         slot.put_value(long_snap(11)); // ready = 11 (active)
         slot.set_paused(true);
         assert!(matches!(
             slot.route_value(long_snap(22)),
             ValueRoute::Slotted
-        )); // held = 22
-        // Do NOT drain ready during pause; resume directly.
-        slot.set_paused(false);
-        assert_eq!(
-            slot.take_deliverable().expect("11").expect("Ok").value,
-            EpicsValue::Long(11),
-            "undrained pre-pause ready survives resume",
-        );
+        )); // gated = 22
+        // Do NOT drain during pause; resume directly.
+        slot.set_paused(false); // resume → gated(22) promoted into ready
         assert_eq!(
             slot.take_deliverable().expect("22").expect("Ok").value,
             EpicsValue::Long(22),
+            "latest (22) survives; undrained 11 coalesced away",
         );
-        assert!(slot.take_deliverable().is_none());
+        assert!(
+            slot.take_deliverable().is_none(),
+            "single deliverable value"
+        );
     }
 
-    /// New-finding F2 (cont.): after resume with ready=11 and held=22, a
-    /// fresh active value 33 coalesces into the tail (held), preserving
-    /// the older `ready`. Delivery: 11 then latest 33 (22 dropped).
+    /// After resume the deliverable value lives in `ready` (the coalesced
+    /// latest); a fresh active value coalesces into it (uniform).
     #[test]
-    fn post_resume_value_coalesces_tail_preserving_ready() {
+    fn post_resume_value_coalesces_into_ready() {
         let slot = CoalesceSlot::new();
         slot.put_value(long_snap(11)); // ready = 11
         slot.set_paused(true);
-        slot.route_value(long_snap(22)); // held = 22
-        slot.set_paused(false); // resume — no collapse: ready=11, held=22
+        slot.route_value(long_snap(22)); // gated = 22
+        slot.set_paused(false); // resume → ready = 22
         assert!(matches!(
             slot.route_value(long_snap(33)),
             ValueRoute::Slotted
-        ));
-        assert_eq!(
-            slot.take_deliverable().expect("11").expect("Ok").value,
-            EpicsValue::Long(11),
-            "older ready preserved",
-        );
+        )); // ready = 33
         assert_eq!(
             slot.take_deliverable().expect("33").expect("Ok").value,
             EpicsValue::Long(33),
-            "tail coalesced to latest (22 superseded by 33)",
+            "uniform coalesce to latest",
         );
         assert!(slot.take_deliverable().is_none());
     }

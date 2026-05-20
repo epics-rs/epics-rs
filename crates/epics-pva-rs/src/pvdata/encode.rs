@@ -1104,14 +1104,27 @@ fn encode_pv_field_generic(value: &PvField, desc: &FieldDesc, order: ByteOrder, 
             // "any": embed the value's own descriptor then the value.
             // pvxs `to_wire_field` emits `to_wire(desc(fld))` then
             // `to_wire_full(fld)`; a bare value carries no stored
-            // descriptor so we infer it.
+            // descriptor so we recover one from the value.
+            //
+            // PVA-FR-5: only emit a descriptor that is *wire-faithful*.
+            // A bare descriptor-sensitive value (empty/untyped array,
+            // union, union array, null) cannot be faithfully described
+            // from the value alone, and emitting a degraded descriptor
+            // would advertise a wrong schema the peer can't decode. For
+            // those, emit a null `any` instead. To carry such a value
+            // through `any`, wrap it in
+            // `PvField::Variant(VariantValue { desc: Some(canonical), .. })`
+            // (handled faithfully by the typed Variant arm), so the
+            // canonical descriptor is used.
             match value {
                 PvField::Null => out.put_u8(0xFF),
-                other => {
-                    let inferred = other.descriptor();
-                    encode_type_desc(&inferred, order, out);
-                    encode_pv_field(other, &inferred, order, out);
-                }
+                other => match other.wire_descriptor() {
+                    Some(desc) => {
+                        encode_type_desc(&desc, order, out);
+                        encode_pv_field(other, &desc, order, out);
+                    }
+                    None => out.put_u8(0xFF),
+                },
             }
         }
         FieldDesc::VariantArray => {
@@ -1949,6 +1962,81 @@ fn zero_scalar(st: ScalarType) -> ScalarValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pvdata::{UnionItem, VariantValue};
+
+    /// PVA-FR-5: a bare descriptor-sensitive value encoded against an
+    /// `any` (FieldDesc::Variant) must NOT advertise a degraded schema;
+    /// the encoder emits a null `any` (0xFF) instead.
+    #[test]
+    fn any_bare_lossy_value_emits_null_not_degraded_schema() {
+        for lossy in [
+            PvField::StructureArray(Vec::new()),
+            PvField::UnionArray(Vec::new()),
+            PvField::UnionArray(vec![UnionItem {
+                selector: 0,
+                variant_name: "i".into(),
+                value: PvField::Scalar(ScalarValue::Int(7)),
+            }]),
+            PvField::ScalarArray(Vec::new()),
+        ] {
+            let mut out = Vec::new();
+            encode_pv_field(&lossy, &FieldDesc::Variant, ByteOrder::Big, &mut out);
+            assert_eq!(
+                out,
+                vec![0xFF],
+                "bare lossy value through `any` must emit null, got {out:?}"
+            );
+        }
+    }
+
+    /// A bare faithful value (scalar) through `any` still encodes its
+    /// inferred descriptor + value.
+    #[test]
+    fn any_bare_faithful_value_encodes_descriptor() {
+        let mut out = Vec::new();
+        encode_pv_field(
+            &PvField::Scalar(ScalarValue::Int(0x01020304)),
+            &FieldDesc::Variant,
+            ByteOrder::Big,
+            &mut out,
+        );
+        // type tag 0x22 (Int) + 4 BE value bytes — not a null `any`.
+        assert_eq!(out, vec![0x22, 0x01, 0x02, 0x03, 0x04]);
+    }
+
+    /// The faithful way to carry a descriptor-sensitive value through
+    /// `any`: wrap it in Variant with an explicit descriptor. That path
+    /// uses the canonical descriptor (not lossy inference).
+    #[test]
+    fn any_explicit_variant_desc_is_faithful() {
+        // UnionArray descriptor carried explicitly.
+        let union_desc = FieldDesc::UnionArray {
+            struct_id: String::new(),
+            variants: vec![
+                ("i".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("f".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+        let value = PvField::Variant(Box::new(VariantValue {
+            desc: Some(union_desc.clone()),
+            value: PvField::UnionArray(vec![UnionItem {
+                selector: 0,
+                variant_name: "i".into(),
+                value: PvField::Scalar(ScalarValue::Int(7)),
+            }]),
+        }));
+        let mut out = Vec::new();
+        encode_pv_field(&value, &FieldDesc::Variant, ByteOrder::Big, &mut out);
+        // Must NOT be a null `any`; the canonical union-array descriptor
+        // (tag bytes) leads the output.
+        assert_ne!(out, vec![0xFF], "explicit-desc `any` must be faithful");
+        let mut desc_bytes = Vec::new();
+        encode_type_desc(&union_desc, ByteOrder::Big, &mut desc_bytes);
+        assert!(
+            out.starts_with(&desc_bytes),
+            "explicit `any` must lead with the canonical descriptor"
+        );
+    }
 
     fn nt_scalar_double_desc() -> FieldDesc {
         FieldDesc::Structure {

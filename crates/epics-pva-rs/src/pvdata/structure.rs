@@ -229,6 +229,66 @@ impl PvField {
             Self::Null => FieldDesc::Variant,
         }
     }
+
+    /// Like [`Self::descriptor`] but **wire-faithful or nothing**:
+    /// returns `Some(desc)` only when the descriptor can be fully
+    /// recovered from the value, and `None` for the lossy shapes
+    /// [`Self::descriptor`] documents (PVA-FR-5). Used by the `any`
+    /// encoder so a bare value never advertises a degraded/wrong
+    /// schema on the wire — see `encode.rs` `FieldDesc::Variant`.
+    ///
+    /// `None` cases (cannot be reconstructed from the value alone):
+    /// - empty untyped `ScalarArray` (no element type),
+    /// - empty `StructureArray` (no element schema),
+    /// - `Union` (sibling variants unknown),
+    /// - `UnionArray` (variant list / selector indices unknown),
+    /// - bare `Null`,
+    /// - any `Structure`/`StructureArray` that *contains* a `None`
+    ///   field (the loss propagates).
+    ///
+    /// Faithful cases: scalars, non-empty/typed scalar arrays,
+    /// fully-recoverable structures, `Variant` carrying a descriptor,
+    /// and `VariantArray` (whose `FieldDesc` is complete on its own).
+    pub fn wire_descriptor(&self) -> Option<FieldDesc> {
+        Some(match self {
+            Self::Scalar(v) => FieldDesc::Scalar(v.scalar_type()),
+            // Empty untyped array has no recoverable element type.
+            Self::ScalarArray(arr) => FieldDesc::ScalarArray(arr.first()?.scalar_type()),
+            Self::ScalarArrayTyped(arr) => FieldDesc::ScalarArray(arr.scalar_type()),
+            Self::Structure(s) => {
+                let mut fields = Vec::with_capacity(s.fields.len());
+                for (n, f) in &s.fields {
+                    fields.push((n.clone(), f.wire_descriptor()?));
+                }
+                FieldDesc::Structure {
+                    struct_id: s.struct_id.clone(),
+                    fields,
+                }
+            }
+            Self::StructureArray(arr) => {
+                let first = arr.first()?;
+                let mut fields = Vec::with_capacity(first.fields.len());
+                for (n, f) in &first.fields {
+                    fields.push((n.clone(), f.wire_descriptor()?));
+                }
+                FieldDesc::StructureArray {
+                    struct_id: first.struct_id.clone(),
+                    fields,
+                }
+            }
+            // Sibling variants / per-item selector indices are not
+            // recoverable from a bare value.
+            Self::Union { .. } | Self::UnionArray(_) => return None,
+            // The inner descriptor travels with the value; the outer
+            // shape is the complete `FieldDesc::Variant`.
+            Self::Variant(v) => match v.desc {
+                Some(_) => FieldDesc::Variant,
+                None => return None,
+            },
+            Self::VariantArray(_) => FieldDesc::VariantArray,
+            Self::Null => return None,
+        })
+    }
 }
 
 /// A PVA structure with ordered named fields.
@@ -308,6 +368,80 @@ impl fmt::Display for PvStructure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PVA-FR-5: `wire_descriptor` is `Some` only for shapes whose
+    /// descriptor is fully recoverable from the value, `None` for the
+    /// lossy ones (so the `any` encoder won't emit a wrong schema).
+    #[test]
+    fn wire_descriptor_faithful_vs_lossy() {
+        // Faithful.
+        assert!(
+            PvField::Scalar(ScalarValue::Int(1))
+                .wire_descriptor()
+                .is_some()
+        );
+        assert!(
+            PvField::scalar_array_int(Vec::<i32>::new())
+                .wire_descriptor()
+                .is_some()
+        ); // typed empty: type known
+        assert!(
+            PvField::ScalarArray(vec![ScalarValue::Int(1)])
+                .wire_descriptor()
+                .is_some()
+        );
+        assert!(
+            PvField::VariantArray(Vec::new())
+                .wire_descriptor()
+                .is_some()
+        );
+        let s = {
+            let mut s = PvStructure::new("x");
+            s.fields
+                .push(("v".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+            PvField::Structure(s)
+        };
+        assert!(s.wire_descriptor().is_some());
+
+        // Lossy → None.
+        assert!(
+            PvField::ScalarArray(Vec::new()).wire_descriptor().is_none(),
+            "empty untyped array has no element type"
+        );
+        assert!(
+            PvField::StructureArray(Vec::new())
+                .wire_descriptor()
+                .is_none(),
+            "empty structure array has no element schema"
+        );
+        assert!(
+            PvField::Union {
+                selector: 0,
+                variant_name: "i".into(),
+                value: Box::new(PvField::Scalar(ScalarValue::Int(1))),
+            }
+            .wire_descriptor()
+            .is_none(),
+            "union loses sibling variants"
+        );
+        assert!(
+            PvField::UnionArray(Vec::new()).wire_descriptor().is_none(),
+            "union array loses variant list / selector indices"
+        );
+        assert!(PvField::Null.wire_descriptor().is_none());
+
+        // Loss propagates: a structure containing a lossy field is lossy.
+        let nested = {
+            let mut s = PvStructure::new("x");
+            s.fields
+                .push(("u".into(), PvField::ScalarArray(Vec::new())));
+            PvField::Structure(s)
+        };
+        assert!(
+            nested.wire_descriptor().is_none(),
+            "lossy field makes the whole structure lossy"
+        );
+    }
 
     #[test]
     fn empty_structure() {

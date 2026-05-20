@@ -2316,15 +2316,16 @@ impl MonitorHandle {
                 Err(TryRecvError::Disconnected) => return None,
                 Err(TryRecvError::Empty) => {}
             }
-            // 2. Channel empty — take the coalesce slot only if it is
-            //    deliverable now. `take_if_deliverable` withholds a
-            //    held *value* while paused (recv-side gate) but lets an
-            //    `Err` through (errors bypass pause). Atomic against
-            //    `resume`.
-            if let Some(msg) = self.coalesce_slot.take_if_deliverable() {
-                let _ = self
-                    .coord_tx
-                    .send(CoordRequest::MonitorConsumed { subid: self.subid });
+            // 2. Channel empty — take the coalesce slot if anything is
+            //    deliverable now. `take_deliverable` returns an `Err`
+            //    even while paused (errors bypass pause), a value when
+            //    not paused or buffered before the pause, and `None`
+            //    for a value held during pause. Atomic against `resume`.
+            //
+            //    No `MonitorConsumed` ack here: the slot is out of flow
+            //    control (invariant I1), so draining it must not
+            //    decrement the per-circuit outstanding count.
+            if let Some(msg) = self.coalesce_slot.take_deliverable() {
                 return Some(msg);
             }
             // 3. Nothing deliverable — wait. `notified` fires on a
@@ -3046,26 +3047,22 @@ async fn run_coordinator(
                     TransportEvent::MonitorData { subid, data_type, count, data } => {
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_data(subid, data_type, count, &data) {
-                            MonitorDeliveryOutcome::Queued(server_addr)
-                            | MonitorDeliveryOutcome::Coalesced(server_addr) => {
-                                // `Coalesced` means the bounded channel was full
-                                // and the snapshot landed in the coalesce slot
-                                // for the first time (slot was empty). Like
-                                // `Queued` it adds one to the per-circuit
-                                // outstanding count, which the existing
-                                // EVENTS_OFF emission already gates on.
+                            MonitorDeliveryOutcome::Queued(server_addr) => {
+                                // Only a bounded-channel write feeds flow
+                                // control (invariant I1) — the single gate
+                                // that bumps the per-circuit outstanding
+                                // count.
                                 flow_control_note_queued(
                                     &mut flow_control,
                                     server_addr,
                                     &transport_tx,
                                 );
                             }
-                            MonitorDeliveryOutcome::Replaced(_server_addr) => {
-                                // Slot already held a coalesced value;
-                                // the new snapshot overwrote it in place.
-                                // Net pending unchanged → no flow-control
-                                // change (mirrors C `nreplace++` without a
-                                // queue-depth bump).
+                            MonitorDeliveryOutcome::Slotted(_server_addr) => {
+                                // Coalesced into the slot (overflow or
+                                // pause-held). Out of flow control (I1) so
+                                // a client-side pause can't trip EVENTS_OFF
+                                // for sibling subscriptions. Diagnostic only.
                                 metrics::counter!(
                                     "ca_client_coalesced_monitors_total"
                                 )
@@ -3102,26 +3099,17 @@ async fn run_coordinator(
                         // exception-callback semantics.
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_error(subid, eca_status) {
-                            // Mirror the data-path flow-control accounting:
-                            // each newly-pending delivery (`Queued` for the
-                            // channel, `Coalesced` for an empty slot
-                            // transitioning to occupied) bumps the
-                            // per-circuit outstanding count. Without this,
-                            // the consumer's `MonitorConsumed` decrement
-                            // had no matching increment and outstanding
-                            // drifted low — EVENTS_ON fired too early.
-                            MonitorDeliveryOutcome::Queued(server_addr)
-                            | MonitorDeliveryOutcome::Coalesced(server_addr) => {
+                            // Only a bounded-channel write feeds flow
+                            // control (invariant I1). An error parked in
+                            // the (out-of-band) error slot is `Slotted`.
+                            MonitorDeliveryOutcome::Queued(server_addr) => {
                                 flow_control_note_queued(
                                     &mut flow_control,
                                     server_addr,
                                     &transport_tx,
                                 );
                             }
-                            MonitorDeliveryOutcome::Replaced(_) => {
-                                // Slot already held a prior error/value
-                                // and we overwrote in place. Net pending
-                                // unchanged → no flow-control change.
+                            MonitorDeliveryOutcome::Slotted(_) => {
                                 metrics::counter!(
                                     "ca_client_coalesced_monitors_total"
                                 )
@@ -4620,10 +4608,10 @@ mod monitor_pause_tests {
         handle.pause();
 
         // A value arrives DURING pause → producer holds it in the slot
-        // (route_value Held path).
+        // (route_value Slotted path).
         assert!(matches!(
-            coalesce_slot.route_value(Ok(snap(2))),
-            subscription::ValueRoute::Held { was_empty: true }
+            coalesce_slot.route_value(snap(2)),
+            subscription::ValueRoute::Slotted
         ));
 
         // (3a) The pre-pause backlog is still delivered while paused.

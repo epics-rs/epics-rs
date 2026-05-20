@@ -383,6 +383,66 @@ async fn p5_monitor_pipeline_does_not_drop() {
     h.abort();
 }
 
+/// PVA-FR-8: pausing a server monitor must HOLD the latest value posted
+/// while paused (squash) and deliver it on resume — not drop it (the
+/// pre-fix P-G28 floor-drop). Mirrors pvxs queue-while-Idle +
+/// drain-on-START.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pva_fr_8_pause_holds_latest_then_resume_delivers() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:PAUSE", 0.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    let received = Arc::new(parking_lot::Mutex::new(Vec::<f64>::new()));
+    let cb = received.clone();
+    let handle = client
+        .pvmonitor_handle("STAB:PAUSE", move |_desc, value| {
+            if let PvField::Structure(s) = value
+                && let Some(ScalarValue::Double(v)) = s.get_value()
+            {
+                cb.lock().push(*v);
+            }
+        })
+        .await
+        .expect("subscribe");
+
+    // Initial snapshot settles.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    handle.pause().await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let before = received.lock().len();
+
+    // Two values posted while paused — the server must hold them,
+    // squashing to the latest (22.0), delivering nothing yet.
+    source.push("STAB:PAUSE", 11.0).await;
+    source.push("STAB:PAUSE", 22.0).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        received.lock().len(),
+        before,
+        "paused monitor must not deliver events"
+    );
+
+    // Resume → the held latest value is delivered.
+    handle.resume().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let got = received.lock().clone();
+    assert!(
+        got.len() > before,
+        "resume must deliver the value held during the pause"
+    );
+    assert_eq!(
+        *got.last().unwrap(),
+        22.0,
+        "resume delivers the latest value squashed during the pause"
+    );
+
+    handle.stop();
+    h.abort();
+}
+
 /// Regression: P-G11 (commit c3f286c) added a server-side pipeline
 /// credit window unconditionally for every Monitor op, but pvxs only
 /// applies flow control when the client's pvRequest explicitly

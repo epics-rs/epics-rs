@@ -553,6 +553,14 @@ struct OpState {
     /// Pulsed via the same notify as the credit window so the loop
     /// wakes on resume.
     monitor_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// PVA-FR-8: pulsed on RESUME so the subscriber loop wakes and
+    /// flushes the value it squashed while paused — for both pipelined
+    /// and non-pipelined monitors (the credit `monitor_window_notify`
+    /// is `None` for non-pipelined, so resume needs its own wake). pvxs
+    /// keeps posting into the monitor queue while Idle and drains it on
+    /// START (`servermon.cpp:211-220,671-688`); the Rust equivalent is
+    /// "hold the squashed latest value, emit on resume".
+    monitor_resume: Arc<tokio::sync::Notify>,
     /// Server-side filter chain decoded from
     /// `record._options._filter` (a JSON string carrying the same
     /// channel-filter syntax CA uses: `{"dbnd":{"d":0.5},...}`). The
@@ -1728,6 +1736,7 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
         monitor_window: None,
         monitor_window_notify: None,
         monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        monitor_resume: Arc::new(tokio::sync::Notify::new()),
         monitor_filters: Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
         put_auto_exec: true,
         pv_request: None,
@@ -2819,6 +2828,7 @@ async fn handle_op(
                 monitor_window,
                 monitor_window_notify,
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                monitor_resume: Arc::new(tokio::sync::Notify::new()),
                 monitor_filters,
                 put_auto_exec,
                 pv_request: stashed_pv_request,
@@ -3208,6 +3218,13 @@ async fn handle_op(
                         if let Some(n) = op.monitor_window_notify.as_ref() {
                             n.notify_waiters();
                         }
+                        // PVA-FR-8: wake the subscriber loop so it flushes
+                        // the value squashed during the pause (works for
+                        // non-pipelined ops too, which have no window
+                        // notify). `notify_one` stores a permit when the
+                        // loop isn't waiting yet, so a resume that races
+                        // ahead of the loop's `notified()` is not lost.
+                        op.monitor_resume.notify_one();
                     }
                 }
             }
@@ -3290,27 +3307,31 @@ async fn handle_op(
                 // BR-R14: also lift the event-affecting monitor
                 // options so they reach the source's
                 // `subscribe_*_checked_opts`.
-                let (window, window_notify, paused_flag, filters, monitor_options) = ch
-                    .ops
-                    .get(&ioid)
-                    .map(|s| {
-                        (
-                            s.monitor_window.clone(),
-                            s.monitor_window_notify.clone(),
-                            s.monitor_paused.clone(),
-                            s.monitor_filters.clone(),
-                            s.monitor_options.clone(),
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        (
-                            None,
-                            None,
-                            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                            Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
-                            crate::server_native::source::MonitorOptions::default(),
-                        )
-                    });
+                let (window, window_notify, paused_flag, resume_notify, filters, monitor_options) =
+                    ch.ops
+                        .get(&ioid)
+                        .map(|s| {
+                            (
+                                s.monitor_window.clone(),
+                                s.monitor_window_notify.clone(),
+                                s.monitor_paused.clone(),
+                                s.monitor_resume.clone(),
+                                s.monitor_filters.clone(),
+                                s.monitor_options.clone(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                None,
+                                None,
+                                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                Arc::new(tokio::sync::Notify::new()),
+                                Arc::new(
+                                    epics_base_rs::server::database::filters::FilterChain::new(),
+                                ),
+                                crate::server_native::source::MonitorOptions::default(),
+                            )
+                        });
                 let total_bits = intro_clone.total_bits();
                 // Raw fast path is correct only when the downstream's
                 // pvRequest matches the upstream's bytes 1:1 — i.e. no
@@ -3587,7 +3608,32 @@ async fn handle_op(
                     // events between writes, keeping only the most recent
                     // value if more than `queue_depth` events stack up.
                     let mut squashing = false;
-                    while let Some(mut value) = rx.recv().await {
+                    // PVA-FR-8: value squashed while paused, flushed on
+                    // resume. `None` between batches.
+                    let mut held: Option<crate::pvdata::PvField> = None;
+                    loop {
+                        // Acquire the next value to consider emitting. A
+                        // value held from a pause takes priority once
+                        // resumed; while paused we keep receiving and
+                        // squash to the latest without emitting, waking on
+                        // resume to flush it (pvxs queues posts while Idle
+                        // and drains on START).
+                        let mut value = if paused_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            tokio::select! {
+                                ev = rx.recv() => match ev {
+                                    Some(v) => { held = Some(v); continue; }
+                                    None => break,
+                                },
+                                _ = resume_notify.notified() => continue,
+                            }
+                        } else if let Some(v) = held.take() {
+                            v
+                        } else {
+                            match rx.recv().await {
+                                Some(v) => v,
+                                None => break,
+                            }
+                        };
                         // R48-G3: ACL re-check on policy reload (same
                         // shape as the raw-fast-path branch above).
                         // The gate's `acl_version` bumps on every
@@ -3670,11 +3716,15 @@ async fn handle_op(
                         // a client with a finite pipeline window stalls
                         // waiting to ACK frames it never received.
                         //
-                        // P-G28: pause drops events on the floor.
-                        // Resume cleanly re-emits whatever the source
-                        // sends next; clients that need state recovery
-                        // re-issue their pvRequest after resume.
+                        // PVA-FR-8: a pause that began while this value was
+                        // already in hand must HOLD it (squash to latest),
+                        // not drop it — resume flushes the held value. This
+                        // mirrors pvxs keeping posts in the monitor queue
+                        // while Idle and draining on START. Like the drop
+                        // it once was, holding consumes no pipeline credit
+                        // (no wire frame is produced).
                         if paused_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            held = Some(value);
                             continue;
                         }
                         // Server-side channel filters: skip when the
@@ -4403,6 +4453,7 @@ mod tests {
                 monitor_window: None,
                 monitor_window_notify: None,
                 monitor_paused: paused.clone(),
+                monitor_resume: Arc::new(tokio::sync::Notify::new()),
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
@@ -6085,6 +6136,7 @@ mod tests {
                 monitor_window: None,
                 monitor_window_notify: None,
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                monitor_resume: Arc::new(tokio::sync::Notify::new()),
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),

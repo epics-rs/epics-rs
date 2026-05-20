@@ -23,14 +23,35 @@ use tokio::task::JoinHandle;
 
 use crate::error::{PvaError, PvaResult};
 
+/// Outcome of a single `wait` body, computed while the result receiver
+/// is borrowed; the `done` flag is updated afterwards so the borrow
+/// never overlaps the `&mut self` write.
+enum WaitOutcome<T> {
+    /// The operation completed and produced a result.
+    Completed(PvaResult<T>),
+    /// The sender was dropped without sending (task aborted).
+    Aborted,
+    /// `interrupt()` woke the waiter; the operation keeps running.
+    Interrupted,
+    /// `cancel()` fired.
+    Cancelled,
+}
+
 /// Handle to an in-flight operation. Pairs with the operation type
 /// returned by `PvaClient::start_*` async methods.
 pub struct PvaOperation<T: Send + 'static> {
     /// Spawned task running the underlying op.
     join: JoinHandle<()>,
-    /// Receiver for the op's final result. `None` once `wait`/`cancel`
-    /// has consumed it.
-    result_rx: Option<oneshot::Receiver<PvaResult<T>>>,
+    /// Receiver for the op's final result. PVA-FR-7: held by value (not
+    /// `take`-n out per wait) and polled by `&mut`, so a `wait` that
+    /// times out or is interrupted leaves the receiver in place and a
+    /// later `wait` can still collect the result — matching pvxs
+    /// `Operation::wait(timeout)`, which can be retried after a timeout.
+    result_rx: oneshot::Receiver<PvaResult<T>>,
+    /// `true` once a result has been successfully consumed; further
+    /// `wait` calls then report "already consumed" (single-consumer
+    /// final-result policy). A timeout/interrupt does NOT set this.
+    done: bool,
     /// Pulsed by [`Self::interrupt`]; `wait*` selects on this and
     /// returns `PvaError::Timeout` (the closest existing variant) so
     /// callers can distinguish operator-driven wake-up from a real
@@ -58,7 +79,8 @@ impl<T: Send + 'static> PvaOperation<T> {
         });
         Self {
             join,
-            result_rx: Some(rx),
+            result_rx: rx,
+            done: false,
             interrupt: Arc::new(Notify::new()),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -70,36 +92,49 @@ impl<T: Send + 'static> PvaOperation<T> {
     /// `PvaError::Timeout` on either (a) the deadline expiring or (b)
     /// an [`Self::interrupt`] wake-up.
     pub async fn wait(&mut self, timeout: Option<Duration>) -> PvaResult<T> {
-        let rx = match self.result_rx.take() {
-            Some(rx) => rx,
-            None => {
-                return Err(PvaError::Protocol(
-                    "Operation result already consumed".into(),
-                ));
-            }
-        };
+        if self.done {
+            return Err(PvaError::Protocol(
+                "Operation result already consumed".into(),
+            ));
+        }
         if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
             return Err(PvaError::Protocol("Operation cancelled".into()));
         }
 
         let interrupt = self.interrupt.clone();
         let cancelled = self.cancelled.clone();
-        let body = async move {
+        // Borrow the receiver by `&mut` so a timeout/interrupt leaves it
+        // in place for a later `wait` (PVA-FR-7). `oneshot::Receiver`
+        // is `Unpin`, so `&mut rx` is itself a `Future`.
+        let rx = &mut self.result_rx;
+        let body = async {
             tokio::select! {
-                v = rx => match v {
-                    Ok(r) => r,
-                    Err(_) => Err(PvaError::Protocol("Operation aborted".into())),
+                v = &mut *rx => match v {
+                    Ok(r) => WaitOutcome::Completed(r),
+                    Err(_) => WaitOutcome::Aborted,
                 },
-                _ = interrupt.notified() => Err(PvaError::Timeout),
-                _ = wait_for_cancel(cancelled) => Err(PvaError::Protocol("Operation cancelled".into())),
+                _ = interrupt.notified() => WaitOutcome::Interrupted,
+                _ = wait_for_cancel(cancelled) => WaitOutcome::Cancelled,
             }
         };
-        match timeout {
+        let outcome = match timeout {
+            // On timeout the body (and its `&mut` borrow of `result_rx`)
+            // is dropped, leaving the receiver intact in `self`.
             Some(d) => match tokio::time::timeout(d, body).await {
-                Ok(v) => v,
-                Err(_) => Err(PvaError::Timeout),
+                Ok(o) => o,
+                Err(_) => return Err(PvaError::Timeout),
             },
             None => body.await,
+        };
+        match outcome {
+            WaitOutcome::Completed(r) => {
+                self.done = true;
+                r
+            }
+            // Interrupt/timeout do not consume; a later `wait` retries.
+            WaitOutcome::Interrupted => Err(PvaError::Timeout),
+            WaitOutcome::Cancelled => Err(PvaError::Protocol("Operation cancelled".into())),
+            WaitOutcome::Aborted => Err(PvaError::Protocol("Operation aborted".into())),
         }
     }
 
@@ -175,10 +210,10 @@ mod tests {
         });
         let r = op.wait(Some(Duration::from_secs(5))).await;
         assert!(matches!(r, Err(PvaError::Timeout)));
-        // Op still completes — verify by waiting again on the
-        // already-spawned task. The original `wait` consumed the
-        // result_rx so we just check the task finished naturally.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // PVA-FR-7: interrupt does NOT consume the result. The op
+        // completes and a second wait still collects its value.
+        let v = op.wait(Some(Duration::from_secs(1))).await.unwrap();
+        assert_eq!(v, 7);
         assert!(op.is_done());
     }
 
@@ -191,5 +226,53 @@ mod tests {
         op.cancel();
         let r = op.wait(Some(Duration::from_secs(1))).await;
         assert!(matches!(r, Err(PvaError::Protocol(_))));
+    }
+
+    /// PVA-FR-7 regression: a `wait` that times out while the op is
+    /// still in-progress must leave the result recoverable by a later
+    /// `wait` (pvxs `Operation::wait` is retriable after a timeout).
+    #[tokio::test]
+    async fn timeout_then_wait_again_recovers_result() {
+        let mut op = PvaOperation::<i32>::spawn(async {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            Ok(99)
+        });
+        // First wait deadline expires before the op completes.
+        let r1 = op.wait(Some(Duration::from_millis(30))).await;
+        assert!(matches!(r1, Err(PvaError::Timeout)), "first wait times out");
+        // Second wait (no deadline) collects the eventual result.
+        let v = op.wait(None).await.unwrap();
+        assert_eq!(v, 99, "result survives the earlier timeout");
+    }
+
+    /// Repeated short timeouts (polling pattern) must not consume the
+    /// result; only actual completion does.
+    #[tokio::test]
+    async fn repeated_timeouts_do_not_consume() {
+        let mut op = PvaOperation::<i32>::spawn(async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok(5)
+        });
+        for _ in 0..3 {
+            assert!(matches!(
+                op.wait(Some(Duration::from_millis(20))).await,
+                Err(PvaError::Timeout)
+            ));
+        }
+        let v = op.wait(Some(Duration::from_secs(1))).await.unwrap();
+        assert_eq!(v, 5);
+    }
+
+    /// After one successful result read the single-consumer policy
+    /// holds: a second `wait` reports the result already consumed.
+    #[tokio::test]
+    async fn second_wait_after_success_is_already_consumed() {
+        let mut op = PvaOperation::spawn(async { Ok::<i32, _>(1) });
+        assert_eq!(op.wait(Some(Duration::from_secs(1))).await.unwrap(), 1);
+        let r2 = op.wait(Some(Duration::from_secs(1))).await;
+        assert!(
+            matches!(r2, Err(PvaError::Protocol(ref m)) if m.contains("already consumed")),
+            "second wait after success must report already-consumed, got {r2:?}"
+        );
     }
 }

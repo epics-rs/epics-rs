@@ -161,6 +161,18 @@ pub struct Subscriber {
     pub filters: crate::server::database::filters::FilterChain,
 }
 
+impl Subscriber {
+    /// CA-FR-6: a monitor delivery is gated on the requested `DBE_*`
+    /// mask. Returns true only when the post's event class intersects
+    /// this subscriber's mask — the single rule C rsrv enforces with
+    /// `caEventMask & pevent->select` (`dbEvent.c:892-900`) and the
+    /// same intersection the record-field monitor path applies. An
+    /// empty post class (no specific class) delivers unconditionally.
+    fn accepts(&self, post: crate::server::recgbl::EventMask) -> bool {
+        post.is_empty() || crate::server::recgbl::EventMask::from_bits(self.mask).intersects(post)
+    }
+}
+
 /// A process variable hosted by the server.
 pub struct ProcessVariable {
     pub name: String,
@@ -254,7 +266,14 @@ impl ProcessVariable {
         let value = self.value.read().await.clone();
         let mut subs = self.subscribers.lock().await;
         subs.retain(|sub| !sub.tx.is_closed());
+        // CA-FR-6: an alarm post is the `DBE_ALARM` event class.
+        let post = EventMask::ALARM;
         for sub in subs.iter() {
+            // Skip subscribers that did not request alarm events
+            // (`caEventMask & pevent->select == 0`).
+            if !sub.accepts(post) {
+                continue;
+            }
             let snapshot = Snapshot::new(
                 value.clone(),
                 status,
@@ -265,14 +284,13 @@ impl ProcessVariable {
                 snapshot,
                 origin: 0,
             };
-            // Alarm-only emission — never gate alarm events.
             // `FilteredMonitorEvent` with `mask = ALARM` tells
             // value filters (e.g. `dbnd`) to pass through (446e0d4a).
             let filtered = if sub.filters.is_empty() {
                 Some(event)
             } else {
                 sub.filters
-                    .apply(FilteredMonitorEvent::new(event, EventMask::ALARM))
+                    .apply(FilteredMonitorEvent::new(event, post))
                     .map(|fe| fe.event)
             };
             let Some(event) = filtered else {
@@ -302,7 +320,14 @@ impl ProcessVariable {
         let mut subs = self.subscribers.lock().await;
         // Remove subscribers whose channel has been dropped
         subs.retain(|sub| !sub.tx.is_closed());
+        // CA-FR-6: a value change is the `DBE_VALUE` event class.
+        let post = EventMask::VALUE;
         for sub in subs.iter() {
+            // Skip subscribers that did not request value events
+            // (e.g. a `DBE_ALARM`-only monitor).
+            if !sub.accepts(post) {
+                continue;
+            }
             let snapshot = Snapshot::new(value.clone(), 0, 0, crate::runtime::time::now_wall());
             let event = MonitorEvent {
                 snapshot,
@@ -314,7 +339,7 @@ impl ProcessVariable {
                 Some(event)
             } else {
                 sub.filters
-                    .apply(FilteredMonitorEvent::new(event, EventMask::VALUE))
+                    .apply(FilteredMonitorEvent::new(event, post))
                     .map(|fe| fe.event)
             };
             let Some(event) = filtered else {
@@ -406,5 +431,74 @@ impl ProcessVariable {
         let subs = self.subscribers.lock().await;
         let sub = subs.iter().find(|s| s.sid == sid)?;
         sub.coalesced.lock().ok()?.take()
+    }
+}
+
+#[cfg(test)]
+mod mask_gate_tests {
+    use super::*;
+
+    // CA DBE_* monitor mask bits (db_access.h).
+    const DBE_VALUE: u16 = 1;
+    const DBE_ALARM: u16 = 4;
+
+    fn pv() -> ProcessVariable {
+        ProcessVariable::new("test:pv".into(), EpicsValue::Double(0.0))
+    }
+
+    /// CA-FR-6: a `DBE_ALARM`-only subscriber must not receive a plain
+    /// value set, but must receive an alarm post.
+    #[tokio::test]
+    async fn alarm_only_subscriber_skips_value_post() {
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_ALARM)
+            .await
+            .expect("subscriber added");
+        pv.set(EpicsValue::Double(1.0)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "DBE_ALARM-only subscriber must not receive a value post"
+        );
+        pv.post_alarm(2, 3).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "DBE_ALARM subscriber must receive an alarm post"
+        );
+    }
+
+    /// CA-FR-6: a `DBE_VALUE`-only subscriber must not receive a
+    /// `post_alarm`, but must receive value sets.
+    #[tokio::test]
+    async fn value_only_subscriber_skips_alarm_post() {
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
+            .await
+            .expect("subscriber added");
+        pv.post_alarm(2, 3).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "DBE_VALUE-only subscriber must not receive an alarm post"
+        );
+        pv.set(EpicsValue::Double(1.0)).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "DBE_VALUE subscriber must receive a value post"
+        );
+    }
+
+    /// A `DBE_VALUE | DBE_ALARM` subscriber receives both event classes.
+    #[tokio::test]
+    async fn both_classes_receive_both_posts() {
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_VALUE | DBE_ALARM)
+            .await
+            .expect("subscriber added");
+        pv.set(EpicsValue::Double(1.0)).await;
+        assert!(rx.try_recv().is_ok(), "value post delivered to VALUE|ALARM");
+        pv.post_alarm(2, 3).await;
+        assert!(rx.try_recv().is_ok(), "alarm post delivered to VALUE|ALARM");
     }
 }

@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.18.4 — 2026-05-20
+
+`epics-ca-rs` monitor-delivery hardening + a new client-side
+per-subscription pause API, and an `epics-pva-rs` NTNDArray wire-shape
+fix.
+
+### epics-ca-rs — monitor delivery no longer drops the latest value
+
+- The CA client used to deliver monitor updates with
+  `try_send` into a bounded queue (default 256) and **silently drop**
+  on overflow. Under load (full test suite + Python GIL contention)
+  that lost terminal transitions — e.g. a motor `DMOV` 1→0 — so an
+  ophyd `MoveStatus` could hang forever. Delivery now coalesces: on a
+  full queue the latest value is kept in a per-subscription slot
+  rather than dropped, mirroring the C IOC `dbEvent.c`
+  replace-last-pending behaviour. The terminal value always reaches
+  the consumer.
+- The per-subscription delivery buffer is a small, single-invariant
+  state machine (`error` / `ready` / `gated` cells with
+  `gated.is_some() ⇒ paused`). Errors (`ECA_DISCONN`, monitor status)
+  bypass pause and are delivered ahead of values; coalescing is
+  uniform (latest-wins) including across a pause boundary.
+- Flow control is single-owner: only a bounded-channel send/receive
+  moves the per-circuit outstanding count, so the coalesce slot can't
+  trip the wire-level `EVENTS_OFF` and freeze sibling subscriptions on
+  the same circuit. `EPICS_CA_MONITOR_QUEUE` is clamped to at least the
+  `EVENTS_OFF` threshold so a lone full channel can still engage flow
+  control.
+- **New API** (`MonitorHandle`, additive): `pause()` / `resume()` /
+  `is_paused()` — client-side per-subscription pause with no CA wire
+  message (wire compatibility preserved). While paused, value updates
+  coalesce into the slot and are withheld; pre-pause channel backlog
+  and connection/terminal errors are still delivered.
+
+### epics-pva-rs — NTNDArray descriptor matches pvxs
+
+- `nt::nd_array::nt_nd_array_desc` drifted from pvxs
+  `nt.cpp::NTNDArray::build`: the `value` union enumerated variants in
+  ScalarType-enum order and the `dimension` element had an empty
+  `struct_id`. Aligned to pvxs (signed-then-unsigned variant order;
+  `dimension_t` struct id) and verified with pvxs's own `pvxget`
+  against the Rust server. `NdArrayBuffer::selector` indices updated to
+  match.
+- Expanded the pvxs wire-golden suite to 90 byte-exact cases now
+  derived from bytes captured at run time from `libpvxs`
+  (`tools/pvxs-golden-capture/`) rather than hand-read from source —
+  scalars, scalar arrays, Size boundaries, sub-structure/union/variant,
+  Status, headers, BitMask, NT descriptors, floating-point specials,
+  UTF-8.
+
 ## v0.18.3 — 2026-05-20
 
 Build fix for non-macOS targets. `v0.18.2` is yanked from crates.io.

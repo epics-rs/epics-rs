@@ -547,6 +547,144 @@ pub async fn op_put_field(
     result
 }
 
+/// Clone the sub-value at a dotted path out of a value tree.
+fn value_at_path(root: &PvField, parts: &[&str]) -> Option<PvField> {
+    match parts.split_first() {
+        None => Some(root.clone()),
+        Some((head, tail)) => match root {
+            PvField::Structure(s) => s.get_field(head).and_then(|c| value_at_path(c, tail)),
+            _ => None,
+        },
+    }
+}
+
+/// Assign `leaf` at a dotted path inside a value tree (the structure
+/// must already contain the path — it does, since the accumulator is
+/// built from the prototype default). No-op if the path is absent.
+fn assign_at_path(root: &mut PvField, parts: &[&str], leaf: PvField) {
+    match parts.split_first() {
+        None => *root = leaf,
+        Some((head, tail)) => {
+            if let PvField::Structure(s) = root {
+                if let Some(child) = s.get_field_mut(head) {
+                    assign_at_path(child, tail, leaf);
+                }
+            }
+        }
+    }
+}
+
+/// PUT multiple `field=value` assignments as a single delta. Mirrors
+/// pvxs `pvxput` (`tools/put.cpp:115-134`): build from the channel
+/// prototype, assign every requested field by dotted path, and mark
+/// only the assigned fields in the changed BitSet. `pv_req_override`
+/// supplies the INIT pvRequest (e.g. `-r record[process=true]`); when
+/// `None`, the request selects exactly the assigned field paths.
+///
+/// PVA-FR-6: one prototype-based PUT, not one round-trip per field and
+/// not a single string concatenated into `.value`.
+pub async fn op_put_fields(
+    channel: &Arc<Channel>,
+    assignments: &[(String, String)],
+    pv_req_override: Option<&[u8]>,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    if assignments.is_empty() {
+        return Err(PvaError::InvalidValue("no field assignments".into()));
+    }
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let order = server.byte_order;
+    let big_endian = matches!(order, ByteOrder::Big);
+    let codec = PvaCodec { big_endian };
+    let ioid = alloc_ioid();
+
+    let derived_req;
+    let pv_req: &[u8] = match pv_req_override {
+        Some(bytes) => bytes,
+        None => {
+            let paths: Vec<&str> = assignments.iter().map(|(p, _)| p.as_str()).collect();
+            derived_req = build_pv_request_fields(&paths, big_endian);
+            &derived_req
+        }
+    };
+
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
+    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
+    let cache = server.type_cache();
+
+    let init_req = codec.build_put_init(sid, ioid, pv_req);
+    server.send(init_req).await?;
+    let init_frame = await_frame(&mut stream, op_timeout).await?;
+    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+        OpResponse::Init(i) => i,
+        other => {
+            server.unregister_ioid(ioid);
+            return Err(PvaError::Protocol(format!(
+                "expected PUT INIT, got {other:?}"
+            )));
+        }
+    };
+    if !init.status.is_success() {
+        server.unregister_ioid(ioid);
+        return Err(PvaError::Protocol(format!(
+            "PUT INIT failed: {:?}",
+            init.status
+        )));
+    }
+    ioid_guard.arm_destroy(sid);
+    let intro = init.introspection;
+
+    // Build the delta from the prototype default, then overwrite just
+    // the assigned leaves and mark just their bits.
+    let mut value = crate::pvdata::encode::default_value_for(&intro);
+    let mut changed = BitSet::new();
+    for (path, value_str) in assignments {
+        let parts: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+        let bit = intro.bit_for_path(path).ok_or_else(|| {
+            PvaError::InvalidValue(format!("field path '{path}' not present in introspection"))
+        })?;
+        // Reuse the single-path builder (parse + tree shape), then lift
+        // just this path's leaf into the shared accumulator.
+        let one = build_put_value_for_path(&intro, &parts, value_str)?;
+        let leaf = value_at_path(&one, &parts)
+            .ok_or_else(|| PvaError::InvalidValue(format!("could not build field '{path}'")))?;
+        assign_at_path(&mut value, &parts, leaf);
+        changed.set(bit);
+    }
+
+    let mut payload = Vec::new();
+    payload.put_u32(sid, order);
+    payload.put_u32(ioid, order);
+    payload.put_u8(0x00);
+    changed.write_into(order, &mut payload);
+    encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut payload);
+    let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
+    let mut frame = Vec::new();
+    header.write_into(&mut frame);
+    frame.extend_from_slice(&payload);
+    server.send(frame).await?;
+
+    let done_frame = await_frame(&mut stream, op_timeout).await?;
+    let result = match decode_op_response(&done_frame, Some(&intro))? {
+        OpResponse::Status(s) => {
+            if s.status.is_success() {
+                Ok(())
+            } else {
+                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+            }
+        }
+        other => Err(PvaError::Protocol(format!(
+            "expected PUT done, got {other:?}"
+        ))),
+    };
+
+    ioid_guard.disarm();
+    let destroy = codec.build_destroy_request(sid, ioid);
+    let _ = server.send(destroy).await;
+    server.unregister_ioid(ioid);
+    result
+}
+
 /// PUT a single dotted-path field using a caller-provided pvRequest.
 /// Like [`op_put_field`] but INIT uses `pv_req` bytes supplied by the
 /// caller (typically `field() record[process=..,block=..]`) instead of

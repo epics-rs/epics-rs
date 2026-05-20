@@ -79,33 +79,50 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Legacy pvput joins multiple value tokens with single spaces when
-    // they aren't `field=value` pairs. We follow the same convention.
-    let value_str = args.values.join(" ");
+    // pvxs `pvxput` (tools/put.cpp:83-104): a single bare token is
+    // shorthand for `value=<token>`; otherwise every token must be
+    // `<field>=<value>`. Mixed bare/field input is rejected.
+    let input = match parse_put_args(&args.values) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let client = PvaClient::new().expect("failed to create PVA client");
+
+    // Parse the optional pvRequest once (shared by both put forms).
+    let trimmed = args.request.trim();
+    let request = if trimmed.is_empty() {
+        None
+    } else {
+        match PvRequestExpr::parse(trimmed) {
+            Ok(req) => Some(req),
+            Err(e) => {
+                eprintln!("error: invalid pvRequest {:?}: {e}", args.request);
+                std::process::exit(1);
+            }
+        }
+    };
 
     // 1. Read old NTScalar (with timestamp) for the `Old :` echo line.
     //    Errors are tolerated — legacy pvput emits an "Error:" line in
     //    the gap and continues to the put.
     let old_get = client.pvget_full(&pv_name).await;
 
-    // 2. Do the put. When a pvRequest was supplied via `-r`, parse it
-    //    and route it onto the wire via `pvput_with_request`; otherwise
-    //    use the channel-default `field(value)` request.
-    let put_result = {
-        let trimmed = args.request.trim();
-        if trimmed.is_empty() {
-            client.pvput(&pv_name, &value_str).await
-        } else {
-            match PvRequestExpr::parse(trimmed) {
-                Ok(req) => client.pvput_with_request(&pv_name, &req, &value_str).await,
-                Err(e) => {
-                    eprintln!("error: invalid pvRequest {:?}: {e}", args.request);
-                    std::process::exit(1);
-                }
-            }
+    // 2. Do the put. Field assignments build one prototype-based delta;
+    //    a bare value targets `.value` via the existing helpers.
+    let put_result = match &input {
+        PutInput::Fields(assignments) => {
+            client
+                .pvput_fields(&pv_name, assignments, request.as_ref())
+                .await
         }
+        PutInput::Bare(value_str) => match &request {
+            None => client.pvput(&pv_name, value_str).await,
+            Some(req) => client.pvput_with_request(&pv_name, req, value_str).await,
+        },
     };
     if let Err(e) = put_result {
         eprintln!("error: {e}");
@@ -146,6 +163,42 @@ async fn main() {
     let _ = (args.provider, args.mode, args.verbose, args.debug);
 }
 
+/// Parsed CLI value tokens. pvxs `pvxput` accepts either one bare
+/// value (→ `value=<token>`) or one-or-more `<field>=<value>` pairs;
+/// the two forms must not be mixed.
+#[derive(Debug)]
+enum PutInput {
+    /// Single bare value (possibly space-joined array tokens), written
+    /// to `.value`.
+    Bare(String),
+    /// One or more `field=value` assignments, written as a delta.
+    Fields(Vec<(String, String)>),
+}
+
+/// Classify the value tokens. A token containing `=` switches the whole
+/// invocation into field-assignment mode (mirrors pvxs put.cpp:83-104):
+/// then *every* token must be `<field>=<value>`, else it is an error.
+fn parse_put_args(values: &[String]) -> Result<PutInput, String> {
+    if !values.iter().any(|v| v.contains('=')) {
+        // No assignment syntax — legacy bare/array value joined by space.
+        return Ok(PutInput::Bare(values.join(" ")));
+    }
+    let mut assignments = Vec::with_capacity(values.len());
+    for tok in values {
+        match tok.split_once('=') {
+            Some((field, value)) if !field.is_empty() => {
+                assignments.push((field.to_string(), value.to_string()));
+            }
+            _ => {
+                return Err(format!(
+                    "expected <field>=<value>, got {tok:?} (do not mix bare and field assignments)"
+                ));
+            }
+        }
+    }
+    Ok(PutInput::Fields(assignments))
+}
+
 /// Render an `Old :` / `New :` echo line in legacy `pvput.cpp` shape:
 ///   `<label><timestamp>  <value> \n`
 /// where `<label>` already carries the `: ` and `<value>` is rendered
@@ -153,4 +206,51 @@ async fn main() {
 /// hexdump of `pvput`'s output (`Old : 2026-... 0 \n`).
 fn format_old_new_line(label: &str, s: &PvStructure) -> String {
     format!("{label}{}", format::format_nt_old_new_payload(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn bare_single_value_maps_to_value() {
+        match parse_put_args(&v(&["42"])).unwrap() {
+            PutInput::Bare(s) => assert_eq!(s, "42"),
+            PutInput::Fields(_) => panic!("single bare token must be Bare"),
+        }
+    }
+
+    #[test]
+    fn bare_array_tokens_join_with_space() {
+        match parse_put_args(&v(&["1", "2", "3"])).unwrap() {
+            PutInput::Bare(s) => assert_eq!(s, "1 2 3"),
+            PutInput::Fields(_) => panic!("no '=' tokens must be Bare"),
+        }
+    }
+
+    #[test]
+    fn field_assignments_parse_each_pair() {
+        match parse_put_args(&v(&["alarm.severity=2", "timeStamp.nanoseconds=5"])).unwrap() {
+            PutInput::Fields(f) => {
+                assert_eq!(
+                    f,
+                    vec![
+                        ("alarm.severity".to_string(), "2".to_string()),
+                        ("timeStamp.nanoseconds".to_string(), "5".to_string()),
+                    ]
+                );
+            }
+            PutInput::Bare(_) => panic!("'=' tokens must be Fields"),
+        }
+    }
+
+    #[test]
+    fn mixed_bare_and_field_is_rejected() {
+        let err = parse_put_args(&v(&["42", "alarm.severity=2"])).unwrap_err();
+        assert!(err.contains("expected <field>=<value>"), "got: {err}");
+    }
 }

@@ -880,6 +880,38 @@ impl PvaClient {
         .await
     }
 
+    /// PUT multiple `field=value` assignments as one prototype-based
+    /// delta (PVA-FR-6). Each `(field_path, value_str)` is applied by
+    /// dotted path and only the assigned fields are marked. `request`
+    /// supplies the INIT pvRequest (e.g. `record[process=true]`); when
+    /// `None` the request selects exactly the assigned paths. Mirrors
+    /// pvxs `pvxput`'s multi-field form.
+    pub async fn pvput_fields(
+        &self,
+        pv_name: &str,
+        assignments: &[(String, String)],
+        request: Option<&crate::pv_request::PvRequestExpr>,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        let req_bytes = match request {
+            Some(req) => {
+                let big_endian = matches!(
+                    ch.ensure_active().await?.0.byte_order,
+                    crate::proto::ByteOrder::Big
+                );
+                Some(req.encode(big_endian))
+            }
+            None => None,
+        };
+        crate::client_native::ops_v2::op_put_fields(
+            &ch,
+            assignments,
+            req_bytes.as_deref(),
+            self.inner.timeout,
+        )
+        .await
+    }
+
     /// PUT a pre-built [`PvField`] with a custom pvRequest. Like
     /// `pvput_pv_field` but INIT carries the caller's record options
     /// (`process`, `block`). DATA still targets `"value"`.

@@ -50,14 +50,6 @@ fn golden_pvxs_nt_enum_desc() {
 }
 
 #[test]
-#[ignore = "Rust nt_nd_array_desc() drifts from pvxs nt.cpp NTNDArray::build: \
-            (1) value-union variant order is ScalarType-enum order \
-            (bool,byte,ubyte,short,ushort,int,uint,long,ulong,float,double) \
-            instead of pvxs's signed-then-unsigned order (bool,byte,short,int,\
-            long,ubyte,ushort,uint,ulong,float,double); \
-            (2) dimension element struct_id is empty instead of pvxs \
-            'dimension_t'. Both are schema findings, not encoder bugs — \
-            pvxs bytes stay locked in fixtures.txt for when nd_array.rs aligns."]
 fn golden_pvxs_nt_ndarray_desc() {
     let d = nd_array::nt_nd_array_desc();
     assert_eq!(encode(&d, ByteOrder::Big), golden("nt_ndarray_desc"));

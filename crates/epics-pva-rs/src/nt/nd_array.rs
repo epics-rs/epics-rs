@@ -65,17 +65,20 @@ pub enum NdArrayBuffer {
 
 impl NdArrayBuffer {
     /// Index into the value union (matches the descriptor produced by
-    /// [`value_union_desc`]).
+    /// [`value_union_desc`]). pvxs `nt.cpp::NTNDArray::build` orders
+    /// variants as all signed types first (bool, byte, short, int,
+    /// long) then all unsigned (ubyte, ushort, uint, ulong) then
+    /// float, double — not ScalarType-enum order.
     pub fn selector(&self) -> i32 {
         match self {
             Self::Boolean(_) => 0,
             Self::Byte(_) => 1,
-            Self::UByte(_) => 2,
-            Self::Short(_) => 3,
-            Self::UShort(_) => 4,
-            Self::Int(_) => 5,
-            Self::UInt(_) => 6,
-            Self::Long(_) => 7,
+            Self::Short(_) => 2,
+            Self::Int(_) => 3,
+            Self::Long(_) => 4,
+            Self::UByte(_) => 5,
+            Self::UShort(_) => 6,
+            Self::UInt(_) => 7,
             Self::ULong(_) => 8,
             Self::Float(_) => 9,
             Self::Double(_) => 10,
@@ -263,8 +266,11 @@ fn time_t_desc() -> FieldDesc {
 }
 
 fn dimension_desc() -> FieldDesc {
+    // pvxs `nt.cpp::NTNDArray::build` names this inner struct
+    // `dimension_t`; an empty struct_id makes Rust's descriptor
+    // tree decode as a different anonymous type than pvxs's.
     FieldDesc::StructureArray {
-        struct_id: String::new(),
+        struct_id: "dimension_t".into(),
         fields: vec![
             ("size".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("offset".into(), FieldDesc::Scalar(ScalarType::Int)),
@@ -303,7 +309,13 @@ fn codec_desc() -> FieldDesc {
     }
 }
 
-/// Descriptor of the `value` union (12 typed-array variants).
+/// Descriptor of the `value` union (11 typed-array variants).
+///
+/// pvxs `nt.cpp::NTNDArray::build` orders the variants
+/// signed-first then unsigned: bool, byte, short, int, long,
+/// ubyte, ushort, uint, ulong, float, double — **not**
+/// ScalarType-enum order. Selector indices must match (see
+/// [`NdArrayBuffer::selector`]).
 pub fn value_union_desc() -> FieldDesc {
     FieldDesc::Union {
         struct_id: String::new(),
@@ -314,20 +326,20 @@ pub fn value_union_desc() -> FieldDesc {
             ),
             ("byteValue".into(), FieldDesc::ScalarArray(ScalarType::Byte)),
             (
-                "ubyteValue".into(),
-                FieldDesc::ScalarArray(ScalarType::UByte),
-            ),
-            (
                 "shortValue".into(),
                 FieldDesc::ScalarArray(ScalarType::Short),
+            ),
+            ("intValue".into(), FieldDesc::ScalarArray(ScalarType::Int)),
+            ("longValue".into(), FieldDesc::ScalarArray(ScalarType::Long)),
+            (
+                "ubyteValue".into(),
+                FieldDesc::ScalarArray(ScalarType::UByte),
             ),
             (
                 "ushortValue".into(),
                 FieldDesc::ScalarArray(ScalarType::UShort),
             ),
-            ("intValue".into(), FieldDesc::ScalarArray(ScalarType::Int)),
             ("uintValue".into(), FieldDesc::ScalarArray(ScalarType::UInt)),
-            ("longValue".into(), FieldDesc::ScalarArray(ScalarType::Long)),
             (
                 "ulongValue".into(),
                 FieldDesc::ScalarArray(ScalarType::ULong),
@@ -404,7 +416,9 @@ fn dimension_value(dims: &[NdDimension]) -> PvField {
     PvField::StructureArray(
         dims.iter()
             .map(|d| {
-                let mut s = PvStructure::new(String::new().as_str());
+                // Paired with `dimension_desc` — must use the same
+                // pvxs-canonical struct_id.
+                let mut s = PvStructure::new("dimension_t");
                 s.fields
                     .push(("size".into(), PvField::Scalar(ScalarValue::Int(d.size))));
                 s.fields

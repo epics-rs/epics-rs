@@ -2196,6 +2196,36 @@ async fn handle_connection_io(
     }
 }
 
+/// Decode the VALUE body of an INIT pvRequest, after its descriptor
+/// has already been read from `cur`.
+///
+/// Distinguishes an ABSENT value body (the cursor is exhausted after
+/// the descriptor — the Rust client's RPC INIT sends only the type)
+/// from a PRESENT but malformed one. pvxs `from_wire_type_value`
+/// requires type+value and resets the connection on `!M.good()`
+/// (`serverget.cpp:368-371`, `servermon.cpp:489`). We tolerate the
+/// absent body for Rust↔Rust interop, but a present-but-undecodable
+/// body is an INIT protocol error — the previous `decode_pv_field(..).ok()`
+/// collapsed both into `None`, so a malformed pvRequest silently
+/// dropped its `_filter` / pipeline / `process`|`block` options and the
+/// op was registered with an OK INIT.
+///
+/// Returns `Ok(None)` for an absent body, `Ok(Some(value))` for a
+/// present-and-decoded one, and `Err(message)` for a present-but-
+/// malformed one (the caller turns that into an INIT error).
+fn decode_init_pv_request_value(
+    cur: &mut std::io::Cursor<&[u8]>,
+    req_desc: &FieldDesc,
+    order: ByteOrder,
+) -> Result<Option<PvField>, String> {
+    if cur.position() as usize >= cur.get_ref().len() {
+        return Ok(None);
+    }
+    decode_pv_field(req_desc, cur, order)
+        .map(Some)
+        .map_err(|e| format!("invalid pvRequest value: {e}"))
+}
+
 /// Build a minimal [`OpState`] for non-MONITOR ops (GET / PUT /
 /// PUT_GET / PROCESS). The monitor-specific fields are all defaulted
 /// to inert values — these ops never spawn a subscriber task.
@@ -2316,7 +2346,13 @@ async fn handle_put_get(
                 return Ok(());
             }
         };
-        let req_value = decode_pv_field(&req_desc, &mut cur, order).ok();
+        let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, order) {
+            Ok(v) => v,
+            Err(e) => {
+                send_op_error(tx, OpKind::PutGet, ioid, &e, order).await?;
+                return Ok(());
+            }
+        };
         // PVA-R19: empty mask is an INIT error.
         let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
             Ok(m) => m,
@@ -3190,16 +3226,21 @@ async fn handle_op(
             }
         };
         // PVA-R19: descriptor decode failure already routed through
-        // `send_op_error` above. The pvRequest VALUE body is more
-        // permissive — Rust client RPC INIT currently omits the
-        // value (only the descriptor), and pipeline-options /
-        // filter-chain parsers happily consume `None`. Treat a
-        // value-decode failure as "no parseable value" rather than
-        // INIT-level protocol error so we don't regress existing
-        // Rust↔Rust interop. pvxs requires both via
-        // `from_wire_type_value`; revisit when the client is brought
-        // up to send the full pvRequest body on RPC INIT too.
-        let req_value = decode_pv_field(&req_desc, &mut cur, order).ok();
+        // `send_op_error` above. For the VALUE body, distinguish an
+        // ABSENT body (the Rust client's RPC INIT sends only the
+        // descriptor — tolerated for interop) from a PRESENT but
+        // malformed one. pvxs `from_wire_type_value` + `!M.good()`
+        // resets on either; we tolerate absence but reject a
+        // present-but-undecodable value, so a malformed pvRequest can no
+        // longer silently drop `_filter` / pipeline / `process`|`block`
+        // options behind an OK INIT. See `decode_init_pv_request_value`.
+        let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, order) {
+            Ok(v) => v,
+            Err(e) => {
+                send_op_error(tx, kind, ioid, &e, order).await?;
+                return Ok(());
+            }
+        };
         let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
             Ok(m) => m,
             Err(e) => {
@@ -5927,6 +5968,56 @@ mod tests {
         let opts = parsed_opts(&req);
         assert!(!opts.enabled, "pipeline=false stays non-pipeline");
         assert_eq!(opts.queue_size, 4, "invalid queueSize → default 4");
+    }
+
+    /// Finding (Medium): the INIT pvRequest VALUE decode must
+    /// distinguish an ABSENT body (cursor exhausted after the
+    /// descriptor — tolerated for the Rust client's RPC INIT) from a
+    /// PRESENT but malformed one (an INIT protocol error). The previous
+    /// `decode_pv_field(..).ok()` collapsed both into `None`, silently
+    /// dropping `_filter` / pipeline / `process`|`block` options.
+    /// Tested by the presence/validity boundary, not by scenario.
+    mod decode_init_pv_request_value_owner {
+        use super::*;
+
+        /// No value body (cursor at end after the descriptor): tolerated
+        /// as "no options".
+        #[test]
+        fn absent_body_is_none() {
+            let desc = FieldDesc::Scalar(ScalarType::Int);
+            let buf: &[u8] = &[];
+            let mut cur = std::io::Cursor::new(buf);
+            assert!(matches!(
+                decode_init_pv_request_value(&mut cur, &desc, ByteOrder::Little),
+                Ok(None)
+            ));
+        }
+
+        /// Present, well-formed value body: decoded to `Some`.
+        #[test]
+        fn present_valid_body_decodes() {
+            let desc = FieldDesc::Scalar(ScalarType::Int);
+            let buf: &[u8] = &[42, 0, 0, 0]; // i32 LE = 42
+            let mut cur = std::io::Cursor::new(buf);
+            assert_eq!(
+                decode_init_pv_request_value(&mut cur, &desc, ByteOrder::Little),
+                Ok(Some(PvField::Scalar(ScalarValue::Int(42)))),
+            );
+        }
+
+        /// Present but malformed body (descriptor needs 4 bytes for an
+        /// Int, only 2 are there): the formerly-swallowed path — now an
+        /// error rather than a silent `None`.
+        #[test]
+        fn present_malformed_body_is_err() {
+            let desc = FieldDesc::Scalar(ScalarType::Int);
+            let buf: &[u8] = &[1, 2]; // truncated i32
+            let mut cur = std::io::Cursor::new(buf);
+            assert!(
+                decode_init_pv_request_value(&mut cur, &desc, ByteOrder::Little).is_err(),
+                "a present-but-truncated value body must error, not collapse to None",
+            );
+        }
     }
 
     #[test]

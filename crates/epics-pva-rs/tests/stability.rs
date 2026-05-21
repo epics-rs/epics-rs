@@ -724,6 +724,37 @@ async fn p5_monitor_explicit_pipeline_window_works() {
     h.abort();
 }
 
+/// pvxs `servermon.cpp:537-540` parity: a pipelined monitor whose
+/// PRESENT `queueSize` is invalid (`< 2`) must be REJECTED at INIT
+/// (`ctrl->error(...)` + `return`), not silently downgraded to a
+/// non-pipeline monitor. The high-level monitor op surfaces the INIT
+/// error as a fatal `Err`, so the call returns rather than streaming.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipeline_invalid_queue_size_rejects_monitor_init() {
+    use epics_pva_rs::pv_request::PvRequestExpr;
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:MON:BADQ", 0.0).await;
+
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    let req = PvRequestExpr::parse("record[pipeline=true,queueSize=1]").expect("parse pvRequest");
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.pvmonitor_with_request("STAB:MON:BADQ", &req, |_| {}),
+    )
+    .await
+    .expect("MONITOR INIT must resolve (reject), not hang");
+
+    assert!(
+        result.is_err(),
+        "pipeline + queueSize<2 must fail the MONITOR INIT, got {result:?}"
+    );
+
+    h.abort();
+}
+
 #[tokio::test]
 async fn p8_channel_coalesces_concurrent_pvget() {
     let source = Arc::new(MemSource::new());

@@ -53,6 +53,21 @@ struct PipelineOptions {
     ack_at: u32,
 }
 
+/// Outcome of parsing a MONITOR INIT pvRequest's `record._options`
+/// pipeline negotiation. Distinguishes the two cases the single `None`
+/// return used to conflate — a parsed set of options vs. a negotiation
+/// error the INIT must be rejected for.
+enum MonitorPipelineRequest {
+    /// Parsed options to apply (pipeline on or off).
+    Options(PipelineOptions),
+    /// pvxs `servermon.cpp:537-540`: `pipeline=true` with a PRESENT but
+    /// invalid (`<2` or unparseable) `queueSize`. The pipeline
+    /// sub-protocol requires agreement on `queueSize`, so the INIT is
+    /// rejected with an error (`ctrl->error(...)` + `return`) rather
+    /// than silently downgraded to a non-pipeline monitor.
+    Reject,
+}
+
 /// pvxs `servermon.cpp:554-581` — derive the pipeline ACK-refill
 /// threshold `ackAt` from `record._options.ackAny` and the negotiated
 /// `queueSize` (pvxs `limit`). `ackAny` may be a plain integer (typed
@@ -598,7 +613,13 @@ fn parse_monitor_init_nack(
 /// Inspect a decoded pvRequest for `record._options.pipeline` and
 /// `record._options.queueSize`. pvxs `Subscription` defaults to
 /// `queueSize = 4` when pipeline is enabled; we follow.
-fn monitor_pipeline_options(req: &PvField) -> Option<PipelineOptions> {
+///
+/// Returns `None` only when there is no `record._options` structure to
+/// negotiate (a plain monitor). A present `_options` yields
+/// [`MonitorPipelineRequest::Options`], or [`MonitorPipelineRequest::Reject`]
+/// when `pipeline=true` is paired with a PRESENT-but-invalid
+/// `queueSize` (pvxs `servermon.cpp:537-540`).
+fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
     use crate::pvdata::ScalarValue;
     let root = match req {
         PvField::Structure(s) => s,
@@ -650,24 +671,28 @@ fn monitor_pipeline_options(req: &PvField) -> Option<PipelineOptions> {
             })
         })
         .unwrap_or(false);
-    // PVA-R20: pvxs `servermon.cpp:533-540` rejects invalid or `<2`
-    // queueSize when pipeline is enabled (sets pipeline off). Pre-fix
-    // Rust silently defaulted to 4 on parse failure and clamped to
-    // 1 — accepting `queueSize=1` for a pipelined monitor, which
-    // pvxs rejects because the credit accounting needs ≥2 slots.
-    let queue_size = opt_s.fields.iter().find_map(|(k, v)| {
-        (k == "queueSize").then_some(v).and_then(|v| match v {
-            PvField::Scalar(ScalarValue::String(s)) => s.parse::<u32>().ok(),
-            PvField::Scalar(ScalarValue::Byte(i)) => u32::try_from(*i).ok(),
-            PvField::Scalar(ScalarValue::UByte(i)) => Some(u32::from(*i)),
-            PvField::Scalar(ScalarValue::Short(i)) => u32::try_from(*i).ok(),
-            PvField::Scalar(ScalarValue::UShort(i)) => Some(u32::from(*i)),
-            PvField::Scalar(ScalarValue::Int(i)) => u32::try_from(*i).ok(),
-            PvField::Scalar(ScalarValue::UInt(i)) => Some(*i),
-            PvField::Scalar(ScalarValue::Long(l)) => u32::try_from(*l).ok(),
-            PvField::Scalar(ScalarValue::ULong(l)) => u32::try_from(*l).ok(),
-            _ => None,
-        })
+    // pvxs `servermon.cpp:533-540` distinguishes a PRESENT-but-invalid
+    // `queueSize` from an ABSENT one: `if(auto queueSize = ...)` gates
+    // on presence, then `queueSize.as(qSize) && qSize>=2` gates on
+    // validity. Track both — the `queue_size` parse collapses
+    // "absent" and "present-unparseable" to `None`, so presence must be
+    // observed separately.
+    let queue_size_field = opt_s
+        .fields
+        .iter()
+        .find_map(|(k, v)| (k == "queueSize").then_some(v));
+    let queue_size_present = queue_size_field.is_some();
+    let queue_size = queue_size_field.and_then(|v| match v {
+        PvField::Scalar(ScalarValue::String(s)) => s.parse::<u32>().ok(),
+        PvField::Scalar(ScalarValue::Byte(i)) => u32::try_from(*i).ok(),
+        PvField::Scalar(ScalarValue::UByte(i)) => Some(u32::from(*i)),
+        PvField::Scalar(ScalarValue::Short(i)) => u32::try_from(*i).ok(),
+        PvField::Scalar(ScalarValue::UShort(i)) => Some(u32::from(*i)),
+        PvField::Scalar(ScalarValue::Int(i)) => u32::try_from(*i).ok(),
+        PvField::Scalar(ScalarValue::UInt(i)) => Some(*i),
+        PvField::Scalar(ScalarValue::Long(l)) => u32::try_from(*l).ok(),
+        PvField::Scalar(ScalarValue::ULong(l)) => u32::try_from(*l).ok(),
+        _ => None,
     });
     // pvxs `servermon.cpp:554` — `record._options.ackAny`. Parsed only
     // for an enabled pipeline (`ackAt` is meaningless without one).
@@ -675,28 +700,42 @@ fn monitor_pipeline_options(req: &PvField) -> Option<PipelineOptions> {
         .fields
         .iter()
         .find_map(|(k, v)| (k == "ackAny").then_some(v));
-    if enabled {
+    let opts = if enabled {
         match queue_size {
-            Some(n) if n >= 2 => Some(PipelineOptions {
+            // Valid: use the requested window (pvxs `op->limit = qSize`).
+            Some(n) if n >= 2 => PipelineOptions {
                 enabled: true,
                 queue_size: n,
                 ack_at: ack_at_from(ack_any, n),
-            }),
-            // pvxs: invalid/<2 queueSize disables pipeline rather than
-            // accepting a broken negotiation.
-            _ => Some(PipelineOptions {
-                enabled: false,
-                queue_size: queue_size.unwrap_or(4).max(1),
-                ack_at: 1,
-            }),
+            },
+            // PRESENT but invalid (`<2` or unparseable): pvxs
+            // `servermon.cpp:537-540` rejects the INIT — the pipeline
+            // sub-protocol requires agreement on `queueSize`. Do NOT
+            // downgrade to a non-pipeline monitor.
+            _ if queue_size_present => return Some(MonitorPipelineRequest::Reject),
+            // ABSENT: pvxs keeps the default `limit` (4) and leaves
+            // pipeline enabled.
+            _ => PipelineOptions {
+                enabled: true,
+                queue_size: 4,
+                ack_at: ack_at_from(ack_any, 4),
+            },
         }
     } else {
-        Some(PipelineOptions {
+        // Non-pipeline: a valid `queueSize` sets the queue depth
+        // (pvxs sets `op->limit` regardless of pipeline); an invalid or
+        // absent one keeps the default 4 (pvxs warns and ignores).
+        let queue_size = match queue_size {
+            Some(n) if n >= 2 => n,
+            _ => 4,
+        };
+        PipelineOptions {
             enabled: false,
-            queue_size: queue_size.unwrap_or(4).max(1),
+            queue_size,
             ack_at: 1,
-        })
-    }
+        }
+    };
+    Some(MonitorPipelineRequest::Options(opts))
 }
 
 #[derive(Debug, Clone)]
@@ -3190,10 +3229,30 @@ async fn handle_op(
         // bug for default `pvmonitor` callers (initial snapshot + 4
         // window credits). Without pipeline=true we don't gate the
         // emit loop — mpsc backpressure remains the only limiter.
-        let pipeline_opt = req_value
-            .as_ref()
-            .and_then(monitor_pipeline_options)
-            .filter(|o| o.enabled);
+        let pipeline_req = req_value.as_ref().and_then(monitor_pipeline_options);
+        // pvxs `servermon.cpp:537-540`: a MONITOR pipeline request whose
+        // PRESENT `queueSize` is invalid (`<2`/unparseable) is a
+        // negotiation error — reject the INIT (`ctrl->error(...)` +
+        // `return`) instead of silently downgrading to a non-pipeline
+        // monitor. GET/PUT/RPC never negotiate pipeline (pvxs
+        // `serverget` ignores these options), so the reject is
+        // monitor-only.
+        if kind == OpKind::Monitor && matches!(pipeline_req, Some(MonitorPipelineRequest::Reject)) {
+            send_op_error(
+                tx,
+                kind,
+                ioid,
+                "can not pipeline invalid queueSize (must be >= 2)",
+                order,
+            )
+            .await?;
+            return Ok(());
+        }
+        let pipeline_opt = match pipeline_req {
+            Some(MonitorPipelineRequest::Options(o)) => Some(o),
+            _ => None,
+        }
+        .filter(|o| o.enabled);
         // pvxs `servermon.cpp:493` — when the client sets the pipeline
         // bit on MONITOR INIT (`subcmd & 0x80`) it appends a u32 `nack`
         // (initial window credit) after the pvRequest. Read and consume
@@ -5750,13 +5809,25 @@ mod tests {
         })
     }
 
+    /// Unwrap the parsed options, asserting the request was NOT a
+    /// pipeline-negotiation reject.
+    fn parsed_opts(req: &PvField) -> PipelineOptions {
+        match monitor_pipeline_options(req) {
+            Some(MonitorPipelineRequest::Options(o)) => o,
+            Some(MonitorPipelineRequest::Reject) => {
+                panic!("expected parsed options, got a pipeline-negotiation Reject")
+            }
+            None => panic!("expected parsed options, got None (no _options structure)"),
+        }
+    }
+
     #[test]
     fn pva_r20_pipeline_typed_bool_true_enables_window() {
         let req = make_pipeline_request(
             PvField::Scalar(ScalarValue::Boolean(true)),
             PvField::Scalar(ScalarValue::Int(16)),
         );
-        let opts = monitor_pipeline_options(&req).expect("parsed");
+        let opts = parsed_opts(&req);
         assert!(opts.enabled, "Boolean(true) must enable pipeline");
         assert_eq!(opts.queue_size, 16);
     }
@@ -5767,7 +5838,7 @@ mod tests {
             PvField::Scalar(ScalarValue::String("true".into())),
             PvField::Scalar(ScalarValue::String("32".into())),
         );
-        let opts = monitor_pipeline_options(&req).expect("parsed");
+        let opts = parsed_opts(&req);
         assert!(opts.enabled, "string \"true\" must still enable pipeline");
         assert_eq!(opts.queue_size, 32);
     }
@@ -5779,22 +5850,83 @@ mod tests {
             PvField::Scalar(ScalarValue::Int(1)),
             PvField::Scalar(ScalarValue::Int(8)),
         );
-        let opts = monitor_pipeline_options(&req).expect("parsed");
+        let opts = parsed_opts(&req);
         assert!(opts.enabled, "Int(1) must enable pipeline");
         assert_eq!(opts.queue_size, 8);
     }
 
     #[test]
-    fn pva_r20_pipeline_queue_size_below_two_disables() {
-        // pvxs `servermon.cpp:533-540` rejects queueSize < 2 even
-        // when pipeline=true. Pre-fix Rust clamped to 1 and ran a
-        // broken window.
+    fn pva_r20_pipeline_queue_size_below_two_rejects() {
+        // pvxs `servermon.cpp:537-540`: pipeline=true with a PRESENT
+        // queueSize < 2 is a negotiation error (`ctrl->error(...)` +
+        // `return`), not a silent downgrade to a non-pipeline monitor.
         let req = make_pipeline_request(
             PvField::Scalar(ScalarValue::Boolean(true)),
             PvField::Scalar(ScalarValue::Int(1)),
         );
-        let opts = monitor_pipeline_options(&req).expect("parsed");
-        assert!(!opts.enabled, "queueSize<2 must disable pipeline");
+        assert!(
+            matches!(
+                monitor_pipeline_options(&req),
+                Some(MonitorPipelineRequest::Reject)
+            ),
+            "pipeline + queueSize<2 must reject the INIT, not downgrade",
+        );
+    }
+
+    #[test]
+    fn pva_r20_pipeline_unparseable_queue_size_rejects() {
+        // PRESENT but unparseable queueSize under pipeline → Reject
+        // (pvxs `queueSize.as(qSize)` fails, then `op->pipeline` → error).
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::String("not-a-number".into())),
+        );
+        assert!(
+            matches!(
+                monitor_pipeline_options(&req),
+                Some(MonitorPipelineRequest::Reject)
+            ),
+            "pipeline + unparseable queueSize must reject the INIT",
+        );
+    }
+
+    #[test]
+    fn pva_r20_pipeline_absent_queue_size_keeps_default_window() {
+        // pvxs keeps the default `limit` (4) when queueSize is ABSENT;
+        // pipeline stays enabled. Only a PRESENT-invalid queueSize
+        // errors — an absent one is not a negotiation failure.
+        let options = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![(
+                "pipeline".to_string(),
+                PvField::Scalar(ScalarValue::Boolean(true)),
+            )],
+        });
+        let record = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("_options".to_string(), options)],
+        });
+        let req = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("record".to_string(), record)],
+        });
+        let opts = parsed_opts(&req);
+        assert!(opts.enabled, "absent queueSize must NOT disable pipeline");
+        assert_eq!(opts.queue_size, 4, "absent queueSize → default window 4");
+    }
+
+    #[test]
+    fn pva_r20_non_pipeline_invalid_queue_size_does_not_reject() {
+        // pipeline=false + invalid queueSize: pvxs warns and ignores
+        // (keeps default limit), it does NOT error. So no Reject, and
+        // the queue depth falls back to the default 4.
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::Int(1)),
+        );
+        let opts = parsed_opts(&req);
+        assert!(!opts.enabled, "pipeline=false stays non-pipeline");
+        assert_eq!(opts.queue_size, 4, "invalid queueSize → default 4");
     }
 
     #[test]
@@ -5803,7 +5935,7 @@ mod tests {
             PvField::Scalar(ScalarValue::Boolean(false)),
             PvField::Scalar(ScalarValue::Int(16)),
         );
-        let opts = monitor_pipeline_options(&req).expect("parsed");
+        let opts = parsed_opts(&req);
         assert!(!opts.enabled, "Boolean(false) must disable pipeline");
     }
 
@@ -5836,7 +5968,7 @@ mod tests {
             PvField::Scalar(ScalarValue::Boolean(true)),
             PvField::Scalar(ScalarValue::Int(16)),
         );
-        let opts = monitor_pipeline_options(&req).expect("parsed");
+        let opts = parsed_opts(&req);
         assert!(opts.enabled);
         assert_eq!(opts.ack_at, 1, "absent ackAny → ackAt == 1");
     }
@@ -5851,7 +5983,7 @@ mod tests {
                 PvField::Scalar(ScalarValue::Int(q as i32)),
                 PvField::Scalar(ScalarValue::Int(ack as i32)),
             );
-            let opts = monitor_pipeline_options(&req).expect("parsed");
+            let opts = parsed_opts(&req);
             assert_eq!(opts.ack_at, want, "ackAny={ack} with queueSize={q}");
         }
         // Explicit 0 → queueSize/2 (servermon.cpp:577-578).
@@ -5860,11 +5992,7 @@ mod tests {
             PvField::Scalar(ScalarValue::Int(q as i32)),
             PvField::Scalar(ScalarValue::Int(0)),
         );
-        assert_eq!(
-            monitor_pipeline_options(&req).unwrap().ack_at,
-            q / 2,
-            "ackAny=0 → queueSize/2"
-        );
+        assert_eq!(parsed_opts(&req).ack_at, q / 2, "ackAny=0 → queueSize/2");
         // Above queueSize → clamps down to queueSize (servermon.cpp:581).
         let req = make_pipeline_request_ack(
             PvField::Scalar(ScalarValue::Boolean(true)),
@@ -5872,7 +6000,7 @@ mod tests {
             PvField::Scalar(ScalarValue::Int(999)),
         );
         assert_eq!(
-            monitor_pipeline_options(&req).unwrap().ack_at,
+            parsed_opts(&req).ack_at,
             q,
             "ackAny>queueSize → clamp to queueSize"
         );
@@ -5886,7 +6014,7 @@ mod tests {
             PvField::Scalar(ScalarValue::Int(16)),
             PvField::Scalar(ScalarValue::String("4".into())),
         );
-        assert_eq!(monitor_pipeline_options(&req).unwrap().ack_at, 4);
+        assert_eq!(parsed_opts(&req).ack_at, 4);
         // Unparseable string → leaves the default of 1.
         let req = make_pipeline_request_ack(
             PvField::Scalar(ScalarValue::Boolean(true)),
@@ -5894,7 +6022,7 @@ mod tests {
             PvField::Scalar(ScalarValue::String("garbage".into())),
         );
         assert_eq!(
-            monitor_pipeline_options(&req).unwrap().ack_at,
+            parsed_opts(&req).ack_at,
             1,
             "unparseable ackAny → default 1"
         );
@@ -5911,7 +6039,7 @@ mod tests {
             PvField::Scalar(ScalarValue::String("0.5%".into())),
         );
         assert_eq!(
-            monitor_pipeline_options(&req).unwrap().ack_at,
+            parsed_opts(&req).ack_at,
             50,
             "0.5% of limit=100 → 0.5*100 = 50 (verbatim pvxs arithmetic)"
         );
@@ -5921,7 +6049,7 @@ mod tests {
             PvField::Scalar(ScalarValue::Int(16)),
             PvField::Scalar(ScalarValue::String("50%".into())),
         );
-        assert_eq!(monitor_pipeline_options(&req).unwrap().ack_at, 16);
+        assert_eq!(parsed_opts(&req).ack_at, 16);
     }
 
     #[test]

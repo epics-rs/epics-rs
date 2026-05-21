@@ -210,6 +210,66 @@ pub fn native_type_for_dbr(dbr_type: u16) -> CaResult<DbFieldType> {
     }
 }
 
+/// DBR request-type names indexed by type code, mirroring the C
+/// `dbr_text[]` table (`ca/src/client/access.cpp`). Index 0 =
+/// `DBR_STRING` … index 38 = `DBR_CLASS_NAME`.
+const DBR_TEXT: [&str; (LAST_BUFFER_TYPE + 1) as usize] = [
+    "DBR_STRING",
+    "DBR_SHORT",
+    "DBR_FLOAT",
+    "DBR_ENUM",
+    "DBR_CHAR",
+    "DBR_LONG",
+    "DBR_DOUBLE",
+    "DBR_STS_STRING",
+    "DBR_STS_SHORT",
+    "DBR_STS_FLOAT",
+    "DBR_STS_ENUM",
+    "DBR_STS_CHAR",
+    "DBR_STS_LONG",
+    "DBR_STS_DOUBLE",
+    "DBR_TIME_STRING",
+    "DBR_TIME_SHORT",
+    "DBR_TIME_FLOAT",
+    "DBR_TIME_ENUM",
+    "DBR_TIME_CHAR",
+    "DBR_TIME_LONG",
+    "DBR_TIME_DOUBLE",
+    "DBR_GR_STRING",
+    "DBR_GR_SHORT",
+    "DBR_GR_FLOAT",
+    "DBR_GR_ENUM",
+    "DBR_GR_CHAR",
+    "DBR_GR_LONG",
+    "DBR_GR_DOUBLE",
+    "DBR_CTRL_STRING",
+    "DBR_CTRL_SHORT",
+    "DBR_CTRL_FLOAT",
+    "DBR_CTRL_ENUM",
+    "DBR_CTRL_CHAR",
+    "DBR_CTRL_LONG",
+    "DBR_CTRL_DOUBLE",
+    "DBR_PUT_ACKT",
+    "DBR_PUT_ACKS",
+    "DBR_STSACK_STRING",
+    "DBR_CLASS_NAME",
+];
+
+/// Resolve a DBR request-type name to its type code, mirroring the C
+/// `dbr_text_to_type` macro (`db_access.h`): an exact, **case-sensitive**
+/// `strcmp` search of the `dbr_text[]` table. Returns the matching code
+/// (`0..=38`) or `None` when no name matches.
+///
+/// The case sensitivity is faithful to C — the `caget`/`caput` tools
+/// feed `-d <type>` straight through this search, so `-d DBR_TIME_FLOAT`
+/// resolves while `-d dbr_time_float` does not (the C tool then reverts
+/// to its plain/native request). Callers that accept the bare family
+/// (`caget -d TIME_FLOAT`) retry with a `DBR_` prefix, exactly as
+/// `caget.c` does.
+pub fn dbr_text_to_type(text: &str) -> Option<u16> {
+    DBR_TEXT.iter().position(|&n| n == text).map(|i| i as u16)
+}
+
 #[cfg(test)]
 mod buffer_size_tests {
     use super::*;
@@ -297,5 +357,48 @@ mod buffer_size_tests {
             28 + 2
         );
         assert_eq!(dbr_buffer_size(DBR_CTRL_CHAR, DbFieldType::Char, 1), 21 + 1);
+    }
+}
+
+#[cfg(test)]
+mod dbr_text_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_every_type_name_to_its_code() {
+        // Round-trip the whole table: each name resolves to its index.
+        for (code, name) in DBR_TEXT.iter().enumerate() {
+            assert_eq!(
+                dbr_text_to_type(name),
+                Some(code as u16),
+                "{name} should resolve to {code}"
+            );
+        }
+        // Boundary names spot-check (the cited High-finding values).
+        assert_eq!(dbr_text_to_type("DBR_STRING"), Some(DBR_STRING));
+        assert_eq!(dbr_text_to_type("DBR_TIME_FLOAT"), Some(DBR_TIME_FLOAT));
+        assert_eq!(
+            dbr_text_to_type("DBR_STSACK_STRING"),
+            Some(DBR_STSACK_STRING)
+        );
+        assert_eq!(dbr_text_to_type("DBR_CLASS_NAME"), Some(DBR_CLASS_NAME));
+    }
+
+    #[test]
+    fn is_case_sensitive_like_c_strcmp() {
+        // C `dbr_text_to_type` uses `strcmp`, so lowercase does not
+        // match — the C tools then revert to their plain request.
+        assert_eq!(dbr_text_to_type("dbr_time_float"), None);
+        assert_eq!(dbr_text_to_type("DBR_Time_Float"), None);
+    }
+
+    #[test]
+    fn unknown_and_bare_family_names_do_not_match() {
+        // Bare family names need the caller's `DBR_` retry — the raw
+        // search rejects them, matching C's first-pass `strcmp`.
+        assert_eq!(dbr_text_to_type("TIME_FLOAT"), None);
+        assert_eq!(dbr_text_to_type("DOUBLE"), None);
+        assert_eq!(dbr_text_to_type("DBR_NONSENSE"), None);
+        assert_eq!(dbr_text_to_type(""), None);
     }
 }

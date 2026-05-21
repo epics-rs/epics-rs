@@ -1934,24 +1934,15 @@ impl CaChannel {
 
     /// Get a PV value with metadata, requesting at most `count` elements.
     /// Pass 0 for the full element count.
+    ///
+    /// The wire request type is the `*_<native>` member of `class` —
+    /// e.g. `DbrClass::Time` on a DOUBLE PV requests `DBR_TIME_DOUBLE`.
+    /// This is the right behaviour for monitors and `caget -a`, where C
+    /// re-derives the value type from the channel's native type
+    /// (`caget.c:175`, `format != specifiedDbr`). For `caget -d`'s
+    /// *exact* type request, use [`Self::get_with_dbr_type`] instead.
     pub async fn get_with_metadata_count(&self, class: DbrClass, count: u32) -> CaResult<Snapshot> {
         let snap = self.snapshot()?;
-
-        // R2-32: C `libca/nciu.cpp::read()` rejects `countIn >
-        // this->count` with ECA_BADCOUNT before queueing the read.
-        // Pre-fix Rust silently clamped with `.min(snap.element_count)`,
-        // so a caller bug requesting 100 elements from a 10-element PV
-        // got a 10-element response from Rust where libca would have
-        // returned ECA_BADCOUNT without sending anything. Validate
-        // up front; `count == 0` keeps the autosize semantic.
-        if count > 0 && count > snap.element_count {
-            return Err(CaError::Protocol(format!(
-                "get count {} exceeds channel element count {} \
-                 (matches libca nciu::read ECA_BADCOUNT)",
-                count, snap.element_count
-            )));
-        }
-        let request_count = if count > 0 { count } else { snap.element_count };
 
         let native = DbFieldType::from_u16(snap.native_type as u16)?;
         // `from_u16` only yields the six CA wire types (0..6), so `native`
@@ -1968,6 +1959,54 @@ impl CaChannel {
             DbrClass::Gr => native.gr_dbr_type(),
             DbrClass::Plain => native.to_dbr_type() as u16,
         };
+
+        self.get_dbr_request(snap, request_type, count).await
+    }
+
+    /// Get a PV value requesting an **exact** DBR type code (`0..=38`),
+    /// sent verbatim over the wire without re-deriving the value type
+    /// from the channel's native type.
+    ///
+    /// This mirrors C `caget -d`'s `pvs[n].dbrType = dbrType`
+    /// (`caget.c:172`): `-d DBR_TIME_FLOAT` on a DOUBLE PV requests
+    /// `DBR_TIME_FLOAT` (16) — the server converts and returns a float —
+    /// rather than the native `DBR_TIME_DOUBLE` (20) that the class-based
+    /// [`Self::get_with_metadata_count`] would derive. It also reaches
+    /// the type codes that have no value-class analogue, e.g.
+    /// `DBR_STSACK_STRING` (37) and `DBR_CLASS_NAME` (38).
+    ///
+    /// The caller is responsible for validating the type code (the tool
+    /// front-ends mirror C's `caget.c:430` range check); an unsupported
+    /// code surfaces as the server's `ECA_BADTYPE`.
+    pub async fn get_with_dbr_type(&self, dbr_type: u16, count: u32) -> CaResult<Snapshot> {
+        let snap = self.snapshot()?;
+        self.get_dbr_request(snap, dbr_type, count).await
+    }
+
+    /// Shared one-shot READ_NOTIFY body for the metadata/exact-type GET
+    /// paths: validate the requested element count, issue the request
+    /// with `request_type` verbatim, await the reply, and decode it.
+    async fn get_dbr_request(
+        &self,
+        snap: ChannelSnapshotPublic,
+        request_type: u16,
+        count: u32,
+    ) -> CaResult<Snapshot> {
+        // R2-32: C `libca/nciu.cpp::read()` rejects `countIn >
+        // this->count` with ECA_BADCOUNT before queueing the read.
+        // Pre-fix Rust silently clamped with `.min(snap.element_count)`,
+        // so a caller bug requesting 100 elements from a 10-element PV
+        // got a 10-element response from Rust where libca would have
+        // returned ECA_BADCOUNT without sending anything. Validate
+        // up front; `count == 0` keeps the autosize semantic.
+        if count > 0 && count > snap.element_count {
+            return Err(CaError::Protocol(format!(
+                "get count {} exceeds channel element count {} \
+                 (matches libca nciu::read ECA_BADCOUNT)",
+                count, snap.element_count
+            )));
+        }
+        let request_count = if count > 0 { count } else { snap.element_count };
 
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();

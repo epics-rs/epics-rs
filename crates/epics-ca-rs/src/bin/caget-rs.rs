@@ -257,52 +257,65 @@ async fn main() {
     // Connect + read all PVs in parallel within single timeout window
     // (C: connect_pvs → ca_pend_io → ca_array_get → ca_pend_io).
     let want_time = args.wide;
+    // CA-FR-4: resolve `-d <type>` ONCE here, mirroring C `caget.c`'s
+    // getopt-time resolution (`caget.c:416-434`). The "out of range or
+    // invalid" diagnostic prints exactly once (not per PV), and an
+    // unresolved/invalid token reverts to the plain native GET, exactly
+    // as C sets `format = plain`. `-a` (wide) forces the DBR_TIME class
+    // regardless of `-d`, matching C's `complainIfNotPlainAndSet`
+    // format precedence.
+    let req_dbr_type: Option<u16> = match args.dbr_type.as_deref() {
+        Some(s) => {
+            let t = parse_dbr_type(s);
+            if t.is_none() {
+                eprintln!(
+                    "Requested dbr type out of range or invalid - ignored. \
+                     ('caget -h' for help.)"
+                );
+            }
+            t
+        }
+        None => None,
+    };
     let mut handles = Vec::new();
     for (name, ch) in &channels {
         let name = name.clone();
         let t = timeout;
         let ch = ch.clone();
-        let dbr_class = args.dbr_type.clone();
         handles.push(tokio::spawn(async move {
             let connect = ch.wait_connected(t).await;
             if connect.is_err() {
                 return (name, Err("not connected".to_string()));
             }
-            // For `-a` (wide / DBR_TIME) we need timestamp + alarm,
-            // so route through `get_with_metadata` and wrap the
-            // response in the same `Ok` variant. The plain path stays
-            // on `get_with_timeout` because it doesn't pay for the
-            // bigger DBR_TIME response.
-            // CA-FR-4: `-d <type>` selects the DBR request class
-            // (STS/TIME/GR/CTRL or plain value); `-a` forces TIME.
-            // Routing the GET through the chosen class makes the wire
-            // request type honour `-d` instead of always using the
-            // channel default.
-            let req_class = if want_time {
-                Some(DbrClass::Time)
-            } else {
-                dbr_class.as_deref().and_then(parse_dbr_class)
-            };
-            let outcome = match req_class {
-                Some(DbrClass::Time) => {
-                    match tokio::time::timeout(t, ch.get_with_metadata(DbrClass::Time)).await {
-                        Ok(Ok(snap)) => Ok(GetResult::Time(Box::new(snap))),
-                        Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
-                        Ok(Err(e)) => Err(format!("{e}")),
-                        Err(_) => Err("timeout".to_string()),
-                    }
+            // For `-a` (wide / DBR_TIME) we need timestamp + alarm, so
+            // route through the DBR_TIME class (native value type) and
+            // wrap the response in the `Time` variant. `-d <type>`
+            // requests the EXACT DBR type verbatim — C keeps the chosen
+            // `dbrType` without re-deriving it from the native type
+            // (`caget.c:172`), so `-d DBR_TIME_FLOAT` on a DOUBLE PV
+            // requests a float, and `-d 38`/`DBR_CLASS_NAME` reaches the
+            // record-class introspection type. The plain path stays on
+            // the cheap `get_with_timeout` (no metadata payload).
+            let outcome = if want_time {
+                match tokio::time::timeout(t, ch.get_with_metadata(DbrClass::Time)).await {
+                    Ok(Ok(snap)) => Ok(GetResult::Time(Box::new(snap))),
+                    Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
+                    Ok(Err(e)) => Err(format!("{e}")),
+                    Err(_) => Err("timeout".to_string()),
                 }
-                Some(class) => match tokio::time::timeout(t, ch.get_with_metadata(class)).await {
+            } else if let Some(rt) = req_dbr_type {
+                match tokio::time::timeout(t, ch.get_with_dbr_type(rt, 0)).await {
                     Ok(Ok(snap)) => Ok(GetResult::Plain(snap.value)),
                     Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
                     Ok(Err(e)) => Err(format!("{e}")),
                     Err(_) => Err("timeout".to_string()),
-                },
-                None => match ch.get_with_timeout(t).await {
+                }
+            } else {
+                match ch.get_with_timeout(t).await {
                     Ok((_dbr, value)) => Ok(GetResult::Plain(value)),
                     Err(CaError::Timeout) => Err("timeout".to_string()),
                     Err(e) => Err(format!("{e}")),
-                },
+                }
             };
             (name, outcome)
         }));
@@ -427,90 +440,124 @@ async fn main() {
     }
 }
 
-/// CA-FR-4: map a `caget -d <type>` request to the DBR metadata class
-/// to fetch. Recognises `DBR_`-prefixed or bare family names; a plain
-/// value type (e.g. `DOUBLE`, `STRING`) or numeric id requests the
-/// `Plain` value class. Returns `None` for an unrecognised token so the
-/// caller falls back to the channel-default GET. Mirrors the C
-/// `caget -d` family selection (`caget.c:175-187`).
-fn parse_dbr_class(s: &str) -> Option<DbrClass> {
-    let up = s.trim().to_ascii_uppercase();
-    // C `caget.c:418` `sscanf(optarg, "%d")` first: a numeric DBR id
-    // selects the metadata class by its db_access.h band, NOT plain
-    // unconditionally. Value 0-6, STS 7-13, TIME 14-20, GR 21-27,
-    // CTRL 28-34. Ids with no value-class analogue here — PUT_ACKT/S
-    // (35/36), STSACK/CLASS_NAME (37/38), or out of range — request the
-    // plain class, mirroring C's `format = plain` revert for an
-    // unusable `-d` type. So `-d 20` → DBR_TIME_DOUBLE (Time), not plain.
-    if let Ok(id) = up.parse::<u32>() {
-        return Some(match id {
-            0..=6 => DbrClass::Plain,
-            7..=13 => DbrClass::Sts,
-            14..=20 => DbrClass::Time,
-            21..=27 => DbrClass::Gr,
-            28..=34 => DbrClass::Ctrl,
-            _ => DbrClass::Plain,
-        });
+/// C `sscanf(optarg, "%d", &type)` semantics: skip leading whitespace,
+/// accept an optional sign, then take the leading run of decimal digits
+/// — trailing junk is ignored (`"16x"` → `16`, `"0x10"` → `0`). Returns
+/// `None` when no digit leads (C's `sscanf` returns 0, so `caget` falls
+/// through to the textual `dbr_text_to_type` lookup).
+fn scan_leading_i64(s: &str) -> Option<i64> {
+    let s = s.trim_start();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut neg = false;
+    if let Some(&c) = bytes.first()
+        && (c == b'+' || c == b'-')
+    {
+        neg = c == b'-';
+        i = 1;
     }
-    let fam = up.strip_prefix("DBR_").unwrap_or(&up);
-    if fam.starts_with("CTRL") {
-        Some(DbrClass::Ctrl)
-    } else if fam.starts_with("GR") {
-        Some(DbrClass::Gr)
-    } else if fam.starts_with("TIME") {
-        Some(DbrClass::Time)
-    } else if fam.starts_with("STS") {
-        Some(DbrClass::Sts)
-    } else if fam.is_empty() {
-        None
+    let start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    s[start..i]
+        .parse::<i64>()
+        .ok()
+        .map(|n| if neg { -n } else { n })
+}
+
+/// CA-FR-4: resolve a `caget -d <type>` token to an EXACT DBR type code,
+/// mirroring C `caget.c:416-434`. The token is resolved as:
+///
+/// 1. `sscanf("%d")` — a leading integer is the type code verbatim.
+/// 2. else `dbr_text_to_type(token)` — exact, case-sensitive name.
+/// 3. else retry with a `DBR_` prefix (so `TIME_FLOAT` resolves).
+///
+/// The code is then validated against C's range
+/// `DBR_STRING(0) ..= DBR_CLASS_NAME(38)`, excluding `DBR_PUT_ACKT(35)`
+/// and `DBR_PUT_ACKS(36)`. An out-of-range or unresolved token yields
+/// `None`; the caller warns once and reverts to the plain native GET,
+/// exactly as C sets `format = plain`.
+///
+/// Unlike the pre-fix `parse_dbr_class`, the resolved code is carried
+/// verbatim to the wire — `-d DBR_TIME_FLOAT` on a DOUBLE PV requests
+/// `DBR_TIME_FLOAT` (16), not the native-derived `DBR_TIME_DOUBLE`, and
+/// `-d 37`/`-d 38` reach `DBR_STSACK_STRING`/`DBR_CLASS_NAME`.
+fn parse_dbr_type(s: &str) -> Option<u16> {
+    let s = s.trim();
+    let resolved: Option<i64> = if let Some(n) = scan_leading_i64(s) {
+        Some(n)
     } else {
-        // Named plain value type (STRING/SHORT/INT/FLOAT/ENUM/CHAR/LONG/
-        // DOUBLE) — request the plain value class.
-        Some(DbrClass::Plain)
+        epics_base_rs::types::dbr_text_to_type(s)
+            .or_else(|| epics_base_rs::types::dbr_text_to_type(&format!("DBR_{s}")))
+            .map(i64::from)
+    };
+    match resolved {
+        Some(t) if (0..=38).contains(&t) && t != 35 && t != 36 => Some(t as u16),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DbrClass, parse_dbr_class};
+    use super::{parse_dbr_type, scan_leading_i64};
+    use epics_base_rs::types::{
+        DBR_CLASS_NAME, DBR_DOUBLE, DBR_STRING, DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
+    };
 
     #[test]
-    fn dbr_class_families() {
-        assert!(matches!(
-            parse_dbr_class("DBR_TIME_DOUBLE"),
-            Some(DbrClass::Time)
-        ));
-        assert!(matches!(
-            parse_dbr_class("ctrl_double"),
-            Some(DbrClass::Ctrl)
-        ));
-        assert!(matches!(parse_dbr_class("DBR_GR_LONG"), Some(DbrClass::Gr)));
-        assert!(matches!(parse_dbr_class("STS_INT"), Some(DbrClass::Sts)));
-        assert!(matches!(parse_dbr_class("DOUBLE"), Some(DbrClass::Plain)));
-        assert!(parse_dbr_class("").is_none());
+    fn scan_leading_i64_matches_sscanf_d() {
+        assert_eq!(scan_leading_i64("16"), Some(16));
+        assert_eq!(scan_leading_i64("  20  "), Some(20));
+        assert_eq!(scan_leading_i64("-5"), Some(-5));
+        assert_eq!(scan_leading_i64("16x"), Some(16));
+        assert_eq!(scan_leading_i64("0x10"), Some(0));
+        assert_eq!(scan_leading_i64("DBR_TIME_FLOAT"), None);
+        assert_eq!(scan_leading_i64(""), None);
     }
 
     #[test]
-    fn dbr_class_numeric_ids_map_by_band() {
-        // db_access.h DBR id bands: value 0-6, STS 7-13, TIME 14-20,
-        // GR 21-27, CTRL 28-34.
-        assert!(matches!(parse_dbr_class("0"), Some(DbrClass::Plain)));
-        assert!(
-            matches!(parse_dbr_class("6"), Some(DbrClass::Plain)),
-            "DBR_DOUBLE = 6 is plain value class"
-        );
-        assert!(matches!(parse_dbr_class("13"), Some(DbrClass::Sts)));
-        assert!(
-            matches!(parse_dbr_class("20"), Some(DbrClass::Time)),
-            "DBR_TIME_DOUBLE = 20"
-        );
-        assert!(matches!(parse_dbr_class("21"), Some(DbrClass::Gr)));
-        assert!(
-            matches!(parse_dbr_class("34"), Some(DbrClass::Ctrl)),
-            "DBR_CTRL_DOUBLE = 34"
-        );
-        // No value-class analogue / out of range → plain (C revert).
-        assert!(matches!(parse_dbr_class("35"), Some(DbrClass::Plain)));
-        assert!(matches!(parse_dbr_class("999"), Some(DbrClass::Plain)));
+    fn numeric_tokens_pass_through_verbatim() {
+        // The exact code is preserved — no collapse to a metadata band.
+        assert_eq!(parse_dbr_type("0"), Some(DBR_STRING));
+        assert_eq!(parse_dbr_type("6"), Some(DBR_DOUBLE));
+        assert_eq!(parse_dbr_type("16"), Some(DBR_TIME_FLOAT));
+        assert_eq!(parse_dbr_type("20"), Some(DBR_TIME_DOUBLE));
+        // 37/38 (STSACK / CLASS_NAME) are valid and reachable.
+        assert_eq!(parse_dbr_type("37"), Some(DBR_STSACK_STRING));
+        assert_eq!(parse_dbr_type("38"), Some(DBR_CLASS_NAME));
+    }
+
+    #[test]
+    fn invalid_codes_revert_to_plain() {
+        // C: type < 0 || > 38 || == 35 || == 36 → revert to plain.
+        assert_eq!(parse_dbr_type("-1"), None);
+        assert_eq!(parse_dbr_type("35"), None); // DBR_PUT_ACKT
+        assert_eq!(parse_dbr_type("36"), None); // DBR_PUT_ACKS
+        assert_eq!(parse_dbr_type("39"), None);
+        assert_eq!(parse_dbr_type("999"), None);
+    }
+
+    #[test]
+    fn named_types_resolve_exactly() {
+        // Full `DBR_`-prefixed name and the bare-family `DBR_` retry
+        // both resolve to the exact code (C `dbr_text_to_type`).
+        assert_eq!(parse_dbr_type("DBR_TIME_FLOAT"), Some(DBR_TIME_FLOAT));
+        assert_eq!(parse_dbr_type("TIME_FLOAT"), Some(DBR_TIME_FLOAT));
+        assert_eq!(parse_dbr_type("DBR_DOUBLE"), Some(DBR_DOUBLE));
+        assert_eq!(parse_dbr_type("DOUBLE"), Some(DBR_DOUBLE));
+        assert_eq!(parse_dbr_type("DBR_CLASS_NAME"), Some(DBR_CLASS_NAME));
+    }
+
+    #[test]
+    fn case_sensitive_and_unknown_revert_to_plain() {
+        // C `strcmp` is case-sensitive; lowercase reverts to plain.
+        assert_eq!(parse_dbr_type("dbr_time_float"), None);
+        assert_eq!(parse_dbr_type("double"), None);
+        assert_eq!(parse_dbr_type("NONSENSE"), None);
+        assert_eq!(parse_dbr_type(""), None);
     }
 }

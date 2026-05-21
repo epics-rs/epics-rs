@@ -26,7 +26,9 @@ use epics_base_rs::server::access_security::AccessLevel;
 use epics_pva_rs::client::{AssertedIdentity, PvaClient};
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server::native_source::AcfCell;
-use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource};
+use epics_pva_rs::server_native::source::{
+    AccessChecked, ChannelContext, ChannelSource, WatermarkEvent, WatermarkKind,
+};
 
 use super::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL};
 
@@ -44,6 +46,30 @@ pub struct RawEvent {
     /// because they were encoded for the new (incompatible)
     /// upstream descriptor.
     pub type_changed: bool,
+}
+
+/// BRIDGE-FR-11: one downstream→upstream pause/resume command queued to
+/// the gateway's single watermark applier (spawned in
+/// [`GatewayChannelSource::new`]).
+///
+/// * `cache` is the *single* cache layer the firing subscription's
+///   upstream lives in — resolved from the downstream credential
+///   context in the callback ([`GatewayChannelSource::upstream_cache_peek_for`]),
+///   so one credential's backpressure never pauses another
+///   credential's separate upstream for the same PV name (Finding 2).
+/// * `op_id` identifies the downstream subscriber op casting this vote;
+///   `seq` is the server's strictly-monotonic per-op watermark crossing
+///   token. The applier folds `(op_id, seq, kind)` into the entry via
+///   [`super::channel_cache::UpstreamEntry::apply_watermark_vote`], which
+///   orders an op's own re-ordered transitions by `seq` (Finding 1) and
+///   reference-counts pause votes across co-subscribers so the shared
+///   upstream pauses only when every live op wants pause (round-3 fix).
+struct WmCommand {
+    cache: Arc<ChannelCache>,
+    name: String,
+    op_id: u64,
+    seq: u64,
+    kind: WatermarkKind,
 }
 
 /// PV-name → ASG-name resolver. Returns the ASG that the gateway
@@ -123,6 +149,17 @@ impl<K: Eq + Hash + Clone, V> BoundedPool<K, V> {
     /// never desync from the pool's actual eviction bound.
     fn capacity(&self) -> usize {
         self.max
+    }
+
+    /// Snapshot every live value (cloned). Used by the gateway's
+    /// all-layers cache administration (BRIDGE-FR-14) so a control
+    /// flush/drop/diagnostic can reach the per-credential caches
+    /// without holding the pool lock across the async cache calls.
+    fn values(&self) -> Vec<V>
+    where
+        V: Clone,
+    {
+        self.map.values().map(|(v, _)| v.clone()).collect()
     }
 
     /// Look up `key` and refresh its LRU timestamp on hit.
@@ -238,6 +275,16 @@ pub struct GatewayChannelSource {
     ///
     /// BR-R7: bounded via `BoundedPool` (same cap as `upstream_pool`).
     upstream_caches: Arc<Mutex<BoundedPool<UpstreamIdentityKey, Arc<ChannelCache>>>>,
+    /// BRIDGE-FR-11: feeds the single watermark pause/resume applier
+    /// task spawned in [`Self::new`]. The sync `notify_watermark_*`
+    /// callbacks push a [`WmCommand`] here with NO per-callback
+    /// `tokio::spawn`, so there is exactly one totally-ordered owner of
+    /// each upstream's pause state — the detached-spawn reorder that
+    /// could otherwise leave an upstream wedged paused after a resume
+    /// cannot happen. Cloning the source clones the sender (all clones
+    /// feed the one applier); the applier exits when the last clone
+    /// drops.
+    wm_tx: mpsc::UnboundedSender<WmCommand>,
 }
 
 impl GatewayChannelSource {
@@ -245,6 +292,12 @@ impl GatewayChannelSource {
         let acf: AcfCell = Arc::new(RwLock::new(None));
         let asg_resolver = Arc::new(RwLock::new(default_asg_resolver()));
         let gate = Self::build_gate(acf.clone(), asg_resolver.clone());
+        // BRIDGE-FR-11: one ordered watermark applier per logical
+        // source. `new` is the only constructor and `Clone` just copies
+        // the sender, so exactly one applier task exists no matter how
+        // many `Arc<dyn ChannelSourceObj>` handles the runtime holds.
+        let (wm_tx, wm_rx) = mpsc::unbounded_channel::<WmCommand>();
+        Self::spawn_watermark_applier(wm_rx);
         Self {
             cache,
             connect_timeout: Duration::from_secs(5),
@@ -257,6 +310,7 @@ impl GatewayChannelSource {
             asg_resolver,
             gate,
             upstream_caches: Arc::new(Mutex::new(BoundedPool::new(256))),
+            wm_tx,
         }
     }
 
@@ -479,6 +533,132 @@ impl GatewayChannelSource {
         self.cache.entry_count().await
     }
 
+    /// BRIDGE-FR-14: flush the shared cache AND every per-credential
+    /// upstream cache, returning the total number of entries removed.
+    /// The control `<prefix>:flush` RPC routes through here so an
+    /// operator flush actually tears down credentialed upstream
+    /// monitors, not just the shared-identity ones. Caches are cloned
+    /// out from under the pool lock first so the async `flush()` calls
+    /// don't hold the (sync) `parking_lot::Mutex`.
+    pub async fn flush_all_caches(&self) -> usize {
+        let mut removed = self.cache.flush().await;
+        let per_cred = self.upstream_caches.lock().values();
+        for c in per_cred {
+            removed += c.flush().await;
+        }
+        removed
+    }
+
+    /// BRIDGE-FR-14: drop one entry by name from the shared cache AND
+    /// every per-credential upstream cache. Returns true if any layer
+    /// held the entry. The control `<prefix>:drop` RPC routes through
+    /// here so a credentialed upstream monitor for the named PV is also
+    /// torn down.
+    pub async fn drop_entry_all_caches(&self, name: &str) -> bool {
+        let mut dropped = self.cache.drop_entry(name).await;
+        let per_cred = self.upstream_caches.lock().values();
+        for c in per_cred {
+            dropped |= c.drop_entry(name).await;
+        }
+        dropped
+    }
+
+    /// BRIDGE-FR-14: total cached entries across the shared cache AND
+    /// every per-credential upstream cache. The control `cacheSize` /
+    /// `upstreamCount` diagnostics route through here so the operator
+    /// does not see zero while credentialed upstream monitors remain
+    /// alive.
+    pub async fn total_cached_entry_count(&self) -> usize {
+        let mut total = self.cache.entry_count().await;
+        let per_cred = self.upstream_caches.lock().values();
+        for c in per_cred {
+            total += c.entry_count().await;
+        }
+        total
+    }
+
+    /// BRIDGE-FR-11: the single ordered owner of upstream pause/resume.
+    /// Draining one mpsc with one task means every vote for a given entry
+    /// is folded in one total order via
+    /// [`super::channel_cache::UpstreamEntry::apply_watermark_vote`], which
+    /// orders each op's own re-ordered transitions by `seq` (Finding 1)
+    /// and reference-counts pause votes across co-subscribers — pausing
+    /// the shared upstream only when every live downstream op wants pause
+    /// and resuming as soon as one has room (round-3 fix). `apply_..`
+    /// returns `Some(_)` only on a real aggregate edge; on an edge the
+    /// applier calls `reconcile_pause`, which re-reads the level and drives
+    /// the installed `Pauser` through the entry's single serialized owner.
+    /// That owner is shared with the reconnect loop's Pauser re-install, so
+    /// a fresh upstream subscription installed mid-backpressure is paused
+    /// immediately rather than running unthrottled until the next HIGH→LOW
+    /// cycle (round-4 fix). Because this is the sole writer of the entry's
+    /// votes, the fold has no competing writer.
+    fn spawn_watermark_applier(mut rx: mpsc::UnboundedReceiver<WmCommand>) {
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                let Some(entry) = cmd.cache.peek(&cmd.name).await else {
+                    continue;
+                };
+                if entry
+                    .apply_watermark_vote(cmd.op_id, cmd.seq, cmd.kind)
+                    .is_none()
+                {
+                    // No aggregate edge — the shared pause-state is
+                    // unchanged by this vote, so the installed Pauser
+                    // already matches and needs no drive.
+                    continue;
+                }
+                // Drive on the edge, but through the single serialized
+                // owner: `reconcile_pause` re-reads the level and is
+                // mutually serialized with the reconnect loop's
+                // re-install, so the installed Pauser always settles to
+                // the current aggregate (no two-driver strand race).
+                entry.reconcile_pause().await;
+            }
+        });
+    }
+
+    /// BRIDGE-FR-11: the cache layer the subscription identified by
+    /// `ctx` monitors through, WITHOUT creating one. Anonymous /
+    /// empty-account peers ride the shared `cache`; a credentialed peer
+    /// rides its per-credential cache iff one already exists. Returns
+    /// `None` for a credentialed peer with no live per-credential cache
+    /// (nothing to pause). Mirrors the layer selection of
+    /// [`Self::upstream_cache_for`] but is side-effect-free — a
+    /// watermark crossing must not mint a new cache. Scoping the
+    /// pause/resume to this one layer is what stops one credential's
+    /// backpressure from throttling another credential's separate
+    /// upstream for the same PV name (Finding 2).
+    fn upstream_cache_peek_for(&self, ctx: &ChannelContext) -> Option<Arc<ChannelCache>> {
+        if ctx.account.is_empty() || ctx.method == "anonymous" {
+            return Some(self.cache.clone());
+        }
+        let key = UpstreamIdentityKey::from_ctx(ctx);
+        self.upstream_caches.lock().get(&key).cloned()
+    }
+
+    /// BRIDGE-FR-11: resolve the firing subscription's single cache
+    /// layer (per-credential targeting) and enqueue a pause vote to the
+    /// ordered applier. Synchronous and non-blocking
+    /// (`UnboundedSender::send`) — no per-callback spawn — so two
+    /// near-simultaneous votes cannot be re-ordered by the runtime; their
+    /// per-op `seq` (minted at the server's crossing) settles each op's
+    /// state in the applier, and the applier reference-counts across ops.
+    fn queue_watermark(&self, name: &str, ev: &WatermarkEvent, ctx: &ChannelContext) {
+        let Some(cache) = self.upstream_cache_peek_for(ctx) else {
+            // Credentialed peer with no live upstream cache — nothing to
+            // pause/resume.
+            return;
+        };
+        let _ = self.wm_tx.send(WmCommand {
+            cache,
+            name: name.to_string(),
+            op_id: ev.op_id,
+            seq: ev.seq,
+            kind: ev.kind,
+        });
+    }
+
     /// Diagnostic: live subscribe-bridge tasks.
     pub fn live_subscribers(&self) -> usize {
         self.subscriber_count.load(Ordering::Relaxed)
@@ -642,6 +822,38 @@ impl ChannelSource for GatewayChannelSource {
         entry.introspection()
     }
 
+    /// BRIDGE-FR-8: a credentialed downstream CREATE_CHANNEL resolves
+    /// existence against THAT peer's per-credential upstream cache, not
+    /// the shared gateway cache, so channel setup never opens or refreshes
+    /// upstream state under the shared identity. Anonymous peers fall back
+    /// to the shared cache (`upstream_cache_for` returns `self.cache`), so
+    /// their behaviour is unchanged. The credential-free `has_pv` is kept
+    /// for the connectionless UDP SEARCH path, which carries no identity.
+    async fn has_pv_checked(&self, name: &str, ctx: ChannelContext) -> bool {
+        self.upstream_cache_for(&ctx)
+            .lookup(name, self.connect_timeout)
+            .await
+            .is_ok()
+    }
+
+    /// BRIDGE-FR-8: descriptor discovery for a credentialed downstream
+    /// peer (CREATE_CHANNEL GET-INIT / GET_FIELD) reads the upstream type
+    /// through that peer's per-credential cache — the same cache
+    /// `get_value_checked`/`subscribe_checked` use — so the upstream audit
+    /// identity matches the operation that follows.
+    async fn get_introspection_checked(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> Option<FieldDesc> {
+        let entry = self
+            .upstream_cache_for(&ctx)
+            .lookup(name, self.connect_timeout)
+            .await
+            .ok()?;
+        entry.introspection()
+    }
+
     async fn get_value(&self, name: &str) -> Option<PvField> {
         let entry = self.cache.lookup(name, self.connect_timeout).await.ok()?;
         // Prefer the cached monitor snapshot — same value the upstream
@@ -720,11 +932,15 @@ impl ChannelSource for GatewayChannelSource {
         }
 
         let name = checked.pv_name();
-        let _entry = self
-            .cache
-            .lookup(name, self.connect_timeout)
-            .await
-            .map_err(|e| e.to_string())?;
+        // BRIDGE-FR-5: no shared-cache preflight. The earlier
+        // `self.cache.lookup(...)` confirmed existence but warmed the
+        // *shared* client's pool and opened an upstream monitor under
+        // the gateway/shared identity — yet the PUT below runs through
+        // the per-credential `upstream_client_for(&ctx)` client, so the
+        // preflight warmed the wrong pool and leaked a shared-identity
+        // monitor as a side effect of a credentialed write. Let the
+        // per-credential client resolve existence and surface the
+        // upstream error itself, exactly as GET/MONITOR do.
         let client = self.upstream_client_for(&ctx);
         tracing::debug!(
             pv = %name,
@@ -815,11 +1031,9 @@ impl ChannelSource for GatewayChannelSource {
             ));
         }
         let name = checked.pv_name();
-        let _entry = self
-            .cache
-            .lookup(name, self.connect_timeout)
-            .await
-            .map_err(|e| e.to_string())?;
+        // BRIDGE-FR-5: no shared-cache preflight (see put_value_checked).
+        // The RPC runs through the per-credential client, which resolves
+        // existence and returns the upstream error itself.
         let client = self.upstream_client_for(&ctx);
         let result = tokio::time::timeout(
             self.rpc_timeout,
@@ -881,11 +1095,9 @@ impl ChannelSource for GatewayChannelSource {
             ));
         }
         let name = checked.pv_name();
-        let _entry = self
-            .cache
-            .lookup(name, self.connect_timeout)
-            .await
-            .map_err(|e| e.to_string())?;
+        // BRIDGE-FR-5: no shared-cache preflight (see put_value_checked).
+        // PROCESS runs through the per-credential client, which resolves
+        // existence and returns the upstream error itself.
         let client = self.upstream_client_for(&ctx);
         client.pvprocess(name).await.map_err(|e| e.to_string())
     }
@@ -973,7 +1185,7 @@ impl ChannelSource for GatewayChannelSource {
         checked: AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
         if opts.affects_upstream_events() {
             tracing::warn!(
                 pv = %checked.pv_name(),
@@ -987,7 +1199,12 @@ impl ChannelSource for GatewayChannelSource {
             );
             return None;
         }
-        self.subscribe_checked(checked, ctx).await
+        // BRIDGE-FR-12: the gateway fans out plain upstream values; it
+        // carries no QSRV `+trigger` graph, so each event derives its
+        // own changed-bitset (marked: None) like every non-group source.
+        self.subscribe_checked(checked, ctx)
+            .await
+            .map(epics_pva_rs::server_native::plain_monitor_updates)
     }
 
     /// BR-R14 raw-path counterpart of [`Self::subscribe_checked_opts`].
@@ -1014,49 +1231,63 @@ impl ChannelSource for GatewayChannelSource {
         self.subscribe_raw_checked(checked, ctx).await
     }
 
-    /// Forward downstream-to-gateway backpressure into upstream
-    /// pipeline pause. The PvaServer fires this when a per-connection
-    /// monitor outbox crosses the high watermark (downstream peer not
-    /// draining fast enough). PG-G9: we now look up the per-PV
-    /// `Pauser` (installed by the auto-restart task in
-    /// `channel_cache.rs::spawn_upstream_monitor`) and spawn a task
-    /// to send the `MonitorPause` control to the upstream — pvxs
-    /// `MonitorControlOp::pipeline` parity. Best effort: if the
-    /// entry isn't currently connected to upstream we just log.
-    fn notify_watermark_high(&self, name: &str) {
-        tracing::warn!(
-            pv = %name,
-            "pva-gateway: downstream monitor outbox crossed high watermark"
-        );
-        // Synchronous lookup via Mutex (no .await) — peek doesn't
-        // exist sync, but `entries` lives in tokio::sync::Mutex
-        // which only has async lock. Spawn a task that does the
-        // async pause; this trait method is sync.
-        let cache = self.cache.clone();
-        let name_owned = name.to_string();
-        tokio::spawn(async move {
-            if let Some(entry) = cache.peek(&name_owned).await {
-                if let Some(p) = entry.pauser_snapshot() {
-                    p.pause().await;
-                }
-            }
-        });
+    /// BRIDGE-FR-11: expose pipeline-window watermark levels so the
+    /// server's monitor loop drives pause/resume on the feeding upstream
+    /// monitor. Pre-FR-11 `GatewayChannelSource` did NOT override this,
+    /// so the trait default `None` made the pause/resume callbacks
+    /// unreachable — the `Pauser` plumbing existed but nothing could fire
+    /// it.
+    ///
+    /// `(low, high) = (0, 0)`: pause the upstream when the downstream
+    /// pipeline window is fully drained (0 credit — the gateway cannot
+    /// emit anyway) and resume as soon as a client ACK returns any
+    /// credit. The `(0, 0)` choice is independent of the client-
+    /// negotiated queue size and therefore deadlock-free for any window:
+    /// `high == 0` guarantees the ACK path can always re-cross it
+    /// (`w_now > 0`) and resume a paused upstream. (A non-zero `high`
+    /// could exceed a small client window and never re-fire after a
+    /// pause.) Returned for every name — only consulted for monitors on
+    /// channels this source already created.
+    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+        let _ = name;
+        Some((0, 0))
     }
 
-    fn notify_watermark_low(&self, name: &str) {
-        tracing::debug!(
-            pv = %name,
-            "pva-gateway: downstream monitor outbox drained below low watermark"
-        );
-        let cache = self.cache.clone();
-        let name_owned = name.to_string();
-        tokio::spawn(async move {
-            if let Some(entry) = cache.peek(&name_owned).await {
-                if let Some(p) = entry.pauser_snapshot() {
-                    p.resume().await;
-                }
-            }
-        });
+    /// Forward downstream pipeline-window flow control into upstream
+    /// pause/resume. pvxs pipeline-window semantics
+    /// (`servermon.cpp`/`source.h`): `Resume` means a client ACK refilled
+    /// the window above the high mark — the downstream is keeping up, so
+    /// its pause vote is dropped; `Pause` means a DATA emission drained the
+    /// window to/below low — the client is falling behind, so it votes to
+    /// pause the feeding upstream. `Withdraw` (the op's subscriber task
+    /// ended) removes its vote so a torn-down op cannot strand the shared
+    /// upstream paused for its co-subscribers. The per-PV `Pauser` is
+    /// installed by the auto-restart task in
+    /// `channel_cache.rs::spawn_upstream_monitor`.
+    ///
+    /// BRIDGE-FR-11 review: the vote is resolved to the *single* cache
+    /// layer this credential monitors through (per-credential targeting —
+    /// Finding 2) and queued to the single ordered applier with the
+    /// server's per-op crossing `seq` (deadlock-free ordering — Finding 1)
+    /// and `op_id` (cross-op reference counting — round-3 fix). Best
+    /// effort: if the entry isn't currently connected upstream the
+    /// pause/resume is a no-op in the applier.
+    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
+        match ev.kind {
+            WatermarkKind::Pause => tracing::warn!(
+                pv = %name, op_id = ev.op_id, seq = ev.seq,
+                "pva-gateway: downstream pipeline window drained below low — voting pause"
+            ),
+            WatermarkKind::Resume => tracing::debug!(
+                pv = %name, op_id = ev.op_id, seq = ev.seq,
+                "pva-gateway: downstream pipeline window refilled above high — releasing pause vote"
+            ),
+            WatermarkKind::Withdraw => tracing::debug!(
+                pv = %name, op_id = ev.op_id,
+                "pva-gateway: downstream monitor op ended — withdrawing pause vote"
+            ),
+        }
+        self.queue_watermark(name, &ev, ctx);
     }
 }
 
@@ -1093,6 +1324,101 @@ mod tests {
         src.access()
             .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
             .await
+    }
+
+    /// BRIDGE-FR-14: operator cache administration must span the shared
+    /// cache AND every per-credential upstream cache, not just the
+    /// shared one. An entry living only in a credentialed cache must be
+    /// counted, droppable, and flushable through the gateway-level
+    /// all-layers API the control RPCs route through.
+    #[tokio::test]
+    async fn control_admin_spans_per_credential_caches() {
+        let src = make_source();
+        // One entry in the shared cache (anonymous identity).
+        src.cache.insert_test_entry("SHARED:PV").await;
+        // One entry in a per-credential cache (alice/ca) — built via the
+        // same selector the credentialed GET/MONITOR path uses.
+        let ctx = make_ctx("h", "alice", "ca");
+        let cred_cache = src.upstream_cache_for_test(&ctx);
+        cred_cache.insert_test_entry("CRED:PV").await;
+
+        // Count aggregates both layers (shared-only would report 1).
+        assert_eq!(src.total_cached_entry_count().await, 2);
+        // Drop reaches the per-credential entry (shared-only drop_entry
+        // would return false and leave the credentialed monitor alive).
+        assert!(src.drop_entry_all_caches("CRED:PV").await);
+        assert_eq!(src.total_cached_entry_count().await, 1);
+        // Flush clears the remaining shared entry too.
+        assert_eq!(src.flush_all_caches().await, 1);
+        assert_eq!(src.total_cached_entry_count().await, 0);
+    }
+
+    /// BRIDGE-FR-11: the gateway source MUST expose pipeline-window
+    /// watermark levels so the server's monitor loop drives upstream
+    /// pause/resume. Pre-FR-11 it inherited the trait default `None`,
+    /// leaving the `Pauser` callbacks unreachable. `(0, 0)` is the
+    /// deadlock-free choice (HIGH always re-crosses on the first ACK
+    /// credit regardless of the client's negotiated window).
+    #[tokio::test]
+    async fn fr11_gateway_exposes_watermark_levels() {
+        let src = make_source();
+        assert_eq!(
+            <GatewayChannelSource as ChannelSource>::monitor_watermarks(&src, "ANY:PV"),
+            Some((0, 0)),
+            "gateway must expose watermark levels so pause/resume is reachable"
+        );
+    }
+
+    /// BRIDGE-FR-11 review (Finding 2): a watermark crossing must
+    /// pause/resume ONLY the cache layer the firing credential monitors
+    /// through. `upstream_cache_peek_for` resolves that single layer
+    /// (and never creates one), so one credential's backpressure cannot
+    /// reach another credential's separate upstream for the same PV
+    /// name — the over-throttle the pre-review all-layers walk caused.
+    #[tokio::test]
+    async fn fr11_watermark_targets_only_the_firing_credentials_cache() {
+        let src = make_source();
+
+        // Anonymous peers ride the shared cache.
+        let anon = make_ctx("h", "", "anonymous");
+        let shared = src
+            .upstream_cache_peek_for(&anon)
+            .expect("anonymous always resolves to the shared cache");
+        assert!(
+            Arc::ptr_eq(&shared, &src.cache),
+            "anonymous peers ride the shared cache"
+        );
+
+        // A credentialed peer with no live per-credential cache resolves
+        // to None — a watermark must not mint a cache (side-effect-free).
+        let alice = make_ctx("h", "alice", "ca");
+        assert!(
+            src.upstream_cache_peek_for(&alice).is_none(),
+            "no live per-credential cache yet → nothing to pause"
+        );
+
+        // Once alice's and bob's per-credential caches exist, alice's
+        // crossing resolves to alice's OWN cache — never the shared
+        // cache and never bob's.
+        let alice_cache = src.upstream_cache_for_test(&alice);
+        let bob = make_ctx("h", "bob", "ca");
+        let bob_cache = src.upstream_cache_for_test(&bob);
+
+        let alice_resolved = src
+            .upstream_cache_peek_for(&alice)
+            .expect("alice's cache now exists");
+        assert!(
+            Arc::ptr_eq(&alice_resolved, &alice_cache),
+            "alice's backpressure targets alice's own upstream cache"
+        );
+        assert!(
+            !Arc::ptr_eq(&alice_resolved, &bob_cache),
+            "alice's backpressure must NOT reach bob's separate upstream"
+        );
+        assert!(
+            !Arc::ptr_eq(&alice_resolved, &src.cache),
+            "a credentialed peer's upstream is not the shared cache"
+        );
     }
 
     /// Round-29 baseline: with no ACF attached, `acl_level` reports

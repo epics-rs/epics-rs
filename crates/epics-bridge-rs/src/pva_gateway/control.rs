@@ -45,7 +45,6 @@ use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarVa
 use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource};
 use tokio::sync::mpsc;
 
-use super::channel_cache::ChannelCache;
 use super::source::GatewayChannelSource;
 
 /// Operator credential predicate for the writable control RPCs (B6).
@@ -64,7 +63,6 @@ pub type CredentialCheck = Arc<dyn Fn(&ChannelContext) -> bool + Send + Sync>;
 #[derive(Clone)]
 pub struct ControlSource {
     prefix: String,
-    cache: Arc<ChannelCache>,
     gateway_source: GatewayChannelSource,
     /// B6: credential predicate gating the writable RPCs. Defaults to
     /// deny-all.
@@ -77,14 +75,9 @@ pub struct ControlSource {
 }
 
 impl ControlSource {
-    pub fn new(
-        prefix: impl Into<String>,
-        cache: Arc<ChannelCache>,
-        gateway_source: GatewayChannelSource,
-    ) -> Self {
+    pub fn new(prefix: impl Into<String>, gateway_source: GatewayChannelSource) -> Self {
         Self {
             prefix: prefix.into(),
-            cache,
             gateway_source,
             // Deny-all default: the writable surface does nothing
             // until an operator installs a real predicate.
@@ -238,8 +231,10 @@ impl ControlSource {
     ) -> Result<(FieldDesc, PvField), String> {
         let names = self.control_pv_names();
         if name == names[0] {
-            // <prefix>:flush — drop the whole cache.
-            let removed = self.cache.flush().await as i64;
+            // <prefix>:flush — drop every cached upstream entry across
+            // the shared cache AND all per-credential caches
+            // (BRIDGE-FR-14).
+            let removed = self.gateway_source.flush_all_caches().await as i64;
             tracing::info!(
                 gateway_control = %name,
                 removed,
@@ -257,7 +252,9 @@ impl ControlSource {
             if target.is_empty() {
                 return Err("drop RPC 'pv' argument must not be empty".to_string());
             }
-            let dropped = self.cache.drop_entry(&target).await;
+            // Drop from the shared cache AND every per-credential cache
+            // (BRIDGE-FR-14).
+            let dropped = self.gateway_source.drop_entry_all_caches(&target).await;
             tracing::info!(
                 gateway_control = %name,
                 pv = %target,
@@ -348,8 +345,11 @@ impl ChannelSource for ControlSource {
         }
         // Live snapshot: pulled at every GET. Cheap — no upstream
         // round-trip, just a HashMap len() under a tokio::Mutex plus
-        // an atomic load for the bridge-task count.
-        let cache_size = self.cache.entry_count().await as i64;
+        // an atomic load for the bridge-task count. BRIDGE-FR-14:
+        // aggregate across the shared cache AND every per-credential
+        // cache so the operator does not see zero while credentialed
+        // upstream monitors remain alive.
+        let cache_size = self.gateway_source.total_cached_entry_count().await as i64;
         let live_subs = self.gateway_source.live_subscribers() as i64;
 
         if name.ends_with(":cacheSize") || name.ends_with(":upstreamCount") {
@@ -510,15 +510,14 @@ impl ChannelSource for ControlSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pva_gateway::channel_cache::DEFAULT_CLEANUP_INTERVAL;
+    use crate::pva_gateway::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL};
     use epics_pva_rs::client::PvaClient;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    fn make_source() -> (Arc<ChannelCache>, GatewayChannelSource) {
+    fn make_source() -> GatewayChannelSource {
         let client = Arc::new(PvaClient::builder().build());
         let cache = ChannelCache::new(client, DEFAULT_CLEANUP_INTERVAL);
-        let gw = GatewayChannelSource::new(cache.clone());
-        (cache, gw)
+        GatewayChannelSource::new(cache)
     }
 
     fn ctx(account: &str, method: &str) -> ChannelContext {
@@ -583,8 +582,8 @@ mod tests {
     /// `process` override covers both entry points.
     #[tokio::test]
     async fn control_process_is_rejected() {
-        let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw);
+        let gw = make_source();
+        let ctrl = ControlSource::new("gw", gw);
 
         // Control PV (RPC target).
         let err = ctrl
@@ -617,8 +616,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_rpc_denied_without_credential_predicate() {
-        let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw);
+        let gw = make_source();
+        let ctrl = ControlSource::new("gw", gw);
         let res = ctrl
             .rpc_checked(
                 checked("gw:flush").await,
@@ -639,10 +638,10 @@ mod tests {
 
     #[tokio::test]
     async fn control_rpc_ctxless_path_always_refused() {
-        let (cache, gw) = make_source();
+        let gw = make_source();
         // Even with an allow-all predicate the ctx-less `rpc` path
         // must refuse — it carries no credentials.
-        let ctrl = ControlSource::new("gw", cache, gw).with_credential_check(Arc::new(|_| true));
+        let ctrl = ControlSource::new("gw", gw).with_credential_check(Arc::new(|_| true));
         let res = ctrl
             .rpc(
                 "gw:flush",
@@ -662,9 +661,9 @@ mod tests {
 
     #[tokio::test]
     async fn flush_rpc_clears_cache_for_authorised_operator() {
-        let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw)
-            .with_credential_check(Arc::new(|c| c.account == "ops"));
+        let gw = make_source();
+        let ctrl =
+            ControlSource::new("gw", gw).with_credential_check(Arc::new(|c| c.account == "ops"));
         let (desc, reply) = ctrl
             .rpc_checked(
                 checked("gw:flush").await,
@@ -685,9 +684,9 @@ mod tests {
 
     #[tokio::test]
     async fn flush_rpc_denied_for_unlisted_account() {
-        let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw)
-            .with_credential_check(Arc::new(|c| c.account == "ops"));
+        let gw = make_source();
+        let ctrl =
+            ControlSource::new("gw", gw).with_credential_check(Arc::new(|c| c.account == "ops"));
         let res = ctrl
             .rpc_checked(
                 checked("gw:flush").await,
@@ -704,8 +703,8 @@ mod tests {
 
     #[tokio::test]
     async fn drop_rpc_requires_pv_argument() {
-        let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw).with_credential_check(Arc::new(|_| true));
+        let gw = make_source();
+        let ctrl = ControlSource::new("gw", gw).with_credential_check(Arc::new(|_| true));
         let res = ctrl
             .rpc_checked(
                 checked("gw:drop").await,
@@ -723,8 +722,8 @@ mod tests {
 
     #[tokio::test]
     async fn drop_rpc_reports_missing_entry() {
-        let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw).with_credential_check(Arc::new(|_| true));
+        let gw = make_source();
+        let ctrl = ControlSource::new("gw", gw).with_credential_check(Arc::new(|_| true));
         let (_desc, reply) = ctrl
             .rpc_checked(
                 checked("gw:drop").await,
@@ -744,8 +743,8 @@ mod tests {
 
     #[tokio::test]
     async fn reload_rpc_without_path_or_default_fails() {
-        let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw).with_credential_check(Arc::new(|_| true));
+        let gw = make_source();
+        let ctrl = ControlSource::new("gw", gw).with_credential_check(Arc::new(|_| true));
         let res = ctrl
             .rpc_checked(
                 checked("gw:reload").await,
@@ -763,9 +762,8 @@ mod tests {
 
     #[tokio::test]
     async fn reload_rpc_parses_acf_from_explicit_path() {
-        let (cache, gw) = make_source();
-        let ctrl =
-            ControlSource::new("gw", cache.clone(), gw).with_credential_check(Arc::new(|_| true));
+        let gw = make_source();
+        let ctrl = ControlSource::new("gw", gw).with_credential_check(Arc::new(|_| true));
         // Write a minimal valid ACF file.
         let dir = std::env::temp_dir();
         let path = dir.join(format!("pva_gw_b6_reload_{}.acf", std::process::id()));
@@ -792,11 +790,11 @@ mod tests {
 
     #[tokio::test]
     async fn reload_rpc_uses_configured_default_path() {
-        let (cache, gw) = make_source();
+        let gw = make_source();
         let dir = std::env::temp_dir();
         let path = dir.join(format!("pva_gw_b6_default_{}.acf", std::process::id()));
         std::fs::write(&path, "ASG(DEFAULT) {\n  RULE(1, READ)\n}\n").unwrap();
-        let ctrl = ControlSource::new("gw", cache, gw)
+        let ctrl = ControlSource::new("gw", gw)
             .with_credential_check(Arc::new(|_| true))
             .with_acf_path(path.to_str().unwrap());
         let res = ctrl
@@ -816,8 +814,8 @@ mod tests {
 
     #[tokio::test]
     async fn reload_rpc_rejects_unparseable_acf() {
-        let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw).with_credential_check(Arc::new(|_| true));
+        let gw = make_source();
+        let ctrl = ControlSource::new("gw", gw).with_credential_check(Arc::new(|_| true));
         let dir = std::env::temp_dir();
         let path = dir.join(format!("pva_gw_b6_bad_{}.acf", std::process::id()));
         std::fs::write(&path, "this is not valid ACF (((").unwrap();
@@ -838,8 +836,8 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostic_pvs_remain_read_only() {
-        let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw);
+        let gw = make_source();
+        let ctrl = ControlSource::new("gw", gw);
         assert!(ctrl.has_pv("gw:cacheSize").await);
         assert!(ctrl.has_pv("gw:report").await);
         assert!(!ctrl.is_writable("gw:cacheSize").await);

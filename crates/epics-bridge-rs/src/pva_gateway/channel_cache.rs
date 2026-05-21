@@ -24,6 +24,7 @@ use tokio::sync::{Mutex, Notify, broadcast};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::ops_v2::Pauser;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
+use epics_pva_rs::server_native::source::WatermarkKind;
 
 use super::error::{GwError, GwResult};
 
@@ -81,15 +82,184 @@ pub struct UpstreamEntry {
     _monitor_task: AbortOnDrop,
     /// Sticky "recently used" bit, lowered by the cleanup tick.
     drop_poke: parking_lot::Mutex<bool>,
-    /// Pause/resume handle on the *current* upstream subscription.
-    /// Refreshed by the auto-restart loop on every successful
-    /// `pvmonitor_handle` cycle. `None` while the loop is in the gap
-    /// between disconnects. Used by [`Self::pauser_snapshot`]
-    /// (PG-G9: forward downstream watermark events into upstream
-    /// pipeline-pause control msgs). Shared between the spawned
-    /// monitor task (writer) and the source's notify_watermark_*
-    /// callbacks (reader) via Arc.
-    pauser: Arc<parking_lot::Mutex<Option<Pauser>>>,
+    /// BRIDGE-FR-11: single owner of upstream backpressure for this entry —
+    /// the per-op pause votes, the pause/resume handle on the *current*
+    /// upstream subscription, and the lock that serializes every physical
+    /// drive of it. Shared (`Arc`) between the spawned monitor task (which
+    /// reinstalls the handle on each reconnect via
+    /// [`PauseControl::install`]) and the gateway's single watermark applier
+    /// task (which folds votes via [`Self::apply_watermark_vote`] and drives
+    /// via [`Self::reconcile_pause`]). Consolidating these into one owner is
+    /// what keeps the invariant "the installed Pauser's physical state always
+    /// equals the current aggregate vote" — see [`PauseControl`].
+    pause: Arc<PauseControl>,
+}
+
+/// The pause/resume surface the gateway drives on the *current* upstream
+/// subscription. The real variant wraps the client [`Pauser`]; the
+/// `#[cfg(test)]` variant records the last requested level so the
+/// single-owner reconcile can be boundary-tested without a live upstream.
+enum PauseSink {
+    Real(Pauser),
+    #[cfg(test)]
+    Fake(Arc<parking_lot::Mutex<Vec<bool>>>),
+}
+
+impl PauseSink {
+    /// Drive this sink to `want_paused`. Async because the real Pauser
+    /// sends a pipeline control frame to the upstream server.
+    async fn apply(&self, want_paused: bool) {
+        match self {
+            PauseSink::Real(p) => {
+                if want_paused {
+                    p.pause().await;
+                } else {
+                    p.resume().await;
+                }
+            }
+            #[cfg(test)]
+            PauseSink::Fake(rec) => rec.lock().push(want_paused),
+        }
+    }
+}
+
+/// BRIDGE-FR-11: the single owner of one upstream entry's backpressure.
+///
+/// **Invariant:** at every settled point, the currently-installed sink's
+/// physical pause-state equals [`Self::all_voting_paused`] over `votes` —
+/// the aggregate of the live downstream ops' votes.
+///
+/// Two things can move either side of that equation: a vote changes
+/// (`apply_vote`, written solely by the gateway's single applier task) or
+/// the physical sink is *replaced* on an upstream reconnect (`install`),
+/// which resets the wire pipeline to flowing while the standing votes
+/// survive. Both paths end in [`Self::reconcile`], which re-reads the
+/// aggregate **at drive time** (level-triggered, not edge-triggered) and
+/// drives the *currently-installed* sink to it. `drive` serializes every
+/// reconcile so the applier's edge-drive and a reconnect's re-install can
+/// never interleave a stale pause/resume — the last reconcile to run reads
+/// the final level and drives the final sink. This is why a fresh,
+/// unpaused subscription installed mid-backpressure is paused immediately
+/// instead of running unthrottled until the next full HIGH→LOW cycle.
+struct PauseControl {
+    /// Per-downstream-op pause votes: `op_id -> (last seq, wants_pause)`.
+    /// One upstream monitor fans out to N downstream subscriber ops (same
+    /// PV+credential); each contributes a vote so the gateway can
+    /// reference-count them — the upstream pauses only when EVERY live op
+    /// wants pause, and resumes as soon as any has room. `seq` orders an
+    /// op's own transitions (its LOW fires from the server emission loop,
+    /// its HIGH from the ACK path, so they can arrive reordered — a stale
+    /// one is rejected per op). A `Withdraw` removes the op's entry so a
+    /// torn-down op cannot strand the shared upstream paused. Mutated solely
+    /// by the gateway's single watermark applier task via [`Self::apply_vote`].
+    votes: parking_lot::Mutex<std::collections::HashMap<u64, (u64, bool)>>,
+    /// Pause/resume handle on the *current* upstream subscription. Refreshed
+    /// by the auto-restart loop on every successful monitor cycle via
+    /// [`Self::install`]; `None` while the loop is in the gap between
+    /// disconnects.
+    sink: parking_lot::Mutex<Option<PauseSink>>,
+    /// Serializes every physical drive of `sink` so the applier edge-drive
+    /// and a reconnect re-install cannot race a stale level onto the wire.
+    /// Async (held across the Pauser's `.await`) — see [`Self::reconcile`].
+    drive: tokio::sync::Mutex<()>,
+}
+
+impl PauseControl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            votes: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            sink: parking_lot::Mutex::new(None),
+            drive: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Aggregate predicate: pause the shared upstream iff at least one op
+    /// is voting and every voting op wants pause.
+    fn all_voting_paused(votes: &std::collections::HashMap<u64, (u64, bool)>) -> bool {
+        !votes.is_empty() && votes.values().all(|(_, wants_pause)| *wants_pause)
+    }
+
+    /// Fold one downstream op's watermark transition into the votes and
+    /// return whether the aggregate pause-state changed (see
+    /// [`UpstreamEntry::apply_watermark_vote`] for the full contract). The
+    /// returned bool is only an *edge hint* for the applier — the physical
+    /// drive always re-reads the level in [`Self::reconcile`].
+    fn apply_vote(&self, op_id: u64, seq: u64, kind: WatermarkKind) -> Option<bool> {
+        let mut votes = self.votes.lock();
+        let was_paused = Self::all_voting_paused(&votes);
+        match kind {
+            WatermarkKind::Pause => match votes.get_mut(&op_id) {
+                Some(entry) if seq > entry.0 => *entry = (seq, true),
+                Some(_) => {} // stale/reordered for this op — keep newer
+                None => {
+                    votes.insert(op_id, (seq, true));
+                }
+            },
+            WatermarkKind::Resume => {
+                if let Some(entry) = votes.get_mut(&op_id)
+                    && seq > entry.0
+                {
+                    *entry = (seq, false);
+                }
+                // Absent op: ignore — never re-insert on a resume so a late
+                // HIGH after a Withdraw cannot resurrect a dead voter.
+            }
+            WatermarkKind::Withdraw => {
+                votes.remove(&op_id);
+            }
+        }
+        let now_paused = Self::all_voting_paused(&votes);
+        (now_paused != was_paused).then_some(now_paused)
+    }
+
+    /// Drive the installed sink to the current aggregate vote. The sole
+    /// physical driver of the sink (applier edge AND reconnect install both
+    /// route here). Holds `drive` across the read+apply so two reconciles
+    /// serialize; the level is re-read inside the lock so the last reconcile
+    /// wins. No-op when no sink is installed (upstream between connections).
+    async fn reconcile(&self) {
+        let _drive = self.drive.lock().await;
+        let want_paused = Self::all_voting_paused(&self.votes.lock());
+        // Clone the sink handle out from under the (sync) slot lock before
+        // the await so we never hold a parking_lot guard across `.await`.
+        let sink = match &*self.sink.lock() {
+            Some(PauseSink::Real(p)) => Some(PauseSink::Real(p.clone())),
+            #[cfg(test)]
+            Some(PauseSink::Fake(rec)) => Some(PauseSink::Fake(rec.clone())),
+            None => None,
+        };
+        if let Some(sink) = sink {
+            sink.apply(want_paused).await;
+        }
+    }
+
+    /// Install a freshly-(re)connected upstream sink AND immediately
+    /// reconcile it to the current aggregate vote. A reconnect resets the
+    /// wire pipeline to flowing, but standing pause votes survive in
+    /// `votes`; without this re-application the new subscription would run
+    /// unpaused until a full HIGH→LOW cycle re-fired an aggregate edge.
+    async fn install(&self, pauser: Pauser) {
+        *self.sink.lock() = Some(PauseSink::Real(pauser));
+        self.reconcile().await;
+    }
+
+    /// Drop the installed sink (upstream disconnected). No physical drive —
+    /// there is nothing connected to pause; the next [`Self::install`]
+    /// reconciles the replacement.
+    fn clear(&self) {
+        *self.sink.lock() = None;
+    }
+
+    #[cfg(test)]
+    fn vote_count(&self) -> usize {
+        self.votes.lock().len()
+    }
+
+    #[cfg(test)]
+    async fn install_fake(&self, rec: Arc<parking_lot::Mutex<Vec<bool>>>) {
+        *self.sink.lock() = Some(PauseSink::Fake(rec));
+        self.reconcile().await;
+    }
 }
 
 #[derive(Default)]
@@ -210,14 +380,46 @@ impl UpstreamEntry {
         *self.drop_poke.lock() = true;
     }
 
-    /// Pause the upstream pipeline if a `Pauser` is currently
-    /// installed (the auto-restart loop refreshes this on every
-    /// cycle). Returns `None` if upstream isn't connected right now —
-    /// caller can't await anything in that case; reaction is best-
-    /// effort. The returned future, when awaited, sends the
-    /// pipeline-pause control to the upstream server.
-    pub fn pauser_snapshot(&self) -> Option<Pauser> {
-        self.pauser.lock().clone()
+    /// BRIDGE-FR-11: fold one downstream op's watermark transition into
+    /// this shared entry's pause votes and return the resulting upstream
+    /// pause-state transition, if any.
+    ///
+    /// Returns `Some(true)` when the aggregate just became "pause the
+    /// upstream", `Some(false)` when it just became "resume", and `None`
+    /// when the applied state is unchanged. The applier uses the
+    /// `Some(_)`/`None` as an *edge hint* to decide whether to reconcile;
+    /// the physical drive re-reads the level in [`Self::reconcile_pause`].
+    /// The aggregate rule is **pause iff there is ≥1 live voting op and
+    /// EVERY live op wants pause** — a fast co-subscriber keeps the
+    /// upstream flowing for everyone, a slow one falls back to
+    /// broadcast-lag coalescing, and the upstream pauses only when no
+    /// downstream can make progress.
+    ///
+    /// Per-op ordering: a `Pause`/`Resume` is applied only if its `seq` is
+    /// strictly newer than the op's last-recorded seq, so a LOW and HIGH
+    /// reordered between the two server tasks resolve to the op's truly
+    /// last crossing. `Resume` for an op not currently voting is ignored
+    /// (a HIGH that lost its race with a `Withdraw`, or for an op that
+    /// never paused). `Withdraw` removes the op unconditionally (terminal,
+    /// FIFO-last from the op's own subscriber task) so a torn-down op never
+    /// strands the shared upstream. Mutated solely by the gateway's single
+    /// watermark applier task.
+    pub fn apply_watermark_vote(&self, op_id: u64, seq: u64, kind: WatermarkKind) -> Option<bool> {
+        self.pause.apply_vote(op_id, seq, kind)
+    }
+
+    /// BRIDGE-FR-11: drive the installed upstream Pauser to the current
+    /// aggregate vote. Called by the gateway's single applier task after a
+    /// vote edge, and by the reconnect loop after re-installing the Pauser
+    /// (via [`PauseControl::install`]). Level-triggered and serialized — see
+    /// [`PauseControl::reconcile`].
+    pub async fn reconcile_pause(&self) {
+        self.pause.reconcile().await;
+    }
+
+    #[cfg(test)]
+    pub fn wm_vote_count(&self) -> usize {
+        self.pause.vote_count()
     }
 }
 
@@ -485,8 +687,7 @@ impl ChannelCache {
             broadcast::channel::<crate::pva_gateway::source::RawEvent>(BROADCAST_CAPACITY);
         let first_event = Arc::new(Notify::new());
         let state = Arc::new(RwLock::new(EntryState::default()));
-        let pauser_slot: Arc<parking_lot::Mutex<Option<Pauser>>> =
-            Arc::new(parking_lot::Mutex::new(None));
+        let pause = PauseControl::new();
 
         let pv_name_owned = pv_name.to_string();
         let client = self.client.clone();
@@ -494,7 +695,7 @@ impl ChannelCache {
         let tx_raw_for_task = tx_raw.clone();
         let state_for_task = state.clone();
         let first_event_for_task = first_event.clone();
-        let pauser_slot_for_task = pauser_slot.clone();
+        let pause_for_task = pause.clone();
 
         let join = tokio::spawn(async move {
             let mut backoff = Duration::from_millis(250);
@@ -516,11 +717,11 @@ impl ChannelCache {
                 // path).
                 //
                 // PG-G9 Pauser: the `_handle` variant returns a
-                // SubscriptionHandle whose `pauser()` we install in
-                // `pauser_slot_for_task`. Downstream watermark events
-                // (DownstreamWatermark::High/Low) call into the slot
-                // and pause/resume the upstream pipeline on the wire
-                // — pvxs `MonitorControlOp::pipeline` parity.
+                // SubscriptionHandle whose `pauser()` we hand to
+                // `pause_for_task.install(..)` below. Downstream watermark
+                // events fold into the entry's vote map and the applier
+                // drives the installed Pauser to the aggregate — pvxs
+                // `MonitorControlOp::pipeline` parity.
                 let tx_raw_inner = tx_raw_for_task.clone();
                 let pv_clone = pv_name_owned.clone();
                 // BR-R41: tx_inner moves into the callback so decoded
@@ -610,9 +811,18 @@ impl ChannelCache {
                         continue;
                     }
                 };
-                *pauser_slot_for_task.lock() = Some(handle.pauser());
+                // Install the fresh Pauser AND immediately reconcile it to
+                // the standing aggregate vote: a reconnect resets the wire
+                // pipeline to flowing, but co-subscribers' pause votes
+                // survive across the disconnect, and no watermark edge
+                // re-fires after reconnect (each op's per-op hysteresis is
+                // unchanged). Without this re-application the new
+                // subscription would run unthrottled until a full HIGH→LOW
+                // cycle. Routed through the single owner so the
+                // installed-Pauser-matches-aggregate invariant holds.
+                pause_for_task.install(handle.pauser()).await;
                 let raw_result = handle.wait().await;
-                *pauser_slot_for_task.lock() = None;
+                pause_for_task.clear();
                 if let Err(e) = raw_result {
                     tracing::warn!(
                         pv = %pv_name_owned,
@@ -653,7 +863,7 @@ impl ChannelCache {
             first_event,
             _monitor_task: AbortOnDrop(join.abort_handle()),
             drop_poke: parking_lot::Mutex::new(true),
-            pauser: pauser_slot,
+            pause,
         })
     }
 
@@ -740,6 +950,31 @@ impl ChannelCache {
         self.negative_cache.lock().retain(|(n, _)| n != pv_name);
         removed
     }
+
+    /// Test-only: insert a synthetic, parked entry under `pv_name` so
+    /// cache-administration paths (`entry_count` / `flush` /
+    /// `drop_entry`, and the gateway's all-layers BRIDGE-FR-14
+    /// aggregation across shared + per-credential caches) can be
+    /// exercised without a live upstream IOC.
+    #[cfg(test)]
+    pub(crate) async fn insert_test_entry(&self, pv_name: &str) {
+        let (tx, rx0) = broadcast::channel::<PvField>(4);
+        drop(rx0);
+        let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
+        drop(rx0_raw);
+        let task = tokio::spawn(std::future::pending::<()>());
+        let entry = Arc::new(UpstreamEntry {
+            pv_name: pv_name.to_string(),
+            state: Arc::new(RwLock::new(EntryState::default())),
+            tx,
+            tx_raw,
+            first_event: Arc::new(Notify::new()),
+            _monitor_task: AbortOnDrop(task.abort_handle()),
+            drop_poke: parking_lot::Mutex::new(false),
+            pause: PauseControl::new(),
+        });
+        self.entries.lock().await.insert(pv_name.to_string(), entry);
+    }
 }
 
 impl Drop for ChannelCache {
@@ -777,6 +1012,272 @@ mod tests {
             &mut body,
         );
         body
+    }
+
+    /// BRIDGE-FR-11 review (Finding 1): within ONE op, a LOW and HIGH that
+    /// reach the applier reordered (they fire from the server emission loop
+    /// vs the ACK path) must resolve to the op's truly-last crossing. The
+    /// per-op `seq` is the gate: only a strictly-newer transition for that
+    /// op is applied; a stale one is discarded. Tested by boundary:
+    /// fresh, reordered-lower Pause, stale Resume, newer, idempotent.
+    #[tokio::test]
+    async fn fr11_per_op_seq_rejects_reordered_stale_transition() {
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        cache.insert_test_entry("WM:PV").await;
+        let entry = cache.peek("WM:PV").await.expect("entry present");
+        const OP: u64 = 1;
+
+        // First Pause (seq 2): the sole voting op now wants pause → the
+        // aggregate becomes "pause the upstream".
+        assert_eq!(
+            entry.apply_watermark_vote(OP, 2, WatermarkKind::Pause),
+            Some(true),
+            "first pause vote pauses the shared upstream"
+        );
+        // A Pause re-ordered behind it (lower seq 1) is discarded — it
+        // must not clobber the op's newer state; aggregate unchanged.
+        assert_eq!(
+            entry.apply_watermark_vote(OP, 1, WatermarkKind::Pause),
+            None,
+            "reordered stale (lower-seq) pause is skipped, no edge"
+        );
+        // Resume (seq 3) is newer → the op no longer wants pause → resume.
+        assert_eq!(
+            entry.apply_watermark_vote(OP, 3, WatermarkKind::Resume),
+            Some(false),
+            "newer resume releases the upstream"
+        );
+        // A stale Resume (seq 2 < 3) and a stale Pause (seq 2 < 3) are both
+        // discarded — the op stays resumed; no edge either way.
+        assert_eq!(
+            entry.apply_watermark_vote(OP, 2, WatermarkKind::Resume),
+            None,
+            "stale resume is skipped"
+        );
+        assert_eq!(
+            entry.apply_watermark_vote(OP, 2, WatermarkKind::Pause),
+            None,
+            "a pause re-ordered behind the newer resume cannot re-pause"
+        );
+        // Withdraw drops the op; aggregate goes empty (resumed→empty, both
+        // non-paused) → no edge, and the vote map is clean.
+        assert_eq!(
+            entry.apply_watermark_vote(OP, 0, WatermarkKind::Withdraw),
+            None,
+            "withdraw of a resumed op produces no pause edge"
+        );
+        assert_eq!(entry.wm_vote_count(), 0, "withdraw clears the op vote");
+    }
+
+    /// BRIDGE-FR-11 review (round 3): the shared upstream entry must
+    /// reference-count pause votes across co-subscribers — pause iff EVERY
+    /// live op wants pause, resume as soon as ANY has room. This is the
+    /// multi-op composition the old last-writer-wins single-seq gate could
+    /// not represent (a fast op's climbing seq shadowed a slow op's pause).
+    /// Tested by the aggregate boundaries with two ops A,B sharing one
+    /// entry, B cycling at a HIGHER seq than A throughout.
+    #[tokio::test]
+    async fn fr11_pause_votes_compose_across_co_subscribers() {
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        cache.insert_test_entry("WM:PV").await;
+        let entry = cache.peek("WM:PV").await.expect("entry present");
+        const A: u64 = 10;
+        const B: u64 = 20;
+        use WatermarkKind::{Pause, Resume, Withdraw};
+
+        // A pauses: the only voting op wants pause → pause upstream.
+        assert_eq!(entry.apply_watermark_vote(A, 2, Pause), Some(true));
+        // B also pauses: all voting ops paused, already paused → no edge.
+        assert_eq!(entry.apply_watermark_vote(B, 3, Pause), None);
+        // B (faster) gets room and resumes: NOT all paused → resume, even
+        // though A still wants pause. A fast co-subscriber keeps the
+        // upstream flowing; A falls back to broadcast-lag coalescing.
+        assert_eq!(entry.apply_watermark_vote(B, 4, Resume), Some(false));
+        // B cycles repeatedly at climbing seqs (5,6,7…). A's standing pause
+        // vote (seq 2) is NEVER shadowed by B's higher seqs — the per-op
+        // key isolates them. Upstream pauses only when B is also paused.
+        assert_eq!(entry.apply_watermark_vote(B, 5, Pause), Some(true));
+        assert_eq!(entry.apply_watermark_vote(B, 6, Resume), Some(false));
+        assert_eq!(entry.apply_watermark_vote(B, 7, Pause), Some(true));
+        // A finally gets room: NOT all paused → resume.
+        assert_eq!(entry.apply_watermark_vote(A, 8, Resume), Some(false));
+
+        // Strand guard: drive both to paused, then tear A down while paused
+        // — B alone still wants pause, so the upstream STAYS paused (no
+        // spurious resume), and tearing B down empties the votes → resume.
+        assert_eq!(entry.apply_watermark_vote(A, 9, Pause), Some(true));
+        assert_eq!(entry.apply_watermark_vote(B, 10, Pause), None);
+        assert_eq!(
+            entry.apply_watermark_vote(A, 0, Withdraw),
+            None,
+            "withdrawing one paused op leaves the other's pause standing"
+        );
+        assert_eq!(
+            entry.apply_watermark_vote(B, 0, Withdraw),
+            Some(false),
+            "withdrawing the last paused op resumes the shared upstream"
+        );
+        assert_eq!(entry.wm_vote_count(), 0, "all votes withdrawn");
+    }
+
+    /// BRIDGE-FR-11 review (round 4, the finding): an upstream reconnect
+    /// installs a fresh, UNPAUSED Pauser, but co-subscribers' standing pause
+    /// votes survive the disconnect and no watermark edge re-fires after
+    /// reconnect. The fresh Pauser must therefore be reconciled to the
+    /// current aggregate at install time, else backpressure is silently lost
+    /// for the whole reconnect-to-recovery window. Boundary: install while
+    /// the aggregate is "all paused" → the new sink is driven to paused.
+    #[tokio::test]
+    async fn fr11_reconnect_reinstall_reapplies_standing_pause() {
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        cache.insert_test_entry("WM:PV").await;
+        let entry = cache.peek("WM:PV").await.expect("entry present");
+
+        // A standing pause vote exists (the sole op wants pause).
+        assert_eq!(
+            entry.apply_watermark_vote(1, 2, WatermarkKind::Pause),
+            Some(true)
+        );
+
+        // Reconnect: a fresh sink is installed. install() must reconcile it
+        // to the standing aggregate — drive it to paused — with NO new vote
+        // edge.
+        let rec = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
+        entry.pause.install_fake(rec.clone()).await;
+        assert_eq!(
+            *rec.lock(),
+            vec![true],
+            "reconnect must re-apply the standing pause to the fresh Pauser"
+        );
+    }
+
+    /// BRIDGE-FR-11 review (round 4): the reconcile is level-triggered, so a
+    /// reconnect while the aggregate is "resumed" must NOT spuriously pause
+    /// the fresh subscription. Boundary: a co-subscriber has room (aggregate
+    /// resumed) at reconnect → the new sink is driven to unpaused.
+    #[tokio::test]
+    async fn fr11_reconnect_reinstall_stays_unpaused_when_aggregate_resumed() {
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        cache.insert_test_entry("WM:PV").await;
+        let entry = cache.peek("WM:PV").await.expect("entry present");
+
+        // Two ops: one paused, one with room → aggregate is NOT all-paused.
+        assert_eq!(
+            entry.apply_watermark_vote(1, 2, WatermarkKind::Pause),
+            Some(true)
+        );
+        assert_eq!(
+            entry.apply_watermark_vote(2, 2, WatermarkKind::Resume),
+            None,
+            "a fresh op voting resume keeps the aggregate non-paused-only"
+        );
+        // op 2 never paused so its Resume is ignored; op 1 alone still wants
+        // pause → aggregate is still all-paused. Give op 2 a real pause then
+        // resume so it is a live, resumed voter alongside op 1's pause.
+        assert_eq!(
+            entry.apply_watermark_vote(2, 3, WatermarkKind::Pause),
+            None,
+            "both ops want pause now → still all-paused, no edge"
+        );
+        assert_eq!(
+            entry.apply_watermark_vote(2, 4, WatermarkKind::Resume),
+            Some(false),
+            "op 2 gets room → aggregate resumes"
+        );
+
+        // Reconnect while resumed: the fresh sink must stay unpaused.
+        let rec = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
+        entry.pause.install_fake(rec.clone()).await;
+        assert_eq!(
+            *rec.lock(),
+            vec![false],
+            "reconnect must not pause a fresh sink when a co-subscriber has room"
+        );
+    }
+
+    /// BRIDGE-FR-11 review (round 4): `reconcile` with no installed sink
+    /// (upstream between connections) is a no-op — it must not panic and
+    /// records nothing.
+    #[tokio::test]
+    async fn fr11_reconcile_without_installed_sink_is_noop() {
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        cache.insert_test_entry("WM:PV").await;
+        let entry = cache.peek("WM:PV").await.expect("entry present");
+        assert_eq!(
+            entry.apply_watermark_vote(1, 2, WatermarkKind::Pause),
+            Some(true)
+        );
+        // No sink installed; reconcile must simply return.
+        entry.reconcile_pause().await;
+        assert!(
+            entry.pause.sink.lock().is_none(),
+            "no sink installed after a bare reconcile"
+        );
+    }
+
+    /// BRIDGE-FR-11 review (round 4, two-driver invariant): the whole point
+    /// of routing every physical drive through one `drive`-serialized,
+    /// level-triggered `reconcile` is that a reconnect re-install and the
+    /// applier's edge-drive can run CONCURRENTLY without stranding the
+    /// installed Pauser in the wrong state. Exercise that under real
+    /// multi-thread contention: race an `install` (sink swap + reconcile)
+    /// against many bare reconciles, then flip the aggregate and settle.
+    /// Post-quiesce invariant: the LAST level driven equals the FINAL
+    /// aggregate, and no interleaving deadlocks or panics. (Catches a
+    /// regression that drops the drive lock or captures the sink/level
+    /// outside it.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fr11_concurrent_install_and_reconcile_settles_to_aggregate() {
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        cache.insert_test_entry("WM:PV").await;
+        let entry = cache.peek("WM:PV").await.expect("entry present");
+        let pc = entry.pause.clone();
+        let rec = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
+
+        // Aggregate starts "all paused".
+        assert_eq!(
+            entry.apply_watermark_vote(1, 2, WatermarkKind::Pause),
+            Some(true)
+        );
+
+        // Race the reconnect install against a burst of edge-drive reconciles.
+        let mut handles = Vec::new();
+        {
+            let pc = pc.clone();
+            let rec = rec.clone();
+            handles.push(tokio::spawn(async move { pc.install_fake(rec).await }));
+        }
+        for _ in 0..8 {
+            let pc = pc.clone();
+            handles.push(tokio::spawn(async move { pc.reconcile().await }));
+        }
+        for h in handles {
+            h.await.expect("no panic/deadlock under concurrent drives");
+        }
+        // Every drive observed the paused aggregate; the install path drove
+        // at least one paused level onto the fresh sink.
+        assert!(
+            rec.lock().iter().any(|&p| p),
+            "the install path drove the standing pause onto the fresh sink"
+        );
+
+        // Flip the aggregate to resumed, then settle with a final reconcile.
+        assert_eq!(
+            entry.apply_watermark_vote(1, 3, WatermarkKind::Resume),
+            Some(false)
+        );
+        pc.reconcile().await;
+        assert!(
+            !*rec.lock().last().expect("at least one drive recorded"),
+            "after concurrent drives + a resume edge, the sink settles to the \
+             final aggregate (resumed)"
+        );
     }
 
     /// BUG 2 regression: `apply_monitor_event` must update
@@ -922,7 +1423,7 @@ mod tests {
             first_event: Arc::new(Notify::new()),
             _monitor_task: AbortOnDrop(task.abort_handle()),
             drop_poke: parking_lot::Mutex::new(false),
-            pauser: Arc::new(parking_lot::Mutex::new(None)),
+            pause: PauseControl::new(),
         };
         assert_eq!(entry.subscriber_count(), 0);
         let _r1 = entry.subscribe();

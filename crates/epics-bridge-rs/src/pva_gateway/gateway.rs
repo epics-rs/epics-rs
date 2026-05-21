@@ -240,7 +240,6 @@ impl PvaGateway {
             let layered = AuditLayer::new(audit_sink).layer(ReadOnlyLayer.layer(acl_layer));
             Self::start_server(
                 layered,
-                &cache,
                 &source,
                 &config.control_prefix,
                 config.server_config,
@@ -249,7 +248,6 @@ impl PvaGateway {
             let layered = AuditLayer::new(audit_sink).layer(acl_layer);
             Self::start_server(
                 layered,
-                &cache,
                 &source,
                 &config.control_prefix,
                 config.server_config,
@@ -269,7 +267,6 @@ impl PvaGateway {
     /// `read_only`.
     fn start_server<S>(
         layered: S,
-        cache: &Arc<ChannelCache>,
         source: &GatewayChannelSource,
         control_prefix: &Option<String>,
         server_config: PvaServerConfig,
@@ -280,7 +277,7 @@ impl PvaGateway {
         match control_prefix {
             Some(prefix) if !prefix.is_empty() => {
                 let composite = CompositeSource::new();
-                let control = ControlSource::new(prefix, cache.clone(), source.clone());
+                let control = ControlSource::new(prefix, source.clone());
                 composite
                     .add_source("__gw_control", Arc::new(control) as DynSource, -100)
                     .map_err(|e| GwError::Other(format!("control source registration: {e}")))?;

@@ -262,14 +262,12 @@ impl MultiTenantPvaGatewayBuilder {
             // operator can always disambiguate via the per-cache
             // diagnostic PVs in each control_prefix namespace.
             let mut first_gw_source: Option<GatewayChannelSource> = None;
-            let mut first_cache: Option<Arc<ChannelCache>> = None;
             for (i, (label, cache)) in sources.iter().enumerate() {
                 let mut src = GatewayChannelSource::new(cache.clone());
                 src.connect_timeout = self.connect_timeout;
                 src.max_subscribers = self.max_subscribers;
                 if first_gw_source.is_none() {
                     first_gw_source = Some(src.clone());
-                    first_cache = Some(cache.clone());
                 }
                 let order = i as i32; // earlier labels win
                 let name = format!("gateway:{label}");
@@ -282,11 +280,9 @@ impl MultiTenantPvaGatewayBuilder {
                         ))
                     })?;
             }
-            if let (Some(prefix), Some(gw_src), Some(cache)) =
-                (ds.control_prefix.as_ref(), first_gw_source, first_cache)
-            {
+            if let (Some(prefix), Some(gw_src)) = (ds.control_prefix.as_ref(), first_gw_source) {
                 if !prefix.is_empty() {
-                    let control = ControlSource::new(prefix, cache, gw_src);
+                    let control = ControlSource::new(prefix, gw_src);
                     composite
                         .add_source("__gw_control", Arc::new(control), -100)
                         .map_err(|e| {

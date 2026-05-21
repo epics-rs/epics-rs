@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server_native::ChannelContext;
-use epics_pva_rs::server_native::source::{ChannelSource, RawMonitorEvent};
+use epics_pva_rs::server_native::source::{ChannelSource, RawMonitorEvent, WatermarkEvent};
 use tokio::sync::mpsc;
 
 /// Wrap a [`ChannelSource`] and produce a new one with extra
@@ -72,6 +72,22 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     }
     async fn get_introspection(&self, name: &str) -> Option<FieldDesc> {
         self.inner.get_introspection(name).await
+    }
+    // BRIDGE-FR-8: forward the credential-aware existence/introspection
+    // variants to the inner. Without these, the trait default would
+    // delegate to THIS layer's ctx-less `has_pv`/`get_introspection`,
+    // dropping the downstream peer's identity before it reaches a
+    // gateway inner source — the same ctx-severing bug the typed-op
+    // forwarders below already guard against.
+    async fn has_pv_checked(&self, name: &str, ctx: ChannelContext) -> bool {
+        self.inner.has_pv_checked(name, ctx).await
+    }
+    async fn get_introspection_checked(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> Option<FieldDesc> {
+        self.inner.get_introspection_checked(name, ctx).await
     }
     async fn get_value(&self, name: &str) -> Option<PvField> {
         self.inner.get_value(name).await
@@ -167,7 +183,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
         self.inner.subscribe_checked_opts(checked, ctx, opts).await
     }
     async fn subscribe_raw_checked_opts(
@@ -199,11 +215,17 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
             .rpc_checked(checked, request_desc, request_value, ctx)
             .await
     }
-    fn notify_watermark_high(&self, name: &str) {
-        self.inner.notify_watermark_high(name);
+    // BRIDGE-FR-11: forward the per-PV watermark levels so the inner
+    // gateway source's `monitor_watermarks` override is reachable
+    // through the wrapper stack. Without this the server's monitor loop
+    // sees the trait default `None` and never fires the pause/resume
+    // callbacks — the same wrapper-severs-override defect family as
+    // FR-8's `has_pv_checked`/`get_introspection_checked`.
+    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+        self.inner.monitor_watermarks(name)
     }
-    fn notify_watermark_low(&self, name: &str) {
-        self.inner.notify_watermark_low(name);
+    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
+        self.inner.notify_watermark(name, ctx, ev);
     }
 }
 
@@ -369,6 +391,28 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.get_introspection(name).await
     }
+    // BRIDGE-FR-8: gate the credential-aware existence/introspection
+    // variants by the same static allowlist as `has_pv`/
+    // `get_introspection`, then forward to the inner's `*_checked` so a
+    // gateway inner source resolves under THIS peer's identity. Without
+    // these the trait default would delegate to this layer's ctx-less
+    // `has_pv`/`get_introspection`, dropping the downstream credentials.
+    async fn has_pv_checked(&self, name: &str, ctx: ChannelContext) -> bool {
+        if !self.config.allowed(name) {
+            return false;
+        }
+        self.inner.has_pv_checked(name, ctx).await
+    }
+    async fn get_introspection_checked(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> Option<FieldDesc> {
+        if !self.config.allowed(name) {
+            return None;
+        }
+        self.inner.get_introspection_checked(name, ctx).await
+    }
     async fn get_value(&self, name: &str) -> Option<PvField> {
         if !self.config.allowed(name) {
             return None;
@@ -483,7 +527,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
         if !self.config.allowed(checked.pv_name()) {
             return None;
         }
@@ -541,11 +585,17 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.process_checked(checked, ctx).await
     }
-    fn notify_watermark_high(&self, name: &str) {
-        self.inner.notify_watermark_high(name);
+    // BRIDGE-FR-11: forward the per-PV watermark levels so the inner
+    // gateway source's `monitor_watermarks` override is reachable
+    // through the wrapper stack. Without this the server's monitor loop
+    // sees the trait default `None` and never fires the pause/resume
+    // callbacks — the same wrapper-severs-override defect family as
+    // FR-8's `has_pv_checked`/`get_introspection_checked`.
+    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+        self.inner.monitor_watermarks(name)
     }
-    fn notify_watermark_low(&self, name: &str) {
-        self.inner.notify_watermark_low(name);
+    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
+        self.inner.notify_watermark(name, ctx, ev);
     }
 }
 
@@ -842,6 +892,22 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     async fn get_introspection(&self, name: &str) -> Option<FieldDesc> {
         self.inner.get_introspection(name).await
     }
+    // BRIDGE-FR-8: pure pass-through of the credential-aware variants,
+    // matching the unaudited `has_pv`/`get_introspection` above
+    // (existence/descriptor probes carry no audit row). Without these
+    // the trait default would route through this layer's ctx-less
+    // `has_pv`/`get_introspection`, dropping the downstream peer's
+    // identity before it reaches a gateway inner source.
+    async fn has_pv_checked(&self, name: &str, ctx: ChannelContext) -> bool {
+        self.inner.has_pv_checked(name, ctx).await
+    }
+    async fn get_introspection_checked(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> Option<FieldDesc> {
+        self.inner.get_introspection_checked(name, ctx).await
+    }
     async fn get_value(&self, name: &str) -> Option<PvField> {
         let result = self.inner.get_value(name).await;
         if self.audit_get {
@@ -1043,7 +1109,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
@@ -1131,11 +1197,17 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    fn notify_watermark_high(&self, name: &str) {
-        self.inner.notify_watermark_high(name);
+    // BRIDGE-FR-11: forward the per-PV watermark levels so the inner
+    // gateway source's `monitor_watermarks` override is reachable
+    // through the wrapper stack. Without this the server's monitor loop
+    // sees the trait default `None` and never fires the pause/resume
+    // callbacks — the same wrapper-severs-override defect family as
+    // FR-8's `has_pv_checked`/`get_introspection_checked`.
+    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+        self.inner.monitor_watermarks(name)
     }
-    fn notify_watermark_low(&self, name: &str) {
-        self.inner.notify_watermark_low(name);
+    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
+        self.inner.notify_watermark(name, ctx, ev);
     }
 }
 
@@ -1566,6 +1638,155 @@ mod tests {
         assert!(!value_reached.load(Ordering::SeqCst));
     }
 
+    // ── BRIDGE-FR-8: credentialed existence / introspection forwarding ──
+
+    /// Records whether the credential-free (`has_pv`/`get_introspection`)
+    /// or the credentialed (`*_checked`) path was reached, plus the
+    /// account the checked path observed. A wrapper that omits the
+    /// `_checked` forwarders lets the trait default delegate to its own
+    /// ctx-less `has_pv`/`get_introspection`, so `plain_*` flips and the
+    /// recorded account stays `None`.
+    struct ExistenceRecordingSource {
+        plain_has_pv: Arc<AtomicBool>,
+        plain_intro: Arc<AtomicBool>,
+        checked_has_pv_account: Arc<std::sync::Mutex<Option<String>>>,
+        checked_intro_account: Arc<std::sync::Mutex<Option<String>>>,
+    }
+    impl ChannelSource for ExistenceRecordingSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["X".into()]
+        }
+        async fn has_pv(&self, _name: &str) -> bool {
+            self.plain_has_pv.store(true, Ordering::SeqCst);
+            true
+        }
+        async fn has_pv_checked(&self, _name: &str, ctx: ChannelContext) -> bool {
+            *self.checked_has_pv_account.lock().unwrap() = Some(ctx.account);
+            true
+        }
+        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            self.plain_intro.store(true, Ordering::SeqCst);
+            Some(FieldDesc::Scalar(ScalarType::Double))
+        }
+        async fn get_introspection_checked(
+            &self,
+            _name: &str,
+            ctx: ChannelContext,
+        ) -> Option<FieldDesc> {
+            *self.checked_intro_account.lock().unwrap() = Some(ctx.account);
+            Some(FieldDesc::Scalar(ScalarType::Double))
+        }
+        async fn get_value(&self, _name: &str) -> Option<PvField> {
+            Some(PvField::Scalar(ScalarValue::Double(0.0)))
+        }
+        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
+            Ok(())
+        }
+        async fn is_writable(&self, _name: &str) -> bool {
+            true
+        }
+        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            None
+        }
+    }
+
+    /// The full production wrapper stack `Audited<ReadOnly<Acl<S>>>`
+    /// (gateway.rs `Audit( ReadOnly?( Acl( source ) ) )`) must forward
+    /// BOTH credentialed existence/introspection variants down to the
+    /// inner source carrying the downstream account — never collapse to
+    /// the ctx-less `has_pv`/`get_introspection` via the trait default.
+    /// Without the per-layer `*_checked` forwarders the credentials die
+    /// at the first wrapper boundary, re-opening the FR-8 leak.
+    #[tokio::test]
+    async fn fr8_wrapper_stack_threads_checked_existence_and_introspection() {
+        let plain_has_pv = Arc::new(AtomicBool::new(false));
+        let plain_intro = Arc::new(AtomicBool::new(false));
+        let checked_has_pv_account = Arc::new(std::sync::Mutex::new(None));
+        let checked_intro_account = Arc::new(std::sync::Mutex::new(None));
+        let inner = ExistenceRecordingSource {
+            plain_has_pv: plain_has_pv.clone(),
+            plain_intro: plain_intro.clone(),
+            checked_has_pv_account: checked_has_pv_account.clone(),
+            checked_intro_account: checked_intro_account.clone(),
+        };
+        let stack = AuditLayer::new(NoopAudit)
+            .layer(ReadOnlyLayer.layer(AclLayer::new(AclConfig::default()).layer(inner)));
+
+        let found = stack.has_pv_checked("X", test_ctx()).await;
+        let intro = stack.get_introspection_checked("X", test_ctx()).await;
+
+        assert!(
+            found,
+            "credentialed existence must resolve through the stack"
+        );
+        assert!(
+            intro.is_some(),
+            "credentialed introspection must resolve through the stack"
+        );
+        assert_eq!(
+            checked_has_pv_account.lock().unwrap().as_deref(),
+            Some("alice"),
+            "has_pv_checked must reach the inner carrying ctx.account through every wrapper"
+        );
+        assert_eq!(
+            checked_intro_account.lock().unwrap().as_deref(),
+            Some("alice"),
+            "get_introspection_checked must reach the inner carrying ctx.account"
+        );
+        assert!(
+            !plain_has_pv.load(Ordering::SeqCst),
+            "no wrapper may collapse has_pv_checked to credential-free has_pv"
+        );
+        assert!(
+            !plain_intro.load(Ordering::SeqCst),
+            "no wrapper may collapse get_introspection_checked to credential-free get_introspection"
+        );
+    }
+
+    /// BRIDGE-FR-11: a source's `monitor_watermarks` levels must survive
+    /// the full `Audited<ReadOnly<Acl<S>>>` wrapper stack. Without the
+    /// per-layer forwarder each wrapper returns the trait default `None`,
+    /// so the server's monitor loop never fires the pause/resume
+    /// callbacks — the same wrapper-severs-override defect family as FR-8.
+    struct WatermarkSource;
+    impl ChannelSource for WatermarkSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["X".into()]
+        }
+        async fn has_pv(&self, _name: &str) -> bool {
+            true
+        }
+        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            Some(FieldDesc::Scalar(ScalarType::Double))
+        }
+        async fn get_value(&self, _name: &str) -> Option<PvField> {
+            Some(PvField::Scalar(ScalarValue::Double(0.0)))
+        }
+        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
+            Ok(())
+        }
+        async fn is_writable(&self, _name: &str) -> bool {
+            true
+        }
+        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            None
+        }
+        fn monitor_watermarks(&self, _name: &str) -> Option<(usize, usize)> {
+            Some((2, 5))
+        }
+    }
+
+    #[tokio::test]
+    async fn fr11_wrapper_stack_forwards_monitor_watermarks() {
+        let stack = AuditLayer::new(NoopAudit)
+            .layer(ReadOnlyLayer.layer(AclLayer::new(AclConfig::default()).layer(WatermarkSource)));
+        assert_eq!(
+            stack.monitor_watermarks("X"),
+            Some((2, 5)),
+            "monitor_watermarks must forward through every wrapper, not collapse to the default None"
+        );
+    }
+
     // ── process / process_checked forwarding through the wrappers ────
 
     /// A typed PROCESS through the `Acl` wrapper (allowed name) must
@@ -1788,7 +2009,7 @@ mod tests {
             _checked: AccessChecked,
             _ctx: ChannelContext,
             _opts: epics_pva_rs::server_native::MonitorOptions,
-        ) -> Option<mpsc::Receiver<PvField>> {
+        ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
             self.opts_reached.store(true, Ordering::SeqCst);
             None
         }

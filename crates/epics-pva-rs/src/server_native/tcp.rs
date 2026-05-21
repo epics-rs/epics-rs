@@ -45,6 +45,73 @@ fn alloc_sid() -> u32 {
 struct PipelineOptions {
     enabled: bool,
     queue_size: u32,
+    /// pvxs `MonitorOp::ackAt` (`servermon.cpp:68`) — the pipeline
+    /// ACK-refill threshold parsed from `record._options.ackAny`. It
+    /// caps the source-provided monitor watermarks at `ack_at - 1`
+    /// (`servermon.cpp:332-333`, see [`clamp_watermarks`]). Defaults to
+    /// `1` when `ackAny` is absent; only meaningful when `enabled`.
+    ack_at: u32,
+}
+
+/// pvxs `servermon.cpp:554-581` — derive the pipeline ACK-refill
+/// threshold `ackAt` from `record._options.ackAny` and the negotiated
+/// `queueSize` (pvxs `limit`). `ackAny` may be a plain integer (typed
+/// builder scalar or a numeric string) or a percentage string
+/// (`"N%"`). An absent or unparseable value keeps the pvxs default of
+/// `1`; an explicit `0` becomes `queueSize / 2`; the result clamps to
+/// `[1, queueSize]`. `queue_size` MUST be `>= 1` (the caller only
+/// invokes this for an enabled pipeline, where `queueSize >= 2`).
+fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> u32 {
+    use crate::pvdata::ScalarValue;
+    // pvxs `MonitorOp::ackAt` struct default.
+    let mut ack_at: u32 = 1;
+    if let Some(PvField::Scalar(sv)) = ack_any {
+        match sv {
+            ScalarValue::String(s) => {
+                if let Some(pct) = s.strip_suffix('%').filter(|p| !p.is_empty()) {
+                    if let Ok(percent) = pct.trim().parse::<f64>() {
+                        // servermon.cpp:564 multiplies the clamped percent
+                        // by `limit` directly (no `/ 100`); the `[1, limit]`
+                        // clamp below bounds the result. Replicated verbatim
+                        // so the threshold matches a pvxs server.
+                        ack_at = (percent.clamp(0.0, 100.0) * queue_size as f64) as u32;
+                    }
+                } else if let Ok(n) = s.trim().parse::<u32>() {
+                    ack_at = n;
+                }
+            }
+            ScalarValue::Byte(i) => ack_at = u32::try_from(*i).unwrap_or(1),
+            ScalarValue::UByte(i) => ack_at = u32::from(*i),
+            ScalarValue::Short(i) => ack_at = u32::try_from(*i).unwrap_or(1),
+            ScalarValue::UShort(i) => ack_at = u32::from(*i),
+            ScalarValue::Int(i) => ack_at = u32::try_from(*i).unwrap_or(1),
+            ScalarValue::UInt(i) => ack_at = *i,
+            ScalarValue::Long(l) => ack_at = u32::try_from(*l).unwrap_or(1),
+            ScalarValue::ULong(l) => ack_at = u32::try_from(*l).unwrap_or(1),
+            _ => {}
+        }
+    }
+    // servermon.cpp:577-581.
+    if ack_at == 0 {
+        ack_at = queue_size / 2;
+    }
+    ack_at.clamp(1, queue_size)
+}
+
+/// pvxs `servermon.cpp:332-333` — the pipeline ACK threshold `ack_at`
+/// caps the source-provided monitor watermarks at `ack_at - 1`. The
+/// single owner of this clamp: both the LOW crossing (subscriber loop)
+/// and the HIGH crossing (ACK dispatch) read the level it produces, so
+/// `ackAny` is honored identically on both. Levels are returned
+/// unchanged for a non-pipelined monitor (`ack_at` `None`).
+fn clamp_watermarks(levels: Option<(usize, usize)>, ack_at: Option<u32>) -> Option<(usize, usize)> {
+    match (levels, ack_at) {
+        (Some((low, high)), Some(a)) => {
+            let cap = a.saturating_sub(1) as usize;
+            Some((low.min(cap), high.min(cap)))
+        }
+        (other, _) => other,
+    }
 }
 
 /// Wrap a PVA monitor event's `PvField` in the CA-side
@@ -521,23 +588,32 @@ fn monitor_pipeline_options(req: &PvField) -> Option<PipelineOptions> {
             _ => None,
         })
     });
+    // pvxs `servermon.cpp:554` — `record._options.ackAny`. Parsed only
+    // for an enabled pipeline (`ackAt` is meaningless without one).
+    let ack_any = opt_s
+        .fields
+        .iter()
+        .find_map(|(k, v)| (k == "ackAny").then_some(v));
     if enabled {
         match queue_size {
             Some(n) if n >= 2 => Some(PipelineOptions {
                 enabled: true,
                 queue_size: n,
+                ack_at: ack_at_from(ack_any, n),
             }),
             // pvxs: invalid/<2 queueSize disables pipeline rather than
             // accepting a broken negotiation.
             _ => Some(PipelineOptions {
                 enabled: false,
                 queue_size: queue_size.unwrap_or(4).max(1),
+                ack_at: 1,
             }),
         }
     } else {
         Some(PipelineOptions {
             enabled: false,
             queue_size: queue_size.unwrap_or(4).max(1),
+            ack_at: 1,
         })
     }
 }
@@ -3127,9 +3203,16 @@ async fn handle_op(
         // PVA-FR-4 / BRIDGE-FR-11: capture the source's pipeline-window
         // watermark levels at INIT so the subscriber loop (LOW) and the
         // ACK dispatch (HIGH) evaluate the same `(low, high)` against the
-        // shared hysteresis flag.
+        // shared hysteresis flag. pvxs `servermon.cpp:332-333`: the
+        // pipeline `ackAny`/`ackAt` threshold caps those levels at
+        // `ackAt - 1`. Clamping here, once, is what makes both crossings
+        // honor `ackAny` identically (the subscriber loop reads the
+        // value threaded out of this `OpState`, not a fresh source read).
         let monitor_wm = if kind == OpKind::Monitor {
-            source.monitor_watermarks(&ch.name)
+            clamp_watermarks(
+                source.monitor_watermarks(&ch.name),
+                pipeline_opt.as_ref().map(|p| p.ack_at),
+            )
         } else {
             None
         };
@@ -3708,6 +3791,7 @@ async fn handle_op(
                     monitor_options,
                     wm_seq,
                     monitor_op_id,
+                    wm_levels_init,
                 ) = ch
                     .ops
                     .get(&ioid)
@@ -3730,6 +3814,12 @@ async fn handle_op(
                             // HIGH uses, so both votes (and the teardown
                             // Withdraw) reference-count under one key.
                             s.monitor_op_id,
+                            // pvxs ackAt parity: the INIT-clamped watermark
+                            // levels (see [`clamp_watermarks`]). The LOW
+                            // crossing below reads THIS, not a fresh source
+                            // read, so it shares the HIGH path's clamped
+                            // levels and honors `ackAny` identically.
+                            s.monitor_wm,
                         )
                     })
                     .unwrap_or_else(|| {
@@ -3742,6 +3832,7 @@ async fn handle_op(
                             crate::server_native::source::MonitorOptions::default(),
                             Arc::new(std::sync::atomic::AtomicU64::new(1)),
                             next_op_id(),
+                            None,
                         )
                     });
                 let total_bits = intro_clone.total_bits();
@@ -3989,8 +4080,13 @@ async fn handle_op(
                     // state + ordering token is the SHARED `wm_seq` counter
                     // (crossed to "above" by the ACK dispatch, back to
                     // "below" here) so a gateway upstream paused on LOW can
-                    // be resumed by the credit-refill HIGH callback.
-                    let wm_levels = src.monitor_watermarks(&pv_name);
+                    // be resumed by the credit-refill HIGH callback. These
+                    // are the INIT-clamped levels threaded out of `OpState`
+                    // (pvxs ackAt parity, [`clamp_watermarks`]) — the same
+                    // value the HIGH path reads via `op.monitor_wm`, NOT a
+                    // fresh `monitor_watermarks` call, so `ackAny` clamps
+                    // both crossings through one owner.
+                    let wm_levels = wm_levels_init;
                     // BRIDGE-FR-11 review: arm the withdraw-on-teardown
                     // finalizer for flow-controlled (gateway) ops only.
                     // Held live for the rest of the task so every exit
@@ -5404,6 +5500,143 @@ mod tests {
         );
         let opts = monitor_pipeline_options(&req).expect("parsed");
         assert!(!opts.enabled, "Boolean(false) must disable pipeline");
+    }
+
+    // ── ackAny → pipeline ackAt parity (servermon.cpp:554-581) ──────────
+
+    fn make_pipeline_request_ack(value_pipe: PvField, queue: PvField, ack_any: PvField) -> PvField {
+        let options = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![
+                ("pipeline".to_string(), value_pipe),
+                ("queueSize".to_string(), queue),
+                ("ackAny".to_string(), ack_any),
+            ],
+        });
+        let record = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("_options".to_string(), options)],
+        });
+        PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("record".to_string(), record)],
+        })
+    }
+
+    #[test]
+    fn ack_at_defaults_to_one_when_ack_any_absent() {
+        // pvxs MonitorOp::ackAt struct default is 1; no ackAny in the
+        // pvRequest leaves it there (then clamp keeps it 1).
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+        );
+        let opts = monitor_pipeline_options(&req).expect("parsed");
+        assert!(opts.enabled);
+        assert_eq!(opts.ack_at, 1, "absent ackAny → ackAt == 1");
+    }
+
+    #[test]
+    fn ack_at_integer_boundaries() {
+        let q = 16u32;
+        // Plain integer in range.
+        for (ack, want) in [(3u32, 3u32), (1, 1), (16, 16)] {
+            let req = make_pipeline_request_ack(
+                PvField::Scalar(ScalarValue::Boolean(true)),
+                PvField::Scalar(ScalarValue::Int(q as i32)),
+                PvField::Scalar(ScalarValue::Int(ack as i32)),
+            );
+            let opts = monitor_pipeline_options(&req).expect("parsed");
+            assert_eq!(opts.ack_at, want, "ackAny={ack} with queueSize={q}");
+        }
+        // Explicit 0 → queueSize/2 (servermon.cpp:577-578).
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(q as i32)),
+            PvField::Scalar(ScalarValue::Int(0)),
+        );
+        assert_eq!(
+            monitor_pipeline_options(&req).unwrap().ack_at,
+            q / 2,
+            "ackAny=0 → queueSize/2"
+        );
+        // Above queueSize → clamps down to queueSize (servermon.cpp:581).
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(q as i32)),
+            PvField::Scalar(ScalarValue::Int(999)),
+        );
+        assert_eq!(
+            monitor_pipeline_options(&req).unwrap().ack_at,
+            q,
+            "ackAny>queueSize → clamp to queueSize"
+        );
+    }
+
+    #[test]
+    fn ack_at_string_integer_and_garbage() {
+        // Numeric string → integer path.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::Scalar(ScalarValue::String("4".into())),
+        );
+        assert_eq!(monitor_pipeline_options(&req).unwrap().ack_at, 4);
+        // Unparseable string → leaves the default of 1.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::Scalar(ScalarValue::String("garbage".into())),
+        );
+        assert_eq!(
+            monitor_pipeline_options(&req).unwrap().ack_at,
+            1,
+            "unparseable ackAny → default 1"
+        );
+    }
+
+    #[test]
+    fn ack_at_percentage_matches_pvxs_formula() {
+        // servermon.cpp:564 computes `clamp(percent,0,100) * limit`
+        // (NO `/ 100`), then clamps to [1, limit]. A fractional percent
+        // is the only way to land strictly below `limit`.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(100)),
+            PvField::Scalar(ScalarValue::String("0.5%".into())),
+        );
+        assert_eq!(
+            monitor_pipeline_options(&req).unwrap().ack_at,
+            50,
+            "0.5% of limit=100 → 0.5*100 = 50 (verbatim pvxs arithmetic)"
+        );
+        // Any percent >= 1 saturates: 50 * 16 = 800 → clamp to 16.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::Scalar(ScalarValue::String("50%".into())),
+        );
+        assert_eq!(monitor_pipeline_options(&req).unwrap().ack_at, 16);
+    }
+
+    #[test]
+    fn clamp_watermarks_caps_at_ack_at_minus_one() {
+        // No pipeline (ack_at None): source levels pass through.
+        assert_eq!(
+            clamp_watermarks(Some((2, 8)), None),
+            Some((2, 8)),
+            "non-pipelined monitor uses source levels unchanged"
+        );
+        // No source levels: nothing to clamp.
+        assert_eq!(clamp_watermarks(None, Some(5)), None);
+        // ack_at=5 → cap=4: low(2) stays, high(8) capped to 4.
+        assert_eq!(clamp_watermarks(Some((2, 8)), Some(5)), Some((2, 4)));
+        // ack_at=1 (pvxs default) → cap=0: both marks forced to 0,
+        // matching pvxs `min(low, ackAt-1)` with ackAt=1.
+        assert_eq!(clamp_watermarks(Some((2, 8)), Some(1)), Some((0, 0)));
+        // Gateway returns (0,0): clamp is a no-op regardless of ack_at,
+        // so ackAt is observable only for sources with high>0 marks.
+        assert_eq!(clamp_watermarks(Some((0, 0)), Some(7)), Some((0, 0)));
     }
 
     fn synth_frame(command: Command, order: ByteOrder, payload: Vec<u8>) -> Frame {

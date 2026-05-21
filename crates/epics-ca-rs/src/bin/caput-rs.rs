@@ -339,6 +339,7 @@ async fn main() {
 /// What `caput-rs` will write — either a value typed against the
 /// channel's native DBR type, or a string to be sent as `DBR_STRING`
 /// for server-side resolution (the ENUM-by-name path).
+#[derive(Debug)]
 enum WriteValue {
     Typed(epics_ca_rs::EpicsValue),
     /// A scalar ENUM value written by name. The server resolves it
@@ -361,15 +362,108 @@ impl WriteValue {
     }
 }
 
-/// Build the value to write, in C `caput`'s precedence order. The single
-/// owner of that precedence — `-S` (long string / charArrAsStr) is
-/// resolved FIRST, before any native-type parse, mirroring C handling
-/// charArrAsStr ahead of normal string conversion (`caput.c:514`).
-/// Otherwise `caput -S PV hello` against a native DBF_CHAR would die
-/// parsing "hello" as a numeric char: the old code parsed the native type
-/// up front and exited on the parse error before ever applying `-S`.
-/// Non-fatal `-a` count-token mismatches warn on stderr; fatal cases
-/// return `Err` with the full message for the caller to print.
+/// Port of EPICS `epicsStrnRawFromEscaped` (`libcom/.../epicsString.c`):
+/// decode C escape sequences in `s` to their raw byte values.
+///
+/// `\a \b \f \n \r \t \v` → the control byte; `\\ \' \"` → the literal
+/// char; `\0` → a NUL byte; `\xH`/`\xHH` → the hex byte (1-2 digits, a
+/// following non-hex char is re-processed normally); any other `\c` → the
+/// literal `c`. A trailing lone `\`, or a literal NUL in the input, stops
+/// decoding. Note C does NOT decode multi-digit octal — only `\0`.
+///
+/// `caput` feeds string- and char-array-destined values through this so a
+/// value like `'a\tb'` is sent with a real TAB byte, matching the C tool
+/// (`caput.c:487,512,520`); the pre-fix Rust left `\n`/`\xNN` literal.
+fn raw_from_escaped(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    'next: while i < b.len() {
+        let mut c = b[i];
+        i += 1;
+        loop {
+            if c == 0 {
+                // Literal NUL in the input stops decoding (C `if (!c)`).
+                return out;
+            }
+            if c != b'\\' {
+                out.push(c);
+                continue 'next;
+            }
+            // Backslash: a trailing lone `\` stops decoding.
+            if i >= b.len() {
+                return out;
+            }
+            c = b[i];
+            i += 1;
+            match c {
+                b'a' => out.push(0x07),
+                b'b' => out.push(0x08),
+                b'f' => out.push(0x0C),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'v' => out.push(0x0B),
+                b'\\' => out.push(b'\\'),
+                b'\'' => out.push(b'\''),
+                b'"' => out.push(b'"'),
+                b'0' => out.push(0),
+                b'x' => {
+                    // 1-2 hex digits; a following non-hex char is
+                    // re-processed normally (C `goto input`).
+                    if i >= b.len() {
+                        return out;
+                    }
+                    c = b[i];
+                    i += 1;
+                    let Some(hi) = (c as char).to_digit(16) else {
+                        // Not a hex digit: re-process `c` from the top.
+                        continue;
+                    };
+                    let u = hi as u8;
+                    if i >= b.len() {
+                        out.push(u);
+                        return out;
+                    }
+                    c = b[i];
+                    i += 1;
+                    match (c as char).to_digit(16) {
+                        Some(lo) => out.push(u << 4 | lo as u8),
+                        None => {
+                            // One hex digit, then re-process `c` (C `goto
+                            // input`); a NUL `c` is caught at the loop top
+                            // and stops decoding, matching C `goto done`.
+                            out.push(u);
+                            continue;
+                        }
+                    }
+                }
+                other => out.push(other),
+            }
+            continue 'next;
+        }
+    }
+    out
+}
+
+/// `raw_from_escaped` decoded into a `String` for the DBR_STRING / ENUM-
+/// by-name put paths. The common escapes (`\n`, `\t`, `\\`, …) decode to
+/// ASCII; a high-byte `\xNN` that is not valid UTF-8 falls back to lossy
+/// decoding (the Rust `EpicsValue::String` is UTF-8, whereas C carries a
+/// raw byte buffer).
+fn raw_from_escaped_string(s: &str) -> String {
+    String::from_utf8_lossy(&raw_from_escaped(s)).into_owned()
+}
+
+/// Build the value to write, in C `caput`'s precedence order
+/// (`caput.c:454-530`): the ENUM field type is handled FIRST, then `-S`
+/// (charArrAsStr → DBR_CHAR) for a NON-ENUM PV, then the DBR_STRING /
+/// numeric paths. `-a` (array) resets charArrAsStr in C (`caput.c:318`),
+/// so the array path takes precedence over `-S`. String- and char-array-
+/// destined values are escape-decoded via [`raw_from_escaped`]; numeric
+/// values are parsed from the raw token (C runs `epicsStrtod` on the
+/// original argv). Non-fatal `-a` count-token mismatches warn on stderr;
+/// fatal cases return `Err` with the full message for the caller to print.
 fn build_write_value(
     values: &[String],
     native_type: epics_ca_rs::DbFieldType,
@@ -378,15 +472,6 @@ fn build_write_value(
     long_string: bool,
     array_mode: bool,
 ) -> Result<WriteValue, String> {
-    // `-S` long-string put: bytes as a NUL-terminated DBR_CHAR array.
-    // Highest precedence — no native-type parse on this path.
-    if long_string {
-        let joined = values.join(" ");
-        let mut bytes: Vec<u8> = joined.into_bytes();
-        bytes.push(0);
-        return Ok(WriteValue::Typed(epics_ca_rs::EpicsValue::CharArray(bytes)));
-    }
-
     if array_mode {
         // C `caput -a` (caput.c:413-418): after the PV name it skips the
         // count token (`optind++`) and uses ALL remaining values — the
@@ -419,12 +504,21 @@ fn build_write_value(
         // unless `-n` forces numeric, route to a DBR_STRING array for
         // server-side menu resolution when `-s` is set or any element is
         // not a plain integer index (the same documented divergence as
-        // the scalar path).
+        // the scalar path). C escapes each enum-name element (caput.c:487).
         let enum_by_name = native_type == epics_ca_rs::DbFieldType::Enum
             && !force_numeric
             && (force_string || tokens.iter().any(|t| parse_plain_integer(t).is_none()));
         if enum_by_name {
-            return Ok(WriteValue::EnumStringArray(tokens.to_vec()));
+            let escaped = tokens.iter().map(|t| raw_from_escaped_string(t)).collect();
+            return Ok(WriteValue::EnumStringArray(escaped));
+        }
+        // String-array elements are escape-decoded (C caput.c:520);
+        // numeric arrays parse the raw token.
+        if native_type == epics_ca_rs::DbFieldType::String {
+            let escaped: Vec<String> = tokens.iter().map(|t| raw_from_escaped_string(t)).collect();
+            return parse_array(native_type, &escaped)
+                .map(WriteValue::Typed)
+                .map_err(|e| format!("error: {e}"));
         }
         return parse_array(native_type, tokens)
             .map(WriteValue::Typed)
@@ -433,19 +527,42 @@ fn build_write_value(
 
     // Scalar: C `caput` joins extra positionals with single spaces.
     let joined = values.join(" ");
-    // ENUM special treatment (C `caput.c:455-510`, not a strict mirror —
-    // we don't fetch the menu, we let the server classify):
+
+    // (1) ENUM field type is handled FIRST (caput.c:455), BEFORE `-S` —
+    // charArrAsStr never applies to an ENUM PV. We don't fetch the menu;
+    // we let the server classify:
     // * `-n` (force_numeric): interpret as a number.
     // * `-s` (force_string): always DBR_STRING; server resolves the menu.
     // * default: a plain integer index goes numeric; anything else is
-    //   sent as DBR_STRING for server-side menu resolution.
-    let is_plain_integer = parse_plain_integer(&joined).is_some();
-    if native_type == epics_ca_rs::DbFieldType::Enum
-        && !force_numeric
-        && (force_string || !is_plain_integer)
-    {
-        return Ok(WriteValue::EnumString(joined));
+    //   sent as DBR_STRING for server-side menu resolution (escaped, as
+    //   C runs epicsStrnRawFromEscaped on the menu name, caput.c:487).
+    if native_type == epics_ca_rs::DbFieldType::Enum {
+        let is_plain_integer = parse_plain_integer(&joined).is_some();
+        if !force_numeric && (force_string || !is_plain_integer) {
+            return Ok(WriteValue::EnumString(raw_from_escaped_string(&joined)));
+        }
+        return epics_ca_rs::EpicsValue::parse(native_type, &joined)
+            .map(WriteValue::Typed)
+            .map_err(|e| format!("error: {e}"));
     }
+
+    // (2) `-S` (charArrAsStr) on a NON-ENUM PV → NUL-terminated DBR_CHAR
+    // array built from the escape-decoded bytes (caput.c:512). No
+    // native-type parse on this path.
+    if long_string {
+        let mut bytes = raw_from_escaped(&joined);
+        bytes.push(0);
+        return Ok(WriteValue::Typed(epics_ca_rs::EpicsValue::CharArray(bytes)));
+    }
+
+    // (3) Native DBR_STRING is escape-decoded (caput.c:520).
+    if native_type == epics_ca_rs::DbFieldType::String {
+        return Ok(WriteValue::Typed(epics_ca_rs::EpicsValue::String(
+            raw_from_escaped_string(&joined),
+        )));
+    }
+
+    // (4) Numeric native types parse the raw token (no escaping).
     epics_ca_rs::EpicsValue::parse(native_type, &joined)
         .map(WriteValue::Typed)
         .map_err(|e| format!("error: {e}"))
@@ -534,11 +651,32 @@ fn parse_array(
 
 #[cfg(test)]
 mod tests {
-    use super::{WriteValue, build_write_value};
+    use super::{WriteValue, build_write_value, raw_from_escaped};
     use epics_ca_rs::{DbFieldType, EpicsValue};
 
     fn vals(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn raw_from_escaped_matches_epics_strn_raw_from_escaped() {
+        // Per-boundary cases against the C `epicsStrnRawFromEscaped`:
+        // control escapes, literal escapes, the lone `\0` octal, `\xHH`
+        // hex with 1 and 2 digits, `\x` followed by a non-hex char
+        // (re-processed), an unknown `\c` (literal `c`), a trailing lone
+        // backslash (stops), and a literal NUL in the input (stops).
+        assert_eq!(
+            raw_from_escaped("\\a\\b\\f\\n\\r\\t\\v"),
+            vec![0x07, 0x08, 0x0C, 0x0A, 0x0D, 0x09, 0x0B]
+        );
+        assert_eq!(raw_from_escaped("\\\\\\'\\\""), vec![b'\\', b'\'', b'"']);
+        assert_eq!(raw_from_escaped("\\0"), vec![0]);
+        assert_eq!(raw_from_escaped("\\x41"), vec![0x41]); // two hex digits
+        assert_eq!(raw_from_escaped("\\xA"), vec![0x0A]); // single trailing hex
+        assert_eq!(raw_from_escaped("\\xG"), vec![b'G']); // non-hex re-processed
+        assert_eq!(raw_from_escaped("\\q"), vec![b'q']); // unknown escape → literal
+        assert_eq!(raw_from_escaped("a\\"), vec![b'a']); // trailing lone backslash stops
+        assert_eq!(raw_from_escaped("a\0b"), vec![b'a']); // literal NUL stops decoding
     }
 
     #[test]
@@ -564,21 +702,87 @@ mod tests {
     }
 
     #[test]
-    fn long_string_precedence_holds_for_every_native_type() {
-        // `-S` is type-independent: it never reaches the native-type
-        // parse, so no native type can make it fail.
+    fn long_string_applies_to_every_non_enum_native_type() {
+        // For a NON-ENUM PV `-S` never reaches the native-type parse, so no
+        // such native type can make it fail — it always yields a
+        // NUL-terminated DBR_CHAR array.
         for nt in [
             DbFieldType::Char,
             DbFieldType::Double,
-            DbFieldType::Enum,
             DbFieldType::Long,
             DbFieldType::String,
         ] {
             let r = build_write_value(&vals(&["not a number"]), nt, false, false, true, false);
             assert!(
                 matches!(r, Ok(WriteValue::Typed(EpicsValue::CharArray(_)))),
-                "-S must yield CharArray for native type {nt:?}"
+                "-S must yield CharArray for non-ENUM native type {nt:?}"
             );
+        }
+    }
+
+    #[test]
+    fn enum_field_type_wins_over_long_string() {
+        // C checks the ENUM field type FIRST (`caput.c:455`), so `-S`
+        // (charArrAsStr) never applies to an ENUM PV: a non-integer token
+        // routes to DBR_STRING for server-side menu resolution, NOT a
+        // DBR_CHAR array. Pre-fix the top-level `-S` block hijacked this.
+        let r = build_write_value(
+            &vals(&["not a number"]),
+            DbFieldType::Enum,
+            false,
+            false,
+            true,
+            false,
+        );
+        match r {
+            Ok(WriteValue::EnumString(s)) => assert_eq!(s, "not a number"),
+            other => panic!("-S on an ENUM PV must yield EnumString, got {other:?}"),
+        }
+        // A plain integer index on an ENUM PV still goes numeric even with
+        // `-S` set — ENUM precedence, then the default index path.
+        let idx = build_write_value(&vals(&["2"]), DbFieldType::Enum, false, false, true, false);
+        assert!(
+            matches!(idx, Ok(WriteValue::Typed(_))),
+            "integer index on ENUM PV stays numeric, got {idx:?}"
+        );
+    }
+
+    #[test]
+    fn long_string_decodes_c_escapes_to_raw_bytes() {
+        // `-S` feeds the value through `epicsStrnRawFromEscaped`, so
+        // `a\tb\n` becomes real TAB/LF bytes (then the NUL terminator), not
+        // the literal backslash sequences the pre-fix `into_bytes()` left.
+        let r = build_write_value(
+            &vals(&["a\\tb\\n"]),
+            DbFieldType::Char,
+            false,
+            false,
+            true,
+            false,
+        );
+        match r {
+            Ok(WriteValue::Typed(EpicsValue::CharArray(bytes))) => {
+                assert_eq!(bytes, vec![b'a', 0x09, b'b', 0x0A, 0x00]);
+            }
+            other => panic!("expected escape-decoded CharArray, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_string_scalar_decodes_c_escapes() {
+        // A native DBR_STRING scalar is escape-decoded too (`caput.c:520`):
+        // `\x41` → 'A', `\\` → one backslash, `\q` (unknown) → 'q'.
+        let r = build_write_value(
+            &vals(&["\\x41\\\\\\q"]),
+            DbFieldType::String,
+            false,
+            false,
+            false,
+            false,
+        );
+        match r {
+            Ok(WriteValue::Typed(EpicsValue::String(s))) => assert_eq!(s, "A\\q"),
+            other => panic!("expected escape-decoded String, got {other:?}"),
         }
     }
 

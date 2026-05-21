@@ -546,7 +546,25 @@ impl ClientState {
 
     async fn compute_access(&self, target: &ChannelTarget) -> (u32, bool) {
         match target {
-            ChannelTarget::SimplePv(_) => {
+            ChannelTarget::SimplePv(pv) => {
+                // BRIDGE-FR-1: a gateway shadow PV carries an access
+                // hook routing the decision through the gateway's own
+                // ACF (`.pvlist` ASG + `AccessConfig::can_read/write`)
+                // for this downstream `(user, host)`. When present it
+                // is authoritative for this PV — the server's own ACF
+                // never saw the `.pvlist` ASG, so consulting `self.acf`
+                // with a hardcoded "DEFAULT" would mis-report read
+                // access. The gateway audits/traps writes in its own
+                // write hook, so no TRAPWRITE rule resolves here.
+                if let Some(hook) = pv.access_hook() {
+                    let decision = hook(&self.username, &self.hostname);
+                    let bits = match (decision.read, decision.write) {
+                        (_, true) => 3,
+                        (true, false) => 1,
+                        (false, false) => 0,
+                    };
+                    return (bits, false);
+                }
                 let guard = self.acf.read().await;
                 if let Some(ref acf_cfg) = *guard {
                     // Simple PVs have no per-record ASL field; treat
@@ -1985,7 +2003,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let (_base, field_raw) = parse_pv_name(&record_path);
             let field = field_raw.to_ascii_uppercase();
 
-            if let Some(entry) = db.find_entry(&record_path).await {
+            // BRIDGE-FR-10: thread the connection peer into the search
+            // resolver so the CA gateway applies host-scoped `.pvlist`
+            // `DENY FROM host` admission on CREATE_CHANNEL (parity with C
+            // `pvExistTest` → `gateAs::findEntry(pvname, hostname)`).
+            if let Some(entry) = db.find_entry_from(&record_path, Some(peer)).await {
                 let sid = state.alloc_sid();
 
                 let (dbr_type, element_count, target) = match entry {

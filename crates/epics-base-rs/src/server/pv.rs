@@ -125,6 +125,34 @@ pub type WriteHook = Arc<
         + Sync,
 >;
 
+/// BRIDGE-FR-1: read/write access decision for a gateway shadow PV,
+/// evaluated for a specific downstream `(user, host)`. Mirrors the CA
+/// access-rights model the server reports to the client and gates
+/// reads on.
+#[derive(Debug, Clone, Copy)]
+pub struct AccessDecision {
+    /// Client may GET / MONITOR (`EVENT_ADD`) the PV.
+    pub read: bool,
+    /// Client may PUT (`WRITE` / `WRITE_NOTIFY`) the PV.
+    pub write: bool,
+}
+
+/// BRIDGE-FR-1: per-PV access hook installed by a proxy (the CA
+/// gateway) so the CA server routes a shadow PV's access-rights
+/// decision through the proxy's own ACF instead of the server's.
+/// Given the downstream client's `(user, host)`, it returns the
+/// [`AccessDecision`].
+///
+/// Symmetric to [`WriteHook`]: the gateway captures its single
+/// `ArcSwap<AccessConfig>` and the PV's `.pvlist` ASG/ASL in the
+/// closure, so `compute_access` reports access rights and gates reads
+/// with the same `can_read` / `can_write` the write hook uses — one
+/// ACF authority, no second copy to keep in sync. The hook is
+/// synchronous (it only reads an in-memory `ArcSwap`, no `.await`); the
+/// server consults it at `CREATE_CHAN` and on access-rights
+/// re-evaluation.
+pub type AccessHook = Arc<dyn Fn(&str, &str) -> AccessDecision + Send + Sync>;
+
 /// A monitor event sent to subscribers when a PV value changes.
 /// Carries a full Snapshot so GR/CTRL metadata (PREC, EGU, limits) is available.
 #[derive(Debug, Clone)]
@@ -188,6 +216,13 @@ pub struct ProcessVariable {
     /// constant-time clone of the optional `Arc`. The hook itself
     /// is async (returns a `Future`); only the slot is sync.
     write_hook: parking_lot::RwLock<Option<WriteHook>>,
+    /// BRIDGE-FR-1: optional access hook consulted by the CA server's
+    /// `compute_access` to decide a downstream client's read/write
+    /// rights for this PV. When set, it overrides the server's own ACF
+    /// for this PV — the gateway uses it to enforce `.pvlist` ASG-based
+    /// `can_read` / `can_write`, symmetric to [`Self::write_hook`].
+    /// Same sync `parking_lot::RwLock` slot rationale as `write_hook`.
+    access_hook: parking_lot::RwLock<Option<AccessHook>>,
 }
 
 impl ProcessVariable {
@@ -197,7 +232,21 @@ impl ProcessVariable {
             value: RwLock::new(initial),
             subscribers: Mutex::new(Vec::new()),
             write_hook: parking_lot::RwLock::new(None),
+            access_hook: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Install an access hook (BRIDGE-FR-1). Replaces any previously
+    /// installed hook.
+    pub fn set_access_hook(&self, hook: AccessHook) {
+        *self.access_hook.write() = Some(hook);
+    }
+
+    /// Snapshot of the installed access hook (clone of the `Arc`), or
+    /// `None`. Consulted by the CA server's `compute_access`; cheap and
+    /// non-async, like [`Self::write_hook`].
+    pub fn access_hook(&self) -> Option<AccessHook> {
+        self.access_hook.read().clone()
     }
 
     /// Install a write hook. Replaces any previously-installed hook.

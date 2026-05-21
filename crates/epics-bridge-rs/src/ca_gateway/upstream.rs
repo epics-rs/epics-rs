@@ -229,14 +229,26 @@ impl UpstreamManager {
     /// 4. Insert/update cache entry to `Connecting`
     /// 5. Spawn forwarding task with auto-restart
     /// 6. Install per-PV WriteHook on the shadow PV
+    ///
+    /// BRIDGE-FR-2: `served_name` is the downstream-facing identity the
+    /// client searched for (a `.pvlist` `ALIAS` name, or — for a plain
+    /// `ALLOW` match — the same string as `upstream_name`). The shadow
+    /// PV, subscription dedup key, cache entry, and monitor fan-out all
+    /// key on `served_name` so a client using the alias can complete
+    /// `CREATE_CHANNEL`/read. `upstream_name` is the resolved real PV the
+    /// gateway connects to upstream; the CA channel, write hook (put
+    /// forwarding + putlog), and DBR negotiation get all target it.
+    /// Mirrors C ca-gateway attaching the requested alias to the real
+    /// `gateVcData` (`gateServer.cc:1747`).
     pub async fn ensure_subscribed(
         &self,
+        served_name: &str,
         upstream_name: &str,
         asg: Option<String>,
         asl: i32,
     ) -> BridgeResult<()> {
         // Fast path: already subscribed.
-        if self.subs.lock().contains_key(upstream_name) {
+        if self.subs.lock().contains_key(served_name) {
             return Ok(());
         }
         // Concurrent first-create dedupe. If another task is already
@@ -249,23 +261,23 @@ impl UpstreamManager {
         }
         let decision = {
             let mut pending = self.pending.lock();
-            if let Some(existing) = pending.get(upstream_name) {
+            if let Some(existing) = pending.get(served_name) {
                 Decision::WaitFor(existing.clone())
             } else {
                 let n = Arc::new(tokio::sync::Notify::new());
-                pending.insert(upstream_name.to_string(), n.clone());
+                pending.insert(served_name.to_string(), n.clone());
                 Decision::Owner(n)
             }
         };
         let dedup_notify = match decision {
             Decision::WaitFor(n) => {
                 n.notified().await;
-                let already = self.subs.lock().contains_key(upstream_name);
+                let already = self.subs.lock().contains_key(served_name);
                 return if already {
                     Ok(())
                 } else {
                     Err(BridgeError::PutRejected(format!(
-                        "upstream subscribe failed (peer creator): {upstream_name}"
+                        "upstream subscribe failed (peer creator): {served_name}"
                     )))
                 };
             }
@@ -286,14 +298,14 @@ impl UpstreamManager {
         }
         let _guard = PendingGuard {
             owner: self,
-            key: upstream_name,
+            key: served_name,
             notify: dedup_notify.clone(),
         };
 
         // Add entry to cache (or get existing) and reset to Connecting
         {
             let mut cache = self.cache.write().await;
-            let entry = cache.get_or_create(upstream_name);
+            let entry = cache.get_or_create(served_name);
             entry.write().await.set_state(PvState::Connecting);
         }
 
@@ -344,15 +356,25 @@ impl UpstreamManager {
             asl,
             self.write_env.clone(),
         );
+        // BRIDGE-FR-1: install the read/write access hook alongside the
+        // write hook, capturing the same ACF authority + this PV's
+        // `.pvlist` ASG/ASL, so the CA server gates downstream reads
+        // through `can_read` instead of granting every shadow PV a
+        // permissive read.
+        let access_hook = build_access_hook(asg.clone(), asl, self.write_env.access.clone());
         // If a prior subscribe attempt left a stale shadow entry (it
         // would have been cleaned up by the failure path, but a hot
         // restart or a crashed task could orphan it), drop it before
         // re-registering. A genuine collision with a non-gateway
         // record/alias surfaces as `Err` and we propagate.
-        self.shadow_db.remove_simple_pv(upstream_name).await;
+        //
+        // BRIDGE-FR-2: registered under `served_name` (the alias) so a
+        // downstream lookup of the alias resolves; the hook above still
+        // forwards puts to `upstream_name` (the real PV).
+        self.shadow_db.remove_simple_pv(served_name).await;
         if let Err(e) = self
             .shadow_db
-            .add_pv_with_hook(upstream_name, initial_value, hook)
+            .add_pv_with_hooks(served_name, initial_value, hook, Some(access_hook))
             .await
         {
             return Err(BridgeError::PutRejected(format!(
@@ -368,7 +390,7 @@ impl UpstreamManager {
         let mut monitor = match channel.subscribe().await {
             Ok(m) => m,
             Err(e) => {
-                self.shadow_db.remove_simple_pv(upstream_name).await;
+                self.shadow_db.remove_simple_pv(served_name).await;
                 return Err(BridgeError::PutRejected(format!("subscribe failed: {e}")));
             }
         };
@@ -385,7 +407,10 @@ impl UpstreamManager {
         let channel_for_task = channel.clone();
         let stats_for_task = self.write_env.stats.clone();
         let beacon_anomaly_for_task = self.write_env.beacon_anomaly.clone();
-        let name = upstream_name.to_string();
+        // BRIDGE-FR-2: the forwarding task addresses the cache entry,
+        // shadow PV, and alarm post by `served_name` — the same key the
+        // shadow PV and cache were registered under above.
+        let name = served_name.to_string();
         let task = tokio::spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
@@ -519,8 +544,11 @@ impl UpstreamManager {
             }
         });
 
+        // BRIDGE-FR-2: subscription dedup keys on `served_name` so a
+        // repeat search for the same alias is a no-op (fast path above)
+        // and a `.pvlist` reload prunes by the served name it admits.
         self.subs.lock().insert(
-            upstream_name.to_string(),
+            served_name.to_string(),
             UpstreamSubscription {
                 channel,
                 task,
@@ -537,14 +565,19 @@ impl UpstreamManager {
     /// upstream channel — cannot be invoked by a downstream client
     /// that opened the channel before the eviction landed.
     /// Mirrors C ca-gateway's `gatePvData::deactivate` cleanup.
-    pub async fn unsubscribe(&self, upstream_name: &str) {
-        let removed = self.subs.lock().remove(upstream_name);
+    ///
+    /// BRIDGE-FR-2: keyed by the *served* name — both `subs` and the
+    /// shadow PV are registered under the downstream-facing name (alias
+    /// or real), so callers (`.pvlist` reload prune, `sweep_orphaned`)
+    /// pass the served name they read from the cache / subs map.
+    pub async fn unsubscribe(&self, served_name: &str) {
+        let removed = self.subs.lock().remove(served_name);
         if let Some(sub) = removed {
             sub.task.abort();
         }
         // Best-effort: if the PV is gone already (concurrent reload
         // path) `remove_simple_pv` returns None; we don't care.
-        let _ = self.shadow_db.remove_simple_pv(upstream_name).await;
+        let _ = self.shadow_db.remove_simple_pv(served_name).await;
     }
 
     /// Forward a put operation to the upstream IOC. Reuses the
@@ -629,6 +662,38 @@ impl UpstreamManager {
         }
         self.client.shutdown().await;
     }
+}
+
+/// BRIDGE-FR-1: build the per-PV access hook the CA server's
+/// `compute_access` consults to report read/write rights and gate
+/// downstream reads. Symmetric to [`build_write_hook`]: it captures the
+/// same single `ArcSwap<AccessConfig>` and the PV's `.pvlist` ASG/ASL,
+/// so a downstream `caget`/`camonitor` is gated by the same `can_read`
+/// the operator configured for `caput` — closing the gap where an ACF
+/// read deny still let reads through because the read path never
+/// consulted ACF.
+///
+/// `read` comes straight from `can_read`. `write` mirrors the write
+/// hook's empty-`user` guard: a client that never sent `CLIENT_NAME`
+/// (no identity) is reported write-denied whenever rules are loaded, so
+/// the access-rights report matches what the write hook will actually
+/// enforce.
+fn build_access_hook(
+    asg: Option<String>,
+    asl: i32,
+    access: Arc<ArcSwap<AccessConfig>>,
+) -> epics_base_rs::server::pv::AccessHook {
+    Arc::new(move |user: &str, host: &str| {
+        let cfg = access.load();
+        let asg_ref = asg.as_deref().unwrap_or("DEFAULT");
+        let read = cfg.can_read(asg_ref, asl, user, host);
+        let write = if user.is_empty() && cfg.has_rules() {
+            false
+        } else {
+            cfg.can_write(asg_ref, asl, user, host)
+        };
+        epics_base_rs::server::pv::AccessDecision { read, write }
+    })
 }
 
 /// Build the [`WriteHook`] closure for one upstream PV. Called once
@@ -913,5 +978,151 @@ mod tests {
     fn _entry_imports() {
         // Sanity check that the cache types are in scope
         let _ = super::super::cache::GwPvEntry::new_connecting("X");
+    }
+
+    /// BRIDGE-FR-1: the access hook reports read/write rights through
+    /// the gateway's ACF + `.pvlist` ASG, so the CA server can gate a
+    /// downstream `caget`/`camonitor` the same way the write hook gates
+    /// `caput`. ACF grants READ to `alice` only and WRITE to nobody.
+    #[test]
+    fn br_fr1_access_hook_routes_read_through_acf() {
+        let acf = r#"
+UAG(ops) { alice }
+ASG(DEFAULT) {
+    RULE(0, READ) { UAG(ops) }
+}
+"#;
+        let access = Arc::new(ArcSwap::from_pointee(
+            AccessConfig::from_string(acf).expect("ACF parses"),
+        ));
+        let hook = build_access_hook(Some("DEFAULT".to_string()), 0, access);
+
+        // Privileged user: read granted, write denied (no WRITE rule).
+        let alice = hook("alice", "host1");
+        assert!(alice.read, "alice is in UAG(ops) → READ");
+        assert!(!alice.write, "no WRITE rule → write denied even for alice");
+
+        // Unprivileged user: read AND write denied — this is the gap
+        // FR-1 closes (previously every shadow PV read was permissive).
+        let intruder = hook("intruder", "host1");
+        assert!(!intruder.read, "intruder is not in UAG(ops) → no READ");
+        assert!(!intruder.write, "intruder → no WRITE");
+
+        // No client identity: read evaluates normally (denied here, no
+        // matching UAG), write is force-denied while rules are loaded —
+        // mirrors the write hook's empty-user guard.
+        let anon = hook("", "host1");
+        assert!(!anon.read, "empty user matches no UAG → no READ");
+        assert!(!anon.write, "empty user + rules → write force-denied");
+    }
+
+    /// BRIDGE-FR-1: with no ACF (allow-all), the hook grants both —
+    /// the gateway's default permissive posture is unchanged.
+    #[test]
+    fn br_fr1_access_hook_allow_all_grants_both() {
+        let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
+        let hook = build_access_hook(None, 0, access);
+        let d = hook("anyone", "anywhere");
+        assert!(d.read && d.write, "allow-all must grant read and write");
+    }
+
+    /// BRIDGE-FR-2: when a downstream client searches for a `.pvlist`
+    /// ALIAS, the gateway must register the shadow PV under the *served*
+    /// (alias) name so the client's `CREATE_CHANNEL`/read resolves, while
+    /// the upstream subscription targets the *real* PV. Pre-fix the shadow
+    /// PV was keyed by the real name, so an alias lookup missed.
+    ///
+    /// No live upstream is needed: the DBR-negotiation `get()` times out
+    /// to a `Double(0.0)` placeholder and `subscribe()` only allocates a
+    /// subid against the coordinator, so `ensure_subscribed` completes and
+    /// the registration keys are observable.
+    #[tokio::test]
+    async fn br_fr2_alias_registers_shadow_pv_under_served_name() {
+        let cache = Arc::new(RwLock::new(PvCache::new()));
+        let db = Arc::new(PvDatabase::new());
+        let env = dummy_env();
+        let mgr = UpstreamManager::new(UpstreamManagerConfig {
+            cache,
+            shadow_db: db.clone(),
+            access: env.access.clone(),
+            pvlist: env.pvlist.clone(),
+            putlog: None,
+            stats: env.stats.clone(),
+            read_only: false,
+            beacon_anomaly: env.beacon_anomaly.clone(),
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls: None,
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls_server_name: None,
+        })
+        .await
+        .expect("manager builds");
+
+        // Search name (served) differs from the resolved real PV.
+        let served = "Beam:current";
+        let real = "SR:DCCT:current.VAL";
+        mgr.ensure_subscribed(served, real, None, 0)
+            .await
+            .expect("ensure_subscribed completes against a dead upstream");
+
+        // The downstream-facing entry is keyed by the alias the client
+        // searched for — this is the FR-2 fix.
+        assert!(
+            db.find_pv(served).await.is_some(),
+            "shadow PV must be registered under the served (alias) name"
+        );
+        // The real upstream name is NOT exposed downstream (the client
+        // never learns it; only the alias is served).
+        assert!(
+            db.find_pv(real).await.is_none(),
+            "real upstream name must not be a downstream entry"
+        );
+        // Subscription dedup also keys on the served name.
+        assert!(
+            mgr.is_subscribed(served),
+            "subscription must be tracked under the served name"
+        );
+        assert!(
+            !mgr.is_subscribed(real),
+            "subscription must not be keyed by the real upstream name"
+        );
+
+        mgr.shutdown().await;
+    }
+
+    /// BRIDGE-FR-2: a plain (non-alias) ALLOW match passes served == real,
+    /// so the shadow PV is keyed by the same name — the pre-FR-2 behavior
+    /// for non-alias names is preserved exactly.
+    #[tokio::test]
+    async fn br_fr2_non_alias_keys_shadow_pv_by_same_name() {
+        let cache = Arc::new(RwLock::new(PvCache::new()));
+        let db = Arc::new(PvDatabase::new());
+        let env = dummy_env();
+        let mgr = UpstreamManager::new(UpstreamManagerConfig {
+            cache,
+            shadow_db: db.clone(),
+            access: env.access.clone(),
+            pvlist: env.pvlist.clone(),
+            putlog: None,
+            stats: env.stats.clone(),
+            read_only: false,
+            beacon_anomaly: env.beacon_anomaly.clone(),
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls: None,
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls_server_name: None,
+        })
+        .await
+        .expect("manager builds");
+
+        let name = "Plain:pv.VAL";
+        mgr.ensure_subscribed(name, name, None, 0)
+            .await
+            .expect("ensure_subscribed completes");
+
+        assert!(db.find_pv(name).await.is_some(), "served == real registers");
+        assert!(mgr.is_subscribed(name), "subscription tracked under name");
+
+        mgr.shutdown().await;
     }
 }

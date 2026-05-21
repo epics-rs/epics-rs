@@ -107,8 +107,18 @@ pub type ExternalPvResolver = Arc<dyn Fn(&str) -> Option<EpicsValue> + Send + Sy
 /// resolver may take some time (TCP search, upstream connect handshake);
 /// the caller (UDP search responder, TCP CREATE_CHANNEL handler) will
 /// `.await` it.
+/// The second argument is the downstream client's socket address when
+/// the lookup originates from a CA/PVA search or channel-create on
+/// behalf of an identified peer (`None` for host-less internal lookups:
+/// preload, iocsh, link processing). BRIDGE-FR-10: the CA gateway needs
+/// this to evaluate `.pvlist` `DENY FROM host` rules at search time, the
+/// way C ca-gateway's `pvExistTest` passes the client host to
+/// `gateAs::findEntry`.
 pub type SearchResolver = Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+    dyn Fn(
+            String,
+            Option<std::net::SocketAddr>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         + Send
         + Sync,
 >;
@@ -627,10 +637,29 @@ impl PvDatabase {
         initial: EpicsValue,
         hook: crate::server::pv::WriteHook,
     ) -> CaResult<()> {
+        self.add_pv_with_hooks(name, initial, hook, None).await
+    }
+
+    /// BRIDGE-FR-1: like [`Self::add_pv_with_hook`] but also installs an
+    /// optional [`AccessHook`](crate::server::pv::AccessHook) so the CA
+    /// gateway can route this shadow PV's read/write access-rights
+    /// decision through its own ACF. Both hooks are attached before the
+    /// PV is inserted into `simple_pvs`, so a downstream `CREATE_CHAN`
+    /// cannot observe the PV without its access hook bound.
+    pub async fn add_pv_with_hooks(
+        &self,
+        name: &str,
+        initial: EpicsValue,
+        write_hook: crate::server::pv::WriteHook,
+        access_hook: Option<crate::server::pv::AccessHook>,
+    ) -> CaResult<()> {
         let _gate = self.inner.registration_mutex.lock().await;
         self.check_name_free(name).await?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
-        pv.set_write_hook(hook);
+        pv.set_write_hook(write_hook);
+        if let Some(access) = access_hook {
+            pv.set_access_hook(access);
+        }
         self.inner
             .simple_pvs
             .write()
@@ -881,13 +910,25 @@ impl PvDatabase {
     /// the resolver is invoked once. If the resolver returns true, the
     /// database is re-checked.
     pub async fn find_entry(&self, name: &str) -> Option<PvEntry> {
+        self.find_entry_from(name, None).await
+    }
+
+    /// Like [`Self::find_entry`], but threads the downstream client's
+    /// socket address into the search resolver. The CA TCP CREATE_CHANNEL
+    /// handler passes the connection peer so the gateway can apply
+    /// host-scoped `.pvlist` admission (BRIDGE-FR-10).
+    pub async fn find_entry_from(
+        &self,
+        name: &str,
+        peer: Option<std::net::SocketAddr>,
+    ) -> Option<PvEntry> {
         if let Some(entry) = self.find_entry_no_resolve(name).await {
             return Some(entry);
         }
         // Try the search resolver
         let resolver = self.inner.search_resolver.read().await.clone();
         if let Some(r) = resolver {
-            if r(name.to_string()).await {
+            if r(name.to_string(), peer).await {
                 return self.find_entry_no_resolve(name).await;
             }
         }
@@ -901,12 +942,20 @@ impl PvDatabase {
     /// (e.g., subscribe to an upstream IOC and add a placeholder PV) and
     /// return true; this method then re-checks.
     pub async fn has_name(&self, name: &str) -> bool {
+        self.has_name_from(name, None).await
+    }
+
+    /// Like [`Self::has_name`], but threads the downstream client's
+    /// socket address into the search resolver. The CA UDP search
+    /// responder passes the datagram source address so the gateway can
+    /// apply host-scoped `.pvlist` admission (BRIDGE-FR-10).
+    pub async fn has_name_from(&self, name: &str, peer: Option<std::net::SocketAddr>) -> bool {
         if self.has_name_no_resolve(name).await {
             return true;
         }
         let resolver = self.inner.search_resolver.read().await.clone();
         if let Some(r) = resolver {
-            if r(name.to_string()).await {
+            if r(name.to_string(), peer).await {
                 return self.has_name_no_resolve(name).await;
             }
         }

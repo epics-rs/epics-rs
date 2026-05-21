@@ -28,11 +28,15 @@
 //! - Backreference substitution is implemented manually because Rust
 //!   `regex` doesn't support backreferences in the pattern, but
 //!   capture groups are available for replacement.
-//! - The DENY `FROM host` clause is enforced via [`PvList::is_host_denied`]
-//!   (consulted from the put-hook path). The UDP search responder still
-//!   uses [`PvList::match_name`] only — it has no client identity to
-//!   match against. Earlier note about "parsed but not enforced" in the
-//!   skeleton phase (host filtering is a future addition).
+//! - The DENY `FROM host` clause is host-scoped: it denies only when the
+//!   requester host matches. It is enforced at the put-hook path via
+//!   [`PvList::is_host_denied`] and at downstream search/create
+//!   resolution via [`PvList::match_name_for_host`] (BRIDGE-FR-10, the
+//!   parity equivalent of C `gateServer::pvExistTest` →
+//!   `gateAs::findEntry(pvname, hostname)`). Host-less callers (preload,
+//!   pvlist-reload prune) use [`PvList::match_name`], which by design
+//!   sees only global (`FROM`-less) DENY rules — a host-targeted deny
+//!   must not remove a PV that is still admissible for other hosts.
 
 use std::path::Path;
 
@@ -90,8 +94,20 @@ impl PvListEntry {
         matches!(self, Self::Allow { .. } | Self::Alias { .. })
     }
 
-    fn is_deny(&self) -> bool {
-        matches!(self, Self::Deny { .. })
+    /// A DENY rule with NO `FROM host …` list — an unconditional
+    /// (global) deny that participates in host-less [`PvList::match_name`].
+    ///
+    /// BRIDGE-FR-10: a host-targeted `pattern DENY FROM host …` rule is
+    /// NOT a global deny. It applies only when the requester host
+    /// matches, via the host-aware path ([`PvList::match_name_for_host`]
+    /// / [`PvList::is_host_denied`]) — mirroring C ca-gateway's
+    /// `gateAs::findEntry`, where the `deny_from_table` is consulted only
+    /// when the passed host matches (gateAs.h:257-267). Treating it as a
+    /// global deny in host-less matching is exactly the defect FR-10
+    /// closes: it over-denies every host with `ALLOW,DENY` order and is
+    /// silently bypassed (allow wins) with `DENY,ALLOW` order.
+    fn is_global_deny(&self) -> bool {
+        matches!(self, Self::Deny { from_hosts, .. } if from_hosts.is_empty())
     }
 }
 
@@ -167,12 +183,23 @@ impl PvList {
         false
     }
 
-    /// Match a PV name against the rule list.
+    /// Match a PV name against the rule list, WITHOUT a requester host.
     ///
     /// Returns `Some(PvListMatch)` if the name should be served (allowed,
     /// possibly via alias), or `None` if the name is denied.
+    ///
+    /// BRIDGE-FR-10: only *global* DENY rules (`pattern DENY`, no `FROM`)
+    /// participate here. Host-targeted `pattern DENY FROM host …` rules
+    /// are excluded from the deny set — they cannot be evaluated without
+    /// a host, and treating them as global denies is the FR-10 defect.
+    /// Callers that know the downstream client host MUST use
+    /// [`Self::match_name_for_host`] so host-scoped denials are honored;
+    /// host-less callers (preload, pvlist-reload prune) intentionally see
+    /// only global rules, because a host-targeted deny must not remove a
+    /// PV that is still admissible for other hosts.
     pub fn match_name(&self, name: &str) -> Option<PvListMatch> {
-        // Find first matching ALLOW (or ALIAS) and first matching DENY
+        // Find first matching ALLOW (or ALIAS) and first matching global
+        // DENY. Host-targeted DENY FROM rules do not participate here.
         let allow_match = self
             .entries
             .iter()
@@ -180,7 +207,7 @@ impl PvList {
         let deny_match = self
             .entries
             .iter()
-            .find(|e| e.is_deny() && e.pattern().is_match(name));
+            .find(|e| e.is_global_deny() && e.pattern().is_match(name));
 
         let allow_decision: Option<PvListMatch> = allow_match.map(|e| match e {
             PvListEntry::Allow { asg, asl, .. } => PvListMatch {
@@ -222,6 +249,32 @@ impl PvList {
                 allow_decision
             }
         }
+    }
+
+    /// Host-aware name admission for downstream CA search/create
+    /// resolution.
+    ///
+    /// BRIDGE-FR-10: this is the parity equivalent of C ca-gateway's
+    /// `gateServer::pvExistTest` calling `gateAs::findEntry(pvname,
+    /// hostname)` (gateServer.cc:1537). A host-targeted `pattern DENY
+    /// FROM host …` rule is evaluated FIRST and unconditionally: if the
+    /// requester `host` matches such a rule for `name`, admission is
+    /// denied regardless of `EVALUATION ORDER`, exactly as C consults the
+    /// `deny_from_table` before the normal allow/deny decision
+    /// (gateAs.h:257-267). Otherwise the normal host-less decision
+    /// ([`Self::match_name`], which honors `EVALUATION ORDER` over the
+    /// global ALLOW/DENY rules) applies.
+    ///
+    /// `host` must be the bracket-less socket-address host form derived
+    /// from the downstream client's address (`127.0.0.1`, `::1`) so it
+    /// matches the `.pvlist` `FROM` syntax — see [`Self::is_host_denied`].
+    pub fn match_name_for_host(&self, name: &str, host: &str) -> Option<PvListMatch> {
+        // Host-scoped DENY FROM is a hard blacklist consulted before the
+        // normal allow/deny decision (mirrors gateAs::findEntry).
+        if self.is_host_denied(name, host) {
+            return None;
+        }
+        self.match_name(name)
     }
 }
 
@@ -550,6 +603,95 @@ mod tests {
         .unwrap();
         assert!(list.match_name("Beam:current").is_some());
         assert!(list.match_name("Other:pv").is_none());
+    }
+
+    // ---- BRIDGE-FR-10: host-aware DENY FROM admission ----
+
+    #[test]
+    fn fr10_host_targeted_deny_is_not_a_global_deny() {
+        // ALLOW,DENY order. A `DENY FROM bad.host` rule must NOT reject
+        // every host at host-less search; before FR-10 it folded into
+        // `match_name`'s deny set and denied everyone.
+        let list = parse_pvlist(
+            r#"
+                EVALUATION ORDER ALLOW, DENY
+                PV.*  ALLOW
+                PV.*  DENY FROM bad.host
+            "#,
+        )
+        .unwrap();
+        assert!(
+            list.match_name("PV:x").is_some(),
+            "host-targeted DENY FROM must not deny the host-less search"
+        );
+
+        // A global (FROM-less) DENY still denies host-lessly.
+        let g = parse_pvlist(
+            r#"
+                EVALUATION ORDER ALLOW, DENY
+                PV.*  ALLOW
+                PV.*  DENY
+            "#,
+        )
+        .unwrap();
+        assert!(
+            g.match_name("PV:x").is_none(),
+            "a global DENY must still deny in match_name"
+        );
+    }
+
+    #[test]
+    fn fr10_match_name_for_host_denies_only_listed_host_allow_deny() {
+        let list = parse_pvlist(
+            r#"
+                EVALUATION ORDER ALLOW, DENY
+                PV.*  ALLOW
+                PV.*  DENY FROM bad.host 10.0.0.9
+            "#,
+        )
+        .unwrap();
+        // Listed hosts (by name and by IP) are rejected at search time.
+        assert!(list.match_name_for_host("PV:x", "bad.host").is_none());
+        assert!(list.match_name_for_host("PV:x", "10.0.0.9").is_none());
+        // Any other host is admitted.
+        assert!(list.match_name_for_host("PV:x", "good.host").is_some());
+        assert!(list.match_name_for_host("PV:x", "10.0.0.1").is_some());
+    }
+
+    #[test]
+    fn fr10_host_deny_preempts_allow_in_deny_allow_order() {
+        // DENY,ALLOW order. The host-targeted deny must win over the
+        // ALLOW rule for the listed host (C `gateAs::findEntry` checks
+        // the deny_from_table before the normal allow/deny decision),
+        // while a different host is still admitted by the ALLOW rule.
+        let list = parse_pvlist(
+            r#"
+                EVALUATION ORDER DENY, ALLOW
+                PV.*  DENY FROM bad.host
+                PV.*  ALLOW
+            "#,
+        )
+        .unwrap();
+        assert!(list.match_name_for_host("PV:x", "bad.host").is_none());
+        assert!(list.match_name_for_host("PV:x", "good.host").is_some());
+    }
+
+    #[test]
+    fn fr10_host_match_is_case_insensitive() {
+        // ALLOW rule admits the PV; the host-targeted deny then denies
+        // the listed host regardless of ASCII case. (Without an ALLOW
+        // rule, ALLOW,DENY order is default-deny — so the ALLOW is
+        // needed to isolate the case-insensitive host match.)
+        let list = parse_pvlist(
+            r#"
+                PV.*  ALLOW
+                PV.*  DENY FROM Bad.Host
+            "#,
+        )
+        .unwrap();
+        assert!(list.match_name_for_host("PV:x", "BAD.HOST").is_none());
+        assert!(list.match_name_for_host("PV:x", "bad.host").is_none());
+        assert!(list.match_name_for_host("PV:x", "other.host").is_some());
     }
 
     #[test]

@@ -333,18 +333,29 @@ impl GatewayServer {
         let beacon_anomaly = self.beacon_anomaly.clone();
 
         let resolver: epics_base_rs::server::database::SearchResolver = std::sync::Arc::new(
-            move |name: String| -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = bool> + Send>,
-            > {
+            move |name: String,
+                  peer: Option<std::net::SocketAddr>|
+                  -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
                 let pvlist = pvlist.clone();
                 let upstream = upstream.clone();
                 let stats = stats.clone();
                 let beacon_anomaly = beacon_anomaly.clone();
                 Box::pin(async move {
-                    // 1. Check pvlist
+                    // 1. Check pvlist. BRIDGE-FR-10: when the downstream
+                    //    client address is known, evaluate `.pvlist`
+                    //    admission host-aware so `DENY FROM host` rules
+                    //    are honored at search/create time (parity with C
+                    //    ca-gateway `pvExistTest` → `gateAs::findEntry`).
+                    //    The host is the bracket-less socket-address form
+                    //    (`127.0.0.1`, `::1`) that `is_host_denied`
+                    //    expects. A `None` peer (host-less internal
+                    //    lookup) falls back to the global rule decision.
                     let m = {
                         let pvlist = pvlist.load_full();
-                        pvlist.match_name(&name)
+                        match peer {
+                            Some(addr) => pvlist.match_name_for_host(&name, &addr.ip().to_string()),
+                            None => pvlist.match_name(&name),
+                        }
                     };
                     let m = match m {
                         Some(m) => m,
@@ -355,8 +366,17 @@ impl GatewayServer {
                     //    shadow database via UpstreamManager::ensure_subscribed.
                     //    Pass the matched ASG/ASL through so the per-PV
                     //    WriteHook can do the right ACL check.
+                    //    BRIDGE-FR-2: serve under the searched name (`name`,
+                    //    the alias) while connecting upstream to the resolved
+                    //    real PV (`m.resolved_name`), so an alias search
+                    //    yields a downstream entry under the alias.
                     if upstream
-                        .ensure_subscribed(&m.resolved_name, m.asg.clone(), m.asl.unwrap_or(0))
+                        .ensure_subscribed(
+                            &name,
+                            &m.resolved_name,
+                            m.asg.clone(),
+                            m.asl.unwrap_or(0),
+                        )
                         .await
                         .is_err()
                     {
@@ -406,8 +426,10 @@ impl GatewayServer {
                 None => continue, // Denied or not in list
             };
 
+            // BRIDGE-FR-2: serve under the preload-file name (which may be
+            // an alias) while connecting to the resolved real PV.
             self.upstream
-                .ensure_subscribed(&m.resolved_name, m.asg.clone(), m.asl.unwrap_or(0))
+                .ensure_subscribed(name, &m.resolved_name, m.asg.clone(), m.asl.unwrap_or(0))
                 .await?;
             count += 1;
         }

@@ -502,7 +502,13 @@ async fn recv_loop(
                         .position(|&b| b == 0)
                         .unwrap_or(scan_end);
                     if let Ok(pv_name) = std::str::from_utf8(&payload[..pv_name_end]) {
-                        if db.has_name(pv_name).await {
+                        // BRIDGE-FR-10: thread the datagram source address
+                        // into the search resolver so the CA gateway can
+                        // apply host-scoped `.pvlist` `DENY FROM host`
+                        // admission at search time (parity with C
+                        // `pvExistTest` passing the client host to
+                        // `gateAs::findEntry`).
+                        if db.has_name_from(pv_name, Some(src)).await {
                             // C parity: `search_reply_udp`
                             // (`rsrv/camessage.c:2193-2207`) sets
                             // `sid = ~0U` (INADDR_BROADCAST), telling

@@ -263,6 +263,52 @@ async fn ca_fr_8_simplepv_monitor_applies_arr() {
     );
 }
 
+/// Finding #4: an `arr` filter on a SCALAR channel must be a no-op for
+/// BOTH the value and the advertised element count — C `arr.c:148`
+/// (`channelRegisterPost`: `if (no_elements <= 1) return; /* array data
+/// only */`). Pre-fix the CREATE_CHAN reply advertised
+/// `final_element_count` over the scalar's native count of 1, which a
+/// slicing config like `{"s":5}` collapses to 0, while READ delivered the
+/// untouched scalar — so the wire-advertised count and the value count
+/// disagreed. The fix makes the count/slice path no-op at length <= 1
+/// (matching `apply`'s scalar pass-through), so the channel resolves and
+/// the read returns the scalar unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn ca_fr_8_arr_on_scalar_channel_is_noop() {
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .pv("CAFR8:SP:SCALAR", EpicsValue::Double(42.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _h = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    point_client_at(port);
+    let client = CaClient::new().await.expect("client");
+
+    // `s:5` past a scalar resolves to an empty slice under
+    // `wrapArrayIndices`, so a (wrong) reshape would advertise 0 elements
+    // and the read could not return the scalar. The filter must instead
+    // be a no-op: the scalar passes through unchanged.
+    let (_t, filtered) = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.caget(r#"CAFR8:SP:SCALAR.{"arr":{"s":5,"e":7}}"#),
+    )
+    .await
+    .expect("scalar+arr caget did not complete")
+    .expect("scalar+arr caget should succeed — the channel must resolve, not advertise 0 elements");
+    match filtered {
+        EpicsValue::Double(v) => assert_eq!(
+            v, 42.0,
+            "arr on a scalar PV must pass the scalar through unchanged, not slice it away"
+        ),
+        other => panic!("expected the scalar Double unchanged, got {other:?}"),
+    }
+}
+
 /// CA-FR-8 (4/4): a malformed filter suffix preserves the permissive
 /// "empty chain with warning" behaviour — the read returns the full
 /// unfiltered value rather than failing the subscription.

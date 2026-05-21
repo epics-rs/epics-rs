@@ -13,7 +13,10 @@
 //!   indices count from the end (`-1` == last element).
 //! * `incr` defaults to `1`. Must be ≥ 1; values < 1 are treated as 1.
 //! * Resulting slice carries the same array variant as the input.
-//! * Scalar (non-array) values pass through unchanged.
+//! * "Array data only" (C `arr.c:148`, `no_elements > 1`): a scalar — or
+//!   a single-element array — passes through unchanged, and its
+//!   advertised element count stays native. The filter only reshapes
+//!   genuine multi-element arrays.
 //! * Slicing is unconditional regardless of `mask` — `arr` is a
 //!   transformation filter (`channelRegisterPost`), not a gate. The
 //!   446e0d4a fix applies only to value-gating filters (`dbnd`); an
@@ -128,8 +131,15 @@ impl SubscriptionFilter for ArrayFilter {
 /// clamps to `[0, len]`, `end` to `[0, len-1]`, so `start > end`
 /// yields 0.
 fn slice_len(len: i64, cfg: ArrayFilterConfig) -> usize {
-    if len <= 0 {
-        return 0;
+    // C arr.c `channelRegisterPost` (arr.c:148): `if (no_elements <= 1)
+    // return; /* array data only */`. For a scalar or single-element
+    // channel the arr filter is never registered, so the advertised
+    // `dbChannelFinalElements` stays the native count. Mirror that here so
+    // the count path agrees with `slice_with` (which passes such inputs
+    // through) — otherwise a scalar channel with `arr` advertises a
+    // reshaped count while READ delivers the untouched scalar.
+    if len <= 1 {
+        return len.max(0) as usize;
     }
     let resolve = |idx: i64, hi: i64| -> i64 {
         let r = if idx < 0 { len + idx } else { idx };
@@ -151,7 +161,12 @@ fn slice_len(len: i64, cfg: ArrayFilterConfig) -> usize {
 /// and yields 0 elements (not 1).
 fn slice_with<T: Clone>(input: Vec<T>, cfg: ArrayFilterConfig) -> Vec<T> {
     let len = input.len() as i64;
-    if len == 0 {
+    // C arr.c "array data only" (arr.c:148, no_elements > 1): a scalar or
+    // single-element array is never sliced. `apply` already routes true
+    // scalar `EpicsValue` variants past this; this guard additionally
+    // covers a 1-element `*Array` variant, so the value and the advertised
+    // count stay consistent at the length-1 boundary.
+    if len <= 1 {
         return input;
     }
     let resolve_start = |idx: i64| -> i64 {
@@ -341,6 +356,13 @@ mod tests {
             (ArrayFilterConfig::new(10, 1, -1), 3, 0),  // start>len → empty
             (ArrayFilterConfig::new(3, 1, 1), 5, 0),    // inverted → empty
             (ArrayFilterConfig::default(), 0, 0),       // empty input
+            // "Array data only" boundary (C arr.c:148, no_elements <= 1):
+            // a scalar / single-element channel is NOT reshaped even with
+            // a slicing config — the count stays 1 and the value passes
+            // through, so the two agree. A bare count of 1 must not be
+            // collapsed to the slice length (the finding-#4 divergence).
+            (ArrayFilterConfig::new(5, 1, -1), 1, 1),
+            (ArrayFilterConfig::new(0, 1, 0), 1, 1),
         ];
         for (cfg, input, expected) in cases {
             let f = ArrayFilter::new(cfg);

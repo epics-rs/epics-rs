@@ -1361,6 +1361,63 @@ pub fn diff_changed_bitset(
     out
 }
 
+/// BRIDGE-FR-12: build a wire *selection* bitset that marks every bit
+/// under each field path in `marked_paths`.
+///
+/// Paths are dot-separated and relative to the root structure — for a
+/// QSRV group monitor they are the triggered target members'
+/// `field_name` paths. Marking a node sets its entire subtree, which
+/// reproduces pvxs's *assigned-not-changed* semantics
+/// (`groupsource.cpp:288` marks each `+trigger` target whether or not
+/// its value changed since the last post), unlike
+/// [`diff_changed_bitset`] which only marks leaves that differ.
+///
+/// The result is a *selection* mask in the same sense as
+/// [`request_to_mask`](crate::pv_request::request_to_mask): the caller
+/// intersects it with the request mask and runs it through
+/// [`canonical_changed_bitset`] before encoding, exactly as the diff
+/// path does.
+///
+/// Bit numbering matches the rest of this module (pvData §5.4): root is
+/// bit 0, fields depth-first in declaration order.
+pub fn marked_changed_bitset(desc: &FieldDesc, marked_paths: &[String]) -> crate::proto::BitSet {
+    fn set_subtree(out: &mut crate::proto::BitSet, bit_offset: usize, desc: &FieldDesc) {
+        let total = desc.total_bits();
+        for i in 0..total {
+            out.set(bit_offset + i);
+        }
+    }
+    fn walk(
+        desc: &FieldDesc,
+        bit_offset: usize,
+        prefix: &str,
+        marked: &[String],
+        out: &mut crate::proto::BitSet,
+    ) {
+        // A node whose full path is explicitly marked contributes its
+        // whole subtree; no need to descend further.
+        if !prefix.is_empty() && marked.iter().any(|m| m == prefix) {
+            set_subtree(out, bit_offset, desc);
+            return;
+        }
+        if let FieldDesc::Structure { fields, .. } = desc {
+            let mut child_bit = bit_offset + 1;
+            for (name, child) in fields {
+                let child_path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                walk(child, child_bit, &child_path, marked, out);
+                child_bit += child.total_bits();
+            }
+        }
+    }
+    let mut out = crate::proto::BitSet::new();
+    walk(desc, 0, "", marked_paths, &mut out);
+    out
+}
+
 /// Encode the value bytes for `value` consulting `bitset` to know which
 /// fields to emit. Mirrors pvxs `to_wire_valid(buf, value)`.
 ///
@@ -2829,6 +2886,40 @@ mod tests {
         let same = nested_alarm_value(5.0, 1, 1);
         let diff3 = diff_changed_bitset(&desc, &same, &same.clone());
         assert_eq!(diff3.count(), 0, "no change → empty changed-bitset");
+    }
+
+    /// BRIDGE-FR-12: `marked_changed_bitset` marks each named path's
+    /// whole subtree (assigned-not-changed), independent of any value
+    /// diff. Structure desc: root=0, value(leaf)=1, alarm(struct)=2,
+    /// alarm.severity=3, alarm.status=4.
+    #[test]
+    fn br_fr12_marked_changed_bitset_marks_target_subtrees() {
+        let desc = nested_alarm_desc();
+
+        // Leaf target: only its own bit.
+        let m_value = marked_changed_bitset(&desc, &["value".to_string()]);
+        assert!(m_value.get(1), "value leaf marked → bit 1");
+        assert_eq!(m_value.count(), 1, "leaf target marks only itself");
+
+        // Structure target: the node bit plus every descendant.
+        let m_alarm = marked_changed_bitset(&desc, &["alarm".to_string()]);
+        assert!(m_alarm.get(2), "alarm structure bit set");
+        assert!(m_alarm.get(3), "alarm.severity set");
+        assert!(m_alarm.get(4), "alarm.status set");
+        assert_eq!(m_alarm.count(), 3, "whole alarm subtree marked");
+
+        // Nested leaf via dotted path.
+        let m_sev = marked_changed_bitset(&desc, &["alarm.severity".to_string()]);
+        assert!(m_sev.get(3), "alarm.severity marked");
+        assert_eq!(m_sev.count(), 1);
+
+        // Empty target set and an unknown path both produce nothing.
+        assert_eq!(marked_changed_bitset(&desc, &[]).count(), 0);
+        assert_eq!(
+            marked_changed_bitset(&desc, &["nope".to_string()]).count(),
+            0,
+            "unknown path marks nothing"
+        );
     }
 
     /// Root bit set → the entire value (every leaf) is emitted and

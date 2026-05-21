@@ -113,6 +113,46 @@ impl MonitorOptions {
     }
 }
 
+/// BRIDGE-FR-11: which pipeline-window watermark transition a downstream
+/// monitor op just made. A gateway fans ONE upstream monitor out to N
+/// downstream subscribers of the same PV+credential and must
+/// reference-count their pause votes — pausing the shared upstream only
+/// when *every* live downstream op wants pause, resuming as soon as any
+/// has room — so a single op's transition is not enough; the op
+/// identity and its disposition are both required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatermarkKind {
+    /// The op's window drained to `<= low`: it wants the upstream paused.
+    Pause,
+    /// The op's window refilled above `high`: it no longer needs a pause.
+    Resume,
+    /// The op's subscriber task ended (DESTROY / disconnect / completion):
+    /// withdraw its vote entirely so a torn-down op cannot strand the
+    /// shared upstream paused for its co-subscribers. Terminal — not
+    /// ordered by `seq`.
+    Withdraw,
+}
+
+/// BRIDGE-FR-11: a downstream monitor op's pipeline-window watermark
+/// transition, carrying the op identity + ordering token a gateway needs
+/// to compose pause votes across co-subscribers of one shared upstream
+/// entry. See [`ChannelSource::notify_watermark`].
+#[derive(Debug, Clone, Copy)]
+pub struct WatermarkEvent {
+    /// Process-unique downstream monitor op id (one per subscriber task).
+    /// The aggregation key: distinct ops voting on one shared upstream.
+    pub op_id: u64,
+    /// Strictly-monotonic per-op ordering token minted in the SAME atomic
+    /// transition that decided this crossing (see `tcp.rs`
+    /// `cross_watermark`). Lets the consumer discard a [`WatermarkKind`]
+    /// re-ordered behind a newer one *for the same op* (the LOW fires
+    /// from the subscriber emission task, the HIGH from the ACK-dispatch
+    /// task, so they can arrive out of order). `0` for
+    /// [`WatermarkKind::Withdraw`], which is terminal and not seq-gated.
+    pub seq: u64,
+    pub kind: WatermarkKind,
+}
+
 /// A backend that can answer pvAccess GET / PUT / MONITOR requests for a
 /// set of named PVs.
 pub trait ChannelSource: Send + Sync + 'static {
@@ -159,6 +199,43 @@ pub trait ChannelSource: Send + Sync + 'static {
         &self,
         name: &str,
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send;
+
+    /// Credential-aware [`Self::has_pv`], called at CREATE_CHANNEL time
+    /// with the downstream connection's [`ChannelContext`].
+    ///
+    /// BRIDGE-FR-8: a gateway must resolve a credentialed downstream
+    /// channel's existence against that peer's own upstream identity, not
+    /// the shared gateway identity — otherwise the upstream cache/monitor
+    /// is opened under the wrong audit identity as a side effect of
+    /// channel setup. pvxs constructs `ServerChannelControl` with
+    /// `conn->cred` (`serverchan.cpp:62`) for exactly this reason. The
+    /// default delegates to the credential-free [`Self::has_pv`], so
+    /// non-gateway sources (which ignore credentials) are unaffected.
+    fn has_pv_checked(
+        &self,
+        name: &str,
+        _ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        self.has_pv(name)
+    }
+
+    /// Credential-aware [`Self::get_introspection`], called at
+    /// CREATE_CHANNEL and GET_FIELD time with the downstream connection's
+    /// [`ChannelContext`].
+    ///
+    /// BRIDGE-FR-8: descriptor discovery for a credentialed downstream
+    /// peer must open/refresh upstream state under that peer's identity,
+    /// not the shared gateway identity (pvxs builds the GET_FIELD
+    /// `ConnectOp` with `conn->cred`, `serverintrospect.cpp:66`). The
+    /// default delegates to the credential-free
+    /// [`Self::get_introspection`].
+    fn get_introspection_checked(
+        &self,
+        name: &str,
+        _ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+        self.get_introspection(name)
+    }
 
     /// Fetch the current value of a PV.
     fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send;
@@ -401,9 +478,18 @@ pub trait ChannelSource: Send + Sync + 'static {
         checked: AccessChecked,
         ctx: ChannelContext,
         opts: MonitorOptions,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<MonitorUpdate>>> + Send {
         let _ = opts;
-        self.subscribe_checked(checked, ctx)
+        async move {
+            // BRIDGE-FR-12: the cooked monitor stream carries
+            // `MonitorUpdate`. A source without a `+trigger` graph
+            // delegates to its plain `subscribe_checked` and wraps each
+            // value with `marked: None`, so the server derives the
+            // changed-bitset as before (full mask / value-diff).
+            self.subscribe_checked(checked, ctx)
+                .await
+                .map(plain_monitor_updates)
+        }
     }
 
     /// BR-R14 raw-path counterpart of [`Self::subscribe_checked_opts`].
@@ -529,22 +615,34 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// a no-op; [`crate::server_native::shared_pv::SharedSource`]
     /// overrides to fire the per-PV `on_high_mark` callback.
     /// Mirrors pvxs `MonitorControlOp::onHighMark`.
-    fn notify_watermark_high(&self, name: &str) {
-        let _ = name;
-    }
-
-    /// Companion to [`Self::notify_watermark_high`]: fired when the
-    /// outbox drained back to empty. Producers should un-throttle.
-    /// Default no-op.
-    fn notify_watermark_low(&self, name: &str) {
-        let _ = name;
+    ///
+    /// BRIDGE-FR-11: a downstream monitor op crossed a pipeline-window
+    /// watermark (`ev.kind`: [`WatermarkKind::Pause`] on the LOW edge,
+    /// [`WatermarkKind::Resume`] on the HIGH edge) or its subscriber task
+    /// ended ([`WatermarkKind::Withdraw`]). Default no-op;
+    /// [`crate::server_native::shared_pv::SharedSource`] overrides to fire
+    /// its per-PV `on_high_mark`/`on_low_mark` callbacks. Mirrors pvxs
+    /// `MonitorControlOp::onHighMark`/`onLowMark`, plus a teardown signal
+    /// the gateway needs.
+    ///
+    /// `ctx` is the firing downstream subscription's credential context: a
+    /// gateway routes per-credential upstreams into separate caches, so it
+    /// must scope the resulting upstream resume/pause to the layer this
+    /// subscription's upstream lives in rather than every layer.
+    /// `ev.op_id` + `ev.seq` let a fanout gateway reference-count pause
+    /// votes across the N downstream ops sharing one upstream entry (pause
+    /// only when every live op wants pause; a `Withdraw` removes a
+    /// torn-down op's vote) and order each op's transitions correctly even
+    /// though its LOW and HIGH fire from different tasks.
+    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
+        let _ = (name, ctx, ev);
     }
 
     /// PVA-FR-4: the per-PV pipeline-window watermark levels `(low,
-    /// high)` for `name`, in window-credit units. The monitor loop
-    /// fires [`Self::notify_watermark_high`] when an ACK refills the
-    /// window above `high` and [`Self::notify_watermark_low`] when a
-    /// DATA emission drains it to `<= low` — pvxs `servermon.cpp`
+    /// high)` for `name`, in window-credit units. The monitor loop fires
+    /// [`Self::notify_watermark`] with [`WatermarkKind::Resume`] when an
+    /// ACK refills the window above `high` and [`WatermarkKind::Pause`]
+    /// when a DATA emission drains it to `<= low` — pvxs `servermon.cpp`
     /// flow-control semantics, not server-queue occupancy. Default
     /// `None` (no per-PV levels);
     /// [`crate::server_native::shared_pv::SharedSource`] overrides to
@@ -571,6 +669,57 @@ pub trait ChannelSource: Send + Sync + 'static {
 /// downstream connection negotiated the opposite endian (rare, but
 /// matters for cross-host gateways). On mismatch, dispatch falls
 /// back to the decoded `subscribe` path.
+/// BRIDGE-FR-12: a cooked MONITOR update — the new value plus an
+/// optional explicit set of changed field paths.
+///
+/// `marked == None` means the server derives the wire changed-bitset
+/// itself: the full request mask for an ordinary source, or a
+/// value-diff for a partial-emitting source ([`ChannelSource::monitor_emits_partial`]).
+///
+/// `marked == Some(paths)` carries an *explicit* marked-leaf set: the
+/// dot-separated field paths the source declares changed for this
+/// event, marked whether or not their value differs from the previous
+/// snapshot. A QSRV group monitor uses this to honor `+trigger` target
+/// graphs (pvxs `groupsource.cpp:288` marks each trigger target
+/// assigned-not-changed); the encoder turns the paths into a wire
+/// changed-bitset via [`crate::pvdata::encode::marked_changed_bitset`].
+#[derive(Debug, Clone)]
+pub struct MonitorUpdate {
+    /// The full snapshot value for this event.
+    pub value: PvField,
+    /// Explicit changed field paths, or `None` to let the server
+    /// derive the changed-bitset.
+    pub marked: Option<Vec<String>>,
+}
+
+impl From<PvField> for MonitorUpdate {
+    /// A plain value with no explicit marked set — the server derives
+    /// the changed-bitset (full mask or value-diff) as before.
+    fn from(value: PvField) -> Self {
+        Self {
+            value,
+            marked: None,
+        }
+    }
+}
+
+/// Adapt a plain `PvField` monitor stream into a [`MonitorUpdate`]
+/// stream that carries no explicit marked set (`marked: None`). Used by
+/// every cooked source without a `+trigger` graph so the
+/// [`ChannelSource::subscribe_checked_opts`] item type is uniform while
+/// the source keeps producing bare `PvField`s on its own channel.
+pub fn plain_monitor_updates(mut rx: mpsc::Receiver<PvField>) -> mpsc::Receiver<MonitorUpdate> {
+    let (tx, out) = mpsc::channel(64);
+    tokio::spawn(async move {
+        while let Some(v) = rx.recv().await {
+            if tx.send(MonitorUpdate::from(v)).await.is_err() {
+                break;
+            }
+        }
+    });
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct RawMonitorEvent {
     /// Body of the MONITOR DATA frame: `changed | value | overrun`.
@@ -615,6 +764,18 @@ pub trait ChannelSourceObj: Send + Sync {
     fn get_introspection<'a>(
         &'a self,
         name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>>;
+    /// BRIDGE-FR-8: dyn forwarder for credential-aware existence.
+    fn has_pv_checked<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    /// BRIDGE-FR-8: dyn forwarder for credential-aware introspection.
+    fn get_introspection_checked<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>>;
     fn get_value<'a>(
         &'a self,
@@ -694,7 +855,7 @@ pub trait ChannelSourceObj: Send + Sync {
         ctx: ChannelContext,
         opts: MonitorOptions,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<MonitorUpdate>>> + Send + 'a>,
     >;
     /// BR-R14: dyn forwarder for raw MONITOR with event-affecting options.
     fn subscribe_raw_checked_opts<'a>(
@@ -734,8 +895,7 @@ pub trait ChannelSourceObj: Send + Sync {
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
     fn monitor_emits_partial(&self, name: &str) -> bool;
-    fn notify_watermark_high(&self, name: &str);
-    fn notify_watermark_low(&self, name: &str);
+    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent);
     fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)>;
 }
 
@@ -762,6 +922,22 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::get_introspection(self, name))
+    }
+    fn has_pv_checked<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::has_pv_checked(self, name, ctx))
+    }
+    fn get_introspection_checked<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::get_introspection_checked(
+            self, name, ctx,
+        ))
     }
     fn get_value<'a>(
         &'a self,
@@ -868,7 +1044,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
         opts: MonitorOptions,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<MonitorUpdate>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe_checked_opts(
             self, checked, ctx, opts,
@@ -934,11 +1110,8 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     fn monitor_emits_partial(&self, name: &str) -> bool {
         <Self as ChannelSource>::monitor_emits_partial(self, name)
     }
-    fn notify_watermark_high(&self, name: &str) {
-        <Self as ChannelSource>::notify_watermark_high(self, name);
-    }
-    fn notify_watermark_low(&self, name: &str) {
-        <Self as ChannelSource>::notify_watermark_low(self, name);
+    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
+        <Self as ChannelSource>::notify_watermark(self, name, ctx, ev);
     }
     fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
         <Self as ChannelSource>::monitor_watermarks(self, name)

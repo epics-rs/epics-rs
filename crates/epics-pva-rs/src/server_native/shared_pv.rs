@@ -993,27 +993,35 @@ impl super::source::ChannelSource for SharedSource {
         }
     }
 
-    /// Override default no-op: when an outbox crosses up through the
-    /// high watermark, fire the per-PV `on_high_mark` callback so
-    /// the producer can throttle. Mirrors pvxs `MonitorControlOp`
-    /// pipeline-pause semantics.
-    fn notify_watermark_high(&self, name: &str) {
-        let pv = self.pvs.lock().get(name).cloned();
-        if let Some(p) = pv {
-            let (high, _low) = p.watermark_handlers();
-            if let Some(cb) = high {
-                cb(&p);
-            }
-        }
-    }
-
-    fn notify_watermark_low(&self, name: &str) {
-        let pv = self.pvs.lock().get(name).cloned();
-        if let Some(p) = pv {
-            let (_high, low) = p.watermark_handlers();
-            if let Some(cb) = low {
-                cb(&p);
-            }
+    /// Override default no-op: fire the per-PV `on_high_mark` /
+    /// `on_low_mark` callback so the producer can throttle. Mirrors pvxs
+    /// `MonitorControlOp` pipeline-pause semantics.
+    fn notify_watermark(
+        &self,
+        name: &str,
+        _ctx: &super::source::ChannelContext,
+        ev: super::source::WatermarkEvent,
+    ) {
+        use super::source::WatermarkKind;
+        // A single-owner SharedPV serves all subscribers from one outbox,
+        // so credential scoping (`_ctx`), the per-op identity (`ev.op_id`)
+        // and ordering token (`ev.seq`) carry no extra meaning here — they
+        // matter only to the gateway, which fans per-credential upstreams
+        // into separate caches and reference-counts pause votes. There is
+        // likewise no shared-upstream to strand, so `Withdraw` is a no-op.
+        let cb = match ev.kind {
+            WatermarkKind::Resume => self.pvs.lock().get(name).and_then(|p| {
+                let (high, _low) = p.watermark_handlers();
+                high.map(|cb| (cb, p.clone()))
+            }),
+            WatermarkKind::Pause => self.pvs.lock().get(name).and_then(|p| {
+                let (_high, low) = p.watermark_handlers();
+                low.map(|cb| (cb, p.clone()))
+            }),
+            WatermarkKind::Withdraw => None,
+        };
+        if let Some((cb, p)) = cb {
+            cb(&p);
         }
     }
 

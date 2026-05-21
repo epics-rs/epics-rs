@@ -139,6 +139,38 @@ impl CompositeSource {
             .map(|x| x.source.clone())
             .collect()
     }
+
+    /// BRIDGE-FR-8: single owner of credentialed inner-source selection
+    /// for every `*_checked` operation. Resolves the matched source via
+    /// `has_pv_checked` — never the credential-free `has_pv` — so a
+    /// gateway inner source opens/refreshes upstream state under THIS
+    /// peer's identity, then mints the inner `AccessChecked` through that
+    /// source's own gate.
+    ///
+    /// Centralising the find-loop here is the structural closure for the
+    /// FR-8 family: the cited leak was CREATE_CHANNEL/GET_FIELD calling
+    /// the credential-free `has_pv`, but the same leak existed in each
+    /// `*_checked` method's hand-rolled selection loop. Routing all of
+    /// them through one helper makes "credentialed selection always uses
+    /// `has_pv_checked`" hold by construction — a future `*_checked`
+    /// method cannot reintroduce the shared-identity leak by selecting
+    /// with plain `has_pv`.
+    async fn resolve_checked(
+        sources: Vec<DynSource>,
+        name: &str,
+        ctx: &crate::server_native::source::ChannelContext,
+    ) -> Option<(DynSource, AccessChecked)> {
+        for src in sources {
+            if src.has_pv_checked(name, ctx.clone()).await {
+                let inner = src
+                    .access_gate()
+                    .check(name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
+                    .await;
+                return Some((src, inner));
+            }
+        }
+        None
+    }
 }
 
 impl ChannelSource for CompositeSource {
@@ -175,7 +207,12 @@ impl ChannelSource for CompositeSource {
         let snapshot = self.snapshot();
         async move {
             for src in snapshot {
-                if src.has_pv(&name).await {
+                // BRIDGE-FR-8: select under the downstream peer's identity
+                // (`has_pv_checked`), not credential-free `has_pv` — a
+                // gateway inner source must resolve the revalidation target
+                // against THIS peer's upstream state, matching the
+                // credentialed `subscribe_checked` that opened the monitor.
+                if src.has_pv_checked(&name, ctx.clone()).await {
                     // Delegate to the matched source's OWN
                     // `revalidate_read`, not `access_gate().check()`
                     // directly. For a leaf source the default
@@ -252,6 +289,49 @@ impl ChannelSource for CompositeSource {
             for src in this {
                 if src.has_pv(&name).await {
                     return src.get_introspection(&name).await;
+                }
+            }
+            None
+        }
+    }
+
+    /// BRIDGE-FR-8: the find-loop itself routes through the inner
+    /// `has_pv_checked` so a gateway source resolves existence under the
+    /// downstream peer's identity — calling the credential-free `has_pv`
+    /// here would re-open the shared-identity upstream cache that this
+    /// fix exists to avoid.
+    fn has_pv_checked(
+        &self,
+        name: &str,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        let name = name.to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv_checked(&name, ctx.clone()).await {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
+    /// BRIDGE-FR-8: credential-aware introspection routed to the matched
+    /// inner source via `has_pv_checked`/`get_introspection_checked`, so
+    /// descriptor discovery for a credentialed downstream peer never
+    /// opens upstream state under the shared gateway identity.
+    fn get_introspection_checked(
+        &self,
+        name: &str,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+        let name = name.to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv_checked(&name, ctx.clone()).await {
+                    return src.get_introspection_checked(&name, ctx).await;
                 }
             }
             None
@@ -352,16 +432,8 @@ impl ChannelSource for CompositeSource {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
-            for src in this {
-                if src.has_pv(&name).await {
-                    let inner_checked = src
-                        .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
-                        .await;
-                    return src.get_value_checked(inner_checked, ctx).await;
-                }
-            }
-            None
+            let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
+            src.get_value_checked(inner_checked, ctx).await
         }
     }
 
@@ -374,16 +446,12 @@ impl ChannelSource for CompositeSource {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
-            for src in this {
-                if src.has_pv(&name).await {
-                    let inner_checked = src
-                        .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
-                        .await;
-                    return src.put_value_checked(inner_checked, value, ctx).await;
+            match Self::resolve_checked(this, &name, &ctx).await {
+                Some((src, inner_checked)) => {
+                    src.put_value_checked(inner_checked, value, ctx).await
                 }
+                None => Err(format!("no source serves '{name}'")),
             }
-            Err(format!("no source serves '{name}'"))
         }
     }
 
@@ -406,18 +474,13 @@ impl ChannelSource for CompositeSource {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
-            for src in this {
-                if src.has_pv(&name).await {
-                    let inner_checked = src
-                        .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
-                        .await;
-                    return src
-                        .put_delta_checked(inner_checked, desc, changed, delta, ctx)
-                        .await;
+            match Self::resolve_checked(this, &name, &ctx).await {
+                Some((src, inner_checked)) => {
+                    src.put_delta_checked(inner_checked, desc, changed, delta, ctx)
+                        .await
                 }
+                None => Err(format!("no source serves '{name}'")),
             }
-            Err(format!("no source serves '{name}'"))
         }
     }
 
@@ -429,16 +492,8 @@ impl ChannelSource for CompositeSource {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
-            for src in this {
-                if src.has_pv(&name).await {
-                    let inner_checked = src
-                        .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
-                        .await;
-                    return src.subscribe_checked(inner_checked, ctx).await;
-                }
-            }
-            None
+            let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
+            src.subscribe_checked(inner_checked, ctx).await
         }
     }
 
@@ -450,16 +505,8 @@ impl ChannelSource for CompositeSource {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
-            for src in this {
-                if src.has_pv(&name).await {
-                    let inner_checked = src
-                        .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
-                        .await;
-                    return src.subscribe_raw_checked(inner_checked, ctx).await;
-                }
-            }
-            None
+            let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
+            src.subscribe_raw_checked(inner_checked, ctx).await
         }
     }
 
@@ -472,20 +519,14 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<
+        Output = Option<mpsc::Receiver<crate::server_native::source::MonitorUpdate>>,
+    > + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
-            for src in this {
-                if src.has_pv(&name).await {
-                    let inner_checked = src
-                        .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
-                        .await;
-                    return src.subscribe_checked_opts(inner_checked, ctx, opts).await;
-                }
-            }
-            None
+            let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
+            src.subscribe_checked_opts(inner_checked, ctx, opts).await
         }
     }
 
@@ -499,18 +540,9 @@ impl ChannelSource for CompositeSource {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
-            for src in this {
-                if src.has_pv(&name).await {
-                    let inner_checked = src
-                        .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
-                        .await;
-                    return src
-                        .subscribe_raw_checked_opts(inner_checked, ctx, opts)
-                        .await;
-                }
-            }
-            None
+            let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
+            src.subscribe_raw_checked_opts(inner_checked, ctx, opts)
+                .await
         }
     }
 
@@ -524,18 +556,13 @@ impl ChannelSource for CompositeSource {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
-            for src in this {
-                if src.has_pv(&name).await {
-                    let inner_checked = src
-                        .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
-                        .await;
-                    return src
-                        .rpc_checked(inner_checked, request_desc, request_value, ctx)
-                        .await;
+            match Self::resolve_checked(this, &name, &ctx).await {
+                Some((src, inner_checked)) => {
+                    src.rpc_checked(inner_checked, request_desc, request_value, ctx)
+                        .await
                 }
+                None => Err(format!("no source serves '{name}'")),
             }
-            Err(format!("no source serves '{name}'"))
         }
     }
 
@@ -576,30 +603,41 @@ impl ChannelSource for CompositeSource {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
-            for src in this {
-                if src.has_pv(&name).await {
-                    let inner_checked = src
-                        .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
-                        .await;
-                    return src.process_checked(inner_checked, ctx).await;
-                }
+            match Self::resolve_checked(this, &name, &ctx).await {
+                Some((src, inner_checked)) => src.process_checked(inner_checked, ctx).await,
+                None => Err(format!("no source serves '{name}'")),
             }
-            Err(format!("no source serves '{name}'"))
         }
     }
 
-    fn notify_watermark_high(&self, name: &str) {
+    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+        // BRIDGE-FR-11: surface the watermark levels of whichever inner
+        // source exposes them, so the server monitor loop drives the
+        // pause/resume hysteresis and reaches the per-source
+        // notify_watermark callback below. Consistent with that
+        // callback (which fans out to every source and lets each decide),
+        // this returns the first source that reports levels — only the
+        // gateway source overrides this; the control source keeps the
+        // default `None`. Without this forwarder the server sees the
+        // CompositeSource trait default `None` and never fires the
+        // callbacks (the wrapper-severs-override defect family).
+        self.snapshot()
+            .into_iter()
+            .find_map(|src| src.monitor_watermarks(name))
+    }
+
+    fn notify_watermark(
+        &self,
+        name: &str,
+        ctx: &crate::server_native::source::ChannelContext,
+        ev: crate::server_native::source::WatermarkEvent,
+    ) {
         for src in self.snapshot() {
             // No has_pv check — fire on every source that registered.
             // The per-source override decides whether the name matches.
-            src.notify_watermark_high(name);
-        }
-    }
-
-    fn notify_watermark_low(&self, name: &str) {
-        for src in self.snapshot() {
-            src.notify_watermark_low(name);
+            // `ctx`/`ev` forward unchanged so the gateway source can scope
+            // per-credential and reference-count the per-op pause vote.
+            src.notify_watermark(name, ctx, ev);
         }
     }
 }
@@ -758,6 +796,83 @@ mod tests {
         );
     }
 
+    /// BRIDGE-FR-11: the composite must forward `monitor_watermarks`
+    /// to whichever inner source exposes levels, mirroring the
+    /// `notify_watermark` fan-out. Pre-fix the composite inherited
+    /// the `ChannelSource` trait default (`None`), so tcp.rs's monitor
+    /// loop saw no watermark levels and never armed the pause/resume
+    /// hysteresis — the gateway override on the inner source was
+    /// severed by the composite (the wrapper-severs-override family).
+    /// This registers a plain source (default `None`) ahead of a
+    /// watermark source and asserts `find_map` skips the `None` and
+    /// surfaces the inner override.
+    #[tokio::test]
+    async fn fr11_composite_forwards_inner_monitor_watermarks() {
+        struct WatermarkSrc;
+        impl ChannelSource for WatermarkSrc {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { Vec::new() }
+            }
+            fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { true }
+            }
+            fn get_introspection(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { None }
+            }
+            fn get_value(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _: &str,
+                _: PvField,
+            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+                async { Err("n/a".into()) }
+            }
+            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+            fn monitor_watermarks(&self, _name: &str) -> Option<(usize, usize)> {
+                Some((2, 5))
+            }
+        }
+
+        let comp = CompositeSource::new();
+        // Plain source (order 0) reports the trait default `None`;
+        // watermark source (order 1) reports levels. find_map must
+        // skip the None and surface the override.
+        comp.add_source(
+            "plain",
+            Arc::new(PvSrc {
+                name: "X",
+                value: 0,
+            }) as DynSource,
+            0,
+        )
+        .unwrap();
+        comp.add_source("wm", Arc::new(WatermarkSrc) as DynSource, 1)
+            .unwrap();
+
+        assert_eq!(
+            comp.monitor_watermarks("X"),
+            Some((2, 5)),
+            "composite must forward the inner source's watermark levels, not the default None"
+        );
+    }
+
     /// Round 50 follow-up (audit): pre-fix the composite used
     /// `max(inner.acl_version)` to aggregate. That's wrong — an
     /// inner that bumps but stays below the existing max produces
@@ -901,5 +1016,122 @@ mod tests {
         let mut pvs = comp.list_pvs().await;
         pvs.sort();
         assert_eq!(pvs, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// BRIDGE-FR-8: every composite `*_checked` op must select the
+    /// inner source through `has_pv_checked` — carrying the downstream
+    /// peer's credentials — never the credential-free `has_pv`. For a
+    /// gateway inner source the plain `has_pv` opens the shared-identity
+    /// upstream cache; the cited CREATE_CHANNEL/GET_FIELD leak had the
+    /// same shape in each `*_checked` find-loop, now centralised in
+    /// `resolve_checked`. The recording mock flips `plain_seen` if its
+    /// `has_pv` is reached and records the account seen by
+    /// `has_pv_checked`; routing `get_value_checked` through the
+    /// composite must hit the credentialed path only.
+    #[tokio::test]
+    async fn fr8_checked_ops_select_via_has_pv_checked() {
+        use crate::server_native::source::ChannelContext;
+        use epics_base_rs::server::access_security::AccessGate;
+        use parking_lot::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct RecordingSrc {
+            gate: AccessGate,
+            plain_seen: Arc<AtomicBool>,
+            checked_account: Arc<Mutex<Option<String>>>,
+        }
+        impl ChannelSource for RecordingSrc {
+            fn access(&self) -> &AccessGate {
+                &self.gate
+            }
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { Vec::new() }
+            }
+            fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                let seen = self.plain_seen.clone();
+                async move {
+                    seen.store(true, Ordering::SeqCst);
+                    true
+                }
+            }
+            fn has_pv_checked(
+                &self,
+                _: &str,
+                ctx: ChannelContext,
+            ) -> impl std::future::Future<Output = bool> + Send {
+                let acct = self.checked_account.clone();
+                async move {
+                    *acct.lock() = Some(ctx.account);
+                    true
+                }
+            }
+            fn get_introspection(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { None }
+            }
+            fn get_value(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { Some(PvField::Scalar(ScalarValue::Int(7))) }
+            }
+            fn put_value(
+                &self,
+                _: &str,
+                _: PvField,
+            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+                async { Ok(()) }
+            }
+            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { true }
+            }
+            fn subscribe(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let plain_seen = Arc::new(AtomicBool::new(false));
+        let checked_account = Arc::new(Mutex::new(None));
+        let mock = Arc::new(RecordingSrc {
+            gate: AccessGate::open(),
+            plain_seen: plain_seen.clone(),
+            checked_account: checked_account.clone(),
+        });
+        let comp = CompositeSource::new();
+        comp.add_source("rec", mock as DynSource, 0).unwrap();
+
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "alice".into(),
+            method: "ca".into(),
+            host: "h".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: None,
+        };
+        let token = AccessGate::open()
+            .check("PVX", "h", "alice", "ca", "")
+            .await;
+        let got = comp.get_value_checked(token, ctx).await;
+
+        assert!(
+            matches!(got, Some(PvField::Scalar(ScalarValue::Int(7)))),
+            "credentialed GET must resolve through the inner source"
+        );
+        assert_eq!(
+            checked_account.lock().as_deref(),
+            Some("alice"),
+            "composite must select via has_pv_checked carrying ctx.account"
+        );
+        assert!(
+            !plain_seen.load(Ordering::SeqCst),
+            "composite *_checked find-loop must NOT call credential-free has_pv"
+        );
     }
 }

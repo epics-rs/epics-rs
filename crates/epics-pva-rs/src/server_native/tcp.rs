@@ -561,6 +561,44 @@ struct OpState {
     /// START (`servermon.cpp:211-220,671-688`); the Rust equivalent is
     /// "hold the squashed latest value, emit on resume".
     monitor_resume: Arc<tokio::sync::Notify>,
+    /// PVA-FR-4 / BRIDGE-FR-11: per-PV pipeline-window watermark levels
+    /// `(low, high)` for this monitor op (from
+    /// [`crate::server_native::ChannelSource::monitor_watermarks`]), or
+    /// `None` when the source exposes none. Captured at INIT so both the
+    /// subscriber loop (LOW, on DATA drain) and the per-connection ACK
+    /// dispatch (HIGH, on credit refill) read the same levels.
+    monitor_wm: Option<(usize, usize)>,
+    /// Hysteresis state + ordering counter shared between the subscriber
+    /// loop and the ACK dispatch so the HIGH (resume) and LOW (pause)
+    /// watermark callbacks fire once per crossing. Its PARITY is the
+    /// state — odd = window above `high` (resume pending), even = at/below
+    /// `low` (pause pending) — and its VALUE is a strictly-monotonic
+    /// firing sequence minted in the same atomic transition that decides
+    /// each crossing (see [`cross_watermark`]). Starts `1` (odd: the
+    /// window begins full, above high).
+    ///
+    /// BRIDGE-FR-11: HIGH MUST fire from the ACK path. A gateway source
+    /// pauses its single upstream monitor on LOW; while paused no further
+    /// events arrive, so firing HIGH from the event loop (the pre-FR-11
+    /// behaviour) could never re-fire — the upstream would stay paused
+    /// forever. pvxs fires `onHighMark` from the ACK handler
+    /// (`servermon.cpp:653-666`).
+    ///
+    /// BRIDGE-FR-11 review: the value is also threaded to the source's
+    /// `notify_watermark` as an ordering token so a gateway applying
+    /// pause/resume out of process can discard a re-ordered command —
+    /// closing a residual race where a resume could be lost behind a
+    /// stale pause across the two firing tasks.
+    monitor_wm_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// BRIDGE-FR-11 review (round 3): process-unique id for THIS monitor
+    /// op, minted once at INIT via [`next_op_id`]. A fanout gateway shares
+    /// one upstream monitor across N downstream ops of the same
+    /// PV+credential; it reference-counts their pause votes keyed on this
+    /// id so a fast co-subscriber's crossings cannot shadow a slow one's
+    /// pause, and a torn-down op's vote is withdrawn by id. Read by BOTH
+    /// the ACK-dispatch HIGH and the subscriber-loop LOW so both votes
+    /// carry the same op identity.
+    monitor_op_id: u64,
     /// Server-side filter chain decoded from
     /// `record._options._filter` (a JSON string carrying the same
     /// channel-filter syntax CA uses: `{"dbnd":{"d":0.5},...}`). The
@@ -600,6 +638,98 @@ struct OpState {
     /// client after DESTROY. Idle (INIT-only) and MONITOR ops leave
     /// this as `None`.
     data_task_abort: Option<Arc<AbortOnDrop>>,
+}
+
+/// BRIDGE-FR-11: atomically cross a pipeline-window watermark and mint
+/// an ordering token in ONE transition over `state`
+/// ([`OpState::monitor_wm_seq`]).
+///
+/// The counter's parity is the hysteresis state — odd = window above
+/// `high` (upstream-resume pending), even = at/below `low`
+/// (upstream-pause pending) — and its value is a strictly-monotonic
+/// firing sequence. Returns `Some(seq)` exactly once per real crossing
+/// (so HIGH/LOW still fire once per edge), with the post-crossing value
+/// as the token; `None` when already in the requested state.
+///
+/// Minting the token in the SAME CAS that decides the crossing is what
+/// lets the gateway apply pause/resume in true firing order: a token
+/// assigned *after* the decision could be re-ordered across the two
+/// firing tasks (subscriber emission loop for LOW, ACK dispatch for
+/// HIGH) and leave an upstream wrongly — and permanently — paused.
+/// `want_above == true` is the HIGH (resume) crossing, `false` the LOW
+/// (pause) crossing.
+fn cross_watermark(state: &std::sync::atomic::AtomicU64, want_above: bool) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+    let mut cur = state.load(Ordering::Acquire);
+    loop {
+        let is_above = cur & 1 == 1;
+        if is_above == want_above {
+            return None;
+        }
+        let next = cur + 1;
+        match state.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(next),
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
+/// Process-unique monitor-op id. A fanout gateway shares one upstream
+/// monitor across N downstream ops and reference-counts their pause votes
+/// keyed on this id; a global monotonic counter keeps ids distinct across
+/// reconnects (a per-(sid,ioid) tuple would recycle). Wraps at u64::MAX —
+/// not reachable in any real deployment.
+fn next_op_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// BRIDGE-FR-11 review: finalizer that withdraws this monitor op's
+/// upstream pause vote when its subscriber task ends — for ANY reason
+/// (normal completion, early `return`, or `AbortOnDrop` cancelling the
+/// task on DESTROY_REQUEST / channel teardown / disconnect).
+///
+/// Invariant (MUST): a torn-down op casts no pause vote on the shared
+/// upstream. The LOW vote fires from the subscriber emission loop; the
+/// matching HIGH (release) fires from the ACK-dispatch path on the
+/// *connection* task. When the op is destroyed the subscriber task is
+/// aborted and that ACK path stops servicing the now-removed ioid, so a
+/// HIGH that would have released the op's last pause vote can never run.
+/// Absent this finalizer the gateway's *shared* `UpstreamEntry` (one
+/// upstream monitor fanned to N downstream subscribers of the same
+/// PV+credential) reference-counts a pause vote with no live owner to
+/// withdraw it — if it was the last op holding data flowing, every
+/// co-subscriber is starved permanently. This is the single owner of the
+/// "withdraw-on-exit" transition: it lives in the subscriber task and so
+/// covers every exit path by construction, rather than scattering a
+/// withdraw at each teardown site.
+///
+/// On drop it fires [`WatermarkKind::Withdraw`] unconditionally for this
+/// op_id. The gateway removes the op's vote and recomputes the aggregate:
+/// if this op's vote was the only thing keeping the upstream paused (or
+/// keeping it from pausing), the aggregate edge fires the corresponding
+/// resume/pause; otherwise it is a no-op. A non-gateway source's
+/// `notify_watermark` default ignores it. Idempotent and cheap (sync mpsc
+/// send), so it is safe to run from `Drop`.
+struct WatermarkWithdrawOnDrop {
+    src: DynSource,
+    pv_name: String,
+    ctx: crate::server_native::source::ChannelContext,
+    op_id: u64,
+}
+
+impl Drop for WatermarkWithdrawOnDrop {
+    fn drop(&mut self) {
+        self.src.notify_watermark(
+            &self.pv_name,
+            &self.ctx,
+            crate::server_native::source::WatermarkEvent {
+                op_id: self.op_id,
+                seq: 0,
+                kind: crate::server_native::source::WatermarkKind::Withdraw,
+            },
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1537,6 +1667,7 @@ async fn handle_connection_io(
                     order,
                     config.max_channels_per_connection,
                     peer,
+                    &cred,
                     &cc_tx,
                     &mut pending_channel_spawns,
                 )
@@ -1617,7 +1748,7 @@ async fn handle_connection_io(
                 .await?;
             }
             Some(Command::GetField) => {
-                handle_get_field(&source, &frame, &tx, &channels, order).await?;
+                handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred).await?;
             }
             Some(Command::Search) => {
                 // PVA-R11: TCP-circuit SEARCH (pvxs
@@ -1746,6 +1877,9 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
         monitor_window_notify: None,
         monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         monitor_resume: Arc::new(tokio::sync::Notify::new()),
+        monitor_wm: None,
+        monitor_wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        monitor_op_id: next_op_id(),
         monitor_filters: Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
         put_auto_exec: true,
         pv_request: None,
@@ -2287,6 +2421,7 @@ async fn handle_create_channel(
     order: ByteOrder,
     max_channels_per_connection: usize,
     peer: SocketAddr,
+    cred: &ClientCredentials,
     cc_tx: &CcTx,
     pending_channel_spawns: &mut usize,
 ) -> PvaResult<()> {
@@ -2357,11 +2492,26 @@ async fn handle_create_channel(
         *pending_channel_spawns += batch.len();
         let src = source.clone();
         let cc = cc_tx.clone();
+        // BRIDGE-FR-8: resolve existence + introspection under the
+        // downstream connection's identity so a gateway opens upstream
+        // state under THIS peer's credentials, not the shared identity.
+        // pvxs builds `ServerChannelControl` with `conn->cred`
+        // (`serverchan.cpp:62`). `pv_request` is `None` — CREATE_CHANNEL
+        // carries no per-op pvRequest.
+        let conn_ctx = crate::server_native::source::ChannelContext {
+            peer,
+            account: cred.account.clone(),
+            method: cred.method.clone(),
+            host: cred.host.clone(),
+            authority: cred.authority.clone(),
+            roles: cred.roles.clone(),
+            pv_request: None,
+        };
         tokio::spawn(async move {
             for (cid, sid, nm) in batch {
-                let found = src.has_pv(&nm).await;
+                let found = src.has_pv_checked(&nm, conn_ctx.clone()).await;
                 let intro = if found {
-                    src.get_introspection(&nm).await
+                    src.get_introspection_checked(&nm, conn_ctx.clone()).await
                 } else {
                     None
                 };
@@ -2829,6 +2979,16 @@ async fn handle_op(
             crate::server_native::source::MonitorOptions::default()
         };
 
+        // PVA-FR-4 / BRIDGE-FR-11: capture the source's pipeline-window
+        // watermark levels at INIT so the subscriber loop (LOW) and the
+        // ACK dispatch (HIGH) evaluate the same `(low, high)` against the
+        // shared hysteresis flag.
+        let monitor_wm = if kind == OpKind::Monitor {
+            source.monitor_watermarks(&ch.name)
+        } else {
+            None
+        };
+
         ch.ops.insert(
             ioid,
             OpState {
@@ -2841,6 +3001,9 @@ async fn handle_op(
                 monitor_window_notify,
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 monitor_resume: Arc::new(tokio::sync::Notify::new()),
+                monitor_wm,
+                monitor_wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                monitor_op_id: next_op_id(),
                 monitor_filters,
                 put_auto_exec,
                 pv_request: stashed_pv_request,
@@ -3251,6 +3414,20 @@ async fn handle_op(
             // subscriber wakes and resumes emission. ACKs can arrive
             // before OR after the START — we always honour them.
             if is_ack {
+                // BRIDGE-FR-11: fire HIGH (resume) from the ACK path —
+                // pvxs `servermon.cpp:653-666` fires `onHighMark` when
+                // ACKs add enough credit. A gateway source that paused
+                // its single upstream monitor on LOW receives no further
+                // events while paused, so the event-loop HIGH check could
+                // never re-fire; the resume MUST be driven by the credit
+                // refill here. `fire_high` (the crossing's ordering
+                // token) is computed under the `op` borrow, then the
+                // callback runs after it is dropped so `source` can
+                // borrow `ch.name` freely.
+                // `(seq, op_id)` of the crossing, computed under the `op`
+                // borrow, fired after it is dropped so `source` can borrow
+                // `ch.name` freely.
+                let mut fire_high: Option<(u64, u64)> = None;
                 if let Some(op) = ch.ops.get(&ioid) {
                     let ack_count = cur.get_u32(order).unwrap_or(4);
                     if let (Some(w), Some(n)) = (
@@ -3261,7 +3438,48 @@ async fn handle_op(
                         if prev == 0 {
                             n.notify_waiters();
                         }
+                        // HIGH fires once per crossing: the refilled
+                        // window stands above `high`. `cross_watermark`
+                        // both checks-and-marks the crossing and mints the
+                        // ordering token in one CAS, returning `Some(seq)`
+                        // exactly on the below→above edge. The companion
+                        // LOW (event loop) crosses back when a DATA
+                        // emission drains to `<= low`.
+                        if let Some((_lo, hi)) = op.monitor_wm {
+                            let w_now = prev as usize + ack_count as usize;
+                            if w_now > hi {
+                                fire_high = cross_watermark(&op.monitor_wm_seq, true)
+                                    .map(|seq| (seq, op.monitor_op_id));
+                            }
+                        }
                     }
+                }
+                if let Some((seq, op_id)) = fire_high {
+                    // BRIDGE-FR-11 review: thread this connection's
+                    // credential context so a gateway scopes the resume to
+                    // the firing credential's own upstream cache layer, the
+                    // crossing `seq` so it orders this op's transitions, and
+                    // `op_id` so it releases THIS op's pause vote (not a
+                    // co-subscriber's). `pv_request` is irrelevant to cache
+                    // selection, so it is omitted.
+                    let wm_ctx = crate::server_native::source::ChannelContext {
+                        peer,
+                        account: cred.account.clone(),
+                        method: cred.method.clone(),
+                        host: cred.host.clone(),
+                        authority: cred.authority.clone(),
+                        roles: cred.roles.clone(),
+                        pv_request: None,
+                    };
+                    source.notify_watermark(
+                        &ch.name,
+                        &wm_ctx,
+                        crate::server_native::source::WatermarkEvent {
+                            op_id,
+                            seq,
+                            kind: crate::server_native::source::WatermarkKind::Resume,
+                        },
+                    );
                 }
             }
 
@@ -3323,31 +3541,51 @@ async fn handle_op(
                 // BR-R14: also lift the event-affecting monitor
                 // options so they reach the source's
                 // `subscribe_*_checked_opts`.
-                let (window, window_notify, paused_flag, resume_notify, filters, monitor_options) =
-                    ch.ops
-                        .get(&ioid)
-                        .map(|s| {
-                            (
-                                s.monitor_window.clone(),
-                                s.monitor_window_notify.clone(),
-                                s.monitor_paused.clone(),
-                                s.monitor_resume.clone(),
-                                s.monitor_filters.clone(),
-                                s.monitor_options.clone(),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            (
-                                None,
-                                None,
-                                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                                Arc::new(tokio::sync::Notify::new()),
-                                Arc::new(
-                                    epics_base_rs::server::database::filters::FilterChain::new(),
-                                ),
-                                crate::server_native::source::MonitorOptions::default(),
-                            )
-                        });
+                let (
+                    window,
+                    window_notify,
+                    paused_flag,
+                    resume_notify,
+                    filters,
+                    monitor_options,
+                    wm_seq,
+                    monitor_op_id,
+                ) = ch
+                    .ops
+                    .get(&ioid)
+                    .map(|s| {
+                        (
+                            s.monitor_window.clone(),
+                            s.monitor_window_notify.clone(),
+                            s.monitor_paused.clone(),
+                            s.monitor_resume.clone(),
+                            s.monitor_filters.clone(),
+                            s.monitor_options.clone(),
+                            // BRIDGE-FR-11: the LOW callback in the loop
+                            // below crosses this shared counter back to
+                            // "below"; the HIGH callback in the ACK dispatch
+                            // crosses it to "above". Sharing it keeps the
+                            // pause/resume hysteresis AND the monotonic
+                            // ordering token coherent across the two paths.
+                            s.monitor_wm_seq.clone(),
+                            // BRIDGE-FR-11 review: same op identity the ACK
+                            // HIGH uses, so both votes (and the teardown
+                            // Withdraw) reference-count under one key.
+                            s.monitor_op_id,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            None,
+                            None,
+                            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            Arc::new(tokio::sync::Notify::new()),
+                            Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
+                            crate::server_native::source::MonitorOptions::default(),
+                            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                            next_op_id(),
+                        )
+                    });
                 let total_bits = intro_clone.total_bits();
                 // Raw fast path is correct only when the downstream's
                 // pvRequest matches the upstream's bytes 1:1 — i.e. no
@@ -3475,6 +3713,9 @@ async fn handle_op(
                             &paused_flag,
                             &resume_notify,
                             |ev| ev.type_changed,
+                            // Raw events carry no marked set; a pause-time
+                            // collapse keeps the newer pre-encoded body.
+                            |_, new| new,
                         )
                         .await
                         {
@@ -3585,12 +3826,32 @@ async fn handle_op(
                     // Diagnostic-only outbound-queue-depth crossing flag.
                     let mut queue_over_high = false;
                     // PVA-FR-4: per-PV pipeline-window watermark levels
-                    // `(low, high)` in credit units, and the hysteresis
-                    // flag for firing the SharedPV callbacks off the
-                    // window (not server-queue occupancy). `None` when
-                    // the source exposes no per-PV levels.
+                    // `(low, high)` in credit units. `None` when the source
+                    // exposes no per-PV levels. BRIDGE-FR-11: the hysteresis
+                    // state + ordering token is the SHARED `wm_seq` counter
+                    // (crossed to "above" by the ACK dispatch, back to
+                    // "below" here) so a gateway upstream paused on LOW can
+                    // be resumed by the credit-refill HIGH callback.
                     let wm_levels = src.monitor_watermarks(&pv_name);
-                    let mut wm_over_high = false;
+                    // BRIDGE-FR-11 review: arm the withdraw-on-teardown
+                    // finalizer for flow-controlled (gateway) ops only.
+                    // Held live for the rest of the task so every exit
+                    // path — normal end, early `return`, or AbortOnDrop
+                    // cancelling this task on DESTROY/disconnect — drops
+                    // it and withdraws this op's upstream pause vote (see
+                    // [`WatermarkWithdrawOnDrop`]). `pv_request` is
+                    // irrelevant to upstream-cache selection, so the ctx
+                    // mirrors the HIGH path and omits it.
+                    let _wm_withdraw_guard = wm_levels.is_some().then(|| {
+                        let mut ctx = mon_ctx.clone();
+                        ctx.pv_request = None;
+                        WatermarkWithdrawOnDrop {
+                            src: src.clone(),
+                            pv_name: pv_name.clone(),
+                            ctx,
+                            op_id: monitor_op_id,
+                        }
+                    });
                     // R49-G1 + R50 audit-3: revalidate ACL BEFORE
                     // sending the initial snapshot on the decoded
                     // path. The re-check is routed through
@@ -3663,7 +3924,7 @@ async fn handle_op(
                     let mut squashing = false;
                     // PVA-FR-8: value squashed while paused, flushed on
                     // resume. `None` between batches.
-                    let mut held: Option<crate::pvdata::PvField> = None;
+                    let mut held: Option<crate::server_native::MonitorUpdate> = None;
                     loop {
                         // Acquire the next value to consider emitting
                         // through the shared pause owner: a value held
@@ -3674,12 +3935,16 @@ async fn handle_op(
                         // drains on START). The decoded path has no
                         // subscription-boundary event, so nothing is
                         // yielded early while paused (`|_| false`).
+                        // BRIDGE-FR-12: events coalesced during a pause
+                        // union their marked-leaf sets via
+                        // `coalesce_monitor_update`.
                         let mut value = match next_monitor_event(
                             &mut rx,
                             &mut held,
                             &paused_flag,
                             &resume_notify,
                             |_| false,
+                            coalesce_monitor_update,
                         )
                         .await
                         {
@@ -3712,12 +3977,14 @@ async fn handle_op(
                             mon_acl_version_at_subscribe_cell
                                 .store(live_v, std::sync::atomic::Ordering::Release);
                         }
-                        // Drain extras; keep the latest.
+                        // Drain extras; keep the latest value but union
+                        // the coalesced events' marked-leaf sets
+                        // (BRIDGE-FR-12).
                         let mut squashed = 0usize;
                         loop {
                             match rx.try_recv() {
                                 Ok(next) => {
-                                    value = next;
+                                    value = coalesce_monitor_update(value, next);
                                     squashed += 1;
                                     if squashed > queue_depth {
                                         squashing = true;
@@ -3773,6 +4040,13 @@ async fn handle_op(
                             held = Some(value);
                             continue;
                         }
+                        // BRIDGE-FR-12: past the pause gate the wire frame is
+                        // built from the PvField snapshot; the explicit
+                        // marked-leaf set (when the source carries one) drives
+                        // the changed-bitset below. `take()` leaves the moved
+                        // MonitorUpdate inert before we shadow `value`.
+                        let marked = value.marked.take();
+                        let value = value.value;
                         // Server-side channel filters: skip when the
                         // chain drops this event. Empty chain (the
                         // default) is a no-op pass-through.
@@ -3841,18 +4115,12 @@ async fn handle_op(
                         // is consumed only for events that will produce
                         // a DATA frame.
                         if let (Some(w), Some(n)) = (window.as_ref(), window_notify.as_ref()) {
-                            // PVA-FR-4: HIGH fires when the window — refilled
-                            // by client ACKs — stands above `high` before we
-                            // consume a credit (pvxs onHighMark on the ACK
-                            // refill). Hysteresis (`wm_over_high`) fires it
-                            // once per crossing.
-                            if let Some((_lo, hi)) = wm_levels {
-                                let w_now = w.load(std::sync::atomic::Ordering::Relaxed) as usize;
-                                if w_now > hi && !wm_over_high {
-                                    wm_over_high = true;
-                                    src.notify_watermark_high(&pv_name);
-                                }
-                            }
+                            // BRIDGE-FR-11: HIGH is fired by the ACK
+                            // dispatch (credit refill), NOT here. Firing it
+                            // from the event loop deadlocks a gateway that
+                            // paused its upstream on LOW: no event arrives
+                            // while paused, so this point is never reached
+                            // to re-fire HIGH. See the ACK handler above.
                             loop {
                                 let cur = w.load(std::sync::atomic::Ordering::Relaxed);
                                 if cur > 0 {
@@ -3887,23 +4155,64 @@ async fn handle_op(
                             }
                             // PVA-FR-4: LOW fires when emitting this DATA
                             // frame drained the window to `<= low` (pvxs
-                            // onLowMark as credit is consumed).
+                            // onLowMark as credit is consumed). BRIDGE-FR-11:
+                            // crosses the SHARED counter back to "below" so
+                            // the ACK dispatch will re-fire HIGH on the next
+                            // refill. `cross_watermark` checks-and-marks the
+                            // crossing AND mints the ordering token in one
+                            // CAS, returning `Some(seq)` exactly on the
+                            // above→below edge — so LOW fires once per
+                            // crossing even though HIGH lives on another path.
+                            // `mon_ctx` scopes the gateway pause to the firing
+                            // credential's own upstream cache layer;
+                            // `monitor_op_id` casts THIS op's pause vote (the
+                            // gateway pauses only when every co-subscriber
+                            // votes pause). Cache selection ignores
+                            // `pv_request`, so `mon_ctx` is passed as-is.
                             if let Some((lo, _hi)) = wm_levels {
                                 let w_after = w.load(std::sync::atomic::Ordering::Relaxed) as usize;
-                                if w_after <= lo && wm_over_high {
-                                    wm_over_high = false;
-                                    src.notify_watermark_low(&pv_name);
+                                if w_after <= lo {
+                                    if let Some(seq) = cross_watermark(&wm_seq, false) {
+                                        src.notify_watermark(
+                                            &pv_name,
+                                            &mon_ctx,
+                                            crate::server_native::source::WatermarkEvent {
+                                                op_id: monitor_op_id,
+                                                seq,
+                                                kind:
+                                                    crate::server_native::source::WatermarkKind::Pause,
+                                            },
+                                        );
+                                    }
                                 }
                             }
                         }
-                        // BR-R29: for a partial-emitting source, narrow
-                        // the wire changed-bitset to exactly the leaves
-                        // that differ from the previously emitted
-                        // snapshot, intersected with the request mask —
-                        // pvxs `to_wire_valid(R, ent, &pvMask)`. The
-                        // first event already went out above with the
-                        // full mask; from here on `prev_value` is set.
-                        let payload = if let Some(prev) = prev_value.as_ref() {
+                        // BRIDGE-FR-12: an explicit marked-leaf set from the
+                        // source (a QSRV group `+trigger` target graph) takes
+                        // precedence over both server-derived bitsets — pvxs
+                        // `groupsource.cpp:288` marks each trigger target
+                        // assigned-not-changed, so a value-diff would wrongly
+                        // drop targets whose value did not move. The encoder
+                        // turns the declared paths into the wire bitset
+                        // intersected with the request mask.
+                        //
+                        // BR-R29: otherwise, for a partial-emitting source,
+                        // narrow the wire changed-bitset to exactly the leaves
+                        // that differ from the previously emitted snapshot,
+                        // intersected with the request mask — pvxs
+                        // `to_wire_valid(R, ent, &pvMask)`. The first event
+                        // already went out above with the full mask; from here
+                        // on `prev_value` is set.
+                        let payload = if let Some(paths) = marked.as_ref() {
+                            build_monitor_payload_marked(
+                                ioid,
+                                &intro_clone,
+                                &value,
+                                paths,
+                                &mask_clone,
+                                order,
+                            )
+                        } else if let Some(prev) = prev_value.as_ref() {
                             build_monitor_payload_partial(
                                 ioid,
                                 &intro_clone,
@@ -4020,6 +4329,8 @@ async fn handle_get_field(
     tx: &SrvTx,
     channels: &HashMap<u32, ChannelState>,
     order: ByteOrder,
+    peer: SocketAddr,
+    cred: &ClientCredentials,
 ) -> PvaResult<()> {
     let mut cur = frame.cursor();
     let sid = cur
@@ -4080,9 +4391,24 @@ async fn handle_get_field(
             let pv_name = chan.name.clone();
             let src = source.clone();
             let tx_clone = tx.clone();
+            // BRIDGE-FR-8: introspect under the downstream connection's
+            // identity. pvxs builds the GET_FIELD ConnectOp with
+            // `conn->cred` (`serverintrospect.cpp:66`); a gateway must
+            // resolve the upstream type against THIS peer's credentials,
+            // not the shared identity. `pv_request` is `None` —
+            // GET_FIELD carries no per-op pvRequest.
+            let conn_ctx = crate::server_native::source::ChannelContext {
+                peer,
+                account: cred.account.clone(),
+                method: cred.method.clone(),
+                host: cred.host.clone(),
+                authority: cred.authority.clone(),
+                roles: cred.roles.clone(),
+                pv_request: None,
+            };
             tokio::spawn(async move {
                 let intro = src
-                    .get_introspection(&pv_name)
+                    .get_introspection_checked(&pv_name, conn_ctx)
                     .await
                     .unwrap_or(FieldDesc::Variant);
                 let mut payload = Vec::new();
@@ -4153,13 +4479,24 @@ async fn next_monitor_event<T>(
     paused: &std::sync::atomic::AtomicBool,
     resume: &tokio::sync::Notify,
     is_boundary: impl Fn(&T) -> bool,
+    // BRIDGE-FR-12: combine an already-held event with a newer one when
+    // multiple events squash into `held` during a pause. The raw path
+    // keeps the latest frame (`|_old, new| new`); the cooked path
+    // unions the per-event marked-leaf sets so a coalesced burst still
+    // marks every field that changed across it.
+    coalesce: impl Fn(T, T) -> T,
 ) -> Option<T> {
     loop {
         if paused.load(Ordering::Relaxed) {
             tokio::select! {
                 ev = rx.recv() => match ev {
                     Some(v) if is_boundary(&v) => return Some(v),
-                    Some(v) => *held = Some(v),
+                    Some(v) => {
+                        *held = Some(match held.take() {
+                            Some(old) => coalesce(old, v),
+                            None => v,
+                        });
+                    }
                     None => return None,
                 },
                 _ = resume.notified() => {}
@@ -4265,6 +4602,84 @@ fn build_monitor_payload_partial(
     h.write_into(&mut buf);
     buf.extend_from_slice(&payload);
     buf
+}
+
+/// BRIDGE-FR-12: build a MONITOR data frame whose wire changed-bitset
+/// is the explicit set of `marked_paths` (a QSRV group `+trigger`
+/// target set), intersected with the request `mask`.
+///
+/// Unlike [`build_monitor_payload_partial`], which reconstructs the
+/// marked set by diffing consecutive snapshots and so only marks
+/// leaves that *changed*, this marks each target field whether or not
+/// its value differs — pvxs `groupsource.cpp:288` refreshes and marks
+/// every `+trigger` target (assigned-not-changed).
+fn build_monitor_payload_marked(
+    ioid: u32,
+    intro: &FieldDesc,
+    value: &PvField,
+    marked_paths: &[String],
+    mask: &BitSet,
+    order: ByteOrder,
+) -> Vec<u8> {
+    // Selection = every leaf under each marked target path.
+    let target = crate::pvdata::encode::marked_changed_bitset(intro, marked_paths);
+    // Intersect with the request mask so a client that subscribed to a
+    // field subset never sees leaves outside it (pvxs intersects with
+    // `pvMask`).
+    let mut selected = BitSet::new();
+    for bit in target.iter() {
+        if mask.get(bit) {
+            selected.set(bit);
+        }
+    }
+
+    let mut payload = Vec::new();
+    payload.put_u32(ioid, order);
+    payload.put_u8(0x00);
+    let changed = crate::pvdata::encode::canonical_changed_bitset(intro, &selected);
+    changed.write_into(order, &mut payload);
+    crate::pvdata::encode::encode_pv_field_with_bitset(
+        value,
+        intro,
+        &changed,
+        0,
+        order,
+        &mut payload,
+    );
+    let overrun = BitSet::new(); // no overruns
+    overrun.write_into(order, &mut payload);
+    let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
+    let mut buf = Vec::with_capacity(8 + payload.len());
+    h.write_into(&mut buf);
+    buf.extend_from_slice(&payload);
+    buf
+}
+
+/// BRIDGE-FR-12: coalesce two cooked monitor updates when the server
+/// squashes events under back-pressure or pause. The newer value wins;
+/// the marked-leaf sets union so the emitted frame still marks every
+/// field that changed across the coalesced burst. A `None` on either
+/// side means "no explicit set — derive by diff", which over-marks
+/// safely, so the union of `None` with anything stays `None`.
+fn coalesce_monitor_update(
+    older: crate::server_native::MonitorUpdate,
+    newer: crate::server_native::MonitorUpdate,
+) -> crate::server_native::MonitorUpdate {
+    let marked = match (older.marked, newer.marked) {
+        (Some(mut a), Some(b)) => {
+            for p in b {
+                if !a.contains(&p) {
+                    a.push(p);
+                }
+            }
+            Some(a)
+        }
+        _ => None,
+    };
+    crate::server_native::MonitorUpdate {
+        value: newer.value,
+        marked,
+    }
 }
 
 /// BR-R44: decode a raw MONITOR event captured under upstream
@@ -4394,6 +4809,140 @@ mod tests {
     use crate::client_native::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
 
+    /// BRIDGE-FR-11 review: `cross_watermark` is the primitive that
+    /// closes the residual pause/resume reorder. Tested by invariant
+    /// boundary, not by narrative — it must fire once per real crossing
+    /// (`None` when already in the requested state), encode the
+    /// resulting state in its PARITY (odd = above/resume, even =
+    /// below/pause), and mint a STRICTLY-monotonic token across
+    /// crossings. Together these let the gateway order pause/resume by
+    /// the token regardless of which firing task reaches it first — a
+    /// resume (higher token) can never be lost behind an earlier pause.
+    #[test]
+    fn fr11_cross_watermark_is_once_per_crossing_parity_and_monotonic() {
+        use std::sync::atomic::AtomicU64;
+        // Starts odd (1) = window above high (matches OpState init).
+        let state = AtomicU64::new(1);
+
+        // Already above → HIGH is a no-op (no double-fire).
+        assert_eq!(cross_watermark(&state, true), None, "already above");
+
+        // Above → below (LOW): fires once, mints an EVEN token.
+        let low1 = cross_watermark(&state, false).expect("LOW crosses");
+        assert_eq!(low1 % 2, 0, "below crossing token is even");
+        assert_eq!(cross_watermark(&state, false), None, "already below");
+
+        // Below → above (HIGH): fires once, mints an ODD token strictly
+        // greater than the previous.
+        let high1 = cross_watermark(&state, true).expect("HIGH crosses");
+        assert_eq!(high1 % 2, 1, "above crossing token is odd");
+        assert!(high1 > low1, "token strictly monotonic across crossings");
+
+        // Another full LOW→HIGH cycle keeps growing monotonically.
+        let low2 = cross_watermark(&state, false).expect("LOW crosses again");
+        let high2 = cross_watermark(&state, true).expect("HIGH crosses again");
+        assert!(
+            low2 > high1 && high2 > low2,
+            "tokens stay strictly monotonic: {low1} < {high1} < {low2} < {high2}"
+        );
+    }
+
+    /// BRIDGE-FR-11 review: the withdraw-on-teardown finalizer
+    /// ([`WatermarkWithdrawOnDrop`]) closes the cross-op strand — a monitor
+    /// op destroyed while it held its *shared* upstream paused must
+    /// withdraw its vote when its subscriber task drops, or it can starve
+    /// co-subscribers that share the upstream entry. Tested by the
+    /// invariant: dropping the guard fires exactly one
+    /// [`WatermarkKind::Withdraw`] carrying this op's `op_id` (the gateway
+    /// then removes the op's vote and recomputes the aggregate). Firing is
+    /// unconditional — a torn-down op always withdraws — and op-scoped, so
+    /// it cannot disturb a co-subscriber's vote.
+    #[test]
+    fn fr11_withdraw_on_drop_fires_op_scoped_withdraw() {
+        use crate::server_native::source::{WatermarkEvent, WatermarkKind};
+
+        struct RecordingWmSource {
+            events: Arc<parking_lot::Mutex<Vec<(u64, WatermarkKind)>>>,
+        }
+        impl crate::server_native::source::ChannelSource for RecordingWmSource {
+            async fn list_pvs(&self) -> Vec<String> {
+                vec!["WM:PV".into()]
+            }
+            async fn has_pv(&self, name: &str) -> bool {
+                name == "WM:PV"
+            }
+            async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+                Some(FieldDesc::Variant)
+            }
+            async fn get_value(&self, _name: &str) -> Option<PvField> {
+                Some(PvField::Scalar(ScalarValue::Double(1.0)))
+            }
+            async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
+                Ok(())
+            }
+            async fn is_writable(&self, _name: &str) -> bool {
+                false
+            }
+            async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+                None
+            }
+            fn notify_watermark(
+                &self,
+                _name: &str,
+                _ctx: &crate::server_native::source::ChannelContext,
+                ev: WatermarkEvent,
+            ) {
+                self.events.lock().push((ev.op_id, ev.kind));
+            }
+        }
+
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let src: DynSource = Arc::new(RecordingWmSource {
+            events: events.clone(),
+        });
+        let ctx = crate::server_native::source::ChannelContext {
+            peer: "127.0.0.1:9001".parse().unwrap(),
+            account: String::new(),
+            method: "anonymous".into(),
+            host: String::new(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: None,
+        };
+
+        // Dropping the guard fires exactly one Withdraw scoped to op 42.
+        {
+            let _g = WatermarkWithdrawOnDrop {
+                src: src.clone(),
+                pv_name: "WM:PV".into(),
+                ctx: ctx.clone(),
+                op_id: 42,
+            };
+        }
+        assert_eq!(
+            *events.lock(),
+            vec![(42, WatermarkKind::Withdraw)],
+            "teardown fires one op-scoped Withdraw, unconditionally"
+        );
+
+        // A second op's guard withdraws its OWN id only — votes never
+        // cross between co-subscribers.
+        events.lock().clear();
+        {
+            let _g = WatermarkWithdrawOnDrop {
+                src: src.clone(),
+                pv_name: "WM:PV".into(),
+                ctx: ctx.clone(),
+                op_id: 99,
+            };
+        }
+        assert_eq!(
+            *events.lock(),
+            vec![(99, WatermarkKind::Withdraw)],
+            "each op withdraws only its own vote"
+        );
+    }
+
     /// PF-R1: a PVA `ulong[]` monitor value must reach the `arr`
     /// server-side filter as `EpicsValue::UInt64Array`. Before the
     /// fix `pv_value_leaf_to_epics`'s `array` helper had no `ULong`
@@ -4417,6 +4966,47 @@ mod tests {
         );
     }
 
+    /// BRIDGE-FR-12: coalescing two cooked updates under pause/squash.
+    /// Tested by the marked-set boundaries, not by narrative: the newer
+    /// value always wins; `Some+Some` unions (so a coalesced burst still
+    /// marks every field that changed across it, deduped), and any
+    /// `None` side collapses to `None` (a server-derived diff over-marks
+    /// safely, so it must not be narrowed by a stale explicit set).
+    #[test]
+    fn br_fr12_coalesce_monitor_update_marked_boundaries() {
+        let val = |tag: i32| PvField::Scalar(ScalarValue::Int(tag));
+        let upd = |tag: i32, marked: Option<Vec<&str>>| crate::server_native::MonitorUpdate {
+            value: val(tag),
+            marked: marked.map(|v| v.into_iter().map(str::to_string).collect()),
+        };
+
+        // Some + Some → union of paths, deduped; newer value wins.
+        let merged =
+            coalesce_monitor_update(upd(1, Some(vec!["a", "b"])), upd(2, Some(vec!["b", "c"])));
+        assert_eq!(merged.value, val(2), "newer value must win");
+        assert_eq!(
+            merged.marked,
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+            "Some+Some must union marked paths without duplicating `b`"
+        );
+
+        // Some(old) + None(new) → None (derive a full/diff bitset).
+        let merged = coalesce_monitor_update(upd(1, Some(vec!["a"])), upd(2, None));
+        assert_eq!(merged.value, val(2));
+        assert!(
+            merged.marked.is_none(),
+            "a None side must collapse the coalesced set to None"
+        );
+
+        // None(old) + Some(new) → None as well.
+        let merged = coalesce_monitor_update(upd(1, None), upd(2, Some(vec!["a"])));
+        assert_eq!(merged.value, val(2));
+        assert!(
+            merged.marked.is_none(),
+            "a None side must collapse the coalesced set to None (either order)"
+        );
+    }
+
     /// PVA-FR-8 owner: invariant boundaries of [`next_monitor_event`],
     /// the single owner of the monitor pause/hold/squash transition that
     /// both the decoded and the raw-frame forward loops acquire through.
@@ -4435,7 +5025,8 @@ mod tests {
             let resume = Notify::new();
             let mut held: Option<u32> = None;
             tx.send(7).await.unwrap();
-            let got = next_monitor_event(&mut rx, &mut held, &paused, &resume, |_| false).await;
+            let got =
+                next_monitor_event(&mut rx, &mut held, &paused, &resume, |_| false, |_, n| n).await;
             assert_eq!(got, Some(7));
         }
 
@@ -4449,7 +5040,8 @@ mod tests {
             let mut held: Option<u32> = Some(42);
             // A fresher value is queued, but the held one must win.
             tx.send(99).await.unwrap();
-            let got = next_monitor_event(&mut rx, &mut held, &paused, &resume, |_| false).await;
+            let got =
+                next_monitor_event(&mut rx, &mut held, &paused, &resume, |_| false, |_, n| n).await;
             assert_eq!(got, Some(42), "held value drains before fresh recv");
             assert!(held.is_none(), "held is consumed once drained");
         }
@@ -4465,7 +5057,7 @@ mod tests {
             let r2 = resume.clone();
             let task = tokio::spawn(async move {
                 let mut held: Option<u32> = None;
-                next_monitor_event(&mut rx, &mut held, &p2, &r2, |_| false).await
+                next_monitor_event(&mut rx, &mut held, &p2, &r2, |_| false, |_, n| n).await
             });
             // Feed while paused; each yield lets the owner squash the
             // sent value into `held` and park again in the select.
@@ -4509,9 +5101,15 @@ mod tests {
             })
             .await
             .unwrap();
-            let got =
-                next_monitor_event(&mut rx, &mut held, &paused, &resume, |ev| ev.type_changed)
-                    .await;
+            let got = next_monitor_event(
+                &mut rx,
+                &mut held,
+                &paused,
+                &resume,
+                |ev| ev.type_changed,
+                |_, n| n,
+            )
+            .await;
             assert!(
                 got.is_some_and(|e| e.type_changed),
                 "boundary event must be yielded immediately even while paused"
@@ -4530,7 +5128,8 @@ mod tests {
             let resume = Notify::new();
             let mut held: Option<u32> = None;
             drop(tx);
-            let got = next_monitor_event(&mut rx, &mut held, &paused, &resume, |_| false).await;
+            let got =
+                next_monitor_event(&mut rx, &mut held, &paused, &resume, |_| false, |_, n| n).await;
             assert_eq!(got, None);
         }
     }
@@ -4684,6 +5283,9 @@ mod tests {
                 monitor_window_notify: None,
                 monitor_paused: paused.clone(),
                 monitor_resume: Arc::new(tokio::sync::Notify::new()),
+                monitor_wm: None,
+                monitor_wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                monitor_op_id: next_op_id(),
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
@@ -6367,6 +6969,9 @@ mod tests {
                 monitor_window_notify: None,
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 monitor_resume: Arc::new(tokio::sync::Notify::new()),
+                monitor_wm: None,
+                monitor_wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                monitor_op_id: next_op_id(),
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
@@ -6396,7 +7001,9 @@ mod tests {
         crate::proto::encode_string_into("", order, &mut payload);
         let frame = synth_frame(Command::GetField, order, payload);
 
-        handle_get_field(&source, &frame, &tx, &channels, order)
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
             .await
             .expect("handler returns Ok");
 
@@ -6441,7 +7048,9 @@ mod tests {
         crate::proto::encode_string_into("", order, &mut payload);
         let frame = synth_frame(Command::GetField, order, payload);
 
-        handle_get_field(&source, &frame, &tx, &channels, order)
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
             .await
             .expect("handler returns Ok");
 

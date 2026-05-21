@@ -907,6 +907,17 @@ async fn ex_r12_server_side_arr_filter_slices_monitor_value() {
         "EX-R12: expected the initial snapshot plus the pushed event, got {}",
         observed.len()
     );
+    // Finding #2: the INITIAL snapshot must be sliced too. Pre-fix it went
+    // straight to `build_monitor_payload`, bypassing the chain, so the
+    // first frame carried the full unsliced array. The arr slice of the
+    // seeded `[0..7]` is indices 0,2,4,6 = `[0,2,4,6]`.
+    let initial = observed.first().unwrap();
+    assert_eq!(
+        initial,
+        &vec![0.0, 2.0, 4.0, 6.0],
+        "finding #2: initial monitor frame must be arr-sliced like updates, not the full \
+         array — got {initial:?}"
+    );
     // The steady-state pushed event flows through the emit loop's
     // filter chain and MUST be the sliced array (indices 0,2,4,6 of
     // [10..17] = [10,12,14,16]). Before the fix the wire payload was

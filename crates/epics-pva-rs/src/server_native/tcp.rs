@@ -228,6 +228,52 @@ fn apply_filter_transform(
     substitute_value_leaf(original, new_leaf)
 }
 
+/// Outcome of running the server-side monitor filter chain on one value.
+///
+/// Centralises the three-way result so the **initial-snapshot path and
+/// the update loop apply the chain identically** — finding #2: the
+/// initial frame previously went straight to `build_monitor_payload`,
+/// so a `record._options._filter` (e.g. `arr`) sliced every update but
+/// not the first frame.
+enum MonitorFilterOutcome {
+    /// Empty chain, or a pass/drop-only filter that passed: emit the
+    /// value unchanged.
+    Pass,
+    /// A gating filter (`dbnd` / `dec` / `sync`) dropped this event.
+    Drop,
+    /// A transformation filter (`arr` / `ts`) produced a new value.
+    Transformed(PvField),
+    /// The transformed value cannot be represented in the negotiated
+    /// monitor descriptor — the subscription cannot honor the filter.
+    DescriptorMismatch,
+}
+
+/// Run the server-side channel-filter chain on one monitor value. The
+/// single owner of "apply the filter to an outbound frame", shared by
+/// every emission point so a frame is never emitted unfiltered while a
+/// sibling frame is filtered. An empty chain is a no-op pass-through.
+fn apply_monitor_filter_chain(
+    filters: &epics_base_rs::server::database::filters::FilterChain,
+    value: &PvField,
+    intro: &FieldDesc,
+) -> MonitorFilterOutcome {
+    if filters.is_empty() {
+        return MonitorFilterOutcome::Pass;
+    }
+    let fev = pv_field_to_filter_event(value);
+    match filters.apply(fev) {
+        None => MonitorFilterOutcome::Drop,
+        Some(transformed) => {
+            match apply_filter_transform(value, &transformed.event.snapshot.value) {
+                Some(tv) if crate::pvdata::value_matches_descriptor(&tv, intro).is_ok() => {
+                    MonitorFilterOutcome::Transformed(tv)
+                }
+                _ => MonitorFilterOutcome::DescriptorMismatch,
+            }
+        }
+    }
+}
+
 /// Convert an `EpicsValue` produced by a filter back into a PVA
 /// value-leaf `PvField` (scalar or scalar array).
 fn epics_value_to_pv_field(v: &epics_base_rs::types::EpicsValue) -> Option<PvField> {
@@ -4007,27 +4053,58 @@ async fn handle_op(
                         .get_value_checked(mon_checked.clone(), mon_ctx.clone())
                         .await
                     {
-                        // BR-R39: pvxs `servermon.cpp:261` always lets
-                        // the first update enter the queue (it bypasses
-                        // the change-or-mask gate), but `:174` still
-                        // encodes the wire BitSet with
-                        // `self->pvMask` — the field mask derived
-                        // from the client's pvRequest. The earlier
-                        // Rust path bypassed both checks, sending the
-                        // initial event with `BitSet::all_set(...)`
-                        // and leaking unrequested leaves. Match pvxs
-                        // by always queueing the first event (no
-                        // change-filter here) but honouring
-                        // `mask_clone` on the wire. The first event is
-                        // always full (pvxs builds a fresh fully-marked
-                        // Value); partial narrowing starts at event #2.
-                        let payload =
-                            build_monitor_payload(ioid, &intro_clone, &initial, &mask_clone, order);
-                        if emits_partial {
-                            prev_value = Some(initial);
-                        }
-                        if tx_clone.send(payload).await.is_err() {
-                            return;
+                        // Finding #2: run the server `_filter` chain on the
+                        // FIRST frame too, through the same owner the update
+                        // loop uses — epics-base `dbChannelRunPreChain`
+                        // filters every monitor event, so `arr` must slice
+                        // the initial snapshot, not just updates. A gating
+                        // filter (`dbnd`/`dec`/`sync`) that drops the first
+                        // event suppresses the initial frame; the update
+                        // loop then delivers the first passing one.
+                        let initial =
+                            match apply_monitor_filter_chain(&filters, &initial, &intro_clone) {
+                                MonitorFilterOutcome::Pass => Some(initial),
+                                MonitorFilterOutcome::Transformed(tv) => Some(tv),
+                                MonitorFilterOutcome::Drop => None,
+                                MonitorFilterOutcome::DescriptorMismatch => {
+                                    let err = build_monitor_error(
+                                        ioid,
+                                        "server-side filter transform does not \
+                                     fit the monitor descriptor",
+                                        order,
+                                    );
+                                    let _ = tx_clone.send(err).await;
+                                    return;
+                                }
+                            };
+                        if let Some(initial) = initial {
+                            // BR-R39: pvxs `servermon.cpp:261` always lets
+                            // the first update enter the queue (it bypasses
+                            // the change-or-mask gate), but `:174` still
+                            // encodes the wire BitSet with
+                            // `self->pvMask` — the field mask derived
+                            // from the client's pvRequest. The earlier
+                            // Rust path bypassed both checks, sending the
+                            // initial event with `BitSet::all_set(...)`
+                            // and leaking unrequested leaves. Match pvxs
+                            // by always queueing the first event (no
+                            // change-filter here) but honouring
+                            // `mask_clone` on the wire. The first event is
+                            // always full (pvxs builds a fresh fully-marked
+                            // Value); partial narrowing starts at event #2.
+                            let payload = build_monitor_payload(
+                                ioid,
+                                &intro_clone,
+                                &initial,
+                                &mask_clone,
+                                order,
+                            );
+                            if emits_partial {
+                                prev_value = Some(initial);
+                            }
+                            if tx_clone.send(payload).await.is_err() {
+                                return;
+                            }
                         }
                     }
                     // Back-pressure / squashing loop: drain available
@@ -4182,38 +4259,20 @@ async fn handle_op(
                         // subscription cannot honor the filter: emit a
                         // monitor error frame and end the stream
                         // rather than silently sending a wrong value.
-                        let value = if filters.is_empty() {
-                            value
-                        } else {
-                            let fev = pv_field_to_filter_event(&value);
-                            match filters.apply(fev) {
-                                None => continue,
-                                Some(transformed) => {
-                                    match apply_filter_transform(
-                                        &value,
-                                        &transformed.event.snapshot.value,
-                                    ) {
-                                        Some(tv)
-                                            if crate::pvdata::value_matches_descriptor(
-                                                &tv,
-                                                &intro_clone,
-                                            )
-                                            .is_ok() =>
-                                        {
-                                            tv
-                                        }
-                                        _ => {
-                                            let err = build_monitor_error(
-                                                ioid,
-                                                "server-side filter transform does not \
-                                                 fit the monitor descriptor",
-                                                order,
-                                            );
-                                            let _ = tx_clone.send(err).await;
-                                            return;
-                                        }
-                                    }
-                                }
+                        let value = match apply_monitor_filter_chain(&filters, &value, &intro_clone)
+                        {
+                            MonitorFilterOutcome::Pass => value,
+                            MonitorFilterOutcome::Drop => continue,
+                            MonitorFilterOutcome::Transformed(tv) => tv,
+                            MonitorFilterOutcome::DescriptorMismatch => {
+                                let err = build_monitor_error(
+                                    ioid,
+                                    "server-side filter transform does not \
+                                     fit the monitor descriptor",
+                                    order,
+                                );
+                                let _ = tx_clone.send(err).await;
+                                return;
                             }
                         };
                         // P-G11: pipeline window check. When pipeline

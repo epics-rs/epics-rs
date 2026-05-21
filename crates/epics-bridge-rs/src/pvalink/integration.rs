@@ -404,7 +404,7 @@ impl PvaLinkResolver {
                 ..cfg.clone()
             };
         }
-        let bare = strip_query(full);
+        let bare = link_pv_name(full);
         if bare != full {
             if let Some(cfg) = opts.get(bare) {
                 return PvaLinkConfig {
@@ -425,7 +425,7 @@ impl PvaLinkResolver {
         if let Some(cfg) = opts.get(full) {
             return cfg.clone();
         }
-        let bare = strip_query(full);
+        let bare = link_pv_name(full);
         if bare != full {
             if let Some(cfg) = opts.get(bare) {
                 return cfg.clone();
@@ -475,7 +475,7 @@ impl PvaLinkResolver {
         // `config.sevr` belongs to an arbitrary other caller. pvxs
         // `pvaLinkConfig::sevr` is per-link (`pvxs/ioc/pvalink.h:65`).
         let full = strip_scheme(pv_name)?;
-        let bare = strip_query(full);
+        let bare = link_pv_name(full);
         if full != bare {
             lazy_register_inp_opts(&self.link_options, full);
         }
@@ -542,7 +542,7 @@ impl PvaLinkResolver {
             // BR-R10/R27: strip query string; lazily register per-link
             // options; get per-link config before the fast path so the
             // field selector is available for `try_read_cached_with_field`.
-            let bare = strip_query(full);
+            let bare = link_pv_name(full);
             if full != bare {
                 lazy_register_inp_opts(&resolver.link_options, full);
             }
@@ -629,7 +629,16 @@ pub async fn install_pvalink_resolver(
             let ParsedLink::Pva(ref s) = parsed else {
                 continue;
             };
-            if !s.contains('?') {
+            // BRIDGE-FR-9: pre-register links that carry per-link options
+            // in EITHER representation — the `?key=value` query form OR
+            // the legacy whitespace suffix form (`TARGET MS`,
+            // `TARGET CPP`). `link_pv_name(s) == s` is true only for a
+            // truly bare PV (no query, no modifiers), which needs no
+            // pre-registration; anything else is parsed and wired so its
+            // `field`/`sevr`/`proc` and any `CP`/`CPP` scan target are
+            // effective before the first read. Pre-fix the gate was
+            // `!s.contains('?')`, which skipped every legacy-suffix link.
+            if link_pv_name(s) == s {
                 continue;
             }
             let link_str = format!("pva://{s}");
@@ -840,7 +849,7 @@ impl LinkSet for PvaLinkResolver {
         let Some(full) = strip_scheme(name) else {
             return false;
         };
-        let bare = strip_query(full);
+        let bare = link_pv_name(full);
         match self.registry.try_get_any(bare, LinkDirection::Inp) {
             Some(link) => link.is_connected(),
             None => false,
@@ -852,7 +861,7 @@ impl LinkSet for PvaLinkResolver {
             return None;
         }
         let full = strip_scheme(name)?;
-        let bare = strip_query(full);
+        let bare = link_pv_name(full);
         // BR-R10/R27: lazily register per-link options from query
         // string; get per-link config for field selector.
         if full != bare {
@@ -893,7 +902,7 @@ impl LinkSet for PvaLinkResolver {
         let full = strip_scheme(name).ok_or_else(|| {
             format!("pvalink rejects ca:// scheme: {name} (use the CA-link path instead)")
         })?;
-        let bare = strip_query(full);
+        let bare = link_pv_name(full);
         // BR-R10/R27: lazily register per-link OUT options from query
         // string; pass full string to out_cfg_for for per-link config.
         if full != bare {
@@ -943,7 +952,7 @@ impl LinkSet for PvaLinkResolver {
         // this caller's `?sevr=` option. pvxs `pvaLinkConfig::sevr`
         // is per-link (`pvxs/ioc/pvalink.h:65`).
         let full = strip_scheme(name)?;
-        let bare = strip_query(full);
+        let bare = link_pv_name(full);
         if full != bare {
             lazy_register_inp_opts(&self.link_options, full);
         }
@@ -965,7 +974,7 @@ impl LinkSet for PvaLinkResolver {
         // caller's full link config), not the cached link's shared
         // `config.sevr`.
         let full = strip_scheme(name)?;
-        let bare = strip_query(full);
+        let bare = link_pv_name(full);
         if full != bare {
             lazy_register_inp_opts(&self.link_options, full);
         }
@@ -980,7 +989,7 @@ impl LinkSet for PvaLinkResolver {
 
     fn time_stamp(&self, name: &str) -> Option<(i64, i32)> {
         let full = strip_scheme(name)?;
-        let bare = strip_query(full);
+        let bare = link_pv_name(full);
         if full != bare {
             lazy_register_inp_opts(&self.link_options, full);
         }
@@ -1030,7 +1039,7 @@ impl LinkSet for PvaLinkResolver {
         // `pvaGetDBFtype` reads the per-link `fld_value`
         // (`pvxs/ioc/pvalink_lset.cpp:199`).
         let full = strip_scheme(name)?;
-        let bare = strip_query(full);
+        let bare = link_pv_name(full);
         if full != bare {
             lazy_register_inp_opts(&self.link_options, full);
         }
@@ -1044,11 +1053,16 @@ impl LinkSet for PvaLinkResolver {
     }
 
     fn link_names(&self) -> Vec<String> {
-        // The registry is keyed on (pv_name, direction). We don't
-        // currently expose iteration; skip for now and rely on
-        // resolver-level stats (read_count / link_count) for
-        // dbpvxr summaries.
-        Vec::new()
+        // BRIDGE-FR-15: surface the opened INP upstream PV names so the
+        // base iocInit external-link wait
+        // (`PvDatabase::wait_for_external_links`) waits for pvalinks to
+        // connect, exactly as CA links already do. The returned names
+        // are the bare upstream PV names — the same key family
+        // `is_connected(name)` resolves through `try_get_any(.., Inp)` —
+        // so the wait's per-name `is_connected` query lands on the
+        // right link. OUT links are excluded: they install no monitor
+        // and have no connection signal this resolver can report.
+        self.registry.inp_link_names()
     }
 }
 
@@ -1078,6 +1092,27 @@ fn strip_scheme(name: &str) -> Option<&str> {
 /// if there is no `?`.
 fn strip_query(s: &str) -> &str {
     s.split_once('?').map_or(s, |(bare, _)| bare)
+}
+
+/// Extract the bare upstream PV identity from a pvalink link body,
+/// dropping BOTH representations of per-link options:
+///   * the `?key=value&…` query part (BR-R10 JSON form), and
+///   * the legacy whitespace-separated trailing modifiers
+///     (`PP`/`NPP`/`CP`/`CPP`/`MS`/`MSI`/`MSS`/`NMS` — the DBD suffix
+///     form a record writes as `pva://TARGET MS`).
+///
+/// BRIDGE-FR-9: `strip_query` alone left the legacy suffix attached, so
+/// `"TARGET MS"` became the registry channel identity and the
+/// `default_inp_cfg` pv_name — the modifier was opened as part of the
+/// remote name. A PV name never contains whitespace, so the first token
+/// after query-stripping is always the PV; `PvaLinkConfig::parse` (via
+/// `strip_legacy_mods`) remains the single owner that interprets the
+/// trailing modifiers into the per-link config. This collapses the two
+/// option representations to one PV identity uniformly, so the existing
+/// `full != bare` lazy-registration path fires for suffix links too.
+fn link_pv_name(s: &str) -> &str {
+    let no_query = strip_query(s);
+    no_query.split_whitespace().next().unwrap_or(no_query)
 }
 
 /// Lazily register INP link options (field, sevr, proc, Q, …) from a
@@ -1822,6 +1857,58 @@ mod tests {
         assert_eq!(resolver.inp_cfg_for("UNSEEN").sevr, SevrMode::Nms);
     }
 
+    /// BRIDGE-FR-15: `LinkSet::link_names()` must surface the opened
+    /// INP upstream PV names so the base iocInit external-link wait can
+    /// poll `is_connected(name)` for each. Pre-fix it returned an empty
+    /// `Vec`, so pvalinks never participated in the wait. The names it
+    /// returns must land on the right link when fed back through
+    /// `is_connected` (the wait's companion query); OUT links are
+    /// excluded (no monitor connection signal).
+    #[tokio::test]
+    async fn fr15_link_names_reports_opened_inp_pvs_queryable_by_is_connected() {
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+
+        // A connected INP link (for_test seeds a cached value, so
+        // is_connected() reads true), a pending INP link (no value yet),
+        // and an OUT link (must be excluded).
+        let connected_cfg = resolver.inp_cfg_for("FR15:CONNECTED");
+        let pending_cfg = resolver.inp_cfg_for("FR15:PENDING");
+        let out_cfg = resolver.out_cfg_for("FR15:OUT");
+        resolver.registry.insert_for_test(
+            &connected_cfg,
+            Arc::new(PvaLink::for_test(
+                connected_cfg.clone(),
+                Some(PvField::Scalar(ScalarValue::Double(1.0))),
+            )),
+        );
+        resolver.registry.insert_for_test(
+            &pending_cfg,
+            Arc::new(PvaLink::for_test(pending_cfg.clone(), None)),
+        );
+        resolver
+            .registry
+            .insert_for_test(&out_cfg, Arc::new(PvaLink::for_test(out_cfg.clone(), None)));
+
+        let mut names = LinkSet::link_names(&resolver);
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["FR15:CONNECTED".to_string(), "FR15:PENDING".to_string()],
+            "wait set = opened INP PV names; OUT excluded"
+        );
+
+        // Each returned name is queryable via is_connected — the exact
+        // query the base wait runs per name.
+        assert!(
+            LinkSet::is_connected(&resolver, "FR15:CONNECTED"),
+            "cached INP link reports connected"
+        );
+        assert!(
+            !LinkSet::is_connected(&resolver, "FR15:PENDING"),
+            "INP link with no value yet reports not connected"
+        );
+    }
+
     #[test]
     fn extract_leaf_walks_dotted_path() {
         let mut alarm = PvStructure::new("alarm_t");
@@ -2170,6 +2257,91 @@ mod tests {
         assert_eq!(
             fanout.records[0].field, "display.precision",
             "ScanTarget.field must reflect the per-link field selector"
+        );
+    }
+
+    /// BRIDGE-FR-9: a DB record can write a pvalink in the *legacy
+    /// whitespace-suffix* form — `pva://TARGET:AI CPP MS` — instead of
+    /// the JSON `?key=value` query form. Before the fix the bare-name
+    /// extraction (`strip_query`) left the suffix attached, so
+    /// `"TARGET:AI CPP MS"` became the upstream channel identity and the
+    /// `default_inp_cfg` pv_name; the `CPP`/`MS` modifiers were never
+    /// interpreted, and the install-time pre-scanner's `!s.contains('?')`
+    /// gate skipped the link entirely (no CP/CPP scan target wired).
+    ///
+    /// After the fix `link_pv_name` collapses BOTH option representations
+    /// to the bare PV identity, so the existing parse-based registration
+    /// honours the suffix uniformly: `PvaLinkConfig::parse`
+    /// (`strip_legacy_mods`) is the single owner that interprets
+    /// `CPP`/`MS`, the channel opens under `"TARGET:AI"`, and the CPP scan
+    /// target lands under the bare PV name.
+    ///
+    /// Upstream parity:
+    ///   pvxs/ioc/pvalink_jlif.cpp — legacy modifier vocabulary
+    ///   pvxs/ioc/pvalink.h:65     — per-link `pvaLinkConfig`
+    #[tokio::test]
+    async fn br_fr9_pvalink_legacy_suffix_options_parsed_not_pv_name() {
+        use epics_base_rs::server::record::{ParsedLink, parse_link_v2};
+
+        // Part 1: the legacy suffix rides into the pvalink layer intact.
+        // epics-base does NOT strip pva:// modifiers — the dual
+        // representation is collapsed in the pvalink layer, not duplicated
+        // in epics-base's modifier vocabulary.
+        let stored = match parse_link_v2("pva://TARGET:AI CPP MS") {
+            ParsedLink::Pva(s) => s,
+            other => panic!("expected Pva, got {other:?}"),
+        };
+        assert_eq!(
+            stored, "TARGET:AI CPP MS",
+            "epics-base must preserve the legacy suffix verbatim"
+        );
+
+        // Part 2: PvaLinkConfig::parse is the single owner that interprets
+        // the suffix — PV name is the first token, modifiers become config
+        // fields. (Was: whole string treated as the PV name.)
+        let cfg = PvaLinkConfig::parse(&format!("pva://{stored}"), LinkDirection::Inp).unwrap();
+        assert_eq!(
+            cfg.pv_name, "TARGET:AI",
+            "suffix must NOT fold into the PV name"
+        );
+        assert_eq!(cfg.sevr, SevrMode::Ms, "MS → maximize-severity");
+        assert!(cfg.scan_on_update, "CPP → scan_on_update");
+        assert!(cfg.scan_on_passive, "CPP → scan_on_passive");
+
+        // Part 3: the integration layer registers options + scan target
+        // for a suffix link exactly as it does for a query-bearing one.
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let _ = resolver
+            .open_link_for_record(&format!("pva://{stored}"), "MY:RECORD")
+            .await;
+
+        // inp_cfg_for keyed by the full suffix string returns the parsed
+        // config — bare PV name, MS, CPP — not the default for a PV
+        // literally named "TARGET:AI CPP MS".
+        let cfg = resolver.inp_cfg_for(stored.as_str());
+        assert_eq!(cfg.pv_name, "TARGET:AI");
+        assert_eq!(
+            cfg.sevr,
+            SevrMode::Ms,
+            "sevr must be registered from the suffix"
+        );
+        assert!(cfg.scan_on_update, "CPP scan_on_update must be registered");
+        assert!(
+            cfg.scan_on_passive,
+            "CPP scan_on_passive must be registered"
+        );
+
+        // Scan target lands under the BARE PV name, never the suffixed
+        // form — the suffix string must never become a registry key.
+        let targets = resolver.scan_targets.read();
+        let fanout = targets
+            .get("TARGET:AI")
+            .expect("CPP target must be registered under the bare PV name");
+        assert_eq!(fanout.records[0].record, "MY:RECORD");
+        assert!(fanout.records[0].passive_only, "CPP must set passive_only");
+        assert!(
+            targets.get("TARGET:AI CPP MS").is_none(),
+            "suffix string must never become a scan-target key"
         );
     }
 

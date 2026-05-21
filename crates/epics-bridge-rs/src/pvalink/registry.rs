@@ -9,7 +9,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
-use super::config::{LinkDirection, PvaLinkConfig};
+use super::config::{LinkDirection, ProcMode, PvaLinkConfig};
 use super::link::{PvaLink, PvaLinkResult};
 
 /// Registry cache key.
@@ -41,7 +41,7 @@ type RegistryKey = (String, bool, usize, LinkDirection, Option<OutOpts>);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct OutOpts {
     field: String,
-    process: bool,
+    proc: ProcMode,
     defer: bool,
     retry: bool,
 }
@@ -53,7 +53,7 @@ impl OutOpts {
         match config.direction {
             LinkDirection::Out => Some(Self {
                 field: config.field.clone(),
-                process: config.process,
+                proc: config.proc,
                 defer: config.defer,
                 retry: config.retry,
             }),
@@ -263,6 +263,35 @@ impl PvaLinkRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// BRIDGE-FR-15: distinct upstream PV names of every opened INP
+    /// link, sorted for a stable order.
+    ///
+    /// The base iocInit external-link wait
+    /// (`PvDatabase::wait_for_external_links`) drives off
+    /// `LinkSet::link_names()` and then queries `is_connected(name)`
+    /// for each. Only INP links carry a monitor connection signal —
+    /// `PvaLinkResolver::is_connected` resolves through
+    /// `try_get_any(.., Inp)`, and OUT links install no monitor so
+    /// they would report perpetually disconnected. Returning INP names
+    /// only keeps the wait set inside the resolver's own key family.
+    ///
+    /// Distinct per-option INP links to the same upstream PV (differing
+    /// `pipeline` / `queue_size`) collapse to a single name here:
+    /// `is_connected` answers for any of them via `try_get_any`, so the
+    /// wait needs each upstream PV exactly once.
+    pub fn inp_link_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .map
+            .read()
+            .keys()
+            .filter(|(_, _, _, dir, _)| *dir == LinkDirection::Inp)
+            .map(|(name, _, _, _, _)| name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
 }
 
 #[cfg(test)]
@@ -277,6 +306,40 @@ mod tests {
         assert!(reg.is_empty());
         reg.close_all();
         assert_eq!(reg.len(), 0);
+    }
+
+    /// BRIDGE-FR-15: `inp_link_names` feeds the base iocInit
+    /// external-link wait. It must (a) report each opened INP upstream
+    /// PV exactly once even when two option-variants of the same PV are
+    /// cached under distinct registry keys, and (b) exclude OUT links
+    /// (which carry no monitor connection signal `is_connected` could
+    /// answer for). `insert_for_test` seeds links without a PVA server.
+    #[tokio::test]
+    async fn fr15_inp_link_names_dedups_by_pv_and_excludes_out() {
+        let reg = PvaLinkRegistry::new();
+
+        // Two INP option-variants of the same upstream PV.
+        let a1 = PvaLinkConfig {
+            queue_size: 1,
+            ..PvaLinkConfig::defaults_for("A:PV", LinkDirection::Inp)
+        };
+        let a2 = PvaLinkConfig {
+            queue_size: 8,
+            ..PvaLinkConfig::defaults_for("A:PV", LinkDirection::Inp)
+        };
+        let b = PvaLinkConfig::defaults_for("B:PV", LinkDirection::Inp);
+        let c_out = PvaLinkConfig::defaults_for("C:OUT", LinkDirection::Out);
+
+        reg.insert_for_test(&a1, Arc::new(PvaLink::for_test(a1.clone(), None)));
+        reg.insert_for_test(&a2, Arc::new(PvaLink::for_test(a2.clone(), None)));
+        reg.insert_for_test(&b, Arc::new(PvaLink::for_test(b.clone(), None)));
+        reg.insert_for_test(&c_out, Arc::new(PvaLink::for_test(c_out.clone(), None)));
+
+        assert_eq!(
+            reg.inp_link_names(),
+            vec!["A:PV".to_string(), "B:PV".to_string()],
+            "INP names deduped by PV (A:PV once), OUT (C:OUT) excluded"
+        );
     }
 
     /// MR-R14: two OUT links to the same remote PV with different
@@ -298,14 +361,14 @@ mod tests {
 
         let cfg_a = PvaLinkConfig {
             field: "fieldA".to_string(),
-            process: false,
+            proc: ProcMode::Default,
             defer: false,
             retry: false,
             ..PvaLinkConfig::defaults_for("MR_R14:PV", LinkDirection::Out)
         };
         let cfg_b = PvaLinkConfig {
             field: "fieldB".to_string(),
-            process: true,
+            proc: ProcMode::Pp,
             defer: true,
             retry: true,
             ..PvaLinkConfig::defaults_for("MR_R14:PV", LinkDirection::Out)
@@ -329,11 +392,13 @@ mod tests {
             "link B must not inherit link A's field"
         );
         assert!(
-            !link_a.config().process && !link_a.config().defer && !link_a.config().retry,
+            link_a.config().proc == ProcMode::Default
+                && !link_a.config().defer
+                && !link_a.config().retry,
             "link A keeps its own proc/defer/retry"
         );
         assert!(
-            link_b.config().process && link_b.config().defer && link_b.config().retry,
+            link_b.config().proc == ProcMode::Pp && link_b.config().defer && link_b.config().retry,
             "link B must not inherit link A's proc/defer/retry"
         );
 
@@ -342,7 +407,7 @@ mod tests {
         // preserved.
         let cfg_a2 = PvaLinkConfig {
             field: "fieldA".to_string(),
-            process: false,
+            proc: ProcMode::Default,
             defer: false,
             retry: false,
             ..PvaLinkConfig::defaults_for("MR_R14:PV", LinkDirection::Out)

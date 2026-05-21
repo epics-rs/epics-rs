@@ -5,7 +5,7 @@
 //! ```text
 //! pva://PV:NAME                              — bare PV name, default options
 //! pva://PV:NAME?field=value                  — explicit value field
-//! pva://PV:NAME?proc=PASSIVE&monitor=true    — multiple options
+//! pva://PV:NAME?proc=NPP&monitor=true        — multiple options
 //! pva://PV:NAME pp                           — legacy "process passive" suffix
 //! ```
 //!
@@ -67,6 +67,65 @@ impl SevrMode {
     }
 }
 
+/// pvxs pvalink `proc` mode — the five-state enum the JSON / legacy
+/// parser preserves (`pvalink_jlif.cpp:69-166`).
+///
+/// BRIDGE-FR-16: the OUT-side process behaviour and the INP-side
+/// scan-on-update behaviour are *related but distinct* (pvxs derives
+/// INP scan at `pvalink_link.cpp:122` and the PUT process request at
+/// `pvalink_channel.cpp:237-263` from the same enum). Collapsing this
+/// into a single `bool` lost two distinctions: `Default` vs `Npp`
+/// (both wrote the wire value `"passive"` instead of `"passive"` vs
+/// `"false"`), and `Cp`/`Cpp` (which request remote processing on PUT,
+/// `"true"`, but were stored as scan-only flags leaving the bool
+/// `false`). This enum keeps all five states; the two outputs are
+/// derived from it via [`Self::put_process_request`] and
+/// [`Self::inp_scan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ProcMode {
+    /// No `proc` given — pvxs `Default`. PUT request → `"passive"`
+    /// (process the target only if it is Passive-scanned).
+    #[default]
+    Default,
+    /// `proc=PP` / `proc=true` — process the target on PUT. PUT
+    /// request → `"true"`.
+    Pp,
+    /// `proc=NPP` / `proc=false` — explicit no-process. PUT request →
+    /// `"false"` (distinct from `Default`'s `"passive"`).
+    Npp,
+    /// `proc=CP` — INP scan-on-update on every monitor event; on PUT,
+    /// requests remote processing (`"true"`).
+    Cp,
+    /// `proc=CPP` — INP scan-on-update only when the owning record is
+    /// Passive; on PUT, requests remote processing (`"true"`).
+    Cpp,
+}
+
+impl ProcMode {
+    /// The `record._options.process` wire value for an OUT PUT.
+    /// Mirrors pvxs `pvalink_channel.cpp:237-263`:
+    /// `Default → "passive"`, `Npp → "false"`,
+    /// `Pp` / `Cp` / `Cpp → "true"`.
+    pub fn put_process_request(self) -> &'static str {
+        match self {
+            ProcMode::Default => "passive",
+            ProcMode::Npp => "false",
+            ProcMode::Pp | ProcMode::Cp | ProcMode::Cpp => "true",
+        }
+    }
+
+    /// INP scan-on-update derivation: `(scan_on_update, scan_on_passive)`.
+    /// Only `Cp` / `Cpp` scan; `Cpp` gates on the owning record being
+    /// Passive. Mirrors pvxs `pvalink_link.cpp:122`.
+    pub fn inp_scan(self) -> (bool, bool) {
+        match self {
+            ProcMode::Cp => (true, false),
+            ProcMode::Cpp => (true, true),
+            ProcMode::Default | ProcMode::Pp | ProcMode::Npp => (false, false),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PvaLinkConfig {
     pub pv_name: String,
@@ -75,8 +134,12 @@ pub struct PvaLinkConfig {
     /// True iff the link should keep an active monitor open instead of
     /// re-reading on each access (INP only).
     pub monitor: bool,
-    /// True iff PUT should call `process()` on the remote record (OUT only).
-    pub process: bool,
+    /// BRIDGE-FR-16: pvxs `proc` mode (`Default`/`PP`/`NPP`/`CP`/`CPP`),
+    /// preserved as a five-state enum. Drives the OUT-side PUT process
+    /// request ([`ProcMode::put_process_request`]) and, for `CP`/`CPP`,
+    /// the INP scan-on-update flags below (set at parse time via
+    /// [`ProcMode::inp_scan`]).
+    pub proc: ProcMode,
     /// True iff the link reports DBE_VALUE notifications back to the local
     /// record (INP, monitor mode).
     pub notify: bool,
@@ -195,23 +258,26 @@ impl PvaLinkConfig {
             cfg.monitor = parse_bool(v)?;
         }
         if let Some(v) = opts.get("proc") {
-            // pvxs `proc`: false/true/NPP/PP/CP/CPP. CP / CPP imply
-            // monitor + scan-on-update; PP / true imply put-side
-            // process.
-            match v.as_str() {
-                "TRUE" | "true" | "1" | "PP" | "pp" | "PASSIVE" | "passive" => cfg.process = true,
-                "FALSE" | "false" | "0" | "NPP" | "npp" => cfg.process = false,
-                "CP" | "cp" => {
-                    cfg.monitor = true;
-                    cfg.scan_on_update = true;
-                    cfg.scan_on_passive = false;
-                }
-                "CPP" | "cpp" => {
-                    cfg.monitor = true;
-                    cfg.scan_on_update = true;
-                    cfg.scan_on_passive = true;
-                }
+            // BRIDGE-FR-16: pvxs `proc` is a five-state enum
+            // (`pvalink_jlif.cpp:69-166`): boolean true→PP / false→NPP,
+            // plus the strings NPP/PP/CP/CPP. `CP`/`CPP` additionally
+            // imply an open monitor and INP scan-on-update. Store the
+            // enum and derive the scan flags from it; `PASSIVE` is NOT
+            // a pvxs `proc` enum value (it is only the later wire
+            // request string for `Default`), so reject it rather than
+            // silently treating it as process-on-PUT.
+            cfg.proc = match v.as_str() {
+                "TRUE" | "true" | "1" | "PP" | "pp" => ProcMode::Pp,
+                "FALSE" | "false" | "0" | "NPP" | "npp" => ProcMode::Npp,
+                "CP" | "cp" => ProcMode::Cp,
+                "CPP" | "cpp" => ProcMode::Cpp,
                 other => return Err(PvaLinkParseError::BadOption(other.to_string())),
+            };
+            let (sou, sop) = cfg.proc.inp_scan();
+            if sou {
+                cfg.monitor = true;
+                cfg.scan_on_update = true;
+                cfg.scan_on_passive = sop;
             }
         }
         if let Some(v) = opts.get("notify") {
@@ -263,17 +329,21 @@ impl PvaLinkConfig {
         // Apply legacy bare modifiers
         for m in legacy_mods {
             match m.as_str() {
-                "PP" | "pp" => cfg.process = true,
-                "NPP" | "npp" => cfg.process = false,
-                "CP" | "cp" => {
+                // BRIDGE-FR-16: legacy bare modifiers map to the same
+                // five-state `ProcMode`; CP/CPP additionally drive the
+                // INP scan flags via `inp_scan`.
+                "PP" | "pp" => cfg.proc = ProcMode::Pp,
+                "NPP" | "npp" => cfg.proc = ProcMode::Npp,
+                "CP" | "cp" | "CPP" | "cpp" => {
+                    cfg.proc = if m.eq_ignore_ascii_case("CPP") {
+                        ProcMode::Cpp
+                    } else {
+                        ProcMode::Cp
+                    };
+                    let (_sou, sop) = cfg.proc.inp_scan();
                     cfg.monitor = true;
                     cfg.scan_on_update = true;
-                    cfg.scan_on_passive = false;
-                }
-                "CPP" | "cpp" => {
-                    cfg.monitor = true;
-                    cfg.scan_on_update = true;
-                    cfg.scan_on_passive = true;
+                    cfg.scan_on_passive = sop;
                 }
                 "MS" | "ms" => cfg.sevr = SevrMode::Ms,
                 "MSI" | "msi" => cfg.sevr = SevrMode::Msi,
@@ -295,7 +365,7 @@ impl PvaLinkConfig {
             pv_name: pv_name.to_string(),
             field: "value".to_string(),
             monitor: false,
-            process: false,
+            proc: ProcMode::Default,
             notify: false,
             scan_on_update: false,
             scan_on_passive: false,
@@ -369,7 +439,7 @@ mod tests {
         assert_eq!(c.pv_name, "OTHER:PV");
         assert_eq!(c.field, "value");
         assert!(!c.monitor);
-        assert!(!c.process);
+        assert_eq!(c.proc, ProcMode::Default);
         // BR-R19: `time` defaults to false to match pvxs.
         assert!(!c.time);
     }
@@ -424,20 +494,92 @@ mod tests {
     #[test]
     fn query_options() {
         let c = PvaLinkConfig::parse(
-            "pva://A?field=alarm.severity&monitor=true&proc=PASSIVE",
+            "pva://A?field=alarm.severity&monitor=true&proc=PP",
             LinkDirection::Inp,
         )
         .unwrap();
         assert_eq!(c.field, "alarm.severity");
         assert!(c.monitor);
-        assert!(c.process);
+        assert_eq!(c.proc, ProcMode::Pp);
     }
 
     #[test]
     fn legacy_pp_modifier() {
         let c = PvaLinkConfig::parse("pva://X PP", LinkDirection::Out).unwrap();
         assert_eq!(c.pv_name, "X");
-        assert!(c.process);
+        assert_eq!(c.proc, ProcMode::Pp);
+        assert_eq!(c.proc.put_process_request(), "true");
+    }
+
+    /// BRIDGE-FR-16: the five pvxs `proc` states are preserved through
+    /// parsing and each derives the correct PUT `process` wire value.
+    /// `Default` (`"passive"`) and `NPP` (`"false"`) are distinct;
+    /// `CP`/`CPP` request remote processing (`"true"`) on PUT even
+    /// though they are primarily INP scan modes.
+    #[test]
+    fn fr16_proc_enum_preserved_and_put_request_derived() {
+        let cases = [
+            ("pva://X", ProcMode::Default, "passive"),
+            ("pva://X?proc=PP", ProcMode::Pp, "true"),
+            ("pva://X?proc=NPP", ProcMode::Npp, "false"),
+            ("pva://X?proc=CP", ProcMode::Cp, "true"),
+            ("pva://X?proc=CPP", ProcMode::Cpp, "true"),
+            // Boolean shorthands map to PP / NPP.
+            ("pva://X?proc=true", ProcMode::Pp, "true"),
+            ("pva://X?proc=false", ProcMode::Npp, "false"),
+        ];
+        for (link, want_mode, want_wire) in cases {
+            let c = PvaLinkConfig::parse(link, LinkDirection::Out).unwrap();
+            assert_eq!(c.proc, want_mode, "{link}: proc mode");
+            assert_eq!(
+                c.proc.put_process_request(),
+                want_wire,
+                "{link}: PUT process wire value"
+            );
+        }
+    }
+
+    /// BRIDGE-FR-16: `Default` and `NPP` must NOT collapse — pre-fix
+    /// both produced `"passive"`; an explicit `NPP` must send `"false"`.
+    #[test]
+    fn fr16_default_and_npp_are_distinct_on_the_wire() {
+        let default = PvaLinkConfig::parse("pva://X", LinkDirection::Out).unwrap();
+        let npp = PvaLinkConfig::parse("pva://X?proc=NPP", LinkDirection::Out).unwrap();
+        assert_ne!(default.proc, npp.proc);
+        assert_eq!(default.proc.put_process_request(), "passive");
+        assert_eq!(npp.proc.put_process_request(), "false");
+    }
+
+    /// BRIDGE-FR-16: `CP`/`CPP` derive INP scan-on-update from the same
+    /// enum (`inp_scan`), independent of the PUT process request — they
+    /// are related but distinct outputs (pvxs `pvalink_link.cpp:122` vs
+    /// `pvalink_channel.cpp:237`).
+    #[test]
+    fn fr16_cp_cpp_derive_scan_flags_and_put_true() {
+        let cp = PvaLinkConfig::parse("pva://X?proc=CP", LinkDirection::Inp).unwrap();
+        assert_eq!(cp.proc.inp_scan(), (true, false));
+        assert!(cp.scan_on_update && !cp.scan_on_passive && cp.monitor);
+        assert_eq!(cp.proc.put_process_request(), "true");
+
+        let cpp = PvaLinkConfig::parse("pva://X?proc=CPP", LinkDirection::Inp).unwrap();
+        assert_eq!(cpp.proc.inp_scan(), (true, true));
+        assert!(cpp.scan_on_update && cpp.scan_on_passive && cpp.monitor);
+        assert_eq!(cpp.proc.put_process_request(), "true");
+    }
+
+    /// BRIDGE-FR-16: `PASSIVE` is the wire request string for `Default`,
+    /// not a pvxs `proc` enum value, so it must be rejected — pre-fix it
+    /// was silently accepted as process-on-PUT.
+    #[test]
+    fn fr16_passive_is_not_a_valid_proc_value() {
+        assert!(matches!(
+            PvaLinkConfig::parse("pva://X?proc=PASSIVE", LinkDirection::Out),
+            Err(PvaLinkParseError::BadOption(_))
+        ));
+        assert!(matches!(
+            PvaLinkConfig::parse("pva://X?proc=passive", LinkDirection::Out),
+            Err(PvaLinkParseError::BadOption(_))
+        ));
     }
 
     #[test]

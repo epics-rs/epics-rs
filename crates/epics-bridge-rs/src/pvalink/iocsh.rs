@@ -136,7 +136,8 @@ pub fn dbpvxr_command(resolver: PvaLinkResolver) -> CommandDef {
                                     ctx.println(&format!("        timeStamp={s}.{n:09}"));
                                 }
                             }
-                            epics_base_rs::server::record::ParsedLink::Ca(name) => {
+                            epics_base_rs::server::record::ParsedLink::Ca(ca) => {
+                                let name = &ca.pv;
                                 ctx.println(&format!(
                                     "    {field}={raw:?}  ca://{name}  (CA link — see camonitor)"
                                 ));

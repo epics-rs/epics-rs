@@ -26,8 +26,25 @@ impl FlowControlGate {
     }
 
     pub async fn wait_until_resumed(&self) {
-        while self.paused.load(Ordering::Acquire) {
-            self.resumed.notified().await;
+        loop {
+            // Register the resume waiter eagerly with `enable()` BEFORE
+            // re-reading the pause flag. `Notify::notified()` does not
+            // register until first polled and `notify_waiters()` stores
+            // no permit, so without this a `resume()` firing between the
+            // `paused.load()` and the `.await` would be lost and leave
+            // this blocked until the next resume. `resume()` stores
+            // `paused = false` (Release) before notifying, so if we still
+            // observe `paused` here the broadcast has not fired yet and is
+            // guaranteed to land on this enabled waiter. Same lost-wake-
+            // safe pattern as `coalesce_while_paused` and
+            // `Channel::wait_until_inactive`.
+            let resumed = self.resumed.notified();
+            tokio::pin!(resumed);
+            resumed.as_mut().enable();
+            if !self.paused.load(Ordering::Acquire) {
+                return;
+            }
+            resumed.await;
         }
     }
 
@@ -40,7 +57,28 @@ impl FlowControlGate {
         rx: &mut mpsc::Receiver<MonitorEvent>,
         mut pending: MonitorEvent,
     ) -> Option<MonitorEvent> {
-        while self.is_paused() {
+        loop {
+            // Register the resume waiter eagerly BEFORE re-reading the
+            // pause flag. `resume()` stores `paused = false` (Release)
+            // *before* `notify_waiters()`, so if we still observe
+            // `is_paused()` here the broadcast has not fired yet and is
+            // guaranteed to land on this already-enabled waiter. This
+            // closes the lost-wake gap where an EVENTS_ON arriving
+            // between the recheck and the `select!` await would otherwise
+            // be dropped — `Notify::notified()` does not register until
+            // first polled, and `notify_waiters()` stores no permit.
+            // `notify_waiters` (broadcast) is required rather than
+            // `notify_one`: one circuit-level gate fans out to every
+            // monitor task on the connection, and `notify_one` would wake
+            // only one of them. Same pattern as
+            // `Channel::wait_until_inactive`.
+            let resumed = self.resumed.notified();
+            tokio::pin!(resumed);
+            resumed.as_mut().enable();
+            if !self.is_paused() {
+                break;
+            }
+            // Collapse the backlog to the latest value while paused.
             while let Ok(event) = rx.try_recv() {
                 pending = event;
             }
@@ -52,7 +90,7 @@ impl FlowControlGate {
                     Some(event) => pending = event,
                     None => return None,
                 },
-                _ = self.resumed.notified() => {}
+                _ = resumed => {}
             }
         }
         Some(pending)
@@ -312,5 +350,138 @@ mod tests {
         );
         // Payload is 8-byte aligned (C client TCP parser requirement).
         assert_eq!(payload_size % 8, 0, "payload not 8-byte aligned");
+    }
+
+    /// FlowControlGate (EVENTS_OFF/EVENTS_ON) pause/resume boundaries.
+    /// The gate is the single owner of the monitor pause transition that
+    /// both `spawn_monitor_sender` and the record-field monitor loop
+    /// acquire through `coalesce_while_paused`. Tested by boundary
+    /// (paused vs not at entry, backlog squash, channel open vs closed,
+    /// resume wake) rather than by narrative scenario.
+    mod flow_control_gate {
+        use super::*;
+        use epics_base_rs::server::pv::MonitorEvent;
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::EpicsValue;
+
+        fn ev(v: i32) -> MonitorEvent {
+            MonitorEvent {
+                snapshot: Snapshot::new(
+                    EpicsValue::Long(v),
+                    0,
+                    0,
+                    std::time::SystemTime::UNIX_EPOCH,
+                ),
+                origin: 0,
+            }
+        }
+
+        fn value_of(e: &MonitorEvent) -> i32 {
+            match e.snapshot.value {
+                EpicsValue::Long(v) => v,
+                ref other => panic!("expected Long, got {other:?}"),
+            }
+        }
+
+        /// Not paused at entry → the pending value is returned at once,
+        /// without waiting on any rx event or resume.
+        #[tokio::test]
+        async fn not_paused_at_entry_returns_pending_immediately() {
+            let gate = FlowControlGate::default();
+            // No sender is ever used; default gate is not paused.
+            let (_tx, mut rx) = mpsc::channel::<MonitorEvent>(1);
+            let got = gate.coalesce_while_paused(&mut rx, ev(7)).await;
+            assert_eq!(value_of(&got.expect("returns pending")), 7);
+        }
+
+        /// Paused → backlog squashes to the latest into `pending`; the
+        /// resume flushes only that latest value (no per-event frame).
+        #[tokio::test]
+        async fn coalesce_to_latest_while_paused_then_resume_flushes() {
+            let gate = Arc::new(FlowControlGate::default());
+            gate.pause();
+            let (tx, mut rx) = mpsc::channel::<MonitorEvent>(8);
+            let g2 = gate.clone();
+            let task = epics_base_rs::runtime::task::spawn(async move {
+                g2.coalesce_while_paused(&mut rx, ev(1)).await
+            });
+            // Feed newer values while paused; each yield lets the gate
+            // absorb the value into `pending` and park again.
+            for v in [2i32, 3, 4] {
+                tx.send(ev(v)).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            gate.resume();
+            let got = task.await.unwrap().expect("resume delivers latest");
+            assert_eq!(
+                value_of(&got),
+                4,
+                "coalesce yields only the latest value on resume"
+            );
+        }
+
+        /// Paused + the source channel closes → `None` (caller ends the
+        /// subscription), not a hang.
+        #[tokio::test]
+        async fn channel_close_while_paused_returns_none() {
+            let gate = Arc::new(FlowControlGate::default());
+            gate.pause();
+            let (tx, mut rx) = mpsc::channel::<MonitorEvent>(1);
+            let g2 = gate.clone();
+            let task = epics_base_rs::runtime::task::spawn(async move {
+                g2.coalesce_while_paused(&mut rx, ev(1)).await
+            });
+            tokio::task::yield_now().await; // let the consumer park in the select
+            drop(tx); // closes the channel; rx.recv() resolves to None
+            assert!(
+                task.await.unwrap().is_none(),
+                "channel close while paused yields None"
+            );
+        }
+
+        /// A resume delivered while the consumer is parked must wake it
+        /// and flush the held value WITHOUT requiring a further rx event.
+        /// The held value is the only one ever sent, so a lost resume
+        /// wake would strand the consumer forever.
+        #[tokio::test]
+        async fn resume_flushes_held_without_further_event() {
+            let gate = Arc::new(FlowControlGate::default());
+            gate.pause();
+            let (tx, mut rx) = mpsc::channel::<MonitorEvent>(4);
+            let g2 = gate.clone();
+            let task = epics_base_rs::runtime::task::spawn(async move {
+                g2.coalesce_while_paused(&mut rx, ev(1)).await
+            });
+            // One value arrives during the pause, then the source goes
+            // quiet — only a resume can release the consumer.
+            tx.send(ev(5)).await.unwrap();
+            tokio::task::yield_now().await;
+            gate.resume();
+            let got = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .expect("resume must wake a parked consumer (no lost wake)")
+                .unwrap()
+                .expect("resume delivers the held value");
+            assert_eq!(value_of(&got), 5);
+        }
+
+        /// `wait_until_resumed` (used by external callers of the gate)
+        /// must return after a resume even when the resume races the
+        /// consumer's entry — the eager `enable()` closes the same
+        /// lost-wake gap as `coalesce_while_paused`.
+        #[tokio::test]
+        async fn wait_until_resumed_unblocks_on_resume() {
+            let gate = Arc::new(FlowControlGate::default());
+            gate.pause();
+            let g2 = gate.clone();
+            let task =
+                epics_base_rs::runtime::task::spawn(async move { g2.wait_until_resumed().await });
+            tokio::task::yield_now().await; // let it park
+            gate.resume();
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .expect("wait_until_resumed must return after resume")
+                .unwrap();
+        }
     }
 }

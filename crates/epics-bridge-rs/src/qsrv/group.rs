@@ -1261,6 +1261,21 @@ pub struct GroupMonitor {
     monitor_queue_size: i32,
 }
 
+/// BRIDGE-FR-12: how a member subscription event maps onto a group
+/// monitor post — pvxs `groupsource.cpp:283-300` (value) /
+/// `:310-340` (property) / `subscriptionPost` `:207`.
+enum EventMark {
+    /// Post the group, marking exactly these group field paths
+    /// (the resolved `+trigger` target set, assigned-not-changed).
+    Marked(Vec<String>),
+    /// Post the group; the server derives the changed-bitset (full
+    /// request mask, or BR-R29 diff for a pure self-trigger group).
+    Derive,
+    /// No post — `TriggerDef::None`, or every named target dropped
+    /// (pvxs `subscriptionPost` `if(empty && !first) return`).
+    Skip,
+}
+
 impl GroupMonitor {
     pub fn new(db: Arc<PvDatabase>, def: GroupPvDef) -> Self {
         // Initialize priming state for each member.
@@ -1324,6 +1339,80 @@ impl GroupMonitor {
         self.monitor_queue_size = queue_size;
         self
     }
+
+    /// BRIDGE-FR-12: resolve the marked-leaf field paths for a *value*
+    /// event from `source_idx`, mirroring pvxs `groupsource.cpp:283`
+    /// iterating `field.triggers` and marking each target.
+    ///
+    /// A *pure self-trigger* group keeps the existing BR-R29 path
+    /// ([`EventMark::Derive`]) so the value-diff narrowing and its
+    /// tests are untouched — this finding is about explicit `+trigger`
+    /// graphs, where `SelfOnly`, `All`, and named `Fields` must stay
+    /// distinct instead of all re-reading the full group.
+    ///
+    /// Takes `&GroupPvDef` (not `&self`) so `poll` can call it while
+    /// holding the `&mut self.event_rx` borrow — `def` is a disjoint
+    /// field.
+    fn value_event_mark(def: &GroupPvDef, source_idx: usize) -> EventMark {
+        let Some(source) = def.members.get(source_idx) else {
+            return EventMark::Skip;
+        };
+        if def.is_pure_self_trigger() {
+            return match source.triggers {
+                TriggerDef::None => EventMark::Skip,
+                _ => EventMark::Derive,
+            };
+        }
+        let targets: Vec<&str> = match &source.triggers {
+            TriggerDef::None => return EventMark::Skip,
+            // Self-trigger inside a mixed group marks only its own field.
+            TriggerDef::SelfOnly => vec![source.field_name.as_str()],
+            // `"*"` marks every member field (whole group).
+            TriggerDef::All => def.members.iter().map(|m| m.field_name.as_str()).collect(),
+            // Named targets: pvxs resolves only references that name an
+            // existing field (`groupconfigprocessor.cpp:381-409`);
+            // unknown refs were warned at `process_groups` and dropped.
+            TriggerDef::Fields(refs) => {
+                let known: std::collections::HashSet<&str> =
+                    def.members.iter().map(|m| m.field_name.as_str()).collect();
+                refs.iter()
+                    .map(String::as_str)
+                    .filter(|r| known.contains(r))
+                    .collect()
+            }
+        };
+        Self::mark_or_derive(targets)
+    }
+
+    /// BRIDGE-FR-12: a *property* event marks only the source field's
+    /// own mapping and never its triggers — pvxs `groupsource.cpp:325`
+    /// ("we (may) only post changes to the field mapping in question.
+    /// But never the triggered fields."). A pure self-trigger group
+    /// keeps the BR-R29 diff path.
+    fn property_event_mark(def: &GroupPvDef, source_idx: usize) -> EventMark {
+        let Some(source) = def.members.get(source_idx) else {
+            return EventMark::Skip;
+        };
+        if def.is_pure_self_trigger() {
+            return EventMark::Derive;
+        }
+        Self::mark_or_derive(vec![source.field_name.as_str()])
+    }
+
+    /// Turn a resolved target list into an [`EventMark`]. An empty list
+    /// means every target was dropped → no post. A target that cannot
+    /// be addressed by a structure path (a root-flattened `Meta` member
+    /// with an empty field name) falls back to [`EventMark::Derive`] —
+    /// a full mask — rather than under-marking and losing data.
+    fn mark_or_derive(targets: Vec<&str>) -> EventMark {
+        if targets.is_empty() {
+            return EventMark::Skip;
+        }
+        if targets.iter().any(|n| n.is_empty()) {
+            return EventMark::Derive;
+        }
+        EventMark::Marked(targets.into_iter().map(str::to_string).collect())
+    }
 }
 
 impl super::provider::PvaMonitor for GroupMonitor {
@@ -1360,30 +1449,43 @@ impl super::provider::PvaMonitor for GroupMonitor {
                 continue; // Structure/Const/Proc-without-channel — no backing channel
             }
 
-            let (record_name, _) = epics_base_rs::server::database::parse_pv_name(&member.channel);
-
-            // BR-R34: pvxs `groupsource.cpp:389` subscribes group
-            // value events with `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE`.
-            // `DBE_ARCHIVE` (epics-base-rs's `EventMask::LOG`) is the
-            // archive-class event that records post via
-            // `recGblFwdLink` when the LOG deadband fires — pvxs
-            // folds those into the group delta so archiver-like
-            // clients watching the group PV see the same posts the
-            // backing record's CA monitor would. Rust subscribed
-            // only with VALUE|ALARM, so log-only posts (e.g. a
-            // periodic record where VAL is unchanged but the
-            // archive deadband is satisfied) silently dropped on
-            // group monitors. The downstream collator
-            // (`run_notify_forwarder` in pvalink and the group
-            // `poll()` in this file) treats every value-side
-            // member event identically, so adding LOG here folds
-            // it into the same value-update path matching pvxs.
-            let value_mask = (epics_base_rs::server::recgbl::EventMask::VALUE
-                | epics_base_rs::server::recgbl::EventMask::ALARM
-                | epics_base_rs::server::recgbl::EventMask::LOG)
-                .bits();
+            // BRIDGE-FR-6: subscribe value events against the full
+            // `member.channel` (e.g. `REC.RVAL`), not the bare record
+            // name. pvxs `field.cpp:25-26` builds both the value and
+            // properties dbChannels from the same `def.channel`
+            // (`groupsource.cpp:386,395`), so the subscription identity
+            // is the configured member field. The previous code parsed
+            // off the field suffix and subscribed against `REC.VAL`, so
+            // a non-`VAL` member woke on unrelated `VAL` posts and
+            // missed posts made only by its own field. `record_name`
+            // is no longer needed here — the read path
+            // (`read_member`) re-parses `member.channel` for the
+            // field it actually decodes.
+            //
+            // BRIDGE-FR-7: choose the value mask per member mapping.
+            // pvxs `groupsource.cpp:386` subscribes `Meta` value-side
+            // events with `DBE_ALARM` only; `groupsource.cpp:389` uses
+            // `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE` for non-meta
+            // mappings. `DBE_ARCHIVE` (epics-base-rs's `EventMask::LOG`)
+            // is the archive-class event records post via
+            // `recGblFwdLink` when the LOG deadband fires; folding it
+            // into the value path lets archiver-like clients watching
+            // the group PV see the same posts the backing record's CA
+            // monitor would. A `Meta` member carries only
+            // `{alarm, timeStamp}` (see `FieldMapping::Meta` decode),
+            // so waking it on plain value/log posts produced group
+            // deltas whose only changed fields were metadata
+            // timestamps — extra traffic pvxs does not emit.
+            let value_mask = if member.mapping == FieldMapping::Meta {
+                epics_base_rs::server::recgbl::EventMask::ALARM.bits()
+            } else {
+                (epics_base_rs::server::recgbl::EventMask::VALUE
+                    | epics_base_rs::server::recgbl::EventMask::ALARM
+                    | epics_base_rs::server::recgbl::EventMask::LOG)
+                    .bits()
+            };
             if let Some(mut sub) =
-                DbSubscription::subscribe_with_mask(&self.db, record_name, 0, value_mask).await
+                DbSubscription::subscribe_with_mask(&self.db, &member.channel, 0, value_mask).await
             {
                 let tx = tx.clone();
                 let handle = tokio::spawn(async move {
@@ -1411,10 +1513,16 @@ impl super::provider::PvaMonitor for GroupMonitor {
 
             // Property subscription (DBE_PROPERTY) — only for Scalar/Meta
             // mappings that include metadata. Plain/Any/Proc don't need it.
+            // BRIDGE-FR-6: target the same `member.channel` as the value
+            // subscription (pvxs `field.cpp:26` derives the properties
+            // dbChannel from the identical `def.channel`); the record
+            // default would mis-scope members configured on a non-`VAL`
+            // field.
             if member.mapping == FieldMapping::Scalar || member.mapping == FieldMapping::Meta {
                 let prop_mask = epics_base_rs::server::recgbl::EventMask::PROPERTY.bits();
                 if let Some(mut sub) =
-                    DbSubscription::subscribe_with_mask(&self.db, record_name, 0, prop_mask).await
+                    DbSubscription::subscribe_with_mask(&self.db, &member.channel, 0, prop_mask)
+                        .await
                 {
                     let tx = tx.clone();
                     let handle = tokio::spawn(async move {
@@ -1472,10 +1580,10 @@ impl super::provider::PvaMonitor for GroupMonitor {
         Ok(())
     }
 
-    async fn poll(&mut self) -> Option<PvStructure> {
+    async fn poll(&mut self) -> Option<super::provider::MonitorPoll> {
         // Return initial snapshot first (C++ BaseMonitor::connect behavior)
         if let Some(initial) = self.initial_snapshot.take() {
-            return Some(initial);
+            return Some(super::provider::MonitorPoll::derive(initial));
         }
 
         let rx = self.event_rx.as_mut()?;
@@ -1502,49 +1610,48 @@ impl super::provider::PvaMonitor for GroupMonitor {
                     self.events_primed = true;
                     // Post the first complete group snapshot now that all
                     // fields have reported their initial state
-                    // (pvxs groupsource.cpp:220-230).
+                    // (pvxs groupsource.cpp:220-230). The first event is
+                    // always full — pvxs marks every field on the priming
+                    // post — so it derives the changed-bitset (`marked:
+                    // None`), like the initial GET the PVA layer already
+                    // sent.
                     let group_channel = self.group_channel.as_ref()?;
-                    return group_channel.read_group().await.ok();
+                    return group_channel
+                        .read_group()
+                        .await
+                        .ok()
+                        .map(super::provider::MonitorPoll::derive);
                 }
                 // Not yet primed — accumulate events but don't return data.
                 continue;
             }
 
-            let member = match self.def.members.get(event.member_index) {
-                Some(m) => m,
-                None => continue,
+            // BRIDGE-FR-12: resolve which group field paths this event
+            // marks, instead of treating every trigger kind identically.
+            // pvxs iterates `field.triggers` (value) or the source field
+            // alone (property), refreshes those targets, then posts the
+            // full group with only those leaves marked. `read_group()`
+            // still reads every member (the posted Value is complete);
+            // the marked set is what the PVA layer turns into the wire
+            // changed-bitset.
+            let mark = match event.kind {
+                MemberEventKind::Value => Self::value_event_mark(&self.def, event.member_index),
+                MemberEventKind::Property => {
+                    Self::property_event_mark(&self.def, event.member_index)
+                }
+            };
+            let marked = match mark {
+                EventMark::Skip => continue,
+                EventMark::Derive => None,
+                EventMark::Marked(paths) => Some(paths),
             };
 
             let group_channel = self.group_channel.as_ref()?;
-
-            // Property events only update the source field's metadata —
-            // they do NOT trigger other fields (pvxs groupsource.cpp:310-340).
-            // However, subscriptionPost still posts the FULL group structure.
-            if matches!(event.kind, MemberEventKind::Property) {
-                return group_channel.read_group().await.ok();
-            }
-
-            match &member.triggers {
-                TriggerDef::None => continue,
-                // `poll()` re-reads + posts the full group structure
-                // here — pvxs `groupsource.cpp:303` likewise posts
-                // `currentValue` which holds every field.
-                //
-                // BR-R29 (residual closed): the *wire* changed-bitset
-                // narrowing that `testqgroup.cpp:220` exercises (only
-                // `value.index` set on a self-triggered VAL update)
-                // now happens server-side. `QsrvPvStore`'s
-                // `monitor_emits_partial` flags a pure self-trigger
-                // group, and the PVA decoded monitor loop derives the
-                // per-event changed-bitset by structurally diffing
-                // consecutive snapshots — reproducing pvxs's
-                // marked-leaf set without per-trigger plumbing into
-                // this loop. SelfOnly therefore no longer behaves
-                // like All on the wire.
-                TriggerDef::SelfOnly | TriggerDef::All | TriggerDef::Fields(_) => {
-                    return group_channel.read_group().await.ok();
-                }
-            }
+            return group_channel
+                .read_group()
+                .await
+                .ok()
+                .map(|value| super::provider::MonitorPoll { value, marked });
         }
     }
 
@@ -1607,7 +1714,7 @@ impl AnyMonitor {
 }
 
 impl super::provider::PvaMonitor for AnyMonitor {
-    async fn poll(&mut self) -> Option<PvStructure> {
+    async fn poll(&mut self) -> Option<super::provider::MonitorPoll> {
         match self {
             Self::Single(m) => m.poll().await,
             Self::Group(m) => m.poll().await,
@@ -2137,6 +2244,93 @@ mod tests {
         let def = defs.pop().unwrap();
         assert!(def.atomic);
         (db, def)
+    }
+
+    /// BRIDGE-FR-6 / BRIDGE-FR-7 regression. Two boundaries in one
+    /// fixture:
+    ///
+    /// FR-6 — a member configured on a non-`VAL` field (`RVAL`) must
+    /// register its value+property subscribers under that field, never
+    /// under the record-default `VAL`. Before the fix the subscription
+    /// stripped the suffix and bound to `VAL`, so the member woke on
+    /// unrelated `VAL` posts and missed `RVAL`-only posts.
+    ///
+    /// FR-7 — the value-event mask is chosen per mapping: a `meta`
+    /// member subscribes value events with `ALARM` only (pvxs
+    /// `groupsource.cpp:386`), while non-meta members keep
+    /// `VALUE | ALARM | LOG`. The `meta` member also retains its
+    /// `PROPERTY` subscription.
+    #[tokio::test]
+    async fn br_fr6_fr7_group_subscribes_member_field_with_per_mapping_mask() {
+        use crate::qsrv::provider::PvaMonitor;
+        use epics_base_rs::server::recgbl::EventMask;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("R:plain", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("R:meta", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+
+        let cfg = r#"{
+            "FR6:GRP": {
+                "p": {"+type": "plain", "+channel": "R:plain.RVAL"},
+                "m": {"+type": "meta",  "+channel": "R:meta.VAL"}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        let mut mon = GroupMonitor::new(db.clone(), def);
+        mon.start().await.expect("group monitor starts");
+
+        // FR-6: plain member subscribes its configured RVAL field, not VAL.
+        let plain = db.get_record("R:plain").await.unwrap();
+        let plain_inst = plain.read().await;
+        assert!(
+            plain_inst.subscribers.contains_key("RVAL"),
+            "plain member must subscribe its configured field RVAL"
+        );
+        assert!(
+            !plain_inst.subscribers.contains_key("VAL"),
+            "plain member must NOT subscribe the record-default VAL"
+        );
+        // FR-7: a plain (non-meta) member has exactly one value
+        // subscription (no property sub) with VALUE|ALARM|LOG.
+        let rval_subs = &plain_inst.subscribers["RVAL"];
+        assert_eq!(
+            rval_subs.len(),
+            1,
+            "plain mapping opens only the value subscription"
+        );
+        assert_eq!(
+            rval_subs[0].mask,
+            (EventMask::VALUE | EventMask::ALARM | EventMask::LOG).bits(),
+            "non-meta value mask must be VALUE|ALARM|LOG"
+        );
+        drop(plain_inst);
+
+        // FR-7: meta member value subscription is ALARM-only; the
+        // PROPERTY subscription is retained on the same field.
+        let meta = db.get_record("R:meta").await.unwrap();
+        let meta_inst = meta.read().await;
+        let val_subs = &meta_inst.subscribers["VAL"];
+        let masks: Vec<u16> = val_subs.iter().map(|s| s.mask).collect();
+        assert!(
+            masks.contains(&EventMask::ALARM.bits()),
+            "meta value subscription must be ALARM-only, got {masks:?}"
+        );
+        assert!(
+            masks.contains(&EventMask::PROPERTY.bits()),
+            "meta member must retain its PROPERTY subscription, got {masks:?}"
+        );
+        assert!(
+            !masks
+                .iter()
+                .any(|m| EventMask::from_bits(*m).intersects(EventMask::VALUE | EventMask::LOG)),
+            "meta member must not wake on plain value/log posts, got {masks:?}"
+        );
     }
 
     /// A PvStructure carrying `a` and `b` plain double values for the

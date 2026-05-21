@@ -35,6 +35,18 @@ const GROUP_JSON_NONATOMIC: &str = r#"{
     }
 }"#;
 
+// BRIDGE-FR-12: explicit cross-named `+trigger` graph — `level`
+// triggers only `count`, `count` triggers only `level`. Neither is a
+// self-trigger and neither is `"*"`, so the group is NOT pure
+// self-trigger and a member event must mark only its named target.
+const GROUP_JSON_NAMED_TRIGGER: &str = r#"{
+    "TEST:grp_trig": {
+        "+atomic": false,
+        "level": { "+channel": "TEST:level.VAL", "+type": "plain", "+putorder": 0, "+trigger": "count" },
+        "count": { "+channel": "TEST:count.VAL", "+type": "plain", "+putorder": 1, "+trigger": "level" }
+    }
+}"#;
+
 fn empty_request() -> PvStructure {
     PvStructure::new("epics:nt/NTRequest:1.0")
 }
@@ -214,7 +226,7 @@ async fn group_monitor_subscribes_archive_log_events() {
         .expect("LOG event must wake group poll within 500ms")
         .expect("snapshot delivered");
     assert!(
-        !snap.fields.is_empty(),
+        !snap.value.fields.is_empty(),
         "log-event group snapshot must carry the full group structure, got {snap:?}"
     );
 
@@ -349,6 +361,7 @@ async fn br_r33_group_monitor_stamps_negotiated_queue_size() {
                 .expect("snapshot");
             mon.stop().await;
             let record = match snap
+                .value
                 .fields
                 .iter()
                 .find(|(n, _)| n == "record")
@@ -509,6 +522,142 @@ async fn group_root_meta_member_flattens_into_root() {
         !names.contains(&""),
         "root must not carry an empty-name sub-field; got {names:?}"
     );
+}
+
+/// BRIDGE-FR-12: an explicit named `+trigger` graph marks only the
+/// named target field on a member event — not the source field, and
+/// not the whole group. `level` triggers `count` and vice versa, so a
+/// `level` post marks exactly `["count"]` and a `count` post marks
+/// exactly `["level"]`. Before the fix every trigger kind re-read the
+/// full group and emitted a full request mask, making named triggers
+/// behave like `+trigger:"*"`.
+#[tokio::test]
+async fn br_fr12_named_trigger_marks_only_target() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_bridge_rs::qsrv::group::GroupMonitor;
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::time::Duration;
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(GROUP_JSON_NAMED_TRIGGER)
+        .expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp_trig")
+        .cloned()
+        .expect("grp_trig registered");
+    assert!(
+        !def.is_pure_self_trigger(),
+        "a named-trigger group must not be classified pure self-trigger"
+    );
+
+    let mut mon = GroupMonitor::new(db.clone(), def);
+    mon.start().await.expect("start");
+
+    // Prime both Plain members with a value event each.
+    for rec_name in ["TEST:level", "TEST:count"] {
+        let rec = db.get_record(rec_name).await.expect("rec exists");
+        rec.read().await.notify_field("VAL", EventMask::VALUE);
+    }
+    let primed = tokio::time::timeout(Duration::from_secs(2), mon.poll())
+        .await
+        .expect("priming snapshot within 2s")
+        .expect("priming snapshot");
+    // The priming/first event is always full — the server derives the
+    // changed-bitset, so it carries no explicit marked set.
+    assert!(
+        primed.marked.is_none(),
+        "priming snapshot must derive a full changed-bitset (marked: None), got {:?}",
+        primed.marked
+    );
+
+    // A `level` post triggers only `count`.
+    {
+        let rec = db.get_record("TEST:level").await.expect("rec exists");
+        rec.read().await.notify_field("VAL", EventMask::VALUE);
+    }
+    let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+        .await
+        .expect("level event wakes poll within 500ms")
+        .expect("snapshot");
+    assert_eq!(
+        ev.marked,
+        Some(vec!["count".to_string()]),
+        "a `level` post must mark only its named trigger target `count`, \
+         not itself and not the whole group"
+    );
+
+    // A `count` post triggers only `level`.
+    {
+        let rec = db.get_record("TEST:count").await.expect("rec exists");
+        rec.read().await.notify_field("VAL", EventMask::VALUE);
+    }
+    let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+        .await
+        .expect("count event wakes poll within 500ms")
+        .expect("snapshot");
+    assert_eq!(
+        ev.marked,
+        Some(vec!["level".to_string()]),
+        "a `count` post must mark only its named trigger target `level`"
+    );
+
+    mon.stop().await;
+}
+
+/// BRIDGE-FR-12: a pure self-trigger group keeps the BR-R29
+/// value-diff path — every member defaults `+trigger`, so the monitor
+/// derives the changed-bitset (`marked: None`) instead of carrying an
+/// explicit set. This guards that the new marked-set path does not
+/// regress the existing self-trigger narrowing.
+#[tokio::test]
+async fn br_fr12_pure_self_trigger_derives_bitset() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_bridge_rs::qsrv::group::GroupMonitor;
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::time::Duration;
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp")
+        .cloned()
+        .expect("grp registered");
+    assert!(
+        def.is_pure_self_trigger(),
+        "the default-trigger group must be pure self-trigger"
+    );
+
+    let mut mon = GroupMonitor::new(db.clone(), def);
+    mon.start().await.expect("start");
+    for rec_name in ["TEST:level", "TEST:count"] {
+        let rec = db.get_record(rec_name).await.expect("rec exists");
+        rec.read().await.notify_field("VAL", EventMask::VALUE);
+    }
+    tokio::time::timeout(Duration::from_secs(2), mon.poll())
+        .await
+        .expect("priming snapshot within 2s")
+        .expect("priming snapshot");
+
+    {
+        let rec = db.get_record("TEST:level").await.expect("rec exists");
+        rec.read().await.notify_field("VAL", EventMask::VALUE);
+    }
+    let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+        .await
+        .expect("level event wakes poll within 500ms")
+        .expect("snapshot");
+    assert!(
+        ev.marked.is_none(),
+        "a pure self-trigger group must derive its bitset (marked: None), got {:?}",
+        ev.marked
+    );
+
+    mon.stop().await;
 }
 
 /// Guard: dbLoadGroup → processGroups → groups() exposes the parsed

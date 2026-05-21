@@ -200,10 +200,10 @@ impl PvaMonitor for BridgeMonitor {
         Ok(())
     }
 
-    async fn poll(&mut self) -> Option<PvStructure> {
+    async fn poll(&mut self) -> Option<super::provider::MonitorPoll> {
         // Return initial snapshot on first poll (C++ BaseMonitor::connect behavior)
         if let Some(initial) = self.initial_snapshot.take() {
-            return Some(initial);
+            return Some(super::provider::MonitorPoll::derive(initial));
         }
 
         // BR-R36: wake on either the VALUE|ALARM subscription or
@@ -211,6 +211,10 @@ impl PvaMonitor for BridgeMonitor {
         // first. snapshot_to_pv_structure rebuilds the full NT
         // structure (with display/control/enums) on every wake,
         // so either firing pushes fresh metadata to the client.
+        //
+        // BRIDGE-FR-12: a single-record monitor has no `+trigger`
+        // graph, so each update derives its own changed-bitset
+        // (`marked: None`).
         match (
             self.subscription.as_mut(),
             self.property_subscription.as_mut(),
@@ -220,11 +224,15 @@ impl PvaMonitor for BridgeMonitor {
                     snap = value_sub.recv_snapshot() => snap?,
                     snap = prop_sub.recv_snapshot() => snap?,
                 };
-                Some(snapshot_to_pv_structure(&snapshot, self.nt_type))
+                Some(super::provider::MonitorPoll::derive(
+                    snapshot_to_pv_structure(&snapshot, self.nt_type),
+                ))
             }
             (Some(value_sub), None) => {
                 let snapshot = value_sub.recv_snapshot().await?;
-                Some(snapshot_to_pv_structure(&snapshot, self.nt_type))
+                Some(super::provider::MonitorPoll::derive(
+                    snapshot_to_pv_structure(&snapshot, self.nt_type),
+                ))
             }
             _ => None,
         }
@@ -342,8 +350,13 @@ mod tests {
             .expect("PROPERTY event must wake poll within 500ms")
             .expect("snapshot delivered");
         // Snapshot is a full NT structure; sanity-check that we got one.
+        // BRIDGE-FR-12: a single-record monitor carries no marked set.
         assert!(
-            !snap.fields.is_empty(),
+            snap.marked.is_none(),
+            "single-record monitor must not carry an explicit marked set"
+        );
+        assert!(
+            !snap.value.fields.is_empty(),
             "PROPERTY-event snapshot must carry the full NT structure"
         );
 

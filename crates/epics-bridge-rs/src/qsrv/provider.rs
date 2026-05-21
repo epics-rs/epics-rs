@@ -405,12 +405,48 @@ pub trait Channel: Send + Sync {
     ) -> impl std::future::Future<Output = BridgeResult<super::group::AnyMonitor>> + Send;
 }
 
+/// BRIDGE-FR-12: the result of a [`PvaMonitor::poll`] — the snapshot
+/// plus an optional explicit marked-leaf set.
+///
+/// `marked == None`: the server derives the wire changed-bitset itself
+/// — the full request mask, or the BR-R29 value-diff for a pure
+/// self-trigger group / single-record monitor. Single-record monitors
+/// and the group priming snapshot use this.
+///
+/// `marked == Some(paths)`: the dot-separated group field paths the
+/// resolved `+trigger` graph marks for this event. pvxs
+/// `groupsource.cpp:283-300` iterates `field.triggers` on a member
+/// event and marks each target field assigned-not-changed; the PVA
+/// layer turns the paths into the wire changed-bitset
+/// (`build_monitor_payload_marked`). Carrying the set here — rather
+/// than re-deriving it by diffing snapshots — is what makes a
+/// `"+trigger": "otherField"` member mark only its named targets
+/// instead of behaving like `+trigger:"*"`.
+#[derive(Debug, Clone)]
+pub struct MonitorPoll {
+    /// The (full) snapshot value for this event.
+    pub value: PvStructure,
+    /// Explicit changed field paths, or `None` to derive the bitset.
+    pub marked: Option<Vec<String>>,
+}
+
+impl MonitorPoll {
+    /// A snapshot with no explicit marked set — the server derives the
+    /// changed-bitset (full mask, or BR-R29 diff for a partial source).
+    pub fn derive(value: PvStructure) -> Self {
+        Self {
+            value,
+            marked: None,
+        }
+    }
+}
+
 /// PVA Monitor interface.
 ///
 /// Corresponds to C++ `pva::Monitor` / `BaseMonitor`.
 pub trait PvaMonitor: Send + Sync {
     /// Wait for the next update. Returns `None` when the monitor is closed.
-    fn poll(&mut self) -> impl std::future::Future<Output = Option<PvStructure>> + Send;
+    fn poll(&mut self) -> impl std::future::Future<Output = Option<MonitorPoll>> + Send;
 
     /// Start the monitor (begin receiving events).
     fn start(&mut self) -> impl std::future::Future<Output = BridgeResult<()>> + Send;

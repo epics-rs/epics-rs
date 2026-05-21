@@ -248,6 +248,77 @@ impl QsrvPvStore {
     }
 }
 
+/// A read-authorized monitor resolved by [`open_monitor`] — either a
+/// native-PVA fan-in receiver (plain values, no `+trigger` graph) or a
+/// started DB/group monitor whose `poll()` carries the per-event marked
+/// set. Shared by the cooked `subscribe_checked` and the marked-aware
+/// `subscribe_checked_opts` so the channel-creation logic lives once.
+enum OpenedMonitor {
+    /// Native PVA PV (NDPluginPva etc.): a `tx` was appended to the
+    /// handle's subscriber list; values fan out as plain `PvField`s.
+    Native(mpsc::Receiver<PvField>),
+    /// A started single-record / group monitor.
+    Db(super::group::AnyMonitor),
+}
+
+/// BRIDGE-FR-12: resolve a started monitor for a read-authorized PV.
+/// Factored out of `subscribe_checked` so `subscribe_checked_opts`
+/// (which carries the `+trigger` marked set to the wire) reuses the
+/// exact same native-PVA / channel / DBE / queue-depth resolution.
+async fn open_monitor(
+    provider: Arc<BridgeProvider>,
+    pva_pvs: Arc<RwLock<HashMap<String, PvaPvHandle>>>,
+    checked: epics_pva_rs::server_native::source::AccessChecked,
+    ctx: epics_pva_rs::server_native::source::ChannelContext,
+) -> Option<OpenedMonitor> {
+    if !checked.allows_read() {
+        return None;
+    }
+    let name = checked.pv_name().to_string();
+    if let Some(handle) = pva_pvs.read().await.get(&name).cloned() {
+        let (tx, rx) = mpsc::channel::<PvField>(64);
+        {
+            let mut subs = handle.subscribers.lock();
+            subs.retain(|s| !s.is_closed());
+            subs.push(tx);
+        }
+        return Some(OpenedMonitor::Native(rx));
+    }
+    let channel = provider
+        .create_channel_with_creds(&name, ctx_to_creds(&ctx))
+        .await
+        .ok()?;
+    // BR-R5: honor `record._options.DBE` from the MONITOR INIT
+    // pvRequest. Single-record channels route through
+    // `BridgeChannel::create_monitor_with_value_mask`; group
+    // and pva_pv-registered channels fall through to the
+    // default mask (their DBE selection is not yet wired).
+    let dbe_mask = match ctx.pv_request {
+        Some(PvField::Structure(ref req)) => crate::qsrv::channel::dbe_mask_from_pv_request(req),
+        _ => None,
+    };
+    // BR-R33-RESIDUAL: resolve the per-operation negotiated monitor
+    // queue depth from the MONITOR INIT pvRequest's
+    // `record._options.queueSize` — pvxs `servermon.cpp:533` then
+    // `groupsource.cpp:359` stamps `stats.limitQueue`.
+    let queue_size = match ctx.pv_request {
+        Some(PvField::Structure(ref req)) => crate::qsrv::group::negotiated_queue_size(req),
+        _ => crate::qsrv::group::GROUP_DEFAULT_QUEUE_SIZE,
+    };
+    let mut monitor = match channel {
+        crate::qsrv::AnyChannel::Single(single) => {
+            single.create_monitor_with_value_mask(dbe_mask).await.ok()?
+        }
+        other => other
+            .create_monitor()
+            .await
+            .ok()?
+            .with_queue_size(queue_size),
+    };
+    monitor.start().await.ok()?;
+    Some(OpenedMonitor::Db(monitor))
+}
+
 // ── ChannelSource impl (native PvAccess server) ──────────────────────────
 //
 // In addition to the legacy spvirit `PvStore` impl above, expose the same
@@ -481,66 +552,70 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
         async move {
-            if !checked.allows_read() {
-                return None;
+            // Legacy cooked path: plain `PvField`s, no marked set. The
+            // PVA layer's `subscribe_checked_opts` (below) is what
+            // carries the `+trigger` marked set to the wire.
+            match open_monitor(provider, pva_pvs, checked, ctx).await? {
+                OpenedMonitor::Native(rx) => Some(rx),
+                OpenedMonitor::Db(mut monitor) => {
+                    let (tx, rx) = mpsc::channel::<PvField>(64);
+                    tokio::spawn(async move {
+                        while let Some(poll) = monitor.poll().await {
+                            if tx.send(PvField::Structure(poll.value)).await.is_err() {
+                                break;
+                            }
+                        }
+                        monitor.stop().await;
+                    });
+                    Some(rx)
+                }
             }
-            let name = checked.pv_name().to_string();
-            if let Some(handle) = pva_pvs.read().await.get(&name).cloned() {
-                let (tx, rx) = mpsc::channel::<PvField>(64);
-                {
-                    let mut subs = handle.subscribers.lock();
-                    subs.retain(|s| !s.is_closed());
-                    subs.push(tx);
+        }
+    }
+
+    /// BRIDGE-FR-12: the cooked MONITOR entry the native PVA server
+    /// actually uses. QSRV overrides it to carry each event's resolved
+    /// `+trigger` target set (`MonitorPoll::marked`) into the
+    /// `MonitorUpdate` stream, so the server emits a wire changed-bitset
+    /// matching the configured trigger graph instead of re-deriving a
+    /// full mask. A native-PVA PV has no trigger graph, so it stays on
+    /// the plain `marked: None` path.
+    ///
+    /// `opts` (pipeline / queueSize / server-filter) is applied by the
+    /// PVA server layer on this same stream — QSRV owns the records
+    /// directly — so there is nothing to reject here.
+    fn subscribe_checked_opts(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+        _opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> impl std::future::Future<
+        Output = Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>>,
+    > + Send {
+        let provider = self.provider.clone();
+        let pva_pvs = self.pva_pvs.clone();
+        async move {
+            match open_monitor(provider, pva_pvs, checked, ctx).await? {
+                OpenedMonitor::Native(rx) => {
+                    Some(epics_pva_rs::server_native::plain_monitor_updates(rx))
                 }
-                return Some(rx);
+                OpenedMonitor::Db(mut monitor) => {
+                    let (tx, rx) = mpsc::channel::<epics_pva_rs::server_native::MonitorUpdate>(64);
+                    tokio::spawn(async move {
+                        while let Some(poll) = monitor.poll().await {
+                            let update = epics_pva_rs::server_native::MonitorUpdate {
+                                value: PvField::Structure(poll.value),
+                                marked: poll.marked,
+                            };
+                            if tx.send(update).await.is_err() {
+                                break;
+                            }
+                        }
+                        monitor.stop().await;
+                    });
+                    Some(rx)
+                }
             }
-            let channel = provider
-                .create_channel_with_creds(&name, ctx_to_creds(&ctx))
-                .await
-                .ok()?;
-            // BR-R5: honor `record._options.DBE` from the MONITOR INIT
-            // pvRequest. Single-record channels route through
-            // `BridgeChannel::create_monitor_with_value_mask`; group
-            // and pva_pv-registered channels fall through to the
-            // default mask (their DBE selection is not yet wired).
-            let dbe_mask = match ctx.pv_request {
-                Some(PvField::Structure(ref req)) => {
-                    crate::qsrv::channel::dbe_mask_from_pv_request(req)
-                }
-                _ => None,
-            };
-            // BR-R33-RESIDUAL: resolve the per-operation negotiated
-            // monitor queue depth from the MONITOR INIT pvRequest's
-            // `record._options.queueSize` — pvxs `servermon.cpp:533`
-            // then `groupsource.cpp:359` stamps `stats.limitQueue`.
-            // A group monitor stamps this into every value's
-            // `record._options.queueSize`; single-record monitors
-            // ignore it.
-            let queue_size = match ctx.pv_request {
-                Some(PvField::Structure(ref req)) => crate::qsrv::group::negotiated_queue_size(req),
-                _ => crate::qsrv::group::GROUP_DEFAULT_QUEUE_SIZE,
-            };
-            let mut monitor = match channel {
-                crate::qsrv::AnyChannel::Single(single) => {
-                    single.create_monitor_with_value_mask(dbe_mask).await.ok()?
-                }
-                other => other
-                    .create_monitor()
-                    .await
-                    .ok()?
-                    .with_queue_size(queue_size),
-            };
-            monitor.start().await.ok()?;
-            let (tx, rx) = mpsc::channel::<PvField>(64);
-            tokio::spawn(async move {
-                while let Some(snapshot) = monitor.poll().await {
-                    if tx.send(PvField::Structure(snapshot)).await.is_err() {
-                        break;
-                    }
-                }
-                monitor.stop().await;
-            });
-            Some(rx)
         }
     }
 
@@ -811,8 +886,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             monitor.start().await.ok()?;
             let (tx, rx) = mpsc::channel::<PvField>(64);
             tokio::spawn(async move {
-                while let Some(snapshot) = monitor.poll().await {
-                    if tx.send(PvField::Structure(snapshot)).await.is_err() {
+                // Legacy ctx-less path: plain values, marked set dropped
+                // (the marked-aware cooked entry is `subscribe_checked_opts`).
+                while let Some(poll) = monitor.poll().await {
+                    if tx.send(PvField::Structure(poll.value)).await.is_err() {
                         break;
                     }
                 }

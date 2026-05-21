@@ -18,7 +18,7 @@ closed are not repeated here.
 | CA-FR-5 | Missing C behavior | Medium | sync group lifecycle | Done |
 | CA-FR-6 | Bug | Medium | SimplePv monitor masks | Done |
 | CA-FR-7 | Bug | High | DBR payload sizing | Done |
-| CA-FR-8 | Missing C behavior | Medium | channel filters on READ / SimplePv | Open |
+| CA-FR-8 | Missing C behavior | Medium | channel filters on READ / SimplePv | Done |
 
 ## CA-FR-1: ACF `CALC` / `INP*` rules fail closed instead of evaluating
 

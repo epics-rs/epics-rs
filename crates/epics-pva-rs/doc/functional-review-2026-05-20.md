@@ -21,8 +21,8 @@ as open findings.
 | PVA-FR-8 | Bug | High | monitor pause/resume queueing | Done |
 | PVA-FR-9 | Missing pvxs API behavior | Medium | operation interrupt result | Done |
 | PVA-FR-10 | Bug / missing pvxs API behavior | Medium | subscription stats | Done |
-| PVA-FR-11 | Missing pvxs API behavior | Medium | monitor start / pause callback | Open |
-| PVA-FR-12 | Bug / missing pvxs behavior | Medium | initial search timeout | Open |
+| PVA-FR-11 | Missing pvxs API behavior | Medium | monitor start / pause callback | Done |
+| PVA-FR-12 | Bug / missing pvxs behavior | Medium | initial search timeout | Done |
 
 ## PVA-FR-1: compound arrays cannot preserve null elements
 

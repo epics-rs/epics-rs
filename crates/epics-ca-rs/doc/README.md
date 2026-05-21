@@ -22,7 +22,7 @@ the crate or trying to understand a runtime issue. End-user usage
 | [`07-flow-control.md`](07-flow-control.md) | Backpressure: client queue, server flow control gate, coalescing |
 | [`08-environment.md`](08-environment.md) | All `EPICS_CA_*` / `EPICS_CAS_*` variables and their effect |
 | [`09-libca-parity.md`](09-libca-parity.md) | Parity matrix vs `epics-base` libca / rsrv |
-| [`functional-review-2026-05-20.md`](functional-review-2026-05-20.md) | Open functional gaps and bugs vs `epics-base` C implementation |
+| [`functional-review-2026-05-20.md`](functional-review-2026-05-20.md) | Functional-review findings (with resolution status) vs `epics-base` C implementation |
 | [`10-observability.md`](10-observability.md) | tracing events, metrics schema, exporter integrations |
 | [`11-tls-design.md`](11-tls-design.md) | CA over TLS (encryption + mTLS auth), design and migration plan |
 | [`12-discovery.md`](12-discovery.md) | Service discovery via mDNS + DNS-SD, BIND zone setup, custom backends |

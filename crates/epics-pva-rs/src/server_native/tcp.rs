@@ -924,6 +924,97 @@ fn cross_watermark(state: &std::sync::atomic::AtomicU64, want_above: bool) -> Op
     }
 }
 
+/// Single owner of a monitor's pipeline-credit accounting. Holds the
+/// per-op window state and watermark plumbing so EVERY monitor DATA send
+/// site consumes its credit through one place.
+///
+/// pvxs `servermon.cpp:192` decrements `window` after every enqueued
+/// DATA frame — the initial snapshot included (it is the first post
+/// delivered once `state==Executing`) — and fires `onLowMark` on the
+/// above→below crossing. Splitting that accounting across the
+/// initial-snapshot send and the update loop (where only the loop
+/// decremented) let the client's window drift to `queueSize + 1`: the
+/// client counts the initial frame against its queue, the server did
+/// not, so the server sent one DATA frame more than the client could
+/// hold before the first ACK. Both send sites now route through
+/// [`Self::acquire`] exactly once before sending.
+struct MonitorPipelineCredit<'a> {
+    /// `None` for a non-pipeline monitor — [`Self::acquire`] is then a
+    /// no-op (mpsc backpressure stays the only gate, as before).
+    window: Option<&'a Arc<std::sync::atomic::AtomicU32>>,
+    window_notify: Option<&'a Arc<tokio::sync::Notify>>,
+    /// INIT-clamped `(low, high)` watermark levels, or `None` when the
+    /// source declares no pipeline watermarks.
+    wm_levels: Option<(usize, usize)>,
+    wm_seq: &'a Arc<std::sync::atomic::AtomicU64>,
+    monitor_op_id: u64,
+    src: &'a DynSource,
+    pv_name: &'a str,
+    mon_ctx: &'a crate::server_native::source::ChannelContext,
+}
+
+impl MonitorPipelineCredit<'_> {
+    /// Block until the pipeline window has a free slot, then consume one
+    /// credit for the DATA frame about to be sent and fire the LOW
+    /// watermark on the above→below crossing. A no-op for a non-pipeline
+    /// monitor (`window` is `None`).
+    ///
+    /// Must be called exactly once per monitor DATA frame, AFTER the
+    /// pause / filter gates (a held or filtered event produces no wire
+    /// frame, so it must not consume a slot — EX-R1).
+    async fn acquire(&self) {
+        use std::sync::atomic::Ordering;
+        let (Some(w), Some(n)) = (self.window, self.window_notify) else {
+            return;
+        };
+        loop {
+            let cur = w.load(Ordering::Relaxed);
+            if cur > 0 {
+                if w.compare_exchange(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+                continue;
+            }
+            // Window exhausted — wait for an ACK to refill. `enable()`
+            // registers the waiter eagerly so an ACK firing between the
+            // recheck and the await is captured (`Notify::notified()`
+            // does not register until first polled). Same pattern as
+            // `channel.rs::wait_until_inactive`.
+            let notified = n.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if w.load(Ordering::Relaxed) > 0 {
+                continue;
+            }
+            notified.await;
+        }
+        // PVA-FR-4: LOW fires when consuming this credit drained the
+        // window to `<= low` (pvxs `onLowMark`). BRIDGE-FR-11:
+        // `cross_watermark` checks-and-marks the above→below crossing AND
+        // mints the ordering token in one CAS, returning `Some(seq)`
+        // exactly on the edge so LOW fires once per crossing even though
+        // the companion HIGH lives on the ACK dispatch path.
+        if let Some((lo, _hi)) = self.wm_levels {
+            let w_after = w.load(Ordering::Relaxed) as usize;
+            if w_after <= lo
+                && let Some(seq) = cross_watermark(self.wm_seq, false)
+            {
+                self.src.notify_watermark(
+                    self.pv_name,
+                    self.mon_ctx,
+                    crate::server_native::source::WatermarkEvent {
+                        op_id: self.monitor_op_id,
+                        seq,
+                        kind: crate::server_native::source::WatermarkKind::Pause,
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// Process-unique monitor-op id. A fanout gateway shares one upstream
 /// monitor across N downstream ops and reference-counts their pause votes
 /// keyed on this id; a global monotonic counter keeps ids distinct across
@@ -4268,6 +4359,22 @@ async fn handle_op(
                     // fresh `monitor_watermarks` call, so `ackAny` clamps
                     // both crossings through one owner.
                     let wm_levels = wm_levels_init;
+                    // Single owner of this monitor's pipeline-credit
+                    // accounting, shared by the initial-snapshot send and
+                    // the update loop so the initial frame consumes a
+                    // window slot exactly like every subsequent DATA
+                    // frame (pvxs `servermon.cpp:192`). Holds shared
+                    // borrows for the rest of the task body.
+                    let credit = MonitorPipelineCredit {
+                        window: window.as_ref(),
+                        window_notify: window_notify.as_ref(),
+                        wm_levels,
+                        wm_seq: &wm_seq,
+                        monitor_op_id,
+                        src: &src,
+                        pv_name: &pv_name,
+                        mon_ctx: &mon_ctx,
+                    };
                     // BRIDGE-FR-11 review: arm the withdraw-on-teardown
                     // finalizer for flow-controlled (gateway) ops only.
                     // Held live for the rest of the task so every exit
@@ -4379,6 +4486,12 @@ async fn handle_op(
                             if emits_partial {
                                 prev_value = Some(initial);
                             }
+                            // pvxs `servermon.cpp:192` decrements `window`
+                            // for the initial snapshot too — consume one
+                            // credit through the single owner before
+                            // sending, or the client's window drifts to
+                            // queueSize + 1.
+                            credit.acquire().await;
                             if tx_clone.send(payload).await.is_err() {
                                 return;
                             }
@@ -4552,89 +4665,16 @@ async fn handle_op(
                                 return;
                             }
                         };
-                        // P-G11: pipeline window check. When pipeline
-                        // is active, wait for window > 0 before
-                        // emitting. ACK frames refill the window via
-                        // the dispatch path; we wake on the notify.
-                        // Without a window (pipeline=false) we emit
-                        // freely; mpsc backpressure remains the only
-                        // gate, matching previous behavior. This runs
-                        // after the pause/filter gates above so credit
-                        // is consumed only for events that will produce
-                        // a DATA frame.
-                        if let (Some(w), Some(n)) = (window.as_ref(), window_notify.as_ref()) {
-                            // BRIDGE-FR-11: HIGH is fired by the ACK
-                            // dispatch (credit refill), NOT here. Firing it
-                            // from the event loop deadlocks a gateway that
-                            // paused its upstream on LOW: no event arrives
-                            // while paused, so this point is never reached
-                            // to re-fire HIGH. See the ACK handler above.
-                            loop {
-                                let cur = w.load(std::sync::atomic::Ordering::Relaxed);
-                                if cur > 0 {
-                                    if w.compare_exchange(
-                                        cur,
-                                        cur - 1,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    )
-                                    .is_ok()
-                                    {
-                                        break;
-                                    }
-                                    continue;
-                                }
-                                // Window exhausted — wait for ACK.
-                                let notified = n.notified();
-                                tokio::pin!(notified);
-                                // enable() registers the waiter eagerly
-                                // so an ACK firing between the recheck
-                                // and the await is captured. Same
-                                // pattern as channel.rs::wait_until_inactive
-                                // — Notify::notified() does NOT register
-                                // until the future is polled, so the
-                                // recheck-then-await window otherwise
-                                // loses the wake from notify_waiters().
-                                notified.as_mut().enable();
-                                if w.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                                    continue;
-                                }
-                                notified.await;
-                            }
-                            // PVA-FR-4: LOW fires when emitting this DATA
-                            // frame drained the window to `<= low` (pvxs
-                            // onLowMark as credit is consumed). BRIDGE-FR-11:
-                            // crosses the SHARED counter back to "below" so
-                            // the ACK dispatch will re-fire HIGH on the next
-                            // refill. `cross_watermark` checks-and-marks the
-                            // crossing AND mints the ordering token in one
-                            // CAS, returning `Some(seq)` exactly on the
-                            // above→below edge — so LOW fires once per
-                            // crossing even though HIGH lives on another path.
-                            // `mon_ctx` scopes the gateway pause to the firing
-                            // credential's own upstream cache layer;
-                            // `monitor_op_id` casts THIS op's pause vote (the
-                            // gateway pauses only when every co-subscriber
-                            // votes pause). Cache selection ignores
-                            // `pv_request`, so `mon_ctx` is passed as-is.
-                            if let Some((lo, _hi)) = wm_levels {
-                                let w_after = w.load(std::sync::atomic::Ordering::Relaxed) as usize;
-                                if w_after <= lo {
-                                    if let Some(seq) = cross_watermark(&wm_seq, false) {
-                                        src.notify_watermark(
-                                            &pv_name,
-                                            &mon_ctx,
-                                            crate::server_native::source::WatermarkEvent {
-                                                op_id: monitor_op_id,
-                                                seq,
-                                                kind:
-                                                    crate::server_native::source::WatermarkKind::Pause,
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                        // P-G11: pipeline window check, through the same
+                        // single owner the initial snapshot uses. When
+                        // pipeline is active this waits for a free window
+                        // slot, consumes one credit, and fires LOW on the
+                        // above→below crossing; for a non-pipeline monitor
+                        // it is a no-op (mpsc backpressure stays the only
+                        // gate). It runs after the pause/filter gates above
+                        // so credit is consumed only for events that will
+                        // produce a DATA frame (EX-R1).
+                        credit.acquire().await;
                         // BRIDGE-FR-12: an explicit marked-leaf set from the
                         // source (a QSRV group `+trigger` target graph) takes
                         // precedence over both server-derived bitsets — pvxs
@@ -6161,6 +6201,225 @@ mod tests {
         // Gateway returns (0,0): clamp is a no-op regardless of ack_at,
         // so ackAt is observable only for sources with high>0 marks.
         assert_eq!(clamp_watermarks(Some((0, 0)), Some(7)), Some((0, 0)));
+    }
+
+    fn test_channel_ctx() -> crate::server_native::source::ChannelContext {
+        crate::server_native::source::ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: String::new(),
+            method: "anonymous".to_string(),
+            host: String::new(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: None,
+        }
+    }
+
+    /// Owner path: `MonitorPipelineCredit::acquire` consumes exactly one
+    /// window slot per call.
+    #[tokio::test]
+    async fn monitor_pipeline_credit_acquire_decrements_window() {
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+        let window = Arc::new(AtomicU32::new(2));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let wm_seq = Arc::new(AtomicU64::new(1));
+        let src: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let ctx = test_channel_ctx();
+        let credit = MonitorPipelineCredit {
+            window: Some(&window),
+            window_notify: Some(&notify),
+            wm_levels: None,
+            wm_seq: &wm_seq,
+            monitor_op_id: 1,
+            src: &src,
+            pv_name: "dut",
+            mon_ctx: &ctx,
+        };
+        credit.acquire().await;
+        assert_eq!(window.load(Ordering::Relaxed), 1);
+        credit.acquire().await;
+        assert_eq!(window.load(Ordering::Relaxed), 0);
+    }
+
+    /// Owner path: at zero credit `acquire` blocks, and proceeds once the
+    /// window is refilled (the ACK dispatch does `fetch_add` + notify).
+    #[tokio::test]
+    async fn monitor_pipeline_credit_acquire_blocks_until_refill() {
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+        let window = Arc::new(AtomicU32::new(0));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let wm_seq = Arc::new(AtomicU64::new(1));
+        let src: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let ctx = test_channel_ctx();
+        let credit = MonitorPipelineCredit {
+            window: Some(&window),
+            window_notify: Some(&notify),
+            wm_levels: None,
+            wm_seq: &wm_seq,
+            monitor_op_id: 1,
+            src: &src,
+            pv_name: "dut",
+            mon_ctx: &ctx,
+        };
+        // Exhausted window: acquire must not complete.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), credit.acquire())
+                .await
+                .is_err(),
+            "acquire must block while the window is empty"
+        );
+        // Refill (as the ACK dispatch does) and re-acquire.
+        window.fetch_add(1, Ordering::Relaxed);
+        notify.notify_waiters();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), credit.acquire())
+                .await
+                .is_ok(),
+            "acquire must complete once the window is refilled"
+        );
+        assert_eq!(window.load(Ordering::Relaxed), 0);
+    }
+
+    /// Owner path: a non-pipeline monitor (no window) never blocks and
+    /// touches no counter.
+    #[tokio::test]
+    async fn monitor_pipeline_credit_no_window_is_no_op() {
+        use std::sync::atomic::AtomicU64;
+        let wm_seq = Arc::new(AtomicU64::new(1));
+        let src: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let ctx = test_channel_ctx();
+        let credit = MonitorPipelineCredit {
+            window: None,
+            window_notify: None,
+            wm_levels: None,
+            wm_seq: &wm_seq,
+            monitor_op_id: 1,
+            src: &src,
+            pv_name: "dut",
+            mon_ctx: &ctx,
+        };
+        tokio::time::timeout(Duration::from_millis(50), credit.acquire())
+            .await
+            .expect("non-pipeline acquire must return immediately");
+    }
+
+    /// Bypass path (the formerly-uncounted send site): the pipeline
+    /// initial snapshot must consume a window credit, exactly like every
+    /// subsequent DATA frame (pvxs `servermon.cpp:192`). With
+    /// `queueSize=2` and NO client ACK, the server may send at most 2
+    /// DATA frames before it stalls. The bug let the initial snapshot
+    /// ride out free, so the server sent 3 — the window drifted to
+    /// `queueSize + 1`, one more than the client's queue could hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipeline_initial_snapshot_consumes_one_credit() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 700;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0));
+        let pusher = pv.clone();
+
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // MONITOR INIT with pipeline=true, queueSize=2 (no nack byte —
+        // window initialises to queueSize).
+        let req_val = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(2)),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Monitor, order, init_payload);
+        handle_op(
+            &source,
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT reply");
+
+        // MONITOR START (subcmd 0x44 = start | process) spawns the
+        // subscriber task.
+        let mut start_payload = Vec::new();
+        start_payload.put_u32(sid, order);
+        start_payload.put_u32(ioid, order);
+        start_payload.put_u8(0x44);
+        let start_frame = synth_frame(Command::Monitor, order, start_payload);
+        handle_op(
+            &source,
+            &start_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("MONITOR START ok");
+
+        // Let the task subscribe and emit the initial snapshot plus the
+        // SharedPV-queued initial event, draining the 2-slot window.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Push updates with NO ACK. The window is exhausted, so none can
+        // produce a DATA frame.
+        for i in 1..=8 {
+            pusher.try_post(three_field_value(i, 0, 0));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut data_frames = 0usize;
+        while rx.try_recv().is_ok() {
+            data_frames += 1;
+        }
+        assert_eq!(
+            data_frames, 2,
+            "with queueSize=2 and no ACK the server must send exactly 2 DATA \
+             frames (the initial snapshot consumes one credit); got \
+             {data_frames} — the initial snapshot bypassed the pipeline window"
+        );
     }
 
     fn synth_frame(command: Command, order: ByteOrder, payload: Vec<u8>) -> Frame {

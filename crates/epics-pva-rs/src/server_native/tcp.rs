@@ -3940,9 +3940,24 @@ async fn handle_op(
                 // `(seq, op_id)` of the crossing, computed under the `op`
                 // borrow, fired after it is dropped so `source` can borrow
                 // `ch.name` freely.
+                // pvxs `servermon.cpp:599-608`: a data-phase ACK
+                // (`subcmd & 0x80`) carries a u32 ack-count; a
+                // missing/truncated one is `!M.good()` → `bev.reset()`
+                // (connection-fatal). The previous `unwrap_or(4)`
+                // fabricated 4 credits from a malformed ACK, silently
+                // corrupting the flow-control window. Read it first and
+                // propagate a Decode error so the connection loop resets
+                // — never fabricate credits. (A data frame on a
+                // non-existent IOID was already rejected with "operation
+                // not initialised" above, so by here the op exists; this
+                // read is the only remaining ACK-payload validation.)
+                let ack_count = cur.get_u32(order).map_err(|e| {
+                    PvaError::Decode(format!(
+                        "malformed MONITOR ACK (ioid {ioid}): missing u32 ack-count: {e}"
+                    ))
+                })?;
                 let mut fire_high: Option<(u64, u64)> = None;
                 if let Some(op) = ch.ops.get(&ioid) {
-                    let ack_count = cur.get_u32(order).unwrap_or(4);
                     if let (Some(w), Some(n)) = (
                         op.monitor_window.as_ref(),
                         op.monitor_window_notify.as_ref(),
@@ -6419,6 +6434,151 @@ mod tests {
             "with queueSize=2 and no ACK the server must send exactly 2 DATA \
              frames (the initial snapshot consumes one credit); got \
              {data_frames} — the initial snapshot bypassed the pipeline window"
+        );
+    }
+
+    /// Build a `channels` map with a single live (started) MONITOR op
+    /// whose pipeline window starts at 0, for the ACK-payload tests.
+    fn ack_test_channels(
+        sid: u32,
+        ioid: u32,
+        window: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) -> HashMap<u32, ChannelState> {
+        let mut ops = HashMap::new();
+        ops.insert(
+            ioid,
+            OpState {
+                intro: FieldDesc::Variant,
+                kind: OpKind::Monitor,
+                monitor_started: true,
+                monitor_abort: None,
+                mask: BitSet::new(),
+                monitor_window: Some(window),
+                monitor_window_notify: Some(Arc::new(tokio::sync::Notify::new())),
+                monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                monitor_resume: Arc::new(tokio::sync::Notify::new()),
+                monitor_wm: None,
+                monitor_wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                monitor_op_id: next_op_id(),
+                monitor_filters: Arc::new(
+                    epics_base_rs::server::database::filters::FilterChain::new(),
+                ),
+                put_auto_exec: true,
+                pv_request: None,
+                monitor_options: crate::server_native::source::MonitorOptions::default(),
+                data_task_abort: None,
+                monitor_start_ctl: None,
+            },
+        );
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: None,
+                ops,
+            },
+        );
+        channels
+    }
+
+    /// pvxs `servermon.cpp:599-608`: a data-phase MONITOR ACK
+    /// (`subcmd & 0x80`) whose u32 ack-count payload is missing/truncated
+    /// is `!M.good()` → `bev.reset()` (connection-fatal). The previous
+    /// `unwrap_or(4)` fabricated 4 credits from a malformed ACK on a live
+    /// monitor, silently corrupting the flow-control window.
+    #[tokio::test]
+    async fn monitor_ack_truncated_payload_is_fatal() {
+        use std::sync::atomic::AtomicU32;
+        let order = ByteOrder::Little;
+        let sid: u32 = 3;
+        let ioid: u32 = 88;
+
+        let window = Arc::new(AtomicU32::new(0));
+        let mut channels = ack_test_channels(sid, ioid, window.clone());
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let config = crate::server_native::runtime::PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // ACK frame (subcmd 0x80) with NO u32 ack-count payload.
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x80);
+        let frame = synth_frame(Command::Monitor, order, payload);
+        let err = handle_op(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect_err("truncated MONITOR ACK must be connection-fatal");
+        assert!(
+            matches!(err, PvaError::Decode(_)),
+            "expected a Decode (connection-reset) error, got {err:?}"
+        );
+        assert_eq!(
+            window.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a malformed ACK must NOT fabricate credits"
+        );
+    }
+
+    /// A well-formed MONITOR ACK refills the pipeline window by exactly
+    /// the decoded count — no fabricated default.
+    #[tokio::test]
+    async fn monitor_ack_well_formed_refills_window_by_count() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let order = ByteOrder::Little;
+        let sid: u32 = 3;
+        let ioid: u32 = 88;
+
+        let window = Arc::new(AtomicU32::new(0));
+        let mut channels = ack_test_channels(sid, ioid, window.clone());
+
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let config = crate::server_native::runtime::PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x80);
+        payload.put_u32(3, order); // ack-count
+        let frame = synth_frame(Command::Monitor, order, payload);
+        handle_op(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("well-formed MONITOR ACK ok");
+        assert_eq!(
+            window.load(Ordering::Relaxed),
+            3,
+            "window must refill by exactly the decoded ack-count"
         );
     }
 

@@ -166,6 +166,9 @@ async fn main() {
     let mask = parse_event_mask(args.event_mask.as_deref());
     let spec = parse_timestamp_spec(args.timestamp_key.as_deref());
     let start = SystemTime::now();
+    // `tsFirst` (`tool_lib.c:40`): the first SERVER stamp seen across all
+    // channels, captured once — the server-relative (`-t sr`) baseline.
+    let first_server = Arc::new(std::sync::Mutex::new(None::<SystemTime>));
     // `i` (incremental across ALL channels) shares the previous-event
     // time across PVs; one slot per source.
     let prev_all_server = Arc::new(std::sync::Mutex::new(None::<SystemTime>));
@@ -177,6 +180,7 @@ async fn main() {
         let pv = pv_name.clone();
         let flag = connected_flags[i].clone();
         let fmt = fmt.clone();
+        let first_server = first_server.clone();
         let prev_all_server = prev_all_server.clone();
         let prev_all_client = prev_all_client.clone();
         handles.push(tokio::spawn(async move {
@@ -189,6 +193,7 @@ async fn main() {
                 mask,
                 spec,
                 start,
+                first_server,
                 prev_all_server,
                 prev_all_client,
             )
@@ -286,12 +291,16 @@ async fn monitor_pv(
     mask: u16,
     spec: TimestampSpec,
     start: SystemTime,
+    first_server: Arc<std::sync::Mutex<Option<SystemTime>>>,
     prev_all_server: Arc<std::sync::Mutex<Option<SystemTime>>>,
     prev_all_client: Arc<std::sync::Mutex<Option<SystemTime>>>,
 ) {
     // Per-channel previous timestamps for `-t I`, one per source.
     let mut prev_chan_server: Option<SystemTime> = None;
     let mut prev_chan_client: Option<SystemTime> = None;
+    // Per-channel `firstStampPrinted` gate: the leading event of THIS
+    // channel always prints an absolute stamp (C `tool_lib.c:414`).
+    let mut first_printed = false;
     let mut conn_rx = channel.connection_events();
     let pv = pv_name.clone();
     let flag = connected_flag.clone();
@@ -334,25 +343,34 @@ async fn monitor_pv(
                 // arrival as possible — this is the `c` (client) source,
                 // distinct from the server-supplied `snap.timestamp`.
                 let recv_time = SystemTime::now();
-                // `-t` selects source(s) + rendering kind. `IncrAll`
-                // shares the previous-event time across channels;
-                // `IncrChan`/the others use the per-channel slots.
+                // `-t` selects source(s) + rendering kind. `tsFirst`
+                // (the server-relative baseline) is global, so it is
+                // always locked. `IncrAll` shares the previous-event
+                // time across channels; `IncrChan`/the others use the
+                // per-channel slots.
+                let mut fs = first_server.lock().unwrap();
                 let time_seg = if spec.kind == TimestampKind::IncrAll {
                     let mut ps = prev_all_server.lock().unwrap();
                     let mut pc = prev_all_client.lock().unwrap();
-                    render_timestamp(spec, snap.timestamp, recv_time, start, &mut ps, &mut pc)
+                    let mut st = TimestampState {
+                        first_server: &mut fs,
+                        first_printed: &mut first_printed,
+                        prev_server: &mut ps,
+                        prev_client: &mut pc,
+                    };
+                    render_timestamp(spec, snap.timestamp, recv_time, start, &mut st)
                 } else {
-                    render_timestamp(
-                        spec,
-                        snap.timestamp,
-                        recv_time,
-                        start,
-                        &mut prev_chan_server,
-                        &mut prev_chan_client,
-                    )
+                    let mut st = TimestampState {
+                        first_server: &mut fs,
+                        first_printed: &mut first_printed,
+                        prev_server: &mut prev_chan_server,
+                        prev_client: &mut prev_chan_client,
+                    };
+                    render_timestamp(spec, snap.timestamp, recv_time, start, &mut st)
                 }
                 .map(|ts| format!("{ts}{sep}"))
                 .unwrap_or_default();
+                drop(fs);
                 let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
                 let rendered = format_value(&snap.value, &fmt, enum_strings, req_elems_present);
                 let is_scalar = snap.value.count() == 1;
@@ -464,17 +482,39 @@ fn parse_timestamp_spec(k: Option<&str>) -> TimestampSpec {
     spec
 }
 
-/// Render the timestamp column for one event under `mode`. `prev` holds
-/// the previous event timestamp for the incremental modes (shared for
-/// `i`, per-channel for `I`); it is updated in place. Returns `None`
-/// when no time column should be printed (`-t n`).
+/// Mutable timestamp state threaded through [`render_timestamp`], one
+/// bundle per event. Mirrors the C `tool_lib.c` globals/per-PV fields:
+/// `tsFirst` (server-relative baseline), `firstStampPrinted`, and the
+/// `tsPrevious{S,C}` incremental baselines.
+struct TimestampState<'a> {
+    /// `tsFirst` (`tool_lib.c:40`): the first SERVER stamp seen, captured
+    /// once across all channels. The server-relative (`-t sr`) baseline.
+    first_server: &'a mut Option<SystemTime>,
+    /// `pv->firstStampPrinted` (`tool_lib.c:414`): this channel has
+    /// already printed its absolute leading stamp.
+    first_printed: &'a mut bool,
+    /// `tsPrevious{S,C}` (`tool_lib.c:466-467`): the previous-event
+    /// baselines for the incremental kinds — shared for `i`, per-channel
+    /// for `I`.
+    prev_server: &'a mut Option<SystemTime>,
+    prev_client: &'a mut Option<SystemTime>,
+}
+
+/// Render the timestamp column for one event under `spec`. Returns
+/// `None` when no time column should be printed (`-t n`).
+///
+/// Mirrors C `print_time_val_sts` (`tool_lib.c:407-467`): the FIRST
+/// event of each channel always prints an ABSOLUTE stamp (C
+/// `printAbs = !pv->firstStampPrinted`), even under `r`/`i`/`I`; only
+/// later events render as diffs. The server-relative baseline is the
+/// first SERVER stamp (`tsFirst`), NOT program start — program start
+/// (`tsStart`) is the CLIENT-relative baseline.
 fn render_timestamp(
     spec: TimestampSpec,
     server_ts: SystemTime,
     client_ts: SystemTime,
     start: SystemTime,
-    prev_server: &mut Option<SystemTime>,
-    prev_client: &mut Option<SystemTime>,
+    state: &mut TimestampState<'_>,
 ) -> Option<String> {
     fn secs_between(a: SystemTime, b: SystemTime) -> f64 {
         a.duration_since(b)
@@ -482,14 +522,30 @@ fn render_timestamp(
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0)
     }
-    let render_one = |ts: SystemTime, prev: &mut Option<SystemTime>| -> String {
+    // C `tool_lib.c:419-422`: latch the first SERVER stamp once; it is
+    // the server-relative baseline (`tsFirst`).
+    if state.first_server.is_none() {
+        *state.first_server = Some(server_ts);
+    }
+    // C `tool_lib.c:414,449-452`: `printAbs = !pv->firstStampPrinted`.
+    // The leading event for THIS channel renders absolute even in a
+    // relative/incremental mode; absolute mode is always absolute.
+    let print_abs = spec.kind == TimestampKind::Absolute || !*state.first_printed;
+    // Server-relative baseline = `tsFirst`; client-relative = `tsStart`.
+    let server_ref = state.first_server.unwrap_or(server_ts);
+    let render_one = |ts: SystemTime, is_server: bool, prev: Option<SystemTime>| -> String {
+        if print_abs {
+            return format_server_timestamp(ts);
+        }
         match spec.kind {
+            // `print_abs` already covers the absolute kind above.
             TimestampKind::Absolute => format_server_timestamp(ts),
-            TimestampKind::Relative => format!("{:.6}", secs_between(ts, start)),
+            TimestampKind::Relative => {
+                let r = if is_server { server_ref } else { start };
+                format!("{:.6}", secs_between(ts, r))
+            }
             TimestampKind::IncrAll | TimestampKind::IncrChan => {
-                let delta = prev.map(|p| secs_between(ts, p)).unwrap_or(0.0);
-                *prev = Some(ts);
-                format!("{delta:.6}")
+                format!("{:.6}", secs_between(ts, prev.unwrap_or(ts)))
             }
         }
     };
@@ -497,13 +553,20 @@ fn render_timestamp(
     // stamp wrapped in `()`, back to back. Either may be absent.
     let mut out = String::new();
     if spec.server {
-        out.push_str(&render_one(server_ts, prev_server));
+        out.push_str(&render_one(server_ts, true, *state.prev_server));
     }
     if spec.client {
-        let c = render_one(client_ts, prev_client);
+        let c = render_one(client_ts, false, *state.prev_client);
         out.push('(');
         out.push_str(&c);
         out.push(')');
+    }
+    // C `tool_lib.c:461-467`: advance the incremental baselines on EVERY
+    // event, and mark this channel's leading absolute stamp as printed.
+    *state.prev_server = Some(server_ts);
+    *state.prev_client = Some(client_ts);
+    if print_abs {
+        *state.first_printed = true;
     }
     if out.is_empty() { None } else { Some(out) }
 }
@@ -511,7 +574,8 @@ fn render_timestamp(
 #[cfg(test)]
 mod tests {
     use super::{
-        TimestampKind, TimestampSpec, parse_event_mask, parse_timestamp_spec, render_timestamp,
+        TimestampKind, TimestampSpec, TimestampState, parse_event_mask, parse_timestamp_spec,
+        render_timestamp,
     };
     use std::time::{Duration, SystemTime};
 
@@ -555,8 +619,28 @@ mod tests {
         ));
     }
 
+    /// Build a fresh `TimestampState` over caller-owned slots so each
+    /// test starts from C's initial state (`tsFirst` unset, this
+    /// channel's leading stamp not yet printed).
+    fn ts_state<'a>(
+        first_server: &'a mut Option<SystemTime>,
+        first_printed: &'a mut bool,
+        prev_server: &'a mut Option<SystemTime>,
+        prev_client: &'a mut Option<SystemTime>,
+    ) -> TimestampState<'a> {
+        TimestampState {
+            first_server,
+            first_printed,
+            prev_server,
+            prev_client,
+        }
+    }
+
     #[test]
-    fn timestamp_render_server_kinds() {
+    fn timestamp_first_event_is_absolute_then_diffs() {
+        // C `tool_lib.c:414`: the leading event of a channel prints an
+        // ABSOLUTE stamp even under `-t sr`; later events diff against
+        // the FIRST SERVER stamp (`tsFirst`), not program start.
         let start = SystemTime::UNIX_EPOCH;
         let t1 = start + Duration::from_secs(10);
         let t2 = start + Duration::from_secs(13);
@@ -565,71 +649,115 @@ mod tests {
             client: false,
             kind,
         };
-        // No source → no column.
+        // No source → no column (state is irrelevant).
         let none = TimestampSpec {
             server: false,
             client: false,
             kind: TimestampKind::Absolute,
         };
-        let (mut ps, mut pc) = (None, None);
-        assert!(render_timestamp(none, t1, t1, start, &mut ps, &mut pc).is_none());
-        // Server relative → seconds since start.
-        let (mut ps, mut pc) = (None, None);
+        let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
+        let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
+        assert!(render_timestamp(none, t1, t1, start, &mut st).is_none());
+
+        // Server relative: first event ABSOLUTE (== absolute render of
+        // t1), NOT "10.000000".
+        let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
+        let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
+        let first = render_timestamp(srv(TimestampKind::Relative), t1, t1, start, &mut st);
         assert_eq!(
-            render_timestamp(
-                srv(TimestampKind::Relative),
-                t1,
-                t1,
-                start,
-                &mut ps,
-                &mut pc
-            )
-            .as_deref(),
-            Some("10.000000")
+            first.as_deref(),
+            Some(super::format_server_timestamp(t1).as_str()),
+            "first event must render the absolute server stamp"
         );
-        // Server incremental → first 0, then the delta; prev advances.
-        let (mut ps, mut pc) = (None, None);
+        // Second event: diff against the FIRST SERVER stamp (t1), so
+        // t2 - t1 = 3s — NOT t2 - start (= 13s).
+        let second = render_timestamp(srv(TimestampKind::Relative), t2, t2, start, &mut st);
+        assert_eq!(second.as_deref(), Some("3.000000"));
+    }
+
+    #[test]
+    fn timestamp_server_incremental_diffs_against_prev() {
+        // First event absolute, then each event diffs against the prior.
+        let start = SystemTime::UNIX_EPOCH;
+        let t1 = start + Duration::from_secs(10);
+        let t2 = start + Duration::from_secs(13);
+        let srv = TimestampSpec {
+            server: true,
+            client: false,
+            kind: TimestampKind::IncrAll,
+        };
+        let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
+        let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
         assert_eq!(
-            render_timestamp(srv(TimestampKind::IncrAll), t1, t1, start, &mut ps, &mut pc)
-                .as_deref(),
-            Some("0.000000")
+            render_timestamp(srv, t1, t1, start, &mut st).as_deref(),
+            Some(super::format_server_timestamp(t1).as_str()),
+            "leading incremental event is absolute"
         );
         assert_eq!(
-            render_timestamp(srv(TimestampKind::IncrAll), t2, t2, start, &mut ps, &mut pc)
-                .as_deref(),
-            Some("3.000000")
+            render_timestamp(srv, t2, t2, start, &mut st).as_deref(),
+            Some("3.000000"),
+            "second incremental event diffs against the prior stamp"
         );
     }
 
     #[test]
-    fn timestamp_client_source_uses_receive_time() {
-        // `-t cr`: the relative time must be computed from the CLIENT
-        // (receive) time, NOT the server stamp. A server_ts == start would
-        // render "0.000000"; the client_ts == start+10 must drive output.
+    fn timestamp_client_relative_uses_program_start_after_first() {
+        // `-t cr`: the leading event is absolute (receive time in
+        // parens); later events diff the CLIENT receive time against
+        // program start (`tsStart`), independent of the server baseline.
         let start = SystemTime::UNIX_EPOCH;
-        let client_ts = start + Duration::from_secs(10);
+        let c1 = start + Duration::from_secs(4);
+        let c2 = start + Duration::from_secs(10);
         let cr = TimestampSpec {
             server: false,
             client: true,
             kind: TimestampKind::Relative,
         };
-        let (mut ps, mut pc) = (None, None);
+        let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
+        let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
+        // First: absolute client receive time in parens.
+        let first = render_timestamp(cr, start, c1, start, &mut st);
         assert_eq!(
-            render_timestamp(cr, start, client_ts, start, &mut ps, &mut pc).as_deref(),
-            Some("(10.000000)"),
-            "client source uses receive time, shown in parens"
+            first.as_deref(),
+            Some(format!("({})", super::format_server_timestamp(c1)).as_str())
         );
-        // Both sources render independently: server then (client).
-        let server_ts = start + Duration::from_secs(5);
+        // Second: client diff vs program start → 10s (NOT vs c1).
+        let second = render_timestamp(cr, start, c2, start, &mut st);
+        assert_eq!(second.as_deref(), Some("(10.000000)"));
+    }
+
+    #[test]
+    fn timestamp_both_sources_render_independently_after_first() {
+        // Both sources: server diffs against tsFirst, client against
+        // tsStart. Drive past the absolute leading event first.
+        let start = SystemTime::UNIX_EPOCH;
+        let s1 = start + Duration::from_secs(5);
+        let c1 = start + Duration::from_secs(4);
+        let s2 = start + Duration::from_secs(8);
+        let c2 = start + Duration::from_secs(10);
         let both = TimestampSpec {
             server: true,
             client: true,
             kind: TimestampKind::Relative,
         };
-        let (mut ps, mut pc) = (None, None);
+        let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
+        let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
+        // Leading event absolute: server stamp then (client stamp).
+        let first = render_timestamp(both, s1, c1, start, &mut st);
         assert_eq!(
-            render_timestamp(both, server_ts, client_ts, start, &mut ps, &mut pc).as_deref(),
-            Some("5.000000(10.000000)")
+            first.as_deref(),
+            Some(
+                format!(
+                    "{}({})",
+                    super::format_server_timestamp(s1),
+                    super::format_server_timestamp(c1)
+                )
+                .as_str()
+            )
         );
+        // Second event: server (s2 - tsFirst=s1) = 3s, client
+        // (c2 - tsStart=start) = 10s.
+        let second = render_timestamp(both, s2, c2, start, &mut st);
+        assert_eq!(second.as_deref(), Some("3.000000(10.000000)"));
     }
 }

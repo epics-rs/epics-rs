@@ -37,7 +37,7 @@ use crate::pvdata::{FieldDesc, PvField};
 /// (sharedpv.cpp:329). Handler receives the new value; returning Err
 /// causes the server to reply with a non-success Status. Returning
 /// Ok(()) lets the server post the value to subscribers — handlers
-/// that want to coerce / transform should do so via [`SharedPV::post`]
+/// that want to coerce / transform should do so via [`SharedPV::try_post`]
 /// inside the closure and return Ok.
 pub type OnPutFn = Arc<dyn Fn(&SharedPV, PvField) -> Result<(), String> + Send + Sync>;
 
@@ -836,7 +836,7 @@ impl SharedSource {
         }
     }
 
-    /// Install an [`AccessGate`] on this source. Subsequent wire
+    /// Install an [`AccessGate`](epics_base_rs::server::access_security::AccessGate) on this source. Subsequent wire
     /// ops use it for every allow/deny check. Idempotent — only
     /// the first call wins (the gate is stored in a `OnceLock`
     /// so subscribers can hold borrowed references without

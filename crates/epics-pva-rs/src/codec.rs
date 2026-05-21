@@ -214,7 +214,7 @@ impl PvaCodec {
     /// with no trailing payload. pvxs `clientmon.cpp:123-137` sends
     /// START/STOP as `sid + ioid + subcmd` only. Pre-fix Rust
     /// appended a 4-byte `pipeline_size` trailer here — pipeline
-    /// negotiation belongs on INIT (see [`build_monitor_init`]).
+    /// negotiation belongs on INIT (see [`Self::build_monitor_init`]).
     pub fn build_monitor_start(&self, server_channel_id: u32, ioid: u32) -> Vec<u8> {
         let p = Self::op_payload(server_channel_id, ioid, 0x44, &[], self.order());
         self.frame(false, CMD_MONITOR, p)

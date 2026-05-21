@@ -11,7 +11,7 @@ use epics_base_rs::server::ioc_app::IocRunConfig;
 
 /// Run an IOC with the pvAccess protocol.
 ///
-/// This is the standard protocol runner for [`IocApplication::run`].
+/// This is the standard protocol runner for [`IocApplication::run`](epics_base_rs::server::ioc_app::IocApplication::run).
 /// It creates a [`PvaServer`] from the provided configuration and
 /// starts the PVA server with an interactive iocsh shell.
 ///

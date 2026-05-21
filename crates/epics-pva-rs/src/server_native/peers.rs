@@ -8,7 +8,7 @@
 //!
 //! Lock granularity: the registry is a [`parking_lot::RwLock`] over a
 //! [`std::collections::HashMap`]. Mutations (insert / remove / update)
-//! take the write lock briefly; the [`PvaServer::report`] read takes
+//! take the write lock briefly; the [`crate::server_native::PvaServer::report`] read takes
 //! the read lock for the snapshot. Concurrent connection handlers
 //! never block each other on this lock — each holds its own
 //! [`Arc<PeerEntry>`] and updates its own atomic counters without

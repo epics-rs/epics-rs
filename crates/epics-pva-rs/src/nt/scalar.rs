@@ -171,7 +171,7 @@ impl NTScalar {
         FieldDesc::Structure { struct_id, fields }
     }
 
-    /// Create a default-initialised value matching [`build()`].
+    /// Create a default-initialised value matching [`build()`](Self::build).
     pub fn create(&self) -> PvField {
         let struct_id = if self.is_array {
             "epics:nt/NTScalarArray:1.0".to_string()

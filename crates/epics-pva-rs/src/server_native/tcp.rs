@@ -914,7 +914,7 @@ pub async fn run_tcp_server(
 }
 
 /// Run the TCP listener with an externally-shared
-/// [`PeerRegistry`]. F-G7: lets [`crate::server_native::PvaServer::report`]
+/// [`PeerRegistry`](crate::server_native::PeerRegistry). F-G7: lets [`crate::server_native::PvaServer::report`]
 /// observe per-connection stats.
 pub async fn run_tcp_server_with_peers(
     source: DynSource,

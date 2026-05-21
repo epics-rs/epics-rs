@@ -351,7 +351,7 @@ pub enum OpResponse {
 /// from a prior INIT response so we can decode data payloads; for INIT
 /// responses themselves, pass `None`.
 ///
-/// `type_cache` is a per-connection [`TypeCache`] used to resolve
+/// `type_cache` is a per-connection [`TypeCache`](crate::pvdata::encode::TypeCache) used to resolve
 /// 0xFD (define) / 0xFE (lookup) markers in INIT responses. Pass an
 /// empty cache initially; the same cache must be reused across all
 /// frames on a single connection for cache references to resolve.
@@ -364,7 +364,7 @@ pub fn decode_op_response(
 }
 
 /// Like [`decode_op_response`] but threads a per-connection
-/// [`TypeCache`] for 0xFD/0xFE marker support.
+/// [`TypeCache`](crate::pvdata::encode::TypeCache) for 0xFD/0xFE marker support.
 pub fn decode_op_response_cached(
     frame: &Frame,
     introspection: Option<&FieldDesc>,

@@ -357,8 +357,8 @@ impl PvRequestBuilder {
 /// Captures the field selectors and record options as parsed from a
 /// pvxs-style expression (e.g. `field(value,alarm.severity)record[pipeline=true]`).
 /// Use [`PvRequestExpr::to_field_desc`] to materialize a wire-encodable
-/// [`FieldDesc`] mirror, or [`PvRequestExpr::field_paths`] to extract just
-/// the dotted field paths.
+/// [`FieldDesc`] mirror, or read [`PvRequestExpr::fields`] for just the
+/// dotted field paths.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PvRequestExpr {
     /// Dotted field paths the caller is interested in. A `None` entry

@@ -586,7 +586,7 @@ impl PvaClient {
         .await
     }
 
-    /// Start a GET and return a [`PvaOperation`] handle the caller can
+    /// Start a GET and return a [`PvaOperation`](crate::client_native::PvaOperation) handle the caller can
     /// `wait()`, `cancel()`, or `interrupt()` from any task. F-G8 —
     /// pvxs `Operation` parity for callers that need to start now and
     /// wait later from a different context, or be able to cancel from
@@ -606,7 +606,7 @@ impl PvaClient {
         )
     }
 
-    /// Start a PUT and return a [`PvaOperation`] handle. F-G8.
+    /// Start a PUT and return a [`PvaOperation`](crate::client_native::PvaOperation) handle. F-G8.
     pub fn start_put(
         &self,
         pv_name: &str,
@@ -620,7 +620,7 @@ impl PvaClient {
         })
     }
 
-    /// Start an RPC and return a [`PvaOperation`] handle. F-G8.
+    /// Start an RPC and return a [`PvaOperation`](crate::client_native::PvaOperation) handle. F-G8.
     pub fn start_rpc(
         &self,
         pv_name: &str,

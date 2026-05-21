@@ -1,7 +1,7 @@
 //! Field selectors used by `pvRequest` to limit which sub-fields the server
 //! sends back.
 //!
-//! At wire level, "selector" really just means a [`BitSet`](super::bitset::BitSet)
+//! At wire level, "selector" really just means a [`BitSet`]
 //! over the same field-numbering scheme used for monitor deltas. This module
 //! exists as a named type so callers can express intent ("which fields the
 //! client asked for") separately from the bit container.

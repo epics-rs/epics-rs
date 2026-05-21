@@ -260,8 +260,9 @@ impl PvaServerConfig {
     /// Loopback-only configuration with random ports — pvxs
     /// `Config::isolated()` (config.cpp:445). The OS picks free TCP
     /// and UDP ports; auto-beacon is disabled so the server doesn't
-    /// leak datagrams onto the LAN. Matching client side: see
-    /// [`crate::client_native::context::PvaClient::isolated_for`].
+    /// leak datagrams onto the LAN. Matching client side: point a
+    /// [`crate::client_native::PvaClient`] at the returned loopback
+    /// address via [`crate::client_native::PvaClientBuilder::server_addr`].
     pub fn isolated() -> Self {
         Self {
             tcp_port: 0,

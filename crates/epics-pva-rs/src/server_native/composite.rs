@@ -5,8 +5,9 @@
 //! Lower `order` values are tried first (`order=0` is the default). Ties
 //! are broken by insertion order. Source names beginning with "__" are
 //! reserved for internal use (pvxs convention) — `__builtin` is a
-//! [`crate::server_native::SharedSource`] for [`Self::add_pv`] /
-//! [`Self::remove_pv`] convenience.
+//! [`crate::server_native::SharedSource`] for
+//! [`add`](crate::server_native::SharedSource::add) /
+//! [`remove`](crate::server_native::SharedSource::remove) convenience.
 //!
 //! For each request the first source whose `has_pv()` returns `true`
 //! wins all subsequent calls (`get_value`, `subscribe`, `put_value`,

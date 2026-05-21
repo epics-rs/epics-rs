@@ -680,7 +680,7 @@ impl ServerConn {
             .map_err(|_| PvaError::Protocol("writer queue closed".into()))
     }
 
-    /// Async wrapper around [`send_sync`] for backward compatibility.
+    /// Async wrapper around [`Self::send_sync`] for backward compatibility.
     /// New code should prefer `send_sync` to avoid unnecessary async overhead.
     pub async fn send(&self, frame: Vec<u8>) -> PvaResult<()> {
         self.send_sync(frame)

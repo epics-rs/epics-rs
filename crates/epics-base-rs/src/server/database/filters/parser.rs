@@ -200,11 +200,11 @@ fn build_arr(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>> {
     let start = obj.get("s").and_then(|v| v.as_i64()).unwrap_or(0);
     let incr = obj.get("i").and_then(|v| v.as_i64()).unwrap_or(1);
     let end = obj.get("e").and_then(|v| v.as_i64()).unwrap_or(-1);
-    Some(Arc::new(ArrayFilter::new(ArrayFilterConfig {
-        start,
-        incr,
-        end,
-    })))
+    // `ArrayFilterConfig::new` clamps `incr` to `>= 1`, so a malicious
+    // `{"i":0}` / `{"i":-3}` cannot reach the slice divisor.
+    Some(Arc::new(ArrayFilter::new(ArrayFilterConfig::new(
+        start, incr, end,
+    ))))
 }
 
 fn build_decimate(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>> {

@@ -36,8 +36,34 @@ pub struct ArrayFilter {
 #[derive(Debug, Clone, Copy)]
 pub struct ArrayFilterConfig {
     pub start: i64,
-    pub incr: i64,
+    /// Stride. **Private on purpose**: `slice_with`/`slice_len` divide by
+    /// it and step a loop by it, so `incr <= 0` would divide-by-zero or
+    /// loop forever. The `incr >= 1` invariant therefore holds *by
+    /// construction* — the only ways to build an `ArrayFilterConfig`
+    /// ([`ArrayFilterConfig::new`] and [`Default`]) clamp it to `>= 1`
+    /// (the pvxs `arr` rule: `i < 1` is treated as `1`). Read it via
+    /// [`ArrayFilterConfig::incr`].
+    incr: i64,
     pub end: i64,
+}
+
+impl ArrayFilterConfig {
+    /// Build a config, clamping `incr` to `>= 1` (pvxs `arr` rule). This
+    /// is the only constructor that sets `incr`, so every reachable
+    /// `ArrayFilterConfig` satisfies `incr >= 1` and the slice helpers
+    /// can never divide by zero or step backwards.
+    pub fn new(start: i64, incr: i64, end: i64) -> Self {
+        Self {
+            start,
+            incr: incr.max(1),
+            end,
+        }
+    }
+
+    /// The stride, guaranteed `>= 1`.
+    pub fn incr(&self) -> i64 {
+        self.incr
+    }
 }
 
 impl Default for ArrayFilterConfig {
@@ -52,9 +78,11 @@ impl Default for ArrayFilterConfig {
 
 impl ArrayFilter {
     pub fn new(config: ArrayFilterConfig) -> Self {
-        let incr = config.incr.max(1);
+        // The `incr >= 1` invariant is owned by `ArrayFilterConfig`
+        // itself (private field + clamping constructors), so there is
+        // no re-clamp here — an illegal stride cannot reach this point.
         Self {
-            config: ArrayFilterConfig { incr, ..config },
+            config,
             _state: Mutex::new(()),
         }
     }
@@ -112,7 +140,7 @@ fn slice_len(len: i64, cfg: ArrayFilterConfig) -> usize {
     if start > end {
         return 0;
     }
-    ((end - start) / cfg.incr + 1) as usize
+    ((end - start) / cfg.incr() + 1) as usize
 }
 
 /// Apply `start..=end` (negative indices wrap from `len`) with stride
@@ -139,11 +167,11 @@ fn slice_with<T: Clone>(input: Vec<T>, cfg: ArrayFilterConfig) -> Vec<T> {
     if start > end {
         return Vec::new();
     }
-    let mut out = Vec::with_capacity(((end - start) / cfg.incr + 1) as usize);
+    let mut out = Vec::with_capacity(((end - start) / cfg.incr() + 1) as usize);
     let mut idx = start;
     while idx <= end {
         out.push(input[idx as usize].clone());
-        idx += cfg.incr;
+        idx += cfg.incr();
     }
     out
 }
@@ -184,11 +212,7 @@ mod tests {
     /// Positive slice indices.
     #[test]
     fn positive_indices_select_range() {
-        let f = ArrayFilter::new(ArrayFilterConfig {
-            start: 1,
-            incr: 1,
-            end: 3,
-        });
+        let f = ArrayFilter::new(ArrayFilterConfig::new(1, 1, 3));
         let out = f.apply(ev_array(vec![0.0, 1.0, 2.0, 3.0, 4.0])).unwrap();
         assert_eq!(unpack(out), vec![1.0, 2.0, 3.0]);
     }
@@ -196,11 +220,7 @@ mod tests {
     /// Negative end index counts from the end (`-1` is last).
     #[test]
     fn negative_end_counts_from_back() {
-        let f = ArrayFilter::new(ArrayFilterConfig {
-            start: 0,
-            incr: 1,
-            end: -2, // up to second-to-last
-        });
+        let f = ArrayFilter::new(ArrayFilterConfig::new(0, 1, -2));
         let out = f.apply(ev_array(vec![0.0, 1.0, 2.0, 3.0, 4.0])).unwrap();
         assert_eq!(unpack(out), vec![0.0, 1.0, 2.0, 3.0]);
     }
@@ -208,25 +228,30 @@ mod tests {
     /// Stride > 1 picks every Nth element.
     #[test]
     fn stride_picks_every_nth() {
-        let f = ArrayFilter::new(ArrayFilterConfig {
-            start: 0,
-            incr: 2,
-            end: -1,
-        });
+        let f = ArrayFilter::new(ArrayFilterConfig::new(0, 2, -1));
         let out = f.apply(ev_array(vec![0.0, 1.0, 2.0, 3.0, 4.0])).unwrap();
         assert_eq!(unpack(out), vec![0.0, 2.0, 4.0]);
     }
 
-    /// `incr < 1` is clamped to 1 (the pvxs rule).
+    /// `incr < 1` is clamped to `1` (the pvxs rule) *by construction* of
+    /// `ArrayFilterConfig`, so the slice helpers cannot divide by zero or
+    /// step backwards. The invariant is enforced at the type boundary,
+    /// not by a separate runtime guard in `ArrayFilter::new`: a config
+    /// built with `incr = 0` or a negative stride reports `incr() == 1`,
+    /// and both `apply` (the divisor + the `idx += incr` loop) and
+    /// `final_element_count` run without panicking.
     #[test]
-    fn invalid_incr_clamps_to_one() {
-        let f = ArrayFilter::new(ArrayFilterConfig {
-            start: 0,
-            incr: 0,
-            end: -1,
-        });
-        let out = f.apply(ev_array(vec![1.0, 2.0])).unwrap();
-        assert_eq!(unpack(out), vec![1.0, 2.0]);
+    fn invalid_incr_clamps_to_one_by_construction() {
+        for bad in [0_i64, -1, -7, i64::MIN] {
+            let cfg = ArrayFilterConfig::new(0, bad, -1);
+            assert_eq!(cfg.incr(), 1, "incr {bad} must clamp to 1 in the config");
+            let f = ArrayFilter::new(cfg);
+            // apply: would divide-by-zero / loop forever if incr <= 0.
+            let out = f.apply(ev_array(vec![1.0, 2.0])).unwrap();
+            assert_eq!(unpack(out), vec![1.0, 2.0]);
+            // final_element_count: the same divisor on the count path.
+            assert_eq!(f.final_element_count(2), 2);
+        }
     }
 
     /// Empty array passes through (no slicing to do, no panic).
@@ -240,11 +265,7 @@ mod tests {
     /// Out-of-order range (start > end after resolution) yields empty.
     #[test]
     fn inverted_range_yields_empty() {
-        let f = ArrayFilter::new(ArrayFilterConfig {
-            start: 3,
-            incr: 1,
-            end: 1,
-        });
+        let f = ArrayFilter::new(ArrayFilterConfig::new(3, 1, 1));
         let out = f.apply(ev_array(vec![0.0, 1.0, 2.0, 3.0, 4.0])).unwrap();
         assert!(unpack(out).is_empty());
     }
@@ -271,11 +292,7 @@ mod tests {
     /// applies to `dbnd` only.
     #[test]
     fn alarm_event_is_also_sliced() {
-        let f = ArrayFilter::new(ArrayFilterConfig {
-            start: 0,
-            incr: 1,
-            end: 0, // slice to single element
-        });
+        let f = ArrayFilter::new(ArrayFilterConfig::new(0, 1, 0));
         let mut ev = ev_array(vec![1.0, 2.0, 3.0]);
         ev.mask = EventMask::ALARM;
         let out = f.apply(ev).unwrap();
@@ -291,11 +308,7 @@ mod tests {
     #[test]
     fn mr_r25_uint64_array_is_sliced() {
         let big = u64::MAX; // > i64::MAX, must survive the slice
-        let f = ArrayFilter::new(ArrayFilterConfig {
-            start: 1,
-            incr: 1,
-            end: 2,
-        });
+        let f = ArrayFilter::new(ArrayFilterConfig::new(1, 1, 2));
         let ev = FilteredMonitorEvent::new(
             MonitorEvent {
                 snapshot: Snapshot::new(
@@ -322,52 +335,12 @@ mod tests {
     #[test]
     fn final_element_count_matches_slice_length() {
         let cases = [
-            (
-                ArrayFilterConfig {
-                    start: 5,
-                    incr: 1,
-                    end: 7,
-                },
-                10usize,
-                3usize,
-            ),
-            (
-                ArrayFilterConfig {
-                    start: 0,
-                    incr: 1,
-                    end: -1,
-                },
-                10,
-                10,
-            ), // identity
-            (
-                ArrayFilterConfig {
-                    start: 0,
-                    incr: 2,
-                    end: -1,
-                },
-                5,
-                3,
-            ), // stride
-            (
-                ArrayFilterConfig {
-                    start: 10,
-                    incr: 1,
-                    end: -1,
-                },
-                3,
-                0,
-            ), // start>len → empty
-            (
-                ArrayFilterConfig {
-                    start: 3,
-                    incr: 1,
-                    end: 1,
-                },
-                5,
-                0,
-            ), // inverted → empty
-            (ArrayFilterConfig::default(), 0, 0), // empty input
+            (ArrayFilterConfig::new(5, 1, 7), 10usize, 3usize),
+            (ArrayFilterConfig::new(0, 1, -1), 10, 10), // identity
+            (ArrayFilterConfig::new(0, 2, -1), 5, 3),   // stride
+            (ArrayFilterConfig::new(10, 1, -1), 3, 0),  // start>len → empty
+            (ArrayFilterConfig::new(3, 1, 1), 5, 0),    // inverted → empty
+            (ArrayFilterConfig::default(), 0, 0),       // empty input
         ];
         for (cfg, input, expected) in cases {
             let f = ArrayFilter::new(cfg);
@@ -393,11 +366,7 @@ mod tests {
     /// collapse to `len-1` and the slice incorrectly returns 1 element.
     #[test]
     fn start_beyond_len_yields_empty() {
-        let f = ArrayFilter::new(ArrayFilterConfig {
-            start: 10,
-            incr: 1,
-            end: -1,
-        });
+        let f = ArrayFilter::new(ArrayFilterConfig::new(10, 1, -1));
         let out = f.apply(ev_array(vec![1.0, 2.0, 3.0])).unwrap();
         assert!(
             unpack(out).is_empty(),

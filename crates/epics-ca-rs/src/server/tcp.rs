@@ -285,6 +285,29 @@ struct ChannelEntry {
     put_notify_busy: Arc<AtomicBool>,
 }
 
+impl ChannelEntry {
+    /// CA-FR-8: parse a FRESH channel-filter chain from this channel's
+    /// stored `.{...}` suffix. Returns an empty (identity) chain when
+    /// the channel carried no suffix or the suffix was malformed
+    /// (`parse_filter_chain` is permissive and warns — finding's
+    /// "empty chain with warning" case is preserved). A fresh chain
+    /// per call is REQUIRED: stateful filters (`dbnd` last-value,
+    /// `dec` counter, `sync` state) must not share state across the
+    /// READ path and each monitor subscriber, nor across two
+    /// subscribers on one channel.
+    ///
+    /// This is the single owner of filter parsing for every delivery
+    /// path — READ / READ_NOTIFY, the monitor initial snapshot, and
+    /// monitor updates — so the chain is applied uniformly instead of
+    /// only on the record-field `EVENT_ADD` path (the CA-FR-8 gap).
+    fn filter_chain(&self) -> epics_base_rs::server::database::filters::FilterChain {
+        match self.filter_suffix.as_deref() {
+            Some(json) => epics_base_rs::server::database::filters::parse_filter_chain(json),
+            None => epics_base_rs::server::database::filters::FilterChain::new(),
+        }
+    }
+}
+
 struct SubscriptionEntry {
     target: ChannelTarget,
     channel_sid: u32,
@@ -2064,6 +2087,25 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     }
                 };
 
+                // CA-FR-8: advertise the filter-FINAL element count
+                // (C `dbChannelFinalElements`). A count-reshaping filter
+                // (`arr` slice) shrinks how many elements the channel can
+                // ever deliver; the client must learn that count so its
+                // READ / monitor request count — and buffer allocation —
+                // match the filtered payload. Without this the client
+                // requests the native count and the server zero-pads the
+                // slice back up to it (R2-13). An empty / value-gating-only
+                // chain folds to the identity, so unfiltered channels keep
+                // their native count unchanged.
+                let element_count = match &filter_suffix {
+                    Some(json) => {
+                        epics_base_rs::server::database::filters::parse_filter_chain(json)
+                            .final_element_count(element_count as usize)
+                            as u32
+                    }
+                    None => element_count,
+                };
+
                 let (access, rule_was_trap) = state.compute_access(&target).await;
                 let access_level = match access {
                     3 => AccessLevel::ReadWrite,
@@ -2268,6 +2310,22 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
                 return Ok(());
             };
+            // CA-FR-8: run the channel filter chain on the read value
+            // before DBR encoding. epics-base `dbChannelRunPreChain`
+            // (db_access.c:160-167 / dbChannel.c:640-649) runs the same
+            // pre-chain on a filtered read channel. `apply_to_read_value`
+            // uses read context, so stream-only filters (`dec`/`sync`)
+            // pass through while `arr`/`ts`/`dbnd` transform; an empty
+            // chain (no suffix / malformed) is the identity. Applied
+            // BEFORE the requested-count truncate so the client's `-#`
+            // count caps the FILTERED result, matching C (arr slices
+            // first, then the count limits).
+            let read_chain = entry.filter_chain();
+            if !read_chain.is_empty() {
+                if let Some(v) = read_chain.apply_to_read_value(snapshot.value.clone()) {
+                    snapshot.value = v;
+                }
+            }
             // Respect client's requested element count (e.g. caget -# 10)
             if requested_count > 0 && requested_count < snapshot.value.count() {
                 snapshot.value.truncate(requested_count as usize);
@@ -3204,6 +3262,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             return Ok(());
                         };
 
+                        // CA-FR-8: attach the channel filter chain to the
+                        // just-added SimplePv subscriber so update delivery
+                        // (`ProcessVariable::notify_subscribers`) runs the
+                        // SAME chain as a record-field monitor. Pre-fix a
+                        // `SimplePv` monitor on a `.{...}` channel always
+                        // used the empty default chain — the filter suffix
+                        // was ignored entirely. Symmetric with the
+                        // record-field `attach_filter_to_last_subscriber`
+                        // path below; both source the chain from the single
+                        // `ChannelEntry::filter_chain` owner.
+                        pv.attach_filters_to_subscriber(sub_id, entry.filter_chain())
+                            .await;
+
                         let denied = Arc::new(AtomicBool::new(access_denied));
                         // R2-5: initial event is the snapshot when read
                         // access is granted, `no_read_access_event` when
@@ -3238,7 +3309,21 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             )
                             .await?;
                         } else {
-                            let snap = pv.snapshot().await;
+                            let mut snap = pv.snapshot().await;
+                            // CA-FR-8: the initial monitor event is the
+                            // current value — filter it like a read so an
+                            // `arr` channel's first event is sliced too
+                            // (epics-base `db_post_single_event` runs the
+                            // pre-chain). A fresh throwaway chain keeps it
+                            // from polluting the subscriber's attached chain
+                            // state (`dbnd` baseline / `dec` counter).
+                            let init_chain = entry.filter_chain();
+                            if !init_chain.is_empty() {
+                                if let Some(v) = init_chain.apply_to_read_value(snap.value.clone())
+                                {
+                                    snap.value = v;
+                                }
+                            }
                             // EX-R9: the initial event honours the
                             // EVENT_ADD request count for BOTH
                             // directions — `send_monitor_snapshot`
@@ -3323,19 +3408,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             return Ok(());
                         };
 
-                        // epics-base 3.15.7 channel filter — if the
-                        // channel was created with a `.{...}` JSON
-                        // suffix, build the FilterChain now and attach
-                        // it to the just-registered subscriber. The
-                        // parser is permissive: malformed JSON or
-                        // unknown filters degrade gracefully to an
-                        // empty chain with a tracing::warn!.
-                        if let Some(json) = entry.filter_suffix.as_deref() {
-                            let chain =
-                                epics_base_rs::server::database::filters::parse_filter_chain(json);
-                            for filt in chain.iter() {
-                                instance.attach_filter_to_last_subscriber(field, filt.clone());
-                            }
+                        // epics-base 3.15.7 channel filter — attach the
+                        // chain (parsed via the single
+                        // `ChannelEntry::filter_chain` owner, the same one
+                        // the READ path and the SimplePv monitor now use)
+                        // to the just-registered subscriber. The parser is
+                        // permissive: malformed JSON or unknown filters
+                        // degrade gracefully to an empty chain with a
+                        // tracing::warn!, so an empty chain is a no-op loop.
+                        for filt in entry.filter_chain().iter() {
+                            instance.attach_filter_to_last_subscriber(field, filt.clone());
                         }
 
                         // R2-5: snapshot when read access granted,
@@ -3355,6 +3437,20 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
                                     snap.class_name =
                                         Some(instance.record.record_type().to_string());
+                                }
+                                // CA-FR-8: filter the initial event value
+                                // (see the SimplePv branch) so an `arr`
+                                // channel's first record-field event is
+                                // sliced consistently with later updates.
+                                // Fresh throwaway chain — never touches the
+                                // subscriber's attached chain state.
+                                let init_chain = entry.filter_chain();
+                                if !init_chain.is_empty() {
+                                    if let Some(v) =
+                                        init_chain.apply_to_read_value(snap.value.clone())
+                                    {
+                                        snap.value = v;
+                                    }
                                 }
                                 snap
                             })

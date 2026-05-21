@@ -467,6 +467,37 @@ impl ProcessVariable {
         Some(rx)
     }
 
+    /// CA-FR-8: attach a channel-filter chain to an already-added
+    /// subscriber (looked up by `sid`). The CA server first
+    /// `add_subscriber`s, then attaches the chain parsed from the
+    /// channel's `.{...}` suffix — symmetric with the record-field
+    /// `RecordInstance::attach_filter_to_last_subscriber` path, so a
+    /// `SimplePv` monitor runs the SAME filter chain as a record-field
+    /// monitor instead of the empty default `FilterChain` that
+    /// `add_subscriber` installs. Update delivery
+    /// ([`Self::notify_subscribers`] / [`Self::post_alarm`]) already
+    /// applies `sub.filters`; this is the missing wiring that populates
+    /// it.
+    ///
+    /// The caller passes a FRESH chain per subscriber so stateful
+    /// filters (`dbnd` last-value, `dec` counter, `sync` state) stay
+    /// isolated across subscribers. An empty chain is a no-op (keeps the
+    /// default). No-op when no subscriber matches `sid` (e.g. it was
+    /// reaped between add and attach).
+    pub async fn attach_filters_to_subscriber(
+        &self,
+        sid: u32,
+        filters: crate::server::database::filters::FilterChain,
+    ) {
+        if filters.is_empty() {
+            return;
+        }
+        let mut subs = self.subscribers.lock().await;
+        if let Some(sub) = subs.iter_mut().find(|s| s.sid == sid) {
+            sub.filters = filters;
+        }
+    }
+
     /// Remove a subscriber by subscription ID.
     pub async fn remove_subscriber(&self, sid: u32) {
         let mut subs = self.subscribers.lock().await;

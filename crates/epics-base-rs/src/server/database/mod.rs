@@ -816,9 +816,20 @@ impl PvDatabase {
 
     /// Internal: synchronous lookup without invoking the search resolver.
     async fn find_entry_no_resolve(&self, name: &str) -> Option<PvEntry> {
-        let (base, _field) = parse_pv_name(name);
+        // CA-FR-8: a channel name may carry a `.{"arr":...}` filter
+        // suffix. Strip it before lookup — the suffix is a per-channel
+        // filter spec, not part of the PV identity. `split_channel_name`
+        // is the single owner of "channel name → record_path" and is
+        // idempotent on an already-stripped name. Without this a
+        // filtered SimplePv (`SP.{"arr":...}`) never matches
+        // `simple_pvs` (keyed by the bare PV name) and even a filtered
+        // record fails when the JSON contains a `.` (e.g.
+        // `{"dbnd":{"d":0.5}}`), because the bare `parse_pv_name` last-dot
+        // split would tear the suffix apart instead of removing it.
+        let record_path = filters::split_channel_name(name).record_path;
+        let (base, _field) = parse_pv_name(&record_path);
 
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(name) {
+        if let Some(pv) = self.inner.simple_pvs.read().await.get(record_path.as_str()) {
             return Some(PvEntry::Simple(pv.clone()));
         }
         if let Some(rec) = self.inner.records.read().await.get(base) {
@@ -889,8 +900,21 @@ impl PvDatabase {
 
     /// Internal: synchronous existence check without resolver.
     async fn has_name_no_resolve(&self, name: &str) -> bool {
-        let (base, _) = parse_pv_name(name);
-        if self.inner.simple_pvs.read().await.contains_key(name) {
+        // CA-FR-8: strip the channel-filter suffix before lookup so a
+        // filtered channel (`SP.{"arr":...}` / `REC.{"dbnd":{"d":0.5}}`)
+        // resolves to its underlying PV at UDP-search time. This is the
+        // search-side twin of `find_entry_no_resolve`; without it a
+        // filtered SimplePv never answers a SEARCH and the client never
+        // reaches CREATE_CHAN. See that function for the full rationale.
+        let record_path = filters::split_channel_name(name).record_path;
+        let (base, _) = parse_pv_name(&record_path);
+        if self
+            .inner
+            .simple_pvs
+            .read()
+            .await
+            .contains_key(record_path.as_str())
+        {
             return true;
         }
         if self.inner.records.read().await.contains_key(base) {

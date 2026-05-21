@@ -82,6 +82,37 @@ impl SubscriptionFilter for ArrayFilter {
         };
         Some(event)
     }
+
+    /// C `dbChannelFinalElements` parity: an `arr` slice of an
+    /// `input`-element array yields `slice_len` elements. The CA
+    /// CREATE_CHAN reply advertises this so the client requests (and
+    /// allocates for) the sliced count instead of the unfiltered
+    /// native count — without it a filtered read over-requests and the
+    /// server zero-pads the slice back up to the native count.
+    fn final_element_count(&self, input: usize) -> usize {
+        slice_len(input as i64, self.config)
+    }
+}
+
+/// Number of elements an `len`-element input produces under `cfg`,
+/// without materialising the slice. Shares the asymmetric start/end
+/// clamps with [`slice_with`] (C `arr.c::wrapArrayIndices`): `start`
+/// clamps to `[0, len]`, `end` to `[0, len-1]`, so `start > end`
+/// yields 0.
+fn slice_len(len: i64, cfg: ArrayFilterConfig) -> usize {
+    if len <= 0 {
+        return 0;
+    }
+    let resolve = |idx: i64, hi: i64| -> i64 {
+        let r = if idx < 0 { len + idx } else { idx };
+        r.clamp(0, hi)
+    };
+    let start = resolve(cfg.start, len);
+    let end = resolve(cfg.end, len - 1);
+    if start > end {
+        return 0;
+    }
+    ((end - start) / cfg.incr + 1) as usize
 }
 
 /// Apply `start..=end` (negative indices wrap from `len`) with stride
@@ -281,6 +312,78 @@ mod tests {
         match out.event.snapshot.value {
             EpicsValue::UInt64Array(v) => assert_eq!(v, vec![big, big - 1]),
             other => panic!("expected sliced UInt64Array, got {other:?}"),
+        }
+    }
+
+    /// `final_element_count` (C `dbChannelFinalElements`) must agree
+    /// with the length of the materialised slice for the same config,
+    /// across the boundary cases the CREATE_CHAN advertised count
+    /// depends on.
+    #[test]
+    fn final_element_count_matches_slice_length() {
+        let cases = [
+            (
+                ArrayFilterConfig {
+                    start: 5,
+                    incr: 1,
+                    end: 7,
+                },
+                10usize,
+                3usize,
+            ),
+            (
+                ArrayFilterConfig {
+                    start: 0,
+                    incr: 1,
+                    end: -1,
+                },
+                10,
+                10,
+            ), // identity
+            (
+                ArrayFilterConfig {
+                    start: 0,
+                    incr: 2,
+                    end: -1,
+                },
+                5,
+                3,
+            ), // stride
+            (
+                ArrayFilterConfig {
+                    start: 10,
+                    incr: 1,
+                    end: -1,
+                },
+                3,
+                0,
+            ), // start>len → empty
+            (
+                ArrayFilterConfig {
+                    start: 3,
+                    incr: 1,
+                    end: 1,
+                },
+                5,
+                0,
+            ), // inverted → empty
+            (ArrayFilterConfig::default(), 0, 0), // empty input
+        ];
+        for (cfg, input, expected) in cases {
+            let f = ArrayFilter::new(cfg);
+            assert_eq!(
+                f.final_element_count(input),
+                expected,
+                "final_element_count({input}) for {cfg:?}"
+            );
+            // Cross-check against the real slice over a ramp of `input`.
+            let ramp: Vec<f64> = (0..input).map(|i| i as f64).collect();
+            let out = f.apply(ev_array(ramp)).unwrap();
+            assert_eq!(
+                unpack(out).len(),
+                expected,
+                "materialised slice length for {cfg:?} over {input} elements"
+            );
         }
     }
 

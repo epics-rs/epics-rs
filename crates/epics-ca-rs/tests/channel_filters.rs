@@ -1,0 +1,370 @@
+//! CA-FR-8 regression tests: channel filters must run on every value
+//! delivery path, not only the record-field `EVENT_ADD` callback.
+//!
+//! epics-base attaches the parsed filter chain to the database channel
+//! (`dbChannelRunPreChain`), so a `REC.{"arr":...}` suffix transforms
+//! the value on `READ` / `READ_NOTIFY`, on `SimplePv` monitors, and on
+//! record-field monitors alike. Pre-fix epics-ca-rs only consumed the
+//! suffix on the record-field `EVENT_ADD` path; `READ_NOTIFY` and
+//! `SimplePv` monitors returned the unfiltered value.
+//!
+//! These tests drive a real `CaClient` ↔ `CaServer` TCP round-trip and
+//! assert the filtered slice arrives on each path. The `arr` filter is
+//! used as the discriminator: with `{"arr":{"s":5,"e":7}}` over a
+//! `[0,1,…,9]` array the first delivered element is the slice start
+//! (`5.0`), whereas the unfiltered value's first element is `0.0`. The
+//! first element is checked rather than the exact length so the
+//! assertion is robust to any requested-count padding on the wire.
+
+use std::time::Duration;
+
+use epics_base_rs::server::records::waveform::WaveformRecord;
+use epics_base_rs::types::DbFieldType;
+use epics_ca_rs::EpicsValue;
+use epics_ca_rs::client::{CaClient, MonitorHandle};
+use epics_ca_rs::server::CaServer;
+use serial_test::serial;
+
+/// Reserve and immediately release a free localhost TCP port so the
+/// `CaServer` can bind it. Mirrors the pattern used across
+/// `protocol_tests.rs`.
+fn free_port() -> u16 {
+    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+    let p = probe.local_addr().unwrap().port();
+    drop(probe);
+    p
+}
+
+/// Point a soon-to-be-constructed `CaClient` at exactly this server so
+/// it skips UDP search.
+///
+/// SAFETY: every test in this file is `#[serial]`, so no other test
+/// mutates the environment concurrently, and the env is set before
+/// `CaClient::new()` snapshots its resolver configuration.
+fn point_client_at(port: u16) {
+    unsafe {
+        std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
+        std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        std::env::set_var("EPICS_CA_SERVER_PORT", port.to_string());
+    }
+}
+
+/// `[start, start+1, …, start+len-1]` as `f64`s — a ramp whose every
+/// element equals its own index offset, so a slice's first element
+/// uniquely identifies the slice start.
+fn ramp(start: f64, len: usize) -> Vec<f64> {
+    (0..len).map(|i| start + i as f64).collect()
+}
+
+/// Extract the first element of a `DoubleArray`, panicking with the
+/// actual variant on any other shape.
+fn first_double(v: &EpicsValue) -> f64 {
+    match v {
+        EpicsValue::DoubleArray(a) => *a.first().expect("non-empty DoubleArray"),
+        other => panic!("expected DoubleArray, got {other:?}"),
+    }
+}
+
+fn len_double(v: &EpicsValue) -> usize {
+    match v {
+        EpicsValue::DoubleArray(a) => a.len(),
+        other => panic!("expected DoubleArray, got {other:?}"),
+    }
+}
+
+/// Borrow the `DoubleArray` slice, panicking on any other variant.
+fn doubles(v: &EpicsValue) -> &[f64] {
+    match v {
+        EpicsValue::DoubleArray(a) => a.as_slice(),
+        other => panic!("expected DoubleArray, got {other:?}"),
+    }
+}
+
+/// Receive the next monitor value within 3s, unwrapping the
+/// `Option<CaResult<Snapshot>>` to the `EpicsValue`.
+async fn recv_value(mon: &mut MonitorHandle) -> EpicsValue {
+    tokio::time::timeout(Duration::from_secs(3), mon.recv())
+        .await
+        .expect("monitor recv timed out")
+        .expect("monitor stream closed before a value arrived")
+        .expect("monitor yielded an error")
+        .value
+}
+
+/// CA-FR-8 (1/4): a filtered record-field `READ_NOTIFY` applies the
+/// `arr` transform before DBR encoding. Pre-fix the `READ` /
+/// `READ_NOTIFY` path called `get_full_snapshot()` and encoded it
+/// directly, never consulting `entry.filter_suffix`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn ca_fr_8_record_field_read_notify_applies_arr() {
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .record("CAFR8:WF:R1", WaveformRecord::new(10, DbFieldType::Double))
+        .build()
+        .await
+        .expect("build CA server");
+    let _h = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    point_client_at(port);
+    let client = CaClient::new().await.expect("client");
+
+    // Seed VAL = [0,1,…,9] so element[0]=0.0 and element[5]=5.0 are
+    // distinct — the arr-slice discriminator.
+    // The server is spawned by value above; drive seeding through a
+    // CA WRITE so we don't need a second handle to the server.
+    let ch = client.create_channel("CAFR8:WF:R1");
+    ch.wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect for seed write");
+    ch.put(&EpicsValue::DoubleArray(ramp(0.0, 10)))
+        .await
+        .expect("seed VAL with [0..9]");
+
+    // Baseline: unfiltered read returns the full ramp, first element 0.0.
+    let (_t, base) = tokio::time::timeout(Duration::from_secs(5), client.caget("CAFR8:WF:R1"))
+        .await
+        .expect("baseline caget did not complete")
+        .expect("baseline caget should succeed");
+    assert_eq!(
+        first_double(&base),
+        0.0,
+        "unfiltered read must start at element 0 of the seeded ramp"
+    );
+    assert_eq!(
+        len_double(&base),
+        10,
+        "unfiltered read must return the full 10-element waveform"
+    );
+
+    // Filtered read: arr {s:5,e:7} slices [5,6,7]; first element 5.0.
+    let (_t, filtered) = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.caget(r#"CAFR8:WF:R1.{"arr":{"s":5,"e":7}}"#),
+    )
+    .await
+    .expect("filtered caget did not complete")
+    .expect("filtered caget should succeed");
+    // The arr slice is exactly `[5,6,7]`. The CREATE_CHAN reply now
+    // advertises the filter-final element count (3, via
+    // `dbChannelFinalElements`), so the client requests 3 and the server
+    // returns the slice with no trailing zero-pad.
+    assert_eq!(
+        doubles(&filtered),
+        &[5.0, 6.0, 7.0],
+        "READ_NOTIFY must return exactly the arr slice [5,6,7], no zero-pad"
+    );
+}
+
+/// CA-FR-8 (2/4): a filtered record-field monitor still applies the
+/// same chain on updates, not only on the first `EVENT_ADD` frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn ca_fr_8_record_field_monitor_applies_arr_on_updates() {
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .record("CAFR8:WF:R2", WaveformRecord::new(10, DbFieldType::Double))
+        .build()
+        .await
+        .expect("build CA server");
+    let _h = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    point_client_at(port);
+    let client = CaClient::new().await.expect("client");
+
+    // Seed [0..9] before subscribing so the initial frame is known.
+    let seed = client.create_channel("CAFR8:WF:R2");
+    seed.wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect for seed");
+    seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10)))
+        .await
+        .expect("seed VAL");
+
+    let channel = client.create_channel(r#"CAFR8:WF:R2.{"arr":{"s":5,"e":7}}"#);
+    let mut monitor = channel.subscribe().await.expect("subscribe");
+
+    // Initial EVENT_ADD frame: exactly the arr slice of the seed.
+    let initial = recv_value(&mut monitor).await;
+    assert_eq!(
+        doubles(&initial),
+        &[5.0, 6.0, 7.0],
+        "initial monitor frame must be the arr slice [5,6,7]"
+    );
+
+    // Update VAL to [100..109]; the monitor must re-apply the chain on
+    // the update → exactly [105,106,107] (unfiltered would start at 100).
+    seed.put(&EpicsValue::DoubleArray(ramp(100.0, 10)))
+        .await
+        .expect("update VAL with [100..109]");
+    let update = recv_value(&mut monitor).await;
+    assert_eq!(
+        doubles(&update),
+        &[105.0, 106.0, 107.0],
+        "record-field monitor must apply the arr chain on UPDATES, not only the first frame"
+    );
+}
+
+/// CA-FR-8 (3/4): a filtered `SimplePv` monitor applies `arr` instead
+/// of the empty chain it received pre-fix. The `SimplePv` subscription
+/// path created the subscriber via `ProcessVariable::add_subscriber()`
+/// without passing the channel's filter suffix, so `pv.rs` gave every
+/// `SimplePv` subscriber an empty `FilterChain`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn ca_fr_8_simplepv_monitor_applies_arr() {
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .pv("CAFR8:SP:R3", EpicsValue::DoubleArray(ramp(0.0, 10)))
+        .build()
+        .await
+        .expect("build CA server");
+    let _h = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    point_client_at(port);
+    let client = CaClient::new().await.expect("client");
+
+    let channel = client.create_channel(r#"CAFR8:SP:R3.{"arr":{"s":5,"e":7}}"#);
+    let mut monitor = channel.subscribe().await.expect("subscribe");
+
+    // Initial frame: the SimplePv subscriber must use the parsed chain,
+    // not an empty one → exactly [5,6,7] (empty chain would give the
+    // full [0..9]).
+    let initial = recv_value(&mut monitor).await;
+    assert_eq!(
+        doubles(&initial),
+        &[5.0, 6.0, 7.0],
+        "SimplePv monitor initial frame must be the arr slice, not the full unfiltered array"
+    );
+
+    // Update via a CA write on an unfiltered channel; the SimplePv
+    // event-delivery path must apply the same chain → first element
+    // 105.0.
+    let writer = client.create_channel("CAFR8:SP:R3");
+    writer
+        .wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect writer channel");
+    writer
+        .put(&EpicsValue::DoubleArray(ramp(100.0, 10)))
+        .await
+        .expect("update SimplePv value");
+    let update = recv_value(&mut monitor).await;
+    assert_eq!(
+        doubles(&update),
+        &[105.0, 106.0, 107.0],
+        "SimplePv monitor must apply the arr chain on event-delivery updates"
+    );
+}
+
+/// CA-FR-8 (4/4): a malformed filter suffix preserves the permissive
+/// "empty chain with warning" behaviour — the read returns the full
+/// unfiltered value rather than failing the subscription.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn ca_fr_8_malformed_suffix_preserves_unfiltered_read() {
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .record("CAFR8:WF:R4", WaveformRecord::new(10, DbFieldType::Double))
+        .build()
+        .await
+        .expect("build CA server");
+    let _h = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    point_client_at(port);
+    let client = CaClient::new().await.expect("client");
+
+    let seed = client.create_channel("CAFR8:WF:R4");
+    seed.wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect for seed");
+    seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10)))
+        .await
+        .expect("seed VAL");
+
+    // `{bad}` is not valid JSON → parse_filter_chain returns an empty
+    // chain (with a tracing warn) and the read proceeds unfiltered.
+    let (_t, val) =
+        tokio::time::timeout(Duration::from_secs(5), client.caget(r#"CAFR8:WF:R4.{bad}"#))
+            .await
+            .expect("caget with malformed suffix did not complete")
+            .expect("caget with malformed suffix should still succeed (permissive empty chain)");
+    assert_eq!(
+        first_double(&val),
+        0.0,
+        "malformed suffix must leave the value unfiltered (first element of the full ramp)"
+    );
+    assert_eq!(
+        len_double(&val),
+        10,
+        "malformed suffix must return the full 10-element waveform, not a slice"
+    );
+}
+
+/// CA-FR-8 (5/5): a filter suffix whose JSON contains a `.` (e.g.
+/// `dbnd` with `{"d":0.5}`) must still resolve the channel at UDP
+/// search and CREATE_CHAN. This is the boundary that motivated the
+/// structural fix in `Database::{has_name,find_entry}_no_resolve`:
+/// the pre-fix code ran `parse_pv_name` (a last-dot split) on the raw
+/// channel name, so the `.` inside `0.5` tore the suffix apart
+/// (`base = "REC.{\"dbnd\":{\"d\":0"`) and the lookup missed — the
+/// channel never connected. Stripping the channel-filter suffix first
+/// (`split_channel_name`) removes the JSON before any dot split.
+///
+/// `dbnd` is a stream-only filter; on a one-shot read it passes the
+/// value through unchanged (no prior value to deadband against), so
+/// the assertion is simply that the channel connects and the read
+/// returns the seeded value — proving search-time resolution, not a
+/// value transform.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn ca_fr_8_dotted_filter_suffix_resolves_at_search() {
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .record("CAFR8:DOT:R5", WaveformRecord::new(10, DbFieldType::Double))
+        .build()
+        .await
+        .expect("build CA server");
+    let _h = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    point_client_at(port);
+    let client = CaClient::new().await.expect("client");
+
+    let seed = client.create_channel("CAFR8:DOT:R5");
+    seed.wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect for seed");
+    seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10)))
+        .await
+        .expect("seed VAL");
+
+    // The `0.5` inside the suffix is the trap for a naive last-dot
+    // split. Post-fix the channel resolves and the read succeeds.
+    let (_t, val) = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.caget(r#"CAFR8:DOT:R5.{"dbnd":{"d":0.5}}"#),
+    )
+    .await
+    .expect("caget with a dot-containing filter suffix did not complete (search resolution failed)")
+    .expect("caget with a dot-containing filter suffix should resolve and succeed");
+    assert_eq!(
+        first_double(&val),
+        0.0,
+        "dbnd passes the read value through unchanged; first element is the seeded ramp start"
+    );
+    assert_eq!(
+        len_double(&val),
+        10,
+        "dbnd read context leaves the full waveform intact"
+    );
+}

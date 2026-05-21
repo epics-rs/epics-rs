@@ -97,6 +97,18 @@ pub trait SubscriptionFilter: Send + Sync + 'static {
     /// Apply the filter to one outgoing event. Return `Some(event)`
     /// to pass through (possibly modified) or `None` to drop.
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent>;
+
+    /// Maximum number of array elements this filter emits for an
+    /// `input`-element array (C `dbChannelFinalElements`). The default
+    /// is the identity — only count-reshaping filters (`arr`) override
+    /// it. Used to advertise the filter-adjusted element count on the
+    /// CA CREATE_CHAN reply so clients request the sliced count rather
+    /// than the unfiltered native count. Value-gating filters (`dbnd`,
+    /// `dec`, `sync`) drop whole events but never change an event's
+    /// element count, so they keep the identity.
+    fn final_element_count(&self, input: usize) -> usize {
+        input
+    }
 }
 
 /// Ordered chain of filters owned by one subscriber. The default is
@@ -139,6 +151,16 @@ impl FilterChain {
     /// Number of filters in the chain (mostly for tests / debug).
     pub fn len(&self) -> usize {
         self.filters.len()
+    }
+
+    /// Final element count this chain produces for a `native`-element
+    /// input (C `dbChannelFinalElements`): fold each filter's
+    /// per-element-count transform head-to-tail. An empty chain is the
+    /// identity, so an unfiltered channel keeps its native count.
+    pub fn final_element_count(&self, native: usize) -> usize {
+        self.filters
+            .iter()
+            .fold(native, |n, f| f.final_element_count(n))
     }
 
     /// Iterate over the filters in registration order.
@@ -288,6 +310,24 @@ mod tests {
             0,
             "b is short-circuited by the upstream drop"
         );
+    }
+
+    /// `final_element_count` folds each filter's count transform
+    /// head-to-tail (C `dbChannelFinalElements`).
+    #[test]
+    fn final_element_count_folds_through_chain() {
+        use super::parse_filter_chain;
+        // Empty chain is the identity — an unfiltered channel keeps its
+        // native count.
+        assert_eq!(FilterChain::new().final_element_count(10), 10);
+        // `arr` reshapes the count; a trailing value-gating filter
+        // (`dbnd`) leaves it unchanged.
+        let chain = parse_filter_chain(r#"{"arr":{"s":5,"e":7},"dbnd":{"d":0.5}}"#);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain.final_element_count(10), 3);
+        // A value-gating-only chain keeps the native count.
+        let dbnd_only = parse_filter_chain(r#"{"dbnd":{"d":0.5}}"#);
+        assert_eq!(dbnd_only.final_element_count(10), 10);
     }
 
     #[test]

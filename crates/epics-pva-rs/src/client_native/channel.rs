@@ -680,10 +680,14 @@ impl Channel {
                 //
                 // - Initial: the engine broadcasts immediately on
                 //   receipt, so a healthy server replies in
-                //   microseconds. We wrap in a short
-                //   `MULTI_SERVER_WINDOW` (200 ms) so failure is
-                //   surfaced quickly when no server answers (e.g.
-                //   the user typed a wrong PV name).
+                //   microseconds, AND places the SEARCH at
+                //   `current_bucket+1` so a slow server is retried on
+                //   the pvxs-style `nSearch+1` escalation. No outer
+                //   timeout (PVA-FR-12): a fresh resolve stays pending
+                //   until a server answers; the operation-level timeout
+                //   surfaces "no server" for one-shot ops (a wrong PV
+                //   name fails when the caller's op timeout elapses,
+                //   not at a hard-coded 200 ms ceiling).
                 //
                 // - Reconnect: NO outer timeout. The engine places
                 //   the SEARCH in the current bucket and the next
@@ -715,18 +719,26 @@ impl Channel {
                 // to single-server `find()`.
                 match &self.resolver {
                     Resolver::Search(engine) => {
-                        let result = match reason {
-                            super::search_engine::SearchReason::Initial => tokio::time::timeout(
-                                super::search_engine::MULTI_SERVER_WINDOW,
-                                engine.find(&self.pv_name, reason),
-                            )
-                            .await
-                            .ok()
-                            .and_then(|r| r.ok()),
-                            super::search_engine::SearchReason::Reconnect => {
-                                engine.find(&self.pv_name, reason).await.ok()
-                            }
-                        };
+                        // PVA-FR-12: no inner timeout for either reason.
+                        // Both `find()` calls stay pending until a
+                        // SEARCH_RESPONSE arrives; the engine drives
+                        // recovery via the bucket scheduler (Initial
+                        // fires immediately + retries from
+                        // `current_bucket+1`, Reconnect rides the next
+                        // tick). The user-visible deadline is owned by
+                        // the operation-level timeout
+                        // (`ops_v2::ensure_active_with_op_timeout`) for
+                        // one-shot ops, and by `SubscriptionHandle` drop
+                        // for monitor loops — matching pvxs, where a
+                        // newly opened channel lives in the search ring
+                        // until the server answers or the caller drops
+                        // the operation. The previous 200 ms
+                        // `MULTI_SERVER_WINDOW` ceiling on `Initial`
+                        // collapsed a slow-but-live search into "no
+                        // servers found" and let the bucket loop reap the
+                        // still-wanted pending entry as a zombie the
+                        // moment the outer timeout closed the responder.
+                        let result = engine.find(&self.pv_name, reason).await.ok();
                         match result {
                             Some(addr) => vec![addr],
                             None => Vec::new(),
@@ -978,6 +990,77 @@ mod tests {
         ch.server_destroyed
             .store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(!ch.is_active(), "still Idle, still not active");
+    }
+
+    /// PVA-FR-12 regression: a fresh channel's initial search must NOT
+    /// fail with "no servers found" at the 200 ms `MULTI_SERVER_WINDOW`.
+    /// The inner cap is gone; `ensure_active` stays pending until a
+    /// SEARCH_RESPONSE arrives or the caller's operation-level timeout
+    /// fires. We assert the failure lands at the *operation* timeout,
+    /// not the old 200 ms ceiling.
+    ///
+    /// Companion to `search_engine::reconnect_find_does_not_complete_without_response`,
+    /// which guards the same invariant for the `Reconnect` reason at the
+    /// engine layer; this guards the `Initial` reason at the
+    /// `ensure_active` layer where the cap actually lived.
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_search_failure_is_owned_by_op_timeout_not_200ms() {
+        use std::time::Duration;
+
+        // Suppress real broadcast so no stray SEARCH on the LAN can be
+        // answered and resolve the channel out from under the test.
+        // SAFETY: env vars are process-global; `current_thread` keeps
+        // other tokio tests from observing partial state, and these
+        // vars aren't read by any production path in this process.
+        unsafe {
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        }
+        let engine =
+            crate::client_native::search_engine::SearchEngine::spawn(Vec::new(), Vec::new())
+                .await
+                .expect("spawn engine");
+
+        let op_timeout = Duration::from_millis(600);
+        let ch = Channel::new(
+            "PVAFR12:MISSING:PV".into(),
+            "u".into(),
+            "h".into(),
+            op_timeout,
+            Duration::from_secs(40),
+            ConnectionPool::new(),
+            engine,
+        );
+
+        // Drive ensure_active under the operation-level timeout, exactly
+        // as `ops_v2::ensure_active_with_op_timeout` does for one-shot ops.
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(op_timeout, ch.ensure_active()).await;
+        let elapsed = started.elapsed();
+
+        // `ServerConn` is not `Debug`, so summarize the outcome by hand.
+        let outcome = match &res {
+            Ok(Ok((conn, sid))) => format!("resolved to {} (sid {sid})", conn.addr),
+            Ok(Err(_)) => "inner error (e.g. \"no servers found\")".to_string(),
+            Err(_) => "timed out — still pending".to_string(),
+        };
+
+        // Pre-fix: ensure_active returned Ok(Err("no servers found")) at
+        // ~200 ms, so the outer timeout never fired and `elapsed` was far
+        // below `op_timeout`. Post-fix: find() stays pending, so the
+        // outer timeout owns the failure at ~op_timeout.
+        assert!(
+            res.is_err(),
+            "ensure_active resolved before the op timeout — the 200 ms \
+             MULTI_SERVER_WINDOW initial-search ceiling was reintroduced \
+             (PVA-FR-12); outcome: {outcome}"
+        );
+        assert!(
+            elapsed >= op_timeout,
+            "initial search bailed early (elapsed {elapsed:?} < op_timeout \
+             {op_timeout:?}) — failure must be owned by the operation \
+             timeout, not the 200 ms window"
+        );
     }
 
     /// BUG 3 regression: `ConnectionPool::get_or_connect` must

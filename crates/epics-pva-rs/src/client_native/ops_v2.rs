@@ -157,15 +157,26 @@ pub async fn op_get_raw(
 
 /// Bound the search-and-connect phase by the operation's overall
 /// timeout. Now that `Channel::ensure_active` has no caller-side
-/// timeout for `Reconnect` (pvxs `Channel::disconnect` parity —
-/// the search engine drives recovery indefinitely until a
-/// SEARCH_RESPONSE arrives), one-shot ops like `pvget` / `pvput` /
-/// `pvrpc` need an outer cap so a permanently-vanished server
-/// doesn't make the user-facing future hang forever. `pvmonitor`
-/// loops keep using the bare `ensure_active` because their
-/// natural cancel path is `SubscriptionHandle` drop, not a
-/// timeout.
-async fn ensure_active_with_op_timeout(
+/// timeout for *any* reason (PVA-FR-12: `Initial` and `Reconnect`
+/// both stay pending until a SEARCH_RESPONSE arrives — pvxs
+/// `Channel::disconnect` parity, the search engine drives recovery
+/// indefinitely), one-shot ops like `pvget` / `pvput` / `pvrpc` /
+/// `pvconnect` need an outer cap so a permanently-vanished or
+/// never-existed server doesn't make the user-facing future hang
+/// forever.
+///
+/// This is the single owner of that cap: it is the ONLY one-shot
+/// resolve path. Every one-shot op routes its search-and-connect —
+/// including the byte-order pre-read that `context.rs` does to
+/// encode a custom `pvRequest` before the op proper — through here,
+/// so the invariant "a one-shot op's resolve is bounded by
+/// `op_timeout`" holds at every call site. (Before PVA-FR-12 the
+/// 200 ms `MULTI_SERVER_WINDOW` cap inside `ensure_active` masked
+/// those pre-reads; removing it exposed every bare-`ensure_active`
+/// one-shot site as an unbounded hang.) `pvmonitor*` loops keep
+/// using the bare `ensure_active` because their natural cancel path
+/// is `SubscriptionHandle` drop, not a timeout.
+pub(crate) async fn ensure_active_with_op_timeout(
     channel: &Arc<Channel>,
     op_timeout: Duration,
 ) -> PvaResult<(Arc<super::server_conn::ServerConn>, u32)> {

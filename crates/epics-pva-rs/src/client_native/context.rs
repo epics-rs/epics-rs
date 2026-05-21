@@ -486,7 +486,14 @@ impl PvaClient {
     /// pool. Returns the resolved server address.
     pub async fn pvconnect(&self, pv_name: &str) -> PvaResult<SocketAddr> {
         let ch = self.channel(pv_name).await?;
-        let (server, _sid) = ch.ensure_active().await?;
+        // PVA-FR-12: pvconnect is a one-shot user op (pvxs
+        // `Context::connect(name)` waits up to the caller's timeout),
+        // so bound the resolve through the single op-timeout owner —
+        // never bare `ensure_active`, which would hang forever against
+        // a never-existed PV now that the 200 ms inner cap is gone.
+        let (server, _sid) =
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?;
         Ok(server.addr)
     }
 
@@ -495,7 +502,12 @@ impl PvaClient {
     /// `ConnectBuilder::server(addr).exec()`.
     pub async fn pvconnect_from(&self, pv_name: &str, server: SocketAddr) -> PvaResult<SocketAddr> {
         let ch = self.channel_with_forced(pv_name, Some(server)).await?;
-        let (sc, _sid) = ch.ensure_active().await?;
+        // PVA-FR-12: one-shot user op — bound through the op-timeout
+        // owner (see `pvconnect`); a pinned-but-dead server must fail at
+        // `op_timeout`, not hang.
+        let (sc, _sid) =
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?;
         Ok(sc.addr)
     }
 
@@ -642,7 +654,10 @@ impl PvaClient {
     ) -> PvaResult<PvField> {
         let ch = self.channel(pv_name).await?;
         let big_endian = matches!(
-            ch.ensure_active().await?.0.byte_order,
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order,
             crate::proto::ByteOrder::Big
         );
         let bytes = request.encode(big_endian);
@@ -844,7 +859,10 @@ impl PvaClient {
     ) -> PvaResult<()> {
         let ch = self.channel(pv_name).await?;
         let big_endian = matches!(
-            ch.ensure_active().await?.0.byte_order,
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order,
             crate::proto::ByteOrder::Big
         );
         let bytes = request.encode(big_endian);
@@ -866,7 +884,10 @@ impl PvaClient {
     ) -> PvaResult<()> {
         let ch = self.channel(pv_name).await?;
         let big_endian = matches!(
-            ch.ensure_active().await?.0.byte_order,
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order,
             crate::proto::ByteOrder::Big
         );
         let bytes = request.encode(big_endian);
@@ -896,7 +917,13 @@ impl PvaClient {
         let req_bytes = match request {
             Some(req) => {
                 let big_endian = matches!(
-                    ch.ensure_active().await?.0.byte_order,
+                    crate::client_native::ops_v2::ensure_active_with_op_timeout(
+                        &ch,
+                        self.inner.timeout
+                    )
+                    .await?
+                    .0
+                    .byte_order,
                     crate::proto::ByteOrder::Big
                 );
                 Some(req.encode(big_endian))
@@ -925,7 +952,10 @@ impl PvaClient {
     ) -> PvaResult<()> {
         let ch = self.channel(pv_name).await?;
         let big_endian = matches!(
-            ch.ensure_active().await?.0.byte_order,
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order,
             crate::proto::ByteOrder::Big
         );
         let bytes = request.encode(big_endian);
@@ -954,7 +984,10 @@ impl PvaClient {
     ) -> PvaResult<()> {
         let ch = self.channel(pv_name).await?;
         let big_endian = matches!(
-            ch.ensure_active().await?.0.byte_order,
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order,
             crate::proto::ByteOrder::Big
         );
         let bytes = request.encode(big_endian);
@@ -1037,6 +1070,13 @@ impl PvaClient {
         F: FnMut(&PvField) + Send,
     {
         let ch = self.channel(pv_name).await?;
+        // PVA-FR-12 (distinct from the one-shot pre-reads): a monitor's
+        // resolve is NOT bounded by `op_timeout`. `pvmonitor*` stays
+        // pending until the server answers (or the caller drops the
+        // future); its natural cancel path is `SubscriptionHandle` drop,
+        // matching the reconnect loop inside `op_monitor_raw`. Bounding
+        // it would fail a live-but-slow monitor at `op_timeout` instead
+        // of retrying — wrong for a long-lived subscription.
         let big_endian = matches!(
             ch.ensure_active().await?.0.byte_order,
             crate::proto::ByteOrder::Big
@@ -1784,6 +1824,83 @@ mod tests {
         assert!(
             client.inner.search.get().is_none(),
             "shared-engine path must not spawn a per-client engine"
+        );
+    }
+
+    /// PVA-FR-12 regression at the *context* layer: a one-shot client op
+    /// against a never-resolving server must fail at the operation-level
+    /// timeout, NOT hang. This is the bypass the 200 ms
+    /// `MULTI_SERVER_WINDOW` removal exposed — `pvconnect` (connect-and-
+    /// return) and `pvget*`/`pvput*` (byte-order pre-read before encoding
+    /// the pvRequest) each awaited a bare `ensure_active()`, which has no
+    /// timeout once the inner cap is gone. The fix routes every one-shot
+    /// resolve through `ops_v2::ensure_active_with_op_timeout`. Pre-fix
+    /// these hung indefinitely (the original symptom was four pvalink
+    /// `b4_*` tests timing out at 120 s in epics-bridge-rs).
+    ///
+    /// Companion to `channel::tests::initial_search_failure_is_owned_by_op_timeout_not_200ms`,
+    /// which guards the same invariant at the `ensure_active` layer; this
+    /// guards that the public `context.rs` one-shot APIs actually route
+    /// through the op-timeout owner rather than bare `ensure_active`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pva_fr_12_one_shot_ops_fail_at_op_timeout_not_hang() {
+        use std::time::Duration;
+        // Suppress broadcast so no LAN server resolves the channel out
+        // from under the test. SAFETY: env vars are process-global;
+        // `current_thread` keeps other tokio tests from observing partial
+        // state, and the per-client engine reads these at spawn time.
+        unsafe {
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        }
+        let op_timeout = Duration::from_millis(400);
+        // share_udp default false → per-client engine spawned with no
+        // broadcast targets (AUTO_ADDR_LIST=NO), so searches never resolve.
+        let client = PvaClient::builder().timeout(op_timeout).build();
+
+        // 20 s outer guard: if the one-shot op hangs (bypass reintroduced)
+        // the guard fires and `.expect` panics with the diagnostic; a
+        // bounded op resolves (with an error) at ~op_timeout, well inside.
+        let guard = Duration::from_secs(20);
+
+        // 1) connect-and-return path (was bare `ensure_active` in pvconnect).
+        let t0 = std::time::Instant::now();
+        let connect = tokio::time::timeout(guard, client.pvconnect("PVAFR12:CTX:MISSING:1"))
+            .await
+            .expect(
+                "pvconnect hung past 20 s — one-shot resolve is not bounded \
+                 by op_timeout (PVA-FR-12 bypass reintroduced in context.rs)",
+            );
+        let connect_elapsed = t0.elapsed();
+        assert!(connect.is_err(), "pvconnect to a missing PV must error");
+        assert!(
+            connect_elapsed >= op_timeout,
+            "pvconnect must wait the op timeout, got {connect_elapsed:?}"
+        );
+
+        // 2) byte-order pre-read path (pvget_with_request resolves the
+        //    channel's byte order before encoding the pvRequest).
+        let req = crate::pv_request::PvRequestBuilder::new()
+            .field("value")
+            .build();
+        let t1 = std::time::Instant::now();
+        let get = tokio::time::timeout(
+            guard,
+            client.pvget_with_request("PVAFR12:CTX:MISSING:2", &req),
+        )
+        .await
+        .expect(
+            "pvget_with_request hung past 20 s — the byte-order pre-read \
+             bypassed the op-timeout owner (PVA-FR-12)",
+        );
+        let get_elapsed = t1.elapsed();
+        assert!(
+            get.is_err(),
+            "pvget_with_request to a missing PV must error"
+        );
+        assert!(
+            get_elapsed >= op_timeout,
+            "pvget_with_request must wait the op timeout, got {get_elapsed:?}"
         );
     }
 }

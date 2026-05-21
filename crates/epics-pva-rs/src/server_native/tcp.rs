@@ -124,8 +124,10 @@ fn clamp_watermarks(levels: Option<(usize, usize)>, ack_at: Option<u32>) -> Opti
 /// Currently extracts:
 /// * The value leaf as an `EpicsValue` — scalar OR array. Arrays are
 ///   carried losslessly (EX-R12) so the `arr` transformation filter
-///   sees the real array to slice. Falls back to `Double(0.0)` only
-///   for shapes with no representable value leaf.
+///   sees the real array to slice. Returns `None` (fails closed) when
+///   the leaf has no faithful `EpicsValue` representation — the
+///   previous `Double(0.0)` fallback fabricated a stand-in value that
+///   corrupted the emitted frame (see below).
 /// * The mask is always set to `EventMask::VALUE` because PVA's
 ///   monitor stream does not carry the CA-style ALARM/PROPERTY
 ///   discriminator at this layer — the field bitset already encodes
@@ -133,24 +135,33 @@ fn clamp_watermarks(levels: Option<(usize, usize)>, ack_at: Option<u32>) -> Opti
 ///
 /// The transformed event is bridged back to the wire by
 /// [`apply_filter_transform`]; see EX-R12.
+///
+/// Returns `None` when the value leaf cannot be carried faithfully:
+/// PVA `Boolean`, signed `Byte`, `UShort`, and `UInt` (and their
+/// arrays) have no DBR-type counterpart in the `EpicsValue` model the
+/// filter engine operates on. The earlier `unwrap_or(Double(0.0))`
+/// turned that gap into silent corruption — a filtered
+/// `NTScalar<Boolean(true)>` was emitted as `false`, and a filtered
+/// `uint[]`/`ushort[]` monitor was coerced to an empty array. The
+/// single owner [`apply_monitor_filter_chain`] turns `None` into a
+/// monitor error rather than emit fabricated data.
 fn pv_field_to_filter_event(
     value: &PvField,
-) -> epics_base_rs::server::database::filters::FilteredMonitorEvent {
+) -> Option<epics_base_rs::server::database::filters::FilteredMonitorEvent> {
     use epics_base_rs::server::database::filters::FilteredMonitorEvent;
     use epics_base_rs::server::pv::MonitorEvent;
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::snapshot::Snapshot;
-    use epics_base_rs::types::EpicsValue;
     use std::time::SystemTime;
 
-    let val = pv_value_leaf_to_epics(value).unwrap_or(EpicsValue::Double(0.0));
-    FilteredMonitorEvent::new(
+    let val = pv_value_leaf_to_epics(value)?;
+    Some(FilteredMonitorEvent::new(
         MonitorEvent {
             snapshot: Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH),
             origin: 0,
         },
         EventMask::VALUE,
-    )
+    ))
 }
 
 /// Extract the value leaf of a PVA monitor `PvField` as an
@@ -310,8 +321,14 @@ enum MonitorFilterOutcome {
     Drop,
     /// A transformation filter (`arr` / `ts`) produced a new value.
     Transformed(PvField),
-    /// The transformed value cannot be represented in the negotiated
-    /// monitor descriptor — the subscription cannot honor the filter.
+    /// The filter cannot honor the negotiated monitor descriptor, for
+    /// one of two reasons: the inbound value leaf has no faithful
+    /// `EpicsValue` representation for the filter engine (forward
+    /// fail-closed — never fabricate a stand-in), or the filter
+    /// rewrote the leaf to a type that does not match the descriptor's
+    /// value-leaf type (backward fail-closed — never coerce a wrong
+    /// type onto the wire). Either way the subscription emits a monitor
+    /// error rather than a corrupted frame.
     DescriptorMismatch,
 }
 
@@ -327,12 +344,23 @@ fn apply_monitor_filter_chain(
     if filters.is_empty() {
         return MonitorFilterOutcome::Pass;
     }
-    let fev = pv_field_to_filter_event(value);
+    // Forward bridge: a value leaf the DBR filter engine cannot carry
+    // faithfully fails closed here — no `Double(0.0)` stand-in.
+    let Some(fev) = pv_field_to_filter_event(value) else {
+        return MonitorFilterOutcome::DescriptorMismatch;
+    };
     match filters.apply(fev) {
         None => MonitorFilterOutcome::Drop,
         Some(transformed) => {
+            // Backward bridge: a filter may rewrite the value leaf to a
+            // different type (e.g. `ts` replaces the value with a
+            // timestamp `Int64`/`Double`/`String`). The substituted
+            // leaf MUST match the negotiated descriptor's value-leaf
+            // type EXACTLY — scalar type, or array element type. A
+            // struct_id-only check let a type-changed NT `value` member
+            // reach the encoder's coercing fallback.
             match apply_filter_transform(value, &transformed.event.snapshot.value) {
-                Some(tv) if crate::pvdata::value_matches_descriptor(&tv, intro).is_ok() => {
+                Some(tv) if transformed_leaf_fits_descriptor(&tv, intro) => {
                     MonitorFilterOutcome::Transformed(tv)
                 }
                 _ => MonitorFilterOutcome::DescriptorMismatch,
@@ -401,6 +429,59 @@ fn substitute_value_leaf(original: &PvField, new_leaf: PvField) -> Option<PvFiel
             Some(PvField::Structure(out))
         }
         _ => None,
+    }
+}
+
+/// The value leaf of a monitor value, looking through an NT-style
+/// structure's `value` member. Mirrors [`substitute_value_leaf`]'s
+/// notion of "the leaf a transformation filter replaces".
+fn value_leaf_of(field: &PvField) -> Option<&PvField> {
+    match field {
+        PvField::Scalar(_) | PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_) => Some(field),
+        PvField::Structure(s) => s
+            .fields
+            .iter()
+            .find_map(|(k, v)| (k == "value").then_some(v)),
+        _ => None,
+    }
+}
+
+/// The value-leaf descriptor of a monitor descriptor, looking through
+/// an NT-style structure's `value` member — the descriptor-side mirror
+/// of [`value_leaf_of`].
+fn value_leaf_desc_of(desc: &FieldDesc) -> Option<&FieldDesc> {
+    match desc {
+        FieldDesc::Scalar(_) | FieldDesc::ScalarArray(_) => Some(desc),
+        FieldDesc::Structure { fields, .. } => {
+            fields.iter().find_map(|(k, d)| (k == "value").then_some(d))
+        }
+        _ => None,
+    }
+}
+
+/// True iff a filter-transformed value's leaf fits the negotiated
+/// monitor descriptor's value-leaf type EXACTLY (scalar type, or array
+/// element type). This is the gate that keeps a filter from emitting a
+/// frame whose value-leaf type differs from the descriptor the channel
+/// was opened with.
+///
+/// [`crate::pvdata::value_matches_descriptor`] compares only
+/// `struct_id` for an NT structure and only the array *shape* for an
+/// array, so a `ts` filter that rewrites an `NTScalar<Double>` value to
+/// an `Int64` timestamp passed that looser check and reached the
+/// encoder's coercing fallback. An empty array carries no element type
+/// and cannot corrupt data, so it always fits.
+fn transformed_leaf_fits_descriptor(value: &PvField, desc: &FieldDesc) -> bool {
+    let (Some(leaf), Some(leaf_desc)) = (value_leaf_of(value), value_leaf_desc_of(desc)) else {
+        return false;
+    };
+    match (leaf, leaf_desc) {
+        (PvField::Scalar(sv), FieldDesc::Scalar(st)) => sv.scalar_type() == *st,
+        (PvField::ScalarArray(items), FieldDesc::ScalarArray(st)) => {
+            items.iter().all(|it| it.scalar_type() == *st)
+        }
+        (PvField::ScalarArrayTyped(t), FieldDesc::ScalarArray(st)) => t.scalar_type() == *st,
+        _ => false,
     }
 }
 
@@ -5254,6 +5335,230 @@ mod tests {
             Some(EpicsValue::UInt64Array(vec![big, 2])),
             "ulong[] monitor value must convert to UInt64Array, not fall through to None",
         );
+    }
+
+    /// Finding (High): the `_filter` bridge must never fabricate or
+    /// coerce a value-leaf whose type differs from the negotiated
+    /// monitor descriptor. Two fail-closed boundaries — forward
+    /// (inbound leaf has no faithful `EpicsValue`) and backward (a
+    /// filter rewrote the leaf to a different type) — both yield
+    /// `DescriptorMismatch` (monitor error) instead of corrupted data.
+    /// Tested by invariant boundary, not by scenario.
+    mod filter_bridge_fail_closed {
+        use super::*;
+        use epics_base_rs::server::database::filters::{FilterChain, parse_filter_chain};
+
+        fn nt_scalar_value(sv: ScalarValue) -> PvField {
+            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+            s.fields.push(("value".into(), PvField::Scalar(sv)));
+            PvField::Structure(s)
+        }
+
+        fn nt_scalar_desc(st: ScalarType) -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), FieldDesc::Scalar(st))],
+            }
+        }
+
+        fn is_mismatch(o: MonitorFilterOutcome) -> bool {
+            matches!(o, MonitorFilterOutcome::DescriptorMismatch)
+        }
+
+        // --- Forward fail-closed: unsupported scalar leaf -> None. ---
+
+        /// PVA scalar types with no DBR `EpicsValue` counterpart must
+        /// fail closed at the forward bridge (None), not be substituted
+        /// with `Double(0.0)`.
+        #[test]
+        fn forward_unsupported_scalars_return_none() {
+            for sv in [
+                ScalarValue::Boolean(true),
+                ScalarValue::Byte(-3),
+                ScalarValue::UShort(7),
+                ScalarValue::UInt(9),
+            ] {
+                assert!(
+                    pv_field_to_filter_event(&PvField::Scalar(sv.clone())).is_none(),
+                    "unsupported scalar {sv:?} must fail closed (None), not fabricate a value",
+                );
+            }
+        }
+
+        /// Supported scalar types still convert (the fix must not
+        /// regress the faithful path).
+        #[test]
+        fn forward_supported_scalars_return_some() {
+            for sv in [
+                ScalarValue::Double(1.5),
+                ScalarValue::Float(2.0),
+                ScalarValue::Int(3),
+                ScalarValue::Long(4),
+                ScalarValue::ULong(5),
+                ScalarValue::Short(6),
+                ScalarValue::UByte(7),
+                ScalarValue::String("x".into()),
+            ] {
+                assert!(
+                    pv_field_to_filter_event(&PvField::Scalar(sv.clone())).is_some(),
+                    "supported scalar {sv:?} must convert faithfully",
+                );
+            }
+        }
+
+        /// Unsupported scalar arrays (uint[]/ushort[]/bool[]/byte[])
+        /// fail closed at the forward bridge.
+        #[test]
+        fn forward_unsupported_arrays_return_none() {
+            let cases = [
+                vec![ScalarValue::UInt(1), ScalarValue::UInt(2)],
+                vec![ScalarValue::UShort(1)],
+                vec![ScalarValue::Boolean(true)],
+                vec![ScalarValue::Byte(-1)],
+            ];
+            for items in cases {
+                assert!(
+                    pv_field_to_filter_event(&PvField::ScalarArray(items.clone())).is_none(),
+                    "unsupported array {items:?} must fail closed (None)",
+                );
+            }
+        }
+
+        // --- End-to-end owner: forward fail-closed -> DescriptorMismatch. ---
+
+        /// `NTScalar<Boolean>` under a non-empty chain: the inbound
+        /// Boolean leaf has no `EpicsValue`, so the owner emits a
+        /// monitor error instead of a fabricated `false`.
+        #[test]
+        fn owner_boolean_under_filter_is_descriptor_mismatch() {
+            let chain = parse_filter_chain(r#"{"ts":{}}"#);
+            let value = nt_scalar_value(ScalarValue::Boolean(true));
+            let desc = nt_scalar_desc(ScalarType::Boolean);
+            assert!(
+                is_mismatch(apply_monitor_filter_chain(&chain, &value, &desc)),
+                "filtered NTScalar<Boolean> must be a DescriptorMismatch, not a coerced frame",
+            );
+        }
+
+        /// `NTScalarArray<uint[]>` under a non-empty chain: the inbound
+        /// uint[] leaf has no `EpicsValue`, so the owner emits a monitor
+        /// error instead of an empty array.
+        #[test]
+        fn owner_uint_array_under_filter_is_descriptor_mismatch() {
+            let chain = parse_filter_chain(r#"{"arr":{}}"#);
+            let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
+            s.fields.push((
+                "value".into(),
+                PvField::ScalarArray(vec![ScalarValue::UInt(1), ScalarValue::UInt(2)]),
+            ));
+            let value = PvField::Structure(s);
+            let desc = FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalarArray:1.0".into(),
+                fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::UInt))],
+            };
+            assert!(
+                is_mismatch(apply_monitor_filter_chain(&chain, &value, &desc)),
+                "filtered uint[] monitor must be a DescriptorMismatch, not an empty array",
+            );
+        }
+
+        // --- Backward fail-closed: filter changes the leaf type. ---
+
+        /// `ts` in `Seconds` mode rewrites the value leaf to `Int64`.
+        /// On an `NTScalar<Double>` that no longer fits the descriptor,
+        /// so the owner emits a monitor error rather than coercing the
+        /// timestamp `Int64` onto the wire `Double` — the struct_id-only
+        /// check would have let it through.
+        #[test]
+        fn owner_ts_type_change_is_descriptor_mismatch() {
+            let chain = parse_filter_chain(r#"{"ts":{"num":"sec"}}"#);
+            let value = nt_scalar_value(ScalarValue::Double(42.5));
+            let desc = nt_scalar_desc(ScalarType::Double);
+            assert!(
+                is_mismatch(apply_monitor_filter_chain(&chain, &value, &desc)),
+                "ts seconds-mode on NTScalar<Double> must be a DescriptorMismatch",
+            );
+        }
+
+        /// `ts` in `Generate` mode leaves the value type untouched, so a
+        /// faithful `NTScalar<Double>` round-trips and is `Transformed`
+        /// (value preserved).
+        #[test]
+        fn owner_ts_generate_preserves_value() {
+            let chain = parse_filter_chain(r#"{"ts":{}}"#);
+            let value = nt_scalar_value(ScalarValue::Double(42.5));
+            let desc = nt_scalar_desc(ScalarType::Double);
+            match apply_monitor_filter_chain(&chain, &value, &desc) {
+                MonitorFilterOutcome::Transformed(PvField::Structure(s)) => {
+                    assert_eq!(
+                        s.get_field("value"),
+                        Some(&PvField::Scalar(ScalarValue::Double(42.5))),
+                        "value must be preserved through a non-type-changing filter",
+                    );
+                }
+                _ => panic!("expected Transformed(NTScalar<Double>), got a different outcome"),
+            }
+        }
+
+        /// An empty chain short-circuits to `Pass` even for a value type
+        /// the filter engine cannot represent — no conversion is
+        /// attempted, so no fail-closed error.
+        #[test]
+        fn owner_empty_chain_passes_unsupported_type() {
+            let chain = FilterChain::new();
+            let value = nt_scalar_value(ScalarValue::Boolean(true));
+            let desc = nt_scalar_desc(ScalarType::Boolean);
+            assert!(
+                matches!(
+                    apply_monitor_filter_chain(&chain, &value, &desc),
+                    MonitorFilterOutcome::Pass
+                ),
+                "empty chain must Pass without converting the value",
+            );
+        }
+
+        // --- Backward gate boundaries: transformed_leaf_fits_descriptor. ---
+
+        #[test]
+        fn leaf_gate_scalar_type_boundaries() {
+            // Matching scalar type fits; differing type does not.
+            assert!(transformed_leaf_fits_descriptor(
+                &nt_scalar_value(ScalarValue::Double(1.0)),
+                &nt_scalar_desc(ScalarType::Double),
+            ));
+            assert!(!transformed_leaf_fits_descriptor(
+                &nt_scalar_value(ScalarValue::Long(1)),
+                &nt_scalar_desc(ScalarType::Double),
+            ));
+        }
+
+        #[test]
+        fn leaf_gate_array_element_boundaries() {
+            let arr = |items: Vec<ScalarValue>| {
+                let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
+                s.fields.push(("value".into(), PvField::ScalarArray(items)));
+                PvField::Structure(s)
+            };
+            let desc = |st| FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalarArray:1.0".into(),
+                fields: vec![("value".into(), FieldDesc::ScalarArray(st))],
+            };
+            // Element type matches descriptor.
+            assert!(transformed_leaf_fits_descriptor(
+                &arr(vec![ScalarValue::Double(1.0), ScalarValue::Double(2.0)]),
+                &desc(ScalarType::Double),
+            ));
+            // Element type differs from descriptor (ts Array-mode shape).
+            assert!(!transformed_leaf_fits_descriptor(
+                &arr(vec![ScalarValue::Long(1)]),
+                &desc(ScalarType::Double),
+            ));
+            // Empty array carries no element type -> always fits.
+            assert!(transformed_leaf_fits_descriptor(
+                &arr(vec![]),
+                &desc(ScalarType::Double),
+            ));
+        }
     }
 
     /// BRIDGE-FR-12: coalescing two cooked updates under pause/squash.

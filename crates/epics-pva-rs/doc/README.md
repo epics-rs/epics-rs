@@ -22,6 +22,7 @@ usage (running a server, building a client) belongs in the top-level
 | [`07-introspection-cache.md`](07-introspection-cache.md) | Per-connection FieldDesc cache, 0xFD/0xFE markers, pvAccessCPP compat |
 | [`08-environment.md`](08-environment.md) | All `EPICS_PVA*` / `EPICS_PVAS*` variables |
 | [`09-pvxs-parity.md`](09-pvxs-parity.md) | API parity matrix vs upstream pvxs |
+| [`functional-review-2026-05-20.md`](functional-review-2026-05-20.md) | Open functional gaps and bugs vs upstream pvxs |
 | [`10-observability.md`](10-observability.md) | tracing events + metrics schema |
 | [`11-gateway.md`](11-gateway.md) | PVA-to-PVA gateway architecture (mirrors `pva2pva/p2pApp`) |
 | [`12-auth-tls.md`](12-auth-tls.md) | Connection validation, ca-auth, x509 mTLS |

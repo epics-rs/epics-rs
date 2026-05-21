@@ -374,7 +374,7 @@ fn test_parse_link_v2() {
 
     assert_eq!(
         parse_link_v2("ca://PV:NAME"),
-        ParsedLink::Ca("PV:NAME".to_string())
+        ParsedLink::Ca(CaLink::new("PV:NAME"))
     );
     assert_eq!(
         parse_link_v2("pva://PV:NAME"),

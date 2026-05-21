@@ -288,6 +288,82 @@ async fn ca_link_out_write_accepts_scheme_prefix() {
     }
 }
 
+/// BRIDGE-FR-4 end-to-end — a CA link inherits the remote PV's
+/// display/control limits, precision, units, DBF type and element count
+/// through `LinkSet::link_metadata`. The upstream `ai` record carries
+/// EGU/PREC/HOPR/LOPR; a `DBR_CTRL` get on connect caches them, mirroring
+/// C `dbCa.c` `getAttribEventCallback` populating `pca->controlLimits` &c.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn ca_link_exposes_remote_metadata() {
+    let port = free_port();
+    // ai record with real display/control metadata so the upstream CTRL
+    // get returns non-default limits/precision/units.
+    let mut src = AiRecord::new(50.0);
+    src.egu = "degC".to_string();
+    src.hopr = 100.0;
+    src.lopr = -50.0;
+    src.prec = 3;
+    let server = CaServer::builder()
+        .port(port)
+        .record("CALINK:META:SRC", src)
+        .build()
+        .await
+        .expect("CA server");
+    let _server = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let client = Arc::new(pinned_client(port).await);
+    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+
+    let connected = resolver
+        .wait_for_link_connected("CALINK:META:SRC", Duration::from_secs(5))
+        .await;
+    assert!(connected, "CA link must connect to the upstream CA server");
+
+    use epics_base_rs::server::database::{LinkDbfType, LinkSet};
+    // The CTRL attribute fetch is detached after the `Connected` event,
+    // so poll until the cached metadata lands.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let md = loop {
+        if let Some(md) = LinkSet::link_metadata(&resolver, "CALINK:META:SRC") {
+            // Wait for the CTRL get to fill the limits, not just the
+            // channel-info type/count from a partial first store.
+            if md.graphic_limits.is_some() {
+                break md;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CA link metadata never populated"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    assert_eq!(
+        md.dbf_type,
+        Some(LinkDbfType::Double),
+        "ai VAL is DBF_DOUBLE"
+    );
+    assert_eq!(md.element_count, Some(1), "scalar ai is one element");
+    assert_eq!(
+        md.graphic_limits,
+        Some((-50.0, 100.0)),
+        "graphic limits come from LOPR/HOPR"
+    );
+    assert_eq!(
+        md.control_limits,
+        Some((-50.0, 100.0)),
+        "input record control limits fall back to LOPR/HOPR"
+    );
+    assert_eq!(md.precision, Some(3), "precision comes from PREC");
+    assert_eq!(md.units.as_deref(), Some("degC"), "units come from EGU");
+
+    // While connected the metadata is served; the read path gates on the
+    // connection flag exactly like the value/alarm getters.
+    assert!(LinkSet::is_connected(&resolver, "CALINK:META:SRC"));
+}
+
 /// `install_calink_resolver` registers under the `ca` scheme so the
 /// database's `registered_link_schemes` reports it.
 #[tokio::test(flavor = "multi_thread")]

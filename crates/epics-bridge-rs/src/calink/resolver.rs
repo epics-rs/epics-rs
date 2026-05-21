@@ -13,9 +13,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
-use epics_base_rs::server::snapshot::Snapshot;
+use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkSet, PvDatabase};
+use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::EpicsValue;
+use epics_ca_rs::DbFieldType;
 use epics_ca_rs::client::{CaChannel, CaClient};
 use parking_lot::RwLock;
 
@@ -52,6 +53,17 @@ pub struct CaLink {
     /// LINK alarm. `dbCa.c` sets `pca->connected = FALSE` in its
     /// `connectionCallback` for exactly this reason.
     connected: Arc<AtomicBool>,
+    /// Cached remote CTRL attributes (display/control/alarm limits,
+    /// precision, units) plus the channel's native DBF type and element
+    /// count. `None` until the first attribute fetch completes; the
+    /// connection-event watcher re-fetches on every (re)connection.
+    /// BRIDGE-FR-4 — mirrors C `dbCa.c`: `connectionCallback`
+    /// (`dbCa.c:833`) schedules `CA_GET_ATTRIBUTES` on connect, and
+    /// `getAttribEventCallback` (`dbCa.c:1080`) caches the
+    /// `DBR_CTRL_DOUBLE` reply that `getControlLimits`/`getGraphicLimits`
+    /// /`getAlarmLimits`/`getPrecision`/`getUnits` (`dbCa.c:726`) later
+    /// serve.
+    meta: Arc<ArcSwap<Option<LinkMetadata>>>,
     /// The CA channel — kept alive so the monitor stays subscribed.
     /// Used by the OUT-link write path.
     channel: Arc<CaChannel>,
@@ -117,6 +129,22 @@ impl CaLink {
             .map(|s| s.alarm.severity as i32)
     }
 
+    /// Cached alarm *status* code (the EPICS `alarm_status` enum), or
+    /// `None` when the link is not connected. BRIDGE-FR-3: lets an
+    /// `MSS`-modified CA link propagate the remote STAT into the owning
+    /// record instead of the generic `LINK_ALARM`. Gated on `connected`
+    /// exactly like [`Self::alarm_severity`].
+    pub fn alarm_status(&self) -> Option<i32> {
+        if !self.connected.load(Ordering::Acquire) {
+            return None;
+        }
+        self.cache
+            .load()
+            .as_ref()
+            .as_ref()
+            .map(|s| s.alarm.status as i32)
+    }
+
     /// Cached timestamp as `(seconds_past_epoch, nanoseconds)`, or
     /// `None` when the link is not connected.
     pub fn time_stamp(&self) -> Option<(i64, i32)> {
@@ -127,6 +155,20 @@ impl CaLink {
         let snap = snap.as_ref().as_ref()?;
         let dur = snap.timestamp.duration_since(std::time::UNIX_EPOCH).ok()?;
         Some((dur.as_secs() as i64, dur.subsec_nanos() as i32))
+    }
+
+    /// Cached remote metadata (display/control/alarm limits, precision,
+    /// units, DBF type, element count), or `None` when the link is not
+    /// connected. BRIDGE-FR-4. Gated on `connected` exactly like
+    /// [`Self::value`]/[`Self::alarm_severity`] — C `pcaGetCheck`
+    /// (`dbCa.c:650`) returns `-1` from every metadata getter while the
+    /// CA link is disconnected, so the owning record keeps its local
+    /// default rather than adopting stale remote limits.
+    pub fn link_metadata(&self) -> Option<LinkMetadata> {
+        if !self.connected.load(Ordering::Acquire) {
+            return None;
+        }
+        self.meta.load().as_ref().clone()
     }
 }
 
@@ -181,6 +223,15 @@ impl CaLinkResolver {
             return Ok(existing);
         }
         let channel = Arc::new(self.client.create_channel(pv_name));
+        // BRIDGE-FR-4: subscribe the connection-event stream BEFORE the
+        // `subscribe()` round-trip that drives the circuit connect, so the
+        // watcher cannot miss the `Connected` event — that event is what
+        // kicks off the one-shot CTRL attribute fetch (mirroring C
+        // `connectionCallback` scheduling `CA_GET_ATTRIBUTES`). Subscribing
+        // after `subscribe()` would race: a connect completing during the
+        // await would emit `Connected` before the watcher existed, leaving
+        // `meta` permanently empty until the next reconnect.
+        let conn_rx = channel.connection_events();
         let monitor = channel
             .subscribe()
             .await
@@ -190,13 +241,20 @@ impl CaLinkResolver {
             })?;
         let cache: Arc<ArcSwap<Option<Snapshot>>> = Arc::new(ArcSwap::from_pointee(None));
         let connected = Arc::new(AtomicBool::new(false));
+        let meta: Arc<ArcSwap<Option<LinkMetadata>>> = Arc::new(ArcSwap::from_pointee(None));
         // Connection-event watcher: keeps `connected` in sync with the
         // real circuit state so `is_connected()` reflects upstream
-        // disconnects. Mirrors `pvalink`'s `monitor_connected` flag.
-        let conn_rx = channel.connection_events();
-        let conn_task = self
-            .handle
-            .spawn(run_connection_watcher(conn_rx, connected.clone()));
+        // disconnects (mirrors `pvalink`'s `monitor_connected` flag), and
+        // re-fetches the remote CTRL attributes into `meta` on each
+        // connect (BRIDGE-FR-4).
+        let conn_task = self.handle.spawn(run_connection_watcher(
+            conn_rx,
+            connected.clone(),
+            channel.clone(),
+            self.handle.clone(),
+            meta.clone(),
+            pv_name.to_string(),
+        ));
         let task = self.handle.spawn(run_monitor(
             monitor,
             cache.clone(),
@@ -206,6 +264,7 @@ impl CaLinkResolver {
         let link = Arc::new(CaLink {
             cache,
             connected,
+            meta,
             channel,
             _monitor_task: AbortOnDrop(task),
             _conn_task: AbortOnDrop(conn_task),
@@ -310,28 +369,170 @@ async fn run_monitor(
 /// `Unresponsive` flip it `false` so a downstream IOC restart is
 /// reflected by `CaLink::is_connected()`. Mirrors `dbCa.c`'s
 /// `connectionCallback` setting `pca->connected`.
+///
+/// BRIDGE-FR-4: on every `Connected` the watcher also (re)fetches the
+/// remote CTRL attributes into `meta`, mirroring `connectionCallback`
+/// scheduling `CA_GET_ATTRIBUTES` (`dbCa.c:910`). The fetch is detached
+/// so a slow or hung CTRL get never delays the watcher from observing a
+/// later disconnect — the metadata is best-effort and the read path
+/// gates on `connected` regardless.
 async fn run_connection_watcher(
     mut conn_rx: epics_base_rs::runtime::sync::broadcast::Receiver<
         epics_ca_rs::client::ConnectionEvent,
     >,
     connected: Arc<AtomicBool>,
+    channel: Arc<CaChannel>,
+    handle: tokio::runtime::Handle,
+    meta: Arc<ArcSwap<Option<LinkMetadata>>>,
+    pv_name: String,
 ) {
-    use epics_ca_rs::client::ConnectionEvent;
     loop {
         match conn_rx.recv().await {
-            Ok(ConnectionEvent::Connected) => connected.store(true, Ordering::Release),
-            Ok(ConnectionEvent::Disconnected) | Ok(ConnectionEvent::Unresponsive) => {
-                connected.store(false, Ordering::Release)
+            // A fresh `Connected` transition kicks off the CTRL attribute
+            // refetch (BRIDGE-FR-4); detached so a hung get never stalls
+            // the watcher from seeing a later disconnect.
+            Ok(evt) => {
+                if note_conn_event(&evt, &connected) {
+                    handle.spawn(fetch_link_metadata(
+                        channel.clone(),
+                        meta.clone(),
+                        pv_name.clone(),
+                    ));
+                }
             }
-            // AccessRightsChanged / NativeTypeChanged don't affect the
-            // connected flag.
-            Ok(_) => {}
             // Lagged: a burst of events overran the bounded channel.
             // Keep watching; the next event resyncs the flag.
             Err(epics_base_rs::runtime::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             // Closed: the channel was dropped — watcher's job is done.
             Err(epics_base_rs::runtime::sync::broadcast::error::RecvError::Closed) => return,
         }
+    }
+}
+
+/// Apply one connection event to the live-connection `flag`, returning
+/// `true` iff this was a `Connected` transition (the caller then kicks
+/// off a metadata refetch). `Disconnected`/`Unresponsive` clear the
+/// flag; `AccessRightsChanged`/`NativeTypeChanged` leave it untouched.
+/// Factored out of [`run_connection_watcher`] so the flag logic — the
+/// disconnect-tracking regression — is unit-testable without a live CA
+/// channel.
+fn note_conn_event(evt: &epics_ca_rs::client::ConnectionEvent, flag: &AtomicBool) -> bool {
+    use epics_ca_rs::client::ConnectionEvent;
+    match evt {
+        ConnectionEvent::Connected => {
+            flag.store(true, Ordering::Release);
+            true
+        }
+        ConnectionEvent::Disconnected | ConnectionEvent::Unresponsive => {
+            flag.store(false, Ordering::Release);
+            false
+        }
+        _ => false,
+    }
+}
+
+/// One-shot CTRL attribute fetch for a CA link, mirroring C `dbCa.c`'s
+/// `CA_GET_ATTRIBUTES` → `getAttribEventCallback` (`dbCa.c:1249`,
+/// `:1080`): a `DBR_CTRL` get whose reply fills the cached
+/// control/display/alarm limits, precision and units. The channel's
+/// native DBF type and element count come from the channel info (C
+/// `getDBFtype`/`getElements` read `pca->dbrType`/`nelements`, not the
+/// CTRL reply). Best-effort: on a failed CTRL get the type/count are
+/// still stored and the next reconnect retries the limits.
+async fn fetch_link_metadata(
+    channel: Arc<CaChannel>,
+    meta: Arc<ArcSwap<Option<LinkMetadata>>>,
+    pv_name: String,
+) {
+    // DBF type + element count from the channel's native description.
+    let (dbf, element_count) = match channel.info().await {
+        Ok(info) => (Some(info.native_type), Some(info.element_count)),
+        Err(_) => (None, None),
+    };
+    // Limits/precision/units from a single DBR_CTRL get. Count 1: the
+    // limits live in the metadata header, so there is no need to pull a
+    // whole waveform just for attributes (C issues the attribute get as a
+    // scalar `ca_get_callback(DBR_CTRL_DOUBLE, ...)`).
+    let ctrl = match channel.get_with_metadata_count(DbrClass::Ctrl, 1).await {
+        Ok(snap) => Some(snap),
+        Err(e) => {
+            tracing::debug!(
+                pv = %pv_name,
+                error = %e,
+                "calink: CTRL attribute get failed; serving DBF type / element count only"
+            );
+            None
+        }
+    };
+    meta.store(Arc::new(Some(build_link_metadata(
+        dbf,
+        element_count,
+        ctrl.as_ref(),
+    ))));
+}
+
+/// Map a fetched CTRL [`Snapshot`] plus the channel's native DBF type /
+/// element count into a [`LinkMetadata`]. Pure transform, factored out
+/// of [`fetch_link_metadata`] so the field mapping is unit-testable
+/// without a live CA server.
+///
+/// Each `LinkMetadata` field is `None` when the source carried nothing:
+/// a String/Enum PV's CTRL reply has no `display`/`control`, so its
+/// limits/precision/units stay `None` and the owning record keeps its
+/// local defaults — exactly as the C getters leave the caller's buffer
+/// untouched on a missing attribute. Alarm-limit order is
+/// `(lolo, lo, hi, hihi)`, matching C `getAlarmLimits` (`dbCa.c:758`).
+fn build_link_metadata(
+    dbf: Option<DbFieldType>,
+    element_count: Option<u32>,
+    ctrl: Option<&Snapshot>,
+) -> LinkMetadata {
+    let mut md = LinkMetadata {
+        dbf_type: dbf.map(map_dbf_type),
+        element_count: element_count.map(|n| n as i64),
+        ..LinkMetadata::default()
+    };
+    if let Some(snap) = ctrl {
+        if let Some(d) = snap.display.as_ref() {
+            md.graphic_limits = Some((d.lower_disp_limit, d.upper_disp_limit));
+            md.alarm_limits = Some((
+                d.lower_alarm_limit,
+                d.lower_warning_limit,
+                d.upper_warning_limit,
+                d.upper_alarm_limit,
+            ));
+            md.precision = Some(d.precision);
+            if !d.units.is_empty() {
+                md.units = Some(d.units.clone());
+            }
+            if !d.description.is_empty() {
+                md.description = Some(d.description.clone());
+            }
+        }
+        if let Some(c) = snap.control.as_ref() {
+            md.control_limits = Some((c.lower_ctrl_limit, c.upper_ctrl_limit));
+        }
+    }
+    md
+}
+
+/// Map a CA native [`DbFieldType`] to the link-metadata
+/// [`LinkDbfType`]. Mirrors C `getDBFtype` returning
+/// `dbDBRoldToDBFnew[pca->dbrType]` (`dbCa.c:695`). The CA wire protocol
+/// carries only the seven base types; `Int64`/`UInt64` are internal and
+/// never appear over CA (such PVs present as `Double`), but are mapped
+/// for completeness.
+fn map_dbf_type(t: DbFieldType) -> LinkDbfType {
+    match t {
+        DbFieldType::String => LinkDbfType::String,
+        DbFieldType::Short => LinkDbfType::Short,
+        DbFieldType::Float => LinkDbfType::Float,
+        DbFieldType::Enum => LinkDbfType::Enum,
+        DbFieldType::Char => LinkDbfType::Char,
+        DbFieldType::Long => LinkDbfType::Long,
+        DbFieldType::Double => LinkDbfType::Double,
+        DbFieldType::Int64 => LinkDbfType::Int64,
+        DbFieldType::UInt64 => LinkDbfType::UInt64,
     }
 }
 
@@ -373,9 +574,29 @@ impl LinkSet for CaLinkResolver {
         if sev > 0 { Some(sev) } else { None }
     }
 
+    fn alarm_status(&self, name: &str) -> Option<i32> {
+        // BRIDGE-FR-3: surface the remote STAT for `MSS` propagation.
+        // Record processing only consults this when the alarm is
+        // actually propagated (severity > 0 via `alarm_severity`), so
+        // no severity gate is needed here.
+        let name = strip_ca_scheme(name);
+        self.link_for(name)?.alarm_status()
+    }
+
     fn time_stamp(&self, name: &str) -> Option<(i64, i32)> {
         let name = strip_ca_scheme(name);
         self.link_for(name)?.time_stamp()
+    }
+
+    fn link_metadata(&self, name: &str) -> Option<LinkMetadata> {
+        // BRIDGE-FR-4: surface the remote display/control/alarm limits,
+        // precision, units, DBF type and element count through the DB
+        // link API so a record with a CA INP link inherits them, matching
+        // the pvalink metadata path. Reads the cached CTRL attributes —
+        // no fresh GET — exactly as C `getControlLimits` &c. read
+        // `pca->controlLimits`.
+        let name = strip_ca_scheme(name);
+        self.link_for(name)?.link_metadata()
     }
 
     fn link_names(&self) -> Vec<String> {
@@ -439,55 +660,47 @@ mod tests {
         assert_eq!(strip_ca_scheme("OTHER:PV"), "OTHER:PV");
     }
 
-    /// Block until `flag` reaches `want`, or panic after a deadline —
-    /// the connection watcher updates the flag asynchronously.
-    async fn await_flag(flag: &AtomicBool, want: bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while flag.load(Ordering::Acquire) != want {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "connected flag never reached {want}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    }
+    /// BUG 1 regression: the connection-event → `connected` flag
+    /// transition, which [`note_conn_event`] owns (the watcher loop only
+    /// calls it). A disconnect MUST flip the flag false; pre-fix
+    /// `is_connected()` keyed off cache presence alone and stayed `true`
+    /// forever once any event had been cached, so an upstream IOC restart
+    /// was invisible and stale data was served. BRIDGE-FR-4: a
+    /// `Connected` transition additionally returns `true` to signal the
+    /// CTRL attribute refetch; the clearing/neutral events return `false`.
+    #[test]
+    fn bug1_connection_event_tracks_disconnect() {
+        let connected = AtomicBool::new(false);
 
-    /// BUG 1 regression: `CaLink::is_connected()` must go false when
-    /// the upstream CA circuit disconnects. The connection-event
-    /// watcher drains `connection_events()` and flips the shared
-    /// `connected` flag; `is_connected()` reads it. Pre-fix
-    /// `is_connected()` keyed off cache presence alone and stayed
-    /// `true` forever once any event had been cached — an upstream
-    /// IOC restart was invisible and stale data was served.
-    #[tokio::test]
-    async fn bug1_connection_watcher_tracks_disconnect() {
-        let (tx, rx) = epics_base_rs::runtime::sync::broadcast::channel::<ConnectionEvent>(16);
-        let connected = Arc::new(AtomicBool::new(false));
-        let watcher = tokio::spawn(run_connection_watcher(rx, connected.clone()));
+        // Circuit comes up — flag true, and signals an attribute refetch.
+        assert!(note_conn_event(&ConnectionEvent::Connected, &connected));
+        assert!(connected.load(Ordering::Acquire));
 
-        // Circuit comes up — flag goes true.
-        tx.send(ConnectionEvent::Connected).unwrap();
-        await_flag(&connected, true).await;
+        // Upstream IOC restart — circuit drops. Flag MUST go false; no
+        // refetch on a disconnect.
+        assert!(!note_conn_event(&ConnectionEvent::Disconnected, &connected));
+        assert!(!connected.load(Ordering::Acquire));
 
-        // Upstream IOC restart — circuit drops. Flag MUST go false;
-        // pre-fix it stayed true forever.
-        tx.send(ConnectionEvent::Disconnected).unwrap();
-        await_flag(&connected, false).await;
+        // Reconnect — flag true again (CA monitors auto-restore), refetch
+        // signalled again.
+        assert!(note_conn_event(&ConnectionEvent::Connected, &connected));
+        assert!(connected.load(Ordering::Acquire));
 
-        // Reconnect — flag goes true again (CA monitors auto-restore).
-        tx.send(ConnectionEvent::Connected).unwrap();
-        await_flag(&connected, true).await;
+        // Unresponsive (TCP up, server hung) also clears it, no refetch.
+        assert!(!note_conn_event(&ConnectionEvent::Unresponsive, &connected));
+        assert!(!connected.load(Ordering::Acquire));
 
-        // An Unresponsive event (TCP up, server hung) also clears it.
-        tx.send(ConnectionEvent::Unresponsive).unwrap();
-        await_flag(&connected, false).await;
-
-        // Dropping the sender closes the channel — the watcher exits.
-        drop(tx);
-        tokio::time::timeout(std::time::Duration::from_secs(2), watcher)
-            .await
-            .expect("watcher must exit when the event channel closes")
-            .expect("watcher task panicked");
+        // An access-rights change is neutral: it leaves the flag as-is
+        // and signals no refetch.
+        connected.store(true, Ordering::Release);
+        assert!(!note_conn_event(
+            &ConnectionEvent::AccessRightsChanged {
+                read: true,
+                write: false,
+            },
+            &connected,
+        ));
+        assert!(connected.load(Ordering::Acquire));
     }
 
     /// BUG 1 regression: the `is_connected()` / `value()` gating logic
@@ -533,5 +746,118 @@ mod tests {
             is_connected,
             "reconnected link with cache must be connected"
         );
+    }
+
+    /// Build a CTRL [`Snapshot`] carrying display + control metadata,
+    /// the shape `get_with_metadata(DbrClass::Ctrl)` returns for a
+    /// numeric PV.
+    fn ctrl_snapshot() -> Snapshot {
+        use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo};
+        let mut snap = Snapshot::new(
+            EpicsValue::Double(0.0),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        snap.display = Some(DisplayInfo {
+            units: "degC".to_string(),
+            precision: 3,
+            upper_disp_limit: 100.0,
+            lower_disp_limit: -50.0,
+            upper_alarm_limit: 90.0,    // hihi
+            upper_warning_limit: 80.0,  // hi
+            lower_warning_limit: -20.0, // lo
+            lower_alarm_limit: -40.0,   // lolo
+            ..Default::default()
+        });
+        snap.control = Some(ControlInfo {
+            upper_ctrl_limit: 95.0,
+            lower_ctrl_limit: -45.0,
+        });
+        snap
+    }
+
+    /// BRIDGE-FR-4: a numeric PV's CTRL attributes map into every
+    /// `LinkMetadata` field. Pins the alarm-limit order to
+    /// `(lolo, lo, hi, hihi)` (C `getAlarmLimits`), graphic/control to
+    /// `(lower, upper)`, and the channel info to dbf type + element
+    /// count.
+    #[test]
+    fn build_link_metadata_numeric_maps_all_fields() {
+        let snap = ctrl_snapshot();
+        let md = build_link_metadata(Some(DbFieldType::Double), Some(1), Some(&snap));
+        assert_eq!(md.dbf_type, Some(LinkDbfType::Double));
+        assert_eq!(md.element_count, Some(1));
+        assert_eq!(md.graphic_limits, Some((-50.0, 100.0)));
+        assert_eq!(md.control_limits, Some((-45.0, 95.0)));
+        assert_eq!(md.alarm_limits, Some((-40.0, -20.0, 80.0, 90.0)));
+        assert_eq!(md.precision, Some(3));
+        assert_eq!(md.units.as_deref(), Some("degC"));
+    }
+
+    /// BRIDGE-FR-4: a CTRL reply with no `display`/`control` (a
+    /// String/Enum PV) yields only the channel-info fields; every limit
+    /// stays `None` so the owning record keeps its local default.
+    #[test]
+    fn build_link_metadata_string_pv_has_no_limits() {
+        let snap = Snapshot::new(
+            EpicsValue::String("x".into()),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let md = build_link_metadata(Some(DbFieldType::String), Some(1), Some(&snap));
+        assert_eq!(md.dbf_type, Some(LinkDbfType::String));
+        assert_eq!(md.element_count, Some(1));
+        assert_eq!(md.graphic_limits, None);
+        assert_eq!(md.control_limits, None);
+        assert_eq!(md.alarm_limits, None);
+        assert_eq!(md.precision, None);
+        assert_eq!(md.units, None);
+    }
+
+    /// BRIDGE-FR-4: when the channel info fetch failed (`None` dbf /
+    /// count) and there is no CTRL reply, every field is `None` — the
+    /// link reports "no metadata yet" rather than fabricating zeros.
+    #[test]
+    fn build_link_metadata_no_info_no_ctrl_is_all_none() {
+        let md = build_link_metadata(None, None, None);
+        assert_eq!(md, LinkMetadata::default());
+    }
+
+    /// BRIDGE-FR-4: an empty `units` string is dropped to `None` (the
+    /// remote carried no engineering units), not surfaced as `Some("")`.
+    #[test]
+    fn build_link_metadata_empty_units_omitted() {
+        use epics_base_rs::server::snapshot::DisplayInfo;
+        let mut snap = Snapshot::new(
+            EpicsValue::Double(0.0),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        snap.display = Some(DisplayInfo {
+            units: String::new(),
+            precision: 0,
+            ..Default::default()
+        });
+        let md = build_link_metadata(Some(DbFieldType::Double), Some(1), Some(&snap));
+        assert_eq!(md.units, None);
+        assert_eq!(md.precision, Some(0));
+    }
+
+    /// BRIDGE-FR-4: every CA native field type maps to its
+    /// `LinkDbfType`.
+    #[test]
+    fn map_dbf_type_covers_every_variant() {
+        assert_eq!(map_dbf_type(DbFieldType::String), LinkDbfType::String);
+        assert_eq!(map_dbf_type(DbFieldType::Short), LinkDbfType::Short);
+        assert_eq!(map_dbf_type(DbFieldType::Float), LinkDbfType::Float);
+        assert_eq!(map_dbf_type(DbFieldType::Enum), LinkDbfType::Enum);
+        assert_eq!(map_dbf_type(DbFieldType::Char), LinkDbfType::Char);
+        assert_eq!(map_dbf_type(DbFieldType::Long), LinkDbfType::Long);
+        assert_eq!(map_dbf_type(DbFieldType::Double), LinkDbfType::Double);
+        assert_eq!(map_dbf_type(DbFieldType::Int64), LinkDbfType::Int64);
+        assert_eq!(map_dbf_type(DbFieldType::UInt64), LinkDbfType::UInt64);
     }
 }

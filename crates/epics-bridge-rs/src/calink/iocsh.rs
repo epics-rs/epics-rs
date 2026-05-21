@@ -89,7 +89,8 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
                 } else {
                     ctx.println(&format!("  '{rec}': {} link field(s)", links.len()));
                     for (field, raw, parsed) in links {
-                        if let epics_base_rs::server::record::ParsedLink::Ca(name) = parsed {
+                        if let epics_base_rs::server::record::ParsedLink::Ca(ca) = parsed {
+                            let name = ca.pv;
                             let connected =
                                 <CaLinkResolver as LinkSet>::is_connected(&resolver, &name);
                             let value = <CaLinkResolver as LinkSet>::get_value(&resolver, &name);

@@ -54,7 +54,7 @@ pub enum ParsedLink {
     None,
     Constant(String),
     Db(DbLink),
-    Ca(String),
+    Ca(CaLink),
     Pva(String),
     /// `@dev arg1 …` or `#Cn Sn` hardware link (epics-base PR #213).
     Hw(HwLink),
@@ -106,6 +106,32 @@ pub struct DbLink {
     pub field: String,
     pub policy: LinkProcessPolicy,
     pub monitor_switch: MonitorSwitch,
+}
+
+/// A Channel Access / PV Access external link to a remote PV.
+///
+/// BRIDGE-FR-3: carries the parsed `MS`/`NMS`/`MSI`/`MSS` maximize-
+/// severity policy alongside the PV name, so the alarm gate is applied
+/// at the record-processing boundary (uniform with [`DbLink`]) rather
+/// than discarded as syntax. Mirrors the C link option parsed by
+/// `dbStaticLib.c:2375` and applied by `recGbl.c:264`. The PV name never
+/// carries trailing modifier tokens (they are stripped during parse);
+/// it may retain a `ca://` scheme prefix, which the resolver strips.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaLink {
+    pub pv: String,
+    pub monitor_switch: MonitorSwitch,
+}
+
+impl CaLink {
+    /// CA link with the default (`NoMaximize`) alarm policy — the
+    /// shape used by callers that have only a bare PV name.
+    pub fn new(pv: impl Into<String>) -> Self {
+        Self {
+            pv: pv.into(),
+            monitor_switch: MonitorSwitch::NoMaximize,
+        }
+    }
 }
 
 /// Discriminated link *type* — the Rust analogue of the C
@@ -195,6 +221,32 @@ impl ParsedLink {
             ParsedLink::Db(_) | ParsedLink::Ca(_) | ParsedLink::Pva(_)
         )
     }
+
+    /// PV name of an external (`Ca`/`Pva`) link, else `None`. Lets a
+    /// caller read the remote name uniformly without matching the two
+    /// variants' differing payload shapes (`Ca` carries a [`CaLink`],
+    /// `Pva` a bare `String`). BRIDGE-FR-3.
+    pub fn external_pv_name(&self) -> Option<&str> {
+        match self {
+            ParsedLink::Ca(ca) => Some(&ca.pv),
+            ParsedLink::Pva(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Maximize-severity policy carried by this link's parsed modifier.
+    /// `Db`/`Ca` links carry an explicit [`MonitorSwitch`]; `Pva` links
+    /// encode it in a stripped `?sevr=` query the lset retains, so they
+    /// report `None` here (the lset gate stands in). Used by record
+    /// processing to apply the MS/NMS/MSI/MSS gate at the fold boundary.
+    /// BRIDGE-FR-3.
+    pub fn monitor_switch(&self) -> Option<MonitorSwitch> {
+        match self {
+            ParsedLink::Db(db) => Some(db.monitor_switch),
+            ParsedLink::Ca(ca) => Some(ca.monitor_switch),
+            _ => None,
+        }
+    }
 }
 
 /// Try to recognize a JSON-style link option (epics-base PR #86).
@@ -244,7 +296,9 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
             // pvxs parity: pvalink_jlif.cpp:24-41, :69-196.
             let (pv, query) = extract_pv_and_opts_from_subobject(rest)?;
             if key == "ca" {
-                Some(ParsedLink::Ca(pv))
+                // JSON CA links carry no plain-text MS modifier; the
+                // alarm policy defaults to NoMaximize (BRIDGE-FR-3).
+                Some(ParsedLink::Ca(CaLink::new(pv)))
             } else if query.is_empty() {
                 Some(ParsedLink::Pva(pv))
             } else {
@@ -374,43 +428,19 @@ fn try_parse_hw_link(s: &str) -> Option<ParsedLink> {
     None
 }
 
-/// Parse a link string into a ParsedLink (v2 — distinguishes constants from DB links).
-pub fn parse_link_v2(s: &str) -> ParsedLink {
-    let s = s.trim();
-    // JSON-style links (epics-base PR #86) — try first so a leading
-    // `{` is not mistaken for a leading-special record-name warning.
-    if let Some(parsed) = try_parse_json_link(s) {
-        return parsed;
-    }
-    // Hardware link (epics-base PR #213). `@` starts INST_IO; `#`
-    // starts VME_IO. Everything else falls through to legacy parsing.
-    if let Some(parsed) = try_parse_hw_link(s) {
-        return parsed;
-    }
-    if s.is_empty() {
-        return ParsedLink::None;
-    }
-
-    // CA/PVA protocol links
-    if let Some(rest) = s.strip_prefix("ca://") {
-        return ParsedLink::Ca(rest.to_string());
-    }
-    if let Some(rest) = s.strip_prefix("pva://") {
-        return ParsedLink::Pva(rest.to_string());
-    }
-
-    // Strip trailing link attributes: PP, NPP, CP, CPP, CA, MS, NMS, MSS, MSI
-    // They can appear in any order: "REC.FIELD NPP NMS", "REC CP", etc.
-    //
-    // The bare ` CA` modifier forces a `pv_link` to be a CA link
-    // (C `link.h` `CA_LINK` 11). C `dbStaticLib.c:2372`
-    // (`else if (strstr(pstr, "CA")) pinfo->modifiers = pvlOptCA;`)
-    // sets `pvlOptCA`; `dbAccess.c:1103-1104` then keeps the link a
-    // `PV_LINK` instead of creating a local `dbChannel`, so the link
-    // ends up a `CA_LINK` after `dbCaAddLink`. A ` CA` may co-occur
-    // with `PP`/`MS`-style modifiers — `force_ca` records the CA
-    // override while `policy`/`ms` continue to capture the rest, and
-    // a CA-forced link is classified `ParsedLink::Ca` below.
+/// Strip trailing link-attribute modifiers (`PP`/`NPP`/`CP`/`CPP`/`CA`/
+/// `MS`/`NMS`/`MSI`/`MSS`) from a link string. Returns the remaining
+/// `record.field` text plus the parsed process policy, maximize-severity
+/// switch, and whether a bare ` CA` modifier forced a CA link. Modifiers
+/// may appear in any order (`"REC.FIELD NPP NMS"`, `"REC CP"`, …).
+///
+/// BRIDGE-FR-3: shared by the legacy plain-text path *and* the `ca://`
+/// scheme path so `ca://PV MS` parses the `MS` modifier instead of
+/// folding it into the PV name. The bare ` CA` modifier forces a
+/// `pv_link` to a CA link (C `dbStaticLib.c:2372`); it may co-occur with
+/// `PP`/`MS`-style modifiers, so `force_ca` is recorded while `policy`
+/// and `ms` continue to capture the rest.
+fn strip_link_modifiers(s: &str) -> (&str, LinkProcessPolicy, MonitorSwitch, bool) {
     let mut policy = LinkProcessPolicy::ProcessPassive;
     let mut ms = MonitorSwitch::NoMaximize;
     let mut force_ca = false;
@@ -467,6 +497,46 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
         link_part = trimmed;
         break;
     }
+    (link_part, policy, ms, force_ca)
+}
+
+/// Parse a link string into a ParsedLink (v2 — distinguishes constants from DB links).
+pub fn parse_link_v2(s: &str) -> ParsedLink {
+    let s = s.trim();
+    // JSON-style links (epics-base PR #86) — try first so a leading
+    // `{` is not mistaken for a leading-special record-name warning.
+    if let Some(parsed) = try_parse_json_link(s) {
+        return parsed;
+    }
+    // Hardware link (epics-base PR #213). `@` starts INST_IO; `#`
+    // starts VME_IO. Everything else falls through to legacy parsing.
+    if let Some(parsed) = try_parse_hw_link(s) {
+        return parsed;
+    }
+    if s.is_empty() {
+        return ParsedLink::None;
+    }
+
+    // CA/PVA protocol links. BRIDGE-FR-3: a `ca://PV MS` link carries
+    // the same trailing maximize-severity modifiers as the legacy form,
+    // so strip them off the scheme body before storing the PV name —
+    // otherwise `MS` would be folded into the PV name (`"PV MS"`). The
+    // parsed `MS`/`NMS`/`MSI`/`MSS` switch rides in the `CaLink` so the
+    // alarm gate is applied at the record-processing boundary.
+    if let Some(rest) = s.strip_prefix("ca://") {
+        let (pv, _policy, ms, _force_ca) = strip_link_modifiers(rest);
+        return ParsedLink::Ca(CaLink {
+            pv: pv.to_string(),
+            monitor_switch: ms,
+        });
+    }
+    if let Some(rest) = s.strip_prefix("pva://") {
+        return ParsedLink::Pva(rest.to_string());
+    }
+
+    // Strip trailing link attributes: PP, NPP, CP, CPP, CA, MS, NMS,
+    // MSS, MSI (any order) — see [`strip_link_modifiers`].
+    let (link_part, policy, ms, force_ca) = strip_link_modifiers(s);
 
     // A bare ` CA` modifier forces the link to be a CA link. C
     // `dbParseLink` only reaches the modifier scan after the
@@ -477,7 +547,14 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     // remaining `link_part` (the `record.field` PV name) verbatim,
     // never as a Constant or local Db link.
     if force_ca {
-        return ParsedLink::Ca(link_part.to_string());
+        // BRIDGE-FR-3: a bare ` CA`-forced link carries the same
+        // maximize-severity policy as any other link — store the parsed
+        // `ms` so e.g. `REC.VAL CA MS` keeps its `MS` gate instead of
+        // discarding it.
+        return ParsedLink::Ca(CaLink {
+            pv: link_part.to_string(),
+            monitor_switch: ms,
+        });
     }
 
     // Numeric constant
@@ -626,7 +703,7 @@ mod json_link_tests {
     fn json_ca_link() {
         assert_eq!(
             parse_link_v2(r#"{ca: { pv: "FOO" }}"#),
-            ParsedLink::Ca("FOO".to_string())
+            ParsedLink::Ca(CaLink::new("FOO"))
         );
     }
 
@@ -642,7 +719,7 @@ mod json_link_tests {
     fn json_ca_link_unquoted_key() {
         assert_eq!(
             parse_link_v2(r#"{ca: { pv: 'BAR' }}"#),
-            ParsedLink::Ca("BAR".to_string())
+            ParsedLink::Ca(CaLink::new("BAR"))
         );
     }
 
@@ -754,9 +831,10 @@ mod json_link_tests {
     fn ca_modifier_classifies_as_ca() {
         // `REC.FIELD CA` must parse as a CA link carrying the
         // `record.field` PV name — NOT a Db link to field "FIELD CA".
+        // No `MS`-class modifier → default NoMaximize.
         assert_eq!(
             parse_link_v2("REC.FIELD CA"),
-            ParsedLink::Ca("REC.FIELD".to_string())
+            ParsedLink::Ca(CaLink::new("REC.FIELD"))
         );
         assert_eq!(link_field_type("REC.FIELD CA"), LinkType::Ca);
     }
@@ -766,25 +844,70 @@ mod json_link_tests {
         // No field suffix — `localPv CA` is still a CA link.
         assert_eq!(
             parse_link_v2("localPv CA"),
-            ParsedLink::Ca("localPv".to_string())
+            ParsedLink::Ca(CaLink::new("localPv"))
         );
         assert_eq!(link_field_type("localPv CA"), LinkType::Ca);
     }
 
     #[test]
     fn ca_modifier_combined_with_pp_ms() {
-        // `CA` may co-occur with PP/MS-style modifiers in any order.
-        // All non-CA modifiers are stripped; the link is still a CA
-        // link carrying just the PV name.
+        // BRIDGE-FR-3: `CA` may co-occur with PP/MS-style modifiers in
+        // any order. The PV name is stripped clean, AND the `MS`-class
+        // modifier is now CARRIED in the CaLink (pre-fix it was
+        // discarded, reducing both forms to a bare `Ca("REC.VAL")`).
         assert_eq!(
             parse_link_v2("REC.VAL CA MS"),
-            ParsedLink::Ca("REC.VAL".to_string())
+            ParsedLink::Ca(CaLink {
+                pv: "REC.VAL".to_string(),
+                monitor_switch: MonitorSwitch::Maximize,
+            })
         );
+        // `PP CA` carries no MS-class modifier → NoMaximize.
         assert_eq!(
             parse_link_v2("REC.VAL PP CA"),
-            ParsedLink::Ca("REC.VAL".to_string())
+            ParsedLink::Ca(CaLink::new("REC.VAL"))
+        );
+        // `CA NMS` carries the explicit NoMaximize switch.
+        assert_eq!(
+            parse_link_v2("REC.VAL CA NMS"),
+            ParsedLink::Ca(CaLink {
+                pv: "REC.VAL".to_string(),
+                monitor_switch: MonitorSwitch::NoMaximize,
+            })
         );
         assert_eq!(link_field_type("REC.VAL CA NMS"), LinkType::Ca);
+    }
+
+    #[test]
+    fn ca_scheme_link_parses_ms_modifier() {
+        // BRIDGE-FR-3: `ca://PV MS` must strip the modifier off the
+        // scheme body — pre-fix the PV name became `"PV MS"`.
+        assert_eq!(
+            parse_link_v2("ca://SR:DCCT MS"),
+            ParsedLink::Ca(CaLink {
+                pv: "SR:DCCT".to_string(),
+                monitor_switch: MonitorSwitch::Maximize,
+            })
+        );
+        assert_eq!(
+            parse_link_v2("ca://SR:DCCT MSI"),
+            ParsedLink::Ca(CaLink {
+                pv: "SR:DCCT".to_string(),
+                monitor_switch: MonitorSwitch::MaximizeIfInvalid,
+            })
+        );
+        assert_eq!(
+            parse_link_v2("ca://SR:DCCT MSS"),
+            ParsedLink::Ca(CaLink {
+                pv: "SR:DCCT".to_string(),
+                monitor_switch: MonitorSwitch::MaximizeStatus,
+            })
+        );
+        // Bare `ca://PV` → default NoMaximize, PV name intact.
+        assert_eq!(
+            parse_link_v2("ca://SR:DCCT"),
+            ParsedLink::Ca(CaLink::new("SR:DCCT"))
+        );
     }
 
     #[test]

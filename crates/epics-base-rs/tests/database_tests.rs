@@ -5082,3 +5082,122 @@ async fn mr_r5_already_locked_process_does_not_self_deadlock() {
     res.expect("owner-path processing of an owned member must succeed");
     assert!(visited.contains("MR_R5_OWNED"));
 }
+
+/// BRIDGE-FR-3: a CA link carries its `MS`/`NMS`/`MSI`/`MSS` modifier in
+/// the parsed model, and record processing applies the maximize-severity
+/// gate using that switch (uniform with DB links). The CA lset returns
+/// the RAW remote alarm (severity + status); processing decides what to
+/// fold. Tested by invariant boundary, not by narrative:
+///
+/// * NMS  → never propagate
+/// * MS   → max severity, STAT = LINK_ALARM (remote stat NOT preserved)
+/// * MSI  → propagate only when remote sevr == INVALID
+/// * MSS  → max severity AND remote STAT preserved (the cited gap)
+#[tokio::test]
+async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
+    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    /// CA lset: connected, returns a configurable RAW remote alarm — it
+    /// does NOT apply any MS/NMS gate itself (that is record processing's
+    /// job for CA links now).
+    struct RawCaLset {
+        sevr: i32,
+        stat: i32,
+    }
+    impl LinkSet for RawCaLset {
+        fn is_connected(&self, _: &str) -> bool {
+            true
+        }
+        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+            Some(EpicsValue::Double(7.0))
+        }
+        fn alarm_severity(&self, _: &str) -> Option<i32> {
+            // Mirror the real CA resolver: only a non-zero severity is a
+            // contribution worth returning.
+            if self.sevr > 0 { Some(self.sevr) } else { None }
+        }
+        fn alarm_status(&self, _: &str) -> Option<i32> {
+            Some(self.stat)
+        }
+    }
+
+    // Process an ai record whose INP is `inp`, with the CA lset serving
+    // the given raw remote (sevr, stat). Returns the record's resulting
+    // (SEVR, STAT).
+    async fn run(inp: &str, remote_sevr: i32, remote_stat: i32) -> (AlarmSeverity, u16) {
+        let db = PvDatabase::new();
+        db.register_link_set(
+            "ca",
+            Arc::new(RawCaLset {
+                sevr: remote_sevr,
+                stat: remote_stat,
+            }),
+        )
+        .await;
+        db.add_record("CADST", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        if let Some(rec) = db.get_record("CADST").await {
+            let mut inst = rec.write().await;
+            inst.put_common_field("INP", EpicsValue::String(inp.into()))
+                .unwrap();
+            inst.common.udf = false;
+        }
+        let mut visited = HashSet::new();
+        db.process_record_with_links("CADST", &mut visited, 0)
+            .await
+            .unwrap();
+        let rec = db.get_record("CADST").await.expect("record exists");
+        let inst = rec.read().await;
+        (inst.common.sevr, inst.common.stat)
+    }
+
+    // Remote: MAJOR severity, COMM_ALARM (9) status — distinct from
+    // LINK_ALARM (14) so an MSS pass-through is observable.
+    const REMOTE_STAT: i32 = alarm_status::COMM_ALARM as i32;
+
+    // NMS — no propagation despite a connected MAJOR remote.
+    let (sevr, _stat) = run("ca://REMOTE NMS", 2, REMOTE_STAT).await;
+    assert_eq!(
+        sevr,
+        AlarmSeverity::NoAlarm,
+        "NMS must not propagate the remote alarm"
+    );
+
+    // MS — lift to remote MAJOR, but surface as the generic LINK_ALARM.
+    let (sevr, stat) = run("ca://REMOTE MS", 2, REMOTE_STAT).await;
+    assert_eq!(sevr, AlarmSeverity::Major, "MS lifts SEVR to remote MAJOR");
+    assert_eq!(
+        stat,
+        alarm_status::LINK_ALARM,
+        "MS surfaces as LINK_ALARM, not the remote STAT"
+    );
+
+    // MSS — lift severity AND adopt the remote STAT (the cited gap).
+    let (sevr, stat) = run("ca://REMOTE MSS", 2, REMOTE_STAT).await;
+    assert_eq!(sevr, AlarmSeverity::Major, "MSS lifts SEVR to remote MAJOR");
+    assert_eq!(
+        stat,
+        alarm_status::COMM_ALARM,
+        "MSS must preserve the remote STAT code, not collapse to LINK_ALARM"
+    );
+
+    // MSI with a non-INVALID (MAJOR) remote — must NOT propagate.
+    let (sevr, _stat) = run("ca://REMOTE MSI", 2, REMOTE_STAT).await;
+    assert_eq!(
+        sevr,
+        AlarmSeverity::NoAlarm,
+        "MSI ignores a non-INVALID remote alarm"
+    );
+
+    // MSI with an INVALID remote — inherits as LINK_ALARM + INVALID.
+    let (sevr, stat) = run("ca://REMOTE MSI", 3, REMOTE_STAT).await;
+    assert_eq!(
+        sevr,
+        AlarmSeverity::Invalid,
+        "MSI inherits an INVALID remote alarm"
+    );
+    assert_eq!(stat, alarm_status::LINK_ALARM, "MSI surfaces as LINK_ALARM");
+}

@@ -624,10 +624,21 @@ impl PvDatabase {
                     let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
                     alarm.map(|a| (db.monitor_switch, a))
                 }
-                crate::server::record::ParsedLink::Pva(_)
-                | crate::server::record::ParsedLink::Ca(_) => {
+                crate::server::record::ParsedLink::Pva(_) => {
+                    // PVA: the lset already applied the MS/NMS/MSI gate,
+                    // so the returned severity is final — fold it as
+                    // MaximizeStatus to preserve the remote stat+msg
+                    // (pvxs `pvalink_lset.cpp`).
                     let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
                     alarm.map(|a| (crate::server::record::MonitorSwitch::MaximizeStatus, a))
+                }
+                crate::server::record::ParsedLink::Ca(ref ca) => {
+                    // CA (BRIDGE-FR-3): apply the link's own
+                    // MS/NMS/MSI/MSS gate at the fold boundary, uniform
+                    // with the Db arm above — the resolver returned the
+                    // *raw* remote alarm, not a gated one.
+                    let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
+                    alarm.map(|a| (ca.monitor_switch, a))
                 }
                 _ => None,
             }
@@ -642,12 +653,9 @@ impl PvDatabase {
         // option internally (returns `None` unless `time=true`), so a
         // bare connected link without the flag still produces local
         // processing time. Mirrors pvxs `pvalink_lset.cpp:427`.
-        let inp_link_remote_time: Option<(i64, i32)> = match inp_parsed {
-            crate::server::record::ParsedLink::Pva(ref name)
-            | crate::server::record::ParsedLink::Ca(ref name) => {
-                self.external_link_time(name).await
-            }
-            _ => None,
+        let inp_link_remote_time: Option<(i64, i32)> = match inp_parsed.external_pv_name() {
+            Some(name) => self.external_link_time(name).await,
+            None => None,
         };
 
         // Read DOL value
@@ -711,16 +719,21 @@ impl PvDatabase {
                         results.push((val_field.clone(), value));
                         resolved_link_fields.push(link_field);
                     }
-                    // B2: multi-input alarm propagation covers external
-                    // `pva://` / `ca://` links too — see the `inp_link_alarm`
-                    // comment for why the switch is `MaximizeStatus`.
+                    // B2 / BRIDGE-FR-3: multi-input alarm propagation
+                    // covers external links too. `Db` and `Ca` carry an
+                    // explicit `MonitorSwitch` (CA's was parsed from its
+                    // `MS`/`NMS`/`MSI`/`MSS` modifier); `Pva` is gated by
+                    // its lset, so its already-final severity folds as
+                    // `MaximizeStatus` (preserving remote stat+msg).
                     if let Some(alarm) = alarm {
                         match &parsed {
                             crate::server::record::ParsedLink::Db(db) => {
                                 link_alarms.push((db.monitor_switch, alarm));
                             }
-                            crate::server::record::ParsedLink::Pva(_)
-                            | crate::server::record::ParsedLink::Ca(_) => {
+                            crate::server::record::ParsedLink::Ca(ca) => {
+                                link_alarms.push((ca.monitor_switch, alarm));
+                            }
+                            crate::server::record::ParsedLink::Pva(_) => {
                                 link_alarms.push((
                                     crate::server::record::MonitorSwitch::MaximizeStatus,
                                     alarm,

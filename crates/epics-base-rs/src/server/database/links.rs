@@ -128,8 +128,8 @@ impl PvDatabase {
     ) -> Option<EpicsValue> {
         match link {
             crate::server::record::ParsedLink::None => None,
-            crate::server::record::ParsedLink::Ca(name)
-            | crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name).await,
+            crate::server::record::ParsedLink::Ca(ca) => self.resolve_external_pv(&ca.pv).await,
+            crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name).await,
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
             crate::server::record::ParsedLink::Db(db) => {
                 // PP: process source record if Passive before reading.
@@ -239,17 +239,26 @@ impl PvDatabase {
             }
             crate::server::record::ParsedLink::Constant(_) => (link.constant_value(), None),
             // External Pva/Ca link: the value comes from the lset's
-            // cached snapshot, and the alarm severity comes from the
-            // lset's `alarm_severity` accessor. The lset has already
-            // applied the link's `MS`/`NMS`/`MSI` mode gate (that
-            // modifier is stripped from the link string before
-            // epics-base-rs parses it), so a returned `Some(sev)` is
-            // propagated verbatim as a maximize-severity contribution.
-            // Without this, a connected pva link carrying a remote
-            // MINOR/MAJOR severity never folded into the owning
-            // record's LINK_ALARM (B2).
-            crate::server::record::ParsedLink::Pva(name)
-            | crate::server::record::ParsedLink::Ca(name) => {
+            // cached snapshot, the alarm from the lset's accessors.
+            //
+            // PVA: the `?sevr=` modifier is stripped before epics-base-rs
+            // parses the link, so the lset retains and applies the
+            // `MS`/`NMS`/`MSI` gate itself — a returned `Some(sev)` is
+            // already gated and the caller folds it as `MaximizeStatus`.
+            //
+            // CA (BRIDGE-FR-3): the `MS`/`NMS`/`MSI`/`MSS` modifier is
+            // now carried in the `CaLink`, so the resolver returns the
+            // *raw* remote alarm and record processing applies the gate
+            // using `link.monitor_switch()`. Either way this fn just
+            // reads the raw/gated alarm; the switch pairing happens in
+            // `processing.rs`. Without this, a connected external link
+            // carrying a remote MINOR/MAJOR severity never folded into
+            // the owning record's LINK_ALARM (B2).
+            crate::server::record::ParsedLink::Pva(_)
+            | crate::server::record::ParsedLink::Ca(_) => {
+                let name = link
+                    .external_pv_name()
+                    .expect("Ca/Pva link carries a PV name");
                 let value = self.resolve_external_pv(name).await;
                 let alarm = self.external_link_alarm(name).await;
                 (value, alarm)
@@ -310,7 +319,12 @@ impl PvDatabase {
                 if let Some(lset) = registry.get(&s) {
                     if let Some(sev) = lset.alarm_severity(name) {
                         return Some(LinkAlarm {
-                            stat: crate::server::recgbl::alarm_status::LINK_ALARM,
+                            // BRIDGE-FR-3: prefer the remote STAT for MSS;
+                            // fall back to LINK_ALARM when the lset has none.
+                            stat: lset
+                                .alarm_status(name)
+                                .map(|s| s as u16)
+                                .unwrap_or(crate::server::recgbl::alarm_status::LINK_ALARM),
                             sevr: crate::server::record::AlarmSeverity::from_u16(sev as u16),
                             amsg: lset.alarm_message(name).unwrap_or_default(),
                         });
@@ -322,7 +336,11 @@ impl PvDatabase {
         let lset = self.inner.link_sets.read().await.get(scheme)?;
         let sev = lset.alarm_severity(body)?;
         Some(LinkAlarm {
-            stat: crate::server::recgbl::alarm_status::LINK_ALARM,
+            // BRIDGE-FR-3: remote STAT for MSS, else LINK_ALARM.
+            stat: lset
+                .alarm_status(body)
+                .map(|s| s as u16)
+                .unwrap_or(crate::server::recgbl::alarm_status::LINK_ALARM),
             sevr: crate::server::record::AlarmSeverity::from_u16(sev as u16),
             amsg: lset.alarm_message(body).unwrap_or_default(),
         })
@@ -438,10 +456,13 @@ impl PvDatabase {
                 };
                 self.get_pv(&pv_name).await.ok()
             }
-            crate::server::record::ParsedLink::Ca(name)
-            | crate::server::record::ParsedLink::Pva(name)
+            crate::server::record::ParsedLink::Ca(_)
+            | crate::server::record::ParsedLink::Pva(_)
                 if is_soft =>
             {
+                let name = link
+                    .external_pv_name()
+                    .expect("Ca/Pva link carries a PV name");
                 self.resolve_external_pv(name).await
             }
             // lnkCalc evaluates regardless of `is_soft` — the input
@@ -610,8 +631,11 @@ impl PvDatabase {
                 self.write_db_link_value(db, value, src_putf, visited, depth)
                     .await;
             }
-            crate::server::record::ParsedLink::Ca(name)
-            | crate::server::record::ParsedLink::Pva(name) => {
+            crate::server::record::ParsedLink::Ca(_)
+            | crate::server::record::ParsedLink::Pva(_) => {
+                let name = link
+                    .external_pv_name()
+                    .expect("Ca/Pva link carries a PV name");
                 if let Err(e) = self.write_external_pv(name, value).await {
                     eprintln!("OUT-link write to external PV '{name}' failed: {e}");
                 }
@@ -1039,8 +1063,11 @@ impl PvDatabase {
                             // meaning for an external write (the remote
                             // record processes on its own IOC), so route
                             // straight through the link set.
-                            crate::server::record::ParsedLink::Ca(ref name)
-                            | crate::server::record::ParsedLink::Pva(ref name) => {
+                            crate::server::record::ParsedLink::Ca(_)
+                            | crate::server::record::ParsedLink::Pva(_) => {
+                                let name = parsed
+                                    .external_pv_name()
+                                    .expect("Ca/Pva link carries a PV name");
                                 if let Err(e) = self.write_external_pv(name, val.clone()).await {
                                     eprintln!(
                                         "dfanout OUT-link write to external PV '{name}' failed: {e}"

@@ -143,6 +143,22 @@ pub trait LinkSet: Send + Sync {
         None
     }
 
+    /// Remote alarm *status* code (the EPICS `alarm_status` enum:
+    /// `0 = NO_ALARM`, `1 = READ`, … `17 = COMM`, …) from the upstream
+    /// PV, when available.
+    ///
+    /// BRIDGE-FR-3: used to honour the `MSS` (maximize-severity-and-
+    /// status) link modifier — the owning record then adopts the remote
+    /// STAT instead of the generic `LINK_ALARM`. `None` means the lset
+    /// cannot report a remote status (no cache, or the link set does not
+    /// track it); the caller falls back to `LINK_ALARM`, which is the
+    /// behaviour for every non-`MSS` modifier and for lsets that leave
+    /// this default. Mirrors pvxs `pvalink_lset.cpp` `pvaGetAlarm`
+    /// surfacing the remote `alarm.status` to `recGblSetSevrMsg`.
+    fn alarm_status(&self, _name: &str) -> Option<i32> {
+        None
+    }
+
     /// `(seconds_past_epoch, nanoseconds)` from the upstream PV's
     /// timestamp slot, when available.
     fn time_stamp(&self, _name: &str) -> Option<(i64, i32)> {

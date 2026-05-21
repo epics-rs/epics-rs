@@ -16,18 +16,26 @@
 //! into a valid-looking PVA response — exactly what PVA-R5 / PVA-R9
 //! flag.
 //!
-//! The check here is a top-level structural match: PvField variant
-//! must align with the FieldDesc variant, and for compound types
-//! either the structure id / fields must match or the variant
-//! descriptor must align. We deliberately do NOT walk all children
-//! — a deep recursive walk is expensive on a per-post hot path, and
-//! the encoder's typed arms already crash safely on grandchild
-//! mismatch (the F-G10 fallback only fires for the top-level pair).
-//! Catching the most common producer mistake — opening one
-//! descriptor and posting an unrelated value — is sufficient for
-//! PVA-R5/R9 parity with pvxs's outer throw.
+//! The check walks the value and descriptor trees together, mirroring
+//! the encoder's coercion surface: at every leaf where the encoder
+//! would silently coerce a mismatched scalar (`encode_pv_field` /
+//! `encode_pv_field_generic`) or empty/retype a mismatched scalar
+//! array, this function returns an error instead so the mismatch is
+//! turned into a wire-level operation error (pvxs' outer throw).
+//! Compound types (`Structure`, `StructureArray`, `Union`,
+//! `UnionArray`) are recursed so a leaf mismatch nested under a
+//! matching outer shape — e.g. `value: Int` posted under an
+//! `NTScalar<Double>` descriptor that shares the same `struct_id` — is
+//! caught rather than coerced. An earlier revision compared only the
+//! outer shape (`struct_id` for a structure, length for an array) and
+//! let nested leaf mismatches reach the coercing fallback; that was
+//! the defect this closes. `Variant`/`VariantArray` are accepted as-is
+//! because the value carries its own descriptor (the encoder emits it
+//! inline rather than coercing to a fixed type); a `Null` field
+//! encodes as the descriptor's default and likewise carries no
+//! value-derived data to corrupt.
 
-use super::{FieldDesc, PvField, ScalarValue};
+use super::{FieldDesc, PvField, PvStructure, ScalarValue};
 
 /// Reason a value does not fit a descriptor.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -68,27 +76,75 @@ pub fn value_matches_descriptor(
                 })
             }
         }
-        // Scalar arrays (either enum-tagged or typed variant).
-        (PvField::ScalarArray(_), FieldDesc::ScalarArray(_))
-        | (PvField::ScalarArrayTyped(_), FieldDesc::ScalarArray(_)) => Ok(()),
-        // Structure: compare struct_id only (member walk is expensive
-        // and the encoder already handles per-member coercion for
-        // descriptor-named fields via `get_field(name)` lookups).
-        (PvField::Structure(s), FieldDesc::Structure { struct_id, .. }) => {
-            if &s.struct_id == struct_id {
+        // Scalar arrays: the element type must equal the descriptor's.
+        // A mismatch routes through `encode_pv_field_generic`, which
+        // coerces every element to the descriptor type (or empties the
+        // array) — silent corruption, e.g. a `uint[]` posted under an
+        // `int[]` descriptor. An empty enum-tagged array carries no
+        // element type and so always fits.
+        (PvField::ScalarArray(items), FieldDesc::ScalarArray(st)) => {
+            match items.iter().map(scalar_type_of).find(|t| t != st) {
+                Some(value) => Err(ValueDescMismatch::ScalarTypeMismatch { desc: *st, value }),
+                None => Ok(()),
+            }
+        }
+        (PvField::ScalarArrayTyped(arr), FieldDesc::ScalarArray(st)) => {
+            if arr.scalar_type() == *st {
                 Ok(())
             } else {
-                Err(ValueDescMismatch::StructureIdMismatch {
-                    desc_id: struct_id.clone(),
-                    value_id: s.struct_id.clone(),
+                Err(ValueDescMismatch::ScalarTypeMismatch {
+                    desc: *st,
+                    value: arr.scalar_type(),
                 })
             }
         }
-        (PvField::StructureArray(_), FieldDesc::StructureArray { .. }) => Ok(()),
-        // Union — the descriptor lists variants; the value just has
-        // a selector. Selector range is enforced at encode time.
-        (PvField::Union { .. }, FieldDesc::Union { .. }) => Ok(()),
-        (PvField::UnionArray(_), FieldDesc::UnionArray { .. }) => Ok(()),
+        // Structure: `struct_id` must match AND every value field the
+        // encoder will emit must fit its descriptor. The encoder
+        // recurses per descriptor-named field (`encode_pv_field`'s
+        // Structure arm), coercing leaf mismatches; matching only
+        // `struct_id` let `value: Int` ride out under an
+        // `NTScalar<Double>` descriptor of the same id.
+        (PvField::Structure(s), FieldDesc::Structure { struct_id, fields }) => {
+            if &s.struct_id != struct_id {
+                return Err(ValueDescMismatch::StructureIdMismatch {
+                    desc_id: struct_id.clone(),
+                    value_id: s.struct_id.clone(),
+                });
+            }
+            structure_fields_match(s, fields)
+        }
+        // Structure array: the encoder encodes each present element
+        // under the descriptor's field list (with the element's own
+        // `struct_id`), coercing leaf mismatches — walk each present
+        // element's fields. A `None` (absent) element emits a presence
+        // byte only and cannot corrupt.
+        (PvField::StructureArray(items), FieldDesc::StructureArray { fields, .. }) => {
+            for elem in items.iter().flatten() {
+                structure_fields_match(elem, fields)?;
+            }
+            Ok(())
+        }
+        // Union: the encoder encodes the selected variant's value under
+        // that variant's descriptor, coercing a leaf mismatch. An
+        // out-of-range / `-1` selector encodes as the null marker (no
+        // value bytes) and cannot corrupt, so it is accepted.
+        (
+            PvField::Union {
+                selector, value, ..
+            },
+            FieldDesc::Union { variants, .. },
+        ) => match selected_variant(*selector, variants) {
+            Some(vdesc) => value_matches_descriptor_child(value, vdesc),
+            None => Ok(()),
+        },
+        (PvField::UnionArray(items), FieldDesc::UnionArray { variants, .. }) => {
+            for it in items.iter().flatten() {
+                if let Some(vdesc) = selected_variant(it.selector, variants) {
+                    value_matches_descriptor_child(&it.value, vdesc)?;
+                }
+            }
+            Ok(())
+        }
         // Variant / VariantArray — pvxs Any/AnyA accepts any
         // payload because the value carries its own descriptor.
         (PvField::Variant(_), FieldDesc::Variant) => Ok(()),
@@ -103,6 +159,48 @@ pub fn value_matches_descriptor(
             value: value_label(val),
         }),
     }
+}
+
+/// Check every value field the encoder will emit for `s` against its
+/// matching descriptor field. `encode_pv_field`'s Structure arm emits
+/// each descriptor-named field from `s` when present, else a type
+/// default; only a *present* field can carry a coerced mismatch, so
+/// absent fields are not walked (a partial post / monitor delta is not
+/// a mismatch).
+fn structure_fields_match(
+    s: &PvStructure,
+    fields: &[(String, FieldDesc)],
+) -> Result<(), ValueDescMismatch> {
+    for (name, child_desc) in fields {
+        if let Some(child_val) = s.get_field(name) {
+            value_matches_descriptor_child(child_val, child_desc)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recurse into a nested field. A `Null` child encodes as the
+/// descriptor's default (no value-derived data), so it fits any
+/// descriptor in a nested position — unlike a top-level `Null`, which
+/// fits only a `Variant` slot.
+fn value_matches_descriptor_child(
+    value: &PvField,
+    desc: &FieldDesc,
+) -> Result<(), ValueDescMismatch> {
+    if matches!(value, PvField::Null) {
+        return Ok(());
+    }
+    value_matches_descriptor(value, desc)
+}
+
+/// The descriptor of the variant a union selector points at, or `None`
+/// for a null / out-of-range selector (encoded as the null marker, so
+/// not a coercible mismatch).
+fn selected_variant(selector: i32, variants: &[(String, FieldDesc)]) -> Option<&FieldDesc> {
+    usize::try_from(selector)
+        .ok()
+        .and_then(|idx| variants.get(idx))
+        .map(|(_, d)| d)
 }
 
 fn scalar_type_of(v: &ScalarValue) -> super::ScalarType {
@@ -149,5 +247,214 @@ fn desc_label(d: &FieldDesc) -> &'static str {
         FieldDesc::Variant => "Variant",
         FieldDesc::VariantArray => "VariantArray",
         FieldDesc::BoundedString(_) => "BoundedString",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pvdata::{ScalarType, UnionItem, VariantValue};
+
+    const NT_SCALAR: &str = "epics:nt/NTScalar:1.0";
+
+    fn nt_scalar_desc(value_ty: ScalarType) -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: NT_SCALAR.to_string(),
+            fields: vec![("value".to_string(), FieldDesc::Scalar(value_ty))],
+        }
+    }
+
+    fn nt_scalar_value(value: ScalarValue) -> PvField {
+        let mut s = PvStructure::new(NT_SCALAR);
+        s.set("value", PvField::Scalar(value));
+        PvField::Structure(s)
+    }
+
+    // ── The cited HIGH defect: a leaf type mismatch nested under a
+    //    matching outer NTScalar struct_id. ──────────────────────────
+
+    #[test]
+    fn nested_scalar_type_mismatch_in_structure_is_err() {
+        // value: Int under an NTScalar<Double> descriptor of the same id.
+        let desc = nt_scalar_desc(ScalarType::Double);
+        let value = nt_scalar_value(ScalarValue::Int(7));
+        assert!(
+            matches!(
+                value_matches_descriptor(&value, &desc),
+                Err(ValueDescMismatch::ScalarTypeMismatch {
+                    desc: ScalarType::Double,
+                    value: ScalarType::Int,
+                })
+            ),
+            "value: Int must not pass an NTScalar<Double> descriptor"
+        );
+    }
+
+    #[test]
+    fn nested_scalar_type_match_in_structure_is_ok() {
+        let desc = nt_scalar_desc(ScalarType::Double);
+        let value = nt_scalar_value(ScalarValue::Double(1.5));
+        assert!(value_matches_descriptor(&value, &desc).is_ok());
+    }
+
+    #[test]
+    fn struct_id_mismatch_is_err() {
+        let desc = nt_scalar_desc(ScalarType::Double);
+        let mut s = PvStructure::new("epics:nt/NTEnum:1.0");
+        s.set("value", PvField::Scalar(ScalarValue::Double(1.0)));
+        assert!(matches!(
+            value_matches_descriptor(&PvField::Structure(s), &desc),
+            Err(ValueDescMismatch::StructureIdMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn partial_structure_missing_field_is_ok() {
+        // Descriptor has `value` + `alarm`; value posts only `value`.
+        // The absent field encodes as a default — a partial post / delta
+        // is not a mismatch.
+        let desc = FieldDesc::Structure {
+            struct_id: NT_SCALAR.to_string(),
+            fields: vec![
+                ("value".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".to_string(),
+                        fields: vec![("severity".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+            ],
+        };
+        let value = nt_scalar_value(ScalarValue::Double(2.0));
+        assert!(value_matches_descriptor(&value, &desc).is_ok());
+    }
+
+    #[test]
+    fn null_nested_field_fits_any_descriptor() {
+        // A present-but-Null field encodes as the descriptor default.
+        let desc = nt_scalar_desc(ScalarType::Double);
+        let mut s = PvStructure::new(NT_SCALAR);
+        s.set("value", PvField::Null);
+        assert!(value_matches_descriptor(&PvField::Structure(s), &desc).is_ok());
+    }
+
+    // ── Scalar-array element-type boundary. ─────────────────────────
+
+    #[test]
+    fn enum_tagged_array_element_type_mismatch_is_err() {
+        let desc = FieldDesc::ScalarArray(ScalarType::Int);
+        let value = PvField::ScalarArray(vec![ScalarValue::UInt(1), ScalarValue::UInt(2)]);
+        assert!(matches!(
+            value_matches_descriptor(&value, &desc),
+            Err(ValueDescMismatch::ScalarTypeMismatch {
+                desc: ScalarType::Int,
+                value: ScalarType::UInt,
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_enum_tagged_array_fits_any_element_type() {
+        let desc = FieldDesc::ScalarArray(ScalarType::Int);
+        let value = PvField::ScalarArray(Vec::new());
+        assert!(value_matches_descriptor(&value, &desc).is_ok());
+    }
+
+    #[test]
+    fn typed_array_wrong_element_type_is_err() {
+        let desc = FieldDesc::ScalarArray(ScalarType::Double);
+        let value = PvField::scalar_array_int(vec![1, 2, 3]);
+        assert!(matches!(
+            value_matches_descriptor(&value, &desc),
+            Err(ValueDescMismatch::ScalarTypeMismatch {
+                desc: ScalarType::Double,
+                value: ScalarType::Int,
+            })
+        ));
+    }
+
+    #[test]
+    fn typed_array_matching_element_type_is_ok() {
+        let desc = FieldDesc::ScalarArray(ScalarType::Double);
+        let value = PvField::scalar_array_double(vec![1.0, 2.0]);
+        assert!(value_matches_descriptor(&value, &desc).is_ok());
+    }
+
+    // ── Compound recursion: StructureArray + Union. ─────────────────
+
+    #[test]
+    fn structure_array_element_nested_mismatch_is_err() {
+        let fields = vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))];
+        let desc = FieldDesc::StructureArray {
+            struct_id: "row_t".to_string(),
+            fields: fields.clone(),
+        };
+        let mut elem = PvStructure::new("row_t");
+        elem.set("value", PvField::Scalar(ScalarValue::Int(1)));
+        let value = PvField::StructureArray(vec![Some(elem)]);
+        assert!(value_matches_descriptor(&value, &desc).is_err());
+    }
+
+    fn double_or_int_union_desc() -> FieldDesc {
+        FieldDesc::Union {
+            struct_id: String::new(),
+            variants: vec![
+                ("d".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+                ("i".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        }
+    }
+
+    #[test]
+    fn union_selected_variant_type_mismatch_is_err() {
+        // selector 0 picks the Double variant; value is Int → coercion.
+        let desc = double_or_int_union_desc();
+        let value = PvField::Union {
+            selector: 0,
+            variant_name: "d".to_string(),
+            value: Box::new(PvField::Scalar(ScalarValue::Int(1))),
+        };
+        assert!(value_matches_descriptor(&value, &desc).is_err());
+    }
+
+    #[test]
+    fn union_null_selector_is_ok() {
+        let desc = double_or_int_union_desc();
+        let value = PvField::Union {
+            selector: -1,
+            variant_name: String::new(),
+            value: Box::new(PvField::Null),
+        };
+        assert!(value_matches_descriptor(&value, &desc).is_ok());
+    }
+
+    #[test]
+    fn union_array_element_variant_mismatch_is_err() {
+        let desc = FieldDesc::UnionArray {
+            struct_id: String::new(),
+            variants: vec![
+                ("d".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+                ("i".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        };
+        let value = PvField::UnionArray(vec![Some(UnionItem {
+            selector: 0,
+            variant_name: "d".to_string(),
+            value: PvField::Scalar(ScalarValue::Int(9)),
+        })]);
+        assert!(value_matches_descriptor(&value, &desc).is_err());
+    }
+
+    #[test]
+    fn variant_accepts_any_payload() {
+        // Variant carries its own descriptor; the encoder emits it
+        // inline, so any payload fits.
+        let desc = FieldDesc::Variant;
+        let value = PvField::Variant(Box::new(VariantValue {
+            desc: Some(FieldDesc::Scalar(ScalarType::Int)),
+            value: PvField::Scalar(ScalarValue::Int(3)),
+        }));
+        assert!(value_matches_descriptor(&value, &desc).is_ok());
     }
 }

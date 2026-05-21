@@ -400,16 +400,23 @@ async fn monitor_pv(
     }
 }
 
-/// CA-FR-4: parse a `camonitor -m <msk>` mask string into `DBE_*` bits.
-/// Letters: `v` value, `a` alarm, `l` log/archive, `p` property
-/// (epics-base `camonitor.c:285-303`). `None`/empty/unrecognised → the
-/// default value+log+alarm mask (matches the pre-`-m` subscription).
+/// CA-FR-4: parse a `camonitor -m <msk>` mask string into `DBE_*` bits,
+/// mirroring C `camonitor.c:40,285-301`.
+///
+/// With no `-m` the mask is the C default `DBE_VALUE | DBE_ALARM` (NOT
+/// value+log+alarm). A `-m` argument resets the mask to 0 and ORs in
+/// each recognised letter (`v` value, `a` alarm, `l` log/archive,
+/// `p` property); the FIRST unrecognised letter prints the C diagnostic
+/// to stderr, reverts the mask to `DBE_VALUE | DBE_ALARM`, and STOPS
+/// scanning the rest of the argument (C sets `err = 1`). An empty
+/// `-m ""` selects no events (mask 0), exactly as C's scan loop leaves
+/// `eventMask` at 0.
 fn parse_event_mask(m: Option<&str>) -> u16 {
     const DBE_VALUE: u16 = 1;
     const DBE_LOG: u16 = 2;
     const DBE_ALARM: u16 = 4;
     const DBE_PROPERTY: u16 = 8;
-    const DEFAULT: u16 = DBE_VALUE | DBE_LOG | DBE_ALARM;
+    const DEFAULT: u16 = DBE_VALUE | DBE_ALARM;
     let Some(s) = m else { return DEFAULT };
     let mut mask = 0u16;
     for c in s.chars() {
@@ -418,10 +425,13 @@ fn parse_event_mask(m: Option<&str>) -> u16 {
             'a' => mask |= DBE_ALARM,
             'l' => mask |= DBE_LOG,
             'p' => mask |= DBE_PROPERTY,
-            _ => {}
+            _ => {
+                eprintln!("Invalid argument '{s}' for option '-m' - ignored.");
+                return DEFAULT;
+            }
         }
     }
-    if mask == 0 { DEFAULT } else { mask }
+    mask
 }
 
 /// CA-FR-4: `camonitor -t <key>` rendering KIND — orthogonal to the
@@ -580,10 +590,25 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     #[test]
-    fn mask_defaults_when_absent_or_unrecognised() {
-        assert_eq!(parse_event_mask(None), 1 | 2 | 4);
-        assert_eq!(parse_event_mask(Some("")), 1 | 2 | 4);
-        assert_eq!(parse_event_mask(Some("xyz")), 1 | 2 | 4);
+    fn mask_default_is_value_alarm() {
+        // C `camonitor.c:40`: the no-`-m` default is VALUE|ALARM, NOT
+        // value+log+alarm.
+        assert_eq!(parse_event_mask(None), 1 | 4);
+    }
+
+    #[test]
+    fn mask_invalid_letter_reverts_to_value_alarm() {
+        // C `camonitor.c:298-300`: the first unrecognised letter reverts
+        // to VALUE|ALARM and stops scanning (so a leading valid `v` is
+        // discarded too).
+        assert_eq!(parse_event_mask(Some("xyz")), 1 | 4);
+        assert_eq!(parse_event_mask(Some("vx")), 1 | 4);
+    }
+
+    #[test]
+    fn mask_empty_selects_no_events() {
+        // C scan loop never runs on an empty arg → eventMask stays 0.
+        assert_eq!(parse_event_mask(Some("")), 0);
     }
 
     #[test]

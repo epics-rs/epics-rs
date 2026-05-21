@@ -1867,6 +1867,61 @@ fn _suppress(_: PvaHeader) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    /// RAII guard for the process-global `EPICS_PVA_*` env vars the
+    /// tests below set to pin search behaviour (suppress real broadcast
+    /// fan-out, fix the beacon port). It snapshots each key's prior
+    /// value on construction and restores it on drop — so a panicking
+    /// assertion can never leak a mutated var into a sibling test that
+    /// shares this process.
+    ///
+    /// `nextest` isolates each test in its own process, but `cargo test`
+    /// runs them as threads in one process — there the leak is real,
+    /// which is why every env-mutating test here also carries
+    /// `#[serial(epics_env)]` (the same cross-crate group key used by
+    /// the `auth::tls` and `epics-base-rs` net tests) so no two of them
+    /// mutate the shared environment concurrently. The earlier
+    /// `flavor = "current_thread"` "SAFETY" rationale was wrong: that
+    /// flavor only constrains the test's own async executor, not the
+    /// test harness's cross-test thread parallelism.
+    struct EnvVarGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvVarGuard {
+        /// Snapshot then set each `(key, value)`; restored on drop.
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(k, _)| (*k, std::env::var(k).ok()))
+                .collect();
+            // SAFETY: only constructed inside `#[serial(epics_env)]`
+            // tests, so no other thread reads or writes these keys
+            // concurrently — the reason `set_var` is `unsafe` in the
+            // 2024 edition.
+            unsafe {
+                for (k, v) in vars {
+                    std::env::set_var(k, v);
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: same serialization guarantee as `set`.
+            unsafe {
+                for (k, prev) in &self.saved {
+                    match prev {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn backoff_caps_at_last_value() {
@@ -2058,18 +2113,15 @@ mod tests {
     /// so the user-visible future resolves to `Vec::new()` and any
     /// outer `PvaClient::timeout` gets a chance to apply.
     #[tokio::test(flavor = "current_thread")]
+    #[serial(epics_env)]
     async fn find_all_returns_empty_when_no_responder() {
         // Suppress UDP fan-out — we don't want the engine bound to
-        // 5076 in CI / racing with a real PVA server.
-        //
-        // SAFETY: env vars are process-global; this test is annotated
-        // current_thread so other tokio tests don't see a partial
-        // state. The variables aren't read by any production path
-        // running in the same process.
-        unsafe {
-            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
-        }
+        // 5076 in CI / racing with a real PVA server. The guard
+        // restores the prior values on drop.
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+        ]);
 
         let engine = SearchEngine::spawn(Vec::new(), Vec::new())
             .await
@@ -2106,16 +2158,17 @@ mod tests {
     /// fired (the channel-layer timeout would have cancelled the
     /// caller's oneshot before any tick processed it).
     #[tokio::test(flavor = "current_thread")]
+    #[serial(epics_env)]
     async fn reconnect_search_broadcasts_within_one_tick() {
         use epics_base_rs::net::AsyncUdpV4;
         use std::net::Ipv4Addr;
 
         // Suppress real broadcast targets so the only destination
-        // is our sniffer below. SAFETY: see find_all_returns_empty.
-        unsafe {
-            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
-        }
+        // is our sniffer below.
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+        ]);
 
         // Sniffer on loopback ephemeral. The engine will be told
         // about it via `extra_targets`.
@@ -2196,14 +2249,15 @@ mod tests {
     /// empty-deadline behaviour to fire for `find` too) and
     /// silently revive the disconnect-storm bug.
     #[tokio::test(flavor = "current_thread")]
+    #[serial(epics_env)]
     async fn reconnect_find_does_not_complete_without_response() {
         // Suppress real broadcast so no actual SEARCH leaves the
         // process to potentially get answered by some other PVA
         // server on the LAN.
-        unsafe {
-            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
-        }
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+        ]);
         let engine = SearchEngine::spawn(Vec::new(), Vec::new())
             .await
             .expect("spawn engine");
@@ -2274,14 +2328,15 @@ mod tests {
     /// not internal state, because internal fields aren't part of
     /// the engine's public contract.
     #[tokio::test(flavor = "current_thread")]
+    #[serial(epics_env)]
     async fn hurry_up_kicks_pending_searches_at_fast_tick_cadence() {
         use epics_base_rs::net::AsyncUdpV4;
         use std::net::Ipv4Addr;
 
-        unsafe {
-            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
-        }
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+        ]);
         let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
@@ -2365,14 +2420,15 @@ mod tests {
     /// Slack: ±500 ms per gap to absorb scheduler / mio jitter on
     /// loaded CI. Total runtime ~4 s.
     #[tokio::test(flavor = "current_thread")]
+    #[serial(epics_env)]
     async fn retry_escalation_pvxs_pattern() {
         use epics_base_rs::net::AsyncUdpV4;
         use std::net::Ipv4Addr;
 
-        unsafe {
-            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
-        }
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+        ]);
         let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
@@ -2434,6 +2490,7 @@ mod tests {
     /// TCP endpoint. Regression guard against the v6 send path being
     /// dropped or the v6 recv arm losing the SEARCH_RESPONSE.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial(epics_env)]
     async fn client_search_resolves_over_ipv6() {
         use crate::nt::typed::TypedNT;
         use crate::server_native::{PvaServer, PvaServerConfig, SharedPV, SharedSource};
@@ -2441,10 +2498,10 @@ mod tests {
 
         // Suppress NIC broadcast so accidental v4 traffic to a sibling
         // pva-rs server on this host can't resolve the PV name.
-        unsafe {
-            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
-        }
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+        ]);
 
         let pv = SharedPV::new();
         pv.open(f64::descriptor(), f64::to_pv_field(&2.5));
@@ -2515,6 +2572,7 @@ mod tests {
     /// plumbing — without it the recv arm in `run_engine` never
     /// fires for v6 beacons.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(epics_env)]
     async fn v6_beacon_socket_binds_and_joins_default_group() {
         // Use a unique broadcast port for this test so we don't fight
         // a parallel test or a local pva-rs IOC for the well-known
@@ -2527,12 +2585,8 @@ mod tests {
             p
         };
         let port = pick_port();
-        // SAFETY: test process-wide env mutation. Tests reading the
-        // same var serialise on this section via tokio's runtime
-        // ordering — set + bind are sequential.
-        unsafe {
-            std::env::set_var("EPICS_PVA_BROADCAST_PORT", port.to_string());
-        }
+        let port_str = port.to_string();
+        let _env = EnvVarGuard::set(&[("EPICS_PVA_BROADCAST_PORT", &port_str)]);
 
         let sock =
             bind_beacon_udp_v6().expect("v6 beacon socket must bind on a host with IPv6 enabled");
@@ -2547,11 +2601,6 @@ mod tests {
             "beacon socket must bind the EPICS_PVA_BROADCAST_PORT we set"
         );
 
-        // Best-effort cleanup so a re-run on the same port doesn't
-        // inherit a stale value.
-        unsafe {
-            std::env::remove_var("EPICS_PVA_BROADCAST_PORT");
-        }
         drop(sock);
     }
 
@@ -2561,6 +2610,7 @@ mod tests {
     /// (server_addr, guid) pair, and `beacon_guid_for(addr)` returns
     /// the GUID we sent. Guards the full recv-decode-track chain.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial(epics_env)]
     async fn v6_beacon_arriving_at_engine_is_observed_by_tracker() {
         use crate::proto::{ByteOrder, Command, PvaHeader, WriteExt};
 
@@ -2573,14 +2623,14 @@ mod tests {
             p
         };
         let port = pick_port();
-        // SAFETY: process-wide env mutation. Suppress v4 search
-        // destinations so the engine's broadcast loop has nothing
-        // useful to fire.
-        unsafe {
-            std::env::set_var("EPICS_PVA_BROADCAST_PORT", port.to_string());
-            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
-        }
+        let port_str = port.to_string();
+        // Suppress v4 search destinations so the engine's broadcast
+        // loop has nothing useful to fire.
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_BROADCAST_PORT", &port_str),
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+        ]);
 
         let engine = SearchEngine::spawn(Vec::new(), Vec::new())
             .await
@@ -2642,14 +2692,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
 
-        // Cleanup env before assertion so a failure doesn't leave it
-        // set for sibling tests.
-        unsafe {
-            std::env::remove_var("EPICS_PVA_BROADCAST_PORT");
-            std::env::remove_var("EPICS_PVA_AUTO_ADDR_LIST");
-            std::env::remove_var("EPICS_PVA_ADDR_LIST");
-        }
-
         let observed = found_guid.expect(
             "BeaconTracker must observe a beacon arriving on the v6 beacon socket; \
              v6 recv arm in run_engine may be broken",
@@ -2668,6 +2710,7 @@ mod tests {
     /// the NS was never wired into the search path; post-fix it resolves
     /// within the timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial(epics_env)]
     async fn pva_r4_tcp_nameserver_persistent_peer() {
         use std::io::Cursor as IoCursor;
         use tokio::net::TcpListener;
@@ -2678,10 +2721,10 @@ mod tests {
             .expect("mock NS listener bind");
         let ns_addr = ns_listener.local_addr().unwrap();
 
-        unsafe {
-            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
-        }
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+        ]);
 
         let ns_handle = tokio::spawn(async move {
             let (mut stream, _peer) = ns_listener.accept().await.expect("mock NS: accept");
@@ -2830,10 +2873,6 @@ mod tests {
         )
         .await;
 
-        unsafe {
-            std::env::remove_var("EPICS_PVA_AUTO_ADDR_LIST");
-            std::env::remove_var("EPICS_PVA_ADDR_LIST");
-        }
         ns_handle.abort();
 
         let resolved = result

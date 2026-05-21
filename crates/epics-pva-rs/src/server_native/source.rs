@@ -61,13 +61,29 @@ pub struct ChannelContext {
 ///
 /// BR-R14: a PVA-to-PVA gateway fans one upstream monitor out to N
 /// downstream subscribers. The upstream monitor is opened with the
-/// gateway's *default* pvRequest, so any downstream option that
-/// changes *upstream event production* — pvxs `record._options`
-/// `pipeline` / `queueSize` / `ackAny` (`servermon.cpp:521-555`) — is
-/// not transparent through the fanout. A source that cannot honor a
-/// given option must be able to see it and reject the subscription
-/// rather than silently serving fanout events that differ from a
-/// direct upstream monitor.
+/// gateway's *default* pvRequest, so a downstream option that changes
+/// *upstream event production* is not transparent through the fanout:
+/// the events the gateway has on the shared stream are not the events
+/// a direct upstream monitor would produce for that option. The only
+/// such option is a server-side `record._options._filter` chain (a
+/// stateful `dbnd` deadband / `arr` slice run per subscription) —
+/// [`Self::server_filter`]. A source that cannot honor it must be able
+/// to see it and reject the subscription rather than silently serving
+/// fanout events that differ from a direct upstream monitor.
+///
+/// The pvxs pipeline flow-control options are deliberately NOT in this
+/// "affects upstream" set, because each is pure downstream credit/ACK/
+/// buffer flow control between the client and *its* server, terminated
+/// locally by the gateway and transparent through the fanout:
+/// `pipeline` (`servermon.cpp:523`, sets `op->pipeline`), `queueSize`
+/// (`:533`, sets `op->limit`), and `ackAny` (`:546-582`, parsed only
+/// inside `if(op->pipeline)`, sets the ACK-refill threshold `op->ackAt`
+/// that feeds the window watermarks at `:332`). None of them change
+/// which events the source produces, so none belongs here — flagging
+/// them would make every pipelined PVA client unable to monitor
+/// through the gateway. `ackAny` therefore has no field: it is
+/// transparent like `pipeline`/`queueSize`, not an upstream-event
+/// option the gateway must detect.
 ///
 /// Field projection (the pvRequest field mask) is intentionally NOT
 /// represented here: it is pure downstream-local masking the server
@@ -101,13 +117,13 @@ impl MonitorOptions {
     /// and therefore cannot be honored transparently by a fanout
     /// gateway that shares one upstream monitor across downstreams.
     ///
-    /// Only a server-side `_filter` chain qualifies. `pipeline` and
-    /// `queueSize` are downstream client↔gateway flow control the
-    /// gateway terminates locally (see the field docs), so they are
-    /// transparent and must NOT trigger a fanout-gateway rejection —
-    /// rejecting them would make every default-configured PVA client
-    /// (which enables pipeline by default) unable to monitor through
-    /// the gateway.
+    /// Only a server-side `_filter` chain qualifies. `pipeline`,
+    /// `queueSize`, and `ackAny` are downstream client↔gateway flow
+    /// control the gateway terminates locally (see the struct docs), so
+    /// they are transparent and must NOT trigger a fanout-gateway
+    /// rejection — rejecting them would make every default-configured
+    /// PVA client (which enables pipeline by default) unable to monitor
+    /// through the gateway.
     pub fn affects_upstream_events(&self) -> bool {
         self.server_filter
     }

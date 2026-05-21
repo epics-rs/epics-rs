@@ -227,6 +227,15 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         self.inner.notify_watermark(name, ctx, ev);
     }
+    // PVA-FR-11: same wrapper-severs-override defect family as
+    // `notify_watermark`/`monitor_watermarks` above — a transparent
+    // middleware layer that forwards one notify_* sibling but not the
+    // other would sever the inner source's monitor-start (onStart)
+    // callback (e.g. a wrapped `SharedPV::set_on_start`). Forward the
+    // Idle↔Executing edge unchanged.
+    fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
+        self.inner.notify_monitor_start(name, ctx, start);
+    }
 }
 
 // ── AclLayer ─────────────────────────────────────────────────────
@@ -596,6 +605,15 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     }
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         self.inner.notify_watermark(name, ctx, ev);
+    }
+    // PVA-FR-11: same wrapper-severs-override defect family as
+    // `notify_watermark`/`monitor_watermarks` above — a transparent
+    // middleware layer that forwards one notify_* sibling but not the
+    // other would sever the inner source's monitor-start (onStart)
+    // callback (e.g. a wrapped `SharedPV::set_on_start`). Forward the
+    // Idle↔Executing edge unchanged.
+    fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
+        self.inner.notify_monitor_start(name, ctx, start);
     }
 }
 
@@ -1208,6 +1226,15 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     }
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         self.inner.notify_watermark(name, ctx, ev);
+    }
+    // PVA-FR-11: same wrapper-severs-override defect family as
+    // `notify_watermark`/`monitor_watermarks` above — a transparent
+    // middleware layer that forwards one notify_* sibling but not the
+    // other would sever the inner source's monitor-start (onStart)
+    // callback (e.g. a wrapped `SharedPV::set_on_start`). Forward the
+    // Idle↔Executing edge unchanged.
+    fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
+        self.inner.notify_monitor_start(name, ctx, start);
     }
 }
 

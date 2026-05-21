@@ -638,6 +638,28 @@ pub trait ChannelSource: Send + Sync + 'static {
         let _ = (name, ctx, ev);
     }
 
+    /// PVA-FR-11: a downstream MONITOR op crossed the Executing<->Idle
+    /// boundary. `start == true` when the op begins or resumes producing
+    /// (MONITOR START / RESUME); `start == false` when it stops (MONITOR
+    /// PAUSE / CANCEL_REQUEST / DESTROY / disconnect). Mirrors pvxs
+    /// `MonitorControlOp::onStart(std::function<void(bool)>)`
+    /// (`source.h:130`, `servermon.cpp:677-683`).
+    ///
+    /// A source uses this to gate work that only matters while a client
+    /// is actually consuming: a gateway suspends its single upstream
+    /// subscription when every downstream op pauses and resumes it on the
+    /// first restart; a hardware/poller source stops sampling. The wire
+    /// layer fires it exactly once per edge through one
+    /// `MonitorStartControl` per op (see `tcp.rs`), so implementors never
+    /// see a duplicate `true`/`false` or a stop without a prior start.
+    /// `ctx` is credential-scoped (no `pv_request`) like
+    /// [`Self::notify_watermark`] so a fanout gateway can scope the
+    /// suspend/resume to the firing credential's upstream cache layer.
+    /// Default impl ignores it.
+    fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
+        let _ = (name, ctx, start);
+    }
+
     /// PVA-FR-4: the per-PV pipeline-window watermark levels `(low,
     /// high)` for `name`, in window-credit units. The monitor loop fires
     /// [`Self::notify_watermark`] with [`WatermarkKind::Resume`] when an
@@ -896,6 +918,7 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
     fn monitor_emits_partial(&self, name: &str) -> bool;
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent);
+    fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool);
     fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)>;
 }
 
@@ -1112,6 +1135,9 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         <Self as ChannelSource>::notify_watermark(self, name, ctx, ev);
+    }
+    fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
+        <Self as ChannelSource>::notify_monitor_start(self, name, ctx, start);
     }
     fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
         <Self as ChannelSource>::monitor_watermarks(self, name)

@@ -638,6 +638,14 @@ struct OpState {
     /// client after DESTROY. Idle (INIT-only) and MONITOR ops leave
     /// this as `None`.
     data_task_abort: Option<Arc<AbortOnDrop>>,
+    /// PVA-FR-11: single owner of this MONITOR op's Executing<->Idle edge
+    /// (see [`MonitorStartControl`]). `Some` once the subscriber task is
+    /// spawned; `None` for GET/PUT/RPC ops and for a MONITOR op that has
+    /// been INIT'd but never STARTed. Dropping the `OpState` (DESTROY /
+    /// channel destroy / connection reset) drops this Arc; the last drop
+    /// fires the terminal `notify_monitor_start(false)` iff still
+    /// executing.
+    monitor_start_ctl: Option<Arc<MonitorStartControl>>,
 }
 
 /// BRIDGE-FR-11: atomically cross a pipeline-window watermark and mint
@@ -729,6 +737,89 @@ impl Drop for WatermarkWithdrawOnDrop {
                 kind: crate::server_native::source::WatermarkKind::Withdraw,
             },
         );
+    }
+}
+
+/// PVA-FR-11: single owner of one MONITOR op's Executing<->Idle edge.
+/// pvxs fires `MonitorControlOp::onStart(bool)` once when a monitor
+/// begins producing and once when it stops (`servermon.cpp:677-683`); we
+/// mirror that through [`ChannelSource::notify_monitor_start`], firing
+/// only on a real edge so a gateway source can suspend its upstream
+/// subscription while every downstream consumer is paused.
+///
+/// INVARIANT: `notify_monitor_start(true)` fires exactly once per
+/// Idle->Executing edge and `notify_monitor_start(false)` exactly once
+/// per Executing->Idle edge, where "Executing" means the subscriber is
+/// producing (started and not paused). This struct is the ONLY caller of
+/// `notify_monitor_start`. Every transition site — START spawn, MONITOR
+/// PAUSE, MONITOR RESUME, CANCEL_REQUEST — routes through [`Self::set`],
+/// which is edge-triggered. Every teardown path — DESTROY, channel
+/// destroy, connection reset — drops the owning [`OpState`] (and thus
+/// this struct), and [`Drop`] fires the terminal `false` iff still
+/// executing. So a torn-down monitor can never leave the source
+/// believing it is still producing, and a DESTROY following a
+/// PAUSE/CANCEL does not double-fire `false`.
+///
+/// `executing` is an `AtomicBool` rather than a lock: every `set` is
+/// driven from the single per-connection read loop (which processes this
+/// op's START/PAUSE/RESUME/CANCEL/DESTROY frames in order), and `swap`
+/// gives the edge test atomically.
+struct MonitorStartControl {
+    src: DynSource,
+    pv_name: String,
+    ctx: crate::server_native::source::ChannelContext,
+    executing: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for MonitorStartControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MonitorStartControl")
+            .field("pv_name", &self.pv_name)
+            .field(
+                "executing",
+                &self.executing.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl MonitorStartControl {
+    fn new(
+        src: DynSource,
+        pv_name: String,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> Self {
+        Self {
+            src,
+            pv_name,
+            ctx,
+            executing: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Edge-triggered: fire `notify_monitor_start(desired)` only when the
+    /// executing state actually changes to `desired`.
+    fn set(&self, desired: bool) {
+        if self
+            .executing
+            .swap(desired, std::sync::atomic::Ordering::Relaxed)
+            != desired
+        {
+            self.src
+                .notify_monitor_start(&self.pv_name, &self.ctx, desired);
+        }
+    }
+}
+
+impl Drop for MonitorStartControl {
+    fn drop(&mut self) {
+        // Terminal Executing->Idle for any teardown that did not PAUSE /
+        // CANCEL first (DESTROY, channel destroy, connection reset).
+        if *self.executing.get_mut() {
+            *self.executing.get_mut() = false;
+            self.src
+                .notify_monitor_start(&self.pv_name, &self.ctx, false);
+        }
     }
 }
 
@@ -1885,6 +1976,7 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
         pv_request: None,
         monitor_options: crate::server_native::source::MonitorOptions::default(),
         data_task_abort: None,
+        monitor_start_ctl: None,
     }
 }
 
@@ -2637,6 +2729,13 @@ fn handle_cancel_request(
             // the MONITOR path).
             op.monitor_paused
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            // PVA-FR-11: CANCEL_REQUEST is Executing->Idle. Route through
+            // the op's single start-control owner so notify_monitor_start(
+            // false) fires once on the edge (no-op if already paused or
+            // never started). DESTROY's terminal stop comes from Drop.
+            if let Some(ctl) = &op.monitor_start_ctl {
+                ctl.set(false);
+            }
         }
     }
     Ok(())
@@ -3009,6 +3108,7 @@ async fn handle_op(
                 pv_request: stashed_pv_request,
                 monitor_options,
                 data_task_abort: None,
+                monitor_start_ctl: None,
             },
         );
 
@@ -3389,6 +3489,12 @@ async fn handle_op(
                 if is_pause {
                     op.monitor_paused
                         .store(true, std::sync::atomic::Ordering::Relaxed);
+                    // PVA-FR-11: Executing->Idle. The op's single
+                    // start-control owner fires notify_monitor_start(false)
+                    // on the edge so a gateway can suspend its upstream.
+                    if let Some(ctl) = &op.monitor_start_ctl {
+                        ctl.set(false);
+                    }
                 } else if is_resume {
                     let prev = op
                         .monitor_paused
@@ -3404,6 +3510,12 @@ async fn handle_op(
                         // loop isn't waiting yet, so a resume that races
                         // ahead of the loop's `notified()` is not lost.
                         op.monitor_resume.notify_one();
+                        // PVA-FR-11: Idle->Executing. `prev` gates this to a
+                        // genuine resume — a START on a monitor that was not
+                        // actually paused does not re-fire on_start(true).
+                        if let Some(ctl) = &op.monitor_start_ctl {
+                            ctl.set(true);
+                        }
                     }
                 }
             }
@@ -4238,9 +4350,32 @@ async fn handle_op(
                     let finish = build_monitor_finish(ioid, order);
                     let _ = tx_clone.send(finish).await;
                 });
+                // PVA-FR-11: install the single-owner Executing<->Idle edge
+                // tracker for this op (see `MonitorStartControl`). The ctx is
+                // credential-scoped (no pv_request), matching the watermark
+                // path, so a fanout gateway can scope the upstream
+                // suspend/resume to the firing credential's cache layer.
+                let start_ctl = Arc::new(MonitorStartControl::new(
+                    source.clone(),
+                    ch.name.clone(),
+                    crate::server_native::source::ChannelContext {
+                        peer,
+                        account: cred.account.clone(),
+                        method: cred.method.clone(),
+                        host: cred.host.clone(),
+                        authority: cred.authority.clone(),
+                        roles: cred.roles.clone(),
+                        pv_request: None,
+                    },
+                ));
                 if let Some(s) = ch.ops.get_mut(&ioid) {
                     s.monitor_started = true;
                     s.monitor_abort = Some(Arc::new(AbortOnDrop(join.abort_handle())));
+                    s.monitor_start_ctl = Some(start_ctl.clone());
+                    // Fire the initial Idle->Executing edge (pvxs
+                    // onStart(true) at MONITOR START) now that the op owns
+                    // the control.
+                    start_ctl.set(true);
                 }
             }
         }
@@ -5293,6 +5428,7 @@ mod tests {
                 pv_request: None,
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
+                monitor_start_ctl: None,
             },
         );
         channels.insert(
@@ -6979,6 +7115,7 @@ mod tests {
                 pv_request: None,
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
+                monitor_start_ctl: None,
             },
         );
         channels.insert(

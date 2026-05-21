@@ -42,6 +42,10 @@ struct MemSourceInner {
     state: Mutex<MemState>,
     /// Subscribers per PV — every push fans out to all of them.
     subs: Mutex<std::collections::HashMap<String, Vec<mpsc::Sender<PvField>>>>,
+    /// PVA-FR-11: ordered log of every `notify_monitor_start(name, start)`
+    /// the server fires, so a test can assert the Executing<->Idle edges.
+    /// Sync mutex because `notify_monitor_start` is a sync trait method.
+    monitor_starts: parking_lot::Mutex<Vec<(String, bool)>>,
 }
 
 struct MemState {
@@ -56,8 +60,21 @@ impl MemSource {
                     values: std::collections::HashMap::new(),
                 }),
                 subs: Mutex::new(std::collections::HashMap::new()),
+                monitor_starts: parking_lot::Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// PVA-FR-11: snapshot the ordered start/stop edges recorded for a
+    /// PV by [`ChannelSource::notify_monitor_start`].
+    fn monitor_starts(&self, name: &str) -> Vec<bool> {
+        self.inner
+            .monitor_starts
+            .lock()
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, s)| *s)
+            .collect()
     }
 
     async fn add_pv(&self, name: &str, value: f64) {
@@ -228,6 +245,17 @@ impl ChannelSource for MemSource {
             Some(rx)
         }
     }
+    fn notify_monitor_start(
+        &self,
+        name: &str,
+        _ctx: &epics_pva_rs::server_native::source::ChannelContext,
+        start: bool,
+    ) {
+        self.inner
+            .monitor_starts
+            .lock()
+            .push((name.to_string(), start));
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -380,6 +408,109 @@ async fn p5_monitor_pipeline_does_not_drop() {
     );
 
     monitor_handle.abort();
+    h.abort();
+}
+
+/// Poll the recorded on_start edges for `name` until at least `want_len`
+/// have landed (bounded ~2 s), then return them. Avoids fixed-sleep
+/// flakiness for the "at least N edges" assertions.
+async fn wait_starts(source: &MemSource, name: &str, want_len: usize) -> Vec<bool> {
+    for _ in 0..100 {
+        let s = source.monitor_starts(name);
+        if s.len() >= want_len {
+            return s;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    source.monitor_starts(name)
+}
+
+/// PVA-FR-11: a server-side monitor exposes pvxs `onStart(bool)` to the
+/// source. MONITOR START fires `on_start(true)`; MONITOR PAUSE fires
+/// `on_start(false)` without tearing the op down; MONITOR RESUME fires
+/// `on_start(true)` once; DESTROY (handle drop) fires the terminal
+/// `on_start(false)`. Mirrors pvxs `servermon.cpp:677-683` onStart edges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pva_fr_11_on_start_fires_across_start_pause_resume_destroy() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:ONSTART", 0.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    let handle = client
+        .pvmonitor_handle("STAB:ONSTART", move |_desc, _value| {})
+        .await
+        .expect("subscribe");
+
+    // START → on_start(true).
+    assert_eq!(
+        wait_starts(&source, "STAB:ONSTART", 1).await,
+        vec![true],
+        "MONITOR START must fire on_start(true) exactly once"
+    );
+
+    // PAUSE → on_start(false); the subscription stays alive.
+    handle.pause().await;
+    assert_eq!(
+        wait_starts(&source, "STAB:ONSTART", 2).await,
+        vec![true, false],
+        "MONITOR PAUSE must fire on_start(false) without destroying the op"
+    );
+
+    // RESUME → on_start(true) once.
+    handle.resume().await;
+    assert_eq!(
+        wait_starts(&source, "STAB:ONSTART", 3).await,
+        vec![true, false, true],
+        "MONITOR RESUME must fire on_start(true) exactly once"
+    );
+
+    // DESTROY (handle drop sends CMD_DESTROY_REQUEST) → terminal
+    // on_start(false) via MonitorStartControl::drop.
+    drop(handle);
+    assert_eq!(
+        wait_starts(&source, "STAB:ONSTART", 4).await,
+        vec![true, false, true, false],
+        "DESTROY must fire the terminal on_start(false) once"
+    );
+
+    h.abort();
+}
+
+/// PVA-FR-11: DESTROY after a prior PAUSE must NOT double-fire
+/// `on_start(false)`. The op is already Idle, so
+/// `MonitorStartControl::drop` sees `executing == false` and stays
+/// silent — closing the dual-fire edge the single-owner design exists
+/// to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pva_fr_11_destroy_after_pause_does_not_double_fire() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:ONSTART2", 0.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    let handle = client
+        .pvmonitor_handle("STAB:ONSTART2", move |_desc, _value| {})
+        .await
+        .expect("subscribe");
+    assert_eq!(wait_starts(&source, "STAB:ONSTART2", 1).await, vec![true]);
+
+    handle.pause().await;
+    assert_eq!(
+        wait_starts(&source, "STAB:ONSTART2", 2).await,
+        vec![true, false]
+    );
+
+    // DESTROY while already paused (Idle). Give the server ample time to
+    // process the DESTROY, then assert NO second `false` was appended.
+    drop(handle);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        source.monitor_starts("STAB:ONSTART2"),
+        vec![true, false],
+        "DESTROY after PAUSE must not double-fire on_start(false)"
+    );
+
     h.abort();
 }
 

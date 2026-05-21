@@ -97,6 +97,24 @@ pub type LifecycleFn = Arc<dyn Fn(&SharedPV) + Send + Sync>;
 /// ```
 pub type WatermarkFn = Arc<dyn Fn(&SharedPV) + Send + Sync>;
 
+/// PVA-FR-11: monitor start/stop callback. Fired with `true` when a
+/// downstream client begins or resumes MONITOR updates and `false` when
+/// it pauses, cancels, disconnects, or destroys the subscription.
+/// Mirrors pvxs `MonitorControlOp::onStart(std::function<void(bool)>)`
+/// (`source.h:130`). Producers gate expensive sampling / upstream
+/// subscriptions on it — start work on `true`, suspend on `false`:
+///
+/// ```ignore
+/// shared.set_on_start(Arc::new(|_pv, start| {
+///     if start { SAMPLER.resume() } else { SAMPLER.suspend() }
+/// }));
+/// ```
+///
+/// The wire layer fires it exactly once per Executing<->Idle edge per
+/// op (one `MonitorStartControl` per op), so a handler never sees a
+/// duplicate `true`/`false` or a `false` without a preceding `true`.
+pub type OnStartFn = Arc<dyn Fn(&SharedPV, bool) + Send + Sync>;
+
 // ── Per-subscriber bounded queue with squash-to-tail semantics ──────────────
 
 struct MonitorQueueInner {
@@ -289,6 +307,9 @@ struct Inner {
     /// Outbox drained back to zero (or below `low_watermark`).
     /// Producer un-throttle hint.
     on_low_mark: Option<WatermarkFn>,
+    /// PVA-FR-11: monitor start/stop hook (pvxs `onStart`). See
+    /// [`OnStartFn`].
+    on_start: Option<OnStartFn>,
 }
 
 impl Default for Inner {
@@ -308,6 +329,7 @@ impl Default for Inner {
             on_last_disconnect: None,
             on_high_mark: None,
             on_low_mark: None,
+            on_start: None,
         }
     }
 }
@@ -767,6 +789,23 @@ impl SharedPV {
         let g = self.inner.lock();
         (g.on_high_mark.clone(), g.on_low_mark.clone())
     }
+
+    /// PVA-FR-11: install a monitor start/stop callback. Fired with
+    /// `true` when a downstream client begins or resumes MONITOR updates
+    /// and `false` when it pauses, cancels, disconnects, or destroys the
+    /// subscription. Mirrors pvxs `MonitorControlOp::onStart`. Use it to
+    /// start/stop work that only matters while a client is consuming
+    /// (upstream subscriptions, hardware sampling). See [`OnStartFn`].
+    pub fn set_on_start(&self, cb: OnStartFn) {
+        self.inner.lock().on_start = Some(cb);
+    }
+
+    /// Internal: snapshot the current monitor start/stop callback so the
+    /// per-connection control path can fire it without holding the inner
+    /// mutex across the call.
+    pub(crate) fn on_start_handler(&self) -> Option<OnStartFn> {
+        self.inner.lock().on_start.clone()
+    }
 }
 
 impl Default for SharedPV {
@@ -1022,6 +1061,24 @@ impl super::source::ChannelSource for SharedSource {
         };
         if let Some((cb, p)) = cb {
             cb(&p);
+        }
+    }
+
+    /// PVA-FR-11: override default no-op to fire the per-PV `on_start`
+    /// callback so a producer can start/stop work as clients begin and
+    /// stop consuming. Mirrors pvxs `MonitorControlOp::onStart`. As with
+    /// the watermark callbacks, credential scoping (`_ctx`) carries no
+    /// extra meaning for a single-owner SharedPV — it matters only to the
+    /// gateway, which fans per-credential upstreams into separate caches.
+    /// The wire layer guarantees one call per Executing<->Idle edge.
+    fn notify_monitor_start(&self, name: &str, _ctx: &super::source::ChannelContext, start: bool) {
+        let cb = self
+            .pvs
+            .lock()
+            .get(name)
+            .and_then(|p| p.on_start_handler().map(|cb| (cb, p.clone())));
+        if let Some((cb, p)) = cb {
+            cb(&p, start);
         }
     }
 

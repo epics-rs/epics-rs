@@ -640,6 +640,25 @@ impl ChannelSource for CompositeSource {
             src.notify_watermark(name, ctx, ev);
         }
     }
+
+    fn notify_monitor_start(
+        &self,
+        name: &str,
+        ctx: &crate::server_native::source::ChannelContext,
+        start: bool,
+    ) {
+        // PVA-FR-11: same wrapper-severs-override defect family as
+        // `notify_watermark`/`monitor_watermarks` above. The server's
+        // MonitorStartControl fires the Idle↔Executing edge against the
+        // *bound* source, which `PvaServer::start` makes a CompositeSource.
+        // Without this forwarder the edge hits the trait-default no-op and
+        // never reaches the leaf (e.g. a `SharedPV`'s `set_on_start`
+        // callback). Fan out to every source with `ctx`/`start` unchanged;
+        // the per-source override decides whether the name matches.
+        for src in self.snapshot() {
+            src.notify_monitor_start(name, ctx, start);
+        }
+    }
 }
 
 #[cfg(test)]

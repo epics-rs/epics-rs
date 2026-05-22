@@ -360,8 +360,10 @@ enum CoordRequest {
         cid: u32,
         reply: oneshot::Sender<Option<Duration>>,
     },
-    /// Number of distinct CA servers we hold a virtual circuit to.
-    /// Mirrors libca `ca_get_ioc_connection_count`.
+    /// Number of distinct operational virtual circuits — keyed by
+    /// `(address, CA priority)` like libca's circuit table, so two
+    /// priorities to one IOC count as two circuits. Mirrors libca
+    /// `ca_get_ioc_connection_count`.
     GetIocConnectionCount {
         reply: oneshot::Sender<usize>,
     },
@@ -740,10 +742,14 @@ impl CaClient {
         self.exception_slot.write().take()
     }
 
-    /// Number of distinct CA servers this client currently holds an
-    /// operational virtual circuit to. Mirrors libca
-    /// `ca_get_ioc_connection_count()` (oldChannelNotify.cpp:891) —
-    /// a circuit-level (not channel-level) count, useful for sizing
+    /// Number of distinct operational CA virtual circuits this client
+    /// currently holds. libca keys its circuit table on
+    /// `(address, CA priority)` (`caServerID::operator==`,
+    /// `caServerID.h:47-55`), so two channels to the same IOC at
+    /// different priorities are two circuits. Mirrors libca
+    /// `ca_get_ioc_connection_count()` (`cac::circuitCount` returns
+    /// `circuitList.count`, `cac.cpp:403` / `access.cpp:671`) — a
+    /// circuit-level (not channel-level) count, useful for sizing
     /// reconnect storms after an IOC restart.
     pub async fn ioc_connection_count(&self) -> usize {
         let (tx, rx) = oneshot::channel();
@@ -2863,18 +2869,16 @@ async fn run_coordinator(
                         let _ = reply.send(v);
                     }
                     CoordRequest::GetIocConnectionCount { reply } => {
-                        // Count distinct servers with at least one
-                        // operational channel — mirrors libca which
-                        // counts virtual circuits, not channels.
-                        let mut servers = HashSet::<SocketAddr>::new();
-                        for ch in channels.values() {
-                            if let Some(addr) = ch.server_addr {
-                                if ch.state.is_operational() {
-                                    servers.insert(addr);
-                                }
-                            }
-                        }
-                        let _ = reply.send(servers.len());
+                        // libca counts virtual circuits, not channels,
+                        // and keys each circuit on (address, priority)
+                        // — so two priorities to one IOC are two
+                        // circuits. The dedup lives in
+                        // `operational_circuit_count` so it is
+                        // unit-testable without the coordinator.
+                        let states = channels
+                            .values()
+                            .map(|ch| (ch.state, ch.server_addr, ch.priority));
+                        let _ = reply.send(operational_circuit_count(states));
                     }
                     CoordRequest::Shutdown { reply } => {
                         // Send ClearChannel for all connected channels
@@ -3735,6 +3739,32 @@ where
     }
 }
 
+/// Count distinct operational virtual circuits for
+/// `ca_get_ioc_connection_count`. libca keys its circuit table on
+/// `(address, CA priority)` (`caServerID::operator==`,
+/// `caServerID.h:47-55`) and the count is `circuitList.count`
+/// (`cac::circuitCount`, `cac.cpp:403`), i.e. the number of `tcpiiu`
+/// circuits — so two channels to the same IOC at different CA
+/// priorities are two circuits. We therefore dedup on the full
+/// [`types::CircuitKey`] `(addr, priority)`, not the address alone
+/// (which under-counted after CA-FR-3 split circuits by priority).
+/// Extracted as a free function so the count is unit-testable without
+/// standing up the coordinator (mirrors `beacon_arrival_targets`).
+fn operational_circuit_count<I>(channel_states: I) -> usize
+where
+    I: IntoIterator<Item = (ChannelState, Option<SocketAddr>, u8)>,
+{
+    let mut circuits = HashSet::<types::CircuitKey>::new();
+    for (state, addr_opt, priority) in channel_states {
+        if !state.is_operational() {
+            continue;
+        }
+        let Some(addr) = addr_opt else { continue };
+        circuits.insert((addr, priority));
+    }
+    circuits.len()
+}
+
 fn remove_server_channel(
     server_channels: &mut HashMap<types::CircuitKey, HashSet<u32>>,
     circuit: types::CircuitKey,
@@ -4433,6 +4463,69 @@ mod beacon_arrival_routing_tests {
         ];
         let targets = beacon_arrival_targets(states, addr("10.0.0.1:5064"));
         assert_eq!(targets, vec![addr("10.0.0.1:5064")]);
+    }
+}
+
+#[cfg(test)]
+mod ioc_connection_count_tests {
+    use super::*;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// The defect this fix closes: two channels to the SAME IOC at
+    /// DIFFERENT CA priorities are two virtual circuits in libca
+    /// (`caServerID` keys on `(addr, priority)`), so the count must be 2.
+    /// Address-only dedup reported 1.
+    #[test]
+    fn two_priorities_to_one_ioc_count_as_two_circuits() {
+        let states = vec![
+            (ChannelState::Connected, Some(addr("10.0.0.1:5064")), 0u8),
+            (ChannelState::Connected, Some(addr("10.0.0.1:5064")), 1u8),
+        ];
+        assert_eq!(operational_circuit_count(states), 2);
+    }
+
+    /// Same `(addr, priority)` shared by many channels is one circuit —
+    /// channels multiplex onto a circuit, the count is circuit-level.
+    #[test]
+    fn many_channels_one_circuit_count_as_one() {
+        let states = vec![
+            (ChannelState::Connected, Some(addr("10.0.0.1:5064")), 0u8),
+            (ChannelState::Connected, Some(addr("10.0.0.1:5064")), 0u8),
+            (ChannelState::Connected, Some(addr("10.0.0.1:5064")), 0u8),
+        ];
+        assert_eq!(operational_circuit_count(states), 1);
+    }
+
+    /// Distinct server addresses at the same priority are distinct
+    /// circuits.
+    #[test]
+    fn distinct_addresses_count_separately() {
+        let states = vec![
+            (ChannelState::Connected, Some(addr("10.0.0.1:5064")), 0u8),
+            (ChannelState::Connected, Some(addr("10.0.0.2:5064")), 0u8),
+        ];
+        assert_eq!(operational_circuit_count(states), 2);
+    }
+
+    /// Non-operational channels hold no live circuit and are excluded.
+    #[test]
+    fn non_operational_channels_excluded() {
+        let states = vec![
+            (ChannelState::Searching, Some(addr("10.0.0.1:5064")), 0u8),
+            (ChannelState::Disconnected, Some(addr("10.0.0.2:5064")), 1u8),
+        ];
+        assert_eq!(operational_circuit_count(states), 0);
+    }
+
+    /// An operational channel that has not yet bound a server address
+    /// contributes no circuit.
+    #[test]
+    fn missing_server_addr_excluded() {
+        let states = vec![(ChannelState::Connected, None, 0u8)];
+        assert_eq!(operational_circuit_count(states), 0);
     }
 }
 

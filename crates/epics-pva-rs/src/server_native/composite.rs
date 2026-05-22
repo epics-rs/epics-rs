@@ -611,20 +611,37 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
-        // BRIDGE-FR-11: surface the watermark levels of whichever inner
-        // source exposes them, so the server monitor loop drives the
+    fn monitor_watermarks(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Option<(usize, usize)>> + Send {
+        // BRIDGE-FR-11: surface the watermark levels of the inner source
+        // that serves `name`, so the server monitor loop drives the
         // pause/resume hysteresis and reaches the per-source
-        // notify_watermark callback below. Consistent with that
-        // callback (which fans out to every source and lets each decide),
-        // this returns the first source that reports levels — only the
-        // gateway source overrides this; the control source keeps the
-        // default `None`. Without this forwarder the server sees the
-        // CompositeSource trait default `None` and never fires the
-        // callbacks (the wrapper-severs-override defect family).
-        self.snapshot()
-            .into_iter()
-            .find_map(|src| src.monitor_watermarks(name))
+        // notify_watermark callback below.
+        //
+        // Resolve the OWNING source the same way every other op does —
+        // first source whose `has_pv` claims `name`, in registration
+        // order (the single-owner resolution `resolve_checked` enforces)
+        // — and read ITS levels. The old `find_map(monitor_watermarks)`
+        // returned the first source that reported ANY levels, which let a
+        // catch-all source (the PVA gateway returns `Some((0,0))` for
+        // every name, served or not) preempt a later name-scoped owner
+        // (e.g. a SharedPV with real per-PV levels). Asking only the
+        // owner keeps the levels consistent with the source whose stream
+        // the monitor actually rides. The `notify_watermark` fan-out
+        // below is unchanged: it lets each source decide per name, and a
+        // non-owning source no-ops.
+        let name = name.to_string();
+        let sources = self.snapshot();
+        async move {
+            for src in sources {
+                if src.has_pv(&name).await {
+                    return src.monitor_watermarks(&name).await;
+                }
+            }
+            None
+        }
     }
 
     fn notify_watermark(
@@ -816,25 +833,33 @@ mod tests {
         );
     }
 
-    /// BRIDGE-FR-11: the composite must forward `monitor_watermarks`
-    /// to whichever inner source exposes levels, mirroring the
-    /// `notify_watermark` fan-out. Pre-fix the composite inherited
-    /// the `ChannelSource` trait default (`None`), so tcp.rs's monitor
-    /// loop saw no watermark levels and never armed the pause/resume
-    /// hysteresis — the gateway override on the inner source was
-    /// severed by the composite (the wrapper-severs-override family).
-    /// This registers a plain source (default `None`) ahead of a
-    /// watermark source and asserts `find_map` skips the `None` and
-    /// surfaces the inner override.
+    /// BRIDGE-FR-11 + watermark-routing fix: the composite must report
+    /// the `monitor_watermarks` levels of the source that **owns** the
+    /// name (resolved by `has_pv`, registration order), not the first
+    /// source that reports any levels. Pre-fix the composite used
+    /// `find_map(monitor_watermarks)`, so a catch-all source that returns
+    /// levels for every name (the PVA gateway returns `Some((0,0))`)
+    /// preempted a later name-scoped owner with real per-PV levels.
+    ///
+    /// `WmSrc` models both shapes: `serves` is the single name it owns
+    /// (its `has_pv` is name-scoped, like the real gateway whose upstream
+    /// lookup fails for names no upstream serves); `blanket` makes it
+    /// report `levels` for EVERY name (the gateway's name-independent
+    /// `monitor_watermarks`) versus only for the name it owns.
     #[tokio::test]
-    async fn fr11_composite_forwards_inner_monitor_watermarks() {
-        struct WatermarkSrc;
-        impl ChannelSource for WatermarkSrc {
+    async fn composite_watermarks_come_from_the_owning_source() {
+        struct WmSrc {
+            serves: &'static str,
+            levels: Option<(usize, usize)>,
+            blanket: bool,
+        }
+        impl ChannelSource for WmSrc {
             fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
                 async { Vec::new() }
             }
-            fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
-                async { true }
+            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+                let owned = name == self.serves;
+                async move { owned }
             }
             fn get_introspection(
                 &self,
@@ -865,32 +890,54 @@ mod tests {
             {
                 async { None }
             }
-            fn monitor_watermarks(&self, _name: &str) -> Option<(usize, usize)> {
-                Some((2, 5))
+            async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+                if self.blanket || name == self.serves {
+                    self.levels
+                } else {
+                    None
+                }
             }
         }
 
         let comp = CompositeSource::new();
-        // Plain source (order 0) reports the trait default `None`;
-        // watermark source (order 1) reports levels. find_map must
-        // skip the None and surface the override.
+        // Gateway-like (order 0, registered first): owns only "GW:PV" but
+        // reports (0,0) for EVERY name (blanket).
         comp.add_source(
-            "plain",
-            Arc::new(PvSrc {
-                name: "X",
-                value: 0,
+            "gw",
+            Arc::new(WmSrc {
+                serves: "GW:PV",
+                levels: Some((0, 0)),
+                blanket: true,
             }) as DynSource,
             0,
         )
         .unwrap();
-        comp.add_source("wm", Arc::new(WatermarkSrc) as DynSource, 1)
-            .unwrap();
+        // SharedPV-like owner (order 1, after the gateway): owns
+        // "LOCAL:PV" with real per-PV levels, reported only for its name.
+        comp.add_source(
+            "local",
+            Arc::new(WmSrc {
+                serves: "LOCAL:PV",
+                levels: Some((3, 9)),
+                blanket: false,
+            }) as DynSource,
+            1,
+        )
+        .unwrap();
 
+        // The owner of "LOCAL:PV" is the SharedPV-like source; the
+        // gateway-like source is ordered first and reports (0,0) for every
+        // name but does NOT own "LOCAL:PV", so it must not shadow the
+        // owner's (3,9). The old find_map(first-Some) returned (0,0).
         assert_eq!(
-            comp.monitor_watermarks("X"),
-            Some((2, 5)),
-            "composite must forward the inner source's watermark levels, not the default None"
+            comp.monitor_watermarks("LOCAL:PV").await,
+            Some((3, 9)),
+            "a catch-all source ordered before the owner must not shadow the owner's levels"
         );
+        // A name the gateway-like source owns still gets its (0,0).
+        assert_eq!(comp.monitor_watermarks("GW:PV").await, Some((0, 0)));
+        // No source owns this name — no levels.
+        assert_eq!(comp.monitor_watermarks("UNKNOWN:PV").await, None);
     }
 
     /// Round 50 follow-up (audit): pre-fix the composite used

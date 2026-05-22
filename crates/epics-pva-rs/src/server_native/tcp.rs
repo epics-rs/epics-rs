@@ -3987,7 +3987,7 @@ async fn handle_op(
         // value threaded out of this `OpState`, not a fresh source read).
         let monitor_wm = if kind == OpKind::Monitor {
             clamp_watermarks(
-                source.monitor_watermarks(&ch.name),
+                source.monitor_watermarks(&ch.name).await,
                 pipeline_opt.as_ref().map(|p| p.ack_at),
             )
         } else {

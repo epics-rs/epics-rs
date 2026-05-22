@@ -221,8 +221,8 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     // sees the trait default `None` and never fires the pause/resume
     // callbacks — the same wrapper-severs-override defect family as
     // FR-8's `has_pv_checked`/`get_introspection_checked`.
-    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
-        self.inner.monitor_watermarks(name)
+    async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+        self.inner.monitor_watermarks(name).await
     }
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         self.inner.notify_watermark(name, ctx, ev);
@@ -600,8 +600,8 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     // sees the trait default `None` and never fires the pause/resume
     // callbacks — the same wrapper-severs-override defect family as
     // FR-8's `has_pv_checked`/`get_introspection_checked`.
-    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
-        self.inner.monitor_watermarks(name)
+    async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+        self.inner.monitor_watermarks(name).await
     }
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         self.inner.notify_watermark(name, ctx, ev);
@@ -1221,8 +1221,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     // sees the trait default `None` and never fires the pause/resume
     // callbacks — the same wrapper-severs-override defect family as
     // FR-8's `has_pv_checked`/`get_introspection_checked`.
-    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
-        self.inner.monitor_watermarks(name)
+    async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+        self.inner.monitor_watermarks(name).await
     }
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         self.inner.notify_watermark(name, ctx, ev);
@@ -1798,7 +1798,7 @@ mod tests {
         async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
             None
         }
-        fn monitor_watermarks(&self, _name: &str) -> Option<(usize, usize)> {
+        async fn monitor_watermarks(&self, _name: &str) -> Option<(usize, usize)> {
             Some((2, 5))
         }
     }
@@ -1808,7 +1808,7 @@ mod tests {
         let stack = AuditLayer::new(NoopAudit)
             .layer(ReadOnlyLayer.layer(AclLayer::new(AclConfig::default()).layer(WatermarkSource)));
         assert_eq!(
-            stack.monitor_watermarks("X"),
+            stack.monitor_watermarks("X").await,
             Some((2, 5)),
             "monitor_watermarks must forward through every wrapper, not collapse to the default None"
         );

@@ -685,9 +685,18 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// `None` (no per-PV levels);
     /// [`crate::server_native::shared_pv::SharedSource`] overrides to
     /// return its `SharedPV` levels.
-    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+    ///
+    /// Async because a [`crate::server_native::CompositeSource`] must
+    /// resolve the source that actually serves `name` (via `has_pv`, the
+    /// same single-owner resolution every other op uses) before reading
+    /// its levels — a catch-all source that returns levels for every
+    /// name (the PVA gateway) must not preempt the name-scoped owner.
+    fn monitor_watermarks(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Option<(usize, usize)>> + Send {
         let _ = name;
-        None
+        async { None }
     }
 }
 
@@ -935,7 +944,10 @@ pub trait ChannelSourceObj: Send + Sync {
     fn monitor_emits_partial(&self, name: &str) -> bool;
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent);
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool);
-    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)>;
+    fn monitor_watermarks<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(usize, usize)>> + Send + 'a>>;
 }
 
 impl<T: ChannelSource + 'static> ChannelSourceObj for T {
@@ -1155,7 +1167,11 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
         <Self as ChannelSource>::notify_monitor_start(self, name, ctx, start);
     }
-    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
-        <Self as ChannelSource>::monitor_watermarks(self, name)
+    fn monitor_watermarks<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(usize, usize)>> + Send + 'a>>
+    {
+        Box::pin(<Self as ChannelSource>::monitor_watermarks(self, name))
     }
 }

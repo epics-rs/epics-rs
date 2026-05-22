@@ -1085,7 +1085,7 @@ impl super::source::ChannelSource for SharedSource {
     /// PVA-FR-4: expose the per-PV `(low, high)` watermark levels so the
     /// monitor loop fires the callbacks off the pipeline window rather
     /// than server-queue occupancy.
-    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+    async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
         self.pvs.lock().get(name).map(|p| p.watermarks())
     }
 }
@@ -1214,8 +1214,8 @@ mod tests {
     /// levels to the monitor loop (which fires the callbacks off the
     /// pipeline window), and `set_*_watermark` retunes them. An unknown
     /// PV / level-less source returns `None`.
-    #[test]
-    fn shared_source_exposes_per_pv_watermark_levels() {
+    #[tokio::test]
+    async fn shared_source_exposes_per_pv_watermark_levels() {
         use super::super::source::ChannelSource;
         let pv = SharedPV::new();
         pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
@@ -1223,8 +1223,8 @@ mod tests {
         pv.set_high_watermark(5);
         let src = SharedSource::new();
         src.add("wm:pv", pv);
-        assert_eq!(src.monitor_watermarks("wm:pv"), Some((2, 5)));
-        assert_eq!(src.monitor_watermarks("nope"), None);
+        assert_eq!(src.monitor_watermarks("wm:pv").await, Some((2, 5)));
+        assert_eq!(src.monitor_watermarks("nope").await, None);
     }
 
     /// MR-R2 regression: a no-handler `put_delta` to a `SharedPV` with

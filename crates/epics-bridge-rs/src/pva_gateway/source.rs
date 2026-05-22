@@ -1246,9 +1246,13 @@ impl ChannelSource for GatewayChannelSource {
     /// `high == 0` guarantees the ACK path can always re-cross it
     /// (`w_now > 0`) and resume a paused upstream. (A non-zero `high`
     /// could exceed a small client window and never re-fire after a
-    /// pause.) Returned for every name — only consulted for monitors on
-    /// channels this source already created.
-    fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+    /// pause.) Name-independent: the gateway applies the same `(0, 0)`
+    /// pipeline-window policy to every monitor it serves. The composite
+    /// resolves the owning source via `has_pv` before reading levels, so
+    /// this is consulted only for names the gateway actually owns —
+    /// returning `Some` for every name no longer shadows a co-registered
+    /// name-scoped source's real per-PV levels.
+    async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
         let _ = name;
         Some((0, 0))
     }

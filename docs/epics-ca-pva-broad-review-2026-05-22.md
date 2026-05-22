@@ -37,6 +37,9 @@ Method:
 | BFR-9 | Medium | PVA raw monitor overrun parsing | Open |
 | BFR-10 | Low | CA/base monitor drop accounting | Open |
 | BFR-11 | Medium | PVA raw monitor control-frame parsing | Open |
+| BFR-12 | Medium | PVA MONITOR FINISH op cleanup | Open |
+| BFR-13 | Medium | PVA data-phase error response shape | Open |
+| BFR-14 | Medium | PVA raw monitor re-encode error handling | Open |
 
 ## Reviewed Anchors
 
@@ -54,6 +57,9 @@ Initial anchors:
 - `rg -n "RawMonitorEvent|reencode_raw_monitor|build_monitor_payload_raw|body_bytes|overrun|op_monitor_raw_frames" crates/epics-pva-rs/src/server_native crates/epics-pva-rs/src/client_native /Users/stevek/codes/pvxs/src/clientmon.cpp`
 - `rg -n "dropped_monitor_events|record_dropped_monitor|coalesced|try_send\\(" crates/epics-base-rs/src/server crates/epics-ca-rs/src/server`
 - `rg -n "frame.payload.len\\(\\) < 5|MONITOR FINISH|Status::decode|decode_op_response" crates/epics-pva-rs/src/client_native /Users/stevek/codes/pvxs/src/clientmon.cpp`
+- `rg -n "build_monitor_finish|ch\\.ops\\.remove\\(&ioid\\)|ServerOp::cleanup|subcmd = 0x10" crates/epics-pva-rs/src/server_native/tcp.rs /Users/stevek/codes/pvxs/src/servermon.cpp /Users/stevek/codes/pvxs/src/serverconn.cpp`
+- `rg -n "send_op_error\\(|payload.put_u8\\(0x08\\)|doReply|to_wire\\(R, subcmd\\)" crates/epics-pva-rs/src/server_native/tcp.rs /Users/stevek/codes/pvxs/src/serverget.cpp`
+- `rg -n "reencode_raw_monitor|raw monitor reencode failed|M.good|clientmon.cpp" crates/epics-pva-rs/src/server_native/tcp.rs /Users/stevek/codes/pvxs/src/clientmon.cpp`
 
 ## Findings
 
@@ -611,3 +617,166 @@ Regression tests to add:
   decode error.
 - Raw monitor FINISH with truncated status returns fatal decode error.
 - Raw monitor FINISH with success status remains a clean end.
+
+### BFR-12 - PVA MONITOR FINISH leaves the operation registered and executing
+
+Severity: medium.
+
+Rust evidence:
+
+- `crates/epics-pva-rs/src/server_native/tcp.rs:4832-4837` sends
+  `build_monitor_finish(ioid, order)` when the decoded monitor source closes,
+  but the spawned subscriber task has no ownership path back into `ch.ops`.
+- `crates/epics-pva-rs/src/server_native/tcp.rs:4304-4306`,
+  `:4367-4370`, `:4391-4393`, `:4442-4444`, `:4523-4525`,
+  and `:4662-4664` have the same FINISH-and-return shape for ACL denial,
+  descriptor change, raw-source close, and filter/transform boundaries.
+- `crates/epics-pva-rs/src/server_native/tcp.rs:4857-4864` marks the op as
+  `monitor_started = true` and fires `MonitorStartControl::set(true)`.
+  Because the op is not removed when the task returns, the `MonitorStartControl`
+  stored in `OpState` does not drop and does not fire the terminal
+  `notify_monitor_start(false)`.
+- `rg "ch\\.ops\\.remove\\(&ioid\\)" crates/epics-pva-rs/src/server_native/tcp.rs`
+  shows removal paths only for PUT_GET/PROCESS destroy, DESTROY_REQUEST, and
+  channel teardown, not for server-originated MONITOR FINISH.
+
+pvxs reference:
+
+- `/Users/stevek/codes/pvxs/src/servermon.cpp:148-150` sets `subcmd = 0x10`
+  and calls `self->cleanup()` before emitting the finish reply.
+- `/Users/stevek/codes/pvxs/src/serverconn.cpp:487-508` implements
+  `ServerOp::cleanup()` by marking the op dead and erasing the IOID from both
+  channel and connection maps.
+
+Impact:
+
+After a Rust server sends MONITOR FINISH, the IOID can remain live in `ch.ops`
+with `monitor_started = true`. A client that tries to re-INIT the same IOID
+hits the duplicate-INIT fatal path, and a client that sends START again finds
+`already_running == true` and no new subscriber is spawned. For gateway sources,
+the source-side start notification can also remain in the executing state until
+the client later sends DESTROY_REQUEST or the channel/connection closes.
+
+Expected fix shape:
+
+Route subscriber-task terminal events through the connection/op owner. The task
+should report `Finished(ioid, status)` to the read-loop owner, and that owner
+should atomically send FINISH, remove the op, and run the same terminal
+start-control/drop finalizers used by DESTROY_REQUEST. The spawned task should
+not be the only actor deciding that a monitor has ended, because it cannot
+mutate `ch.ops`.
+
+Regression tests to add:
+
+- Source close sends MONITOR FINISH and removes the IOID from `ch.ops`.
+- Source close fires `notify_monitor_start(false)` exactly once after an
+  initial START.
+- Re-INIT of the same IOID after server-originated FINISH is accepted as a
+  fresh operation, not rejected as duplicate.
+- Raw-path type-change/ACL-denial FINISH uses the same cleanup path.
+
+### BFR-13 - PVA data-phase errors are emitted as INIT-phase responses
+
+Severity: medium.
+
+Rust evidence:
+
+- `crates/epics-pva-rs/src/server_native/tcp.rs:5051-5062` hardcodes
+  `payload.put_u8(0x08)` in `send_op_error`, so every helper-generated error
+  response is framed as INIT phase.
+- Data-phase callers route through that helper:
+  `crates/epics-pva-rs/src/server_native/tcp.rs:3635-3637` for a generic
+  GET/PUT/RPC uninitialised op, `:3685-3701` for GET source-missing or
+  descriptor-mismatch failures, `:3778-3789` for PUT readback source-missing
+  failures, `:2587-2589` for PUT_GET uninitialised op, and `:2784-2792` for
+  PROCESS uninitialised op.
+- `crates/epics-pva-rs/src/client_native/decode.rs:404-427` treats
+  `subcmd & 0x08 != 0` as an INIT response. A data-phase GET waiting for a
+  value can therefore receive a legitimate server error but classify it as an
+  unexpected INIT instead of a data-phase status.
+
+pvxs reference:
+
+- `/Users/stevek/codes/pvxs/src/serverget.cpp:81-84` writes the operation's
+  current `subcmd` into every GET/PUT/RPC reply.
+- `/Users/stevek/codes/pvxs/src/serverget.cpp:86-94` handles an error by
+  preserving the phase-specific reply shape: an executing op becomes idle,
+  while a creating op is cleaned up.
+- `/Users/stevek/codes/pvxs/src/serverget.cpp:470-475` records the data-phase
+  subcmd on the op before executing the callback, so callback errors reply with
+  the data-phase subcmd, not INIT.
+
+Impact:
+
+A Rust server can turn a data-phase failure into an INIT-shaped frame. Rust
+clients then lose the original operation failure and surface a phase mismatch
+such as "expected GET data, got INIT", while non-Rust clients may apply their
+state-machine checks and disconnect on a server response that was only meant to
+report a source/readback error. The error status payload is present, but it is
+attached to the wrong wire phase.
+
+Expected fix shape:
+
+Split INIT-error and data-error helpers, or pass the response subcmd explicitly
+from each call site. INIT negotiation failures should keep `0x08`; data-phase
+errors should echo the request's data subcmd (`0x00`, `0x40`, or command-specific
+shape) and let the op owner decide whether the op remains idle, is removed for
+last-request, or tears down on protocol error.
+
+Regression tests to add:
+
+- GET data-phase source failure replies with subcmd `0x00` and status error.
+- PUT readback (`subcmd & 0x40`) source failure replies with subcmd `0x40` and
+  status error.
+- INIT negotiation failures still reply with subcmd `0x08`.
+- Rust client GET surfaces the server status from a data-phase error instead of
+  reporting an unexpected INIT response.
+
+### BFR-14 - Cross-endian raw monitor re-encode failures are dropped silently
+
+Severity: medium.
+
+Rust evidence:
+
+- `crates/epics-pva-rs/src/server_native/tcp.rs:4423-4433` calls
+  `reencode_raw_monitor` for byte-order-mismatched raw events, but on `Err`
+  only logs at debug and `continue`s the monitor loop.
+- `crates/epics-pva-rs/src/server_native/tcp.rs:5317-5327` returns `Err` when
+  the raw event's changed bitset or partial value cannot be decoded under the
+  upstream byte order.
+- Same-endian raw forwarding at
+  `crates/epics-pva-rs/src/server_native/tcp.rs:4435-4437` does not decode the
+  body, so malformed upstream bytes are forwarded downstream; cross-endian
+  forwarding instead hides the malformed event by dropping it.
+
+pvxs reference:
+
+- `/Users/stevek/codes/pvxs/src/clientmon.cpp:545-550` decodes MONITOR DATA
+  as value plus overrun bitset.
+- `/Users/stevek/codes/pvxs/src/clientmon.cpp:596-600` resets the connection
+  when the monitor message is not good after decoding.
+
+Impact:
+
+A gateway can suppress upstream raw monitor corruption on cross-endian
+connections. The downstream subscriber receives neither the bad frame nor a
+FINISH/error frame, and the server keeps the monitor alive as if one update had
+not existed. That differs from both pvxs decode behavior and Rust's same-endian
+raw path, where the downstream peer still sees the malformed bytes and can fail
+at its own protocol boundary.
+
+Expected fix shape:
+
+Make raw monitor validation/re-encode a protocol boundary. A re-encode failure
+should route through the same terminal monitor-error owner as BFR-12, emitting a
+non-success MONITOR FINISH or tearing down the upstream/downstream connection
+according to the gateway policy. It should not be a debug-only dropped event.
+
+Regression tests to add:
+
+- Cross-endian raw monitor with truncated changed bitset terminates the monitor
+  with an error instead of continuing.
+- Cross-endian raw monitor with truncated partial value terminates the monitor
+  with an error instead of continuing.
+- Same-endian and cross-endian malformed raw handling have one documented
+  policy, not byte-order-dependent behavior.

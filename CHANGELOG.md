@@ -9,9 +9,25 @@ tooling reaches flag parity with the C `caget`/`caput`/`camonitor`/
 pause and `onStart` edge callbacks, and pipeline-window watermarks; the
 CA/PVA gateway enforces ACF rules and PVA credentials; and the parity
 sweep (BFR / PVXS-SR findings) closes monitor, RPC, and PUT lifecycle
-and flow-control divergences. No public API was removed — the one struct
-field flagged as a "regression" (`ArrayFilterConfig.incr`) is
-intentionally private to keep its `>= 1` invariant by construction.
+and flow-control divergences.
+
+**Breaking changes (vs `0.18.4`, within the `0.18.x` line):** two public
+API shapes changed.
+
+- `epics_base_rs::server::database::filters::arr::ArrayFilterConfig.incr`
+  changed from a `pub` field to a private field. Construct via
+  `ArrayFilterConfig::new()` / `Default` (both clamp `incr` to `>= 1`);
+  read it through the `incr()` accessor. Struct-literal construction of
+  this type no longer compiles. The field is private on purpose: the
+  slice helpers divide and step by `incr`, so the `>= 1` invariant is
+  held by construction rather than re-checked at every use.
+- `epics_pva_rs::server_native::ChannelSource::subscribe_checked_opts`
+  changed its return type from `Receiver<PvField>` to
+  `Receiver<MonitorUpdate>` (BRIDGE-FR-12: the cooked monitor stream now
+  carries the trigger `marked` bitset). External `ChannelSource`
+  implementations that override this method must update the return type;
+  a source that owns its record directly can wrap its `subscribe_checked`
+  stream with the new `plain_monitor_updates` helper (`marked: None`).
 
 ### epics-ca-rs — client tooling flag parity and circuit accounting
 

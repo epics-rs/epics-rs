@@ -1,5 +1,109 @@
 # Changelog
 
+## v0.18.5 — 2026-05-22
+
+The largest functional-review batch to date, plus a broad CA/PVA
+wire-protocol parity sweep against EPICS base and pvxs. CA client
+tooling reaches flag parity with the C `caget`/`caput`/`camonitor`/
+`cainfo`; the native PVA server/client gain report counters, monitor
+pause and `onStart` edge callbacks, and pipeline-window watermarks; the
+CA/PVA gateway enforces ACF rules and PVA credentials; and the parity
+sweep (BFR / PVXS-SR findings) closes monitor, RPC, and PUT lifecycle
+and flow-control divergences. No public API was removed — the one struct
+field flagged as a "regression" (`ArrayFilterConfig.incr`) is
+intentionally private to keep its `>= 1` invariant by construction.
+
+### epics-ca-rs — client tooling flag parity and circuit accounting
+
+- **CA-FR-1** — the CA server now evaluates CALC-gated ACF rules.
+- **CA-FR-2** — channel/operation id allocation (cid/ioid/subid) is
+  registry-owned and collision-checked.
+- **CA-FR-3** — channels are priority-aware; virtual circuits are keyed
+  per `(address, CA priority)`, and `ca_get_ioc_connection_count` now
+  counts one circuit per `(addr, priority)` rather than per distinct
+  address (matching libca `caServerID` / `cac::circuitCount`).
+- **CA-FR-4** — `caget -d` requests the exact DBR type (not a class
+  band); `caput -S` writes a NUL-terminated `DBR_CHAR` array, checks
+  ENUM type first, and escape-decodes; `camonitor` honors `-m` event
+  masks (default `VALUE|ALARM`, invalid letters warn and revert) and
+  `-t` timestamp rendering modes (`r`/`i`/`I` baselined on the first
+  server stamp); `cainfo -s` emits client-status diagnostics.
+- **CA-FR-5** — reusable synchronous group with test/reset/stat.
+- **CA-FR-8** — channel filters run on the READ and `SimplePv` paths.
+- Monitor delivery hardening: `EVENTS_ON` resume is no longer lost in
+  the flow-control gate, and pause coalescing folds the producer
+  overflow slot rather than only the receive side.
+
+### epics-pva-rs — server/client features and parity fixes
+
+- **PVA-FR-1** — compound arrays preserve null elements.
+- **PVA-FR-2** — per-connection (client) and per-channel (server) report
+  counters with credentials and reset.
+- **PVA-FR-4** — monitor watermarks fire from the pipeline window;
+  composite sources now report the **owning** source's watermark levels
+  (resolved through the async `has_pv` owner check) instead of the first
+  source returning any levels.
+- **PVA-FR-5** — `any` no longer advertises a degraded descriptor.
+- **PVA-FR-6** — `pvput-rs` supports `field=value` multi-field
+  assignment.
+- **PVA-FR-7** — `PvaOperation::wait` is retriable after a timeout.
+- **PVA-FR-8** — server monitor pause holds the latest update.
+- **PVA-FR-9** — distinct `PvaError::Interrupted` vs `Timeout`.
+- **PVA-FR-10** — the MONITOR overrun bitset is carried into the
+  server-side squash.
+- **PVA-FR-11** — server monitor `onStart(bool)` edge callback.
+- **PVA-FR-12** — one-shot operations fail at the op timeout instead of
+  hanging.
+- Broad parity sweep (BFR-4..15, PVXS-SR-5/9/21): RPC EXEC malformed
+  args are fatal rather than coerced to Null (BFR-4); GET/PUT/RPC
+  last-request (`0x10`) lifecycle (BFR-5); GET_FIELD on an unknown SID
+  replies an error instead of a fabricated Variant (BFR-6); PROCESS INIT
+  pvRequest routes through the structured decode boundary (BFR-8); raw
+  monitor re-encode errors on a missing/malformed overrun bitset and
+  terminates on cross-endian re-encode failure (BFR-9/11/14); MONITOR
+  finish routes through the read-loop owner so the op is removed
+  (BFR-12); error replies echo the request data subcmd (BFR-13); in-
+  flight data-phase EXEC is gated and re-EXEC ignored (BFR-15); `ackAny`
+  is a true percentage of the queue (PVXS-SR-5); inbound message size
+  defaults to unbounded with an opt-in cap (PVXS-SR-9); a panicking
+  source handler becomes an exec error reply (PVXS-SR-21).
+- Pipeline/flow-control: malformed MONITOR ACK resets the connection
+  instead of fabricating credits; ACK refill saturates the window
+  instead of wrapping; the initial monitor snapshot consumes a window
+  credit; `ackAny` clamps watermarks at `ackAt-1`.
+- Server `_filter` chain applies to the initial monitor snapshot (not
+  just updates) and fails closed rather than fabricating a value leaf.
+- Bulk-PUT throughput benchmark (in-process + external IOC) and an
+  expanded pvxs-captured golden suite (NTTable / NTURI descriptors).
+
+### epics-base-rs — access control, monitor accounting, arr filter
+
+- **CA-FR-1 / PVA-FR-3** — the access gate evaluates CALC via the `INP*`
+  resolver and matches role UAG members against the account string or
+  the roles slice.
+- **CA-FR-6** — `SimplePv` emission honors the `DBE_*` subscriber mask.
+- **CA-FR-7** — table-driven `dbr_buffer_size` matching C `dbr_size_n`.
+- **BFR-10** — record-field monitor overflow routes through the shared
+  drop-accounting owner.
+- arr filter: `incr >= 1` holds by construction (private field +
+  clamping constructors, not a runtime clamp), and the filter no-ops at
+  length `<= 1` so count and value agree on scalars.
+
+### epics-bridge-rs — CA/PVA gateway and QSRV
+
+- **BRIDGE-FR-1/2/10** — CA gateway ACF read/monitor enforcement, ALIAS
+  serving, host-scoped `pvlist` `DENY FROM`.
+- **BRIDGE-FR-3/4** — CA link alarm severity modifiers and metadata
+  getters.
+- **BRIDGE-FR-5/8/11/14** — PVA gateway credential preflight,
+  credentialed CREATE_CHANNEL, reachable pause watermark, credential-
+  scoped flush/drop.
+- **BRIDGE-FR-6/7/12** — QSRV group monitors subscribe the configured
+  member field, meta value-event mask, explicit trigger target sets.
+- **BRIDGE-FR-9/13/15/16** — pvalink legacy suffix parsing, disconnected
+  stale-read alarm, `link_names` for `iocInit` wait, `proc` `ProcMode`
+  enum.
+
 ## v0.18.4 — 2026-05-20
 
 `epics-ca-rs` monitor-delivery hardening + a new client-side

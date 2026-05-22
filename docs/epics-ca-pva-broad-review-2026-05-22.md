@@ -37,7 +37,7 @@ Method:
 | BFR-9 | Medium | PVA raw monitor overrun parsing | Fixed in current source |
 | BFR-10 | Low | CA/base monitor drop accounting | Fixed in current source (accounting); metrics-surface wiring deferred |
 | BFR-11 | Medium | PVA raw monitor control-frame parsing | Fixed in current source |
-| BFR-12 | Medium | PVA MONITOR FINISH op cleanup | Open |
+| BFR-12 | Medium | PVA MONITOR FINISH op cleanup | Fixed in current source |
 | BFR-13 | Medium | PVA data-phase error response shape | Open |
 | BFR-14 | Medium | PVA raw monitor re-encode error handling | Fixed in current source |
 | BFR-15 | Medium | PVA GET/PUT/RPC in-flight EXEC state | Open |
@@ -875,6 +875,98 @@ Regression tests to add:
 - Re-INIT of the same IOID after server-originated FINISH is accepted as a
   fresh operation, not rejected as duplicate.
 - Raw-path type-change/ACL-denial FINISH uses the same cleanup path.
+
+Applied fix (Fixed in current source):
+
+Routed every MONITOR subscriber-task terminal exit back through the read-loop
+owner, mirroring the existing `CreateChannelCompletion` (`cc_tx`/`cc_rx`)
+pattern that already solves the "spawned task cannot mutate `channels`" problem
+for CREATE_CHANNEL:
+
+- Added a per-connection unbounded completion channel
+  `(mon_fin_tx, mon_fin_rx)` in the read loop
+  (`crates/epics-pva-rs/src/server_native/tcp.rs`, alongside `cc_tx`/`cc_rx`)
+  and a third `tokio::select!` arm
+  (`fin_opt = mon_fin_rx.recv() => apply_monitor_finish(&mut channels, fin)`).
+- Added `MonitorFinishGuard`, a single RAII local installed as the FIRST
+  statement of the spawned subscriber task body. Its `Drop` reports
+  `MonitorFinished { sid, ioid, op_id }` on the channel. Because it is one local
+  at the top of the async block, EVERY exit drops it: the normal source-close
+  FINISH fall-through, all 13 early `return;` sites (raw-path ACL-deny /
+  initial-revalidate-deny / type-change FINISH / per-event revalidate-deny /
+  BFR-14 re-encode `Terminate` / send-error; decoded-path revalidate-deny /
+  filter `DescriptorMismatch` (initial and update) / send-error), a panic, and
+  an `AbortOnDrop`-driven cancellation. The op-removal invariant holds by
+  construction, not by remembering to signal on each path.
+- `apply_monitor_finish` (the owner side) mirrors `handle_destroy_request`'s
+  removal — dropping the `OpState` drops `monitor_start_ctl` (terminal
+  `notify_monitor_start(false)`) and `monitor_abort` — but is GATED on the
+  op-instance id (`OpState::monitor_op_id`). A signal whose `op_id` no longer
+  matches the live op is ignored, so a late signal from an aborted task cannot
+  evict a fresh op that re-used the ioid (ABA guard).
+
+The decision to keep the task's own FINISH/ERROR wire sends (rather than move
+them into the owner per the literal "atomically send FINISH" wording) was
+deliberate: those sends are already correct on every path and are not the
+defect. The defect was purely the registry leak — the op never leaving
+`ch.ops`. The single-guard structure closes that family; moving the 6+ correct
+wire-send sites would be churn that does not close any additional defect.
+
+Re-INIT race: the guard enqueues the completion signal the instant the task
+body's scope ends — right after the FINISH frame is handed to the writer mpsc,
+strictly before the client can receive that FINISH and send a fresh INIT. The
+owner therefore removes the op before any legitimate re-INIT of the same ioid is
+read, so the re-INIT is accepted as fresh rather than rejected on the
+duplicate-INIT fatal path. The `select!` arm is left unbiased so the existing
+`cc_rx` ordering is unchanged.
+
+Invariant:
+
+- MUST: an op present in `ch.ops` with `monitor_started == true` ⟺ its
+  subscriber task is alive.
+- Owner/Gate: the read loop (the single actor that may mutate `channels`).
+  `apply_monitor_finish` is the only writer of the finish transition; the
+  subscriber task only signals.
+
+Defect-family audit:
+
+- Anchor: the monitor subscriber `tokio::spawn(async move { … })` body
+  (`tcp.rs:4402-5014`) — every `return;` plus the natural fall-through end.
+- Sites: `return;` at 4482, 4505, 4546, 4569, 4611, 4615, 4620, 4631, 4701,
+  4747, 4782, 4840, 5005, and the source-close FINISH fall-through at 5012-5014.
+- Same defect (closed by this change): ALL of them — the single `_fin_guard`
+  at the top of the body covers every exit by Rust drop semantics.
+- Distinct, skip: the GET/PUT/RPC/PUT_GET/PROCESS exec spawns
+  (`finish_exec_data_task`) are two-shot and removed by the owner synchronously,
+  so they never leak; the CREATE_CHANNEL resolver spawn already signals the
+  owner via `cc_tx`. Neither is a long-lived self-terminating subscriber.
+
+Regression tests added (`crates/epics-pva-rs/src/server_native/tcp.rs`, mod
+`tests`):
+
+- `bfr12_monitor_source_close_signals_owner_and_removes_op` (load-bearing,
+  end-to-end): drives MONITOR INIT+START through `handle_op` against a source
+  whose subscription closes, asserts the guard signals
+  `(sid, ioid, monitor_op_id)`, that a MONITOR FINISH (subcmd `0x10`) was
+  emitted, that the owner removes the op, and that `notify_monitor_start(false)`
+  fires exactly once after the START's `true`.
+- `bfr12_apply_finish_ignores_stale_op_id`: ABA guard — a stale `op_id` does not
+  evict the live op (no terminal notify), a matching `op_id` does.
+- `bfr12_reinit_after_finish_accepted_as_fresh`: after removal the
+  duplicate-INIT gate (`ch.ops.contains_key(&ioid)`) no longer trips.
+- `bfr12_finish_guard_signals_on_drop`: the guard mechanism itself.
+
+Revert-verified:
+
+- Removing the `MonitorFinishGuard` install in the spawned task →
+  `bfr12_monitor_source_close_signals_owner_and_removes_op` times out at
+  `mon_fin_rx.recv()` (the pre-fix leak: op never removed, terminal notify never
+  fires).
+- Removing the `op_id` gate in `apply_monitor_finish` →
+  `bfr12_apply_finish_ignores_stale_op_id` fails (a stale signal evicts the live
+  op).
+- `cargo nextest run -p epics-pva-rs`: 533 passed. `cargo clippy -p epics-pva-rs
+  --all-targets -- -D warnings`: clean.
 
 ### BFR-13 - PVA data-phase errors are emitted as INIT-phase responses
 

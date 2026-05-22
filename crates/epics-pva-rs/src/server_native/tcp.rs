@@ -801,6 +801,69 @@ fn finish_exec_data_task(
     }
 }
 
+/// BFR-12: terminal signal a spawned MONITOR subscriber task sends to
+/// its read-loop owner when the task ends.
+///
+/// The subscriber task owns no handle to `channels`, so it cannot remove
+/// its own op from `ch.ops` when the monitor ends (source close,
+/// descriptor change, ACL denial, filter/transform mismatch, raw
+/// re-encode terminal). It instead reports its identity here and the
+/// read-loop owner — the single actor that may mutate `channels` — runs
+/// the same removal `DESTROY_REQUEST` runs. pvxs models this as
+/// `servermon.cpp:148-150` calling `ServerOp::cleanup()`
+/// (`serverconn.cpp:487-508`) before emitting the FINISH reply.
+///
+/// `op_id` is the op instance's process-unique [`OpState::monitor_op_id`].
+/// It tags THIS subscriber instance so a signal that arrives late — an
+/// aborted task whose future is dropped only after its ioid was already
+/// removed and re-INIT'd — cannot evict the *fresh* op that reused the
+/// ioid. The owner removes only when the live op's id still matches
+/// ([`apply_monitor_finish`]).
+#[derive(Debug, Clone, Copy)]
+struct MonitorFinished {
+    sid: u32,
+    ioid: u32,
+    op_id: u64,
+}
+
+/// BFR-12: RAII finalizer held as a single local at the top of the
+/// MONITOR subscriber task body. Its `Drop` reports completion to the
+/// read-loop owner on EVERY task exit — the normal source-close FINISH,
+/// an early `return` for an ACL-deny / descriptor-change / filter-
+/// mismatch / raw re-encode terminal, a panic, or an `AbortOnDrop`-driven
+/// cancellation (DESTROY / channel teardown / disconnect). Because it is
+/// one local that no path can step around, the op-removal invariant holds
+/// by construction rather than by remembering to signal on each exit
+/// (see CLAUDE.md "Strong state transitions").
+struct MonitorFinishGuard {
+    tx: mpsc::UnboundedSender<MonitorFinished>,
+    fin: MonitorFinished,
+}
+
+impl Drop for MonitorFinishGuard {
+    fn drop(&mut self) {
+        // Unbounded so this sync Drop never loses the signal to a full
+        // channel; the only `send` failure is a closed receiver, which
+        // means the read loop already ended and dropped every op.
+        let _ = self.tx.send(self.fin);
+    }
+}
+
+/// BFR-12: read-loop owner side of a MONITOR subscriber's terminal
+/// signal. Mirrors [`handle_destroy_request`]'s removal — dropping the
+/// `OpState` drops `monitor_start_ctl` (terminal
+/// `notify_monitor_start(false)`) and `monitor_abort` (subscriber abort,
+/// already a no-op for a task that ended on its own) — but gated on the
+/// op-instance id so a stale signal cannot evict a re-INIT'd op that
+/// reused the ioid (the ABA guard described on [`MonitorFinished`]).
+fn apply_monitor_finish(channels: &mut HashMap<u32, ChannelState>, fin: MonitorFinished) {
+    if let Some(ch) = channels.get_mut(&fin.sid)
+        && ch.ops.get(&fin.ioid).map(|op| op.monitor_op_id) == Some(fin.op_id)
+    {
+        ch.ops.remove(&fin.ioid);
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct OpState {
@@ -1849,6 +1912,16 @@ async fn handle_connection_io(
     // insertions into `channels` and emits wire responses in arrival
     // order (mpsc FIFO preserves the per-frame ordering guarantee).
     let (cc_tx, mut cc_rx) = mpsc::channel::<CreateChannelCompletion>(64);
+    // BFR-12: MONITOR subscriber-completion channel. A spawned subscriber
+    // task that ends (source close, descriptor change, ACL deny, filter
+    // mismatch, raw re-encode terminal, panic, abort) signals its
+    // `(sid, ioid, op_id)` here via `MonitorFinishGuard`; the select! arm
+    // below removes the op through the owner, running the same
+    // start-control / abort finalizers `DESTROY_REQUEST` runs. Unbounded
+    // so the guard's sync `Drop` never loses a signal; the queue is
+    // bounded in practice by the live op count, which `max_ops_per_channel`
+    // already caps.
+    let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
     // Count of in-flight CREATE_CHANNEL resolver tasks. Used in the
     // per-connection channel cap check: channels being resolved count
     // against the limit to prevent a burst of concurrent requests from
@@ -1909,6 +1982,26 @@ async fn handle_connection_io(
                     h.write_into(&mut buf);
                     buf.extend_from_slice(&payload);
                     let _ = tx.send(buf).await;
+                }
+                continue;
+            }
+            fin_opt = mon_fin_rx.recv() => {
+                // BFR-12: a MONITOR subscriber task ended. Remove its op
+                // through the owner — dropping the `OpState` fires
+                // `monitor_start_ctl` (terminal `notify_monitor_start(false)`)
+                // and `monitor_abort` (already-ended task), identical to
+                // DESTROY_REQUEST — gated on the op-instance id so a stale
+                // signal cannot evict a re-INIT'd op that reused the ioid.
+                //
+                // Ordering: the guard enqueues this signal the instant the
+                // task body's scope ends — right after the FINISH frame is
+                // handed to the writer mpsc, strictly before the client can
+                // receive that FINISH and send a fresh INIT. So the op is
+                // already removed by the time any legitimate re-INIT of the
+                // same ioid is read, and that re-INIT is accepted as fresh
+                // rather than rejected on the duplicate-INIT fatal path.
+                if let Some(fin) = fin_opt {
+                    apply_monitor_finish(&mut channels, fin);
                 }
                 continue;
             }
@@ -2161,6 +2254,7 @@ async fn handle_connection_io(
                     &mut encode_type_cache,
                     peer,
                     &cred,
+                    &mon_fin_tx,
                 )
                 .await?;
             }
@@ -2177,6 +2271,7 @@ async fn handle_connection_io(
                     &mut encode_type_cache,
                     peer,
                     &cred,
+                    &mon_fin_tx,
                 )
                 .await?;
             }
@@ -2193,6 +2288,7 @@ async fn handle_connection_io(
                     &mut encode_type_cache,
                     peer,
                     &cred,
+                    &mon_fin_tx,
                 )
                 .await?;
             }
@@ -2209,6 +2305,7 @@ async fn handle_connection_io(
                     &mut encode_type_cache,
                     peer,
                     &cred,
+                    &mon_fin_tx,
                 )
                 .await?;
             }
@@ -3355,6 +3452,12 @@ async fn handle_op(
     encode_cache: &mut EncodeTypeCache,
     peer: std::net::SocketAddr,
     cred: &ClientCredentials,
+    // BFR-12: read-loop owner's MONITOR subscriber-completion sender. The
+    // spawned subscriber task installs a `MonitorFinishGuard` cloned from
+    // this so its terminal removal is routed back to the owner. Only the
+    // MONITOR branch uses it; GET/PUT/RPC tasks are two-shot and the owner
+    // removes them synchronously via `finish_exec_data_task`.
+    mon_fin_tx: &mpsc::UnboundedSender<MonitorFinished>,
 ) -> PvaResult<()> {
     let mut cur = frame.cursor();
     let sid = cur
@@ -4285,7 +4388,26 @@ async fn handle_op(
                     && mask_clone.size() >= total_bits
                     && window.is_none()
                     && filters.is_empty();
+                // BFR-12: capture this op instance's terminal-signal payload
+                // (sid + ioid + the process-unique `monitor_op_id`) before
+                // the move. The guard installed as the first statement of the
+                // task body reports it on EVERY exit so the read-loop owner
+                // removes the op — the task itself owns no `ch.ops` handle.
+                let mon_fin = MonitorFinished {
+                    sid,
+                    ioid,
+                    op_id: monitor_op_id,
+                };
+                let mon_fin_tx_task = mon_fin_tx.clone();
                 let join = tokio::spawn(async move {
+                    // BFR-12: terminal finalizer — see `MonitorFinishGuard`.
+                    // A single local at the top of the body so no exit (source
+                    // close FINISH, ACL/descriptor/filter/raw terminal return,
+                    // panic, abort) can skip notifying the owner.
+                    let _fin_guard = MonitorFinishGuard {
+                        tx: mon_fin_tx_task,
+                        fin: mon_fin,
+                    };
                     // PVA-R14: access gate check moved inside the spawn
                     // so the read loop is not blocked while the ACF
                     // policy resolves. The version capture must precede
@@ -5555,6 +5677,17 @@ mod tests {
     use crate::client_native::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
 
+    /// BFR-12: a throwaway MONITOR-completion sender for `handle_op`
+    /// calls in tests that do not exercise the read-loop owner's removal
+    /// arm. The receiver is dropped immediately, so the spawned subscriber
+    /// task's `MonitorFinishGuard::drop` `send` is a harmless no-op (the
+    /// op stays in `ch.ops` exactly as before this fix, since these tests
+    /// never call [`apply_monitor_finish`]). Tests that DO assert the
+    /// cleanup build a real channel and keep the receiver.
+    fn discard_mon_fin() -> mpsc::UnboundedSender<MonitorFinished> {
+        mpsc::unbounded_channel().0
+    }
+
     /// BRIDGE-FR-11 review: `cross_watermark` is the primitive that
     /// closes the residual pause/resume reorder. Tested by invariant
     /// boundary, not by narrative — it must fire once per real crossing
@@ -6607,6 +6740,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect("MONITOR INIT ok");
@@ -6630,6 +6764,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect("MONITOR START ok");
@@ -6742,6 +6877,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect_err("truncated MONITOR ACK must be connection-fatal");
@@ -6792,6 +6928,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect("well-formed MONITOR ACK ok");
@@ -6842,6 +6979,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect("well-formed MONITOR ACK ok");
@@ -7377,6 +7515,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect("PUT INIT ok");
@@ -7411,6 +7550,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect("PUT EXEC ok");
@@ -7499,6 +7639,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect("PUT INIT ok");
@@ -7531,6 +7672,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect("PUT EXEC ok");
@@ -7629,6 +7771,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect("GET EXEC (last request) ok");
@@ -7664,6 +7807,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect("GET EXEC (not last request) ok");
@@ -7913,6 +8057,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect("PUT INIT ok");
@@ -7952,6 +8097,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_mon_fin(),
         )
         .await
         .expect("PUT EXEC ok");
@@ -9424,6 +9570,366 @@ mod tests {
             }
         }
     }
+
+    // ─── BFR-12: MONITOR FINISH op cleanup ───────────────────────────
+    //
+    // Invariant (MUST): an op present in `ch.ops` with
+    // `monitor_started == true` ⟺ its subscriber task is alive. When the
+    // task ends for ANY reason (source close, descriptor change, ACL
+    // deny, filter mismatch, raw re-encode terminal, panic, abort) the
+    // read-loop OWNER removes the op — dropping `monitor_start_ctl`
+    // (terminal `notify_monitor_start(false)`) and `monitor_abort`. The
+    // task reports its identity via `MonitorFinishGuard`; the owner
+    // applies it via `apply_monitor_finish`, gated on the op-instance id
+    // so a stale signal cannot evict a re-INIT'd op that reused the ioid.
+
+    /// Minimal BFR-12 source: serves one PV, records every
+    /// `notify_monitor_start` edge, and hands MONITOR a subscription that
+    /// closes immediately so the subscriber task ends as on source close.
+    struct Bfr12Source {
+        intro: FieldDesc,
+        value: PvField,
+        starts: Arc<parking_lot::Mutex<Vec<bool>>>,
+    }
+    impl crate::server_native::source::ChannelSource for Bfr12Source {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        async fn has_pv(&self, n: &str) -> bool {
+            n == "dut"
+        }
+        async fn get_introspection(&self, _n: &str) -> Option<FieldDesc> {
+            Some(self.intro.clone())
+        }
+        async fn get_value(&self, _n: &str) -> Option<PvField> {
+            Some(self.value.clone())
+        }
+        async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), String> {
+            Ok(())
+        }
+        async fn is_writable(&self, _n: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _n: &str) -> Option<mpsc::Receiver<PvField>> {
+            // Sender dropped immediately → receiver closed → the subscriber
+            // loop sees end-of-stream and the task ends (source close).
+            let (_tx, rx) = mpsc::channel(1);
+            Some(rx)
+        }
+        fn notify_monitor_start(
+            &self,
+            _name: &str,
+            _ctx: &crate::server_native::source::ChannelContext,
+            start: bool,
+        ) {
+            self.starts.lock().push(start);
+        }
+    }
+
+    fn bfr12_anon_ctx() -> crate::server_native::source::ChannelContext {
+        crate::server_native::source::ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: String::new(),
+            method: "anonymous".into(),
+            host: String::new(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: None,
+        }
+    }
+
+    /// Build a `channels` map with one started MONITOR op (op id `op_id`,
+    /// `monitor_started = true`) whose `monitor_start_ctl` has already
+    /// fired the Idle→Executing edge — so the terminal Executing→Idle edge
+    /// is observable when the op is removed. The op holds the ONLY
+    /// `MonitorStartControl` Arc ref, so removal drops it and fires
+    /// `notify_monitor_start(false)`.
+    fn bfr12_started_monitor_channels(
+        sid: u32,
+        ioid: u32,
+        op_id: u64,
+        src: &DynSource,
+        intro: &FieldDesc,
+    ) -> HashMap<u32, ChannelState> {
+        let mut op = non_monitor_op_state(
+            intro.clone(),
+            OpKind::Monitor,
+            BitSet::all_set(intro.total_bits()),
+        );
+        op.monitor_op_id = op_id;
+        op.monitor_started = true;
+        let ctl = Arc::new(MonitorStartControl::new(
+            src.clone(),
+            "dut".into(),
+            bfr12_anon_ctx(),
+        ));
+        ctl.set(true); // record the Idle→Executing edge
+        op.monitor_start_ctl = Some(ctl); // op now holds the only Arc ref
+        let mut ops = HashMap::new();
+        ops.insert(ioid, op);
+        let mut channels = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                ops,
+            },
+        );
+        channels
+    }
+
+    /// The guard's `Drop` reports completion to the owner — the mechanism
+    /// that makes the op-removal invariant hold on EVERY task exit.
+    /// Revert-verify: delete the `Drop` body and `try_recv` returns Empty.
+    #[test]
+    fn bfr12_finish_guard_signals_on_drop() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<MonitorFinished>();
+        {
+            let _g = MonitorFinishGuard {
+                tx: tx.clone(),
+                fin: MonitorFinished {
+                    sid: 3,
+                    ioid: 11,
+                    op_id: 77,
+                },
+            };
+        } // guard drops here
+        let got = rx.try_recv().expect("guard Drop must signal the owner");
+        assert_eq!((got.sid, got.ioid, got.op_id), (3, 11, 77));
+    }
+
+    /// The owner removes only the op INSTANCE that signaled: a stale
+    /// signal (different `op_id`, e.g. from a late-dropped aborted task
+    /// whose ioid was re-INIT'd) must not evict the live op, and a
+    /// matching signal removes it and fires the terminal start edge once.
+    /// Revert-verify: make `apply_monitor_finish` remove unconditionally
+    /// (drop the op_id guard) and the first assertion fails.
+    #[test]
+    fn bfr12_apply_finish_ignores_stale_op_id() {
+        let intro = three_field_intro();
+        let starts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let src: DynSource = Arc::new(Bfr12Source {
+            intro: intro.clone(),
+            value: three_field_value(0, 0, 0),
+            starts: starts.clone(),
+        });
+        let (sid, ioid, op_id) = (1u32, 7u32, 12_345u64);
+        let mut channels = bfr12_started_monitor_channels(sid, ioid, op_id, &src, &intro);
+
+        // Stale signal: same (sid, ioid) but a DIFFERENT instance id.
+        apply_monitor_finish(
+            &mut channels,
+            MonitorFinished {
+                sid,
+                ioid,
+                op_id: op_id + 999,
+            },
+        );
+        assert!(
+            channels[&sid].ops.contains_key(&ioid),
+            "a stale op_id must NOT evict the live op (ABA guard)"
+        );
+        assert_eq!(
+            *starts.lock(),
+            vec![true],
+            "a rejected stale signal fires no terminal notify_monitor_start"
+        );
+
+        // Matching signal removes the op and fires the terminal edge once.
+        apply_monitor_finish(&mut channels, MonitorFinished { sid, ioid, op_id });
+        assert!(
+            !channels[&sid].ops.contains_key(&ioid),
+            "a matching op_id removes the op from ch.ops"
+        );
+        assert_eq!(
+            *starts.lock(),
+            vec![true, false],
+            "removal drops monitor_start_ctl → terminal notify_monitor_start(false) once"
+        );
+    }
+
+    /// After a server-originated FINISH the ioid is freed in `ch.ops`, so
+    /// the duplicate-INIT fatal gate (`ch.ops.contains_key(&ioid)` in
+    /// `handle_op`) no longer trips and a re-INIT of the same ioid is
+    /// accepted as a fresh operation. Revert-verify: skip the removal and
+    /// `contains_key` stays true (pre-fix: re-INIT rejected as duplicate).
+    #[test]
+    fn bfr12_reinit_after_finish_accepted_as_fresh() {
+        let intro = three_field_intro();
+        let starts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let src: DynSource = Arc::new(Bfr12Source {
+            intro: intro.clone(),
+            value: three_field_value(0, 0, 0),
+            starts: starts.clone(),
+        });
+        let (sid, ioid, op_id) = (1u32, 7u32, 555u64);
+        let mut channels = bfr12_started_monitor_channels(sid, ioid, op_id, &src, &intro);
+
+        assert!(
+            channels[&sid].ops.contains_key(&ioid),
+            "precondition: a started monitor op trips the duplicate-INIT gate"
+        );
+        apply_monitor_finish(&mut channels, MonitorFinished { sid, ioid, op_id });
+        assert!(
+            !channels[&sid].ops.contains_key(&ioid),
+            "after FINISH the ioid is free → a re-INIT is accepted as fresh, not duplicate"
+        );
+    }
+
+    /// Load-bearing regression: START a MONITOR through `handle_op`, let
+    /// the source-close end the subscriber task, and prove the task
+    /// signals its read-loop owner so the op is removed and the terminal
+    /// start-control edge fires exactly once. This exercises the guard
+    /// install at the spawn site end-to-end.
+    ///
+    /// Revert-verify: drop the `MonitorFinishGuard` install in the spawned
+    /// task and `mon_fin_rx.recv()` below times out — the op leaks in
+    /// `ch.ops` with `monitor_started == true` and `notify_monitor_start`
+    /// never reaches `false`, exactly the pre-fix behaviour.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bfr12_monitor_source_close_signals_owner_and_removes_op() {
+        use crate::server_native::runtime::PvaServerConfig;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 900;
+        let intro = three_field_intro();
+        let starts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let source: DynSource = Arc::new(Bfr12Source {
+            intro: intro.clone(),
+            value: three_field_value(0, 0, 0),
+            starts: starts.clone(),
+        });
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // MONITOR INIT (subcmd 0x08): empty pvRequest → full monitor.
+        let req_val = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![],
+        });
+        let req_desc = req_val.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Monitor, order, init_payload);
+        handle_op(
+            &source,
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon_fin_tx,
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT reply");
+
+        // The op-instance id minted at INIT — the guard signals THIS id.
+        let op_id = channels[&sid].ops[&ioid].monitor_op_id;
+
+        // MONITOR START (subcmd 0x44 = start | process) spawns the task
+        // and fires the Idle→Executing edge.
+        let mut start_payload = Vec::new();
+        start_payload.put_u32(sid, order);
+        start_payload.put_u32(ioid, order);
+        start_payload.put_u8(0x44);
+        let start_frame = synth_frame(Command::Monitor, order, start_payload);
+        handle_op(
+            &source,
+            &start_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon_fin_tx,
+        )
+        .await
+        .expect("MONITOR START ok");
+
+        assert!(
+            channels[&sid].ops.contains_key(&ioid),
+            "op is live in ch.ops immediately after START"
+        );
+        assert_eq!(
+            *starts.lock(),
+            vec![true],
+            "START fires the Idle→Executing edge exactly once"
+        );
+
+        // The closing subscription ends the task: it sends FINISH and drops
+        // its MonitorFinishGuard → the owner receives the terminal signal.
+        let fin = tokio::time::timeout(Duration::from_secs(2), mon_fin_rx.recv())
+            .await
+            .expect("subscriber task must signal completion to the read-loop owner")
+            .expect("completion channel stays open");
+        assert_eq!(
+            (fin.sid, fin.ioid, fin.op_id),
+            (sid, ioid, op_id),
+            "the signal identifies the exact op instance that ended"
+        );
+
+        // The task emitted a MONITOR FINISH (subcmd 0x10) before ending.
+        let mut saw_finish = false;
+        while let Ok(buf) = rx.try_recv() {
+            if let Ok(Some((frame, _))) = try_parse_frame(&buf)
+                && frame.header.command == Command::Monitor.code()
+            {
+                let mut cur = frame.cursor();
+                let _ = cur.get_u32(order);
+                if let Ok(sub) = cur.get_u8()
+                    && sub & 0x10 != 0
+                {
+                    saw_finish = true;
+                }
+            }
+        }
+        assert!(saw_finish, "source close emits a MONITOR FINISH frame");
+
+        // Owner applies the signal: op removed, terminal Executing→Idle.
+        apply_monitor_finish(&mut channels, fin);
+        assert!(
+            !channels[&sid].ops.contains_key(&ioid),
+            "owner removes the op from ch.ops on monitor finish"
+        );
+        assert_eq!(
+            *starts.lock(),
+            vec![true, false],
+            "terminal notify_monitor_start(false) fires exactly once after START"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9595,6 +10101,11 @@ mod r14_tests {
         let frame = synth_frame(Command::Get, order, payload);
 
         let t0 = tokio::time::Instant::now();
+        // BFR-12: this is a GET op, which never installs a MONITOR finish
+        // guard, so a throwaway completion sender with its receiver dropped
+        // is sufficient. (`r14_tests` is a sibling module and cannot reach
+        // `tests::discard_mon_fin`.)
+        let (mon_fin_tx, _mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
         handle_op(
             &source,
             &frame,
@@ -9606,6 +10117,7 @@ mod r14_tests {
             &mut encode_cache,
             peer,
             &cred,
+            &mon_fin_tx,
         )
         .await
         .expect("GET EXEC ok");

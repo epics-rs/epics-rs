@@ -85,11 +85,14 @@ fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> u32 {
             ScalarValue::String(s) => {
                 if let Some(pct) = s.strip_suffix('%').filter(|p| !p.is_empty()) {
                     if let Ok(percent) = pct.trim().parse::<f64>() {
-                        // servermon.cpp:564 multiplies the clamped percent
-                        // by `limit` directly (no `/ 100`); the `[1, limit]`
-                        // clamp below bounds the result. Replicated verbatim
-                        // so the threshold matches a pvxs server.
-                        ack_at = (percent.clamp(0.0, 100.0) * queue_size as f64) as u32;
+                        // PVXS-SR-5: pvxs `servermon.cpp:563` historically
+                        // computed `clamp(percent,0,100) * limit` with NO
+                        // `/ 100`, so any percent >= 1% saturated to the full
+                        // queue after the `[1, limit]` clamp below, defeating
+                        // the percentage control. Divide by 100 so `"50%"` of a
+                        // queue of 4 is 2 — honoring the documented percentage
+                        // semantics. pvxs adopts the same fix.
+                        ack_at = (percent.clamp(0.0, 100.0) / 100.0 * queue_size as f64) as u32;
                     }
                 } else if let Ok(n) = s.trim().parse::<u32>() {
                     ack_at = n;
@@ -6843,27 +6846,50 @@ mod tests {
     }
 
     #[test]
-    fn ack_at_percentage_matches_pvxs_formula() {
-        // servermon.cpp:564 computes `clamp(percent,0,100) * limit`
-        // (NO `/ 100`), then clamps to [1, limit]. A fractional percent
-        // is the only way to land strictly below `limit`.
-        let req = make_pipeline_request_ack(
-            PvField::Scalar(ScalarValue::Boolean(true)),
-            PvField::Scalar(ScalarValue::Int(100)),
-            PvField::Scalar(ScalarValue::String("0.5%".into())),
-        );
-        assert_eq!(
-            parsed_opts(&req).ack_at,
-            50,
-            "0.5% of limit=100 → 0.5*100 = 50 (verbatim pvxs arithmetic)"
-        );
-        // Any percent >= 1 saturates: 50 * 16 = 800 → clamp to 16.
+    fn ack_at_percentage_is_true_percentage_of_queue() {
+        // PVXS-SR-5: `ackAny="N%"` is a true percentage of the queue,
+        // computed as `clamp(percent,0,100) / 100 * limit` then clamped
+        // to [1, limit]. (Pre-fix pvxs `servermon.cpp:563` omitted the
+        // `/ 100`, saturating any percent >= 1% to the full queue.)
         let req = make_pipeline_request_ack(
             PvField::Scalar(ScalarValue::Boolean(true)),
             PvField::Scalar(ScalarValue::Int(16)),
             PvField::Scalar(ScalarValue::String("50%".into())),
         );
-        assert_eq!(parsed_opts(&req).ack_at, 16);
+        assert_eq!(
+            parsed_opts(&req).ack_at,
+            8,
+            "50% of limit=16 → 8 (true percentage, not the pre-fix saturate-to-16)"
+        );
+        // 100% → the full queue.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::Scalar(ScalarValue::String("100%".into())),
+        );
+        assert_eq!(parsed_opts(&req).ack_at, 16, "100% → full queue");
+        // 25% of 16 → 4: a clean fractional case the pre-fix formula
+        // could not produce (it saturated 25*16 → clamp 16).
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::Scalar(ScalarValue::String("25%".into())),
+        );
+        assert_eq!(parsed_opts(&req).ack_at, 4, "25% of 16 → 4");
+        // A percent so small it truncates below one slot becomes 0,
+        // which hits the explicit `ackAt==0 → limit/2` fallback
+        // (pvxs `servermon.cpp:577`), NOT the `[1, limit]` floor:
+        // 0.5% of 16 = 0.08 → 0 → limit/2 = 8.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::Scalar(ScalarValue::String("0.5%".into())),
+        );
+        assert_eq!(
+            parsed_opts(&req).ack_at,
+            8,
+            "0.5% of 16 = 0.08 → truncates to 0 → limit/2 fallback = 8"
+        );
     }
 
     #[test]

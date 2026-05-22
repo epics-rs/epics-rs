@@ -864,6 +864,95 @@ fn apply_monitor_finish(channels: &mut HashMap<u32, ChannelState>, fin: MonitorF
     }
 }
 
+/// BFR-15: in-flight state of a non-monitor (GET/PUT/RPC/PUT_GET/PROCESS)
+/// data-phase op. pvxs models this as `ServerOp::state`
+/// (`serverget.cpp:467-476`, `:511-514`): a data-phase EXEC runs only when
+/// the op is `Idle`, flips it to `Executing`, and the op returns to `Idle`
+/// only when the original callback replies (`:112-116`). A second EXEC while
+/// `Executing` is logged and IGNORED — the first task is NOT cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecState {
+    /// No data-phase task in flight; an EXEC is accepted here.
+    Idle,
+    /// A spawned data-phase task is running; a further EXEC is ignored.
+    Executing,
+}
+
+/// BFR-15: begin a data-phase EXEC. Returns `Some(op_id)` when the op was
+/// `Idle` (now transitioned to `Executing`) and the caller may spawn the
+/// task, or `None` to IGNORE this EXEC — either the op is already
+/// `Executing` (pvxs `serverget.cpp:511-514`: log + drop, do NOT abort the
+/// in-flight task) or the op no longer exists. The returned `op_id`
+/// (`OpState::monitor_op_id`, minted per op at INIT) tags this exec instance
+/// for the [`ExecFinished`] ABA guard.
+fn begin_exec(ch: &mut ChannelState, ioid: u32) -> Option<u64> {
+    match ch.ops.get_mut(&ioid) {
+        Some(op) if op.exec_state == ExecState::Executing => None,
+        Some(op) => {
+            op.exec_state = ExecState::Executing;
+            Some(op.monitor_op_id)
+        }
+        None => None,
+    }
+}
+
+/// BFR-15: terminal signal a spawned data-phase task sends to its read-loop
+/// owner when the task ends (mirrors BFR-12's [`MonitorFinished`] for the
+/// non-monitor lifecycle). The spawned task owns no handle to `channels`, so
+/// it cannot return its own op to `Idle` when its response is sent; it
+/// reports its identity here and the read-loop owner — the single actor that
+/// may mutate `channels` — applies the transition. pvxs returns the op to
+/// `Idle` (or cleans it up on `lastRequest`) when the callback replies
+/// (`serverget.cpp:112-116`).
+///
+/// `op_id` is the op-instance's process-unique [`OpState::monitor_op_id`]. It
+/// tags THIS exec instance so a signal that arrives late (an aborted task
+/// whose future drops after its ioid was removed and re-INIT'd) cannot flip a
+/// *fresh* op back to `Idle` ([`apply_exec_finish`] ABA guard).
+#[derive(Debug, Clone, Copy)]
+struct ExecFinished {
+    sid: u32,
+    ioid: u32,
+    op_id: u64,
+}
+
+/// BFR-15: RAII finalizer held as a single local at the top of a data-phase
+/// task body. Its `Drop` reports completion to the read-loop owner on EVERY
+/// task exit — the normal reply-then-return, an early `return` on an error
+/// reply, a panic, or an `AbortOnDrop`-driven cancellation (DESTROY / channel
+/// teardown / disconnect). Because it is one local that no path can step
+/// around, the "executing op returns to idle when its task ends" invariant
+/// holds by construction (see CLAUDE.md "Strong state transitions").
+struct ExecFinishGuard {
+    tx: mpsc::UnboundedSender<ExecFinished>,
+    fin: ExecFinished,
+}
+
+impl Drop for ExecFinishGuard {
+    fn drop(&mut self) {
+        // Unbounded so this sync Drop never loses the signal to a full
+        // channel; the only `send` failure is a closed receiver (the read
+        // loop already ended and dropped every op).
+        let _ = self.tx.send(self.fin);
+    }
+}
+
+/// BFR-15: read-loop owner side of a data-phase task's terminal signal.
+/// Returns the op to `Idle` and clears its (now-inert) abort guard so a later
+/// explicit re-EXEC is accepted (pvxs `serverget.cpp:114-115`). Gated on the
+/// op-instance id so a stale signal cannot flip a re-INIT'd op that reused the
+/// ioid. For a `lastRequest` EXEC the op was already removed synchronously by
+/// [`finish_exec_data_task`], so the lookup misses and this is a no-op.
+fn apply_exec_finish(channels: &mut HashMap<u32, ChannelState>, fin: ExecFinished) {
+    if let Some(ch) = channels.get_mut(&fin.sid)
+        && let Some(op) = ch.ops.get_mut(&fin.ioid)
+        && op.monitor_op_id == fin.op_id
+    {
+        op.exec_state = ExecState::Idle;
+        op.data_task_abort = None;
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct OpState {
@@ -992,6 +1081,14 @@ struct OpState {
     /// fires the terminal `notify_monitor_start(false)` iff still
     /// executing.
     monitor_start_ctl: Option<Arc<MonitorStartControl>>,
+    /// BFR-15: in-flight EXEC state for non-monitor (GET/PUT/RPC/PUT_GET/
+    /// PROCESS) ops. `Idle` at INIT; flipped to `Executing` by [`begin_exec`]
+    /// when a data-phase EXEC is accepted, and back to `Idle` by
+    /// [`apply_exec_finish`] when the spawned task's response is sent. A
+    /// second EXEC while `Executing` is ignored rather than aborting the
+    /// in-flight task (pvxs `serverget.cpp:467-476`/`:511-514`). MONITOR ops
+    /// leave this `Idle` (their lifecycle is `monitor_start_ctl`).
+    exec_state: ExecState,
 }
 
 /// BRIDGE-FR-11: atomically cross a pipeline-window watermark and mint
@@ -1922,6 +2019,11 @@ async fn handle_connection_io(
     // bounded in practice by the live op count, which `max_ops_per_channel`
     // already caps.
     let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+    // BFR-15: a spawned GET/PUT/RPC/PUT_GET/PROCESS data-phase task signals
+    // here when its response is sent so the owner can return the op to `Idle`
+    // (see [`ExecFinished`]/[`apply_exec_finish`]). Same unbounded-so-Drop-
+    // never-loses rationale as `mon_fin_tx`.
+    let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
     // Count of in-flight CREATE_CHANNEL resolver tasks. Used in the
     // per-connection channel cap check: channels being resolved count
     // against the limit to prevent a burst of concurrent requests from
@@ -2002,6 +2104,17 @@ async fn handle_connection_io(
                 // rather than rejected on the duplicate-INIT fatal path.
                 if let Some(fin) = fin_opt {
                     apply_monitor_finish(&mut channels, fin);
+                }
+                continue;
+            }
+            exec_opt = exec_fin_rx.recv() => {
+                // BFR-15: a GET/PUT/RPC/PUT_GET/PROCESS data-phase task sent
+                // its response and ended. Return the op to `Idle` through the
+                // owner so a later explicit re-EXEC is accepted, gated on the
+                // op-instance id so a stale signal cannot flip a re-INIT'd op
+                // (a `lastRequest` op was already removed and is a no-op here).
+                if let Some(fin) = exec_opt {
+                    apply_exec_finish(&mut channels, fin);
                 }
                 continue;
             }
@@ -2255,6 +2368,7 @@ async fn handle_connection_io(
                     peer,
                     &cred,
                     &mon_fin_tx,
+                    &exec_fin_tx,
                 )
                 .await?;
             }
@@ -2272,6 +2386,7 @@ async fn handle_connection_io(
                     peer,
                     &cred,
                     &mon_fin_tx,
+                    &exec_fin_tx,
                 )
                 .await?;
             }
@@ -2289,6 +2404,7 @@ async fn handle_connection_io(
                     peer,
                     &cred,
                     &mon_fin_tx,
+                    &exec_fin_tx,
                 )
                 .await?;
             }
@@ -2306,6 +2422,7 @@ async fn handle_connection_io(
                     peer,
                     &cred,
                     &mon_fin_tx,
+                    &exec_fin_tx,
                 )
                 .await?;
             }
@@ -2349,6 +2466,7 @@ async fn handle_connection_io(
                     &mut encode_type_cache,
                     peer,
                     &cred,
+                    &exec_fin_tx,
                 )
                 .await?;
             }
@@ -2367,6 +2485,7 @@ async fn handle_connection_io(
                     &config,
                     peer,
                     &cred,
+                    &exec_fin_tx,
                 )
                 .await?;
             }
@@ -2536,6 +2655,7 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
         monitor_options: crate::server_native::source::MonitorOptions::default(),
         data_task_abort: None,
         monitor_start_ctl: None,
+        exec_state: ExecState::Idle,
     }
 }
 
@@ -2566,6 +2686,10 @@ async fn handle_put_get(
     encode_cache: &mut EncodeTypeCache,
     peer: std::net::SocketAddr,
     cred: &ClientCredentials,
+    // BFR-15: data-phase-completion sender (see [`handle_op`]). The spawned
+    // PUT_GET exec task installs an `ExecFinishGuard` so the owner returns
+    // the op to `Idle` when its readback reply is sent.
+    exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
 ) -> PvaResult<()> {
     let mut cur = frame.cursor();
     let sid = cur
@@ -2762,7 +2886,25 @@ async fn handle_put_get(
 
     let src = source.clone();
     let tx_clone = tx.clone();
+    // BFR-15: run this PUT_GET exec only when the op is `Idle`, and ignore a
+    // second EXEC while the first is in flight rather than aborting it (pvxs
+    // `serverget.cpp:467-476`/`:511-514`).
+    let op_id = match begin_exec(ch, ioid) {
+        Some(id) => id,
+        None => {
+            debug!(ioid, "PUT_GET EXEC ignored: op already executing");
+            return Ok(());
+        }
+    };
+    let exec_fin = ExecFinished { sid, ioid, op_id };
+    let exec_fin_tx_task = exec_fin_tx.clone();
     let join = tokio::spawn(async move {
+        // BFR-15: return this op to `Idle` (via the read-loop owner) when the
+        // task ends so a later explicit re-EXEC is accepted.
+        let _exec_fin_guard = ExecFinishGuard {
+            tx: exec_fin_tx_task,
+            fin: exec_fin,
+        };
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
         payload.put_u8(subcmd);
@@ -2858,6 +3000,10 @@ async fn handle_process(
     config: &PvaServerConfig,
     peer: std::net::SocketAddr,
     cred: &ClientCredentials,
+    // BFR-15: data-phase-completion sender (see [`handle_op`]). The spawned
+    // PROCESS exec task installs an `ExecFinishGuard` so the owner returns
+    // the op to `Idle` when its reply is sent.
+    exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
 ) -> PvaResult<()> {
     let mut cur = frame.cursor();
     let sid = cur
@@ -3025,7 +3171,25 @@ async fn handle_process(
     };
     let src = source.clone();
     let tx_clone = tx.clone();
+    // BFR-15: run this PROCESS exec only when the op is `Idle`, and ignore a
+    // second EXEC while the first is in flight rather than aborting it (pvxs
+    // `serverget.cpp:467-476`/`:511-514`).
+    let op_id = match begin_exec(ch, ioid) {
+        Some(id) => id,
+        None => {
+            debug!(ioid, "PROCESS EXEC ignored: op already executing");
+            return Ok(());
+        }
+    };
+    let exec_fin = ExecFinished { sid, ioid, op_id };
+    let exec_fin_tx_task = exec_fin_tx.clone();
     let join = tokio::spawn(async move {
+        // BFR-15: return this op to `Idle` (via the read-loop owner) when the
+        // task ends so a later explicit re-EXEC is accepted.
+        let _exec_fin_guard = ExecFinishGuard {
+            tx: exec_fin_tx_task,
+            fin: exec_fin,
+        };
         let checked = src
             .access_gate()
             .check_with_roles(
@@ -3500,10 +3664,13 @@ async fn handle_op(
     cred: &ClientCredentials,
     // BFR-12: read-loop owner's MONITOR subscriber-completion sender. The
     // spawned subscriber task installs a `MonitorFinishGuard` cloned from
-    // this so its terminal removal is routed back to the owner. Only the
-    // MONITOR branch uses it; GET/PUT/RPC tasks are two-shot and the owner
-    // removes them synchronously via `finish_exec_data_task`.
+    // this so its terminal op removal is routed back to the owner. Only the
+    // MONITOR branch uses it.
     mon_fin_tx: &mpsc::UnboundedSender<MonitorFinished>,
+    // BFR-15: read-loop owner's data-phase-completion sender. Each spawned
+    // GET/PUT/RPC data task installs an `ExecFinishGuard` cloned from this so
+    // the owner returns the op to `Idle` when the response is sent.
+    exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
 ) -> PvaResult<()> {
     let mut cur = frame.cursor();
     let sid = cur
@@ -3799,6 +3966,7 @@ async fn handle_op(
                 monitor_options,
                 data_task_abort: None,
                 monitor_start_ctl: None,
+                exec_state: ExecState::Idle,
             },
         );
 
@@ -3875,12 +4043,26 @@ async fn handle_op(
             // context so QSRV group GET honors `record._options`
             // (e.g. `atomic`). Previously dropped here as `None`.
             let init_pv_request_t = init_pv_request.clone();
-            // Abort any previous in-flight data task for this ioid
-            // (e.g. double-EXEC from a misbehaving client).
-            if let Some(op_mut) = ch.ops.get_mut(&ioid) {
-                op_mut.data_task_abort = None;
-            }
+            // BFR-15: pvxs `serverget.cpp:467-476` runs a data-phase EXEC
+            // only when the op is `Idle`, flips it to `Executing`, and
+            // IGNORES a second EXEC that arrives while the first task is in
+            // flight (`:511-514`) — it does NOT abort the in-flight task.
+            let op_id = match begin_exec(ch, ioid) {
+                Some(id) => id,
+                None => {
+                    debug!(ioid, "GET EXEC ignored: op already executing");
+                    return Ok(());
+                }
+            };
+            let exec_fin = ExecFinished { sid, ioid, op_id };
+            let exec_fin_tx_task = exec_fin_tx.clone();
             let join = tokio::spawn(async move {
+                // BFR-15: returns this op to `Idle` (via the read-loop owner)
+                // when the task ends, so a later explicit re-EXEC is accepted.
+                let _exec_fin_guard = ExecFinishGuard {
+                    tx: exec_fin_tx_task,
+                    fin: exec_fin,
+                };
                 let ctx = crate::server_native::source::ChannelContext {
                     peer,
                     account: cred_account,
@@ -3981,10 +4163,22 @@ async fn handle_op(
                 // readback GET context so the readback honors the
                 // same `record._options` the GET path would.
                 let init_pv_request_t = init_pv_request.clone();
-                if let Some(op_mut) = ch.ops.get_mut(&ioid) {
-                    op_mut.data_task_abort = None;
-                }
+                // BFR-15: ignore a second EXEC while the readback task is in
+                // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
+                let op_id = match begin_exec(ch, ioid) {
+                    Some(id) => id,
+                    None => {
+                        debug!(ioid, "PUT readback EXEC ignored: op already executing");
+                        return Ok(());
+                    }
+                };
+                let exec_fin = ExecFinished { sid, ioid, op_id };
+                let exec_fin_tx_task = exec_fin_tx.clone();
                 let join = tokio::spawn(async move {
+                    let _exec_fin_guard = ExecFinishGuard {
+                        tx: exec_fin_tx_task,
+                        fin: exec_fin,
+                    };
                     let ctx = crate::server_native::source::ChannelContext {
                         peer,
                         account: cred_account,
@@ -4084,10 +4278,22 @@ async fn handle_op(
             let cred_authority = cred.authority.clone();
             let cred_roles = cred.roles.clone();
             let init_pv_request_t = init_pv_request.clone();
-            if let Some(op_mut) = ch.ops.get_mut(&ioid) {
-                op_mut.data_task_abort = None;
-            }
+            // BFR-15: ignore a second PUT EXEC while the first write is in
+            // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
+            let op_id = match begin_exec(ch, ioid) {
+                Some(id) => id,
+                None => {
+                    debug!(ioid, "PUT EXEC ignored: op already executing");
+                    return Ok(());
+                }
+            };
+            let exec_fin = ExecFinished { sid, ioid, op_id };
+            let exec_fin_tx_task = exec_fin_tx.clone();
             let join = tokio::spawn(async move {
+                let _exec_fin_guard = ExecFinishGuard {
+                    tx: exec_fin_tx_task,
+                    fin: exec_fin,
+                };
                 let ctx = crate::server_native::source::ChannelContext {
                     peer,
                     account: cred_account,
@@ -5136,7 +5342,22 @@ async fn handle_op(
                 roles: cred.roles.clone(),
                 pv_request: None,
             };
+            // BFR-15: ignore a second RPC EXEC while the first call is in
+            // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
+            let op_id = match begin_exec(ch, ioid) {
+                Some(id) => id,
+                None => {
+                    debug!(ioid, "RPC EXEC ignored: op already executing");
+                    return Ok(());
+                }
+            };
+            let exec_fin = ExecFinished { sid, ioid, op_id };
+            let exec_fin_tx_task = exec_fin_tx.clone();
             let join = tokio::spawn(async move {
+                let _exec_fin_guard = ExecFinishGuard {
+                    tx: exec_fin_tx_task,
+                    fin: exec_fin,
+                };
                 let rpc_checked = src
                     .access_gate()
                     .check_with_roles(
@@ -5768,6 +5989,17 @@ mod tests {
     /// never call [`apply_monitor_finish`]). Tests that DO assert the
     /// cleanup build a real channel and keep the receiver.
     fn discard_mon_fin() -> mpsc::UnboundedSender<MonitorFinished> {
+        mpsc::unbounded_channel().0
+    }
+
+    /// BFR-15: a throwaway data-phase-completion sender for handler calls in
+    /// tests that do not exercise the read-loop owner's `Idle`-return arm.
+    /// The receiver is dropped immediately, so the spawned task's
+    /// `ExecFinishGuard::drop` `send` is a harmless no-op (the op keeps its
+    /// `Executing` state, exactly as a single in-flight EXEC would, since
+    /// these tests never call [`apply_exec_finish`]). Tests that assert the
+    /// return-to-`Idle` build a real channel and keep the receiver.
+    fn discard_exec_fin() -> mpsc::UnboundedSender<ExecFinished> {
         mpsc::unbounded_channel().0
     }
 
@@ -6824,6 +7056,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("MONITOR INIT ok");
@@ -6848,6 +7081,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("MONITOR START ok");
@@ -6906,6 +7140,7 @@ mod tests {
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
                 monitor_start_ctl: None,
+                exec_state: ExecState::Idle,
             },
         );
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
@@ -6961,6 +7196,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect_err("truncated MONITOR ACK must be connection-fatal");
@@ -7012,6 +7248,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("well-formed MONITOR ACK ok");
@@ -7063,6 +7300,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("well-formed MONITOR ACK ok");
@@ -7155,6 +7393,7 @@ mod tests {
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
                 monitor_start_ctl: None,
+                exec_state: ExecState::Idle,
             },
         );
         channels.insert(
@@ -7599,6 +7838,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("PUT INIT ok");
@@ -7634,6 +7874,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("PUT EXEC ok");
@@ -7723,6 +7964,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("PUT INIT ok");
@@ -7756,6 +7998,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("PUT EXEC ok");
@@ -7855,6 +8098,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("GET EXEC (last request) ok");
@@ -7891,6 +8135,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("GET EXEC (not last request) ok");
@@ -8141,6 +8386,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("PUT INIT ok");
@@ -8181,6 +8427,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("PUT EXEC ok");
@@ -8262,6 +8509,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_exec_fin(),
         )
         .await
         .expect("PUT_GET INIT ok");
@@ -8297,6 +8545,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &cred,
+            &discard_exec_fin(),
         )
         .await
         .expect("PUT_GET data ok");
@@ -8597,6 +8846,7 @@ mod tests {
             &config,
             peer,
             &x509_cred("MyCA"),
+            &discard_exec_fin(),
         )
         .await
         .expect("handle_process ok");
@@ -8654,6 +8904,7 @@ mod tests {
             &config,
             peer,
             &x509_cred("OtherCA"),
+            &discard_exec_fin(),
         )
         .await
         .expect("handle_process ok");
@@ -8737,6 +8988,7 @@ mod tests {
             &config,
             peer,
             &x509_cred("MyCA"),
+            &discard_exec_fin(),
         )
         .await;
         assert!(
@@ -8781,6 +9033,7 @@ mod tests {
             &config,
             peer,
             &x509_cred("MyCA"),
+            &discard_exec_fin(),
         )
         .await;
         assert!(
@@ -8851,6 +9104,7 @@ mod tests {
             &config,
             peer,
             &x509_cred("MyCA"),
+            &discard_exec_fin(),
         )
         .await
         .expect("handle_process returns Ok (op-error boundary, not connection-fatal)");
@@ -8987,6 +9241,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &x509_cred("MyCA"),
+            &discard_exec_fin(),
         )
         .await;
         assert!(
@@ -9039,6 +9294,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &x509_cred("MyCA"),
+            &discard_exec_fin(),
         )
         .await;
         assert!(
@@ -9118,6 +9374,7 @@ mod tests {
             &mut encode_cache,
             peer,
             &x509_cred("MyCA"),
+            &discard_exec_fin(),
         )
         .await
         .expect("handle_put_get ok");
@@ -9196,6 +9453,7 @@ mod tests {
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
                 monitor_start_ctl: None,
+                exec_state: ExecState::Idle,
             },
         );
         channels.insert(
@@ -9931,6 +10189,7 @@ mod tests {
             peer,
             &cred,
             &mon_fin_tx,
+            &discard_exec_fin(),
         )
         .await
         .expect("MONITOR INIT ok");
@@ -9958,6 +10217,7 @@ mod tests {
             peer,
             &cred,
             &mon_fin_tx,
+            &discard_exec_fin(),
         )
         .await
         .expect("MONITOR START ok");
@@ -10135,6 +10395,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("GET INIT ok");
@@ -10158,6 +10419,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("GET EXEC ok");
@@ -10211,6 +10473,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("PUT INIT ok");
@@ -10235,6 +10498,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("PUT readback EXEC ok");
@@ -10289,6 +10553,7 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
+            &discard_exec_fin(),
         )
         .await
         .expect("GET INIT handled");
@@ -10516,6 +10781,7 @@ mod r14_tests {
         // is sufficient. (`r14_tests` is a sibling module and cannot reach
         // `tests::discard_mon_fin`.)
         let (mon_fin_tx, _mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+        let (exec_fin_tx, _exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         handle_op(
             &source,
             &frame,
@@ -10528,6 +10794,7 @@ mod r14_tests {
             peer,
             &cred,
             &mon_fin_tx,
+            &exec_fin_tx,
         )
         .await
         .expect("GET EXEC ok");
@@ -10547,5 +10814,522 @@ mod r14_tests {
             resp.len() > PvaHeader::SIZE,
             "GET response frame must be non-empty"
         );
+    }
+}
+
+#[cfg(test)]
+mod bfr15_tests {
+    //! BFR-15 regression: a data-phase EXEC runs only when the op is `Idle`,
+    //! flips it to `Executing`, and a *second* EXEC that arrives while the
+    //! first task is in flight is IGNORED — the first task is NOT cancelled
+    //! (pvxs `serverget.cpp:467-476` runs the EXEC only on `Idle`/sets
+    //! `Executing`; `:511-514` logs + drops a second EXEC; `:112-116` returns
+    //! the op to `Idle` when the original callback replies). Pre-fix Rust
+    //! aborted the in-flight task on a second EXEC (GET/PUT pre-cleared
+    //! `data_task_abort`; RPC/PUT_GET/PROCESS overwrote it), and no `Idle`
+    //! return-after-completion existed.
+    //!
+    //! Tested by invariant boundary, not by narrative:
+    //! - `Idle` → first EXEC accepted, op `Executing` (tests a/b set up).
+    //! - `Executing` → second EXEC ignored, in-flight task untouched (a/b).
+    //! - explicit DESTROY still aborts the in-flight task (c).
+    //! - task completion returns the op to `Idle`, so a later re-EXEC is
+    //!   accepted as a fresh exec (d).
+    //! - a stale completion signal (op-instance id mismatch) is a no-op (e).
+
+    use super::*;
+    use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn synth_frame(command: Command, order: ByteOrder, payload: Vec<u8>) -> Frame {
+        let header = PvaHeader::application(false, order, command.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    /// Fired when the source future is dropped. A blocked source future is
+    /// dropped exactly when the spawned task is aborted, so a non-zero count
+    /// distinguishes "task aborted" from "task still blocked" (a normal
+    /// completion is impossible within a test because the block is a 1-hour
+    /// sleep).
+    struct DropSignal(Arc<AtomicUsize>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A source whose `get_value` / `put_value` can be made to block on a
+    /// 1-hour sleep, keeping the spawned data-phase task in flight while the
+    /// test fires a second EXEC. Each call is counted; cancellation of a
+    /// blocked call is observable via the `*_cancelled` counters.
+    struct ExecBlockSource {
+        get_calls: Arc<AtomicUsize>,
+        put_calls: Arc<AtomicUsize>,
+        get_cancelled: Arc<AtomicUsize>,
+        put_cancelled: Arc<AtomicUsize>,
+        block_get: bool,
+        block_put: bool,
+    }
+
+    fn nt_scalar_desc() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        }
+    }
+
+    fn nt_scalar_value(v: f64) -> PvField {
+        let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+        s.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(v))));
+        PvField::Structure(s)
+    }
+
+    impl crate::server_native::source::ChannelSource for ExecBlockSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        async fn has_pv(&self, name: &str) -> bool {
+            name == "dut"
+        }
+        async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+            Some(nt_scalar_desc())
+        }
+        async fn get_value(&self, _: &str) -> Option<PvField> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            if self.block_get {
+                let _d = DropSignal(self.get_cancelled.clone());
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            Some(nt_scalar_value(1.0))
+        }
+        async fn put_value(&self, _: &str, _: PvField) -> Result<(), String> {
+            self.put_calls.fetch_add(1, Ordering::SeqCst);
+            if self.block_put {
+                let _d = DropSignal(self.put_cancelled.clone());
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            Ok(())
+        }
+        async fn is_writable(&self, _: &str) -> bool {
+            true
+        }
+        async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+            None
+        }
+    }
+
+    /// Channel map with a single `Idle` op of `kind` bound to `ioid`.
+    fn channels_with_op(sid: u32, ioid: u32, kind: OpKind) -> HashMap<u32, ChannelState> {
+        let intro = nt_scalar_desc();
+        let mut ops: HashMap<u32, OpState> = HashMap::new();
+        ops.insert(
+            ioid,
+            non_monitor_op_state(intro.clone(), kind, BitSet::new()),
+        );
+        let mut channels = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 1,
+                sid,
+                introspection: Some(intro),
+                ops,
+            },
+        );
+        channels
+    }
+
+    fn get_exec_frame(sid: u32, ioid: u32, order: ByteOrder) -> Frame {
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00); // EXEC, not last-request, not INIT
+        synth_frame(Command::Get, order, payload)
+    }
+
+    fn put_exec_frame(sid: u32, ioid: u32, order: ByteOrder) -> Frame {
+        let intro = nt_scalar_desc();
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00); // EXEC: subcmd & 0x40 == 0 → a real write
+        let bs = BitSet::all_set(intro.total_bits());
+        bs.write_into(order, &mut payload);
+        crate::pvdata::encode::encode_pv_field(&nt_scalar_value(2.5), &intro, order, &mut payload);
+        synth_frame(Command::Put, order, payload)
+    }
+
+    fn destroy_frame(sid: u32, ioid: u32, order: ByteOrder) -> Frame {
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        synth_frame(Command::DestroyRequest, order, payload)
+    }
+
+    /// Poll `counter` until it reaches `want`, panicking after ~1 s. Used to
+    /// wait for a spawned task to enter its (blocking) source call.
+    async fn wait_for(counter: &AtomicUsize, want: usize) {
+        for _ in 0..200 {
+            if counter.load(Ordering::SeqCst) >= want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!(
+            "counter never reached {want}; stuck at {}",
+            counter.load(Ordering::SeqCst)
+        );
+    }
+
+    fn op_exec_state(channels: &HashMap<u32, ChannelState>, sid: u32, ioid: u32) -> ExecState {
+        channels
+            .get(&sid)
+            .expect("channel present")
+            .ops
+            .get(&ioid)
+            .expect("op present")
+            .exec_state
+    }
+
+    fn op_abort_armed(channels: &HashMap<u32, ChannelState>, sid: u32, ioid: u32) -> bool {
+        channels
+            .get(&sid)
+            .expect("channel present")
+            .ops
+            .get(&ioid)
+            .expect("op present")
+            .data_task_abort
+            .is_some()
+    }
+
+    /// (a) `Executing` boundary on GET: a second GET EXEC arriving while the
+    /// first source read is in flight is ignored — it neither starts a second
+    /// source read nor aborts the first.
+    #[tokio::test]
+    async fn bfr15_second_get_exec_while_executing_is_ignored_not_aborted() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (1u32, 100u32);
+        let peer: SocketAddr = "127.0.0.1:9101".parse().unwrap();
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let get_cancelled = Arc::new(AtomicUsize::new(0));
+        let source: DynSource = Arc::new(ExecBlockSource {
+            get_calls: get_calls.clone(),
+            put_calls: Arc::new(AtomicUsize::new(0)),
+            get_cancelled: get_cancelled.clone(),
+            put_cancelled: Arc::new(AtomicUsize::new(0)),
+            block_get: true,
+            block_put: false,
+        });
+        let mut channels = channels_with_op(sid, ioid, OpKind::Get);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let cred = ClientCredentials::anonymous();
+        let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
+        let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
+
+        // First EXEC: op was Idle → accepted, now Executing, source read spawned.
+        handle_op(
+            &source,
+            &get_exec_frame(sid, ioid, order),
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon,
+            &exec_tx,
+        )
+        .await
+        .expect("first GET EXEC ok");
+        wait_for(&get_calls, 1).await;
+        assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Executing);
+        assert!(op_abort_armed(&channels, sid, ioid));
+
+        // Second EXEC while Executing: ignored.
+        handle_op(
+            &source,
+            &get_exec_frame(sid, ioid, order),
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon,
+            &exec_tx,
+        )
+        .await
+        .expect("second GET EXEC ok (ignored)");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(
+            get_calls.load(Ordering::SeqCst),
+            1,
+            "second GET EXEC must not start a second source read"
+        );
+        assert_eq!(
+            get_cancelled.load(Ordering::SeqCst),
+            0,
+            "second GET EXEC must not abort the in-flight first read"
+        );
+        assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Executing);
+        assert!(op_abort_armed(&channels, sid, ioid));
+    }
+
+    /// (b) `Executing` boundary on PUT: a second PUT EXEC arriving while the
+    /// first write is in flight is ignored — neither a second write starts nor
+    /// the first is aborted.
+    #[tokio::test]
+    async fn bfr15_second_put_exec_while_executing_is_ignored_not_aborted() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (1u32, 200u32);
+        let peer: SocketAddr = "127.0.0.1:9102".parse().unwrap();
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let put_calls = Arc::new(AtomicUsize::new(0));
+        let put_cancelled = Arc::new(AtomicUsize::new(0));
+        // get_value returns the prior value fast (the delta-PUT read-merge);
+        // put_value is what blocks, holding the op Executing.
+        let source: DynSource = Arc::new(ExecBlockSource {
+            get_calls: get_calls.clone(),
+            put_calls: put_calls.clone(),
+            get_cancelled: Arc::new(AtomicUsize::new(0)),
+            put_cancelled: put_cancelled.clone(),
+            block_get: false,
+            block_put: true,
+        });
+        let mut channels = channels_with_op(sid, ioid, OpKind::Put);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let cred = ClientCredentials::anonymous();
+        let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
+        let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
+
+        handle_op(
+            &source,
+            &put_exec_frame(sid, ioid, order),
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon,
+            &exec_tx,
+        )
+        .await
+        .expect("first PUT EXEC ok");
+        wait_for(&put_calls, 1).await;
+        assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Executing);
+        assert!(op_abort_armed(&channels, sid, ioid));
+
+        handle_op(
+            &source,
+            &put_exec_frame(sid, ioid, order),
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon,
+            &exec_tx,
+        )
+        .await
+        .expect("second PUT EXEC ok (ignored)");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(
+            put_calls.load(Ordering::SeqCst),
+            1,
+            "second PUT EXEC must not start a second write"
+        );
+        assert_eq!(
+            put_cancelled.load(Ordering::SeqCst),
+            0,
+            "second PUT EXEC must not abort the in-flight first write"
+        );
+        assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Executing);
+    }
+
+    /// (c) An explicit DESTROY_REQUEST still aborts an in-flight EXEC task:
+    /// removing the op drops its `AbortOnDrop` guard, cancelling the spawned
+    /// read. (The `Executing` gate suppresses only an implicit re-EXEC, never
+    /// an explicit teardown.)
+    #[tokio::test]
+    async fn bfr15_destroy_request_aborts_in_flight_exec_task() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (1u32, 300u32);
+        let peer: SocketAddr = "127.0.0.1:9103".parse().unwrap();
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let get_cancelled = Arc::new(AtomicUsize::new(0));
+        let source: DynSource = Arc::new(ExecBlockSource {
+            get_calls: get_calls.clone(),
+            put_calls: Arc::new(AtomicUsize::new(0)),
+            get_cancelled: get_cancelled.clone(),
+            put_cancelled: Arc::new(AtomicUsize::new(0)),
+            block_get: true,
+            block_put: false,
+        });
+        let mut channels = channels_with_op(sid, ioid, OpKind::Get);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let cred = ClientCredentials::anonymous();
+        let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
+        let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
+
+        handle_op(
+            &source,
+            &get_exec_frame(sid, ioid, order),
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon,
+            &exec_tx,
+        )
+        .await
+        .expect("GET EXEC ok");
+        wait_for(&get_calls, 1).await;
+        assert_eq!(get_cancelled.load(Ordering::SeqCst), 0);
+        assert!(op_abort_armed(&channels, sid, ioid));
+
+        // DESTROY_REQUEST removes the op → drops AbortOnDrop → aborts the task.
+        handle_destroy_request(&destroy_frame(sid, ioid, order), &mut channels, order)
+            .expect("DESTROY_REQUEST ok");
+        wait_for(&get_cancelled, 1).await;
+        assert!(
+            !channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            "DESTROY_REQUEST must remove the op"
+        );
+    }
+
+    /// (d) A completed EXEC returns the op to `Idle` (through the read-loop
+    /// owner via `ExecFinished`/`apply_exec_finish`), so a later explicit
+    /// re-EXEC is accepted as a fresh exec and runs a second source read.
+    #[tokio::test]
+    async fn bfr15_completed_exec_returns_op_to_idle_and_allows_reexec() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (1u32, 400u32);
+        let peer: SocketAddr = "127.0.0.1:9104".parse().unwrap();
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let source: DynSource = Arc::new(ExecBlockSource {
+            get_calls: get_calls.clone(),
+            put_calls: Arc::new(AtomicUsize::new(0)),
+            get_cancelled: Arc::new(AtomicUsize::new(0)),
+            put_cancelled: Arc::new(AtomicUsize::new(0)),
+            block_get: false, // completes immediately
+            block_put: false,
+        });
+        let mut channels = channels_with_op(sid, ioid, OpKind::Get);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let cred = ClientCredentials::anonymous();
+        let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
+        let (exec_tx, mut exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
+
+        // First EXEC completes; the task sends its response, then its
+        // ExecFinishGuard drops and signals the owner.
+        handle_op(
+            &source,
+            &get_exec_frame(sid, ioid, order),
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon,
+            &exec_tx,
+        )
+        .await
+        .expect("first GET EXEC ok");
+        let _resp = rx.recv().await.expect("first GET response emitted");
+
+        // Owner applies the completion → op back to Idle, abort guard cleared.
+        let fin = exec_rx.recv().await.expect("ExecFinished signalled");
+        apply_exec_finish(&mut channels, fin);
+        assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Idle);
+        assert!(!op_abort_armed(&channels, sid, ioid));
+        assert_eq!(get_calls.load(Ordering::SeqCst), 1);
+
+        // Re-EXEC against the now-Idle op is accepted and runs a fresh read.
+        handle_op(
+            &source,
+            &get_exec_frame(sid, ioid, order),
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon,
+            &exec_tx,
+        )
+        .await
+        .expect("re-EXEC ok");
+        let _resp2 = rx.recv().await.expect("re-EXEC response emitted");
+        assert_eq!(
+            get_calls.load(Ordering::SeqCst),
+            2,
+            "re-EXEC after Idle return must run a fresh source read"
+        );
+    }
+
+    /// (e) ABA boundary: a stale completion signal (op-instance id mismatch,
+    /// e.g. the ioid was removed and re-INIT'd) must NOT flip the fresh op
+    /// back to `Idle`. Only an exact `monitor_op_id` match applies.
+    #[tokio::test]
+    async fn bfr15_apply_exec_finish_ignores_stale_op_id() {
+        let (sid, ioid) = (1u32, 500u32);
+        let mut channels = channels_with_op(sid, ioid, OpKind::Get);
+        // Drive the op to Executing and capture its instance id.
+        let op_id =
+            begin_exec(channels.get_mut(&sid).unwrap(), ioid).expect("Idle op accepts the exec");
+        assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Executing);
+
+        // Stale signal (id+1): no-op.
+        apply_exec_finish(
+            &mut channels,
+            ExecFinished {
+                sid,
+                ioid,
+                op_id: op_id.wrapping_add(1),
+            },
+        );
+        assert_eq!(
+            op_exec_state(&channels, sid, ioid),
+            ExecState::Executing,
+            "stale op-instance id must not return the op to Idle"
+        );
+
+        // Matching signal: applies.
+        apply_exec_finish(&mut channels, ExecFinished { sid, ioid, op_id });
+        assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Idle);
     }
 }

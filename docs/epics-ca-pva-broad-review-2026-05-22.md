@@ -40,7 +40,7 @@ Method:
 | BFR-12 | Medium | PVA MONITOR FINISH op cleanup | Fixed in current source |
 | BFR-13 | Medium | PVA data-phase error response shape | Fixed in current source |
 | BFR-14 | Medium | PVA raw monitor re-encode error handling | Fixed in current source |
-| BFR-15 | Medium | PVA GET/PUT/RPC in-flight EXEC state | Open |
+| BFR-15 | Medium | PVA GET/PUT/RPC in-flight EXEC state | Fixed in current source |
 
 ## Reviewed Anchors
 
@@ -1266,3 +1266,120 @@ Regression tests to add:
 - DESTROY_REQUEST still aborts the in-flight task.
 - A completed GET/PUT/RPC task returns the op to Idle so a later explicit
   re-EXEC works when the protocol permits it.
+
+Applied fix (Fixed in current source):
+
+Modeled the non-monitor data-phase op state explicitly and routed the
+return-to-`Idle` transition through the single read-loop owner, exactly as pvxs
+gates the op on `ServerOp::state` (`serverget.cpp:467-476`/`:511-514`/`:112-116`).
+This is the BFR-12 lifecycle applied to GET/PUT/RPC/PUT_GET/PROCESS:
+
+- New `ExecState { Idle, Executing }` (`tcp.rs:873-879`) added as
+  `OpState::exec_state` (`tcp.rs:1091`), `Idle` at INIT in both op constructors
+  (`non_monitor_op_state` `tcp.rs:2658`, the `handle_op` INIT literal
+  `tcp.rs:3969`).
+- `begin_exec` (`tcp.rs:888-897`) is the single gate: it returns `Some(op_id)`
+  and flips `Idle -> Executing` only when the op is `Idle`, and `None` (IGNORE,
+  do NOT abort) when the op is already `Executing`. Every one of the six
+  data-phase EXEC spawn sites now calls it BEFORE spawning and returns
+  `Ok(())` early on `None`: GET (`tcp.rs:4050`), PUT readback (`:4168`), PUT
+  exec (`:4283`), RPC (`:5347`) in `handle_op`; PUT_GET (`:2892`) in
+  `handle_put_get`; PROCESS (`:3177`) in `handle_process`. The pre-fix GET/PUT
+  `data_task_abort = None` pre-clears (which aborted the in-flight task) and the
+  RPC/PUT_GET/PROCESS guard overwrites are gone — replaced by the gate.
+- Completion is owner-applied. Each spawned task installs an `ExecFinishGuard`
+  (`tcp.rs:926-938`) as its first local; its `Drop` sends `ExecFinished`
+  (`tcp.rs:912-917`) on EVERY task exit (reply-then-return, early error return,
+  panic, or `AbortOnDrop` cancellation) over an unbounded channel
+  (`tcp.rs:2026`). The read loop's `select!` arm (`tcp.rs:2110-2120`) calls
+  `apply_exec_finish` (`tcp.rs:946-954`), the single actor that may mutate
+  `channels`, which returns the op to `Idle` and clears the now-inert abort
+  guard. It is ABA-gated on `OpState::monitor_op_id` (minted per op at INIT) so a
+  stale signal cannot flip a re-INIT'd op that reused the ioid; for a
+  `lastRequest` EXEC the op was already removed by `finish_exec_data_task`
+  (`tcp.rs:797-798`), so the lookup misses and the signal is a no-op.
+- DESTROY_REQUEST remains the abort owner: `finish_exec_data_task`
+  (`tcp.rs:791-802`) and the PUT_GET/PROCESS stores (`tcp.rs:2978`/`:3220`)
+  still arm `data_task_abort` after the gate, so removing the op
+  (`handle_destroy_request` `tcp.rs:3591`) drops the `AbortOnDrop` and cancels
+  the in-flight task. The gate suppresses only an implicit re-EXEC, never an
+  explicit teardown.
+
+This is a structural fix, not a patch: the illegal "second EXEC cancels the
+first" transition is removed by construction. There is no field with a dual
+meaning and no runtime "is another EXEC in flight?" check scattered across the
+handlers — the single `begin_exec` gate makes a concurrent second EXEC
+unrepresentable as a cancellation, and the single `apply_exec_finish` owner is
+the only writer of the `Executing -> Idle` edge.
+
+Invariant:
+
+- MUST: a data-phase EXEC transitions the op `Idle -> Executing` exactly once
+  per accepted EXEC (via `begin_exec`); a second EXEC while `Executing` is
+  ignored and MUST NOT abort or restart the in-flight task.
+- MUST: the op returns `Executing -> Idle` only when its originating task ends,
+  and only through `apply_exec_finish` on the read-loop owner (ABA-gated on
+  `monitor_op_id`).
+- MUST NOT: any side path (a second EXEC, a timeout) poke `data_task_abort` or
+  `exec_state` directly. Only `begin_exec` (arm), the owner-side
+  `finish_exec_data_task`/PUT_GET/PROCESS store (arm abort), `apply_exec_finish`
+  (clear), and `handle_destroy_request` (remove → drop abort) touch them.
+- Owner/Gate: `begin_exec` (entry gate) + `apply_exec_finish` on the read loop
+  (exit gate). The spawned task owns no handle to `channels`; it only signals.
+
+Defect-family audit:
+
+- Anchor: `rg 'begin_exec\('` (every data-phase EXEC entry), `rg 'tokio::spawn'`
+  (every spawn that could be an EXEC task), and `rg 'data_task_abort\s*='`
+  (every abort-guard write).
+- Sites: 6 `begin_exec` gate sites (PUT_GET `tcp.rs:2892`, PROCESS `:3177`, GET
+  `:4050`, PUT readback `:4168`, PUT exec `:4283`, RPC `:5347`) — all spawn only
+  after the gate. The 4 production `data_task_abort =` writes
+  (`finish_exec_data_task` `:800`, `apply_exec_finish` clear `:952`, PUT_GET
+  `:2978`, PROCESS `:3220`) all run on the owner, after the gate.
+- Same defect (closed by this change): all six EXEC spawn sites — every one is
+  now gated and none aborts the prior task on re-EXEC.
+- Distinct, skip: `tokio::spawn` at `:1881` (connection writer) and `:1920`
+  (heartbeat) are circuit-lifetime tasks, not op EXECs; `:3406`
+  (`handle_create_channel` resolution batch) and `:5491` (`handle_get_field`
+  introspection) are one-shot completions with no EXEC/re-EXEC lifecycle and
+  never touch `data_task_abort`/`exec_state`; `:4679` is the MONITOR subscriber
+  task, which uses BFR-12's `MonitorFinished`/`MonitorFinishGuard` (MONITOR has
+  START/STOP/PIPELINE, not the GET/PUT EXEC re-issue semantics); spawns at
+  `:6476`/`:7363`/`:8657`/`:8666` are inside test modules.
+
+Regression tests added (`tcp.rs`, mod `bfr15_tests`):
+
+- `bfr15_second_get_exec_while_executing_is_ignored_not_aborted`: a second GET
+  EXEC while the first source read is in flight leaves `get_calls == 1` (no
+  second read started), `get_cancelled == 0` (first not aborted), op still
+  `Executing` with its abort guard armed.
+- `bfr15_second_put_exec_while_executing_is_ignored_not_aborted`: a second PUT
+  EXEC while the first write blocks leaves `put_calls == 1`, `put_cancelled == 0`,
+  op still `Executing`.
+- `bfr15_destroy_request_aborts_in_flight_exec_task`: DESTROY_REQUEST on an
+  in-flight GET removes the op and cancels the task (`get_cancelled == 1`),
+  proving the gate did not break explicit teardown.
+- `bfr15_completed_exec_returns_op_to_idle_and_allows_reexec`: after a completed
+  GET EXEC the owner applies `ExecFinished`, the op is `Idle` with the abort
+  guard cleared, and a re-EXEC runs a fresh read (`get_calls == 2`).
+- `bfr15_apply_exec_finish_ignores_stale_op_id` (ABA boundary): a completion
+  signal with a mismatched `op_id` does NOT flip the op to `Idle`; only an exact
+  `monitor_op_id` match applies.
+
+Revert-verified:
+
+- `begin_exec` gate disabled (always `Some`):
+  `bfr15_second_get_exec_*` and `bfr15_second_put_exec_*` fail (the second EXEC
+  starts a second source call / aborts the first); the other three pass.
+- `apply_exec_finish` `exec_state = Idle` removed:
+  `bfr15_completed_exec_returns_op_to_idle_and_allows_reexec` fails at
+  `assert_eq!(exec_state, Idle)` (`left: Executing, right: Idle`).
+- ABA guard (`&& op.monitor_op_id == fin.op_id`) removed:
+  `bfr15_apply_exec_finish_ignores_stale_op_id` fails (stale signal returns the
+  op to `Idle`).
+- `finish_exec_data_task` abort-arming removed:
+  `bfr15_destroy_request_aborts_in_flight_exec_task` fails (DESTROY no longer
+  cancels the task; `get_cancelled` never reaches 1).
+- All four reverts restored. `cargo nextest run -p epics-pva-rs`: 543 passed.
+  `cargo clippy -p epics-pva-rs --all-targets -- -D warnings`: clean.

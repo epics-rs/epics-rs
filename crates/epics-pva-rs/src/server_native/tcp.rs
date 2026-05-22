@@ -2327,6 +2327,64 @@ fn decode_init_pv_request_value(
         .map_err(|e| format!("invalid pvRequest value: {e}"))
 }
 
+/// Decode an RPC EXEC argument body (`type + full value`), keeping the
+/// "parameterless" case structurally distinct from the "malformed"
+/// case.
+///
+/// pvxs `serverget.cpp:443-447` decodes RPC EXEC with
+/// `from_wire_type_value`, then `serverget.cpp:454-458` resets the
+/// connection when that decode leaves the message bad. The underlying
+/// `from_wire_type` (`dataencode.cpp:729-745`) reads a single type-code
+/// byte: a NULL (`0xFF`) type code yields a null `Value` — a
+/// parameterless RPC — with the buffer still good, while a present
+/// non-null descriptor is decoded in full and any underflow faults the
+/// buffer.
+///
+/// The previous inline `match decode_type_desc { Err(_) => Null }` gave
+/// `decode_type_desc`'s error a dual meaning: it stood for both "absent
+/// body / NULL type code (parameterless)" and "present but undecodable
+/// descriptor (must be fatal)". That conflation let a truncated or
+/// corrupt RPC EXEC frame reach the application handler as a fabricated
+/// `Null` argument. This helper gives each path one meaning:
+///
+/// - `Ok((FieldDesc::Variant, PvField::Null))` for an absent body or a
+///   NULL (`0xFF`) type code — a parameterless RPC. (pvxs encodes a
+///   parameterless RPC as the single `0xFF` byte written by
+///   `clientget.cpp:308` `to_wire(R, desc(arg))` when `arg` is null;
+///   `decode_type_desc` rejects `0xFF` as caller-context dependent, so
+///   it is peek-handled here. An empty body is additionally tolerated
+///   for Rust↔Rust interop, where the client may send no payload after
+///   subcmd.)
+/// - `Ok((desc, value))` for a present, fully decoded descriptor +
+///   value.
+/// - `Err(message)` for a present-but-malformed descriptor or value;
+///   the caller turns that into a connection-fatal decode error,
+///   matching pvxs `bev.reset()`.
+fn decode_rpc_exec_arg(
+    cur: &mut std::io::Cursor<&[u8]>,
+    order: ByteOrder,
+) -> Result<(FieldDesc, PvField), String> {
+    // Absent body (no payload after subcmd): parameterless RPC.
+    if cur.position() as usize >= cur.get_ref().len() {
+        return Ok((FieldDesc::Variant, PvField::Null));
+    }
+    // NULL (0xFF) type code: parameterless RPC (pvxs interop). Peek so
+    // we can consume exactly the one byte without depending on
+    // `decode_type_desc`'s error-vs-consume behaviour for 0xFF.
+    if cur.get_ref()[cur.position() as usize] == 0xFF {
+        cur.set_position(cur.position() + 1);
+        return Ok((FieldDesc::Variant, PvField::Null));
+    }
+    // Present, non-null descriptor: decode type + full value or fail
+    // fatally — a present-but-undecodable body is a protocol error, not
+    // a parameterless call.
+    let desc = decode_type_desc(cur, order)
+        .map_err(|e| format!("invalid RPC argument descriptor: {e}"))?;
+    let value = decode_pv_field(&desc, cur, order)
+        .map_err(|e| format!("invalid RPC argument value: {e}"))?;
+    Ok((desc, value))
+}
+
 /// Build a minimal [`OpState`] for non-MONITOR ops (GET / PUT /
 /// PUT_GET / PROCESS). The monitor-specific fields are all defaulted
 /// to inert values — these ops never spawn a subscriber task.
@@ -4812,17 +4870,12 @@ async fn handle_op(
             // pvxs clientget.cpp:307-311 — `to_wire(R, type); to_wire_full(R, arg)`.
             // Decode the argument inline (before spawning) because the cursor
             // is borrowed from the frame which lives on the read-loop stack.
-            let (req_desc, req_value) = match decode_type_desc(&mut cur, order) {
-                Ok(desc) => match decode_pv_field(&desc, &mut cur, order) {
-                    Ok(v) => (desc, v),
-                    Err(_) => (desc, PvField::Null),
-                },
-                Err(_) => {
-                    // Empty body — some clients send parameterless RPCs with
-                    // no payload after subcmd.
-                    (FieldDesc::Variant, PvField::Null)
-                }
-            };
+            // An absent body or a NULL (0xFF) type code is a parameterless
+            // RPC; a present-but-malformed descriptor or value is a
+            // connection-fatal decode error (pvxs `serverget.cpp:454-458`
+            // `bev.reset()`), not a fabricated `Null` argument.
+            let (req_desc, req_value) =
+                decode_rpc_exec_arg(&mut cur, order).map_err(PvaError::Decode)?;
             let pv_name = ch.name.clone();
             let _ = intro;
             let src = source.clone();
@@ -6975,6 +7028,69 @@ mod tests {
             matches!(err, PvaError::Decode(_)),
             "expected a Decode error, got {err:?}"
         );
+    }
+
+    /// BFR-4: an RPC EXEC argument body must classify as parameterless,
+    /// fully decoded, or fatally malformed — never silently fabricate a
+    /// `Null` argument from a present-but-undecodable body. pvxs
+    /// `serverget.cpp:443-447` decodes `from_wire_type_value` and
+    /// `serverget.cpp:454-458` `bev.reset()`s the connection on
+    /// `!M.good()`.
+    #[test]
+    fn decode_rpc_exec_arg_parameterless_vs_malformed() {
+        let order = ByteOrder::Little;
+
+        // Absent body (no payload after subcmd) → parameterless; cursor
+        // does not advance.
+        let mut cur = std::io::Cursor::new([].as_slice());
+        assert_eq!(
+            decode_rpc_exec_arg(&mut cur, order).unwrap(),
+            (FieldDesc::Variant, PvField::Null)
+        );
+        assert_eq!(cur.position(), 0);
+
+        // NULL (0xFF) type code → parameterless; consume exactly that one
+        // byte even when trailing bytes follow. pvxs encodes a
+        // parameterless RPC as the single 0xFF byte produced by
+        // `clientget.cpp:308` `to_wire(R, desc(arg))` for a null arg.
+        let buf = [0xFFu8, 0xAA, 0xBB];
+        let mut cur = std::io::Cursor::new(buf.as_slice());
+        assert_eq!(
+            decode_rpc_exec_arg(&mut cur, order).unwrap(),
+            (FieldDesc::Variant, PvField::Null)
+        );
+        assert_eq!(
+            cur.position(),
+            1,
+            "only the 0xFF type-code byte is consumed"
+        );
+
+        // Present, fully decodable descriptor + value round-trips to the
+        // exact argument.
+        let desc = FieldDesc::Scalar(ScalarType::Int);
+        let value = PvField::Scalar(ScalarValue::Int(0x1234_5678));
+        let mut wire = Vec::new();
+        encode_type_desc(&desc, order, &mut wire);
+        let desc_len = wire.len();
+        encode_pv_field(&value, &desc, order, &mut wire);
+        let mut cur = std::io::Cursor::new(wire.as_slice());
+        assert_eq!(
+            decode_rpc_exec_arg(&mut cur, order).unwrap(),
+            (desc.clone(), value.clone())
+        );
+        assert_eq!(cur.position() as usize, wire.len());
+
+        // Present-but-truncated descriptor (a structure tag with no body)
+        // is a connection-fatal decode error, not a parameterless call.
+        let buf = [0x80u8]; // TAG_STRUCTURE, no id/field body
+        let mut cur = std::io::Cursor::new(buf.as_slice());
+        decode_rpc_exec_arg(&mut cur, order).expect_err("truncated RPC descriptor must be fatal");
+
+        // Valid descriptor plus a truncated value (a 4-byte Int cut to
+        // two bytes) is also fatal.
+        let truncated = &wire[..desc_len + 2];
+        let mut cur = std::io::Cursor::new(truncated);
+        decode_rpc_exec_arg(&mut cur, order).expect_err("truncated RPC value must be fatal");
     }
 
     /// pvxs `serverchan.cpp:382-386`: when the SID in DESTROY_CHANNEL

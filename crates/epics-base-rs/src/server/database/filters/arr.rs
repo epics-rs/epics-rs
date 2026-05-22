@@ -36,6 +36,16 @@ pub struct ArrayFilter {
     _state: Mutex<()>,
 }
 
+/// Configuration for [`ArrayFilter`] — the `arr` slice parameters
+/// `(start, incr, end)`.
+///
+/// **Construct via [`ArrayFilterConfig::new`] or [`Default`], not a
+/// struct literal.** `incr` is a private field on purpose (the slice
+/// helpers divide and step a loop by it, so it must stay `>= 1`), which
+/// makes the `incr >= 1` invariant hold by construction — the type
+/// cannot be built with an illegal stride. `start` and `end` are public
+/// for direct read/update; only `incr` is gated behind the clamping
+/// constructor and the [`ArrayFilterConfig::incr`] accessor.
 #[derive(Debug, Clone, Copy)]
 pub struct ArrayFilterConfig {
     pub start: i64,

@@ -36,7 +36,7 @@ Method:
 | BFR-8 | Medium | PVA PROCESS payload parsing | Fixed in current source (INIT); DATA-phase strictness declined (reference parity) |
 | BFR-9 | Medium | PVA raw monitor overrun parsing | Fixed in current source |
 | BFR-10 | Low | CA/base monitor drop accounting | Fixed in current source (accounting); metrics-surface wiring deferred |
-| BFR-11 | Medium | PVA raw monitor control-frame parsing | Open |
+| BFR-11 | Medium | PVA raw monitor control-frame parsing | Fixed in current source |
 | BFR-12 | Medium | PVA MONITOR FINISH op cleanup | Open |
 | BFR-13 | Medium | PVA data-phase error response shape | Open |
 | BFR-14 | Medium | PVA raw monitor re-encode error handling | Fixed in current source |
@@ -778,6 +778,46 @@ Regression tests to add:
   decode error.
 - Raw monitor FINISH with truncated status returns fatal decode error.
 - Raw monitor FINISH with success status remains a clean end.
+
+Applied fix (2026-05-22):
+
+- The raw monitor loop's control-frame decision was extracted from
+  `op_monitor_raw_frames` into one pure function
+  `crates/epics-pva-rs/src/client_native/ops_v2.rs` `classify_raw_monitor_frame`,
+  returning a `RawMonitorFrameKind` enum (`Data` / `Skip` / `FinishOk` /
+  `Fatal(PvaError)`). Both swallow bugs are closed:
+  `payload.len() < 5` now returns `Fatal(PvaError::Decode)` (not `continue`), and
+  a FINISH whose required `Status` cannot be decoded returns
+  `Fatal(PvaError::Decode)` (not a fall-through to `Ok(())`). Success FINISH →
+  `FinishOk` (clean end); non-success FINISH → `Fatal(PvaError::Protocol)`. The
+  loop matches the enum: `Fatal`/`FinishOk` unregister the IOID, clear `active`,
+  and return; `Skip` continues (pipeline ACK echo); `Data` forwards `payload[5..]`.
+- This routes the control-frame status decode through `Status::decode` as its
+  owner — mirroring the typed path — and makes the policy one testable point.
+
+Defect-family audit:
+
+- Anchor: `if let Ok(..) = Status::decode` swallow + `payload.len() < N` in the
+  raw monitor loop. Same defect at `op_monitor_raw_frames` (both bugs), now via
+  `classify_raw_monitor_frame`.
+- Distinct, not fixed: the typed `run_monitor_loop` `Err(e) => debug!("MONITOR
+  decode error")` (`ops_v2.rs:~2353`) decodes the FINISH status through
+  `decode_op_response` (which validates it) and on error skips-and-continues the
+  stream — it never returns a false clean `Ok(())` end nor treats a too-short
+  frame as clean; not cited by this finding. INIT-phase decode-error arms already
+  return `Fatal`.
+
+Regression tests added (`crates/epics-pva-rs/src/client_native/ops_v2.rs`):
+
+- `bfr11_too_short_frame_is_fatal_decode` — a `< 5`-byte payload → `Fatal(Decode)`.
+- `bfr11_finish_truncated_status_is_fatal_decode` — FINISH (`0x10`) with no status
+  bytes → `Fatal(Decode)`.
+- `bfr11_finish_success_status_is_clean_end` — FINISH + `Status::ok()` → `FinishOk`.
+- `bfr11_finish_error_status_is_fatal_protocol` — FINISH + error status →
+  `Fatal(Protocol)`.
+- `bfr11_data_frame_is_data` — subcmd `0x00` → `Data`.
+- Revert-verified: restoring `Skip` for too-short and `FinishOk` for a status
+  decode error makes the two negative tests fail.
 
 ### BFR-12 - PVA MONITOR FINISH leaves the operation registered and executing
 

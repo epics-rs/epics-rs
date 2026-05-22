@@ -1531,6 +1531,65 @@ impl Pauser {
     }
 }
 
+/// BFR-11: classification of a frame arriving on the raw MONITOR
+/// stream. The control-frame policy lives here as one pure, testable
+/// decision so a malformed control frame cannot be silently skipped or
+/// reported as a clean end-of-stream — the two swallow bugs the raw
+/// loop previously had (`payload.len() < 5 => continue` and a FINISH
+/// `Status::decode` failure falling through to `Ok(())`).
+#[derive(Debug)]
+enum RawMonitorFrameKind {
+    /// subcmd `0x00` — a DATA frame; the caller forwards `payload[5..]`.
+    Data,
+    /// A non-DATA, non-FINISH control frame (e.g. a pipeline ACK echo) —
+    /// the caller ignores it.
+    Skip,
+    /// FINISH (`subcmd & 0x10`) carrying a success Status — clean end of
+    /// stream.
+    FinishOk,
+    /// A fatal condition: a truncated frame (shorter than `ioid +
+    /// subcmd`), a FINISH whose required Status cannot be decoded, or a
+    /// FINISH carrying a non-success Status. The caller surfaces
+    /// `MonitorEnd::Fatal`.
+    Fatal(PvaError),
+}
+
+/// BFR-11: classify a raw MONITOR stream frame. Mirrors the typed path's
+/// `Status::decode` owner — a missing/malformed FINISH Status is an
+/// error, not a clean end. pvxs resets the connection when a monitor
+/// message decode is not good (`clientmon.cpp:596`).
+fn classify_raw_monitor_frame(payload: &[u8], order: ByteOrder) -> RawMonitorFrameKind {
+    // A MONITOR application frame always carries ioid (4) + subcmd (1).
+    // A shorter payload is a truncated control frame, not one to skip.
+    if payload.len() < 5 {
+        return RawMonitorFrameKind::Fatal(PvaError::Decode(format!(
+            "MONITOR frame too short: {} bytes (need >= 5 for ioid+subcmd)",
+            payload.len()
+        )));
+    }
+    let subcmd = payload[4];
+    if subcmd == 0x00 {
+        return RawMonitorFrameKind::Data;
+    }
+    if subcmd & 0x10 != 0 {
+        // FINISH carries a required Status after the subcmd. A decode
+        // failure must NOT degrade to a clean end-of-stream — that would
+        // hide an upstream protocol error from a forwarding gateway.
+        let mut cur = std::io::Cursor::new(&payload[5..]);
+        return match crate::proto::Status::decode(&mut cur, order) {
+            Ok(st) if st.is_success() => RawMonitorFrameKind::FinishOk,
+            Ok(st) => RawMonitorFrameKind::Fatal(PvaError::Protocol(format!(
+                "MONITOR FINISH with non-success status: {st:?}"
+            ))),
+            Err(e) => RawMonitorFrameKind::Fatal(PvaError::Decode(format!(
+                "MONITOR FINISH status decode failed: {e}"
+            ))),
+        };
+    }
+    // Non-DATA, non-FINISH control frame (pipeline ACK echo etc.).
+    RawMonitorFrameKind::Skip
+}
+
 /// F-G12 raw-frame monitor entry: like [`op_monitor`] but the
 /// callback receives the **raw MONITOR DATA body bytes** (the
 /// `changed | value | overrun` triplet from the wire) instead of a
@@ -1791,48 +1850,37 @@ where
                 return Err(MonitorEnd::ConnectionLost);
             }
         };
-        // Inspect subcmd (first byte after the u32 ioid) to filter
-        // out non-DATA frames (FINISH at 0x10, OK status, etc.).
-        if frame.payload.len() < 5 {
-            continue;
-        }
-        let subcmd = frame.payload[4];
-        if subcmd != 0x00 {
-            // Pipeline ack / FINISH / status — fall through to the
-            // regular decode path so we can recognize FINISH and
-            // unwind. ACK frames have subcmd 0x80; we ignore them
-            // here since we drive ACKs ourselves below.
-            if subcmd & 0x10 != 0 {
+        // BFR-11: classify the frame through the single control-frame
+        // owner. A too-short frame and a FINISH with a missing/malformed
+        // Status are fatal — never silently skipped (`continue`) nor
+        // degraded to a clean end (`Ok(())`), which would hide upstream
+        // protocol corruption from a forwarding gateway.
+        match classify_raw_monitor_frame(&frame.payload, order) {
+            // subcmd 0x00: DATA — fall through to body forwarding below.
+            RawMonitorFrameKind::Data => {}
+            // Non-DATA, non-FINISH control frame (pipeline ACK echo); we
+            // drive ACKs ourselves, so ignore it.
+            RawMonitorFrameKind::Skip => continue,
+            RawMonitorFrameKind::FinishOk => {
                 server.unregister_ioid(ioid);
-                // PVA-R17: clear the handle's `active` tuple on
-                // FINISH so a later `pause()` / `resume()` / `drop()`
-                // doesn't act on a (sid, ioid) the client has already
-                // unregistered and the server has already finalised.
-                // pvxs `clientmon.cpp:720-729` treats FINISH as the
-                // operation-owner cleanup path: state→Done, IOID
-                // maps erased, no DESTROY sent. The typed monitor
-                // loop already cleared `active` here; the raw path
-                // didn't (audit-cited gap).
+                // PVA-R17: clear the handle's `active` tuple on FINISH so
+                // a later `pause()` / `resume()` / `drop()` doesn't act on
+                // a (sid, ioid) the client has already unregistered and the
+                // server has already finalised. pvxs `clientmon.cpp:720-729`
+                // treats FINISH as the operation-owner cleanup path:
+                // state→Done, IOID maps erased, no DESTROY sent.
                 if let Some(s) = &state {
                     s.active.lock().take();
                 }
-                // FINISH carries a Status after subcmd; a non-success
-                // status means the server is reporting an error
-                // (out-of-memory, oversubscription, etc.) rather than
-                // clean end-of-stream. Surface as Fatal so the bridge
-                // gateway sees the failure and can rebind / log.
-                let order_le = order;
-                let mut cur = std::io::Cursor::new(&frame.payload[5..]);
-                if let Ok(st) = crate::proto::Status::decode(&mut cur, order_le)
-                    && !st.is_success()
-                {
-                    return Err(MonitorEnd::Fatal(PvaError::Protocol(format!(
-                        "MONITOR FINISH with non-success status: {st:?}"
-                    ))));
-                }
                 return Ok(());
             }
-            continue;
+            RawMonitorFrameKind::Fatal(e) => {
+                server.unregister_ioid(ioid);
+                if let Some(s) = &state {
+                    s.active.lock().take();
+                }
+                return Err(MonitorEnd::Fatal(e));
+            }
         }
         // Body = payload[5..] = changed | value | overrun (raw).
         // Wrap in `Bytes` so the broadcast fan-out shares this
@@ -3369,5 +3417,69 @@ mod tests {
                 other => panic!("expected structure, got {other:?}"),
             }
         }
+    }
+
+    // ---- BFR-11: raw monitor control-frame classification ----------
+    //
+    // The raw loop previously had two swallow bugs: a frame shorter than
+    // `ioid + subcmd` was skipped (`continue`), and a FINISH whose
+    // required Status failed to decode fell through to a clean `Ok(())`
+    // end-of-stream. `classify_raw_monitor_frame` is the single owner of
+    // that policy; both malformed cases must be `Fatal`.
+
+    #[test]
+    fn bfr11_too_short_frame_is_fatal_decode() {
+        // < 5 bytes: no room for ioid (4) + subcmd (1).
+        match classify_raw_monitor_frame(&[0, 0, 0], ByteOrder::Little) {
+            RawMonitorFrameKind::Fatal(PvaError::Decode(msg)) => {
+                assert!(msg.contains("too short"), "msg: {msg}");
+            }
+            other => panic!("too-short frame must be Fatal(Decode), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bfr11_finish_truncated_status_is_fatal_decode() {
+        // subcmd 0x10 (FINISH) but NO status bytes after it → the
+        // required Status cannot decode.
+        let payload = [0u8, 0, 0, 0, 0x10];
+        match classify_raw_monitor_frame(&payload, ByteOrder::Little) {
+            RawMonitorFrameKind::Fatal(PvaError::Decode(msg)) => {
+                assert!(msg.contains("FINISH status"), "msg: {msg}");
+            }
+            other => panic!("truncated FINISH status must be Fatal(Decode), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bfr11_finish_success_status_is_clean_end() {
+        let mut payload = vec![0u8, 0, 0, 0, 0x10];
+        crate::proto::Status::ok().write_into(ByteOrder::Little, &mut payload);
+        assert!(matches!(
+            classify_raw_monitor_frame(&payload, ByteOrder::Little),
+            RawMonitorFrameKind::FinishOk
+        ));
+    }
+
+    #[test]
+    fn bfr11_finish_error_status_is_fatal_protocol() {
+        let mut payload = vec![0u8, 0, 0, 0, 0x10];
+        crate::proto::Status::error("boom".to_string()).write_into(ByteOrder::Little, &mut payload);
+        match classify_raw_monitor_frame(&payload, ByteOrder::Little) {
+            RawMonitorFrameKind::Fatal(PvaError::Protocol(msg)) => {
+                assert!(msg.contains("non-success"), "msg: {msg}");
+            }
+            other => panic!("non-success FINISH must be Fatal(Protocol), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bfr11_data_frame_is_data() {
+        // subcmd 0x00 = DATA, with a body trailing the header.
+        let payload = [0u8, 0, 0, 0, 0x00, 1, 2, 3];
+        assert!(matches!(
+            classify_raw_monitor_frame(&payload, ByteOrder::Little),
+            RawMonitorFrameKind::Data
+        ));
     }
 }

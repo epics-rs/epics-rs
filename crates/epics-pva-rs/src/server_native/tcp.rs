@@ -3973,7 +3973,32 @@ async fn handle_op(
                         op.monitor_window.as_ref(),
                         op.monitor_window_notify.as_ref(),
                     ) {
-                        let prev = w.fetch_add(ack_count, std::sync::atomic::Ordering::Relaxed);
+                        // pvxs `servermon.cpp:653` refills a `size_t`
+                        // window (`op->window += nack`) and tests that SAME
+                        // post-add value against `op->high`. Mirror it with
+                        // a SATURATING add: a raw `AtomicU32::fetch_add`
+                        // wraps past `u32::MAX`, leaving the stored credit
+                        // (which `acquire` decrements) far below the value
+                        // the HIGH-watermark check computed in `usize` — the
+                        // two then disagree on how much credit exists. An
+                        // un-acked window above `u32::MAX` is nonsensical
+                        // (it counts in-flight monitor updates), so capping
+                        // is strictly safer than wrapping and keeps the
+                        // stored window and the watermark decision derived
+                        // from one number.
+                        let mut prev = w.load(std::sync::atomic::Ordering::Relaxed);
+                        let w_now = loop {
+                            let next = prev.saturating_add(ack_count);
+                            match w.compare_exchange_weak(
+                                prev,
+                                next,
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break next,
+                                Err(observed) => prev = observed,
+                            }
+                        };
                         if prev == 0 {
                             n.notify_waiters();
                         }
@@ -3983,10 +4008,11 @@ async fn handle_op(
                         // ordering token in one CAS, returning `Some(seq)`
                         // exactly on the below→above edge. The companion
                         // LOW (event loop) crosses back when a DATA
-                        // emission drains to `<= low`.
+                        // emission drains to `<= low`. The check uses the
+                        // saturated `w_now` — the same value now stored —
+                        // so credit and watermark cannot diverge.
                         if let Some((_lo, hi)) = op.monitor_wm {
-                            let w_now = prev as usize + ack_count as usize;
-                            if w_now > hi {
+                            if w_now as usize > hi {
                                 fire_high = cross_watermark(&op.monitor_wm_seq, true)
                                     .map(|seq| (seq, op.monitor_op_id));
                             }
@@ -6590,6 +6616,56 @@ mod tests {
             window.load(Ordering::Relaxed),
             3,
             "window must refill by exactly the decoded ack-count"
+        );
+    }
+
+    /// A MONITOR ACK whose count would push the window past `u32::MAX`
+    /// SATURATES the stored credit instead of wrapping it. A raw
+    /// `fetch_add` would wrap to a tiny value, leaving `acquire`'s view
+    /// of the credit far below what the watermark logic computed in
+    /// `usize` — the divergence pvxs avoids with a `size_t` window.
+    #[tokio::test]
+    async fn monitor_ack_refill_saturates_instead_of_wrapping() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let order = ByteOrder::Little;
+        let sid: u32 = 3;
+        let ioid: u32 = 88;
+
+        // Window already near the cap; a large ACK would wrap a raw u32.
+        let window = Arc::new(AtomicU32::new(u32::MAX - 1));
+        let mut channels = ack_test_channels(sid, ioid, window.clone());
+
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let config = crate::server_native::runtime::PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x80);
+        payload.put_u32(100, order); // would overflow (MAX-1) + 100
+        let frame = synth_frame(Command::Monitor, order, payload);
+        handle_op(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("well-formed MONITOR ACK ok");
+        assert_eq!(
+            window.load(Ordering::Relaxed),
+            u32::MAX,
+            "refill must saturate at u32::MAX, not wrap to a tiny value"
         );
     }
 

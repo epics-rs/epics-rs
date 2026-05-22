@@ -2579,7 +2579,15 @@ async fn handle_put_get(
     let ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
-            send_op_error(tx, OpKind::PutGet, ioid, "unknown channel sid", order).await?;
+            send_op_error(
+                tx,
+                OpKind::PutGet,
+                ioid,
+                subcmd,
+                "unknown channel sid",
+                order,
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -2603,6 +2611,7 @@ async fn handle_put_get(
                 tx,
                 OpKind::PutGet,
                 ioid,
+                subcmd,
                 "max ops per channel exceeded",
                 order,
             )
@@ -2613,7 +2622,15 @@ async fn handle_put_get(
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
-                send_op_error(tx, OpKind::PutGet, ioid, "must provide prototype", order).await?;
+                send_op_error(
+                    tx,
+                    OpKind::PutGet,
+                    ioid,
+                    subcmd,
+                    "must provide prototype",
+                    order,
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -2626,6 +2643,7 @@ async fn handle_put_get(
                     tx,
                     OpKind::PutGet,
                     ioid,
+                    subcmd,
                     &format!("invalid pvRequest descriptor: {e}"),
                     order,
                 )
@@ -2636,7 +2654,7 @@ async fn handle_put_get(
         let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, order) {
             Ok(v) => v,
             Err(e) => {
-                send_op_error(tx, OpKind::PutGet, ioid, &e, order).await?;
+                send_op_error(tx, OpKind::PutGet, ioid, subcmd, &e, order).await?;
                 return Ok(());
             }
         };
@@ -2648,6 +2666,7 @@ async fn handle_put_get(
                     tx,
                     OpKind::PutGet,
                     ioid,
+                    subcmd,
                     &format!("invalid pvRequest mask: {e}"),
                     order,
                 )
@@ -2712,7 +2731,15 @@ async fn handle_put_get(
             (o.intro, o.mask, o.pv_request)
         }
         None => {
-            send_op_error(tx, OpKind::PutGet, ioid, "operation not initialised", order).await?;
+            send_op_error(
+                tx,
+                OpKind::PutGet,
+                ioid,
+                subcmd,
+                "operation not initialised",
+                order,
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -2844,7 +2871,15 @@ async fn handle_process(
     let ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
-            send_op_error(tx, OpKind::Process, ioid, "unknown channel sid", order).await?;
+            send_op_error(
+                tx,
+                OpKind::Process,
+                ioid,
+                subcmd,
+                "unknown channel sid",
+                order,
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -2866,6 +2901,7 @@ async fn handle_process(
                 tx,
                 OpKind::Process,
                 ioid,
+                subcmd,
                 "max ops per channel exceeded",
                 order,
             )
@@ -2880,7 +2916,15 @@ async fn handle_process(
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
-                send_op_error(tx, OpKind::Process, ioid, "must provide prototype", order).await?;
+                send_op_error(
+                    tx,
+                    OpKind::Process,
+                    ioid,
+                    subcmd,
+                    "must provide prototype",
+                    order,
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -2908,6 +2952,7 @@ async fn handle_process(
                     tx,
                     OpKind::Process,
                     ioid,
+                    subcmd,
                     &format!("invalid pvRequest descriptor: {e}"),
                     order,
                 )
@@ -2916,7 +2961,7 @@ async fn handle_process(
             }
         };
         if let Err(e) = decode_init_pv_request_value(&mut cur, &req_desc, order) {
-            send_op_error(tx, OpKind::Process, ioid, &e, order).await?;
+            send_op_error(tx, OpKind::Process, ioid, subcmd, &e, order).await?;
             return Ok(());
         }
         let mask = BitSet::all_set(intro.total_bits());
@@ -2944,6 +2989,7 @@ async fn handle_process(
                 tx,
                 OpKind::Process,
                 ioid,
+                subcmd,
                 "operation not initialised",
                 order,
             )
@@ -3472,7 +3518,7 @@ async fn handle_op(
         Some(c) => c,
         None => {
             // Send error.
-            send_op_error(tx, kind, ioid, "unknown channel sid", order).await?;
+            send_op_error(tx, kind, ioid, subcmd, "unknown channel sid", order).await?;
             return Ok(());
         }
     };
@@ -3496,7 +3542,15 @@ async fn handle_op(
         // so a malicious peer can't accumulate IOID state forever
         // by sending INIT … INIT … without ever issuing DESTROY.
         if ch.ops.len() >= config.max_ops_per_channel {
-            send_op_error(tx, kind, ioid, "max ops per channel exceeded", order).await?;
+            send_op_error(
+                tx,
+                kind,
+                ioid,
+                subcmd,
+                "max ops per channel exceeded",
+                order,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -3512,7 +3566,7 @@ async fn handle_op(
             (OpKind::Rpc, None) => FieldDesc::Variant,
             (_, Some(d)) => d,
             (_, None) => {
-                send_op_error(tx, kind, ioid, "must provide prototype", order).await?;
+                send_op_error(tx, kind, ioid, subcmd, "must provide prototype", order).await?;
                 return Ok(());
             }
         };
@@ -3540,6 +3594,7 @@ async fn handle_op(
                     tx,
                     kind,
                     ioid,
+                    subcmd,
                     &format!("invalid pvRequest descriptor: {e}"),
                     order,
                 )
@@ -3559,7 +3614,7 @@ async fn handle_op(
         let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, order) {
             Ok(v) => v,
             Err(e) => {
-                send_op_error(tx, kind, ioid, &e, order).await?;
+                send_op_error(tx, kind, ioid, subcmd, &e, order).await?;
                 return Ok(());
             }
         };
@@ -3577,6 +3632,7 @@ async fn handle_op(
                     tx,
                     kind,
                     ioid,
+                    subcmd,
                     &format!("invalid pvRequest mask: {e}"),
                     order,
                 )
@@ -3605,6 +3661,7 @@ async fn handle_op(
                 tx,
                 kind,
                 ioid,
+                subcmd,
                 "can not pipeline invalid queueSize (must be >= 2)",
                 order,
             )
@@ -3795,7 +3852,7 @@ async fn handle_op(
             (o.intro, o.mask, o.pv_request)
         }
         None => {
-            send_op_error(tx, kind, ioid, "operation not initialised", order).await?;
+            send_op_error(tx, kind, ioid, subcmd, "operation not initialised", order).await?;
             return Ok(());
         }
     };
@@ -3847,8 +3904,15 @@ async fn handle_op(
                 let value = match src.get_value_checked(checked, ctx).await {
                     Some(v) => v,
                     None => {
-                        let _ = send_op_error(&tx_clone, OpKind::Get, ioid, "PV not found", order)
-                            .await;
+                        let _ = send_op_error(
+                            &tx_clone,
+                            OpKind::Get,
+                            ioid,
+                            subcmd,
+                            "PV not found",
+                            order,
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -3858,6 +3922,7 @@ async fn handle_op(
                         &tx_clone,
                         OpKind::Get,
                         ioid,
+                        subcmd,
                         &format!("source value does not match opened descriptor: {e}"),
                         order,
                     )
@@ -3943,9 +4008,15 @@ async fn handle_op(
                     let value = match src.get_value_checked(checked, ctx).await {
                         Some(v) => v,
                         None => {
-                            let _ =
-                                send_op_error(&tx_clone, OpKind::Put, ioid, "PV not found", order)
-                                    .await;
+                            let _ = send_op_error(
+                                &tx_clone,
+                                OpKind::Put,
+                                ioid,
+                                subcmd,
+                                "PV not found",
+                                order,
+                            )
+                            .await;
                             return;
                         }
                     };
@@ -5241,13 +5312,25 @@ async fn send_op_error(
     tx: &SrvTx,
     kind: OpKind,
     ioid: u32,
+    // BFR-13: the reply's sub-command byte. pvxs writes the operation's
+    // current subcmd into EVERY GET/PUT/RPC reply (`serverget.cpp:82-84`),
+    // recording the data-phase subcmd on the op before the callback runs
+    // (`serverget.cpp:475`). An error therefore preserves the request's
+    // phase: an INIT-negotiation failure echoes the INIT subcmd (`0x08`),
+    // a data-phase failure echoes the request's data subcmd (`0x00` for a
+    // GET exec, `0x40` for a PUT readback). Every caller passes its
+    // in-scope request `subcmd`, exactly as the success-reply paths do
+    // (`payload.put_u8(subcmd)`). Hardcoding `0x08` here mis-framed every
+    // data-phase error as an INIT response, so a client waiting for GET
+    // data saw an unexpected INIT instead of the failure status.
+    subcmd: u8,
     msg: &str,
     order: ByteOrder,
 ) -> PvaResult<()> {
     let cmd = kind.command();
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
-    payload.put_u8(0x08); // INIT phase err
+    payload.put_u8(subcmd);
     Status::error(msg.to_string()).write_into(order, &mut payload);
     let h = PvaHeader::application(true, order, cmd.code(), payload.len() as u32);
     let mut buf = Vec::new();
@@ -9929,6 +10012,333 @@ mod tests {
             vec![true, false],
             "terminal notify_monitor_start(false) fires exactly once after START"
         );
+    }
+
+    // ================================================================
+    // BFR-13: a data-phase GET/PUT error reply must echo the request's
+    // data subcmd (`0x00` GET exec, `0x40` PUT readback), NOT the INIT
+    // subcmd `0x08`. pvxs writes `op->subcmd` into EVERY reply
+    // (`serverget.cpp:82-84`, recorded at `:475`) and emits a
+    // status-only body on `!sts.isSuccess()` (`:84-94`). The pre-fix
+    // `send_op_error` hardcoded `0x08`, so a client awaiting GET data
+    // decoded the failure as a (malformed) INIT response and lost the
+    // server status behind a phase mismatch.
+    // ================================================================
+
+    /// A source whose value read always fails (`get_value` → `None`),
+    /// driving the GET exec / PUT readback data-phase task onto its
+    /// `send_op_error` path. INIT still succeeds via `ch.introspection`.
+    struct Bfr13FailSource;
+    impl crate::server_native::source::ChannelSource for Bfr13FailSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+            let n = n.to_string();
+            async move { n == "dut" }
+        }
+        async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+            Some(three_field_intro())
+        }
+        async fn get_value(&self, _: &str) -> Option<PvField> {
+            None
+        }
+        async fn put_value(&self, _: &str, _: PvField) -> Result<(), String> {
+            Ok(())
+        }
+        async fn is_writable(&self, _: &str) -> bool {
+            true
+        }
+        async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+            None
+        }
+    }
+
+    /// One channel `sid=1`/`dut` with the supplied prototype.
+    fn bfr13_channels(intro: Option<FieldDesc>) -> HashMap<u32, ChannelState> {
+        let mut channels = HashMap::new();
+        channels.insert(
+            1,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid: 1,
+                introspection: intro,
+                ops: HashMap::new(),
+            },
+        );
+        channels
+    }
+
+    /// Encode an INIT pvRequest body (empty struct → all-field mask).
+    fn bfr13_init_pv_request(order: ByteOrder, payload: &mut Vec<u8>) {
+        let req_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![],
+        };
+        let req_val = PvField::Structure(PvStructure::new(""));
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, payload);
+    }
+
+    /// `(subcmd, status)` from a status-only op reply payload.
+    fn bfr13_parse_reply(buf: &[u8], order: ByteOrder, expect_cmd: Command) -> (u8, Status) {
+        let (frame, _) = try_parse_frame(buf)
+            .expect("reply frame parses")
+            .expect("complete frame");
+        assert_eq!(
+            frame.header.command,
+            expect_cmd.code(),
+            "reply command matches the request"
+        );
+        let mut cur = frame.cursor();
+        let _ioid = cur.get_u32(order).expect("ioid");
+        let subcmd = cur.get_u8().expect("subcmd");
+        let status = Status::decode(&mut cur, order).expect("status");
+        (subcmd, status)
+    }
+
+    /// BFR-13: a GET whose source read fails during the data phase
+    /// replies with the request's data subcmd `0x00` and an error
+    /// status — not an INIT `0x08` frame.
+    #[tokio::test]
+    async fn bfr13_get_data_phase_error_echoes_data_subcmd() {
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::tcp::ClientCredentials;
+
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (1u32, 700u32);
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        let mut channels = bfr13_channels(Some(three_field_intro()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // GET INIT (subcmd 0x08) — succeeds via ch.introspection.
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        bfr13_init_pv_request(order, &mut init_payload);
+        let init_frame = synth_frame(Command::Get, order, init_payload);
+        handle_op(
+            &source,
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("GET INIT ok");
+        let _ = rx.recv().await.expect("GET INIT reply");
+
+        // GET EXEC (subcmd 0x00) — get_value → None → send_op_error.
+        let mut exec_payload = Vec::new();
+        exec_payload.put_u32(sid, order);
+        exec_payload.put_u32(ioid, order);
+        exec_payload.put_u8(0x00);
+        let exec_frame = synth_frame(Command::Get, order, exec_payload);
+        handle_op(
+            &source,
+            &exec_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("GET EXEC ok");
+        let resp = rx.recv().await.expect("GET EXEC error reply emitted");
+
+        let (subcmd, status) = bfr13_parse_reply(&resp, order, Command::Get);
+        assert_eq!(
+            subcmd, 0x00,
+            "data-phase GET error must echo the request data subcmd 0x00, not INIT 0x08"
+        );
+        assert!(
+            !status.is_success(),
+            "data-phase GET failure carries an error status"
+        );
+    }
+
+    /// BFR-13: a PUT readback (`subcmd & 0x40`) whose readback GET
+    /// fails replies with the request's `0x40` subcmd and an error
+    /// status — not INIT `0x08`.
+    #[tokio::test]
+    async fn bfr13_put_readback_error_echoes_0x40_subcmd() {
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::tcp::ClientCredentials;
+
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (1u32, 701u32);
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        let mut channels = bfr13_channels(Some(three_field_intro()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // PUT INIT (subcmd 0x08).
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        bfr13_init_pv_request(order, &mut init_payload);
+        let init_frame = synth_frame(Command::Put, order, init_payload);
+        handle_op(
+            &source,
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("PUT INIT ok");
+        let _ = rx.recv().await.expect("PUT INIT reply");
+
+        // PUT readback EXEC (subcmd 0x40) — the readback GET reads the
+        // current value via get_value_checked → None → send_op_error.
+        let mut exec_payload = Vec::new();
+        exec_payload.put_u32(sid, order);
+        exec_payload.put_u32(ioid, order);
+        exec_payload.put_u8(0x40);
+        let exec_frame = synth_frame(Command::Put, order, exec_payload);
+        handle_op(
+            &source,
+            &exec_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("PUT readback EXEC ok");
+        let resp = rx.recv().await.expect("PUT readback error reply emitted");
+
+        let (subcmd, status) = bfr13_parse_reply(&resp, order, Command::Put);
+        assert_eq!(
+            subcmd, 0x40,
+            "data-phase PUT readback error must echo the request subcmd 0x40, not INIT 0x08"
+        );
+        assert!(
+            !status.is_success(),
+            "PUT readback failure carries an error status"
+        );
+    }
+
+    /// BFR-13 boundary: an INIT-phase negotiation failure (here a
+    /// missing prototype) must still echo the INIT subcmd `0x08`. The
+    /// fix makes error replies echo the *request* subcmd uniformly, so
+    /// an INIT request stays `0x08` while a data request becomes
+    /// `0x00`/`0x40` — it does not flip every error to `0x00`.
+    #[tokio::test]
+    async fn bfr13_init_phase_error_still_echoes_0x08() {
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::tcp::ClientCredentials;
+
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (1u32, 702u32);
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        // No prototype on the channel → INIT fails "must provide prototype".
+        let mut channels = bfr13_channels(None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        let init_frame = synth_frame(Command::Get, order, init_payload);
+        handle_op(
+            &source,
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("GET INIT handled");
+        let resp = rx.recv().await.expect("INIT error reply emitted");
+
+        let (subcmd, status) = bfr13_parse_reply(&resp, order, Command::Get);
+        assert_eq!(
+            subcmd, 0x08,
+            "INIT-phase negotiation error must still echo the INIT subcmd 0x08"
+        );
+        assert!(
+            !status.is_success(),
+            "INIT negotiation failure carries an error status"
+        );
+    }
+
+    /// BFR-13 client side: a data-phase GET error reply is status-only
+    /// (`ioid + subcmd + status`, no bitset/value). The client decode
+    /// must surface it as `OpResponse::Status` so `op_get` reports the
+    /// server status, instead of faulting on the missing value body
+    /// (decode error) or mislabelling it "expected GET data, got
+    /// Status". Mirrors the server fix above on the wire.
+    #[test]
+    fn bfr13_client_decodes_data_phase_error_as_status() {
+        let order = ByteOrder::Little;
+        let intro = three_field_intro();
+
+        let mut payload = Vec::new();
+        payload.put_u32(700u32, order); // ioid
+        payload.put_u8(0x00); // data subcmd, as the fixed server now echoes
+        Status::error("source read failed".to_string()).write_into(order, &mut payload);
+        let frame = synth_frame(Command::Get, order, payload);
+
+        match decode_op_response(&frame, Some(&intro))
+            .expect("a status-only data-phase error must decode, not fault on a missing value")
+        {
+            OpResponse::Status(s) => {
+                assert_eq!(
+                    s.subcmd, 0x00,
+                    "decoded status preserves the data-phase subcmd"
+                );
+                assert!(
+                    !s.status.is_success(),
+                    "the server's failure status is surfaced to the op"
+                );
+            }
+            other => {
+                panic!("data-phase GET error must decode to OpResponse::Status, got {other:?}")
+            }
+        }
     }
 }
 

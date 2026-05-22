@@ -493,6 +493,21 @@ pub fn decode_op_response_cached(
     } else {
         Status::ok()
     };
+    // BFR-13: a data-phase GET/PUT(/Get) error reply is status-only. pvxs
+    // `serverget.cpp:84-94` writes `ioid + subcmd + status` and emits NO
+    // bitset/value when `!sts.isSuccess()` — the value branch (`:102-104`)
+    // runs only on success. Surface the failure status here (as the RPC
+    // data path above and the PUT-no-getback path already do) instead of
+    // decoding a value body that was never sent. Without this the
+    // BitSet::decode below would fault on EOF and the original server
+    // failure would be lost behind a decode error.
+    if (cmd == Command::Get || cmd == Command::Put) && !status.is_success() {
+        return Ok(OpResponse::Status(OpStatusResponse {
+            ioid,
+            subcmd,
+            status,
+        }));
+    }
     let changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
     let value = crate::pvdata::encode::decode_pv_field_with_bitset_cached(
         intro, &changed, 0, &mut cur, order, type_cache,

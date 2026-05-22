@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{PvaServer, SharedSource};
+use epics_pva_rs::server_native::{ChannelSource, PvaServer, SharedSource};
 use epics_pva_rs::service::pva_service;
 
 #[derive(Default)]
@@ -215,4 +215,65 @@ async fn pva_service_accepts_direct_struct_request() {
         other => panic!("unexpected wrapper: {other:?}"),
     };
     assert_eq!(v, 7);
+}
+
+/// BFR-13 (client end-to-end): a source that opens (descriptor
+/// present at INIT) but fails the value read at the data phase makes
+/// the server emit a data-phase error reply. Before the fix the
+/// server hardcoded the INIT subcmd `0x08` on that error, so the
+/// client decoded it as an INIT response and `pvget` failed with
+/// "expected GET data, got Init …" — losing the server status. The
+/// fix (server echoes the request subcmd `0x00`; client decodes the
+/// status-only body and `op_get` maps it to an error) makes `pvget`
+/// surface the server's data-phase status instead.
+struct FailAtDataSource;
+impl ChannelSource for FailAtDataSource {
+    async fn list_pvs(&self) -> Vec<String> {
+        vec!["dut".into()]
+    }
+    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+        let n = n.to_string();
+        async move { n == "dut" }
+    }
+    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        Some(FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        })
+    }
+    // The data-phase failure: INIT negotiated a descriptor, but the
+    // value read returns None at exec time.
+    async fn get_value(&self, _: &str) -> Option<PvField> {
+        None
+    }
+    async fn put_value(&self, _: &str, _: PvField) -> Result<(), String> {
+        Ok(())
+    }
+    async fn is_writable(&self, _: &str) -> bool {
+        false
+    }
+    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        None
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bfr13_client_get_surfaces_data_phase_error() {
+    let server =
+        PvaServer::isolated(Arc::new(FailAtDataSource)).expect("isolated test server must start");
+    let client = server.client_config();
+
+    let res = tokio::time::timeout(Duration::from_secs(5), client.pvget("dut"))
+        .await
+        .expect("pvget must not hang");
+    let err = res.expect_err("a data-phase source failure must surface as a GET error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("GET data:"),
+        "client must surface the server's data-phase status, got: {msg}"
+    );
+    assert!(
+        !msg.contains("expected GET data, got Init"),
+        "client must NOT mis-report the data-phase error as an unexpected INIT response, got: {msg}"
+    );
 }

@@ -38,7 +38,7 @@ Method:
 | BFR-10 | Low | CA/base monitor drop accounting | Fixed in current source (accounting); metrics-surface wiring deferred |
 | BFR-11 | Medium | PVA raw monitor control-frame parsing | Fixed in current source |
 | BFR-12 | Medium | PVA MONITOR FINISH op cleanup | Fixed in current source |
-| BFR-13 | Medium | PVA data-phase error response shape | Open |
+| BFR-13 | Medium | PVA data-phase error response shape | Fixed in current source |
 | BFR-14 | Medium | PVA raw monitor re-encode error handling | Fixed in current source |
 | BFR-15 | Medium | PVA GET/PUT/RPC in-flight EXEC state | Open |
 
@@ -1024,6 +1024,94 @@ Regression tests to add:
 - INIT negotiation failures still reply with subcmd `0x08`.
 - Rust client GET surfaces the server status from a data-phase error instead of
   reporting an unexpected INIT response.
+
+Applied fix (Fixed in current source):
+
+Made the error-reply phase byte echo the request subcmd uniformly, removing the
+single hardcoded phase byte. This matches what every *success* reply already
+does (`payload.put_u8(subcmd)`) and what pvxs does (`op->subcmd` into every
+reply, `serverget.cpp:82-84`, recorded at `:475`):
+
+- `send_op_error` (`crates/epics-pva-rs/src/server_native/tcp.rs:5311`) now takes
+  a `subcmd: u8` parameter and writes it (`:5333`) instead of the hardcoded
+  `payload.put_u8(0x08)`. All 24 call sites pass their in-scope request `subcmd`,
+  so an INIT request (`0x08`) stays `0x08`, a GET exec failure echoes `0x00`, and
+  a PUT readback failure echoes `0x40` — the same value the matching success
+  path would have written. The exec-task error sites
+  (`tcp.rs:3907`/`:3921` GET, `:4011` PUT readback) capture the data-phase frame
+  subcmd, identical to their success `put_u8(subcmd)` (`:3934`/`:4025`).
+- Client decode (`crates/epics-pva-rs/src/client_native/decode.rs:504-510`): a
+  status-only GET/PUT data-phase reply (`!status.is_success()`) now short-circuits
+  to `OpResponse::Status` BEFORE attempting to decode the changed-bitset/value
+  body that pvxs never sends on error (`serverget.cpp:84-94`; value branch
+  `:102-104` runs only on success). Without this the `BitSet::decode` below
+  faulted on EOF (`short read u8`) and lost the server status behind a decode
+  error.
+- Client `op_get` (`crates/epics-pva-rs/src/client_native/ops_v2.rs:312`): added
+  an `OpResponse::Status(s) => Err(Protocol("GET data: {status}"))` arm to the
+  data-phase match, so the surfaced status is reported cleanly instead of hitting
+  the `other =>` catch-all ("expected GET data, got Status"). Mirrors the RPC
+  data path (`ops_v2.rs:2444`) and the PUT-done paths.
+
+This is a structural fix, not a patch: the dual meaning ("error reply ⟹ INIT
+phase") that the hardcoded `0x08` baked in is removed. The phase byte now has one
+meaning on all paths — the request's own subcmd — so there is no INIT-vs-data
+special case left to spawn a new edge.
+
+Invariant:
+
+- MUST: every GET/PUT/RPC reply (success OR error) carries the request's data-
+  phase subcmd. There is no error-only phase byte.
+- Owner/Gate: `send_op_error` is the single error-reply builder; it has no
+  independent phase opinion — the caller supplies `subcmd` exactly as the success
+  emitters do.
+
+Defect-family audit:
+
+- Anchor: `rg 'send_op_error'` (the error-reply builder) plus the hardcoded
+  reply phase bytes `rg 'put_u8\(0x08\)'` in production paths.
+- Sites: 1 `send_op_error` definition + 24 call sites
+  (`tcp.rs` GET/PUT/RPC `handle_op`, `handle_put_get`, `handle_process`, and the
+  GET/PUT-readback exec tasks). The only production hardcoded phase byte was the
+  one inside `send_op_error`.
+- Same defect (closed by this change): the `send_op_error` body — every caller
+  now threads `subcmd`.
+- Distinct, skip: the MONITOR payload builders (`build_monitor_payload*` write
+  `0x00` data / `build_monitor_finish`+`build_monitor_error` write `0x10`
+  finish, `tcp.rs:5342-5676`) are MONITOR's own subcmd semantics, not the
+  GET/PUT/RPC error path; the success emitters' `put_u8(subcmd)` were already
+  correct; the `0x08` literals in `mod tests`/INIT request encoders are client
+  request frames, not server replies.
+
+Regression tests added:
+
+- `bfr13_get_data_phase_error_echoes_data_subcmd` (`tcp.rs`, mod `tests`): GET
+  INIT then GET exec against a source whose value read fails → reply subcmd is
+  `0x00` with an error status, not `0x08`.
+- `bfr13_put_readback_error_echoes_0x40_subcmd`: PUT readback (`subcmd & 0x40`)
+  whose readback GET fails → reply subcmd `0x40` with error status.
+- `bfr13_init_phase_error_still_echoes_0x08` (boundary): an INIT-phase
+  "must provide prototype" negotiation failure still echoes `0x08`.
+- `bfr13_client_decodes_data_phase_error_as_status`: a status-only GET data error
+  frame decodes to `OpResponse::Status`, not a `short read u8` decode fault.
+- `bfr13_client_get_surfaces_data_phase_error`
+  (`crates/epics-pva-rs/tests/service_framework.rs`, end-to-end): a real client
+  `pvget` against a server whose source fails at the data phase returns a
+  "GET data:" error and does NOT report "expected GET data, got Init".
+
+Revert-verified:
+
+- `send_op_error` `put_u8(subcmd)` → `put_u8(0x08)`:
+  `bfr13_get_data_phase_error_echoes_data_subcmd` and
+  `bfr13_put_readback_error_echoes_0x40_subcmd` fail (`left: 8, right: 0`/`64`);
+  the end-to-end test fails with the exact pre-fix symptom
+  `expected GET data, got Init(... subcmd: 8 ... "PV not found")`. INIT and decode
+  tests still pass (`0x08` is correct for INIT; the decode test builds its own
+  frame).
+- Decode short-circuit disabled: `bfr13_client_decodes_data_phase_error_as_status`
+  fails with `short read u8` (decoding the absent value body).
+- `cargo nextest run -p epics-pva-rs`: 538 passed. `cargo clippy -p epics-pva-rs
+  --all-targets -- -D warnings`: clean.
 
 ### BFR-14 - Cross-endian raw monitor re-encode failures are dropped silently
 

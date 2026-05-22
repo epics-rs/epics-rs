@@ -305,6 +305,11 @@ async fn op_get_inner(
                 Err(PvaError::Protocol(format!("GET data: {:?}", d.status)))
             }
         }
+        // BFR-13: a data-phase failure now arrives as a status-only
+        // reply (server echoes the request data subcmd, no bitset/value),
+        // so it decodes to OpResponse::Status. Surface the server status
+        // instead of mislabelling it "expected GET data, got Status".
+        OpResponse::Status(s) => Err(PvaError::Protocol(format!("GET data: {:?}", s.status))),
         other => Err(PvaError::Protocol(format!(
             "expected GET data, got {other:?}"
         ))),

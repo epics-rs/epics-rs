@@ -5393,9 +5393,19 @@ fn reencode_raw_monitor(
         ev.byte_order,
     )
     .map_err(|e| format!("decode value with bitset: {e}"))?;
-    // The overrun bitset is optional in some upstream variants;
-    // tolerate truncation by defaulting to empty.
-    let overrun = BitSet::decode(&mut cur, ev.byte_order).unwrap_or_else(|_| BitSet::new());
+    // BFR-9: the overrun bitset is part of the MONITOR DATA wire format,
+    // NOT optional. pvxs reads it unconditionally
+    // (`clientmon.cpp:550` `from_wire(M, overrun)`) and disconnects when
+    // the message is not good afterwards (`clientmon.cpp:596`). A failed
+    // decode here means a truncated/corrupt upstream body; defaulting to
+    // an empty bitset would fabricate a valid frame from corruption and
+    // erase the server-squash overrun signal — and make a same-endian
+    // forward (which carries the malformed bytes through verbatim, so
+    // the downstream client detects it) and a cross-endian re-encode
+    // disagree on the same event. Propagate the error so the caller can
+    // tear the monitor down instead.
+    let overrun = BitSet::decode(&mut cur, ev.byte_order)
+        .map_err(|e| format!("decode overrun bitset: {e}"))?;
 
     let mut payload = Vec::new();
     payload.put_u32(ioid, downstream_order);
@@ -9110,6 +9120,130 @@ mod tests {
             decoded.introspection.as_ref(),
             Some(&intro),
             "slow path must return the exact source descriptor"
+        );
+    }
+
+    // ---- BFR-9: raw monitor re-encode must not fabricate a missing
+    // overrun bitset ------------------------------------------------
+    //
+    // `RawMonitorEvent.body_bytes` is the `changed | value | overrun`
+    // triplet. The trailing overrun bitset is a REQUIRED part of the
+    // MONITOR DATA wire format: pvxs reads it unconditionally
+    // (`clientmon.cpp:550` `from_wire(M, overrun)`) and disconnects
+    // when the message is not good afterwards (`clientmon.cpp:596`).
+    // Before the fix, `reencode_raw_monitor` mapped a failed overrun
+    // decode to `BitSet::new()`, fabricating a valid empty overrun from
+    // a truncated/corrupt upstream body — so the SAME event meant
+    // different things depending only on the negotiated byte order:
+    // the same-endian forward carries the malformed bytes through
+    // verbatim (downstream detects it), while the cross-endian
+    // re-encode silently "repaired" it.
+
+    /// Build a raw MONITOR DATA body for the three-`Int` test structure.
+    /// `with_overrun` controls whether the required trailing overrun
+    /// bitset is present; omitting it models a truncated upstream body.
+    #[cfg(test)]
+    fn bfr9_raw_body(order: ByteOrder, with_overrun: bool) -> bytes::Bytes {
+        let intro = three_field_intro();
+        let changed = BitSet::all_set(intro.total_bits());
+        let value = three_field_value(1, 2, 3);
+        let mut body = Vec::new();
+        changed.write_into(order, &mut body);
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &value, &intro, &changed, 0, order, &mut body,
+        );
+        if with_overrun {
+            // Mark bit 1 (field `a`) so a NON-EMPTY overrun is exercised.
+            let mut overrun = BitSet::new();
+            overrun.set(1);
+            overrun.write_into(order, &mut body);
+        }
+        bytes::Bytes::from(body)
+    }
+
+    /// Cross-endian re-encode of a body whose required overrun trailer
+    /// is missing must return an error — NOT fabricate an empty overrun
+    /// and emit a "valid" frame from corruption.
+    #[test]
+    fn bfr9_reencode_missing_overrun_returns_error() {
+        let intro = three_field_intro();
+        let ev = crate::server_native::RawMonitorEvent {
+            body_bytes: bfr9_raw_body(ByteOrder::Little, false),
+            byte_order: ByteOrder::Little,
+            type_changed: false,
+        };
+        // Downstream negotiated the opposite order → re-encode path.
+        let result = reencode_raw_monitor(7, &intro, &ev, ByteOrder::Big);
+        let err =
+            result.expect_err("missing overrun trailer must error, not fabricate an empty bitset");
+        assert!(
+            err.contains("overrun"),
+            "error must name the overrun bitset, got: {err}"
+        );
+    }
+
+    /// A NON-EMPTY overrun bitset must survive a cross-endian re-encode:
+    /// the bit set under the upstream order is still set after decoding
+    /// the re-encoded frame under the downstream order.
+    #[test]
+    fn bfr9_reencode_nonempty_overrun_survives_cross_endian() {
+        let intro = three_field_intro();
+        let ev = crate::server_native::RawMonitorEvent {
+            body_bytes: bfr9_raw_body(ByteOrder::Little, true),
+            byte_order: ByteOrder::Little,
+            type_changed: false,
+        };
+        let down = ByteOrder::Big;
+        let frame_bytes =
+            reencode_raw_monitor(7, &intro, &ev, down).expect("valid triplet re-encodes");
+        let (frame, _) = try_parse_frame(&frame_bytes)
+            .expect("re-encoded frame parses")
+            .expect("complete frame");
+        assert_eq!(
+            frame.header.command,
+            Command::Monitor.code(),
+            "re-encoded frame is a MONITOR"
+        );
+        let mut cur = frame.cursor();
+        assert_eq!(cur.get_u32(down).expect("ioid"), 7, "ioid preserved");
+        assert_eq!(cur.get_u8().expect("subcmd"), 0x00, "DATA subcmd");
+        let changed = BitSet::decode(&mut cur, down).expect("changed bitset");
+        let value =
+            crate::pvdata::encode::decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, down)
+                .expect("value");
+        assert_eq!(
+            three_field_extract(&value),
+            (1, 2, 3),
+            "value survives the cross-endian round-trip"
+        );
+        let overrun = BitSet::decode(&mut cur, down).expect("overrun bitset present");
+        assert!(
+            overrun.get(1),
+            "the non-empty overrun bit must survive cross-endian re-encode"
+        );
+    }
+
+    /// Agreement check: the same-endian forward does NOT fabricate. A
+    /// truncated body (missing overrun) is forwarded byte-for-byte, so
+    /// a downstream client sees the same malformed bytes the
+    /// cross-endian path now refuses to "repair". Both paths therefore
+    /// decline to invent a valid empty overrun.
+    #[test]
+    fn bfr9_same_endian_forward_does_not_fabricate() {
+        let order = ByteOrder::Little;
+        let body = bfr9_raw_body(order, false);
+        let ev = crate::server_native::RawMonitorEvent {
+            body_bytes: body.clone(),
+            byte_order: order,
+            type_changed: false,
+        };
+        let frame_bytes = build_monitor_payload_raw(7, &ev, order);
+        // Layout: [8-byte PVA header][4-byte ioid][1-byte subcmd][body].
+        let prefix = 8 + 4 + 1;
+        assert_eq!(
+            &frame_bytes[prefix..],
+            &body[..],
+            "same-endian path forwards the truncated body verbatim — no fabricated overrun trailer"
         );
     }
 }

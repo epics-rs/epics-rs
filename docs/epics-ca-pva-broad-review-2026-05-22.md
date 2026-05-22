@@ -34,7 +34,7 @@ Method:
 | BFR-6 | Medium | PVA GET_FIELD descriptor fallback | Fixed in current source |
 | BFR-7 | Medium | CA monitor single-event filter context | Fixed in current source |
 | BFR-8 | Medium | PVA PROCESS payload parsing | Fixed in current source (INIT); DATA-phase strictness declined (reference parity) |
-| BFR-9 | Medium | PVA raw monitor overrun parsing | Open |
+| BFR-9 | Medium | PVA raw monitor overrun parsing | Fixed in current source |
 | BFR-10 | Low | CA/base monitor drop accounting | Open |
 | BFR-11 | Medium | PVA raw monitor control-frame parsing | Open |
 | BFR-12 | Medium | PVA MONITOR FINISH op cleanup | Open |
@@ -609,6 +609,49 @@ Regression tests to add:
 - Same-endian raw forwarding and cross-endian re-encode agree on malformed
   body handling.
 - Non-empty overrun survives cross-endian re-encode.
+
+Applied fix (2026-05-22):
+
+- `crates/epics-pva-rs/src/server_native/tcp.rs` `reencode_raw_monitor` — the
+  trailing overrun decode changed from
+  `BitSet::decode(&mut cur, ev.byte_order).unwrap_or_else(|_| BitSet::new())`
+  to `BitSet::decode(&mut cur, ev.byte_order).map_err(|e| format!("decode
+  overrun bitset: {e}"))?`. A truncated/corrupt upstream body now propagates an
+  error to the caller instead of fabricating a valid empty overrun. This makes
+  the cross-endian re-encode path agree with the same-endian forward path, which
+  carries malformed bytes through verbatim (the downstream client detects them).
+
+Defect-family audit:
+
+- Anchor: `BitSet::decode\(` across `crates/epics-pva-rs/src`. Every production
+  decode site propagates with `.map_err(..)?` (`client_native/decode.rs:496,505`,
+  `client_native/ops_v2.rs:2552`, `server_native/tcp.rs:2625,3891,5386,5407`);
+  the remaining `.expect()`/`.unwrap()` hits are test-only. `tcp.rs:5407` was the
+  sole fabricate-on-failed-decode site and is fixed this round.
+- Anchor: `BitSet::new()` overrun construction (`tcp.rs:5222,5282,5333`,
+  `decode.rs:480`). Distinct, not fixed: these are the ENCODE side (server emits a
+  fresh frame with genuinely no overruns) or the RPC path (RPC responses carry no
+  overrun bitset on the wire) — legitimate empty construction, not a default
+  fabricated from a failed decode.
+- Anchor: `decode(..)\.ok\(\)\?` (`codec.rs:303`, `udp.rs:1055`). Distinct, not
+  fixed: incomplete-frame detection that returns `None` to signal "need more
+  bytes" / "skip malformed datagram", not a fabricated value default.
+
+Regression tests added (`crates/epics-pva-rs/src/server_native/tcp.rs`):
+
+- `bfr9_reencode_missing_overrun_returns_error` — cross-endian re-encode of a body
+  whose required overrun trailer is missing returns `Err` naming the overrun
+  bitset, not a fabricated empty overrun.
+- `bfr9_reencode_nonempty_overrun_survives_cross_endian` — a non-empty overrun
+  (bit 1 set) survives a Little→Big re-encode; parsing the re-encoded frame under
+  the downstream order recovers the value `(1,2,3)` and `overrun.get(1)`.
+- `bfr9_same_endian_forward_does_not_fabricate` — same-endian
+  `build_monitor_payload_raw` forwards the truncated body byte-for-byte (no
+  fabricated overrun trailer), so both paths decline to invent a valid empty
+  overrun.
+- Revert-verified: restoring `.unwrap_or_else(|_| BitSet::new())` makes
+  `bfr9_reencode_missing_overrun_returns_error` fail (the function returns a
+  fabricated `Ok` frame instead of `Err`).
 
 ### BFR-10 - Record-field monitor overflow drops are invisible to shared drop accounting
 

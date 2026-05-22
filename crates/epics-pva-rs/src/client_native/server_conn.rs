@@ -64,12 +64,29 @@ pub fn heartbeat_timeout() -> Duration {
     Duration::from_secs_f64((configured * 4.0 / 3.0).max(2.0))
 }
 
-/// Hard cap on a single inbound message's payload length on the
-/// client side. Mirrors `PvaServerConfig::max_message_size` — without
-/// it, a malicious or compromised server announcing a 4 GiB header
-/// would force the client to OOM-loop growing rx_buf. 64 MiB matches
-/// the server-side default. Override compile-time only for now.
-pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+/// Per-connection timeouts and limits threaded from the client builder
+/// into each dialed [`ServerConn`]. Bundled into one value so the dial
+/// signatures stay below clippy's argument-count threshold as knobs are
+/// added (the three fields always travel together through
+/// `connect` / `connect_tls` / `run_handshake_and_spawn`).
+#[derive(Clone, Copy, Debug)]
+pub struct ConnConfig {
+    /// Per-operation I/O deadline for the dial + handshake (pvxs
+    /// `Config::operationTimeout`).
+    pub op_timeout: Duration,
+    /// TCP idle timeout governing the heartbeat task (pvxs
+    /// `effective.tcpTimeout`, clientconn.cpp:73-74).
+    pub tcp_timeout: Duration,
+    /// PVXS-SR-9: optional opt-in cap on a single inbound message's
+    /// payload length. `None` = **unbounded**, matching pvxs, which
+    /// deliberately keeps no client-side RX message-size limit. The
+    /// streaming reader stays bounded regardless via incremental 4 KiB
+    /// reads plus the heartbeat/`op_timeout` deadlines, so the absence
+    /// of a cap is not itself an OOM vector. `Some(n)` rejects (and
+    /// drops the connection on) any server header announcing more than
+    /// `n` bytes.
+    pub max_message_size: Option<usize>,
+}
 
 /// Routing slot for a registered IOID.
 ///
@@ -158,10 +175,9 @@ impl ServerConn {
         target: SocketAddr,
         user: &str,
         host: &str,
-        op_timeout: Duration,
-        tcp_timeout: Duration,
+        conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
-        let stream = timeout(op_timeout, TcpStream::connect(target))
+        let stream = timeout(conn.op_timeout, TcpStream::connect(target))
             .await
             .map_err(|_| PvaError::Timeout)?
             .map_err(PvaError::Io)?;
@@ -170,17 +186,7 @@ impl ServerConn {
         let reader: DynRead = Box::new(reader);
         let writer: DynWrite = Box::new(writer);
         // Plain `pva://` TCP — no TLS, so no server X.509 identity.
-        Self::run_handshake_and_spawn(
-            target,
-            reader,
-            writer,
-            None,
-            user,
-            host,
-            op_timeout,
-            tcp_timeout,
-        )
-        .await
+        Self::run_handshake_and_spawn(target, reader, writer, None, user, host, conn).await
     }
 
     /// Open a TLS-wrapped connection (`pvas://`).
@@ -190,10 +196,9 @@ impl ServerConn {
         tls: Arc<crate::auth::TlsClientConfig>,
         user: &str,
         host: &str,
-        op_timeout: Duration,
-        tcp_timeout: Duration,
+        conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
-        let stream = timeout(op_timeout, TcpStream::connect(target))
+        let stream = timeout(conn.op_timeout, TcpStream::connect(target))
             .await
             .map_err(|_| PvaError::Timeout)?
             .map_err(PvaError::Io)?;
@@ -202,7 +207,7 @@ impl ServerConn {
         let connector = tokio_rustls::TlsConnector::from(tls.config.clone());
         let dnsname = rustls::pki_types::ServerName::try_from(server_name.to_string())
             .map_err(|e| PvaError::Protocol(format!("invalid TLS server name: {e}")))?;
-        let tls_stream = timeout(op_timeout, connector.connect(dnsname, stream))
+        let tls_stream = timeout(conn.op_timeout, connector.connect(dnsname, stream))
             .await
             .map_err(|_| PvaError::Timeout)?
             .map_err(PvaError::Io)?;
@@ -214,31 +219,22 @@ impl ServerConn {
         // is the cryptographically-checked server identity that pvxs
         // `pvxinfo -v` reports (`Connected::cred`).
         let server_identity = {
-            let (_, conn) = tls_stream.get_ref();
-            conn.peer_certificates()
+            let (_, tls_conn) = tls_stream.get_ref();
+            tls_conn
+                .peer_certificates()
                 .and_then(crate::auth::x509_credentials_from_chain)
         };
 
         let (reader, writer) = tokio::io::split(tls_stream);
         let reader: DynRead = Box::new(reader);
         let writer: DynWrite = Box::new(writer);
-        Self::run_handshake_and_spawn(
-            target,
-            reader,
-            writer,
-            server_identity,
-            user,
-            host,
-            op_timeout,
-            tcp_timeout,
-        )
-        .await
+        Self::run_handshake_and_spawn(target, reader, writer, server_identity, user, host, conn)
+            .await
     }
 
     /// Internal: takes already-split read/write halves, runs the handshake,
     /// then spawns the reader/writer/heartbeat tasks. Used by both
     /// [`connect`] and [`connect_tls`].
-    #[allow(clippy::too_many_arguments)]
     async fn run_handshake_and_spawn(
         target: SocketAddr,
         mut reader: DynRead,
@@ -246,13 +242,17 @@ impl ServerConn {
         server_identity: Option<crate::auth::X509Credentials>,
         user: &str,
         host: &str,
-        op_timeout: Duration,
-        tcp_timeout: Duration,
+        conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
+        let ConnConfig {
+            op_timeout,
+            tcp_timeout,
+            max_message_size,
+        } = conn;
         // Step 1+2: read handshake frames until we get CONNECTION_VALIDATION.
         let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
         let (byte_order, _server_buf, _server_reg, auth_methods) =
-            read_handshake_init(&mut reader, &mut rx_buf, op_timeout).await?;
+            read_handshake_init(&mut reader, &mut rx_buf, op_timeout, max_message_size).await?;
 
         // Choose auth method: prefer "ca" if offered.
         let negotiated_auth = if auth_methods.iter().any(|m| m == "ca") {
@@ -278,7 +278,7 @@ impl ServerConn {
             .map_err(PvaError::Io)?;
 
         // Step 4: wait for CONNECTION_VALIDATED.
-        wait_for_validated(&mut reader, &mut rx_buf, op_timeout).await?;
+        wait_for_validated(&mut reader, &mut rx_buf, op_timeout, max_message_size).await?;
 
         // Spawn background tasks.
         let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -373,11 +373,12 @@ impl ServerConn {
                             last_rx_reader.store(now_nanos(), Ordering::SeqCst);
                             // PVA-FR-2: count bytes read off the socket.
                             bytes_rx_reader.fetch_add(n as u64, Ordering::Relaxed);
-                            // Peek the header once we have 8 bytes — drop
-                            // the connection if the announced payload
-                            // exceeds MAX_MESSAGE_SIZE. Defends against a
-                            // malicious or compromised server announcing a
-                            // 4 GiB header to OOM the client.
+                            // Peek the header once we have 8 bytes — when
+                            // the client opted into a cap, drop the
+                            // connection if the announced payload exceeds
+                            // it (PVXS-SR-9; `None` = unbounded, pvxs
+                            // parity). Defends a hardened client against a
+                            // compromised server announcing a 4 GiB header.
                             if buf.len() >= crate::proto::PvaHeader::SIZE {
                                 // PVA-R7: decode the prefix to enforce
                                 // the payload cap. An undecodable
@@ -393,16 +394,21 @@ impl ServerConn {
                                     &mut std::io::Cursor::new(&buf[..])
                                 ) {
                                     Ok(hdr) => {
-                                        if !hdr.flags.is_control()
-                                            && hdr.payload_length as usize > MAX_MESSAGE_SIZE
-                                        {
-                                            warn!(
-                                                payload = hdr.payload_length,
-                                                cap = MAX_MESSAGE_SIZE,
-                                                "PVA inbound payload exceeds cap, closing"
-                                            );
-                                            cancel_reader.cancel();
-                                            return;
+                                        // PVXS-SR-9: only enforce when the
+                                        // client opted into a cap; `None`
+                                        // is unbounded (pvxs parity).
+                                        if let Some(cap) = max_message_size {
+                                            if !hdr.flags.is_control()
+                                                && hdr.payload_length as usize > cap
+                                            {
+                                                warn!(
+                                                    payload = hdr.payload_length,
+                                                    cap,
+                                                    "PVA inbound payload exceeds cap, closing"
+                                                );
+                                                cancel_reader.cancel();
+                                                return;
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -480,20 +486,23 @@ impl ServerConn {
                                     seg_flags = frame.header.flags;
                                     seg_buf.clear();
                                 }
-                                // Cap reassembly: peer that streams
+                                // Cap reassembly when the client opted
+                                // into a cap; a peer that streams
                                 // SegFirst → SegMiddle … forever would
                                 // grow seg_buf without bound otherwise.
-                                if seg_buf.len().saturating_add(frame.payload.len())
-                                    > MAX_MESSAGE_SIZE
-                                {
-                                    warn!(
-                                        accumulated = seg_buf.len(),
-                                        next = frame.payload.len(),
-                                        cap = MAX_MESSAGE_SIZE,
-                                        "PVA reassembled message exceeds cap, closing"
-                                    );
-                                    cancel_reader.cancel();
-                                    return;
+                                // PVXS-SR-9: `None` = unbounded (pvxs
+                                // parity).
+                                if let Some(cap) = max_message_size {
+                                    if seg_buf.len().saturating_add(frame.payload.len()) > cap {
+                                        warn!(
+                                            accumulated = seg_buf.len(),
+                                            next = frame.payload.len(),
+                                            cap,
+                                            "PVA reassembled message exceeds cap, closing"
+                                        );
+                                        cancel_reader.cancel();
+                                        return;
+                                    }
                                 }
                                 seg_buf.extend_from_slice(&frame.payload);
                                 if raw_seg != 0
@@ -809,10 +818,11 @@ async fn read_handshake_init<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
     op_timeout: Duration,
+    max_message_size: Option<usize>,
 ) -> PvaResult<(ByteOrder, u32, u16, Vec<String>)> {
     let mut byte_order = ByteOrder::Little;
     loop {
-        let frame = read_one_frame(reader, rx_buf, op_timeout).await?;
+        let frame = read_one_frame(reader, rx_buf, op_timeout, max_message_size).await?;
         if frame.header.flags.is_control() {
             if frame.header.command == ControlCommand::SetByteOrder.code() {
                 byte_order = frame.header.flags.byte_order();
@@ -835,9 +845,10 @@ async fn wait_for_validated<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
     op_timeout: Duration,
+    max_message_size: Option<usize>,
 ) -> PvaResult<()> {
     loop {
-        let frame = read_one_frame(reader, rx_buf, op_timeout).await?;
+        let frame = read_one_frame(reader, rx_buf, op_timeout, max_message_size).await?;
         if frame.header.flags.is_control() {
             continue;
         }
@@ -858,6 +869,7 @@ async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
     op_timeout: Duration,
+    max_message_size: Option<usize>,
 ) -> PvaResult<Frame> {
     loop {
         // Role-aware: read_one_frame is used by client connections, so
@@ -867,15 +879,20 @@ async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
             rx_buf.drain(..n);
             return Ok(frame);
         }
-        // Same MAX_MESSAGE_SIZE peek as the streaming reader (P-G8).
-        if rx_buf.len() >= crate::proto::PvaHeader::SIZE {
-            if let Ok(hdr) = crate::proto::PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[..]))
-            {
-                if !hdr.flags.is_control() && hdr.payload_length as usize > MAX_MESSAGE_SIZE {
-                    return Err(PvaError::Protocol(format!(
-                        "inbound payload {} exceeds MAX_MESSAGE_SIZE {}",
-                        hdr.payload_length, MAX_MESSAGE_SIZE
-                    )));
+        // Same opt-in payload peek as the streaming reader (P-G8).
+        // PVXS-SR-9: `None` = unbounded (pvxs parity); the handshake
+        // read is `op_timeout`-deadlined regardless.
+        if let Some(cap) = max_message_size {
+            if rx_buf.len() >= crate::proto::PvaHeader::SIZE {
+                if let Ok(hdr) =
+                    crate::proto::PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[..]))
+                {
+                    if !hdr.flags.is_control() && hdr.payload_length as usize > cap {
+                        return Err(PvaError::Protocol(format!(
+                            "inbound payload {} exceeds max_message_size {}",
+                            hdr.payload_length, cap
+                        )));
+                    }
                 }
             }
         }
@@ -1598,9 +1615,18 @@ mod tests {
         let tcp_timeout = Duration::from_millis(500);
         let op_timeout = Duration::from_secs(2);
 
-        let conn = ServerConn::connect(addr, "testuser", "testhost", op_timeout, tcp_timeout)
-            .await
-            .expect("handshake must succeed");
+        let conn = ServerConn::connect(
+            addr,
+            "testuser",
+            "testhost",
+            ConnConfig {
+                op_timeout,
+                tcp_timeout,
+                max_message_size: None,
+            },
+        )
+        .await
+        .expect("handshake must succeed");
 
         assert!(conn.is_alive(), "connection must be alive after handshake");
 

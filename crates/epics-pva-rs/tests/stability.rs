@@ -296,6 +296,47 @@ fn client_for(tcp_port: u16) -> PvaClient {
         .build()
 }
 
+/// PVXS-SR-9: a client that opts into a 1-byte inbound message-size cap.
+/// Any real PVA frame (even the server's CONNECTION_VALIDATION) carries a
+/// payload over 1 byte, so the reader drops the connection and every
+/// operation fails — proving the opt-in cap is enforced.
+fn capped_client_for(tcp_port: u16, cap: usize) -> PvaClient {
+    let addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        tcp_port,
+    );
+    PvaClient::builder()
+        .timeout(Duration::from_secs(2))
+        .server_addr(addr)
+        .max_message_size(cap)
+        .build()
+}
+
+/// PVXS-SR-9: spawn a server that opts into a tiny inbound cap. The
+/// client's CONNECTION_VALIDATION reply exceeds `cap` bytes, so the
+/// server drops the circuit during the handshake.
+async fn spawn_server_capped(
+    source: Arc<MemSource>,
+    cap: usize,
+) -> (u16, u16, tokio::task::JoinHandle<()>) {
+    let (tcp, udp) = alloc_port_pair();
+    let cfg = PvaServerConfig {
+        tcp_port: tcp,
+        udp_port: udp,
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 16,
+        max_channels_per_connection: 64,
+        monitor_queue_depth: 8,
+        max_message_size: Some(cap),
+        ..Default::default()
+    };
+    let h = tokio::spawn(async move {
+        let _ = run_pva_server(source, cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (tcp, udp, h)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -344,6 +385,64 @@ async fn p2_auto_reconnect_after_server_restart() {
 
     h2.abort();
     let _ = h2.await;
+}
+
+/// PVXS-SR-9: the default client is **unbounded** (pvxs parity — no
+/// RX message-size cap), while a client that opts into a tiny cap drops
+/// the connection and fails every op. Same server, two clients: proves
+/// both the new default and that the opt-in knob is still enforced.
+#[tokio::test]
+async fn sr9_client_default_unbounded_opt_in_cap_enforced() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:SR9C", 3.5).await;
+
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+
+    // Default client (cap None) — the GET succeeds.
+    let ok = tokio::time::timeout(Duration::from_secs(3), client_for(tcp).pvget("STAB:SR9C"))
+        .await
+        .expect("default client pvget timed out");
+    assert!(
+        matches!(ok, Ok(PvField::Structure(_))),
+        "default client must be unbounded and GET successfully, got {ok:?}"
+    );
+
+    // Opt-in 1-byte cap — the reader drops the connection, GET fails.
+    let capped = tokio::time::timeout(
+        Duration::from_secs(3),
+        capped_client_for(tcp, 1).pvget("STAB:SR9C"),
+    )
+    .await
+    .expect("capped client pvget hung past op timeout");
+    assert!(
+        capped.is_err(),
+        "1-byte cap must reject the oversized inbound frame and fail the GET, got {capped:?}"
+    );
+
+    h.abort();
+    let _ = h.await;
+}
+
+/// PVXS-SR-9: the server side of the opt-in cap. A server that opts into
+/// a 1-byte cap drops the client during the handshake (its
+/// CONNECTION_VALIDATION reply exceeds 1 byte), so the GET fails.
+#[tokio::test]
+async fn sr9_server_opt_in_cap_enforced() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:SR9S", 7.0).await;
+
+    let (tcp, _udp, h) = spawn_server_capped(source.clone(), 1).await;
+
+    let res = tokio::time::timeout(Duration::from_secs(3), client_for(tcp).pvget("STAB:SR9S"))
+        .await
+        .expect("pvget against capped server hung past op timeout");
+    assert!(
+        res.is_err(),
+        "server 1-byte cap must drop the oversized inbound handshake and fail the GET, got {res:?}"
+    );
+
+    h.abort();
+    let _ = h.await;
 }
 
 #[tokio::test]

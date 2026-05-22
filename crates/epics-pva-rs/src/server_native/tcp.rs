@@ -2191,15 +2191,20 @@ async fn handle_connection_io(
             seg_cmd = frame.header.command;
             seg_buf.clear();
         }
-        // Cap reassembly at max_msg_size. read_frame already enforces
-        // it per-frame; without this an adversary streams SegFirst →
-        // SegMiddle … forever, growing seg_buf without bound.
-        if seg_buf.len().saturating_add(frame.payload.len()) > max_msg_size {
-            return Err(PvaError::Protocol(format!(
-                "segmented PVA message exceeds max_message_size ({} > {})",
-                seg_buf.len() + frame.payload.len(),
-                max_msg_size
-            )));
+        // Cap reassembly when an opt-in `max_message_size` is set.
+        // read_frame already enforces it per-frame; without this an
+        // adversary streams SegFirst → SegMiddle … forever, growing
+        // seg_buf without bound. PVXS-SR-9: `None` = unbounded (pvxs
+        // parity), so this guard only fires for hardened deployments
+        // that opted into a ceiling.
+        if let Some(cap) = max_msg_size {
+            if seg_buf.len().saturating_add(frame.payload.len()) > cap {
+                return Err(PvaError::Protocol(format!(
+                    "segmented PVA message exceeds max_message_size ({} > {})",
+                    seg_buf.len() + frame.payload.len(),
+                    cap
+                )));
+            }
         }
         seg_buf.extend_from_slice(&frame.payload);
         if raw_seg != 0 && raw_seg != HeaderFlags::SEGMENT_LAST {
@@ -3267,7 +3272,7 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
     op_timeout: Duration,
-    max_msg_size: usize,
+    max_msg_size: Option<usize>,
 ) -> PvaResult<Frame> {
     loop {
         // Role-aware parse: a server's inbound frames must have the
@@ -3279,19 +3284,22 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
             rx_buf.drain(..n);
             return Ok(frame);
         }
-        // Peek the header length once we have 8 bytes — if the peer
-        // claimed a payload larger than `max_msg_size`, drop the
-        // connection before growing rx_buf any further. Without this
-        // a malicious header announcing 4 GiB would force us to
-        // OOM-loop here. pvxs enforces the same cap implicitly via
-        // libevent's evbuffer_setwatermark; we do it explicitly.
-        if rx_buf.len() >= PvaHeader::SIZE {
-            if let Ok(hdr) = PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[..])) {
-                if !hdr.flags.is_control() && hdr.payload_length as usize > max_msg_size {
-                    return Err(PvaError::Protocol(format!(
-                        "inbound payload {} exceeds max_message_size {}",
-                        hdr.payload_length, max_msg_size
-                    )));
+        // Peek the header length once we have 8 bytes — if an opt-in
+        // `max_msg_size` is set and the peer claimed more, drop the
+        // connection before growing rx_buf any further. PVXS-SR-9:
+        // `None` = unbounded (pvxs parity, which keeps no RX cap).
+        // Even unbounded, the read stays incremental (4 KiB chunks)
+        // and `op_timeout`-deadlined, so a stalled or oversized peer
+        // is bounded by the deadline rather than the cap.
+        if let Some(cap) = max_msg_size {
+            if rx_buf.len() >= PvaHeader::SIZE {
+                if let Ok(hdr) = PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[..])) {
+                    if !hdr.flags.is_control() && hdr.payload_length as usize > cap {
+                        return Err(PvaError::Protocol(format!(
+                            "inbound payload {} exceeds max_message_size {}",
+                            hdr.payload_length, cap
+                        )));
+                    }
                 }
             }
         }

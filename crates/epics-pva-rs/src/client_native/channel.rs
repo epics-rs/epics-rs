@@ -30,7 +30,7 @@ use crate::error::{PvaError, PvaResult};
 
 use super::beacon_throttle::BeaconTracker;
 use super::search_engine::SearchEngine;
-use super::server_conn::ServerConn;
+use super::server_conn::{ConnConfig, ServerConn};
 
 static NEXT_CID: AtomicU32 = AtomicU32::new(1);
 
@@ -176,6 +176,13 @@ pub struct ConnectionPool {
     /// reader/writer/heartbeat tasks leaked until idle timeout.
     connecting: parking_lot::Mutex<std::collections::HashMap<std::net::SocketAddr, Arc<Mutex<()>>>>,
     tls: parking_lot::Mutex<Option<Arc<crate::auth::TlsClientConfig>>>,
+    /// Optional opt-in cap on a single inbound message's payload length,
+    /// threaded into every `ServerConn` this pool dials. `None` (the
+    /// default) means **unbounded** — pvxs keeps no client-side RX cap,
+    /// and the streaming reader stays bounded by incremental 4 KiB reads
+    /// plus the `op_timeout` deadline regardless. `Some(n)` rejects (and
+    /// drops) any server header announcing more than `n` bytes. PVXS-SR-9.
+    max_message_size: parking_lot::Mutex<Option<usize>>,
     /// Set by `PvaClient::close` (pvxs `Context::close`). Once true,
     /// reconnect attempts (especially the name-server fallback in
     /// `Channel::connect`) MUST refuse to dial — pvxs commit
@@ -222,6 +229,12 @@ impl ConnectionPool {
     /// Enable TLS for every subsequent connect call.
     pub fn set_tls(&self, tls: Option<Arc<crate::auth::TlsClientConfig>>) {
         *self.tls.lock() = tls;
+    }
+
+    /// PVXS-SR-9: set the opt-in inbound message-size cap applied to
+    /// every subsequent connect call. `None` (the default) is unbounded.
+    pub fn set_max_message_size(&self, cap: Option<usize>) {
+        *self.max_message_size.lock() = cap;
     }
 
     /// PVA-FR-2: per-connection `(peer, bytes_rx, bytes_tx, alive)`
@@ -351,6 +364,11 @@ impl ConnectionPool {
                 }
             }
             let tls = self.tls.lock().clone();
+            let conn_config = ConnConfig {
+                op_timeout,
+                tcp_timeout,
+                max_message_size: *self.max_message_size.lock(),
+            };
             let connect_result = match tls {
                 Some(cfg) => {
                     ServerConn::connect_tls(
@@ -359,12 +377,11 @@ impl ConnectionPool {
                         cfg,
                         user,
                         host,
-                        op_timeout,
-                        tcp_timeout,
+                        conn_config,
                     )
                     .await
                 }
-                None => ServerConn::connect(addr, user, host, op_timeout, tcp_timeout).await,
+                None => ServerConn::connect(addr, user, host, conn_config).await,
             };
             let fresh = connect_result?;
             let mut map = self.inner.lock();

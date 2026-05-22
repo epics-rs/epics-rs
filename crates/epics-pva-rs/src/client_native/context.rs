@@ -102,6 +102,11 @@ pub struct PvaClientBuilder {
     /// whose auth method (e.g. `x509`) cannot be forwarded verbatim
     /// on the pvAccess wire. `None` for first-party clients.
     asserted_identity: Option<AssertedIdentity>,
+    /// PVXS-SR-9: optional opt-in cap on a single inbound message's
+    /// payload length. `None` (the default) is **unbounded**, matching
+    /// pvxs, which keeps no client-side RX message-size limit. `Some(n)`
+    /// drops any connection whose server announces a payload over `n`.
+    max_message_size: Option<usize>,
 }
 
 impl PvaClientBuilder {
@@ -120,6 +125,7 @@ impl PvaClientBuilder {
             tcp_timeout: super::server_conn::heartbeat_timeout(),
             share_udp: false,
             asserted_identity: None,
+            max_message_size: None,
         }
     }
 
@@ -135,6 +141,18 @@ impl PvaClientBuilder {
     /// Default 40s.
     pub fn tcp_timeout(mut self, d: Duration) -> Self {
         self.tcp_timeout = d;
+        self
+    }
+
+    /// PVXS-SR-9: opt in to a hard cap on a single inbound message's
+    /// payload length. By default the client is **unbounded** (pvxs
+    /// parity — pvxs keeps no client-side RX message-size limit), since
+    /// the streaming reader stays bounded by incremental 4 KiB reads
+    /// plus the heartbeat/operation deadlines. Call this only for a
+    /// hardened client that should reject (and drop) any server header
+    /// announcing more than `cap` bytes.
+    pub fn max_message_size(mut self, cap: usize) -> Self {
+        self.max_message_size = Some(cap);
         self
     }
 
@@ -214,6 +232,9 @@ impl PvaClientBuilder {
         if self.tls.is_some() {
             pool.set_tls(self.tls.clone());
         }
+        // PVXS-SR-9: thread the opt-in cap into the pool so every dialed
+        // connection enforces it (default `None` = unbounded).
+        pool.set_max_message_size(self.max_message_size);
         PvaClient {
             inner: Arc::new(ClientInner {
                 timeout: self.timeout,
@@ -233,6 +254,7 @@ impl PvaClientBuilder {
                 tcp_timeout: self.tcp_timeout,
                 share_udp: self.share_udp,
                 asserted_identity: self.asserted_identity,
+                max_message_size: self.max_message_size,
             }),
         }
     }
@@ -274,6 +296,10 @@ struct ClientInner {
     /// assertion of a downstream identity. Surfaced through
     /// [`PvaClient::asserted_identity`].
     asserted_identity: Option<AssertedIdentity>,
+    /// PVXS-SR-9: opt-in inbound message-size cap (`None` = unbounded).
+    /// Stored so `with_asserted_identity` can carry it onto the derived
+    /// client's fresh pool. Set on the pool at `build()` time.
+    max_message_size: Option<usize>,
 }
 
 /// Process-wide singleton SearchEngine for `share_udp(true)` clients.
@@ -344,6 +370,9 @@ impl PvaClient {
             .share_udp(self.inner.share_udp)
             .name_servers(self.inner.name_servers.clone())
             .asserted_identity(asserted);
+        if let Some(cap) = self.inner.max_message_size {
+            builder = builder.max_message_size(cap);
+        }
         if let Some(addr) = self.inner.server_addr {
             builder = builder.server_addr(addr);
         }

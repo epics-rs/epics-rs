@@ -153,14 +153,18 @@ pub struct PvaServerConfig {
     /// libevent `bufferevent_set_timeouts`; we do it explicitly here.
     /// Default: 10 s, override via `EPICS_PVAS_TLS_HANDSHAKE_TMO`.
     pub tls_handshake_timeout: Duration,
-    /// Hard cap on a single inbound message's payload length.
-    /// `read_frame` rejects (and drops the connection) any header
-    /// claiming more than this. Without a cap a malicious peer
-    /// can announce a 4 GiB payload and force the server to grow
-    /// its rx_buf until OOM. Default: 64 MiB — large enough for
-    /// legitimate huge structures (NTTable bulk transfers) but
-    /// well below address-space exhaustion.
-    pub max_message_size: usize,
+    /// Optional hard cap on a single inbound message's payload length.
+    /// `None` (the default) means **unbounded** — matching pvxs, which
+    /// deliberately keeps no RX message-size limit so PVA can carry
+    /// arbitrarily large structures (the design point that replaced
+    /// CA's `EPICS_CA_MAX_ARRAY_BYTES`). `read_frame` and the
+    /// segment-reassembly path stay bounded regardless via incremental
+    /// 4 KiB reads, the `op_timeout` deadline, and `safe_capacity`
+    /// (PVXS-SR-8), so the absence of a cap is not itself an
+    /// amplification vector. Set `Some(n)` to opt in to a hard ceiling
+    /// (e.g. a hardened deployment that wants to reject any header
+    /// claiming more than `n` bytes and drop the connection). PVXS-SR-9.
+    pub max_message_size: Option<usize>,
     /// Inbound peer ACL. Each entry is `(IpAddr, port_or_zero)` —
     /// matching connections (TCP) and search packets (UDP) are silently
     /// dropped. `port == 0` matches any port from that IP. Mirrors
@@ -251,7 +255,7 @@ impl Default for PvaServerConfig {
             auth_complete: None,
             send_timeout: Duration::from_secs(5),
             tls_handshake_timeout: Duration::from_secs(10),
-            max_message_size: 64 * 1024 * 1024,
+            max_message_size: None,
         }
     }
 }
@@ -1134,5 +1138,26 @@ mod tcp_fallback_tests {
         // a panic would be a regression.
         assert!(report.tcp_port != 0, "must bind a real port");
         drop(server);
+    }
+}
+
+#[cfg(test)]
+mod sr9_message_size_tests {
+    //! PVXS-SR-9: the inbound message-size cap defaults to unbounded
+    //! (`None`), matching pvxs which deliberately keeps no RX cap. A
+    //! deployment opts into a hard ceiling by setting `Some(n)`.
+    use super::*;
+
+    #[test]
+    fn default_message_size_is_unbounded() {
+        assert_eq!(
+            PvaServerConfig::default().max_message_size,
+            None,
+            "PVXS-SR-9: default server config must be unbounded (None), not a fixed cap"
+        );
+        // `isolated()` inherits the default via `..Default::default()`.
+        assert_eq!(PvaServerConfig::isolated().max_message_size, None);
+        // `with_env()` does not introduce a cap either.
+        assert_eq!(PvaServerConfig::default().with_env().max_message_size, None);
     }
 }

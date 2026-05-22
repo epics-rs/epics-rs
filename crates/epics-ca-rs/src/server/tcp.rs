@@ -3524,8 +3524,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 };
                                 let Some(mut event) = next else { break };
                                 if flow_control.is_paused() {
-                                    let Some(coalesced) =
-                                        flow_control.coalesce_while_paused(&mut rx, event).await
+                                    let Some(coalesced) = flow_control
+                                        .coalesce_while_paused(&mut rx, event, || async {
+                                            record_for_task.read().await.pop_coalesced(sub_id)
+                                        })
+                                        .await
                                     else {
                                         break;
                                     };

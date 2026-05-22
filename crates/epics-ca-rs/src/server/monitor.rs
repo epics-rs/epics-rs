@@ -52,11 +52,29 @@ impl FlowControlGate {
         self.paused.load(Ordering::Acquire)
     }
 
-    pub async fn coalesce_while_paused(
+    /// Collapse the monitor backlog to a single latest value while the
+    /// circuit is paused (EVENTS_OFF), returning it once EVENTS_ON
+    /// resumes (or `None` if the source channel closes).
+    ///
+    /// `pop_overflow` drains the producer's coalesce *slot* — the place
+    /// `notify_subscribers` / `post_monitor` parks the newest value once
+    /// the per-subscriber `rx` queue fills (`ProcessVariable` /
+    /// `RecordInstance::pop_coalesced`). Both sources must be folded here:
+    /// draining only `rx` lets an overflow that lands during the pause
+    /// stay in the slot, so resume delivers the stale `rx` tail first and
+    /// the newer slot value only on the next loop — defeating the
+    /// collapse-to-latest the pause exists to provide. Mirrors the
+    /// not-paused loop, which also prefers the slot as the newest value.
+    pub async fn coalesce_while_paused<F, Fut>(
         &self,
         rx: &mut mpsc::Receiver<MonitorEvent>,
         mut pending: MonitorEvent,
-    ) -> Option<MonitorEvent> {
+        mut pop_overflow: F,
+    ) -> Option<MonitorEvent>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<MonitorEvent>>,
+    {
         loop {
             // Register the resume waiter eagerly BEFORE re-reading the
             // pause flag. `resume()` stores `paused = false` (Release)
@@ -78,8 +96,15 @@ impl FlowControlGate {
             if !self.is_paused() {
                 break;
             }
-            // Collapse the backlog to the latest value while paused.
+            // Collapse the backlog to the latest value while paused:
+            // drain the rx queue, then fold the producer overflow slot,
+            // which holds a value newer than anything in rx once the
+            // queue has filled. The slot holds at most one (overwritten)
+            // value, so a single take suffices; the next wake re-drains.
             while let Ok(event) = rx.try_recv() {
+                pending = event;
+            }
+            if let Some(event) = pop_overflow().await {
                 pending = event;
             }
             if !self.is_paused() {
@@ -136,7 +161,9 @@ where
             };
             let Some(mut event) = next else { break };
             if flow_control.is_paused() {
-                let Some(coalesced) = flow_control.coalesce_while_paused(&mut rx, event).await
+                let Some(coalesced) = flow_control
+                    .coalesce_while_paused(&mut rx, event, || pv.pop_coalesced(sub_id))
+                    .await
                 else {
                     break;
                 };
@@ -390,7 +417,9 @@ mod tests {
             let gate = FlowControlGate::default();
             // No sender is ever used; default gate is not paused.
             let (_tx, mut rx) = mpsc::channel::<MonitorEvent>(1);
-            let got = gate.coalesce_while_paused(&mut rx, ev(7)).await;
+            let got = gate
+                .coalesce_while_paused(&mut rx, ev(7), || async { None })
+                .await;
             assert_eq!(value_of(&got.expect("returns pending")), 7);
         }
 
@@ -403,7 +432,8 @@ mod tests {
             let (tx, mut rx) = mpsc::channel::<MonitorEvent>(8);
             let g2 = gate.clone();
             let task = epics_base_rs::runtime::task::spawn(async move {
-                g2.coalesce_while_paused(&mut rx, ev(1)).await
+                g2.coalesce_while_paused(&mut rx, ev(1), || async { None })
+                    .await
             });
             // Feed newer values while paused; each yield lets the gate
             // absorb the value into `pending` and park again.
@@ -420,6 +450,43 @@ mod tests {
             );
         }
 
+        /// Paused + the producer overflow slot holds the genuine newest
+        /// value (rx queue filled during the pause) → resume must deliver
+        /// that slot value, NOT the stale rx tail. Regression for the
+        /// pause coalescing only draining rx: previously the rx tail went
+        /// out first and the newer slot value only on the next loop.
+        #[tokio::test]
+        async fn overflow_slot_folds_into_latest_on_resume() {
+            let gate = Arc::new(FlowControlGate::default());
+            gate.pause();
+            let (tx, mut rx) = mpsc::channel::<MonitorEvent>(8);
+            // The rx backlog is older than the overflow slot.
+            tx.send(ev(2)).await.unwrap();
+            tx.send(ev(3)).await.unwrap();
+            // Producer parked the genuine newest value in the slot once
+            // rx filled. `Cell::take` yields it once, then `None`.
+            let slot = std::cell::Cell::new(Some(ev(99)));
+            // Resume from a separate task (touches only the Send gate
+            // Arc) after the coalesce future has drained + folded the
+            // slot and parked. The coalesce future itself holds the
+            // non-Send `Cell`, so it runs on this task, not spawned.
+            let g2 = gate.clone();
+            let resumer = epics_base_rs::runtime::task::spawn(async move {
+                tokio::task::yield_now().await;
+                g2.resume();
+            });
+            let got = gate
+                .coalesce_while_paused(&mut rx, ev(1), || async { slot.take() })
+                .await
+                .expect("resume delivers the coalesced latest");
+            resumer.await.unwrap();
+            assert_eq!(
+                value_of(&got),
+                99,
+                "overflow slot (newest) must win over the stale rx tail"
+            );
+        }
+
         /// Paused + the source channel closes → `None` (caller ends the
         /// subscription), not a hang.
         #[tokio::test]
@@ -429,7 +496,8 @@ mod tests {
             let (tx, mut rx) = mpsc::channel::<MonitorEvent>(1);
             let g2 = gate.clone();
             let task = epics_base_rs::runtime::task::spawn(async move {
-                g2.coalesce_while_paused(&mut rx, ev(1)).await
+                g2.coalesce_while_paused(&mut rx, ev(1), || async { None })
+                    .await
             });
             tokio::task::yield_now().await; // let the consumer park in the select
             drop(tx); // closes the channel; rx.recv() resolves to None
@@ -450,7 +518,8 @@ mod tests {
             let (tx, mut rx) = mpsc::channel::<MonitorEvent>(4);
             let g2 = gate.clone();
             let task = epics_base_rs::runtime::task::spawn(async move {
-                g2.coalesce_while_paused(&mut rx, ev(1)).await
+                g2.coalesce_while_paused(&mut rx, ev(1), || async { None })
+                    .await
             });
             // One value arrives during the pause, then the source goes
             // quiet — only a resume can release the consumer.

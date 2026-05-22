@@ -2787,12 +2787,41 @@ async fn handle_process(
                 return Ok(());
             }
         };
-        // The PROCESS pvRequest carries no field selection of interest
-        // (process transfers no value) — decode-and-discard so any
-        // trailing bytes are consumed cleanly.
-        let _ = decode_type_desc(&mut cur, order)
-            .ok()
-            .and_then(|d| decode_pv_field(&d, &mut cur, order).ok());
+        // BFR-8: route the PROCESS INIT pvRequest through the SAME
+        // structured boundary as the generic GET/PUT/MONITOR INIT path
+        // (`decode_init_pv_request_value`). PROCESS transfers no value,
+        // so the decoded pvRequest is discarded — but a present-but-
+        // malformed pvRequest is an INIT protocol error, not something
+        // to swallow. The previous `decode_type_desc(..).ok().and_then(
+        // |d| decode_pv_field(..).ok())` collapsed "absent body",
+        // "malformed descriptor", and "malformed value" all into a
+        // silent no-op, so a truncated/corrupt PROCESS INIT was
+        // acknowledged with `Status::ok()` and the op registered. Mirror
+        // the generic policy: a malformed descriptor or value replies an
+        // op error and returns WITHOUT registering the IOID (an absent
+        // value body is tolerated for Rust↔Rust interop, exactly as the
+        // generic path tolerates it). pvxs `from_wire_type_value` +
+        // `if(!M.good()) bev.reset()` (serverget.cpp:369-374) is even
+        // stricter (connection-fatal); the op-error boundary is the
+        // codebase's deliberate, uniform choice.
+        let req_desc = match decode_type_desc(&mut cur, order) {
+            Ok(d) => d,
+            Err(e) => {
+                send_op_error(
+                    tx,
+                    OpKind::Process,
+                    ioid,
+                    &format!("invalid pvRequest descriptor: {e}"),
+                    order,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        if let Err(e) = decode_init_pv_request_value(&mut cur, &req_desc, order) {
+            send_op_error(tx, OpKind::Process, ioid, &e, order).await?;
+            return Ok(());
+        }
         let mask = BitSet::all_set(intro.total_bits());
         ch.ops
             .insert(ioid, non_monitor_op_state(intro, OpKind::Process, mask));
@@ -8471,6 +8500,151 @@ mod tests {
             process_hits.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "EX-R5: record processing must NOT run for a wrong-kind PROCESS frame"
+        );
+    }
+
+    /// BFR-8: a (sid → ChannelState) map with introspection but NO
+    /// registered ops, so a PROCESS INIT frame exercises the INIT
+    /// pvRequest decode + registration path.
+    #[cfg(test)]
+    fn process_channels_no_op(sid: u32) -> HashMap<u32, ChannelState> {
+        let intro = three_field_intro();
+        let mut channels = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro),
+                ops: HashMap::new(),
+            },
+        );
+        channels
+    }
+
+    /// BFR-8: build a PROCESS INIT frame `sid + ioid + 0x08 +
+    /// pv_request_bytes`.
+    #[cfg(test)]
+    fn process_init_frame(sid: u32, ioid: u32, pv_request: &[u8], order: ByteOrder) -> Frame {
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x08); // INIT
+        payload.extend_from_slice(pv_request);
+        synth_frame(Command::Process, order, payload)
+    }
+
+    /// BFR-8: drive `handle_process` for an INIT frame and return the
+    /// `(ops contains ioid, response status success)` pair.
+    #[cfg(test)]
+    async fn run_process_init(
+        sid: u32,
+        ioid: u32,
+        pv_request: &[u8],
+        order: ByteOrder,
+    ) -> (bool, bool) {
+        let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
+        let mut channels = process_channels_no_op(sid);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let peer: SocketAddr = "127.0.0.1:5076".parse().unwrap();
+        let frame = process_init_frame(sid, ioid, pv_request, order);
+
+        handle_process(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            peer,
+            &x509_cred("MyCA"),
+        )
+        .await
+        .expect("handle_process returns Ok (op-error boundary, not connection-fatal)");
+
+        let registered = channels.get(&sid).unwrap().ops.contains_key(&ioid);
+        let resp = rx.recv().await.expect("a response frame is emitted");
+        let (rframe, _) = try_parse_frame(&resp)
+            .expect("frame parses")
+            .expect("complete frame");
+        let mut cur = rframe.cursor();
+        let _ioid = cur.get_u32(order).expect("ioid");
+        let _subcmd = cur.get_u8().expect("subcmd");
+        let status = Status::decode(&mut cur, order).expect("status");
+        (registered, status.is_success())
+    }
+
+    /// BFR-8 regression: a PROCESS INIT whose pvRequest VALUE is present
+    /// but truncated must be rejected (op-error) and MUST NOT register
+    /// the IOID. The previous `decode_type_desc(..).ok().and_then(|d|
+    /// decode_pv_field(..).ok())` swallowed the value error and
+    /// registered the op with `Status::ok()`.
+    #[tokio::test]
+    async fn bfr8_process_init_truncated_value_rejected_and_unregistered() {
+        let order = ByteOrder::Little;
+        // Valid Int descriptor, then a truncated (2-byte) i32 value.
+        let desc = FieldDesc::Scalar(crate::pvdata::ScalarType::Int);
+        let mut req = Vec::new();
+        crate::pvdata::encode::encode_type_desc(&desc, order, &mut req);
+        req.extend_from_slice(&[1u8, 2u8]);
+
+        let (registered, success) = run_process_init(1, 700, &req, order).await;
+        assert!(
+            !registered,
+            "BFR-8: a malformed PROCESS INIT pvRequest value must not register the IOID"
+        );
+        assert!(
+            !success,
+            "BFR-8: a malformed PROCESS INIT pvRequest value must reply an error status"
+        );
+    }
+
+    /// BFR-8 regression: a PROCESS INIT with no decodable pvRequest
+    /// descriptor (empty body after subcmd) is rejected and not
+    /// registered — the descriptor is required (mirrors the generic
+    /// GET/PUT INIT descriptor-required policy; pvxs faults the buffer
+    /// and `bev.reset()`s).
+    #[tokio::test]
+    async fn bfr8_process_init_missing_descriptor_rejected_and_unregistered() {
+        let order = ByteOrder::Little;
+        let (registered, success) = run_process_init(1, 701, &[], order).await;
+        assert!(
+            !registered,
+            "BFR-8: a PROCESS INIT with no pvRequest descriptor must not register the IOID"
+        );
+        assert!(
+            !success,
+            "BFR-8: a PROCESS INIT with no pvRequest descriptor must reply an error status"
+        );
+    }
+
+    /// BFR-8 control: a well-formed PROCESS INIT pvRequest (the Rust
+    /// client's shape — descriptor + value) is accepted, registers the
+    /// IOID, and replies `Status::ok()`. Guards against the rejection
+    /// path over-firing on valid input.
+    #[tokio::test]
+    async fn bfr8_process_init_valid_pvrequest_registers_op() {
+        let order = ByteOrder::Little;
+        let desc = FieldDesc::Scalar(crate::pvdata::ScalarType::Int);
+        let mut req = Vec::new();
+        crate::pvdata::encode::encode_type_desc(&desc, order, &mut req);
+        crate::pvdata::encode::encode_pv_field(
+            &PvField::Scalar(crate::pvdata::ScalarValue::Int(7)),
+            &desc,
+            order,
+            &mut req,
+        );
+
+        let (registered, success) = run_process_init(1, 702, &req, order).await;
+        assert!(
+            registered,
+            "BFR-8: a valid PROCESS INIT must register the IOID"
+        );
+        assert!(
+            success,
+            "BFR-8: a valid PROCESS INIT must reply Status::ok()"
         );
     }
 

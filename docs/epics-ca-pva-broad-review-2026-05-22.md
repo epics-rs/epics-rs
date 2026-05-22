@@ -33,7 +33,7 @@ Method:
 | BFR-5 | Medium | PVA GET/PUT/RPC subcmd lifecycle | Fixed in current source |
 | BFR-6 | Medium | PVA GET_FIELD descriptor fallback | Fixed in current source |
 | BFR-7 | Medium | CA monitor single-event filter context | Fixed in current source |
-| BFR-8 | Medium | PVA PROCESS payload parsing | Open |
+| BFR-8 | Medium | PVA PROCESS payload parsing | Fixed in current source (INIT); DATA-phase strictness declined (reference parity) |
 | BFR-9 | Medium | PVA raw monitor overrun parsing | Open |
 | BFR-10 | Low | CA/base monitor drop accounting | Open |
 | BFR-11 | Medium | PVA raw monitor control-frame parsing | Open |
@@ -489,48 +489,73 @@ Regression tests added:
 
 Severity: medium.
 
-Rust evidence:
+Status: INIT defect fixed in the current source. The DATA-phase
+cursor-exhaustion proposal was evaluated and intentionally NOT applied
+(see "DATA-phase decision" below) because it would diverge from both
+pvxs and the sibling generic GET EXEC path.
 
-- `crates/epics-pva-rs/src/client_native/ops_v2.rs:2582-2588` shows the Rust
-  PROCESS INIT shape: `sid + ioid + 0x08 + pvRequest`.
-- `crates/epics-pva-rs/src/client_native/ops_v2.rs:2598-2603` shows the Rust
-  PROCESS DATA shape: `sid + ioid + 0x00` with no payload.
-- `crates/epics-pva-rs/src/server_native/tcp.rs:2701-2706` decodes the INIT
-  pvRequest with `.ok().and_then(...)`, then discards both descriptor and value
-  errors.
-- `crates/epics-pva-rs/src/server_native/tcp.rs:2707-2717` registers the
-  PROCESS op and replies `Status::ok()` even after that failed decode.
-- `crates/epics-pva-rs/src/server_native/tcp.rs:2725-2779` treats every
-  non-INIT PROCESS frame as a no-payload data phase and runs
-  `process_checked`; it never verifies that the cursor is exhausted after
-  `sid + ioid + subcmd`.
-- `crates/epics-pva-rs/src/proto/command.rs:25-26` defines PROCESS as its own
-  PVA command code, so this path is not covered by the generic GET/PUT/RPC
-  malformed INIT helper.
+Original Rust evidence (INIT defect):
+
+- `crates/epics-pva-rs/src/server_native/tcp.rs` decoded the PROCESS INIT
+  pvRequest with `decode_type_desc(..).ok().and_then(|d|
+  decode_pv_field(..).ok())`, discarding both descriptor and value errors,
+  then registered the op and replied `Status::ok()` even after that failed
+  decode. A truncated/corrupt PROCESS INIT was acknowledged and registered.
+
+epics-base / pvxs reference:
+
+- `/Users/stevek/codes/epics-modules/pvxs/src/serverget.cpp:366-374` — INIT
+  (`subcmd&0x08`) decodes the pvRequest with
+  `from_wire_type_value(M, rxRegistry, pvRequest)` and `if(!M.good())
+  bev.reset()` (connection-fatal on a malformed pvRequest).
+- `/Users/stevek/codes/epics-modules/pvxs/src/serverget.cpp:357,419-446` —
+  the EXEC/data phase reads `from_wire(M, subcmd)` and dispatches; a no-value
+  EXEC (GET / process) does NOT assert the buffer is fully consumed, so
+  trailing bytes are tolerated.
 
 Impact:
 
-A malformed PROCESS INIT can be acknowledged and registered, and a PROCESS DATA
-frame with trailing garbage can still trigger the source `process()` hook. That
-turns a malformed wire frame into a state-changing operation. The adjacent
-generic GET/PUT/MONITOR INIT path already distinguishes absent from malformed
-pvRequest bodies; PROCESS has not been routed through the same boundary.
+A malformed PROCESS INIT was acknowledged and registered with `Status::ok()`.
+The adjacent generic GET/PUT/MONITOR INIT path already distinguishes absent
+from malformed pvRequest bodies via `decode_init_pv_request_value`; PROCESS was
+the one INIT site not routed through that boundary.
 
-Expected fix shape:
+Current Rust source / Applied fix:
 
-Use the same structured pvRequest decoding policy as generic op INIT:
-`Ok(None)` only when the pvRequest value is intentionally absent, and `Err` for
-present but malformed bytes. For PROCESS DATA, require the cursor to be
-exhausted after `sid + ioid + subcmd`; any trailing bytes should be a decode
-error before `process_checked` is invoked.
+- `crates/epics-pva-rs/src/server_native/tcp.rs` `handle_process` INIT now
+  decodes the pvRequest descriptor (malformed → `send_op_error`, return WITHOUT
+  registering the IOID) and runs `decode_init_pv_request_value` (present-but-
+  malformed value → `send_op_error`, no registration; absent value tolerated
+  for Rust↔Rust interop). This mirrors the generic GET/PUT/MONITOR INIT
+  boundary. PROCESS transfers no value, so the decoded pvRequest is discarded
+  after validation. The op-error boundary is the codebase's deliberate uniform
+  choice; pvxs is stricter (`bev.reset()`), but the Rust port consistently uses
+  an op-error reply across all INIT paths.
 
-Regression tests to add:
+DATA-phase decision (proposal declined):
 
-- PROCESS INIT with a truncated pvRequest descriptor/value is rejected and does
-  not register the IOID.
-- PROCESS DATA with extra trailing bytes returns a decode error and does not
-  run the process hook.
-- The Rust client's valid PROCESS INIT/DATA sequence remains accepted.
+The original "require the cursor exhausted after `sid + ioid + subcmd` on
+PROCESS DATA; trailing bytes = decode error" was NOT implemented. The generic
+GET EXEC path (`tcp.rs` data phase, `OpKind::Get`) — the structural sibling, a
+no-value EXEC — does not check exhaustion either, and neither does pvxs
+(`serverget.cpp` `from_wire(M, subcmd)` then dispatch, no `M.empty()` assert).
+Adding the check to PROCESS alone would make it stricter than pvxs AND
+inconsistent with the sibling GET EXEC, i.e. defensive validation the reference
+does not perform. The frame's `sid + ioid + subcmd` is itself a valid process
+request; trailing bytes are simply unread and change nothing. If extra
+strictness is later desired, it should be applied uniformly to every no-value
+EXEC (GET + PROCESS) as its own finding, not special-cased here.
+
+Regression tests added:
+
+- `bfr8_process_init_truncated_value_rejected_and_unregistered` — present-but-
+  truncated pvRequest value → op-error, IOID not registered.
+- `bfr8_process_init_missing_descriptor_rejected_and_unregistered` — no
+  decodable descriptor → op-error, IOID not registered.
+- `bfr8_process_init_valid_pvrequest_registers_op` — control: the Rust client's
+  descriptor+value INIT registers the IOID and replies `Status::ok()`.
+- Revert-verified: restoring the `.ok().and_then(..)` swallow makes both
+  negative tests observe the op registered with `Status::ok()`.
 
 ### BFR-9 - PVA raw monitor re-encode fabricates a missing overrun bitset
 

@@ -770,6 +770,37 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Apply the data-phase op continuation after a GET/PUT/RPC EXEC task
+/// has been spawned.
+///
+/// pvxs `serverget.cpp:112-116` either returns the op to `Idle` (more
+/// requests allowed) or `cleanup()`s it when the data-phase `subcmd`
+/// carried the last-request bit (`0x10`, recorded as `lastRequest` at
+/// `serverget.cpp:470-471`). The Rust EXEC handlers serialize their
+/// response from a spawned task that cannot reach `ch.ops`, so the
+/// read-loop owner applies the same rule once the task is running:
+///
+/// - last request (`subcmd & 0x10`): remove the op so its IOID is freed
+///   and a later re-INIT is accepted as fresh (matching pvxs
+///   `ServerOp::cleanup`). The spawned task already owns everything it
+///   needs to finish the response, so the op is dropped *without*
+///   installing an abort guard — installing one and then dropping the
+///   `OpState` would cancel the still-running response task.
+/// - otherwise: keep the op and store the task's abort guard so a later
+///   re-EXEC or connection teardown can cancel the in-flight response.
+fn finish_exec_data_task(
+    ch: &mut ChannelState,
+    ioid: u32,
+    subcmd: u8,
+    abort: tokio::task::AbortHandle,
+) {
+    if subcmd & 0x10 != 0 {
+        ch.ops.remove(&ioid);
+    } else if let Some(op_mut) = ch.ops.get_mut(&ioid) {
+        op_mut.data_task_abort = Some(Arc::new(AbortOnDrop(abort)));
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct OpState {
@@ -3722,9 +3753,7 @@ async fn handle_op(
                 buf.extend_from_slice(&payload);
                 let _ = tx_clone.send(buf).await;
             });
-            if let Some(op_mut) = ch.ops.get_mut(&ioid) {
-                op_mut.data_task_abort = Some(Arc::new(AbortOnDrop(join.abort_handle())));
-            }
+            finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
         }
         OpKind::Put => {
             // pvxs `serverget.cpp:364` derives `isput = cmd!=CMD_GET
@@ -3814,9 +3843,7 @@ async fn handle_op(
                     buf.extend_from_slice(&payload);
                     let _ = tx_clone.send(buf).await;
                 });
-                if let Some(op_mut) = ch.ops.get_mut(&ioid) {
-                    op_mut.data_task_abort = Some(Arc::new(AbortOnDrop(join.abort_handle())));
-                }
+                finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
                 return Ok(());
             }
             // PUT EXEC (subcmd & 0x40 == 0): read bitset (which
@@ -3935,9 +3962,7 @@ async fn handle_op(
                 buf.extend_from_slice(&payload);
                 let _ = tx_clone.send(buf).await;
             });
-            if let Some(op_mut) = ch.ops.get_mut(&ioid) {
-                op_mut.data_task_abort = Some(Arc::new(AbortOnDrop(join.abort_handle())));
-            }
+            finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
         }
         OpKind::Monitor => {
             // MONITOR_START / pipeline-ack: pvxs uses subcmd 0x40 for
@@ -4926,9 +4951,7 @@ async fn handle_op(
                 buf.extend_from_slice(&payload);
                 let _ = tx_clone.send(buf).await;
             });
-            if let Some(op_mut) = ch.ops.get_mut(&ioid) {
-                op_mut.data_task_abort = Some(Arc::new(AbortOnDrop(join.abort_handle())));
-            }
+            finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
         }
         // PUT_GET / PROCESS have dedicated handlers (`handle_put_get`,
         // `handle_process`) and are never dispatched into `handle_op`.
@@ -7411,6 +7434,137 @@ mod tests {
             resp_subcmd, 0x00,
             "plain PUT EXEC reply subcmd must echo 0x00"
         );
+    }
+
+    /// BFR-5: a GET EXEC that sets the last-request bit (`subcmd & 0x10`)
+    /// must serialize its data response and then remove the op, matching
+    /// pvxs `serverget.cpp:112-116` (`cleanup()` after the reply, recorded
+    /// from `lastRequest = subcmd & 0x10` at `serverget.cpp:470-471`). The
+    /// removal must not abort the still-running response task. A plain GET
+    /// EXEC (no `0x10`) must keep the op registered.
+    #[tokio::test]
+    async fn get_exec_last_request_removes_op_after_response() {
+        use crate::pvdata::FieldDesc;
+        use crate::pvdata::{PvField, PvStructure, ScalarType, ScalarValue};
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+        use crate::server_native::tcp::ClientCredentials;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 100;
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let pv = SharedPV::new();
+        let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
+        initial
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.5))));
+        pv.open(intro.clone(), PvField::Structure(initial));
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let config = PvaServerConfig::default();
+        let cred = ClientCredentials::anonymous();
+
+        // A channel carrying one already-INIT'd GET op.
+        let make_channels = || {
+            let mut ops: HashMap<u32, OpState> = HashMap::new();
+            ops.insert(
+                ioid,
+                non_monitor_op_state(
+                    intro.clone(),
+                    OpKind::Get,
+                    BitSet::all_set(intro.total_bits()),
+                ),
+            );
+            let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+            channels.insert(
+                sid,
+                ChannelState {
+                    name: "dut".into(),
+                    cid: 0,
+                    sid,
+                    introspection: Some(intro.clone()),
+                    ops,
+                },
+            );
+            channels
+        };
+
+        let exec_frame = |subcmd: u8| {
+            let mut payload = Vec::new();
+            payload.put_u32(sid, order);
+            payload.put_u32(ioid, order);
+            payload.put_u8(subcmd);
+            synth_frame(Command::Get, order, payload)
+        };
+
+        // Last request: subcmd = 0x50 (0x40 | 0x10).
+        let mut channels = make_channels();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        handle_op(
+            &source,
+            &exec_frame(0x50),
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("GET EXEC (last request) ok");
+        // Op removed synchronously by the read-loop owner (pvxs cleanup()).
+        assert!(
+            !channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            "last-request GET EXEC must remove the op from ch.ops"
+        );
+        // The response still arrives — the task was not aborted by removal.
+        let resp = rx.recv().await.expect("GET data response emitted");
+        assert_eq!(
+            resp[PvaHeader::SIZE + 4],
+            0x50,
+            "data response echoes the last-request subcmd"
+        );
+        assert!(
+            resp.len() > PvaHeader::SIZE + 5,
+            "data response carries a value, not a status-only frame"
+        );
+
+        // Not the last request: subcmd = 0x00 keeps the op registered.
+        let mut channels = make_channels();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        handle_op(
+            &source,
+            &exec_frame(0x00),
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("GET EXEC (not last request) ok");
+        assert!(
+            channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            "non-last-request GET EXEC must keep the op registered"
+        );
+        let _ = rx.recv().await.expect("GET data response emitted");
     }
 
     /// Build a flat 3-field NTScalar-like structure descriptor with

@@ -386,12 +386,16 @@ pub fn decode_op_response_cached(
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
-    // FINISH/DESTROY (subcmd & 0x10) — server signals end-of-stream
-    // (typically MONITOR after the source closes its broadcast channel).
-    // pvxs servermon.cpp:148 sets `subcmd = 0x10` and emits only a Status
-    // after ioid/subcmd. Surface this as `OpResponse::Status` so the
-    // caller can tear down cleanly.
-    if subcmd & 0x10 != 0 {
+    // MONITOR FINISH (subcmd & 0x10) — the server signals end-of-stream
+    // and emits only a Status after ioid/subcmd. pvxs `servermon.cpp:148`
+    // sets `subcmd = 0x10` and `cleanup()`s the monitor. This status-only
+    // shape is MONITOR-specific: for GET/PUT/RPC the same bit is the
+    // "last request" marker that pvxs echoes on an otherwise normal data
+    // response (`serverget.cpp:83,112-116`) and the client decodes by
+    // `cmd`/`init`/`get` bits, not as status-only (`clientget.cpp:405-452`).
+    // Classifying every `0x10` op response as status-only dropped the value
+    // body of a GET/PUT/RPC last-request data response.
+    if cmd == Command::Monitor && subcmd & 0x10 != 0 {
         let status =
             Status::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
         return Ok(OpResponse::Status(OpStatusResponse {
@@ -988,6 +992,94 @@ mod tests {
                 assert!(d.overrun.is_empty(), "absent overrun decodes empty");
             }
             other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    /// BFR-5: a GET data response carrying the last-request bit
+    /// (`subcmd & 0x10`) must still decode its value body. pvxs echoes the
+    /// request subcmd on an otherwise normal data reply
+    /// (`serverget.cpp:83,112-116`) and the client decodes by
+    /// `cmd`/`init`/`get` bits (`clientget.cpp:405-452`). The `0x10`
+    /// status-only shape is reserved for MONITOR FINISH; classifying every
+    /// `0x10` op response as status-only dropped the GET/PUT/RPC value.
+    #[test]
+    fn get_data_response_with_last_request_bit_decodes_value() {
+        use crate::proto::WriteExt;
+        use crate::pvdata::{PvField, PvStructure, ScalarType, ScalarValue};
+
+        let order = ByteOrder::Little;
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+        s.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(3.5))));
+        let value = PvField::Structure(s);
+
+        // GET data response with the last-request bit: subcmd = 0x50
+        // (0x40 | 0x10).
+        let mut payload = Vec::new();
+        payload.put_u32(7, order); // ioid
+        payload.put_u8(0x50); // last-request data response
+        Status::ok().write_into(order, &mut payload);
+        let changed = crate::pvdata::encode::canonical_changed_bitset(
+            &intro,
+            &BitSet::all_set(intro.total_bits()),
+        );
+        changed.write_into(order, &mut payload);
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &value,
+            &intro,
+            &changed,
+            0,
+            order,
+            &mut payload,
+        );
+
+        let header = PvaHeader::application(true, order, Command::Get.code(), payload.len() as u32);
+        let frame = Frame { header, payload };
+
+        match decode_op_response(&frame, Some(&intro)).unwrap() {
+            OpResponse::Data(d) => {
+                assert_eq!(d.ioid, 7);
+                assert_eq!(d.subcmd, 0x50, "last-request bit echoed on data response");
+                let PvField::Structure(st) = &d.value else {
+                    panic!("expected structure value, got {:?}", d.value);
+                };
+                let got = st.fields.iter().find(|(n, _)| n == "value").map(|(_, v)| v);
+                assert!(
+                    matches!(got, Some(PvField::Scalar(ScalarValue::Double(x))) if (*x - 3.5).abs() < 1e-9),
+                    "value body must decode to 3.5, got {got:?}"
+                );
+            }
+            other => panic!("expected Data (value preserved), got {other:?}"),
+        }
+    }
+
+    /// BFR-5 companion: MONITOR FINISH (`subcmd & 0x10`) remains a
+    /// status-only end-of-stream event. pvxs `servermon.cpp:148` emits
+    /// only `ioid + subcmd + status`. This MONITOR-specific shape must not
+    /// regress when GET/PUT/RPC stop treating `0x10` as status-only.
+    #[test]
+    fn monitor_finish_remains_status_only() {
+        use crate::proto::WriteExt;
+
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(7, order); // ioid
+        payload.put_u8(0x10); // FINISH
+        Status::ok().write_into(order, &mut payload);
+        let header =
+            PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
+        let frame = Frame { header, payload };
+
+        match decode_op_response(&frame, None).unwrap() {
+            OpResponse::Status(s) => {
+                assert_eq!(s.ioid, 7);
+                assert_eq!(s.subcmd, 0x10);
+            }
+            other => panic!("expected Status (MONITOR FINISH), got {other:?}"),
         }
     }
 

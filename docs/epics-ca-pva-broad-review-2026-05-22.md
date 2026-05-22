@@ -30,7 +30,7 @@ Method:
 | BFR-2 | Medium | PVA monitor INIT pipeline parsing | Fixed in current source |
 | BFR-3 | Low | PVA monitor ACK credit accounting | Fixed in current source |
 | BFR-4 | Medium | PVA RPC DATA payload parsing | Fixed in current source |
-| BFR-5 | Medium | PVA GET/PUT/RPC subcmd lifecycle | Open |
+| BFR-5 | Medium | PVA GET/PUT/RPC subcmd lifecycle | Fixed in current source |
 | BFR-6 | Medium | PVA GET_FIELD descriptor fallback | Open |
 | BFR-7 | Medium | CA monitor single-event filter context | Open |
 | BFR-8 | Medium | PVA PROCESS payload parsing | Open |
@@ -40,6 +40,7 @@ Method:
 | BFR-12 | Medium | PVA MONITOR FINISH op cleanup | Open |
 | BFR-13 | Medium | PVA data-phase error response shape | Open |
 | BFR-14 | Medium | PVA raw monitor re-encode error handling | Open |
+| BFR-15 | Medium | PVA GET/PUT/RPC in-flight EXEC state | Open |
 
 ## Reviewed Anchors
 
@@ -60,6 +61,7 @@ Initial anchors:
 - `rg -n "build_monitor_finish|ch\\.ops\\.remove\\(&ioid\\)|ServerOp::cleanup|subcmd = 0x10" crates/epics-pva-rs/src/server_native/tcp.rs /Users/stevek/codes/pvxs/src/servermon.cpp /Users/stevek/codes/pvxs/src/serverconn.cpp`
 - `rg -n "send_op_error\\(|payload.put_u8\\(0x08\\)|doReply|to_wire\\(R, subcmd\\)" crates/epics-pva-rs/src/server_native/tcp.rs /Users/stevek/codes/pvxs/src/serverget.cpp`
 - `rg -n "reencode_raw_monitor|raw monitor reencode failed|M.good|clientmon.cpp" crates/epics-pva-rs/src/server_native/tcp.rs /Users/stevek/codes/pvxs/src/clientmon.cpp`
+- `rg -n "data_task_abort = None|data_task_abort = Some|double-EXEC|state==ServerOp::Idle|Get exec in incorrect state" crates/epics-pva-rs/src/server_native/tcp.rs /Users/stevek/codes/pvxs/src/serverget.cpp`
 
 ## Findings
 
@@ -267,17 +269,31 @@ Regression tests added (`tcp.rs:7040-7102`, per invariant boundary):
 
 Severity: medium.
 
-Rust evidence:
+Status: fixed in the current source.
 
-- `crates/epics-pva-rs/src/server_native/tcp.rs:3582-3668` handles GET data
-  EXEC, echoes the incoming `subcmd` in the response, and leaves the op in
-  `ch.ops`; there is no data-phase `subcmd & 0x10` cleanup for GET/PUT/RPC.
-- `rg "ch\\.ops\\.remove\\(&ioid\\)" crates/epics-pva-rs/src/server_native/tcp.rs`
-  shows removals only in PUT_GET/PROCESS subcmd-destroy handlers and the
-  separate `DESTROY_REQUEST` path, not the generic GET/PUT/RPC EXEC path.
-- `crates/epics-pva-rs/src/client_native/decode.rs:389-397` treats any op
-  response whose `subcmd & 0x10 != 0` as a status-only FINISH/DESTROY frame
-  before command-specific GET/PUT/RPC decoding.
+Original Rust evidence:
+
+- Earlier source handled GET/PUT/RPC data EXEC, echoed the incoming `subcmd`
+  in the response, and left the op in `ch.ops`; there was no data-phase
+  `subcmd & 0x10` cleanup for GET/PUT/RPC (removals existed only in the
+  PUT_GET/PROCESS subcmd-destroy handlers and the separate `DESTROY_REQUEST`
+  path).
+- The client decoder treated any op response whose `subcmd & 0x10 != 0` as a
+  status-only FINISH/DESTROY frame before command-specific GET/PUT/RPC
+  decoding, dropping the value body of a last-request data response.
+
+Current Rust evidence:
+
+- `crates/epics-pva-rs/src/server_native/tcp.rs:773-808` adds
+  `finish_exec_data_task`, the read-loop owner's data-phase op continuation:
+  on `subcmd & 0x10` it removes the op (pvxs `cleanup()`), otherwise it keeps
+  the op and installs the in-flight task's abort guard.
+- `crates/epics-pva-rs/src/server_native/tcp.rs:3756`, `:3845`, `:3963`,
+  and `:4953` route the GET / PUT-getback / plain-PUT / RPC EXEC spawn sites
+  through that single finalizer.
+- `crates/epics-pva-rs/src/client_native/decode.rs:389-403` now gates the
+  status-only `0x10` branch on `cmd == Command::Monitor`, so GET/PUT/RPC data
+  responses decode their value even with the last-request bit set.
 
 pvxs reference:
 
@@ -298,20 +314,32 @@ bit set will decode only `Status` and drop the value body. Rust's own client
 currently sends a separate `DESTROY_REQUEST`, so this hides in Rust-to-Rust
 paths while remaining an interop and lifecycle gap.
 
-Expected fix shape:
+Applied fix shape:
 
-Keep MONITOR FINISH handling separate from GET/PUT/RPC last-request handling.
-For server GET/PUT/RPC, execute normally, emit the normal data/status response,
-then remove the op when `subcmd & 0x10` was set. For the client decoder, decode
-GET/PUT/RPC data according to command/state even when the bit is set; reserve
-status-only `0x10` for MONITOR FINISH or actual destroy-status shapes.
+MONITOR FINISH handling stays separate from GET/PUT/RPC last-request handling.
+Server GET/PUT/RPC EXEC executes normally and emits its data/status response
+from the spawned task; the read-loop owner then applies `finish_exec_data_task`,
+which removes the op on `subcmd & 0x10` (matching pvxs `cleanup()`) and
+otherwise installs the abort guard. The op is dropped *without* installing the
+abort guard on last-request, so removal does not cancel the still-running
+response task. The client decoder reserves the status-only `0x10` shape for
+MONITOR (`cmd == Command::Monitor`); GET/PUT/RPC decode their data by
+`cmd`/`init`/`get` bits even when the last-request bit is set.
 
-Regression tests to add:
+PUT_GET / PROCESS were classified as distinct: their handlers already treat
+`subcmd & QosFlags::DESTROY` (`0x10`) as an upfront destroy that removes the op
+and returns before the EXEC spawn, so they are out of this finding's scope.
 
-- GET EXEC with `subcmd = 0x50` returns a value and removes the server op.
-- Client decode of a GET data response with `subcmd = 0x50` yields
-  `OpResponse::Data`.
-- MONITOR FINISH with `subcmd = 0x10` still yields a status/end event.
+Regression tests added:
+
+- `tcp.rs` `get_exec_last_request_removes_op_after_response`: GET EXEC with
+  `subcmd = 0x50` removes the op from `ch.ops` and the value response still
+  arrives; a plain `subcmd = 0x00` GET EXEC keeps the op registered.
+- `decode.rs` `get_data_response_with_last_request_bit_decodes_value`: a GET
+  data response with `subcmd = 0x50` decodes as `OpResponse::Data` with the
+  value body preserved.
+- `decode.rs` `monitor_finish_remains_status_only`: MONITOR FINISH with
+  `subcmd = 0x10` still yields `OpResponse::Status`.
 
 ### BFR-6 - PVA GET_FIELD fabricates a successful `Variant` descriptor
 
@@ -780,3 +808,62 @@ Regression tests to add:
   with an error instead of continuing.
 - Same-endian and cross-endian malformed raw handling have one documented
   policy, not byte-order-dependent behavior.
+
+### BFR-15 - GET/PUT/RPC double EXEC aborts the in-flight operation
+
+Severity: medium.
+
+Rust evidence:
+
+- `crates/epics-pva-rs/src/server_native/tcp.rs:884-892` stores an
+  `AbortOnDrop` for spawned GET/PUT/RPC/PUT_GET/PROCESS data-phase tasks.
+- `crates/epics-pva-rs/src/server_native/tcp.rs:3658-3662` explicitly drops
+  the previous GET data task on a double EXEC before spawning a new GET task.
+- `crates/epics-pva-rs/src/server_native/tcp.rs:3757-3759` and `:3856-3859`
+  do the same for PUT readback and PUT exec.
+- `crates/epics-pva-rs/src/server_native/tcp.rs:4928-4931` overwrites the RPC
+  task abort guard after spawning the new task; assigning the new guard drops
+  any old guard and aborts the previous RPC task.
+- There is no GET/PUT/RPC `Executing` state in `OpState`, so the second EXEC
+  is not rejected while the first source future is still running.
+
+pvxs reference:
+
+- `/Users/stevek/codes/pvxs/src/serverget.cpp:467-476` executes a GET/PUT/RPC
+  request only when the op state is `Idle`, then sets the op state to
+  `Executing`.
+- `/Users/stevek/codes/pvxs/src/serverget.cpp:511-514` logs an incorrect-state
+  EXEC and does not call the operation handler again while the first EXEC is
+  still running.
+- `/Users/stevek/codes/pvxs/src/serverget.cpp:86-116` moves the op back to
+  `Idle` only when the original callback replies, or cleans it up when
+  `lastRequest` was set.
+
+Impact:
+
+A peer can cancel a slow GET/PUT/RPC source future by sending another EXEC for
+the same IOID before the first task replies. For PUT/RPC this is not just a
+duplicate response issue: the first operation may have already entered
+source-side code and then be cancelled at an await point while the second
+operation runs. That diverges from pvxs' single in-flight operation invariant
+and can expose cancellation boundaries inside source implementations as a wire
+visible behavior.
+
+Expected fix shape:
+
+Model non-monitor op state explicitly: `Idle`, `Executing(task)`, and terminal
+or destroying states. The data-phase owner should transition `Idle -> Executing`
+exactly once per accepted EXEC, reject or ignore a second EXEC while executing
+according to the pvxs policy, and transition back to `Idle` only when the
+original task sends its response. DESTROY_REQUEST should remain the owner that
+cancels an executing task.
+
+Regression tests to add:
+
+- A second GET EXEC while the first GET source future is pending does not abort
+  the first future and does not start a second source call.
+- A second PUT EXEC while the first PUT future is pending does not abort the
+  first write.
+- DESTROY_REQUEST still aborts the in-flight task.
+- A completed GET/PUT/RPC task returns the op to Idle so a later explicit
+  re-EXEC works when the protocol permits it.

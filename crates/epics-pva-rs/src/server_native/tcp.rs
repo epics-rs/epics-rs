@@ -593,21 +593,31 @@ fn put_autoexec_from_request(req: Option<&PvField>) -> Option<bool> {
 
 /// Consume the optional u32 `nack` (initial pipeline window) that a
 /// pvxs client appends to a MONITOR INIT body when it sets the
-/// pipeline bit (pvxs `servermon.cpp:493` / `clientmon.cpp:341-342`).
-/// Returns `Some(nack)` when the bit is set AND the four bytes are
-/// present; `None` otherwise (kind mismatch, bit clear, or short
-/// payload — the last case mirrors pvxs's "pipeline monitor w/o
-/// initial nack incompatible" warn-but-accept policy).
+/// pipeline bit (pvxs `servermon.cpp:494-495` / `clientmon.cpp:341-342`).
+///
+/// - kind mismatch or pipeline bit clear → `Ok(None)` (no nack to read).
+/// - bit set AND four bytes present → `Ok(Some(nack))`.
+/// - bit set but the four bytes are truncated → `Err` (FATAL). pvxs
+///   reads the nack unconditionally once the bit is set and resets the
+///   connection on `!M.good()` (`servermon.cpp:494-503`), so a truncated
+///   nack is a framing violation, not a legacy omission. (The "pipeline
+///   monitor w/o initial nack incompatible" warn-but-accept in pvxs is
+///   for a PRESENT `nack == 0`, not a missing one —
+///   `servermon.cpp:546-552`.)
 fn parse_monitor_init_nack(
     kind: OpKind,
     subcmd: u8,
     cur: &mut std::io::Cursor<&[u8]>,
     order: ByteOrder,
-) -> Option<u32> {
+) -> Result<Option<u32>, PvaError> {
     if kind != OpKind::Monitor || (subcmd & 0x80) == 0 {
-        return None;
+        return Ok(None);
     }
-    cur.get_u32(order).ok()
+    cur.get_u32(order).map(Some).map_err(|e| {
+        PvaError::Decode(format!(
+            "malformed MONITOR INIT: pipeline bit set but initial nack u32 truncated: {e}"
+        ))
+    })
 }
 
 /// Inspect a decoded pvRequest for `record._options.pipeline` and
@@ -3385,17 +3395,18 @@ async fn handle_op(
             _ => None,
         }
         .filter(|o| o.enabled);
-        // pvxs `servermon.cpp:493` — when the client sets the pipeline
-        // bit on MONITOR INIT (`subcmd & 0x80`) it appends a u32 `nack`
-        // (initial window credit) after the pvRequest. Read and consume
-        // those bytes so any data following INIT in the same segment
-        // decodes from the correct offset, and prefer the wire value
-        // over the pvRequest `queueSize` so the negotiated initial
-        // window matches what the client requested. We tolerate a
-        // truncated nack (legacy clients sometimes omit it even with
-        // the bit set — pvxs warns "pipeline monitor w/o initial nack
-        // incompatible" but accepts the operation).
-        let pipeline_initial_nack = parse_monitor_init_nack(kind, subcmd, &mut cur, order);
+        // pvxs `servermon.cpp:494-503` — when the client sets the
+        // pipeline bit on MONITOR INIT (`subcmd & 0x80`) it appends a u32
+        // `nack` (initial window credit) after the pvRequest. Read and
+        // consume those bytes so any data following INIT in the same
+        // segment decodes from the correct offset, and prefer the wire
+        // value over the pvRequest `queueSize` so the negotiated initial
+        // window matches what the client requested. A truncated nack with
+        // the bit set is FATAL: pvxs reads it unconditionally and resets
+        // the connection on `!M.good()`, so propagating the decode error
+        // here tears down the connection (matches `bev.reset()`). It is a
+        // framing violation, not a legacy omission.
+        let pipeline_initial_nack = parse_monitor_init_nack(kind, subcmd, &mut cur, order)?;
         let (monitor_window, monitor_window_notify) = if kind == OpKind::Monitor
             && let Some(opt) = pipeline_opt.as_ref()
         {
@@ -6844,43 +6855,50 @@ mod tests {
     /// cursor see the correct offset, AND surface the parsed value
     /// to override the pvRequest queueSize-based default.
     #[test]
-    fn parse_monitor_init_nack_consumes_window_byte_when_pipeline_bit_set() {
+    fn parse_monitor_init_nack_consumes_window_and_faults_on_truncation() {
         let order = ByteOrder::Little;
 
-        // Bit clear → no-op even on Monitor.
+        // Bit clear → Ok(None) even on Monitor; cursor untouched.
         let bytes = [0u8; 8];
         let mut cur = std::io::Cursor::new(bytes.as_slice());
         assert_eq!(
-            parse_monitor_init_nack(OpKind::Monitor, 0x08, &mut cur, order),
+            parse_monitor_init_nack(OpKind::Monitor, 0x08, &mut cur, order).unwrap(),
             None
         );
         assert_eq!(cur.position(), 0, "cursor must not advance when bit clear");
 
-        // Bit set, kind != Monitor → no-op (matches pvxs which only
+        // Bit set, kind != Monitor → Ok(None) (matches pvxs which only
         // honours the pipeline shape on the MONITOR command code).
         let mut cur = std::io::Cursor::new(bytes.as_slice());
         assert_eq!(
-            parse_monitor_init_nack(OpKind::Get, 0x88, &mut cur, order),
+            parse_monitor_init_nack(OpKind::Get, 0x88, &mut cur, order).unwrap(),
             None
         );
         assert_eq!(cur.position(), 0);
 
-        // Bit set, four bytes available → return decoded value.
+        // Bit set, four bytes available → Ok(Some(value)), advance 4.
         let mut buf = Vec::new();
         buf.put_u32(0x1234_5678, order);
         buf.extend_from_slice(b"trailing");
         let mut cur = std::io::Cursor::new(buf.as_slice());
-        let parsed = parse_monitor_init_nack(OpKind::Monitor, 0x88, &mut cur, order);
-        assert_eq!(parsed, Some(0x1234_5678));
+        assert_eq!(
+            parse_monitor_init_nack(OpKind::Monitor, 0x88, &mut cur, order).unwrap(),
+            Some(0x1234_5678)
+        );
         assert_eq!(cur.position(), 4, "must advance exactly four bytes");
 
-        // Bit set, fewer than four bytes → tolerate (pvxs warns but
-        // accepts; we surface `None` so the caller falls back to the
-        // pvRequest queueSize-based default).
+        // Bit set, fewer than four bytes → FATAL decode error. pvxs reads
+        // the nack unconditionally once the bit is set and resets the
+        // connection on `!M.good()` (servermon.cpp:494-503); there is no
+        // silent fallback to the pvRequest queueSize default.
         let buf = vec![0x11, 0x22];
         let mut cur = std::io::Cursor::new(buf.as_slice());
-        let parsed = parse_monitor_init_nack(OpKind::Monitor, 0x88, &mut cur, order);
-        assert_eq!(parsed, None);
+        let err = parse_monitor_init_nack(OpKind::Monitor, 0x88, &mut cur, order)
+            .expect_err("truncated nack with pipeline bit set must be fatal");
+        assert!(
+            matches!(err, PvaError::Decode(_)),
+            "expected a Decode error, got {err:?}"
+        );
     }
 
     /// pvxs `serverchan.cpp:382-386`: when the SID in DESTROY_CHANNEL

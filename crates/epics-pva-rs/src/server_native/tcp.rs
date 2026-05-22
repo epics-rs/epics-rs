@@ -956,6 +956,28 @@ fn apply_exec_finish(channels: &mut HashMap<u32, ChannelState>, fin: ExecFinishe
     }
 }
 
+/// PVXS-SR-21: await a user-supplied source handler so that a panic inside it
+/// becomes a recoverable `Err` instead of unwinding the spawned exec task.
+///
+/// Each data-phase exec task builds and sends its single client reply *after*
+/// awaiting the handler (GET/PUT/PUT_GET/PROCESS/RPC). An uncaught panic would
+/// skip that reply: [`ExecFinishGuard`] still returns the op to `Idle`, but the
+/// client receives no response and waits out its full operation timeout. By
+/// mapping the panic to `Err`, the caller routes it into the same
+/// `Status::error` reply path a returned `Err` already uses, so every exec exit
+/// emits exactly one reply. The abort/cancel path (DESTROY / channel teardown)
+/// drops the future before this returns and so still sends nothing, which is
+/// the correct behavior for a destroyed op. Only the untrusted user handler is
+/// wrapped — a panic in internal code (access gate, encode) still propagates so
+/// it surfaces as a bug rather than a silenced client error.
+async fn catch_handler_panic<T>(fut: impl std::future::Future<Output = T>) -> Result<T, String> {
+    use futures_util::future::FutureExt;
+    std::panic::AssertUnwindSafe(fut)
+        .catch_unwind()
+        .await
+        .map_err(|_| "source handler panicked".to_string())
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct OpState {
@@ -2925,8 +2947,17 @@ async fn handle_put_get(
                     &ctx.authority,
                 )
                 .await;
-            src.put_delta_checked(checked, intro.clone(), changed, put_delta, ctx.clone())
-                .await
+            // PVXS-SR-21: a panic in the user PUT handler becomes an error
+            // reply instead of skipping the reply below.
+            catch_handler_panic(src.put_delta_checked(
+                checked,
+                intro.clone(),
+                changed,
+                put_delta,
+                ctx.clone(),
+            ))
+            .await
+            .and_then(|r| r)
         };
         if let Err(msg) = put_result {
             Status::error(msg).write_into(order, &mut payload);
@@ -2951,8 +2982,10 @@ async fn handle_put_get(
                 &ctx.authority,
             )
             .await;
-        match src.get_value_checked(read_checked, ctx).await {
-            Some(v) => {
+        // PVXS-SR-21: a panic in the user GET handler becomes an error reply
+        // instead of skipping the reply below.
+        match catch_handler_panic(src.get_value_checked(read_checked, ctx)).await {
+            Ok(Some(v)) => {
                 Status::ok().write_into(order, &mut payload);
                 let wire_changed = crate::pvdata::encode::canonical_changed_bitset(&intro, &mask);
                 wire_changed.write_into(order, &mut payload);
@@ -2965,11 +2998,12 @@ async fn handle_put_get(
                     &mut payload,
                 );
             }
-            None => {
+            Ok(None) => {
                 Status::ok().write_into(order, &mut payload);
                 let empty = BitSet::with_capacity(intro.total_bits());
                 empty.write_into(order, &mut payload);
             }
+            Err(msg) => Status::error(msg).write_into(order, &mut payload),
         }
         let h = PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
         let mut buf = Vec::new();
@@ -3204,7 +3238,11 @@ async fn handle_process(
                 &ctx.authority,
             )
             .await;
-        let result = src.process_checked(checked, ctx).await;
+        // PVXS-SR-21: a panic in the user PROCESS handler becomes an error
+        // reply instead of skipping the reply below.
+        let result = catch_handler_panic(src.process_checked(checked, ctx))
+            .await
+            .and_then(|r| r);
 
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
@@ -4086,9 +4124,11 @@ async fn handle_op(
                         &ctx.authority,
                     )
                     .await;
-                let value = match src.get_value_checked(checked, ctx).await {
-                    Some(v) => v,
-                    None => {
+                // PVXS-SR-21: a panic in the user GET handler becomes a
+                // data-phase error reply instead of skipping the reply below.
+                let value = match catch_handler_panic(src.get_value_checked(checked, ctx)).await {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
                         let _ = send_op_error(
                             &tx_clone,
                             OpKind::Get,
@@ -4098,6 +4138,11 @@ async fn handle_op(
                             order,
                         )
                         .await;
+                        return;
+                    }
+                    Err(msg) => {
+                        let _ =
+                            send_op_error(&tx_clone, OpKind::Get, ioid, subcmd, &msg, order).await;
                         return;
                     }
                 };
@@ -4202,9 +4247,13 @@ async fn handle_op(
                             &ctx.authority,
                         )
                         .await;
-                    let value = match src.get_value_checked(checked, ctx).await {
-                        Some(v) => v,
-                        None => {
+                    // PVXS-SR-21: a panic in the user GET (PUT readback)
+                    // handler becomes a data-phase error reply instead of
+                    // skipping the reply below.
+                    let value = match catch_handler_panic(src.get_value_checked(checked, ctx)).await
+                    {
+                        Ok(Some(v)) => v,
+                        Ok(None) => {
                             let _ = send_op_error(
                                 &tx_clone,
                                 OpKind::Put,
@@ -4214,6 +4263,12 @@ async fn handle_op(
                                 order,
                             )
                             .await;
+                            return;
+                        }
+                        Err(msg) => {
+                            let _ =
+                                send_op_error(&tx_clone, OpKind::Put, ioid, subcmd, &msg, order)
+                                    .await;
                             return;
                         }
                     };
@@ -4318,14 +4373,17 @@ async fn handle_op(
                             &ctx.authority,
                         )
                         .await;
-                    src.put_delta_checked(
+                    // PVXS-SR-21: a panic in the user PUT handler becomes an
+                    // error reply instead of skipping the reply below.
+                    catch_handler_panic(src.put_delta_checked(
                         checked,
                         intro_t.clone(),
                         changed.clone(),
                         delta,
                         ctx.clone(),
-                    )
+                    ))
                     .await
+                    .and_then(|r| r)
                 };
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
@@ -4348,18 +4406,24 @@ async fn handle_op(
                                     &ctx.authority,
                                 )
                                 .await;
-                            match src.get_value_checked(read_checked, ctx).await {
-                                Some(v) => {
+                            // PVXS-SR-21: a panic in the user GET (PUT_GET
+                            // readback) handler becomes an error reply instead
+                            // of skipping the reply below.
+                            match catch_handler_panic(src.get_value_checked(read_checked, ctx))
+                                .await
+                            {
+                                Ok(Some(v)) => {
                                     Status::ok().write_into(order, &mut payload);
                                     let bits = BitSet::all_set(intro_t.total_bits());
                                     bits.write_into(order, &mut payload);
                                     encode_pv_field(&v, &intro_t, order, &mut payload);
                                 }
-                                None => {
+                                Ok(None) => {
                                     Status::ok().write_into(order, &mut payload);
                                     let empty = BitSet::with_capacity(intro_t.total_bits());
                                     empty.write_into(order, &mut payload);
                                 }
+                                Err(msg) => Status::error(msg).write_into(order, &mut payload),
                             }
                         } else {
                             Status::ok().write_into(order, &mut payload);
@@ -5372,9 +5436,16 @@ async fn handle_op(
                         &rpc_ctx_val.authority,
                     )
                     .await;
-                let result = src
-                    .rpc_checked(rpc_checked, req_desc, req_value, rpc_ctx_val)
-                    .await;
+                // PVXS-SR-21: a panic in the user RPC handler becomes an error
+                // reply instead of skipping the reply below.
+                let result = catch_handler_panic(src.rpc_checked(
+                    rpc_checked,
+                    req_desc,
+                    req_value,
+                    rpc_ctx_val,
+                ))
+                .await
+                .and_then(|r| r);
 
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);

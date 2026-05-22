@@ -277,3 +277,77 @@ async fn bfr13_client_get_surfaces_data_phase_error() {
         "client must NOT mis-report the data-phase error as an unexpected INIT response, got: {msg}"
     );
 }
+
+/// PVXS-SR-21: a source handler that PANICS (not returns Err) must still
+/// produce a client reply. Before the fix the panic unwound the spawned exec
+/// task and skipped the reply-build; the op returned to Idle but the client
+/// received nothing and waited out its full operation timeout. The fix wraps
+/// the user handler so a panic is converted into the same error reply a
+/// returned Err already produces. These tests assert the client gets an Err
+/// quickly (the `tokio::time::timeout` wrapper would fail on the pre-fix hang).
+///
+/// The panic is deliberate and is caught inside the server's exec task; the
+/// test process does not abort. A panic backtrace on stderr during this test
+/// is expected.
+struct PanicSource;
+impl ChannelSource for PanicSource {
+    async fn list_pvs(&self) -> Vec<String> {
+        vec!["boom".into()]
+    }
+    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+        let n = n.to_string();
+        async move { n == "boom" }
+    }
+    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        Some(FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        })
+    }
+    async fn get_value(&self, _: &str) -> Option<PvField> {
+        panic!("get_value handler panicked on purpose (SR-21 regression)");
+    }
+    async fn put_value(&self, _: &str, _: PvField) -> Result<(), String> {
+        panic!("put_value handler panicked on purpose (SR-21 regression)");
+    }
+    async fn is_writable(&self, _: &str) -> bool {
+        true
+    }
+    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        None
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sr21_panicking_get_handler_replies_error_not_hang() {
+    let server =
+        PvaServer::isolated(Arc::new(PanicSource)).expect("isolated test server must start");
+    let client = server.client_config();
+
+    let res = tokio::time::timeout(Duration::from_secs(5), client.pvget("boom"))
+        .await
+        .expect("pvget must not hang when the GET handler panics");
+    let err = res.expect_err("a panicking GET handler must surface as a GET error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("panicked"),
+        "client must surface the converted panic as the server's data-phase status, got: {msg}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sr21_panicking_put_handler_replies_error_not_hang() {
+    let server =
+        PvaServer::isolated(Arc::new(PanicSource)).expect("isolated test server must start");
+    let client = server.client_config();
+
+    let res = tokio::time::timeout(Duration::from_secs(5), client.pvput("boom", "1.0"))
+        .await
+        .expect("pvput must not hang when the PUT handler panics");
+    let err = res.expect_err("a panicking PUT handler must surface as a PUT error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("panicked"),
+        "client must surface the converted panic as the server's PUT status, got: {msg}"
+    );
+}

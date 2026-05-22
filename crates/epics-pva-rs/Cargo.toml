@@ -27,6 +27,10 @@ bytes = "1"
 parking_lot = "0.12"
 dashmap = "6"
 if-addrs = "0.13"
+# `FutureExt::catch_unwind` — converts a panic in a user-supplied source
+# handler into an error reply rather than letting it skip the exec
+# reply (PVXS-SR-21). Already a workspace dep (epics-ca-rs, ad-core-rs).
+futures-util = "0.3"
 
 # TLS for `pvas://` (opt-in via `EPICS_PVAS_TLS_KEYCHAIN`).
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }

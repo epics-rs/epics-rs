@@ -1111,6 +1111,7 @@ dependencies = [
  "der 0.8.0",
  "epics-base-rs",
  "epics-macros-rs",
+ "futures-util",
  "hmac 0.13.0",
  "hostname",
  "if-addrs",

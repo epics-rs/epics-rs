@@ -32,7 +32,7 @@ Method:
 | BFR-4 | Medium | PVA RPC DATA payload parsing | Fixed in current source |
 | BFR-5 | Medium | PVA GET/PUT/RPC subcmd lifecycle | Fixed in current source |
 | BFR-6 | Medium | PVA GET_FIELD descriptor fallback | Fixed in current source |
-| BFR-7 | Medium | CA monitor single-event filter context | Open |
+| BFR-7 | Medium | CA monitor single-event filter context | Fixed in current source |
 | BFR-8 | Medium | PVA PROCESS payload parsing | Open |
 | BFR-9 | Medium | PVA raw monitor overrun parsing | Open |
 | BFR-10 | Low | CA/base monitor drop accounting | Open |
@@ -410,75 +410,80 @@ Regression tests added (`tcp.rs`):
 
 Severity: medium.
 
-Rust evidence:
+Status: fixed in the current source.
 
-- `crates/epics-ca-rs/src/server/tcp.rs:3312-3326` builds the first
-  `ProcessVariable` monitor snapshot with a fresh filter chain and calls
-  `apply_to_read_value`.
-- `crates/epics-ca-rs/src/server/tcp.rs:3441-3454` does the same for
-  record-field monitor snapshots.
-- `crates/epics-base-rs/src/server/database/filters/mod.rs:186-204`
-  implements `apply_to_read_value` by constructing a read-context event.
-- `crates/epics-base-rs/src/server/database/filters/decimate.rs:58-66` and
-  `crates/epics-base-rs/src/server/database/filters/sync.rs:180-188` bypass
-  their state machines when `read_context` is set.
-- The CA snapshot callers use `if let Some(v) = ... { snap.value = v; }`, so a
-  filter drop leaves the original unfiltered value in the initial event.
-- `crates/epics-ca-rs/src/server/tcp.rs:4247-4294` sends access-revoked
-  `no_read_access_event` frames directly, outside the filter chain.
-- `crates/epics-ca-rs/src/server/tcp.rs:4299-4331` sends access-restored
-  current-value snapshots directly with `send_monitor_snapshot`, also outside
-  the filter chain.
+Original Rust evidence:
+
+- `crates/epics-ca-rs/src/server/tcp.rs` built the first `ProcessVariable` and
+  record-field monitor snapshots with a fresh filter chain and called
+  `apply_to_read_value` (read context: `dec`/`sync` bypass).
+- The CA snapshot callers used `if let Some(v) = ... { snap.value = v; }`, so a
+  filter drop left the original unfiltered value in the initial event.
+- Access-revoke sent `no_read_access_event` frames directly, and access-restore
+  sent current-value snapshots directly with `send_monitor_snapshot` — both
+  outside the filter chain.
+- The initial DENIED branches (SimplePv and record-field) sent the
+  `ECA_NORDACCESS` frame unconditionally, never consulting the chain.
 
 epics-base reference:
 
-- `/Users/stevek/codes/epics-base/modules/database/src/ioc/rsrv/camessage.c:1812-1813`
-  registers CA monitor subscriptions with `db_add_event(..., read_reply, ...)`.
 - `/Users/stevek/codes/epics-base/modules/database/src/ioc/rsrv/camessage.c:1851-1853`
-  posts the initial event with `db_post_single_event`.
+  posts the initial event with `db_post_single_event` — called
+  UNCONDITIONALLY at monitor creation, BEFORE the access check at 1858, so the
+  initial DENIED `ECA_NORDACCESS` frame is gated by the chain too.
 - `/Users/stevek/codes/epics-base/modules/database/src/ioc/rsrv/camessage.c:1085-1093`
-  also posts access-rights transition events through `db_post_single_event`
-  before enabling/disabling the event subscription.
+  posts access-rights transition events through `db_post_single_event`:
+  revoke = `db_post_single_event` then `db_event_disable` (1090-1092);
+  restore = `db_event_enable` then `db_post_single_event` (1086-1088).
 - `/Users/stevek/codes/epics-base/modules/database/src/ioc/db/dbEvent.c:746-752`
-  creates event logs with `dbfl_context_event`.
+  creates event logs with `dbfl_context_event` (`db_create_event_log`).
 - `/Users/stevek/codes/epics-base/modules/database/src/ioc/db/dbEvent.c:922-924`
-  runs the pre-chain and queues the single event only when the filtered log is
-  non-null.
-- `/Users/stevek/codes/epics-base/modules/database/src/std/filters/decimate.c:64-76`
-  and `/Users/stevek/codes/epics-base/modules/database/src/std/filters/sync.c:98-140`
-  bypass only `dbfl_context_read`; event-context initial monitor events are
-  still decimated or gated.
+  runs `dbChannelRunPreChain` and `db_queue_event_log` ONLY when the filtered
+  log is non-null (`if(pLog)`) — a dropped post emits no frame at all.
+- `/Users/stevek/codes/epics-base/modules/database/src/std/filters/decimate.c:64`
+  and `.../sync.c:98` bypass only `dbfl_context_read`; event-context initial
+  monitor events are still decimated or gated.
 
 Impact:
 
-A CA monitor created on a filtered channel can receive initial/access-transition
-frames that C would drop. `sync` filters always pass Rust's initial snapshot
-even when the state machine would suppress an event-context post, access
-restore bypasses the chain entirely, and any filter returning `None` on the
-initial path falls back to the unfiltered value. `dec` with the default C
-semantics passes the first event, but Rust still uses the wrong context
-boundary and would also bypass any non-default Rust decimator offset.
+A CA monitor created on a filtered channel received initial/access-transition
+frames that C would drop. `sync` always passed Rust's initial snapshot even
+when the state machine would suppress an event-context post; access restore
+bypassed the chain entirely; a filter returning `None` on the initial path fell
+back to the unfiltered value; and a non-default `dec` offset that decimates
+window slot 0 was ignored on the initial post.
 
-Expected fix shape:
+Current Rust source / Applied fix:
 
-Separate one-shot reads from monitor single-event posts. Keep
-`apply_to_read_value` for `READ`/`READ_NOTIFY`, but add an event-context helper
-that uses `FilteredMonitorEvent::new`, preserves the fresh-chain state
-isolation where required, and lets `None` mean "do not send this single event."
-Use the same helper for `ProcessVariable`, record-field initial snapshots, and
-access-rights revoke/restore posts.
+- `crates/epics-base-rs/src/server/database/filters/mod.rs` factors a private
+  `apply_single_value(value, read_context)` and exposes two public methods:
+  `apply_to_read_value` (read context, unchanged) and a NEW
+  `apply_to_event_value` (event context — `FilteredMonitorEvent::new`, so
+  `dec`/`sync` run; `None` means "drop the post, send no frame").
+- `crates/epics-ca-rs/src/server/tcp.rs` routes every CA monitor single-event
+  post (`db_post_single_event` equivalent) through `apply_to_event_value` on a
+  fresh per-subscriber chain, translating `None` into "send nothing":
+  SimplePv initial (granted + denied), record-field initial (granted via
+  `and_then`, + denied gated under the lock), access-revoke
+  (`no_read_access_event` skipped on drop), access-restore (filtered
+  `send_monitor_snapshot`, skipped on drop). The genuine one-shot
+  `READ`/`READ_NOTIFY` path keeps `apply_to_read_value`.
 
-Regression tests to add:
+Regression tests added:
 
-- `sync` initial monitor snapshot is suppressed when the C event-context rule
-  would suppress it.
-- A filter returning `None` for the initial snapshot causes no initial
-  `EVENT_ADD` frame, not an unfiltered fallback.
-- Access restore runs the monitor event-context filter chain before sending the
-  restore snapshot.
-- Access revoke does not send `no_read_access_event` when the event-context
-  filter drops the single event.
-- `arr`/`ts` initial snapshot transforms still apply.
+- `epics-base-rs` filters: `apply_to_event_value_decimates_while_read_value_bypasses`,
+  `apply_to_event_value_suppresses_sync_while_read_value_passes`,
+  `apply_to_event_value_drop_yields_none_no_fallback`,
+  `apply_to_event_and_read_value_empty_chain_identity`,
+  `apply_to_event_value_arr_slice_still_applies`.
+- `epics-ca-rs` `bfr7_event_context_filter_tests` (end-to-end `handle_client`):
+  `event_context_sync_gate_suppresses_initial_event` (no initial `EVENT_ADD`
+  frame under a `sync`-while gate), `event_context_decimator_suppresses_initial_event`
+  (`dec` offset 1 drops the fresh-counter slot-0 post),
+  `plain_channel_sends_initial_event` (control — unfiltered channel still sends
+  one). Revert-verified: flipping `apply_to_event_value` back to read context
+  makes the two suppression tests observe the unfiltered initial frame
+  (`got [(1, 24)]`).
 
 ### BFR-8 - PVA PROCESS accepts malformed INIT/DATA payloads
 

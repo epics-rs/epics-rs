@@ -3295,55 +3295,80 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             // by the client before the `ECA_NORDACCESS`
                             // status is read (`cac.cpp` eventRespAction
                             // returns on `m_postsize == 0`).
-                            let denied_count = no_read_access_count(
-                                requested_count,
-                                pv.snapshot().await.value.count(),
-                            );
-                            send_no_read_access_event(
-                                writer,
-                                CA_PROTO_EVENT_ADD,
-                                requested_type,
-                                denied_count,
-                                sub_id,
-                                ECA_NORDACCESS,
-                            )
-                            .await?;
+                            // BFR-7: C calls `db_post_single_event`
+                            // unconditionally at monitor creation
+                            // (`camessage.c:1853`, BEFORE the access
+                            // check at 1858), so even the initial
+                            // DENIED post runs through the event-context
+                            // pre-chain; the ECA_NORDACCESS frame is
+                            // gated by it (`db_queue_event_log` fires
+                            // only `if(pLog)`). Skip the frame when the
+                            // chain drops the post — the subscription is
+                            // still registered below.
+                            let snap = pv.snapshot().await;
+                            if entry
+                                .filter_chain()
+                                .apply_to_event_value(snap.value.clone())
+                                .is_some()
+                            {
+                                let denied_count =
+                                    no_read_access_count(requested_count, snap.value.count());
+                                send_no_read_access_event(
+                                    writer,
+                                    CA_PROTO_EVENT_ADD,
+                                    requested_type,
+                                    denied_count,
+                                    sub_id,
+                                    ECA_NORDACCESS,
+                                )
+                                .await?;
+                            }
                         } else {
                             let mut snap = pv.snapshot().await;
-                            // CA-FR-8: the initial monitor event is the
-                            // current value — filter it like a read so an
-                            // `arr` channel's first event is sliced too
-                            // (epics-base `db_post_single_event` runs the
-                            // pre-chain). A fresh throwaway chain keeps it
-                            // from polluting the subscriber's attached chain
-                            // state (`dbnd` baseline / `dec` counter).
+                            // BFR-7: the initial monitor event is a
+                            // CA monitor single-event post (C
+                            // `db_post_single_event` →
+                            // `db_create_event_log` with
+                            // `dbfl_context_event`), NOT a one-shot
+                            // read. Run the EVENT-context chain
+                            // (`dec`/`sync` DO decimate/gate, unlike
+                            // `READ`) on a fresh throwaway chain so the
+                            // subscriber's attached chain state stays
+                            // isolated (`dbnd` baseline / `dec`
+                            // counter). `None` means the chain dropped
+                            // the post (C `db_queue_event_log` fires
+                            // only `if(pLog)`), so send no initial
+                            // frame — never fall back to the unfiltered
+                            // value.
                             let init_chain = entry.filter_chain();
-                            if !init_chain.is_empty() {
-                                if let Some(v) = init_chain.apply_to_read_value(snap.value.clone())
-                                {
+                            match init_chain.apply_to_event_value(snap.value.clone()) {
+                                Some(v) => {
                                     snap.value = v;
+                                    // EX-R9: the initial event honours
+                                    // the EVENT_ADD request count for
+                                    // BOTH directions —
+                                    // `send_monitor_snapshot` now pads
+                                    // when `requested_count` exceeds
+                                    // the live element count and
+                                    // truncates when it is smaller, via
+                                    // `pad_dbr_to_requested_count` (C
+                                    // `read_reply` parity). The
+                                    // producer task already
+                                    // pads/truncates future updates
+                                    // through the same helper, so the
+                                    // initial frame and later frames
+                                    // now share one shape.
+                                    send_monitor_snapshot(
+                                        writer,
+                                        sub_id,
+                                        requested_type,
+                                        requested_count,
+                                        &snap,
+                                    )
+                                    .await?;
                                 }
+                                None => {}
                             }
-                            // EX-R9: the initial event honours the
-                            // EVENT_ADD request count for BOTH
-                            // directions — `send_monitor_snapshot`
-                            // now pads when `requested_count` exceeds
-                            // the live element count and truncates
-                            // when it is smaller, via
-                            // `pad_dbr_to_requested_count` (C
-                            // `read_reply` parity). The producer task
-                            // already pads/truncates future updates
-                            // through the same helper, so the initial
-                            // frame and later frames now share one
-                            // shape.
-                            send_monitor_snapshot(
-                                writer,
-                                sub_id,
-                                requested_type,
-                                requested_count,
-                                &snap,
-                            )
-                            .await?;
                         }
 
                         let task = spawn_monitor_sender(
@@ -3433,40 +3458,60 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let initial_snap = if access_denied {
                             None
                         } else {
-                            instance.snapshot_for_field(field).map(|mut snap| {
+                            instance.snapshot_for_field(field).and_then(|mut snap| {
                                 if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
                                     snap.class_name =
                                         Some(instance.record.record_type().to_string());
                                 }
-                                // CA-FR-8: filter the initial event value
-                                // (see the SimplePv branch) so an `arr`
-                                // channel's first record-field event is
-                                // sliced consistently with later updates.
-                                // Fresh throwaway chain — never touches the
-                                // subscriber's attached chain state.
+                                // BFR-7: the initial record-field monitor
+                                // event is an EVENT-context single-event
+                                // post (see the SimplePv branch) — run the
+                                // event-context chain (`dec`/`sync` apply)
+                                // on a fresh throwaway chain so the
+                                // subscriber's attached chain state stays
+                                // isolated. `None` means the chain dropped
+                                // the post (C `db_queue_event_log` fires
+                                // only `if(pLog)`); fold it through so the
+                                // send below is skipped — never fall back
+                                // to the unfiltered value.
                                 let init_chain = entry.filter_chain();
-                                if !init_chain.is_empty() {
-                                    if let Some(v) =
-                                        init_chain.apply_to_read_value(snap.value.clone())
-                                    {
+                                match init_chain.apply_to_event_value(snap.value.clone()) {
+                                    Some(v) => {
                                         snap.value = v;
+                                        Some(snap)
                                     }
+                                    None => None,
                                 }
-                                snap
                             })
                         };
-                        // EX-R6: derive the field's element count for
-                        // the autosize-denial frame. `snapshot_for_field`
-                        // is the same accessor the granted path uses,
-                        // so the denial count matches what a granted
-                        // monitor on the same field would carry.
-                        let denied_field_count = if access_denied {
-                            instance
-                                .snapshot_for_field(field)
-                                .map(|snap| snap.value.count())
-                                .unwrap_or(1)
+                        // EX-R6 + BFR-7: derive the field's element
+                        // count for the autosize-denial frame AND run
+                        // the event-context chain under the lock (the
+                        // value is needed for both). `snapshot_for_field`
+                        // is the same accessor the granted path uses, so
+                        // the denial count matches what a granted monitor
+                        // on the same field would carry. C
+                        // `event_add_action` calls `db_post_single_event`
+                        // unconditionally (`camessage.c:1853`, before the
+                        // access check), so the DENIED initial post is
+                        // gated by the event-context chain too:
+                        // `Some(count)` => send the ECA_NORDACCESS frame,
+                        // `None` => the chain dropped the post, send
+                        // nothing. A missing field snapshot keeps the
+                        // prior count=1 fallback (no value to filter).
+                        let denied_event_count = if access_denied {
+                            match instance.snapshot_for_field(field) {
+                                Some(snap) => {
+                                    let count = snap.value.count();
+                                    entry
+                                        .filter_chain()
+                                        .apply_to_event_value(snap.value)
+                                        .map(|_| count)
+                                }
+                                None => Some(1),
+                            }
                         } else {
-                            0
+                            None
                         };
                         drop(instance);
                         if access_denied {
@@ -3475,17 +3520,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             // SimplePv branch above for the C
                             // `read_reply` (`camessage.c:507-509`)
                             // parity rationale.
-                            let denied_count =
-                                no_read_access_count(requested_count, denied_field_count);
-                            send_no_read_access_event(
-                                writer,
-                                CA_PROTO_EVENT_ADD,
-                                requested_type,
-                                denied_count,
-                                sub_id,
-                                ECA_NORDACCESS,
-                            )
-                            .await?;
+                            if let Some(field_count) = denied_event_count {
+                                let denied_count =
+                                    no_read_access_count(requested_count, field_count);
+                                send_no_read_access_event(
+                                    writer,
+                                    CA_PROTO_EVENT_ADD,
+                                    requested_type,
+                                    denied_count,
+                                    sub_id,
+                                    ECA_NORDACCESS,
+                                )
+                                .await?;
+                            }
                         } else if let Some(snap) = initial_snap {
                             // EX-R9: initial event honours the
                             // EVENT_ADD request count in both
@@ -4266,6 +4313,28 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                         sub.target.clone(),
                     )
                 };
+                // BFR-7: C posts the access-revoked event through
+                // `db_post_single_event` (event-context pre-chain)
+                // BEFORE `db_event_disable` (`camessage.c:1090-1092`);
+                // the ECA_NORDACCESS frame is only sent when the chain
+                // passes the post (`db_queue_event_log` fires only
+                // `if(pLog)`). Run a fresh event-context chain on the
+                // current value and skip the frame when it drops — the
+                // `denied` gate is already set, so the producer stays
+                // disabled either way. The denial frame is zero-filled,
+                // so only the chain's pass/drop decision matters, not
+                // the filtered value.
+                let snap = get_full_snapshot(&target).await;
+                let dropped_by_filter = match (state.channels.get(&sid), &snap) {
+                    (Some(entry), Some(snap)) => entry
+                        .filter_chain()
+                        .apply_to_event_value(snap.value.clone())
+                        .is_none(),
+                    _ => false,
+                };
+                if dropped_by_filter {
+                    continue;
+                }
                 // EX-R6: an autosize (`data_count == 0`) subscription
                 // revoked here must also be normalised to the live
                 // element count, otherwise the access-revoked
@@ -4275,10 +4344,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                 // (`camessage.c:507-509`) as the initial EVENT_ADD
                 // denial path.
                 let denied_count = if data_count == 0 {
-                    let actual = get_full_snapshot(&target)
-                        .await
-                        .map(|snap| snap.value.count())
-                        .unwrap_or(1);
+                    let actual = snap.as_ref().map(|snap| snap.value.count()).unwrap_or(1);
                     no_read_access_count(data_count, actual)
                 } else {
                     data_count
@@ -4327,7 +4393,27 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                         sub.sub_id,
                     )
                 };
-                if let Some(snap) = get_full_snapshot(&target).await {
+                if let Some(mut snap) = get_full_snapshot(&target).await {
+                    // BFR-7: C enables the event (`db_event_enable`)
+                    // THEN posts the current value through the
+                    // event-context pre-chain
+                    // (`db_post_single_event`, `camessage.c:1086-1088`);
+                    // the restore frame is sent only when the chain
+                    // passes (`db_queue_event_log` fires only
+                    // `if(pLog)`) and carries the FILTERED value. The
+                    // `denied` gate is already cleared above so future
+                    // natural updates resume; a fresh event-context
+                    // chain per subscriber keeps `dec`/`sync`/`dbnd`
+                    // state isolated. `None` => send no restore frame.
+                    if let Some(entry) = state.channels.get(&sid) {
+                        match entry
+                            .filter_chain()
+                            .apply_to_event_value(snap.value.clone())
+                        {
+                            Some(v) => snap.value = v,
+                            None => continue,
+                        }
+                    }
                     send_monitor_snapshot(writer, sub_id_val, data_type, data_count, &snap).await?;
                 }
             }
@@ -5074,7 +5160,7 @@ mod non_graceful_disconnect_teardown_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Build a CA_PROTO_VERSION request (minor version 13).
-    fn version_frame() -> Vec<u8> {
+    pub(super) fn version_frame() -> Vec<u8> {
         let mut h = CaHeader::new(CA_PROTO_VERSION);
         h.count = CA_MINOR_VERSION;
         h.to_bytes().to_vec()
@@ -5082,7 +5168,7 @@ mod non_graceful_disconnect_teardown_tests {
 
     /// Build a CA_PROTO_CREATE_CHAN request for `pv_name` with the
     /// given client cid. Payload is the 8-aligned, NUL-terminated name.
-    fn create_chan_frame(cid: u32, pv_name: &str) -> Vec<u8> {
+    pub(super) fn create_chan_frame(cid: u32, pv_name: &str) -> Vec<u8> {
         let name = pad_string(pv_name);
         let mut h = CaHeader::new(CA_PROTO_CREATE_CHAN);
         h.cid = cid;
@@ -5095,7 +5181,7 @@ mod non_graceful_disconnect_teardown_tests {
 
     /// Build a CA_PROTO_EVENT_ADD request: subscribe `sub_id` on `sid`.
     /// Payload is the 16-byte monitor request (low/high/to f32 + mask).
-    fn event_add_frame(sid: u32, sub_id: u32) -> Vec<u8> {
+    pub(super) fn event_add_frame(sid: u32, sub_id: u32) -> Vec<u8> {
         let mut h = CaHeader::new(CA_PROTO_EVENT_ADD);
         h.data_type = epics_base_rs::types::DBR_TIME_DOUBLE;
         h.count = 1;
@@ -5113,7 +5199,7 @@ mod non_graceful_disconnect_teardown_tests {
 
     /// Drain `rx` for up to `timeout`, returning the first event that
     /// satisfies `pred`, or `None` on timeout.
-    async fn await_event(
+    pub(super) async fn await_event(
         rx: &mut broadcast::Receiver<ServerConnectionEvent>,
         timeout: Duration,
         mut pred: impl FnMut(&ServerConnectionEvent) -> bool,
@@ -5140,7 +5226,7 @@ mod non_graceful_disconnect_teardown_tests {
     /// seen, then return its server-assigned sid (`m_available`). The
     /// EVENT_ADD request must address the channel by this sid, not by
     /// the client cid.
-    async fn read_create_chan_sid<R: tokio::io::AsyncRead + Unpin>(
+    pub(super) async fn read_create_chan_sid<R: tokio::io::AsyncRead + Unpin>(
         client: &mut R,
         timeout: Duration,
     ) -> u32 {
@@ -5639,5 +5725,215 @@ mod ex_r6_no_read_access_count_tests {
              DBR payload so the client does not drop it as a cancel-ack"
         );
         assert_eq!(payload, 4 * DbFieldType::Double.element_size());
+    }
+}
+
+#[cfg(test)]
+mod bfr7_event_context_filter_tests {
+    //! BFR-7: a CA monitor initial single-event post
+    //! (`db_post_single_event`, `rsrv/camessage.c:1853`) runs the
+    //! channel filter chain in EVENT context (`db_create_event_log` →
+    //! `dbfl_context_event`), NOT in one-shot READ context. `dec`/`sync`
+    //! therefore decimate/gate the initial event, and a chain that drops
+    //! the post sends NO initial `EVENT_ADD` frame (C
+    //! `db_queue_event_log` fires only `if(pLog)`) — never an unfiltered
+    //! fallback.
+    //!
+    //! These drive the full `handle_client` EVENT_ADD path; the
+    //! deterministic context split (read bypasses `sync`, event gates it)
+    //! is also unit-proven in
+    //! `epics_base_rs::server::database::filters` tests.
+    use super::non_graceful_disconnect_teardown_tests::{
+        await_event, create_chan_frame, event_add_frame, read_create_chan_sid, version_frame,
+    };
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::types::EpicsValue;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Read frames from `client` for `window`, returning the
+    /// `(cmd, postsize)` of every COMPLETE CA frame observed. Used to
+    /// assert presence/absence of an initial `CA_PROTO_EVENT_ADD` data
+    /// frame.
+    async fn collect_frames<R: tokio::io::AsyncRead + Unpin>(
+        client: &mut R,
+        window: Duration,
+    ) -> Vec<(u16, usize)> {
+        let mut acc: Vec<u8> = Vec::new();
+        let mut frames: Vec<(u16, usize)> = Vec::new();
+        let mut buf = [0u8; 512];
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, client.read(&mut buf)).await {
+                Ok(Ok(0)) => break, // EOF
+                Ok(Ok(n)) => {
+                    acc.extend_from_slice(&buf[..n]);
+                    let mut offset = 0;
+                    while offset + CaHeader::SIZE <= acc.len() {
+                        let Ok((hdr, hdr_size)) = CaHeader::from_bytes_extended(&acc[offset..])
+                        else {
+                            break;
+                        };
+                        let msg_len = hdr_size + hdr.actual_postsize();
+                        if offset + msg_len > acc.len() {
+                            break;
+                        }
+                        frames.push((hdr.cmmd, hdr.actual_postsize()));
+                        offset += msg_len;
+                    }
+                    acc.drain(0..offset);
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        frames
+    }
+
+    /// Spawn `handle_client` over a duplex socket; returns the client
+    /// half, the join handle, the connection-event receiver, and the
+    /// ACF-reload sender. The caller MUST keep the sender alive for the
+    /// connection's lifetime — dropping it closes the ACF-reload
+    /// broadcast, which `handle_client` treats as a shutdown signal.
+    fn spawn_server(
+        db: Arc<PvDatabase>,
+        port: u16,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<CaResult<()>>,
+        broadcast::Receiver<ServerConnectionEvent>,
+        broadcast::Sender<()>,
+    ) {
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (conn_tx, conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                Some(conn_tx),
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+        (client_io, handle, conn_rx, acf_reload_tx)
+    }
+
+    /// Open a subscription on `pv_name` and return every frame the
+    /// server emits in the `window` after the subscription opens.
+    /// Asserts the subscription actually opened so a missing initial
+    /// frame is never a vacuous pass.
+    async fn subscribe_and_collect(pv_name: &str, port: u16) -> Vec<(u16, usize)> {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("bfr7:pv", EpicsValue::Double(42.0))
+            .await
+            .expect("add pv");
+        let (mut client, handle, mut conn_rx, _acf_reload_tx) = spawn_server(db, port);
+
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(0xA1, pv_name))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+        let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+
+        client
+            .write_all(&event_add_frame(sid, 0xB1))
+            .await
+            .expect("event_add");
+        client.flush().await.expect("flush event_add");
+
+        let opened = await_event(&mut conn_rx, Duration::from_secs(3), |ev| {
+            matches!(ev, ServerConnectionEvent::SubscriptionOpened { .. })
+        })
+        .await;
+        assert!(
+            matches!(opened, Some(ServerConnectionEvent::SubscriptionOpened { sub_id, .. }) if sub_id == 0xB1),
+            "subscription must open (else the no-initial-frame assertion is vacuous): got {opened:?}"
+        );
+
+        let frames = collect_frames(&mut client, Duration::from_millis(700)).await;
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        frames
+    }
+
+    /// BFR-7 regression: a `sync` filter gating `while` a never-set
+    /// state drops the initial monitor post in EVENT context, so the
+    /// server sends NO `CA_PROTO_EVENT_ADD` data frame. Pre-fix the
+    /// initial post ran in READ context (`apply_to_read_value`), where
+    /// `sync` is bypassed, so an initial frame WAS sent — this test
+    /// fails against that behaviour.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_context_sync_gate_suppresses_initial_event() {
+        let pv = r#"bfr7:pv.{"sync":{"while":"BFR7:NEVERSET"}}"#;
+        let frames = subscribe_and_collect(pv, 55301).await;
+        let event_adds: Vec<_> = frames
+            .iter()
+            .filter(|(cmd, _)| *cmd == CA_PROTO_EVENT_ADD)
+            .collect();
+        assert!(
+            event_adds.is_empty(),
+            "BFR-7: the event-context `sync` gate must suppress the \
+             initial EVENT_ADD post — no fallback to the unfiltered \
+             value (got {event_adds:?})"
+        );
+    }
+
+    /// Control: an unfiltered channel still sends exactly one initial
+    /// `CA_PROTO_EVENT_ADD` data frame — proving the harness/timing is
+    /// sound and the suppression above is the filter's doing, not a
+    /// dropped read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plain_channel_sends_initial_event() {
+        let frames = subscribe_and_collect("bfr7:pv", 55302).await;
+        let event_adds = frames
+            .iter()
+            .filter(|(cmd, _)| *cmd == CA_PROTO_EVENT_ADD)
+            .count();
+        assert!(
+            event_adds >= 1,
+            "control: an unfiltered channel must send an initial \
+             EVENT_ADD frame (got frames {frames:?})"
+        );
+    }
+
+    /// BFR-7: a `dec` filter whose window offset skips slot 0
+    /// (`offset = 1`) drops the FIRST event in EVENT context — the
+    /// initial monitor post lands on a fresh decimator counter at
+    /// position 0, which is decimated away. READ context would bypass
+    /// the decimator and send it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_context_decimator_suppresses_initial_event() {
+        let pv = r#"bfr7:pv.{"dec":{"n":2,"offset":1}}"#;
+        let frames = subscribe_and_collect(pv, 55303).await;
+        let event_adds: Vec<_> = frames
+            .iter()
+            .filter(|(cmd, _)| *cmd == CA_PROTO_EVENT_ADD)
+            .collect();
+        assert!(
+            event_adds.is_empty(),
+            "BFR-7: the event-context decimator must drop the initial \
+             EVENT_ADD post (offset 1 skips window slot 0): got {event_adds:?}"
+        );
     }
 }

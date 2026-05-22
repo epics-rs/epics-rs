@@ -35,7 +35,7 @@ Method:
 | BFR-7 | Medium | CA monitor single-event filter context | Fixed in current source |
 | BFR-8 | Medium | PVA PROCESS payload parsing | Fixed in current source (INIT); DATA-phase strictness declined (reference parity) |
 | BFR-9 | Medium | PVA raw monitor overrun parsing | Fixed in current source |
-| BFR-10 | Low | CA/base monitor drop accounting | Open |
+| BFR-10 | Low | CA/base monitor drop accounting | Fixed in current source (accounting); metrics-surface wiring deferred |
 | BFR-11 | Medium | PVA raw monitor control-frame parsing | Open |
 | BFR-12 | Medium | PVA MONITOR FINISH op cleanup | Open |
 | BFR-13 | Medium | PVA data-phase error response shape | Open |
@@ -692,6 +692,46 @@ Regression tests to add:
 - Record-field monitor with a full subscriber queue and occupied coalesced slot
   increments the shared drop counter on replacement.
 - Simple PV and record-field overflow use the same accounting helper.
+
+Applied fix (2026-05-22):
+
+- `crates/epics-base-rs/src/server/pv.rs` adds `Subscriber::coalesce_overflow`,
+  the single owner of the slow-consumer coalesce overflow: it locks the slot,
+  records a dropped monitor event when it displaces an unobserved value
+  (`slot.is_some()`), then stores the newest event. All four overflow-write sites
+  now route through it — the two `ProcessVariable` posts (`pv.rs:380` value,
+  `pv.rs:423` alarm) and the two `RecordInstance` field monitors
+  (`record_instance.rs:1857` snapshot, `:1910` field). The record-field path
+  previously overwrote the slot directly and never incremented the counter.
+- The `DROPPED_MONITOR_EVENTS` doc comment over-claimed exposure ("Exposed for the
+  `/queues` admin endpoint and the `dropped_events` Prometheus metric"). It is
+  corrected: the counter has no live scrape reader in this workspace — `/queues`
+  renders configured limits only. Wiring `dropped_monitor_events()` into a metrics
+  surface is net-new feature work (cross-crate, changes the `/queues` JSON schema)
+  and is deferred, not part of this fix; the accounting defect itself is closed.
+
+Invariant / Owner / Bypass audit:
+
+- Invariant: only `Subscriber::coalesce_overflow` may write the coalesce slot on
+  the queue-full overflow path, and it is the sole site that records a
+  slow-consumer drop.
+- Owner: `Subscriber::coalesce_overflow` (`pv.rs:221`); the increment owner
+  `record_dropped_monitor` (`pv.rs:57`) now has exactly one caller (the overflow
+  owner).
+- Bypass audit: `rg "\*slot = Some"` → one site, inside `coalesce_overflow`.
+  `rg "coalesced.lock()"` → the owner plus the two `pop_coalesced` consumer drains
+  (`pv.rs:526`, `record_instance.rs:2007`), which `.take()` an OBSERVED value and
+  are correctly distinct (no drop accounting). `rg "coalesce_overflow"` → exactly
+  four overflow-write callers.
+
+Regression tests added (`crates/epics-base-rs/src/server/record/record_instance.rs`):
+
+- `bfr10_record_field_overflow_counts_dropped_event` — drives a record-field
+  monitor whose 64-deep queue and coalesce slot are full, then asserts
+  `dropped_monitor_events()` strictly increases (process-global counter →
+  monotonic assertion, robust under parallel tests).
+- Revert-verified in isolation: restoring the direct `*slot = Some(event)` at both
+  record-field sites makes the test observe `before=0, after=0` and fail.
 
 ### BFR-11 - Raw monitor loop treats malformed control frames as no-op or clean finish
 

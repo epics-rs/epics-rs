@@ -1849,9 +1849,12 @@ impl RecordInstance {
                             continue;
                         };
                         if sub.tx.try_send(event.clone()).is_err() {
-                            if let Ok(mut slot) = sub.coalesced.lock() {
-                                *slot = Some(event);
-                            }
+                            // BFR-10: route the coalesce overwrite through
+                            // the single owner so a record-field monitor
+                            // value lost to a slow consumer is counted in
+                            // `dropped_monitor_events()`, exactly like a
+                            // `ProcessVariable` overflow.
+                            sub.coalesce_overflow(event);
                         }
                     }
                 }
@@ -1900,9 +1903,11 @@ impl RecordInstance {
                             continue;
                         };
                         if sub.tx.try_send(event.clone()).is_err() {
-                            if let Ok(mut slot) = sub.coalesced.lock() {
-                                *slot = Some(event);
-                            }
+                            // BFR-10: same single coalesce-overflow owner
+                            // as the snapshot path — record-field loss to
+                            // a slow consumer must be counted, not silently
+                            // overwritten.
+                            sub.coalesce_overflow(event);
                         }
                     }
                 }
@@ -2078,6 +2083,45 @@ mod metadata_cache_tests {
         let _ = rec.put_field("LOPR", EpicsValue::Double(0.0));
         let _ = rec.put_field("VAL", EpicsValue::Double(25.0));
         RecordInstance::new("TEMP".to_string(), rec)
+    }
+
+    /// BFR-10: a record-field monitor whose bounded queue is full and
+    /// whose coalesce slot already holds an unobserved value must count
+    /// the displaced value in the shared `dropped_monitor_events()`
+    /// counter — the same accounting a `ProcessVariable` overflow uses.
+    /// Before the fix the record-field path overwrote the slot without
+    /// counting, hiding slow-consumer loss on the path most CA/PVA
+    /// database monitors use. The counter is process-global, so the
+    /// assertion is a strict monotonic increase (robust under parallel
+    /// tests); the revert-verify runs this test in isolation.
+    #[test]
+    fn bfr10_record_field_overflow_counts_dropped_event() {
+        use crate::server::pv::dropped_monitor_events;
+        use crate::server::recgbl::EventMask;
+        let mut inst = ai_instance();
+        // Keep `rx` alive (do NOT drain) so the bounded 64-deep queue
+        // fills, then the coalesce slot, before overflow replacement.
+        let _rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Double,
+                EventMask::VALUE.bits(),
+            )
+            .expect("subscriber added");
+        let before = dropped_monitor_events();
+        // 64 sends fill the queue; the 65th fills the (empty) coalesce
+        // slot; each send after that overwrites an UNOBSERVED slot value
+        // and must be counted as a dropped monitor event.
+        for _ in 0..70 {
+            inst.notify_field_with_origin("VAL", EventMask::VALUE, 0);
+        }
+        let after = dropped_monitor_events();
+        assert!(
+            after > before,
+            "record-field overflow onto an occupied coalesce slot must \
+             record a dropped monitor event (before={before}, after={after})"
+        );
     }
 
     #[test]

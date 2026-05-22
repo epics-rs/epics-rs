@@ -32,14 +32,21 @@ pub(crate) fn max_subscribers_per_pv() -> usize {
 
 /// Process-global counter of monitor events dropped because the
 /// per-channel mpsc was full AND the coalesce slot was already
-/// occupied by an even-newer overflow value. Exposed for the
-/// `/queues` admin endpoint and the `dropped_events` Prometheus
-/// metric. Mirrors the pattern of `dropped_monitors` on the client
-/// side (subscribe_with_deadband).
+/// occupied by an even-newer overflow value. Covers both
+/// `ProcessVariable` and `RecordInstance` overflow via the single
+/// [`Subscriber::coalesce_overflow`] owner. Mirrors the pattern of
+/// `dropped_monitors` on the client side (subscribe_with_deadband).
+///
+/// BFR-10: read via [`dropped_monitor_events`]. That reader is not yet
+/// wired to a live scrape surface — the `/queues` admin endpoint
+/// currently renders configured limits only, not this counter — so do
+/// not assume the value is observable through an endpoint until that
+/// wiring lands.
 static DROPPED_MONITOR_EVENTS: AtomicU64 = AtomicU64::new(0);
 
-/// Read the cumulative count. Used by introspection / Prometheus
-/// scrape.
+/// Read the cumulative count of dropped monitor events. Intended for
+/// introspection / metrics; see [`DROPPED_MONITOR_EVENTS`] for the
+/// current wiring status.
 pub fn dropped_monitor_events() -> u64 {
     DROPPED_MONITOR_EVENTS.load(Ordering::Relaxed)
 }
@@ -199,6 +206,26 @@ impl Subscriber {
     fn accepts(&self, post: crate::server::recgbl::EventMask) -> bool {
         post.is_empty() || crate::server::recgbl::EventMask::from_bits(self.mask).intersects(post)
     }
+
+    /// BFR-10: single owner of the slow-consumer coalesce overflow.
+    /// Call after the bounded `tx` rejected a send: store the newest
+    /// `event` in the coalesce slot, and — when it displaces a value the
+    /// consumer never observed — record one dropped monitor event.
+    ///
+    /// Every coalesced-slot overwrite on the overflow path (both
+    /// `ProcessVariable` value/alarm posts and `RecordInstance`
+    /// field monitors) MUST go through here, so `dropped_monitor_events()`
+    /// cannot undercount one path: the record-field path previously
+    /// overwrote the slot directly and never bumped the counter, hiding
+    /// slow-consumer loss for the path most CA/PVA database monitors use.
+    pub(crate) fn coalesce_overflow(&self, event: MonitorEvent) {
+        if let Ok(mut slot) = self.coalesced.lock() {
+            if slot.is_some() {
+                record_dropped_monitor();
+            }
+            *slot = Some(event);
+        }
+    }
 }
 
 /// A process variable hosted by the server.
@@ -346,18 +373,11 @@ impl ProcessVariable {
                 continue;
             };
             if sub.tx.try_send(event.clone()).is_err() {
-                if let Ok(mut slot) = sub.coalesced.lock() {
-                    // L4: an alarm event overwriting an unconsumed
-                    // coalesced slot is genuinely lost — bump the
-                    // diagnostic counter exactly as
-                    // `notify_subscribers` does for value events, so
-                    // alarm events dropped to a slow consumer are
-                    // visible in the `dropped_events` metric.
-                    if slot.is_some() {
-                        record_dropped_monitor();
-                    }
-                    *slot = Some(event);
-                }
+                // L4 / BFR-10: an alarm event overwriting an unconsumed
+                // coalesced slot is genuinely lost. Route through the
+                // single coalesce-overflow owner so alarm-event loss to
+                // a slow consumer is counted exactly like value events.
+                sub.coalesce_overflow(event);
             }
         }
     }
@@ -396,18 +416,11 @@ impl ProcessVariable {
             };
             if sub.tx.try_send(event.clone()).is_err() {
                 // Queue full — overwrite any prior pending overflow with
-                // the newest event. The consumer will pick it up via
-                // `pop_coalesced` after the next normal recv.
-                if let Ok(mut slot) = sub.coalesced.lock() {
-                    if slot.is_some() {
-                        // Previous overflow value being replaced before
-                        // the consumer ever observed it — that value is
-                        // genuinely lost. Bump the diag counter so the
-                        // operator can spot a slow viewer.
-                        record_dropped_monitor();
-                    }
-                    *slot = Some(event);
-                }
+                // the newest event (consumer picks it up via
+                // `pop_coalesced` after the next normal recv). The single
+                // coalesce-overflow owner counts a value that the
+                // consumer never observed as a dropped monitor event.
+                sub.coalesce_overflow(event);
             }
         }
     }

@@ -39,7 +39,7 @@ Method:
 | BFR-11 | Medium | PVA raw monitor control-frame parsing | Open |
 | BFR-12 | Medium | PVA MONITOR FINISH op cleanup | Open |
 | BFR-13 | Medium | PVA data-phase error response shape | Open |
-| BFR-14 | Medium | PVA raw monitor re-encode error handling | Open |
+| BFR-14 | Medium | PVA raw monitor re-encode error handling | Fixed in current source |
 | BFR-15 | Medium | PVA GET/PUT/RPC in-flight EXEC state | Open |
 
 ## Reviewed Anchors
@@ -901,6 +901,52 @@ Regression tests to add:
   with an error instead of continuing.
 - Same-endian and cross-endian malformed raw handling have one documented
   policy, not byte-order-dependent behavior.
+
+Applied fix (2026-05-22):
+
+- The per-event forward-or-terminate decision was extracted from the ~200-line
+  monitor-send closure into one pure function,
+  `crates/epics-pva-rs/src/server_native/tcp.rs` `raw_monitor_frame`, returning a
+  new `RawMonitorFrame` enum (`Forward(Vec<u8>)` /
+  `Terminate { frame, reason }`). This makes the malformed-raw policy a single
+  testable point and enforces "same-endian and cross-endian agree" by
+  construction: same-endian forwards verbatim (`build_monitor_payload_raw`),
+  cross-endian re-encodes (`reencode_raw_monitor`) and, on failure, returns
+  `Terminate` carrying a `build_monitor_error` frame.
+- The caller (formerly `Err(e) => { debug!(..); continue; }`) now matches the
+  enum: `Terminate` logs at debug, sends the terminal MONITOR error frame, and
+  `return`s — the same `send(error) + return` terminal shape the decoded path
+  already uses for a descriptor-mismatch transform (`tcp.rs:~4618`). The silent
+  `continue` is gone.
+
+Defect-family audit:
+
+- Anchor: `reencode_raw_monitor\(` production callers across
+  `crates/epics-pva-rs/src`. Exactly one — inside `raw_monitor_frame`
+  (`tcp.rs:5405`). The previous direct caller in the send loop now routes through
+  `raw_monitor_frame`. `build_monitor_payload_raw` (same-endian) is infallible.
+- Anchor: `continue;` inside the raw monitor send loop (`tcp.rs:4288-4525`). The
+  only remaining `continue` is the legitimate paused-squash (`held_raw =
+  Some(ev); continue;`); the re-encode failure path now `send`s an error frame
+  and `return`s. No other site silently drops a malformed raw monitor event.
+
+Regression tests added (`crates/epics-pva-rs/src/server_native/tcp.rs`):
+
+- `bfr14_cross_endian_truncated_changed_bitset_terminates` — a cross-endian event
+  whose changed bitset is truncated yields `Terminate` with a MONITOR FINISH
+  (subcmd `0x10`) + non-success status; the reason names the changed bitset.
+- `bfr14_cross_endian_truncated_value_terminates` — a cross-endian event whose
+  partial value is truncated yields `Terminate`; the reason names the value.
+- `bfr14_same_and_cross_endian_malformed_one_policy` — the SAME missing-overrun
+  body forwards verbatim same-endian (`Forward`, body byte-for-byte) but
+  terminates cross-endian (`Terminate`, MONITOR error).
+- Revert-verified: changing the `Err` arm of `raw_monitor_frame` to `Forward`
+  (instead of `Terminate`) makes all three tests fail.
+
+Note: BFR-14 makes the failure terminal at the spawned-task boundary (the task's
+existing `send + return` teardown). The orthogonal `ch.ops` registry cleanup for
+ALL terminal monitor exits (type-change, ACL-denial, source-close FINISH, and
+this error) is BFR-12's scope and is tracked separately.
 
 ### BFR-15 - GET/PUT/RPC double EXEC aborts the in-flight operation
 

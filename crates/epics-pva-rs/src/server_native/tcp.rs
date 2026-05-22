@@ -4463,31 +4463,31 @@ async fn handle_op(
                                 held_raw = Some(ev);
                                 continue;
                             }
-                            // BR-R44: on byte-order mismatch we must
-                            // decode the raw event under the upstream
-                            // order and re-encode under the downstream
-                            // order. Earlier code dropped the event
-                            // with `continue`, so any cross-host
-                            // gateway between peers with different
-                            // negotiated byte orders silently lost
-                            // every monitor update after the initial
-                            // snapshot (the decoded-fallback path
-                            // never sees those events under raw
-                            // subscription).
-                            let payload = if ev.byte_order != order {
-                                match reencode_raw_monitor(ioid, &intro_clone, &ev, order) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        debug!(
-                                            pv = %pv_name,
-                                            error = %e,
-                                            "F-G12 raw monitor reencode failed — dropping event"
-                                        );
-                                        continue;
-                                    }
+                            // BR-R44: on byte-order mismatch we decode the
+                            // raw event under the upstream order and
+                            // re-encode under the downstream order. Earlier
+                            // code dropped the event with `continue`, so any
+                            // cross-host gateway between peers with different
+                            // negotiated byte orders silently lost every
+                            // monitor update after the initial snapshot (the
+                            // decoded-fallback path never sees those events
+                            // under raw subscription). BFR-14: a re-encode
+                            // failure (malformed upstream body) is now a
+                            // terminal protocol boundary, not a silent drop —
+                            // `raw_monitor_frame` owns that single policy so
+                            // the same-endian forward and the cross-endian
+                            // re-encode cannot diverge on malformed input.
+                            let payload = match raw_monitor_frame(ioid, &intro_clone, &ev, order) {
+                                RawMonitorFrame::Forward(p) => p,
+                                RawMonitorFrame::Terminate { frame, reason } => {
+                                    debug!(
+                                        pv = %pv_name,
+                                        error = %reason,
+                                        "F-G12 raw monitor reencode failed — terminating monitor with error"
+                                    );
+                                    let _ = tx_clone.send(frame).await;
+                                    return;
                                 }
-                            } else {
-                                build_monitor_payload_raw(ioid, &ev, order)
                             };
                             if tx_clone.send(payload).await.is_err() {
                                 return;
@@ -5363,6 +5363,58 @@ fn coalesce_monitor_update(
     crate::server_native::MonitorUpdate {
         value: newer.value,
         marked,
+    }
+}
+
+/// BFR-14: outcome of turning one [`crate::server_native::RawMonitorEvent`]
+/// into a downstream wire frame. Carries the single malformed-raw policy
+/// so the same-endian forward and the cross-endian re-encode cannot
+/// diverge: a frame that cannot be produced terminates the stream with
+/// an error rather than being silently dropped.
+enum RawMonitorFrame {
+    /// Forward this frame to the downstream subscriber.
+    Forward(Vec<u8>),
+    /// The raw body could not be re-encoded (malformed/truncated under
+    /// the upstream byte order). Emit `frame` (a terminal MONITOR error)
+    /// and end the stream; `reason` is for server-side logging.
+    Terminate { frame: Vec<u8>, reason: String },
+}
+
+/// BFR-14: build the downstream wire frame for a single raw monitor
+/// event, owning the malformed-body policy in one place.
+///
+/// - Same-endian: forward the body verbatim (zero-copy memcpy via
+///   [`build_monitor_payload_raw`]). A malformed body is carried through
+///   so the downstream client fails at its own protocol boundary.
+/// - Cross-endian: decode under the upstream order and re-encode under
+///   `downstream_order` ([`reencode_raw_monitor`]). A malformed body
+///   cannot be re-encoded, so it yields [`RawMonitorFrame::Terminate`]
+///   with a MONITOR error frame — pvxs likewise resets the connection
+///   when a monitor message is not good (`clientmon.cpp:596`). Earlier
+///   code dropped it with a debug log + `continue`, hiding upstream
+///   corruption and keeping the monitor alive as if the bad update never
+///   existed — and making cross-endian behaviour disagree with the
+///   same-endian forward on identical input.
+fn raw_monitor_frame(
+    ioid: u32,
+    intro: &FieldDesc,
+    ev: &crate::server_native::RawMonitorEvent,
+    downstream_order: ByteOrder,
+) -> RawMonitorFrame {
+    if ev.byte_order != downstream_order {
+        match reencode_raw_monitor(ioid, intro, ev, downstream_order) {
+            Ok(p) => RawMonitorFrame::Forward(p),
+            Err(reason) => RawMonitorFrame::Terminate {
+                frame: build_monitor_error(
+                    ioid,
+                    &format!("raw monitor re-encode failed: {reason}"),
+                    downstream_order,
+                ),
+                reason,
+            },
+        }
+    } else {
+        RawMonitorFrame::Forward(build_monitor_payload_raw(ioid, ev, downstream_order))
     }
 }
 
@@ -9245,6 +9297,132 @@ mod tests {
             &body[..],
             "same-endian path forwards the truncated body verbatim — no fabricated overrun trailer"
         );
+    }
+
+    // ---- BFR-14: a cross-endian raw monitor re-encode failure is a
+    // terminal protocol boundary, not a silently dropped event -------
+    //
+    // `raw_monitor_frame` owns the single malformed-raw policy: a body
+    // that cannot be re-encoded under the downstream order yields
+    // `Terminate` (a MONITOR error frame ends the stream) rather than a
+    // debug-logged drop. pvxs resets the connection when a monitor
+    // message is not good (`clientmon.cpp:596`); the same-endian forward
+    // carries malformed bytes through verbatim so the downstream peer
+    // fails at its own boundary. Both decline to invent a valid frame.
+
+    /// Assert `frame_bytes` is a terminal MONITOR error: command
+    /// MONITOR, subcmd `0x10` (finish), non-success status.
+    #[cfg(test)]
+    fn bfr14_assert_monitor_error(frame_bytes: &[u8], order: ByteOrder) {
+        let (frame, _) = try_parse_frame(frame_bytes)
+            .expect("terminate frame parses")
+            .expect("complete frame");
+        assert_eq!(
+            frame.header.command,
+            Command::Monitor.code(),
+            "terminate frame is a MONITOR"
+        );
+        let mut cur = frame.cursor();
+        let _ioid = cur.get_u32(order).expect("ioid");
+        assert_eq!(cur.get_u8().expect("subcmd"), 0x10, "FINISH subcmd");
+        let status = Status::decode(&mut cur, order).expect("status");
+        assert!(
+            !status.is_success(),
+            "terminate frame must carry a non-success status"
+        );
+    }
+
+    /// Cross-endian raw monitor whose changed bitset is truncated must
+    /// terminate the monitor with an error, not be silently dropped.
+    #[test]
+    fn bfr14_cross_endian_truncated_changed_bitset_terminates() {
+        let intro = three_field_intro();
+        // Size prefix claims 5 bytes follow, but none do → the changed
+        // bitset (the first decode) fails.
+        let ev = crate::server_native::RawMonitorEvent {
+            body_bytes: bytes::Bytes::from_static(&[0x05]),
+            byte_order: ByteOrder::Little,
+            type_changed: false,
+        };
+        match raw_monitor_frame(7, &intro, &ev, ByteOrder::Big) {
+            RawMonitorFrame::Terminate { frame, reason } => {
+                assert!(
+                    reason.contains("changed bitset"),
+                    "reason names the truncation point, got: {reason}"
+                );
+                bfr14_assert_monitor_error(&frame, ByteOrder::Big);
+            }
+            RawMonitorFrame::Forward(_) => {
+                panic!("a truncated changed bitset must terminate the monitor, not forward")
+            }
+        }
+    }
+
+    /// Cross-endian raw monitor whose partial value is truncated must
+    /// terminate the monitor with an error.
+    #[test]
+    fn bfr14_cross_endian_truncated_value_terminates() {
+        let intro = three_field_intro();
+        let changed = BitSet::all_set(intro.total_bits());
+        let mut body = Vec::new();
+        changed.write_into(ByteOrder::Little, &mut body);
+        // Only 2 value bytes where 3 marked `Int` fields need 12 → the
+        // value decode fails.
+        body.extend_from_slice(&[0u8, 0u8]);
+        let ev = crate::server_native::RawMonitorEvent {
+            body_bytes: bytes::Bytes::from(body),
+            byte_order: ByteOrder::Little,
+            type_changed: false,
+        };
+        match raw_monitor_frame(7, &intro, &ev, ByteOrder::Big) {
+            RawMonitorFrame::Terminate { frame, reason } => {
+                assert!(
+                    reason.contains("value"),
+                    "reason names the truncation point, got: {reason}"
+                );
+                bfr14_assert_monitor_error(&frame, ByteOrder::Big);
+            }
+            RawMonitorFrame::Forward(_) => {
+                panic!("a truncated partial value must terminate the monitor, not forward")
+            }
+        }
+    }
+
+    /// One documented policy for malformed raw, not byte-order-dependent
+    /// behaviour: the SAME truncated body (missing overrun trailer)
+    /// forwards verbatim same-endian but terminates cross-endian. Both
+    /// decline to fabricate a valid frame.
+    #[test]
+    fn bfr14_same_and_cross_endian_malformed_one_policy() {
+        let intro = three_field_intro();
+        let body = bfr9_raw_body(ByteOrder::Little, false); // missing overrun
+        let ev = crate::server_native::RawMonitorEvent {
+            body_bytes: body.clone(),
+            byte_order: ByteOrder::Little,
+            type_changed: false,
+        };
+        // Same-endian → forward the malformed body verbatim.
+        match raw_monitor_frame(7, &intro, &ev, ByteOrder::Little) {
+            RawMonitorFrame::Forward(frame) => {
+                let prefix = 8 + 4 + 1;
+                assert_eq!(
+                    &frame[prefix..],
+                    &body[..],
+                    "same-endian forwards the malformed body verbatim"
+                );
+            }
+            RawMonitorFrame::Terminate { .. } => panic!("same-endian must forward, not terminate"),
+        }
+        // Cross-endian → terminate with an error (the missing overrun
+        // trailer cannot be re-encoded).
+        match raw_monitor_frame(7, &intro, &ev, ByteOrder::Big) {
+            RawMonitorFrame::Terminate { frame, .. } => {
+                bfr14_assert_monitor_error(&frame, ByteOrder::Big);
+            }
+            RawMonitorFrame::Forward(_) => {
+                panic!("cross-endian malformed must terminate, not forward")
+            }
+        }
     }
 }
 

@@ -31,7 +31,7 @@ Method:
 | BFR-3 | Low | PVA monitor ACK credit accounting | Fixed in current source |
 | BFR-4 | Medium | PVA RPC DATA payload parsing | Fixed in current source |
 | BFR-5 | Medium | PVA GET/PUT/RPC subcmd lifecycle | Fixed in current source |
-| BFR-6 | Medium | PVA GET_FIELD descriptor fallback | Open |
+| BFR-6 | Medium | PVA GET_FIELD descriptor fallback | Fixed in current source |
 | BFR-7 | Medium | CA monitor single-event filter context | Open |
 | BFR-8 | Medium | PVA PROCESS payload parsing | Open |
 | BFR-9 | Medium | PVA raw monitor overrun parsing | Open |
@@ -345,16 +345,27 @@ Regression tests added:
 
 Severity: medium.
 
-Rust evidence:
+Status: fixed in the current source.
 
-- `crates/epics-pva-rs/src/server_native/tcp.rs:4972-4976` calls
-  `get_introspection_checked(...).await.unwrap_or(FieldDesc::Variant)` in the
-  GET_FIELD slow path.
-- `crates/epics-pva-rs/src/server_native/tcp.rs:4977-4980` then sends
-  `Status::ok()` plus that descriptor.
-- `crates/epics-pva-rs/src/server_native/tcp.rs:1853-1860` allows a channel
-  to be created with `found == true` and `intro == None`, so this slow path is
-  reachable for an existing PV whose source cannot provide a descriptor.
+Original Rust evidence:
+
+- The GET_FIELD slow path called
+  `get_introspection_checked(...).await.unwrap_or(FieldDesc::Variant)` and then
+  sent `Status::ok()` plus that fabricated descriptor.
+- CREATE_CHANNEL allows a channel to be created with `found == true` and
+  `intro == None` (`tcp.rs:3070-3088` stores `intro: Option`, None preserved),
+  so the slow path is reachable for an existing PV whose source cannot provide a
+  descriptor.
+
+Current Rust evidence:
+
+- `crates/epics-pva-rs/src/server_native/tcp.rs:5048-5072` now matches on the
+  `Option<FieldDesc>`: `Some(desc)` → `Status::ok()` + descriptor; `None` →
+  `Status::error(...)` with no descriptor word.
+- The Rust client decoder already handles this shape:
+  `crates/epics-pva-rs/src/client_native/decode.rs:690-696` returns
+  `introspection: None` without decoding a descriptor when the status is not
+  success.
 
 pvxs reference:
 
@@ -373,18 +384,27 @@ whose source returned no descriptor. That hides the source failure and teaches
 the client the wrong type tree. Later GET/PUT/MONITOR operations then fail with
 "must provide prototype" or decode against the wrong expectation.
 
-Expected fix shape:
+Applied fix shape:
 
-Do not use `FieldDesc::Variant` as a fallback for GET_FIELD. If the source
-returns `None`, reply with `Status::Error` and no descriptor, or make channel
-creation reject `found == true && intro == None` for sources that cannot support
-descriptor-late operations.
+The slow path no longer uses `FieldDesc::Variant` as a fallback. When the
+source returns `None` it replies `Status::Error` with no descriptor word,
+exactly mirroring pvxs `doReply(nullptr, Status::Error)` and the `if(type)`
+guard (`serverintrospect.cpp:38-42,83-87`). Channel creation is left unchanged
+(pvxs allows the late-descriptor channel and fails the GET_FIELD at reply time,
+rather than rejecting channel creation).
 
-Regression tests to add:
+Distinct sites classified and skipped: CREATE_CHANNEL (`tcp.rs:3070-3088`)
+already preserves `intro: Option` (no fabrication); the client RPC-response
+`response_desc.unwrap_or(FieldDesc::Variant)` (`ops_v2.rs`) is a legitimate
+parameterless-RPC descriptor; the `PvField::Variant` desc fallback
+(`structure.rs`) returns `Variant` for an already-Variant field.
 
-- Existing PV with `get_introspection_checked == None` returns a GET_FIELD
-  error status.
-- Successful GET_FIELD still returns the exact descriptor from the source.
+Regression tests added (`tcp.rs`):
+
+- `get_field_none_introspection_replies_error_no_descriptor`: slow path with a
+  source that returns `None` replies `Status::Error` and `introspection: None`.
+- `get_field_slow_path_returns_source_descriptor`: a valid source descriptor
+  still round-trips through the slow path unchanged.
 
 ### BFR-7 - CA monitor single-event posts bypass event-context filters
 

@@ -5046,14 +5046,30 @@ async fn handle_get_field(
                 pv_request: None,
             };
             tokio::spawn(async move {
-                let intro = src
-                    .get_introspection_checked(&pv_name, conn_ctx)
-                    .await
-                    .unwrap_or(FieldDesc::Variant);
+                let intro = src.get_introspection_checked(&pv_name, conn_ctx).await;
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
-                Status::ok().write_into(order, &mut payload);
-                encode_type_desc(&intro, order, &mut payload);
+                match intro {
+                    Some(desc) => {
+                        // pvxs `serverintrospect.cpp:38-42`: `ioid + status`
+                        // then the descriptor, written only when non-null.
+                        Status::ok().write_into(order, &mut payload);
+                        encode_type_desc(&desc, order, &mut payload);
+                    }
+                    None => {
+                        // A source that cannot supply a descriptor must reply
+                        // `Status::Error` with NO descriptor — pvxs
+                        // `ServerIntrospectControl::error` →
+                        // `doReply(nullptr, Status::Error)`
+                        // (`serverintrospect.cpp:83-87`), and the `if(type)`
+                        // guard at `:41-42` omits the type word. Fabricating a
+                        // `Variant` here (the old `unwrap_or`) reported success
+                        // and taught the client a wrong type tree, so a later
+                        // GET/PUT/MONITOR would decode against the wrong shape.
+                        Status::error("field introspection unavailable".to_string())
+                            .write_into(order, &mut payload);
+                    }
+                }
                 let h = PvaHeader::application(
                     true,
                     order,
@@ -8795,6 +8811,132 @@ mod tests {
             .expect("clean GET_FIELD must emit introspection reply");
         // ioid (4) + status (1 + ...) + type descriptor
         assert!(resp.len() > PvaHeader::SIZE + 4);
+    }
+
+    /// BFR-6: GET_FIELD slow path on a channel whose source returns no
+    /// descriptor must reply `Status::Error` with NO descriptor, matching
+    /// pvxs `ServerIntrospectControl::error` → `doReply(nullptr, Status::
+    /// Error)` (`serverintrospect.cpp:83-87`) and the `if(type)` guard at
+    /// `:41-42`. The old `unwrap_or(FieldDesc::Variant)` reported success
+    /// and fabricated a Variant type tree.
+    #[tokio::test]
+    async fn get_field_none_introspection_replies_error_no_descriptor() {
+        use crate::client_native::decode::{decode_get_field_response, try_parse_frame};
+        use crate::server_native::SharedSource;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 7;
+        let ioid: u32 = 5555;
+
+        // SharedSource with no PV named "dut": get_introspection → None.
+        let source: DynSource = Arc::new(SharedSource::new());
+
+        // Channel exists but introspection was never cached → slow path.
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: None,
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        crate::proto::encode_string_into("", order, &mut payload);
+        let frame = synth_frame(Command::GetField, order, payload);
+
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
+            .await
+            .expect("handler returns Ok");
+
+        // Slow path spawns the source call; await its reply.
+        let resp = rx.recv().await.expect("GET_FIELD slow-path reply emitted");
+        let (rframe, _) = try_parse_frame(&resp).unwrap().unwrap();
+        let decoded = decode_get_field_response(&rframe).unwrap();
+        assert_eq!(decoded.ioid, ioid);
+        assert!(
+            !decoded.status.is_success(),
+            "introspection failure must reply Status::Error, not OK"
+        );
+        assert!(
+            decoded.introspection.is_none(),
+            "no descriptor on failure (pvxs if(type) guard); must not fabricate Variant"
+        );
+    }
+
+    /// BFR-6 companion: a successful GET_FIELD slow path still returns the
+    /// exact descriptor the source provided (no regression from the
+    /// error-path fix).
+    #[tokio::test]
+    async fn get_field_slow_path_returns_source_descriptor() {
+        use crate::client_native::decode::{decode_get_field_response, try_parse_frame};
+        use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+        use crate::server_native::SharedSource;
+        use crate::server_native::shared_pv::SharedPV;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 7;
+        let ioid: u32 = 5556;
+
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let pv = SharedPV::new();
+        let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
+        initial
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        pv.open(intro.clone(), PvField::Structure(initial));
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        // Channel introspection not cached → exercise the slow path.
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: None,
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        crate::proto::encode_string_into("", order, &mut payload);
+        let frame = synth_frame(Command::GetField, order, payload);
+
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
+            .await
+            .expect("handler returns Ok");
+
+        let resp = rx.recv().await.expect("GET_FIELD slow-path reply emitted");
+        let (rframe, _) = try_parse_frame(&resp).unwrap().unwrap();
+        let decoded = decode_get_field_response(&rframe).unwrap();
+        assert!(decoded.status.is_success(), "valid descriptor → Status::Ok");
+        assert_eq!(
+            decoded.introspection.as_ref(),
+            Some(&intro),
+            "slow path must return the exact source descriptor"
+        );
     }
 }
 

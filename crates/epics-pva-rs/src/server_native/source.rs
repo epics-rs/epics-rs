@@ -480,29 +480,47 @@ pub trait ChannelSource: Send + Sync + 'static {
     }
 
     /// BR-R14: MONITOR with the downstream's event-affecting pvRequest
-    /// options. The default impl ignores `opts` and delegates to
-    /// [`Self::subscribe_checked`] — correct for any source that owns
-    /// the record directly, since it applies pipeline / filter
-    /// semantics itself on the same stream.
+    /// options, decoded-`PvField` form. The default impl ignores `opts`
+    /// and delegates to [`Self::subscribe_checked`] — correct for any
+    /// source that owns the record directly, since it applies pipeline /
+    /// filter semantics itself on the same stream.
     ///
     /// A fanout source (the PVA gateway) overrides this to reject a
     /// subscription whose options cannot be honored transparently
     /// across a shared upstream monitor, instead of silently serving
     /// fanout events that diverge from a direct upstream monitor.
+    ///
+    /// The server's monitor dispatch uses the cooked
+    /// [`Self::subscribe_checked_opts_marked`] variant (which carries the
+    /// trigger `marked` bitset); this `PvField`-returning method is the
+    /// stable entry point retained for API compatibility and for callers
+    /// that do not need the marked metadata.
     fn subscribe_checked_opts(
         &self,
         checked: AccessChecked,
         ctx: ChannelContext,
         opts: MonitorOptions,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<MonitorUpdate>>> + Send {
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
         let _ = opts;
+        self.subscribe_checked(checked, ctx)
+    }
+
+    /// BRIDGE-FR-12: MONITOR with event-affecting pvRequest options,
+    /// **cooked** form — the stream carries [`MonitorUpdate`] so a
+    /// `+trigger` graph can mark which members changed. The default impl
+    /// delegates to [`Self::subscribe_checked_opts`] and wraps each value
+    /// with `marked: None`, so the server derives the changed-bitset as
+    /// before (full mask / value-diff). The server's monitor dispatch
+    /// calls this method; a fanout source (the PVA gateway) overrides it
+    /// to apply trigger selection over a shared upstream monitor.
+    fn subscribe_checked_opts_marked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<MonitorUpdate>>> + Send {
         async move {
-            // BRIDGE-FR-12: the cooked monitor stream carries
-            // `MonitorUpdate`. A source without a `+trigger` graph
-            // delegates to its plain `subscribe_checked` and wraps each
-            // value with `marked: None`, so the server derives the
-            // changed-bitset as before (full mask / value-diff).
-            self.subscribe_checked(checked, ctx)
+            self.subscribe_checked_opts(checked, ctx, opts)
                 .await
                 .map(plain_monitor_updates)
         }
@@ -753,8 +771,8 @@ impl From<PvField> for MonitorUpdate {
 /// Adapt a plain `PvField` monitor stream into a [`MonitorUpdate`]
 /// stream that carries no explicit marked set (`marked: None`). Used by
 /// every cooked source without a `+trigger` graph so the
-/// [`ChannelSource::subscribe_checked_opts`] item type is uniform while
-/// the source keeps producing bare `PvField`s on its own channel.
+/// [`ChannelSource::subscribe_checked_opts_marked`] item type is uniform
+/// while the source keeps producing bare `PvField`s on its own channel.
 pub fn plain_monitor_updates(mut rx: mpsc::Receiver<PvField>) -> mpsc::Receiver<MonitorUpdate> {
     let (tx, out) = mpsc::channel(64);
     tokio::spawn(async move {
@@ -895,8 +913,20 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
     >;
-    /// BR-R14: dyn forwarder for MONITOR with event-affecting options.
+    /// BR-R14: dyn forwarder for MONITOR with event-affecting options
+    /// (decoded `PvField` form; the stable entry point retained for API
+    /// compatibility).
     fn subscribe_checked_opts<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+    >;
+    /// BRIDGE-FR-12: dyn forwarder for the cooked (`MonitorUpdate`) MONITOR
+    /// with event-affecting options. The server's monitor dispatch uses this.
+    fn subscribe_checked_opts_marked<'a>(
         &'a self,
         checked: AccessChecked,
         ctx: ChannelContext,
@@ -1095,9 +1125,21 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
         opts: MonitorOptions,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<MonitorUpdate>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe_checked_opts(
+            self, checked, ctx, opts,
+        ))
+    }
+    fn subscribe_checked_opts_marked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<MonitorUpdate>>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::subscribe_checked_opts_marked(
             self, checked, ctx, opts,
         ))
     }

@@ -252,7 +252,7 @@ impl QsrvPvStore {
 /// native-PVA fan-in receiver (plain values, no `+trigger` graph) or a
 /// started DB/group monitor whose `poll()` carries the per-event marked
 /// set. Shared by the cooked `subscribe_checked` and the marked-aware
-/// `subscribe_checked_opts` so the channel-creation logic lives once.
+/// `subscribe_checked_opts_marked` so the channel-creation logic lives once.
 enum OpenedMonitor {
     /// Native PVA PV (NDPluginPva etc.): a `tx` was appended to the
     /// handle's subscriber list; values fan out as plain `PvField`s.
@@ -262,7 +262,7 @@ enum OpenedMonitor {
 }
 
 /// BRIDGE-FR-12: resolve a started monitor for a read-authorized PV.
-/// Factored out of `subscribe_checked` so `subscribe_checked_opts`
+/// Factored out of `subscribe_checked` so `subscribe_checked_opts_marked`
 /// (which carries the `+trigger` marked set to the wire) reuses the
 /// exact same native-PVA / channel / DBE / queue-depth resolution.
 async fn open_monitor(
@@ -553,7 +553,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let pva_pvs = self.pva_pvs.clone();
         async move {
             // Legacy cooked path: plain `PvField`s, no marked set. The
-            // PVA layer's `subscribe_checked_opts` (below) is what
+            // PVA layer's `subscribe_checked_opts_marked` (below) is what
             // carries the `+trigger` marked set to the wire.
             match open_monitor(provider, pva_pvs, checked, ctx).await? {
                 OpenedMonitor::Native(rx) => Some(rx),
@@ -584,7 +584,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// `opts` (pipeline / queueSize / server-filter) is applied by the
     /// PVA server layer on this same stream — QSRV owns the records
     /// directly — so there is nothing to reject here.
-    fn subscribe_checked_opts(
+    fn subscribe_checked_opts_marked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
@@ -887,7 +887,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             let (tx, rx) = mpsc::channel::<PvField>(64);
             tokio::spawn(async move {
                 // Legacy ctx-less path: plain values, marked set dropped
-                // (the marked-aware cooked entry is `subscribe_checked_opts`).
+                // (the marked-aware cooked entry is `subscribe_checked_opts_marked`).
                 while let Some(poll) = monitor.poll().await {
                     if tx.send(PvField::Structure(poll.value)).await.is_err() {
                         break;

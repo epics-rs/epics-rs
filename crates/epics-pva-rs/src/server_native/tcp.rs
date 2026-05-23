@@ -4973,7 +4973,7 @@ async fn handle_op(
                     }
 
                     let Some(mut rx) = src
-                        .subscribe_checked_opts(
+                        .subscribe_checked_opts_marked(
                             mon_checked.clone(),
                             mon_ctx.clone(),
                             monitor_options.clone(),

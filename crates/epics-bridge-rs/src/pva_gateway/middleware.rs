@@ -173,18 +173,22 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
         self.inner.subscribe_raw_checked(checked, ctx).await
     }
-    // BR-R14: forward the event-affecting-options MONITOR variants to
-    // the inner. Without these the trait default drops `opts` and
-    // routes through `subscribe_checked`, so the gateway source never
-    // sees the options it must reject. A read-only gateway places no
-    // extra constraint on a (read) MONITOR — pure pass-through.
-    async fn subscribe_checked_opts(
+    // BRIDGE-FR-12: forward the cooked (marked) event-affecting-options
+    // MONITOR — the entry point the PVA server dispatches on — to the
+    // inner. Without this the wrapper's `_marked` falls to the trait
+    // default, which routes through this layer's own
+    // `subscribe_checked_opts` and would hide the inner gateway's options
+    // (which it must reject) and its marked set. A read-only gateway
+    // places no extra constraint on a (read) MONITOR — pure pass-through.
+    async fn subscribe_checked_opts_marked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
-        self.inner.subscribe_checked_opts(checked, ctx, opts).await
+        self.inner
+            .subscribe_checked_opts_marked(checked, ctx, opts)
+            .await
     }
     async fn subscribe_raw_checked_opts(
         &self,
@@ -529,9 +533,10 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.subscribe_raw_checked(checked, ctx).await
     }
-    // BR-R14: forward the event-affecting-options MONITOR variants,
-    // applying the same ACL deny-list gate as `subscribe_*_checked`.
-    async fn subscribe_checked_opts(
+    // BRIDGE-FR-12: forward the cooked (marked) event-affecting-options
+    // MONITOR — the server's dispatch entry point — applying the same ACL
+    // deny-list gate as `subscribe_*_checked`.
+    async fn subscribe_checked_opts_marked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
@@ -540,7 +545,9 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         if !self.config.allowed(checked.pv_name()) {
             return None;
         }
-        self.inner.subscribe_checked_opts(checked, ctx, opts).await
+        self.inner
+            .subscribe_checked_opts_marked(checked, ctx, opts)
+            .await
     }
     async fn subscribe_raw_checked_opts(
         &self,
@@ -1118,11 +1125,12 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    // BR-R14: forward the event-affecting-options MONITOR variants,
-    // recording the same Subscribe audit row as `subscribe_*_checked`.
-    // The audit layer is outermost, so it records the attempt even
-    // when the inner gateway source rejects an unsupported option.
-    async fn subscribe_checked_opts(
+    // BRIDGE-FR-12: forward the cooked (marked) event-affecting-options
+    // MONITOR — the server's dispatch entry point — recording the same
+    // Subscribe audit row as `subscribe_*_checked`. The audit layer is
+    // outermost, so it records the attempt even when the inner gateway
+    // source rejects an unsupported option.
+    async fn subscribe_checked_opts_marked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
@@ -1131,7 +1139,10 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
-        let result = self.inner.subscribe_checked_opts(checked, ctx, opts).await;
+        let result = self
+            .inner
+            .subscribe_checked_opts_marked(checked, ctx, opts)
+            .await;
         if self.audit_subscribe {
             let outcome: Result<(), String> = if result.is_some() {
                 Ok(())
@@ -2031,7 +2042,7 @@ mod tests {
         async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
             None
         }
-        async fn subscribe_checked_opts(
+        async fn subscribe_checked_opts_marked(
             &self,
             _checked: AccessChecked,
             _ctx: ChannelContext,
@@ -2051,13 +2062,14 @@ mod tests {
         }
     }
 
-    /// BR-R14: the `Audit` / `ReadOnly` / `Acl` middleware wrappers
-    /// must forward `subscribe_checked_opts` /
-    /// `subscribe_raw_checked_opts` to the inner source. Pre-fix the
-    /// wrappers inherited the trait default, which drops `opts` and
-    /// routes through `subscribe_checked` — so the gateway source (the
-    /// innermost layer) never saw the downstream's event-affecting
-    /// monitor options and could not reject an unsupported set.
+    /// BRIDGE-FR-12: the `Audit` / `ReadOnly` / `Acl` middleware wrappers
+    /// must forward `subscribe_checked_opts_marked` (the server's cooked
+    /// dispatch entry point) / `subscribe_raw_checked_opts` to the inner
+    /// source. Without the override the wrapper inherits the trait
+    /// default, which drops the inner source's own marked path — so the
+    /// gateway source (the innermost layer) never sees the downstream's
+    /// event-affecting monitor options and cannot reject an unsupported
+    /// set.
     #[tokio::test]
     async fn middleware_layers_forward_subscribe_opts_to_inner() {
         use epics_pva_rs::server_native::MonitorOptions;
@@ -2083,7 +2095,7 @@ mod tests {
                     .await;
             } else {
                 let _ = layered
-                    .subscribe_checked_opts(checked_for("X").await, test_ctx(), opts)
+                    .subscribe_checked_opts_marked(checked_for("X").await, test_ctx(), opts)
                     .await;
             }
             assert!(

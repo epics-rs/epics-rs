@@ -1185,7 +1185,7 @@ impl ChannelSource for GatewayChannelSource {
         checked: AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
+    ) -> Option<mpsc::Receiver<PvField>> {
         if opts.affects_upstream_events() {
             tracing::warn!(
                 pv = %checked.pv_name(),
@@ -1199,12 +1199,14 @@ impl ChannelSource for GatewayChannelSource {
             );
             return None;
         }
-        // BRIDGE-FR-12: the gateway fans out plain upstream values; it
-        // carries no QSRV `+trigger` graph, so each event derives its
-        // own changed-bitset (marked: None) like every non-group source.
-        self.subscribe_checked(checked, ctx)
-            .await
-            .map(epics_pva_rs::server_native::plain_monitor_updates)
+        // A subscription with no event-affecting option delegates to the
+        // normal ACF-gated `subscribe_checked` path. The gateway fans out
+        // plain upstream values and carries no QSRV `+trigger` graph; the
+        // cooked `subscribe_checked_opts_marked` variant the server
+        // dispatches on inherits this rejection via the trait default
+        // (which routes through this method) and wraps each value with
+        // `marked: None`, like every non-group source.
+        self.subscribe_checked(checked, ctx).await
     }
 
     /// BR-R14 raw-path counterpart of [`Self::subscribe_checked_opts`].

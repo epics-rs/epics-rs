@@ -514,8 +514,27 @@ impl ChannelSource for CompositeSource {
     /// BR-R14: forward the downstream monitor options to the matched
     /// inner source. A composite over a gateway source must carry
     /// `opts` through so the gateway can reject options it cannot
-    /// honor across a fanout monitor.
+    /// honor across a fanout monitor. Decoded-`PvField` form, retained
+    /// for API compatibility.
     fn subscribe_checked_opts(
+        &self,
+        checked: AccessChecked,
+        ctx: crate::server_native::source::ChannelContext,
+        opts: crate::server_native::source::MonitorOptions,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
+            src.subscribe_checked_opts(inner_checked, ctx, opts).await
+        }
+    }
+
+    /// BRIDGE-FR-12: cooked (`MonitorUpdate`) counterpart of
+    /// [`Self::subscribe_checked_opts`] — the server's monitor dispatch
+    /// path. Resolves the owning inner source and forwards `opts` so a
+    /// gateway can reject options it cannot honor across a fanout monitor.
+    fn subscribe_checked_opts_marked(
         &self,
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
@@ -527,7 +546,8 @@ impl ChannelSource for CompositeSource {
         let this = self.snapshot();
         async move {
             let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
-            src.subscribe_checked_opts(inner_checked, ctx, opts).await
+            src.subscribe_checked_opts_marked(inner_checked, ctx, opts)
+                .await
         }
     }
 

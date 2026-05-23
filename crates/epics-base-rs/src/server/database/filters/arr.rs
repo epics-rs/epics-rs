@@ -37,34 +37,33 @@ pub struct ArrayFilter {
 }
 
 /// Configuration for [`ArrayFilter`] — the `arr` slice parameters
-/// `(start, incr, end)`.
-///
-/// **Construct via [`ArrayFilterConfig::new`] or [`Default`], not a
-/// struct literal.** `incr` is a private field on purpose (the slice
-/// helpers divide and step a loop by it, so it must stay `>= 1`), which
-/// makes the `incr >= 1` invariant hold by construction — the type
-/// cannot be built with an illegal stride. `start` and `end` are public
-/// for direct read/update; only `incr` is gated behind the clamping
-/// constructor and the [`ArrayFilterConfig::incr`] accessor.
+/// `(start, incr, end)`. All three fields are public; prefer
+/// [`ArrayFilterConfig::new`] / [`Default`] (both clamp `incr` to `>= 1`,
+/// the pvxs `arr` rule). **Read `incr` through the
+/// [`ArrayFilterConfig::incr`] accessor**, which also clamps to `>= 1`:
+/// the slice helpers divide and step a loop by the stride, and the
+/// accessor is the single read owner they go through, so the `>= 1`
+/// invariant holds even when the struct is built by literal with an
+/// illegal value.
 #[derive(Debug, Clone, Copy)]
 pub struct ArrayFilterConfig {
     pub start: i64,
-    /// Stride. **Private on purpose**: `slice_with`/`slice_len` divide by
-    /// it and step a loop by it, so `incr <= 0` would divide-by-zero or
-    /// loop forever. The `incr >= 1` invariant therefore holds *by
-    /// construction* — the only ways to build an `ArrayFilterConfig`
-    /// ([`ArrayFilterConfig::new`] and [`Default`]) clamp it to `>= 1`
-    /// (the pvxs `arr` rule: `i < 1` is treated as `1`). Read it via
-    /// [`ArrayFilterConfig::incr`].
-    incr: i64,
+    /// Stride. Public for struct-literal / direct construction, but
+    /// **read it through [`ArrayFilterConfig::incr`]**: `slice_with` /
+    /// `slice_len` divide by it and step a loop by it, so a raw `<= 0`
+    /// value would divide-by-zero or loop forever. The accessor clamps to
+    /// `>= 1` (pvxs `arr`: `i < 1` ⇒ `1`) and is the only path the slice
+    /// helpers read through, so that family stays closed however the
+    /// config was constructed.
+    pub incr: i64,
     pub end: i64,
 }
 
 impl ArrayFilterConfig {
-    /// Build a config, clamping `incr` to `>= 1` (pvxs `arr` rule). This
-    /// is the only constructor that sets `incr`, so every reachable
-    /// `ArrayFilterConfig` satisfies `incr >= 1` and the slice helpers
-    /// can never divide by zero or step backwards.
+    /// Build a config, normalising `incr` to `>= 1` (pvxs `arr` rule) so
+    /// the stored field is already valid. Struct-literal construction can
+    /// still store any value; [`ArrayFilterConfig::incr`] re-clamps on
+    /// read, which is what the slice helpers actually rely on.
     pub fn new(start: i64, incr: i64, end: i64) -> Self {
         Self {
             start,
@@ -73,9 +72,13 @@ impl ArrayFilterConfig {
         }
     }
 
-    /// The stride, guaranteed `>= 1`.
+    /// The stride to use for slicing, clamped to `>= 1` (pvxs `arr` rule:
+    /// `i < 1` is treated as `1`). This accessor — not the raw `incr`
+    /// field — is the single read owner the slice helpers go through, so
+    /// the `>= 1` invariant holds even for a config built by struct
+    /// literal that bypasses [`ArrayFilterConfig::new`]'s clamp.
     pub fn incr(&self) -> i64 {
-        self.incr
+        self.incr.max(1)
     }
 }
 
@@ -91,9 +94,9 @@ impl Default for ArrayFilterConfig {
 
 impl ArrayFilter {
     pub fn new(config: ArrayFilterConfig) -> Self {
-        // The `incr >= 1` invariant is owned by `ArrayFilterConfig`
-        // itself (private field + clamping constructors), so there is
-        // no re-clamp here — an illegal stride cannot reach this point.
+        // The `incr >= 1` invariant is owned by `ArrayFilterConfig::incr()`
+        // (the clamping read accessor the slice helpers use), so there is
+        // no re-clamp here — an illegal stored stride is neutralised on read.
         Self {
             config,
             _state: Mutex::new(()),
@@ -258,24 +261,34 @@ mod tests {
         assert_eq!(unpack(out), vec![0.0, 2.0, 4.0]);
     }
 
-    /// `incr < 1` is clamped to `1` (the pvxs rule) *by construction* of
-    /// `ArrayFilterConfig`, so the slice helpers cannot divide by zero or
-    /// step backwards. The invariant is enforced at the type boundary,
-    /// not by a separate runtime guard in `ArrayFilter::new`: a config
-    /// built with `incr = 0` or a negative stride reports `incr() == 1`,
-    /// and both `apply` (the divisor + the `idx += incr` loop) and
-    /// `final_element_count` run without panicking.
+    /// `incr < 1` is clamped to `1` (the pvxs rule) on **read** via
+    /// [`ArrayFilterConfig::incr`], the single accessor the slice helpers
+    /// use, so they can never divide by zero or step backwards — whether
+    /// the config came from [`ArrayFilterConfig::new`] (which also clamps
+    /// the stored value) or from a struct literal with an illegal stride
+    /// (the public-field path restored for API compatibility).
     #[test]
-    fn invalid_incr_clamps_to_one_by_construction() {
+    fn invalid_incr_clamps_to_one_on_read() {
         for bad in [0_i64, -1, -7, i64::MIN] {
+            // via new(): the stored value is clamped.
             let cfg = ArrayFilterConfig::new(0, bad, -1);
-            assert_eq!(cfg.incr(), 1, "incr {bad} must clamp to 1 in the config");
-            let f = ArrayFilter::new(cfg);
-            // apply: would divide-by-zero / loop forever if incr <= 0.
-            let out = f.apply(ev_array(vec![1.0, 2.0])).unwrap();
-            assert_eq!(unpack(out), vec![1.0, 2.0]);
-            // final_element_count: the same divisor on the count path.
-            assert_eq!(f.final_element_count(2), 2);
+            assert_eq!(cfg.incr(), 1, "new() incr {bad} must report 1");
+            // via struct literal: the raw field bypasses new()'s clamp,
+            // but incr() still clamps so the slice helpers stay safe.
+            let lit = ArrayFilterConfig {
+                start: 0,
+                incr: bad,
+                end: -1,
+            };
+            assert_eq!(lit.incr(), 1, "struct-literal incr {bad} must read as 1");
+            for cfg in [cfg, lit] {
+                let f = ArrayFilter::new(cfg);
+                // apply: would divide-by-zero / loop forever if incr <= 0.
+                let out = f.apply(ev_array(vec![1.0, 2.0])).unwrap();
+                assert_eq!(unpack(out), vec![1.0, 2.0]);
+                // final_element_count: the same divisor on the count path.
+                assert_eq!(f.final_element_count(2), 2);
+            }
         }
     }
 

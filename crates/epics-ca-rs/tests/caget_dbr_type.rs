@@ -16,8 +16,11 @@
 
 use std::time::Duration;
 
+use epics_base_rs::server::records::stringin::StringinRecord;
 use epics_base_rs::server::records::waveform::WaveformRecord;
-use epics_base_rs::types::{DBR_CLASS_NAME, DBR_TIME_DOUBLE, DBR_TIME_FLOAT, DbFieldType};
+use epics_base_rs::types::{
+    DBR_CHAR, DBR_CLASS_NAME, DBR_TIME_DOUBLE, DBR_TIME_FLOAT, DbFieldType,
+};
 use epics_ca_rs::EpicsValue;
 use epics_ca_rs::client::CaClient;
 use epics_ca_rs::server::CaServer;
@@ -123,5 +126,102 @@ async fn caget_dbr_type_reaches_class_name() {
         snap.class_name.as_deref(),
         Some("waveform"),
         "DBR_CLASS_NAME must carry the record's type name"
+    );
+}
+
+/// R55 boundary 1: autosize GET on a `$`-suffix channel returns exactly
+/// `MAX_STRING_SIZE` (= 40) bytes — string, NUL terminator, zero-padded.
+/// C `dbChannel.c:489` sets `no_elements = field_size` (= 40); the Rust
+/// server must advertise 40 on CREATE_CHAN and deliver 40 on every read.
+/// Pre-fix `apply_long_string` emitted `strlen+1` bytes; autosize
+/// `caget PV.VAL$` returned 6 bytes instead of 40 for "hello".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn long_string_autosize_returns_40_nul_padded() {
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .record("R55:LS:AUTO", StringinRecord::new("hello"))
+        .build()
+        .await
+        .expect("build CA server");
+    let _h = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    point_client_at(port);
+    let client = CaClient::new().await.expect("client");
+    // The `$` suffix requests the VAL field as a DBR_CHAR array.
+    let ch = client.create_channel("R55:LS:AUTO.VAL$");
+    ch.wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect to long-string channel");
+
+    // Autosize (count=0) must return exactly 40 elements (field_size).
+    let snap = ch
+        .get_with_dbr_type(DBR_CHAR, 0)
+        .await
+        .expect("autosize DBR_CHAR get");
+    let bytes = match snap.value {
+        EpicsValue::CharArray(ref b) => b.as_slice(),
+        ref other => panic!("expected CharArray, got {other:?}"),
+    };
+    assert_eq!(
+        bytes.len(),
+        40,
+        "autosize `$` channel must return 40 bytes (= MAX_STRING_SIZE); got {}",
+        bytes.len()
+    );
+    // First 5 bytes are "hello", byte 5 is NUL, bytes 6-39 are zero.
+    assert_eq!(&bytes[..5], b"hello", "string content must match");
+    assert_eq!(bytes[5], 0, "byte after string must be NUL terminator");
+    assert!(
+        bytes[6..].iter().all(|&b| b == 0),
+        "trailing bytes must be zero-padded"
+    );
+}
+
+/// R55 boundary 2: a count-clamped GET on a `$` channel trims the 40-byte
+/// array to the requested count (C `read_reply` dbr_size_n parity).
+/// Pre-fix the clamp ran BEFORE apply_long_string so it saw
+/// `EpicsValue::String::count() == 1` and the predicate `count < 1`
+/// was always false — `caget -# 3 PV.VAL$` returned 40 bytes, not 3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn long_string_count_clamp_trims_char_array() {
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .record("R55:LS:CLAMP", StringinRecord::new("hello"))
+        .build()
+        .await
+        .expect("build CA server");
+    let _h = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    point_client_at(port);
+    let client = CaClient::new().await.expect("client");
+    let ch = client.create_channel("R55:LS:CLAMP.VAL$");
+    ch.wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect to long-string channel");
+
+    // count=3 must trim the 40-element char array to 3 bytes "hel".
+    let snap = ch
+        .get_with_dbr_type(DBR_CHAR, 3)
+        .await
+        .expect("count-3 DBR_CHAR get");
+    let bytes = match snap.value {
+        EpicsValue::CharArray(ref b) => b.as_slice(),
+        ref other => panic!("expected CharArray, got {other:?}"),
+    };
+    assert_eq!(
+        bytes.len(),
+        3,
+        "`caget -# 3 PV.VAL$` must return 3 bytes; got {}",
+        bytes.len()
+    );
+    assert_eq!(
+        bytes, b"hel",
+        "trimmed content must be first 3 chars of string"
     );
 }

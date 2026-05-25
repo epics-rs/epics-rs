@@ -283,6 +283,14 @@ struct ChannelEntry {
     /// the task finishes (`Arc` so the spawned task can clear it
     /// without re-borrowing `state.channels`).
     put_notify_busy: Arc<AtomicBool>,
+    /// R55: client appended `$` to the field name, requesting the
+    /// full string as a `DBR_CHAR` array (C `dbChannel.c:483-507`
+    /// long-string convention). When true, every GET/monitor
+    /// delivery converts `EpicsValue::String` → `EpicsValue::CharArray`
+    /// with a NUL terminator before DBR encoding, and the channel's
+    /// native type and element count are overridden to `DBR_CHAR` /
+    /// `MAX_STRING_SIZE` (= 40) at channel-create time.
+    long_string: bool,
 }
 
 impl ChannelEntry {
@@ -327,6 +335,11 @@ struct SubscriptionEntry {
     /// access can resume the same camonitor).
     denied: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
+    /// R55: mirrors `ChannelEntry::long_string`; stored here so the
+    /// access-restore path and `reeval_access_rights` can apply the
+    /// same `EpicsValue::String` → `EpicsValue::CharArray` conversion
+    /// without re-borrowing the channel entry.
+    long_string: bool,
 }
 
 struct ClientState {
@@ -2024,11 +2037,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let record_path = parsed_channel.record_path;
             let filter_suffix = parsed_channel.json_suffix;
             let (_base, field_raw) = parse_pv_name(&record_path);
-            // R55: `$` long-string suffix not stripped; field_raw includes
-            // the literal `$`, so `resolve_field("FIELD$")` returns None
-            // and CREATE_CHAN sends CREATE_CH_FAIL instead of a DBR_CHAR
-            // channel (C dbChannel.c:483-507 parity gap).
-            let field = field_raw.to_ascii_uppercase();
+            // R55: detect the `$` long-string suffix (C dbChannel.c:483-507).
+            // Strip it before the field lookup; set `long_string` so every
+            // delivery path converts the value to DBR_CHAR with a NUL
+            // terminator.
+            let (field_bare, long_string) = if let Some(stripped) = field_raw.strip_suffix('$') {
+                (stripped, true)
+            } else {
+                (field_raw, false)
+            };
+            let field = field_bare.to_ascii_uppercase();
 
             // BRIDGE-FR-10: thread the connection peer into the search
             // resolver so the CA gateway applies host-scoped `.pvlist`
@@ -2052,25 +2070,43 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let value = instance.resolve_field(&field);
                         match value {
                             Some(v) => {
-                                // For waveform records, get_field("VAL") returns
-                                // NORD elements (valid data) but the channel's
-                                // native count must be NELM (max capacity) so
-                                // clients allocate the right buffer.
-                                let element_count = if field == "VAL"
+                                // R55: `$` long-string — C dbChannel.c:483-507
+                                // requires the field to be DBF_STRING
+                                // (EpicsValue::String). Other field types get
+                                // S_dbLib_fieldNotFound (CREATE_CH_FAIL parity).
+                                if long_string && !matches!(v, EpicsValue::String(_)) {
+                                    let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
+                                    fail.cid = client_cid;
+                                    let mut w = writer.lock().await;
+                                    w.write_all(&fail.to_bytes()).await?;
+                                    return Ok(());
+                                }
+                                // R55: override type and count for `$` channels.
+                                // C sets `paddr->field_type = DBF_CHAR`,
+                                // `paddr->dbr_field_type = DBR_CHAR`, and
+                                // `paddr->no_elements = paddr->field_size` (= 40).
+                                let (dbr_type_val, element_count) = if long_string {
+                                    (DbFieldType::Char, 40u32)
+                                } else if field == "VAL"
                                     && instance.record.record_type() == "waveform"
                                 {
-                                    instance
+                                    // For waveform records, get_field("VAL") returns
+                                    // NORD elements (valid data) but the channel's
+                                    // native count must be NELM (max capacity) so
+                                    // clients allocate the right buffer.
+                                    let nelm = instance
                                         .resolve_field("NELM")
                                         .and_then(|n| match n {
                                             EpicsValue::Long(n) => Some(n.max(0) as u32),
                                             _ => None,
                                         })
-                                        .unwrap_or(v.count() as u32)
+                                        .unwrap_or(v.count() as u32);
+                                    (v.dbr_type(), nelm)
                                 } else {
-                                    v.count() as u32
+                                    (v.dbr_type(), v.count() as u32)
                                 };
                                 (
-                                    v.dbr_type(),
+                                    dbr_type_val,
                                     element_count,
                                     ChannelTarget::RecordField {
                                         record: rec.clone(),
@@ -2125,6 +2161,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         pv_name: pv_name.clone(),
                         filter_suffix: filter_suffix.clone(),
                         put_notify_busy: Arc::new(AtomicBool::new(false)),
+                        long_string,
                     },
                 );
                 state.channel_access.insert(sid, access_level);
@@ -2329,6 +2366,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 if let Some(v) = read_chain.apply_to_read_value(snapshot.value.clone()) {
                     snapshot.value = v;
                 }
+            }
+            // R55: convert String → CharArray of exactly 40 elements BEFORE the
+            // requested-count clamp. C read_reply sizes the payload to
+            // dbr_size_n(DBR_CHAR, request_count) after the channel reports
+            // no_elements=40; the clamp must see the 40-element array so
+            // `caget -# N PV.DESC$` trims to N chars (not the pre-convert
+            // count of 1 that EpicsValue::String::count() returns).
+            if entry.long_string {
+                super::apply_long_string(&mut snapshot);
             }
             // Respect client's requested element count (e.g. caget -# 10)
             if requested_count > 0 && requested_count < snapshot.value.count() {
@@ -3205,6 +3251,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // `state.subscriptions` so the entry borrow has to be
             // released before then).
             let sub_pv_name = entry.pv_name.clone();
+            let long_string = entry.long_string; // R55
 
             // R38-G3 / Round 38: EVENT_ADD must also consult the
             // channel's access_rights. A NoAccess peer mounting a
@@ -3366,6 +3413,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             match init_chain.apply_to_event_value(snap.value.clone()) {
                                 Some(v) => {
                                     snap.value = v;
+                                    // R55: convert for `$` long-string channels.
+                                    if long_string {
+                                        super::apply_long_string(&mut snap);
+                                    }
                                     // EX-R9: the initial event honours
                                     // the EVENT_ADD request count for
                                     // BOTH directions —
@@ -3402,6 +3453,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             state.flow_control.clone(),
                             rx,
                             denied.clone(),
+                            long_string,
                         );
 
                         state.subscriptions.insert(
@@ -3414,6 +3466,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 data_count: requested_count,
                                 denied,
                                 task,
+                                long_string,
                             },
                         );
                         if let Some(tx) = conn_events {
@@ -3500,6 +3553,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 match init_chain.apply_to_event_value(snap.value.clone()) {
                                     Some(v) => {
                                         snap.value = v;
+                                        // R55: convert for `$` long-string channels.
+                                        if long_string {
+                                            super::apply_long_string(&mut snap);
+                                        }
                                         Some(snap)
                                     }
                                     None => None,
@@ -3631,6 +3688,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                             .to_string(),
                                     );
                                 }
+                                // R55: convert String → CharArray+NUL for
+                                // `$` long-string channels before encoding.
+                                if long_string {
+                                    super::apply_long_string(&mut event.snapshot);
+                                }
                                 let mut payload_bytes =
                                     match encode_dbr(requested_type, &event.snapshot) {
                                         Ok(bytes) => bytes,
@@ -3708,6 +3770,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 data_count: requested_count,
                                 denied,
                                 task,
+                                long_string,
                             },
                         );
                         if let Some(tx) = conn_events {
@@ -4403,7 +4466,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
             // at the live `snapshot.value.count()`, only truncating
             // and never padding.
             for sub_id in &affected {
-                let (target, data_type, data_count, sub_id_val) = {
+                let (target, data_type, data_count, sub_id_val, sub_long_string) = {
                     let Some(sub) = state.subscriptions.get(sub_id) else {
                         continue;
                     };
@@ -4413,6 +4476,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                         sub.data_type,
                         sub.data_count,
                         sub.sub_id,
+                        sub.long_string,
                     )
                 };
                 if let Some(mut snap) = get_full_snapshot(&target).await {
@@ -4435,6 +4499,10 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                             Some(v) => snap.value = v,
                             None => continue,
                         }
+                    }
+                    // R55: convert for `$` long-string channels.
+                    if sub_long_string {
+                        super::apply_long_string(&mut snap);
                     }
                     send_monitor_snapshot(writer, sub_id_val, data_type, data_count, &snap).await?;
                 }

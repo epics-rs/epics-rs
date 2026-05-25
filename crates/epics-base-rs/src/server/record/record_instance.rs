@@ -266,6 +266,12 @@ impl RecordInstance {
         let now = self.record.get_field(&upper);
         if prev != now.as_ref() {
             self.invalidate_metadata_cache();
+            // R47: mirror C dbAccess.c:1396-1397 db_post_events(precord, NULL, DBE_PROPERTY).
+            // Collect keys first to avoid a re-entrant immutable borrow on subscribers.
+            let fields: Vec<String> = self.subscribers.keys().cloned().collect();
+            for f in fields {
+                self.notify_field_with_origin(&f, crate::server::recgbl::EventMask::PROPERTY, 0);
+            }
         }
     }
 
@@ -1499,7 +1505,11 @@ impl RecordInstance {
         // most records pay zero cost here.
         if self.record.took_metadata_change() {
             self.invalidate_metadata_cache();
-            // R47: must post EventMask::PROPERTY to subscribers when record updates metadata
+            // R47: mirror C db_post_events(precord, NULL, DBE_PROPERTY) after record processing.
+            let fields: Vec<String> = self.subscribers.keys().cloned().collect();
+            for f in fields {
+                self.notify_field_with_origin(&f, crate::server::recgbl::EventMask::PROPERTY, 0);
+            }
         }
 
         if process_result == RecordProcessResult::AsyncPending {

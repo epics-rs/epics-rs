@@ -286,8 +286,52 @@ not correspond to pvxs. Update the module header to describe the actual bucket-r
 (1 s tick × 30 buckets, cap ~29 s). Do not remove `BACKOFF_SECS` — it is `pub` and removal is
 a semver-breaking change.
 
+### R68 — x509 `authority` empty when peer sends partial TLS chain
+
+Severity: Medium (functional parity gap; ACF `AUTHORITY(...)` rules fail)
+
+Status: Fixed
+
+Evidence:
+
+- Rust site: `src/server_native/tcp.rs:1594` —
+  `conn.peer_certificates().and_then(|chain| crate::auth::x509_credentials_from_chain(chain))`.
+  `rustls::CommonState::peer_certificates()` returns **only the certificate chain the peer sent**
+  (RFC 5246 §7.4.2 allows peers to omit the root CA since it is expected to be pre-installed on
+  the verifying side). When the peer omits the root, `chain.last()` is the intermediate CA (or
+  the leaf itself); `is_self_signed_ca` returns `false`; `authority` is left `""`.
+  `ClientCredentials::authority` flows into ACF matching at
+  `src/server_native/source.rs:295` (`check_with_roles`) and
+  `src/server_native/composite.rs:168` (`check`).
+- C++ site: `pvxs-tls/src/ossl.cpp:423-432` — pvxs calls
+  `SSL_get0_verified_chain(ctx)` (not `SSL_get_peer_cert_chain`), which returns the **verified
+  chain as built by OpenSSL's `X509_verify_cert`** — including root CAs fetched from the local
+  trust store even when the peer did not send them. `sk_X509_value(chain, N-1)` is therefore
+  reliably the root CA; `X509_check_ca(root) && (EXFLAG_SS)` passes; `authority = root_CN`.
+
+Impact:
+
+In a typical PKI the client sends `[leaf]` or `[leaf, intermediate]` without the root CA (the
+root is already in the server trust store). pvxs always sets `authority = root_CA_CN` after a
+successful TLS handshake; Rust leaves it empty. Any ACF rule of the form
+`METHOD("x509") AUTHORITY("Root CA")` that works against a pvxs server would be silently denied
+by the Rust server for every well-behaved client — a functional regression that is hard to
+diagnose because the cert is accepted (TLS handshake passes) but access is denied.
+
+Fix direction:
+
+After extracting the leaf `account` from the peer chain, walk the server's `RootCertStore` trust
+anchors: find the anchor whose `subject` DER matches the `issuer` DN of the last peer-chain cert.
+Extract the CN from that anchor's subject as `authority`. Requires:
+1. Adding `trust_roots: Arc<RootCertStore>` to `TlsServerConfig` (stored at config-build time
+   when the trust store is constructed).
+2. Threading the roots to the credential-extraction call at `tcp.rs:1594`.
+3. A new internal helper `authority_from_trust_roots(chain, roots)` using `x509_parser` subject
+   DN comparison and CN extraction.
+The existing `pub fn x509_credentials_from_chain(chain)` signature is unchanged (it is public
+API); the internal call site is changed to use the roots-aware path.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).
-A full audit of the `EncodeTypeCache` emit/decode round-trip and the TLS x.509 peer-credential
-extraction is deferred to a future review.
+A full audit of the `EncodeTypeCache` emit/decode round-trip is deferred to a future review.

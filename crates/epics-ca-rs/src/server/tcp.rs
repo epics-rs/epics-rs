@@ -2024,6 +2024,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let record_path = parsed_channel.record_path;
             let filter_suffix = parsed_channel.json_suffix;
             let (_base, field_raw) = parse_pv_name(&record_path);
+            // R55: `$` long-string suffix not stripped; field_raw includes
+            // the literal `$`, so `resolve_field("FIELD$")` returns None
+            // and CREATE_CHAN sends CREATE_CH_FAIL instead of a DBR_CHAR
+            // channel (C dbChannel.c:483-507 parity gap).
             let field = field_raw.to_ascii_uppercase();
 
             // BRIDGE-FR-10: thread the connection peer into the search

@@ -135,6 +135,9 @@ impl FlowControlGate {
 /// count)` — matches C `read_reply` which keeps the request count
 /// and pads (or uses `snapshot.value.count()` when the request was
 /// autosize=0).
+// R55: `long_string` parameter absent; monitor events for `$`-suffix
+// channels are not converted from `EpicsValue::String` to
+// `EpicsValue::CharArray` before encoding (C dbChannel.c:483-507 gap).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_monitor_sender<W>(
     pv: Arc<ProcessVariable>,

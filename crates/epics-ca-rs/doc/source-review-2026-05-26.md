@@ -394,6 +394,63 @@ Fix direction:
 2. `record_instance.rs` `"mbbi" | "mbbo"` arm — apply C's highwater-mark:
    `rposition(|s| !s.is_empty()).map(|i| i+1).unwrap_or(0)` then `truncate(no_str)`.
 
+### R55 — `$` long-string suffix not parsed; `RECORD.FIELD$` returns `CREATE_CH_FAIL`
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-ca-rs/src/server/tcp.rs` — `CA_PROTO_CREATE_CHAN` handler:
+  `parse_pv_name(&record_path)` splits `RECORD.DESC$` into field `"DESC$"` (dollar
+  included). `instance.resolve_field("DESC$")` returns `None` → the handler sends
+  `CA_PROTO_CREATE_CH_FAIL`. `split_channel_name` only strips JSON `{...}` suffixes;
+  `$` is never recognised. `spawn_monitor_sender` (`monitor.rs`) likewise has no
+  long-string conversion path.
+- **C**: `modules/database/src/ioc/db/dbChannel.c:483-507` — when `*pname == '$'`
+  and the field is `DBF_STRING`: `paddr->no_elements = paddr->field_size` (= 40 =
+  `MAX_STRING_SIZE`), `paddr->field_type = DBF_CHAR`, `paddr->dbr_field_type =
+  DBR_CHAR`. The channel then behaves as a `DBR_CHAR` array of up to 40 elements.
+  For link fields (`DBF_INLINK`/`OUTLINK`/`FWDLINK`): `paddr->no_elements =
+  PVLINK_STRINGSZ` (= 1024). For all other field types: returns
+  `S_dbLib_fieldNotFound` (wire equivalent: `CREATE_CH_FAIL`).
+
+Impact:
+
+CA clients that append `$` to a field name (e.g. `caget PV.DESC$`) to read the
+string as a `DBR_CHAR` array — bypassing the 40-byte `DBR_STRING` truncation for
+long-string records, or consuming string fields as raw bytes — receive
+`CA_PROTO_CREATE_CH_FAIL` from the Rust server instead of a `DBR_CHAR` channel.
+Tools like `caget -S PV.DESC` (which maps to a `$` channel under the hood) and any
+CA client using the long-string convention fail silently.
+
+Fix direction:
+
+1. `tcp.rs` `CREATE_CHAN` handler: after `parse_pv_name`, detect trailing `$` on the
+   field name, strip it, look up the bare field. Verify the value is
+   `EpicsValue::String`; if not, send `CREATE_CH_FAIL` (C parity:
+   `S_dbLib_fieldNotFound`). If it is a string field: override `dbr_type =
+   DbFieldType::Char` and `element_count = 40` (C parity:
+   `paddr->field_size = MAX_STRING_SIZE`). Store `long_string = true` in
+   `ChannelEntry` and `SubscriptionEntry`.
+2. `tcp.rs` READ handler: if `entry.long_string`, convert `snapshot.value` from
+   `EpicsValue::String(s)` to `EpicsValue::CharArray(s_bytes + NUL)` before
+   `encode_dbr`.
+3. `tcp.rs` EVENT_ADD handler: capture `long_string`; apply the same conversion to
+   the initial snapshot and inside the per-event monitor-task loop (both RecordField
+   and SimplePv paths). Store `long_string` in `SubscriptionEntry` so the
+   access-restore path can apply it too.
+4. `monitor.rs` `spawn_monitor_sender` / `send_event`: add `long_string: bool`;
+   apply the same conversion before `encode_dbr`.
+5. Access-restore path: read `sub.long_string` from `SubscriptionEntry` and apply
+   conversion before `send_monitor_snapshot`.
+
+Note: link fields (`DBF_INLINK`/`OUTLINK`/`FWDLINK`) with `$` (C uses
+`PVLINK_STRINGSZ = 1024`) are not covered — the Rust server does not distinguish
+link-field types at the `get_field` level. The fix covers all `EpicsValue::String`
+results, which corresponds to `DBF_STRING` fields in C.
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,

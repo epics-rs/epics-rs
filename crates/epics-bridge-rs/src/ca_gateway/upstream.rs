@@ -38,6 +38,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -45,7 +46,7 @@ use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
 use epics_base_rs::types::EpicsValue;
-use epics_ca_rs::client::{CaChannel, CaClient};
+use epics_ca_rs::client::{CaChannel, CaClient, EventWatcher};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
@@ -72,6 +73,10 @@ struct UpstreamSubscription {
     asg: Option<String>,
     /// Resolved access security level (paired with `asg`).
     asl: i32,
+    /// BR-R51: watcher that keeps `upstream_write` in the access hook
+    /// closure up-to-date. Aborted on drop (when the subscription is
+    /// removed via `unsubscribe`).
+    _access_rights_watcher: EventWatcher,
 }
 
 /// Shared state every upstream subscription's WriteHook needs. Hoisted
@@ -347,6 +352,20 @@ impl UpstreamManager {
             }
         };
 
+        // BR-R51: read initial upstream write-access and create a flag
+        // the access hook AND write-hook closures share. `channel.info()`
+        // reads a cached snapshot — no round-trip — and succeeds here
+        // because `channel.get()` above already waited for connection.
+        // Defaults to true (permissive) on the rare timeout/error path so
+        // we match the C gateway's connect-time behaviour (activate() calls
+        // ca_write_access only after the channel is operational).
+        let upstream_write_init = channel
+            .info()
+            .await
+            .map(|i| i.access_rights.write)
+            .unwrap_or(true);
+        let upstream_write = Arc::new(AtomicBool::new(upstream_write_init));
+
         // Atomically register the shadow PV WITH its WriteHook
         // attached. `add_pv_with_hook` constructs the PV with the
         // hook installed before inserting into `simple_pvs`, so a
@@ -366,10 +385,12 @@ impl UpstreamManager {
         // `.pvlist` ASG/ASL, so the CA server gates downstream reads
         // through `can_read` instead of granting every shadow PV a
         // permissive read.
-        // BR-R51: access hook consults only local ACF can_write; upstream
-        // ca_write_access(chID) is not ANDed in — C gateVcChan::writeAccess
-        // (gateVc.cc:341) requires BOTH asclient AND vc write access.
-        let access_hook = build_access_hook(asg.clone(), asl, self.write_env.access.clone());
+        let access_hook = build_access_hook(
+            asg.clone(),
+            asl,
+            self.write_env.access.clone(),
+            upstream_write.clone(),
+        );
         // If a prior subscribe attempt left a stale shadow entry (it
         // would have been cleaned up by the failure path, but a hot
         // restart or a crashed task could orphan it), drop it before
@@ -402,6 +423,16 @@ impl UpstreamManager {
                 return Err(BridgeError::PutRejected(format!("subscribe failed: {e}")));
             }
         };
+
+        // BR-R51: keep upstream_write up-to-date when the IOC's write-
+        // access changes (e.g. ASG protection lockout). The C gateway's
+        // accessCB (gatePv.cc:1851-1852) calls setWriteAccess + postAccessRights;
+        // runtime re-notification to connected downstream clients requires a
+        // CaServer::notify_access_change() API (deferred cross-crate).
+        let access_rights_watcher = channel.on_access_rights_change({
+            let flag = upstream_write.clone();
+            move |rights| flag.store(rights.write, Ordering::Relaxed)
+        });
 
         // Spawn forwarding task — does NOT borrow the channel, so the
         // direct put()/get() path can use the same channel without
@@ -570,6 +601,7 @@ impl UpstreamManager {
                 task,
                 asg,
                 asl,
+                _access_rights_watcher: access_rights_watcher,
             },
         );
         Ok(())
@@ -695,24 +727,26 @@ impl UpstreamManager {
 /// the access-rights report matches what the write hook will actually
 /// enforce.
 ///
-/// BR-R51: this function does not yet AND in `ca_write_access(chID)` —
-/// the compound `asclient->writeAccess() && vc->writeAccess()` check
-/// from `gateVcChan::writeAccess` (gateVc.cc:341). Fix: pass
-/// `upstream_write: Arc<AtomicBool>` and AND into the write decision.
+/// BR-R51: `upstream_write` mirrors the upstream IOC's `ca_write_access(chID)`,
+/// set at connect time and kept live by `on_access_rights_change`. The write
+/// decision is now `local_acf_write && upstream_write`, matching C
+/// `gateVcChan::writeAccess` (gateVc.cc:341): `asclient->writeAccess() && vc->writeAccess()`.
 fn build_access_hook(
     asg: Option<String>,
     asl: i32,
     access: Arc<ArcSwap<AccessConfig>>,
+    upstream_write: Arc<AtomicBool>,
 ) -> epics_base_rs::server::pv::AccessHook {
     Arc::new(move |user: &str, host: &str| {
         let cfg = access.load();
         let asg_ref = asg.as_deref().unwrap_or("DEFAULT");
         let read = cfg.can_read(asg_ref, asl, user, host);
-        let write = if user.is_empty() && cfg.has_rules() {
+        let local_write = if user.is_empty() && cfg.has_rules() {
             false
         } else {
             cfg.can_write(asg_ref, asl, user, host)
         };
+        let write = local_write && upstream_write.load(Ordering::Relaxed);
         epics_base_rs::server::pv::AccessDecision { read, write }
     })
 }
@@ -1016,7 +1050,8 @@ ASG(DEFAULT) {
         let access = Arc::new(ArcSwap::from_pointee(
             AccessConfig::from_string(acf).expect("ACF parses"),
         ));
-        let hook = build_access_hook(Some("DEFAULT".to_string()), 0, access);
+        let upstream_write = Arc::new(AtomicBool::new(true));
+        let hook = build_access_hook(Some("DEFAULT".to_string()), 0, access, upstream_write);
 
         // Privileged user: read granted, write denied (no WRITE rule).
         let alice = hook("alice", "host1");
@@ -1042,9 +1077,33 @@ ASG(DEFAULT) {
     #[test]
     fn br_fr1_access_hook_allow_all_grants_both() {
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
-        let hook = build_access_hook(None, 0, access);
+        let upstream_write = Arc::new(AtomicBool::new(true));
+        let hook = build_access_hook(None, 0, access, upstream_write);
         let d = hook("anyone", "anywhere");
         assert!(d.read && d.write, "allow-all must grant read and write");
+    }
+
+    /// BR-R51: when upstream write-access is denied (e.g. upstream IOC
+    /// ACF), the access hook must report write=false regardless of local
+    /// ACF — mirrors C gateVcChan::writeAccess (gateVc.cc:341):
+    /// asclient->writeAccess() && vc->writeAccess().
+    #[test]
+    fn br_r51_upstream_write_denied_overrides_local_acf_allow() {
+        let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
+        let upstream_write = Arc::new(AtomicBool::new(false));
+        let hook = build_access_hook(None, 0, access, upstream_write.clone());
+
+        let d = hook("alice", "host1");
+        assert!(d.read, "read must still be granted by allow-all");
+        assert!(
+            !d.write,
+            "upstream write-denied must override local allow-all"
+        );
+
+        // Restoring upstream write-access restores write permission.
+        upstream_write.store(true, Ordering::Relaxed);
+        let d2 = hook("alice", "host1");
+        assert!(d2.write, "write must be granted once upstream restores it");
     }
 
     /// BRIDGE-FR-2: when a downstream client searches for a `.pvlist`

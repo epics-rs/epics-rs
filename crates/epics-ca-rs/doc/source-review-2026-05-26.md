@@ -10,6 +10,9 @@ Scope:
 - Areas reviewed: CA wire protocol framing, CA_PROTO_ERROR reply layout, DBR type
   conversions, monitor flow control, search/UDP/repeater, ECA status codes,
   extended-header handling, beacon, client transport, access rights.
+- Finding-ID series: `R-N` (the global parity-round series; this document records the
+  epics-ca-rs slice — R45 here). IDs are globally unique by prefix and never reused;
+  see `docs/review-tagging-conventions.md`.
 
 ## References
 

@@ -342,8 +342,8 @@ impl ProcessVariable {
         let value = self.value.read().await.clone();
         let mut subs = self.subscribers.lock().await;
         subs.retain(|sub| !sub.tx.is_closed());
-        // CA-FR-6: an alarm post is the `DBE_ALARM` event class.
-        let post = EventMask::ALARM;
+        // BR-R52: ALARM|LOG so DBE_LOG (archiver) subscribers receive alarm events.
+        let post = EventMask::ALARM | EventMask::LOG;
         for sub in subs.iter() {
             // Skip subscribers that did not request alarm events
             // (`caEventMask & pevent->select == 0`).
@@ -389,8 +389,8 @@ impl ProcessVariable {
         let mut subs = self.subscribers.lock().await;
         // Remove subscribers whose channel has been dropped
         subs.retain(|sub| !sub.tx.is_closed());
-        // CA-FR-6: a value change is the `DBE_VALUE` event class.
-        let post = EventMask::VALUE;
+        // BR-R52: VALUE|LOG so DBE_LOG (archiver) subscribers receive value events.
+        let post = EventMask::VALUE | EventMask::LOG;
         for sub in subs.iter() {
             // Skip subscribers that did not request value events
             // (e.g. a `DBE_ALARM`-only monitor).
@@ -593,5 +593,28 @@ mod mask_gate_tests {
         assert!(rx.try_recv().is_ok(), "value post delivered to VALUE|ALARM");
         pv.post_alarm(2, 3).await;
         assert!(rx.try_recv().is_ok(), "alarm post delivered to VALUE|ALARM");
+    }
+
+    /// BR-R52: a DBE_LOG-only subscriber (archiver) must receive both value
+    /// events and alarm events.  Pre-fix: VALUE-only / ALARM-only post masks
+    /// never intersected DBE_LOG(2), so archivers received silence.
+    #[tokio::test]
+    async fn br_r52_log_subscriber_receives_value_and_alarm_events() {
+        const DBE_LOG: u16 = 2;
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_LOG)
+            .await
+            .expect("subscriber added");
+        pv.set(EpicsValue::Double(1.0)).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "DBE_LOG subscriber must receive a value post"
+        );
+        pv.post_alarm(2, 3).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "DBE_LOG subscriber must receive an alarm post"
+        );
     }
 }

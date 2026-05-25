@@ -305,10 +305,10 @@ impl ChannelSource for PanicSource {
         })
     }
     async fn get_value(&self, _: &str) -> Option<PvField> {
-        panic!("get_value handler panicked on purpose (SR-21 regression)");
+        panic!("get_value handler panicked on purpose (PVXS-SR-21 regression)");
     }
     async fn put_value(&self, _: &str, _: PvField) -> Result<(), String> {
-        panic!("put_value handler panicked on purpose (SR-21 regression)");
+        panic!("put_value handler panicked on purpose (PVXS-SR-21 regression)");
     }
     async fn is_writable(&self, _: &str) -> bool {
         true

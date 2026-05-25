@@ -53,6 +53,10 @@ pub struct CompressRecord {
     /// Both modes update internal state identically; the difference
     /// is purely in what `get_field("VAL")` returns.
     pub pbuf: i16,
+    pub egu: String,
+    pub hopr: f64,
+    pub lopr: f64,
+    pub prec: i16,
     // Internal element-wise summing buffer for the rolling-Average
     // algorithm (alg=3) — C `prec->sptr`. The N-to-1 algorithms keep
     // their running state in `cvb`/`inx` (`compress_scalar`) or work
@@ -77,6 +81,10 @@ impl Default for CompressRecord {
             ihil: 0.0,
             inx: 0,
             cvb: 0.0,
+            egu: String::new(),
+            hopr: 0.0,
+            lopr: 0.0,
+            prec: 0,
             accum: Vec::new(),
         }
     }
@@ -445,6 +453,10 @@ impl Record for CompressRecord {
             "IHIL" => Some(EpicsValue::Double(self.ihil)),
             "INX" => Some(EpicsValue::Long(self.inx)),
             "CVB" => Some(EpicsValue::Double(self.cvb)),
+            "EGU" => Some(EpicsValue::String(self.egu.clone())),
+            "HOPR" => Some(EpicsValue::Double(self.hopr)),
+            "LOPR" => Some(EpicsValue::Double(self.lopr)),
+            "PREC" => Some(EpicsValue::Short(self.prec)),
             _ => None,
         }
     }
@@ -544,6 +556,33 @@ impl Record for CompressRecord {
             },
             "NSAM" | "OFF" | "NUSE" | "INX" | "CVB" => {
                 Err(CaError::ReadOnlyField(name.to_string()))
+            }
+            "EGU" => {
+                if let EpicsValue::String(s) = value {
+                    self.egu = s;
+                    Ok(())
+                } else {
+                    Err(CaError::TypeMismatch("EGU".into()))
+                }
+            }
+            "HOPR" => {
+                self.hopr = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("HOPR".into()))?;
+                Ok(())
+            }
+            "LOPR" => {
+                self.lopr = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("LOPR".into()))?;
+                Ok(())
+            }
+            "PREC" => {
+                self.prec = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("PREC".into()))?
+                    as i16;
+                Ok(())
             }
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }

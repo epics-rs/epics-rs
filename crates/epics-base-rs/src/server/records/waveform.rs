@@ -376,6 +376,10 @@ impl Record for WaveformRecord {
             // record type that doesn't declare the field).
             "INDX" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.indx)),
             "MALM" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.malm)),
+            "EGU" => Some(EpicsValue::String(self.egu.clone())),
+            "HOPR" => Some(EpicsValue::Double(self.hopr)),
+            "LOPR" => Some(EpicsValue::Double(self.lopr)),
+            "PREC" => Some(EpicsValue::Short(self.prec)),
             _ => None,
         }
     }
@@ -511,6 +515,33 @@ impl Record for WaveformRecord {
                 if self.malm > 0 && self.indx >= self.malm {
                     self.indx = self.malm - 1;
                 }
+                Ok(())
+            }
+            "EGU" => {
+                if let EpicsValue::String(s) = value {
+                    self.egu = s;
+                    Ok(())
+                } else {
+                    Err(CaError::TypeMismatch("EGU".into()))
+                }
+            }
+            "HOPR" => {
+                self.hopr = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("HOPR".into()))?;
+                Ok(())
+            }
+            "LOPR" => {
+                self.lopr = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("LOPR".into()))?;
+                Ok(())
+            }
+            "PREC" => {
+                self.prec = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("PREC".into()))?
+                    as i16;
                 Ok(())
             }
             _ => Err(CaError::FieldNotFound(name.to_string())),

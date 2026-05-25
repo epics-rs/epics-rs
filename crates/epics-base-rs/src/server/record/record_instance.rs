@@ -467,9 +467,88 @@ impl RecordInstance {
                     ..Default::default()
                 });
             }
-            // R52: waveform/aai/aao and compress missing; DBR_GR returns zeroed limits.
-            // (waveformRecord.c:251-252,239; aaiRecord.c:280-281,268;
-            //  aaoRecord.c:283-284; compressRecord.c:478-479,464)
+            // R52: waveform/aai/aao — HOPR/LOPR/PREC/EGU for VAL display limits.
+            // (waveformRecord.c:251-252,239; aaiRecord.c:280-281,268; aaoRecord.c:283-284)
+            "waveform" | "aai" | "aao" => {
+                let egu = self
+                    .record
+                    .get_field("EGU")
+                    .and_then(|v| {
+                        if let EpicsValue::String(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let prec = self
+                    .record
+                    .get_field("PREC")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0) as i16;
+                let hopr = self
+                    .record
+                    .get_field("HOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                let lopr = self
+                    .record
+                    .get_field("LOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                snap.display = Some(super::super::snapshot::DisplayInfo {
+                    units: egu,
+                    precision: prec,
+                    upper_disp_limit: hopr,
+                    lower_disp_limit: lopr,
+                    upper_alarm_limit: 0.0,
+                    upper_warning_limit: 0.0,
+                    lower_warning_limit: 0.0,
+                    lower_alarm_limit: 0.0,
+                    ..Default::default()
+                });
+            }
+            // R52: compress — HOPR/LOPR/PREC/EGU for VAL display limits.
+            // (compressRecord.c:478-479,464,455)
+            "compress" => {
+                let egu = self
+                    .record
+                    .get_field("EGU")
+                    .and_then(|v| {
+                        if let EpicsValue::String(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let prec = self
+                    .record
+                    .get_field("PREC")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0) as i16;
+                let hopr = self
+                    .record
+                    .get_field("HOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                let lopr = self
+                    .record
+                    .get_field("LOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                snap.display = Some(super::super::snapshot::DisplayInfo {
+                    units: egu,
+                    precision: prec,
+                    upper_disp_limit: hopr,
+                    lower_disp_limit: lopr,
+                    upper_alarm_limit: 0.0,
+                    upper_warning_limit: 0.0,
+                    lower_warning_limit: 0.0,
+                    lower_alarm_limit: 0.0,
+                    ..Default::default()
+                });
+            }
             "motor" => {
                 let egu = self
                     .record

@@ -846,6 +846,16 @@ impl ChannelCache {
                 pause_for_task.install(handle.pauser()).await;
                 let raw_result = handle.wait().await;
                 pause_for_task.clear();
+                // BR-R57: upstream disconnected — no disconnect indicator is
+                // sent to downstream PVA monitors here. The CA gateway posts
+                // INVALID+LINK_ALARM (upstream.rs:543) so downstream CA
+                // clients see the outage via alarm severity. pva2pva fans out
+                // channelStateChange(DISCONNECTED) to all GWChannels
+                // (chancache.cpp:90-98). The PVA gateway does neither: the
+                // broadcast channel goes quiet and downstream monitors
+                // observe the last upstream value at its last alarm state
+                // until reconnect. Design decision deferred — see source
+                // review BR-R57.
                 if let Err(e) = raw_result {
                     tracing::warn!(
                         pv = %pv_name_owned,

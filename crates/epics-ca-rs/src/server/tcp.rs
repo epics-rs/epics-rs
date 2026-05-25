@@ -3162,6 +3162,24 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             } else {
                 DBE_VALUE | DBE_ALARM
             };
+            // R46: C `db_add_event` (dbEvent.c:437-439) returns NULL when
+            // select==0, which propagates as ECA_ALLOCMEM + disconnect
+            // (`camessage.c:1814-1822`). A zero mask installs a subscription
+            // that never triggers — match C by rejecting it immediately.
+            if mask == 0 {
+                let entry_cid = state.channels.get(&sid).map(|e| e.cid).unwrap_or(u32::MAX);
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_ALLOCMEM,
+                    entry_cid,
+                    "EVENT_ADD mask=0: no events would be triggered",
+                )
+                .await?;
+                return Err(epics_base_rs::error::CaError::Protocol(
+                    "EVENT_ADD mask=0 (matches C db_add_event select==0 + RSRV_ERROR)".into(),
+                ));
+            }
 
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,

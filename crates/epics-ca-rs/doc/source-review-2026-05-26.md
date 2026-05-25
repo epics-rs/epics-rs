@@ -71,6 +71,51 @@ calculation and change `payload_size` to use `orig_bytes.len()` instead of
 bytes sent (echo header length + padded diagnostic), covering both the 16-byte and
 24-byte echo cases with one formula.
 
+### R46 — EVENT_ADD with mask=0 silently installs dead subscription; C sends ECA_ALLOCMEM + disconnects
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-ca-rs/src/server/tcp.rs:3160-3164` — mask is extracted from
+  `payload[12..13]` (the `mon_info.m_mask` field), but no guard checks for zero before
+  passing it to `pv.add_subscriber(sub_id, native_type, mask)`. A zero-mask subscription
+  installs in the subscriber Vec, the initial snapshot is delivered to the client, but
+  `Subscriber::accepts(post)` always returns `false` (mask bits never intersect any event
+  class), so no further events ever arrive.
+- **C**: `modules/database/src/ioc/db/dbEvent.c:437-439` — `db_add_event` guards
+  `if (select==0 || select > UCHAR_MAX) return NULL;`. `select > UCHAR_MAX` also covers
+  masks with bits above bit 7 set (nonexistent DBE classes). Back in
+  `modules/database/src/ioc/rsrv/camessage.c:1814-1822` — the NULL return triggers
+  `send_err(mp, ECA_ALLOCMEM, ...)` (CA_PROTO_ERROR on wire) followed by
+  `return RSRV_ERROR` which closes the connection.
+
+Impact:
+
+A client that sends EVENT_ADD with mask=0 (always a client bug; no standard CA library
+does this) gets different treatment:
+- C IOC: ECA_ALLOCMEM error reply (CA_PROTO_ERROR) + connection closed.
+- Rust server: subscription installed (wastes a subscriber slot), initial snapshot
+  delivered (CA_PROTO_EVENT_ADD with ECA_NORMAL status), then silence. The client thinks
+  the monitor is live but never receives further events — a silent hang.
+
+Fix direction:
+
+After extracting `mask` at line 3164, add:
+```rust
+if mask == 0 {
+    send_ca_error(writer, hdr, ECA_ALLOCMEM, entry.cid,
+        "EVENT_ADD mask=0: no events would be triggered").await?;
+    return Err(CaError::Protocol("EVENT_ADD mask=0".into()));
+}
+```
+The CA_PROTO_ERROR reply matches C `send_err(ECA_ALLOCMEM)`; the `Err` return closes the
+connection matching C `RSRV_ERROR`. A mask that only has bits above bit 7 set (> 0x0F) is
+not guarded separately since DBE bits 4-7 are reserved and such a mask would never match
+any C DBE category; the Rust `Subscriber::accepts` already yields false for them.
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,

@@ -1118,15 +1118,16 @@ pub struct X509Credentials {
 
 /// Extract the subject CommonName from a DER-encoded X.509 certificate.
 /// Returns `None` when the cert fails to parse, carries no CN RDN, or the
-/// CN contains an embedded NUL.
+/// CN is not a usable account name (empty or containing an embedded NUL).
 ///
-/// The embedded-NUL rejection mirrors pvxs `SSLContext::commonName()`
-/// (PVXS-SR-13, pvxs @b16b945). `attr.as_str()` returns the CN's raw
-/// `ASN1_STRING` bytes and a NUL is valid UTF-8, so a CN such as
-/// `admin\0.evil` would otherwise become a Rust `String` that downstream
-/// ACF matching/logging treats inconsistently — the NUL-prefix
-/// identity-confusion class (CVE-2009-2408). A NUL-bearing CN is never a
-/// legitimate account, so we drop it (leaving the credential unset)
+/// The usability rejection mirrors pvxs `SSLContext::commonName()`
+/// (PVXS-SR-13, pvxs @b16b945), which rejects BOTH an embedded NUL and a
+/// `len <= 0` CN. `attr.as_str()` returns the CN's raw `ASN1_STRING`
+/// bytes and a NUL is valid UTF-8, so a CN such as `admin\0.evil` would
+/// otherwise become a Rust `String` that downstream ACF matching/logging
+/// treats inconsistently — the NUL-prefix identity-confusion class
+/// (CVE-2009-2408); an empty CN would map to an empty account. Neither is
+/// a legitimate account, so we drop it (leaving the credential unset)
 /// rather than map it to an account. Both the leaf `account` and the
 /// root-CA `authority` route through this one helper, so the rejection
 /// holds for both by construction.
@@ -1136,7 +1137,7 @@ fn subject_common_name(der: &[u8]) -> Option<String> {
         .iter_common_name()
         .next()
         .and_then(|attr| attr.as_str().ok())
-        .filter(|s| !s.contains('\0'))
+        .filter(|s| !s.is_empty() && !s.contains('\0'))
         .map(|s| s.to_string())
 }
 
@@ -1809,5 +1810,16 @@ mod tests {
         let creds = x509_credentials_from_chain(&chain).expect("credentials");
         assert_eq!(creds.account, "svc-ok");
         assert_eq!(creds.authority, "");
+    }
+
+    /// PVXS-SR-13 (len<=0 arm): an empty CN is not a usable account
+    /// either — pvxs `commonName()` rejects `len <= 0`, so the Rust port
+    /// must drop it rather than build an empty-account credential.
+    #[test]
+    fn subject_common_name_rejects_empty_cn() {
+        let (ca_cert, ca_key) = make_ca("CA");
+        let leaf = make_leaf("", &ca_cert, &ca_key);
+        assert_eq!(subject_common_name(&leaf), None);
+        assert!(x509_credentials_from_chain(&[leaf]).is_none());
     }
 }

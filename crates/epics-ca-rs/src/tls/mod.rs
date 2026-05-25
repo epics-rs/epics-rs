@@ -317,24 +317,30 @@ pub fn issuer_from_cert(cert: &CertificateDer<'_>) -> Option<String> {
     }
     // x509-parser renders string-typed DN attributes via `from_utf8`
     // without escaping, so an embedded NUL survives into the authority
-    // string used for ACF `AUTHORITY()` matching. Reject it — same
-    // identity-confusion class as the peer identity below.
-    reject_embedded_nul(dn)
+    // string used for ACF `AUTHORITY()` matching. Reject a NUL-bearing or
+    // empty DN — same usability rule as the peer identity below.
+    reject_unusable_identity(dn)
 }
 
-/// Reject a certificate-derived identity/authority string that contains
-/// an embedded NUL. `x509-parser` returns string-typed attributes via
-/// `from_utf8` (NUL is valid UTF-8), so an attacker-issued CN / SAN /
-/// issuer-DN such as `admin\0.evil` would otherwise pass through into an
-/// ACF identity and be matched/logged inconsistently — the NUL-prefix
+/// Reject a certificate-derived identity/authority string that is not a
+/// usable ACF identity: empty (zero length) or containing an embedded
+/// NUL. `x509-parser` returns string-typed attributes via `from_utf8`
+/// (NUL is valid UTF-8), so an attacker-issued CN / SAN / issuer-DN such
+/// as `admin\0.evil` would otherwise pass through into an ACF identity
+/// and be matched/logged inconsistently — the NUL-prefix
 /// identity-confusion class (CVE-2009-2408). Mirrors pvxs
 /// `SSLContext::commonName()` (PVXS-SR-13, pvxs @b16b945), which rejects
-/// any CN whose length does not round-trip through `strlen()`. A
-/// NUL-bearing name is never a legitimate identity, so the caller falls
-/// back to the safe SHA-256 fingerprint (or no authority).
+/// BOTH an embedded NUL (the length must round-trip through `strlen()`)
+/// AND a `len <= 0` (no usable CN). An unusable name is never a
+/// legitimate identity, so the caller falls back to the safe SHA-256
+/// fingerprint (or no authority).
 #[cfg(feature = "experimental-rust-tls")]
-fn reject_embedded_nul(s: String) -> Option<String> {
-    if s.contains('\0') { None } else { Some(s) }
+fn reject_unusable_identity(s: String) -> Option<String> {
+    if s.is_empty() || s.contains('\0') {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Best-effort parse of an X.509 cert to extract a name field. Returns
@@ -350,10 +356,11 @@ fn parse_san_dns_or_cn(der: &[u8]) -> Option<String> {
             match name {
                 x509_parser::extensions::GeneralName::DNSName(s)
                 | x509_parser::extensions::GeneralName::URI(s) => {
-                    // A NUL in the name is the CVE-2009-2408 vector; skip
-                    // this entry and let a later SAN entry or the
+                    // A NUL-bearing or empty name is not a usable
+                    // identity (CVE-2009-2408 vector / pvxs len<=0 rule);
+                    // skip this entry and let a later SAN entry or the
                     // fingerprint fallback supply the identity.
-                    if let Some(name) = reject_embedded_nul(s.to_string()) {
+                    if let Some(name) = reject_unusable_identity(s.to_string()) {
                         return Some(name);
                     }
                 }
@@ -368,7 +375,7 @@ fn parse_san_dns_or_cn(der: &[u8]) -> Option<String> {
         .next()
         .and_then(|cn| cn.as_str().ok())
         .map(|s| s.to_string())
-        .and_then(reject_embedded_nul)
+        .and_then(reject_unusable_identity)
 }
 
 // Re-exports needed by the public API when the feature is enabled.
@@ -418,6 +425,21 @@ mod nul_identity_tests {
             "expected fingerprint, got {id:?}"
         );
         assert!(!id.contains('\0'));
+    }
+
+    /// pvxs `len <= 0` parity: an empty CN is not a usable identity, so
+    /// `parse_san_dns_or_cn` rejects it and `identity_from_cert` falls
+    /// back to the fingerprint rather than an empty identity string.
+    #[test]
+    fn identity_rejects_empty_cn_falls_back_to_fingerprint() {
+        let cert = self_signed_with_cn("");
+        assert_eq!(parse_san_dns_or_cn(cert.as_ref()), None);
+        let id = identity_from_cert(&cert);
+        assert!(
+            id.starts_with("sha256:"),
+            "expected fingerprint, got {id:?}"
+        );
+        assert!(!id.is_empty());
     }
 
     /// A clean CN still resolves to the CN identity (no false rejection).

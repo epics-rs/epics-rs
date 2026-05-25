@@ -5571,6 +5571,9 @@ async fn handle_get_field(
                 roles: cred.roles.clone(),
                 pv_request: None,
             };
+            // R65: no abort handle — task outlives connection if get_introspection_checked hangs.
+            // pvxs registers the introspect op in opByIOID and fires error("Implicit Cancel")
+            // on teardown (serverintrospect.cpp:63-68 + serverconn.cpp:366-382).
             tokio::spawn(async move {
                 let intro = src.get_introspection_checked(&pv_name, conn_ctx).await;
                 let mut payload = Vec::new();

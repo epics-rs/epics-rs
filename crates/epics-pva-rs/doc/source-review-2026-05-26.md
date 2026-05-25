@@ -116,6 +116,35 @@ Fix direction:
 Change the hard-coded `87_040` to `0x10000` (65536) in both the server builder call and the
 client's `DEFAULT_BUFFER_SIZE` constant, matching pvxs.
 
+### R63 — `QosFlags::MONITOR_START` and `MONITOR_STOP` hold wrong subcmd values
+
+Severity: Low (unused in production paths)
+
+Status: Fixed
+
+Evidence:
+
+- Rust site: `src/proto/command.rs:113-115` — `MONITOR_START = 0x40` and `MONITOR_STOP = 0x80`.
+  The correct protocol values are `START = 0x44` (`0x04 | 0x40`) and `STOP = 0x04`.
+  Additionally `MONITOR_STOP = 0x80` aliases `PIPELINE_ACK = 0x80`, making both names refer to
+  different protocol concepts with identical bit patterns.
+- C++ site: `pvxs/src/clientmon.cpp:127` — `subcmd = p ? 0x04 : 0x44; // STOP | START`.
+  `p` is the pause flag: pause → `0x04` (STOP), resume → `0x44` (START).
+- C++ site: `pvxs/src/servermon.cpp:671-675` — `if(subcmd & 0x04) { bool start = subcmd & 0x40; }`
+  confirms STOP = `0x04`, START = `0x04 | 0x40 = 0x44`.
+
+Impact:
+
+`MONITOR_START` and `MONITOR_STOP` are not used in any wire-building production code
+(`codec.rs` uses hard-coded `0x44` and `0x04` directly). However, the constants are public
+API; any caller relying on them to build monitor control frames would produce malformed
+subcmds. The `MONITOR_STOP = 0x80` alias with `PIPELINE_ACK` is a silent semantic collision.
+
+Fix direction:
+
+Correct `MONITOR_START = 0x44` and `MONITOR_STOP = 0x04`. Also update the doc-comment for
+`MONITOR_START` to note it combines the control bit (`0x04`) with the GET bit (`0x40`).
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct or bug). A full audit of

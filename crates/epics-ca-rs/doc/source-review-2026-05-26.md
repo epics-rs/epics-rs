@@ -247,6 +247,36 @@ Add `pub fn notify_access_change(&self)` to `CaServer` that sends `()` on the
 `reeval_access_rights`, which re-pushes `CA_PROTO_ACCESS_RIGHTS` only when the
 computed access level actually changes (`oldaccess != access` filter, R2-51 parity).
 
+### R50 — `int64in` missing from `populate_control_info`; DBR_CTRL_LONG/DOUBLE returns zeroed control limits
+
+Severity: Low
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-base-rs/src/server/record/record_instance.rs` —
+  `populate_control_info` match arm `"ai" | "longin" | "calc" | "calcout"` uses
+  HOPR/LOPR as control limits. `int64in` is absent from every arm; the `_ => {}`
+  wildcard leaves `snap.control = None`, so `encode_ctrl` encodes
+  `upper_ctrl_limit = 0` / `lower_ctrl_limit = 0` for all `int64in` channels.
+- **C**: `modules/database/src/std/rec/int64inRecord.c:226-227` —
+  `int64inRecord::get_control_double` sets
+  `pcd->upper_ctrl_limit = prec->hopr; pcd->lower_ctrl_limit = prec->lopr;`.
+  Parity with `longinRecord.c:231-232` which also uses HOPR/LOPR.
+
+Impact:
+
+CA clients that request `DBR_CTRL_LONG` (or `DBR_CTRL_DOUBLE`) for an `int64in`
+channel receive `upper_ctrl_limit = 0` / `lower_ctrl_limit = 0` regardless of the
+record's HOPR/LOPR settings. Control-panel widgets that respect control limits
+(sliders, spin boxes) display unconstrained ranges for `int64in` channels.
+
+Fix direction:
+
+Add `"int64in"` to the `"ai" | "longin" | "calc" | "calcout"` arm in
+`populate_control_info`.
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,

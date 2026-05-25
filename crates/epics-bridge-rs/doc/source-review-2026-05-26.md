@@ -202,6 +202,33 @@ Structural change required in `epics-base-rs`:
 2. Optionally change `post_alarm` (`pv.rs:359`) to `EventMask::ALARM | EventMask::LOG` so archiver clients with `DBE_LOG` also see disconnect/alarm events.
 3. No changes required in `epics-bridge-rs`: the gateway's `put_pv_and_post_snapshot` and `post_alarm` calls are already correct; only the per-subscriber event-class gate inside `ProcessVariable` needs widening.
 
+### BR-R53 — pvlist `DENY FROM hostname` rules silently non-functional; C gateway resolves hostnames to IPs at parse time
+
+Severity: Medium
+
+Status: Doc-only (fix required in `epics-bridge-rs/src/ca_gateway/pvlist.rs`)
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/ca_gateway/pvlist.rs:396-410` — `parse_pvlist` stores raw `DENY FROM` host tokens verbatim into `PvListEntry::Deny { from_hosts: Vec<String> }` without DNS resolution.
+- `crates/epics-bridge-rs/src/ca_gateway/pvlist.rs:178` — `is_host_denied` compares using `eq_ignore_ascii_case(host)` against the stored raw strings.
+- `crates/epics-bridge-rs/src/ca_gateway/server.rs:356` — the search/create path passes `&addr.ip().to_string()` (TCP peer IP) as the host argument to `match_name_for_host`.
+- `crates/epics-bridge-rs/src/ca_gateway/upstream.rs:799` — the put path passes `&ctx.host` as the host argument to `is_host_denied`; by default `ctx.host` = `state.hostname` = `peer.ip().to_string()` (CA TCP server `tcp.rs:1215`, `WriteContext` at `pv.rs:66-73`).
+- `epics-modules/ca-gateway/src/gateAs.cc:455-509` (always active: `src/Makefile:17` defines `USE_DENYFROM`) — the C pvlist parser calls `aToIPAddr(hname, 0, pSockAdd)` for every hostname token in `DENY FROM`, converts to dotted-IP string via `ipAddrToDottedIP`, and replaces the hostname with the resolved IP in the buffer before subsequent parsing. Unresolvable hostnames are dropped with a stderr warning.
+
+Impact:
+
+A pvlist file using `DENY FROM hostname.example.com` rules has those deny rules **silently bypassed** in the Rust gateway: the stored string `hostname.example.com` never matches the TCP peer IP `192.168.1.5` that callers pass at match time. The host-targeted deny is a no-op. Only pvlist files that use IP-literal syntax (`DENY FROM 192.168.1.5`) work correctly in both C and Rust.
+
+This is a security-relevant gap: human-readable pvlist files that rely on hostname-based deny rules for host isolation provide no actual isolation in the Rust gateway.
+
+Fix direction:
+
+Within `epics-bridge-rs/src/ca_gateway/pvlist.rs`:
+- At parse time (line 399), after collecting each hostname token, attempt to resolve it to its IP address. An async post-parse resolution step is the cleanest approach given that `parse_pvlist` is currently synchronous and called from async Tokio context: run DNS resolution via `tokio::net::lookup_host` in the caller, or make `parse_pvlist` async. A simpler fallback: after `PvList` is constructed by the sync parser, add an async `PvList::resolve_hosts(&mut self)` method that replaces each hostname in `from_hosts` with its resolved IP string, called once after loading.
+- Mirror C error handling: log a warning and skip unresolvable hostnames rather than silently keeping the raw string.
+- Do not change the type of `from_hosts` — keep it `Vec<String>` (resolved IPs are still strings); only the content changes from hostname to IP.
+
 ## Uncertain candidates
 
 None identified this round.

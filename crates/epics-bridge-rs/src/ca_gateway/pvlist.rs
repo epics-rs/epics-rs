@@ -397,6 +397,11 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
             if let Some(t) = tokens.next() {
                 if t.eq_ignore_ascii_case("FROM") {
                     for h in tokens {
+                        // BR-R53: C gateway resolves each hostname to its IP
+                        // via aToIPAddr at parse time (gateAs.cc:488-506).
+                        // Callers pass the TCP peer IP, so hostname strings
+                        // here never match. Fix: resolve hostnames to IPs
+                        // after parsing (async PvList::resolve_hosts step).
                         from_hosts.push(h.to_string());
                     }
                 } else {

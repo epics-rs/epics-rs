@@ -207,6 +207,46 @@ only field suppressed (because Passive records process VAL through `dbProcess`, 
 posts VALUE events during the processing cycle). Non-VAL fields have no equivalent
 deferred-posting path and must be notified immediately after the write.
 
+### R49 — `CaServer` has no public `notify_access_change()` method; INP*-driven re-notification impossible
+
+Severity: Low
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-ca-rs/src/server/ca_server.rs:434` —
+  `acf_reload_tx: broadcast::Sender<()>` is a private field. The only paths that
+  send on it are `reload_acf_inner` (triggered by `reload_acf_from` — file-based)
+  and the ASG-field-change forwarder task in `run_tcp_listener` (triggered by
+  `notify_asg_field_changed` when the `ASG` record field is written). No public
+  method exists on `CaServer` to fire the broadcast programmatically, so library
+  code that monitors INP* link values for CALC-gated ACF rules has no way to
+  trigger `reeval_access_rights` on connected clients.
+- **C**: `modules/database/src/ioc/as/asCa.c:137,161` — `eventCallback` and
+  `connectCallback` call `asComputeAsg(pasg)` when an INP* link value changes or
+  disconnects. `modules/database/src/ioc/as/asCa.c:205` — `asComputeAllAsg()` is
+  called after ACF initialisation. Both paths propagate through
+  `asComputePvt` → `casAccessRightsCB(asClientCOAR)` →
+  `camessage.c:1057-1101` → `access_rights_reply` → `CA_PROTO_ACCESS_RIGHTS` for
+  every affected already-connected channel. C exposes `asComputeAsg` as a public
+  subsystem hook; Rust has no equivalent at the `CaServer` API level.
+
+Impact:
+
+Library code that monitors INP* link values for CALC-gated ACF rules (or that
+changes access-security state programmatically in other ways) cannot trigger
+`CA_PROTO_ACCESS_RIGHTS` re-push for connected clients. The ACF-file-reload and
+ASG-field-change paths are correctly wired; only the programmatic trigger is missing.
+
+Fix direction:
+
+Add `pub fn notify_access_change(&self)` to `CaServer` that sends `()` on the
+`acf_reload_tx` broadcast. This is the Rust equivalent of calling
+`asComputeAllAsg()` — it prompts every connected TCP client's select loop to run
+`reeval_access_rights`, which re-pushes `CA_PROTO_ACCESS_RIGHTS` only when the
+computed access level actually changes (`oldaccess != access` filter, R2-51 parity).
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,

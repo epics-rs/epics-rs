@@ -431,6 +431,7 @@ pub struct CaServer {
     /// for its open channels. Mirrors RSRV `sendAllUpdateAS`
     /// (caservertask.c:1224) — the broadcast that keeps already-open
     /// channels in sync with rule changes.
+    // R49: no public `notify_access_change` method to fire this broadcast
     acf_reload_tx: tokio::sync::broadcast::Sender<()>,
     autosave_config: Option<autosave::SaveSetConfig>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,

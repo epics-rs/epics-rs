@@ -20,7 +20,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::{ServerConfig, ServerConnection};
+use rustls::{RootCertStore, ServerConfig, ServerConnection};
 
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::{Mutex, mpsc};
@@ -209,6 +209,7 @@ async fn pvxs_pvxget_to_rust_tls_server() {
     let server_tls = Arc::new(TlsServerConfig {
         config: Arc::new(server_cfg),
         require_client_cert: false,
+        trust_roots: Arc::new(RootCertStore::empty()),
     });
 
     // Spawn Rust TLS server.

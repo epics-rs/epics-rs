@@ -1589,10 +1589,22 @@ pub async fn run_tcp_server_on_listener(
                                     // already passed `WebPkiClientVerifier`,
                                     // so this is the cryptographically-checked
                                     // identity (pvxs `fill_credentials`).
+                                    //
+                                    // R68: use trust_roots so that `authority`
+                                    // is populated even when the peer sends a
+                                    // partial chain (leaf-only or leaf+CA),
+                                    // matching pvxs SSL_get0_verified_chain.
                                     let x509_id = {
                                         let (_, conn) = tls_stream.get_ref();
-                                        conn.peer_certificates().and_then(|chain| {
-                                            crate::auth::x509_credentials_from_chain(chain)
+                                        let roots =
+                                            cfg.tls.as_ref().map(|t| t.trust_roots.as_ref());
+                                        conn.peer_certificates().and_then(|chain| match roots {
+                                            Some(r) => {
+                                                crate::auth::x509_credentials_from_chain_with_roots(
+                                                    chain, r,
+                                                )
+                                            }
+                                            None => crate::auth::x509_credentials_from_chain(chain),
                                         })
                                     };
                                     let (r, w) = tokio::io::split(tls_stream);

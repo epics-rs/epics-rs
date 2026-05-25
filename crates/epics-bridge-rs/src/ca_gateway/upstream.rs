@@ -366,6 +366,9 @@ impl UpstreamManager {
         // `.pvlist` ASG/ASL, so the CA server gates downstream reads
         // through `can_read` instead of granting every shadow PV a
         // permissive read.
+        // BR-R51: access hook consults only local ACF can_write; upstream
+        // ca_write_access(chID) is not ANDed in — C gateVcChan::writeAccess
+        // (gateVc.cc:341) requires BOTH asclient AND vc write access.
         let access_hook = build_access_hook(asg.clone(), asl, self.write_env.access.clone());
         // If a prior subscribe attempt left a stale shadow entry (it
         // would have been cleaned up by the failure path, but a hot
@@ -691,6 +694,11 @@ impl UpstreamManager {
 /// (no identity) is reported write-denied whenever rules are loaded, so
 /// the access-rights report matches what the write hook will actually
 /// enforce.
+///
+/// BR-R51: this function does not yet AND in `ca_write_access(chID)` —
+/// the compound `asclient->writeAccess() && vc->writeAccess()` check
+/// from `gateVcChan::writeAccess` (gateVc.cc:341). Fix: pass
+/// `upstream_write: Arc<AtomicBool>` and AND into the write decision.
 fn build_access_hook(
     asg: Option<String>,
     asl: i32,

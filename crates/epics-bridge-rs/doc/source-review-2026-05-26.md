@@ -149,6 +149,34 @@ Remove the three early exits that abort the monitor task when `receiver_count ==
 
 With these removed, the task loops and retries the upstream reconnect regardless of subscriber count. The `cleanup_tick()` aborts the task (via `AbortOnDrop` in `UpstreamEntry`) when it evicts the entry after two consecutive 30 s ticks with `subscriber_count() == 0`. A subscriber that arrives before cleanup gets a live reconnecting task, not a dead one. This matches pva2pva's invariant that a cached entry always has an active upstream connection attempt in flight.
 
+### BR-R51 — CA gateway access hook does not AND upstream write-access into `AccessDecision`
+
+Severity: Medium
+
+Status: Fixed (initial rights AND; runtime re-notification deferred cross-crate)
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/ca_gateway/upstream.rs:694-710` — `build_access_hook` closure consults only local ACF `can_write()`; no upstream `ca_write_access(chID)` is queried or included. `AccessDecision::write` is set from `cfg.can_write()` alone.
+- `crates/epics-ca-rs/src/client/mod.rs:2299-2310` — `CaChannel::on_access_rights_change()` exists and provides real-time upstream write-access notification but is never called from `ensure_subscribed` in the gateway.
+- `epics-modules/ca-gateway/src/gateVc.cc:331-342` — `gateVcChan::writeAccess()` returns `asclient->writeAccess() && vc->writeAccess()` — compound AND of local ACF (`asclient`) and upstream access (`vc->write_access`). Both must permit before the downstream client is shown write-allowed.
+- `epics-modules/ca-gateway/src/gatePv.cc:395-396` — at connect time, `activate()` sets `vc->setWriteAccess(ca_write_access(chID))` from the upstream channel's current access state.
+- `epics-modules/ca-gateway/src/gatePv.cc:1851-1852` — in `accessCB` (upstream access-rights change callback), updates `vc->setWriteAccess(ca_write_access(args.chid))` and fires `postAccessRights()` to notify all downstream clients.
+
+Impact:
+
+A downstream CA client connecting to a gateway PV where the upstream IOC has write-access denied (upstream ACF, EPICS access security, or read-only field) sees `AccessDecision::write = true` in the gateway's `CA_PROTO_ACCESS_RIGHTS` reply. Operator displays and alarm-management tools that use the access-rights field to show lock icons (e.g. CSS/Phoebus, camonitor `-w`) display the channel as writable when it is upstream-read-only. Individual `caput` operations do eventually fail after being forwarded upstream (ECA_NORDACCESS is propagated back via put-notify), but the initial advertisement is wrong. Additionally, if the upstream IOC changes write access at runtime (lockout, protection enable), the Rust gateway never updates connected downstream clients — they continue seeing the stale access-rights until they disconnect and reconnect.
+
+Fix direction:
+
+Within `epics-bridge-rs` (initial rights AND):
+1. In `ensure_subscribed` (upstream.rs), after `channel.get()`: query `channel.info().access_rights.write` and store in `Arc<AtomicBool>` as `upstream_write`.
+2. Pass `upstream_write.clone()` to `build_access_hook`; AND `upstream_write.load(Relaxed)` into the write decision so `AccessDecision::write = local_acf_write && upstream_write`.
+3. Call `channel.on_access_rights_change(|r| upstream_write.store(r.write, Relaxed))` and store the returned `EventWatcher` in `UpstreamSubscription` (dropped on `unsubscribe`, aborting the watcher task).
+
+Deferred to main worker (cross-crate, `epics-ca-rs`):
+When upstream write-access changes at runtime, the `AtomicBool` updates but connected downstream clients are not re-notified until they reconnect. The C gateway calls `postAccessRights()` → per-channel `postAccessRightsEvent()`. The Rust CA server has an `acf_reload_tx` broadcast that triggers `reeval_access_rights` on all client tasks, but no public "fire access-reload broadcast without reloading the ACF file" API. Adding `CaServer::notify_access_change()` (just fire the broadcast) would let the gateway watcher trigger per-server re-evaluation; deferred to main worker.
+
 ## Uncertain candidates
 
 None identified this round.

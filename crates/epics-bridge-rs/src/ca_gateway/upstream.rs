@@ -497,13 +497,17 @@ impl UpstreamManager {
                 if let Some(entry_arc) = cache_clone.read().await.get(&name) {
                     entry_arc.write().await.set_state(PvState::Disconnect);
                 }
-                // BR-R47: status=0 (NO_ALARM) is wrong; LINK_ALARM (14)
-                // is the correct EPICS status for a link-disconnect alarm.
-                // 3 = AlarmSeverity::Invalid; status 0 = LINK alarm
-                // (downstream client cannot tell why upstream is gone,
-                // only that it is — INVALID severity is the closest
-                // EPICS alarm to "channel disconnected").
-                let _ = db_clone.post_alarm(&name, 3, 0).await;
+                // 3 = INVALID severity. BR-R47: LINK_ALARM (14) is the
+                // correct EPICS status for a link-disconnect alarm;
+                // upstream disconnect is visible to downstream monitors
+                // both via severity and via the correct status code.
+                let _ = db_clone
+                    .post_alarm(
+                        &name,
+                        3,
+                        epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                    )
+                    .await;
 
                 // Try to re-subscribe with exponential backoff. The
                 // CaChannel itself drives reconnect under the hood;

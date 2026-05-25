@@ -75,6 +75,12 @@ pub struct UpstreamEntry {
     /// `tx` (decoded PvField, for `subscribe()` and snapshot) and
     /// `tx_raw` (raw bytes) per upstream event.
     tx_raw: broadcast::Sender<crate::pva_gateway::source::RawEvent>,
+    /// BR-R46: cached latest raw event. Populated after the first
+    /// upstream monitor event so `subscribe_raw_inner` can deliver it
+    /// as the initial snapshot to new raw subscribers. Cleared on
+    /// type-change so stale bytes from the old descriptor are not
+    /// replayed under the new one. Mirrors `moncache.cpp` `lastelem`.
+    latest_raw: Arc<RwLock<Option<crate::pva_gateway::source::RawEvent>>>,
     /// Pulsed on the first successful upstream event. `lookup()` waits
     /// on this so callers see a populated snapshot before returning.
     first_event: Arc<Notify>,
@@ -366,6 +372,13 @@ impl UpstreamEntry {
     pub fn subscribe_raw(&self) -> broadcast::Receiver<crate::pva_gateway::source::RawEvent> {
         self.poke();
         self.tx_raw.subscribe()
+    }
+
+    /// BR-R46: latest cached raw upstream frame. Returns `None` until
+    /// the first upstream monitor event has been received (or after a
+    /// type-change resets the cache).
+    pub fn snapshot_raw(&self) -> Option<crate::pva_gateway::source::RawEvent> {
+        self.latest_raw.read().clone()
     }
 
     /// Number of live downstream subscribers (broadcast receivers).
@@ -689,6 +702,8 @@ impl ChannelCache {
         let state = Arc::new(RwLock::new(EntryState::default()));
         let pause = PauseControl::new();
 
+        let latest_raw = Arc::new(RwLock::new(None::<crate::pva_gateway::source::RawEvent>));
+
         let pv_name_owned = pv_name.to_string();
         let client = self.client.clone();
         let tx_for_task = tx.clone();
@@ -696,6 +711,7 @@ impl ChannelCache {
         let state_for_task = state.clone();
         let first_event_for_task = first_event.clone();
         let pause_for_task = pause.clone();
+        let latest_raw_for_task = latest_raw.clone();
 
         let join = tokio::spawn(async move {
             let mut backoff = Duration::from_millis(250);
@@ -724,6 +740,7 @@ impl ChannelCache {
                 // `MonitorControlOp::pipeline` parity.
                 let tx_raw_inner = tx_raw_for_task.clone();
                 let pv_clone = pv_name_owned.clone();
+                let latest_raw_inner = latest_raw_for_task.clone();
                 // BR-R41: tx_inner moves into the callback so decoded
                 // events fan out to typed subscribers (subscribe_inner /
                 // subscribe_checked fallback path). Pre-fix this sender
@@ -752,6 +769,9 @@ impl ChannelCache {
                             // downstream dispatch path sends MONITOR FINISH
                             // and the client knows to reopen with a fresh
                             // INIT against the new descriptor.
+                            // BR-R46: clear stale bytes so new raw
+                            // subscribers don't replay the old descriptor.
+                            *latest_raw_inner.write() = None;
                             let _ = tx_raw_inner.send(RawEvent {
                                 body: bytes::Bytes::new(),
                                 byte_order: order,
@@ -780,12 +800,17 @@ impl ChannelCache {
                                 let _ = tx_inner.send(val);
                             }
                         }
-                        // Fan out raw body — refcount only, no copy.
-                        let _ = tx_raw_inner.send(RawEvent {
+                        // BR-R46: cache latest raw event for initial
+                        // snapshot delivery to new raw subscribers.
+                        // Clone is cheap (Bytes is refcounted).
+                        let raw_ev = RawEvent {
                             body,
                             byte_order: order,
                             type_changed: false,
-                        });
+                        };
+                        *latest_raw_inner.write() = Some(raw_ev.clone());
+                        // Fan out raw body — refcount only, no copy.
+                        let _ = tx_raw_inner.send(raw_ev);
                     })
                     .await;
                 // `pvmonitor_raw_frames_handle` returns immediately
@@ -860,6 +885,7 @@ impl ChannelCache {
             state,
             tx,
             tx_raw,
+            latest_raw,
             first_event,
             _monitor_task: AbortOnDrop(join.abort_handle()),
             drop_poke: parking_lot::Mutex::new(true),
@@ -968,6 +994,7 @@ impl ChannelCache {
             state: Arc::new(RwLock::new(EntryState::default())),
             tx,
             tx_raw,
+            latest_raw: Arc::new(RwLock::new(None)),
             first_event: Arc::new(Notify::new()),
             _monitor_task: AbortOnDrop(task.abort_handle()),
             drop_poke: parking_lot::Mutex::new(false),
@@ -1420,6 +1447,7 @@ mod tests {
             state: Arc::new(RwLock::new(EntryState::default())),
             tx,
             tx_raw,
+            latest_raw: Arc::new(RwLock::new(None)),
             first_event: Arc::new(Notify::new()),
             _monitor_task: AbortOnDrop(task.abort_handle()),
             drop_poke: parking_lot::Mutex::new(false),

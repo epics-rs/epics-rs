@@ -705,11 +705,11 @@ impl GatewayChannelSource {
                 return None;
             }
         };
-        // BR-R46: no initial snapshot delivered to new raw subscribers.
-        // The first upstream frame was broadcast before this receiver was
-        // created, so it is lost. pva2pva moncache.cpp:285-311 copies the
-        // cached lastelem to new subscribers; the raw path must do the same.
         let mut bcast = entry.subscribe_raw();
+        // BR-R46: deliver cached initial snapshot to new raw subscriber.
+        // pva2pva moncache.cpp:285-311 delivers `lastelem` on start();
+        // the typed path (subscribe_inner) does the same via snapshot().
+        let initial_raw = entry.snapshot_raw();
         let (mpsc_tx, mpsc_rx) =
             mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
@@ -721,6 +721,16 @@ impl GatewayChannelSource {
                 }
             }
             let _guard = CounterGuard(counter);
+            if let Some(init) = initial_raw {
+                let out = epics_pva_rs::server_native::RawMonitorEvent {
+                    body_bytes: init.body,
+                    byte_order: init.byte_order,
+                    type_changed: false,
+                };
+                if mpsc_tx.send(out).await.is_err() {
+                    return;
+                }
+            }
             loop {
                 match bcast.recv().await {
                     Ok(ev) => {

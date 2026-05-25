@@ -506,6 +506,66 @@ Conclusion:
 All six check points — credit decrement ownership, credit increment ownership, INIT window,
 START/STOP, queue overflow, watermarks — are functionally equivalent to pvxs. No fix required.
 
+### R72 — Unadvertised auth method: error + keep-alive + credential revert (parity-correct, documented)
+
+Severity: N/A — parity-correct
+
+Status: No change
+
+Context:
+
+pvxs `serverconn.cpp:238-241` rejects any `selected` method that is not exactly `"ca"` or
+`"anonymous"` by calling `auth_complete(this, Status{Error,...})` and returning. There is no
+`bev.reset()`, so the connection stays alive. pvxs also does NOT close the connection on this
+path — the comment at lines 249-250 explains the design choice: `"No practical way to handle
+auth failure. So we accept all credentials, but may not grant rights."`.
+
+Evidence — pvxs identity state after rejection:
+
+- C++ site: `serverconn.cpp:221-234` — a copy `C` of the current credential is built. For
+  anything other than `selected=="ca"` with a `user` field, the "ca" lambda is NOT entered,
+  so `C->method` stays empty. Line 229: `if(C->method.empty()) C->account = C->method =
+  "anonymous"` runs for ALL non-ca-with-user selections including "x509". `cred = C` at
+  line 234 stores this anonymous identity BEFORE the unadvertised check at line 238.
+  Therefore `auth_complete(Status::Error)` at line 240 fires with the connection credential
+  already set to `{method="anonymous", account="anonymous"}`.
+
+Evidence — Rust identity state after rejection:
+
+- Rust site: `tcp.rs:2320-2344` — after parse, `cred` may hold the client's claimed identity
+  (e.g. `{method="x509", account="alice"}`). Before the advertised check, if the method is
+  not in `ADVERTISED_AUTH_METHODS`, Rust explicitly executes `cred =
+  ClientCredentials::anonymous()` (line 2344), then sends `Status::Error` in
+  `CONNECTION_VALIDATED`, then calls `auth_complete` — which therefore sees
+  `{method="anonymous", account="anonymous"}` exactly as pvxs does.
+
+- Rationale documented in tcp.rs:2332-2344 (`EX-R7` comment): before this fix, the parsed
+  claimed identity was installed into `cred` before the unadvertised check, so `auth_complete`
+  and subsequent ACF-gated operations saw an identity the server had just rejected. The fix
+  reverts `cred` to anonymous first, matching pvxs's implicit revert via the empty-method
+  path.
+
+Evidence — connection liveness:
+
+- C++ site: `serverconn.cpp:238-241` — no `bev.reset()` call; handler returns, connection
+  lives.
+- Rust site: `tcp.rs:2358-2359` — frame sent, `handshake_complete = true`, loop continues.
+  Both keep the connection open; subsequent operations see anonymous credentials.
+
+Test coverage:
+
+- `stability.rs:1339` (`auth_method_unadvertised_returns_status_error`): asserts
+  `CONNECTION_VALIDATED` carries `Status::Error` for unadvertised method.
+- `stability.rs:1437` (`ex_r7_unadvertised_auth_reverts_credential_to_anonymous`): asserts
+  `auth_complete` hook observes `{method="anonymous", account="anonymous"}`, not the
+  rejected claim.
+
+Conclusion:
+
+Rust matches pvxs exactly: Status::Error reply, connection kept alive, credential reverted to
+anonymous. The EX-R7 label marks the bug that the credential revert fixed. No further change
+required.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

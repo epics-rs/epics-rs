@@ -1117,13 +1117,26 @@ pub struct X509Credentials {
 }
 
 /// Extract the subject CommonName from a DER-encoded X.509 certificate.
-/// Returns `None` when the cert fails to parse or carries no CN RDN.
+/// Returns `None` when the cert fails to parse, carries no CN RDN, or the
+/// CN contains an embedded NUL.
+///
+/// The embedded-NUL rejection mirrors pvxs `SSLContext::commonName()`
+/// (PVXS-SR-13, pvxs @b16b945). `attr.as_str()` returns the CN's raw
+/// `ASN1_STRING` bytes and a NUL is valid UTF-8, so a CN such as
+/// `admin\0.evil` would otherwise become a Rust `String` that downstream
+/// ACF matching/logging treats inconsistently — the NUL-prefix
+/// identity-confusion class (CVE-2009-2408). A NUL-bearing CN is never a
+/// legitimate account, so we drop it (leaving the credential unset)
+/// rather than map it to an account. Both the leaf `account` and the
+/// root-CA `authority` route through this one helper, so the rejection
+/// holds for both by construction.
 fn subject_common_name(der: &[u8]) -> Option<String> {
     let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
     cert.subject()
         .iter_common_name()
         .next()
         .and_then(|attr| attr.as_str().ok())
+        .filter(|s| !s.contains('\0'))
         .map(|s| s.to_string())
 }
 
@@ -1766,5 +1779,35 @@ mod tests {
         let (ca_cert, ca_key) = make_ca("CA");
         let leaf = make_leaf("my-account", &ca_cert, &ca_key);
         assert_eq!(subject_common_name(&leaf).as_deref(), Some("my-account"));
+    }
+
+    /// PVXS-SR-13: a peer-certificate CN with an embedded NUL must not be
+    /// mapped to an ACF account. Without the rejection `subject_common_name`
+    /// returns the full `"admin\0.evil"` string and the credential is built
+    /// as that confused identity; the guard drops it so no `x509` credential
+    /// is produced (matching pvxs leaving `method`/`account` at default).
+    #[test]
+    fn subject_common_name_rejects_embedded_nul_cn() {
+        let (ca_cert, ca_key) = make_ca("CA");
+        let leaf = make_leaf("admin\0.evil", &ca_cert, &ca_key);
+        // Sanity: the CN really is the NUL-bearing one (the cert encodes it).
+        assert_eq!(subject_common_name(&leaf), None);
+        // And no credential is built from a NUL-bearing leaf CN.
+        let chain = vec![leaf];
+        assert!(x509_credentials_from_chain(&chain).is_none());
+    }
+
+    /// The same single helper guards the root-CA `authority`: a self-signed
+    /// CA whose CN embeds a NUL yields a clean account from the leaf but an
+    /// empty authority, never the truncated/confused authority string.
+    #[test]
+    fn nul_in_root_ca_cn_leaves_authority_empty() {
+        let (ca_cert, ca_key) = make_ca("evil\0.ca");
+        let leaf = make_leaf("svc-ok", &ca_cert, &ca_key);
+        let root = CertificateDer::from(ca_cert.der().to_vec());
+        let chain = vec![leaf, root];
+        let creds = x509_credentials_from_chain(&chain).expect("credentials");
+        assert_eq!(creds.account, "svc-ok");
+        assert_eq!(creds.authority, "");
     }
 }

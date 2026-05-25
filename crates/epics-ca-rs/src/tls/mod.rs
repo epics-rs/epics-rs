@@ -312,7 +312,29 @@ pub fn identity_from_cert(cert: &CertificateDer<'_>) -> String {
 pub fn issuer_from_cert(cert: &CertificateDer<'_>) -> Option<String> {
     let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref()).ok()?;
     let dn = parsed.tbs_certificate.issuer.to_string();
-    if dn.is_empty() { None } else { Some(dn) }
+    if dn.is_empty() {
+        return None;
+    }
+    // x509-parser renders string-typed DN attributes via `from_utf8`
+    // without escaping, so an embedded NUL survives into the authority
+    // string used for ACF `AUTHORITY()` matching. Reject it — same
+    // identity-confusion class as the peer identity below.
+    reject_embedded_nul(dn)
+}
+
+/// Reject a certificate-derived identity/authority string that contains
+/// an embedded NUL. `x509-parser` returns string-typed attributes via
+/// `from_utf8` (NUL is valid UTF-8), so an attacker-issued CN / SAN /
+/// issuer-DN such as `admin\0.evil` would otherwise pass through into an
+/// ACF identity and be matched/logged inconsistently — the NUL-prefix
+/// identity-confusion class (CVE-2009-2408). Mirrors pvxs
+/// `SSLContext::commonName()` (PVXS-SR-13, pvxs @b16b945), which rejects
+/// any CN whose length does not round-trip through `strlen()`. A
+/// NUL-bearing name is never a legitimate identity, so the caller falls
+/// back to the safe SHA-256 fingerprint (or no authority).
+#[cfg(feature = "experimental-rust-tls")]
+fn reject_embedded_nul(s: String) -> Option<String> {
+    if s.contains('\0') { None } else { Some(s) }
 }
 
 /// Best-effort parse of an X.509 cert to extract a name field. Returns
@@ -326,8 +348,15 @@ fn parse_san_dns_or_cn(der: &[u8]) -> Option<String> {
     if let Ok(Some(san_ext)) = cert.tbs_certificate.subject_alternative_name() {
         for name in &san_ext.value.general_names {
             match name {
-                x509_parser::extensions::GeneralName::DNSName(s) => return Some(s.to_string()),
-                x509_parser::extensions::GeneralName::URI(s) => return Some(s.to_string()),
+                x509_parser::extensions::GeneralName::DNSName(s)
+                | x509_parser::extensions::GeneralName::URI(s) => {
+                    // A NUL in the name is the CVE-2009-2408 vector; skip
+                    // this entry and let a later SAN entry or the
+                    // fingerprint fallback supply the identity.
+                    if let Some(name) = reject_embedded_nul(s.to_string()) {
+                        return Some(name);
+                    }
+                }
                 _ => continue,
             }
         }
@@ -339,6 +368,7 @@ fn parse_san_dns_or_cn(der: &[u8]) -> Option<String> {
         .next()
         .and_then(|cn| cn.as_str().ok())
         .map(|s| s.to_string())
+        .and_then(reject_embedded_nul)
 }
 
 // Re-exports needed by the public API when the feature is enabled.
@@ -352,4 +382,70 @@ pub use tokio_rustls::rustls::RootCertStore as Roots;
 #[cfg(feature = "experimental-rust-tls")]
 mod rustls {
     pub use tokio_rustls::rustls::*;
+}
+
+#[cfg(all(test, feature = "experimental-rust-tls"))]
+mod nul_identity_tests {
+    use super::*;
+
+    /// Self-signed cert carrying `cn` as its only DN CommonName and no
+    /// SAN, so `parse_san_dns_or_cn` exercises the CN fallback path.
+    /// rcgen encodes the CN as a UTF-8 string, so an embedded NUL is
+    /// serialized verbatim — the attacker-issued cert this models.
+    fn self_signed_with_cn(cn: &str) -> CertificateDer<'static> {
+        let mut params = rcgen::CertificateParams::new(Vec::new()).expect("params");
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let key = rcgen::KeyPair::generate().expect("key");
+        let cert = params.self_signed(&key).expect("self-signed");
+        CertificateDer::from(cert.der().to_vec())
+    }
+
+    /// PVXS-SR-13 / CVE-2009-2408: a peer-cert CN with an embedded NUL
+    /// must not become the ACF identity. Without the guard
+    /// `parse_san_dns_or_cn` returns `"admin\0.evil"`; with it the name is
+    /// rejected and `identity_from_cert` falls back to the SHA-256
+    /// fingerprint — never the confused identity.
+    #[test]
+    fn identity_rejects_embedded_nul_cn_falls_back_to_fingerprint() {
+        let cert = self_signed_with_cn("admin\0.evil");
+        assert_eq!(parse_san_dns_or_cn(cert.as_ref()), None);
+        let id = identity_from_cert(&cert);
+        assert!(
+            id.starts_with("sha256:"),
+            "expected fingerprint, got {id:?}"
+        );
+        assert!(!id.contains('\0'));
+    }
+
+    /// A clean CN still resolves to the CN identity (no false rejection).
+    #[test]
+    fn identity_extracts_clean_cn() {
+        let cert = self_signed_with_cn("operator-bob");
+        assert_eq!(
+            parse_san_dns_or_cn(cert.as_ref()).as_deref(),
+            Some("operator-bob")
+        );
+        assert_eq!(identity_from_cert(&cert), "operator-bob");
+    }
+
+    /// The issuer DN feeds the ACF `AUTHORITY()` clause; an embedded NUL
+    /// in the (self-signed) issuer CN must drop the authority rather than
+    /// surface a NUL-bearing string.
+    #[test]
+    fn issuer_rejects_embedded_nul() {
+        let cert = self_signed_with_cn("ca\0.evil");
+        assert_eq!(issuer_from_cert(&cert), None);
+    }
+
+    /// A clean issuer DN is still returned.
+    #[test]
+    fn issuer_extracts_clean_dn() {
+        let cert = self_signed_with_cn("ops-ca");
+        let dn = issuer_from_cert(&cert).expect("issuer dn");
+        assert!(dn.contains("ops-ca"), "got {dn:?}");
+        assert!(!dn.contains('\0'));
+    }
 }

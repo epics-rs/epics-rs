@@ -637,6 +637,22 @@ impl CaServer {
         self.acf_source_path.lock().ok().and_then(|g| g.clone())
     }
 
+    /// Trigger `CA_PROTO_ACCESS_RIGHTS` re-notification for all connected
+    /// clients without touching the ACF configuration. Equivalent to C
+    /// `asComputeAllAsg()` (asCa.c:205) — prompts every active TCP
+    /// connection to run `reeval_access_rights`, which re-pushes
+    /// `CA_PROTO_ACCESS_RIGHTS` only when the computed level changed
+    /// (`oldaccess != access` filter, R2-51 parity).
+    ///
+    /// Use this after programmatic access-security state changes the
+    /// server cannot detect automatically — for example, when INP* link
+    /// values used by CALC-gated ACF rules change. For ACF-file changes
+    /// prefer [`Self::reload_acf_from`], which swaps the config and
+    /// notifies in one step.
+    pub fn notify_access_change(&self) {
+        let _ = self.acf_reload_tx.send(());
+    }
+
     /// Set callbacks to run after PINI processing completes.
     pub fn set_after_init_hooks(&mut self, hooks: Vec<Box<dyn FnOnce() + Send>>) {
         *self.after_init_hooks.lock().unwrap() = hooks;

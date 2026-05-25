@@ -736,6 +736,83 @@ All four check points — cadence, GUID, change_count, format — are functional
 to pvxs. The only deviation (polling vs. immediate change_count) is a semantic simplification
 that has no client-visible correctness impact. No fix required.
 
+### R76 — UDP SEARCH → SEARCH_RESPONSE handling (parity-correct)
+
+**Rust sites:** `udp.rs:588-741` (`process_search_datagram`), `udp.rs:846-908`
+(`process_v6_search_datagram`), `udp.rs:920-950` (`build_search_response_proto`),
+`udp.rs:1050-1124` (`parse_search_request`), `tcp.rs:3675-3723` (`handle_tcp_search`)
+
+**C++ sites:** `server.cpp:669-763` (`Server::Pvt::onSearch`),
+`serverchan.cpp:173-255` (`ServerConn::handle_SEARCH`)
+
+#### (1) Multiple PV names — parsed + answered
+
+- pvxs `server.cpp:689-693`: iterates `msg.names`, sets `_claim = false` on each.
+  `server.cpp:721-728`: counts claimed names into `nreply`. `server.cpp:747-751`:
+  writes matched IDs — `if(searchOp._names[i]._claim) { to_wire(M, uint32_t(msg.names[i].id)); }`.
+- Rust `parse_search_request` (udp.rs:1108-1112): builds `Vec<(u32, String)>` from all
+  (cid, name) pairs. `process_search_datagram:694-704`: calls `source.searchable(name)` for
+  each, accumulates `matched_cids`. `build_search_response_proto:936-938`: writes matched
+  cids. Multi-PV parsing correct on both sides. ✓
+
+#### (2) Reply policy — mustReply
+
+- pvxs UDP: `server.cpp:730-732` — `if(nreply==0 && !msg.mustReply) return;`
+- Rust UDP: `udp.rs:712` — `if !matched_cids.is_empty() || req.must_reply`
+- pvxs TCP: `serverchan.cpp:230-231` — `if(nreply==0 && !mustReply) return;`
+- Rust TCP: `tcp.rs:3711` — `if !matched.is_empty() || req.must_reply`
+- Both paths (UDP + TCP) honour `mustReply` for `pvlist`-style discovery. ✓
+
+#### (3) Response contents
+
+pvxs `server.cpp:738-752` wire layout:
+
+```
+ 0..12  12B  GUID
+12..16   4B  searchID (u32)
+16..32  16B  SockAddr::any(AF_INET) — all zeros, 16-byte IPv4-mapped
+32..34   2B  tcp_port (bind port)
+34..?   pvString "tcp"
+ ?..+1   1B  found = (nreply!=0 ? 1 : 0)
+ +..+2   2B  nreply
++2..    u32 × nreply — matched searchInstanceIDs
+```
+
+Rust `build_search_response_proto` (udp.rs:929-939): identical layout —
+`ip_to_bytes(IpAddr::V4(Ipv4Addr::UNSPECIFIED))` produces the same 16-byte
+IPv4-mapped zeros as pvxs `SockAddr::any(AF_INET)` (same encoding confirmed by R75).
+`found` byte: `0 if cids.is_empty() else 1` matches pvxs `nreply!=0 ? 1 : 0`. ✓
+
+#### (4) TCP search path
+
+- pvxs `serverchan.cpp:173-255` (`handle_SEARCH`): reads searchID + flags (mustReply),
+  skips replyAddr/port (`M.skip(3+16+2)` — "we always and only reply to TCP peer"),
+  reads protocol list to advance M (but does **not** gate on it), reads nchan, calls
+  `onSearch`, replies via `enqueueTxBody(CMD_SEARCH_RESPONSE)`.
+- Rust `handle_tcp_search` (tcp.rs:3675-3723): reuses `parse_search_request` (same wire
+  shape), gathers matches, sends via `tx.send(response)` on the established connection.
+- Minor deviation: Rust applies `protocol_ok` filter (PVA-R10) on the TCP path; pvxs
+  TCP path reads but does not gate on the protocol list. Effect: Rust refuses matches when
+  the client asked for a protocol the server does not speak (e.g. "udp" over a tcp
+  connection). pvxs would answer anyway. Conservative and intentional under PVA-R10. ✓
+
+#### (5) Unicast-vs-broadcast reply address
+
+- pvxs: `replyDest` is resolved by the UDP manager before `onSearch` is called; the
+  `msg.reply()` callback routes to the correct address. `udp_collector.cpp:351-371`
+  prefers the SEARCH payload's announced address; falls back to UDP source when payload
+  addr is unspecified; drops an ORIGIN_TAG SEARCH with unspecified reply addr.
+- Rust `process_search_datagram:667-681`: identical three-way resolution —
+  `Some(ip)` → payload addr, `None` + Direct → UDP source IP + payload port,
+  `None` + FromOriginTag → drop. v6 path always uses UDP source. ✓
+
+Conclusion:
+
+All five check points — multi-PV parsing, mustReply policy, response wire format, TCP
+search path, unicast/broadcast reply — are functionally equivalent to pvxs. The only
+deviation (protocol_ok gate on TCP path) is a conservative intentional extension of
+PVA-R10. No fix required.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

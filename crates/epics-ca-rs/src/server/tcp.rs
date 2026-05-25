@@ -4654,7 +4654,10 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     message: &str,
 ) -> CaResult<()> {
     let error_msg_bytes = pad_string(truncate_diag(message));
-    let payload_size = CaHeader::SIZE + error_msg_bytes.len();
+    // R45: payload_size must use the echo header's ACTUAL byte length (16 or 24
+    // for extended), not the constant CaHeader::SIZE=16.  Compute orig_bytes first.
+    let orig_bytes = original_hdr.to_bytes_extended();
+    let payload_size = orig_bytes.len() + error_msg_bytes.len();
 
     let mut resp = CaHeader::new(CA_PROTO_ERROR);
     resp.set_payload_size(payload_size, 0);
@@ -4679,7 +4682,7 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     // 16 bytes otherwise), so an extended READ/WRITE error
     // round-trips byte-for-byte with libca.
     let resp_bytes = resp.to_bytes_extended();
-    let orig_bytes = original_hdr.to_bytes_extended();
+    // orig_bytes computed above (before payload_size) for R45.
     let mut frame = Vec::with_capacity(resp_bytes.len() + orig_bytes.len() + error_msg_bytes.len());
     frame.extend_from_slice(&resp_bytes);
     frame.extend_from_slice(&orig_bytes);
@@ -5522,6 +5525,54 @@ mod single_write_all_framing_tests {
             16 + payload_size,
             frame.len(),
             "CA_PROTO_ERROR header-declared size must match the contiguous frame",
+        );
+    }
+
+    /// R45 regression: when the original request used an extended
+    /// 24-byte header, the outer CA_PROTO_ERROR reply must declare
+    /// `m_postsize = 24 + diag_len`, not `16 + diag_len`.
+    #[tokio::test]
+    async fn send_ca_error_extended_original_declares_correct_payload_size() {
+        let writer = recording_writer();
+        // Build an extended original header: set_payload_size triggers
+        // extended form when count >= 0xFFFF.
+        let mut original = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        original.set_payload_size(0, 0x1_0000); // count >= 0xFFFF → extended (24 bytes)
+        assert!(
+            original.is_extended(),
+            "test requires an extended original header"
+        );
+
+        send_ca_error(
+            &writer,
+            &original,
+            ECA_INTERNAL,
+            0xFFFF_FFFF,
+            "R45 regression test",
+        )
+        .await
+        .expect("send_ca_error succeeds");
+
+        let guard = writer.lock().await;
+        let batches = &guard.get_ref().batches;
+        assert_eq!(batches.len(), 1, "must issue exactly one write_all");
+        let frame = &batches[0];
+        // Outer CA_PROTO_ERROR response header is normal form (payload < 0xFFFF);
+        // m_postsize lives at bytes [2..4].
+        let declared = u16::from_be_bytes([frame[2], frame[3]]) as usize;
+        assert_eq!(
+            16 + declared,
+            frame.len(),
+            "declared m_postsize must account for the full payload (echo hdr + diag)"
+        );
+        // With an extended original, the echoed header contributes 24 bytes.
+        // Any diagnostic shorter than 0xFFFF − 24 keeps the outer header normal.
+        // Echo header occupies frame bytes [16..40]; those 24 bytes must round-trip
+        // the extended marker (postsize field = 0xFFFF at echo-hdr offset 2..4).
+        let echo_postsize = u16::from_be_bytes([frame[18], frame[19]]);
+        assert_eq!(
+            echo_postsize, 0xFFFF,
+            "echoed request header must preserve the extended marker (m_postsize = 0xFFFF)"
         );
     }
 

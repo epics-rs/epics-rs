@@ -3173,18 +3173,8 @@ async fn handle_process(
     // PROCESS data phase — no payload to decode.
     match ch.ops.get(&ioid) {
         None => {
-            // R61: same divergence as the handle_op data-phase path — unknown IOID on
-            // data-phase PROCESS should silently drop, not send an error reply (pvxs
-            // serverget.cpp:423-428 and servermon.cpp:611-619 return silently here).
-            send_op_error(
-                tx,
-                OpKind::Process,
-                ioid,
-                subcmd,
-                "operation not initialised",
-                order,
-            )
-            .await?;
+            // R61: silently drop — pvxs serverget.cpp:423-428 and servermon.cpp:611-619
+            // return without reply here to handle the DESTROY_REQUEST race.
             return Ok(());
         }
         Some(o) => {
@@ -4078,11 +4068,8 @@ async fn handle_op(
             (o.intro, o.mask, o.pv_request)
         }
         None => {
-            // R61: data-phase EXEC on unknown IOID should silently drop (pvxs
-            // serverget.cpp:423-428 returns without reply, with rxRegistryDirty=true, to handle
-            // the race between DESTROY_REQUEST and in-flight client frames). Current code sends
-            // an error reply, diverging from pvxs.
-            send_op_error(tx, kind, ioid, subcmd, "operation not initialised", order).await?;
+            // R61: silently drop — pvxs serverget.cpp:423-428 returns without reply here
+            // to handle the DESTROY_REQUEST/in-flight-frame race.
             return Ok(());
         }
     };

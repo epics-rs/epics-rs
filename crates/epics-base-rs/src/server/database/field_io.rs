@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 
 use crate::error::{CaError, CaResult};
-use crate::server::record::ScanType;
 use crate::types::EpicsValue;
 
 use super::PvDatabase;
@@ -646,9 +645,10 @@ impl PvDatabase {
             // `complete_async_record` (async completion).
 
             instance.cleanup_subscribers();
-            // R48: non-VAL fields must be notified regardless of scan type; VAL is
-            // handled by the processing cycle (deadband check + snapshot).
-            if instance.common.scan != ScanType::Passive && field != "VAL" { // R48: scan gate wrong — suppresses Passive non-VAL writes
+            // Non-VAL fields get VALUE|LOG immediately regardless of scan type.
+            // VAL is handled by the processing cycle (deadband check + snapshot).
+            // C dbPut:1409-1414: !(isValueField && process_passive) — only VAL suppressed.
+            if field != "VAL" {
                 instance.notify_field(
                     &field,
                     crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,

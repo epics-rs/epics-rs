@@ -803,6 +803,8 @@ impl ServerConn {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+// R62: pvxs uses 0x10000 for serverReceiveBufferSize in CONNECTION_VALIDATION
+// (clientconn.cpp:292-293 "not used"). 87_040 diverges from upstream.
 const DEFAULT_BUFFER_SIZE: u32 = 87_040;
 const DEFAULT_REGISTRY_SIZE: u16 = 32_767;
 

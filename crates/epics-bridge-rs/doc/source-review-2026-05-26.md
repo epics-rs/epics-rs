@@ -96,6 +96,59 @@ Fix direction:
 
 Before the `tokio::spawn`, capture `dedup_body: Option<bytes::Bytes> = initial_raw.as_ref().map(|e| e.body.clone())`. Inside the spawn, after delivering `initial_raw`, if the first broadcast event's `body.as_ptr()` equals `dedup_body.take().map_or(null, |b| b.as_ptr())`, skip it. `bytes::Bytes::clone()` is a refcount clone; same monitor callback invocation produces identical `as_ptr()` values, making the pointer a reliable one-shot dedup key.
 
+### BR-R49 — CA gateway shadow PV never fetches DBR_CTRL_* metadata from upstream
+
+Severity: High
+
+Status: Doc-only (structural fix required in `epics-base-rs`)
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/ca_gateway/upstream.rs:324-343` — `channel.get()` returns `(DbFieldType, EpicsValue)` only; no display/control metadata is extracted. Shadow PV created at `upstream.rs:375-377` with `initial_value` (bare value) only.
+- `crates/epics-base-rs/src/server/pv.rs:317-319` — `ProcessVariable::snapshot()` always returns `display=None`, `control=None`; `set_snapshot` (line 336-342) stores only `snapshot.value`, discarding display/control.
+- `crates/epics-base-rs/src/types/codec.rs:413-420, 424-441` — `encode_units` writes zeros when `snapshot.display.is_none()`; `get_limits` returns all-zero limits when display/control are `None`.
+- `epics-modules/ca-gateway/src/gatePv.cc:1252-1295` — `connectCB` sets `pv->data_type = DBR_CTRL_SHORT/FLOAT/DOUBLE/ENUM/LONG/CHAR` per native type at connect time.
+- `epics-modules/ca-gateway/src/gatePv.cc:930-934` — `gatePvData::get()` calls `ca_array_get_callback(dataType(), 1, chID, ::getCB, this)` to fetch full CTRL metadata on connect; `dataType()` is the `DBR_CTRL_*` type set above.
+- No `DBR_CTRL_*` GET and no `DBE_PROPERTY` subscription exist anywhere in `crates/epics-bridge-rs/src/ca_gateway/`.
+
+Impact:
+
+Every CA client that requests `DBR_CTRL_*` or `DBR_GR_*` from a gateway PV receives all-zero values for engineering units, precision, and display/alarm/warning/control limits. Operator displays, archivers, and alarm-management tools that rely on EGU or limit metadata from the gateway are silently broken.
+
+Fix direction:
+
+Structural change required in `epics-base-rs`:
+1. Add `display: Option<DisplayInfo>` and `control: Option<ControlInfo>` fields to `ProcessVariable` in `epics-base-rs/src/server/pv.rs`.
+2. Expose a `set_display_control(display, control)` method on `ProcessVariable`.
+3. In the gateway connect path (`upstream.rs:ensure_subscribed`): after the initial `channel.get()`, issue a `DBR_CTRL_*` GET callback to fetch units/precision/limits; update the shadow PV on receipt.
+4. Add a `DBE_PROPERTY` subscription (as in `gatePv.cc:858-862`) so property changes are forwarded throughout the connection lifetime.
+
+### BR-R50 — PVA gateway monitor task exits on upstream disconnect with zero subscribers, leaving stale cache entry
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/pva_gateway/channel_cache.rs:873-878` — after the upstream monitor closes naturally, the task exits when `tx_for_task.receiver_count() == 0 && tx_raw_for_task.receiver_count() == 0`. The `UpstreamEntry` remains in the cache map; its `_monitor_task: AbortOnDrop` now holds an abort handle for a finished task.
+- `crates/epics-bridge-rs/src/pva_gateway/channel_cache.rs:582-620` — `lookup()` returns existing entries without checking whether the monitor task is still alive. A new subscriber arriving within the ~60 s cleanup window receives the stale entry.
+- `crates/epics-bridge-rs/src/pva_gateway/channel_cache.rs:928-939` — `cleanup_tick()` retains an entry when `subscriber_count() > 0`; if a new subscriber arrives after the task exited, they join a dead broadcast channel and receive no events. Their subscription then prevents cleanup from evicting the entry, potentially keeping it alive indefinitely.
+- `epics-base/modules/pva2pva/p2pApp/chancache.cpp:78-83` — pva2pva `ChannelCacheEntry::CRequester::channelStateChange` immediately removes the entry from the cache map on `DISCONNECTED` / `DESTROYED`. Any subsequent `lookup()` gets a cache miss and spawns a fresh entry with a new upstream monitor.
+
+Impact:
+
+A client that subscribes to a gateway PV within ~60 s of the upstream IOC cleanly closing its connection (and while no other subscribers are active) receives the cached snapshot as the initial event but no further updates. The gateway neither signals disconnection nor retries the upstream subscription; the subscriber silently stalls. If retrying clients keep poking the entry (each `lookup()` sets `drop_poke=true`), the stale entry is never evicted and the client sees stale data indefinitely.
+
+Fix direction:
+
+Remove the three early exits that abort the monitor task when `receiver_count == 0`:
+- `channel_cache.rs:831-833` (startup-error exit)
+- `channel_cache.rs:858-860` (runtime-error exit)
+- `channel_cache.rs:873-878` (clean-cycle exit)
+
+With these removed, the task loops and retries the upstream reconnect regardless of subscriber count. The `cleanup_tick()` aborts the task (via `AbortOnDrop` in `UpstreamEntry`) when it evicts the entry after two consecutive 30 s ticks with `subscriber_count() == 0`. A subscriber that arrives before cleanup gets a live reconnecting task, not a dead one. This matches pva2pva's invariant that a cached entry always has an active upstream connection attempt in flight.
+
 ## Uncertain candidates
 
 None identified this round.

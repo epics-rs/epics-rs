@@ -321,6 +321,11 @@ impl UpstreamManager {
         // value either way. The timeout/error is logged at INFO so
         // an operator chasing type-mismatch confusion can correlate
         // a confused downstream introspect with its upstream miss.
+        // BR-R49: channel.get() returns (DbFieldType, EpicsValue)
+        // only — no DBR_CTRL_* metadata (units/precision/limits).
+        // A DBR_CTRL GET + DBE_PROPERTY subscription is needed so
+        // downstream DBR_CTRL_* and DBR_GR_* reads return real
+        // metadata (gatePv.cc:930-934, gatePv.cc:858-862).
         let initial_value = match tokio::time::timeout(Duration::from_millis(500), channel.get())
             .await
         {

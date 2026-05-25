@@ -2055,6 +2055,10 @@ async fn handle_connection_io(
     // against the limit to prevent a burst of concurrent requests from
     // racing past it before the first completions arrive.
     let mut pending_channel_spawns: usize = 0;
+    // R65: abort guards for GET_FIELD slow-path introspect tasks. Dropping
+    // on connection close cancels any task whose source hasn't returned yet,
+    // matching pvxs opByIOID cleanup (serverconn.cpp:366-382).
+    let mut gf_abort_guards: Vec<AbortOnDrop> = Vec::new();
     loop {
         // C-G2: if the writer task has died (send_timeout fired,
         // panic, etc.) the outbound mpsc is closed. Every subsequent
@@ -2458,7 +2462,11 @@ async fn handle_connection_io(
                 .await?;
             }
             Some(Command::GetField) => {
-                handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred).await?;
+                if let Some(guard) =
+                    handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred).await?
+                {
+                    gf_abort_guards.push(guard);
+                }
             }
             Some(Command::Search) => {
                 // PVA-R11: TCP-circuit SEARCH (pvxs
@@ -5488,6 +5496,8 @@ async fn handle_op(
     Ok(())
 }
 
+/// Returns `Some(AbortOnDrop)` when a slow-path task was spawned so the
+/// caller can store it for connection-lifetime abort on teardown (R65).
 async fn handle_get_field(
     source: &DynSource,
     frame: &Frame,
@@ -5496,7 +5506,7 @@ async fn handle_get_field(
     order: ByteOrder,
     peer: SocketAddr,
     cred: &ClientCredentials,
-) -> PvaResult<()> {
+) -> PvaResult<Option<AbortOnDrop>> {
     let mut cur = frame.cursor();
     let sid = cur
         .get_u32(order)
@@ -5526,7 +5536,7 @@ async fn handle_get_field(
         Some(c) => c,
         None => {
             debug!(sid, ioid, "GET_FIELD on unknown SID: dropping");
-            return Ok(());
+            return Ok(None);
         }
     };
     if chan.ops.contains_key(&ioid) {
@@ -5534,7 +5544,7 @@ async fn handle_get_field(
             sid,
             ioid, "GET_FIELD reuses IOID bound to active op: dropping (pvxs parity)"
         );
-        return Ok(());
+        return Ok(None);
     }
     match chan.introspection.clone() {
         Some(intro) => {
@@ -5549,6 +5559,7 @@ async fn handle_get_field(
             h.write_into(&mut buf);
             buf.extend_from_slice(&payload);
             let _ = tx.send(buf).await;
+            Ok(None)
         }
         None => {
             // Slow path: introspection not yet cached; fetch from source without blocking
@@ -5571,10 +5582,10 @@ async fn handle_get_field(
                 roles: cred.roles.clone(),
                 pv_request: None,
             };
-            // R65: no abort handle — task outlives connection if get_introspection_checked hangs.
-            // pvxs registers the introspect op in opByIOID and fires error("Implicit Cancel")
-            // on teardown (serverintrospect.cpp:63-68 + serverconn.cpp:366-382).
-            tokio::spawn(async move {
+            // R65: return the abort handle so the caller stores it for
+            // connection-lifetime abort on teardown, matching pvxs opByIOID
+            // cleanup (serverconn.cpp:366-382).
+            let join = tokio::spawn(async move {
                 let intro = src.get_introspection_checked(&pv_name, conn_ctx).await;
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
@@ -5610,9 +5621,9 @@ async fn handle_get_field(
                 buf.extend_from_slice(&payload);
                 let _ = tx_clone.send(buf).await;
             });
+            Ok(Some(AbortOnDrop(join.abort_handle())))
         }
     }
-    Ok(())
 }
 
 async fn send_op_error(
@@ -9686,7 +9697,8 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
+        // Keep the guard alive until after the slow-path reply is received.
+        let _guard = handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
             .await
             .expect("handler returns Ok");
 
@@ -9756,7 +9768,8 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
+        // Keep the guard alive until after the slow-path reply is received.
+        let _guard = handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
             .await
             .expect("handler returns Ok");
 

@@ -2460,6 +2460,120 @@ mod metadata_cache_tests {
         let _ = inst.process_local();
         assert!(inst.metadata_cache.lock().unwrap().is_some());
     }
+
+    // ── R47 regression: DBE_PROPERTY event delivery boundaries ──────────────
+
+    /// Boundary 1: metadata field written with a CHANGED value, subscriber
+    /// mask includes PROPERTY → subscriber receives an event.
+    /// Mirrors C dbAccess.c:1396-1397 `db_post_events(precord,NULL,DBE_PROPERTY)`.
+    #[test]
+    fn r47_property_event_delivered_on_changed_metadata() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = ai_instance();
+        let mut rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Double,
+                EventMask::PROPERTY.bits(),
+            )
+            .expect("subscriber added");
+
+        let prev = inst.record.get_field("EGU"); // "degC"
+        let _ = inst
+            .record
+            .put_field("EGU", EpicsValue::String("kPa".into()));
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "PROPERTY subscriber must receive event when metadata field changes"
+        );
+    }
+
+    /// Boundary 2: same metadata field written with the SAME value → NO event.
+    /// Matches C suppression at dbAccess.c:1379-1383 and the `prev != now` gate.
+    #[test]
+    fn r47_no_event_on_unchanged_metadata() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = ai_instance();
+        let mut rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Double,
+                EventMask::PROPERTY.bits(),
+            )
+            .expect("subscriber added");
+
+        let prev = inst.record.get_field("EGU"); // "degC"
+        // Write the same value — no change
+        let _ = inst.record.put_field("EGU", prev.clone().unwrap());
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
+
+        assert!(
+            rx.try_recv().is_err(),
+            "PROPERTY subscriber must NOT receive event when metadata value is unchanged"
+        );
+    }
+
+    /// Boundary 3: VALUE-only subscriber (no PROPERTY bit) receives NO event
+    /// from a metadata write, even when the field value changed.
+    #[test]
+    fn r47_value_only_subscriber_no_event_on_metadata_write() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = ai_instance();
+        let mut rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Double,
+                EventMask::VALUE.bits(),
+            )
+            .expect("subscriber added");
+
+        let prev = inst.record.get_field("EGU"); // "degC"
+        let _ = inst
+            .record
+            .put_field("EGU", EpicsValue::String("kPa".into()));
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
+
+        assert!(
+            rx.try_recv().is_err(),
+            "VALUE-only subscriber must NOT receive event from a metadata write"
+        );
+    }
+
+    /// Boundary 4 (took_metadata_change path): PROPERTY subscriber receives
+    /// event after process_local() when the record reports a metadata change.
+    #[test]
+    fn r47_process_local_property_event_on_took_metadata_change() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = RecordInstance::new(
+            "MUT2".to_string(),
+            MutatingMetaRecord {
+                val: 1.0,
+                egu: "V".to_string(),
+                took_change: false,
+            },
+        );
+        let mut rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Double,
+                EventMask::PROPERTY.bits(),
+            )
+            .expect("subscriber added");
+
+        // process() sets took_change = true and updates egu to "kV"
+        let _ = inst.process_local();
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "PROPERTY subscriber must receive event after process_local reports took_metadata_change"
+        );
+    }
 }
 
 #[cfg(test)]

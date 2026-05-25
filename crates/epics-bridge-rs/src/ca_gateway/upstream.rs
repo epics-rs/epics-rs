@@ -458,6 +458,9 @@ impl UpstreamManager {
                         beacon_anomaly_for_task.request();
                     }
 
+                    // BR-R45: only snapshot.value is forwarded; upstream alarm
+                    // status/severity and IOC timestamp are discarded. Shadow PV
+                    // always delivers zero alarm + local wall-clock timestamp.
                     // Push to shadow PvDatabase to fan out to downstream clients
                     let post_result = db_clone
                         .put_pv_and_post(&name, snapshot.value.clone())
@@ -495,6 +498,8 @@ impl UpstreamManager {
                 if let Some(entry_arc) = cache_clone.read().await.get(&name) {
                     entry_arc.write().await.set_state(PvState::Disconnect);
                 }
+                // BR-R47: status=0 (NO_ALARM) is wrong; LINK_ALARM (14)
+                // is the correct EPICS status for a link-disconnect alarm.
                 // 3 = AlarmSeverity::Invalid; status 0 = LINK alarm
                 // (downstream client cannot tell why upstream is gone,
                 // only that it is — INVALID severity is the closest

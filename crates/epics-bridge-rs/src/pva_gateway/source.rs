@@ -705,6 +705,10 @@ impl GatewayChannelSource {
                 return None;
             }
         };
+        // BR-R46: no initial snapshot delivered to new raw subscribers.
+        // The first upstream frame was broadcast before this receiver was
+        // created, so it is lost. pva2pva moncache.cpp:285-311 copies the
+        // cached lastelem to new subscribers; the raw path must do the same.
         let mut bcast = entry.subscribe_raw();
         let (mpsc_tx, mpsc_rx) =
             mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);

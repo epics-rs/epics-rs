@@ -2860,9 +2860,11 @@ async fn handle_put_get(
         ch.ops.insert(ioid, put_get_op);
 
         // INIT response: ioid + subcmd + status + putIF + getIF.
-        // pvxs `serverget.cpp` emits two type descriptors for PUT_GET
-        // (the put-request and get-response structures). We serve the
-        // same channel introspection for both legs.
+        // R69: pvAccessJava protocol defines PUT_GET INIT with two type
+        // descriptors (put-request structure, then get-response structure).
+        // pvxs never implements PUT_GET (`handle_PUT_GET` is an empty stub
+        // in serverconn.cpp). We serve the same channel introspection for
+        // both legs.
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
         payload.put_u8(subcmd);

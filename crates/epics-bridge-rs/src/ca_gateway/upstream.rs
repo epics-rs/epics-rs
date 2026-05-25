@@ -458,26 +458,25 @@ impl UpstreamManager {
                         beacon_anomaly_for_task.request();
                     }
 
-                    // BR-R45: only snapshot.value is forwarded; upstream alarm
-                    // status/severity and IOC timestamp are discarded. Shadow PV
-                    // always delivers zero alarm + local wall-clock timestamp.
-                    // Push to shadow PvDatabase to fan out to downstream clients
+                    // Push upstream snapshot (value + alarm + timestamp) to
+                    // shadow PvDatabase so downstream monitors see the real
+                    // upstream alarm state and IOC timestamp.
                     let post_result = db_clone
-                        .put_pv_and_post(&name, snapshot.value.clone())
+                        .put_pv_and_post_snapshot(&name, snapshot.clone())
                         .await;
                     // B5 RATE_STATS: count the monitor post fanned
                     // out downstream (C++ gateServer::postEventCount).
                     // Count only on a SUCCESSFUL fan-out so
                     // `postEventCount` stays consistent with
                     // `clientEventCount`, which counts successes — a
-                    // failed `put_pv_and_post` (e.g. shadow PV missing)
-                    // forwarded nothing downstream.
+                    // failed post (e.g. shadow PV missing) forwarded
+                    // nothing downstream.
                     match post_result {
                         Ok(()) => stats_for_task.record_post_event(),
                         Err(e) => tracing::debug!(
                             pv = %name,
                             error = %e,
-                            "ca-gateway-rs: shadow put_pv_and_post failed; \
+                            "ca-gateway-rs: shadow put_pv_and_post_snapshot failed; \
                              postEventCount not incremented"
                         ),
                     }

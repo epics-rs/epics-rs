@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::ScanType;
+use crate::server::snapshot::Snapshot;
 use crate::types::EpicsValue;
 
 use super::PvDatabase;
@@ -216,6 +217,20 @@ impl PvDatabase {
             return Ok(());
         }
         Err(crate::error::CaError::ChannelNotFound(name.to_string()))
+    }
+
+    /// Propagate a full upstream snapshot (value + alarm status/severity +
+    /// IOC timestamp) to a simple shadow PV and fan out to downstream
+    /// monitor subscribers. Used by the CA gateway forwarding task to avoid
+    /// discarding the upstream alarm and timestamp decoded from the incoming
+    /// `DBR_TIME_*` frame. Returns `ChannelNotFound` for record-backed PVs
+    /// (those carry their own alarm engine and are not shadow PVs).
+    pub async fn put_pv_and_post_snapshot(&self, name: &str, snapshot: Snapshot) -> CaResult<()> {
+        if let Some(pv) = self.inner.simple_pvs.read().await.get(name).cloned() {
+            pv.set_snapshot(snapshot).await;
+            return Ok(());
+        }
+        Err(CaError::ChannelNotFound(name.to_string()))
     }
 
     /// Like `put_pv_and_post` but with explicit origin tag.

@@ -328,6 +328,19 @@ impl ProcessVariable {
         self.notify_subscribers(new_value).await;
     }
 
+    /// Set value from a full snapshot (value + alarm + timestamp) and notify
+    /// all subscribers. Used by the CA gateway forwarding task to propagate
+    /// the upstream alarm status/severity and IOC timestamp to downstream
+    /// monitors. Mirrors `gateVcData::setEventData` + `vcPostEvent` in the
+    /// C ca-gateway: the incoming `dbr_time_xxx` GDD carries all three fields.
+    pub async fn set_snapshot(&self, snapshot: Snapshot) {
+        {
+            let mut val = self.value.write().await;
+            *val = snapshot.value.clone();
+        }
+        self.notify_subscribers_from_snapshot(snapshot).await;
+    }
+
     /// Push a fresh monitor event holding the current value but with
     /// the supplied alarm severity/status. Used by the PVA / CA
     /// gateway adapter to surface upstream-disconnect to downstream
@@ -420,6 +433,40 @@ impl ProcessVariable {
                 // `pop_coalesced` after the next normal recv). The single
                 // coalesce-overflow owner counts a value that the
                 // consumer never observed as a dropped monitor event.
+                sub.coalesce_overflow(event);
+            }
+        }
+    }
+
+    /// Notify all subscribers using a pre-built Snapshot (value + alarm +
+    /// timestamp). Used by `set_snapshot` to propagate the upstream alarm
+    /// and IOC timestamp without synthesising a new zero-alarm local-time
+    /// snapshot.
+    async fn notify_subscribers_from_snapshot(&self, snapshot: Snapshot) {
+        use crate::server::database::filters::FilteredMonitorEvent;
+        use crate::server::recgbl::EventMask;
+        let mut subs = self.subscribers.lock().await;
+        subs.retain(|sub| !sub.tx.is_closed());
+        let post = EventMask::VALUE;
+        for sub in subs.iter() {
+            if !sub.accepts(post) {
+                continue;
+            }
+            let event = MonitorEvent {
+                snapshot: snapshot.clone(),
+                origin: 0,
+            };
+            let filtered = if sub.filters.is_empty() {
+                Some(event)
+            } else {
+                sub.filters
+                    .apply(FilteredMonitorEvent::new(event, post))
+                    .map(|fe| fe.event)
+            };
+            let Some(event) = filtered else {
+                continue;
+            };
+            if sub.tx.try_send(event.clone()).is_err() {
                 sub.coalesce_overflow(event);
             }
         }

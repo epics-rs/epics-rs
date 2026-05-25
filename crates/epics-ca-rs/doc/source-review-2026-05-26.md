@@ -163,6 +163,50 @@ PROPERTY bit in their mask receive it, via the `sub_mask.intersects(mask)` gate 
 broadcast. Also add the same broadcast in `process_local`'s `took_metadata_change()`
 block so record-processing-driven metadata changes are covered.
 
+### R48 — non-VAL field writes on Passive scan records suppress VALUE|LOG events
+
+Severity: Low
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-base-rs/src/server/database/field_io.rs:652` —
+  `if instance.common.scan != ScanType::Passive && field != "VAL"` gates the
+  VALUE|LOG `notify_field` call on the record not being Passive. For Passive-scan
+  records, all non-VAL field writes (DESC, SCAN, PHAS, EGU, HOPR, LOPR, etc.) skip
+  the event post; monitors on those fields receive silence after the write.
+- **C**: `modules/database/src/ioc/db/dbAccess.c:1409-1414` — `dbPut` calls
+  `db_post_events(precord, pfieldsave, DBE_VALUE | DBE_LOG)` under the condition
+  `!(isValueField && pfldDes->process_passive)`. For any field that is not the
+  record's primary value field (`isValueField=false`), this condition is always true
+  — VALUE|LOG events are posted for non-VAL field writes regardless of the record's
+  scan type (`precord->scan`).
+
+Impact:
+
+CA clients monitoring non-VAL fields (DESC, SCAN, PHAS, EGU, HOPR, LOPR, or other
+auxiliary fields) on Passive scan records do not receive VALUE|LOG monitor events
+after a CA write. The initial EVENT_ADD snapshot is delivered, but subsequent writes
+are silent. Records with Periodic or Event scan modes are unaffected (the existing
+non-Passive branch posts correctly).
+
+Fix direction:
+
+Remove the `scan != ScanType::Passive` guard from the condition at `field_io.rs:652`.
+Change:
+```rust
+if instance.common.scan != ScanType::Passive && field != "VAL" {
+```
+to:
+```rust
+if field != "VAL" {
+```
+This matches C's `!(isValueField && pfldDes->process_passive)` logic where VAL is the
+only field suppressed (because Passive records process VAL through `dbProcess`, which
+posts VALUE events during the processing cycle). Non-VAL fields have no equivalent
+deferred-posting path and must be notified immediately after the write.
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,

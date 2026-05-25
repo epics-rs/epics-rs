@@ -2379,6 +2379,7 @@ pub async fn op_rpc(
     // R64: pvxs serverget.cpp:369 calls from_wire_type_value (type+value); type-only fails.
     let mut pv_req = Vec::new();
     encode_type_desc(request_desc, order, &mut pv_req);
+    encode_pv_field(request_value, request_desc, order, &mut pv_req);
 
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Rpc.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);

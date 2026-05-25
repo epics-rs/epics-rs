@@ -2579,11 +2579,11 @@ async fn handle_connection_io(
 /// has already been read from `cur`.
 ///
 /// Distinguishes an ABSENT value body (the cursor is exhausted after
-/// the descriptor — the Rust client's RPC INIT sends only the type)
-/// from a PRESENT but malformed one. pvxs `from_wire_type_value`
-/// requires type+value and resets the connection on `!M.good()`
-/// (`serverget.cpp:368-371`, `servermon.cpp:489`). We tolerate the
-/// absent body for Rust↔Rust interop, but a present-but-undecodable
+/// the descriptor) from a PRESENT but malformed one. pvxs
+/// `from_wire_type_value` requires type+value and resets the connection
+/// on `!M.good()` (`serverget.cpp:368-371`, `servermon.cpp:489`). We
+/// tolerate the absent body for future-compat / legacy clients, but a
+/// present-but-undecodable
 /// body is an INIT protocol error — the previous `decode_pv_field(..).ok()`
 /// collapsed both into `None`, so a malformed pvRequest silently
 /// dropped its `_filter` / pipeline / `process`|`block` options and the

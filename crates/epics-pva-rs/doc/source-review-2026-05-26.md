@@ -178,8 +178,78 @@ Fix direction:
 Append the full value encoding after the type descriptor in the RPC INIT payload:
 `encode_pv_field(request_value, request_desc, order, &mut pv_req)`.
 
+### R65 — GET_FIELD slow-path spawn not cancelled on connection teardown
+
+Severity: Low-Medium
+
+Status: Fixed
+
+Evidence:
+
+- Rust site: `src/server_native/tcp.rs:5574` — the GET_FIELD slow-path `tokio::spawn` stores no
+  abort handle. If `src.get_introspection_checked()` hangs on a slow or unresponsive source,
+  the task outlives the connection: it only exits when it eventually reaches
+  `tx_clone.send(buf).await` and that send fails because the writer mpsc is closed. Every
+  sibling task in this file (monitor subscriber via `monitor_abort: Option<Arc<AbortOnDrop>>`,
+  data-phase tasks via `data_task_abort: Option<Arc<AbortOnDrop>>`) is tied to a per-connection
+  abort chain; the GET_FIELD slow path bypasses it.
+- C++ site: `pvxs/src/serverintrospect.cpp:63-68` — `ServerIntrospect` is registered in both
+  `conn->opByIOID` and `chan->opByIOID`. On connection teardown,
+  `ServerConn::cleanup()` (`serverconn.cpp:366-382`) iterates `opByIOID` and calls
+  `op->cleanup()` on every entry, which fires `ServerIntrospectControl::error("Implicit Cancel")`
+  — the source's `get_introspection` future receives an explicit cancellation signal and is
+  expected to abort promptly. The Rust slow path leaves the source's future running until the
+  source itself completes.
+
+Impact:
+
+If a `ChannelSource::get_introspection_checked()` implementation awaits an upstream connection
+or network round-trip (e.g., a PVA gateway proxy), a client GET_FIELD followed by a disconnect
+leaves one detached task per in-flight introspect alive until the upstream responds. Under a
+slow/offline upstream the tasks can accumulate indefinitely.
+
+Fix direction:
+
+Pass the connection's cancellation token into the spawned task and `tokio::select!` between the
+introspect future and the token's cancellation. This mirrors the abort-handle pattern used by
+monitor and data-phase tasks, and matches pvxs's `opByIOID`-cleanup cancellation.
+
+### R66 — `ChannelSource` trait lacks a per-channel `on_channel_close` hook
+
+Severity: Low (feature gap, no state leak)
+
+Status: Documented — fix deferred (breaking trait API change, needs sign-off)
+
+Evidence:
+
+- Rust site: `src/server_native/source.rs:174` — the `ChannelSource` trait has no
+  `on_channel_close` (or equivalent) method. When a channel is destroyed (DESTROY_CHANNEL or
+  connection close), the Rust server fires `notify_monitor_start(false)` via
+  `MonitorStartControl::drop()` for each executing monitor op, but there is no channel-level
+  teardown notification delivered to the source.
+- C++ site: `pvxs/src/serverchan.cpp:57-59` — `ServerChan::cleanup()` calls `onClose("")` after
+  cleaning up all ops. `ServerChannelControl::onClose()` (`:115-126`) lets a source register a
+  per-channel teardown callback. pvxs uses this, for example, to notify `SharedPV` that a
+  specific client channel is gone.
+
+Impact:
+
+A source that needs per-channel accounting (e.g., tracking which clients hold a channel open,
+or releasing per-channel upstream connections) has no hook to act on channel teardown. The
+existing `notify_monitor_start(false)` covers per-monitor-op teardown, but not the channel
+level (a channel may have zero monitors and still benefit from an `on_channel_close` signal).
+No state is leaked by the omission — RAII cleanup is correct — but sources requiring this
+callback must poll or use out-of-band means.
+
+Fix direction:
+
+Add a default-no-op `on_channel_close(&self, name: &str, ctx: &ChannelContext)` method to
+`ChannelSource`, called from `handle_destroy_channel` after `channels.remove(&sid)` and from
+the connection teardown path. Default impl is empty so existing sources are unaffected; this
+is still a semver-minor breaking change for object-safe vtable users (`ChannelSourceObj`).
+
 ## Uncertain Candidates
 
-None. All investigated paths reached a definite conclusion (correct or bug). A full audit of
-the `EncodeTypeCache` emit/decode round-trip, the search-engine backoff bucket algebra, and
-the TLS x.509 peer-credential extraction is deferred to a future review.
+None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).
+A full audit of the `EncodeTypeCache` emit/decode round-trip, the search-engine backoff bucket
+algebra, and the TLS x.509 peer-credential extraction is deferred to a future review.

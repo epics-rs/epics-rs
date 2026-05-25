@@ -171,6 +171,8 @@ pub struct WatermarkEvent {
 
 /// A backend that can answer pvAccess GET / PUT / MONITOR requests for a
 /// set of named PVs.
+// R66: no on_channel_close hook — pvxs serverchan.cpp:57-59 fires onClose("") per channel;
+// this trait has no equivalent. Doc-only; fix requires a semver-minor breaking API change.
 pub trait ChannelSource: Send + Sync + 'static {
     /// Per-source access policy. Returns the [`AccessGate`] used by
     /// the wire layer to mint [`AccessChecked`] tokens for the typed

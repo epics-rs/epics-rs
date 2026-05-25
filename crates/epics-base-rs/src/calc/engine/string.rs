@@ -1052,7 +1052,7 @@ fn simple_random() -> f64 {
 #[cfg(test)]
 mod parity_tests {
     //! C-parity regression tests for the string evaluator
-    //! (parity-review/01-calc.md H-6, H-7).
+    //! (doc/parity-review/01-calc.md H-6, H-7).
     use crate::calc::{StackValue, StringInputs, scalc};
 
     fn run_num(expr: &str) -> f64 {

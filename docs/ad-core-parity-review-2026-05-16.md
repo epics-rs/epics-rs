@@ -4,10 +4,10 @@ Date: 2026-05-16. Reference: `~/codes/epics-modules/ADCore` (areaDetector ADCore
 Method: 4 parallel review agents, each crate area cross-checked file-by-file against
 the C++ source. Detail reports:
 
-- `crates/ad-core-rs/REVIEW_core.md` — NDArray / NDArrayPool / asynNDArrayDriver / ADDriver
-- `crates/ad-core-rs/REVIEW_plugin_framework.md` — NDPluginDriver / NDPluginFile base
-- `crates/ad-plugins-rs/REVIEW_compute.md` — 21 compute plugins
-- `crates/ad-plugins-rs/REVIEW_files.md` — 6 file-writer plugins
+- `crates/ad-core-rs/doc/parity-review-core.md` — NDArray / NDArrayPool / asynNDArrayDriver / ADDriver
+- `crates/ad-core-rs/doc/parity-review-plugin-framework.md` — NDPluginDriver / NDPluginFile base
+- `crates/ad-plugins-rs/doc/parity-review-compute.md` — 21 compute plugins
+- `crates/ad-plugins-rs/doc/parity-review-files.md` — 6 file-writer plugins
 
 ---
 

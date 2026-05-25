@@ -1,5 +1,5 @@
 //! C-parity integration tests for the string / array / subroutine
-//! record types reviewed in `parity-review/08-records-string.md`.
+//! record types reviewed in `doc/parity-review/08-records-string.md`.
 
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::compress::CompressRecord;

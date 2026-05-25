@@ -482,7 +482,7 @@ fn simple_random() -> f64 {
 
 #[cfg(test)]
 mod parity_tests {
-    //! C-parity regression tests for calc engine fixes (parity-review/01-calc.md).
+    //! C-parity regression tests for calc engine fixes (doc/parity-review/01-calc.md).
     use super::{d2i, d2ui, f64_to_i32_wrap};
     use crate::calc::engine::error::calc_error_str;
     use crate::calc::{ArrayInputs, CalcError, NumericInputs, acalc, calc, compile, eval};

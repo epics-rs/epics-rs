@@ -1,6 +1,6 @@
 //! Parity tests for binary / multibit / sel / dfanout records.
 //!
-//! Covers the findings in `parity-review/07-records-binary.md`:
+//! Covers the findings in `doc/parity-review/07-records-binary.md`:
 //! H-3 (mbbiDirect/mbboDirect 32-bit B0..B1F), H-4 (mbboDirect RBV),
 //! H-5..H-8 (bi/bo/busy/mbbi/mbbo STATE/COS/SOFT alarms), H-9 / M-1 /
 //! M-4 / M-5 (sel SELN range / UDF / SELN update / Median), M-3

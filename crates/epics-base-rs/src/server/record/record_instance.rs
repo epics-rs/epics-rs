@@ -551,7 +551,7 @@ impl RecordInstance {
                 });
             }
             // R50: int64in uses HOPR/LOPR as control limits (int64inRecord.c:226-227)
-            "ai" | "longin" | "calc" | "calcout" => {
+            "ai" | "int64in" | "longin" | "calc" | "calcout" => {
                 // Input records use HOPR/LOPR as control limits
                 let hopr = self
                     .record

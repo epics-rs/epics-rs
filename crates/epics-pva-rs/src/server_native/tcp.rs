@@ -3735,9 +3735,12 @@ async fn handle_op(
         None => {
             // R60: unknown SID on INIT must be connection-fatal (pvxs serverget.cpp:378-384
             // calls bev.reset()); on data-phase it should silently drop (pvxs
-            // serverget.cpp:423-428 just returns). Current code sends an error reply on both
-            // paths, keeping the connection alive on INIT — a protocol-violation divergence.
-            send_op_error(tx, kind, ioid, subcmd, "unknown channel sid", order).await?;
+            // serverget.cpp:423-428 just returns).
+            if subcmd & 0x08 != 0 {
+                return Err(PvaError::Decode(format!(
+                    "INIT on unknown channel SID {sid} (pvxs serverget.cpp:378-384 protocol error)"
+                )));
+            }
             return Ok(());
         }
     };

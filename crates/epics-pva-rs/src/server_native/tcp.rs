@@ -3733,7 +3733,10 @@ async fn handle_op(
     let ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
-            // Send error.
+            // R60: unknown SID on INIT must be connection-fatal (pvxs serverget.cpp:378-384
+            // calls bev.reset()); on data-phase it should silently drop (pvxs
+            // serverget.cpp:423-428 just returns). Current code sends an error reply on both
+            // paths, keeping the connection alive on INIT — a protocol-violation divergence.
             send_op_error(tx, kind, ioid, subcmd, "unknown channel sid", order).await?;
             return Ok(());
         }

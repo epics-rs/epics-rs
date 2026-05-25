@@ -667,6 +667,75 @@ Both pvxs and the Rust server always emit single unsegmented frames for server�
 application messages. Neither implementation ever sets segment flags on outgoing frames.
 Parity-correct. No fix required.
 
+### R75 — Server beacon emission: cadence, GUID, change_count, format (parity-correct)
+
+Severity: N/A — parity-correct
+
+Status: No change
+
+#### (1) Cadence / back-off schedule
+
+- Rust site: `server_native/udp.rs:263-267` — `if emitted < beacon_burst_count { beacon_period }
+  else { beacon_period_long }`. Defaults: `beacon_period = 15s`, `beacon_burst_count = 10`,
+  `beacon_period_long = 180s` (`runtime.rs:243-245`).
+- C++ site: `server.cpp:44-46` — `beaconIntervalShort = {15, 0}`, `beaconIntervalLong = {180,
+  0}`; `server.cpp:827-832` — `if(beaconCnt<10u) { interval = beaconIntervalShort; beaconCnt++;
+  }`.
+- Both emit at most 10 short-interval beacons then fall back to 180s. ✓
+- First beacon: Rust fires immediately via `first_beacon` skip at `udp.rs:261,268-269`. pvxs
+  arms the libevent timer with `&immediate = {0,0}` (`server.cpp:606-607`). Both fire
+  immediately on start. ✓
+
+#### (2) GUID — stable, secure-random
+
+- Rust site: `udp.rs:38-50` (`random_guid`) — uses `/dev/urandom`; falls back to
+  timestamp+PID on non-Unix. Generated once at server start (`runtime.rs:473`).
+- C++ site: `server.cpp:514-554` — seeds `evutil_secure_rng_get_bytes` then XORs in
+  timestamp, host IP, PID, port, `this` pointer. Also generated once.
+- Both use cryptographic randomness; GUIDs are stable for the server's lifetime. ✓
+
+#### (3) change_count semantics
+
+- Rust site: `udp.rs:275-290` — polls `beacon_source.list_pvs().await` at each beacon
+  emission, hashes the sorted PV list, and calls `change_count.wrapping_add(1)` when the
+  hash differs from `last_set_hash`. The guard `last_set_hash != 0` prevents a spurious
+  change on the very first beacon (no prior reference point).
+- C++ site: `server.cpp:95,113,180,189` — `beaconChange++` fires IMMEDIATELY inside
+  `addSource`, `removeSource`, `addPV`, `removePV`.
+- Semantic difference: pvxs increments on each add/remove call; Rust detects net change at
+  beacon period boundary. Rapid add+remove within one period: pvxs count += 2, Rust count +=
+  0 (no net change). In both cases clients see the correct current PV set via a subsequent
+  SEARCH; the change_count is a hint to trigger re-search, not an exact operation journal.
+  No client correctness impact. Noted as intentional simplification.
+
+#### (4) Wire format
+
+Beacon payload (both pvxs `doBeacons` server.cpp:773-782 and Rust `build_beacon`
+udp.rs:962-990):
+
+```
+ 0..12  12B  GUID
+12..13   1B  flags / QoS = 0
+13..14   1B  beacon_seq  (u8, wrapping monotonic)
+14..16   2B  change_count (u16)
+16..32  16B  server IP — IPv4-mapped IPv6 (::ffff:0.0.0.0 = UNSPECIFIED)
+32..34   2B  tcp_port
+34..?   pvString "tcp" (or "tls" for TLS transport)
+ ?..?+1  1B  0xFF — null serverStatus
+```
+
+- pvxs writes `SockAddr::any(AF_INET)` via `evhelper.cpp:891-908`: 10×0x00 + 2×0xFF +
+  4 bytes of INADDR_ANY.
+- Rust writes `ip_to_bytes(IpAddr::V4(Ipv4Addr::UNSPECIFIED))` via `proto/ip.rs:9-20`:
+  same 16-byte IPv4-mapped encoding.
+- Formats are byte-for-byte identical. ✓
+
+Conclusion:
+
+All four check points — cadence, GUID, change_count, format — are functionally equivalent
+to pvxs. The only deviation (polling vs. immediate change_count) is a semantic simplification
+that has no client-visible correctness impact. No fix required.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

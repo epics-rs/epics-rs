@@ -435,6 +435,77 @@ In `parse_client_credentials`:
    `Ok(None)` — the `ca`-method identity requires a non-empty user to be meaningful; without one
    pvxs falls back to anonymous.
 
+### R71 — Monitor flow-control / pipeline credit accounting (parity-correct)
+
+Severity: N/A — parity-correct
+
+Status: No change
+
+Evidence — credit ownership:
+
+- Rust site: `tcp.rs:1182-1241` (`MonitorPipelineCredit::acquire()`): the ONLY site that
+  decrements `monitor_window` (AtomicU32). CAS loop blocks when window==0, then atomically
+  decrements. Called at `tcp.rs:5162` (initial snapshot) and `tcp.rs:5345` (each DATA event).
+  No other path touches the counter downward.
+- Rust ACK site: `tcp.rs:4537-4618` — the ONLY site that increments the window. On `is_ack =
+  subcmd & 0x80`, reads u32 `nack` from frame, CAS saturating_add loop, then fires
+  `notify_waiters()` when `prev==0` so blocked `acquire()` wakes.
+- C++ sites: `pvxs/src/servermon.cpp:193` (`window--` in `doReply`, after `enqueueTxBody`),
+  `servermon.cpp:652` (`op->window += nack` in ACK path). Same two-actor ownership.
+
+Evidence — INIT / initial window:
+
+- Rust site: `tcp.rs:3933-3948` — `pipeline_initial_nack` parsed when INIT subcmd has 0x80
+  bit; stored in `monitor_window = Some(Arc<AtomicU32>)` initialized to `nack`.
+- C++ site: `servermon.cpp:493-495` — `if(subcmd&0x80) from_wire(M, nack)`;
+  `op->window = nack` at line 518.
+
+Evidence — START / STOP:
+
+- Rust site: `tcp.rs:4495-4496`: `is_pause = subcmd == 0x04`; `is_resume = subcmd & 0x40 != 0`.
+- C++ site: `servermon.cpp:670-678`: `if(subcmd & 0x04)` (bit test); `bool start = subcmd & 0x40`.
+- pvxs clients (`clientmon.cpp:127`): send `subcmd = 0x04` for STOP and `subcmd = 0x44` for
+  START — the only two values that contain the 0x04 bit. For both, Rust produces the same
+  result as the pvxs bit-test.
+- Minor deviation: Rust uses exact-match (`== 0x04`) for STOP vs. pvxs bit-test (`& 0x04`). A
+  hypothetical client sending `subcmd = 0x05` (unknown bit + stop bit) would be treated as STOP
+  by pvxs but ignored by Rust. No conforming PVA client sends such a value; this is not a
+  real-world bug.
+
+Evidence — queue overflow / squash:
+
+- Rust site: `tcp.rs:5230-5243` — after receiving the first event, drains remaining via
+  `try_recv()`, coalescing via `coalesce_monitor_update` (keeps latest value, unions changed
+  bitsets). During pause: `next_monitor_event` coalesces into `held` and flushes on resume
+  (`tcp.rs:5704-5737`).
+- C++ site: `servermon.cpp:280-285` — when `queue.size() >= limit && !maybe`, overwrites
+  `queue.back()` (squash to the newest queued slot). Both implementations preserve the latest
+  value and merge changed fields across overflows.
+
+Evidence — LOW / HIGH watermarks:
+
+- Rust site: `tcp.rs:1225-1238` — after `acquire()`, fires LOW (`WatermarkKind::Pause`) when
+  `window_after <= lo` and crossing is freshly below (once per crossing via `cross_watermark`).
+  `tcp.rs:4611-4644` — ACK path fires HIGH (`WatermarkKind::Resume`) when window crosses above
+  `high`. Watermark levels clamped at INIT to `min(level, ack_at - 1)` (`tcp.rs:125-133`,
+  matching `servermon.cpp:331-332`).
+- C++ site: `servermon.cpp:195-207` (`onLowMark` when `window <= low`); `servermon.cpp:654-666`
+  (`onHighMark` when `window > high` after ACK).
+
+Evidence — DESTROY:
+
+- Rust site: `tcp.rs:2501-2502` — MONITOR DESTROY handled via `Command::DestroyRequest` (a
+  separate PVA command), not via subcmd bit 0x10 in the MONITOR message.
+- C++ client site: `pvxs/src/clientmon.cpp:570` — "assume op has already sent
+  CMD_DESTROY_REQUEST". pvxs clients use DESTROY_REQUEST, not subcmd 0x10.
+- The subcmd 0x10 path in `servermon.cpp:690-707` exists but is not used by pvxs clients.
+  Rust's DESTROY_REQUEST path covers the actual traffic.
+
+Conclusion:
+
+All six check points — credit decrement ownership, credit increment ownership, INIT window,
+START/STOP, queue overflow, watermarks — are functionally equivalent to pvxs. No fix required.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

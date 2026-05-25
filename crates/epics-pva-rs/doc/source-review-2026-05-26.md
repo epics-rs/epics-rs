@@ -617,6 +617,56 @@ Rust correctly decodes the changed-BitSet and partial value from the wire, merge
 leaves against the prior value, and stores the result atomically. Parity with pvxs is exact.
 No fix required.
 
+### R74 — Server-side message segmentation of large responses (parity-correct)
+
+Severity: N/A — parity-correct
+
+Status: No change
+
+Context:
+
+The PVA wire format has segment flags in the header byte (bit 4 = SegFirst, bit 5 = SegLast,
+defined in pvxs `pvaproto.h:599-600` as `0x10` / `0x20`) to allow splitting large application
+messages across multiple TCP writes. The question is whether the server emits segmented frames
+for large responses, or sends a single unsegmented frame regardless of payload size.
+
+Evidence — pvxs send side:
+
+- C++ site: `pvxs/src/conn.cpp:89-101` (`ConnBase::enqueueTxBody`):
+  ```cpp
+  to_evbuf(tx, Header{cmd,
+                      uint8_t(isClient ? 0u : pva_flags::Server),
+                      uint32_t(blen)}, sendBE);
+  ```
+  The `flags` byte is set to only `pva_flags::Server` (0x40) — no `SegFirst` (0x10) or
+  `SegLast` (0x20). Every server-→-client application message is emitted as a single
+  unsegmented frame with the full body length in the 32-bit payload_length field.
+- C++ site: `pvxs/src/conn.cpp:224-225` — explicit design comment: "so far we do not use
+  segmentation to support incremental processing of long messages. We instead accumulate all
+  segments of a message".
+- The `SegFirst` / `SegLast` constants in `pvaproto.h` are checked only on the RECEIVE path
+  (`conn.cpp:228-244`) to reassemble inbound segmented frames from clients that do segment.
+  No send site in pvxs ever sets either flag.
+
+Evidence — Rust send side:
+
+- Rust site: `proto/header.rs:95-102` (`PvaHeader::application`): constructs a header with
+  `HeaderFlags::new(server, false, order)` — this sets only the SERVER bit (0x40) and the
+  byte-order bit (0x80). No SEGMENT_FIRST (0x10) or SEGMENT_LAST (0x20) is set.
+- Rust site: `server_native/tcp.rs:1922-1946` — writer task: `while let Some(frame) =
+  rx.recv().await { writer_raw.write_all(&frame).await }`. Frames are `Vec<u8>` containing a
+  single 8-byte header + full payload built by the per-op send paths. No splitting occurs at
+  any point on the send path.
+- The inbound segmentation handling (`tcp.rs:2194-2239`, P-G20 label) is the RECEIVE side —
+  correctly reassembles inbound segmented client messages. This is a separate concern from the
+  outgoing emit path.
+
+Conclusion:
+
+Both pvxs and the Rust server always emit single unsegmented frames for server→client
+application messages. Neither implementation ever sets segment flags on outgoing frames.
+Parity-correct. No fix required.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

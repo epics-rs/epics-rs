@@ -1778,10 +1778,16 @@ fn parse_client_credentials(
     let method = crate::proto::decode_string(&mut cur, order)
         .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION method: {e}")))?
         .unwrap_or_default();
-    if method.is_empty() {
-        // pvxs anonymous handshake: empty method, no auth body to
-        // decode. Surface as `Ok(None)` so the caller can install
-        // the default anonymous credentials.
+    // R70: pvxs serverconn.cpp:223-231 — method/account are set from
+    // the auth body ONLY for selected=="ca" with a valid user field;
+    // every other path lands on method="anonymous"/account="anonymous"
+    // via `if(C->method.empty())`. Mirror that: an empty method or an
+    // explicit "anonymous" selection both yield Ok(None), letting the
+    // caller keep the pre-initialised ClientCredentials::anonymous()
+    // (account="anonymous"). pvxs clients always send the string
+    // "anonymous" — not empty — so the is_empty() guard alone left
+    // account="" for every pvxs anonymous handshake.
+    if method.is_empty() || method.eq_ignore_ascii_case("anonymous") {
         return Ok(None);
     }
     // Auth value: type descriptor + full value. pvxs requires both to
@@ -1835,14 +1841,15 @@ fn parse_client_credentials(
             }
         }
     }
-    // Pre-fix Rust filled `account` with `method` whenever the auth
-    // body didn't carry a `user` field — that turned a truncated
-    // `ca` handshake into `account="ca"`. pvxs only populates
-    // user/host/groups from a successfully decoded ca structure;
-    // anything else leaves them empty (anonymous-shaped tuple). Mirror
-    // that — leave `account` empty when the structure didn't carry a
-    // `user` field. ACF rules will then see an empty-account ca
-    // credential rather than a fabricated method=name pair.
+    // R70: pvxs serverconn.cpp:223-231 — for "ca", the credential is
+    // only meaningful when a user field was present (the lambda sets
+    // BOTH method and account). Without a user field the lambda never
+    // fires, C->method stays empty, and the anonymous fallback triggers.
+    // Mirror that: ca with a missing or empty user field returns Ok(None)
+    // so the caller falls back to ClientCredentials::anonymous().
+    if creds.method.eq_ignore_ascii_case("ca") && creds.account.is_empty() {
+        return Ok(None);
+    }
     Ok(Some(creds))
 }
 

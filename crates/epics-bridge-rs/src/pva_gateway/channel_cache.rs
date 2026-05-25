@@ -828,11 +828,7 @@ impl ChannelCache {
                             backoff_ms = backoff.as_millis() as u64,
                             "pva-gateway: raw upstream monitor failed to start, will retry"
                         );
-                        // BR-R50: exits here leave a stale entry in the
-                        // cache — cleanup_tick should abort via AbortOnDrop.
-                        if tx_raw_for_task.receiver_count() == 0 {
-                            return;
-                        }
+                        // BR-R50: guard removed — cleanup_tick aborts via AbortOnDrop.
                         tokio::time::sleep(backoff).await;
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                         continue;
@@ -857,10 +853,7 @@ impl ChannelCache {
                         backoff_ms = backoff.as_millis() as u64,
                         "pva-gateway: raw upstream monitor failed, will retry"
                     );
-                    // BR-R50: same family as the clean-cycle exit below.
-                    if tx_raw_for_task.receiver_count() == 0 {
-                        return;
-                    }
+                    // BR-R50: guard removed — cleanup_tick aborts via AbortOnDrop.
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, max_backoff);
                     continue;
@@ -873,18 +866,10 @@ impl ChannelCache {
                 // empty. Only exit when BOTH have no live receivers,
                 // otherwise upstream IOC restart silently kills every
                 // raw-path downstream monitor.
-                // BR-R50: exiting here leaves a stale entry in the cache
-                // map for ~60 s; a new subscriber in that window joins a
-                // dead broadcast channel (pva2pva evicts immediately on
-                // DISCONNECTED: chancache.cpp:78-83). Fix: remove guard,
-                // let cleanup_tick evict via AbortOnDrop instead.
-                if tx_for_task.receiver_count() == 0 && tx_raw_for_task.receiver_count() == 0 {
-                    tracing::debug!(
-                        pv = %pv_name_owned,
-                        "pva-gateway: monitor exit (no subscribers)"
-                    );
-                    return;
-                }
+                // BR-R50: guard removed — cleanup_tick evicts idle entries
+                // (subscriber_count==0 && !drop_poke) and aborts this task
+                // via AbortOnDrop. Keeping the task alive until eviction
+                // prevents new subscribers from joining a dead broadcast.
             }
         });
 

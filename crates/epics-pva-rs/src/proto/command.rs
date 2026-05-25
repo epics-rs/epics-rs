@@ -111,9 +111,9 @@ impl QosFlags {
     pub const GET: u8 = 0x40;
     // R63: MONITOR_START and MONITOR_STOP hold wrong values — see doc/source-review-2026-05-26.md.
     /// `0x44` — START a paused monitor (control bit `0x04` | GET bit `0x40`; subscriber → server).
-    pub const MONITOR_START: u8 = 0x40;
+    pub const MONITOR_START: u8 = 0x44;
     /// `0x04` — STOP a running monitor (control bit only; subscriber → server).
-    pub const MONITOR_STOP: u8 = 0x80;
+    pub const MONITOR_STOP: u8 = 0x04;
     /// `0x80` — pipelined ack (number of free slots in flow window).
     pub const PIPELINE_ACK: u8 = 0x80;
 }

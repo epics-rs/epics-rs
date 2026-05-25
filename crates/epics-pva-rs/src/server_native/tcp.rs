@@ -1987,10 +1987,9 @@ async fn handle_connection_io(
     // Modern pvxs clients explicitly prefer `ca`; validation still
     // accepts both, only the wire order changes.
     const ADVERTISED_AUTH_METHODS: &[&str] = &["anonymous", "ca"];
-    // R62: pvxs uses 0x10000 (65536) for serverReceiveBufferSize in CONNECTION_VALIDATION
-    // (serverconn.cpp:103-104 "not used"). 87_040 diverges from upstream.
+    // R62: match pvxs serverconn.cpp:103-104 — serverReceiveBufferSize = 0x10000 ("not used").
     let val_req =
-        build_server_connection_validation(order, 87_040, 32_767, ADVERTISED_AUTH_METHODS);
+        build_server_connection_validation(order, 0x10000, 32_767, ADVERTISED_AUTH_METHODS);
     let _ = tx.send(val_req).await;
 
     // Step 3+: drive the read loop.

@@ -2741,7 +2741,7 @@ mod tests {
             // ── Step 2: CONNECTION_VALIDATION request (server→client) ──────────
             {
                 let mut payload = Vec::new();
-                payload.put_u32(87_040, order); // buffer_size
+                payload.put_u32(0x10000, order); // buffer_size (R62: match pvxs 0x10000)
                 payload.put_u16(32_767, order); // registry_size
                 payload.push(1u8); // auth_methods count (size-encoded, 1 < 254)
                 encode_string_into("anonymous", order, &mut payload);

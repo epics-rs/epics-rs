@@ -1182,7 +1182,7 @@ async fn create_channel_multi_name_emits_one_reply_per_name() {
     let mut sock = read_handshake_prelude(server_addr);
     let order = ByteOrder::Little;
     let mut payload: Vec<u8> = Vec::new();
-    payload.put_u32(87_040, order);
+    payload.put_u32(0x10000, order);
     payload.put_u16(32_767, order);
     payload.put_u16(0, order);
     encode_string_into("anonymous", order, &mut payload);
@@ -1363,7 +1363,7 @@ async fn auth_method_unadvertised_returns_status_error() {
     // advertised by the server.
     let order = ByteOrder::Little;
     let mut payload: Vec<u8> = Vec::new();
-    payload.put_u32(87_040, order); // client buffer hint
+    payload.put_u32(0x10000, order); // client buffer hint (R62: match pvxs 0x10000)
     payload.put_u16(32_767, order); // intro registry size
     payload.put_u16(0, order); // qos
     encode_string_into("x509", order, &mut payload);
@@ -1399,7 +1399,7 @@ async fn auth_method_unadvertised_returns_status_error() {
     // anonymous flow doesn't regress.
     let mut sock2 = read_handshake_prelude(server_addr);
     let mut payload: Vec<u8> = Vec::new();
-    payload.put_u32(87_040, order);
+    payload.put_u32(0x10000, order);
     payload.put_u16(32_767, order);
     payload.put_u16(0, order);
     encode_string_into("anonymous", order, &mut payload);
@@ -1489,7 +1489,7 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
     let auth_val = PvField::Structure(auth_struct);
 
     let mut payload: Vec<u8> = Vec::new();
-    payload.put_u32(87_040, order);
+    payload.put_u32(0x10000, order);
     payload.put_u16(32_767, order);
     payload.put_u16(0, order);
     encode_string_into("x509", order, &mut payload);

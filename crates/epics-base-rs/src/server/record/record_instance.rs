@@ -514,26 +514,54 @@ impl RecordInstance {
     fn populate_control_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         let rtype = self.record.record_type();
         match rtype {
-            // R51: ao unconditionally uses DRVH/DRVL (aoRecord.c:356-357);
-            // longout/int64out use DRVH/DRVL only when drvh > drvl, else HOPR/LOPR
-            // (longoutRecord.c:282-287, int64outRecord.c:265-270).
-            "ao" | "longout" | "int64out" => {
-                // Output records use DRVH/DRVL, fallback to HOPR/LOPR
-                let drvh = self.record.get_field("DRVH").and_then(|v| v.to_f64());
-                let drvl = self.record.get_field("DRVL").and_then(|v| v.to_f64());
-                let hopr = self
+            // R51: ao unconditionally uses DRVH/DRVL (aoRecord.c:356-357).
+            "ao" => {
+                let upper = self
                     .record
-                    .get_field("HOPR")
+                    .get_field("DRVH")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
-                let lopr = self
+                let lower = self
                     .record
-                    .get_field("LOPR")
+                    .get_field("DRVL")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
                 snap.control = Some(super::super::snapshot::ControlInfo {
-                    upper_ctrl_limit: drvh.unwrap_or(hopr),
-                    lower_ctrl_limit: drvl.unwrap_or(lopr),
+                    upper_ctrl_limit: upper,
+                    lower_ctrl_limit: lower,
+                });
+            }
+            // R51: longout/int64out use DRVH/DRVL only when drvh > drvl, else HOPR/LOPR
+            // (longoutRecord.c:282-287, int64outRecord.c:265-270).
+            "longout" | "int64out" => {
+                let drvh = self
+                    .record
+                    .get_field("DRVH")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                let drvl = self
+                    .record
+                    .get_field("DRVL")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                let (upper, lower) = if drvh > drvl {
+                    (drvh, drvl)
+                } else {
+                    let hopr = self
+                        .record
+                        .get_field("HOPR")
+                        .and_then(|v| v.to_f64())
+                        .unwrap_or(0.0);
+                    let lopr = self
+                        .record
+                        .get_field("LOPR")
+                        .and_then(|v| v.to_f64())
+                        .unwrap_or(0.0);
+                    (hopr, lopr)
+                };
+                snap.control = Some(super::super::snapshot::ControlInfo {
+                    upper_ctrl_limit: upper,
+                    lower_ctrl_limit: lower,
                 });
             }
             "motor" => {

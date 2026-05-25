@@ -689,6 +689,7 @@ impl RecordInstance {
     fn populate_enum_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         let rtype = self.record.record_type();
         match rtype {
+            // R53: bi/bo/busy — C trims no_str to 1 when ZNAM set and ONAM empty (boRecord.c:342-352).
             "bi" | "bo" | "busy" => {
                 let znam = self
                     .record
@@ -716,6 +717,7 @@ impl RecordInstance {
                     strings: vec![znam, onam],
                 });
             }
+            // R53: mbbi/mbbo — C uses highwater mark: last non-empty index + 1 (mbbiRecord.c:262-269).
             "mbbi" | "mbbo" => {
                 let state_fields = [
                     "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST",

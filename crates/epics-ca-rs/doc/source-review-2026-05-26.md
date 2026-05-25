@@ -356,6 +356,44 @@ Fix direction:
    Neither record type has analog alarm limits (no HIHI/HIGH/LOW/LOLO), so those
    fields remain 0.0.
 
+### R53 — `bi`/`bo` and `mbbi`/`mbbo` enum-string `no_str` not trimmed; trailing empty strings inflated
+
+Severity: Low
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-base-rs/src/server/record/record_instance.rs` —
+  `populate_enum_info` `"bi" | "bo" | "busy"` arm unconditionally produces
+  `strings: vec![znam, onam]` (length 2, no_str=2). `"mbbi" | "mbbo"` arm collects
+  all 16 `*ST` fields unconditionally (length 16, no_str=16). The codec
+  (`crates/epics-base-rs/src/types/codec.rs:524`) derives `no_str` directly as
+  `ei.strings.len().min(16)`.
+- **C** (bi/bo): `boRecord.c:342-352` — `get_enum_strs` starts at `no_str=2`,
+  then applies: `if (*prec->znam != 0) no_str=1; if (*prec->onam != 0) no_str=2;`.
+  Result: `no_str=1` when ZNAM is set and ONAM is empty. Comment reads
+  "SETTING no_str=0 breaks channel access clients."
+- **C** (mbbi/mbbo): `mbbiRecord.c:262-269` — `get_enum_strs` uses a highwater
+  mark: `if (*pstate != 0) states = i+1; … pes->no_str = states;`. Result: `no_str`
+  equals the index of the last non-empty string + 1; all-empty → `no_str=0`.
+
+Impact:
+
+`bi`/`bo` PVs whose ZNAM is set but ONAM is unset return `no_str=2` with an empty
+string in slot 1; C returns `no_str=1`. `mbbi`/`mbbo` PVs with fewer than 16 states
+configured return `no_str=16`; C returns the count of actually-defined states. CA
+clients (control-panel widgets, camonitor) display extra blank enum entries beyond
+the configured states.
+
+Fix direction:
+
+1. `record_instance.rs` `"bi" | "bo" | "busy"` arm — apply C's logic: evaluate
+   `!znam.is_empty() && onam.is_empty()` before moving into the vec, then
+   `truncate(1)` when true.
+2. `record_instance.rs` `"mbbi" | "mbbo"` arm — apply C's highwater-mark:
+   `rposition(|s| !s.is_empty()).map(|i| i+1).unwrap_or(0)` then `truncate(no_str)`.
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,

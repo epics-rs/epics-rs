@@ -7,7 +7,9 @@ Scope:
 - Areas reviewed: server op lifecycle (GET/PUT/RPC/MONITOR/PROCESS INIT and data-phase error
   handling), CONNECTION_VALIDATION buffer-size field, server-side type registry on data-phase
   frame decode.
-- Finding-ID series: `PVA-SR-N` (this document owns the namespace; numbers are not reused).
+- Finding-ID series: `R-N` (the global parity-round series; this document records the
+  epics-pva-rs slice — R60–R63 here). IDs are globally unique by prefix and never reused;
+  see `docs/review-tagging-conventions.md`.
 
 References:
 

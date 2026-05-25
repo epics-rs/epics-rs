@@ -66,7 +66,7 @@ fresh search.
 
 | Constant | Default | Source |
 |----------|---------|--------|
-| `BACKOFF_SECS` | `[1, 1, 2, 5, 10, 15, 30, 60, 120, 210]` | matches pvxs `clientdiscover.cpp` |
+| `BACKOFF_SECS` | `[1, 1, 2, 5, 10, 15, 30, 60, 120, 210]` | R67: unused by engine; actual retry uses 30-bucket ring (~29 s cap) |
 | `BEACON_TIMEOUT` | 360s | 2× pvxs beacon clean interval |
 | `BEACON_CLEAN_INTERVAL` | 180s | matches pvxs `tickBeaconClean` |
 | `MULTI_SERVER_WINDOW` | 200ms | per-search collection window |

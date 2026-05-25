@@ -248,8 +248,46 @@ Add a default-no-op `on_channel_close(&self, name: &str, ctx: &ChannelContext)` 
 the connection teardown path. Default impl is empty so existing sources are unaffected; this
 is still a semver-minor breaking change for object-safe vtable users (`ChannelSourceObj`).
 
+### R67 — `BACKOFF_SECS` is dead code with a false "matches pvxs clientdiscover.cpp" claim
+
+Severity: Low (doc inconsistency; no production runtime impact)
+
+Status: Fixed (misleading doc corrected; constant retained as public API)
+
+Evidence:
+
+- Rust site: `src/client_native/search_engine.rs:44` —
+  `pub const BACKOFF_SECS: &[u64] = &[1, 1, 2, 5, 10, 15, 30, 60, 120, 210];`
+  with doc comment "matching pvxs `clientdiscover.cpp`". The constant is only referenced in the
+  test `backoff_caps_at_last_value` (line 1928), which asserts the sequence is bounded. No
+  production code path consults `BACKOFF_SECS`; retry scheduling is driven exclusively by the
+  30-bucket ring mechanism in `run_engine`/`cascade_smoothed_next` (lines 713-732, 1300-1311).
+  The module doc header (line 12) also states "pvxs-style backoff (15s → 30s → 60s → 120s →
+  210s capped)", which is incorrect — the actual production cap is ~29 s (30-bucket ring at 1 s
+  per tick, minus one rotation lag).
+- C++ site: `pvxs/src/clientdiscover.cpp` — **no such sequence exists**. The values
+  `[1, 1, 2, 5, 10, 15, 30, 60, 120, 210]` do not appear in any pvxs source file. The actual
+  pvxs retry geometry is in `client.cpp:1118-1121`: `nSearch = min(nBuckets, nSearch+1u)`,
+  placing the next retry at `(idx + nSearch) % 30`, giving linearly-growing waits of 1 s, 2 s,
+  3 s, …, capping at 29 s (when nSearch reaches 30, next = idx, and the cursor takes 29 more
+  ticks to return). The 210 s cap in `BACKOFF_SECS` has no pvxs equivalent.
+
+Impact:
+
+An external caller reading the public `BACKOFF_SECS` constant to predict channel search retry
+timing would receive a sequence that caps at 210 s instead of the actual ~29 s, and would
+attribute it to a file that contains no such values. The production search behaviour is correct;
+only the documentation is misleading.
+
+Fix direction:
+
+Update the `BACKOFF_SECS` doc comment to clearly state it is not used by the engine and does
+not correspond to pvxs. Update the module header to describe the actual bucket-ring geometry
+(1 s tick × 30 buckets, cap ~29 s). Do not remove `BACKOFF_SECS` — it is `pub` and removal is
+a semver-breaking change.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).
-A full audit of the `EncodeTypeCache` emit/decode round-trip, the search-engine backoff bucket
-algebra, and the TLS x.509 peer-credential extraction is deferred to a future review.
+A full audit of the `EncodeTypeCache` emit/decode round-trip and the TLS x.509 peer-credential
+extraction is deferred to a future review.

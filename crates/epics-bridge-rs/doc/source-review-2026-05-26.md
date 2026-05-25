@@ -177,6 +177,31 @@ Within `epics-bridge-rs` (initial rights AND):
 Deferred to main worker (cross-crate, `epics-ca-rs`):
 When upstream write-access changes at runtime, the `AtomicBool` updates but connected downstream clients are not re-notified until they reconnect. The C gateway calls `postAccessRights()` → per-channel `postAccessRightsEvent()`. The Rust CA server has an `acf_reload_tx` broadcast that triggers `reeval_access_rights` on all client tasks, but no public "fire access-reload broadcast without reloading the ACF file" API. Adding `CaServer::notify_access_change()` (just fire the broadcast) would let the gateway watcher trigger per-server re-evaluation; deferred to main worker.
 
+### BR-R52 — CA gateway shadow-PV events use single-class event mask; `DBE_LOG` and `DBE_ALARM`-only subscribers receive no events
+
+Severity: Medium
+
+Status: Doc-only (structural fix required in `epics-base-rs`)
+
+Evidence:
+
+- `crates/epics-base-rs/src/server/pv.rs:450` — `notify_subscribers_from_snapshot` posts with `let post = EventMask::VALUE;` (0x01 only). Every upstream monitor event forwarded via `put_pv_and_post_snapshot` fires exclusively as a `DBE_VALUE` event.
+- `crates/epics-base-rs/src/server/pv.rs:358-359` — `post_alarm` posts with `let post = EventMask::ALARM;` (0x04 only). The disconnect LINK_ALARM fires exclusively as a `DBE_ALARM` event.
+- `crates/epics-bridge-rs/src/ca_gateway/upstream.rs:503-505` — the gateway forwarding task calls `db_clone.put_pv_and_post_snapshot(&name, snapshot.clone())` for every upstream update, and `db_clone.post_alarm(&name, 3, LINK_ALARM)` on disconnect. Both reach subscribers via the single-class paths above.
+- `epics-modules/ca-gateway/src/gateVc.cc:374-376` — the C gateway sets `select_mask |= (alarmEventMask() | valueEventMask() | logEventMask())`, i.e. `DBE_VALUE | DBE_ALARM | DBE_LOG` (0x07), before calling `postEvent(event_mask, *local_event_data)`. All downstream subscribers — regardless of whether they subscribed with `VALUE`, `ALARM`, or `LOG` — receive every upstream event.
+- `crates/epics-base-rs/src/server/recgbl.rs:39-41` — `EventMask::VALUE = 0x01`, `EventMask::LOG = 0x02`, `EventMask::ALARM = 0x04`.
+
+Impact:
+
+Downstream CA clients that subscribe with `DBE_LOG` (0x02) — the mask used by archiver appliances such as Channel Archiver / Phoebus Archiver — receive zero events from any Rust CA gateway PV. Their subscription silently produces no data. Clients with `DBE_ALARM`-only (0x04) subscriptions (alarm systems, operator panels requesting alarm-change notification) also receive no normal upstream events, only the disconnect LINK_ALARM. Clients with the common `DBE_VALUE | DBE_ALARM` (0x05) combined mask are unaffected.
+
+Fix direction:
+
+Structural change required in `epics-base-rs`:
+1. Change `notify_subscribers_from_snapshot` (`pv.rs:450`) from `let post = EventMask::VALUE` to `let post = EventMask::VALUE | EventMask::LOG | EventMask::ALARM` so any subscription mask that overlaps at least one of those bits fires.
+2. Optionally change `post_alarm` (`pv.rs:359`) to `EventMask::ALARM | EventMask::LOG` so archiver clients with `DBE_LOG` also see disconnect/alarm events.
+3. No changes required in `epics-bridge-rs`: the gateway's `put_pv_and_post_snapshot` and `post_alarm` calls are already correct; only the per-subscriber event-class gate inside `ProcessVariable` needs widening.
+
 ## Uncertain candidates
 
 None identified this round.

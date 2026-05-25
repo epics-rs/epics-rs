@@ -447,6 +447,10 @@ impl ProcessVariable {
         use crate::server::recgbl::EventMask;
         let mut subs = self.subscribers.lock().await;
         subs.retain(|sub| !sub.tx.is_closed());
+        // BR-R52: C gateway fires postEvent(VALUE|ALARM|LOG) for every
+        // upstream event (gateVc.cc:374-376). Using VALUE only here means
+        // DBE_LOG (archivers) and DBE_ALARM-only subscribers receive no
+        // events. Fix: widen to VALUE|ALARM|LOG (requires epics-base-rs change).
         let post = EventMask::VALUE;
         for sub in subs.iter() {
             if !sub.accepts(post) {

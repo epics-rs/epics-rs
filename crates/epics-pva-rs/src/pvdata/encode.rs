@@ -2532,6 +2532,42 @@ mod tests {
         );
     }
 
+    /// PVXS-SR-11 (value-decode recursion): a chain of nested `Any`
+    /// *values* must be bounded by the same depth cap as the descriptor
+    /// decoder. Each `0x82` (`TAG_VARIANT`) byte costs exactly one wire
+    /// byte but one `decode_pv_field_at_depth` stack frame, so an
+    /// unbounded run is a remote stack overflow — a hard SIGSEGV that the
+    /// `catch(std::exception)`-equivalent dispatch guard cannot catch.
+    /// It is reachable pre-auth: CONNECTION_VALIDATION decodes a
+    /// peer-supplied value via `decode_pv_field`, whose top type may be
+    /// `Any`. The descriptor-depth test above exercises only
+    /// `decode_type_desc`; this feeds the `0x82` value-recursion vector
+    /// through `decode_pv_field` directly.
+    #[test]
+    fn decode_pv_field_caps_nested_any_value_recursion() {
+        // A 20-deep Any value (20 × `0x82` tags, terminated by a `0xFF`
+        // null at depth 20) sits exactly at the cap and must decode.
+        let mut ok = vec![TAG_VARIANT; 20];
+        ok.push(0xFF);
+        let mut cur = Cursor::new(ok.as_slice());
+        decode_pv_field(&FieldDesc::Variant, &mut cur, ByteOrder::Little)
+            .expect("depth-20 nested Any value must decode");
+
+        // A longer run (>20) must be rejected by the depth guard, NOT by
+        // EOF: 64 tags with no terminator faults at depth 21 while ~43
+        // bytes remain unread, so the cap — not a short read — is what
+        // stops the recursion.
+        let too_deep = vec![TAG_VARIANT; 64];
+        let mut cur2 = Cursor::new(too_deep.as_slice());
+        let err = decode_pv_field(&FieldDesc::Variant, &mut cur2, ByteOrder::Little)
+            .expect_err("a >20-deep nested Any value must be rejected (PVXS-SR-11)");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("MAX_FIELD_DEPTH"),
+            "expected MAX_FIELD_DEPTH error, got: {msg}"
+        );
+    }
+
     // ── F-G10: generic encode fallback ──────────────────────────────────
 
     /// `PvField::Null` against a Union descriptor must emit the `0xFF`

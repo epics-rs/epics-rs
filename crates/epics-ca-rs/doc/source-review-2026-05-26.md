@@ -116,6 +116,53 @@ connection matching C `RSRV_ERROR`. A mask that only has bits above bit 7 set (>
 not guarded separately since DBE bits 4-7 are reserved and such a mask would never match
 any C DBE category; the Rust `Subscriber::accepts` already yields false for them.
 
+### R47 — `DBE_PROPERTY` events never posted on metadata-field write; subscribers silent after initial snapshot
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-base-rs/src/server/record/record_instance.rs:260-268` —
+  `notify_field_written_if_changed` calls `invalidate_metadata_cache()` when a
+  metadata field (EGU/HOPR/LOPR/PREC/HIHI/LOLO/enum strings) actually changes, but
+  never calls `notify_field_with_origin(*, EventMask::PROPERTY)`. The four write-path
+  callers in `crates/epics-base-rs/src/server/database/field_io.rs:151,326,630,835`
+  all rely on this function for metadata invalidation. A second path at
+  `record_instance.rs:1499-1500` (`took_metadata_change()` during record processing)
+  also only invalidates the cache without posting PROPERTY.
+- **C**: `modules/database/src/ioc/db/dbAccess.c:1396-1397` — `dbPutField` sets
+  `propertyUpdate = paddr->pfldDes->prop && precord->mlis.count` (line 1329), then
+  after the write and optional change-suppression (lines 1374-1383), calls
+  `db_post_events(precord, NULL, DBE_PROPERTY)` when `propertyUpdate && !status`.
+  The `NULL` field pointer broadcasts to all field monitors on the record.
+
+Impact:
+
+CA clients that subscribe with `DBE_PROPERTY` mask (0x08) to monitor EGU/HOPR/LOPR/
+PREC/enum-string changes receive the initial snapshot delivered at EVENT_ADD time
+but are silent thereafter. Every subsequent write to a metadata field that changes
+its value goes undelivered to those subscribers. The PVA gateway (`epics-bridge-rs`)
+subscribes with `EventMask::PROPERTY` for NTScalar `display.units`/`display.form`
+propagation; an IOC record writing its own EGU will not propagate that change to
+PVA clients.
+
+Fix direction:
+
+In `notify_field_written_if_changed`, after `self.invalidate_metadata_cache()`, add:
+```rust
+let fields: Vec<String> = self.subscribers.keys().cloned().collect();
+for f in fields {
+    self.notify_field_with_origin(&f, EventMask::PROPERTY, 0);
+}
+```
+This broadcasts the PROPERTY event to all field subscribers (only those with the
+PROPERTY bit in their mask receive it, via the `sub_mask.intersects(mask)` gate in
+`notify_field_with_origin`), matching C's `db_post_events(precord, NULL, DBE_PROPERTY)`
+broadcast. Also add the same broadcast in `process_local`'s `took_metadata_change()`
+block so record-processing-driven metadata changes are covered.
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,
@@ -123,5 +170,7 @@ CREATE_CHAN response field layout, READ_NOTIFY field layout, WRITE_NOTIFY field
 layout, beacon m_available = 0, repeater registration noop, client CA_PROTO_ERROR
 parsing with extended-echo handling, search reply cid sentinel, ECA status code
 table, CLEAR_CHANNEL reply field echo, READ_SYNC echo, ECHO full-payload round-trip,
-monitor flow-control lost-wake-safe gate) were found to match C behavior or be
-intentional, documented deviations.
+monitor flow-control lost-wake-safe gate, CA access security / access-rights frame
+layout, large-array / dynamic element count autosize + padding + truncation +
+extended-header) were found to match C behavior or be intentional, documented
+deviations.

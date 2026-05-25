@@ -257,6 +257,7 @@ impl RecordInstance {
     /// don't need the change-detection (e.g. internal writers that
     /// know the field is non-metadata) can keep using
     /// [`notify_field_written`].
+    // R47: must post EventMask::PROPERTY to all field subscribers when metadata changes
     pub fn notify_field_written_if_changed(&self, field: &str, prev: Option<&EpicsValue>) {
         let upper = field.to_ascii_uppercase();
         if !is_metadata_field(&upper) {
@@ -1498,6 +1499,7 @@ impl RecordInstance {
         // most records pay zero cost here.
         if self.record.took_metadata_change() {
             self.invalidate_metadata_cache();
+            // R47: must post EventMask::PROPERTY to subscribers when record updates metadata
         }
 
         if process_result == RecordProcessResult::AsyncPending {

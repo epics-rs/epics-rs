@@ -2376,6 +2376,7 @@ pub async fn op_rpc(
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
 
+    // R64: pvxs serverget.cpp:369 calls from_wire_type_value (type+value); type-only fails.
     let mut pv_req = Vec::new();
     encode_type_desc(request_desc, order, &mut pv_req);
 

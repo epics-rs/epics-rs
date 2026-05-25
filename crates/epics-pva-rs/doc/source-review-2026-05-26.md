@@ -147,6 +147,37 @@ Fix direction:
 Correct `MONITOR_START = 0x44` and `MONITOR_STOP = 0x04`. Also update the doc-comment for
 `MONITOR_START` to note it combines the control bit (`0x04`) with the GET bit (`0x40`).
 
+### R64 — RPC client INIT sends type-only; pvxs server expects type + full value
+
+Severity: High (all Rust client RPC against a pvxs server)
+
+Status: Fixed
+
+Evidence:
+
+- Rust site: `src/client_native/ops_v2.rs:2379-2390` — `op_rpc` builds the INIT payload as
+  `encode_type_desc(request_desc)` only, omitting the full value. The comment at
+  `src/server_native/tcp.rs:2582-2590` explicitly acknowledges "the Rust client's RPC INIT
+  sends only the descriptor — tolerated for interop."
+- C++ site: `pvxs/src/serverget.cpp:366-376` — INIT branch calls
+  `from_wire_type_value(M, rxRegistry, pvRequest)` which reads type **and** full value, then
+  `if(!M.good()) { bev.reset(); return; }`. If any non-null type is present, pvxs expects
+  value bytes to follow; absent value bytes leave M bad → connection-fatal.
+- C++ client: `pvxs/src/clientget.cpp:348-352` (`createOp`) — sends
+  `to_wire(R, Value::Helper::desc(pvRequest)); to_wire_full(R, pvRequest);` at INIT.
+
+Impact:
+
+Any Rust PVA client RPC operation targeting a real pvxs server is immediately connection-fatal
+after the RPC INIT frame when the argument type is non-null (i.e. any real RPC argument).
+The Rust server tolerates type-only via `decode_init_pv_request_value`'s absent-body path,
+so Rust↔Rust interop works; cross-server interop (Rust client → pvxs server) does not.
+
+Fix direction:
+
+Append the full value encoding after the type descriptor in the RPC INIT payload:
+`encode_pv_field(request_value, request_desc, order, &mut pv_req)`.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct or bug). A full audit of

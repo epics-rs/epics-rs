@@ -9,7 +9,8 @@ Scope:
   - ca-gateway C++ at `/Users/stevek/codes/epics-modules/ca-gateway/` — for CA gateway parity
   - pva2pva C++ at `/Users/stevek/codes/epics-base/modules/pva2pva/` — for PVA p2p gateway parity
 - Areas reviewed: CA gateway event forwarding, PVA gateway raw subscriber lifecycle, CA gateway disconnect alarm, QSRV group priming, pvalink propagation.
-- Finding-ID series: `BR-SR-N`
+- Finding-ID series: `BR-R-N` (the epics-bridge-rs round series; BR-R45–BR-R48 here).
+  IDs are never reused; see `docs/review-tagging-conventions.md`.
 
 ## Findings
 

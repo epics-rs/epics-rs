@@ -713,9 +713,12 @@ impl RecordInstance {
                         }
                     })
                     .unwrap_or_default();
-                snap.enums = Some(super::super::snapshot::EnumInfo {
-                    strings: vec![znam, onam],
-                });
+                let no_str_1 = !znam.is_empty() && onam.is_empty();
+                let mut strings = vec![znam, onam];
+                if no_str_1 {
+                    strings.truncate(1);
+                }
+                snap.enums = Some(super::super::snapshot::EnumInfo { strings });
             }
             // R53: mbbi/mbbo — C uses highwater mark: last non-empty index + 1 (mbbiRecord.c:262-269).
             "mbbi" | "mbbo" => {
@@ -723,7 +726,7 @@ impl RecordInstance {
                     "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST",
                     "TEST", "ELST", "TVST", "TTST", "FTST", "FFST",
                 ];
-                let strings: Vec<String> = state_fields
+                let mut strings: Vec<String> = state_fields
                     .iter()
                     .map(|f| {
                         self.record
@@ -738,6 +741,12 @@ impl RecordInstance {
                             .unwrap_or_default()
                     })
                     .collect();
+                let no_str = strings
+                    .iter()
+                    .rposition(|s| !s.is_empty())
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                strings.truncate(no_str);
                 snap.enums = Some(super::super::snapshot::EnumInfo { strings });
             }
             _ => {}

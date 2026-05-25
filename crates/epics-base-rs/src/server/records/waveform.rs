@@ -356,6 +356,8 @@ impl Record for WaveformRecord {
         self.kind.is_output()
     }
 
+    // R52: EGU/HOPR/LOPR/PREC not exposed in get_field or put_field; populate_display_info
+    // gets None for all four, leaving DBR_GR display limits zeroed (waveformRecord.c:251-252).
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => {

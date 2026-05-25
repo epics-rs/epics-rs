@@ -311,6 +311,51 @@ Split the `"ao" | "longout" | "int64out"` arm into two arms:
   else use HOPR/LOPR (matching `longoutRecord.c:282-287` /
   `int64outRecord.c:265-270`).
 
+### R52 — `waveform`/`aai`/`aao`/`compress` missing from `populate_display_info`; DBR_GR_* returns zeroed display limits
+
+Severity: Low
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-base-rs/src/server/record/record_instance.rs` —
+  `populate_display_info` has arms for `ai|ao|calc|calcout`,
+  `longin|longout|int64in|int64out`, and `motor` only. `waveform`, `aai`, `aao`,
+  and `compress` all fall through to `_ => {}` so `snap.display` stays `None`;
+  `encode_gr` / `encode_ctrl` encode zeroed limits for these PVs.
+  Compound gap: `crates/epics-base-rs/src/server/records/waveform.rs` has
+  `egu`/`hopr`/`lopr`/`prec` struct fields but `get_field` returns `None` for all
+  four; `put_field` returns `FieldNotFound` for them. `CompressRecord` lacks those
+  struct fields entirely.
+- **C**: `modules/database/src/std/rec/waveformRecord.c:251-252` —
+  `get_graphic_double` sets `pgd->upper_disp_limit = prec->hopr` /
+  `pgd->lower_disp_limit = prec->lopr` for the VAL field; line 239 returns
+  `*precision = prec->prec`.
+  `aaiRecord.c:280-281`, `aaoRecord.c:283-284` — identical HOPR/LOPR assignment.
+  `compressRecord.c:478-479` — same for VAL/IHIL/ILIL; line 464 returns
+  `prec->prec`. All four also expose EGU via `get_units` (waveformRecord.c:230,
+  compressRecord.c:455).
+
+Impact:
+
+CA clients that request `DBR_GR_DOUBLE` (or any `DBR_GR_*` / `DBR_CTRL_*` type)
+for a `waveform`, `aai`, `aao`, or `compress` PV receive `upper_disp_limit = 0`,
+`lower_disp_limit = 0`, `precision = 0`, and `units = ""` regardless of the
+record's HOPR/LOPR/PREC/EGU settings. Control-panel widgets show unconstrained
+ranges and no engineering units for all array PVs.
+
+Fix direction:
+
+1. `waveform.rs` — add EGU, HOPR, LOPR, PREC to `get_field` (returning the
+   stored struct fields) and to `put_field` (storing into the struct).
+2. `compress.rs` — add `egu`/`hopr`/`lopr`/`prec` struct fields + Default values,
+   then expose them in `get_field` and `put_field`.
+3. `record_instance.rs` — add `"waveform" | "aai" | "aao"` and `"compress"` arms
+   to `populate_display_info`, sourcing EGU/PREC/HOPR/LOPR from `get_field`.
+   Neither record type has analog alarm limits (no HIHI/HIGH/LOW/LOLO), so those
+   fields remain 0.0.
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,

@@ -467,6 +467,9 @@ impl RecordInstance {
                     ..Default::default()
                 });
             }
+            // R52: waveform/aai/aao and compress missing; DBR_GR returns zeroed limits.
+            // (waveformRecord.c:251-252,239; aaiRecord.c:280-281,268;
+            //  aaoRecord.c:283-284; compressRecord.c:478-479,464)
             "motor" => {
                 let egu = self
                     .record

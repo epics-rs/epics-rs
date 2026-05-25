@@ -419,6 +419,8 @@ impl Record for CompressRecord {
         Ok(ProcessOutcome::complete())
     }
 
+    // R52: CompressRecord missing egu/hopr/lopr/prec struct fields entirely;
+    // DBR_GR display limits zeroed for compress PVs (compressRecord.c:478-479,455).
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => {

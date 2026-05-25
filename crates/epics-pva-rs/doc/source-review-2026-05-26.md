@@ -383,6 +383,58 @@ Outcome: No additional bugs found. Summary of verified-correct properties:
   two inline descriptors correctly. Round-trip verified correct.
 - R69 (doc-only fix): the comment attributing the two-descriptor format to pvxs is wrong.
 
+### R70 — `anonymous` method sets `account = ""` instead of `"anonymous"`; `ca` with missing user falls back to `method="ca"/account=""` instead of anonymous
+
+Severity: Medium (identity parity gap; ACF rules matching `USER("anonymous")` or `METHOD("ca")` without user constraint yield wrong decisions)
+
+Status: Fixed
+
+Evidence:
+
+- Rust site: `src/server_native/tcp.rs:1781-1785` — `parse_client_credentials` returns
+  `Ok(None)` only when `method.is_empty()`. For `method="anonymous"` (the string a pvxs client
+  always sends — pvxs `clientconn.cpp:258`: `selected = "anonymous"; to_wire(R, selected)`) the
+  early-return is NOT taken. The function continues, finds a `0xFF` null auth body (pvxs ca
+  `clientconn.cpp:301-303`: `to_wire(R, Value::Helper::desc(cred))` where `cred` is empty →
+  null type tag), hits the `0xFF` peek-branch at `tcp.rs:1803`, returns
+  `Ok(Some({ method="anonymous", account="" }))`. Caller at `tcp.rs:2290` does `cred = claimed`
+  → `cred.account` becomes `""` instead of `"anonymous"`.
+- C++ site: `pvxs/src/serverconn.cpp:221-234` — for `selected="anonymous"` the
+  `if(selected=="ca")` lambda is not entered, so `C->method` stays empty;
+  `if(C->method.empty())` at line 229 sets `C->method = C->account = "anonymous"`.
+  pvxs always produces `account="anonymous"` for the anonymous method.
+
+Second aspect — `ca` with missing user field:
+
+- Rust site: same `parse_client_credentials` — when `method="ca"` but the auth structure carries
+  no `user` field, the extraction loop at `tcp.rs:1813-1836` leaves `creds.account = ""`. The
+  caller sets `cred = { method="ca", account="" }`.
+- C++ site: `pvxs/src/serverconn.cpp:223-231` — the `auth["user"].as<std::string>(lambda)`
+  lambda is only called when the `user` field exists and converts to string; it is the lambda
+  that sets `C->method = "ca"`. Without it, `C->method` stays empty →
+  `if(C->method.empty())` triggers → `method="anonymous", account="anonymous"`.
+
+Impact:
+
+1. Anonymous: a normal pvxs client sends `method="anonymous"` with a null body. Rust produces
+   `account=""`, pvxs produces `account="anonymous"`. Any ACF rule `USER("anonymous")` or
+   `ACCOUNT("anonymous")` that works against a pvxs server fails silently against Rust because
+   the account field doesn't match.
+2. `ca` without user: a client that sends `method="ca"` but omits or empties the `user` field
+   gets `method="ca", account=""` in Rust vs `method="anonymous", account="anonymous"` in pvxs.
+   An ACF rule with `METHOD("ca")` and no user constraint grants the full `ca`-method privilege
+   in Rust but only the anonymous default in pvxs — a privilege escalation vector.
+
+Fix direction:
+
+In `parse_client_credentials`:
+1. Extend the early `Ok(None)` return to cover `method == "anonymous"` (matching the existing
+   empty-method case), so the caller's pre-initialised `ClientCredentials::anonymous()`
+   (account=`"anonymous"`) is preserved.
+2. For `method == "ca"`, if after full auth-body decoding `creds.account` is still empty, return
+   `Ok(None)` — the `ca`-method identity requires a non-empty user to be meaningful; without one
+   pvxs falls back to anonymous.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

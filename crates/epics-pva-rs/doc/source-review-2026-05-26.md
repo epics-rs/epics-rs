@@ -331,7 +331,58 @@ Extract the CN from that anchor's subject as `authority`. Requires:
 The existing `pub fn x509_credentials_from_chain(chain)` signature is unchanged (it is public
 API); the internal call site is changed to use the roots-aware path.
 
+### R69 — PUT_GET INIT comment falsely attributes two-descriptor format to pvxs
+
+Severity: Doc (comment cites pvxs for a protocol format pvxs never implements)
+
+Status: Fixed
+
+Evidence:
+
+- Rust site: `src/server_native/tcp.rs:2863-2865` — comment reads
+  "pvxs `serverget.cpp` emits two type descriptors for PUT_GET (the put-request and
+  get-response structures)." pvxs `serverconn.cpp:259-260` shows `void ServerConn::handle_PUT_GET() {}`
+  — an empty stub. pvxs implements GET/PUT/RPC via `ServerGPR` in `serverget.cpp`; it has no
+  PUT_GET server implementation and never emits a PUT_GET INIT response.
+- C++ site: `pvxs/src/serverconn.cpp:259-260` — `void ServerConn::handle_PUT_GET() {}`.
+  Also `pvxs/src/serverget.cpp:19-158`: `ServerGPR` handles only `CMD_GET`, `CMD_PUT`, `CMD_RPC`;
+  no PUT_GET handler. `CMD_PUT_GET=12` is defined in `pvaproto.h:628` but never dispatched
+  beyond the empty stub.
+
+Impact:
+
+The comment misleads readers into thinking pvxs servers send PUT_GET INIT responses with two
+descriptors. The actual format source is the pvAccessJava protocol specification; the Rust
+implementation is correct — the comment is wrong. A reviewer trying to verify the two-descriptor
+layout against pvxs would find `handle_PUT_GET()` empty and wrongly conclude the Rust code is
+fabricating the format.
+
+Fix direction:
+
+Replace the pvxs cite with a reference to the pvAccessJava protocol wire format that defines
+`PUT_GET INIT = ioid + subcmd + status + putIF + getIF`.
+
+## EncodeTypeCache audit — Area A (R69 session)
+
+Investigated: encode/decode round-trip for 0xFD/0xFE type-cache markers (Area A deferred from
+prior session).
+
+Outcome: No additional bugs found. Summary of verified-correct properties:
+
+- `EncodeTypeCache` is connection-scoped (one instance at `handle_connection_io:2031`); passed
+  `&mut` to all op handlers on the same connection. pvxs never emits 0xFD/0xFE (`to_wire`
+  is inline only); Rust emits them when `config.emit_type_cache = true`. Parity gap is intentional
+  (pvxs client accepts them via `from_wire` for pvAccessJava compat; Rust server mirrors that).
+- Decode TypeCache is connection-scoped: `reader_type_cache` (local to the reader task,
+  `server_conn.rs:362`) resolves 0xFD/0xFE in strict wire order via `flatten_type_cache_markers`
+  before routing frames to per-op tasks. This structurally prevents 0xFE-before-0xFD races.
+  pvxs `ConnBase::rxRegistry` is also per-connection (`conn.h:23`). Scoping matches.
+- PUT_GET INIT double-emit (tcp.rs:2871-2872): first call emits `0xFD <slot N> <body>`;
+  second call emits `0xFE <slot N>`. `flatten_type_cache_markers` expands both to inline
+  before the client decoder sees them. `decode_put_get_init` (ops_v2.rs:2576-2579) decodes
+  two inline descriptors correctly. Round-trip verified correct.
+- R69 (doc-only fix): the comment attributing the two-descriptor format to pvxs is wrong.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).
-A full audit of the `EncodeTypeCache` emit/decode round-trip is deferred to a future review.

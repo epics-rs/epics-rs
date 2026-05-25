@@ -277,6 +277,40 @@ Fix direction:
 Add `"int64in"` to the `"ai" | "longin" | "calc" | "calcout"` arm in
 `populate_control_info`.
 
+### R51 — `longout`/`int64out` control limits zeroed when DRVH=DRVL=0; HOPR/LOPR fallback missing
+
+Severity: Low
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-base-rs/src/server/record/record_instance.rs` —
+  `populate_control_info` arm `"ao" | "longout" | "int64out"` reads DRVH/DRVL
+  with `.unwrap_or(hopr)` / `.unwrap_or(lopr)`. Because DRVH/DRVL default to
+  `0.0` (always present), the `unwrap_or` fallback never fires; when DRVH=DRVL=0.0
+  (the typical "not configured" state), the encoded control limits are 0/0.
+- **C**: `modules/database/src/std/rec/longoutRecord.c:282-287` and
+  `int64outRecord.c:265-270` — `get_control_double` uses
+  `if(prec->drvh > prec->drvl) { drvh/drvl } else { hopr/lopr }`.
+  `aoRecord.c:356-357` does NOT have this guard — it always uses DRVH/DRVL.
+
+Impact:
+
+`longout` and `int64out` channels whose DRVH/DRVL are left at their default
+values (0.0/0.0) report `upper_ctrl_limit = 0` / `lower_ctrl_limit = 0` instead
+of HOPR/LOPR. This is the common case for output records that rely on HOPR/LOPR
+for both display and control range. `ao` is unaffected (C also uses unconditional
+DRVH/DRVL for `ao`).
+
+Fix direction:
+
+Split the `"ao" | "longout" | "int64out"` arm into two arms:
+- `"ao"`: unconditionally use DRVH/DRVL (matching `aoRecord.c:356-357`).
+- `"longout" | "int64out"`: fetch both DRVH and DRVL; if `drvh > drvl` use them,
+  else use HOPR/LOPR (matching `longoutRecord.c:282-287` /
+  `int64outRecord.c:265-270`).
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,

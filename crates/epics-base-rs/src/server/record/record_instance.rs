@@ -514,6 +514,9 @@ impl RecordInstance {
     fn populate_control_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         let rtype = self.record.record_type();
         match rtype {
+            // R51: ao unconditionally uses DRVH/DRVL (aoRecord.c:356-357);
+            // longout/int64out use DRVH/DRVL only when drvh > drvl, else HOPR/LOPR
+            // (longoutRecord.c:282-287, int64outRecord.c:265-270).
             "ao" | "longout" | "int64out" => {
                 // Output records use DRVH/DRVL, fallback to HOPR/LOPR
                 let drvh = self.record.get_field("DRVH").and_then(|v| v.to_f64());

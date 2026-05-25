@@ -448,10 +448,9 @@ impl ProcessVariable {
         let mut subs = self.subscribers.lock().await;
         subs.retain(|sub| !sub.tx.is_closed());
         // BR-R52: C gateway fires postEvent(VALUE|ALARM|LOG) for every
-        // upstream event (gateVc.cc:374-376). Using VALUE only here means
-        // DBE_LOG (archivers) and DBE_ALARM-only subscribers receive no
-        // events. Fix: widen to VALUE|ALARM|LOG (requires epics-base-rs change).
-        let post = EventMask::VALUE;
+        // upstream event (gateVc.cc:374-376); widen to match so DBE_LOG
+        // archivers and DBE_ALARM-only monitors receive gateway snapshot posts.
+        let post = EventMask::VALUE | EventMask::LOG | EventMask::ALARM;
         for sub in subs.iter() {
             if !sub.accepts(post) {
                 continue;
@@ -584,6 +583,7 @@ mod mask_gate_tests {
 
     // CA DBE_* monitor mask bits (db_access.h).
     const DBE_VALUE: u16 = 1;
+    const DBE_LOG: u16 = 2;
     const DBE_ALARM: u16 = 4;
 
     fn pv() -> ProcessVariable {
@@ -629,6 +629,62 @@ mod mask_gate_tests {
         assert!(
             rx.try_recv().is_ok(),
             "DBE_VALUE subscriber must receive a value post"
+        );
+    }
+
+    // --- BR-R52 regression: set_snapshot must reach DBE_LOG and DBE_ALARM-only subs ---
+
+    fn snapshot() -> Snapshot {
+        Snapshot::new(
+            EpicsValue::Double(2.0),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    /// BR-R52: a DBE_LOG (archiver) subscriber must receive a set_snapshot post.
+    #[tokio::test]
+    async fn log_subscriber_receives_snapshot_post() {
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_LOG)
+            .await
+            .expect("subscriber added");
+        pv.set_snapshot(snapshot()).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "DBE_LOG subscriber must receive a set_snapshot post"
+        );
+    }
+
+    /// BR-R52: a DBE_ALARM-only subscriber must receive a set_snapshot post.
+    #[tokio::test]
+    async fn alarm_only_subscriber_receives_snapshot_post() {
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_ALARM)
+            .await
+            .expect("subscriber added");
+        pv.set_snapshot(snapshot()).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "DBE_ALARM-only subscriber must receive a set_snapshot post"
+        );
+    }
+
+    /// BR-R52: a DBE_VALUE subscriber must still receive a set_snapshot post.
+    #[tokio::test]
+    async fn value_subscriber_receives_snapshot_post() {
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
+            .await
+            .expect("subscriber added");
+        pv.set_snapshot(snapshot()).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "DBE_VALUE subscriber must receive a set_snapshot post"
         );
     }
 

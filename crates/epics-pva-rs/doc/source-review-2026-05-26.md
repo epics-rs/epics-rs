@@ -813,6 +813,89 @@ search path, unicast/broadcast reply — are functionally equivalent to pvxs. Th
 deviation (protocol_ok gate on TCP path) is a conservative intentional extension of
 PVA-R10. No fix required.
 
+### R77 — Channel/request DESTROY + CANCEL lifecycle (parity-correct)
+
+**Rust sites:** `tcp.rs:3501-3559` (`handle_destroy_channel`),
+`tcp.rs:3581-3617` (`handle_cancel_request`), `tcp.rs:3646-3665`
+(`handle_destroy_request`), `tcp.rs:983-1117` (`OpState` + `AbortOnDrop`)
+
+**C++ sites:** `serverchan.cpp:43-59` (`ServerChan::cleanup`),
+`serverconn.cpp:262-295` (`handle_CANCEL_REQUEST`),
+`serverconn.cpp:297-321` (`handle_DESTROY_REQUEST`),
+`serverchan.cpp:371-411` (`handle_DESTROY_CHANNEL`),
+`serverconn.cpp:487-511` (`ServerOp::cleanup`)
+
+#### (1) DESTROY_CHANNEL — removes SID + all ops, stops monitors
+
+- pvxs `serverchan.cpp:371-411`: finds SID; unknown → debug + return (no reply).
+  CID mismatch logged but proceeds. `chanBySID.erase(it)` then `chan->cleanup()`
+  which iterates `opByIOID`, calls `op->cleanup()` on each: fires `onCancel` if
+  Executing, sets Dead, calls `onClose`, removes from both `conn->opByIOID` and
+  `chan->opByIOID`.
+- Rust `tcp.rs:3501-3559`: unknown SID → debug + early return (no reply) ✓.
+  CID mismatch logged, proceeds. `channels.remove(&sid)` drops `ChannelState`,
+  which drops `HashMap<ioid, OpState>`; each `OpState` drop fires `monitor_abort:
+  Arc<AbortOnDrop>` (subscriber task aborted) and `data_task_abort: Arc<AbortOnDrop>`
+  (exec task aborted), and `monitor_start_ctl` (terminal `notify_monitor_start(false)`).
+  Sends DESTROY_CHANNEL echo (sid + cid). ✓
+- Tested: `destroy_channel_on_unknown_sid_emits_no_reply` (tcp.rs:7834) +
+  `destroy_channel_on_known_sid_emits_echo` (tcp.rs:7865).
+
+#### (2) DESTROY_REQUEST — removes IOID, stops monitor, aborts in-flight
+
+- pvxs `serverconn.cpp:297-321`: `lookupSID(sid)` returns null ptr on unknown SID
+  (static empty shared_ptr); `!chan` → logs debug. Unknown IOID → logs debug,
+  no cleanup. Known IOID → removes from `opByIOID` (both conn and chan), calls
+  `op->cleanup()`.
+- Rust `tcp.rs:3646-3665`: unknown SID → no-op (silent). Unknown IOID →
+  `ch.ops.remove(&ioid)` returns None → no-op. Known IOID → drops `OpState` →
+  fires `AbortOnDrop` chain as in (1). ✓
+- Tested: `bfr15_destroy_request_aborts_in_flight_exec_task` (tcp.rs:11318) —
+  DESTROY_REQUEST while a blocking GET exec is running cancels the task.
+
+#### (3) CANCEL_REQUEST — Executing→Idle without aborting
+
+- pvxs `serverconn.cpp:262-295`: finds op by IOID globally (not gated by SID);
+  unknown IOID → `log_warn` + return. SID mismatch → `log_err` + return.
+  Executing → `op->state = Idle` + call `onCancel`. Non-executing → debug
+  ("allowed race").
+- Rust `tcp.rs:3581-3617`: unknown SID → no-op (silent). Unknown IOID → no-op
+  (silent). Known op → `monitor_paused.store(true)` + `monitor_start_ctl.set(false)`
+  (no-op if already paused or never started per PVA-FR-11). Subscriber task stays
+  alive; subsequent START clears the pause via the resume path. ✓
+- Minor difference: Rust silently ignores unknown SID/IOID; pvxs logs a warning.
+  Log-only; no correctness impact.
+- Rust lookup is `channels[sid] → ops[ioid]` (structurally nested), so a stale
+  SID with known IOID cannot be found; pvxs's separate `opByIOID` + SID-check
+  path is logically equivalent in practice.
+- Tested: `cancel_request_pauses_monitor_without_aborting` (tcp.rs:7492).
+
+#### (4) Unknown SID/IOID graceful; double-destroy; destroy-while-in-flight
+
+- Unknown SID/IOID: all three Rust handlers return `Ok(())` without panic or
+  spurious reply. `HashMap::get_mut` / `HashMap::remove` return `None` on miss
+  → silent. DESTROY_CHANNEL sends no reply on miss (matches pvxs:382-386). ✓
+- Double-destroy (DESTROY_REQUEST × 2): second call hits `ch.ops.remove(&ioid)
+  = None` → no-op. Double DESTROY_CHANNEL: second call hits `!channels.
+  contains_key(&sid)` → early return, no double-reply. ✓
+- Destroy-while-in-flight: exec task holds no clone of `data_task_abort` Arc
+  (only `OpState` owns the arc). `ch.ops.remove` drops the Arc; if refcount
+  reaches zero `AbortOnDrop::drop()` aborts the task. If the task already sent
+  its response the abort is a no-op on a completed task (tokio no-op). This
+  "allowed race" matches pvxs's single-threaded model where queued responses
+  can already be in the tx buffer before cleanup. ✓
+- Last-request path (`finish_exec_data_task`, tcp.rs:794-832): op removed
+  WITHOUT installing abort guard so the spawned task can finish normally. A
+  subsequent DESTROY_REQUEST for the same IOID finds no entry → no-op. ✓
+
+Conclusion:
+
+All four check points — DESTROY_CHANNEL cleanup, DESTROY_REQUEST IOID removal,
+CANCEL_REQUEST Executing→Idle, and graceful unknown/double/in-flight races —
+are functionally equivalent to pvxs. The only difference is Rust is silent on
+unknown SID/IOID in CANCEL_REQUEST + DESTROY_REQUEST where pvxs logs; log-only,
+no correctness impact. No fix required.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

@@ -566,6 +566,57 @@ Rust matches pvxs exactly: Status::Error reply, connection kept alive, credentia
 anonymous. The EX-R7 label marks the bug that the credential revert fixed. No further change
 required.
 
+### R73 — PUT partial-update BitSet semantics (parity-correct)
+
+Severity: N/A — parity-correct
+
+Status: No change
+
+Context:
+
+A PVA PUT data-phase frame carries a changed-BitSet followed by a partial value that contains
+only the fields whose bits are set. The server must apply ONLY those fields, leaving unmarked
+fields at their prior values. Incorrect handling (e.g. overwriting the full structure) would
+clobber unmarked fields.
+
+Evidence — wire decode:
+
+- Rust site: `tcp.rs:4354-4363` — `changed = BitSet::decode(...)` reads the per-field changed
+  mask; `decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, order)` decodes only the
+  bytes present on the wire for marked fields. The comment at `tcp.rs:4342-4353` explains:
+  "Decoding the value as a full structure (`decode_pv_field`) desyncs the stream for any
+  multi-field structure where not every field is marked."
+- C++ site: `serverget.cpp:450-451` — `val = Value::Helper::build(op->type);
+  from_wire_valid(M, rxRegistry, val)` reads a BitMask followed by partial fields. Only marked
+  fields are populated in `val`; unmarked fields hold their zero defaults.
+
+Evidence — merge:
+
+- Rust site: `pvdata/encode.rs:1651-1721` (`fill_unmarked_from_prior`): for each leaf in the
+  type tree, if the corresponding bit is set in `changed` → keep the decoded value; if unset →
+  copy from prior. Recurses into Structure children, handling pvData BitSet compression
+  (parent-bit set means entire subtree is fresh). Called from both:
+  - `SharedPV::put_delta` (`shared_pv.rs:545`) under a single mutex: read-prior, merge, store
+    atomically.
+  - Default `ChannelSource::put_delta_checked` (`source.rs:410-416`): get-prior, merge, put.
+- C++ site: `sharedpv.cpp:431` — `impl->current.assign(val)` — pvxs `Value::assign()` copies
+  only the marked fields from `val` into `current`, leaving unmarked fields intact. The marked
+  set lives inside `val`'s own BitSet as set by `from_wire_valid`.
+
+Evidence — test coverage:
+
+- `tcp.rs:8468` (`put_delta_multi_field_applies_only_changed_field`): 3-field structure
+  `{a, b, c}` opened with `(10, 20, 30)`; PUT EXEC changes only `b` to 99 (bit 2 set).
+  Post-PUT assertion: `(10, 99, 30)` — `a` and `c` untouched.
+- `encode.rs:2419` (`fill_unmarked_carries_prior_for_unmarked_leaves`): unit test for the
+  merge primitive itself.
+
+Conclusion:
+
+Rust correctly decodes the changed-BitSet and partial value from the wire, merges only marked
+leaves against the prior value, and stores the result atomically. Parity with pvxs is exact.
+No fix required.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

@@ -705,6 +705,10 @@ impl GatewayChannelSource {
                 return None;
             }
         };
+        // BR-R48: subscribe before snapshot to avoid losing events in the
+        // gap, but the same gap can deliver event E to both the broadcast
+        // receiver (created here) and snapshot_raw() (read below).
+        // Dedup the first broadcast event by Bytes ptr when it matches.
         let mut bcast = entry.subscribe_raw();
         // BR-R46: deliver cached initial snapshot to new raw subscriber.
         // pva2pva moncache.cpp:285-311 delivers `lastelem` on start();

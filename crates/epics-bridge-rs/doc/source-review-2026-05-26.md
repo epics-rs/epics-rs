@@ -75,6 +75,26 @@ Fix direction:
 
 Change `post_alarm(&name, 3, 0)` to `post_alarm(&name, 3, epics_base_rs::server::recgbl::alarm_status::LINK_ALARM)`.
 
+### BR-R48 — PVA gateway raw subscriber can receive the initial cached snapshot twice
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/pva_gateway/source.rs:708-712` — `subscribe_raw_inner` calls `entry.subscribe_raw()` at line 708, then `entry.snapshot_raw()` at line 712. If the upstream monitor delivers event E between these two calls, the broadcast receiver (created at line 708) queues E, AND `snapshot_raw()` returns E (because `latest_raw` was updated before the broadcast). The spawned task delivers E once as `initial_raw` (line 724-733) and a second time from the broadcast loop (line 735-754). The downstream raw-frame client sees a duplicate initial event.
+- `crates/epics-bridge-rs/src/pva_gateway/channel_cache.rs:806-813` — the monitor callback updates `latest_raw` and calls `tx_raw_inner.send(raw_ev)` unconditionally (no `was_first` guard). The typed path has a `was_first` guard at line 798 that prevents broadcasting event 1; the raw path has no such guard, making the first event the most likely duplicate.
+- `epics-base/modules/pva2pva/p2pApp/moncache.cpp:285-311` — `MonitorCacheEntry::Requester::start()` delivers the cached `lastelem` synchronously before the subscription is live, so no upstream event can race the initial delivery. The Rust implementation subscribes first (asynchronous), leaving the race window open.
+
+Impact:
+
+Downstream raw-frame PVA clients receive a duplicate initial monitor event on every subscription to an already-connected PV. For most scalar PVs this is a benign stutter; for clients that treat the first event as a connection-established signal, it may trigger double-initialisation logic.
+
+Fix direction:
+
+Before the `tokio::spawn`, capture `dedup_body: Option<bytes::Bytes> = initial_raw.as_ref().map(|e| e.body.clone())`. Inside the spawn, after delivering `initial_raw`, if the first broadcast event's `body.as_ptr()` equals `dedup_body.take().map_or(null, |b| b.as_ptr())`, skip it. `bytes::Bytes::clone()` is a refcount clone; same monitor callback invocation produces identical `as_ptr()` values, making the pointer a reliable one-shot dedup key.
+
 ## Uncertain candidates
 
 None identified this round.

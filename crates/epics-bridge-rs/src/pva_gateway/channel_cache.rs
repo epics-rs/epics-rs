@@ -390,7 +390,10 @@ fn build_invalid_alarm_event(
     if let PvField::Structure(ref mut root) = modified {
         for (name, field) in &mut root.fields {
             if name == "alarm" {
-                if let PvField::Structure(ref mut alarm) = field {
+                // `field` is already `&mut PvField` (from `&mut root.fields`);
+                // default binding mode borrows, so no explicit `ref mut`
+                // (edition-2024 match-ergonomics hard error otherwise).
+                if let PvField::Structure(alarm) = field {
                     for (fname, fval) in &mut alarm.fields {
                         match fname.as_str() {
                             "severity" => *fval = PvField::Scalar(ScalarValue::Int(3)),

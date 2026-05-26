@@ -1409,7 +1409,7 @@ mod tests {
     async fn fr11_gateway_exposes_watermark_levels() {
         let src = make_source();
         assert_eq!(
-            <GatewayChannelSource as ChannelSource>::monitor_watermarks(&src, "ANY:PV"),
+            <GatewayChannelSource as ChannelSource>::monitor_watermarks(&src, "ANY:PV").await,
             Some((0, 0)),
             "gateway must expose watermark levels so pause/resume is reachable"
         );

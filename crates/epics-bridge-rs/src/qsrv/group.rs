@@ -929,6 +929,11 @@ impl GroupChannel {
             }
         }
 
+        // BR-R60: track whether any member write/proc actually fired so a
+        // marked PUT that writes nothing returns an error like pvxs
+        // (groupsource.cpp:605-608) instead of silently succeeding.
+        let mut did_something = false;
+
         if atomic {
             // BR-R15: atomic PUT — `DBManyLock`-equivalent exclusion.
             //
@@ -1005,6 +1010,7 @@ impl GroupChannel {
                         .process_record_already_locked(record_name)
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                    did_something = true; // BR-R60
                 } else if let Some(epics_val) = val {
                     if use_process {
                         self.db
@@ -1024,6 +1030,7 @@ impl GroupChannel {
                             .await
                             .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     }
+                    did_something = true; // BR-R60
                 }
             }
         } else {
@@ -1047,6 +1054,7 @@ impl GroupChannel {
                         .process_record(record_name)
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                    did_something = true; // BR-R60
                     continue;
                 }
 
@@ -1072,13 +1080,29 @@ impl GroupChannel {
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                 }
+                did_something = true; // BR-R60
             }
         }
 
         // BR-R60: pvxs returns a remote error "No fields changed" when the
         // client marked fields but nothing was actually written
         // (groupsource.cpp:605-608, `!didSomething && value.isMarked`).
-        // This fall-through silently reports success instead.
+        // Approximate `value.isMarked` by "the client supplied at least one
+        // group-member field in the incoming value": if so and nothing
+        // fired, reject. A genuinely empty PUT (no member field present)
+        // stays a silent no-op, matching pvxs (`value.isMarked` false).
+        if !did_something {
+            let client_supplied_field = self.def.members.iter().any(|m| {
+                !m.field_name.is_empty() && get_nested_field(value, &m.field_name).is_some()
+            });
+            if client_supplied_field {
+                return Err(BridgeError::PutRejected(format!(
+                    "group {} PUT: No fields changed",
+                    self.def.name
+                )));
+            }
+        }
+
         Ok(())
     }
 }

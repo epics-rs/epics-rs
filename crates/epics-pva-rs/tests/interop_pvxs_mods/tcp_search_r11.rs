@@ -122,7 +122,7 @@ async fn interop_r11_tcp_circuit_search_returns_matching_cid() {
     // PVA-R22's parser).
     use std::io::Write;
     let mut val_reply: Vec<u8> = Vec::new();
-    val_reply.put_u32(87_040, order); // client buffer
+    val_reply.put_u32(0x10000, order); // client buffer (R62: match pvxs 0x10000)
     val_reply.put_u16(32_767, order); // intro registry size
     val_reply.put_u16(0, order); // qos
     val_reply.put_u8(0); // empty method string (Size=0)

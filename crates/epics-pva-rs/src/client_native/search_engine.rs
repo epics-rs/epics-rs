@@ -9,8 +9,10 @@
 //!
 //! The engine drives:
 //!
-//! - Per-PV search retry with pvxs-style backoff (15s → 30s → 60s → 120s
-//!   → 210s capped).
+//! - Per-PV search retry using a 30-bucket ring at 1 s/tick (pvxs
+//!   `client.cpp` `searchBuckets`/`tickSearch`). Each retry advances the
+//!   channel by `min(attempt, 30)` buckets, giving 1 s, 2 s, 3 s, …,
+//!   ~29 s cap (pvxs `nBuckets = 30`). See `cascade_smoothed_next`.
 //! - Beacon-driven fast reconnect: when a beacon arrives for a server we
 //!   have a disconnected channel against, the engine re-issues SEARCH for
 //!   that channel immediately.
@@ -40,7 +42,14 @@ use crate::proto::{
 use super::beacon_throttle::BeaconTracker;
 use super::decode::{PeerRole, decode_search_response, try_parse_frame_role};
 
-/// Search retry backoff sequence (seconds), matching pvxs `clientdiscover.cpp`.
+/// Search retry intervals in seconds.
+///
+/// R67: this constant is NOT used by the engine — actual retry scheduling
+/// uses the 30-bucket ring in `run_engine`/`cascade_smoothed_next`
+/// (pvxs `client.cpp::tickSearch`), which caps at ~29 s. The values here
+/// do not appear in pvxs; the previous doc "matching pvxs clientdiscover.cpp"
+/// was incorrect (no such sequence exists there). Retained as public API;
+/// do NOT use this to predict channel retry timing.
 pub const BACKOFF_SECS: &[u64] = &[1, 1, 2, 5, 10, 15, 30, 60, 120, 210];
 
 /// Default UDP broadcast port for SEARCH/BEACON messages (5076).
@@ -2741,7 +2750,7 @@ mod tests {
             // ── Step 2: CONNECTION_VALIDATION request (server→client) ──────────
             {
                 let mut payload = Vec::new();
-                payload.put_u32(87_040, order); // buffer_size
+                payload.put_u32(0x10000, order); // buffer_size (R62: match pvxs 0x10000)
                 payload.put_u16(32_767, order); // registry_size
                 payload.push(1u8); // auth_methods count (size-encoded, 1 < 254)
                 encode_string_into("anonymous", order, &mut payload);

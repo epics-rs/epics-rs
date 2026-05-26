@@ -65,6 +65,7 @@ use std::sync::Arc;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use x509_parser::prelude::FromDer as _;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsConfigError {
@@ -108,6 +109,11 @@ pub enum TlsConfigError {
 pub struct TlsServerConfig {
     pub config: Arc<ServerConfig>,
     pub require_client_cert: bool,
+    /// R68: trust anchors used to resolve the root CA's CN when the peer
+    /// sends a partial chain (leaf-only or leaf+intermediate). Mirrors
+    /// pvxs `SSL_get0_verified_chain` which includes trust-store roots
+    /// even when the peer omits the root from its chain.
+    pub trust_roots: Arc<RootCertStore>,
 }
 
 /// Client-side TLS configuration.
@@ -162,22 +168,27 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     let chain: Vec<CertificateDer<'static>> =
         certs.iter().chain(ca_certs.iter()).cloned().collect();
 
-    let config = if optional_client_cert {
-        // Build a client verifier whose root CA store is the same bundle.
-        // For PKCS#12, `ca_certs` holds the CA stack `PKCS12_parse`
-        // split out; for PEM the whole bundle (including the leaf) is
-        // offered and the verifier rejects non-CA entries on its own.
+    // R68: build the root CA store up front so we can (a) give it to the
+    // WebPkiClientVerifier and (b) keep it in TlsServerConfig for
+    // authority resolution when the peer sends a partial chain.
+    let trust_roots = if optional_client_cert {
         let mut roots = RootCertStore::empty();
         for cert in certs.iter().chain(ca_certs.iter()) {
-            // Best-effort: skip non-CA leaf certs — verifier will reject any.
+            // Best-effort: skip non-CA leaf certs — verifier rejects any.
             let _ = roots.add(cert.clone());
         }
+        Arc::new(roots)
+    } else {
+        Arc::new(RootCertStore::empty())
+    };
+
+    let config = if optional_client_cert {
         let verifier = if require_client_cert {
-            WebPkiClientVerifier::builder(Arc::new(roots))
+            WebPkiClientVerifier::builder(trust_roots.clone())
                 .build()
                 .map_err(|e| TlsConfigError::Verifier(e.to_string()))?
         } else {
-            WebPkiClientVerifier::builder(Arc::new(roots))
+            WebPkiClientVerifier::builder(trust_roots.clone())
                 .allow_unauthenticated()
                 .build()
                 .map_err(|e| TlsConfigError::Verifier(e.to_string()))?
@@ -194,6 +205,7 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     Ok(Some(TlsServerConfig {
         config: Arc::new(config),
         require_client_cert,
+        trust_roots,
     }))
 }
 
@@ -1170,6 +1182,12 @@ fn is_self_signed_ca(der: &[u8]) -> bool {
 /// Returns `None` when the chain is empty or the leaf has no subject
 /// CommonName — matching pvxs, which only sets `method="x509"` once a
 /// peer CN is in hand.
+///
+/// **Note:** this function resolves `authority` only when the peer
+/// explicitly includes the root CA in its chain. For the common case
+/// where the peer omits the root (RFC 5246 §7.4.2 allows this), call
+/// [`x509_credentials_from_chain_with_roots`] which walks the server
+/// trust store to find the root CA CN (R68).
 pub fn x509_credentials_from_chain(chain: &[CertificateDer<'_>]) -> Option<X509Credentials> {
     let leaf = chain.first()?;
     let account = subject_common_name(leaf)?;
@@ -1183,6 +1201,97 @@ pub fn x509_credentials_from_chain(chain: &[CertificateDer<'_>]) -> Option<X509C
         .unwrap_or_default();
 
     Some(X509Credentials { account, authority })
+}
+
+/// Like [`x509_credentials_from_chain`] but also resolves the `authority`
+/// from the server trust store when the peer sends a partial chain (R68).
+///
+/// pvxs uses `SSL_get0_verified_chain` (`ossl.cpp:423`) which appends the
+/// root CA from the trust store even when the peer omits it; this function
+/// reproduces that by walking `trust_roots` to find the anchor whose
+/// subject DN matches the issuer of the last peer-provided cert.
+pub fn x509_credentials_from_chain_with_roots(
+    chain: &[CertificateDer<'_>],
+    trust_roots: &RootCertStore,
+) -> Option<X509Credentials> {
+    let mut creds = x509_credentials_from_chain(chain)?;
+    if creds.authority.is_empty() {
+        creds.authority = authority_from_trust_roots(chain, trust_roots);
+    }
+    Some(creds)
+}
+
+/// Resolve the root CA CN for a peer chain by walking the server trust
+/// store. Used when the peer omits the root from its chain (R68).
+///
+/// Finds the trust anchor whose subject CN matches the issuer CN of the
+/// last peer-provided cert, then returns that CN as the authority.
+///
+/// **Note on encoding:** rustls `TrustAnchor::subject` stores the CONTENT
+/// bytes of the Subject SEQUENCE (no outer TLV tag+length) as returned by
+/// webpki's `der::expect_tag`. `x509_parser::X509Name::from_der` expects
+/// the full SEQUENCE TLV, so we reconstruct the header before parsing.
+fn authority_from_trust_roots(chain: &[CertificateDer<'_>], roots: &RootCertStore) -> String {
+    let Some(last) = chain.last() else {
+        return String::new();
+    };
+    let Ok((_, last_cert)) = x509_parser::parse_x509_certificate(last) else {
+        return String::new();
+    };
+    // Extract the issuer CN from the last peer cert.
+    let issuer_cn = last_cert
+        .issuer()
+        .iter_common_name()
+        .next()
+        .and_then(|attr| attr.as_str().ok())
+        .filter(|s| !s.is_empty() && !s.contains('\0'))
+        .map(|s| s.to_string());
+    let Some(issuer_cn) = issuer_cn else {
+        return String::new();
+    };
+
+    // Confirm a trust anchor with that issuer CN exists.
+    // anchor.subject is the raw CONTENT bytes (no outer SEQUENCE TLV) —
+    // prepend the SEQUENCE tag+length before x509_parser can parse it.
+    for anchor in &roots.roots {
+        let content = anchor.subject.as_ref();
+        let full = der_sequence_wrap(content);
+        let Ok((_, name)) = x509_parser::x509::X509Name::from_der(&full) else {
+            continue;
+        };
+        if let Some(cn) = name
+            .iter_common_name()
+            .next()
+            .and_then(|attr| attr.as_str().ok())
+            .filter(|s| !s.is_empty() && !s.contains('\0'))
+        {
+            if cn == issuer_cn.as_str() {
+                return issuer_cn;
+            }
+        }
+    }
+    String::new()
+}
+
+/// Wrap raw DER content bytes in a SEQUENCE TLV (tag 0x30 + length encoding).
+/// Used to reconstruct a parsable Name from a `TrustAnchor::subject` content
+/// slice, which rustls/webpki stores without the outer tag+length header.
+fn der_sequence_wrap(content: &[u8]) -> Vec<u8> {
+    let n = content.len();
+    let mut out = Vec::with_capacity(n + 4);
+    out.push(0x30); // SEQUENCE tag
+    if n < 0x80 {
+        out.push(n as u8);
+    } else if n < 0x100 {
+        out.push(0x81);
+        out.push(n as u8);
+    } else {
+        out.push(0x82);
+        out.push((n >> 8) as u8);
+        out.push(n as u8);
+    }
+    out.extend_from_slice(content);
+    out
 }
 
 #[cfg(test)]

@@ -1589,10 +1589,22 @@ pub async fn run_tcp_server_on_listener(
                                     // already passed `WebPkiClientVerifier`,
                                     // so this is the cryptographically-checked
                                     // identity (pvxs `fill_credentials`).
+                                    //
+                                    // R68: use trust_roots so that `authority`
+                                    // is populated even when the peer sends a
+                                    // partial chain (leaf-only or leaf+CA),
+                                    // matching pvxs SSL_get0_verified_chain.
                                     let x509_id = {
                                         let (_, conn) = tls_stream.get_ref();
-                                        conn.peer_certificates().and_then(|chain| {
-                                            crate::auth::x509_credentials_from_chain(chain)
+                                        let roots =
+                                            cfg.tls.as_ref().map(|t| t.trust_roots.as_ref());
+                                        conn.peer_certificates().and_then(|chain| match roots {
+                                            Some(r) => {
+                                                crate::auth::x509_credentials_from_chain_with_roots(
+                                                    chain, r,
+                                                )
+                                            }
+                                            None => crate::auth::x509_credentials_from_chain(chain),
                                         })
                                     };
                                     let (r, w) = tokio::io::split(tls_stream);
@@ -1766,10 +1778,16 @@ fn parse_client_credentials(
     let method = crate::proto::decode_string(&mut cur, order)
         .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION method: {e}")))?
         .unwrap_or_default();
-    if method.is_empty() {
-        // pvxs anonymous handshake: empty method, no auth body to
-        // decode. Surface as `Ok(None)` so the caller can install
-        // the default anonymous credentials.
+    // R70: pvxs serverconn.cpp:223-231 — method/account are set from
+    // the auth body ONLY for selected=="ca" with a valid user field;
+    // every other path lands on method="anonymous"/account="anonymous"
+    // via `if(C->method.empty())`. Mirror that: an empty method or an
+    // explicit "anonymous" selection both yield Ok(None), letting the
+    // caller keep the pre-initialised ClientCredentials::anonymous()
+    // (account="anonymous"). pvxs clients always send the string
+    // "anonymous" — not empty — so the is_empty() guard alone left
+    // account="" for every pvxs anonymous handshake.
+    if method.is_empty() || method.eq_ignore_ascii_case("anonymous") {
         return Ok(None);
     }
     // Auth value: type descriptor + full value. pvxs requires both to
@@ -1823,14 +1841,15 @@ fn parse_client_credentials(
             }
         }
     }
-    // Pre-fix Rust filled `account` with `method` whenever the auth
-    // body didn't carry a `user` field — that turned a truncated
-    // `ca` handshake into `account="ca"`. pvxs only populates
-    // user/host/groups from a successfully decoded ca structure;
-    // anything else leaves them empty (anonymous-shaped tuple). Mirror
-    // that — leave `account` empty when the structure didn't carry a
-    // `user` field. ACF rules will then see an empty-account ca
-    // credential rather than a fabricated method=name pair.
+    // R70: pvxs serverconn.cpp:223-231 — for "ca", the credential is
+    // only meaningful when a user field was present (the lambda sets
+    // BOTH method and account). Without a user field the lambda never
+    // fires, C->method stays empty, and the anonymous fallback triggers.
+    // Mirror that: ca with a missing or empty user field returns Ok(None)
+    // so the caller falls back to ClientCredentials::anonymous().
+    if creds.method.eq_ignore_ascii_case("ca") && creds.account.is_empty() {
+        return Ok(None);
+    }
     Ok(Some(creds))
 }
 
@@ -1987,8 +2006,9 @@ async fn handle_connection_io(
     // Modern pvxs clients explicitly prefer `ca`; validation still
     // accepts both, only the wire order changes.
     const ADVERTISED_AUTH_METHODS: &[&str] = &["anonymous", "ca"];
+    // R62: match pvxs serverconn.cpp:103-104 — serverReceiveBufferSize = 0x10000 ("not used").
     let val_req =
-        build_server_connection_validation(order, 87_040, 32_767, ADVERTISED_AUTH_METHODS);
+        build_server_connection_validation(order, 0x10000, 32_767, ADVERTISED_AUTH_METHODS);
     let _ = tx.send(val_req).await;
 
     // Step 3+: drive the read loop.
@@ -2054,6 +2074,10 @@ async fn handle_connection_io(
     // against the limit to prevent a burst of concurrent requests from
     // racing past it before the first completions arrive.
     let mut pending_channel_spawns: usize = 0;
+    // R65: abort guards for GET_FIELD slow-path introspect tasks. Dropping
+    // on connection close cancels any task whose source hasn't returned yet,
+    // matching pvxs opByIOID cleanup (serverconn.cpp:366-382).
+    let mut gf_abort_guards: Vec<AbortOnDrop> = Vec::new();
     loop {
         // C-G2: if the writer task has died (send_timeout fired,
         // panic, etc.) the outbound mpsc is closed. Every subsequent
@@ -2457,7 +2481,11 @@ async fn handle_connection_io(
                 .await?;
             }
             Some(Command::GetField) => {
-                handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred).await?;
+                if let Some(guard) =
+                    handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred).await?
+                {
+                    gf_abort_guards.push(guard);
+                }
             }
             Some(Command::Search) => {
                 // PVA-R11: TCP-circuit SEARCH (pvxs
@@ -2578,11 +2606,11 @@ async fn handle_connection_io(
 /// has already been read from `cur`.
 ///
 /// Distinguishes an ABSENT value body (the cursor is exhausted after
-/// the descriptor — the Rust client's RPC INIT sends only the type)
-/// from a PRESENT but malformed one. pvxs `from_wire_type_value`
-/// requires type+value and resets the connection on `!M.good()`
-/// (`serverget.cpp:368-371`, `servermon.cpp:489`). We tolerate the
-/// absent body for Rust↔Rust interop, but a present-but-undecodable
+/// the descriptor) from a PRESENT but malformed one. pvxs
+/// `from_wire_type_value` requires type+value and resets the connection
+/// on `!M.good()` (`serverget.cpp:368-371`, `servermon.cpp:489`). We
+/// tolerate the absent body for future-compat / legacy clients, but a
+/// present-but-undecodable
 /// body is an INIT protocol error — the previous `decode_pv_field(..).ok()`
 /// collapsed both into `None`, so a malformed pvRequest silently
 /// dropped its `_filter` / pipeline / `process`|`block` options and the
@@ -2839,9 +2867,11 @@ async fn handle_put_get(
         ch.ops.insert(ioid, put_get_op);
 
         // INIT response: ioid + subcmd + status + putIF + getIF.
-        // pvxs `serverget.cpp` emits two type descriptors for PUT_GET
-        // (the put-request and get-response structures). We serve the
-        // same channel introspection for both legs.
+        // R69: pvAccessJava protocol defines PUT_GET INIT with two type
+        // descriptors (put-request structure, then get-response structure).
+        // pvxs never implements PUT_GET (`handle_PUT_GET` is an empty stub
+        // in serverconn.cpp). We serve the same channel introspection for
+        // both legs.
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
         payload.put_u8(subcmd);
@@ -3173,15 +3203,8 @@ async fn handle_process(
     // PROCESS data phase — no payload to decode.
     match ch.ops.get(&ioid) {
         None => {
-            send_op_error(
-                tx,
-                OpKind::Process,
-                ioid,
-                subcmd,
-                "operation not initialised",
-                order,
-            )
-            .await?;
+            // R61: silently drop — pvxs serverget.cpp:423-428 and servermon.cpp:611-619
+            // return without reply here to handle the DESTROY_REQUEST race.
             return Ok(());
         }
         Some(o) => {
@@ -3733,8 +3756,14 @@ async fn handle_op(
     let ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
-            // Send error.
-            send_op_error(tx, kind, ioid, subcmd, "unknown channel sid", order).await?;
+            // R60: unknown SID on INIT must be connection-fatal (pvxs serverget.cpp:378-384
+            // calls bev.reset()); on data-phase it should silently drop (pvxs
+            // serverget.cpp:423-428 just returns).
+            if subcmd & 0x08 != 0 {
+                return Err(PvaError::Decode(format!(
+                    "INIT on unknown channel SID {sid} (pvxs serverget.cpp:378-384 protocol error)"
+                )));
+            }
             return Ok(());
         }
     };
@@ -4069,7 +4098,8 @@ async fn handle_op(
             (o.intro, o.mask, o.pv_request)
         }
         None => {
-            send_op_error(tx, kind, ioid, subcmd, "operation not initialised", order).await?;
+            // R61: silently drop — pvxs serverget.cpp:423-428 returns without reply here
+            // to handle the DESTROY_REQUEST/in-flight-frame race.
             return Ok(());
         }
     };
@@ -5487,6 +5517,8 @@ async fn handle_op(
     Ok(())
 }
 
+/// Returns `Some(AbortOnDrop)` when a slow-path task was spawned so the
+/// caller can store it for connection-lifetime abort on teardown (R65).
 async fn handle_get_field(
     source: &DynSource,
     frame: &Frame,
@@ -5495,7 +5527,7 @@ async fn handle_get_field(
     order: ByteOrder,
     peer: SocketAddr,
     cred: &ClientCredentials,
-) -> PvaResult<()> {
+) -> PvaResult<Option<AbortOnDrop>> {
     let mut cur = frame.cursor();
     let sid = cur
         .get_u32(order)
@@ -5525,7 +5557,7 @@ async fn handle_get_field(
         Some(c) => c,
         None => {
             debug!(sid, ioid, "GET_FIELD on unknown SID: dropping");
-            return Ok(());
+            return Ok(None);
         }
     };
     if chan.ops.contains_key(&ioid) {
@@ -5533,7 +5565,7 @@ async fn handle_get_field(
             sid,
             ioid, "GET_FIELD reuses IOID bound to active op: dropping (pvxs parity)"
         );
-        return Ok(());
+        return Ok(None);
     }
     match chan.introspection.clone() {
         Some(intro) => {
@@ -5548,6 +5580,7 @@ async fn handle_get_field(
             h.write_into(&mut buf);
             buf.extend_from_slice(&payload);
             let _ = tx.send(buf).await;
+            Ok(None)
         }
         None => {
             // Slow path: introspection not yet cached; fetch from source without blocking
@@ -5570,7 +5603,10 @@ async fn handle_get_field(
                 roles: cred.roles.clone(),
                 pv_request: None,
             };
-            tokio::spawn(async move {
+            // R65: return the abort handle so the caller stores it for
+            // connection-lifetime abort on teardown, matching pvxs opByIOID
+            // cleanup (serverconn.cpp:366-382).
+            let join = tokio::spawn(async move {
                 let intro = src.get_introspection_checked(&pv_name, conn_ctx).await;
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
@@ -5606,9 +5642,9 @@ async fn handle_get_field(
                 buf.extend_from_slice(&payload);
                 let _ = tx_clone.send(buf).await;
             });
+            Ok(Some(AbortOnDrop(join.abort_handle())))
         }
     }
-    Ok(())
 }
 
 async fn send_op_error(
@@ -9682,7 +9718,8 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
+        // Keep the guard alive until after the slow-path reply is received.
+        let _guard = handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
             .await
             .expect("handler returns Ok");
 
@@ -9752,7 +9789,8 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
+        // Keep the guard alive until after the slow-path reply is received.
+        let _guard = handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
             .await
             .expect("handler returns Ok");
 

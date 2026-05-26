@@ -168,8 +168,8 @@ async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
     }
 
     // Build Rust TlsServerConfig from the in-memory cert/key.
-    use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::{RootCertStore, ServerConfig};
     let cert_der = CertificateDer::from(cert_der_vec);
     let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(key_der_vec).into();
     let rustls_cfg = ServerConfig::builder()
@@ -179,6 +179,7 @@ async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
     let tls_cfg = epics_pva_rs::auth::TlsServerConfig {
         config: Arc::new(rustls_cfg),
         require_client_cert: false,
+        trust_roots: std::sync::Arc::new(RootCertStore::empty()),
     };
 
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};

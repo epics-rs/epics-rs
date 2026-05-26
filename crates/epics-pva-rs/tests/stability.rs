@@ -1182,7 +1182,7 @@ async fn create_channel_multi_name_emits_one_reply_per_name() {
     let mut sock = read_handshake_prelude(server_addr);
     let order = ByteOrder::Little;
     let mut payload: Vec<u8> = Vec::new();
-    payload.put_u32(87_040, order);
+    payload.put_u32(0x10000, order);
     payload.put_u16(32_767, order);
     payload.put_u16(0, order);
     encode_string_into("anonymous", order, &mut payload);
@@ -1363,7 +1363,7 @@ async fn auth_method_unadvertised_returns_status_error() {
     // advertised by the server.
     let order = ByteOrder::Little;
     let mut payload: Vec<u8> = Vec::new();
-    payload.put_u32(87_040, order); // client buffer hint
+    payload.put_u32(0x10000, order); // client buffer hint (R62: match pvxs 0x10000)
     payload.put_u16(32_767, order); // intro registry size
     payload.put_u16(0, order); // qos
     encode_string_into("x509", order, &mut payload);
@@ -1399,7 +1399,7 @@ async fn auth_method_unadvertised_returns_status_error() {
     // anonymous flow doesn't regress.
     let mut sock2 = read_handshake_prelude(server_addr);
     let mut payload: Vec<u8> = Vec::new();
-    payload.put_u32(87_040, order);
+    payload.put_u32(0x10000, order);
     payload.put_u16(32_767, order);
     payload.put_u16(0, order);
     encode_string_into("anonymous", order, &mut payload);
@@ -1489,7 +1489,7 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
     let auth_val = PvField::Structure(auth_struct);
 
     let mut payload: Vec<u8> = Vec::new();
-    payload.put_u32(87_040, order);
+    payload.put_u32(0x10000, order);
     payload.put_u16(32_767, order);
     payload.put_u16(0, order);
     encode_string_into("x509", order, &mut payload);
@@ -1530,6 +1530,190 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
     assert_eq!(
         account, "anonymous",
         "EX-R7: rejected claimed account `alice` must not survive on the connection"
+    );
+
+    h.abort();
+}
+
+/// R70 regression: pvxs clients send `method="anonymous"` (non-empty
+/// string) + a null auth body (`0xFF`). Pre-fix Rust produced
+/// `account=""` for this case because the `is_empty()` early-return
+/// only triggered on a truly empty method string, not on "anonymous".
+/// Post-fix `method="anonymous"` returns `Ok(None)`, preserving the
+/// pre-initialised `ClientCredentials::anonymous()` (account="anonymous").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r70_anonymous_method_yields_account_anonymous() {
+    use std::io::Write;
+    use std::sync::Mutex as StdMutex;
+
+    use epics_pva_rs::codec::CMD_CONNECTION_VALIDATED;
+    use epics_pva_rs::proto::encode_string_into;
+    use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, Status, WriteExt};
+    use epics_pva_rs::server_native::PvaServerConfig;
+    use epics_pva_rs::server_native::run_pva_server;
+
+    let captured: Arc<StdMutex<Option<(String, String)>>> = Arc::new(StdMutex::new(None));
+    let captured_hook = captured.clone();
+
+    let source = Arc::new(MemSource::new());
+    let (tcp, udp) = alloc_port_pair();
+    let cfg = PvaServerConfig {
+        tcp_port: tcp,
+        udp_port: udp,
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 16,
+        max_channels_per_connection: 64,
+        monitor_queue_depth: 8,
+        auth_complete: Some(Arc::new(move |_peer, cred| {
+            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
+        })),
+        ..Default::default()
+    };
+    let h = tokio::spawn(async move {
+        let _ = run_pva_server(source, cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let mut sock = read_handshake_prelude(server_addr);
+
+    // pvxs-style anonymous handshake: method="anonymous" + 0xFF null body.
+    let order = ByteOrder::Little;
+    let mut payload: Vec<u8> = Vec::new();
+    payload.put_u32(0x10000, order);
+    payload.put_u16(32_767, order);
+    payload.put_u16(0, order);
+    encode_string_into("anonymous", order, &mut payload);
+    payload.push(0xFF); // null auth body
+    let h_req = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut req = Vec::new();
+    h_req.write_into(&mut req);
+    req.extend_from_slice(&payload);
+    sock.write_all(&req).unwrap();
+
+    let frame = read_one_frame(&mut sock);
+    assert_eq!(
+        frame.header.command, CMD_CONNECTION_VALIDATED,
+        "expected CONNECTION_VALIDATED"
+    );
+    let mut cur = frame.cursor();
+    let status = Status::decode(&mut cur, order).expect("status");
+    assert!(
+        status.is_success(),
+        "anonymous method must succeed: {status:?}"
+    );
+
+    let observed = captured.lock().unwrap().clone();
+    let (method, account) = observed.expect("auth_complete hook must have fired");
+    assert_eq!(method, "anonymous", "R70: method");
+    assert_eq!(
+        account, "anonymous",
+        "R70: anonymous method must produce account=\"anonymous\", not \"\""
+    );
+
+    h.abort();
+}
+
+/// R70 regression: `method="ca"` with no `user` field in the auth body
+/// must fall back to anonymous credentials (matches pvxs
+/// serverconn.cpp:223-231 — the ca lambda only fires when user is present;
+/// without it C->method stays empty → anonymous fallback).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r70_ca_without_user_falls_back_to_anonymous() {
+    use std::io::Write;
+    use std::sync::Mutex as StdMutex;
+
+    use epics_pva_rs::codec::CMD_CONNECTION_VALIDATED;
+    use epics_pva_rs::proto::encode_string_into;
+    use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, Status, WriteExt};
+    use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+    use epics_pva_rs::server_native::PvaServerConfig;
+    use epics_pva_rs::server_native::run_pva_server;
+
+    let captured: Arc<StdMutex<Option<(String, String)>>> = Arc::new(StdMutex::new(None));
+    let captured_hook = captured.clone();
+
+    let source = Arc::new(MemSource::new());
+    let (tcp, udp) = alloc_port_pair();
+    let cfg = PvaServerConfig {
+        tcp_port: tcp,
+        udp_port: udp,
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 16,
+        max_channels_per_connection: 64,
+        monitor_queue_depth: 8,
+        auth_complete: Some(Arc::new(move |_peer, cred| {
+            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
+        })),
+        ..Default::default()
+    };
+    let h = tokio::spawn(async move {
+        let _ = run_pva_server(source, cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let mut sock = read_handshake_prelude(server_addr);
+
+    // ca auth body with only a `host` field (no `user`).
+    let order = ByteOrder::Little;
+    let auth_desc = FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![("host".into(), FieldDesc::Scalar(ScalarType::String))],
+    };
+    let mut auth_struct = PvStructure::new("");
+    auth_struct.fields.push((
+        "host".into(),
+        PvField::Scalar(ScalarValue::String("somehost".into())),
+    ));
+    let auth_val = PvField::Structure(auth_struct);
+
+    let mut payload: Vec<u8> = Vec::new();
+    payload.put_u32(0x10000, order);
+    payload.put_u16(32_767, order);
+    payload.put_u16(0, order);
+    encode_string_into("ca", order, &mut payload);
+    epics_pva_rs::pvdata::encode::encode_type_desc(&auth_desc, order, &mut payload);
+    epics_pva_rs::pvdata::encode::encode_pv_field(&auth_val, &auth_desc, order, &mut payload);
+    let h_req = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut req = Vec::new();
+    h_req.write_into(&mut req);
+    req.extend_from_slice(&payload);
+    sock.write_all(&req).unwrap();
+
+    let frame = read_one_frame(&mut sock);
+    assert_eq!(
+        frame.header.command, CMD_CONNECTION_VALIDATED,
+        "expected CONNECTION_VALIDATED"
+    );
+    let mut cur = frame.cursor();
+    let status = Status::decode(&mut cur, order).expect("status");
+    assert!(
+        status.is_success(),
+        "ca-without-user is not an error (accepted but downgraded): {status:?}"
+    );
+
+    let observed = captured.lock().unwrap().clone();
+    let (method, account) = observed.expect("auth_complete hook must have fired");
+    assert_eq!(
+        method, "anonymous",
+        "R70: ca without user field must fall back to method=\"anonymous\""
+    );
+    assert_eq!(
+        account, "anonymous",
+        "R70: ca without user field must fall back to account=\"anonymous\""
     );
 
     h.abort();

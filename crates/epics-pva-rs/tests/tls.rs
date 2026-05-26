@@ -170,6 +170,7 @@ async fn tls_client_to_tls_server_full_handshake() {
     let server_tls = Arc::new(TlsServerConfig {
         config: Arc::new(server_cfg),
         require_client_cert: false,
+        trust_roots: Arc::new(RootCertStore::empty()),
     });
 
     // Build client-side TLS config trusting the server cert.
@@ -258,6 +259,7 @@ async fn mtls_client_cert_populates_x509_credentials() {
     let server_tls = Arc::new(TlsServerConfig {
         config: Arc::new(server_cfg),
         require_client_cert: true,
+        trust_roots: Arc::new(RootCertStore::empty()),
     });
 
     // Client: trust the CA, present its own leaf chain (leaf + root).
@@ -347,6 +349,117 @@ async fn mtls_client_cert_populates_x509_credentials() {
     server_handle.abort();
 }
 
+/// R68: when the client sends only the leaf cert (no root CA in the chain),
+/// the server must still populate `authority` by walking its trust store.
+/// This mirrors pvxs `SSL_get0_verified_chain` which appends the root from
+/// the trust store even when the peer omits it.
+#[tokio::test]
+async fn mtls_partial_chain_authority_resolved_from_trust_roots() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let (ca_cert, ca_key) = make_ca("EPICS Test Root CA");
+    let ca_der = CertificateDer::from(ca_cert.der().to_vec());
+    let (server_cert, server_key) = make_leaf("pva-test-server", &ca_cert, &ca_key);
+    let (client_cert, client_key) = make_leaf("operator-alice", &ca_cert, &ca_key);
+
+    // Server trust store for client verification.
+    let mut client_ca_roots = RootCertStore::empty();
+    client_ca_roots.add(ca_der.clone()).unwrap();
+    let trust_roots = Arc::new(client_ca_roots);
+
+    let client_verifier = rustls::server::WebPkiClientVerifier::builder(trust_roots.clone())
+        .build()
+        .expect("client verifier");
+    let server_cfg = ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(vec![server_cert.clone(), ca_der.clone()], server_key)
+        .expect("server tls config");
+    let server_tls = Arc::new(TlsServerConfig {
+        config: Arc::new(server_cfg),
+        require_client_cert: true,
+        trust_roots,
+    });
+
+    // Client sends only [leaf] — NO root CA in the chain (R68 scenario).
+    let mut server_ca_roots = RootCertStore::empty();
+    server_ca_roots.add(ca_der.clone()).unwrap();
+    let client_cfg = ClientConfig::builder()
+        .with_root_certificates(server_ca_roots)
+        .with_client_auth_cert(vec![client_cert], client_key)
+        .expect("client tls config");
+    let client_tls = Arc::new(TlsClientConfig {
+        config: Arc::new(client_cfg),
+    });
+
+    let source = Arc::new(StaticSource::new());
+    source.put("R68:PV", 99.0).await;
+
+    let captured: Arc<Mutex<Option<(String, String, String)>>> = Arc::new(Mutex::new(None));
+    let captured_hook = captured.clone();
+    let auth_complete: AuthCompleteHook = Arc::new(move |_peer, cred| {
+        if let Ok(mut g) = captured_hook.try_lock() {
+            *g = Some((
+                cred.method.clone(),
+                cred.account.clone(),
+                cred.authority.clone(),
+            ));
+        }
+    });
+
+    let (tcp, udp) = alloc_port_pair();
+    let cfg = PvaServerConfig {
+        tcp_port: tcp,
+        udp_port: udp,
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 16,
+        max_channels_per_connection: 64,
+        monitor_queue_depth: 8,
+        tls: Some(server_tls),
+        auth_complete: Some(auth_complete),
+        ..Default::default()
+    };
+    let server_handle = tokio::spawn(async move {
+        let _ = run_pva_server(source, cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let client = PvaClient::builder()
+        .timeout(Duration::from_secs(3))
+        .server_addr(server_addr)
+        .with_tls(client_tls)
+        .build();
+
+    let v = tokio::time::timeout(Duration::from_secs(5), client.pvget("R68:PV"))
+        .await
+        .expect("pvget timed out")
+        .expect("pvget failed");
+    match v {
+        PvField::Structure(s) => {
+            assert!(matches!(
+                s.get_value(),
+                Some(ScalarValue::Double(d)) if (d - 99.0).abs() < 1e-9
+            ));
+        }
+        other => panic!("expected NTScalar structure, got {other:?}"),
+    }
+
+    let creds = captured
+        .lock()
+        .await
+        .clone()
+        .expect("auth_complete hook should have fired");
+    assert_eq!(creds.0, "x509", "method must be x509 for mTLS peer");
+    assert_eq!(creds.1, "operator-alice", "account from leaf CN");
+    assert_eq!(
+        creds.2, "EPICS Test Root CA",
+        "R68: authority from trust store when peer sends partial chain"
+    );
+
+    server_handle.abort();
+}
+
 /// PVA item #5: the client must extract the *server*'s X.509 identity
 /// from the verified TLS chain and expose it via
 /// `pvinfo_full_with_credentials` — the credentials pvxs `pvxinfo -v`
@@ -371,6 +484,7 @@ async fn client_extracts_server_x509_identity() {
     let server_tls = Arc::new(TlsServerConfig {
         config: Arc::new(server_cfg),
         require_client_cert: false,
+        trust_roots: Arc::new(RootCertStore::empty()),
     });
 
     let mut roots = RootCertStore::empty();
@@ -498,6 +612,7 @@ async fn pva_tls_nameserver_mixed_mode_listener() {
     let server_tls = Arc::new(TlsServerConfig {
         config: Arc::new(server_cfg),
         require_client_cert: false,
+        trust_roots: Arc::new(RootCertStore::empty()),
     });
 
     let source = Arc::new(StaticSource::new());

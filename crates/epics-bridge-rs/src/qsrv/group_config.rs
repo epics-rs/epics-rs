@@ -281,7 +281,14 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         members.push(member);
     }
 
-    // Sort by put_order for deterministic ordering
+    // BR-R59: this put_order-ONLY stable sort over a HashMap-random input
+    // (`fields` is a `#[serde(flatten)]` HashMap) leaves equal-put_order
+    // members (the common case — only writable members carry +putorder) in
+    // arbitrary order, making the wire field/bit layout non-deterministic.
+    // pvxs derives a deterministic putOrder-then-name order from a
+    // name-sorted std::map + stable_sort (groupconfig.h:28,
+    // groupconfigprocessor.cpp:253-262). Fixed by a (put_order, field_name)
+    // total order — see sort_members_canonical.
     members.sort_by_key(|m| m.put_order);
 
     // Validate trigger field references against actual member field names.

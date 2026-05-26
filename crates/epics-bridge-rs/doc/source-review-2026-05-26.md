@@ -280,6 +280,27 @@ Fix direction (structural):
 
 The defect is that the self-trigger default is decided per-member at parse time, while pvxs decides it at the group level after seeing every member. Add `GroupPvDef::resolve_self_trigger_default(&mut self)`: if any member is `All`/`Fields`, demote every `SelfOnly` member to `None` (silent). Call it at both group-assembly points — end of `raw_to_group_def` (single-source groups) and after the member `extend` in `merge_group_defs` (cross-source groups) — so the invariant "a `SelfOnly` member can exist only in a pure self-trigger group" holds by construction. The conversion is monotonic (groups only gain members via merge), so re-running on merge is safe.
 
+### BR-R59 — QSRV group member / changed-BitSet order is non-deterministic; pvxs is name-sorted deterministic
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/qsrv/group_config.rs:228` — `RawGroupDef.fields: HashMap<String, serde_json::Value>` (a `#[serde(flatten)]` catch-all). `HashMap` iteration order is randomized per process (SipHash `RandomState`).
+- `crates/epics-bridge-rs/src/qsrv/group_config.rs:238-249` — members are collected in that randomized iteration order, then `members.sort_by_key(|m| m.put_order)` — a STABLE sort keyed only on `put_order`. Members with equal `put_order` (the common case: only writable members carry `+putorder`, so most are `None`) retain the arbitrary HashMap order. The resulting member order drives the value-template field declaration order (`group.rs` `set_member_field`), which is the PVA wire field index / changed-BitSet bit position.
+- `epics-modules/pvxs/ioc/groupconfig.h:28` — `std::map<std::string, FieldConfig> fieldConfigMap;` — field configs are stored name-sorted.
+- `epics-modules/pvxs/ioc/groupconfigprocessor.cpp:253-262` — `std::stable_sort(... l.info.putOrder < r.info.putOrder)` over the name-sorted map, then rebuilds `fieldMap[name] = index++`. Because the input is name-sorted and the sort is stable, the final field/bit order is `putOrder`-primary, field-name-secondary, and fully deterministic.
+
+Impact:
+
+Two Rust gateway instances (or two restarts of one) given the identical group JSON can assign different field/bit positions within a group, and the layout differs from pvxs's name-sorted-within-`putOrder` order. PVA clients re-fetch introspection per connection, so a single live session decodes correctly; the divergence surfaces as (a) non-reproducible wire layout vs pvxs for the same config, and (b) inconsistency for tooling or cached descriptors that assume the pvxs canonical (name-sorted) order.
+
+Fix direction (structural):
+
+Replace the `put_order`-only stable sort with a total deterministic comparator `(put_order, field_name)` so the order is a pure function of the config independent of HashMap iteration — matching pvxs's `putOrder`-then-name ordering. Apply at both assembly points: `raw_to_group_def` and after the `extend` in `merge_group_defs` (the merge path appends members without re-sorting, so a group split across sources must be re-sorted to stay canonical).
+
 ## Uncertain candidates
 
 None identified this round.

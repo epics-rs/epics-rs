@@ -2439,40 +2439,42 @@ impl PvDatabase {
     ) {
         let cp_targets = self.get_cp_targets(name).await;
         for target in cp_targets {
-            if visited.contains(&target) {
+            if visited.contains(&target.record) {
                 continue;
             }
             let target_rec = {
                 let records = self.inner.records.read().await;
-                records.get(&target).cloned()
+                records.get(&target.record).cloned()
             };
-            let already_active = if let Some(ref t) = target_rec {
+            let mut skip = false;
+            if let Some(ref t) = target_rec {
                 let mut tg = t.write().await;
-                if tg.processing.load(std::sync::atomic::Ordering::Acquire) {
+                if target.passive_only && tg.common.scan != crate::server::record::ScanType::Passive
+                {
+                    // CPP gate (`dbCa.c:854,994,1072`): a CPP link adds
+                    // `CA_DBPROCESS` only when the link-holder's SCAN is
+                    // Passive. A non-Passive target is reached by its own
+                    // periodic/event scan, so skip it here — no process,
+                    // no RPRO. A CP link (`passive_only == false`) never
+                    // takes this branch and always processes.
+                    skip = true;
+                } else if tg.processing.load(std::sync::atomic::Ordering::Acquire) {
                     tg.common.rpro = true;
-                    true
-                } else {
-                    // epics-base PR #3fb10b6: PUTF must remain
-                    // false on CP-driven targets — only the record
-                    // directly receiving the dbPut should report
-                    // PUTF=1 to dbNotify/onChange observers. The
-                    // pre-fix C path (and this Rust port until now)
-                    // wrongly propagated PUTF=true onto every CP
-                    // target, so a downstream OPI reading PUTF on
-                    // chained records saw the put attribution
-                    // smeared across the entire chain.
-                    false
+                    skip = true;
                 }
-            } else {
-                false
-            };
-            if already_active {
+                // else (not processing): fall through and process below.
+                // epics-base PR #3fb10b6: PUTF must remain false on
+                // CP-driven targets — only the record directly receiving
+                // the dbPut reports PUTF=1 to dbNotify/onChange observers,
+                // so we deliberately do NOT set PUTF here.
+            }
+            if skip {
                 continue;
             }
             // MR-R5: recursive CP-target fan-out within one chain —
             // gate already held by the foreign entry record.
             let _ = self
-                .process_record_with_links_recursive(&target, visited, depth + 1)
+                .process_record_with_links_recursive(&target.record, visited, depth + 1)
                 .await;
         }
     }

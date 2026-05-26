@@ -151,6 +151,20 @@ pub type SearchResolver = Arc<
 /// `get_record` first OR run the canonical-normalisation snippet
 /// at function entry. Direct `inner.records` access is reserved
 /// for the alias-management primitives listed above.
+/// One CP/CPP edge in the [`PvDatabaseInner::cp_links`] index: the record
+/// to (re)process when the source record changes.
+///
+/// `passive_only` distinguishes CPP from CP. C adds the `CA_DBPROCESS`
+/// action for a CP link unconditionally, but for a CPP link only when the
+/// link-holding record's `SCAN` is Passive (`dbCa.c:854,994,1072`). CP
+/// edges clear the flag; CPP edges set it, and `dispatch_cp_targets`
+/// honours it.
+#[derive(Clone, Debug)]
+pub struct CpTarget {
+    pub record: String,
+    pub passive_only: bool,
+}
+
 struct PvDatabaseInner {
     simple_pvs: RwLock<HashMap<String, Arc<ProcessVariable>>>,
     records: RwLock<HashMap<String, Arc<RwLock<RecordInstance>>>>,
@@ -174,8 +188,10 @@ struct PvDatabaseInner {
     load_order: RwLock<HashMap<String, u64>>,
     /// Monotonic counter feeding `load_order`.
     load_order_counter: std::sync::atomic::AtomicU64,
-    /// CP link index: maps source_record → list of target records to process when source changes.
-    cp_links: RwLock<HashMap<String, Vec<String>>>,
+    /// CP/CPP link index: maps source_record → target edges to process when
+    /// the source changes. Each edge carries the CP-vs-CPP distinction (see
+    /// [`CpTarget`]).
+    cp_links: RwLock<HashMap<String, Vec<CpTarget>>>,
     /// Alias map: alternate-name → real-record-name. Mirrors epics-base
     /// PR #336 (alias name validation + parsing). `find_entry` and
     /// related lookups consult this map after the canonical record
@@ -800,7 +816,7 @@ impl PvDatabase {
         let mut cp = self.inner.cp_links.write().await;
         cp.remove(name);
         for targets in cp.values_mut() {
-            targets.retain(|t| t != name);
+            targets.retain(|t| t.record != name);
         }
         drop(cp);
 
@@ -1365,12 +1381,14 @@ mod tests {
         db.add_alias("SRC_ALIAS", "SRC_REAL").await.unwrap();
         db.add_alias("DST_ALIAS", "DST_REAL").await.unwrap();
 
-        // Register using the alias forms.
-        db.register_cp_link("SRC_ALIAS", "DST_ALIAS").await;
+        // Register using the alias forms (CP edge: passive_only = false).
+        db.register_cp_link("SRC_ALIAS", "DST_ALIAS", false).await;
 
         // Lookup must succeed via the canonical source name.
         let targets = db.get_cp_targets("SRC_REAL").await;
-        assert_eq!(targets, vec!["DST_REAL".to_string()]);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].record, "DST_REAL");
+        assert!(!targets[0].passive_only);
         // Alias-keyed lookup must NOT have been registered.
         let alias_lookup = db.get_cp_targets("SRC_ALIAS").await;
         assert!(alias_lookup.is_empty());

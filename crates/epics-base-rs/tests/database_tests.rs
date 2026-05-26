@@ -3517,7 +3517,9 @@ async fn test_dol_cp_link_registration() {
     db.add_record("MOTOR_POS", Box::new(ao)).await.unwrap();
     db.setup_cp_links().await;
     let targets = db.get_cp_targets("MTR").await;
-    assert_eq!(targets, vec!["MOTOR_POS"]);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].record, "MOTOR_POS");
+    assert!(!targets[0].passive_only, "CP link must not be passive_only");
 }
 
 #[tokio::test]
@@ -3542,6 +3544,150 @@ async fn test_dol_cp_link_triggers_processing() {
     }
 }
 
+/// A CPP link registers as `passive_only` (distinct from CP). Collapsing
+/// CPP into CP loses C's `precord->scan == 0` gate (`dbCa.c:994`).
+#[tokio::test]
+async fn test_cpp_link_registration_is_passive_only() {
+    let db = PvDatabase::new();
+    db.add_record("SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let mut ao = AoRecord::new(0.0);
+    ao.omsl = 1;
+    ao.dol = "SRC CPP".to_string();
+    db.add_record("DST", Box::new(ao)).await.unwrap();
+    db.setup_cp_links().await;
+    let targets = db.get_cp_targets("SRC").await;
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].record, "DST");
+    assert!(
+        targets[0].passive_only,
+        "CPP link must register as passive_only"
+    );
+}
+
+/// CPP gate (`dbCa.c:854,994,1072`): on a source change, a CPP link
+/// processes the link-holder only when its SCAN is Passive. A non-Passive
+/// CPP target must NOT be processed by the dispatch — its own periodic scan
+/// owns it. Boundary: target SCAN != Passive.
+#[tokio::test]
+async fn test_cpp_link_skips_nonpassive_target() {
+    let db = PvDatabase::new();
+    db.add_record("SRC", Box::new(AoRecord::new(10.0)))
+        .await
+        .unwrap();
+    let mut ao = AoRecord::new(0.0);
+    ao.omsl = 1;
+    ao.dol = "SRC CPP".to_string();
+    db.add_record("DST", Box::new(ao)).await.unwrap();
+    if let Some(rec_arc) = db.get_record("DST").await {
+        rec_arc.write().await.common.scan = ScanType::Sec1;
+    }
+    db.setup_cp_links().await;
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SRC", &mut visited, 0)
+        .await
+        .unwrap();
+    let val = db.get_pv("DST").await.unwrap();
+    match val {
+        EpicsValue::Double(v) => assert!(
+            v.abs() < 1e-10,
+            "non-Passive CPP target was processed (VAL={v}); CPP must skip it"
+        ),
+        other => panic!("expected Double, got {:?}", other),
+    }
+}
+
+/// CPP gate, complementary boundary: a CPP link DOES process the link-holder
+/// when its SCAN is Passive (the default). Boundary: target SCAN == Passive.
+#[tokio::test]
+async fn test_cpp_link_processes_passive_target() {
+    let db = PvDatabase::new();
+    db.add_record("SRC", Box::new(AoRecord::new(10.0)))
+        .await
+        .unwrap();
+    let mut ao = AoRecord::new(0.0);
+    ao.omsl = 1;
+    ao.dol = "SRC CPP".to_string();
+    db.add_record("DST", Box::new(ao)).await.unwrap();
+    // DST keeps the default Passive SCAN.
+    db.setup_cp_links().await;
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SRC", &mut visited, 0)
+        .await
+        .unwrap();
+    let val = db.get_pv("DST").await.unwrap();
+    match val {
+        EpicsValue::Double(v) => assert!(
+            (v - 10.0).abs() < 1e-10,
+            "Passive CPP target was not processed (VAL={v})"
+        ),
+        other => panic!("expected Double, got {:?}", other),
+    }
+}
+
+/// CP (not CPP) processes the link-holder regardless of its SCAN
+/// (`dbCa.c:993` adds CA_DBPROCESS unconditionally). A non-Passive CP target
+/// IS processed — the boundary that distinguishes CP from CPP.
+#[tokio::test]
+async fn test_cp_link_processes_nonpassive_target() {
+    let db = PvDatabase::new();
+    db.add_record("SRC", Box::new(AoRecord::new(10.0)))
+        .await
+        .unwrap();
+    let mut ao = AoRecord::new(0.0);
+    ao.omsl = 1;
+    ao.dol = "SRC CP".to_string();
+    db.add_record("DST", Box::new(ao)).await.unwrap();
+    if let Some(rec_arc) = db.get_record("DST").await {
+        rec_arc.write().await.common.scan = ScanType::Sec1;
+    }
+    db.setup_cp_links().await;
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SRC", &mut visited, 0)
+        .await
+        .unwrap();
+    let val = db.get_pv("DST").await.unwrap();
+    match val {
+        EpicsValue::Double(v) => assert!(
+            (v - 10.0).abs() < 1e-10,
+            "non-Passive CP target was not processed (VAL={v}); CP must always process"
+        ),
+        other => panic!("expected Double, got {:?}", other),
+    }
+}
+
+/// When the same source→target edge is registered from both a CP and a CPP
+/// link, CP dominates: the merged edge is NOT passive_only — an
+/// unconditional CP CA_DBPROCESS overrides the CPP scan gate (`dbCa.c:993`).
+#[tokio::test]
+async fn test_cp_overrides_cpp_for_same_edge() {
+    let db = PvDatabase::new();
+    db.add_record("SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let mut ao = AoRecord::new(0.0);
+    ao.omsl = 1;
+    ao.dol = "SRC CP".to_string(); // CP edge SRC -> DST
+    db.add_record("DST", Box::new(ao)).await.unwrap();
+    // Second SRC -> DST edge via INP, this time CPP.
+    if let Some(rec_arc) = db.get_record("DST").await {
+        rec_arc.write().await.common.inp = "SRC CPP".to_string();
+    }
+    db.setup_cp_links().await;
+    let targets = db.get_cp_targets("SRC").await;
+    assert_eq!(
+        targets.len(),
+        1,
+        "CP and CPP to the same edge must merge to one"
+    );
+    assert_eq!(targets[0].record, "DST");
+    assert!(
+        !targets[0].passive_only,
+        "CP must override CPP on a merged edge"
+    );
+}
+
 #[tokio::test]
 async fn test_seq_dol_cp_link_registration() {
     use epics_base_rs::server::records::seq::SeqRecord;
@@ -3554,7 +3700,9 @@ async fn test_seq_dol_cp_link_registration() {
     db.add_record("MY_SEQ", Box::new(seq)).await.unwrap();
     db.setup_cp_links().await;
     let targets = db.get_cp_targets("SENSOR").await;
-    assert_eq!(targets, vec!["MY_SEQ"]);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].record, "MY_SEQ");
+    assert!(!targets[0].passive_only, "CP link must not be passive_only");
 }
 
 #[tokio::test]
@@ -3569,7 +3717,9 @@ async fn test_sel_nvl_cp_link_registration() {
     db.add_record("MY_SEL", Box::new(sel)).await.unwrap();
     db.setup_cp_links().await;
     let targets = db.get_cp_targets("INDEX_SRC").await;
-    assert_eq!(targets, vec!["MY_SEL"]);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].record, "MY_SEL");
+    assert!(!targets[0].passive_only, "CP link must not be passive_only");
 }
 
 #[tokio::test]
@@ -3586,7 +3736,9 @@ async fn test_sdis_cp_link_registration() {
     }
     db.setup_cp_links().await;
     let targets = db.get_cp_targets("DISABLE_SRC").await;
-    assert_eq!(targets, vec!["GUARDED"]);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].record, "GUARDED");
+    assert!(!targets[0].passive_only, "CP link must not be passive_only");
 }
 
 /// C `epicsTimeEventBestTime = -1` (epicsTime.h:103). The C path
@@ -3715,7 +3867,9 @@ async fn test_tsel_cp_link_registration() {
     }
     db.setup_cp_links().await;
     let targets = db.get_cp_targets("TSE_SRC").await;
-    assert_eq!(targets, vec!["TARGET"]);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].record, "TARGET");
+    assert!(!targets[0].passive_only, "CP link must not be passive_only");
 }
 
 #[tokio::test]

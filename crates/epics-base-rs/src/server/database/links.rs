@@ -1202,7 +1202,18 @@ impl PvDatabase {
     /// register the CP edge under the alias key and then never see
     /// the target processed (the source record's canonical-name
     /// dispatch would miss).
-    pub async fn register_cp_link(&self, source_record: &str, target_record: &str) {
+    /// `passive_only` is `true` for a CPP edge (process the target only when
+    /// its `SCAN` is Passive) and `false` for CP (always process). When the
+    /// same source→target edge is registered from both a CP and a CPP link,
+    /// CP dominates: the merged edge keeps `passive_only == false`, matching
+    /// C, where an unconditional CP `CA_DBPROCESS` overrides any CPP gate on
+    /// the same record.
+    pub async fn register_cp_link(
+        &self,
+        source_record: &str,
+        target_record: &str,
+        passive_only: bool,
+    ) {
         let source = self
             .resolve_alias(source_record)
             .await
@@ -1213,13 +1224,18 @@ impl PvDatabase {
             .unwrap_or_else(|| target_record.to_string());
         let mut cp = self.inner.cp_links.write().await;
         let targets = cp.entry(source).or_default();
-        if !targets.contains(&target) {
-            targets.push(target);
+        if let Some(existing) = targets.iter_mut().find(|t| t.record == target) {
+            existing.passive_only = existing.passive_only && passive_only;
+        } else {
+            targets.push(super::CpTarget {
+                record: target,
+                passive_only,
+            });
         }
     }
 
-    /// Get target records that should be processed when source_record changes (CP links).
-    pub async fn get_cp_targets(&self, source_record: &str) -> Vec<String> {
+    /// Get target edges to process when `source_record` changes (CP/CPP links).
+    pub async fn get_cp_targets(&self, source_record: &str) -> Vec<super::CpTarget> {
         self.inner
             .cp_links
             .read()
@@ -1232,7 +1248,7 @@ impl PvDatabase {
     /// Scan all records for CP input links and register them.
     pub async fn setup_cp_links(&self) {
         let names = self.all_record_names().await;
-        let mut links_to_register: Vec<(String, String)> = Vec::new();
+        let mut links_to_register: Vec<(String, String, bool)> = Vec::new();
 
         for target_name in &names {
             if let Some(rec_arc) = self.get_record(target_name).await {
@@ -1242,8 +1258,12 @@ impl PvDatabase {
                 if !inp_str.is_empty() {
                     let parsed = crate::server::record::parse_link_v2(inp_str);
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        if db.policy == crate::server::record::LinkProcessPolicy::ChannelProcess {
-                            links_to_register.push((db.record.clone(), target_name.clone()));
+                        if let Some(passive_only) = db.policy.cp_passive_only() {
+                            links_to_register.push((
+                                db.record.clone(),
+                                target_name.clone(),
+                                passive_only,
+                            ));
                         }
                     }
                 }
@@ -1253,11 +1273,12 @@ impl PvDatabase {
                         if !link_str.is_empty() {
                             let parsed = crate::server::record::parse_link_v2(&link_str);
                             if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                                if db.policy
-                                    == crate::server::record::LinkProcessPolicy::ChannelProcess
-                                {
-                                    links_to_register
-                                        .push((db.record.clone(), target_name.clone()));
+                                if let Some(passive_only) = db.policy.cp_passive_only() {
+                                    links_to_register.push((
+                                        db.record.clone(),
+                                        target_name.clone(),
+                                        passive_only,
+                                    ));
                                 }
                             }
                         }
@@ -1278,11 +1299,12 @@ impl PvDatabase {
                         if !link_str.is_empty() {
                             let parsed = crate::server::record::parse_link_v2(&link_str);
                             if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                                if db.policy
-                                    == crate::server::record::LinkProcessPolicy::ChannelProcess
-                                {
-                                    links_to_register
-                                        .push((db.record.clone(), target_name.clone()));
+                                if let Some(passive_only) = db.policy.cp_passive_only() {
+                                    links_to_register.push((
+                                        db.record.clone(),
+                                        target_name.clone(),
+                                        passive_only,
+                                    ));
                                 }
                             }
                         }
@@ -1293,8 +1315,12 @@ impl PvDatabase {
                 if !tsel_str.is_empty() {
                     let parsed = crate::server::record::parse_link_v2(tsel_str);
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        if db.policy == crate::server::record::LinkProcessPolicy::ChannelProcess {
-                            links_to_register.push((db.record.clone(), target_name.clone()));
+                        if let Some(passive_only) = db.policy.cp_passive_only() {
+                            links_to_register.push((
+                                db.record.clone(),
+                                target_name.clone(),
+                                passive_only,
+                            ));
                         }
                     }
                 }
@@ -1303,8 +1329,12 @@ impl PvDatabase {
                 if !sdis_str.is_empty() {
                     let parsed = crate::server::record::parse_link_v2(sdis_str);
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        if db.policy == crate::server::record::LinkProcessPolicy::ChannelProcess {
-                            links_to_register.push((db.record.clone(), target_name.clone()));
+                        if let Some(passive_only) = db.policy.cp_passive_only() {
+                            links_to_register.push((
+                                db.record.clone(),
+                                target_name.clone(),
+                                passive_only,
+                            ));
                         }
                     }
                 }
@@ -1312,8 +1342,8 @@ impl PvDatabase {
         }
 
         let count = links_to_register.len();
-        for (source, target) in links_to_register {
-            self.register_cp_link(&source, &target).await;
+        for (source, target, passive_only) in links_to_register {
+            self.register_cp_link(&source, &target, passive_only).await;
         }
         if count > 0 {
             eprintln!("iocInit: {count} CP link subscriptions");

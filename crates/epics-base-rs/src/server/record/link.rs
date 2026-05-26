@@ -6,8 +6,29 @@ pub enum LinkProcessPolicy {
     NoProcess,
     #[default]
     ProcessPassive,
-    /// CP: subscribe to source; when source changes, process this record.
+    /// CP (`pvlOptCP`): subscribe to source; when source changes, process
+    /// this record unconditionally (`dbCa.c:993` adds `CA_DBPROCESS`
+    /// regardless of `precord->scan`).
     ChannelProcess,
+    /// CPP (`pvlOptCPP`): like `ChannelProcess`, but on a source change
+    /// process this record only when its `SCAN` is `Passive` — C gates the
+    /// `CA_DBPROCESS` action on `precord->scan == 0` (`dbCa.c:854,994,1072`).
+    ChannelProcessPassive,
+}
+
+impl LinkProcessPolicy {
+    /// For a CP (`ChannelProcess`) or CPP (`ChannelProcessPassive`) link,
+    /// returns `Some(passive_only)`: `false` for CP (always process the
+    /// link-holder when the source changes), `true` for CPP (process it
+    /// only when it is Passive). Returns `None` for every other policy, so
+    /// CP-link registration can filter in one match.
+    pub fn cp_passive_only(self) -> Option<bool> {
+        match self {
+            LinkProcessPolicy::ChannelProcess => Some(false),
+            LinkProcessPolicy::ChannelProcessPassive => Some(true),
+            _ => None,
+        }
+    }
 }
 
 /// Parsed link address pointing to another record's field.
@@ -472,10 +493,16 @@ fn strip_link_modifiers(s: &str) -> (&str, LinkProcessPolicy, MonitorSwitch, boo
             link_part = rest;
             continue;
         }
-        if let Some(rest) = trimmed
-            .strip_suffix(" CP")
-            .or_else(|| trimmed.strip_suffix(" CPP"))
-        {
+        // CPP before CP: a ` CPP` suffix must not be misread as ` CP`
+        // leaving a stray `P`. (` CP` never matches a `...CPP` tail, but
+        // keep the order explicit.) C distinguishes the two — CP processes
+        // the link-holder unconditionally, CPP only when it is Passive.
+        if let Some(rest) = trimmed.strip_suffix(" CPP") {
+            policy = LinkProcessPolicy::ChannelProcessPassive;
+            link_part = rest;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_suffix(" CP") {
             policy = LinkProcessPolicy::ChannelProcess;
             link_part = rest;
             continue;
@@ -1017,5 +1044,36 @@ mod json_link_tests {
             }
             other => panic!("expected Db link, got {other:?}"),
         }
+    }
+
+    /// CP and CPP must parse to distinct policies — collapsing CPP into
+    /// `ChannelProcess` loses C's `precord->scan == 0` gate (`dbCa.c:994`).
+    #[test]
+    fn parse_cp_and_cpp_are_distinct_policies() {
+        match parse_link_v2("SRC.VAL CP") {
+            ParsedLink::Db(db) => assert_eq!(db.policy, LinkProcessPolicy::ChannelProcess),
+            other => panic!("expected Db link for CP, got {other:?}"),
+        }
+        match parse_link_v2("SRC.VAL CPP") {
+            ParsedLink::Db(db) => {
+                assert_eq!(db.policy, LinkProcessPolicy::ChannelProcessPassive)
+            }
+            other => panic!("expected Db link for CPP, got {other:?}"),
+        }
+    }
+
+    /// `cp_passive_only`: CP → `Some(false)`, CPP → `Some(true)`, others → None.
+    #[test]
+    fn cp_passive_only_maps_cp_and_cpp() {
+        assert_eq!(
+            LinkProcessPolicy::ChannelProcess.cp_passive_only(),
+            Some(false)
+        );
+        assert_eq!(
+            LinkProcessPolicy::ChannelProcessPassive.cp_passive_only(),
+            Some(true)
+        );
+        assert_eq!(LinkProcessPolicy::ProcessPassive.cp_passive_only(), None);
+        assert_eq!(LinkProcessPolicy::NoProcess.cp_passive_only(), None);
     }
 }

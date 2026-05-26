@@ -327,6 +327,43 @@ pub fn server_tls_keychain_password() -> Option<String> {
         .map(|s| expand_dollar_vars(&s))
 }
 
+/// Keychain path for a server-side TLS endpoint.
+///
+/// Reads `EPICS_PVAS_TLS_KEYCHAIN`, falling back to `EPICS_PVA_TLS_KEYCHAIN`
+/// when the server-specific form is unset — matching pvxs `Config::server()`
+/// `pickone({"EPICS_PVAS_TLS_KEYCHAIN", "EPICS_PVA_TLS_KEYCHAIN"})`
+/// (`config.cpp:497`), which takes the first variable present. A server
+/// configured with only the shared `EPICS_PVA_TLS_KEYCHAIN` must still
+/// enable TLS (pvxs does); reading the server-specific form alone left such
+/// a server with TLS silently disabled. The client path stays
+/// `EPICS_PVA_TLS_KEYCHAIN`-only (pvxs `config.cpp:672`). `$(VAR)` /
+/// `${VAR}` refs are expanded (PVA-466 parity). Returns `None` when neither
+/// variable is set.
+pub fn server_tls_keychain() -> Option<String> {
+    std::env::var("EPICS_PVAS_TLS_KEYCHAIN")
+        .or_else(|_| std::env::var("EPICS_PVA_TLS_KEYCHAIN"))
+        .ok()
+        .map(|s| expand_dollar_vars(&s))
+}
+
+/// TLS option string for a server-side endpoint.
+///
+/// Reads `EPICS_PVAS_TLS_OPTIONS`, falling back to `EPICS_PVA_TLS_OPTIONS`
+/// when the server-specific form is unset — matching pvxs `Config::server()`
+/// `pickone({"EPICS_PVAS_TLS_OPTIONS", "EPICS_PVA_TLS_OPTIONS"})`
+/// (`config.cpp:501`), which takes the first variable present and ignores
+/// the other (no merge). An operator who sets only the server form (e.g.
+/// `EPICS_PVAS_TLS_OPTIONS=client_cert=require`) must see it honoured;
+/// reading the shared `EPICS_PVA_TLS_OPTIONS` alone silently dropped the
+/// requirement and let the server accept certless clients (fail-open).
+/// Options are not `$(VAR)`-expanded (pvxs parity; the string is option
+/// tokens like `client_cert=require`, not a path). Empty when neither set.
+pub fn server_tls_options() -> String {
+    std::env::var("EPICS_PVAS_TLS_OPTIONS")
+        .or_else(|_| std::env::var("EPICS_PVA_TLS_OPTIONS"))
+        .unwrap_or_default()
+}
+
 /// Keychain password for a client-side TLS keychain.
 ///
 /// Reads `EPICS_PVA_TLS_KEYCHAIN_PASSWORD`. `$(VAR)` / `${VAR}` refs
@@ -600,5 +637,75 @@ mod tests {
         assert_eq!(max_connections(), 1024);
         assert_eq!(max_channels_per_connection(), 256);
         assert_eq!(max_ops_per_channel(), 64);
+    }
+
+    /// A6-1: server TLS options resolve PVAS-first, then shared PVA (pvxs
+    /// `pickone({EPICS_PVAS_TLS_OPTIONS, EPICS_PVA_TLS_OPTIONS})`,
+    /// config.cpp:501) — first present wins, no merge.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn server_tls_options_prefers_pvas_then_pva() {
+        let prev_pvas = std::env::var("EPICS_PVAS_TLS_OPTIONS").ok();
+        let prev_pva = std::env::var("EPICS_PVA_TLS_OPTIONS").ok();
+        unsafe {
+            std::env::set_var("EPICS_PVAS_TLS_OPTIONS", "client_cert=require");
+            std::env::set_var("EPICS_PVA_TLS_OPTIONS", "client_cert=optional");
+        }
+        assert_eq!(server_tls_options(), "client_cert=require", "PVAS must win");
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_TLS_OPTIONS");
+        }
+        assert_eq!(
+            server_tls_options(),
+            "client_cert=optional",
+            "PVA fallback when PVAS unset"
+        );
+        unsafe {
+            std::env::remove_var("EPICS_PVA_TLS_OPTIONS");
+        }
+        assert_eq!(server_tls_options(), "", "neither set → empty");
+        unsafe {
+            match prev_pvas {
+                Some(v) => std::env::set_var("EPICS_PVAS_TLS_OPTIONS", v),
+                None => std::env::remove_var("EPICS_PVAS_TLS_OPTIONS"),
+            }
+            match prev_pva {
+                Some(v) => std::env::set_var("EPICS_PVA_TLS_OPTIONS", v),
+                None => std::env::remove_var("EPICS_PVA_TLS_OPTIONS"),
+            }
+        }
+    }
+
+    /// A6-1: server TLS keychain resolves PVAS-first, then shared PVA (pvxs
+    /// `pickone({EPICS_PVAS_TLS_KEYCHAIN, EPICS_PVA_TLS_KEYCHAIN})`,
+    /// config.cpp:497). The client path stays PVA-only (config.cpp:672).
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn server_tls_keychain_prefers_pvas_then_pva() {
+        let prev_pvas = std::env::var("EPICS_PVAS_TLS_KEYCHAIN").ok();
+        let prev_pva = std::env::var("EPICS_PVA_TLS_KEYCHAIN").ok();
+        unsafe {
+            std::env::set_var("EPICS_PVAS_TLS_KEYCHAIN", "/srv/server.p12");
+            std::env::set_var("EPICS_PVA_TLS_KEYCHAIN", "/cli/client.p12");
+        }
+        assert_eq!(server_tls_keychain().as_deref(), Some("/srv/server.p12"));
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_TLS_KEYCHAIN");
+        }
+        assert_eq!(server_tls_keychain().as_deref(), Some("/cli/client.p12"));
+        unsafe {
+            std::env::remove_var("EPICS_PVA_TLS_KEYCHAIN");
+        }
+        assert_eq!(server_tls_keychain(), None);
+        unsafe {
+            match prev_pvas {
+                Some(v) => std::env::set_var("EPICS_PVAS_TLS_KEYCHAIN", v),
+                None => std::env::remove_var("EPICS_PVAS_TLS_KEYCHAIN"),
+            }
+            match prev_pva {
+                Some(v) => std::env::set_var("EPICS_PVA_TLS_KEYCHAIN", v),
+                None => std::env::remove_var("EPICS_PVA_TLS_KEYCHAIN"),
+            }
+        }
     }
 }

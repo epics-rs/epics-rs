@@ -139,12 +139,14 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     if tls_disabled() {
         return Ok(None);
     }
-    let Ok(keychain) = std::env::var("EPICS_PVAS_TLS_KEYCHAIN") else {
+    // PVAS-priority fallback (pvxs `config.cpp:497`): server reads
+    // `EPICS_PVAS_TLS_KEYCHAIN` first, then shared `EPICS_PVA_TLS_KEYCHAIN`.
+    // Reading only the server-specific form left a server configured with
+    // the shared keychain with TLS silently disabled. `$(VAR)` is expanded
+    // inside the helper (PVA-466 parity).
+    let Some(keychain) = crate::config::env::server_tls_keychain() else {
         return Ok(None);
     };
-    // PVA-466: expand $(VAR) / ${VAR} in path env so operators can
-    // template `EPICS_PVAS_TLS_KEYCHAIN="$(IOC_HOME)/server.pem"`.
-    let keychain = crate::config::env::expand_dollar_vars(&keychain);
     let path = PathBuf::from(keychain);
 
     // PKCS#12 keychains carry the password from the env; PEM keys in
@@ -157,7 +159,11 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     } = load_keychain(&path, password.as_deref())?;
     let key = key.ok_or_else(|| TlsConfigError::NoKey(path.to_path_buf()))?;
 
-    let options = std::env::var("EPICS_PVA_TLS_OPTIONS").unwrap_or_default();
+    // PVAS-priority fallback (pvxs `config.cpp:501`): server reads
+    // `EPICS_PVAS_TLS_OPTIONS` first, then shared `EPICS_PVA_TLS_OPTIONS`.
+    // Reading only the shared form silently dropped a server-only
+    // `client_cert=require`, accepting certless clients (fail-open).
+    let options = crate::config::env::server_tls_options();
     let require_client_cert = options.contains("client_cert=require");
     let optional_client_cert = require_client_cert || options.contains("client_cert=optional");
 
@@ -1327,14 +1333,23 @@ mod tests {
     #[serial(epics_env)]
     fn unset_env_yields_none() {
         let prev_keychain = std::env::var("EPICS_PVAS_TLS_KEYCHAIN").ok();
+        // The server keychain now falls back to the shared
+        // EPICS_PVA_TLS_KEYCHAIN (pvxs config.cpp:497), so this test must
+        // also clear it — otherwise a shared client keychain in the
+        // ambient env would enable server TLS and defeat the assertion.
+        let prev_pva_keychain = std::env::var("EPICS_PVA_TLS_KEYCHAIN").ok();
         let prev_disable = std::env::var("EPICS_PVA_TLS_DISABLE").ok();
         unsafe {
             std::env::remove_var("EPICS_PVAS_TLS_KEYCHAIN");
+            std::env::remove_var("EPICS_PVA_TLS_KEYCHAIN");
             std::env::remove_var("EPICS_PVA_TLS_DISABLE");
         }
         assert!(load_server_config().unwrap().is_none());
         if let Some(v) = prev_keychain {
             unsafe { std::env::set_var("EPICS_PVAS_TLS_KEYCHAIN", v) }
+        }
+        if let Some(v) = prev_pva_keychain {
+            unsafe { std::env::set_var("EPICS_PVA_TLS_KEYCHAIN", v) }
         }
         if let Some(v) = prev_disable {
             unsafe { std::env::set_var("EPICS_PVA_TLS_DISABLE", v) }
@@ -1734,10 +1749,12 @@ mod tests {
         let (_dir, path) = write_temp(&p12);
 
         // Drive the full env-var path: keychain + password env vars.
+        // Clear both TLS_OPTIONS forms (server now reads PVAS-first).
         let _g = EnvGuard::set(&[
             ("EPICS_PVAS_TLS_KEYCHAIN", Some(path.to_str().unwrap())),
             ("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD", Some("kc-pw")),
             ("EPICS_PVA_TLS_DISABLE", None),
+            ("EPICS_PVAS_TLS_OPTIONS", None),
             ("EPICS_PVA_TLS_OPTIONS", None),
         ]);
         let cfg = load_server_config()
@@ -1761,6 +1778,7 @@ mod tests {
             ("EPICS_PVAS_TLS_KEYCHAIN", Some(path.to_str().unwrap())),
             ("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD", Some("not-the-password")),
             ("EPICS_PVA_TLS_DISABLE", None),
+            ("EPICS_PVAS_TLS_OPTIONS", None),
             ("EPICS_PVA_TLS_OPTIONS", None),
         ]);
         match load_server_config() {
@@ -1768,6 +1786,67 @@ mod tests {
             Err(other) => panic!("expected Pkcs12 error, got {other:?}"),
             Ok(_) => panic!("expected error for wrong PKCS#12 password"),
         }
+    }
+
+    /// A6-1 fail-open regression: a server-only
+    /// `EPICS_PVAS_TLS_OPTIONS=client_cert=require` must be honoured even
+    /// when the shared `EPICS_PVA_TLS_OPTIONS` is unset (pvxs PVAS-first
+    /// `pickone`, config.cpp:501). Reading only the shared form dropped the
+    /// requirement and let the server accept certless clients.
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    #[serial(epics_env)]
+    fn server_honors_pvas_only_tls_options_require() {
+        let pem = gen_self_signed("epics-pkcs12-server");
+        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
+            eprintln!("skipping: `openssl` not available");
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+
+        let _g = EnvGuard::set(&[
+            ("EPICS_PVAS_TLS_KEYCHAIN", Some(path.to_str().unwrap())),
+            ("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD", Some("kc-pw")),
+            ("EPICS_PVAS_TLS_OPTIONS", Some("client_cert=require")),
+            ("EPICS_PVA_TLS_OPTIONS", None),
+            ("EPICS_PVA_TLS_DISABLE", None),
+        ]);
+        let cfg = load_server_config()
+            .expect("load_server_config")
+            .expect("Some(config)");
+        assert!(
+            cfg.require_client_cert,
+            "server-only EPICS_PVAS_TLS_OPTIONS=client_cert=require must be honoured"
+        );
+    }
+
+    /// A6-1: pvxs `Config::server()` resolves the keychain via
+    /// `pickone({PVAS, PVA})` (config.cpp:497), so a server configured with
+    /// only the shared `EPICS_PVA_TLS_KEYCHAIN` must still enable TLS.
+    /// Reading the server-specific form alone left it silently disabled.
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    #[serial(epics_env)]
+    fn server_falls_back_to_shared_pva_keychain() {
+        let pem = gen_self_signed("epics-pkcs12-server");
+        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
+            eprintln!("skipping: `openssl` not available");
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+
+        let _g = EnvGuard::set(&[
+            ("EPICS_PVAS_TLS_KEYCHAIN", None),
+            ("EPICS_PVA_TLS_KEYCHAIN", Some(path.to_str().unwrap())),
+            ("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD", None),
+            ("EPICS_PVA_TLS_KEYCHAIN_PASSWORD", Some("kc-pw")),
+            ("EPICS_PVAS_TLS_OPTIONS", None),
+            ("EPICS_PVA_TLS_OPTIONS", None),
+            ("EPICS_PVA_TLS_DISABLE", None),
+        ]);
+        load_server_config()
+            .expect("load_server_config")
+            .expect("Some(config) — server must fall back to shared EPICS_PVA_TLS_KEYCHAIN");
     }
 
     /// RAII env-var guard: sets the given vars on construction (or

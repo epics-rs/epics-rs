@@ -1546,15 +1546,28 @@ fn handle_search_response(
     let Ok(resp) = decode_search_response(&frame) else {
         return consumed;
     };
-    // R90: pvxs client.cpp:866-878 — when a UDP SEARCH_RESPONSE arrives with
+    // R90: pvxs client.cpp:889 — when a UDP SEARCH_RESPONSE arrives with
     // found=false and no channel IDs it is a discovery pong: the server
     // acknowledged a DiscoverPing (MustReply SEARCH with zero channels).
     // Treat it as a fake beacon so the server enters the tracker and
     // Discovered::Online fires for subscribers — mirrors pvxs's
     // `self.onBeacon(fakebeacon)` path. Pre-fix this returned unconditionally
     // on any found=false response, leaving DiscoverPing completely broken.
+    //
+    // The discovery-pong branch MUST only fire when a discovery is actually
+    // outstanding. pvxs gates it on `!self.discoverers.empty()` (client.cpp:889);
+    // the analog here is `!subscribers.is_empty()` (subscribers are the active
+    // `discover()` operations, populated by SearchCommand::Subscribe). Without
+    // this guard an ordinary not-found reply (any server that simply doesn't
+    // host the searched PV, or a stale/duplicate reply) would spuriously feed
+    // the beacon tracker, announce the server, and poke every pending search's
+    // backoff — fabricating discovery activity nobody requested.
     if !resp.found {
-        if !is_tcp && resp.cids.is_empty() && !ignore_guids.contains(&resp.guid) {
+        if !subscribers.is_empty()
+            && !is_tcp
+            && resp.cids.is_empty()
+            && !ignore_guids.contains(&resp.guid)
+        {
             let server = rewrite_loopback(resp.server_addr, peer);
             let allow_reconnect = beacons.observe(server, resp.guid);
             let first_announce = announced.insert((server, resp.guid));
@@ -2042,6 +2055,107 @@ mod tests {
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5076);
         let r = rewrite_loopback(a, peer);
         assert_eq!(r, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5075));
+    }
+
+    /// Build a server→client `SEARCH_RESPONSE` frame with `found=false`
+    /// and zero channel IDs — the on-wire shape of a discovery pong
+    /// (the reply to a `DiscoverPing`) and also the shape any server
+    /// would use to say "I do not host this" if it bothered to reply.
+    fn found_false_response() -> Vec<u8> {
+        crate::server_native::udp::build_search_response_proto(
+            [0x42u8; 12],
+            0,
+            5075,
+            &[], // empty cids ⇒ found byte encodes false
+            ByteOrder::Little,
+            "tcp",
+        )
+    }
+
+    /// Regression: a `found=false` UDP `SEARCH_RESPONSE` must NOT be
+    /// treated as a discovery pong when no `discover()` is outstanding.
+    /// pvxs gates the fake-beacon branch on `!self.discoverers.empty()`
+    /// (client.cpp:889); the analog here is `!subscribers.is_empty()`.
+    /// Without an active subscriber the reply must be inert — no beacon
+    /// observation, no announce, no poke.
+    #[test]
+    fn discovery_pong_inert_without_active_discover() {
+        let frame = found_false_response();
+        let beacons = BeaconTracker::new();
+        let mut pending: HashMap<u32, Pending> = HashMap::new();
+        let mut by_name: HashMap<String, u32> = HashMap::new();
+        let ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+        let mut subscribers: Vec<mpsc::Sender<Discovered>> = Vec::new(); // no discover() active
+        let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
+            std::collections::HashSet::new();
+        let mut poke = false;
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
+
+        let consumed = handle_search_response(
+            &frame,
+            &mut pending,
+            &mut by_name,
+            &beacons,
+            &ignore_guids,
+            &mut subscribers,
+            &mut announced,
+            &mut poke,
+            peer,
+            false, // UDP
+        );
+
+        assert!(consumed > 0, "frame must still be consumed/advanced");
+        assert!(
+            !poke,
+            "no discover() outstanding ⇒ discovery-pong poke must NOT fire"
+        );
+        assert!(
+            announced.is_empty(),
+            "no discover() outstanding ⇒ server must NOT be announced"
+        );
+    }
+
+    /// R90 must still work: with an active `discover()` subscriber, a
+    /// `found=false`/zero-cid UDP reply IS a discovery pong — fake-beacon
+    /// processing fires (announce + poke) and `Discovered::Online` is
+    /// delivered to the subscriber.
+    #[test]
+    fn discovery_pong_fires_with_active_discover() {
+        let frame = found_false_response();
+        let beacons = BeaconTracker::new();
+        let mut pending: HashMap<u32, Pending> = HashMap::new();
+        let mut by_name: HashMap<String, u32> = HashMap::new();
+        let ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+        let (tx, mut rx) = mpsc::channel::<Discovered>(8);
+        let mut subscribers: Vec<mpsc::Sender<Discovered>> = vec![tx]; // discover() active
+        let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
+            std::collections::HashSet::new();
+        let mut poke = false;
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
+
+        let consumed = handle_search_response(
+            &frame,
+            &mut pending,
+            &mut by_name,
+            &beacons,
+            &ignore_guids,
+            &mut subscribers,
+            &mut announced,
+            &mut poke,
+            peer,
+            false, // UDP
+        );
+
+        assert!(consumed > 0, "frame must be consumed");
+        assert!(
+            poke,
+            "fresh server via discovery pong must poke pending searches"
+        );
+        assert_eq!(announced.len(), 1, "server must be announced exactly once");
+        match rx.try_recv() {
+            Ok(Discovered::Online { guid, .. }) => assert_eq!(guid, [0x42u8; 12]),
+            other => panic!("expected Discovered::Online for discovery pong, got {other:?}"),
+        }
     }
 
     /// pvxs `Channel::disconnect` (client.cpp:213) parity: a

@@ -35,6 +35,16 @@ const GROUP_JSON_NONATOMIC: &str = r#"{
     }
 }"#;
 
+// BR-R60: members WITHOUT `+putorder` are not putable, so a PUT that
+// supplies their fields writes nothing. pvxs returns "No fields changed".
+const GROUP_JSON_READONLY: &str = r#"{
+    "TEST:grp_ro": {
+        "+atomic": false,
+        "level": { "+channel": "TEST:level.VAL", "+type": "plain" },
+        "count": { "+channel": "TEST:count.VAL", "+type": "plain" }
+    }
+}"#;
+
 // BRIDGE-FR-12: explicit cross-named `+trigger` graph — `level`
 // triggers only `count`, `count` triggers only `level`. Neither is a
 // self-trigger and neither is `"*"`, so the group is NOT pure
@@ -167,6 +177,42 @@ async fn group_nonatomic_put_updates_all_members() {
         Some(v) if (v - 2.5).abs() < 1e-9
     ));
     assert_eq!(extract_long(&result, "count"), Some(99));
+}
+
+/// BR-R60: a PUT that supplies a member field which is not putable
+/// (no `+putorder`) writes nothing and must return a "No fields changed"
+/// error, matching pvxs `groupsource.cpp:605-608`. An empty PUT (no
+/// member field supplied) stays a silent no-op.
+#[tokio::test]
+async fn br_r60_put_with_no_writable_field_errors() {
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(GROUP_JSON_READONLY)
+        .expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp_ro")
+        .cloned()
+        .expect("grp_ro registered");
+    let ch = GroupChannel::new(db, def);
+
+    // Client supplies `level`, but no member is putable → nothing writes.
+    let mut put = PvStructure::new("structure");
+    put.fields
+        .push(("level".into(), PvField::Scalar(ScalarValue::Double(42.0))));
+    let err = ch
+        .put(&put)
+        .await
+        .expect_err("PUT writing nothing must error");
+    assert!(
+        format!("{err}").contains("No fields changed"),
+        "expected 'No fields changed', got: {err}"
+    );
+
+    // Empty PUT (no member field supplied) → silent no-op.
+    let empty = PvStructure::new("structure");
+    ch.put(&empty).await.expect("empty PUT is a silent no-op");
 }
 
 /// BR-R34: a `DBE_LOG`-only post against a backing record (archive

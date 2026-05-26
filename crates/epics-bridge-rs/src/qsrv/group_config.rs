@@ -111,6 +111,37 @@ impl GroupPvDef {
             m.channel.is_empty() || matches!(m.triggers, TriggerDef::SelfOnly | TriggerDef::None)
         })
     }
+
+    /// BR-R58: resolve the provisional self-trigger default with
+    /// group-level context, mirroring pvxs `resolveTriggerReferences`
+    /// (`groupconfigprocessor.cpp:317-339`). pvxs applies the self-trigger
+    /// fallback to every channeled field ONLY when the whole group
+    /// declares no triggers (`!hasTriggers`); when any member carries an
+    /// explicit `+trigger` (`"*"`/named), a member without one keeps an
+    /// EMPTY trigger set (`defineTriggers`, `:300-309`) and posts nothing
+    /// on its own change.
+    ///
+    /// `parse_member` cannot make this decision — it sees one member at a
+    /// time. Resolve it here so a `SelfOnly` member can exist only in a
+    /// pure self-trigger group (invariant held by construction), instead
+    /// of leaking the dual meaning into the monitor mark path.
+    ///
+    /// Idempotent and monotonic: a group only gains members via
+    /// [`merge_group_defs`], so "has an explicit trigger" never reverts;
+    /// re-running after a merge can only demote more `SelfOnly` members.
+    pub fn resolve_self_trigger_default(&mut self) {
+        let has_explicit = self
+            .members
+            .iter()
+            .any(|m| matches!(m.triggers, TriggerDef::All | TriggerDef::Fields(_)));
+        if has_explicit {
+            for m in &mut self.members {
+                if matches!(m.triggers, TriggerDef::SelfOnly) {
+                    m.triggers = TriggerDef::None;
+                }
+            }
+        }
+    }
 }
 
 /// Defines which group fields are updated when a member's source record changes.
@@ -195,6 +226,15 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
         if let Some(existing_def) = existing.get_mut(&def.name) {
             // Merge members into existing group
             existing_def.members.extend(def.members);
+            // BR-R59: re-sort the combined member list — the merge appends
+            // a second source's members, so the canonical (put_order,
+            // field_name) order must be re-established over the union.
+            sort_members_canonical(&mut existing_def.members);
+            // BR-R58: the merge may have turned a previously pure
+            // self-trigger group into a mixed-trigger group (a new member
+            // carries `+trigger`). Re-resolve so any `SelfOnly` member is
+            // demoted to silent, matching pvxs's group-level resolution.
+            existing_def.resolve_self_trigger_default();
             // Update struct_id if newly specified (last wins)
             if def.struct_id.is_some() {
                 existing_def.struct_id = def.struct_id;
@@ -232,6 +272,21 @@ fn default_atomic() -> bool {
     true
 }
 
+/// BR-R59: canonical group-member ordering — `put_order` primary,
+/// `field_name` secondary. `put_order` is `Option<i32>`; `None`
+/// (no `+putorder`, "not putable") sorts before any `Some`, matching
+/// pvxs's `i64::MIN` sentinel ordering (`fieldconfig.h:37`). The
+/// field-name tiebreak makes the order a pure function of the config,
+/// independent of the HashMap iteration order the members were collected
+/// in.
+fn sort_members_canonical(members: &mut [GroupMember]) {
+    members.sort_by(|a, b| {
+        a.put_order
+            .cmp(&b.put_order)
+            .then_with(|| a.field_name.cmp(&b.field_name))
+    });
+}
+
 fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> {
     let mut members = Vec::new();
 
@@ -245,8 +300,15 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         members.push(member);
     }
 
-    // Sort by put_order for deterministic ordering
-    members.sort_by_key(|m| m.put_order);
+    // BR-R59: total (put_order, field_name) order. The `fields` source is
+    // a `#[serde(flatten)]` HashMap (randomized iteration), so a
+    // put_order-only stable sort left equal-put_order members (the common
+    // case — only writable members carry +putorder) in arbitrary order,
+    // making the wire field/bit layout non-deterministic. pvxs derives a
+    // deterministic putOrder-then-name order from a name-sorted std::map +
+    // stable_sort (groupconfig.h:28, groupconfigprocessor.cpp:253-262); the
+    // field-name tiebreak reproduces it independent of HashMap order.
+    sort_members_canonical(&mut members);
 
     // Validate trigger field references against actual member field names.
     // C++ QSRV does this in pdb.cpp:510-533 (trigger resolution phase).
@@ -280,13 +342,17 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         }
     }
 
-    Ok(GroupPvDef {
+    let mut def = GroupPvDef {
         name,
         struct_id: raw.id,
         atomic: raw.atomic,
         members,
         atomic_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-    })
+    };
+    // BR-R58: resolve the per-member self-trigger default now that every
+    // member of this (single-source) group is known. Re-run after merge.
+    def.resolve_self_trigger_default();
+    Ok(def)
 }
 
 fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<GroupMember> {
@@ -380,6 +446,14 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
             // pvxs's narrow self-trigger delta visible in
             // testqgroup.cpp:220 (NTEnum group: only `value.index`
             // bit set on a VAL update).
+            // BR-R58: this per-member default is only provisional. pvxs
+            // applies the self-trigger fallback at the GROUP level and only
+            // when the whole group declares no triggers
+            // (`groupconfigprocessor.cpp:317-339`). In a group where any
+            // member has an explicit `+trigger`, a no-`+trigger` member is
+            // silent. `GroupPvDef::resolve_self_trigger_default` demotes
+            // `SelfOnly` → `None` for such mixed groups after all members
+            // are assembled.
             None => TriggerDef::SelfOnly,
             Some("") => TriggerDef::None,
             Some(s) => TriggerDef::Fields(s.split(',').map(|f| f.trim().to_string()).collect()),
@@ -609,6 +683,145 @@ mod tests {
             !with_fields[0].is_pure_self_trigger(),
             "a group with a named +trigger member must NOT be pure self-trigger"
         );
+    }
+
+    /// BR-R58: in a group where any member carries an explicit
+    /// `+trigger`, a member WITHOUT one is silent in pvxs (empty trigger
+    /// set), not self-triggering. The provisional `SelfOnly` default must
+    /// be demoted to `None` for such mixed groups; a pure self-trigger
+    /// group keeps `SelfOnly`.
+    #[test]
+    fn br_r58_mixed_trigger_group_demotes_self_to_silent() {
+        // Mixed group: `a` no trigger, `b` explicit "*".
+        let mixed = parse_group_config(
+            r#"{ "GRP:mixed": {
+                "a": {"+channel": "R:a"},
+                "b": {"+channel": "R:b", "+trigger": "*"}
+            }}"#,
+        )
+        .unwrap();
+        let a = mixed[0]
+            .members
+            .iter()
+            .find(|m| m.field_name == "a")
+            .unwrap();
+        assert!(
+            matches!(a.triggers, TriggerDef::None),
+            "no-+trigger member in a mixed group must be silent (None), got {:?}",
+            a.triggers
+        );
+
+        // Mixed group with named trigger: `x` no trigger, `y` -> "x".
+        let named = parse_group_config(
+            r#"{ "GRP:named": {
+                "x": {"+channel": "R:x"},
+                "y": {"+channel": "R:y", "+trigger": "x"}
+            }}"#,
+        )
+        .unwrap();
+        let x = named[0]
+            .members
+            .iter()
+            .find(|m| m.field_name == "x")
+            .unwrap();
+        assert!(
+            matches!(x.triggers, TriggerDef::None),
+            "no-+trigger member in a named-trigger group must be silent (None)"
+        );
+
+        // Pure group: both default -> both keep SelfOnly.
+        let pure = parse_group_config(
+            r#"{ "GRP:pure2": {
+                "a": {"+channel": "R:a"},
+                "b": {"+channel": "R:b"}
+            }}"#,
+        )
+        .unwrap();
+        for m in &pure[0].members {
+            assert!(
+                matches!(m.triggers, TriggerDef::SelfOnly),
+                "pure self-trigger group must keep SelfOnly for member {}",
+                m.field_name
+            );
+        }
+    }
+
+    /// BR-R58: the same demotion must happen when a group is assembled
+    /// across multiple sources via `merge_group_defs` — a later source
+    /// adding an explicit-trigger member demotes the earlier no-trigger
+    /// member.
+    #[test]
+    fn br_r58_merge_demotes_self_to_silent() {
+        let mut existing = std::collections::HashMap::new();
+        let first = parse_group_config(r#"{ "GRP:m": { "a": {"+channel": "R:a"} } }"#).unwrap();
+        merge_group_defs(&mut existing, first);
+        // After the first (pure) source, `a` is self-trigger.
+        assert!(matches!(
+            existing["GRP:m"].members[0].triggers,
+            TriggerDef::SelfOnly
+        ));
+
+        let second =
+            parse_group_config(r#"{ "GRP:m": { "b": {"+channel": "R:b", "+trigger": "*"} } }"#)
+                .unwrap();
+        merge_group_defs(&mut existing, second);
+        let a = existing["GRP:m"]
+            .members
+            .iter()
+            .find(|m| m.field_name == "a")
+            .unwrap();
+        assert!(
+            matches!(a.triggers, TriggerDef::None),
+            "merge that introduces an explicit-trigger member must demote the earlier no-trigger member to silent"
+        );
+    }
+
+    /// BR-R59: member order must be a deterministic (put_order,
+    /// field_name) total order, not HashMap-iteration order. Members with
+    /// no `+putorder` (`None`) sort first, then by put_order; ties broken
+    /// by field name — matching pvxs's name-sorted-then-stable-putOrder
+    /// layout.
+    #[test]
+    fn br_r59_member_order_is_canonical() {
+        let groups = parse_group_config(
+            r#"{ "GRP:ord": {
+                "zebra": {"+channel": "R:z"},
+                "alpha": {"+channel": "R:a"},
+                "mid":   {"+channel": "R:m", "+putorder": 5},
+                "first": {"+channel": "R:f", "+putorder": 1}
+            }}"#,
+        )
+        .unwrap();
+        let order: Vec<&str> = groups[0]
+            .members
+            .iter()
+            .map(|m| m.field_name.as_str())
+            .collect();
+        // None-put_order members first (alpha, zebra by name), then
+        // put_order 1 (first), then 5 (mid).
+        assert_eq!(order, vec!["alpha", "zebra", "first", "mid"]);
+    }
+
+    /// BR-R59: the canonical order is re-established over the union after
+    /// a cross-source merge (members appended, then re-sorted).
+    #[test]
+    fn br_r59_merge_reestablishes_canonical_order() {
+        let mut existing = std::collections::HashMap::new();
+        merge_group_defs(
+            &mut existing,
+            parse_group_config(r#"{ "GRP:mo": { "yankee": {"+channel": "R:y"} } }"#).unwrap(),
+        );
+        merge_group_defs(
+            &mut existing,
+            parse_group_config(r#"{ "GRP:mo": { "bravo": {"+channel": "R:b"} } }"#).unwrap(),
+        );
+        let order: Vec<&str> = existing["GRP:mo"]
+            .members
+            .iter()
+            .map(|m| m.field_name.as_str())
+            .collect();
+        // Both no-put_order → name-sorted union: bravo before yankee.
+        assert_eq!(order, vec!["bravo", "yankee"]);
     }
 
     /// BR-R29: an explicit `+trigger:"*"` is still parsed as `All`

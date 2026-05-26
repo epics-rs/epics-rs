@@ -258,6 +258,103 @@ Fix applied (Option 1 — alarm update, parity with CA gateway B-G11 design):
 
 Regression tests added: `br_r57_build_invalid_alarm_no_prior_snapshot_returns_none`, `br_r57_build_invalid_alarm_non_nt_type_returns_none`, `br_r57_build_invalid_alarm_nt_scalar_sets_invalid`, `br_r57_reconnect_clears_invalid_alarm`.
 
+### BR-R58 — QSRV mixed-trigger group posts a no-`+trigger` member on its own change; pvxs leaves it silent
+
+Severity: High
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/qsrv/group_config.rs:383` — `parse_member` maps a missing `+trigger` to `TriggerDef::SelfOnly` per-member at parse time. This decision is made with no knowledge of whether *other* members in the group declare triggers.
+- `crates/epics-bridge-rs/src/qsrv/group.rs:1366-1369` — in a group that is NOT pure-self-trigger (`is_pure_self_trigger()` false because some member is `All`/`Fields`), `value_event_mark` takes the explicit-graph path and a `SelfOnly` member resolves to `vec![source.field_name]` → `EventMark::Marked([own])`, i.e. it POSTS a monitor update marking its own field whenever its source record changes.
+- `epics-modules/pvxs/ioc/groupconfigprocessor.cpp:300-309` — `defineTriggers`: a field whose `+trigger` is empty gets an EMPTY `TriggerNames` inserted into `fieldTriggerMap`; only a non-empty trigger sets `groupDefinition.hasTriggers = true`.
+- `epics-modules/pvxs/ioc/groupconfigprocessor.cpp:317-339` — `resolveTriggerReferences`: the self-trigger default (`field.triggerNames.insert(field.name)`) is applied to all channeled fields ONLY in the `else` branch, i.e. only when `!groupDefinition.hasTriggers` (no member in the whole group declared a trigger). When `hasTriggers` is true, a no-`+trigger` field keeps its empty trigger set and posts nothing on its own change.
+- `epics-modules/pvxs/ioc/groupconfigprocessor.cpp:381-391` — `defineGroupTriggers` iterates the (empty) trigger set, so a no-`+trigger` field in a mixed group ends with `fieldDefinition.triggerNames` empty; the downstream `subscriptionValueCallback` trigger loop is then empty → no post.
+
+Impact:
+
+In a group where *any* member carries an explicit `+trigger` (`"*"` or named), a member that omits `+trigger` is a data-only field in pvxs: its value is delivered when a *triggering* member fires, but its own change generates no monitor update. The Rust port instead posts an update for that member on its own change. This breaks the `+trigger` atomic-bundling contract (qgroup.rst: an empty/default trigger "means that changes to the field do not cause a subscription update"): downstream clients receive spurious updates and can observe partially-updated group snapshots that pvxs would never emit. The pure-self-trigger group (no member declares a trigger) is unaffected — there the Rust default matches pvxs's whole-group self-trigger fallback.
+
+Fix direction (structural):
+
+The defect is that the self-trigger default is decided per-member at parse time, while pvxs decides it at the group level after seeing every member. Add `GroupPvDef::resolve_self_trigger_default(&mut self)`: if any member is `All`/`Fields`, demote every `SelfOnly` member to `None` (silent). Call it at both group-assembly points — end of `raw_to_group_def` (single-source groups) and after the member `extend` in `merge_group_defs` (cross-source groups) — so the invariant "a `SelfOnly` member can exist only in a pure self-trigger group" holds by construction. The conversion is monotonic (groups only gain members via merge), so re-running on merge is safe.
+
+### BR-R59 — QSRV group member / changed-BitSet order is non-deterministic; pvxs is name-sorted deterministic
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/qsrv/group_config.rs:228` — `RawGroupDef.fields: HashMap<String, serde_json::Value>` (a `#[serde(flatten)]` catch-all). `HashMap` iteration order is randomized per process (SipHash `RandomState`).
+- `crates/epics-bridge-rs/src/qsrv/group_config.rs:238-249` — members are collected in that randomized iteration order, then `members.sort_by_key(|m| m.put_order)` — a STABLE sort keyed only on `put_order`. Members with equal `put_order` (the common case: only writable members carry `+putorder`, so most are `None`) retain the arbitrary HashMap order. The resulting member order drives the value-template field declaration order (`group.rs` `set_member_field`), which is the PVA wire field index / changed-BitSet bit position.
+- `epics-modules/pvxs/ioc/groupconfig.h:28` — `std::map<std::string, FieldConfig> fieldConfigMap;` — field configs are stored name-sorted.
+- `epics-modules/pvxs/ioc/groupconfigprocessor.cpp:253-262` — `std::stable_sort(... l.info.putOrder < r.info.putOrder)` over the name-sorted map, then rebuilds `fieldMap[name] = index++`. Because the input is name-sorted and the sort is stable, the final field/bit order is `putOrder`-primary, field-name-secondary, and fully deterministic.
+
+Impact:
+
+Two Rust gateway instances (or two restarts of one) given the identical group JSON can assign different field/bit positions within a group, and the layout differs from pvxs's name-sorted-within-`putOrder` order. PVA clients re-fetch introspection per connection, so a single live session decodes correctly; the divergence surfaces as (a) non-reproducible wire layout vs pvxs for the same config, and (b) inconsistency for tooling or cached descriptors that assume the pvxs canonical (name-sorted) order.
+
+Fix direction (structural):
+
+Replace the `put_order`-only stable sort with a total deterministic comparator `(put_order, field_name)` so the order is a pure function of the config independent of HashMap iteration — matching pvxs's `putOrder`-then-name ordering. Apply at both assembly points: `raw_to_group_def` and after the `extend` in `merge_group_defs` (the merge path appends members without re-sorting, so a group split across sources must be re-sorted to stay canonical).
+
+### BR-R60 — QSRV group PUT never returns "No fields changed"; pvxs errors when a marked PUT writes nothing
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/qsrv/group.rs:854-1077` (`put_with_options`) — both the atomic and non-atomic apply loops skip members with no `+putorder` (dropped from `ordered`, `group.rs:880-887`) and skip members whose field is absent from the incoming value (`get_nested_field(...) => None => continue`). The function falls through to `Ok(())` with no tracking of whether any write actually occurred. `rg "did_something|No fields changed"` over `qsrv/` returns nothing.
+- `epics-modules/pvxs/ioc/groupsource.cpp:596-608` — pvxs accumulates `didSomething |= putGroupField(...)` over the members and, after the loop, `if (!didSomething && value.isMarked(true, true)) throw std::runtime_error("No fields changed");`. The `catch` turns this into `putOperation->error(...)`, a remote error to the client.
+
+Impact:
+
+When a client sends a group PUT that marks fields but none map to a writable member (all marked leaves lack `+putorder`, or none of the marked names resolve to a group member), pvxs returns a remote error; the Rust port silently reports success. A client that relies on the error to detect a no-op or mis-addressed write sees a false success.
+
+Fix direction:
+
+Track `did_something` (set true whenever a member value write or `proc` actually fires) in both the atomic and non-atomic apply loops. After the loops, if `!did_something` and the client supplied at least one group-member field in the incoming `value` (any member's field present via `get_nested_field`), return `BridgeError::PutRejected("group <name> PUT: No fields changed")` — mirroring pvxs's `!didSomething && value.isMarked` guard. A genuinely empty PUT (no group field present) stays a silent no-op, matching pvxs (where `value.isMarked` is false).
+
+### BR-R61 — PVA gateway monitor forwarder drops broadcast-`Lagged` events with no overrun signal to the client
+
+Severity: Medium
+
+Status: Doc-only (structural fix is cross-crate: `epics-pva-rs` monitor encoder + bridge plumbing)
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/pva_gateway/source.rs:768` (raw path) and `crates/epics-bridge-rs/src/pva_gateway/source.rs:826` (typed path) — the downstream forwarder loop handles `Err(broadcast::error::RecvError::Lagged(_)) => continue`: when this receiver falls behind the per-PV broadcast ring (capacity `BROADCAST_CAPACITY = 16`, `channel_cache.rs:35`), the dropped events are silently skipped and the next live event is forwarded as-is, carrying upstream's own (usually empty) overrun byte.
+- `epics-base/modules/pva2pva/p2pApp/moncache.cpp:157-174` — when a downstream user's queue is full, pva2pva coalesces into `usr->overflowElement`, accumulating `overrunBitSet |= lastelem->overrunBitSet`, `overrunBitSet->or_and(changedBitSet, lastelem->changedBitSet)`, and `changedBitSet |= lastelem->changedBitSet`, and increments `ndropped`. The next element delivered to that user carries the overrun bitset flagging exactly which fields were squashed.
+
+Note: tokio `broadcast` keeps per-receiver cursors, so one slow downstream only lags itself (matching pva2pva's per-user queues) — that part is faithful. The gap is purely the missing overrun signaling: a client cannot distinguish "no intervening change" from "the gateway dropped intermediate states."
+
+Impact:
+
+A slow downstream PVA monitor that overflows the gateway's broadcast buffer loses intermediate monitor updates with no indication. pvxs/pva2pva guarantee the client learns of the loss via the overrun bitset on the next element. The Rust gateway hides its own drops.
+
+Fix direction (cross-crate, deferred to main worker):
+
+The raw forwarding path ships opaque pre-encoded body bytes, so signaling overrun requires the monitor encoder. Plumb a per-subscription "overrun pending" flag from the gateway forwarder (set on `Lagged`) through to the `epics-pva-rs` server monitor encoder (`build_monitor_payload`), which currently hardcodes `let overrun = BitSet::new()`, so it sets the overrun bitset (at minimum the root/changed bits) on the next emitted monitor frame. Until then the gateway silently coalesces under its own backpressure.
+
 ## Uncertain candidates
 
-None identified this round.
+### BR-R-UNCERTAIN-1 — CA gateway subscribes upstream with the channel's native element count, not CA `count=0`
+
+- `crates/epics-bridge-rs/src/ca_gateway/upstream.rs:419` — the gateway monitor is created via `channel.subscribe()` (no explicit count); inside `epics-ca-rs` (`src/client/mod.rs:~2696`) the subscription count is `ch.element_count` (native max NELM), not 0.
+- `epics-modules/ca-gateway/src/gatePv.cc:773` — `ca_create_subscription(eventType(), 0, chID, GR->eventMask(), ::eventCB, this, &evID)` uses count `0` (CA "deliver current valid count / NORD" convention).
+- Why uncertain: the observable impact (a dynamic-count waveform with `NORD < NELM` forwarded zero-padded to `NELM`) depends on `epics-ca-rs` server/monitor count handling, which I did not verify in this round, and the fix is cross-crate (an `epics-ca-rs` `count=0` subscription path). Both sides are cited; left for main-worker confirmation of the padding behavior and the cross-crate fix.
+
+### BR-R-UNCERTAIN-2 — `convert.rs` collapses `pvUInt` to `i32` (and `pvUInt` arrays to `DoubleArray`) while the sibling 64-bit cases preserve range
+
+- `crates/epics-bridge-rs/src/convert.rs:76` — `ScalarValue::UInt(v) => EpicsValue::Long(*v as i32)` silently wraps `pvUInt` values above `i32::MAX`; the array path (`convert.rs:~283`) folds `UInt` arrays into `DoubleArray`.
+- Why uncertain: `EpicsValue`/`DbFieldType` in `epics-base-rs` have no unsigned 8/16/32 variant (only `UInt64`), so there is no lossless target type; I cannot cite an "intended" upstream-C behavior for this internal type-model collapse. Flagged because it is asymmetric with the explicitly range-preserved 64-bit handling. No fix applied.
+
+### BR-R-UNCERTAIN-3 — `convert.rs` empty `ScalarArray` loses its element type
+
+- `crates/epics-bridge-rs/src/convert.rs:241-243` — a zero-length PVA scalar array is converted to `EpicsValue::DoubleArray(vec![])` regardless of the original element type (string/char/int/…).
+- Why uncertain: reachable on a zero-length update, but I found no upstream-C line pinning the intended empty-array element type, so the divergence's correctness/severity is unconfirmed. No fix applied.

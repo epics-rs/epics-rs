@@ -3212,12 +3212,34 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             } else {
                 DBE_VALUE | DBE_ALARM
             };
+            let entry = match state.channels.get(&sid) {
+                Some(e) => e,
+                None => {
+                    // C `event_add_action` (camessage.c:1773-1777):
+                    // `logBadId` + RSRV_ERROR on missing channel —
+                    // logs server-side, no wire reply, then drops the
+                    // connection. Same silent-disconnect pattern as
+                    // the INVALID_DB_REQ branch above. This MUST run
+                    // before the mask==0 ALLOCMEM check below: in C the
+                    // missing-channel branch precedes the `db_add_event`
+                    // NULL (select==0) path, so an unknown SID stays a
+                    // silent drop regardless of mask.
+                    return Err(epics_base_rs::error::CaError::Protocol(format!(
+                        "EVENT_ADD on unknown SID {} (matches C event_add_action logBadId + RSRV_ERROR)",
+                        sid
+                    )));
+                }
+            };
+
             // R46: C `db_add_event` (dbEvent.c:437-439) returns NULL when
             // select==0, which propagates as ECA_ALLOCMEM + disconnect
             // (`camessage.c:1814-1822`). A zero mask installs a subscription
             // that never triggers — match C by rejecting it immediately.
+            // This is the `db_add_event` NULL path, which in C only runs for
+            // a *valid* channel (after the missing-channel check above), so
+            // `entry.cid` is always known here — no `u32::MAX` fallback.
             if mask == 0 {
-                let entry_cid = state.channels.get(&sid).map(|e| e.cid).unwrap_or(u32::MAX);
+                let entry_cid = entry.cid;
                 send_ca_error(
                     writer,
                     hdr,
@@ -3230,21 +3252,6 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     "EVENT_ADD mask=0 (matches C db_add_event select==0 + RSRV_ERROR)".into(),
                 ));
             }
-
-            let entry = match state.channels.get(&sid) {
-                Some(e) => e,
-                None => {
-                    // C `event_add_action` (camessage.c:1773-1777):
-                    // `logBadId` + RSRV_ERROR on missing channel —
-                    // logs server-side, no wire reply, then drops the
-                    // connection. Same silent-disconnect pattern as
-                    // the INVALID_DB_REQ branch above.
-                    return Err(epics_base_rs::error::CaError::Protocol(format!(
-                        "EVENT_ADD on unknown SID {} (matches C event_add_action logBadId + RSRV_ERROR)",
-                        sid
-                    )));
-                }
-            };
             // Captured up front so the SubscriptionOpened event we
             // emit after a successful insert below doesn't have to
             // re-borrow `state.channels` (the insert path mutates
@@ -6219,6 +6226,130 @@ mod r46_zero_mask_event_add_tests {
             res.is_err(),
             "R46: zero-mask EVENT_ADD must close the connection with Err \
              (matches C RSRV_ERROR), got {res:?}"
+        );
+    }
+
+    /// Guard-ordering regression: an EVENT_ADD carrying an unknown/stale
+    /// SID *and* mask==0 must fall through to the silent missing-channel
+    /// drop, NOT emit a spurious ECA_ALLOCMEM. In C `event_add_action`
+    /// the missing-channel branch (`if (!pciu) { logBadId; return
+    /// RSRV_ERROR; }`, camessage.c:1773-1777) is silent and runs *before*
+    /// the `db_add_event` NULL (select==0) ALLOCMEM path
+    /// (camessage.c:1814-1822), so an unknown SID stays silent regardless
+    /// of mask. The defective guard ran the mask==0 check before the
+    /// channel lookup and replied `CA_PROTO_ERROR(ECA_ALLOCMEM,
+    /// m_cid=0xFFFF_FFFF)` here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_sid_zero_mask_event_add_drops_silently() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("r46:pv", EpicsValue::Double(0.0))
+            .await
+            .expect("add pv");
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:55401".parse().unwrap();
+
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                Some(conn_tx),
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(1, "r46:pv"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+        let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+
+        // Target a SID the server never assigned: unknown/stale channel.
+        let unknown_sid = sid.wrapping_add(0xDEAD);
+        assert_ne!(
+            unknown_sid, sid,
+            "test must use a SID distinct from the real one"
+        );
+        client
+            .write_all(&event_add_zero_mask_frame(unknown_sid, 0xC0DE))
+            .await
+            .expect("unknown-sid zero-mask event_add");
+        client
+            .flush()
+            .await
+            .expect("flush unknown-sid zero-mask event_add");
+
+        // Read server output until EOF; the unknown SID must produce NO
+        // wire reply (silent drop) — in particular no CA_PROTO_ERROR.
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 256];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for server to close"
+            );
+            match tokio::time::timeout(remaining, client.read(&mut buf)).await {
+                Ok(Ok(0)) => break, // EOF — server closed
+                Ok(Ok(n)) => acc.extend_from_slice(&buf[..n]),
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        // Scan the accumulated bytes: there must be NO CA_PROTO_ERROR frame.
+        let mut got_error = false;
+        let mut offset = 0;
+        while offset + CaHeader::SIZE <= acc.len() {
+            if let Ok((hdr, hdr_size)) = CaHeader::from_bytes_extended(&acc[offset..]) {
+                if hdr.cmmd == CA_PROTO_ERROR {
+                    got_error = true;
+                    break;
+                }
+                let msg_len = hdr_size + hdr.actual_postsize();
+                if msg_len == 0 {
+                    break;
+                }
+                offset += msg_len;
+            } else {
+                break;
+            }
+        }
+        assert!(
+            !got_error,
+            "R46 guard ordering: EVENT_ADD on an unknown SID with mask=0 must be a \
+             silent drop (C logBadId + RSRV_ERROR), but a CA_PROTO_ERROR frame was \
+             emitted (received {} bytes: {acc:?})",
+            acc.len()
+        );
+
+        // The handler still closes the connection with Err (RSRV_ERROR).
+        let res = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_client completes after unknown-sid event_add")
+            .expect("join ok");
+        assert!(
+            res.is_err(),
+            "R46 guard ordering: unknown-SID EVENT_ADD must close the connection with \
+             Err (matches C RSRV_ERROR), got {res:?}"
         );
     }
 }

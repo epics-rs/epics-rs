@@ -854,12 +854,18 @@ async fn wait_for_validated<R: tokio::io::AsyncRead + Unpin>(
             continue;
         }
         if frame.header.command == Command::ConnectionValidated.code() {
+            // pvxs `clientconn.cpp:303-313`: a non-success
+            // CONNECTION_VALIDATED means the server refused the offered
+            // credentials, but pvxs logs "Trying to proceed w/o cred" and
+            // proceeds anyway (`ready = true; createChannels()`) — the
+            // server may still serve PVs anonymously. Only a malformed
+            // frame (`!M.good()`) disconnects, which here is the `?`
+            // decode error below. Hard-failing on non-success instead
+            // left a Rust client unable to reach a refuse-cred-serve-anon
+            // server: the connection tore down and reconnected forever.
             let st = decode_connection_validated(&frame)?;
             if !st.is_success() {
-                return Err(PvaError::Protocol(format!(
-                    "connection validation rejected: {:?}",
-                    st
-                )));
+                warn!("server refused auth ({st:?}); proceeding without credentials");
             }
             return Ok(());
         }
@@ -1251,6 +1257,37 @@ mod tests {
         p.put_u8(mtype);
         encode_string_into(msg, order, &mut p);
         p
+    }
+
+    /// A8-1: pvxs `clientconn.cpp:303-313` logs "Trying to proceed w/o
+    /// cred" and proceeds (`ready = true; createChannels()`) after a
+    /// non-success CONNECTION_VALIDATED — the server refused the offered
+    /// credentials but may still serve PVs anonymously. Only a malformed
+    /// frame disconnects. The pre-fix port hard-failed, so a Rust client
+    /// could not reach a refuse-cred-serve-anon server (reconnect loop).
+    /// `wait_for_validated` must return `Ok` on a non-success status.
+    #[tokio::test]
+    async fn wait_for_validated_proceeds_on_auth_refused() {
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        Status::error("auth refused").write_into(order, &mut payload);
+        let mut frame = Vec::new();
+        PvaHeader::application(
+            true,
+            order,
+            Command::ConnectionValidated.code(),
+            payload.len() as u32,
+        )
+        .write_into(&mut frame);
+        frame.extend_from_slice(&payload);
+
+        let mut reader = std::io::Cursor::new(frame);
+        let mut rx_buf = Vec::new();
+        let res = wait_for_validated(&mut reader, &mut rx_buf, Duration::from_secs(1), None).await;
+        assert!(
+            res.is_ok(),
+            "non-success CONNECTION_VALIDATED must proceed anonymously (pvxs parity), got {res:?}"
+        );
     }
 
     #[test]

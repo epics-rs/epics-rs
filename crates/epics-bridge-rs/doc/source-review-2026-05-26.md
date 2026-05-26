@@ -343,4 +343,18 @@ The raw forwarding path ships opaque pre-encoded body bytes, so signaling overru
 
 ## Uncertain candidates
 
-None identified this round.
+### BR-R-UNCERTAIN-1 — CA gateway subscribes upstream with the channel's native element count, not CA `count=0`
+
+- `crates/epics-bridge-rs/src/ca_gateway/upstream.rs:419` — the gateway monitor is created via `channel.subscribe()` (no explicit count); inside `epics-ca-rs` (`src/client/mod.rs:~2696`) the subscription count is `ch.element_count` (native max NELM), not 0.
+- `epics-modules/ca-gateway/src/gatePv.cc:773` — `ca_create_subscription(eventType(), 0, chID, GR->eventMask(), ::eventCB, this, &evID)` uses count `0` (CA "deliver current valid count / NORD" convention).
+- Why uncertain: the observable impact (a dynamic-count waveform with `NORD < NELM` forwarded zero-padded to `NELM`) depends on `epics-ca-rs` server/monitor count handling, which I did not verify in this round, and the fix is cross-crate (an `epics-ca-rs` `count=0` subscription path). Both sides are cited; left for main-worker confirmation of the padding behavior and the cross-crate fix.
+
+### BR-R-UNCERTAIN-2 — `convert.rs` collapses `pvUInt` to `i32` (and `pvUInt` arrays to `DoubleArray`) while the sibling 64-bit cases preserve range
+
+- `crates/epics-bridge-rs/src/convert.rs:76` — `ScalarValue::UInt(v) => EpicsValue::Long(*v as i32)` silently wraps `pvUInt` values above `i32::MAX`; the array path (`convert.rs:~283`) folds `UInt` arrays into `DoubleArray`.
+- Why uncertain: `EpicsValue`/`DbFieldType` in `epics-base-rs` have no unsigned 8/16/32 variant (only `UInt64`), so there is no lossless target type; I cannot cite an "intended" upstream-C behavior for this internal type-model collapse. Flagged because it is asymmetric with the explicitly range-preserved 64-bit handling. No fix applied.
+
+### BR-R-UNCERTAIN-3 — `convert.rs` empty `ScalarArray` loses its element type
+
+- `crates/epics-bridge-rs/src/convert.rs:241-243` — a zero-length PVA scalar array is converted to `EpicsValue::DoubleArray(vec![])` regardless of the original element type (string/char/int/…).
+- Why uncertain: reachable on a zero-length update, but I found no upstream-C line pinning the intended empty-array element type, so the divergence's correctness/severity is unconfirmed. No fix applied.

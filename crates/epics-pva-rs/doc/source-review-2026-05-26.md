@@ -1051,6 +1051,35 @@ and the upstream pvxs C++ site.
   the SID allocator) so both sites share one sentinel definition, mirroring
   pvxs's single `sid = -1`.
 
+### R81 — Standalone `NTAttribute` builder uses struct id `:1.1`; pvxs (and this crate's NTNDArray embed) use `:1.0`
+
+- **Severity:** Low–Medium (the standalone `nt::NTAttribute` builder is public
+  API but not wired into any server-emit path today; the NTNDArray-embedded
+  attribute already uses `:1.0`. A consumer that emits a value from this
+  builder would put a type id pvxs does not define onto the wire).
+- **Status:** Fixed.
+- **Evidence:**
+  - Rust `src/nt/attribute.rs:42` (`build()` struct_id), `:57` (`create()`
+    struct_id), and the pinned test `:99` all use
+    `"epics:nt/NTAttribute:1.1"`; the module doc (`:1`, `:6`) and
+    `src/nt/mod.rs:8` repeat `:1.1`. The field set
+    (name/value/tags/descriptor/alarm/timeStamp/sourceType/source) already
+    matches pvxs.
+  - C++ pvxs `src/nt.cpp:238`: the only NTAttribute id in pvxs is
+    `StructA("attribute", "epics:nt/NTAttribute:1.0", { String("name"),
+    Any("value"), StringA("tags"), String("descriptor"), Struct("alarm",
+    ...), time_t.as("timeStamp"), Int32("sourceType"), String("source") })`.
+    There is no `:1.1` anywhere in pvxs.
+  - Internal inconsistency: `src/nt/nd_array.rs:288` (`attribute_desc()`)
+    already uses `:1.0` for the NTNDArray-embedded attribute.
+- **Impact:** A pvxs client doing NT-aware introspection (type-id match on
+  `epics:nt/NTAttribute:1.0`) would not recognise the `:1.1` id this builder
+  emits. The common NTNDArray path is unaffected (it uses its own `:1.0`
+  descriptor).
+- **Fix direction:** Change `:1.1` → `:1.0` at all source sites (`build()`,
+  `create()`, module docs, the `mod.rs` re-export doc) and update the pinned
+  test assertion. The field set is already correct, so no other change.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

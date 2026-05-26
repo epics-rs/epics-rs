@@ -182,6 +182,14 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
             continue;
         }
 
+        // Intentional divergence from C: `repeater.cpp:613-637` only
+        // special-cases `size >= sizeof(caHdr)` (16) and `size == 0`, so
+        // a 1–15-byte sub-header datagram falls through to `fanOut` and
+        // is forwarded verbatim. We drop it instead — a runt datagram
+        // carries no decodable CA header, every registered (loopback)
+        // client would discard it on receipt anyway, and no legitimate
+        // sender emits one; dropping here avoids waking every client
+        // with an undecodable packet.
         if len < CaHeader::SIZE {
             continue;
         }

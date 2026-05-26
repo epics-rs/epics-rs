@@ -1075,6 +1075,10 @@ impl GroupChannel {
             }
         }
 
+        // BR-R60: pvxs returns a remote error "No fields changed" when the
+        // client marked fields but nothing was actually written
+        // (groupsource.cpp:605-608, `!didSomething && value.isMarked`).
+        // This fall-through silently reports success instead.
         Ok(())
     }
 }

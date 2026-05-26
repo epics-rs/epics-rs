@@ -301,6 +301,25 @@ Fix direction (structural):
 
 Replace the `put_order`-only stable sort with a total deterministic comparator `(put_order, field_name)` so the order is a pure function of the config independent of HashMap iteration — matching pvxs's `putOrder`-then-name ordering. Apply at both assembly points: `raw_to_group_def` and after the `extend` in `merge_group_defs` (the merge path appends members without re-sorting, so a group split across sources must be re-sorted to stay canonical).
 
+### BR-R60 — QSRV group PUT never returns "No fields changed"; pvxs errors when a marked PUT writes nothing
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/qsrv/group.rs:854-1077` (`put_with_options`) — both the atomic and non-atomic apply loops skip members with no `+putorder` (dropped from `ordered`, `group.rs:880-887`) and skip members whose field is absent from the incoming value (`get_nested_field(...) => None => continue`). The function falls through to `Ok(())` with no tracking of whether any write actually occurred. `rg "did_something|No fields changed"` over `qsrv/` returns nothing.
+- `epics-modules/pvxs/ioc/groupsource.cpp:596-608` — pvxs accumulates `didSomething |= putGroupField(...)` over the members and, after the loop, `if (!didSomething && value.isMarked(true, true)) throw std::runtime_error("No fields changed");`. The `catch` turns this into `putOperation->error(...)`, a remote error to the client.
+
+Impact:
+
+When a client sends a group PUT that marks fields but none map to a writable member (all marked leaves lack `+putorder`, or none of the marked names resolve to a group member), pvxs returns a remote error; the Rust port silently reports success. A client that relies on the error to detect a no-op or mis-addressed write sees a false success.
+
+Fix direction:
+
+Track `did_something` (set true whenever a member value write or `proc` actually fires) in both the atomic and non-atomic apply loops. After the loops, if `!did_something` and the client supplied at least one group-member field in the incoming `value` (any member's field present via `get_nested_field`), return `BridgeError::PutRejected("group <name> PUT: No fields changed")` — mirroring pvxs's `!didSomething && value.isMarked` guard. A genuinely empty PUT (no group field present) stays a silent no-op, matching pvxs (where `value.isMarked` is false).
+
 ## Uncertain candidates
 
 None identified this round.

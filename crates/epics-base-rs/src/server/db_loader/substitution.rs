@@ -131,10 +131,18 @@ fn lex(input: &str) -> CaResult<Vec<(Tok, usize)>> {
                             message: "newline in string in substitutions file".into(),
                         });
                     }
-                    if ch == '\\' && i + 1 < chars.len() {
+                    if ch == '\\' && i + 1 < chars.len() && chars[i + 1] != '\n' {
                         // Keep escape bytes raw — they are forwarded
                         // into the macro substitution string verbatim,
                         // matching C `dbmfStrdup(yytext+1)`.
+                        //
+                        // The `!= '\n'` guard is required: C `{escape}`
+                        // is `{backslash}.` and flex `.` never matches a
+                        // newline (`dstringchar`/`sstringchar` are
+                        // `[^"\n\\]`), so a backslash immediately before a
+                        // newline is NOT an escape. Skipping this branch
+                        // lets the newline reach the `\n` check above,
+                        // which is the lexer error C produces.
                         s.push('\\');
                         s.push(chars[i + 1]);
                         i += 2;
@@ -656,6 +664,17 @@ file "b.db" { { Y=2 } }
     #[test]
     fn parse_rejects_unterminated_string() {
         let src = "file \"rec.db\" { { A=\"oops\nB=1 } }";
+        assert!(parse_substitutions(src).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_backslash_before_newline_in_string() {
+        // C `{escape}` is `{backslash}.` and flex `.` never matches a
+        // newline (`dstringchar` is `[^"\n\\]`), so a backslash
+        // immediately before a newline is NOT an escape — the string
+        // cannot continue across the line and the lexer errors. The
+        // backslash must not "swallow" the newline.
+        let src = "file \"rec.db\" { { A=\"oops\\\nB\" } }";
         assert!(parse_substitutions(src).is_err());
     }
 

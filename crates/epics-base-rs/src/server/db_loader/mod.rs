@@ -672,8 +672,15 @@ fn read_quoted_string(
     // both bytes are emitted verbatim.
     let mut s = String::new();
     while *pos < chars.len() && chars[*pos] != '"' {
-        if chars[*pos] == '\\' && *pos + 1 < chars.len() {
+        if chars[*pos] == '\\' && *pos + 1 < chars.len() && chars[*pos + 1] != '\n' {
             // Emit both the backslash and the escaped char raw.
+            //
+            // The `!= '\n'` guard is required: C `{escape}` is
+            // `{backslash}.` and flex `.` never matches a newline
+            // (`{dqschar}` is `[^"\n\\]`), so a backslash immediately
+            // before a newline is NOT an escape. Skipping this branch
+            // lets the newline fall through to the `Newline in string`
+            // error below (dbLex.l:131-133).
             s.push('\\');
             s.push(chars[*pos + 1]);
             *pos += 2;
@@ -1004,6 +1011,22 @@ mod tests {
         // H-3: a literal newline inside a quoted string (missing
         // closing quote) is a hard parse error in C (dbLex.l:131-133).
         let input = "record(stringin, \"TEST\") {\n    field(DESC, \"line1\nline2\")\n}\n";
+        let res = parse_db(input, &HashMap::new());
+        assert!(
+            matches!(res, Err(CaError::DbParseError { ref message, .. })
+                if message.contains("Newline in string")),
+            "expected newline-in-string abort, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn test_quoted_string_backslash_before_newline_aborts() {
+        // C `{escape}` is `{backslash}.` and flex `.` never matches a
+        // newline (`{dqschar}` is `[^"\n\\]`), so a backslash
+        // immediately before a newline is NOT an escape: the string
+        // stays unterminated and aborts with the same newline-in-string
+        // error (dbLex.l:131-133). The `\` must not swallow the newline.
+        let input = "record(stringin, \"TEST\") {\n    field(DESC, \"line1\\\nline2\")\n}\n";
         let res = parse_db(input, &HashMap::new());
         assert!(
             matches!(res, Err(CaError::DbParseError { ref message, .. })

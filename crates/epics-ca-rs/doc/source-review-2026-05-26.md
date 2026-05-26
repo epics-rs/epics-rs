@@ -547,6 +547,50 @@ fields keep the existing `to_string` path (C `getLongString` etc. carry no
 precision, so Rust already matches). Scalar Double/Float and DoubleArray/
 FloatArray are all converted element-wise with the same precision.
 
+### R58 — enum→DBR_STRING returns the numeric index instead of the state label
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-base-rs/src/types/value.rs:680` — `convert_to`'s
+  `String` arm renders `EpicsValue::Enum(idx)` via `format!("{self}")`, and
+  `Display for Enum(v)` (`value.rs:47`) writes the decimal index (`"1"`). The
+  codec's enum label array (`snapshot.enums.strings`) is consumed only by the
+  DBR_GR_ENUM / DBR_CTRL_ENUM metadata encoder
+  (`crates/epics-base-rs/src/types/codec.rs:522-528`); no path maps an enum
+  index to its label for a `*_STRING` request.
+- **C**: `modules/database/src/ioc/db/dbConvert.c` —
+  `dbGetConvertRoutine[DBF_ENUM][DBR_STRING] = getEnumString`; `getEnumString`
+  calls `prset->get_enum_str(paddr, pdst)`, which returns the state label:
+  `biRecord.c get_enum_str` (val 0 → ZNAM, 1 → ONAM, else `"Illegal_Value"`),
+  `mbbiRecord.c get_enum_str` (val ≤ 15 → the val-th `*ST` string, else
+  `"Illegal Value"`).
+
+Impact:
+
+CA clients that request a string representation of an enum PV (`caget -d
+DBR_STRING bipv`, display managers / scripts reading the human-readable state)
+receive the decimal index (`"1"`) from the Rust server instead of the configured
+label (`"On"`). Affects bi, bo, mbbi, mbbo for every `*_STRING` DBR variant.
+Native DBR_ENUM and DBR_GR_ENUM reads (which carry index + label array) are
+unaffected.
+
+Fix direction:
+
+Extend the `native == String` converter (the R57 dispatch in `encode_dbr`) so
+`Enum`/`EnumArray` map each index to `snapshot.enums.strings[idx]`. The label
+array is the same one already populated for DBR_GR_ENUM, so no new metadata is
+needed. Residual: the record-type-specific out-of-range sentinel
+(`"Illegal_Value"` / `"Illegal Value"` / empty `*ST`) is not reproduced because
+the record type is not carried in the snapshot; an out-of-range index (or a
+channel with no enum metadata) falls back to the decimal index. This edge is
+unreachable in normal operation — a record's VAL is always one of its defined
+states — so the observable behavior (label vs index for configured states) is
+byte-exact with C.
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,

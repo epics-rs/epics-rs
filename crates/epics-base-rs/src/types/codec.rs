@@ -107,6 +107,9 @@ fn convert_value_to_dbr_string(
         EpicsValue::FloatArray(a) => {
             EpicsValue::StringArray(a.iter().map(|v| cvt_float_to_string(*v, prec)).collect())
         }
+        // R58: an enum value reaches here and falls through to
+        // `convert_to(String)` = the decimal index, but C `getEnumString`
+        // returns the state LABEL (`get_enum_str`). Handled in the fix.
         other => other.convert_to(DbFieldType::String),
     }
 }

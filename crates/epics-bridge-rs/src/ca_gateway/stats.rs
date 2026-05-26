@@ -33,8 +33,8 @@
 //!
 //! | PV | Type | Maps to |
 //! |----|------|---------|
-//! | `<prefix>vctotal` | Long | totalPvs (virtual-channel total) |
-//! | `<prefix>pvtotal` | Long | totalPvs (real-PV total — same source as vctotal in C) |
+//! | `<prefix>vctotal` | Long | total_vc — entries with ≥1 downstream client |
+//! | `<prefix>pvtotal` | Long | total_pv — cache size (all real PVs) |
 //! | `<prefix>connected` | Long | active + inactive (upstream-alive) |
 //! | `<prefix>active` | Long | activeCount |
 //! | `<prefix>inactive` | Long | inactiveCount |
@@ -202,8 +202,9 @@ impl Stats {
             // B-G10: aliases matching C++ ca-gateway (gateServer.cc:
             // 1903-1965) so dashboards/scripts written against the C
             // names keep working. Connected = active + inactive
-            // (both are "upstream is alive"); pvtotal/vctotal are
-            // both alias for totalPvs in the C source.
+            // (both are "upstream is alive"). pvtotal = total_pv (cache
+            // size); vctotal = total_vc (entries with a downstream
+            // client) — these are distinct counters in the C source.
             ("vctotal", EpicsValue::Long(0)),
             ("pvtotal", EpicsValue::Long(0)),
             ("connected", EpicsValue::Long(0)),
@@ -254,7 +255,8 @@ impl Stats {
         // per-entry Arc borrows once collected, so the outer
         // `cache.read().await` doesn't span the per-entry awaits.
         let cache_guard = cache.read().await;
-        let (connecting, active, inactive, dead, _disconnect) = cache_guard.count_states().await;
+        let (connecting, active, inactive, dead, _disconnect, vc) =
+            cache_guard.count_states().await;
         drop(cache_guard);
 
         // Compute event rate over the interval since last refresh
@@ -354,7 +356,10 @@ impl Stats {
             db.put_pv_and_post(&n_put, EpicsValue::Long(put_count as i32)),
             db.put_pv_and_post(&n_readonly, EpicsValue::Long(readonly as i32)),
             db.put_pv_and_post(&n_hosts, EpicsValue::Long(host_count as i32)),
-            db.put_pv_and_post(&n_vctotal, EpicsValue::Long(cache_size as i32)),
+            // `vctotal` counts only entries with an attached downstream
+            // client (C `total_vc`, gateVc.cc:406,472), distinct from the
+            // `pvtotal` cache size (C `total_pv`, gatePv.cc:183).
+            db.put_pv_and_post(&n_vctotal, EpicsValue::Long(vc as i32)),
             db.put_pv_and_post(&n_pvtotal, EpicsValue::Long(cache_size as i32)),
             db.put_pv_and_post(&n_connected, EpicsValue::Long(connected)),
             db.put_pv_and_post(&n_active_alias, EpicsValue::Long(active as i32)),
@@ -626,5 +631,50 @@ mod tests {
         if let Ok(EpicsValue::Long(fd)) = db.get_pv("g:fd").await {
             assert!(fd >= 0);
         }
+    }
+
+    /// A9-4: `vctotal` must count only cache entries with an attached
+    /// downstream client (C `total_vc`, gateVc.cc:406,472), NOT the
+    /// whole cache. `pvtotal` (C `total_pv`, gatePv.cc:183) remains the
+    /// cache size. Pre-fix both were posted from `cache_size`, so a
+    /// gateway caching unsubscribed PVs over-reported its virtual
+    /// channels.
+    #[tokio::test]
+    async fn refresh_vctotal_counts_only_subscribed_entries() {
+        use super::super::cache::{GwPvEntry, PvState};
+
+        let stats = Stats::new("g:".into());
+        let db = PvDatabase::new();
+        stats.publish_initial(&db).await;
+
+        let mut cache = PvCache::new();
+
+        // Active entry with downstream subscribers → a virtual channel.
+        let mut a = GwPvEntry::new_connecting("pvA");
+        a.set_state(PvState::Active);
+        a.add_subscriber(1);
+        a.add_subscriber(2);
+        cache.insert(a);
+
+        // Connecting entry that already has a downstream client attached
+        // → still a VC even though the upstream is not yet active.
+        let mut b = GwPvEntry::new_connecting("pvB");
+        b.add_subscriber(3);
+        cache.insert(b);
+
+        // Inactive entry with no downstream client → NOT a VC, but still
+        // a cached PV counted by pvtotal.
+        let mut c = GwPvEntry::new_connecting("pvC");
+        c.set_state(PvState::Inactive);
+        cache.insert(c);
+
+        let cache_size = cache.len();
+        let cache = RwLock::new(cache);
+        stats.refresh(&cache, &db, cache_size, 0).await;
+
+        // pvtotal = all cached PVs (3); vctotal = only the 2 with a
+        // downstream client.
+        assert_eq!(db.get_pv("g:pvtotal").await.unwrap(), EpicsValue::Long(3));
+        assert_eq!(db.get_pv("g:vctotal").await.unwrap(), EpicsValue::Long(2));
     }
 }

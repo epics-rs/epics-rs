@@ -268,15 +268,29 @@ impl PvCache {
     /// states in a single pass — saves N×Vec_clone iterations when
     /// the caller wants a full breakdown (the typical Stats refresh
     /// case). Order: (Connecting, Active, Inactive, Dead, Disconnect).
-    pub async fn count_states(&self) -> (usize, usize, usize, usize, usize) {
+    /// Returns `(connecting, active, inactive, dead, disconnect, vc)`.
+    ///
+    /// `vc` is the virtual-channel count: cache entries that currently
+    /// have ≥1 attached downstream subscriber, regardless of upstream
+    /// state. C ca-gateway's `total_vc` (`gateVc.cc:406,472`) is bumped
+    /// per `gateVcData` create/destroy — i.e. per PV served to a
+    /// downstream client — and is distinct from `total_pv` (cache size).
+    /// A subscriber can be attached while the upstream is `Connecting` or
+    /// `Disconnect`, so this is NOT the same as the `Active` count.
+    pub async fn count_states(&self) -> (usize, usize, usize, usize, usize, usize) {
         let entries: Vec<Arc<RwLock<GwPvEntry>>> = self.entries.values().cloned().collect();
         let mut connecting = 0;
         let mut active = 0;
         let mut inactive = 0;
         let mut dead = 0;
         let mut disconnect = 0;
+        let mut vc = 0;
         for entry in entries {
-            match entry.read().await.state {
+            let guard = entry.read().await;
+            if guard.subscriber_count() > 0 {
+                vc += 1;
+            }
+            match guard.state {
                 PvState::Connecting => connecting += 1,
                 PvState::Active => active += 1,
                 PvState::Inactive => inactive += 1,
@@ -284,7 +298,7 @@ impl PvCache {
                 PvState::Disconnect => disconnect += 1,
             }
         }
-        (connecting, active, inactive, dead, disconnect)
+        (connecting, active, inactive, dead, disconnect, vc)
     }
 
     /// Sweep expired entries based on timeouts.

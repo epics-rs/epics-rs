@@ -165,7 +165,6 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     // `client_cert=require`, accepting certless clients (fail-open).
     let options = crate::config::env::server_tls_options();
     let require_client_cert = options.contains("client_cert=require");
-    let optional_client_cert = require_client_cert || options.contains("client_cert=optional");
 
     // Presented chain = leaf + any CA certs the keychain carried, so a
     // peer that lacks the intermediates can still build the path.
@@ -177,36 +176,40 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     // R68: build the root CA store up front so we can (a) give it to the
     // WebPkiClientVerifier and (b) keep it in TlsServerConfig for
     // authority resolution when the peer sends a partial chain.
-    let trust_roots = if optional_client_cert {
+    let trust_roots = {
         let mut roots = RootCertStore::empty();
         for cert in certs.iter().chain(ca_certs.iter()) {
-            // Best-effort: skip non-CA leaf certs — verifier rejects any.
             let _ = roots.add(cert.clone());
         }
         Arc::new(roots)
-    } else {
-        Arc::new(RootCertStore::empty())
     };
 
-    let config = if optional_client_cert {
-        let verifier = if require_client_cert {
-            WebPkiClientVerifier::builder(trust_roots.clone())
-                .build()
-                .map_err(|e| TlsConfigError::Verifier(e.to_string()))?
-        } else {
-            WebPkiClientVerifier::builder(trust_roots.clone())
-                .allow_unauthenticated()
-                .build()
-                .map_err(|e| TlsConfigError::Verifier(e.to_string()))?
-        };
-        ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(chain, key)?
+    // pvxs `ossl.cpp:355` sets `SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE`
+    // on the server unconditionally — for `Default`, `Optional`, AND
+    // `Require` alike — so the server always sends a CertificateRequest
+    // and verifies a presented client cert; only `Require` additionally
+    // sets `SSL_VERIFY_FAIL_IF_NO_PEER_CERT` to reject certless clients.
+    // There is no pvxs mode that skips the client-cert request.
+    //
+    // The pre-fix port took `with_no_client_auth()` whenever neither
+    // `client_cert=optional` nor `=require` was set (the default), so the
+    // default TLS server never requested a client cert — every client
+    // connected anonymously and the x509 ACF identity was never
+    // established. Match pvxs: always install the verifier, requesting +
+    // verifying-if-present, and only require a cert under `=require`.
+    let verifier = if require_client_cert {
+        WebPkiClientVerifier::builder(trust_roots.clone())
+            .build()
+            .map_err(|e| TlsConfigError::Verifier(e.to_string()))?
     } else {
-        ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(chain, key)?
+        WebPkiClientVerifier::builder(trust_roots.clone())
+            .allow_unauthenticated()
+            .build()
+            .map_err(|e| TlsConfigError::Verifier(e.to_string()))?
     };
+    let config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(chain, key)?;
 
     Ok(Some(TlsServerConfig {
         config: Arc::new(config),
@@ -1761,6 +1764,49 @@ mod tests {
             .expect("load_server_config")
             .expect("Some(config)");
         assert!(!cfg.require_client_cert);
+    }
+
+    /// A6-2: pvxs `ossl.cpp:355` sets `SSL_VERIFY_PEER` on the server for
+    /// `Default`/`Optional`/`Require` alike, so even the default TLS
+    /// server requests a client cert and verifies it if presented. The
+    /// pre-fix port took `with_no_client_auth()` for the default (no
+    /// `client_cert=` option), never sending a CertificateRequest — every
+    /// client stayed anonymous and the x509 ACF identity was never
+    /// established. Observable boundary: the default server now builds a
+    /// non-empty trust store and installs the verifier (the old
+    /// no-client-auth path left `trust_roots` empty); `require` stays off.
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    #[serial(epics_env)]
+    fn server_default_requests_client_cert() {
+        let pem = gen_self_signed("epics-pkcs12-server");
+        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
+            eprintln!("skipping: `openssl` not available");
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+
+        // No client_cert option set → the pvxs `Default` mode.
+        let _g = EnvGuard::set(&[
+            ("EPICS_PVAS_TLS_KEYCHAIN", Some(path.to_str().unwrap())),
+            ("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD", Some("kc-pw")),
+            ("EPICS_PVA_TLS_DISABLE", None),
+            ("EPICS_PVAS_TLS_OPTIONS", None),
+            ("EPICS_PVA_TLS_OPTIONS", None),
+        ]);
+        let cfg = load_server_config()
+            .expect("load_server_config")
+            .expect("Some(config)");
+        assert!(
+            !cfg.require_client_cert,
+            "default (no client_cert option) must not require a client cert"
+        );
+        assert!(
+            !cfg.trust_roots.is_empty(),
+            "default server must build a trust store and install the client-cert \
+             verifier (request + verify-if-present); the pre-fix no_client_auth \
+             path left trust_roots empty and never requested a client cert"
+        );
     }
 
     #[test]

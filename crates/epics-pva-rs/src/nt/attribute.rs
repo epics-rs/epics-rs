@@ -1,9 +1,10 @@
-//! `epics:nt/NTAttribute:1.1` builder.
+//! `epics:nt/NTAttribute:1.0` builder.
 //!
-//! Used inside NTNDArray's `attribute[]` array. pvxs nt.cpp emits
-//! NTAttribute with `name`, `value` (Variant), `descriptor`, plus
-//! optional `tags`, `alarm`, `timeStamp`, `sourceType`, `source`.
-//! We expose the minimal NT 1.1 shape: name + value + descriptor.
+//! pvxs `nt.cpp:238` defines NTAttribute with the fields `name`,
+//! `value` (Variant), `tags`, `descriptor`, `alarm`, `timeStamp`,
+//! `sourceType`, `source`. This builder emits that full 8-field shape.
+//! The NTNDArray `attribute[]` element type is built separately in
+//! `nd_array.rs::attribute_desc()` (also `:1.0`).
 
 use super::meta::{alarm_default, alarm_desc, time_default, time_desc};
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, VariantValue};
@@ -42,7 +43,7 @@ impl NTAttribute {
             // R81: pvxs defines only `epics:nt/NTAttribute:1.0` (nt.cpp:238);
             // `:1.1` does not exist upstream and disagrees with the NTNDArray
             // embed in nd_array.rs.
-            struct_id: "epics:nt/NTAttribute:1.1".into(),
+            struct_id: "epics:nt/NTAttribute:1.0".into(),
             fields: vec![
                 ("name".into(), FieldDesc::Scalar(ScalarType::String)),
                 ("value".into(), FieldDesc::Variant),
@@ -57,7 +58,7 @@ impl NTAttribute {
     }
 
     pub fn create(&self) -> PvField {
-        let mut s = PvStructure::new("epics:nt/NTAttribute:1.1");
+        let mut s = PvStructure::new("epics:nt/NTAttribute:1.0");
         s.fields.push((
             "name".into(),
             PvField::Scalar(ScalarValue::String(self.name.clone())),
@@ -99,7 +100,7 @@ mod tests {
     #[test]
     fn nt_attribute_struct_id_and_fields() {
         if let FieldDesc::Structure { struct_id, fields } = NTAttribute::build() {
-            assert_eq!(struct_id, "epics:nt/NTAttribute:1.1");
+            assert_eq!(struct_id, "epics:nt/NTAttribute:1.0");
             let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
             assert!(names.contains(&"name"));
             assert!(names.contains(&"value"));

@@ -5,7 +5,7 @@
 //! - `epics:nt/NTEnum:1.0` ([`enum_t`])
 //! - `epics:nt/NTTable:1.0` ([`table`])
 //! - `epics:nt/NTURI:1.0` ([`uri`]) — RPC argument passing
-//! - `epics:nt/NTAttribute:1.1` ([`attribute`]) — used by NTNDArray
+//! - `epics:nt/NTAttribute:1.0` ([`attribute`]) — standalone (NTNDArray embeds its own)
 //! - `epics:nt/NTNDArray:1.0` ([`nd_array`]) — areaDetector image
 //!
 //! Each module produces both the `FieldDesc` introspection and a `PvField`

@@ -75,6 +75,12 @@ pub struct UpstreamEntry {
     /// `tx` (decoded PvField, for `subscribe()` and snapshot) and
     /// `tx_raw` (raw bytes) per upstream event.
     tx_raw: broadcast::Sender<crate::pva_gateway::source::RawEvent>,
+    /// BR-R46: cached latest raw event. Populated after the first
+    /// upstream monitor event so `subscribe_raw_inner` can deliver it
+    /// as the initial snapshot to new raw subscribers. Cleared on
+    /// type-change so stale bytes from the old descriptor are not
+    /// replayed under the new one. Mirrors `moncache.cpp` `lastelem`.
+    latest_raw: Arc<RwLock<Option<crate::pva_gateway::source::RawEvent>>>,
     /// Pulsed on the first successful upstream event. `lookup()` waits
     /// on this so callers see a populated snapshot before returning.
     first_event: Arc<Notify>,
@@ -341,6 +347,75 @@ fn apply_monitor_event(
     }
 }
 
+/// BR-R57: synthesise a `changed | value` monitor body marking only the
+/// `alarm` sub-struct as changed, setting `severity=3 (INVALID)` and
+/// `status=3 (UNDEFINED)`. Returns the modified [`PvField`] (for the typed
+/// broadcast channel) alongside the encoded [`crate::pva_gateway::source::RawEvent`]
+/// (for the raw broadcast channel and `latest_raw` cache).
+///
+/// Returns `None` when:
+/// - No prior raw snapshot exists (`latest_raw` is `None` — first-ever
+///   connection attempt, nothing to invalidate yet), or
+/// - The cached type has no `alarm` sub-struct (non-NT shape).
+///
+/// On reconnect the first real upstream event overwrites both `state.latest`
+/// and `latest_raw` via the normal monitor callback path, so the INVALID
+/// alarm does not stick after the upstream recovers.
+fn build_invalid_alarm_event(
+    state: &RwLock<EntryState>,
+    latest_raw: &RwLock<Option<crate::pva_gateway::source::RawEvent>>,
+) -> Option<(PvField, crate::pva_gateway::source::RawEvent)> {
+    use epics_pva_rs::pvdata::ScalarValue;
+    use epics_pva_rs::pvdata::encode::{encode_pv_field_with_bitset, marked_changed_bitset};
+
+    // Derive byte order from the last received raw event; None → no prior
+    // upstream data, nothing to invalidate, return early.
+    let byte_order = latest_raw.read().as_ref()?.byte_order;
+
+    let s = state.read();
+    let desc = s.introspection.as_ref()?;
+    let latest = s.latest.as_ref()?;
+
+    // Bitset that covers only the `alarm` sub-struct (all its leaf bits).
+    // Returns an empty bitset when the type has no `alarm` field (non-NT shape).
+    let alarm_bits = marked_changed_bitset(desc, &["alarm".to_string()]);
+    if alarm_bits.is_empty() {
+        return None;
+    }
+
+    // Clone the last known value and overwrite alarm.severity = INVALID (3)
+    // and alarm.status = UNDEFINED (3). Value and timeStamp are left unchanged
+    // so operators see the last good reading flagged as invalid.
+    let mut modified = latest.clone();
+    if let PvField::Structure(ref mut root) = modified {
+        for (name, field) in &mut root.fields {
+            if name == "alarm" {
+                if let PvField::Structure(ref mut alarm) = field {
+                    for (fname, fval) in &mut alarm.fields {
+                        match fname.as_str() {
+                            "severity" => *fval = PvField::Scalar(ScalarValue::Int(3)),
+                            "status" => *fval = PvField::Scalar(ScalarValue::Int(3)),
+                            _ => {}
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    let mut body = Vec::new();
+    alarm_bits.write_into(byte_order, &mut body);
+    encode_pv_field_with_bitset(&modified, desc, &alarm_bits, 0, byte_order, &mut body);
+
+    let raw_ev = crate::pva_gateway::source::RawEvent {
+        body: bytes::Bytes::from(body),
+        byte_order,
+        type_changed: false,
+    };
+    Some((modified, raw_ev))
+}
+
 impl UpstreamEntry {
     /// Latest cached value; cheap clone of the `PvField` enum.
     pub fn snapshot(&self) -> Option<PvField> {
@@ -366,6 +441,13 @@ impl UpstreamEntry {
     pub fn subscribe_raw(&self) -> broadcast::Receiver<crate::pva_gateway::source::RawEvent> {
         self.poke();
         self.tx_raw.subscribe()
+    }
+
+    /// BR-R46: latest cached raw upstream frame. Returns `None` until
+    /// the first upstream monitor event has been received (or after a
+    /// type-change resets the cache).
+    pub fn snapshot_raw(&self) -> Option<crate::pva_gateway::source::RawEvent> {
+        self.latest_raw.read().clone()
     }
 
     /// Number of live downstream subscribers (broadcast receivers).
@@ -689,6 +771,8 @@ impl ChannelCache {
         let state = Arc::new(RwLock::new(EntryState::default()));
         let pause = PauseControl::new();
 
+        let latest_raw = Arc::new(RwLock::new(None::<crate::pva_gateway::source::RawEvent>));
+
         let pv_name_owned = pv_name.to_string();
         let client = self.client.clone();
         let tx_for_task = tx.clone();
@@ -696,10 +780,15 @@ impl ChannelCache {
         let state_for_task = state.clone();
         let first_event_for_task = first_event.clone();
         let pause_for_task = pause.clone();
+        let latest_raw_for_task = latest_raw.clone();
 
         let join = tokio::spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
+            // BR-R57: emit INVALID alarm once per outage cycle, not once per
+            // backoff iteration. Reset when a new connection starts successfully
+            // (Ok(h) arm below) so the next disconnect emits a fresh alarm.
+            let mut disconnected_alarm_sent = false;
             loop {
                 let tx_inner = tx_for_task.clone();
                 let state_inner = state_for_task.clone();
@@ -724,6 +813,7 @@ impl ChannelCache {
                 // `MonitorControlOp::pipeline` parity.
                 let tx_raw_inner = tx_raw_for_task.clone();
                 let pv_clone = pv_name_owned.clone();
+                let latest_raw_inner = latest_raw_for_task.clone();
                 // BR-R41: tx_inner moves into the callback so decoded
                 // events fan out to typed subscribers (subscribe_inner /
                 // subscribe_checked fallback path). Pre-fix this sender
@@ -752,6 +842,9 @@ impl ChannelCache {
                             // downstream dispatch path sends MONITOR FINISH
                             // and the client knows to reopen with a fresh
                             // INIT against the new descriptor.
+                            // BR-R46: clear stale bytes so new raw
+                            // subscribers don't replay the old descriptor.
+                            *latest_raw_inner.write() = None;
                             let _ = tx_raw_inner.send(RawEvent {
                                 body: bytes::Bytes::new(),
                                 byte_order: order,
@@ -780,12 +873,17 @@ impl ChannelCache {
                                 let _ = tx_inner.send(val);
                             }
                         }
-                        // Fan out raw body — refcount only, no copy.
-                        let _ = tx_raw_inner.send(RawEvent {
+                        // BR-R46: cache latest raw event for initial
+                        // snapshot delivery to new raw subscribers.
+                        // Clone is cheap (Bytes is refcounted).
+                        let raw_ev = RawEvent {
                             body,
                             byte_order: order,
                             type_changed: false,
-                        });
+                        };
+                        *latest_raw_inner.write() = Some(raw_ev.clone());
+                        // Fan out raw body — refcount only, no copy.
+                        let _ = tx_raw_inner.send(raw_ev);
                     })
                     .await;
                 // `pvmonitor_raw_frames_handle` returns immediately
@@ -795,7 +893,13 @@ impl ChannelCache {
                 // the task to terminate (clean disconnect, channel
                 // close, or fatal error).
                 let handle = match handle_result {
-                    Ok(h) => h,
+                    Ok(h) => {
+                        // New upstream connection started — reset the
+                        // disconnect guard so the next outage emits a
+                        // fresh INVALID alarm.
+                        disconnected_alarm_sent = false;
+                        h
+                    }
                     Err(e) => {
                         tracing::warn!(
                             pv = %pv_name_owned,
@@ -803,9 +907,21 @@ impl ChannelCache {
                             backoff_ms = backoff.as_millis() as u64,
                             "pva-gateway: raw upstream monitor failed to start, will retry"
                         );
-                        if tx_raw_for_task.receiver_count() == 0 {
-                            return;
+                        // BR-R57: emit INVALID alarm once on this outage cycle
+                        // so downstream monitors see the connection failure
+                        // rather than observing stale data at NoAlarm.
+                        if !disconnected_alarm_sent {
+                            if let Some((invalid_pv, invalid_raw)) =
+                                build_invalid_alarm_event(&state_for_task, &latest_raw_for_task)
+                            {
+                                *latest_raw_for_task.write() = Some(invalid_raw.clone());
+                                state_for_task.write().latest = Some(invalid_pv.clone());
+                                let _ = tx_raw_for_task.send(invalid_raw);
+                                let _ = tx_for_task.send(invalid_pv);
+                            }
+                            disconnected_alarm_sent = true;
                         }
+                        // BR-R50: guard removed — cleanup_tick aborts via AbortOnDrop.
                         tokio::time::sleep(backoff).await;
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                         continue;
@@ -823,6 +939,24 @@ impl ChannelCache {
                 pause_for_task.install(handle.pauser()).await;
                 let raw_result = handle.wait().await;
                 pause_for_task.clear();
+                // BR-R57: upstream disconnected — emit INVALID alarm once per
+                // outage cycle so downstream PVA monitors see the disconnect
+                // via alarm severity (matching the CA gateway's B-G11
+                // INVALID+LINK_ALARM design). The subscription stays alive for
+                // transparent reconnect; the first real upstream event after
+                // reconnect overwrites the INVALID state via the normal
+                // monitor callback path.
+                if !disconnected_alarm_sent {
+                    if let Some((invalid_pv, invalid_raw)) =
+                        build_invalid_alarm_event(&state_for_task, &latest_raw_for_task)
+                    {
+                        *latest_raw_for_task.write() = Some(invalid_raw.clone());
+                        state_for_task.write().latest = Some(invalid_pv.clone());
+                        let _ = tx_raw_for_task.send(invalid_raw);
+                        let _ = tx_for_task.send(invalid_pv);
+                    }
+                    disconnected_alarm_sent = true;
+                }
                 if let Err(e) = raw_result {
                     tracing::warn!(
                         pv = %pv_name_owned,
@@ -830,9 +964,7 @@ impl ChannelCache {
                         backoff_ms = backoff.as_millis() as u64,
                         "pva-gateway: raw upstream monitor failed, will retry"
                     );
-                    if tx_raw_for_task.receiver_count() == 0 {
-                        return;
-                    }
+                    // BR-R50: guard removed — cleanup_tick aborts via AbortOnDrop.
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, max_backoff);
                     continue;
@@ -845,13 +977,10 @@ impl ChannelCache {
                 // empty. Only exit when BOTH have no live receivers,
                 // otherwise upstream IOC restart silently kills every
                 // raw-path downstream monitor.
-                if tx_for_task.receiver_count() == 0 && tx_raw_for_task.receiver_count() == 0 {
-                    tracing::debug!(
-                        pv = %pv_name_owned,
-                        "pva-gateway: monitor exit (no subscribers)"
-                    );
-                    return;
-                }
+                // BR-R50: guard removed — cleanup_tick evicts idle entries
+                // (subscriber_count==0 && !drop_poke) and aborts this task
+                // via AbortOnDrop. Keeping the task alive until eviction
+                // prevents new subscribers from joining a dead broadcast.
             }
         });
 
@@ -860,6 +989,7 @@ impl ChannelCache {
             state,
             tx,
             tx_raw,
+            latest_raw,
             first_event,
             _monitor_task: AbortOnDrop(join.abort_handle()),
             drop_poke: parking_lot::Mutex::new(true),
@@ -968,6 +1098,7 @@ impl ChannelCache {
             state: Arc::new(RwLock::new(EntryState::default())),
             tx,
             tx_raw,
+            latest_raw: Arc::new(RwLock::new(None)),
             first_event: Arc::new(Notify::new()),
             _monitor_task: AbortOnDrop(task.abort_handle()),
             drop_poke: parking_lot::Mutex::new(false),
@@ -1420,6 +1551,7 @@ mod tests {
             state: Arc::new(RwLock::new(EntryState::default())),
             tx,
             tx_raw,
+            latest_raw: Arc::new(RwLock::new(None)),
             first_event: Arc::new(Notify::new()),
             _monitor_task: AbortOnDrop(task.abort_handle()),
             drop_poke: parking_lot::Mutex::new(false),
@@ -1430,5 +1562,194 @@ mod tests {
         let _r2 = entry.subscribe();
         assert_eq!(entry.subscriber_count(), 2);
         assert!(*entry.drop_poke.lock(), "subscribe must poke");
+    }
+
+    /// BR-R57: `build_invalid_alarm_event` must return `None` when no prior
+    /// snapshot exists (first-connect, `latest_raw` is `None`). Nothing to
+    /// invalidate — the first real upstream event will establish state.
+    #[test]
+    fn br_r57_build_invalid_alarm_no_prior_snapshot_returns_none() {
+        let state = RwLock::new(EntryState::default());
+        let latest_raw = RwLock::new(None::<crate::pva_gateway::source::RawEvent>);
+        assert!(
+            build_invalid_alarm_event(&state, &latest_raw).is_none(),
+            "no prior data → nothing to invalidate"
+        );
+    }
+
+    /// BR-R57: `build_invalid_alarm_event` must return `None` for a non-NT
+    /// scalar type that has no `alarm` sub-struct. Only NTScalar-shaped PVs
+    /// carry `alarm`; raw scalars must be left untouched.
+    #[test]
+    fn br_r57_build_invalid_alarm_non_nt_type_returns_none() {
+        use crate::pva_gateway::source::RawEvent;
+        // Populate state with a plain scalar double (no alarm sub-struct).
+        let desc = FieldDesc::Scalar(ScalarType::Double);
+        let state = RwLock::new(EntryState::default());
+        let body = encode_body(&desc, &PvField::Scalar(ScalarValue::Double(1.0)), &[0]);
+        apply_monitor_event(&state, &desc, &body, ByteOrder::Little);
+
+        // Fake a `latest_raw` so the byte_order guard passes.
+        let latest_raw = RwLock::new(Some(RawEvent {
+            body: bytes::Bytes::from(body),
+            byte_order: ByteOrder::Little,
+            type_changed: false,
+        }));
+
+        assert!(
+            build_invalid_alarm_event(&state, &latest_raw).is_none(),
+            "plain scalar (no alarm field) must yield None"
+        );
+    }
+
+    /// Build an NTScalar-shaped PvField with value and alarm for tests.
+    /// Bit layout: 0=root, 1=value, 2=alarm_struct, 3=severity, 4=status, 5=message.
+    fn nt_scalar_desc() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![
+                            ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("message".into(), FieldDesc::Scalar(ScalarType::String)),
+                        ],
+                    },
+                ),
+            ],
+        }
+    }
+
+    fn nt_scalar_value(val: f64, severity: i32) -> PvField {
+        let mut s = epics_pva_rs::pvdata::PvStructure::new("epics:nt/NTScalar:1.0");
+        s.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(val))));
+        let mut alarm = epics_pva_rs::pvdata::PvStructure::new("alarm_t");
+        alarm.fields.push((
+            "severity".into(),
+            PvField::Scalar(ScalarValue::Int(severity)),
+        ));
+        alarm
+            .fields
+            .push(("status".into(), PvField::Scalar(ScalarValue::Int(0))));
+        alarm.fields.push((
+            "message".into(),
+            PvField::Scalar(ScalarValue::String("".into())),
+        ));
+        s.fields.push(("alarm".into(), PvField::Structure(alarm)));
+        PvField::Structure(s)
+    }
+
+    /// All bits 0-5 set for the NTScalar desc (root + value + alarm + 3 alarm fields).
+    const NT_SCALAR_ALL_BITS: &[usize] = &[0, 1, 2, 3, 4, 5];
+
+    fn get_alarm_severity(pv: &PvField) -> Option<i32> {
+        if let PvField::Structure(s) = pv {
+            if let Some(PvField::Structure(alarm)) =
+                s.fields.iter().find(|(n, _)| n == "alarm").map(|(_, v)| v)
+            {
+                if let Some(PvField::Scalar(ScalarValue::Int(sev))) = alarm
+                    .fields
+                    .iter()
+                    .find(|(n, _)| n == "severity")
+                    .map(|(_, v)| v)
+                {
+                    return Some(*sev);
+                }
+            }
+        }
+        None
+    }
+
+    /// BR-R57: for an NTScalar value, `build_invalid_alarm_event` must return
+    /// a PvField with alarm.severity=3 (INVALID) and alarm.status=3 (UNDEFINED),
+    /// while the value field is preserved unchanged.
+    #[test]
+    fn br_r57_build_invalid_alarm_nt_scalar_sets_invalid() {
+        use crate::pva_gateway::source::RawEvent;
+
+        let desc = nt_scalar_desc();
+        let initial = nt_scalar_value(42.0, 0);
+        let body = encode_body(&desc, &initial, NT_SCALAR_ALL_BITS);
+
+        let state = RwLock::new(EntryState::default());
+        apply_monitor_event(&state, &desc, &body, ByteOrder::Little);
+
+        let latest_raw = RwLock::new(Some(RawEvent {
+            body: bytes::Bytes::from(body),
+            byte_order: ByteOrder::Little,
+            type_changed: false,
+        }));
+
+        let (invalid_pv, _invalid_raw) = build_invalid_alarm_event(&state, &latest_raw)
+            .expect("NTScalar with alarm must produce an event");
+
+        assert_eq!(
+            get_alarm_severity(&invalid_pv),
+            Some(3),
+            "alarm.severity must be INVALID (3)"
+        );
+
+        // Value must be preserved at 42.0.
+        if let PvField::Structure(ref s) = invalid_pv {
+            let val = s
+                .fields
+                .iter()
+                .find(|(n, _)| n == "value")
+                .map(|(_, v)| v.clone());
+            assert_eq!(
+                val,
+                Some(PvField::Scalar(ScalarValue::Double(42.0))),
+                "value must be preserved at 42.0"
+            );
+        }
+    }
+
+    /// BR-R57: on reconnect, the normal upstream monitor event must overwrite
+    /// the INVALID alarm state so the indicator does not stick after recovery.
+    /// Verifies via `apply_monitor_event` — the same path the real monitor task uses.
+    #[test]
+    fn br_r57_reconnect_clears_invalid_alarm() {
+        use crate::pva_gateway::source::RawEvent;
+
+        let desc = nt_scalar_desc();
+        let initial = nt_scalar_value(1.0, 0);
+        let body0 = encode_body(&desc, &initial, NT_SCALAR_ALL_BITS);
+
+        let state = RwLock::new(EntryState::default());
+        apply_monitor_event(&state, &desc, &body0, ByteOrder::Little);
+
+        let latest_raw = RwLock::new(Some(RawEvent {
+            body: bytes::Bytes::from(body0),
+            byte_order: ByteOrder::Little,
+            type_changed: false,
+        }));
+
+        // Simulate disconnect: record INVALID alarm into state.
+        let (invalid_pv, invalid_raw) =
+            build_invalid_alarm_event(&state, &latest_raw).expect("must produce event");
+        *latest_raw.write() = Some(invalid_raw);
+        state.write().latest = Some(invalid_pv);
+
+        assert_eq!(
+            get_alarm_severity(state.read().latest.as_ref().unwrap()),
+            Some(3),
+            "precondition: INVALID alarm must be recorded"
+        );
+
+        // Simulate reconnect: upstream sends new event with value=2.0, severity=0.
+        let reconnect_value = nt_scalar_value(2.0, 0);
+        let body_reconnect = encode_body(&desc, &reconnect_value, NT_SCALAR_ALL_BITS);
+        apply_monitor_event(&state, &desc, &body_reconnect, ByteOrder::Little);
+
+        assert_eq!(
+            get_alarm_severity(state.read().latest.as_ref().unwrap()),
+            Some(0),
+            "reconnect event must clear INVALID alarm back to NO_ALARM (0)"
+        );
     }
 }

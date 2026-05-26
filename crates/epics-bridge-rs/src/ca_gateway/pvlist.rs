@@ -140,6 +140,67 @@ impl PvList {
         }
     }
 
+    /// Resolve all `DENY FROM <hostname>` entries to IP address strings.
+    ///
+    /// Called **once after parsing** (before the `PvList` is put into
+    /// service). Mirrors C ca-gateway's `aToIPAddr` pass at pvlist load
+    /// time (`gateAs.cc:488–509`):
+    ///
+    /// - Tokens that are already IP-address literals are kept verbatim.
+    /// - Hostnames are resolved via `tokio::net::lookup_host`; a hostname
+    ///   that resolves to multiple addresses expands into one IP entry per
+    ///   address.
+    /// - A hostname that fails to resolve is logged at `WARN` level and
+    ///   **dropped** from the deny list (matches C's fail-open behaviour:
+    ///   `fprintf(stderr, "cannot resolve host name >%s<\n", ...)`).
+    ///
+    /// After this call, every non-empty `from_hosts` vec contains only
+    /// IP-address strings, so [`Self::is_host_denied`] can compare them
+    /// directly against the TCP peer IP that callers pass.
+    pub async fn resolve_hosts(&mut self) {
+        for entry in &mut self.entries {
+            if let PvListEntry::Deny { from_hosts, .. } = entry {
+                if from_hosts.is_empty() {
+                    continue; // global deny — no hosts to resolve
+                }
+                let tokens = std::mem::take(from_hosts);
+                for token in tokens {
+                    // Already an IP literal? Preserve verbatim.
+                    if token.parse::<std::net::IpAddr>().is_ok() {
+                        from_hosts.push(token);
+                        continue;
+                    }
+                    // Hostname — resolve to IP(s). Append `:0` as the
+                    // required port sentinel for lookup_host.
+                    match tokio::net::lookup_host(format!("{token}:0")).await {
+                        Ok(addrs) => {
+                            let mut resolved_any = false;
+                            for sa in addrs {
+                                from_hosts.push(sa.ip().to_string());
+                                resolved_any = true;
+                            }
+                            if !resolved_any {
+                                tracing::warn!(
+                                    hostname = %token,
+                                    "pvlist DENY FROM: hostname resolved to no addresses \
+                                     — entry has no effect (matches C gateAs.cc:504-506)"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                hostname = %token,
+                                error = %e,
+                                "pvlist DENY FROM: cannot resolve hostname \
+                                 — entry has no effect (matches C gateAs.cc:504-506)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether the put from `host` for PV `name` is denied by a host-
     /// targeted DENY rule (`pattern DENY FROM host1 host2 …`).
     ///
@@ -153,12 +214,11 @@ impl PvList {
     ///
     /// This matches C ca-gateway semantics: `DENY FROM host` is a
     /// hard host-blacklist that applies regardless of `EVALUATION
-    /// ORDER`. Comparison is ASCII-case-insensitive (CA hostnames are
-    /// ASCII in practice; punycode is NOT decoded).
-    ///
-    /// IPv6 hosts: callers should pass the bracket-less `to_string()`
-    /// form (`::1`, NOT `[::1]`) so it matches the pvlist syntax. The
-    /// CA TCP handler populates `WriteContext::host` with that form.
+    /// ORDER`. After [`Self::resolve_hosts`] has been called, every
+    /// entry in `from_hosts` is an IP-address string, so comparison
+    /// is exact (case-insensitive for IPv6 hex digits; IPv4 is all
+    /// numeric). Callers must pass the TCP peer IP in bracket-less
+    /// form (`192.0.2.1`, `::1`).
     pub fn is_host_denied(&self, name: &str, host: &str) -> bool {
         for entry in &self.entries {
             if let PvListEntry::Deny {
@@ -397,6 +457,9 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
             if let Some(t) = tokens.next() {
                 if t.eq_ignore_ascii_case("FROM") {
                     for h in tokens {
+                        // Stored as-is here; PvList::resolve_hosts() converts
+                        // hostnames to IP strings at load time (BR-R53 fix),
+                        // mirroring C aToIPAddr (gateAs.cc:488-506).
                         from_hosts.push(h.to_string());
                     }
                 } else {
@@ -726,5 +789,84 @@ mod tests {
         // \0 is the whole match
         let result = expand_template(&pat, "hello", r"prefix_\0_suffix");
         assert_eq!(result, "prefix_hello_suffix");
+    }
+
+    // --- BR-R53: resolve_hosts converts DENY FROM hostnames to IPs ---
+
+    /// An IP literal in DENY FROM is preserved verbatim after resolve_hosts.
+    #[tokio::test]
+    async fn resolve_hosts_ip_literal_unchanged() {
+        let mut list = parse_pvlist(
+            r#"
+            PV.* ALLOW
+            PV.* DENY FROM 192.0.2.1
+            "#,
+        )
+        .unwrap();
+        list.resolve_hosts().await;
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[1] {
+            assert_eq!(from_hosts, &["192.0.2.1"]);
+        } else {
+            panic!("expected Deny");
+        }
+        // Deny fires for the literal IP.
+        assert!(list.is_host_denied("PV:x", "192.0.2.1"));
+        // Other IPs are not denied.
+        assert!(!list.is_host_denied("PV:x", "192.0.2.2"));
+    }
+
+    /// A hostname in DENY FROM is resolved and the resolved IP denies
+    /// the peer. Uses `localhost` which resolves reliably in CI.
+    #[tokio::test]
+    async fn resolve_hosts_hostname_resolves_to_ip() {
+        let mut list = parse_pvlist(
+            r#"
+            PV.* ALLOW
+            PV.* DENY FROM localhost
+            "#,
+        )
+        .unwrap();
+        list.resolve_hosts().await;
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[1] {
+            // After resolution, from_hosts must contain IPs, not "localhost".
+            assert!(
+                !from_hosts.is_empty(),
+                "localhost must resolve to at least one IP"
+            );
+            for h in from_hosts {
+                assert!(
+                    h.parse::<std::net::IpAddr>().is_ok(),
+                    "resolved entry must be an IP string, got {h:?}"
+                );
+            }
+            // The resolved IPs (127.0.0.1 and/or ::1) must deny the peer.
+            let denied = from_hosts.iter().any(|ip| list.is_host_denied("PV:x", ip));
+            assert!(denied, "resolved IP must be denied");
+        } else {
+            panic!("expected Deny");
+        }
+    }
+
+    /// An unresolvable hostname is dropped (fail-open, matching C).
+    #[tokio::test]
+    async fn resolve_hosts_unresolvable_dropped() {
+        let mut list = parse_pvlist(
+            r#"
+            PV.* ALLOW
+            PV.* DENY FROM this.hostname.definitely.does.not.exist.invalid
+            "#,
+        )
+        .unwrap();
+        list.resolve_hosts().await;
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[1] {
+            assert!(
+                from_hosts.is_empty(),
+                "unresolvable hostname must be dropped; got {from_hosts:?}"
+            );
+        } else {
+            panic!("expected Deny");
+        }
+        // With no resolved hosts, no peer is denied by this rule.
+        assert!(!list.is_host_denied("PV:x", "10.0.0.1"));
     }
 }

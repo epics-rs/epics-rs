@@ -38,6 +38,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -45,7 +46,7 @@ use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
 use epics_base_rs::types::EpicsValue;
-use epics_ca_rs::client::{CaChannel, CaClient};
+use epics_ca_rs::client::{CaChannel, CaClient, EventWatcher};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
@@ -72,6 +73,10 @@ struct UpstreamSubscription {
     asg: Option<String>,
     /// Resolved access security level (paired with `asg`).
     asl: i32,
+    /// BR-R51: watcher that keeps `upstream_write` in the access hook
+    /// closure up-to-date. Aborted on drop (when the subscription is
+    /// removed via `unsubscribe`).
+    _access_rights_watcher: EventWatcher,
 }
 
 /// Shared state every upstream subscription's WriteHook needs. Hoisted
@@ -321,6 +326,11 @@ impl UpstreamManager {
         // value either way. The timeout/error is logged at INFO so
         // an operator chasing type-mismatch confusion can correlate
         // a confused downstream introspect with its upstream miss.
+        // BR-R49: channel.get() returns (DbFieldType, EpicsValue)
+        // only — no DBR_CTRL_* metadata (units/precision/limits).
+        // A DBR_CTRL GET + DBE_PROPERTY subscription is needed so
+        // downstream DBR_CTRL_* and DBR_GR_* reads return real
+        // metadata (gatePv.cc:930-934, gatePv.cc:858-862).
         let initial_value = match tokio::time::timeout(Duration::from_millis(500), channel.get())
             .await
         {
@@ -342,6 +352,20 @@ impl UpstreamManager {
             }
         };
 
+        // BR-R51: read initial upstream write-access and create a flag
+        // the access hook AND write-hook closures share. `channel.info()`
+        // reads a cached snapshot — no round-trip — and succeeds here
+        // because `channel.get()` above already waited for connection.
+        // Defaults to true (permissive) on the rare timeout/error path so
+        // we match the C gateway's connect-time behaviour (activate() calls
+        // ca_write_access only after the channel is operational).
+        let upstream_write_init = channel
+            .info()
+            .await
+            .map(|i| i.access_rights.write)
+            .unwrap_or(true);
+        let upstream_write = Arc::new(AtomicBool::new(upstream_write_init));
+
         // Atomically register the shadow PV WITH its WriteHook
         // attached. `add_pv_with_hook` constructs the PV with the
         // hook installed before inserting into `simple_pvs`, so a
@@ -361,7 +385,12 @@ impl UpstreamManager {
         // `.pvlist` ASG/ASL, so the CA server gates downstream reads
         // through `can_read` instead of granting every shadow PV a
         // permissive read.
-        let access_hook = build_access_hook(asg.clone(), asl, self.write_env.access.clone());
+        let access_hook = build_access_hook(
+            asg.clone(),
+            asl,
+            self.write_env.access.clone(),
+            upstream_write.clone(),
+        );
         // If a prior subscribe attempt left a stale shadow entry (it
         // would have been cleaned up by the failure path, but a hot
         // restart or a crashed task could orphan it), drop it before
@@ -394,6 +423,16 @@ impl UpstreamManager {
                 return Err(BridgeError::PutRejected(format!("subscribe failed: {e}")));
             }
         };
+
+        // BR-R51: keep upstream_write up-to-date when the IOC's write-
+        // access changes (e.g. ASG protection lockout). The C gateway's
+        // accessCB (gatePv.cc:1851-1852) calls setWriteAccess + postAccessRights;
+        // runtime re-notification to connected downstream clients requires a
+        // CaServer::notify_access_change() API (deferred cross-crate).
+        let access_rights_watcher = channel.on_access_rights_change({
+            let flag = upstream_write.clone();
+            move |rights| flag.store(rights.write, Ordering::Relaxed)
+        });
 
         // Spawn forwarding task — does NOT borrow the channel, so the
         // direct put()/get() path can use the same channel without
@@ -458,23 +497,25 @@ impl UpstreamManager {
                         beacon_anomaly_for_task.request();
                     }
 
-                    // Push to shadow PvDatabase to fan out to downstream clients
+                    // Push upstream snapshot (value + alarm + timestamp) to
+                    // shadow PvDatabase so downstream monitors see the real
+                    // upstream alarm state and IOC timestamp.
                     let post_result = db_clone
-                        .put_pv_and_post(&name, snapshot.value.clone())
+                        .put_pv_and_post_snapshot(&name, snapshot.clone())
                         .await;
                     // B5 RATE_STATS: count the monitor post fanned
                     // out downstream (C++ gateServer::postEventCount).
                     // Count only on a SUCCESSFUL fan-out so
                     // `postEventCount` stays consistent with
                     // `clientEventCount`, which counts successes — a
-                    // failed `put_pv_and_post` (e.g. shadow PV missing)
-                    // forwarded nothing downstream.
+                    // failed post (e.g. shadow PV missing) forwarded
+                    // nothing downstream.
                     match post_result {
                         Ok(()) => stats_for_task.record_post_event(),
                         Err(e) => tracing::debug!(
                             pv = %name,
                             error = %e,
-                            "ca-gateway-rs: shadow put_pv_and_post failed; \
+                            "ca-gateway-rs: shadow put_pv_and_post_snapshot failed; \
                              postEventCount not incremented"
                         ),
                     }
@@ -495,11 +536,17 @@ impl UpstreamManager {
                 if let Some(entry_arc) = cache_clone.read().await.get(&name) {
                     entry_arc.write().await.set_state(PvState::Disconnect);
                 }
-                // 3 = AlarmSeverity::Invalid; status 0 = LINK alarm
-                // (downstream client cannot tell why upstream is gone,
-                // only that it is — INVALID severity is the closest
-                // EPICS alarm to "channel disconnected").
-                let _ = db_clone.post_alarm(&name, 3, 0).await;
+                // 3 = INVALID severity. BR-R47: LINK_ALARM (14) is the
+                // correct EPICS status for a link-disconnect alarm;
+                // upstream disconnect is visible to downstream monitors
+                // both via severity and via the correct status code.
+                let _ = db_clone
+                    .post_alarm(
+                        &name,
+                        3,
+                        epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                    )
+                    .await;
 
                 // Try to re-subscribe with exponential backoff. The
                 // CaChannel itself drives reconnect under the hood;
@@ -554,6 +601,7 @@ impl UpstreamManager {
                 task,
                 asg,
                 asl,
+                _access_rights_watcher: access_rights_watcher,
             },
         );
         Ok(())
@@ -678,20 +726,27 @@ impl UpstreamManager {
 /// (no identity) is reported write-denied whenever rules are loaded, so
 /// the access-rights report matches what the write hook will actually
 /// enforce.
+///
+/// BR-R51: `upstream_write` mirrors the upstream IOC's `ca_write_access(chID)`,
+/// set at connect time and kept live by `on_access_rights_change`. The write
+/// decision is now `local_acf_write && upstream_write`, matching C
+/// `gateVcChan::writeAccess` (gateVc.cc:341): `asclient->writeAccess() && vc->writeAccess()`.
 fn build_access_hook(
     asg: Option<String>,
     asl: i32,
     access: Arc<ArcSwap<AccessConfig>>,
+    upstream_write: Arc<AtomicBool>,
 ) -> epics_base_rs::server::pv::AccessHook {
     Arc::new(move |user: &str, host: &str| {
         let cfg = access.load();
         let asg_ref = asg.as_deref().unwrap_or("DEFAULT");
         let read = cfg.can_read(asg_ref, asl, user, host);
-        let write = if user.is_empty() && cfg.has_rules() {
+        let local_write = if user.is_empty() && cfg.has_rules() {
             false
         } else {
             cfg.can_write(asg_ref, asl, user, host)
         };
+        let write = local_write && upstream_write.load(Ordering::Relaxed);
         epics_base_rs::server::pv::AccessDecision { read, write }
     })
 }
@@ -995,7 +1050,8 @@ ASG(DEFAULT) {
         let access = Arc::new(ArcSwap::from_pointee(
             AccessConfig::from_string(acf).expect("ACF parses"),
         ));
-        let hook = build_access_hook(Some("DEFAULT".to_string()), 0, access);
+        let upstream_write = Arc::new(AtomicBool::new(true));
+        let hook = build_access_hook(Some("DEFAULT".to_string()), 0, access, upstream_write);
 
         // Privileged user: read granted, write denied (no WRITE rule).
         let alice = hook("alice", "host1");
@@ -1021,9 +1077,33 @@ ASG(DEFAULT) {
     #[test]
     fn br_fr1_access_hook_allow_all_grants_both() {
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
-        let hook = build_access_hook(None, 0, access);
+        let upstream_write = Arc::new(AtomicBool::new(true));
+        let hook = build_access_hook(None, 0, access, upstream_write);
         let d = hook("anyone", "anywhere");
         assert!(d.read && d.write, "allow-all must grant read and write");
+    }
+
+    /// BR-R51: when upstream write-access is denied (e.g. upstream IOC
+    /// ACF), the access hook must report write=false regardless of local
+    /// ACF — mirrors C gateVcChan::writeAccess (gateVc.cc:341):
+    /// asclient->writeAccess() && vc->writeAccess().
+    #[test]
+    fn br_r51_upstream_write_denied_overrides_local_acf_allow() {
+        let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
+        let upstream_write = Arc::new(AtomicBool::new(false));
+        let hook = build_access_hook(None, 0, access, upstream_write.clone());
+
+        let d = hook("alice", "host1");
+        assert!(d.read, "read must still be granted by allow-all");
+        assert!(
+            !d.write,
+            "upstream write-denied must override local allow-all"
+        );
+
+        // Restoring upstream write-access restores write permission.
+        upstream_write.store(true, Ordering::Relaxed);
+        let d2 = hook("alice", "host1");
+        assert!(d2.write, "write must be granted once upstream restores it");
     }
 
     /// BRIDGE-FR-2: when a downstream client searches for a `.pvlist`

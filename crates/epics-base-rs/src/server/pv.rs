@@ -328,6 +328,19 @@ impl ProcessVariable {
         self.notify_subscribers(new_value).await;
     }
 
+    /// Set value from a full snapshot (value + alarm + timestamp) and notify
+    /// all subscribers. Used by the CA gateway forwarding task to propagate
+    /// the upstream alarm status/severity and IOC timestamp to downstream
+    /// monitors. Mirrors `gateVcData::setEventData` + `vcPostEvent` in the
+    /// C ca-gateway: the incoming `dbr_time_xxx` GDD carries all three fields.
+    pub async fn set_snapshot(&self, snapshot: Snapshot) {
+        {
+            let mut val = self.value.write().await;
+            *val = snapshot.value.clone();
+        }
+        self.notify_subscribers_from_snapshot(snapshot).await;
+    }
+
     /// Push a fresh monitor event holding the current value but with
     /// the supplied alarm severity/status. Used by the PVA / CA
     /// gateway adapter to surface upstream-disconnect to downstream
@@ -420,6 +433,43 @@ impl ProcessVariable {
                 // `pop_coalesced` after the next normal recv). The single
                 // coalesce-overflow owner counts a value that the
                 // consumer never observed as a dropped monitor event.
+                sub.coalesce_overflow(event);
+            }
+        }
+    }
+
+    /// Notify all subscribers using a pre-built Snapshot (value + alarm +
+    /// timestamp). Used by `set_snapshot` to propagate the upstream alarm
+    /// and IOC timestamp without synthesising a new zero-alarm local-time
+    /// snapshot.
+    async fn notify_subscribers_from_snapshot(&self, snapshot: Snapshot) {
+        use crate::server::database::filters::FilteredMonitorEvent;
+        use crate::server::recgbl::EventMask;
+        let mut subs = self.subscribers.lock().await;
+        subs.retain(|sub| !sub.tx.is_closed());
+        // BR-R52: C gateway fires postEvent(VALUE|ALARM|LOG) for every
+        // upstream event (gateVc.cc:374-376); widen to match so DBE_LOG
+        // archivers and DBE_ALARM-only monitors receive gateway snapshot posts.
+        let post = EventMask::VALUE | EventMask::LOG | EventMask::ALARM;
+        for sub in subs.iter() {
+            if !sub.accepts(post) {
+                continue;
+            }
+            let event = MonitorEvent {
+                snapshot: snapshot.clone(),
+                origin: 0,
+            };
+            let filtered = if sub.filters.is_empty() {
+                Some(event)
+            } else {
+                sub.filters
+                    .apply(FilteredMonitorEvent::new(event, post))
+                    .map(|fe| fe.event)
+            };
+            let Some(event) = filtered else {
+                continue;
+            };
+            if sub.tx.try_send(event.clone()).is_err() {
                 sub.coalesce_overflow(event);
             }
         }
@@ -533,6 +583,7 @@ mod mask_gate_tests {
 
     // CA DBE_* monitor mask bits (db_access.h).
     const DBE_VALUE: u16 = 1;
+    const DBE_LOG: u16 = 2;
     const DBE_ALARM: u16 = 4;
 
     fn pv() -> ProcessVariable {
@@ -578,6 +629,62 @@ mod mask_gate_tests {
         assert!(
             rx.try_recv().is_ok(),
             "DBE_VALUE subscriber must receive a value post"
+        );
+    }
+
+    // --- BR-R52 regression: set_snapshot must reach DBE_LOG and DBE_ALARM-only subs ---
+
+    fn snapshot() -> Snapshot {
+        Snapshot::new(
+            EpicsValue::Double(2.0),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    /// BR-R52: a DBE_LOG (archiver) subscriber must receive a set_snapshot post.
+    #[tokio::test]
+    async fn log_subscriber_receives_snapshot_post() {
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_LOG)
+            .await
+            .expect("subscriber added");
+        pv.set_snapshot(snapshot()).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "DBE_LOG subscriber must receive a set_snapshot post"
+        );
+    }
+
+    /// BR-R52: a DBE_ALARM-only subscriber must receive a set_snapshot post.
+    #[tokio::test]
+    async fn alarm_only_subscriber_receives_snapshot_post() {
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_ALARM)
+            .await
+            .expect("subscriber added");
+        pv.set_snapshot(snapshot()).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "DBE_ALARM-only subscriber must receive a set_snapshot post"
+        );
+    }
+
+    /// BR-R52: a DBE_VALUE subscriber must still receive a set_snapshot post.
+    #[tokio::test]
+    async fn value_subscriber_receives_snapshot_post() {
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
+            .await
+            .expect("subscriber added");
+        pv.set_snapshot(snapshot()).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "DBE_VALUE subscriber must receive a set_snapshot post"
         );
     }
 

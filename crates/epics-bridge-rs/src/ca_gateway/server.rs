@@ -194,9 +194,13 @@ impl GatewayServer {
     pub async fn build(config: GatewayConfig) -> BridgeResult<Self> {
         // Load .pvlist
         let pvlist = if let Some(path) = &config.pvlist_path {
-            super::pvlist::parse_pvlist_file(path)?
+            let mut p = super::pvlist::parse_pvlist_file(path)?;
+            p.resolve_hosts().await;
+            p
         } else if let Some(content) = &config.pvlist_content {
-            super::pvlist::parse_pvlist(content)?
+            let mut p = super::pvlist::parse_pvlist(content)?;
+            p.resolve_hosts().await;
+            p
         } else {
             // Empty pvlist allows nothing
             PvList::new()

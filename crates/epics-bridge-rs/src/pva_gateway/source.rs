@@ -705,7 +705,22 @@ impl GatewayChannelSource {
                 return None;
             }
         };
+        // BR-R48: subscribe before snapshot to avoid losing events in the
+        // gap, but the same gap can deliver event E to both the broadcast
+        // receiver (created here) and snapshot_raw() (read below).
+        // Dedup the first broadcast event by Bytes ptr when it matches.
         let mut bcast = entry.subscribe_raw();
+        // BR-R46: deliver cached initial snapshot to new raw subscriber.
+        // pva2pva moncache.cpp:285-311 delivers `lastelem` on start();
+        // the typed path (subscribe_inner) does the same via snapshot().
+        let initial_raw = entry.snapshot_raw();
+        // BR-R48: capture the Bytes pointer of the initial snapshot so the
+        // broadcast loop can skip the duplicate if the same event landed in
+        // both the snapshot cache and the broadcast queue (the race window
+        // between subscribe_raw() and snapshot_raw() above).
+        // bytes::Bytes::clone() is a refcount clone; same allocation ⟹ same
+        // as_ptr(). Take the Option once so only a single event is skipped.
+        let dedup_body: Option<bytes::Bytes> = initial_raw.as_ref().map(|e| e.body.clone());
         let (mpsc_tx, mpsc_rx) =
             mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
@@ -717,9 +732,25 @@ impl GatewayChannelSource {
                 }
             }
             let _guard = CounterGuard(counter);
+            if let Some(init) = initial_raw {
+                let out = epics_pva_rs::server_native::RawMonitorEvent {
+                    body_bytes: init.body,
+                    byte_order: init.byte_order,
+                    type_changed: false,
+                };
+                if mpsc_tx.send(out).await.is_err() {
+                    return;
+                }
+            }
+            let mut dedup = dedup_body;
             loop {
                 match bcast.recv().await {
                     Ok(ev) => {
+                        if let Some(d) = dedup.take() {
+                            if ev.body.as_ptr() == d.as_ptr() {
+                                continue;
+                            }
+                        }
                         let type_changed = ev.type_changed;
                         let out = epics_pva_rs::server_native::RawMonitorEvent {
                             body_bytes: ev.body,

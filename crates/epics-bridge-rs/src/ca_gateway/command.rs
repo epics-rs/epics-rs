@@ -145,7 +145,8 @@ impl CommandHandler {
                     Some(p) => p,
                     None => return Ok("No pvlist path configured\n".to_string()),
                 };
-                let new = parse_pvlist_file(path)?;
+                let mut new = parse_pvlist_file(path)?;
+                new.resolve_hosts().await;
                 let count = new.entries.len();
                 let new_arc = Arc::new(new);
                 self.pvlist.store(new_arc.clone());

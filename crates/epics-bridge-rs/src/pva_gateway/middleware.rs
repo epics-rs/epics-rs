@@ -349,14 +349,53 @@ fn compile_anchored(pattern: &str) -> Result<regex::Regex, regex::Error> {
         .build()
 }
 
+/// Match `name` against a glob `pattern` where each `*` matches any
+/// (possibly empty) run of characters and every other character is a
+/// literal. Supports leading, trailing, interior, and multiple `*`
+/// (e.g. `MOTOR:*:JOG`, `A*B*C`), matching ca-gateway's regex-backed
+/// pvlist semantics for `*` (`gateAs.cc` compiles each pvlist pattern
+/// to an anchored regex). Only `*` is special — for full regular
+/// expressions use the `allow_regex` / `deny_regex` lists.
 fn matches_pattern(pattern: &str, name: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return name.starts_with(prefix);
+    // No wildcard → exact match.
+    if !pattern.contains('*') {
+        return name == pattern;
     }
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        return name.ends_with(suffix);
+
+    // Split on `*`; N stars yield N+1 literal segments. An empty
+    // segment comes from a leading/trailing/consecutive `*` and imposes
+    // no constraint. Non-empty segments must appear in order; a
+    // non-empty first segment is anchored to the start, a non-empty
+    // last segment to the end.
+    let segments: Vec<&str> = pattern.split('*').collect();
+    let last = segments.len() - 1;
+    let mut pos = 0; // byte offset into `name` already consumed
+
+    for (i, seg) in segments.iter().enumerate() {
+        if seg.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // Leading literal (pattern does not start with `*`).
+            if !name.starts_with(seg) {
+                return false;
+            }
+            pos = seg.len();
+        } else if i == last {
+            // Trailing literal (pattern does not end with `*`): pin to
+            // the end, ensuring it does not overlap the consumed prefix.
+            if name.len() < pos + seg.len() || !name[pos..].ends_with(seg) {
+                return false;
+            }
+        } else {
+            // Interior literal: must occur at or after `pos`.
+            match name[pos..].find(seg) {
+                Some(off) => pos += off + seg.len(),
+                None => return false,
+            }
+        }
     }
-    name == pattern
+    true
 }
 
 pub struct AclLayer {
@@ -1260,6 +1299,45 @@ mod tests {
         assert!(matches_pattern("EXACT", "EXACT"));
         assert!(!matches_pattern("EXACT", "EXACT2"));
         assert!(!matches_pattern("MOTOR:*", "OTHER:VAL"));
+    }
+
+    #[test]
+    fn pattern_matching_interior_wildcard() {
+        // A9-10: an interior `*` must behave as a wildcard, not a
+        // literal. Previously `MOTOR:*:JOG` matched only the literal
+        // string `MOTOR:*:JOG`.
+        assert!(matches_pattern("MOTOR:*:JOG", "MOTOR:X:JOG"));
+        assert!(matches_pattern("MOTOR:*:JOG", "MOTOR:AXIS1:JOG"));
+        // `*` matches the empty run too.
+        assert!(matches_pattern("MOTOR:*:JOG", "MOTOR::JOG"));
+        // Trailing literal must still be present and pinned to the end.
+        assert!(!matches_pattern("MOTOR:*:JOG", "MOTOR:X:VAL"));
+        assert!(!matches_pattern("MOTOR:*:JOG", "MOTOR:X:JOGGER"));
+        // The leading literal stays anchored to the start.
+        assert!(!matches_pattern("MOTOR:*:JOG", "PUMP:X:JOG"));
+        // Multiple `*`.
+        assert!(matches_pattern("A*B*C", "AxxByyC"));
+        assert!(matches_pattern("A*B*C", "ABC"));
+        assert!(!matches_pattern("A*B*C", "AxxByy"));
+        // The literal `*`-as-text meaning is gone: a pattern with `*`
+        // no longer matches a name that literally contains `*` unless
+        // the glob does.
+        assert!(!matches_pattern("MOTOR:*:JOG", "MOTOR:*:JOGX"));
+    }
+
+    /// A9-10: an interior-wildcard glob now works directly in the
+    /// allow/deny lists, without needing the `deny_regex` workaround.
+    #[test]
+    fn acl_interior_glob_in_allow_and_deny() {
+        let cfg = AclConfig {
+            allow_only: vec!["MOTOR:*".into()],
+            deny: vec!["MOTOR:*:JOG".into()],
+            ..Default::default()
+        };
+        assert!(cfg.allowed("MOTOR:X:VAL"));
+        // Interior-glob deny now actually fires (was a literal before).
+        assert!(!cfg.allowed("MOTOR:X:JOG"));
+        assert!(!cfg.allowed("MOTOR:AXIS1:JOG"));
     }
 
     #[test]

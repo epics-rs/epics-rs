@@ -461,6 +461,24 @@ impl UpstreamEntry {
         self.tx.receiver_count() + self.tx_raw.receiver_count()
     }
 
+    /// Single keep-predicate for both eviction paths: an entry is retained
+    /// when it still holds its one-tick `drop_poke` grace (freshly spawned /
+    /// recently looked up) or has at least one live downstream subscriber.
+    /// Mirrors pva2pva `cacheClean::expire` (`!dropPoke &&
+    /// interested.empty()` → evict; `chancache.cpp:121`).
+    ///
+    /// Pure read — it does NOT consume the grace; only `cleanup_tick` resets
+    /// `drop_poke`. The cache-full emergency sweep in [`Self::lookup`] used
+    /// `Arc::strong_count > 1`, but a live subscriber holds only a
+    /// `broadcast::Receiver`, never an `Arc<UpstreamEntry>`, so a
+    /// subscribed-but-not-mid-lookup entry had `strong_count == 1` and was
+    /// wrongly swept — silently killing the shared upstream monitor for
+    /// every downstream subscriber. Routing both paths through this
+    /// predicate makes that divergence unrepresentable.
+    fn is_retained(&self) -> bool {
+        *self.drop_poke.lock() || self.subscriber_count() > 0
+    }
+
     fn poke(&self) {
         *self.drop_poke.lock() = true;
     }
@@ -669,13 +687,16 @@ impl ChannelCache {
                 (existing.clone(), false)
             } else {
                 if map.len() >= self.max_entries {
-                    // PG-G11 spurious-reject mitigation: pre-sweep
-                    // entries pinned only by the cache itself
-                    // (strong_count==1 means no other Arc holders —
-                    // no live UpstreamEntry references via subscribe,
-                    // no in-flight CleanupGuard. These are just
-                    // waiting for the next cleanup tick to evict.)
-                    map.retain(|_, e| Arc::strong_count(e) > 1);
+                    // PG-G11 spurious-reject mitigation: pre-sweep the
+                    // entries the periodic `cleanup_tick` would also evict —
+                    // no remaining `drop_poke` grace AND no live downstream
+                    // subscriber. Shares the `is_retained` keep-predicate
+                    // with `cleanup_tick`. (The old `Arc::strong_count > 1`
+                    // test missed subscribers — they hold a
+                    // `broadcast::Receiver`, not an `Arc<UpstreamEntry>` — so
+                    // it swept live entries and killed their upstream
+                    // monitor. The sweep does not consume the poke grace.)
+                    map.retain(|_, e| e.is_retained());
                 }
                 if map.len() >= self.max_entries {
                     tracing::warn!(
@@ -1035,14 +1056,17 @@ impl ChannelCache {
     async fn cleanup_tick(&self) {
         let mut map = self.entries.lock().await;
         map.retain(|_, entry| {
-            let mut poke = entry.drop_poke.lock();
-            if *poke {
-                *poke = false;
-                return true; // recently used — keep
+            // Same keep-predicate as the cache-full emergency sweep.
+            let retained = entry.is_retained();
+            if retained {
+                // Consume one tick of `drop_poke` grace (pva2pva resets
+                // `dropPoke` on keep, `chancache.cpp:126`), so a
+                // poked-but-idle entry is evicted on the next tick once it
+                // has no subscribers. Harmless on a subscriber-retained
+                // entry whose poke may already be false.
+                *entry.drop_poke.lock() = false;
             }
-            // Idle for one full tick. Drop unless someone is still
-            // listening to the broadcast channel.
-            entry.subscriber_count() > 0
+            retained
         });
     }
 
@@ -1565,6 +1589,57 @@ mod tests {
         let _r2 = entry.subscribe();
         assert_eq!(entry.subscriber_count(), 2);
         assert!(*entry.drop_poke.lock(), "subscribe must poke");
+    }
+
+    /// A9-1: both eviction paths share `is_retained`. Boundaries — idle &
+    /// unsubscribed → evictable; poked → kept (one-tick grace); subscribed
+    /// → kept even when `drop_poke == false` and `Arc::strong_count == 1`
+    /// (a subscriber holds only a `broadcast::Receiver`). The old
+    /// `strong_count > 1` sweep failed the last case and killed live
+    /// upstream monitors.
+    #[tokio::test]
+    async fn is_retained_keeps_subscribers_and_poked_evicts_idle() {
+        fn make(drop_poke: bool) -> UpstreamEntry {
+            let (tx, rx0) = broadcast::channel::<PvField>(4);
+            drop(rx0);
+            let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
+            drop(rx0_raw);
+            let task = tokio::spawn(std::future::pending::<()>());
+            UpstreamEntry {
+                pv_name: "X".into(),
+                state: Arc::new(RwLock::new(EntryState::default())),
+                tx,
+                tx_raw,
+                latest_raw: Arc::new(RwLock::new(None)),
+                first_event: Arc::new(Notify::new()),
+                _monitor_task: AbortOnDrop(task.abort_handle()),
+                drop_poke: parking_lot::Mutex::new(drop_poke),
+                pause: PauseControl::new(),
+            }
+        }
+
+        // Idle: no subscriber, no poke grace → evictable.
+        let idle = make(false);
+        assert!(
+            !idle.is_retained(),
+            "idle unsubscribed entry must be evictable"
+        );
+
+        // Poked but no subscriber → kept for one tick.
+        let poked = make(true);
+        assert!(poked.is_retained(), "poked entry keeps its grace");
+
+        // Subscribed via broadcast Receiver, poke cleared to isolate: the
+        // entry has strong_count == 1 (only the test holds the Arc-free
+        // value) yet must be retained because a downstream is listening.
+        let subbed = make(false);
+        let _rx = subbed.subscribe(); // subscribe() also pokes…
+        *subbed.drop_poke.lock() = false; // …clear it to prove subscriber-only retention.
+        assert_eq!(subbed.subscriber_count(), 1);
+        assert!(
+            subbed.is_retained(),
+            "subscribed entry must survive the cache-full sweep"
+        );
     }
 
     /// BR-R57: `build_invalid_alarm_event` must return `None` when no prior

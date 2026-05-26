@@ -319,6 +319,35 @@ impl UpstreamManager {
         // exactly once when the subscription is dropped.
         let channel = Arc::new(self.client.create_channel(upstream_name));
 
+        // BR-R64: only register a shadow PV once the upstream channel
+        // actually connects. Without this gate the get() below times out,
+        // falls back to Double(0.0), and we register a placeholder the
+        // search resolver then advertises as existing — black-holing a
+        // name that matches the pvlist pattern but is absent upstream.
+        // C ca-gateway answers does-not-exist for an unconnected PV
+        // (gatePvData::death → pverDoesNotExistHere, gatePv.cc:622) and
+        // exists-here only after connect (life → pverExistsHere,
+        // gatePv.cc:518). The connect budget matches the cache reaper's
+        // CacheTimeouts::connect_timeout (cache.rs:181).
+        const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+        if let Err(e) = channel.wait_connected(UPSTREAM_CONNECT_TIMEOUT).await {
+            // Drop the Connecting cache entry created above; no shadow PV
+            // is registered, so the resolver answers does-not-exist. The
+            // dedup PendingGuard notifies waiters, who then see no live
+            // subscription and propagate the same miss.
+            self.cache.write().await.remove(served_name);
+            tracing::info!(
+                pv = upstream_name,
+                served = served_name,
+                error = %e,
+                "ca-gateway-rs: upstream did not connect within connect_timeout; \
+                 treating search as a miss (BR-R64)"
+            );
+            return Err(BridgeError::PutRejected(format!(
+                "upstream PV did not connect: {upstream_name}"
+            )));
+        }
+
         // DBR negotiation: best-effort initial GET so the shadow
         // PV's first registered type matches upstream's native type.
         // Falls back to a Double placeholder if the get fails or
@@ -952,6 +981,8 @@ fn format_value_for_audit(v: &EpicsValue, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_ca_rs::server::CaServer;
+    use serial_test::serial;
 
     fn dummy_env() -> WriteHookEnv {
         WriteHookEnv {
@@ -962,6 +993,52 @@ mod tests {
             stats: Arc::new(Stats::new("gw:".into())),
             beacon_anomaly: Arc::new(crate::ca_gateway::beacon::BeaconAnomaly::new()),
         }
+    }
+
+    /// Reserve a free TCP port by binding ephemeral then dropping.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("reserve free CA port")
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Point the ambient `EPICS_CA_*` env at `127.0.0.1:port` so the
+    /// `UpstreamManager`'s internal env-driven `CaClient::new()` connects
+    /// to the test server. Callers must be `#[serial(epics_env)]`.
+    fn pin_env(port: u16) {
+        // SAFETY: env-touching tests are serialized via
+        // `#[serial(epics_env)]`; no other thread reads/writes these
+        // vars concurrently.
+        unsafe {
+            std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
+            std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_CA_SERVER_PORT", port.to_string());
+        }
+    }
+
+    /// Build an `UpstreamManager` whose internal `CaClient::new()` reads
+    /// the ambient `EPICS_CA_*` env — call [`pin_env`] first so the client
+    /// is pinned to the test server.
+    async fn pinned_manager(db: Arc<PvDatabase>) -> UpstreamManager {
+        let env = dummy_env();
+        UpstreamManager::new(UpstreamManagerConfig {
+            cache: Arc::new(RwLock::new(PvCache::new())),
+            shadow_db: db,
+            access: env.access.clone(),
+            pvlist: env.pvlist.clone(),
+            putlog: None,
+            stats: env.stats.clone(),
+            read_only: false,
+            beacon_anomaly: env.beacon_anomaly.clone(),
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls: None,
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls_server_name: None,
+        })
+        .await
+        .expect("manager builds")
     }
 
     #[tokio::test]
@@ -1112,38 +1189,33 @@ ASG(DEFAULT) {
     /// the upstream subscription targets the *real* PV. Pre-fix the shadow
     /// PV was keyed by the real name, so an alias lookup missed.
     ///
-    /// No live upstream is needed: the DBR-negotiation `get()` times out
-    /// to a `Double(0.0)` placeholder and `subscribe()` only allocates a
-    /// subid against the coordinator, so `ensure_subscribed` completes and
-    /// the registration keys are observable.
-    #[tokio::test]
+    /// BR-R64 now gates registration on a live upstream connection, so this
+    /// test hosts a real `CaServer` serving the *real* name; the served
+    /// (alias) name is what the shadow PV must be keyed by.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
     async fn br_fr2_alias_registers_shadow_pv_under_served_name() {
-        let cache = Arc::new(RwLock::new(PvCache::new()));
-        let db = Arc::new(PvDatabase::new());
-        let env = dummy_env();
-        let mgr = UpstreamManager::new(UpstreamManagerConfig {
-            cache,
-            shadow_db: db.clone(),
-            access: env.access.clone(),
-            pvlist: env.pvlist.clone(),
-            putlog: None,
-            stats: env.stats.clone(),
-            read_only: false,
-            beacon_anomaly: env.beacon_anomaly.clone(),
-            #[cfg(feature = "ca-gateway-tls")]
-            upstream_tls: None,
-            #[cfg(feature = "ca-gateway-tls")]
-            upstream_tls_server_name: None,
-        })
-        .await
-        .expect("manager builds");
-
-        // Search name (served) differs from the resolved real PV.
+        // Served (alias) name differs from the resolved real PV.
         let served = "Beam:current";
-        let real = "SR:DCCT:current.VAL";
+        let real = "SR:DCCT:current";
+
+        let port = free_port();
+        let server = CaServer::builder()
+            .port(port)
+            .pv(real, EpicsValue::Double(1.0))
+            .build()
+            .await
+            .expect("CA server");
+        let _server = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let mgr = pinned_manager(db.clone()).await;
+
         mgr.ensure_subscribed(served, real, None, 0)
             .await
-            .expect("ensure_subscribed completes against a dead upstream");
+            .expect("ensure_subscribed connects to the hosted upstream");
 
         // The downstream-facing entry is keyed by the alias the client
         // searched for — this is the FR-2 fix.
@@ -1173,35 +1245,68 @@ ASG(DEFAULT) {
     /// BRIDGE-FR-2: a plain (non-alias) ALLOW match passes served == real,
     /// so the shadow PV is keyed by the same name — the pre-FR-2 behavior
     /// for non-alias names is preserved exactly.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
     async fn br_fr2_non_alias_keys_shadow_pv_by_same_name() {
-        let cache = Arc::new(RwLock::new(PvCache::new()));
-        let db = Arc::new(PvDatabase::new());
-        let env = dummy_env();
-        let mgr = UpstreamManager::new(UpstreamManagerConfig {
-            cache,
-            shadow_db: db.clone(),
-            access: env.access.clone(),
-            pvlist: env.pvlist.clone(),
-            putlog: None,
-            stats: env.stats.clone(),
-            read_only: false,
-            beacon_anomaly: env.beacon_anomaly.clone(),
-            #[cfg(feature = "ca-gateway-tls")]
-            upstream_tls: None,
-            #[cfg(feature = "ca-gateway-tls")]
-            upstream_tls_server_name: None,
-        })
-        .await
-        .expect("manager builds");
+        let name = "Plain:pv";
 
-        let name = "Plain:pv.VAL";
+        let port = free_port();
+        let server = CaServer::builder()
+            .port(port)
+            .pv(name, EpicsValue::Double(2.0))
+            .build()
+            .await
+            .expect("CA server");
+        let _server = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let mgr = pinned_manager(db.clone()).await;
+
         mgr.ensure_subscribed(name, name, None, 0)
             .await
-            .expect("ensure_subscribed completes");
+            .expect("ensure_subscribed connects to the hosted upstream");
 
         assert!(db.find_pv(name).await.is_some(), "served == real registers");
         assert!(mgr.is_subscribed(name), "subscription tracked under name");
+
+        mgr.shutdown().await;
+    }
+
+    /// BR-R64: when the upstream never connects, `ensure_subscribed` must
+    /// treat the search as a miss — return `Err`, register no shadow PV,
+    /// and track no subscription — so the gateway answers does-not-exist
+    /// instead of black-holing a name that merely matches a `.pvlist`
+    /// pattern. Mirrors C ca-gateway `gatePvData::death →
+    /// pverDoesNotExistHere` (gatePv.cc:622): exists-here is reported only
+    /// after the upstream connects, not on a bare pattern match.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn br_r64_dead_upstream_not_registered() {
+        // A free port with NO server bound: the upstream search never
+        // resolves and the connect budget (UPSTREAM_CONNECT_TIMEOUT)
+        // expires.
+        let port = free_port();
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let mgr = pinned_manager(db.clone()).await;
+
+        let name = "Ghost:pv";
+        let result = mgr.ensure_subscribed(name, name, None, 0).await;
+
+        assert!(
+            result.is_err(),
+            "ensure_subscribed must fail when the upstream never connects"
+        );
+        assert!(
+            db.find_pv(name).await.is_none(),
+            "no shadow PV may be registered for a never-connected upstream"
+        );
+        assert!(
+            !mgr.is_subscribed(name),
+            "no subscription may be tracked for a never-connected upstream"
+        );
 
         mgr.shutdown().await;
     }

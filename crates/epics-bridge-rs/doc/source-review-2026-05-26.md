@@ -341,7 +341,73 @@ Fix direction (cross-crate, deferred to main worker):
 
 The raw forwarding path ships opaque pre-encoded body bytes, so signaling overrun requires the monitor encoder. Plumb a per-subscription "overrun pending" flag from the gateway forwarder (set on `Lagged`) through to the `epics-pva-rs` server monitor encoder (`build_monitor_payload`), which currently hardcodes `let overrun = BitSet::new()`, so it sets the overrun bitset (at minimum the root/changed bits) on the next emitted monitor frame. Until then the gateway silently coalesces under its own backpressure.
 
+### BR-R62 — QSRV `alarm_t` emits the raw EPICS condition code in `alarm.status` and the wrong `alarm.message`
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/qsrv/pvif.rs:554` (`build_alarm`) and `crates/epics-bridge-rs/src/qsrv/pvif.rs:582` (`build_alarm_overlay`) write `snapshot.alarm.status as i32` straight into the PVA `alarm.status` field. `snapshot.alarm.status` is the raw `epicsAlarmCondition` (0–21; `crates/epics-base-rs/src/server/recgbl.rs:9-30` mirrors `libcom/src/misc/alarm.h`, e.g. `LINK_ALARM = 14`, `UDF_ALARM = 17`). `crates/epics-bridge-rs/src/qsrv/group.rs:1941` (`build_alarm_from_snapshot`) does the same.
+- `alarm.message` is also wrong: `pvif.rs:558` and `pvif.rs:586` set it to `alarm_severity_string(severity)` (`pvif.rs:870` — "NO_ALARM"/"MINOR"/"MAJOR"/"INVALID"), and `group.rs:1945` sets it to `String::new()` (always empty).
+- `epics-modules/pvxs/ioc/iocsource.cpp:187-227` maps `meta.status` (the `epicsAlarmCondition`) to the PVA **status class** before storing: `NO_ALARM→0` (NONE); `READ/WRITE/HIHI/HIGH/LOLO/LOW/STATE/COS/HW_LIMIT→1` (DEVICE); `COMM/TIMEOUT/UDF→2` (DRIVER); `CALC/SCAN/LINK/SOFT/BAD_SUB→3` (RECORD); `DISABLE/SIMM/READ_ACCESS/WRITE_ACCESS→4` (DB); `default→6` (UNDEFINED). It then `node["alarm.status"] = status` (the class) and `node["alarm.severity"] = meta.severity` (raw severity, unchanged).
+- `epics-modules/pvxs/ioc/iocsource.cpp:225-236` sets `alarm.message`: `stsmsg = epicsAlarmConditionStrings[meta.status]` then `node["alarm.message"] = meta.status && stsmsg ? stsmsg : ""` — the alarm **condition string** (`epics-base modules/libcom/src/misc/alarmString.c:27-50`: index 0–21 = `NO_ALARM, READ, WRITE, HIHI, HIGH, LOLO, LOW, STATE, COS, COMM, TIMEOUT, HWLIMIT, CALC, SCAN, LINK, SOFT, BAD_SUB, UDF, DISABLE, SIMM, READ_ACCESS, WRITE_ACCESS`), empty when status is `NO_ALARM`.
+
+Impact:
+
+Every QSRV single-PV NTScalar/NTEnum and every group monitor/GET emits `alarm.status` as the raw `epicsAlarmCondition` (0–21) where the NTScalar normative type and every pvxs/QSRV peer expect the PVA status class (0–6). A PVA client that interprets `alarm.status` per the normative `alarm_t` (status class) mis-reads the value (e.g. a `LINK_ALARM` record reports class `14`, an undefined class). `alarm.message` carries the severity name (redundant with the severity field) or nothing, instead of the human-readable alarm condition.
+
+Fix direction (structural):
+
+Add two shared helpers — `alarm_status_class(condition: u16) -> i32` (the `iocsource.cpp:187-223` switch) and `alarm_condition_string(condition: u16) -> &'static str` (indexing `epicsAlarmConditionStrings`) — and apply them at all three alarm builders (`pvif.rs build_alarm`, `pvif.rs build_alarm_overlay`, `group.rs build_alarm_from_snapshot`). Each builder: `status` = `alarm_status_class(condition)`; `message` = `alarm_condition_string(condition)` when `condition != 0` else `""`. `severity` stays the raw `epicsAlarmSeverity` (matches pvxs `node["alarm.severity"] = meta.severity`).
+
+### BR-R63 — CA gateway default (no `.access` file) is allow-all, allowing writes; C ca-gateway default is read-only
+
+Severity: High
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/ca_gateway/server.rs:212-216` — when `config.access_path` is `None`, the gateway builds `AccessConfig::allow_all()`. `crates/epics-bridge-rs/src/ca_gateway/access.rs:98-109` (`can_write`) returns `true` unconditionally when `allow_all` is set, and `access.rs:118-122` makes `allow_all()` the `Default`. The separate gateway-wide `read_only` flag (`crates/epics-bridge-rs/src/ca_gateway/upstream.rs:124`) defaults `false`, so with no `.access` file **both** the read-only gate and the ACF gate pass → downstream writes are forwarded upstream.
+- `epics-modules/ca-gateway/src/gateAs.cc:667-672` — when `afile` (the access file) is `NULL`, `gateAs::initialize` sets `use_default_rules = aitTrue` (the same default is installed at `gateAs.cc:653-655` when the file fails to open). `epics-modules/ca-gateway/src/gateAs.cc:735-737` — with `use_default_rules`, `readFunc` feeds `asInitialize` the single rule `ASG(DEFAULT) { RULE(1,READ) }` — read access at level 1, **no write**.
+
+Impact:
+
+A CA gateway started without an `.access` file fails **open** in the Rust port (every downstream client may write through to upstream IOCs) but fails **safe** (read-only) in the C gateway. This is a security-relevant default: the C gateway's read-only fallback is a deliberate guard so a mis-deployed or file-less gateway cannot be used to write to protected upstream records; the Rust default removes that guard silently.
+
+Fix direction (structural):
+
+Model `AccessConfig`'s policy as an explicit `Mode` enum (`ReadOnly` / `AllowAll` / `Rules(cfg)`) so the previous `allow_all: bool` + `Option<rules>` pair cannot represent an illegal combination, and add `AccessConfig::read_only()` (reads allowed, writes denied — the C `ASG(DEFAULT) { RULE(1,READ) }` equivalent). Use `read_only()` at the no-file default (`server.rs:215`) and as the `Default` impl, so the "no ACF ⟹ writes denied" invariant holds by construction. `allow_all()` stays as an explicit opt-in only.
+
+### BR-R64 — CA gateway answers a downstream search positively for an upstream PV that never connects (black-hole)
+
+Severity: High
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/ca_gateway/server.rs:377-400` — the search resolver returns `true` (exists-here) whenever `UpstreamManager::ensure_subscribed` returns `Ok`, with no check that the upstream channel actually connected.
+- `crates/epics-bridge-rs/src/ca_gateway/upstream.rs:334-353` — `ensure_subscribed` does `channel.get()` under a 500 ms `tokio::time::timeout`; on timeout **or** error it falls back to `EpicsValue::Double(0.0)` and continues. `crates/epics-bridge-rs/src/ca_gateway/upstream.rs:404-425` then registers a shadow PV and calls `channel.subscribe()`, which returns `Ok` immediately — `crates/epics-ca-rs/src/client/mod.rs:2248-2275` allocates the subid without awaiting connection. So for a name that matches the pvlist pattern but does **not** exist upstream, the resolver answers exists-here after ~500 ms and leaves a placeholder shadow PV whose monitor never fires.
+- `epics-modules/ca-gateway/src/gateServer.cc:1652-1709` — `pvExistTest` returns `pverAsyncCompletion` while a PV is connecting (`conFind` path line 1669; new-`gatePvData` `gatePvConnect` path line 1696), deferring the answer via `pv->addET(ctx)`; it returns `pverExistsHere` **only** for an already-connected PV (`gatePvInactive`/`gatePvActive`, lines 1624-1629).
+- `epics-modules/ca-gateway/src/gatePv.cc:518` — `gatePvData::life()` (run from `connectCB` on a successful connect) flushes the deferred exist tests as `pverExistsHere`. `epics-modules/ca-gateway/src/gatePv.cc:622` — `gatePvData::death()` (run from `connectCB` on connect-dead, or from `connectCleanup` on connect timeout) flushes them as `pverDoesNotExistHere`. The C gateway never answers exists-here for a PV that has not connected upstream.
+
+Impact:
+
+Any downstream search for a name that matches an `ALLOW` pvlist pattern but is absent upstream is black-holed: the gateway claims to serve it, so the client binds to the gateway and never re-searches to find the real (later-started) IOC, and the gateway streams a frozen `Double(0.0)`. Broad `ALLOW` patterns — the normal ca-gateway deployment — make this the common case. The C gateway's asynchronous exist-test machinery exists precisely to avoid this; the Rust port defeats it by answering positively on the connect-timeout fallback.
+
+Fix direction (structural):
+
+`ensure_subscribed` is the single owner of "register a shadow PV for an upstream PV"; it must confirm the channel actually connected before registering. Call `channel.wait_connected(timeout)` (`crates/epics-ca-rs/src/client/mod.rs:1295`) up front; on error (never connected / timed out) drop the `Connecting` cache entry and return `Err` so the resolver answers `false` — mirroring C's `death → pverDoesNotExistHere`. The connect budget is the gateway's existing `CacheTimeouts::connect_timeout` (1 s default, `cache.rs:181`), the same window the cache reaper uses to give up on a `Connecting` entry. Only after a confirmed connection do we register the shadow PV and run the best-effort DBR-negotiation GET (whose `Double(0.0)` fallback then only ever applies to a connected-but-slow GET, its intended purpose). Both callers of `ensure_subscribed` (the resolver and `preload_pvs`) inherit the guarantee.
+
 ## Uncertain candidates
+
+### BR-R-UNCERTAIN-4 — ctx-less PVA gateway `rpc`/`process` skip the ACF gate that ctx-less `put_value` enforces
+
+- `crates/epics-bridge-rs/src/pva_gateway/source.rs:1016` (`rpc`) and `crates/epics-bridge-rs/src/pva_gateway/source.rs:1097` (`process`) forward `pvrpc`/`pvprocess` with no `self.gate.check(...)`, whereas the ctx-less `put_value` (`source.rs:912-922`, the "BUG 3" fix) does gate. C pva2pva gates PUT/RPC/PROCESS through `p2pReadOnly`.
+- Why uncertain: not reachable on the live wire path, so it is not an observable ACF bypass. The PVA TCP dispatcher always calls the `_checked` variants — `crates/epics-pva-rs/src/server_native/tcp.rs:5489` (`src.rpc_checked(...)`) and `crates/epics-pva-rs/src/server_native/tcp.rs:3279` (`src.process_checked(...)`) — and the gateway's `rpc_checked` (`source.rs:1057`, `allows_read()`) and `process_checked` (`source.rs:1121`, `allows_write()`) DO gate. The ctx-less `rpc`/`process` are reached only via `CompositeSource`'s ctx-less methods (`crates/epics-pva-rs/src/server_native/composite.rs:401`/`385`), which the wire layer never invokes. So this is a latent internal inconsistency (a defense-in-depth gap matching the `put_value` fix), not a live divergence. Documented, not fixed.
 
 ### BR-R-UNCERTAIN-1 — CA gateway subscribes upstream with the channel's native element count, not CA `count=0`
 

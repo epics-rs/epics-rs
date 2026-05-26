@@ -549,15 +549,18 @@ fn build_alarm(snapshot: &Snapshot) -> PvStructure {
         "severity".into(),
         PvField::Scalar(ScalarValue::Int(snapshot.alarm.severity as i32)),
     ));
+    // BR-R62: PVA alarm.status is the status CLASS, and alarm.message is
+    // the condition string (pvxs iocsource.cpp:187-236) — not the raw
+    // condition code / severity name.
     alarm.fields.push((
         "status".into(),
-        PvField::Scalar(ScalarValue::Int(snapshot.alarm.status as i32)),
+        PvField::Scalar(ScalarValue::Int(alarm_status_class(snapshot.alarm.status))),
     ));
     alarm.fields.push((
         "message".into(),
-        PvField::Scalar(ScalarValue::String(alarm_severity_string(
-            snapshot.alarm.severity,
-        ))),
+        PvField::Scalar(ScalarValue::String(
+            alarm_condition_string(snapshot.alarm.status).to_string(),
+        )),
     ));
     alarm
 }
@@ -577,13 +580,17 @@ fn build_alarm_overlay(snapshot: &Snapshot, severity: u16, status: u16) -> PvStr
         "severity".into(),
         PvField::Scalar(ScalarValue::Int(eff_severity as i32)),
     ));
+    // BR-R62: status CLASS + condition-string message (pvxs
+    // iocsource.cpp:187-236), using the escalated `eff_status`.
     alarm.fields.push((
         "status".into(),
-        PvField::Scalar(ScalarValue::Int(eff_status as i32)),
+        PvField::Scalar(ScalarValue::Int(alarm_status_class(eff_status))),
     ));
     alarm.fields.push((
         "message".into(),
-        PvField::Scalar(ScalarValue::String(alarm_severity_string(eff_severity))),
+        PvField::Scalar(ScalarValue::String(
+            alarm_condition_string(eff_status).to_string(),
+        )),
     ));
     alarm
 }
@@ -867,13 +874,61 @@ fn value_alarm_desc(scalar_type: ScalarType) -> FieldDesc {
     }
 }
 
-fn alarm_severity_string(severity: u16) -> String {
-    match severity {
-        0 => "NO_ALARM".into(),
-        1 => "MINOR".into(),
-        2 => "MAJOR".into(),
-        3 => "INVALID".into(),
-        _ => format!("UNKNOWN({severity})"),
+/// BR-R62: map a raw EPICS `epicsAlarmCondition` (0–21, `alarm.h`) to the
+/// PVA `alarm_t.status` **status class**. PVA carries the alarm *class*
+/// (NONE/DEVICE/DRIVER/RECORD/DB/UNDEFINED), not the raw DB condition
+/// code — mirrors pvxs `ioc/iocsource.cpp:187-223`.
+pub(crate) fn alarm_status_class(condition: u16) -> i32 {
+    use epics_base_rs::server::recgbl::alarm_status as a;
+    match condition {
+        a::NO_ALARM => 0, // NONE
+        a::READ_ALARM
+        | a::WRITE_ALARM
+        | a::HIHI_ALARM
+        | a::HIGH_ALARM
+        | a::LOLO_ALARM
+        | a::LOW_ALARM
+        | a::STATE_ALARM
+        | a::COS_ALARM
+        | a::HW_LIMIT_ALARM => 1, // DEVICE
+        a::COMM_ALARM | a::TIMEOUT_ALARM | a::UDF_ALARM => 2, // DRIVER
+        a::CALC_ALARM | a::SCAN_ALARM | a::LINK_ALARM | a::SOFT_ALARM | a::BAD_SUB_ALARM => 3, // RECORD
+        a::DISABLE_ALARM | a::SIMM_ALARM | a::READ_ACCESS_ALARM | a::WRITE_ACCESS_ALARM => 4,  // DB
+        _ => 6, // UNDEFINED
+    }
+}
+
+/// BR-R62: the EPICS alarm **condition string** for a raw
+/// `epicsAlarmCondition` (`epicsAlarmConditionStrings`,
+/// `libcom/src/misc/alarmString.c:27-50`), or `""` for `NO_ALARM` /
+/// out-of-range. pvxs uses this for `alarm.message`
+/// (`ioc/iocsource.cpp:225-236`).
+pub(crate) fn alarm_condition_string(condition: u16) -> &'static str {
+    use epics_base_rs::server::recgbl::alarm_status as a;
+    match condition {
+        a::NO_ALARM => "",
+        a::READ_ALARM => "READ",
+        a::WRITE_ALARM => "WRITE",
+        a::HIHI_ALARM => "HIHI",
+        a::HIGH_ALARM => "HIGH",
+        a::LOLO_ALARM => "LOLO",
+        a::LOW_ALARM => "LOW",
+        a::STATE_ALARM => "STATE",
+        a::COS_ALARM => "COS",
+        a::COMM_ALARM => "COMM",
+        a::TIMEOUT_ALARM => "TIMEOUT",
+        a::HW_LIMIT_ALARM => "HWLIMIT",
+        a::CALC_ALARM => "CALC",
+        a::SCAN_ALARM => "SCAN",
+        a::LINK_ALARM => "LINK",
+        a::SOFT_ALARM => "SOFT",
+        a::BAD_SUB_ALARM => "BAD_SUB",
+        a::UDF_ALARM => "UDF",
+        a::DISABLE_ALARM => "DISABLE",
+        a::SIMM_ALARM => "SIMM",
+        a::READ_ACCESS_ALARM => "READ_ACCESS",
+        a::WRITE_ACCESS_ALARM => "WRITE_ACCESS",
+        _ => "",
     }
 }
 
@@ -900,6 +955,68 @@ mod tests {
             lower_ctrl_limit: 0.0,
         });
         snap
+    }
+
+    fn alarm_scalar_int(s: &PvStructure, name: &str) -> i32 {
+        match s.fields.iter().find(|(n, _)| n == name).map(|(_, f)| f) {
+            Some(PvField::Scalar(ScalarValue::Int(v))) => *v,
+            other => panic!("expected Int field {name}, got {other:?}"),
+        }
+    }
+
+    fn alarm_scalar_str(s: &PvStructure, name: &str) -> String {
+        match s.fields.iter().find(|(n, _)| n == name).map(|(_, f)| f) {
+            Some(PvField::Scalar(ScalarValue::String(v))) => v.clone(),
+            other => panic!("expected String field {name}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn br_r62_status_class_mapping() {
+        // Raw epicsAlarmCondition -> PVA status class (pvxs iocsource.cpp).
+        use epics_base_rs::server::recgbl::alarm_status as a;
+        assert_eq!(alarm_status_class(a::NO_ALARM), 0); // NONE
+        assert_eq!(alarm_status_class(a::HIGH_ALARM), 1); // DEVICE
+        assert_eq!(alarm_status_class(a::HW_LIMIT_ALARM), 1); // DEVICE
+        assert_eq!(alarm_status_class(a::COMM_ALARM), 2); // DRIVER
+        assert_eq!(alarm_status_class(a::UDF_ALARM), 2); // DRIVER
+        assert_eq!(alarm_status_class(a::LINK_ALARM), 3); // RECORD
+        assert_eq!(alarm_status_class(a::SCAN_ALARM), 3); // RECORD
+        assert_eq!(alarm_status_class(a::WRITE_ACCESS_ALARM), 4); // DB
+        assert_eq!(alarm_status_class(a::SIMM_ALARM), 4); // DB
+        assert_eq!(alarm_status_class(999), 6); // UNDEFINED (out of range)
+    }
+
+    #[test]
+    fn br_r62_condition_string() {
+        // alarm.message is the condition string, "" for NO_ALARM/out-of-range.
+        use epics_base_rs::server::recgbl::alarm_status as a;
+        assert_eq!(alarm_condition_string(a::NO_ALARM), "");
+        assert_eq!(alarm_condition_string(a::HIGH_ALARM), "HIGH");
+        assert_eq!(alarm_condition_string(a::LINK_ALARM), "LINK");
+        assert_eq!(alarm_condition_string(a::HW_LIMIT_ALARM), "HWLIMIT");
+        assert_eq!(alarm_condition_string(a::UDF_ALARM), "UDF");
+        assert_eq!(alarm_condition_string(999), "");
+    }
+
+    #[test]
+    fn br_r62_build_alarm_emits_class_and_condition_message() {
+        // LINK_ALARM (raw 14) must emit status class RECORD (3) and the
+        // condition string "LINK" — not raw 14 / the severity name.
+        use epics_base_rs::server::recgbl::alarm_status as a;
+        let snap = Snapshot::new(EpicsValue::Double(1.0), a::LINK_ALARM, 2, UNIX_EPOCH);
+        let alarm = build_alarm(&snap);
+        assert_eq!(alarm_scalar_int(&alarm, "severity"), 2); // raw severity
+        assert_eq!(alarm_scalar_int(&alarm, "status"), 3); // RECORD, not 14
+        assert_eq!(alarm_scalar_str(&alarm, "message"), "LINK");
+    }
+
+    #[test]
+    fn br_r62_build_alarm_no_alarm_has_empty_message() {
+        let snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, UNIX_EPOCH);
+        let alarm = build_alarm(&snap);
+        assert_eq!(alarm_scalar_int(&alarm, "status"), 0); // NONE
+        assert_eq!(alarm_scalar_str(&alarm, "message"), "");
     }
 
     #[test]
@@ -931,14 +1048,18 @@ mod tests {
         // F6: when an empty array reaches NTScalar conversion, value cannot
         // be recovered — alarm must escalate to INVALID severity / UDF status
         // so clients don't read the placeholder zero as a valid sample.
+        // BR-R62: alarm.status is the PVA status CLASS — UDF maps to DRIVER
+        // (2) — and alarm.message is the condition string "UDF".
         let snap = test_snapshot(EpicsValue::DoubleArray(vec![]));
         let pv = snapshot_to_nt_scalar(&snap);
 
         if let Some(PvField::Structure(alarm)) = pv.get_field("alarm") {
             let sev = alarm.get_field("severity");
             let st = alarm.get_field("status");
+            let msg = alarm.get_field("message");
             assert!(matches!(sev, Some(PvField::Scalar(ScalarValue::Int(3)))));
-            assert!(matches!(st, Some(PvField::Scalar(ScalarValue::Int(17)))));
+            assert!(matches!(st, Some(PvField::Scalar(ScalarValue::Int(2)))));
+            assert!(matches!(msg, Some(PvField::Scalar(ScalarValue::String(s))) if s == "UDF"));
         } else {
             panic!("expected alarm structure");
         }

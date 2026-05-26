@@ -209,10 +209,13 @@ impl GatewayServer {
 
         // Load .access (optional). `ArcSwap` for the same lock-free
         // hot-reload pattern as `pvlist`.
+        // BR-R63: no .access file defaults to READ-ONLY (C ca-gateway
+        // installs `ASG(DEFAULT) { RULE(1,READ) }`, gateAs.cc:735-737) —
+        // allow_all() would fail open, forwarding writes upstream.
         let access = if let Some(path) = &config.access_path {
             AccessConfig::from_file(path)?
         } else {
-            AccessConfig::allow_all()
+            AccessConfig::read_only()
         };
         let access = Arc::new(ArcSwap::from_pointee(access));
 
@@ -368,6 +371,10 @@ impl GatewayServer {
 
                     // 2. Subscribe upstream — this also adds the PV to the
                     //    shadow database via UpstreamManager::ensure_subscribed.
+                    //    BR-R64: ensure_subscribed must only succeed when the
+                    //    upstream actually connects, else this positive reply
+                    //    black-holes a non-existent PV (C answers does-not-exist
+                    //    via gatePvData::death(), gatePv.cc:622).
                     //    Pass the matched ASG/ASL through so the per-PV
                     //    WriteHook can do the right ACL check.
                     //    BRIDGE-FR-2: serve under the searched name (`name`,

@@ -283,6 +283,14 @@ struct ChannelEntry {
     /// the task finishes (`Arc` so the spawned task can clear it
     /// without re-borrowing `state.channels`).
     put_notify_busy: Arc<AtomicBool>,
+    /// R55: client appended `$` to the field name, requesting the
+    /// full string as a `DBR_CHAR` array (C `dbChannel.c:483-507`
+    /// long-string convention). When true, every GET/monitor
+    /// delivery converts `EpicsValue::String` → `EpicsValue::CharArray`
+    /// with a NUL terminator before DBR encoding, and the channel's
+    /// native type and element count are overridden to `DBR_CHAR` /
+    /// `MAX_STRING_SIZE` (= 40) at channel-create time.
+    long_string: bool,
 }
 
 impl ChannelEntry {
@@ -327,6 +335,11 @@ struct SubscriptionEntry {
     /// access can resume the same camonitor).
     denied: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
+    /// R55: mirrors `ChannelEntry::long_string`; stored here so the
+    /// access-restore path and `reeval_access_rights` can apply the
+    /// same `EpicsValue::String` → `EpicsValue::CharArray` conversion
+    /// without re-borrowing the channel entry.
+    long_string: bool,
 }
 
 struct ClientState {
@@ -2024,7 +2037,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let record_path = parsed_channel.record_path;
             let filter_suffix = parsed_channel.json_suffix;
             let (_base, field_raw) = parse_pv_name(&record_path);
-            let field = field_raw.to_ascii_uppercase();
+            // R55: detect the `$` long-string suffix (C dbChannel.c:483-507).
+            // Strip it before the field lookup; set `long_string` so every
+            // delivery path converts the value to DBR_CHAR with a NUL
+            // terminator.
+            let (field_bare, long_string) = if let Some(stripped) = field_raw.strip_suffix('$') {
+                (stripped, true)
+            } else {
+                (field_raw, false)
+            };
+            let field = field_bare.to_ascii_uppercase();
 
             // BRIDGE-FR-10: thread the connection peer into the search
             // resolver so the CA gateway applies host-scoped `.pvlist`
@@ -2048,25 +2070,43 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let value = instance.resolve_field(&field);
                         match value {
                             Some(v) => {
-                                // For waveform records, get_field("VAL") returns
-                                // NORD elements (valid data) but the channel's
-                                // native count must be NELM (max capacity) so
-                                // clients allocate the right buffer.
-                                let element_count = if field == "VAL"
+                                // R55: `$` long-string — C dbChannel.c:483-507
+                                // requires the field to be DBF_STRING
+                                // (EpicsValue::String). Other field types get
+                                // S_dbLib_fieldNotFound (CREATE_CH_FAIL parity).
+                                if long_string && !matches!(v, EpicsValue::String(_)) {
+                                    let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
+                                    fail.cid = client_cid;
+                                    let mut w = writer.lock().await;
+                                    w.write_all(&fail.to_bytes()).await?;
+                                    return Ok(());
+                                }
+                                // R55: override type and count for `$` channels.
+                                // C sets `paddr->field_type = DBF_CHAR`,
+                                // `paddr->dbr_field_type = DBR_CHAR`, and
+                                // `paddr->no_elements = paddr->field_size` (= 40).
+                                let (dbr_type_val, element_count) = if long_string {
+                                    (DbFieldType::Char, 40u32)
+                                } else if field == "VAL"
                                     && instance.record.record_type() == "waveform"
                                 {
-                                    instance
+                                    // For waveform records, get_field("VAL") returns
+                                    // NORD elements (valid data) but the channel's
+                                    // native count must be NELM (max capacity) so
+                                    // clients allocate the right buffer.
+                                    let nelm = instance
                                         .resolve_field("NELM")
                                         .and_then(|n| match n {
                                             EpicsValue::Long(n) => Some(n.max(0) as u32),
                                             _ => None,
                                         })
-                                        .unwrap_or(v.count() as u32)
+                                        .unwrap_or(v.count() as u32);
+                                    (v.dbr_type(), nelm)
                                 } else {
-                                    v.count() as u32
+                                    (v.dbr_type(), v.count() as u32)
                                 };
                                 (
-                                    v.dbr_type(),
+                                    dbr_type_val,
                                     element_count,
                                     ChannelTarget::RecordField {
                                         record: rec.clone(),
@@ -2121,6 +2161,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         pv_name: pv_name.clone(),
                         filter_suffix: filter_suffix.clone(),
                         put_notify_busy: Arc::new(AtomicBool::new(false)),
+                        long_string,
                     },
                 );
                 state.channel_access.insert(sid, access_level);
@@ -2325,6 +2366,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 if let Some(v) = read_chain.apply_to_read_value(snapshot.value.clone()) {
                     snapshot.value = v;
                 }
+            }
+            // R55: convert String → CharArray of exactly 40 elements BEFORE the
+            // requested-count clamp. C read_reply sizes the payload to
+            // dbr_size_n(DBR_CHAR, request_count) after the channel reports
+            // no_elements=40; the clamp must see the 40-element array so
+            // `caget -# N PV.DESC$` trims to N chars (not the pre-convert
+            // count of 1 that EpicsValue::String::count() returns).
+            if entry.long_string {
+                super::apply_long_string(&mut snapshot);
             }
             // Respect client's requested element count (e.g. caget -# 10)
             if requested_count > 0 && requested_count < snapshot.value.count() {
@@ -3162,6 +3212,24 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             } else {
                 DBE_VALUE | DBE_ALARM
             };
+            // R46: C `db_add_event` (dbEvent.c:437-439) returns NULL when
+            // select==0, which propagates as ECA_ALLOCMEM + disconnect
+            // (`camessage.c:1814-1822`). A zero mask installs a subscription
+            // that never triggers — match C by rejecting it immediately.
+            if mask == 0 {
+                let entry_cid = state.channels.get(&sid).map(|e| e.cid).unwrap_or(u32::MAX);
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_ALLOCMEM,
+                    entry_cid,
+                    "EVENT_ADD mask=0: no events would be triggered",
+                )
+                .await?;
+                return Err(epics_base_rs::error::CaError::Protocol(
+                    "EVENT_ADD mask=0 (matches C db_add_event select==0 + RSRV_ERROR)".into(),
+                ));
+            }
 
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,
@@ -3183,6 +3251,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // `state.subscriptions` so the entry borrow has to be
             // released before then).
             let sub_pv_name = entry.pv_name.clone();
+            let long_string = entry.long_string; // R55
 
             // R38-G3 / Round 38: EVENT_ADD must also consult the
             // channel's access_rights. A NoAccess peer mounting a
@@ -3344,6 +3413,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             match init_chain.apply_to_event_value(snap.value.clone()) {
                                 Some(v) => {
                                     snap.value = v;
+                                    // R55: convert for `$` long-string channels.
+                                    if long_string {
+                                        super::apply_long_string(&mut snap);
+                                    }
                                     // EX-R9: the initial event honours
                                     // the EVENT_ADD request count for
                                     // BOTH directions —
@@ -3380,6 +3453,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             state.flow_control.clone(),
                             rx,
                             denied.clone(),
+                            long_string,
                         );
 
                         state.subscriptions.insert(
@@ -3392,6 +3466,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 data_count: requested_count,
                                 denied,
                                 task,
+                                long_string,
                             },
                         );
                         if let Some(tx) = conn_events {
@@ -3478,6 +3553,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 match init_chain.apply_to_event_value(snap.value.clone()) {
                                     Some(v) => {
                                         snap.value = v;
+                                        // R55: convert for `$` long-string channels.
+                                        if long_string {
+                                            super::apply_long_string(&mut snap);
+                                        }
                                         Some(snap)
                                     }
                                     None => None,
@@ -3609,6 +3688,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                             .to_string(),
                                     );
                                 }
+                                // R55: convert String → CharArray+NUL for
+                                // `$` long-string channels before encoding.
+                                if long_string {
+                                    super::apply_long_string(&mut event.snapshot);
+                                }
                                 let mut payload_bytes =
                                     match encode_dbr(requested_type, &event.snapshot) {
                                         Ok(bytes) => bytes,
@@ -3686,6 +3770,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 data_count: requested_count,
                                 denied,
                                 task,
+                                long_string,
                             },
                         );
                         if let Some(tx) = conn_events {
@@ -4381,7 +4466,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
             // at the live `snapshot.value.count()`, only truncating
             // and never padding.
             for sub_id in &affected {
-                let (target, data_type, data_count, sub_id_val) = {
+                let (target, data_type, data_count, sub_id_val, sub_long_string) = {
                     let Some(sub) = state.subscriptions.get(sub_id) else {
                         continue;
                     };
@@ -4391,6 +4476,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                         sub.data_type,
                         sub.data_count,
                         sub.sub_id,
+                        sub.long_string,
                     )
                 };
                 if let Some(mut snap) = get_full_snapshot(&target).await {
@@ -4413,6 +4499,10 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                             Some(v) => snap.value = v,
                             None => continue,
                         }
+                    }
+                    // R55: convert for `$` long-string channels.
+                    if sub_long_string {
+                        super::apply_long_string(&mut snap);
                     }
                     send_monitor_snapshot(writer, sub_id_val, data_type, data_count, &snap).await?;
                 }
@@ -4654,7 +4744,10 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     message: &str,
 ) -> CaResult<()> {
     let error_msg_bytes = pad_string(truncate_diag(message));
-    let payload_size = CaHeader::SIZE + error_msg_bytes.len();
+    // R45: payload_size must use the echo header's ACTUAL byte length (16 or 24
+    // for extended), not the constant CaHeader::SIZE=16.  Compute orig_bytes first.
+    let orig_bytes = original_hdr.to_bytes_extended();
+    let payload_size = orig_bytes.len() + error_msg_bytes.len();
 
     let mut resp = CaHeader::new(CA_PROTO_ERROR);
     resp.set_payload_size(payload_size, 0);
@@ -4679,7 +4772,7 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     // 16 bytes otherwise), so an extended READ/WRITE error
     // round-trips byte-for-byte with libca.
     let resp_bytes = resp.to_bytes_extended();
-    let orig_bytes = original_hdr.to_bytes_extended();
+    // orig_bytes computed above (before payload_size) for R45.
     let mut frame = Vec::with_capacity(resp_bytes.len() + orig_bytes.len() + error_msg_bytes.len());
     frame.extend_from_slice(&resp_bytes);
     frame.extend_from_slice(&orig_bytes);
@@ -5525,6 +5618,54 @@ mod single_write_all_framing_tests {
         );
     }
 
+    /// R45 regression: when the original request used an extended
+    /// 24-byte header, the outer CA_PROTO_ERROR reply must declare
+    /// `m_postsize = 24 + diag_len`, not `16 + diag_len`.
+    #[tokio::test]
+    async fn send_ca_error_extended_original_declares_correct_payload_size() {
+        let writer = recording_writer();
+        // Build an extended original header: set_payload_size triggers
+        // extended form when count >= 0xFFFF.
+        let mut original = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        original.set_payload_size(0, 0x1_0000); // count >= 0xFFFF → extended (24 bytes)
+        assert!(
+            original.is_extended(),
+            "test requires an extended original header"
+        );
+
+        send_ca_error(
+            &writer,
+            &original,
+            ECA_INTERNAL,
+            0xFFFF_FFFF,
+            "R45 regression test",
+        )
+        .await
+        .expect("send_ca_error succeeds");
+
+        let guard = writer.lock().await;
+        let batches = &guard.get_ref().batches;
+        assert_eq!(batches.len(), 1, "must issue exactly one write_all");
+        let frame = &batches[0];
+        // Outer CA_PROTO_ERROR response header is normal form (payload < 0xFFFF);
+        // m_postsize lives at bytes [2..4].
+        let declared = u16::from_be_bytes([frame[2], frame[3]]) as usize;
+        assert_eq!(
+            16 + declared,
+            frame.len(),
+            "declared m_postsize must account for the full payload (echo hdr + diag)"
+        );
+        // With an extended original, the echoed header contributes 24 bytes.
+        // Any diagnostic shorter than 0xFFFF − 24 keeps the outer header normal.
+        // Echo header occupies frame bytes [16..40]; those 24 bytes must round-trip
+        // the extended marker (postsize field = 0xFFFF at echo-hdr offset 2..4).
+        let echo_postsize = u16::from_be_bytes([frame[18], frame[19]]);
+        assert_eq!(
+            echo_postsize, 0xFFFF,
+            "echoed request header must preserve the extended marker (m_postsize = 0xFFFF)"
+        );
+    }
+
     /// `send_monitor_snapshot` (the introspection EVENT_ADD reply) must
     /// emit header + padded payload as a single `write_all`.
     #[tokio::test]
@@ -5934,6 +6075,150 @@ mod bfr7_event_context_filter_tests {
             event_adds.is_empty(),
             "BFR-7: the event-context decimator must drop the initial \
              EVENT_ADD post (offset 1 skips window slot 0): got {event_adds:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod r46_zero_mask_event_add_tests {
+    //! R46: EVENT_ADD with mask=0 must be rejected with CA_PROTO_ERROR
+    //! (ECA_ALLOCMEM) + connection close.
+    //!
+    //! C reference: `db_add_event` (dbEvent.c:437-439) returns NULL when
+    //! `select==0`; `event_add_action` (camessage.c:1814-1822) then calls
+    //! `send_err(ECA_ALLOCMEM)` and returns `RSRV_ERROR`, closing the
+    //! connection.  Before R46 the Rust server silently installed a dead
+    //! subscription whose `Subscriber::accepts` always returned false, so
+    //! no events ever arrived after the initial snapshot.
+    use super::non_graceful_disconnect_teardown_tests::{
+        create_chan_frame, read_create_chan_sid, version_frame,
+    };
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::types::EpicsValue;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Build a CA_PROTO_EVENT_ADD request with mask=0 (the R46 defect input).
+    fn event_add_zero_mask_frame(sid: u32, sub_id: u32) -> Vec<u8> {
+        let mut h = CaHeader::new(CA_PROTO_EVENT_ADD);
+        h.data_type = epics_base_rs::types::DBR_TIME_DOUBLE;
+        h.count = 1;
+        h.cid = sid;
+        h.available = sub_id;
+        h.set_payload_size(16, 1);
+        let mut frame = h.to_bytes().to_vec();
+        frame.extend_from_slice(&0f32.to_be_bytes());
+        frame.extend_from_slice(&0f32.to_be_bytes());
+        frame.extend_from_slice(&0f32.to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes()); // mask = 0 — the defect input
+        frame.extend_from_slice(&0u16.to_be_bytes()); // pad
+        frame
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_mask_event_add_replies_eca_allocmem_and_disconnects() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("r46:pv", EpicsValue::Double(0.0))
+            .await
+            .expect("add pv");
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:55400".parse().unwrap();
+
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                Some(conn_tx),
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(1, "r46:pv"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+        let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+
+        // Send the defect input: EVENT_ADD with mask=0.
+        client
+            .write_all(&event_add_zero_mask_frame(sid, 0xC0DE))
+            .await
+            .expect("zero-mask event_add");
+        client.flush().await.expect("flush zero-mask event_add");
+
+        // Read server output until EOF; expect at least one CA_PROTO_ERROR
+        // frame before the connection closes.
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 256];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for server to close"
+            );
+            match tokio::time::timeout(remaining, client.read(&mut buf)).await {
+                Ok(Ok(0)) => break, // EOF — server closed
+                Ok(Ok(n)) => acc.extend_from_slice(&buf[..n]),
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        // Scan the accumulated bytes for a CA_PROTO_ERROR frame.
+        let mut got_error = false;
+        let mut offset = 0;
+        while offset + CaHeader::SIZE <= acc.len() {
+            if let Ok((hdr, hdr_size)) = CaHeader::from_bytes_extended(&acc[offset..]) {
+                if hdr.cmmd == CA_PROTO_ERROR {
+                    got_error = true;
+                    break;
+                }
+                let msg_len = hdr_size + hdr.actual_postsize();
+                if msg_len == 0 {
+                    break;
+                }
+                offset += msg_len;
+            } else {
+                break;
+            }
+        }
+        assert!(
+            got_error,
+            "R46: zero-mask EVENT_ADD must produce a CA_PROTO_ERROR (ECA_ALLOCMEM) \
+             reply before the connection closes (received {} bytes: {acc:?})",
+            acc.len()
+        );
+
+        // The handler must exit with Err (RSRV_ERROR path, not graceful EOF).
+        let res = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_client completes after zero-mask rejection")
+            .expect("join ok");
+        assert!(
+            res.is_err(),
+            "R46: zero-mask EVENT_ADD must close the connection with Err \
+             (matches C RSRV_ERROR), got {res:?}"
         );
     }
 }

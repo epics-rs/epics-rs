@@ -431,6 +431,7 @@ pub struct CaServer {
     /// for its open channels. Mirrors RSRV `sendAllUpdateAS`
     /// (caservertask.c:1224) — the broadcast that keeps already-open
     /// channels in sync with rule changes.
+    // R49: no public `notify_access_change` method to fire this broadcast
     acf_reload_tx: tokio::sync::broadcast::Sender<()>,
     autosave_config: Option<autosave::SaveSetConfig>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
@@ -634,6 +635,22 @@ impl CaServer {
     /// Returns the path the ACF was loaded from, if any.
     pub fn acf_source_path(&self) -> Option<String> {
         self.acf_source_path.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Trigger `CA_PROTO_ACCESS_RIGHTS` re-notification for all connected
+    /// clients without touching the ACF configuration. Equivalent to C
+    /// `asComputeAllAsg()` (asCa.c:205) — prompts every active TCP
+    /// connection to run `reeval_access_rights`, which re-pushes
+    /// `CA_PROTO_ACCESS_RIGHTS` only when the computed level changed
+    /// (`oldaccess != access` filter, R2-51 parity).
+    ///
+    /// Use this after programmatic access-security state changes the
+    /// server cannot detect automatically — for example, when INP* link
+    /// values used by CALC-gated ACF rules change. For ACF-file changes
+    /// prefer [`Self::reload_acf_from`], which swaps the config and
+    /// notifies in one step.
+    pub fn notify_access_change(&self) {
+        let _ = self.acf_reload_tx.send(());
     }
 
     /// Set callbacks to run after PINI processing completes.

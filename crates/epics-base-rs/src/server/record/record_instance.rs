@@ -257,6 +257,7 @@ impl RecordInstance {
     /// don't need the change-detection (e.g. internal writers that
     /// know the field is non-metadata) can keep using
     /// [`notify_field_written`].
+    // R47: must post EventMask::PROPERTY to all field subscribers when metadata changes
     pub fn notify_field_written_if_changed(&self, field: &str, prev: Option<&EpicsValue>) {
         let upper = field.to_ascii_uppercase();
         if !is_metadata_field(&upper) {
@@ -265,6 +266,12 @@ impl RecordInstance {
         let now = self.record.get_field(&upper);
         if prev != now.as_ref() {
             self.invalidate_metadata_cache();
+            // R47: mirror C dbAccess.c:1396-1397 db_post_events(precord, NULL, DBE_PROPERTY).
+            // Collect keys first to avoid a re-entrant immutable borrow on subscribers.
+            let fields: Vec<String> = self.subscribers.keys().cloned().collect();
+            for f in fields {
+                self.notify_field_with_origin(&f, crate::server::recgbl::EventMask::PROPERTY, 0);
+            }
         }
     }
 
@@ -460,6 +467,88 @@ impl RecordInstance {
                     ..Default::default()
                 });
             }
+            // R52: waveform/aai/aao — HOPR/LOPR/PREC/EGU for VAL display limits.
+            // (waveformRecord.c:251-252,239; aaiRecord.c:280-281,268; aaoRecord.c:283-284)
+            "waveform" | "aai" | "aao" => {
+                let egu = self
+                    .record
+                    .get_field("EGU")
+                    .and_then(|v| {
+                        if let EpicsValue::String(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let prec = self
+                    .record
+                    .get_field("PREC")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0) as i16;
+                let hopr = self
+                    .record
+                    .get_field("HOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                let lopr = self
+                    .record
+                    .get_field("LOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                snap.display = Some(super::super::snapshot::DisplayInfo {
+                    units: egu,
+                    precision: prec,
+                    upper_disp_limit: hopr,
+                    lower_disp_limit: lopr,
+                    upper_alarm_limit: 0.0,
+                    upper_warning_limit: 0.0,
+                    lower_warning_limit: 0.0,
+                    lower_alarm_limit: 0.0,
+                    ..Default::default()
+                });
+            }
+            // R52: compress — HOPR/LOPR/PREC/EGU for VAL display limits.
+            // (compressRecord.c:478-479,464,455)
+            "compress" => {
+                let egu = self
+                    .record
+                    .get_field("EGU")
+                    .and_then(|v| {
+                        if let EpicsValue::String(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let prec = self
+                    .record
+                    .get_field("PREC")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0) as i16;
+                let hopr = self
+                    .record
+                    .get_field("HOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                let lopr = self
+                    .record
+                    .get_field("LOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                snap.display = Some(super::super::snapshot::DisplayInfo {
+                    units: egu,
+                    precision: prec,
+                    upper_disp_limit: hopr,
+                    lower_disp_limit: lopr,
+                    upper_alarm_limit: 0.0,
+                    upper_warning_limit: 0.0,
+                    lower_warning_limit: 0.0,
+                    lower_alarm_limit: 0.0,
+                    ..Default::default()
+                });
+            }
             "motor" => {
                 let egu = self
                     .record
@@ -507,23 +596,54 @@ impl RecordInstance {
     fn populate_control_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         let rtype = self.record.record_type();
         match rtype {
-            "ao" | "longout" | "int64out" => {
-                // Output records use DRVH/DRVL, fallback to HOPR/LOPR
-                let drvh = self.record.get_field("DRVH").and_then(|v| v.to_f64());
-                let drvl = self.record.get_field("DRVL").and_then(|v| v.to_f64());
-                let hopr = self
+            // R51: ao unconditionally uses DRVH/DRVL (aoRecord.c:356-357).
+            "ao" => {
+                let upper = self
                     .record
-                    .get_field("HOPR")
+                    .get_field("DRVH")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
-                let lopr = self
+                let lower = self
                     .record
-                    .get_field("LOPR")
+                    .get_field("DRVL")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
                 snap.control = Some(super::super::snapshot::ControlInfo {
-                    upper_ctrl_limit: drvh.unwrap_or(hopr),
-                    lower_ctrl_limit: drvl.unwrap_or(lopr),
+                    upper_ctrl_limit: upper,
+                    lower_ctrl_limit: lower,
+                });
+            }
+            // R51: longout/int64out use DRVH/DRVL only when drvh > drvl, else HOPR/LOPR
+            // (longoutRecord.c:282-287, int64outRecord.c:265-270).
+            "longout" | "int64out" => {
+                let drvh = self
+                    .record
+                    .get_field("DRVH")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                let drvl = self
+                    .record
+                    .get_field("DRVL")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                let (upper, lower) = if drvh > drvl {
+                    (drvh, drvl)
+                } else {
+                    let hopr = self
+                        .record
+                        .get_field("HOPR")
+                        .and_then(|v| v.to_f64())
+                        .unwrap_or(0.0);
+                    let lopr = self
+                        .record
+                        .get_field("LOPR")
+                        .and_then(|v| v.to_f64())
+                        .unwrap_or(0.0);
+                    (hopr, lopr)
+                };
+                snap.control = Some(super::super::snapshot::ControlInfo {
+                    upper_ctrl_limit: upper,
+                    lower_ctrl_limit: lower,
                 });
             }
             "motor" => {
@@ -543,7 +663,8 @@ impl RecordInstance {
                     lower_ctrl_limit: llm,
                 });
             }
-            "ai" | "longin" | "calc" | "calcout" => {
+            // R50: int64in uses HOPR/LOPR as control limits (int64inRecord.c:226-227)
+            "ai" | "int64in" | "longin" | "calc" | "calcout" => {
                 // Input records use HOPR/LOPR as control limits
                 let hopr = self
                     .record
@@ -568,6 +689,7 @@ impl RecordInstance {
     fn populate_enum_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         let rtype = self.record.record_type();
         match rtype {
+            // R53: bi/bo/busy — C trims no_str to 1 when ZNAM set and ONAM empty (boRecord.c:342-352).
             "bi" | "bo" | "busy" => {
                 let znam = self
                     .record
@@ -591,16 +713,20 @@ impl RecordInstance {
                         }
                     })
                     .unwrap_or_default();
-                snap.enums = Some(super::super::snapshot::EnumInfo {
-                    strings: vec![znam, onam],
-                });
+                let no_str_1 = !znam.is_empty() && onam.is_empty();
+                let mut strings = vec![znam, onam];
+                if no_str_1 {
+                    strings.truncate(1);
+                }
+                snap.enums = Some(super::super::snapshot::EnumInfo { strings });
             }
+            // R53: mbbi/mbbo — C uses highwater mark: last non-empty index + 1 (mbbiRecord.c:262-269).
             "mbbi" | "mbbo" => {
                 let state_fields = [
                     "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST",
                     "TEST", "ELST", "TVST", "TTST", "FTST", "FFST",
                 ];
-                let strings: Vec<String> = state_fields
+                let mut strings: Vec<String> = state_fields
                     .iter()
                     .map(|f| {
                         self.record
@@ -615,6 +741,12 @@ impl RecordInstance {
                             .unwrap_or_default()
                     })
                     .collect();
+                let no_str = strings
+                    .iter()
+                    .rposition(|s| !s.is_empty())
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                strings.truncate(no_str);
                 snap.enums = Some(super::super::snapshot::EnumInfo { strings });
             }
             _ => {}
@@ -1498,6 +1630,11 @@ impl RecordInstance {
         // most records pay zero cost here.
         if self.record.took_metadata_change() {
             self.invalidate_metadata_cache();
+            // R47: mirror C db_post_events(precord, NULL, DBE_PROPERTY) after record processing.
+            let fields: Vec<String> = self.subscribers.keys().cloned().collect();
+            for f in fields {
+                self.notify_field_with_origin(&f, crate::server::recgbl::EventMask::PROPERTY, 0);
+            }
         }
 
         if process_result == RecordProcessResult::AsyncPending {
@@ -2447,6 +2584,120 @@ mod metadata_cache_tests {
         assert!(inst.metadata_cache.lock().unwrap().is_some());
         let _ = inst.process_local();
         assert!(inst.metadata_cache.lock().unwrap().is_some());
+    }
+
+    // ── R47 regression: DBE_PROPERTY event delivery boundaries ──────────────
+
+    /// Boundary 1: metadata field written with a CHANGED value, subscriber
+    /// mask includes PROPERTY → subscriber receives an event.
+    /// Mirrors C dbAccess.c:1396-1397 `db_post_events(precord,NULL,DBE_PROPERTY)`.
+    #[test]
+    fn r47_property_event_delivered_on_changed_metadata() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = ai_instance();
+        let mut rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Double,
+                EventMask::PROPERTY.bits(),
+            )
+            .expect("subscriber added");
+
+        let prev = inst.record.get_field("EGU"); // "degC"
+        let _ = inst
+            .record
+            .put_field("EGU", EpicsValue::String("kPa".into()));
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "PROPERTY subscriber must receive event when metadata field changes"
+        );
+    }
+
+    /// Boundary 2: same metadata field written with the SAME value → NO event.
+    /// Matches C suppression at dbAccess.c:1379-1383 and the `prev != now` gate.
+    #[test]
+    fn r47_no_event_on_unchanged_metadata() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = ai_instance();
+        let mut rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Double,
+                EventMask::PROPERTY.bits(),
+            )
+            .expect("subscriber added");
+
+        let prev = inst.record.get_field("EGU"); // "degC"
+        // Write the same value — no change
+        let _ = inst.record.put_field("EGU", prev.clone().unwrap());
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
+
+        assert!(
+            rx.try_recv().is_err(),
+            "PROPERTY subscriber must NOT receive event when metadata value is unchanged"
+        );
+    }
+
+    /// Boundary 3: VALUE-only subscriber (no PROPERTY bit) receives NO event
+    /// from a metadata write, even when the field value changed.
+    #[test]
+    fn r47_value_only_subscriber_no_event_on_metadata_write() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = ai_instance();
+        let mut rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Double,
+                EventMask::VALUE.bits(),
+            )
+            .expect("subscriber added");
+
+        let prev = inst.record.get_field("EGU"); // "degC"
+        let _ = inst
+            .record
+            .put_field("EGU", EpicsValue::String("kPa".into()));
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
+
+        assert!(
+            rx.try_recv().is_err(),
+            "VALUE-only subscriber must NOT receive event from a metadata write"
+        );
+    }
+
+    /// Boundary 4 (took_metadata_change path): PROPERTY subscriber receives
+    /// event after process_local() when the record reports a metadata change.
+    #[test]
+    fn r47_process_local_property_event_on_took_metadata_change() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = RecordInstance::new(
+            "MUT2".to_string(),
+            MutatingMetaRecord {
+                val: 1.0,
+                egu: "V".to_string(),
+                took_change: false,
+            },
+        );
+        let mut rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Double,
+                EventMask::PROPERTY.bits(),
+            )
+            .expect("subscriber added");
+
+        // process() sets took_change = true and updates egu to "kV"
+        let _ = inst.process_local();
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "PROPERTY subscriber must receive event after process_local reports took_metadata_change"
+        );
     }
 }
 

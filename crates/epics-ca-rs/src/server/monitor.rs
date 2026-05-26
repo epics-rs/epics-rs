@@ -135,6 +135,9 @@ impl FlowControlGate {
 /// count)` — matches C `read_reply` which keeps the request count
 /// and pads (or uses `snapshot.value.count()` when the request was
 /// autosize=0).
+// R55 (fixed): `long_string` propagated from `ChannelEntry`; monitor events
+// for `$`-suffix channels are converted from `EpicsValue::String` to
+// `EpicsValue::CharArray` inside `send_event` (C dbChannel.c:483-507).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_monitor_sender<W>(
     pv: Arc<ProcessVariable>,
@@ -145,6 +148,7 @@ pub fn spawn_monitor_sender<W>(
     flow_control: Arc<FlowControlGate>,
     mut rx: mpsc::Receiver<MonitorEvent>,
     denied: Arc<AtomicBool>,
+    long_string: bool,
 ) -> tokio::task::JoinHandle<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -178,7 +182,7 @@ where
             if denied.load(Ordering::Acquire) {
                 continue;
             }
-            if send_event(data_type, data_count, sub_id, &event, &writer)
+            if send_event(data_type, data_count, sub_id, &event, &writer, long_string)
                 .await
                 .is_err()
             {
@@ -194,8 +198,22 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     sub_id: u32,
     event: &MonitorEvent,
     writer: &Arc<Mutex<BufWriter<W>>>,
+    long_string: bool,
 ) -> std::io::Result<()> {
-    let mut payload = encode_dbr(data_type, &event.snapshot)
+    // R55: for `$` long-string channels convert String → CharArray+NUL
+    // before encoding. Clone only when needed (most channels are not `$`).
+    let ls_snap;
+    let snapshot = if long_string {
+        ls_snap = {
+            let mut s = event.snapshot.clone();
+            super::apply_long_string(&mut s);
+            s
+        };
+        &ls_snap
+    } else {
+        &event.snapshot
+    };
+    let mut payload = encode_dbr(data_type, snapshot)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "encode"))?;
     // CA-268: DBR_CLASS_NAME wire payload is always one fixed 40-byte
     // string regardless of the underlying value count. Same override
@@ -214,7 +232,7 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     // pad when requested > actual AND truncate when requested <
     // actual. C `read_reply` (`rsrv/camessage.c:507-571`) sizes
     // the payload to `dbr_size_n(type, request_count)` either way.
-    let actual_count = event.snapshot.value.count() as u32;
+    let actual_count = snapshot.value.count() as u32;
     let element_count = if data_type == epics_base_rs::types::DBR_CLASS_NAME {
         1
     } else if data_count == 0 {
@@ -336,7 +354,7 @@ mod tests {
 
         // data_count = 0 means autosize (use snapshot's actual count);
         // matches every pre-R2-12 producer caller.
-        send_event(DBR_LONG, 0, 7, &event, &writer)
+        send_event(DBR_LONG, 0, 7, &event, &writer, false)
             .await
             .expect("send_event must succeed");
 

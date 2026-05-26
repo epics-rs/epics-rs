@@ -204,18 +204,26 @@ pub fn request_to_mask(
         _ => None,
     };
     let request_field = match request_field {
+        // `field` is a sub-structure → walk its children below. pvxs
+        // `request2mask` (pvrequest.cpp): the `fields.type()==Struct`
+        // branch.
         Some((_, FieldDesc::Structure { fields, .. })) => fields,
-        _ => {
-            // No `field` sub-structure (e.g., the standard "empty
-            // pvRequest" the Rust client sends as a 6-byte 0xFD-cached
-            // empty struct). Per pvxs convention this means "send the
-            // whole structure".
+        // No `field` entry at all (e.g. the standard "empty pvRequest"
+        // the Rust client sends as a 6-byte 0xFD-cached empty struct).
+        // pvxs `else if(!fields.valid()) foundrequested = true` →
+        // wildcard: select the whole structure.
+        None => {
             let total = value_desc.total_bits();
             for i in 0..total {
                 mask.set(i);
             }
             return Ok(mask);
         }
+        // `field` present but NOT a sub-structure (e.g. a scalar). pvxs's
+        // trailing `else` leaves `foundrequested == false`, so it throws
+        // "pvRequest must select at least one field". Mirror that as an
+        // error rather than silently widening to a wildcard.
+        Some(_) => return Err(RequestMaskError::EmptyMask),
     };
 
     // Empty `field {}` → all fields set.
@@ -1351,6 +1359,52 @@ mod tests {
             request_to_mask(&ntenum, &req).is_ok(),
             "request_to_mask must resolve a nested value.index path"
         );
+    }
+
+    #[test]
+    fn request_to_mask_field_as_scalar_errors() {
+        // A8-2: pvxs `request2mask` (pvrequest.cpp) — when `field` is
+        // present but is NOT a sub-structure, the trailing `else`
+        // leaves `foundrequested == false` and it throws "pvRequest
+        // must select at least one field". A scalar `field` must error,
+        // not silently widen to a wildcard.
+        use crate::pvdata::ScalarType;
+
+        let value = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                ("value".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: Vec::new(),
+                    },
+                ),
+            ],
+        };
+
+        // pvRequest whose `field` is a scalar rather than a sub-struct.
+        let req_field_scalar = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("field".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+        };
+        assert_eq!(
+            request_to_mask(&value, &req_field_scalar),
+            Err(RequestMaskError::EmptyMask),
+            "a non-structure `field` must error, not select all"
+        );
+
+        // Control: a pvRequest with NO `field` entry is still the
+        // whole-structure wildcard (pvxs `!fields.valid()` branch).
+        let req_no_field = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: Vec::new(),
+        };
+        let mask = request_to_mask(&value, &req_no_field).expect("absent field → wildcard");
+        for i in 0..value.total_bits() {
+            assert!(mask.get(i), "wildcard must set bit {i}");
+        }
     }
 
     #[test]

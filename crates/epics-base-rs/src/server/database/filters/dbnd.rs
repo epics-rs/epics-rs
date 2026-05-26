@@ -128,11 +128,16 @@ impl SubscriptionFilter for DeadbandFilter {
             *last = cur;
         }
 
-        // 446e0d4a: ALARM / PROPERTY / LOG bits guarantee delivery
-        // independent of the deadband. VALUE-only emissions are gated
-        // by `supra`.
-        let non_value = EventMask::from_bits(event.mask.bits() & !EventMask::VALUE.bits());
-        if supra || !non_value.is_empty() {
+        // C `dbnd.c:84`: `send = pfl->mask & ~(DBE_VALUE|DBE_LOG)` —
+        // both VALUE and LOG are stripped before the deadband test, and
+        // `recGblCheckDeadband` re-adds `mask & (DBE_VALUE|DBE_LOG)` only
+        // when `delta > deadband`. So VALUE *and* LOG are deadband-gated;
+        // only ALARM / PROPERTY (446e0d4a) bypass the deadband. Stripping
+        // LOG here too is what stops BR-R52's widened `VALUE|LOG` emission
+        // mask from defeating the `.{dbnd}` filter on every value change.
+        let bypass =
+            EventMask::from_bits(event.mask.bits() & !(EventMask::VALUE | EventMask::LOG).bits());
+        if supra || !bypass.is_empty() {
             Some(event)
         } else {
             None
@@ -281,6 +286,43 @@ mod tests {
         assert!(f.apply(ev(50.5, EventMask::PROPERTY)).is_some());
         // last_sent untouched — 50.5 still inside the deadband around 50.
         assert!(f.apply(ev(50.5, EventMask::VALUE)).is_none());
+    }
+
+    /// BR-R52 regression — the value-change emission mask was widened
+    /// to `VALUE|LOG` (C-faithful, gateVc.cc posts VALUE|ALARM|LOG).
+    /// dbnd MUST strip LOG as well as VALUE before the deadband test
+    /// (C `dbnd.c:84`: `send = pfl->mask & ~(DBE_VALUE|DBE_LOG)`);
+    /// otherwise the LOG bit makes the bypass mask non-empty and every
+    /// value change defeats the `.{dbnd}` filter. A sub-threshold
+    /// `VALUE|LOG` change and a sub-threshold LOG-only event must both
+    /// be suppressed; a supra-threshold change is delivered.
+    #[test]
+    fn value_log_subthreshold_is_deadband_gated() {
+        let f = DeadbandFilter::absolute(1.0);
+        // Seed baseline at 10.0 (delta=INF on NaN seed → passes).
+        assert!(
+            f.apply(ev(10.0, EventMask::VALUE | EventMask::LOG))
+                .is_some()
+        );
+        // Sub-threshold VALUE|LOG (delta 0.4 ≤ 1.0): LOG must NOT
+        // bypass the deadband — suppressed.
+        assert!(
+            f.apply(ev(10.4, EventMask::VALUE | EventMask::LOG))
+                .is_none(),
+            "VALUE|LOG sub-threshold change must be deadband-gated (C dbnd.c:84 strips DBE_LOG)"
+        );
+        // LOG-only sub-threshold event is likewise gated (last_sent
+        // untouched, still 10.0; delta 0.4 ≤ 1.0).
+        assert!(
+            f.apply(ev(10.4, EventMask::LOG)).is_none(),
+            "LOG-only sub-threshold event must be deadband-gated"
+        );
+        // Supra-threshold VALUE|LOG (delta 1.5 > 1.0) is delivered.
+        assert!(
+            f.apply(ev(11.5, EventMask::VALUE | EventMask::LOG))
+                .is_some(),
+            "VALUE|LOG supra-threshold change passes"
+        );
     }
 
     /// NaN ↔ finite transitions produce delta=INF in C; they MUST

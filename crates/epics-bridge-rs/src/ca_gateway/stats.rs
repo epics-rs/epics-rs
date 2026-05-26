@@ -31,17 +31,21 @@
 //! and scripts written against the C source's `gateServer.cc:1903-1965`
 //! names keep working against the Rust gateway:
 //!
+//! All C gateStat PVs are served as DBR_DOUBLE (`gateStat.cc:27`
+//! `#define STAT_DOUBLE`), so these C-name aliases are Double even for
+//! integer counts, matching the native type a C-compat client sees.
+//!
 //! | PV | Type | Maps to |
 //! |----|------|---------|
-//! | `<prefix>vctotal` | Long | total_vc — entries with ≥1 downstream client |
-//! | `<prefix>pvtotal` | Long | total_pv — cache size (all real PVs) |
-//! | `<prefix>connected` | Long | active + inactive (upstream-alive) |
-//! | `<prefix>active` | Long | activeCount |
-//! | `<prefix>inactive` | Long | inactiveCount |
-//! | `<prefix>unconnected` | Long | connecting + dead + disconnect (statUnconnected) |
-//! | `<prefix>dead` | Long | deadCount |
-//! | `<prefix>connecting` | Long | connectingCount |
-//! | `<prefix>disconnected` | Long | disconnect-state count (statDisconnected) |
+//! | `<prefix>vctotal` | Double | total_vc — entries with ≥1 downstream client |
+//! | `<prefix>pvtotal` | Double | total_pv — cache size (all real PVs) |
+//! | `<prefix>connected` | Double | active + inactive (upstream-alive) |
+//! | `<prefix>active` | Double | activeCount |
+//! | `<prefix>inactive` | Double | inactiveCount |
+//! | `<prefix>unconnected` | Double | connecting + dead + disconnect (statUnconnected) |
+//! | `<prefix>dead` | Double | deadCount |
+//! | `<prefix>connecting` | Double | connectingCount |
+//! | `<prefix>disconnected` | Double | disconnect-state count (statDisconnected) |
 //! | `<prefix>clientEventRate` | Double | eventRate |
 //! | `<prefix>existTestRate` | Double | pvExistTest (search) resolutions/sec — separate from eventRate |
 //!
@@ -54,8 +58,8 @@
 //!
 //! | PV | Type | Maps to |
 //! |----|------|---------|
-//! | `<prefix>fd` | Long | Current open file-descriptor count |
-//! | `<prefix>clientEventCount` | Long | Cumulative upstream events received |
+//! | `<prefix>fd` | Double | Current open file-descriptor count (C statFd) |
+//! | `<prefix>clientEventCount` | Long | Cumulative upstream events received (Rust-native, no C name) |
 //! | `<prefix>postEventCount` | Long | Cumulative monitor posts fanned downstream |
 //! | `<prefix>loopCount` | Long | Cumulative gateway run-loop iterations |
 
@@ -205,23 +209,32 @@ impl Stats {
             // (both are "upstream is alive"). pvtotal = total_pv (cache
             // size); vctotal = total_vc (entries with a downstream
             // client) — these are distinct counters in the C source.
-            ("vctotal", EpicsValue::Long(0)),
-            ("pvtotal", EpicsValue::Long(0)),
-            ("connected", EpicsValue::Long(0)),
-            ("active", EpicsValue::Long(0)),
-            ("inactive", EpicsValue::Long(0)),
-            ("unconnected", EpicsValue::Long(0)),
-            ("dead", EpicsValue::Long(0)),
-            ("connecting", EpicsValue::Long(0)),
-            ("disconnected", EpicsValue::Long(0)),
+            // C ca-gateway serves every gateStat PV as DBR_DOUBLE
+            // (gateStat.cc:27 `#define STAT_DOUBLE` → bestExternalType()
+            // = aitEnumFloat64, gateStat.cc:235-238). The C-name compat
+            // aliases must therefore be Double, not Long, or a downstream
+            // client sees a divergent native type at CREATE_CHANNEL.
+            ("vctotal", EpicsValue::Double(0.0)),
+            ("pvtotal", EpicsValue::Double(0.0)),
+            ("connected", EpicsValue::Double(0.0)),
+            ("active", EpicsValue::Double(0.0)),
+            ("inactive", EpicsValue::Double(0.0)),
+            ("unconnected", EpicsValue::Double(0.0)),
+            ("dead", EpicsValue::Double(0.0)),
+            ("connecting", EpicsValue::Double(0.0)),
+            ("disconnected", EpicsValue::Double(0.0)),
             ("clientEventRate", EpicsValue::Double(0.0)),
             // Downstream search-resolution rate. C ca-gateway exposes
             // `existTestRate` (gateServer.cc:1991) from a counter
             // separate from the upstream event counters.
             ("existTestRate", EpicsValue::Double(0.0)),
             // B5: RATE_STATS internals — tokio-model equivalents of
-            // the C++ ca-gateway gateServer counters.
-            ("fd", EpicsValue::Long(0)),
+            // the C++ ca-gateway gateServer counters. `fd` is a C
+            // gateStat PV (statFd) → DBR_DOUBLE like the other stats;
+            // clientEventCount/postEventCount/loopCount have no C-name
+            // counterpart (C exposes rates, not raw counts), so they
+            // stay Long as a Rust-native API surface.
+            ("fd", EpicsValue::Double(0.0)),
             ("clientEventCount", EpicsValue::Long(0)),
             ("postEventCount", EpicsValue::Long(0)),
             ("loopCount", EpicsValue::Long(0)),
@@ -360,20 +373,22 @@ impl Stats {
             db.put_pv_and_post(&n_put, EpicsValue::Long(put_count as i32)),
             db.put_pv_and_post(&n_readonly, EpicsValue::Long(readonly as i32)),
             db.put_pv_and_post(&n_hosts, EpicsValue::Long(host_count as i32)),
-            // `vctotal` counts only entries with an attached downstream
-            // client (C `total_vc`, gateVc.cc:406,472), distinct from the
-            // `pvtotal` cache size (C `total_pv`, gatePv.cc:183).
-            db.put_pv_and_post(&n_vctotal, EpicsValue::Long(vc as i32)),
-            db.put_pv_and_post(&n_pvtotal, EpicsValue::Long(cache_size as i32)),
-            db.put_pv_and_post(&n_connected, EpicsValue::Long(connected)),
-            db.put_pv_and_post(&n_active_alias, EpicsValue::Long(active as i32)),
-            db.put_pv_and_post(&n_inactive_alias, EpicsValue::Long(inactive as i32)),
-            db.put_pv_and_post(&n_unconnected, EpicsValue::Long(unconnected)),
-            db.put_pv_and_post(&n_dead_alias, EpicsValue::Long(dead as i32)),
-            db.put_pv_and_post(&n_connecting_alias, EpicsValue::Long(connecting as i32)),
+            // C-name compat aliases are served as DBR_DOUBLE to match C
+            // ca-gateway (gateStat STAT_DOUBLE). `vctotal` counts only
+            // entries with an attached downstream client (C `total_vc`,
+            // gateVc.cc:406,472), distinct from the `pvtotal` cache size
+            // (C `total_pv`, gatePv.cc:183).
+            db.put_pv_and_post(&n_vctotal, EpicsValue::Double(vc as f64)),
+            db.put_pv_and_post(&n_pvtotal, EpicsValue::Double(cache_size as f64)),
+            db.put_pv_and_post(&n_connected, EpicsValue::Double(connected as f64)),
+            db.put_pv_and_post(&n_active_alias, EpicsValue::Double(active as f64)),
+            db.put_pv_and_post(&n_inactive_alias, EpicsValue::Double(inactive as f64)),
+            db.put_pv_and_post(&n_unconnected, EpicsValue::Double(unconnected as f64)),
+            db.put_pv_and_post(&n_dead_alias, EpicsValue::Double(dead as f64)),
+            db.put_pv_and_post(&n_connecting_alias, EpicsValue::Double(connecting as f64)),
             // C `disconnected` = statDisconnected = the Disconnect-state
             // count (gatePv.cc:607,616), NOT the Dead count.
-            db.put_pv_and_post(&n_disconnected, EpicsValue::Long(disconnect as i32)),
+            db.put_pv_and_post(&n_disconnected, EpicsValue::Double(disconnect as f64)),
             db.put_pv_and_post(&n_client_event_rate, EpicsValue::Double(event_rate)),
             db.put_pv_and_post(&n_exist_test_rate, EpicsValue::Double(exist_test_rate)),
             // B5 RATE_STATS internals.
@@ -393,7 +408,10 @@ impl Stats {
         // platform we leave the PV at its last value rather than
         // posting a misleading 0.
         if let Some(fd) = fd_count {
-            let _ = db.put_pv_and_post(&n_fd, EpicsValue::Long(fd as i32)).await;
+            // C `fd` (statFd) is a gateStat PV → DBR_DOUBLE.
+            let _ = db
+                .put_pv_and_post(&n_fd, EpicsValue::Double(fd as f64))
+                .await;
         }
     }
 
@@ -633,9 +651,9 @@ mod tests {
         );
         assert_eq!(db.get_pv("g:loopCount").await.unwrap(), EpicsValue::Long(3));
         // `fd` should have been posted with a plausible value on any
-        // supported platform.
-        if let Ok(EpicsValue::Long(fd)) = db.get_pv("g:fd").await {
-            assert!(fd >= 0);
+        // supported platform. It is a C gateStat PV → DBR_DOUBLE.
+        if let Ok(EpicsValue::Double(fd)) = db.get_pv("g:fd").await {
+            assert!(fd >= 0.0);
         }
     }
 
@@ -679,9 +697,15 @@ mod tests {
         stats.refresh(&cache, &db, cache_size, 0).await;
 
         // pvtotal = all cached PVs (3); vctotal = only the 2 with a
-        // downstream client.
-        assert_eq!(db.get_pv("g:pvtotal").await.unwrap(), EpicsValue::Long(3));
-        assert_eq!(db.get_pv("g:vctotal").await.unwrap(), EpicsValue::Long(2));
+        // downstream client. Both served as DBR_DOUBLE (C STAT_DOUBLE).
+        assert_eq!(
+            db.get_pv("g:pvtotal").await.unwrap(),
+            EpicsValue::Double(3.0)
+        );
+        assert_eq!(
+            db.get_pv("g:vctotal").await.unwrap(),
+            EpicsValue::Double(2.0)
+        );
     }
 
     /// A9-5: the `disconnected` alias must report the Disconnect-state
@@ -716,17 +740,68 @@ mod tests {
         stats.refresh(&cache, &db, cache_size, 0).await;
 
         // disconnected = Disconnect-state count (2), distinct from dead (1).
+        // C-name aliases are served as DBR_DOUBLE (C STAT_DOUBLE).
         assert_eq!(
             db.get_pv("g:disconnected").await.unwrap(),
-            EpicsValue::Long(2)
+            EpicsValue::Double(2.0)
         );
-        assert_eq!(db.get_pv("g:dead").await.unwrap(), EpicsValue::Long(1));
+        assert_eq!(db.get_pv("g:dead").await.unwrap(), EpicsValue::Double(1.0));
         // unconnected = connecting(1) + dead(1) + disconnect(2) = 4.
         assert_eq!(
             db.get_pv("g:unconnected").await.unwrap(),
-            EpicsValue::Long(4)
+            EpicsValue::Double(4.0)
         );
         // connected = active(1) + inactive(1) = 2 (unchanged by this fix).
-        assert_eq!(db.get_pv("g:connected").await.unwrap(), EpicsValue::Long(2));
+        assert_eq!(
+            db.get_pv("g:connected").await.unwrap(),
+            EpicsValue::Double(2.0)
+        );
+    }
+
+    /// A9-6: every C-name compat-alias stat PV must be served as
+    /// DBR_DOUBLE (C ca-gateway `gateStat.cc:27` `#define STAT_DOUBLE` →
+    /// `bestExternalType()` = aitEnumFloat64, gateStat.cc:235-238).
+    /// Pre-fix they were registered as DBR_LONG, so a downstream client
+    /// connecting against the Rust gateway saw a divergent native type
+    /// at CREATE_CHANNEL. The native type is fixed at registration, so a
+    /// client connecting before the first refresh already sees Double.
+    /// Rust-native names (totalPvs, activeCount, …) keep DBR_LONG — they
+    /// have no C-name counterpart.
+    #[tokio::test]
+    async fn compat_alias_stats_are_double_native_type() {
+        let stats = Stats::new("g:".into());
+        let db = PvDatabase::new();
+        stats.publish_initial(&db).await;
+
+        for name in [
+            "g:vctotal",
+            "g:pvtotal",
+            "g:connected",
+            "g:active",
+            "g:inactive",
+            "g:unconnected",
+            "g:dead",
+            "g:connecting",
+            "g:disconnected",
+            "g:fd",
+        ] {
+            assert!(
+                matches!(db.get_pv(name).await.unwrap(), EpicsValue::Double(_)),
+                "{name} must be DBR_DOUBLE to match C gateStat"
+            );
+        }
+
+        // Rust-native names have no C counterpart and stay DBR_LONG.
+        for name in [
+            "g:totalPvs",
+            "g:activeCount",
+            "g:deadCount",
+            "g:clientEventCount",
+        ] {
+            assert!(
+                matches!(db.get_pv(name).await.unwrap(), EpicsValue::Long(_)),
+                "{name} is Rust-native and must stay DBR_LONG"
+            );
+        }
     }
 }

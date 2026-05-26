@@ -5,8 +5,8 @@
 //! flags. We default all of them off; callers that want richer NT
 //! shapes set the flags explicitly.
 
-use super::meta::{alarm_default, alarm_desc, time_default, time_desc};
-use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+use super::meta::{alarm_desc, time_desc};
+use crate::pvdata::{FieldDesc, PvField, ScalarType};
 
 /// Builder for `NTScalar` / `NTScalarArray`. Configure scalar type
 /// and optional meta sub-structures, then call `build()` /
@@ -176,38 +176,7 @@ impl NTScalar {
     // pvxs nt.h:96 does the same: `create() { return build().create(); }`.
     /// Create a default-initialised value matching [`build()`](Self::build).
     pub fn create(&self) -> PvField {
-        let struct_id = if self.is_array {
-            "epics:nt/NTScalarArray:1.0".to_string()
-        } else {
-            "epics:nt/NTScalar:1.0".to_string()
-        };
-        let mut s = PvStructure::new(&struct_id);
-        let value_default = if self.is_array {
-            PvField::ScalarArray(Vec::new())
-        } else {
-            PvField::Scalar(default_scalar(self.value_type))
-        };
-        s.fields.push(("value".into(), value_default));
-        s.fields.push(("alarm".into(), alarm_default()));
-        s.fields.push(("timeStamp".into(), time_default()));
-        PvField::Structure(s)
-    }
-}
-
-fn default_scalar(t: ScalarType) -> ScalarValue {
-    match t {
-        ScalarType::Boolean => ScalarValue::Boolean(false),
-        ScalarType::Byte => ScalarValue::Byte(0),
-        ScalarType::Short => ScalarValue::Short(0),
-        ScalarType::Int => ScalarValue::Int(0),
-        ScalarType::Long => ScalarValue::Long(0),
-        ScalarType::UByte => ScalarValue::UByte(0),
-        ScalarType::UShort => ScalarValue::UShort(0),
-        ScalarType::UInt => ScalarValue::UInt(0),
-        ScalarType::ULong => ScalarValue::ULong(0),
-        ScalarType::Float => ScalarValue::Float(0.0),
-        ScalarType::Double => ScalarValue::Double(0.0),
-        ScalarType::String => ScalarValue::String(String::new()),
+        crate::pvdata::encode::default_value_for(&self.build())
     }
 }
 

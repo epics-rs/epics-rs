@@ -1424,17 +1424,33 @@ impl GroupMonitor {
             TriggerDef::None => return EventMark::Skip,
             // Self-trigger inside a mixed group marks only its own field.
             TriggerDef::SelfOnly => vec![source.field_name.as_str()],
-            // `"*"` marks every member field (whole group).
-            TriggerDef::All => def.members.iter().map(|m| m.field_name.as_str()).collect(),
+            // `"*"` marks every member field WITH A CHANNEL. pvxs drops
+            // channel-less Const/Structure targets from the `*` expansion
+            // (`groupconfigprocessor.cpp:387-388`: `if(!…channel.empty())`)
+            // — a channel-less member never produces a runtime event, so
+            // marking it would flag it "changed" + re-serialize on every
+            // update for nothing.
+            TriggerDef::All => def
+                .members
+                .iter()
+                .filter(|m| !m.channel.is_empty())
+                .map(|m| m.field_name.as_str())
+                .collect(),
             // Named targets: pvxs resolves only references that name an
-            // existing field (`groupconfigprocessor.cpp:381-409`);
-            // unknown refs were warned at `process_groups` and dropped.
+            // existing field WITH A CHANNEL (`groupconfigprocessor.cpp:
+            // 405-409`: a target whose `channel.empty()` is ignored).
+            // Unknown refs were warned + dropped at parse time (A10-1) and
+            // are absent from `channeled` here too.
             TriggerDef::Fields(refs) => {
-                let known: std::collections::HashSet<&str> =
-                    def.members.iter().map(|m| m.field_name.as_str()).collect();
+                let channeled: std::collections::HashSet<&str> = def
+                    .members
+                    .iter()
+                    .filter(|m| !m.channel.is_empty())
+                    .map(|m| m.field_name.as_str())
+                    .collect();
                 refs.iter()
                     .map(String::as_str)
-                    .filter(|r| known.contains(r))
+                    .filter(|r| channeled.contains(r))
                     .collect()
             }
         };
@@ -2039,6 +2055,69 @@ mod tests {
             PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(42)),
         );
         assert!(pv.get_field("x").is_some());
+    }
+
+    /// A10-2: a `+trigger` target without a backing channel (Const /
+    /// Structure member) must NOT be marked in the changed-bitset. pvxs
+    /// filters channel-less members out of BOTH the `*` expansion
+    /// (`groupconfigprocessor.cpp:387-388`) and named-target resolution
+    /// (`405-409`). Pre-fix the Rust `*` and named arms marked them, so a
+    /// `+trigger:"*"` group with a const/structure member flagged it
+    /// "changed" and re-serialized it on every update.
+    #[test]
+    fn value_trigger_excludes_channelless_members() {
+        use crate::qsrv::group_config::parse_group_config;
+
+        fn src_idx(def: &GroupPvDef) -> usize {
+            def.members
+                .iter()
+                .position(|m| m.field_name == "src")
+                .expect("src member present")
+        }
+
+        // `*` arm: marks every CHANNELED member, never the structure one.
+        let star = r#"{ "GRP": {
+            "src":  { "+channel": "R:src", "+trigger": "*" },
+            "chan": { "+channel": "R:chan" },
+            "meta": { "+type": "structure", "+id": "x/v1" }
+        } }"#;
+        let def = parse_group_config(star).unwrap().pop().unwrap();
+        match GroupMonitor::value_event_mark(&def, src_idx(&def)) {
+            EventMark::Marked(paths) => {
+                assert!(
+                    paths.contains(&"chan".to_string()),
+                    "channeled member must be marked: {paths:?}"
+                );
+                assert!(
+                    !paths.contains(&"meta".to_string()),
+                    "channel-less structure member must NOT be marked by `*`: {paths:?}"
+                );
+            }
+            EventMark::Derive => panic!("expected Marked from a `*` trigger, got Derive"),
+            EventMark::Skip => panic!("expected Marked from a `*` trigger, got Skip"),
+        }
+
+        // Named arm: a named channel-less target is dropped, channeled kept.
+        let named = r#"{ "GRP2": {
+            "src":  { "+channel": "R:src", "+trigger": "chan,meta" },
+            "chan": { "+channel": "R:chan" },
+            "meta": { "+type": "structure", "+id": "x/v1" }
+        } }"#;
+        let def = parse_group_config(named).unwrap().pop().unwrap();
+        match GroupMonitor::value_event_mark(&def, src_idx(&def)) {
+            EventMark::Marked(paths) => {
+                assert!(
+                    paths.contains(&"chan".to_string()),
+                    "named channeled target must be marked: {paths:?}"
+                );
+                assert!(
+                    !paths.contains(&"meta".to_string()),
+                    "named channel-less target must NOT be marked: {paths:?}"
+                );
+            }
+            EventMark::Derive => panic!("expected Marked from named triggers, got Derive"),
+            EventMark::Skip => panic!("expected Marked from named triggers, got Skip"),
+        }
     }
 
     #[test]

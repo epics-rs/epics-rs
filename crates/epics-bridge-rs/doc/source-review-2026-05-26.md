@@ -362,6 +362,25 @@ Fix direction (structural):
 
 Add two shared helpers — `alarm_status_class(condition: u16) -> i32` (the `iocsource.cpp:187-223` switch) and `alarm_condition_string(condition: u16) -> &'static str` (indexing `epicsAlarmConditionStrings`) — and apply them at all three alarm builders (`pvif.rs build_alarm`, `pvif.rs build_alarm_overlay`, `group.rs build_alarm_from_snapshot`). Each builder: `status` = `alarm_status_class(condition)`; `message` = `alarm_condition_string(condition)` when `condition != 0` else `""`. `severity` stays the raw `epicsAlarmSeverity` (matches pvxs `node["alarm.severity"] = meta.severity`).
 
+### BR-R63 — CA gateway default (no `.access` file) is allow-all, allowing writes; C ca-gateway default is read-only
+
+Severity: High
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/ca_gateway/server.rs:212-216` — when `config.access_path` is `None`, the gateway builds `AccessConfig::allow_all()`. `crates/epics-bridge-rs/src/ca_gateway/access.rs:98-109` (`can_write`) returns `true` unconditionally when `allow_all` is set, and `access.rs:118-122` makes `allow_all()` the `Default`. The separate gateway-wide `read_only` flag (`crates/epics-bridge-rs/src/ca_gateway/upstream.rs:124`) defaults `false`, so with no `.access` file **both** the read-only gate and the ACF gate pass → downstream writes are forwarded upstream.
+- `epics-modules/ca-gateway/src/gateAs.cc:667-672` — when `afile` (the access file) is `NULL`, `gateAs::initialize` sets `use_default_rules = aitTrue` (the same default is installed at `gateAs.cc:653-655` when the file fails to open). `epics-modules/ca-gateway/src/gateAs.cc:735-737` — with `use_default_rules`, `readFunc` feeds `asInitialize` the single rule `ASG(DEFAULT) { RULE(1,READ) }` — read access at level 1, **no write**.
+
+Impact:
+
+A CA gateway started without an `.access` file fails **open** in the Rust port (every downstream client may write through to upstream IOCs) but fails **safe** (read-only) in the C gateway. This is a security-relevant default: the C gateway's read-only fallback is a deliberate guard so a mis-deployed or file-less gateway cannot be used to write to protected upstream records; the Rust default removes that guard silently.
+
+Fix direction (structural):
+
+Model `AccessConfig`'s policy as an explicit `Mode` enum (`ReadOnly` / `AllowAll` / `Rules(cfg)`) so the previous `allow_all: bool` + `Option<rules>` pair cannot represent an illegal combination, and add `AccessConfig::read_only()` (reads allowed, writes denied — the C `ASG(DEFAULT) { RULE(1,READ) }` equivalent). Use `read_only()` at the no-file default (`server.rs:215`) and as the `Default` impl, so the "no ACF ⟹ writes denied" invariant holds by construction. `allow_all()` stays as an explicit opt-in only.
+
 ## Uncertain candidates
 
 ### BR-R-UNCERTAIN-1 — CA gateway subscribes upstream with the channel's native element count, not CA `count=0`

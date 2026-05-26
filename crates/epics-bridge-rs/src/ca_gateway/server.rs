@@ -209,6 +209,9 @@ impl GatewayServer {
 
         // Load .access (optional). `ArcSwap` for the same lock-free
         // hot-reload pattern as `pvlist`.
+        // BR-R63: no .access file must default to READ-ONLY (C ca-gateway
+        // installs `ASG(DEFAULT) { RULE(1,READ) }`, gateAs.cc:735-737);
+        // allow_all() here fails open, forwarding writes upstream.
         let access = if let Some(path) = &config.access_path {
             AccessConfig::from_file(path)?
         } else {

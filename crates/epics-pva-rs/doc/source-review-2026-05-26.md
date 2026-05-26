@@ -1024,6 +1024,33 @@ and the upstream pvxs C++ site.
   `build().create()`. Single source of truth: the field set can no longer
   drift from `build()` by construction.
 
+### R80 — CREATE_CHANNEL failure reply sends `serverChannelID = 0` instead of pvxs's `-1` (0xFFFFFFFF) sentinel
+
+- **Severity:** Low (the non-OK status governs the client's handling of a
+  failed CREATE_CHANNEL; a spec-correct client ignores the sid on failure.
+  Still a genuine wire-byte divergence from the pvxs sentinel, and `0` could
+  be misread as a literal channel id by a lenient client).
+- **Status:** Fixed.
+- **Evidence:**
+  - Rust `src/server_native/tcp.rs:2123` (unknown-PV branch) and
+    `src/server_native/tcp.rs:3436` (per-connection max-channels branch):
+    both build the reply as `cid` + `put_u32(0u32)` (sid) + error `Status`.
+    The success branch writes the real `cc.sid`.
+  - C++ pvxs `src/serverchan.cpp:273` initialises `uint32_t cid = -1, sid =
+    -1;`, leaves `sid = -1` on the not-found / error path (`:286`) and resets
+    `sid = -1` on fatal create failure (`:338`), then emits
+    `to_wire(R, cid); to_wire(R, sid); to_wire(R, sts);` (`:349-351`). So the
+    failure reply carries `sid = 0xFFFFFFFF`.
+- **Impact:** CREATE_CHANNEL failure replies differ from pvxs by one field
+  (sid `0x00000000` vs `0xFFFFFFFF`). This server's `alloc_sid()`
+  (`tcp.rs:40-43`) starts `NEXT_SID` at 1, so `0` is never a live channel id
+  here — hence no internal collision — but the wire value still diverges from
+  the documented pvxs sentinel.
+- **Fix direction:** Emit the pvxs sentinel `0xFFFFFFFF` at both failure
+  sites. Define it once (`CREATE_CHANNEL_NO_SID = u32::MAX`, co-located with
+  the SID allocator) so both sites share one sentinel definition, mirroring
+  pvxs's single `sid = -1`.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

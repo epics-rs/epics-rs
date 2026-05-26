@@ -2120,6 +2120,9 @@ async fn handle_connection_io(
                         peer_entry
                             .set_channel_names(channels.values().map(|c| c.name.clone()).collect());
                     } else {
+                        // R80: CREATE_CHANNEL failure sid must be the
+                        // no-channel sentinel 0xFFFFFFFF (pvxs
+                        // serverchan.cpp:349, sid=-1), not 0.
                         payload.put_u32(0u32, order);
                         Status::error(format!("unknown PV: {}", cc.name))
                             .write_into(order, &mut payload);
@@ -3433,6 +3436,8 @@ async fn handle_create_channel(
             );
             let mut payload = Vec::new();
             payload.put_u32(cid, order);
+            // R80: CREATE_CHANNEL failure sid must be the no-channel sentinel
+            // 0xFFFFFFFF (pvxs serverchan.cpp:349, sid=-1), not 0.
             payload.put_u32(0u32, order);
             Status::error("max channels per connection reached".to_string())
                 .write_into(order, &mut payload);

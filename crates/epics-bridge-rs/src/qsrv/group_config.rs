@@ -226,6 +226,10 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
         if let Some(existing_def) = existing.get_mut(&def.name) {
             // Merge members into existing group
             existing_def.members.extend(def.members);
+            // BR-R59: re-sort the combined member list — the merge appends
+            // a second source's members, so the canonical (put_order,
+            // field_name) order must be re-established over the union.
+            sort_members_canonical(&mut existing_def.members);
             // BR-R58: the merge may have turned a previously pure
             // self-trigger group into a mixed-trigger group (a new member
             // carries `+trigger`). Re-resolve so any `SelfOnly` member is
@@ -268,6 +272,21 @@ fn default_atomic() -> bool {
     true
 }
 
+/// BR-R59: canonical group-member ordering — `put_order` primary,
+/// `field_name` secondary. `put_order` is `Option<i32>`; `None`
+/// (no `+putorder`, "not putable") sorts before any `Some`, matching
+/// pvxs's `i64::MIN` sentinel ordering (`fieldconfig.h:37`). The
+/// field-name tiebreak makes the order a pure function of the config,
+/// independent of the HashMap iteration order the members were collected
+/// in.
+fn sort_members_canonical(members: &mut [GroupMember]) {
+    members.sort_by(|a, b| {
+        a.put_order
+            .cmp(&b.put_order)
+            .then_with(|| a.field_name.cmp(&b.field_name))
+    });
+}
+
 fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> {
     let mut members = Vec::new();
 
@@ -281,15 +300,15 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         members.push(member);
     }
 
-    // BR-R59: this put_order-ONLY stable sort over a HashMap-random input
-    // (`fields` is a `#[serde(flatten)]` HashMap) leaves equal-put_order
-    // members (the common case — only writable members carry +putorder) in
-    // arbitrary order, making the wire field/bit layout non-deterministic.
-    // pvxs derives a deterministic putOrder-then-name order from a
-    // name-sorted std::map + stable_sort (groupconfig.h:28,
-    // groupconfigprocessor.cpp:253-262). Fixed by a (put_order, field_name)
-    // total order — see sort_members_canonical.
-    members.sort_by_key(|m| m.put_order);
+    // BR-R59: total (put_order, field_name) order. The `fields` source is
+    // a `#[serde(flatten)]` HashMap (randomized iteration), so a
+    // put_order-only stable sort left equal-put_order members (the common
+    // case — only writable members carry +putorder) in arbitrary order,
+    // making the wire field/bit layout non-deterministic. pvxs derives a
+    // deterministic putOrder-then-name order from a name-sorted std::map +
+    // stable_sort (groupconfig.h:28, groupconfigprocessor.cpp:253-262); the
+    // field-name tiebreak reproduces it independent of HashMap order.
+    sort_members_canonical(&mut members);
 
     // Validate trigger field references against actual member field names.
     // C++ QSRV does this in pdb.cpp:510-533 (trigger resolution phase).
@@ -755,6 +774,54 @@ mod tests {
             matches!(a.triggers, TriggerDef::None),
             "merge that introduces an explicit-trigger member must demote the earlier no-trigger member to silent"
         );
+    }
+
+    /// BR-R59: member order must be a deterministic (put_order,
+    /// field_name) total order, not HashMap-iteration order. Members with
+    /// no `+putorder` (`None`) sort first, then by put_order; ties broken
+    /// by field name — matching pvxs's name-sorted-then-stable-putOrder
+    /// layout.
+    #[test]
+    fn br_r59_member_order_is_canonical() {
+        let groups = parse_group_config(
+            r#"{ "GRP:ord": {
+                "zebra": {"+channel": "R:z"},
+                "alpha": {"+channel": "R:a"},
+                "mid":   {"+channel": "R:m", "+putorder": 5},
+                "first": {"+channel": "R:f", "+putorder": 1}
+            }}"#,
+        )
+        .unwrap();
+        let order: Vec<&str> = groups[0]
+            .members
+            .iter()
+            .map(|m| m.field_name.as_str())
+            .collect();
+        // None-put_order members first (alpha, zebra by name), then
+        // put_order 1 (first), then 5 (mid).
+        assert_eq!(order, vec!["alpha", "zebra", "first", "mid"]);
+    }
+
+    /// BR-R59: the canonical order is re-established over the union after
+    /// a cross-source merge (members appended, then re-sorted).
+    #[test]
+    fn br_r59_merge_reestablishes_canonical_order() {
+        let mut existing = std::collections::HashMap::new();
+        merge_group_defs(
+            &mut existing,
+            parse_group_config(r#"{ "GRP:mo": { "yankee": {"+channel": "R:y"} } }"#).unwrap(),
+        );
+        merge_group_defs(
+            &mut existing,
+            parse_group_config(r#"{ "GRP:mo": { "bravo": {"+channel": "R:b"} } }"#).unwrap(),
+        );
+        let order: Vec<&str> = existing["GRP:mo"]
+            .members
+            .iter()
+            .map(|m| m.field_name.as_str())
+            .collect();
+        // Both no-put_order → name-sorted union: bravo before yankee.
+        assert_eq!(order, vec!["bravo", "yankee"]);
     }
 
     /// BR-R29: an explicit `+trigger:"*"` is still parsed as `All`

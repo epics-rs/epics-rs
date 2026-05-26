@@ -233,14 +233,14 @@ Within `epics-bridge-rs/src/ca_gateway/pvlist.rs`:
 
 Severity: Medium
 
-Status: Doc-only (design decision deferred; fix direction below requires downstream-semantics sign-off)
+Status: Fixed — Option 1 implemented (alarm update, keep subscriptions alive). See commit after `0a281922`.
 
 Evidence:
 
 - `crates/epics-bridge-rs/src/pva_gateway/channel_cache.rs:847–860` — after `handle.wait().await` returns (upstream monitor closed or errored), the backoff loop calls `pause_for_task.clear()`, logs a warning, sleeps, and `continue`s to reconnect. No event is written to `tx_raw_for_task` or `tx_for_task` in this sequence. Downstream forwarder tasks block indefinitely on `bcast.recv().await` (`source.rs:747` raw path; `source.rs:820` typed path).
 - `crates/epics-bridge-rs/src/ca_gateway/upstream.rs:543–549` — the CA gateway explicitly posts `db_clone.post_alarm(&name, 3, LINK_ALARM)` on upstream CA disconnect so all downstream CA monitors receive `INVALID + LINK_ALARM` immediately.
 - `epics-base/modules/pva2pva/p2pApp/chancache.cpp:90–98` — pva2pva fans out `channelStateChange(DISCONNECTED/DESTROYED)` to every interested downstream `GWChannel`, causing each to propagate the disconnect to its PVA client.
-- All PVA gateway source files (`channel_cache.rs`, `source.rs`, `gateway.rs`, `middleware.rs`, `multi_gateway.rs`) contain zero alarm-setting or channelStateChange calls.
+- All PVA gateway source files (`channel_cache.rs`, `source.rs`, `gateway.rs`, `middleware.rs`, `multi_gateway.rs`) contained zero alarm-setting or channelStateChange calls before this fix.
 
 Impact:
 
@@ -252,15 +252,11 @@ During an upstream PVA IOC disconnect, downstream PVA monitors observe the last 
 
 This creates a visible inconsistency between the CA and PVA sides of the same gateway process: a PV accessible via both CA and PVA clients will raise INVALID+LINK_ALARM on the CA side but stay "normal" (last alarm state) on the PVA side during the same upstream outage.
 
-Fix direction (design decision required — not yet implemented):
+Fix applied (Option 1 — alarm update, parity with CA gateway B-G11 design):
 
-Two candidate approaches; semantics differ and need operator sign-off:
+`build_invalid_alarm_event` synthesizes an INVALID alarm event (`alarm.severity = INVALID (3)`, `alarm.status = UNDEFINED (3)`) using only the alarm sub-struct bitset, preserving the last upstream value. It fans the event into `tx_raw` and `tx` once per outage cycle — at both the startup-error path (`pvmonitor_raw_frames_handle` returns `Err`) and the runtime-disconnect path (after `handle.wait()` returns). A `disconnected_alarm_sent` guard prevents re-emission on every backoff iteration; the guard resets when a new connection starts. The first real upstream event after reconnect overwrites the INVALID state via the normal monitor callback path — no special reconnect handling needed.
 
-1. **Alarm update** (parity with CA gateway): synthesize an INVALID alarm event and fan it into `tx_raw` and `tx` immediately after `handle.wait()` returns. For the raw path this requires fabricating NTScalar-compatible wire bytes that set `alarm.severity = INVALID (2)` and `alarm.status = UNDEFINED (0)` while leaving the value field at its last state. `EntryState::introspection` holds the upstream type descriptor, enabling field-offset calculation. Downstream PVA monitors receive one MONITOR DATA frame with INVALID severity before silence; they see the outage the same way CA monitors do.
-
-2. **MONITOR FINISH** (parity with pva2pva): emit `RawEvent { type_changed: true, body: Bytes::new() }` into `tx_raw` after `handle.wait()`, triggering `source.rs:764–766` which sends MONITOR FINISH to each downstream forwarder and exits it. Downstream clients must re-subscribe; they naturally re-subscribe to the cache entry (which auto-restarts) and resume after reconnect. This matches pva2pva's evict-and-re-subscribe model without actually evicting the cache entry.
-
-Option 1 keeps subscriptions alive (consistent with the transparent-reconnect design); option 2 mirrors pva2pva more closely. Either requires a design decision on downstream-visible semantics before implementation.
+Regression tests added: `br_r57_build_invalid_alarm_no_prior_snapshot_returns_none`, `br_r57_build_invalid_alarm_non_nt_type_returns_none`, `br_r57_build_invalid_alarm_nt_scalar_sets_invalid`, `br_r57_reconnect_clears_invalid_alarm`.
 
 ## Uncertain candidates
 

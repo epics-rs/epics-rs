@@ -360,17 +360,15 @@ impl PvDatabase {
                 )
             };
 
-            if let crate::server::record::ParsedLink::Db(ref link) = sdis_link {
-                let pv_name = if link.field == "VAL" {
-                    link.record.clone()
-                } else {
-                    format!("{}.{}", link.record, link.field)
-                };
-                if let Ok(val) = self.get_pv(&pv_name).await {
-                    let disa_val = val.to_f64().unwrap_or(0.0) as i16;
-                    let mut instance = rec.write().await;
-                    instance.common.disa = disa_val;
-                }
+            // C `dbGetLink(&precord->sdis, DBR_SHORT, &precord->disa, 0, 0)`
+            // reads the SDIS link regardless of its type (DB / CA / PVA /
+            // constant) via the lset. The pre-fix port only refreshed
+            // `disa` from a `ParsedLink::Db` SDIS, so a remote-sourced
+            // (CA/PVA) or constant enable/disable was silently ignored.
+            if let Some(val) = self.read_link_value_no_process(&sdis_link).await {
+                let disa_val = val.to_f64().unwrap_or(0.0) as i16;
+                let mut instance = rec.write().await;
+                instance.common.disa = disa_val;
             }
 
             let disa = rec.read().await.common.disa;
@@ -446,31 +444,33 @@ impl PvDatabase {
                 let instance = rec.read().await;
                 instance.parsed_tsel.clone()
             };
-            if let crate::server::record::ParsedLink::Db(ref link) = tsel_link {
-                if link.field.eq_ignore_ascii_case("TIME") {
-                    // TSEL points at a `.TIME` field — copy the source
-                    // record's timestamp straight into `time`. The
-                    // following `apply_timestamp` leaves it untouched
-                    // for TSE=-2-equivalent (device-set) semantics; we
-                    // mark TSE=-2 so it is not overwritten.
+            // TSEL pointing at a `.TIME` field is DB-specific (C
+            // `DBLINK_FLAG_TSELisTIME`, set only for a DB link targeting
+            // another record's `.TIME`): copy that record's timestamp
+            // into `time` and mark TSE=-2 so `apply_timestamp` leaves it
+            // alone.
+            let tsel_is_time = matches!(
+                &tsel_link,
+                crate::server::record::ParsedLink::Db(link)
+                    if link.field.eq_ignore_ascii_case("TIME")
+            );
+            if tsel_is_time {
+                if let crate::server::record::ParsedLink::Db(ref link) = tsel_link {
                     if let Some(src) = self.get_record(&link.record).await {
                         let src_time = src.read().await.common.time;
                         let mut instance = rec.write().await;
                         instance.common.time = src_time;
                         instance.common.tse = -2;
                     }
-                } else {
-                    let pv_name = if link.field == "VAL" {
-                        link.record.clone()
-                    } else {
-                        format!("{}.{}", link.record, link.field)
-                    };
-                    if let Ok(val) = self.get_pv(&pv_name).await {
-                        let tse_val = val.to_f64().unwrap_or(0.0) as i16;
-                        let mut instance = rec.write().await;
-                        instance.common.tse = tse_val;
-                    }
                 }
+            } else if let Some(val) = self.read_link_value_no_process(&tsel_link).await {
+                // Non-`.TIME` TSEL: C `dbGetLink(&tsel, DBR_SHORT,
+                // &prec->tse)` loads TSE from the link regardless of its
+                // type. The pre-fix port only read a `ParsedLink::Db`
+                // TSEL, ignoring a CA/PVA/constant TSE source.
+                let tse_val = val.to_f64().unwrap_or(0.0) as i16;
+                let mut instance = rec.write().await;
+                instance.common.tse = tse_val;
             }
         }
 
@@ -2552,20 +2552,16 @@ impl PvDatabase {
             (siml_parsed, siol_parsed, sims, rtype, is_input)
         };
 
-        // Read SIML -> update SIMM
-        if let crate::server::record::ParsedLink::Db(ref link) = siml_link {
-            let pv_name = if link.field == "VAL" {
-                link.record.clone()
-            } else {
-                format!("{}.{}", link.record, link.field)
-            };
-            if let Ok(val) = self.get_pv(&pv_name).await {
-                let simm_val = val.to_f64().unwrap_or(0.0) as i16;
-                let mut instance = rec.write().await;
-                let _ = instance
-                    .record
-                    .put_field("SIMM", EpicsValue::Short(simm_val));
-            }
+        // Read SIML -> update SIMM. C `dbGetLink(&prec->siml, DBR_USHORT,
+        // &prec->simm, 0, 0)` reads the SIML link for any type; the
+        // pre-fix port only read a `ParsedLink::Db` SIML, ignoring a
+        // CA/PVA/constant simulation-mode source.
+        if let Some(val) = self.read_link_value_no_process(&siml_link).await {
+            let simm_val = val.to_f64().unwrap_or(0.0) as i16;
+            let mut instance = rec.write().await;
+            let _ = instance
+                .record
+                .put_field("SIMM", EpicsValue::Short(simm_val));
         }
 
         // Check SIMM

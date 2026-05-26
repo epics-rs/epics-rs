@@ -156,6 +156,46 @@ impl PvDatabase {
         }
     }
 
+    /// Read a link's current value WITHOUT processing a Passive source —
+    /// the parity of C `dbGetLink` (`dbLink.c:325` → `dbTryGetLink` →
+    /// `lset->getValue`), which fetches the value for *any* link type
+    /// (DB / CA / PVA / constant / lnkCalc) and never processes the
+    /// target record.
+    ///
+    /// Distinct from [`Self::read_link_value`], which threads
+    /// `visited`/`depth` to PP-process a Passive DB source before reading
+    /// (the INPUT-link path). `dbGetLink` does no such processing, so the
+    /// DB arm here reads with a plain `get_pv` exactly as the pre-fix
+    /// control-link sites did.
+    ///
+    /// Used by the control links that C reads via `dbGetLink` every
+    /// process cycle — `SDIS`→`disa`, `SIML`→`simm`, `SELL`→`seln`, and
+    /// `TSEL`'s `TSE` load. The pre-fix sites open-coded an
+    /// `if let ParsedLink::Db` read, so a control link sourced over
+    /// CA/PVA or given as a constant was silently ignored.
+    pub(crate) async fn read_link_value_no_process(
+        &self,
+        link: &crate::server::record::ParsedLink,
+    ) -> Option<EpicsValue> {
+        match link {
+            crate::server::record::ParsedLink::None => None,
+            crate::server::record::ParsedLink::Ca(ca) => self.resolve_external_pv(&ca.pv).await,
+            crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name).await,
+            crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
+            crate::server::record::ParsedLink::Db(db) => {
+                let pv_name = if db.field == "VAL" {
+                    db.record.clone()
+                } else {
+                    format!("{}.{}", db.record, db.field)
+                };
+                self.get_pv(&pv_name).await.ok()
+            }
+            // Hardware links carry no generic readable value.
+            crate::server::record::ParsedLink::Hw(_) => None,
+            crate::server::record::ParsedLink::Calc(calc) => self.evaluate_calc_link(calc).await,
+        }
+    }
+
     /// lnkCalc evaluation: fetch each input PV, bind to calc engine
     /// vars A..L, run `expr`, return the result as `EpicsValue::Double`.
     /// Returns `None` if any input fetch fails, expr compile fails, or
@@ -735,23 +775,20 @@ impl PvDatabase {
             };
             if let Some(sell) = sell {
                 if !sell.is_empty() {
-                    if let crate::server::record::ParsedLink::Db(ref link) =
-                        crate::server::record::parse_link_v2(&sell)
-                    {
-                        let pv_name = if link.field == "VAL" {
-                            link.record.clone()
-                        } else {
-                            format!("{}.{}", link.record, link.field)
-                        };
-                        if let Ok(val) = self.get_pv(&pv_name).await {
-                            // DBR_USHORT — clamp to the unsigned 16-bit
-                            // range the C `epicsUInt16 seln` field holds,
-                            // then store into the record's SELN field.
-                            let seln = val.to_f64().unwrap_or(0.0);
-                            let seln = seln.clamp(0.0, 65535.0) as u16 as i16;
-                            let mut instance = rec.write().await;
-                            let _ = instance.record.put_field("SELN", EpicsValue::Short(seln));
-                        }
+                    // C reads SELL via `dbGetLink(&prec->sell, DBR_USHORT,
+                    // &prec->seln, 0, 0)` for any link type; the pre-fix
+                    // port only read a `ParsedLink::Db` SELL, so a SELL
+                    // sourced over CA/PVA or given as a constant never
+                    // updated SELN.
+                    let parsed = crate::server::record::parse_link_v2(&sell);
+                    if let Some(val) = self.read_link_value_no_process(&parsed).await {
+                        // DBR_USHORT — clamp to the unsigned 16-bit
+                        // range the C `epicsUInt16 seln` field holds,
+                        // then store into the record's SELN field.
+                        let seln = val.to_f64().unwrap_or(0.0);
+                        let seln = seln.clamp(0.0, 65535.0) as u16 as i16;
+                        let mut instance = rec.write().await;
+                        let _ = instance.record.put_field("SELN", EpicsValue::Short(seln));
                     }
                 }
             }

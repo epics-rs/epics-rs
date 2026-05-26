@@ -1405,6 +1405,70 @@ async fn test_sdis_disable_skips_process() {
     );
 }
 
+/// A1-2: C `dbGetLink(&precord->sdis, DBR_SHORT, &precord->disa, 0, 0)`
+/// reads the SDIS link for ANY type. The pre-fix port refreshed `disa`
+/// only for a `ParsedLink::Db` SDIS, so a constant (and CA/PVA) SDIS was
+/// silently ignored — `disa` stayed at its default and a record meant to
+/// be disabled by a constant SDIS kept processing. Boundary: constant
+/// value == DISV (disabled) vs != DISV (enabled).
+#[tokio::test]
+async fn test_sdis_constant_link_refreshes_disa() {
+    let db = PvDatabase::new();
+    db.add_record("TARGET", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Constant SDIS "1" — equals the default DISV (1) → disabled.
+    if let Some(rec) = db.get_record("TARGET").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("SDIS", EpicsValue::String("1".into()))
+            .unwrap();
+        inst.put_common_field("DISS", EpicsValue::Short(1)).unwrap();
+    }
+    let mut visited = HashSet::new();
+    db.process_record_with_links("TARGET", &mut visited, 0)
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("TARGET").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.common.disa, 1,
+            "constant SDIS '1' must refresh disa to 1 (was ignored pre-fix)"
+        );
+        assert_eq!(
+            inst.common.stat,
+            epics_base_rs::server::recgbl::alarm_status::DISABLE_ALARM,
+            "disa==disv must disable the record"
+        );
+    }
+
+    // Constant SDIS "0" — differs from DISV (1) → re-enabled. Proves the
+    // refresh reads the actual constant value, not a hard-coded disable.
+    if let Some(rec) = db.get_record("TARGET").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("SDIS", EpicsValue::String("0".into()))
+            .unwrap();
+    }
+    let mut visited = HashSet::new();
+    db.process_record_with_links("TARGET", &mut visited, 0)
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("TARGET").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.common.disa, 0,
+            "constant SDIS '0' must refresh disa to 0"
+        );
+        assert_ne!(
+            inst.common.stat,
+            epics_base_rs::server::recgbl::alarm_status::DISABLE_ALARM,
+            "disa!=disv must leave the record enabled"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_phas_scan_order() {
     let db = PvDatabase::new();

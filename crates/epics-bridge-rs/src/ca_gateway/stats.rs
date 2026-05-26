@@ -43,6 +43,7 @@
 //! | `<prefix>connecting` | Long | connectingCount |
 //! | `<prefix>disconnected` | Long | deadCount (alias — C source treats these as the same bucket) |
 //! | `<prefix>clientEventRate` | Double | eventRate |
+//! | `<prefix>existTestRate` | Double | pvExistTest (search) resolutions/sec — separate from eventRate |
 //!
 //! RATE_STATS internals (B5) — tokio-model equivalents of the C++
 //! ca-gateway `gateServer` RATE_STATS counters from `gateServer.cc`.
@@ -92,10 +93,18 @@ pub struct Stats {
     pub loop_count: AtomicU64,
     /// Per-host connection set, kept behind a mutex for distinct counting.
     per_host: Mutex<HashSet<String>>,
+    /// Cumulative `pvExistTest` count (downstream search resolutions).
+    /// C ca-gateway tracks this separately as `exist_count` and exposes
+    /// it as the `existTestRate` stat (`gateServer.cc:1497,1991`); it is
+    /// NOT an upstream event and must not feed `total_events` /
+    /// `clientEventCount` / `eventRate`.
+    pub exist_count: AtomicU64,
     /// Last refresh timestamp for event rate calculation.
     last_refresh: Mutex<Instant>,
     /// Last total_events value at refresh time, for delta calculation.
     last_total_events: AtomicU64,
+    /// Last exist_count value at refresh time, for existTestRate delta.
+    last_exist_count: AtomicU64,
 }
 
 impl Stats {
@@ -108,15 +117,27 @@ impl Stats {
             heartbeat: AtomicU64::new(0),
             post_event_count: AtomicU64::new(0),
             loop_count: AtomicU64::new(0),
+            exist_count: AtomicU64::new(0),
             per_host: Mutex::new(HashSet::new()),
             last_refresh: Mutex::new(Instant::now()),
             last_total_events: AtomicU64::new(0),
+            last_exist_count: AtomicU64::new(0),
         }
     }
 
-    /// Record an upstream event.
+    /// Record an upstream event. Only the upstream CA monitor callback
+    /// (`upstream.rs`) calls this — a `pvExistTest` search resolution is
+    /// NOT an upstream event (use [`Self::record_exist_test`]).
     pub fn record_event(&self) {
         self.total_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a downstream `pvExistTest` (search resolution). C
+    /// ca-gateway bumps a separate `exist_count` here
+    /// (`gateServer.cc:1497`), feeding the `existTestRate` stat — it does
+    /// not touch the upstream event counters.
+    pub fn record_exist_test(&self) {
+        self.exist_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a put operation.
@@ -193,6 +214,10 @@ impl Stats {
             ("connecting", EpicsValue::Long(0)),
             ("disconnected", EpicsValue::Long(0)),
             ("clientEventRate", EpicsValue::Double(0.0)),
+            // Downstream search-resolution rate. C ca-gateway exposes
+            // `existTestRate` (gateServer.cc:1991) from a counter
+            // separate from the upstream event counters.
+            ("existTestRate", EpicsValue::Double(0.0)),
             // B5: RATE_STATS internals — tokio-model equivalents of
             // the C++ ca-gateway gateServer counters.
             ("fd", EpicsValue::Long(0)),
@@ -248,6 +273,17 @@ impl Stats {
             0.0
         };
 
+        // Exist-test rate from its own counter (C `existTestRate`,
+        // gateServer.cc:1991) — independent of the upstream event rate.
+        let exist_count = self.exist_count.load(Ordering::Relaxed);
+        let last_exist = self.last_exist_count.swap(exist_count, Ordering::Relaxed);
+        let exist_delta = exist_count.saturating_sub(last_exist);
+        let exist_test_rate = if elapsed > 0.0 {
+            exist_delta as f64 / elapsed
+        } else {
+            0.0
+        };
+
         let put_count = self.put_count.load(Ordering::Relaxed);
         let readonly = self.read_only_rejects.load(Ordering::Relaxed);
         let heartbeat = self.heartbeat.load(Ordering::Relaxed);
@@ -293,6 +329,7 @@ impl Stats {
         let n_connecting_alias = format!("{p}connecting");
         let n_disconnected = format!("{p}disconnected");
         let n_client_event_rate = format!("{p}clientEventRate");
+        let n_exist_test_rate = format!("{p}existTestRate");
         // B5 RATE_STATS PV names.
         let n_fd = format!("{p}fd");
         let n_client_event_count = format!("{p}clientEventCount");
@@ -327,6 +364,7 @@ impl Stats {
             db.put_pv_and_post(&n_connecting_alias, EpicsValue::Long(connecting as i32)),
             db.put_pv_and_post(&n_disconnected, EpicsValue::Long(dead as i32)),
             db.put_pv_and_post(&n_client_event_rate, EpicsValue::Double(event_rate)),
+            db.put_pv_and_post(&n_exist_test_rate, EpicsValue::Double(exist_test_rate)),
             // B5 RATE_STATS internals.
             db.put_pv_and_post(
                 &n_client_event_count,
@@ -421,6 +459,34 @@ mod tests {
         assert_eq!(stats.read_only_rejects.load(Ordering::Relaxed), 1);
     }
 
+    /// A9-3: a `pvExistTest` (search resolution) must bump only the
+    /// separate `exist_count` (C `existTestRate`), never the upstream
+    /// event counters. Pre-fix the resolver called `record_event()`,
+    /// inflating total_events / eventRate / clientEventCount with search
+    /// traffic.
+    #[test]
+    fn exist_test_does_not_inflate_event_counters() {
+        let stats = Stats::new("g:".into());
+        stats.record_exist_test();
+        stats.record_exist_test();
+        stats.record_exist_test();
+        assert_eq!(
+            stats.exist_count.load(Ordering::Relaxed),
+            3,
+            "exist_count tracks pvExistTest resolutions"
+        );
+        assert_eq!(
+            stats.total_events.load(Ordering::Relaxed),
+            0,
+            "pvExistTest must NOT touch total_events (clientEventCount/eventRate source)"
+        );
+
+        // And an upstream event bumps only total_events, not exist_count.
+        stats.record_event();
+        assert_eq!(stats.total_events.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.exist_count.load(Ordering::Relaxed), 3);
+    }
+
     #[tokio::test]
     async fn host_tracking() {
         let stats = Stats::new("g:".into());
@@ -444,6 +510,7 @@ mod tests {
         assert!(db.has_name("g:totalPvs").await);
         assert!(db.has_name("g:heartbeat").await);
         assert!(db.has_name("g:eventRate").await);
+        assert!(db.has_name("g:existTestRate").await);
     }
 
     #[tokio::test]

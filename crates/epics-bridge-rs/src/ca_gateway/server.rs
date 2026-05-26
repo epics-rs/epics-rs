@@ -402,8 +402,13 @@ impl GatewayServer {
                     //    add-PV path.
                     beacon_anomaly.request();
 
-                    // 4. Stats: count this resolution
-                    stats.record_event();
+                    // 4. Stats: count this as a pvExistTest resolution,
+                    //    NOT an upstream event. C ca-gateway bumps a
+                    //    separate `exist_count` (existTestRate,
+                    //    gateServer.cc:1497); routing it through
+                    //    record_event() inflated total_events / eventRate
+                    //    / clientEventCount with search traffic.
+                    stats.record_exist_test();
                     true
                 })
             },

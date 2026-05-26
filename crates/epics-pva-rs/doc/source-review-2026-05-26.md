@@ -896,6 +896,98 @@ are functionally equivalent to pvxs. The only difference is Rust is silent on
 unknown SID/IOID in CANCEL_REQUEST + DESTROY_REQUEST where pvxs logs; log-only,
 no correctness impact. No fix required.
 
+### R78 — pvRequest FIELD-MASK filtering on GET + MONITOR (parity-correct with behavioral note)
+
+**Rust sites:** `pv_request.rs:194-248` (`request_to_mask`), `pvdata/encode.rs:1248-1293`
+(`canonical_changed_bitset`), `pvdata/encode.rs:1433-1501`
+(`encode_pv_field_with_bitset`), `tcp.rs:3866-3887` (INIT mask computation),
+`tcp.rs:4204` (GET reply), `tcp.rs:5756` (MONITOR emit)
+
+**C++ sites:** `pvrequest.cpp:13-72` (`request2mask`), `dataencode.cpp:414-438`
+(`to_wire_valid`), `serverget.cpp:200` (INIT: `pvMask = request2mask(...)`),
+`serverget.cpp:104` (GET reply: `to_wire_valid(R, value, &pvMask)`),
+`servermon.cpp:173` (MONITOR emit: `to_wire_valid(R, ent, &pvMask)`)
+
+#### (1) pvRequest `field()` node parsed into field selection
+
+- pvxs `request2mask` (pvrequest.cpp:13-72): extracts `fields = pvRequest["field"]`.
+  Iterates `rdesc->mlookup` (the "field" sub-struct's flat lookup including dotted nested
+  paths like "alarm.status"). For each name found in the VALUE structure's mlookup,
+  marks `ret[it->second] = true`. When the pvRequest sub-entry is an empty struct AND the
+  VALUE node is a struct, iterates that node's children to mark them too
+  (`pvrequest.cpp:44-45`). No "field" sub-struct → wildcard (all bits).
+- Rust `request_to_mask` (pv_request.rs:194-248): identical structure. Extracts
+  "field" sub-struct from pvRequest descriptor; if absent/empty → all-bits wildcard.
+  Otherwise recurses via `mark_path` for each top-level name that exists in `value_desc`.
+  `mark_path`: sets the field's bit; if sub-request is empty → sets entire subtree; else
+  recurses into specifically-named sub-fields.
+- Both reject an entirely-empty result as `EmptyMask` error
+  (`pvrequest.cpp:61-62`; `pv_request.rs:244-246`, returned to caller as INIT error
+  at `tcp.rs:3876-3886`). ✓
+
+#### (2) Changed/overrun BitSet restricted to selected fields
+
+- pvxs GET (`serverget.cpp:104`): `to_wire_valid(R, value, &pvMask)` — builds a `valid`
+  BitMask from store marks AND pvMask, then emits only the set bits.
+- pvxs MONITOR (`servermon.cpp:173`): same `to_wire_valid(R, ent, &pvMask)`.
+- Rust GET (`tcp.rs:4204`):
+  ```rust
+  let changed = canonical_changed_bitset(&intro_t, &mask_t);
+  encode_pv_field_with_bitset(&value, &intro_t, &changed, 0, order, &mut payload);
+  ```
+- Rust MONITOR (`tcp.rs:5756`, `udp.rs:5796-5810`): same pattern, with
+  `diff_changed_bitset` intersected with `mask` for partial-update sources.
+- Both restrict the wire changed-bitset and value bytes to selected fields. ✓
+
+#### (3) Nested selection — behavioral note
+
+For `field(value.index)` on a structure where "value" is a struct with multiple children
+(e.g., NTEnum `value { index, choices }`):
+
+**pvxs:**
+- `request2mask` marks the "value" struct bit AND the "value.index" leaf bit (via the
+  dotted-path iteration of `rdesc->mlookup`).
+- `to_wire_valid` (dataencode.cpp:423-430): when `pvMask[value_struct_bit]` is set,
+  it immediately sets `valid[value_struct_bit] = true` and jumps
+  `bit += desc[value_struct_bit].size()` past all value children. Result: wire
+  changed-bitset has only the struct bit set; the full value subtree (index + choices) is
+  encoded.
+- **pvxs effectively treats `field(value.index)` as `field(value)` — it sends the entire
+  "value" subtree whenever any part of it is in the pvMask.**
+
+**Rust:**
+- `request_to_mask` marks the "value" struct bit AND the "value.index" leaf bit.
+- `canonical_changed_bitset`: "value"'s subtree is not fully selected (choices bit not in
+  selection) → recurse; only sets bit 2 (index leaf) in the wire BitSet. NOT bit 1
+  (value struct).
+- `encode_pv_field_with_bitset`: bit 1 not set → recurse into value's children; only
+  encodes index bytes (bit 2 set).
+- **Rust sends ONLY the requested sub-field ("index"), not the entire parent subtree.**
+
+Summary: pvxs sends a superset (entire parent struct); Rust sends exactly the selection.
+Both are valid PVA wire formats — pvxs clients parse the Rust `{index_leaf_bit}` bitset
+correctly (they decode only the present leaf). The wire content differs but clients
+observe the correct logical result either way. No client-visible correctness defect on
+either side; the Rust behavior is more spec-compliant.
+
+#### (4) Empty/absent field() = whole structure
+
+- pvxs `pvrequest.cpp:54-56`: `!fields.valid()` → `foundrequested=true`; later empty
+  mask expands to all bits.
+- pvxs `pvrequest.cpp:24-25`: `rdesc->mlookup.empty()` → `foundrequested=true` (empty
+  `field {}` = wildcard).
+- Rust `pv_request.rs:206-218`: no "field" sub-structure → all bits set, return.
+- Rust `pv_request.rs:222-228`: `request_field.is_empty()` → all bits set, return.
+- Both: absent or empty `field()` → full structure selected. ✓
+
+Conclusion:
+
+All four check points are functionally correct. The only deviation is in how nested
+sub-field selection is encoded in the wire changed-bitset: pvxs promotes to the nearest
+struct parent (sends entire subtree), Rust emits exactly the selected leaf. Both formats
+are valid PVA and interoperable with pvxs clients. Rust is more spec-compliant for nested
+sub-field requests (`field(value.index)`). No fix required.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

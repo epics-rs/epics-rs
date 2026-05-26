@@ -988,6 +988,42 @@ struct parent (sends entire subtree), Rust emits exactly the selected leaf. Both
 are valid PVA and interoperable with pvxs clients. Rust is more spec-compliant for nested
 sub-field requests (`field(value.index)`). No fix required.
 
+## Round 2 findings (R79+) — epics-pva-rs vs pvxs
+
+Continuation of the global `R-N` series (CA panel owns R56–R59; R60–R78 used,
+never reused). Round 2 reviews the already-fixed code on the integration tip
+(`66a5b006`) for NEW divergences. All findings below cite BOTH the Rust site
+and the upstream pvxs C++ site.
+
+### R79 — `NTScalar::create()` omits `display`/`control`/`valueAlarm` sub-structures that `build()` includes
+
+- **Severity:** Low (no server-emit wire desync — `encode_pv_field` fills
+  missing value fields from the descriptor; affects direct consumers of the
+  `create()` value and the documented "matching `build()`" contract).
+- **Status:** Fixed (structural — `create()` now derives its value from
+  `build()`).
+- **Evidence:**
+  - Rust `src/nt/scalar.rs:175-191`: `create()` pushes only
+    `value`/`alarm`/`timeStamp`, ignoring `self.display` / `self.control` /
+    `self.value_alarm`, even though its own doc says "default-initialised
+    value matching `build()`". `build()` (`src/nt/scalar.rs:93-169`) DOES add
+    `display` / `control` / `valueAlarm` gated on those flags.
+  - C++ pvxs `src/pvxs/nt.h:96-97`: `inline Value create() const { return
+    build().create(); }` — pvxs derives the value directly from the
+    descriptor, so `create()` can never drift from `build()`. `build()`
+    (`src/nt.cpp`) adds the `display`/`control`/`valueAlarm` members under the
+    same flags.
+- **Impact:** A caller that does
+  `NTScalar::new(Double).with_display().create()` and then inspects/mutates
+  the `display` sub-field (the intended use of `create()`) finds no such
+  field in the Rust value, whereas pvxs's value has it. The wire bytes the
+  server emits are unaffected because the encoder is descriptor-driven, but
+  the `create()` API contract and pvxs parity are violated.
+- **Fix direction:** Make the value derive from the descriptor —
+  `create()` = `default_value_for(&self.build())` — mirroring pvxs's
+  `build().create()`. Single source of truth: the field set can no longer
+  drift from `build()` by construction.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

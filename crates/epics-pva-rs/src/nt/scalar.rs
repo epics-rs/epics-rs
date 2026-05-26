@@ -171,6 +171,9 @@ impl NTScalar {
         FieldDesc::Structure { struct_id, fields }
     }
 
+    // R79: derive the value from the descriptor so the optional
+    // display/control/valueAlarm sub-structures always match build().
+    // pvxs nt.h:96 does the same: `create() { return build().create(); }`.
     /// Create a default-initialised value matching [`build()`](Self::build).
     pub fn create(&self) -> PvField {
         let struct_id = if self.is_array {

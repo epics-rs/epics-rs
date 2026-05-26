@@ -765,6 +765,12 @@ impl GatewayChannelSource {
                             return;
                         }
                     }
+                    // BR-R61: dropped events under this receiver's own
+                    // backpressure are skipped with NO overrun signal to the
+                    // client. pva2pva coalesces into an overflowElement and
+                    // sets the overrun bitset (moncache.cpp:157-174). Faithful
+                    // signaling needs the epics-pva-rs monitor encoder — see
+                    // legend (cross-crate, deferred).
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
@@ -823,6 +829,9 @@ impl GatewayChannelSource {
                             return;
                         }
                     }
+                    // BR-R61: same as the raw path — drops under this
+                    // receiver's backpressure carry no overrun signal
+                    // (pva2pva moncache.cpp:157-174). Cross-crate, deferred.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }

@@ -320,6 +320,27 @@ Fix direction:
 
 Track `did_something` (set true whenever a member value write or `proc` actually fires) in both the atomic and non-atomic apply loops. After the loops, if `!did_something` and the client supplied at least one group-member field in the incoming `value` (any member's field present via `get_nested_field`), return `BridgeError::PutRejected("group <name> PUT: No fields changed")` — mirroring pvxs's `!didSomething && value.isMarked` guard. A genuinely empty PUT (no group field present) stays a silent no-op, matching pvxs (where `value.isMarked` is false).
 
+### BR-R61 — PVA gateway monitor forwarder drops broadcast-`Lagged` events with no overrun signal to the client
+
+Severity: Medium
+
+Status: Doc-only (structural fix is cross-crate: `epics-pva-rs` monitor encoder + bridge plumbing)
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/pva_gateway/source.rs:768` (raw path) and `crates/epics-bridge-rs/src/pva_gateway/source.rs:826` (typed path) — the downstream forwarder loop handles `Err(broadcast::error::RecvError::Lagged(_)) => continue`: when this receiver falls behind the per-PV broadcast ring (capacity `BROADCAST_CAPACITY = 16`, `channel_cache.rs:35`), the dropped events are silently skipped and the next live event is forwarded as-is, carrying upstream's own (usually empty) overrun byte.
+- `epics-base/modules/pva2pva/p2pApp/moncache.cpp:157-174` — when a downstream user's queue is full, pva2pva coalesces into `usr->overflowElement`, accumulating `overrunBitSet |= lastelem->overrunBitSet`, `overrunBitSet->or_and(changedBitSet, lastelem->changedBitSet)`, and `changedBitSet |= lastelem->changedBitSet`, and increments `ndropped`. The next element delivered to that user carries the overrun bitset flagging exactly which fields were squashed.
+
+Note: tokio `broadcast` keeps per-receiver cursors, so one slow downstream only lags itself (matching pva2pva's per-user queues) — that part is faithful. The gap is purely the missing overrun signaling: a client cannot distinguish "no intervening change" from "the gateway dropped intermediate states."
+
+Impact:
+
+A slow downstream PVA monitor that overflows the gateway's broadcast buffer loses intermediate monitor updates with no indication. pvxs/pva2pva guarantee the client learns of the loss via the overrun bitset on the next element. The Rust gateway hides its own drops.
+
+Fix direction (cross-crate, deferred to main worker):
+
+The raw forwarding path ships opaque pre-encoded body bytes, so signaling overrun requires the monitor encoder. Plumb a per-subscription "overrun pending" flag from the gateway forwarder (set on `Lagged`) through to the `epics-pva-rs` server monitor encoder (`build_monitor_payload`), which currently hardcodes `let overrun = BitSet::new()`, so it sets the overrun bitset (at minimum the root/changed bits) on the next emitted monitor frame. Until then the gateway silently coalesces under its own backpressure.
+
 ## Uncertain candidates
 
 None identified this round.

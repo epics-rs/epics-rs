@@ -2235,31 +2235,31 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let requested_type = hdr.data_type;
             let requested_count = hdr.actual_count();
 
-            // R2-34: C `read_notify_action` (`rsrv/camessage.c:693-697`)
-            // checks `INVALID_DB_REQ(m_dataType)` BEFORE the channel
-            // lookup and returns RSRV_ERROR with no wire frame.
-            // Deprecated `read_action` resolves the channel first
-            // but still checks `INVALID_DB_REQ` BEFORE the access
-            // check — bad DBR type sends ECA_BADTYPE + drops. Pre-
-            // fix Rust ran the access check first, so a read-denied
-            // peer sending a bad DBR type saw a NORDACCESS reply
-            // (or, on READ_NOTIFY, a `no_read_access_event` frame
-            // using an invalid type) where rsrv would have treated
-            // the request as a bad protocol frame and dropped.
-            // `LAST_BUFFER_TYPE = 38` (caProto.h); request types
-            // above that are not encodable.
+            // R2-34: the two read commands differ in WHERE the
+            // `INVALID_DB_REQ(m_dataType)` type check sits relative to
+            // the channel lookup.
+            //
+            // C `read_notify_action` (`rsrv/camessage.c:693-697`) checks
+            // the type BEFORE the lookup and returns RSRV_ERROR with no
+            // wire frame, so READ_NOTIFY is handled here, silently.
+            //
+            // C `read_action` (`rsrv/camessage.c:608-619`) resolves the
+            // channel FIRST (`if(!pciu){logBadId;return}` — a silent
+            // drop on unknown SID) and only THEN, if the type is
+            // invalid, sends ECA_BADTYPE carrying the channel's real cid
+            // + record name. So the deprecated-READ bad-type frame must
+            // be gated on the channel existing: it is emitted below,
+            // after the lookup, never with a `u32::MAX` sentinel here.
+            // Otherwise an unknown SID + bad type drew a spurious
+            // ECA_BADTYPE(cid=0xFFFFFFFF) where C silently drops.
+            //
+            // `LAST_BUFFER_TYPE = 38` (caProto.h); request types above
+            // that are not encodable.
             const LAST_BUFFER_TYPE: u16 = 38;
-            if requested_type > LAST_BUFFER_TYPE {
-                if !is_notify {
-                    // Deprecated READ: ECA_BADTYPE via CA_PROTO_ERROR.
-                    // We don't have entry.cid yet (matches C: bad
-                    // type is checked before channel lookup is
-                    // strictly required), so use the sentinel.
-                    send_ca_error(writer, hdr, ECA_BADTYPE, u32::MAX, "bad READ data type").await?;
-                }
+            if is_notify && requested_type > LAST_BUFFER_TYPE {
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
-                    "READ with unsupported DBR type {} > LAST_BUFFER_TYPE \
-                     (matches C read_(notify_)action INVALID_DB_REQ RSRV_ERROR)",
+                    "READ_NOTIFY with unsupported DBR type {} > LAST_BUFFER_TYPE \
+                     (matches C read_notify_action INVALID_DB_REQ RSRV_ERROR)",
                     requested_type
                 )));
             }
@@ -2282,6 +2282,29 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     )));
                 }
             };
+
+            // Deprecated READ: C `read_action` (`rsrv/camessage.c:616-619`)
+            // checks `INVALID_DB_REQ` AFTER resolving the channel and
+            // BEFORE the access check, sending ECA_BADTYPE with the
+            // channel's real cid + record name (`vsend_err` uses
+            // `pciu->cid`). READ_NOTIFY already returned above (its type
+            // check is pre-lookup and silent), so reaching here with a
+            // bad type means the deprecated READ command.
+            // `LAST_BUFFER_TYPE = 38`.
+            if requested_type > LAST_BUFFER_TYPE {
+                let audit_pv = match &entry.target {
+                    ChannelTarget::SimplePv(pv) => pv.name.clone(),
+                    ChannelTarget::RecordField { record, field } => {
+                        format!("{}.{}", record.read().await.name, field)
+                    }
+                };
+                send_ca_error(writer, hdr, ECA_BADTYPE, entry.cid, &audit_pv).await?;
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "READ with unsupported DBR type {} > LAST_BUFFER_TYPE \
+                     (matches C read_action INVALID_DB_REQ ECA_BADTYPE)",
+                    requested_type
+                )));
+            }
 
             // R38-G2 / Round 38, Round 44 type-state:
             // `state.lookup_access(sid)` is the only path to the
@@ -6350,6 +6373,223 @@ mod r46_zero_mask_event_add_tests {
             res.is_err(),
             "R46 guard ordering: unknown-SID EVENT_ADD must close the connection with \
              Err (matches C RSRV_ERROR), got {res:?}"
+        );
+    }
+
+    /// Build a deprecated CA_PROTO_READ (cmd=3) request addressing
+    /// `sid` with DBR `data_type`, element `count`, and read `ioid`.
+    fn read_frame(sid: u32, data_type: u16, count: u16, ioid: u32) -> Vec<u8> {
+        let mut h = CaHeader::new(CA_PROTO_READ);
+        h.data_type = data_type;
+        h.count = count;
+        h.cid = sid;
+        h.available = ioid;
+        h.to_bytes().to_vec()
+    }
+
+    /// Read all server output until EOF (server closed) or `timeout`.
+    async fn drain_to_eof<R: tokio::io::AsyncRead + Unpin>(
+        client: &mut R,
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 256];
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for server to close"
+            );
+            match tokio::time::timeout(remaining, client.read(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => acc.extend_from_slice(&buf[..n]),
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        acc
+    }
+
+    /// Scan `acc` for the first CA_PROTO_ERROR frame and return its
+    /// parsed header, or `None` if there is none.
+    fn first_ca_proto_error(acc: &[u8]) -> Option<CaHeader> {
+        let mut offset = 0;
+        while offset + CaHeader::SIZE <= acc.len() {
+            if let Ok((hdr, hdr_size)) = CaHeader::from_bytes_extended(&acc[offset..]) {
+                if hdr.cmmd == CA_PROTO_ERROR {
+                    return Some(hdr);
+                }
+                let msg_len = hdr_size + hdr.actual_postsize();
+                if msg_len == 0 {
+                    break;
+                }
+                offset += msg_len;
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deprecated_read_unknown_sid_bad_type_drops_silently() {
+        // A4-1: C `read_action` (`rsrv/camessage.c:608-619`) resolves
+        // the channel BEFORE checking the DBR type, so an unknown SID
+        // is a silent `logBadId` drop even when the requested type is
+        // also invalid. Pre-fix Rust checked the type first and emitted
+        // a spurious ECA_BADTYPE(cid=0xFFFFFFFF) ahead of the lookup.
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("a41:pv", EpicsValue::Double(0.0))
+            .await
+            .expect("add pv");
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:55411".parse().unwrap();
+
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                Some(conn_tx),
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(1, "a41:pv"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+        let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+
+        let unknown_sid = sid.wrapping_add(0xDEAD);
+        assert_ne!(
+            unknown_sid, sid,
+            "test must use a SID distinct from the real one"
+        );
+        // Bad DBR type (99 > LAST_BUFFER_TYPE = 38) on the unknown SID.
+        client
+            .write_all(&read_frame(unknown_sid, 99, 1, 0x4141))
+            .await
+            .expect("read unknown sid bad type");
+        client.flush().await.expect("flush read");
+
+        let acc = drain_to_eof(&mut client, Duration::from_secs(3)).await;
+        assert!(
+            first_ca_proto_error(&acc).is_none(),
+            "A4-1: deprecated READ on an unknown SID with a bad type must be a silent \
+             drop (C read_action logBadId), but a CA_PROTO_ERROR frame was emitted \
+             (received {} bytes: {acc:?})",
+            acc.len()
+        );
+
+        let res = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_client completes after unknown-sid read")
+            .expect("join ok");
+        assert!(
+            res.is_err(),
+            "unknown-SID READ must close the connection with Err (C RSRV_ERROR), got {res:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deprecated_read_known_sid_bad_type_sends_badtype_with_real_cid() {
+        // A4-1: with a VALID channel, C `read_action`
+        // (`rsrv/camessage.c:616-619`) sends ECA_BADTYPE carrying the
+        // channel's real cid (`pciu->cid`) + record name — never the
+        // 0xFFFFFFFF sentinel the pre-fix code used.
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("a41:pv", EpicsValue::Double(0.0))
+            .await
+            .expect("add pv");
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:55412".parse().unwrap();
+
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                Some(conn_tx),
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+        client.write_all(&version_frame()).await.expect("version");
+        // create_chan client cid = 1; the BADTYPE error must echo it.
+        client
+            .write_all(&create_chan_frame(1, "a41:pv"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+        let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+
+        // Bad DBR type (99 > LAST_BUFFER_TYPE = 38) on the VALID sid.
+        client
+            .write_all(&read_frame(sid, 99, 1, 0x4242))
+            .await
+            .expect("read known sid bad type");
+        client.flush().await.expect("flush read");
+
+        let acc = drain_to_eof(&mut client, Duration::from_secs(3)).await;
+        let err = first_ca_proto_error(&acc)
+            .expect("A4-1: deprecated READ with a valid SID + bad type must emit a CA_PROTO_ERROR");
+        assert_eq!(
+            err.available, ECA_BADTYPE,
+            "status must be ECA_BADTYPE, got {:#x}",
+            err.available
+        );
+        assert_ne!(
+            err.cid,
+            u32::MAX,
+            "A4-1: BADTYPE cid must be the channel's real cid, not the 0xFFFFFFFF sentinel"
+        );
+        assert_eq!(
+            err.cid, 1,
+            "BADTYPE cid must echo the create_chan client cid (pciu->cid)"
+        );
+
+        let res = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_client completes after known-sid bad-type read")
+            .expect("join ok");
+        assert!(
+            res.is_err(),
+            "bad-type READ must close the connection with Err (C RSRV_ERROR), got {res:?}"
         );
     }
 }

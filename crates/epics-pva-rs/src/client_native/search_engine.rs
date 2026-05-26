@@ -1521,6 +1521,9 @@ fn handle_search_response(
     let Ok(resp) = decode_search_response(&frame) else {
         return consumed;
     };
+    // R90: pvxs client.cpp:866-878 — when UDP search response has found=false
+    // and no cids, treat as a discovery pong (fake beacon). Pre-fix this block
+    // returned unconditionally, so DiscoverPing responses were silently dropped.
     if !resp.found {
         return consumed;
     }

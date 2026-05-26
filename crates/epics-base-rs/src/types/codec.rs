@@ -107,11 +107,31 @@ fn convert_value_to_dbr_string(
         EpicsValue::FloatArray(a) => {
             EpicsValue::StringArray(a.iter().map(|v| cvt_float_to_string(*v, prec)).collect())
         }
-        // R58: an enum value reaches here and falls through to
-        // `convert_to(String)` = the decimal index, but C `getEnumString`
-        // returns the state LABEL (`get_enum_str`). Handled in the fix.
+        // R58: C `getEnumString` (dbConvert.c, `[DBF_ENUM][DBR_STRING]`)
+        // returns the state LABEL via `get_enum_str`, not the index. Map each
+        // index to `snapshot.enums.strings[idx]`; see `enum_label`.
+        EpicsValue::Enum(v) => EpicsValue::String(enum_label(snapshot, *v)),
+        EpicsValue::EnumArray(a) => {
+            EpicsValue::StringArray(a.iter().map(|v| enum_label(snapshot, *v)).collect())
+        }
         other => other.convert_to(DbFieldType::String),
     }
+}
+
+/// R58: render an enum index as its state label for a `*_STRING` request,
+/// matching C `get_enum_str`. The label array is the one already populated
+/// for DBR_GR_ENUM. An index past the configured states (or a channel with no
+/// enum metadata) falls back to the decimal index — the record-type-specific
+/// out-of-range sentinel (`"Illegal_Value"` / `"Illegal Value"`) is not
+/// reproducible without the record type, and a record's VAL is always a
+/// defined state in normal operation.
+fn enum_label(snapshot: &crate::server::snapshot::Snapshot, idx: u16) -> String {
+    snapshot
+        .enums
+        .as_ref()
+        .and_then(|e| e.strings.get(idx as usize))
+        .cloned()
+        .unwrap_or_else(|| idx.to_string())
 }
 
 /// Port of libCom `cvtDoubleToString` (cvtFast.c:111-190).
@@ -1398,5 +1418,63 @@ mod r57_string_precision_tests {
         assert_eq!(cvt_float_to_string(3.5_f32, 2), "3.50");
         assert_eq!(cvt_float_to_string(1.0_f32, 3), "1.000");
         assert_eq!(cvt_float_to_string(-2.0_f32, 1), "-2.0");
+    }
+}
+
+#[cfg(test)]
+mod r58_enum_label_tests {
+    //! R58 — an enum value requested as a `*_STRING` DBR must render the
+    //! state label (C `getEnumString` → `get_enum_str`), not the index.
+    use super::{EpicsValue, convert_value_to_dbr_string};
+    use crate::server::snapshot::{EnumInfo, Snapshot};
+    use std::time::SystemTime;
+
+    fn snap_with_enum(value: EpicsValue, labels: &[&str]) -> Snapshot {
+        let mut s = Snapshot::new(value, 0, 0, SystemTime::UNIX_EPOCH);
+        s.enums = Some(EnumInfo {
+            strings: labels.iter().map(|x| x.to_string()).collect(),
+        });
+        s
+    }
+
+    #[test]
+    fn enum_renders_label_not_index() {
+        let s = snap_with_enum(EpicsValue::Enum(1), &["Off", "On"]);
+        assert_eq!(
+            convert_value_to_dbr_string(&s.value, &s),
+            EpicsValue::String("On".to_string())
+        );
+        let s0 = snap_with_enum(EpicsValue::Enum(0), &["Off", "On"]);
+        assert_eq!(
+            convert_value_to_dbr_string(&s0.value, &s0),
+            EpicsValue::String("Off".to_string())
+        );
+    }
+
+    #[test]
+    fn enum_array_renders_labels() {
+        let s = snap_with_enum(EpicsValue::EnumArray(vec![0, 1, 0]), &["Off", "On"]);
+        assert_eq!(
+            convert_value_to_dbr_string(&s.value, &s),
+            EpicsValue::StringArray(vec!["Off".to_string(), "On".to_string(), "Off".to_string()])
+        );
+    }
+
+    #[test]
+    fn enum_out_of_range_falls_back_to_index() {
+        let s = snap_with_enum(EpicsValue::Enum(5), &["Off", "On"]);
+        assert_eq!(
+            convert_value_to_dbr_string(&s.value, &s),
+            EpicsValue::String("5".to_string())
+        );
+    }
+
+    #[test]
+    fn enum_without_metadata_falls_back_to_index() {
+        let s = Snapshot::new(EpicsValue::Enum(1), 0, 0, SystemTime::UNIX_EPOCH);
+        assert_eq!(
+            convert_value_to_dbr_string(&s.value, &s),
+            EpicsValue::String("1".to_string())
+        );
     }
 }

@@ -992,9 +992,24 @@ impl GroupChannel {
                 // (e.g., "axis.position") resolve correctly. The read
                 // path uses set_nested_field — put must use the same
                 // path semantics.
+                // A supplied-but-unconvertible value is a conversion error,
+                // not a "field absent" no-op (see the non-atomic path for the
+                // pvxs IOCSource::put/groupsource.cpp parity rationale). Fail
+                // the whole atomic PUT here, in the pre-write conversion phase,
+                // before any member record is touched — nothing has been
+                // applied yet, so the all-or-nothing guarantee holds.
                 let epics_val = match get_nested_field(value, &member.field_name) {
-                    Some(pv_field) => self.convert_member_value(member, &pv_field).await,
-                    None => None,
+                    Some(pv_field) => match self.convert_member_value(member, &pv_field).await {
+                        Some(v) => Some(v),
+                        None => {
+                            return Err(BridgeError::PutRejected(format!(
+                                "group {} PUT: member '{}' value is not convertible \
+                                 to backing field '{}'",
+                                self.def.name, member.field_name, member.channel
+                            )));
+                        }
+                    },
+                    None => None, // field not supplied by client → legitimate skip
                 };
                 writes.push((member, epics_val));
             }
@@ -1064,9 +1079,23 @@ impl GroupChannel {
                     None => continue,
                 };
 
+                // The field WAS supplied by the client; failing to convert
+                // it is a conversion error, not a no-op. pvxs's
+                // `IOCSource::put` throws on an unsupported conversion
+                // (iocsource.cpp:114) and the group put handler turns that
+                // into a remote error (groupsource.cpp:665), distinct from
+                // the "No fields changed" reply (:656) which fires only when
+                // nothing putable was marked. Mirror that: surface the
+                // failure instead of silently dropping the member's write.
                 let epics_val = match self.convert_member_value(member, &pv_field).await {
                     Some(v) => v,
-                    None => continue,
+                    None => {
+                        return Err(BridgeError::PutRejected(format!(
+                            "group {} PUT: member '{}' value is not convertible \
+                             to backing field '{}'",
+                            self.def.name, member.field_name, member.channel
+                        )));
+                    }
                 };
 
                 if use_process {

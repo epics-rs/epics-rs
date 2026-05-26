@@ -125,6 +125,22 @@ pub struct PvListMatch {
     pub is_alias: bool,
 }
 
+impl PvListMatch {
+    /// Access-security level for this match, applying the C ca-gateway
+    /// default of **1** when the rule omitted the ASL field. In
+    /// `gateAs.cc` every rule carries `int lev=1`: an omitted ASG, an
+    /// omitted ASL, or an unparseable level all fall back to 1, and the
+    /// implicit `.* allow` rule (no pvlist file) is created at level 1.
+    /// AS activates a rule iff `client_asl <= rule.level`, so defaulting
+    /// to 0 — as the call sites previously did via `unwrap_or(0)` —
+    /// applies a superset of rules, over-permitting a level-0 WRITE/READ
+    /// grant that C would deny. Centralising the default here keeps every
+    /// consumer from re-deriving it (and re-introducing the `0` bug).
+    pub fn effective_asl(&self) -> i32 {
+        self.asl.unwrap_or(1)
+    }
+}
+
 /// A parsed `.pvlist` file.
 #[derive(Debug)]
 pub struct PvList {
@@ -521,6 +537,47 @@ fn build_pattern(pat: &str, lineno: usize) -> BridgeResult<Regex> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A9-2: an omitted `.pvlist` ASL must default to C ca-gateway's
+    /// `int lev=1` (gateAs.cc), not 0. The call sites previously used
+    /// `unwrap_or(0)`, which over-permitted: AS activates a rule iff
+    /// `client_asl <= rule.level`, so a level-0 default applies a
+    /// superset of rules — a level-0 WRITE/READ grant C would deny.
+    #[test]
+    fn effective_asl_defaults_to_one_when_omitted() {
+        let base = PvListMatch {
+            resolved_name: "PV".into(),
+            asg: None,
+            asl: None,
+            is_alias: false,
+        };
+        assert_eq!(base.effective_asl(), 1, "omitted ASL → 1 (C default)");
+        assert_eq!(
+            PvListMatch {
+                asl: Some(2),
+                ..base.clone()
+            }
+            .effective_asl(),
+            2,
+            "explicit ASL preserved"
+        );
+        assert_eq!(
+            PvListMatch {
+                asl: Some(0),
+                ..base.clone()
+            }
+            .effective_asl(),
+            0,
+            "explicit level-0 preserved (only the omitted case defaults to 1)"
+        );
+
+        // Integration: an ALLOW rule with an ASG but no ASL token parses
+        // to asl=None and resolves to level 1.
+        let list = parse_pvlist("PV.*  ALLOW  grp\n").unwrap();
+        let m = list.match_name("PV:x").expect("ALLOW match");
+        assert_eq!(m.asl, None, "ASG-only rule leaves ASL unset");
+        assert_eq!(m.effective_asl(), 1);
+    }
 
     #[test]
     fn parse_empty() {

@@ -386,7 +386,7 @@ impl GatewayServer {
                             &name,
                             &m.resolved_name,
                             m.asg.clone(),
-                            m.asl.unwrap_or(0),
+                            m.effective_asl(),
                         )
                         .await
                         .is_err()
@@ -440,7 +440,7 @@ impl GatewayServer {
             // BRIDGE-FR-2: serve under the preload-file name (which may be
             // an alias) while connecting to the resolved real PV.
             self.upstream
-                .ensure_subscribed(name, &m.resolved_name, m.asg.clone(), m.asl.unwrap_or(0))
+                .ensure_subscribed(name, &m.resolved_name, m.asg.clone(), m.effective_asl())
                 .await?;
             count += 1;
         }

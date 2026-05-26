@@ -8,15 +8,15 @@
 //!
 //! ```text
 //! epics:nt/NTNDArray:1.0
-//!   union value
+//!   union value           // signed-first then unsigned, then float/double
 //!     boolean[] booleanValue
 //!     byte[]    byteValue
-//!     ubyte[]   ubyteValue
 //!     short[]   shortValue
-//!     ushort[]  ushortValue
 //!     int[]     intValue
-//!     uint[]    uintValue
 //!     long[]    longValue
+//!     ubyte[]   ubyteValue
+//!     ushort[]  ushortValue
+//!     uint[]    uintValue
 //!     ulong[]   ulongValue
 //!     float[]   floatValue
 //!     double[]  doubleValue
@@ -25,25 +25,27 @@
 //!     any    parameters
 //!   long compressedSize
 //!   long uncompressedSize
-//!   structure[] dimension
-//!     structure
-//!       int size, offset, fullSize, binning
-//!       boolean reverse
 //!   int uniqueId
 //!   time_t dataTimeStamp
-//!   structure[] attribute
-//!     structure epics:nt/NTAttribute:1.0
-//!       string name
-//!       any    value
-//!       string descriptor
-//!       int    sourceType
-//!       string source
-//!   string descriptor
 //!   alarm_t alarm
 //!   time_t timeStamp
-//!   display_t display
+//!   dimension_t[] dimension
+//!     int     size, offset, fullSize, binning
+//!     boolean reverse
+//!   epics:nt/NTAttribute:1.0[] attribute
+//!     string   name
+//!     any      value
+//!     string[] tags
+//!     string   descriptor
+//!     alarm_t  alarm
+//!     time_t   timeStamp
+//!     int      sourceType
+//!     string   source
 //! ```
 
+// R82: the module-doc layout block above is kept in sync with
+// nt_nd_array_desc()/pvxs nt.cpp:196-251 — it had drifted to a stale
+// pre-fix shape (trailing descriptor+display, 5-field attribute).
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, VariantValue};
 
 /// Per-array data buffer. Caller chooses one variant; the builder produces

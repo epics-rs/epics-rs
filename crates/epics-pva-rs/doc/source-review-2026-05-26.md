@@ -988,6 +988,125 @@ struct parent (sends entire subtree), Rust emits exactly the selected leaf. Both
 are valid PVA and interoperable with pvxs clients. Rust is more spec-compliant for nested
 sub-field requests (`field(value.index)`). No fix required.
 
+## Round 2 findings (R79+) — epics-pva-rs vs pvxs
+
+Continuation of the global `R-N` series (CA panel owns R56–R59; R60–R78 used,
+never reused). Round 2 reviews the already-fixed code on the integration tip
+(`66a5b006`) for NEW divergences. All findings below cite BOTH the Rust site
+and the upstream pvxs C++ site.
+
+### R79 — `NTScalar::create()` omits `display`/`control`/`valueAlarm` sub-structures that `build()` includes
+
+- **Severity:** Low (no server-emit wire desync — `encode_pv_field` fills
+  missing value fields from the descriptor; affects direct consumers of the
+  `create()` value and the documented "matching `build()`" contract).
+- **Status:** Fixed (structural — `create()` now derives its value from
+  `build()`).
+- **Evidence:**
+  - Rust `src/nt/scalar.rs:175-191`: `create()` pushes only
+    `value`/`alarm`/`timeStamp`, ignoring `self.display` / `self.control` /
+    `self.value_alarm`, even though its own doc says "default-initialised
+    value matching `build()`". `build()` (`src/nt/scalar.rs:93-169`) DOES add
+    `display` / `control` / `valueAlarm` gated on those flags.
+  - C++ pvxs `src/pvxs/nt.h:96-97`: `inline Value create() const { return
+    build().create(); }` — pvxs derives the value directly from the
+    descriptor, so `create()` can never drift from `build()`. `build()`
+    (`src/nt.cpp`) adds the `display`/`control`/`valueAlarm` members under the
+    same flags.
+- **Impact:** A caller that does
+  `NTScalar::new(Double).with_display().create()` and then inspects/mutates
+  the `display` sub-field (the intended use of `create()`) finds no such
+  field in the Rust value, whereas pvxs's value has it. The wire bytes the
+  server emits are unaffected because the encoder is descriptor-driven, but
+  the `create()` API contract and pvxs parity are violated.
+- **Fix direction:** Make the value derive from the descriptor —
+  `create()` = `default_value_for(&self.build())` — mirroring pvxs's
+  `build().create()`. Single source of truth: the field set can no longer
+  drift from `build()` by construction.
+
+### R80 — CREATE_CHANNEL failure reply sends `serverChannelID = 0` instead of pvxs's `-1` (0xFFFFFFFF) sentinel
+
+- **Severity:** Low (the non-OK status governs the client's handling of a
+  failed CREATE_CHANNEL; a spec-correct client ignores the sid on failure.
+  Still a genuine wire-byte divergence from the pvxs sentinel, and `0` could
+  be misread as a literal channel id by a lenient client).
+- **Status:** Fixed.
+- **Evidence:**
+  - Rust `src/server_native/tcp.rs:2123` (unknown-PV branch) and
+    `src/server_native/tcp.rs:3436` (per-connection max-channels branch):
+    both build the reply as `cid` + `put_u32(0u32)` (sid) + error `Status`.
+    The success branch writes the real `cc.sid`.
+  - C++ pvxs `src/serverchan.cpp:273` initialises `uint32_t cid = -1, sid =
+    -1;`, leaves `sid = -1` on the not-found / error path (`:286`) and resets
+    `sid = -1` on fatal create failure (`:338`), then emits
+    `to_wire(R, cid); to_wire(R, sid); to_wire(R, sts);` (`:349-351`). So the
+    failure reply carries `sid = 0xFFFFFFFF`.
+- **Impact:** CREATE_CHANNEL failure replies differ from pvxs by one field
+  (sid `0x00000000` vs `0xFFFFFFFF`). This server's `alloc_sid()`
+  (`tcp.rs:40-43`) starts `NEXT_SID` at 1, so `0` is never a live channel id
+  here — hence no internal collision — but the wire value still diverges from
+  the documented pvxs sentinel.
+- **Fix direction:** Emit the pvxs sentinel `0xFFFFFFFF` at both failure
+  sites. Define it once (`CREATE_CHANNEL_NO_SID = u32::MAX`, co-located with
+  the SID allocator) so both sites share one sentinel definition, mirroring
+  pvxs's single `sid = -1`.
+
+### R81 — Standalone `NTAttribute` builder uses struct id `:1.1`; pvxs (and this crate's NTNDArray embed) use `:1.0`
+
+- **Severity:** Low–Medium (the standalone `nt::NTAttribute` builder is public
+  API but not wired into any server-emit path today; the NTNDArray-embedded
+  attribute already uses `:1.0`. A consumer that emits a value from this
+  builder would put a type id pvxs does not define onto the wire).
+- **Status:** Fixed.
+- **Evidence:**
+  - Rust `src/nt/attribute.rs:42` (`build()` struct_id), `:57` (`create()`
+    struct_id), and the pinned test `:99` all use
+    `"epics:nt/NTAttribute:1.1"`; the module doc (`:1`, `:6`) and
+    `src/nt/mod.rs:8` repeat `:1.1`. The field set
+    (name/value/tags/descriptor/alarm/timeStamp/sourceType/source) already
+    matches pvxs.
+  - C++ pvxs `src/nt.cpp:238`: the only NTAttribute id in pvxs is
+    `StructA("attribute", "epics:nt/NTAttribute:1.0", { String("name"),
+    Any("value"), StringA("tags"), String("descriptor"), Struct("alarm",
+    ...), time_t.as("timeStamp"), Int32("sourceType"), String("source") })`.
+    There is no `:1.1` anywhere in pvxs.
+  - Internal inconsistency: `src/nt/nd_array.rs:288` (`attribute_desc()`)
+    already uses `:1.0` for the NTNDArray-embedded attribute.
+- **Impact:** A pvxs client doing NT-aware introspection (type-id match on
+  `epics:nt/NTAttribute:1.0`) would not recognise the `:1.1` id this builder
+  emits. The common NTNDArray path is unaffected (it uses its own `:1.0`
+  descriptor).
+- **Fix direction:** Change `:1.1` → `:1.0` at all source sites (`build()`,
+  `create()`, module docs, the `mod.rs` re-export doc) and update the pinned
+  test assertion. The field set is already correct, so no other change.
+
+### R82 — NTNDArray module-doc layout block is stale (contradicts the already-correct `nt_nd_array_desc()`)
+
+- **Severity:** Low (documentation only — NO code or wire change. The
+  descriptor is already parity-correct and asserted by a test).
+- **Status:** Fixed (doc only).
+- **Evidence:**
+  - Rust `src/nt/nd_array.rs:7-45` (module `//!` doc layout block) shows an
+    OLD shape: trailing `string descriptor` + `display_t display` fields, a
+    5-field `attribute` substructure
+    (`name`/`value`/`descriptor`/`sourceType`/`source`), and a field order
+    that does not match the actual descriptor.
+  - The actual descriptor `src/nt/nd_array.rs:359-379` (`nt_nd_array_desc()`)
+    emits exactly 10 top-level fields — `value`, `codec`, `compressedSize`,
+    `uncompressedSize`, `uniqueId`, `dataTimeStamp`, `alarm`, `timeStamp`,
+    `dimension`, `attribute` — with an 8-field `attribute` substructure
+    (`attribute_desc()`, `:284-300`). Asserted by the test
+    `descriptor_matches_canonical_layout` (`:565-594`).
+  - C++ pvxs `src/nt.cpp:196-251` (`NTNDArray::build()`) is the source of that
+    10-field layout; the descriptor code already matches it (a prior round
+    closed the code divergence — in-code note at `nd_array.rs:219-226`).
+    (kodex node `aba2467e` describing the *code* divergence is stale/pre-fix.)
+- **Impact:** A reader using the module doc to understand the NTNDArray wire
+  layout is misled (it lists fields that are not emitted and the wrong order).
+  No runtime/wire effect.
+- **Fix direction:** Rewrite the module-doc layout block to match
+  `nt_nd_array_desc()` / pvxs `nt.cpp:196-251`. No code change.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

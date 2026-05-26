@@ -42,6 +42,11 @@ fn alloc_sid() -> u32 {
     NEXT_SID.fetch_add(1, Ordering::Relaxed)
 }
 
+// R80: serverChannelID sentinel in a CREATE_CHANNEL failure reply. pvxs
+// uses `sid = -1` (serverchan.cpp:273/338) and wires it as 0xFFFFFFFF;
+// `NEXT_SID` starts at 1, so this value can never be a live channel id.
+const CREATE_CHANNEL_NO_SID: u32 = u32::MAX;
+
 struct PipelineOptions {
     enabled: bool,
     queue_size: u32,
@@ -2120,7 +2125,10 @@ async fn handle_connection_io(
                         peer_entry
                             .set_channel_names(channels.values().map(|c| c.name.clone()).collect());
                     } else {
-                        payload.put_u32(0u32, order);
+                        // R80: CREATE_CHANNEL failure sid must be the
+                        // no-channel sentinel 0xFFFFFFFF (pvxs
+                        // serverchan.cpp:349, sid=-1), not 0.
+                        payload.put_u32(CREATE_CHANNEL_NO_SID, order);
                         Status::error(format!("unknown PV: {}", cc.name))
                             .write_into(order, &mut payload);
                     }
@@ -3433,7 +3441,9 @@ async fn handle_create_channel(
             );
             let mut payload = Vec::new();
             payload.put_u32(cid, order);
-            payload.put_u32(0u32, order);
+            // R80: CREATE_CHANNEL failure sid must be the no-channel sentinel
+            // 0xFFFFFFFF (pvxs serverchan.cpp:349, sid=-1), not 0.
+            payload.put_u32(CREATE_CHANNEL_NO_SID, order);
             Status::error("max channels per connection reached".to_string())
                 .write_into(order, &mut payload);
             let h = PvaHeader::application(

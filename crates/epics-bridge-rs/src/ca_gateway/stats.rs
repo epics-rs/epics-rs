@@ -38,10 +38,10 @@
 //! | `<prefix>connected` | Long | active + inactive (upstream-alive) |
 //! | `<prefix>active` | Long | activeCount |
 //! | `<prefix>inactive` | Long | inactiveCount |
-//! | `<prefix>unconnected` | Long | connecting + dead (upstream-not-alive) |
+//! | `<prefix>unconnected` | Long | connecting + dead + disconnect (statUnconnected) |
 //! | `<prefix>dead` | Long | deadCount |
 //! | `<prefix>connecting` | Long | connectingCount |
-//! | `<prefix>disconnected` | Long | deadCount (alias — C source treats these as the same bucket) |
+//! | `<prefix>disconnected` | Long | disconnect-state count (statDisconnected) |
 //! | `<prefix>clientEventRate` | Double | eventRate |
 //! | `<prefix>existTestRate` | Double | pvExistTest (search) resolutions/sec — separate from eventRate |
 //!
@@ -255,8 +255,7 @@ impl Stats {
         // per-entry Arc borrows once collected, so the outer
         // `cache.read().await` doesn't span the per-entry awaits.
         let cache_guard = cache.read().await;
-        let (connecting, active, inactive, dead, _disconnect, vc) =
-            cache_guard.count_states().await;
+        let (connecting, active, inactive, dead, disconnect, vc) = cache_guard.count_states().await;
         drop(cache_guard);
 
         // Compute event rate over the interval since last refresh
@@ -337,8 +336,13 @@ impl Stats {
         let n_client_event_count = format!("{p}clientEventCount");
         let n_post_event_count = format!("{p}postEventCount");
         let n_loop_count = format!("{p}loopCount");
+        // C `connected` = statAlive = active + inactive (gatePv.cc bumps
+        // total_alive only for those two states). `unconnected` =
+        // statUnconnected, which C increments for Connecting, Dead AND
+        // Disconnect (gatePv.cc:315,328,608,617) — the Disconnect state
+        // must be counted here, not dropped.
         let connected = (active + inactive) as i32;
-        let unconnected = (connecting + dead) as i32;
+        let unconnected = (connecting + dead + disconnect) as i32;
         // Sample the live open-fd count. `open_fd_count` reads a kernel
         // directory; on the rare platform where neither exists, keep
         // the PV at its previous value rather than posting a bogus 0.
@@ -367,7 +371,9 @@ impl Stats {
             db.put_pv_and_post(&n_unconnected, EpicsValue::Long(unconnected)),
             db.put_pv_and_post(&n_dead_alias, EpicsValue::Long(dead as i32)),
             db.put_pv_and_post(&n_connecting_alias, EpicsValue::Long(connecting as i32)),
-            db.put_pv_and_post(&n_disconnected, EpicsValue::Long(dead as i32)),
+            // C `disconnected` = statDisconnected = the Disconnect-state
+            // count (gatePv.cc:607,616), NOT the Dead count.
+            db.put_pv_and_post(&n_disconnected, EpicsValue::Long(disconnect as i32)),
             db.put_pv_and_post(&n_client_event_rate, EpicsValue::Double(event_rate)),
             db.put_pv_and_post(&n_exist_test_rate, EpicsValue::Double(exist_test_rate)),
             // B5 RATE_STATS internals.
@@ -676,5 +682,51 @@ mod tests {
         // downstream client.
         assert_eq!(db.get_pv("g:pvtotal").await.unwrap(), EpicsValue::Long(3));
         assert_eq!(db.get_pv("g:vctotal").await.unwrap(), EpicsValue::Long(2));
+    }
+
+    /// A9-5: the `disconnected` alias must report the Disconnect-state
+    /// count (C `statDisconnected`, gatePv.cc:607,616), NOT the Dead
+    /// count; and `unconnected` (C `statUnconnected`) must include
+    /// Disconnect alongside Connecting and Dead (gatePv.cc:315,328,608,
+    /// 617). Pre-fix `disconnected` posted `dead` and `unconnected`
+    /// dropped the Disconnect state entirely.
+    #[tokio::test]
+    async fn refresh_disconnected_and_unconnected_map_disconnect_state() {
+        use super::super::cache::{GwPvEntry, PvState};
+
+        let stats = Stats::new("g:".into());
+        let db = PvDatabase::new();
+        stats.publish_initial(&db).await;
+
+        let mut cache = PvCache::new();
+        let mut add = |name: &str, state: PvState| {
+            let mut e = GwPvEntry::new_connecting(name);
+            e.set_state(state);
+            cache.insert(e);
+        };
+        add("a", PvState::Active);
+        add("b", PvState::Inactive);
+        add("c", PvState::Connecting);
+        add("d", PvState::Dead);
+        add("e", PvState::Disconnect);
+        add("f", PvState::Disconnect);
+
+        let cache_size = cache.len();
+        let cache = RwLock::new(cache);
+        stats.refresh(&cache, &db, cache_size, 0).await;
+
+        // disconnected = Disconnect-state count (2), distinct from dead (1).
+        assert_eq!(
+            db.get_pv("g:disconnected").await.unwrap(),
+            EpicsValue::Long(2)
+        );
+        assert_eq!(db.get_pv("g:dead").await.unwrap(), EpicsValue::Long(1));
+        // unconnected = connecting(1) + dead(1) + disconnect(2) = 4.
+        assert_eq!(
+            db.get_pv("g:unconnected").await.unwrap(),
+            EpicsValue::Long(4)
+        );
+        // connected = active(1) + inactive(1) = 2 (unchanged by this fix).
+        assert_eq!(db.get_pv("g:connected").await.unwrap(), EpicsValue::Long(2));
     }
 }

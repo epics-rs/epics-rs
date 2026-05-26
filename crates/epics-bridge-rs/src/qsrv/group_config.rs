@@ -325,13 +325,20 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         if let TriggerDef::Fields(targets) = &member.triggers {
             for target in targets {
                 if !member_names.contains(target.as_str()) {
-                    return Err(BridgeError::GroupConfigError(format!(
-                        "group '{}': member '{}' has trigger '{}' which is not a member of this group",
+                    // pvxs `defineGroupTriggers` (groupconfigprocessor.cpp:
+                    // 396-397) logs the bad reference and `continue`s,
+                    // dropping just this trigger target — the group and
+                    // every sibling group still load. Do NOT fail the
+                    // whole config. The unknown ref is then filtered out
+                    // at runtime in `value_event_mark`.
+                    eprintln!(
+                        "Error: group '{}': member '{}' defines trigger to nonexistent field '{}' (ignored)",
                         name, member.field_name, target
-                    )));
+                    );
+                    continue;
                 }
-                // Warn if trigger target has no channel (Structure/Const) —
-                // pvxs silently ignores these (groupconfigprocessor.cpp:405-407).
+                // A channel-less target (Structure/Const) is dropped too —
+                // pvxs ignores these (groupconfigprocessor.cpp:405-407).
                 if !channeled_names.contains(target.as_str()) {
                     eprintln!(
                         "warning: group '{}': trigger '{}' on member '{}' targets a field without a channel (ignored)",
@@ -1006,22 +1013,34 @@ mod tests {
     }
 
     #[test]
-    fn trigger_validation_unknown_field() {
+    fn trigger_validation_unknown_field_drops_ref_not_config() {
+        // A10-1: pvxs (groupconfigprocessor.cpp:396-397) logs an unknown
+        // trigger target and `continue`s — it drops only that reference,
+        // never the group or its siblings. Pre-fix the Rust parser
+        // returned Err, aborting the whole blob and dropping EVERY group.
         let json = r#"{
             "GRP:bad": {
-                "x": {
-                    "+channel": "R:x",
-                    "+trigger": "y,z"
-                },
+                "x": { "+channel": "R:x", "+trigger": "y,z" },
                 "y": { "+channel": "R:y" }
+            },
+            "GRP:sibling": {
+                "a": { "+channel": "R:a" }
             }
         }"#;
 
-        // y exists but z doesn't — should fail
-        let result = parse_group_config(json);
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("'z'"), "expected error about 'z': {err}");
+        // 'z' does not exist, but the config must still parse and BOTH
+        // groups must load.
+        let groups =
+            parse_group_config(json).expect("unknown trigger ref must not fail the config");
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"GRP:bad"),
+            "the group with the bad ref still loads: {names:?}"
+        );
+        assert!(
+            names.contains(&"GRP:sibling"),
+            "the sibling group must not be dropped by the bad ref: {names:?}"
+        );
     }
 
     #[test]

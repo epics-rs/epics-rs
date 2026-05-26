@@ -777,6 +777,13 @@ impl RecordInstance {
     }
 
     /// Extract analog alarm limits from CommonFields.
+    // R56: DBR_GR_*/DBR_CTRL_* alarm limits MUST be severity-gated — C
+    // get_alarm_double returns `prec->hhsv ? prec->hihi : epicsNAN`
+    // (aiRecord.c:295-298 and ao/longin/longout/calc/calcout). int64in/
+    // int64out are the sole exception (unconditional, int64inRecord.c:239-243)
+    // and use `alarm_limits_unchecked()`. NaN encodes byte-exact for every
+    // DBR variant: f64/f32 keep NaN, integer casts make `NaN as iN == 0`,
+    // matching dbAccess.c:300-326 (`finite(ald)?cast:0`).
     fn alarm_limits(&self) -> (f64, f64, f64, f64) {
         if let Some(ref aa) = self.common.analog_alarm {
             (aa.hihi, aa.high, aa.low, aa.lolo)

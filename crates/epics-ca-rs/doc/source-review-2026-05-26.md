@@ -451,6 +451,54 @@ Note: link fields (`DBF_INLINK`/`OUTLINK`/`FWDLINK`) with `$` (C uses
 link-field types at the `get_field` level. The fix covers all `EpicsValue::String`
 results, which corresponds to `DBF_STRING` fields in C.
 
+### R56 — DBR_GR_*/DBR_CTRL_* alarm limits not severity-gated; ungated limits sent verbatim instead of NaN/0
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-base-rs/src/server/record/record_instance.rs:780-786` —
+  `alarm_limits()` returns `(aa.hihi, aa.high, aa.low, aa.lolo)` UNCONDITIONALLY,
+  and both `populate_display_info` arms feed it into `DisplayInfo`:
+  `"ai" | "ao" | "calc" | "calcout"` (line 422) and
+  `"longin" | "longout" | "int64in" | "int64out"` (line 457). The codec sources
+  the four alarm-limit slots of every DBR_GR_*/DBR_CTRL_* response from
+  `DisplayInfo` (`crates/epics-base-rs/src/types/codec.rs:429-432`, GR `limits[2..5]`
+  / CTRL `limits[2..5]`).
+- **C**: `get_alarm_double` is severity-gated for the analog records —
+  `modules/database/src/std/rec/aiRecord.c:295-298`
+  (`pad->upper_alarm_limit = prec->hhsv ? prec->hihi : epicsNAN`),
+  `aoRecord.c:368-372`, `longinRecord.c:244-248`, `longoutRecord.c:300-304`,
+  `calcRecord.c:263-267`, `calcoutRecord.c:538-542`. `int64inRecord.c:239-243`
+  and `int64outRecord.c:283-287` are UNCONDITIONAL (no gating) — the asymmetry
+  is real and must be preserved. `modules/database/src/ioc/db/dbAccess.c:294-326`
+  shows the gated NaN is encoded as NaN for `DBR_AL_DOUBLE` (float/double DBR
+  fields) and as `finite(ald) ? (epicsInt32)ald : 0` (i.e. **0**) for
+  `DBR_AL_LONG` (integer DBR fields).
+
+Impact:
+
+CA clients that request DBR_GR_* / DBR_CTRL_* (control-panel widgets, `caget -a`)
+for an analog record whose alarm severities are disabled (HHSV/HSV/LSV/LLSV =
+NO_ALARM, the default) receive the raw HIHI/HIGH/LOW/LOLO field values (typically
+0.0) where the C IOC returns NaN (float/double types) or 0 (integer types). A
+widget that respects alarm limits draws an alarm marker at 0.0 instead of treating
+the limit as "not configured" (NaN). Affects ai, ao, longin, longout, calc,
+calcout. int64in/int64out are already correct (C does not gate them).
+
+Fix direction:
+
+Gate `alarm_limits()` with `f64::NAN` when the matching severity field is
+`AlarmSeverity::NoAlarm` (and when `analog_alarm` is `None`, since C reads
+prec->hhsv == 0 → NaN there too). Add `alarm_limits_unchecked()` returning the
+raw limits for the int64in/int64out path, and select the source by record type
+inside the `longin | longout | int64in | int64out` arm. The codec's existing
+`f64 → i16/i32/i8` casts make `NaN as iN == 0` (matching C's
+`finite()?cast:0`) and `f64 → f32` preserves NaN, so storing NaN in `DisplayInfo`
+is byte-exact for every DBR variant — no codec change needed.
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,

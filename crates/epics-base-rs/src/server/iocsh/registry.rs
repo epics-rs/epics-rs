@@ -502,6 +502,58 @@ pub(crate) fn substitute_env_vars(s: &str) -> String {
     result
 }
 
+/// Parse an `iocshArgInt` token the way C `cvtArg` does
+/// (`iocsh.cpp:814-836`): `strtol(arg, &endp, 0)`. Base-0 means a
+/// `0x`/`0X` prefix is hex and a leading `0` is octal — so `dbpr REC 010`
+/// is 8, not 10, and `postEvent 0x10` is 16, not an error. On signed
+/// overflow C retries with `strtoul` (`0xFFFFFFFFFFFFFFFF` → the same
+/// bit pattern reinterpreted into the signed `long`), and an empty arg
+/// defaults to 0. Trailing non-numeric characters are rejected, matching
+/// C's `if (*endp)` "Invalid integer" check.
+fn parse_iocsh_int(token: &str) -> Result<i64, ()> {
+    // C `if (arg && *arg)` — an empty token defaults to 0.
+    if token.is_empty() {
+        return Ok(0);
+    }
+    // strtol skips leading whitespace, then takes an optional sign.
+    let s = token.trim_start();
+    if s.is_empty() {
+        // Whitespace-only: strtol converts nothing and leaves *endp set
+        // → C reports "Invalid integer".
+        return Err(());
+    }
+    let (neg, body) = match s.as_bytes()[0] {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    // Base-0 prefix detection on the unsigned magnitude.
+    let (radix, digits): (u32, &str) =
+        if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            (16, hex)
+        } else if body.len() > 1 && body.starts_with('0') {
+            // Leading `0` + at least one more char → octal (the C
+            // convention); `0` alone stays decimal so it parses to 0.
+            (8, &body[1..])
+        } else {
+            (10, body)
+        };
+    if digits.is_empty() {
+        // e.g. a bare sign, or `0x` with no hex digits.
+        return Err(());
+    }
+    // Signed first; on overflow fall back to unsigned (C `strtol`
+    // ERANGE → `strtoul`) and reinterpret the bit pattern into the
+    // signed result exactly as C stores it in `long ival`. An invalid
+    // digit fails both parses → error (matches C's `*endp` check, e.g.
+    // octal `08`).
+    let parsed = match i64::from_str_radix(digits, radix) {
+        Ok(v) => v,
+        Err(_) => u64::from_str_radix(digits, radix).map_err(|_| ())? as i64,
+    };
+    Ok(if neg { parsed.wrapping_neg() } else { parsed })
+}
+
 /// Parse tokens into argument values according to argument descriptors.
 pub(crate) fn parse_args(tokens: &[String], descs: &[ArgDesc]) -> Result<Vec<ArgValue>, String> {
     let mut result = Vec::with_capacity(descs.len());
@@ -511,7 +563,7 @@ pub(crate) fn parse_args(tokens: &[String], descs: &[ArgDesc]) -> Result<Vec<Arg
             let token = &tokens[i];
             let val = match desc.arg_type {
                 ArgType::String => ArgValue::String(token.clone()),
-                ArgType::Int => token.parse::<i64>().map(ArgValue::Int).map_err(|_| {
+                ArgType::Int => parse_iocsh_int(token).map(ArgValue::Int).map_err(|_| {
                     format!(
                         "argument '{}': expected integer, got '{}'",
                         desc.name, token
@@ -699,6 +751,48 @@ mod tests {
         }];
         let tokens = vec!["abc".to_string()];
         assert!(parse_args(&tokens, &descs).is_err());
+    }
+
+    /// A3-1: `iocshArgInt` must parse like C `strtol(arg, &endp, 0)`
+    /// (base-0: `0x` hex, leading `0` octal), with a `strtoul` overflow
+    /// fallback and empty→0 — not Rust's decimal-only `parse::<i64>`.
+    #[test]
+    fn test_parse_iocsh_int_base0() {
+        // Decimal.
+        assert_eq!(parse_iocsh_int("10"), Ok(10));
+        assert_eq!(parse_iocsh_int("0"), Ok(0));
+        assert_eq!(parse_iocsh_int("-5"), Ok(-5));
+        assert_eq!(parse_iocsh_int("+5"), Ok(5));
+        // Octal: `dbpr REC 010` is 8 in C, was silently 10 pre-fix.
+        assert_eq!(parse_iocsh_int("010"), Ok(8));
+        assert_eq!(parse_iocsh_int("00"), Ok(0));
+        // Hex: `postEvent 0x10` is 16 in C, errored pre-fix.
+        assert_eq!(parse_iocsh_int("0x10"), Ok(16));
+        assert_eq!(parse_iocsh_int("0X1F"), Ok(31));
+        assert_eq!(parse_iocsh_int("-0x10"), Ok(-16));
+        // Empty arg defaults to 0 (C `if (arg && *arg)` else branch).
+        assert_eq!(parse_iocsh_int(""), Ok(0));
+        // strtoul fallback: bit pattern reinterpreted into signed long.
+        assert_eq!(parse_iocsh_int("0xFFFFFFFFFFFFFFFF"), Ok(-1));
+        assert_eq!(parse_iocsh_int("18446744073709551615"), Ok(-1));
+        // Errors: trailing garbage, invalid octal digit, bare/oversized.
+        assert!(parse_iocsh_int("10abc").is_err());
+        assert!(parse_iocsh_int("08").is_err());
+        assert!(parse_iocsh_int("0x").is_err());
+        assert!(parse_iocsh_int("0x1FFFFFFFFFFFFFFFF").is_err());
+        assert!(parse_iocsh_int("   ").is_err());
+        assert!(parse_iocsh_int("abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_args_int_base0_via_parse_args() {
+        let descs = vec![ArgDesc {
+            name: "mask",
+            arg_type: ArgType::Int,
+            optional: false,
+        }];
+        let result = parse_args(&["0x10".to_string()], &descs).unwrap();
+        assert!(matches!(&result[0], ArgValue::Int(16)));
     }
 
     #[test]

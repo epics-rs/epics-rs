@@ -1073,16 +1073,25 @@ async fn run_engine(
                     // SEARCH messages per UDP datagram. Without the
                     // loop we'd parse only the first and silently
                     // drop the rest.
+                    let mut poke = false;
                     let mut pos = 0usize;
                     while pos < n {
                         let consumed = handle_search_response(
                             &search_buf[pos..n],
-                            &mut pending, &mut by_name, &beacons, &ignore_guids, peer, false,
+                            &mut pending, &mut by_name, &beacons, &ignore_guids,
+                            &mut subscribers, &mut announced, &mut poke, peer, false,
                         );
                         if consumed == 0 {
                             break;
                         }
                         pos = pos.saturating_add(consumed);
+                    }
+                    if poke && fast_ticks_remaining == 0 {
+                        tick = interval(Duration::from_millis(200));
+                        tick.tick().await;
+                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
+                    } else if poke {
+                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
                     }
                 }
             }
@@ -1092,16 +1101,25 @@ async fn run_engine(
                 // unicast back to this v6 socket. Decode reuses the
                 // same family-agnostic handler.
                 if let Some(Ok((n, peer))) = res {
+                    let mut poke = false;
                     let mut pos = 0usize;
                     while pos < n {
                         let consumed = handle_search_response(
                             &search_buf_v6[pos..n],
-                            &mut pending, &mut by_name, &beacons, &ignore_guids, peer, false,
+                            &mut pending, &mut by_name, &beacons, &ignore_guids,
+                            &mut subscribers, &mut announced, &mut poke, peer, false,
                         );
                         if consumed == 0 {
                             break;
                         }
                         pos = pos.saturating_add(consumed);
+                    }
+                    if poke && fast_ticks_remaining == 0 {
+                        tick = interval(Duration::from_millis(200));
+                        tick.tick().await;
+                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
+                    } else if poke {
+                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
                     }
                 }
             }
@@ -1174,9 +1192,12 @@ async fn run_engine(
             ns_rsp = ns_response_rx.recv() => {
                 // SEARCH_RESPONSE received over a TCP name-server connection.
                 // pvxs client.cpp:984-995: procSearchReply with istcp=true.
+                // is_tcp=true so the R90 discovery-pong path does not fire here.
                 if let Some((bytes, ns_addr)) = ns_rsp {
+                    let mut poke = false;
                     handle_search_response(
-                        &bytes, &mut pending, &mut by_name, &beacons, &ignore_guids, ns_addr, true,
+                        &bytes, &mut pending, &mut by_name, &beacons, &ignore_guids,
+                        &mut subscribers, &mut announced, &mut poke, ns_addr, true,
                     );
                 }
             }
@@ -1505,12 +1526,16 @@ fn flush_expired_pending(
 /// the next chained message in the same datagram (P-G10).
 /// `is_tcp`: true when the response arrived on a TCP name-server connection;
 /// enables pvxs procSearchReply port-0 rule (client.cpp:828-846).
+#[allow(clippy::too_many_arguments)]
 fn handle_search_response(
     bytes: &[u8],
     pending: &mut HashMap<u32, Pending>,
     by_name: &mut HashMap<String, u32>,
-    _beacons: &Arc<BeaconTracker>,
+    beacons: &Arc<BeaconTracker>,
     ignore_guids: &std::collections::HashSet<[u8; 12]>,
+    subscribers: &mut Vec<mpsc::Sender<Discovered>>,
+    announced: &mut std::collections::HashSet<(SocketAddr, [u8; 12])>,
+    poke_request: &mut bool,
     peer: SocketAddr,
     is_tcp: bool,
 ) -> usize {
@@ -1521,7 +1546,35 @@ fn handle_search_response(
     let Ok(resp) = decode_search_response(&frame) else {
         return consumed;
     };
+    // R90: pvxs client.cpp:866-878 — when a UDP SEARCH_RESPONSE arrives with
+    // found=false and no channel IDs it is a discovery pong: the server
+    // acknowledged a DiscoverPing (MustReply SEARCH with zero channels).
+    // Treat it as a fake beacon so the server enters the tracker and
+    // Discovered::Online fires for subscribers — mirrors pvxs's
+    // `self.onBeacon(fakebeacon)` path. Pre-fix this returned unconditionally
+    // on any found=false response, leaving DiscoverPing completely broken.
     if !resp.found {
+        if !is_tcp && resp.cids.is_empty() && !ignore_guids.contains(&resp.guid) {
+            let server = rewrite_loopback(resp.server_addr, peer);
+            let allow_reconnect = beacons.observe(server, resp.guid);
+            let first_announce = announced.insert((server, resp.guid));
+            if allow_reconnect && first_announce {
+                *poke_request = true;
+                for p in pending.values_mut() {
+                    p.last_attempt = Instant::now() - Duration::from_secs(60);
+                    p.attempt = 0;
+                }
+            }
+            if first_announce {
+                let evt = Discovered::Online {
+                    server,
+                    guid: resp.guid,
+                    peer,
+                    proto: resp.protocol,
+                };
+                subscribers.retain(|tx| tx.try_send(evt.clone()).is_ok());
+            }
+        }
         return consumed;
     }
     // PVA-R10: pvxs `client.cpp:849-880` ignores SEARCH_RESPONSE

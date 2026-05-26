@@ -1107,6 +1107,36 @@ and the upstream pvxs C++ site.
 - **Fix direction:** Rewrite the module-doc layout block to match
   `nt_nd_array_desc()` / pvxs `nt.cpp:196-251`. No code change.
 
+### R90 — DiscoverPing response silently dropped; active discovery broken
+
+- **Severity:** Medium
+- **Status:** Fixed
+- **Evidence:**
+  - Rust: `src/client_native/search_engine.rs:1515-1517` — `if !resp.found { return consumed; }`
+    unconditionally drops ALL `found=false` SEARCH_RESPONSE frames on both the UDP search
+    socket and the TCP name-server path. This includes the server's mandatory reply to a
+    `DiscoverPing` (empty SEARCH with `MustReply` set): that reply has `found=false` and
+    `nSearch=0`, so it is silently discarded. The `_beacons` parameter was passed to the
+    function but was never used (underscore prefix confirms the code was set up for this path
+    but left unfinished).
+  - C++: `pvxs/src/client.cpp:866-878` — `if(!found && !istcp && seq==search_seq &&
+    nSearch==0u && !discoverers.empty())` treats a UDP `found=false, nSearch=0`
+    SEARCH_RESPONSE as a fake beacon: creates a synthetic `UDPManager::Beacon` from the
+    reply's GUID and server address and calls `self.onBeacon(fakebeacon)`, which registers
+    the server in the tracker and fires `Discovered::Online` to all subscribers.
+- **Impact:** `SearchEngine::discover_ping()` sends the correct wire packet
+  (`build_discover_search`: empty SEARCH with `MustReply`, zero channels) but the server's
+  response is discarded. No `Discovered::Online` event fires for servers discovered only via
+  active ping (servers that do not send periodic beacons). Normal PV connect/get/put/monitor
+  are unaffected — only the Discovery subscription API is broken.
+- **Fix direction:** Before the early `!found` return in `handle_search_response`, add a
+  guard for the UDP discovery pong case (`!is_tcp && resp.cids.is_empty()`). When matched:
+  check `ignore_guids`, call `beacons.observe(server, guid)`, update `announced`, notify
+  `subscribers` with `Discovered::Online`, and set `poke_request` to accelerate pending
+  searches (same logic as `handle_beacon`). Add `subscribers`, `announced`, and
+  `poke_request` to the function signature; update all three call sites. Rename `_beacons`
+  to `beacons` to use the parameter.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

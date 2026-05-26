@@ -341,6 +341,27 @@ Fix direction (cross-crate, deferred to main worker):
 
 The raw forwarding path ships opaque pre-encoded body bytes, so signaling overrun requires the monitor encoder. Plumb a per-subscription "overrun pending" flag from the gateway forwarder (set on `Lagged`) through to the `epics-pva-rs` server monitor encoder (`build_monitor_payload`), which currently hardcodes `let overrun = BitSet::new()`, so it sets the overrun bitset (at minimum the root/changed bits) on the next emitted monitor frame. Until then the gateway silently coalesces under its own backpressure.
 
+### BR-R62 — QSRV `alarm_t` emits the raw EPICS condition code in `alarm.status` and the wrong `alarm.message`
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/qsrv/pvif.rs:554` (`build_alarm`) and `crates/epics-bridge-rs/src/qsrv/pvif.rs:582` (`build_alarm_overlay`) write `snapshot.alarm.status as i32` straight into the PVA `alarm.status` field. `snapshot.alarm.status` is the raw `epicsAlarmCondition` (0–21; `crates/epics-base-rs/src/server/recgbl.rs:9-30` mirrors `libcom/src/misc/alarm.h`, e.g. `LINK_ALARM = 14`, `UDF_ALARM = 17`). `crates/epics-bridge-rs/src/qsrv/group.rs:1941` (`build_alarm_from_snapshot`) does the same.
+- `alarm.message` is also wrong: `pvif.rs:558` and `pvif.rs:586` set it to `alarm_severity_string(severity)` (`pvif.rs:870` — "NO_ALARM"/"MINOR"/"MAJOR"/"INVALID"), and `group.rs:1945` sets it to `String::new()` (always empty).
+- `epics-modules/pvxs/ioc/iocsource.cpp:187-227` maps `meta.status` (the `epicsAlarmCondition`) to the PVA **status class** before storing: `NO_ALARM→0` (NONE); `READ/WRITE/HIHI/HIGH/LOLO/LOW/STATE/COS/HW_LIMIT→1` (DEVICE); `COMM/TIMEOUT/UDF→2` (DRIVER); `CALC/SCAN/LINK/SOFT/BAD_SUB→3` (RECORD); `DISABLE/SIMM/READ_ACCESS/WRITE_ACCESS→4` (DB); `default→6` (UNDEFINED). It then `node["alarm.status"] = status` (the class) and `node["alarm.severity"] = meta.severity` (raw severity, unchanged).
+- `epics-modules/pvxs/ioc/iocsource.cpp:225-236` sets `alarm.message`: `stsmsg = epicsAlarmConditionStrings[meta.status]` then `node["alarm.message"] = meta.status && stsmsg ? stsmsg : ""` — the alarm **condition string** (`epics-base modules/libcom/src/misc/alarmString.c:27-50`: index 0–21 = `NO_ALARM, READ, WRITE, HIHI, HIGH, LOLO, LOW, STATE, COS, COMM, TIMEOUT, HWLIMIT, CALC, SCAN, LINK, SOFT, BAD_SUB, UDF, DISABLE, SIMM, READ_ACCESS, WRITE_ACCESS`), empty when status is `NO_ALARM`.
+
+Impact:
+
+Every QSRV single-PV NTScalar/NTEnum and every group monitor/GET emits `alarm.status` as the raw `epicsAlarmCondition` (0–21) where the NTScalar normative type and every pvxs/QSRV peer expect the PVA status class (0–6). A PVA client that interprets `alarm.status` per the normative `alarm_t` (status class) mis-reads the value (e.g. a `LINK_ALARM` record reports class `14`, an undefined class). `alarm.message` carries the severity name (redundant with the severity field) or nothing, instead of the human-readable alarm condition.
+
+Fix direction (structural):
+
+Add two shared helpers — `alarm_status_class(condition: u16) -> i32` (the `iocsource.cpp:187-223` switch) and `alarm_condition_string(condition: u16) -> &'static str` (indexing `epicsAlarmConditionStrings`) — and apply them at all three alarm builders (`pvif.rs build_alarm`, `pvif.rs build_alarm_overlay`, `group.rs build_alarm_from_snapshot`). Each builder: `status` = `alarm_status_class(condition)`; `message` = `alarm_condition_string(condition)` when `condition != 0` else `""`. `severity` stays the raw `epicsAlarmSeverity` (matches pvxs `node["alarm.severity"] = meta.severity`).
+
 ## Uncertain candidates
 
 ### BR-R-UNCERTAIN-1 — CA gateway subscribes upstream with the channel's native element count, not CA `count=0`

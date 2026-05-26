@@ -549,6 +549,9 @@ fn build_alarm(snapshot: &Snapshot) -> PvStructure {
         "severity".into(),
         PvField::Scalar(ScalarValue::Int(snapshot.alarm.severity as i32)),
     ));
+    // BR-R62: emits the raw epicsAlarmCondition; pvxs maps to the PVA
+    // status class (iocsource.cpp:187-227). message must be the condition
+    // string, not the severity name.
     alarm.fields.push((
         "status".into(),
         PvField::Scalar(ScalarValue::Int(snapshot.alarm.status as i32)),
@@ -577,6 +580,8 @@ fn build_alarm_overlay(snapshot: &Snapshot, severity: u16, status: u16) -> PvStr
         "severity".into(),
         PvField::Scalar(ScalarValue::Int(eff_severity as i32)),
     ));
+    // BR-R62: raw epicsAlarmCondition; needs status-class mapping +
+    // condition-string message (see build_alarm / iocsource.cpp:187-236).
     alarm.fields.push((
         "status".into(),
         PvField::Scalar(ScalarValue::Int(eff_status as i32)),

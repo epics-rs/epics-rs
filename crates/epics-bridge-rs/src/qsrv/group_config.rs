@@ -380,6 +380,14 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
             // pvxs's narrow self-trigger delta visible in
             // testqgroup.cpp:220 (NTEnum group: only `value.index`
             // bit set on a VAL update).
+            // BR-R58: this per-member default is only provisional. pvxs
+            // applies the self-trigger fallback at the GROUP level and only
+            // when the whole group declares no triggers
+            // (`groupconfigprocessor.cpp:317-339`). In a group where any
+            // member has an explicit `+trigger`, a no-`+trigger` member is
+            // silent. `GroupPvDef::resolve_self_trigger_default` demotes
+            // `SelfOnly` → `None` for such mixed groups after all members
+            // are assembled.
             None => TriggerDef::SelfOnly,
             Some("") => TriggerDef::None,
             Some(s) => TriggerDef::Fields(s.split(',').map(|f| f.trim().to_string()).collect()),

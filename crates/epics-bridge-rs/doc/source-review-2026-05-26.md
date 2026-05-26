@@ -258,6 +258,28 @@ Fix applied (Option 1 — alarm update, parity with CA gateway B-G11 design):
 
 Regression tests added: `br_r57_build_invalid_alarm_no_prior_snapshot_returns_none`, `br_r57_build_invalid_alarm_non_nt_type_returns_none`, `br_r57_build_invalid_alarm_nt_scalar_sets_invalid`, `br_r57_reconnect_clears_invalid_alarm`.
 
+### BR-R58 — QSRV mixed-trigger group posts a no-`+trigger` member on its own change; pvxs leaves it silent
+
+Severity: High
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/qsrv/group_config.rs:383` — `parse_member` maps a missing `+trigger` to `TriggerDef::SelfOnly` per-member at parse time. This decision is made with no knowledge of whether *other* members in the group declare triggers.
+- `crates/epics-bridge-rs/src/qsrv/group.rs:1366-1369` — in a group that is NOT pure-self-trigger (`is_pure_self_trigger()` false because some member is `All`/`Fields`), `value_event_mark` takes the explicit-graph path and a `SelfOnly` member resolves to `vec![source.field_name]` → `EventMark::Marked([own])`, i.e. it POSTS a monitor update marking its own field whenever its source record changes.
+- `epics-modules/pvxs/ioc/groupconfigprocessor.cpp:300-309` — `defineTriggers`: a field whose `+trigger` is empty gets an EMPTY `TriggerNames` inserted into `fieldTriggerMap`; only a non-empty trigger sets `groupDefinition.hasTriggers = true`.
+- `epics-modules/pvxs/ioc/groupconfigprocessor.cpp:317-339` — `resolveTriggerReferences`: the self-trigger default (`field.triggerNames.insert(field.name)`) is applied to all channeled fields ONLY in the `else` branch, i.e. only when `!groupDefinition.hasTriggers` (no member in the whole group declared a trigger). When `hasTriggers` is true, a no-`+trigger` field keeps its empty trigger set and posts nothing on its own change.
+- `epics-modules/pvxs/ioc/groupconfigprocessor.cpp:381-391` — `defineGroupTriggers` iterates the (empty) trigger set, so a no-`+trigger` field in a mixed group ends with `fieldDefinition.triggerNames` empty; the downstream `subscriptionValueCallback` trigger loop is then empty → no post.
+
+Impact:
+
+In a group where *any* member carries an explicit `+trigger` (`"*"` or named), a member that omits `+trigger` is a data-only field in pvxs: its value is delivered when a *triggering* member fires, but its own change generates no monitor update. The Rust port instead posts an update for that member on its own change. This breaks the `+trigger` atomic-bundling contract (qgroup.rst: an empty/default trigger "means that changes to the field do not cause a subscription update"): downstream clients receive spurious updates and can observe partially-updated group snapshots that pvxs would never emit. The pure-self-trigger group (no member declares a trigger) is unaffected — there the Rust default matches pvxs's whole-group self-trigger fallback.
+
+Fix direction (structural):
+
+The defect is that the self-trigger default is decided per-member at parse time, while pvxs decides it at the group level after seeing every member. Add `GroupPvDef::resolve_self_trigger_default(&mut self)`: if any member is `All`/`Fields`, demote every `SelfOnly` member to `None` (silent). Call it at both group-assembly points — end of `raw_to_group_def` (single-source groups) and after the member `extend` in `merge_group_defs` (cross-source groups) — so the invariant "a `SelfOnly` member can exist only in a pure self-trigger group" holds by construction. The conversion is monotonic (groups only gain members via merge), so re-running on merge is safe.
+
 ## Uncertain candidates
 
 None identified this round.

@@ -854,12 +854,11 @@ impl SharedSource {
 
     pub fn add(&self, name: impl Into<String>, pv: SharedPV) {
         let key = name.into();
-        // R-6: warn on silent overwrite. A second registration with
-        // the same name swaps in the new SharedPV — but in-flight
-        // clones held by ongoing RPCs still reference the previous
-        // SharedPV, so live operations don't migrate. Surfacing
-        // this nudges callers toward `remove` then `add` for
-        // intentional swaps.
+        // Warn on silent overwrite: a second registration with the
+        // same name swaps in the new SharedPV, but in-flight clones
+        // held by ongoing RPCs still reference the previous SharedPV.
+        // Surfacing this nudges callers toward `remove` then `add`
+        // for intentional swaps.
         if self.pvs.lock().insert(key.clone(), pv).is_some() {
             tracing::warn!(
                 pv = %key,

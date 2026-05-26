@@ -28,9 +28,9 @@ Each ID series resolves to a dated review document under `docs/`:
 
 | Series              | Legend document                               |
 |---------------------|-----------------------------------------------|
-| `PVXS-SR-N`         | `docs/pvxs-source-review-2026-05-22.md`       |
+| `PVXS-SR-N`         | `~/Documents/pvxs-source-review-2026-05-22.md` (archived) |
+| `BFR-N`             | `docs/epics-ca-pva-broad-review-2026-05-22.md` |
 | parity `H/CR/PF-N`  | `crates/<crate>/doc/parity-review/` (+ index) |
-| `R-N` (round)       | `docs/c-parity-review-*.md`, `merge-regression-review-*.md` |
 
 In-crate review sets (the `parity-review/` index + detail files) live under
 that crate's `doc/` directory, not at the crate root.

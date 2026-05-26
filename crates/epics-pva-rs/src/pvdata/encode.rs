@@ -1911,9 +1911,9 @@ fn decode_pv_field_at_depth(
                 // Variant peeling: each FieldDesc::Variant value
                 // carries an inline FieldDesc + recursive PvField,
                 // costing only 1 byte on the wire per peel but one
-                // Rust stack frame. R-2: cap the recursion via the
-                // depth counter so an adversary can't blow the
-                // per-task stack with chained Variant tags.
+                // Rust stack frame. Cap the recursion via the depth
+                // counter so an adversary can't blow the per-task
+                // stack with chained Variant tags.
                 let inner = decode_type_desc_cached(cur, order, cache)?;
                 let value = decode_pv_field_at_depth(&inner, cur, order, cache, depth + 1)?;
                 PvField::Variant(Box::new(VariantValue {

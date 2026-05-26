@@ -1936,15 +1936,20 @@ fn build_alarm_from_snapshot(snapshot: &epics_base_rs::server::snapshot::Snapsho
         "severity".into(),
         PvField::Scalar(ScalarValue::Int(snapshot.alarm.severity as i32)),
     ));
-    // BR-R62: raw epicsAlarmCondition + empty message; pvxs emits the PVA
-    // status class and the condition string (iocsource.cpp:187-236).
+    // BR-R62: PVA alarm.status is the status CLASS and alarm.message is
+    // the condition string (pvxs iocsource.cpp:187-236), not the raw
+    // condition code / empty string.
     alarm.fields.push((
         "status".into(),
-        PvField::Scalar(ScalarValue::Int(snapshot.alarm.status as i32)),
+        PvField::Scalar(ScalarValue::Int(pvif::alarm_status_class(
+            snapshot.alarm.status,
+        ))),
     ));
     alarm.fields.push((
         "message".into(),
-        PvField::Scalar(ScalarValue::String(String::new())),
+        PvField::Scalar(ScalarValue::String(
+            pvif::alarm_condition_string(snapshot.alarm.status).to_string(),
+        )),
     ));
     alarm
 }

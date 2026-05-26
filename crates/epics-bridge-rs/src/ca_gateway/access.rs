@@ -40,21 +40,42 @@ use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig, 
 
 use crate::error::{BridgeError, BridgeResult};
 
+/// The gateway's access policy. Modelled as one sum type so the
+/// "no rules" state cannot simultaneously mean allow-all and read-only
+/// (BR-R63): each variant gives `can_read`/`can_write` exactly one
+/// meaning.
+enum Mode {
+    /// Read-only default — reads allowed, writes denied. Installed when no
+    /// `.access` file is provided, mirroring C ca-gateway's
+    /// `ASG(DEFAULT) { RULE(1,READ) }` (`gateAs.cc:735-737`).
+    ReadOnly,
+    /// Allow everything — reads and writes permitted regardless of rules.
+    /// Explicit opt-in only; not the no-file default.
+    AllowAll,
+    /// Rules parsed from an `.access` file.
+    Rules(AccessSecurityConfig),
+}
+
 /// Access security configuration for the gateway.
 pub struct AccessConfig {
-    /// Underlying parsed ACF, or None if no file was loaded.
-    config: Option<AccessSecurityConfig>,
-    /// If true, all operations are allowed regardless of rules.
-    /// Used as the default when no `.access` file is provided.
-    allow_all: bool,
+    mode: Mode,
 }
 
 impl AccessConfig {
-    /// Construct an "allow all" config with no underlying rules.
+    /// Read-only default policy (no `.access` file): reads allowed, writes
+    /// denied. Matches C ca-gateway's `ASG(DEFAULT) { RULE(1,READ) }`
+    /// fallback (`gateAs.cc:735-737`).
+    pub fn read_only() -> Self {
+        Self {
+            mode: Mode::ReadOnly,
+        }
+    }
+
+    /// Construct an "allow all" config with no underlying rules. Explicit
+    /// opt-in only — the no-file default is [`Self::read_only`] (BR-R63).
     pub fn allow_all() -> Self {
         Self {
-            config: None,
-            allow_all: true,
+            mode: Mode::AllowAll,
         }
     }
 
@@ -69,8 +90,7 @@ impl AccessConfig {
         let config = parse_acf(content)
             .map_err(|e| BridgeError::GroupConfigError(format!("ACF parse: {e}")))?;
         Ok(Self {
-            config: Some(config),
-            allow_all: false,
+            mode: Mode::Rules(config),
         })
     }
 
@@ -81,43 +101,45 @@ impl AccessConfig {
     /// `asLibRoutines.c::asCompute`. Negative or zero ASL is treated
     /// as level 0 (most-restrictive).
     pub fn can_read(&self, asg: &str, asl: i32, user: &str, host: &str) -> bool {
-        if self.allow_all {
-            return true;
-        }
-        let asl = asl.max(0).min(u8::MAX as i32) as u8;
-        match &self.config {
-            Some(cfg) => matches!(
-                cfg.check_access_asl(asg, host, user, asl),
-                AccessLevel::Read | AccessLevel::ReadWrite
-            ),
-            None => true,
+        match &self.mode {
+            // Both allow-all and the read-only default grant reads.
+            Mode::AllowAll | Mode::ReadOnly => true,
+            Mode::Rules(cfg) => {
+                let asl = asl.max(0).min(u8::MAX as i32) as u8;
+                matches!(
+                    cfg.check_access_asl(asg, host, user, asl),
+                    AccessLevel::Read | AccessLevel::ReadWrite
+                )
+            }
         }
     }
 
     /// Whether writing the given tuple is allowed.
     pub fn can_write(&self, asg: &str, asl: i32, user: &str, host: &str) -> bool {
-        if self.allow_all {
-            return true;
-        }
-        let asl = asl.max(0).min(u8::MAX as i32) as u8;
-        match &self.config {
-            Some(cfg) => matches!(
-                cfg.check_access_asl(asg, host, user, asl),
-                AccessLevel::ReadWrite
-            ),
-            None => true,
+        match &self.mode {
+            Mode::AllowAll => true,
+            // BR-R63: the read-only default denies writes (C parity).
+            Mode::ReadOnly => false,
+            Mode::Rules(cfg) => {
+                let asl = asl.max(0).min(u8::MAX as i32) as u8;
+                matches!(
+                    cfg.check_access_asl(asg, host, user, asl),
+                    AccessLevel::ReadWrite
+                )
+            }
         }
     }
 
     /// Whether the underlying ACF was successfully loaded.
     pub fn has_rules(&self) -> bool {
-        self.config.is_some()
+        matches!(self.mode, Mode::Rules(_))
     }
 }
 
 impl Default for AccessConfig {
     fn default() -> Self {
-        Self::allow_all()
+        // BR-R63: the no-config default is read-only, not allow-all.
+        Self::read_only()
     }
 }
 
@@ -134,9 +156,20 @@ mod tests {
     }
 
     #[test]
-    fn allow_all_default_via_default_trait() {
+    fn br_r63_default_is_read_only() {
+        // BR-R63: no-config default must allow reads but DENY writes,
+        // matching C ca-gateway's `ASG(DEFAULT) { RULE(1,READ) }`.
         let acc = AccessConfig::default();
+        assert!(!acc.has_rules());
         assert!(acc.can_read("X", 0, "u", "h"));
+        assert!(!acc.can_write("X", 0, "u", "h"));
+    }
+
+    #[test]
+    fn br_r63_read_only_denies_write_allows_read() {
+        let acc = AccessConfig::read_only();
+        assert!(acc.can_read("BeamGroup", 1, "anyone", "anywhere"));
+        assert!(!acc.can_write("BeamGroup", 1, "anyone", "anywhere"));
     }
 
     #[test]

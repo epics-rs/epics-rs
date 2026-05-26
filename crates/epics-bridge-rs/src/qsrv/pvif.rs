@@ -1059,9 +1059,7 @@ mod tests {
             let msg = alarm.get_field("message");
             assert!(matches!(sev, Some(PvField::Scalar(ScalarValue::Int(3)))));
             assert!(matches!(st, Some(PvField::Scalar(ScalarValue::Int(2)))));
-            assert!(
-                matches!(msg, Some(PvField::Scalar(ScalarValue::String(s))) if s == "UDF")
-            );
+            assert!(matches!(msg, Some(PvField::Scalar(ScalarValue::String(s))) if s == "UDF"));
         } else {
             panic!("expected alarm structure");
         }

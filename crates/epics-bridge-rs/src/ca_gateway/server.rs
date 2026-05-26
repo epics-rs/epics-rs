@@ -371,6 +371,10 @@ impl GatewayServer {
 
                     // 2. Subscribe upstream — this also adds the PV to the
                     //    shadow database via UpstreamManager::ensure_subscribed.
+                    //    BR-R64: ensure_subscribed must only succeed when the
+                    //    upstream actually connects, else this positive reply
+                    //    black-holes a non-existent PV (C answers does-not-exist
+                    //    via gatePvData::death(), gatePv.cc:622).
                     //    Pass the matched ASG/ASL through so the per-PV
                     //    WriteHook can do the right ACL check.
                     //    BRIDGE-FR-2: serve under the searched name (`name`,

@@ -319,6 +319,10 @@ impl UpstreamManager {
         // exactly once when the subscription is dropped.
         let channel = Arc::new(self.client.create_channel(upstream_name));
 
+        // BR-R64: the get() below times out → Double(0.0) and we still
+        // register the shadow PV, so the resolver advertises a never-
+        // connected upstream as existing (black-hole). C ca-gateway only
+        // answers exists-here once the channel connects (gatePv.cc:518).
         // DBR negotiation: best-effort initial GET so the shadow
         // PV's first registered type matches upstream's native type.
         // Falls back to a Double placeholder if the get fails or

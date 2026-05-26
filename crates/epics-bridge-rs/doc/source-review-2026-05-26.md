@@ -381,7 +381,33 @@ Fix direction (structural):
 
 Model `AccessConfig`'s policy as an explicit `Mode` enum (`ReadOnly` / `AllowAll` / `Rules(cfg)`) so the previous `allow_all: bool` + `Option<rules>` pair cannot represent an illegal combination, and add `AccessConfig::read_only()` (reads allowed, writes denied — the C `ASG(DEFAULT) { RULE(1,READ) }` equivalent). Use `read_only()` at the no-file default (`server.rs:215`) and as the `Default` impl, so the "no ACF ⟹ writes denied" invariant holds by construction. `allow_all()` stays as an explicit opt-in only.
 
+### BR-R64 — CA gateway answers a downstream search positively for an upstream PV that never connects (black-hole)
+
+Severity: High
+
+Status: Fixed
+
+Evidence:
+
+- `crates/epics-bridge-rs/src/ca_gateway/server.rs:377-400` — the search resolver returns `true` (exists-here) whenever `UpstreamManager::ensure_subscribed` returns `Ok`, with no check that the upstream channel actually connected.
+- `crates/epics-bridge-rs/src/ca_gateway/upstream.rs:334-353` — `ensure_subscribed` does `channel.get()` under a 500 ms `tokio::time::timeout`; on timeout **or** error it falls back to `EpicsValue::Double(0.0)` and continues. `crates/epics-bridge-rs/src/ca_gateway/upstream.rs:404-425` then registers a shadow PV and calls `channel.subscribe()`, which returns `Ok` immediately — `crates/epics-ca-rs/src/client/mod.rs:2248-2275` allocates the subid without awaiting connection. So for a name that matches the pvlist pattern but does **not** exist upstream, the resolver answers exists-here after ~500 ms and leaves a placeholder shadow PV whose monitor never fires.
+- `epics-modules/ca-gateway/src/gateServer.cc:1652-1709` — `pvExistTest` returns `pverAsyncCompletion` while a PV is connecting (`conFind` path line 1669; new-`gatePvData` `gatePvConnect` path line 1696), deferring the answer via `pv->addET(ctx)`; it returns `pverExistsHere` **only** for an already-connected PV (`gatePvInactive`/`gatePvActive`, lines 1624-1629).
+- `epics-modules/ca-gateway/src/gatePv.cc:518` — `gatePvData::life()` (run from `connectCB` on a successful connect) flushes the deferred exist tests as `pverExistsHere`. `epics-modules/ca-gateway/src/gatePv.cc:622` — `gatePvData::death()` (run from `connectCB` on connect-dead, or from `connectCleanup` on connect timeout) flushes them as `pverDoesNotExistHere`. The C gateway never answers exists-here for a PV that has not connected upstream.
+
+Impact:
+
+Any downstream search for a name that matches an `ALLOW` pvlist pattern but is absent upstream is black-holed: the gateway claims to serve it, so the client binds to the gateway and never re-searches to find the real (later-started) IOC, and the gateway streams a frozen `Double(0.0)`. Broad `ALLOW` patterns — the normal ca-gateway deployment — make this the common case. The C gateway's asynchronous exist-test machinery exists precisely to avoid this; the Rust port defeats it by answering positively on the connect-timeout fallback.
+
+Fix direction (structural):
+
+`ensure_subscribed` is the single owner of "register a shadow PV for an upstream PV"; it must confirm the channel actually connected before registering. Call `channel.wait_connected(timeout)` (`crates/epics-ca-rs/src/client/mod.rs:1295`) up front; on error (never connected / timed out) drop the `Connecting` cache entry and return `Err` so the resolver answers `false` — mirroring C's `death → pverDoesNotExistHere`. The connect budget is the gateway's existing `CacheTimeouts::connect_timeout` (1 s default, `cache.rs:181`), the same window the cache reaper uses to give up on a `Connecting` entry. Only after a confirmed connection do we register the shadow PV and run the best-effort DBR-negotiation GET (whose `Double(0.0)` fallback then only ever applies to a connected-but-slow GET, its intended purpose). Both callers of `ensure_subscribed` (the resolver and `preload_pvs`) inherit the guarantee.
+
 ## Uncertain candidates
+
+### BR-R-UNCERTAIN-4 — ctx-less PVA gateway `rpc`/`process` skip the ACF gate that ctx-less `put_value` enforces
+
+- `crates/epics-bridge-rs/src/pva_gateway/source.rs:1016` (`rpc`) and `crates/epics-bridge-rs/src/pva_gateway/source.rs:1097` (`process`) forward `pvrpc`/`pvprocess` with no `self.gate.check(...)`, whereas the ctx-less `put_value` (`source.rs:912-922`, the "BUG 3" fix) does gate. C pva2pva gates PUT/RPC/PROCESS through `p2pReadOnly`.
+- Why uncertain: not reachable on the live wire path, so it is not an observable ACF bypass. The PVA TCP dispatcher always calls the `_checked` variants — `crates/epics-pva-rs/src/server_native/tcp.rs:5489` (`src.rpc_checked(...)`) and `crates/epics-pva-rs/src/server_native/tcp.rs:3279` (`src.process_checked(...)`) — and the gateway's `rpc_checked` (`source.rs:1057`, `allows_read()`) and `process_checked` (`source.rs:1121`, `allows_write()`) DO gate. The ctx-less `rpc`/`process` are reached only via `CompositeSource`'s ctx-less methods (`crates/epics-pva-rs/src/server_native/composite.rs:401`/`385`), which the wire layer never invokes. So this is a latent internal inconsistency (a defense-in-depth gap matching the `put_value` fix), not a live divergence. Documented, not fixed.
 
 ### BR-R-UNCERTAIN-1 — CA gateway subscribes upstream with the channel's native element count, not CA `count=0`
 

@@ -317,11 +317,15 @@ fn decode_datagram(buf: &[u8], hdr: &CaHeader, src: SocketAddr) -> DatagramActio
 /// the sender. Mirrors C `repeater.cpp::fanOut`: per-client `sendMessage`,
 /// and on send failure the client is verified, removed if dead.
 fn fan_out(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr, data: &[u8], debug: u8) {
-    let src_port = src.port();
     let mut dead = Vec::new();
     for (port, client) in clients.iter() {
-        // Don't reflect back to sender
-        if *port == src_port {
+        // Don't reflect back to sender. C `fanOut` (repeater.cpp:340-349)
+        // skips the originating client via `identicalAddress`, which
+        // compares the FULL address (family + port + IP), not just the
+        // port. Matching on port alone wrongly suppresses a beacon to a
+        // local client whose ephemeral registration port happens to
+        // equal the beacon's source (server) port.
+        if client.addr == src {
             continue;
         }
         if !client.send_message(data) {
@@ -650,5 +654,52 @@ mod tests {
         // And the m_available stays zero — C does not rewrite it after
         // the strip.
         assert_eq!(&data[12..16], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn fan_out_skips_on_full_address_not_port_alone() {
+        // A5-2: C `fanOut` (repeater.cpp:340-349) skips the originating
+        // client by FULL address (`identicalAddress` = family + port +
+        // IP). A client registered on loopback:P must still receive a
+        // beacon whose SOURCE is a server at a different IP but the same
+        // port P — port-only skip wrongly suppressed it.
+        let recv = StdUdpSocket::bind("127.0.0.1:0").expect("bind recv");
+        recv.set_read_timeout(Some(std::time::Duration::from_millis(750)))
+            .unwrap();
+        let local = recv.local_addr().unwrap();
+        let port = local.port();
+
+        let mut clients: HashMap<u16, RepeaterClient> = HashMap::new();
+        clients.insert(port, RepeaterClient::new(local).expect("client sock"));
+
+        let data = header_bytes(CA_PROTO_RSRV_IS_UP, 0x0a00_0005);
+
+        // (1) Beacon from a DIFFERENT IP but the SAME port → the client
+        // must NOT be skipped; it receives the fanned-out datagram.
+        let server_src = src_v4(10, 0, 0, 5, port);
+        fan_out(&mut clients, server_src, &data, 0);
+        let mut buf = [0u8; 64];
+        let n = recv
+            .recv(&mut buf)
+            .expect("client with a coinciding port must still receive the beacon");
+        assert_eq!(
+            &buf[..n],
+            &data[..],
+            "fanned-out bytes must match the input"
+        );
+
+        // (2) Datagram whose FULL address equals the client → skipped
+        // (no reflect-to-self), so the receive times out.
+        fan_out(&mut clients, local, &data, 0);
+        let err = recv.recv(&mut buf).expect_err(
+            "a datagram from the client's own full address must be skipped, not reflected",
+        );
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "expected a read timeout for the self-skip case, got {err:?}"
+        );
     }
 }

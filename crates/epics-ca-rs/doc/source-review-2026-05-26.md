@@ -451,6 +451,146 @@ Note: link fields (`DBF_INLINK`/`OUTLINK`/`FWDLINK`) with `$` (C uses
 link-field types at the `get_field` level. The fix covers all `EpicsValue::String`
 results, which corresponds to `DBF_STRING` fields in C.
 
+### R56 — DBR_GR_*/DBR_CTRL_* alarm limits not severity-gated; ungated limits sent verbatim instead of NaN/0
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-base-rs/src/server/record/record_instance.rs:780-786` —
+  `alarm_limits()` returns `(aa.hihi, aa.high, aa.low, aa.lolo)` UNCONDITIONALLY,
+  and both `populate_display_info` arms feed it into `DisplayInfo`:
+  `"ai" | "ao" | "calc" | "calcout"` (line 422) and
+  `"longin" | "longout" | "int64in" | "int64out"` (line 457). The codec sources
+  the four alarm-limit slots of every DBR_GR_*/DBR_CTRL_* response from
+  `DisplayInfo` (`crates/epics-base-rs/src/types/codec.rs:429-432`, GR `limits[2..5]`
+  / CTRL `limits[2..5]`).
+- **C**: `get_alarm_double` is severity-gated for the analog records —
+  `modules/database/src/std/rec/aiRecord.c:295-298`
+  (`pad->upper_alarm_limit = prec->hhsv ? prec->hihi : epicsNAN`),
+  `aoRecord.c:368-372`, `longinRecord.c:244-248`, `longoutRecord.c:300-304`,
+  `calcRecord.c:263-267`, `calcoutRecord.c:538-542`. `int64inRecord.c:239-243`
+  and `int64outRecord.c:283-287` are UNCONDITIONAL (no gating) — the asymmetry
+  is real and must be preserved. `modules/database/src/ioc/db/dbAccess.c:294-326`
+  shows the gated NaN is encoded as NaN for `DBR_AL_DOUBLE` (float/double DBR
+  fields) and as `finite(ald) ? (epicsInt32)ald : 0` (i.e. **0**) for
+  `DBR_AL_LONG` (integer DBR fields).
+
+Impact:
+
+CA clients that request DBR_GR_* / DBR_CTRL_* (control-panel widgets, `caget -a`)
+for an analog record whose alarm severities are disabled (HHSV/HSV/LSV/LLSV =
+NO_ALARM, the default) receive the raw HIHI/HIGH/LOW/LOLO field values (typically
+0.0) where the C IOC returns NaN (float/double types) or 0 (integer types). A
+widget that respects alarm limits draws an alarm marker at 0.0 instead of treating
+the limit as "not configured" (NaN). Affects ai, ao, longin, longout, calc,
+calcout. int64in/int64out are already correct (C does not gate them).
+
+Fix direction:
+
+Gate `alarm_limits()` with `f64::NAN` when the matching severity field is
+`AlarmSeverity::NoAlarm` (and when `analog_alarm` is `None`, since C reads
+prec->hhsv == 0 → NaN there too). Add `alarm_limits_unchecked()` returning the
+raw limits for the int64in/int64out path, and select the source by record type
+inside the `longin | longout | int64in | int64out` arm. The codec's existing
+`f64 → i16/i32/i8` casts make `NaN as iN == 0` (matching C's
+`finite()?cast:0`) and `f64 → f32` preserves NaN, so storing NaN in `DisplayInfo`
+is byte-exact for every DBR variant — no codec change needed.
+
+### R57 — numeric→DBR_STRING conversion ignores record precision (cvtDoubleToString parity)
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-base-rs/src/types/value.rs:680` — `convert_to`'s
+  `DbFieldType::String => EpicsValue::String(format!("{self}"))` formats a
+  `Double`/`Float` value with Rust's default `Display` (e.g. `3.14`), with no
+  access to the record's precision. `crates/epics-base-rs/src/types/codec.rs:287`
+  (`encode_dbr`) routes every `*_STRING` request through
+  `convert_and_serialize(String, value)` → `value.convert_to(String)`.
+- **C**: `modules/database/src/ioc/db/dbConvert.c:772-799` (`getDoubleString`,
+  the `[DBF_DOUBLE][DBR_STRING]` table entry) formats via
+  `cvtDoubleToString(*psrc, pdst, precision)` where `precision` comes from the
+  record's `get_precision` RSET (PREC field; default 6 when absent).
+  `getFloatString` (`:731`) is the parallel for `DBF_FLOAT`.
+  `modules/libcom/src/cvtFast/cvtFast.c:111-190` (`cvtDoubleToString`): fast
+  path for `|val| <= 1e7` and `precision <= 8` uses a **round-half-up**
+  algorithm (`(fraction + 5) / 10`); `precision > 8` or `|val| > 1e16` →
+  `sprintf("%*.*e", precision+7, precision, val)`; `1e7 < |val| <= 1e16` →
+  `sprintf("%.*f", min(precision,3), val)`. `cvtFloatToString` (`:32-109`) is
+  the f32 analogue (thresholds `1e8` / width `precision+6`).
+
+Impact:
+
+CA clients that request a string representation of a numeric record (`caget -d
+DBR_STRING PV`, `caget -s`, StripTool, simple scripts, display managers reading
+the value as text) receive the wrong string from the Rust server: precision is
+not applied at all. For an `ai` with `PREC=3` and `VAL=3.14`, the C IOC returns
+`"3.140"` while Rust returns `"3.14"`; for `VAL=1.0` C returns `"1.000"` while
+Rust returns `"1"`. Also affects the round-half-up boundary (`0.125` at `PREC=2`
+→ C `"0.13"`, Rust `format!`-based `"0.12"`). Applies to every `*_STRING` DBR
+variant for Double/Float-valued records.
+
+Fix direction:
+
+In `encode_dbr`, when `native == DbFieldType::String`, route the value through a
+precision-aware converter that ports `cvtDoubleToString` / `cvtFloatToString`
+byte-for-byte (round-half-up fast path, `%.*f` and C-style `%*.*e` fallbacks,
+glibc `"nan"`/`"inf"` spellings), sourcing precision from
+`snapshot.display.precision` (default 6 when `display` is `None`). Integer
+fields keep the existing `to_string` path (C `getLongString` etc. carry no
+precision, so Rust already matches). Scalar Double/Float and DoubleArray/
+FloatArray are all converted element-wise with the same precision.
+
+### R58 — enum→DBR_STRING returns the numeric index instead of the state label
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-base-rs/src/types/value.rs:680` — `convert_to`'s
+  `String` arm renders `EpicsValue::Enum(idx)` via `format!("{self}")`, and
+  `Display for Enum(v)` (`value.rs:47`) writes the decimal index (`"1"`). The
+  codec's enum label array (`snapshot.enums.strings`) is consumed only by the
+  DBR_GR_ENUM / DBR_CTRL_ENUM metadata encoder
+  (`crates/epics-base-rs/src/types/codec.rs:522-528`); no path maps an enum
+  index to its label for a `*_STRING` request.
+- **C**: `modules/database/src/ioc/db/dbConvert.c` —
+  `dbGetConvertRoutine[DBF_ENUM][DBR_STRING] = getEnumString`; `getEnumString`
+  calls `prset->get_enum_str(paddr, pdst)`, which returns the state label:
+  `biRecord.c get_enum_str` (val 0 → ZNAM, 1 → ONAM, else `"Illegal_Value"`),
+  `mbbiRecord.c get_enum_str` (val ≤ 15 → the val-th `*ST` string, else
+  `"Illegal Value"`).
+
+Impact:
+
+CA clients that request a string representation of an enum PV (`caget -d
+DBR_STRING bipv`, display managers / scripts reading the human-readable state)
+receive the decimal index (`"1"`) from the Rust server instead of the configured
+label (`"On"`). Affects bi, bo, mbbi, mbbo for every `*_STRING` DBR variant.
+Native DBR_ENUM and DBR_GR_ENUM reads (which carry index + label array) are
+unaffected.
+
+Fix direction:
+
+Extend the `native == String` converter (the R57 dispatch in `encode_dbr`) so
+`Enum`/`EnumArray` map each index to `snapshot.enums.strings[idx]`. The label
+array is the same one already populated for DBR_GR_ENUM, so no new metadata is
+needed. Residual: the record-type-specific out-of-range sentinel
+(`"Illegal_Value"` / `"Illegal Value"` / empty `*ST`) is not reproduced because
+the record type is not carried in the snapshot; an out-of-range index (or a
+channel with no enum metadata) falls back to the decimal index. This edge is
+unreachable in normal operation — a record's VAL is always one of its defined
+states — so the observable behavior (label vs index for configured states) is
+byte-exact with C.
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,

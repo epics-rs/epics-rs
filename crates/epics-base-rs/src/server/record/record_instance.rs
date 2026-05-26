@@ -75,6 +75,17 @@ fn is_metadata_field(name: &str) -> bool {
     )
 }
 
+/// One alarm limit for a DBR_AL_DOUBLE response: the value when its
+/// severity threshold is enabled, `NaN` otherwise. Mirrors C
+/// `get_alarm_double`'s `prec->hhsv ? prec->hihi : epicsNAN` (R56).
+fn gated(severity: AlarmSeverity, limit: f64) -> f64 {
+    if severity != AlarmSeverity::NoAlarm {
+        limit
+    } else {
+        f64::NAN
+    }
+}
+
 fn parse_alarm_severity(value: &EpicsValue) -> AlarmSeverity {
     match value {
         EpicsValue::Short(v) => AlarmSeverity::from_u16(*v as u16),
@@ -454,7 +465,13 @@ impl RecordInstance {
                     .get_field("LOPR")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
-                let (hihi, high, low, lolo) = self.alarm_limits();
+                // R56: longin/longout severity-gate (get_alarm_double);
+                // int64in/int64out send the limits verbatim (C is
+                // unconditional for those two record types only).
+                let (hihi, high, low, lolo) = match rtype {
+                    "int64in" | "int64out" => self.alarm_limits_unchecked(),
+                    _ => self.alarm_limits(),
+                };
                 snap.display = Some(super::super::snapshot::DisplayInfo {
                     units: egu,
                     precision: 0,
@@ -777,7 +794,35 @@ impl RecordInstance {
     }
 
     /// Extract analog alarm limits from CommonFields.
+    // R56: DBR_GR_*/DBR_CTRL_* alarm limits MUST be severity-gated — C
+    // get_alarm_double returns `prec->hhsv ? prec->hihi : epicsNAN`
+    // (aiRecord.c:295-298 and ao/longin/longout/calc/calcout). int64in/
+    // int64out are the sole exception (unconditional, int64inRecord.c:239-243)
+    // and use `alarm_limits_unchecked()`. NaN encodes byte-exact for every
+    // DBR variant: f64/f32 keep NaN, integer casts make `NaN as iN == 0`,
+    // matching dbAccess.c:300-326 (`finite(ald)?cast:0`).
     fn alarm_limits(&self) -> (f64, f64, f64, f64) {
+        match self.common.analog_alarm {
+            // Each limit is reported only when its severity is enabled,
+            // exactly as C `get_alarm_double` (`x ? limit : epicsNAN`).
+            Some(ref aa) => (
+                gated(aa.hhsv, aa.hihi),
+                gated(aa.hsv, aa.high),
+                gated(aa.lsv, aa.low),
+                gated(aa.llsv, aa.lolo),
+            ),
+            // No analog-alarm config ⇒ all severities are NO_ALARM in C,
+            // so every limit is NaN (not 0).
+            None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+        }
+    }
+
+    // int64in/int64out are the one analog family whose C `get_alarm_double`
+    // is UNCONDITIONAL (int64inRecord.c:239-243, int64outRecord.c:283-287):
+    // the limits are sent verbatim regardless of HHSV/HSV/LSV/LLSV. Keep a
+    // separate accessor so the gated `alarm_limits()` cannot leak into this
+    // path.
+    fn alarm_limits_unchecked(&self) -> (f64, f64, f64, f64) {
         if let Some(ref aa) = self.common.analog_alarm {
             (aa.hihi, aa.high, aa.low, aa.lolo)
         } else {

@@ -151,8 +151,13 @@ impl PvList {
     ///   that resolves to multiple addresses expands into one IP entry per
     ///   address.
     /// - A hostname that fails to resolve is logged at `WARN` level and
-    ///   **dropped** from the deny list (matches C's fail-open behaviour:
-    ///   `fprintf(stderr, "cannot resolve host name >%s<\n", ...)`).
+    ///   dropped from this rule's host set, mirroring C's pass-1 omission
+    ///   (`gateAs.cc:504-507` — the unresolved host is simply not appended).
+    ///   If a rule's hosts **all** fail to resolve, its `from_hosts` ends
+    ///   empty and the rule is thereafter treated as a **global** deny by
+    ///   [`Self::is_global_deny`] — fail-**closed**, matching canonical
+    ///   ca-gateway (`USE_DENYFROM`), whose two-pass parser re-parses the
+    ///   host-stripped line into the global `deny_list` (`gateAs.cc:540-556`).
     ///
     /// After this call, every non-empty `from_hosts` vec contains only
     /// IP-address strings, so [`Self::is_host_denied`] can compare them
@@ -183,7 +188,8 @@ impl PvList {
                                 tracing::warn!(
                                     hostname = %token,
                                     "pvlist DENY FROM: hostname resolved to no addresses \
-                                     — entry has no effect (matches C gateAs.cc:504-506)"
+                                     — host dropped; if it is the rule's only host the \
+                                     rule collapses to a global deny (matches C gateAs.cc:540-556)"
                                 );
                             }
                         }
@@ -192,7 +198,8 @@ impl PvList {
                                 hostname = %token,
                                 error = %e,
                                 "pvlist DENY FROM: cannot resolve hostname \
-                                 — entry has no effect (matches C gateAs.cc:504-506)"
+                                 — host dropped; if it is the rule's only host the \
+                                 rule collapses to a global deny (matches C gateAs.cc:540-556)"
                             );
                         }
                     }
@@ -847,7 +854,10 @@ mod tests {
         }
     }
 
-    /// An unresolvable hostname is dropped (fail-open, matching C).
+    /// An all-unresolvable `DENY FROM` rule ends with empty `from_hosts`, so
+    /// `is_host_denied` (host-targeted check only) no longer matches it — the
+    /// deny collapses to a global deny enforced by `match_name`. Fail-closed,
+    /// matching canonical C (`gateAs.cc:540-556`).
     #[tokio::test]
     async fn resolve_hosts_unresolvable_dropped() {
         let mut list = parse_pvlist(
@@ -866,7 +876,9 @@ mod tests {
         } else {
             panic!("expected Deny");
         }
-        // With no resolved hosts, no peer is denied by this rule.
+        // The rule collapsed to a global deny: no longer host-targeted, so the
+        // host-targeted `is_host_denied` check does not match it. The deny is
+        // now enforced globally by `match_name` (see `is_global_deny`).
         assert!(!list.is_host_denied("PV:x", "10.0.0.1"));
     }
 }

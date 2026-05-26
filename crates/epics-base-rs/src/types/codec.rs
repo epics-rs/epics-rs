@@ -284,6 +284,10 @@ pub fn encode_dbr(
         return Ok(buf.to_vec());
     }
     let native = super::native_type_for_dbr(dbr_type)?;
+    // R57: a `*_STRING` request of a Double/Float field must honor the
+    // record's precision (C `getDoubleString` → `cvtDoubleToString`).
+    // `EpicsValue::convert_to(String)` (value.rs) has no record context, so
+    // route string requests through the precision-aware converter here.
     let val_bytes = convert_and_serialize(native, &snapshot.value)?;
     let status = snapshot.alarm.status;
     let severity = snapshot.alarm.severity;

@@ -499,6 +499,54 @@ inside the `longin | longout | int64in | int64out` arm. The codec's existing
 `finite()?cast:0`) and `f64 → f32` preserves NaN, so storing NaN in `DisplayInfo`
 is byte-exact for every DBR variant — no codec change needed.
 
+### R57 — numeric→DBR_STRING conversion ignores record precision (cvtDoubleToString parity)
+
+Severity: Medium
+
+Status: Fixed
+
+Evidence:
+
+- **Rust**: `crates/epics-base-rs/src/types/value.rs:680` — `convert_to`'s
+  `DbFieldType::String => EpicsValue::String(format!("{self}"))` formats a
+  `Double`/`Float` value with Rust's default `Display` (e.g. `3.14`), with no
+  access to the record's precision. `crates/epics-base-rs/src/types/codec.rs:287`
+  (`encode_dbr`) routes every `*_STRING` request through
+  `convert_and_serialize(String, value)` → `value.convert_to(String)`.
+- **C**: `modules/database/src/ioc/db/dbConvert.c:772-799` (`getDoubleString`,
+  the `[DBF_DOUBLE][DBR_STRING]` table entry) formats via
+  `cvtDoubleToString(*psrc, pdst, precision)` where `precision` comes from the
+  record's `get_precision` RSET (PREC field; default 6 when absent).
+  `getFloatString` (`:731`) is the parallel for `DBF_FLOAT`.
+  `modules/libcom/src/cvtFast/cvtFast.c:111-190` (`cvtDoubleToString`): fast
+  path for `|val| <= 1e7` and `precision <= 8` uses a **round-half-up**
+  algorithm (`(fraction + 5) / 10`); `precision > 8` or `|val| > 1e16` →
+  `sprintf("%*.*e", precision+7, precision, val)`; `1e7 < |val| <= 1e16` →
+  `sprintf("%.*f", min(precision,3), val)`. `cvtFloatToString` (`:32-109`) is
+  the f32 analogue (thresholds `1e8` / width `precision+6`).
+
+Impact:
+
+CA clients that request a string representation of a numeric record (`caget -d
+DBR_STRING PV`, `caget -s`, StripTool, simple scripts, display managers reading
+the value as text) receive the wrong string from the Rust server: precision is
+not applied at all. For an `ai` with `PREC=3` and `VAL=3.14`, the C IOC returns
+`"3.140"` while Rust returns `"3.14"`; for `VAL=1.0` C returns `"1.000"` while
+Rust returns `"1"`. Also affects the round-half-up boundary (`0.125` at `PREC=2`
+→ C `"0.13"`, Rust `format!`-based `"0.12"`). Applies to every `*_STRING` DBR
+variant for Double/Float-valued records.
+
+Fix direction:
+
+In `encode_dbr`, when `native == DbFieldType::String`, route the value through a
+precision-aware converter that ports `cvtDoubleToString` / `cvtFloatToString`
+byte-for-byte (round-half-up fast path, `%.*f` and C-style `%*.*e` fallbacks,
+glibc `"nan"`/`"inf"` spellings), sourcing precision from
+`snapshot.display.precision` (default 6 when `display` is `None`). Integer
+fields keep the existing `to_string` path (C `getLongString` etc. carry no
+precision, so Rust already matches). Scalar Double/Float and DoubleArray/
+FloatArray are all converted element-wise with the same precision.
+
 ## Uncertain Candidates
 
 None identified. All other areas checked (EVENT_ADD mask extraction at offset 12,

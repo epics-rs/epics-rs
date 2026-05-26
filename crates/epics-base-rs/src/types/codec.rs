@@ -62,6 +62,183 @@ fn convert_and_serialize(native: DbFieldType, value: &EpicsValue) -> CaResult<Ve
     Ok(value.convert_to(native).to_bytes())
 }
 
+// R57: precision-aware `*_STRING` rendering of a numeric field.
+//
+// A `*_STRING` DBR request of a Double/Float field is converted by the C
+// IOC with `cvtDoubleToString` / `cvtFloatToString` (libCom cvtFast.c)
+// using the record's `get_precision` (PREC). `EpicsValue::convert_to` has
+// no record context, so the precision-aware conversion lives here where
+// `encode_dbr` holds the snapshot.
+
+/// libCom cvtFast.c `frac_multiplier` — fractional scale by precision 0..=8.
+const FRAC_MULTIPLIER: [i32; 9] = [
+    1,
+    10,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+];
+
+/// Render a numeric value as its DBR_STRING form, applying `precision` to
+/// Float/Double exactly as C `getDoubleString`/`getFloatString` do. Integer
+/// and string values keep the plain `convert_to(String)` path (their C
+/// conversions carry no precision, so the default `Display` already matches).
+fn convert_value_to_dbr_string(
+    value: &EpicsValue,
+    snapshot: &crate::server::snapshot::Snapshot,
+) -> EpicsValue {
+    // C precision = record `get_precision` (PREC field), default 6 when the
+    // record exposes no `get_precision` RSET (here: no display metadata).
+    let prec = snapshot
+        .display
+        .as_ref()
+        .map(|d| d.precision.max(0) as u16)
+        .unwrap_or(6);
+    match value {
+        EpicsValue::Double(v) => EpicsValue::String(cvt_double_to_string(*v, prec)),
+        EpicsValue::Float(v) => EpicsValue::String(cvt_float_to_string(*v, prec)),
+        EpicsValue::DoubleArray(a) => {
+            EpicsValue::StringArray(a.iter().map(|v| cvt_double_to_string(*v, prec)).collect())
+        }
+        EpicsValue::FloatArray(a) => {
+            EpicsValue::StringArray(a.iter().map(|v| cvt_float_to_string(*v, prec)).collect())
+        }
+        other => other.convert_to(DbFieldType::String),
+    }
+}
+
+/// Port of libCom `cvtDoubleToString` (cvtFast.c:111-190).
+fn cvt_double_to_string(val: f64, precision: u16) -> String {
+    if val.is_nan() || precision > 8 || val > 1e7 || val < -1e7 {
+        if precision > 8 || val > 1e16 || val < -1e16 {
+            let p = precision.min(17) as usize;
+            return fmt_exp_c(val, p, p + 7);
+        }
+        return fmt_fixed_c(val, precision.min(3) as usize);
+    }
+    let mut val = val;
+    let mut out = String::new();
+    if val < 0.0 {
+        out.push('-');
+        val = -val;
+    }
+    let mut whole = val as i32;
+    let ftemp = val - whole as f64;
+    let fplace_full = FRAC_MULTIPLIER[precision as usize];
+    let mut fraction = (ftemp * fplace_full as f64 * 10.0) as i32;
+    fraction = (fraction + 5) / 10; // round half up
+    if fraction / fplace_full >= 1 {
+        whole += 1;
+        fraction -= fplace_full;
+    }
+    push_fixed_digits(&mut out, whole, fraction, fplace_full, precision);
+    out
+}
+
+/// Port of libCom `cvtFloatToString` (cvtFast.c:32-109). The fast path runs
+/// in f32 to match the C float arithmetic; the overflow branches cast to
+/// double exactly as the C `sprintf((double) flt_value)` does.
+fn cvt_float_to_string(val: f32, precision: u16) -> String {
+    if val.is_nan() || precision > 8 || val > 1e7 || val < -1e7 {
+        if precision > 8 || val >= 1e8 || val <= -1e8 {
+            let p = precision.min(12) as usize;
+            return fmt_exp_c(val as f64, p, p + 6);
+        }
+        return fmt_fixed_c(val as f64, precision.min(3) as usize);
+    }
+    let mut val = val;
+    let mut out = String::new();
+    if val < 0.0 {
+        out.push('-');
+        val = -val;
+    }
+    let mut whole = val as i32;
+    let ftemp = val - whole as f32;
+    let fplace_full = FRAC_MULTIPLIER[precision as usize];
+    let mut fraction = (ftemp * fplace_full as f32 * 10.0) as i32;
+    fraction = (fraction + 5) / 10; // round half up
+    if fraction / fplace_full >= 1 {
+        whole += 1;
+        fraction -= fplace_full;
+    }
+    push_fixed_digits(&mut out, whole, fraction, fplace_full, precision);
+    out
+}
+
+/// Emit the whole-number then fractional digits, shared by the float/double
+/// fast paths (cvtFast.c:75-105 / :156-186).
+fn push_fixed_digits(
+    out: &mut String,
+    mut whole: i32,
+    mut fraction: i32,
+    fplace_full: i32,
+    precision: u16,
+) {
+    let mut got_one = false;
+    let mut iplace = 10_000_000i32;
+    while iplace >= 1 {
+        if whole >= iplace {
+            got_one = true;
+            let number = whole / iplace;
+            whole -= number * iplace;
+            out.push((b'0' + number as u8) as char);
+        } else if got_one {
+            out.push('0');
+        }
+        iplace /= 10;
+    }
+    if !got_one {
+        out.push('0');
+    }
+    if precision > 0 {
+        out.push('.');
+        let mut fplace = fplace_full / 10;
+        for _ in 0..precision {
+            let number = fraction / fplace;
+            fraction -= number * fplace;
+            out.push((b'0' + number as u8) as char);
+            fplace /= 10;
+        }
+    }
+}
+
+/// C `sprintf("%.*f", precision, val)`, with glibc NaN/Inf spellings.
+fn fmt_fixed_c(val: f64, precision: usize) -> String {
+    if val.is_nan() {
+        return "nan".to_string();
+    }
+    if val.is_infinite() {
+        return if val < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
+    format!("{val:.precision$}")
+}
+
+/// C `sprintf("%*.*e", width, precision, val)`: scientific notation with a
+/// signed, ≥2-digit exponent, right-justified in `width`. glibc NaN/Inf
+/// spellings.
+fn fmt_exp_c(val: f64, precision: usize, width: usize) -> String {
+    let body = if val.is_nan() {
+        "nan".to_string()
+    } else if val.is_infinite() {
+        if val < 0.0 { "-inf" } else { "inf" }.to_string()
+    } else {
+        // Rust `{:.*e}` rounds the mantissa half-to-even (matching glibc)
+        // and emits `<mantissa>e<exp>` with no exponent sign / leading
+        // zero; reformat the exponent to C's `e±dd`.
+        let raw = format!("{val:.precision$e}");
+        let (mantissa, exp) = raw.split_once('e').unwrap_or((raw.as_str(), "0"));
+        let exp_num: i32 = exp.parse().unwrap_or(0);
+        let sign = if exp_num < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exp_num.abs())
+    };
+    // Right-justify in `width` (C `%*.*e` pads with leading spaces).
+    format!("{body:>width$}")
+}
+
 /// RISC alignment padding bytes required between metadata header and value.
 pub(crate) fn sts_pad(native: DbFieldType) -> &'static [u8] {
     match native {
@@ -288,7 +465,11 @@ pub fn encode_dbr(
     // record's precision (C `getDoubleString` → `cvtDoubleToString`).
     // `EpicsValue::convert_to(String)` (value.rs) has no record context, so
     // route string requests through the precision-aware converter here.
-    let val_bytes = convert_and_serialize(native, &snapshot.value)?;
+    let val_bytes = if native == DbFieldType::String {
+        convert_value_to_dbr_string(&snapshot.value, snapshot).to_bytes()
+    } else {
+        convert_and_serialize(native, &snapshot.value)?
+    };
     let status = snapshot.alarm.status;
     let severity = snapshot.alarm.severity;
 
@@ -1153,5 +1334,66 @@ mod wire_format_tests {
     fn stsack_string_short_payload_errors() {
         let buf = [0u8; 16];
         assert!(decode_dbr(super::super::DBR_STSACK_STRING, &buf, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod r57_string_precision_tests {
+    //! R57 — numeric→DBR_STRING must match C `cvtDoubleToString` /
+    //! `cvtFloatToString` (libCom cvtFast.c), including the round-half-up
+    //! fast path and the `%.*f` / `%*.*e` overflow fallbacks.
+    use super::{cvt_double_to_string, cvt_float_to_string};
+
+    #[test]
+    fn double_fixed_point_applies_precision() {
+        assert_eq!(cvt_double_to_string(3.14, 3), "3.140");
+        assert_eq!(cvt_double_to_string(1.0, 3), "1.000");
+        assert_eq!(cvt_double_to_string(1.0, 0), "1");
+        assert_eq!(cvt_double_to_string(0.0, 3), "0.000");
+        assert_eq!(cvt_double_to_string(-3.14159, 2), "-3.14");
+        assert_eq!(cvt_double_to_string(123.456, 2), "123.46");
+        assert_eq!(cvt_double_to_string(123.456, 0), "123");
+    }
+
+    #[test]
+    fn double_fast_path_rounds_half_up() {
+        // C cvtFast.c uses `(fraction + 5) / 10` — round half *up*, unlike
+        // Rust's default round-half-to-even.
+        assert_eq!(cvt_double_to_string(0.125, 2), "0.13");
+        assert_eq!(cvt_double_to_string(2.5, 0), "3");
+        assert_eq!(cvt_double_to_string(0.5, 0), "1");
+    }
+
+    #[test]
+    fn double_exp_path_for_huge_or_highprec() {
+        // |val| > 1e16 → "%*.*e" with width = precision + 7.
+        assert_eq!(cvt_double_to_string(1e20, 6), " 1.000000e+20");
+        // precision > 8 → exponential, precision clamped to 17.
+        assert_eq!(cvt_double_to_string(3.14159, 10), " 3.1415900000e+00");
+    }
+
+    #[test]
+    fn double_mid_range_uses_fixed_with_clamped_prec() {
+        // 1e7 < |val| <= 1e16 → "%.*f" with precision clamped to 3.
+        assert_eq!(cvt_double_to_string(5e7, 0), "50000000");
+    }
+
+    #[test]
+    fn double_nan_inf_glibc_spelling() {
+        // NaN takes the `%.*f` branch (NaN compares false against the e-path
+        // thresholds) → unpadded glibc "nan".
+        assert_eq!(cvt_double_to_string(f64::NAN, 3), "nan");
+        // ±Inf exceeds 1e16 → "%*.*e" branch: glibc spelling right-justified
+        // in width = precision + 7 (= 13 here), matching C `cvtDoubleToString`.
+        assert_eq!(cvt_double_to_string(f64::INFINITY, 6), "          inf");
+        assert_eq!(cvt_double_to_string(f64::NEG_INFINITY, 6), "         -inf");
+        assert_eq!(cvt_double_to_string(f64::INFINITY, 6).trim(), "inf");
+    }
+
+    #[test]
+    fn float_fixed_point_applies_precision() {
+        assert_eq!(cvt_float_to_string(3.5_f32, 2), "3.50");
+        assert_eq!(cvt_float_to_string(1.0_f32, 3), "1.000");
+        assert_eq!(cvt_float_to_string(-2.0_f32, 1), "-2.0");
     }
 }

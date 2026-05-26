@@ -880,5 +880,13 @@ mod tests {
         // host-targeted `is_host_denied` check does not match it. The deny is
         // now enforced globally by `match_name` (see `is_global_deny`).
         assert!(!list.is_host_denied("PV:x", "10.0.0.1"));
+        // Distinguishing assertion (fail-closed vs fail-open): under the default
+        // ALLOW,DENY order the collapsed global deny must make `match_name`
+        // reject the pattern outright. `is_host_denied` alone is true under both
+        // fail-open and fail-closed, so this is what actually pins the behavior.
+        assert!(
+            list.match_name("PV:x").is_none(),
+            "all-unresolvable DENY FROM must collapse to a global deny (fail-closed)"
+        );
     }
 }

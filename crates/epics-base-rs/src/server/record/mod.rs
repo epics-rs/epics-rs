@@ -1,6 +1,7 @@
 mod alarm;
 mod common_fields;
 mod link;
+mod process_passive;
 mod record_instance;
 mod record_trait;
 mod scan;

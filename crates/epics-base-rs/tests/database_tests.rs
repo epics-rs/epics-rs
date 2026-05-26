@@ -1740,7 +1740,11 @@ async fn test_input_record_no_device_write() {
 }
 
 #[tokio::test]
-async fn test_non_passive_output_ca_put_triggers_write() {
+async fn test_non_passive_output_ca_put_defers_write_until_scan() {
+    // C `dbAccess.c::dbPutField:1263-1266` only processes a record on a
+    // put when `precord->scan == 0` (Passive). A CA put to a non-Passive
+    // (here 1-second-scanned) output record updates VAL but does NOT
+    // process — the device write happens on the next scan, not at put.
     let db = PvDatabase::new();
     db.add_record("AO_NP", Box::new(AoRecord::new(0.0)))
         .await
@@ -1757,7 +1761,22 @@ async fn test_non_passive_output_ca_put_triggers_write() {
     db.put_record_field_from_ca("AO_NP", "VAL", EpicsValue::Double(42.0))
         .await
         .unwrap();
-    assert_eq!(write_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        write_count.load(Ordering::SeqCst),
+        0,
+        "put to a non-Passive record must not process/write at put time"
+    );
+
+    // The periodic scan processes the record and writes the new VAL.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("AO_NP", &mut visited, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        write_count.load(Ordering::SeqCst),
+        1,
+        "the scan cycle writes the value the put staged"
+    );
 }
 
 #[tokio::test]

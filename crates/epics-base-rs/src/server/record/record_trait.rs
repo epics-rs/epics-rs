@@ -239,6 +239,20 @@ pub trait Record: Send + Sync + 'static {
     /// Return the list of field descriptors.
     fn field_list(&self) -> &'static [FieldDesc];
 
+    /// Field names declared `pp(TRUE)` in this record type's DBD, or
+    /// `None` if the type's pp-flags have not been modeled.
+    ///
+    /// Drives the `dbPutField` processing gate: C
+    /// `dbAccess.c:1263` re-processes a record on a put only when the put
+    /// field is `PROC` or it is `pp(TRUE)` **and** `SCAN == Passive`. A
+    /// `None` return tells the put path to fall back to the legacy
+    /// "process on every put" behavior, so un-modeled record types keep
+    /// working unchanged. The default consults the central DBD-sourced
+    /// table keyed by [`Record::record_type`]; record types can override.
+    fn process_passive_fields(&self) -> Option<&'static [&'static str]> {
+        super::process_passive::pp_fields_for(self.record_type())
+    }
+
     /// Validate a put before it is applied. Return Err to reject.
     fn validate_put(&self, _field: &str, _value: &EpicsValue) -> CaResult<()> {
         Ok(())
@@ -434,6 +448,19 @@ pub trait Record: Send + Sync + 'static {
     /// Called before/after a field put for side-effect processing.
     fn special(&mut self, _field: &str, _after: bool) -> CaResult<()> {
         Ok(())
+    }
+
+    /// Other fields whose monitors must be posted because a put to
+    /// `put_field` changed them as a side effect, without driving a full
+    /// process cycle.
+    ///
+    /// Mirrors the explicit `db_post_events` calls a C `special()` makes:
+    /// e.g. `compressRecord.c::reset` (invoked on a `SPC_RESET` write to
+    /// `RES`) posts `NUSE` and `VAL` even though `RES` is not `pp(TRUE)`
+    /// and so does not process. The framework posts a `VALUE|LOG` monitor
+    /// for each returned field after the put. Default: none.
+    fn monitor_side_effect_fields(&self, _put_field: &str) -> &'static [&'static str] {
+        &[]
     }
 
     /// Downcast to concrete type for device support init injection.

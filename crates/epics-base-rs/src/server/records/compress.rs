@@ -409,6 +409,16 @@ impl Record for CompressRecord {
         "compress"
     }
 
+    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
+        // C `compressRecord.c::reset` posts NUSE and VAL on a SPC_RESET
+        // write to RES; RES is not pp(TRUE), so this is the only monitor
+        // the put produces.
+        match put_field {
+            "RES" => &["NUSE", "VAL"],
+            _ => &[],
+        }
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         if self.res != 0 {
             // C `reset` (compressRecord.c:85-99) clears the running

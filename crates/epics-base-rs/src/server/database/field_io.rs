@@ -670,6 +670,18 @@ impl PvDatabase {
                 );
             }
 
+            // Fields a `special()` changed as a side effect of this put
+            // (e.g. compress RES reset zeroing NUSE/VAL) get their monitors
+            // posted here, mirroring the explicit `db_post_events` a C
+            // `special()` makes — these fields are not pp(TRUE), so no
+            // process cycle would otherwise post them.
+            for sf in instance.record.monitor_side_effect_fields(&field) {
+                instance.notify_field(
+                    sf,
+                    crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+                );
+            }
+
             common_result
         };
         // R2-54: ASG-field change re-evaluation hook. C
@@ -705,6 +717,43 @@ impl PvDatabase {
                     .await;
             }
             crate::server::record::CommonFieldPutResult::NoChange => {}
+        }
+
+        // C `dbAccess.c::dbPutField:1263-1268` re-processes the
+        // record on a put only when the put field is `pp(TRUE)` AND the
+        // record is Passive (`SCAN == 0`). (The `PROC` field has its own
+        // always-process intercept above, matching C's
+        // `pfield == &precord->proc`; alarm-ack fields like ACKT/ACKS are
+        // not `pp(TRUE)` so they fall out here, matching C's
+        // `dbrType < DBR_PUT_ACKT`.) Processing on every put would
+        // double-process scanned records and spuriously process puts to
+        // non-`pp` fields (extra FLNK / monitors / device writes /
+        // timestamps). A record type whose DBD pp-flags are not modeled
+        // returns `None` and keeps the legacy "process on every put"
+        // behavior so un-modeled types (other crates, tests) are unchanged.
+        let should_process = {
+            let instance = rec.read().await;
+            match instance.record.process_passive_fields() {
+                Some(pp) => {
+                    instance.common.scan == crate::server::record::ScanType::Passive
+                        && pp.iter().any(|f| f.eq_ignore_ascii_case(&field))
+                }
+                None => true,
+            }
+        };
+
+        if !should_process {
+            // No processing cycle. C never sets `putf` on this path, so
+            // clear the flag the field-put set at entry, and report
+            // immediate (synchronous) completion to a WRITE_NOTIFY caller.
+            let recs = self.inner.records.read().await;
+            if let Some(rec_arc) = recs.get(record_name) {
+                let mut guard = rec_arc.write().await;
+                if !guard.is_processing() {
+                    guard.common.putf = false;
+                }
+            }
+            return Ok(None);
         }
 
         // Set up put_notify completion channel BEFORE processing.

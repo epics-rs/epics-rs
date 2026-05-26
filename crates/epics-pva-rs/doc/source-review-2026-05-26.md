@@ -1080,6 +1080,33 @@ and the upstream pvxs C++ site.
   `create()`, module docs, the `mod.rs` re-export doc) and update the pinned
   test assertion. The field set is already correct, so no other change.
 
+### R82 — NTNDArray module-doc layout block is stale (contradicts the already-correct `nt_nd_array_desc()`)
+
+- **Severity:** Low (documentation only — NO code or wire change. The
+  descriptor is already parity-correct and asserted by a test).
+- **Status:** Fixed (doc only).
+- **Evidence:**
+  - Rust `src/nt/nd_array.rs:7-45` (module `//!` doc layout block) shows an
+    OLD shape: trailing `string descriptor` + `display_t display` fields, a
+    5-field `attribute` substructure
+    (`name`/`value`/`descriptor`/`sourceType`/`source`), and a field order
+    that does not match the actual descriptor.
+  - The actual descriptor `src/nt/nd_array.rs:359-379` (`nt_nd_array_desc()`)
+    emits exactly 10 top-level fields — `value`, `codec`, `compressedSize`,
+    `uncompressedSize`, `uniqueId`, `dataTimeStamp`, `alarm`, `timeStamp`,
+    `dimension`, `attribute` — with an 8-field `attribute` substructure
+    (`attribute_desc()`, `:284-300`). Asserted by the test
+    `descriptor_matches_canonical_layout` (`:565-594`).
+  - C++ pvxs `src/nt.cpp:196-251` (`NTNDArray::build()`) is the source of that
+    10-field layout; the descriptor code already matches it (a prior round
+    closed the code divergence — in-code note at `nd_array.rs:219-226`).
+    (kodex node `aba2467e` describing the *code* divergence is stale/pre-fix.)
+- **Impact:** A reader using the module doc to understand the NTNDArray wire
+  layout is misled (it lists fields that are not emitted and the wrong order).
+  No runtime/wire effect.
+- **Fix direction:** Rewrite the module-doc layout block to match
+  `nt_nd_array_desc()` / pvxs `nt.cpp:196-251`. No code change.
+
 ## Uncertain Candidates
 
 None. All investigated paths reached a definite conclusion (correct, bug, or documented gap).

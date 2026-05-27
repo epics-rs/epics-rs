@@ -1,6 +1,6 @@
 #![no_main]
 //! Fuzz the UDP search-response decoder reachable via `try_parse_frame`
-//! → `decode_search_response`. Targets the path that A-G2 capped: a
+//! → `decode_search_response`. Targets the path that caps a
 //! peer-controlled `count` field driving `Vec::with_capacity`. Should
 //! never panic, regardless of malformed addr blob, unterminated
 //! string, oversized count, or truncated cid array.

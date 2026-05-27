@@ -3,10 +3,50 @@ use std::sync::Arc;
 
 use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
-use crate::server::record::RecordInstance;
+use crate::server::record::{NotifyWaitSet, RecordInstance};
 use crate::types::EpicsValue;
 
 use super::{PvDatabase, apply_timestamp};
+
+/// C `dbNotifyAdd`: a will-process PP target (FLNK / OUT) joins the active
+/// put-notify wait-set exactly once, so the completion waits for it. Called
+/// only on the `!pact` (will-process) branch — a busy target sets RPRO and
+/// does not join (matching the pre-fix drop behaviour), and the
+/// `notify.is_none()` guard prevents a double-join when a record is reached
+/// again within the same chain.
+pub(super) fn join_put_notify(
+    target: &mut RecordInstance,
+    src_notify: Option<&Arc<NotifyWaitSet>>,
+) {
+    if target.notify.is_none() {
+        if let Some(ws) = src_notify {
+            target.notify = Some(ws.clone());
+            ws.enter();
+        }
+    }
+}
+
+/// C `dbNotifyCompletion`: this record finished its contribution to the
+/// put-notify (sync completion, async completion, or SDIS-disable bail).
+/// Take its wait-set membership and leave — the completion oneshot fires on
+/// the `leave` that empties the set. Idempotent: a record not in any
+/// put-notify is a no-op.
+fn complete_put_notify(inst: &mut RecordInstance) {
+    if let Some(ws) = inst.notify.take() {
+        ws.leave();
+    }
+}
+
+/// The source record's put-propagation context for the forward-link tail.
+/// C `processTarget` (dbDbLink.c:460-474) carries `psrc->putf` and
+/// `psrc->ppn` to each target as a unit — the PUTF bit and the put-notify
+/// wait-set always travel together. Bundled so the tail threads one
+/// snapshot instead of a `(putf, notify)` pair.
+#[derive(Clone, Copy)]
+struct PutNotifyCtx<'a> {
+    putf: bool,
+    notify: Option<&'a Arc<NotifyWaitSet>>,
+}
 
 /// Result of the simulation-mode check.
 ///
@@ -373,17 +413,19 @@ impl PvDatabase {
 
             let disa = rec.read().await.common.disa;
             if disa == disv {
-                let put_notify_tx = {
+                let notify = {
                     let mut instance = rec.write().await;
                     // C `dbAccess.c:575-577` — clear rpro/putf and arm
                     // notifyCompletion BEFORE the alarm check. Disabled
                     // records skip processing entirely, so any pending
                     // reprocess request is dropped (the next non-
                     // disabled cycle will pick up fresh state) and the
-                    // CA put_notify caller must be released.
+                    // CA put-notify caller must be released. A disabled
+                    // record drives no FLNK/OUT chain, so leaving the
+                    // wait-set here is its whole contribution.
                     instance.common.rpro = false;
                     instance.common.putf = false;
-                    let tx = instance.put_notify_tx.take();
+                    let notify = instance.notify.take();
 
                     // Reset nsta/nsev so stale alarm state doesn't bleed
                     // into a subsequent (re-enabled) cycle. C resets
@@ -416,15 +458,16 @@ impl PvDatabase {
                         instance.notify_field("SEVR", EventMask::VALUE);
                         instance.notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
                     }
-                    tx
+                    notify
                 };
                 // Fire dbNotifyCompletion outside the record lock —
                 // C `dbAccess.c:622-623` runs it at `all_done` after
                 // the disable bail. Without this, a CA WRITE_NOTIFY
                 // landing on a disabled record stalls until socket
-                // disconnect.
-                if let Some(tx) = put_notify_tx {
-                    let _ = tx.send(());
+                // disconnect. `leave` fires the completion oneshot when
+                // this empties the wait-set.
+                if let Some(ws) = notify {
+                    ws.leave();
                 }
                 return Ok(());
             }
@@ -1497,13 +1540,15 @@ impl PvDatabase {
                 None
             };
 
-            // Fire deferred put_notify completion when the record reports
-            // that async work is done (e.g. motor: DMOV=1).
-            if instance.put_notify_tx.is_some() && instance.record.is_put_complete() {
-                if let Some(tx) = instance.put_notify_tx.take() {
-                    let _ = tx.send(());
-                }
-            }
+            // Put-notify completion is NOT fired here. Firing before the
+            // OUT/FLNK/process-action tail (below) would report the
+            // WRITE_NOTIFY done while the chain it triggers — including
+            // an async FLNK target — is still running (C `dbNotify.c`
+            // keeps the originating record in the waitList until the
+            // chain settles). The originating record instead `leave`s
+            // the wait-set at the END of this function, after every PP
+            // target it drives has joined. See `complete_put_notify`
+            // at the tail.
 
             (snapshot, out_info, flnk_name, process_actions, alarm_posts)
         };
@@ -1519,10 +1564,15 @@ impl PvDatabase {
             }
         }
 
-        // Snapshot source PUTF for the C `processTarget` invariant (see
+        // Snapshot source PUTF + put-notify wait-set for the C
+        // `processTarget` / `dbNotifyAdd` invariants (see
         // `write_db_link_value` doc). Captured once here so every OUT /
-        // multi-OUT / FLNK dispatch in this cycle propagates the same bit.
-        let src_putf = rec.read().await.common.putf;
+        // multi-OUT / FLNK dispatch in this cycle propagates the same
+        // bit and joins the same wait-set.
+        let (src_putf, src_notify) = {
+            let guard = rec.read().await;
+            (guard.common.putf, guard.notify.clone())
+        };
 
         // 4. OUT link — DB *or* external `ca://`/`pva://`. C
         // `dbLink.c::dbPutLink` (dbLink.c:434-448) routes every link
@@ -1531,8 +1581,15 @@ impl PvDatabase {
         // `resolve_external_pv`). An external link with no registered
         // lset fails gracefully inside `write_out_link_value`.
         if let Some((ref link, ref out_val)) = out_info {
-            self.write_out_link_value(link, out_val.clone(), src_putf, visited, depth)
-                .await;
+            self.write_out_link_value(
+                link,
+                out_val.clone(),
+                src_putf,
+                src_notify.as_ref(),
+                visited,
+                depth,
+            )
+            .await;
             // OOPT 7.0.8: latch the record's post-output state so the
             // next cycle's `should_output` sees the right pval.
             {
@@ -1549,7 +1606,10 @@ impl PvDatabase {
             name,
             &rec,
             flnk_name.as_deref(),
-            src_putf,
+            PutNotifyCtx {
+                putf: src_putf,
+                notify: src_notify.as_ref(),
+            },
             visited,
             depth,
         )
@@ -1581,6 +1641,22 @@ impl PvDatabase {
             }
         }
 
+        // Put-notify completion: the record `leave`s the wait-set only
+        // here, after its full OUT/FLNK/process-action tail has run — so
+        // every PP target it drove has already joined (`enter`ed). Gated
+        // on `is_put_complete`: a record reporting more work (e.g. motor
+        // mid-move via `is_put_complete()==false`) keeps its membership
+        // and leaves on the later cycle that completes the put — matching
+        // the old fire site's gate. An async-pending record returned
+        // earlier and is handled in `complete_async_record_inner`. The
+        // completion oneshot fires on the `leave` that empties the set.
+        {
+            let mut guard = rec.write().await;
+            if guard.record.is_put_complete() {
+                complete_put_notify(&mut guard);
+            }
+        }
+
         Ok(())
     }
 
@@ -1602,7 +1678,7 @@ impl PvDatabase {
         visited: &mut std::collections::HashSet<String>,
         depth: usize,
     ) {
-        let (flnk_name, src_putf) = {
+        let (flnk_name, src_putf, src_notify) = {
             let instance = rec.read().await;
             let flnk = if instance.record.should_fire_forward_link() {
                 if let crate::server::record::ParsedLink::Db(ref l) = instance.parsed_flnk {
@@ -1613,13 +1689,16 @@ impl PvDatabase {
             } else {
                 None
             };
-            (flnk, instance.common.putf)
+            (flnk, instance.common.putf, instance.notify.clone())
         };
         self.run_forward_link_tail_with_putf(
             name,
             rec,
             flnk_name.as_deref(),
-            src_putf,
+            PutNotifyCtx {
+                putf: src_putf,
+                notify: src_notify.as_ref(),
+            },
             visited,
             depth,
         )
@@ -1636,7 +1715,7 @@ impl PvDatabase {
         name: &str,
         rec: &Arc<RwLock<RecordInstance>>,
         flnk_name: Option<&str>,
-        src_putf: bool,
+        src: PutNotifyCtx<'_>,
         visited: &mut std::collections::HashSet<String>,
         depth: usize,
     ) {
@@ -1708,7 +1787,7 @@ impl PvDatabase {
                     // `putValue` (C `dbLink.c::dbPutLink`,
                     // dbLink.c:434-448).
                     let parsed = crate::server::record::parse_output_link_v2(&link_str);
-                    self.write_out_link_value(&parsed, val, src_putf, visited, depth)
+                    self.write_out_link_value(&parsed, val, src.putf, src.notify, visited, depth)
                         .await;
                 }
             }
@@ -1716,20 +1795,33 @@ impl PvDatabase {
 
         // 5. FLNK -- only process if target is Passive (like C dbScanFwdLink).
         // FLNK goes through C `dbScanPassive` -> `processTarget`, which
-        // propagates `src_putf` to the target the same way OUT links do.
+        // propagates `src.putf` to the target the same way OUT links do.
         if let Some(flnk) = flnk_name {
             if let Some(target_rec) = self.get_record(flnk).await {
                 let (target_scan, should_process) = {
                     let mut tg = target_rec.write().await;
                     let pact = tg.is_processing();
                     let on_chain = visited.contains(flnk);
+                    let scan = tg.common.scan;
                     if !pact {
-                        tg.common.putf = src_putf;
-                    } else if src_putf && !on_chain {
+                        tg.common.putf = src.putf;
+                        // C `dbNotifyAdd` (dbDbLink.c:460) lives inside
+                        // `processTarget`, which `dbScanPassive` reaches
+                        // ONLY for a passive target (it returns early for
+                        // non-passive — dbDbLink.c:431). Gate the join on
+                        // the same passive condition as the process call
+                        // below: a non-passive FLNK target is dropped here
+                        // and must NOT join, or it would `enter` the
+                        // wait-set without ever processing to `leave` it,
+                        // hanging the completion forever.
+                        if scan == crate::server::record::ScanType::Passive {
+                            join_put_notify(&mut tg, src.notify);
+                        }
+                    } else if src.putf && !on_chain {
                         tg.common.rpro = true;
                         tg.common.putf = false;
                     }
-                    (tg.common.scan, !pact)
+                    (scan, !pact)
                 };
                 if should_process && target_scan == crate::server::record::ScanType::Passive {
                     // recursive FLNK within one chain — gate
@@ -1877,7 +1969,7 @@ impl PvDatabase {
                 ProcessAction::WriteDbLink { link_field, value } => {
                     // 1. Get the link string (record fields → common fields)
                     // and the source PUTF for processTarget propagation.
-                    let (link_str, src_putf) = {
+                    let (link_str, src_putf, src_notify) = {
                         let instance = rec.read().await;
                         let link = instance
                             .resolve_field(link_field)
@@ -1889,7 +1981,7 @@ impl PvDatabase {
                                 }
                             })
                             .unwrap_or_default();
-                        (link, instance.common.putf)
+                        (link, instance.common.putf, instance.notify.clone())
                     };
                     if link_str.is_empty() {
                         continue;
@@ -1903,8 +1995,15 @@ impl PvDatabase {
                     // set's `putValue` identically to a DB link
                     // (dbLink.c:434-448).
                     let parsed = crate::server::record::parse_link_v2(&link_str);
-                    self.write_out_link_value(&parsed, value, src_putf, visited, depth)
-                        .await;
+                    self.write_out_link_value(
+                        &parsed,
+                        value,
+                        src_putf,
+                        src_notify.as_ref(),
+                        visited,
+                        depth,
+                    )
+                    .await;
                 }
                 ProcessAction::DeviceCommand { command, ref args } => {
                     let mut instance = rec.write().await;
@@ -2064,10 +2163,13 @@ impl PvDatabase {
                 .processing
                 .store(false, std::sync::atomic::Ordering::Release);
 
-            // Fire put_notify completion (CA WRITE_NOTIFY response)
-            if let Some(tx) = instance.put_notify_tx.take() {
-                let _ = tx.send(());
-            }
+            // Put-notify completion is NOT fired here. The async device
+            // round-trip has finished, but the OUT/FLNK/process-action
+            // tail it drives (below) may itself reach an async target;
+            // firing now would report WRITE_NOTIFY done while that chain
+            // still runs. The originating record `leave`s the wait-set at
+            // the END of this function, after every PP target it drives
+            // has joined. See `complete_put_notify` at the tail.
 
             use crate::server::recgbl::EventMask;
             let mut event_mask = EventMask::NONE;
@@ -2273,18 +2375,30 @@ impl PvDatabase {
             }
         }
 
-        // Snapshot source PUTF for processTarget propagation (see
-        // `write_db_link_value` doc). For the async-completion path PUTF
-        // would have been set when the put landed on the record; it must
-        // propagate through the (now-completing) OUT / FLNK chain.
-        let src_putf = rec.read().await.common.putf;
+        // Snapshot source PUTF + put-notify wait-set for processTarget /
+        // dbNotifyAdd propagation (see `write_db_link_value` doc). For the
+        // async-completion path PUTF would have been set when the put
+        // landed on the record; it (and wait-set membership) must
+        // propagate through the (now-completing) OUT / FLNK chain so an
+        // async target reached here also defers WRITE_NOTIFY completion.
+        let (src_putf, src_notify) = {
+            let guard = rec.read().await;
+            (guard.common.putf, guard.notify.clone())
+        };
 
         // OUT link — DB *or* external `ca://`/`pva://`. Same scheme
         // dispatch as the sync path (C `dbLink.c::dbPutLink`,
         // dbLink.c:434-448).
         if let Some((link, out_val)) = out_info {
-            self.write_out_link_value(&link, out_val, src_putf, visited, depth)
-                .await;
+            self.write_out_link_value(
+                &link,
+                out_val,
+                src_putf,
+                src_notify.as_ref(),
+                visited,
+                depth,
+            )
+            .await;
         }
 
         // Multi-output dispatch (fanout/dfanout/seq/sseq)
@@ -2345,8 +2459,15 @@ impl PvDatabase {
                     // routed through the link set's `putValue` — see the
                     // sync-path twin above.
                     let parsed = crate::server::record::parse_output_link_v2(&link_str);
-                    self.write_out_link_value(&parsed, val, src_putf, visited, depth)
-                        .await;
+                    self.write_out_link_value(
+                        &parsed,
+                        val,
+                        src_putf,
+                        src_notify.as_ref(),
+                        visited,
+                        depth,
+                    )
+                    .await;
                 }
             }
         }
@@ -2360,13 +2481,23 @@ impl PvDatabase {
                     let mut tg = target_rec.write().await;
                     let pact = tg.is_processing();
                     let on_chain = visited.contains(flnk);
+                    let scan = tg.common.scan;
                     if !pact {
                         tg.common.putf = src_putf;
+                        // C `dbNotifyAdd` (dbDbLink.c:460) is reached only
+                        // inside `processTarget`, which `dbScanPassive`
+                        // calls solely for a passive target. Gate the join
+                        // on the same passive condition as the process
+                        // call below so a dropped (non-passive) target
+                        // never `enter`s the wait-set without `leave`ing.
+                        if scan == crate::server::record::ScanType::Passive {
+                            join_put_notify(&mut tg, src_notify.as_ref());
+                        }
                     } else if src_putf && !on_chain {
                         tg.common.rpro = true;
                         tg.common.putf = false;
                     }
-                    (tg.common.scan, !pact)
+                    (scan, !pact)
                 };
                 if should_process && target_scan == crate::server::record::ScanType::Passive {
                     // recursive FLNK within one chain — gate
@@ -2418,6 +2549,20 @@ impl PvDatabase {
         {
             let mut guard = rec.write().await;
             guard.common.putf = false;
+        }
+
+        // Put-notify completion: the async device round-trip is done and
+        // the full OUT/FLNK/process-action tail above has run, so every PP
+        // target it drove has joined the wait-set. The originating record
+        // now `leave`s; the completion oneshot fires on the `leave` that
+        // empties the set (i.e. once every joined async target has also
+        // completed). `complete_put_notify` `take`s the membership, so a
+        // motor re-entering `complete_async_record_inner` over several
+        // device cycles leaves exactly once — matching the old fire site,
+        // which `take`d its oneshot.
+        {
+            let mut guard = rec.write().await;
+            complete_put_notify(&mut guard);
         }
 
         Ok(())

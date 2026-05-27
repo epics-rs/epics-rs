@@ -2,9 +2,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::runtime::sync::RwLock;
-use crate::server::record::{AlarmSeverity, RecordInstance, ScanType};
+use crate::server::record::{AlarmSeverity, NotifyWaitSet, RecordInstance, ScanType};
 use crate::types::EpicsValue;
 
+use super::processing::join_put_notify;
 use super::{PvDatabase, SelmKind, SelmResult, select_link_indices_ex};
 
 /// Alarm state from a link source, used for MS/NMS propagation.
@@ -522,6 +523,7 @@ impl PvDatabase {
         link: &crate::server::record::DbLink,
         value: EpicsValue,
         src_putf: bool,
+        src_notify: Option<&Arc<NotifyWaitSet>>,
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
@@ -561,13 +563,26 @@ impl PvDatabase {
                     let mut tg = target_rec.write().await;
                     let pact = tg.is_processing();
                     let on_chain = visited.contains(&link.record);
+                    let scan = tg.common.scan;
                     if !pact {
                         tg.common.putf = src_putf;
+                        // C `dbNotifyAdd` (dbDbLink.c:460) lives inside
+                        // `processTarget`, which `dbDbPutValue` reaches
+                        // for a `.PROC` write or a `PP` link to a passive
+                        // target (dbDbLink.c:387-389). This Rust port only
+                        // processes the target on the passive branch
+                        // below, so gate the join on the same condition:
+                        // a target that will not be processed must NOT
+                        // join, or it would `enter` the wait-set without
+                        // ever `leave`ing it and hang the completion.
+                        if scan == ScanType::Passive {
+                            join_put_notify(&mut tg, src_notify);
+                        }
                     } else if src_putf && !on_chain {
                         tg.common.rpro = true;
                         tg.common.putf = false;
                     }
-                    (tg.common.scan, !pact)
+                    (scan, !pact)
                 };
                 if should_process && target_scan == ScanType::Passive {
                     // recursive OUT-link target processing within
@@ -659,12 +674,13 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         value: EpicsValue,
         src_putf: bool,
+        src_notify: Option<&Arc<NotifyWaitSet>>,
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
         match link {
             crate::server::record::ParsedLink::Db(db) => {
-                self.write_db_link_value(db, value, src_putf, visited, depth)
+                self.write_db_link_value(db, value, src_putf, src_notify, visited, depth)
                     .await;
             }
             crate::server::record::ParsedLink::Ca(_)
@@ -745,10 +761,14 @@ impl PvDatabase {
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
-        // Snapshot the source record's PUTF bit so every write_db_link_value
-        // call below can propagate it to its target — C `dbDbLink.c::
-        // processTarget` invariant (see write_db_link_value doc).
-        let src_putf = rec.read().await.common.putf;
+        // Snapshot the source record's PUTF bit + put-notify wait-set so
+        // every write_db_link_value call below propagates them to its
+        // target — C `dbDbLink.c::processTarget` PUTF and `dbNotifyAdd`
+        // wait-set invariants (see write_db_link_value doc).
+        let (src_putf, src_notify) = {
+            let guard = rec.read().await;
+            (guard.common.putf, guard.notify.clone())
+        };
 
         // Resolve the SELL link into SELN before SELN is read below.
         // C `fanoutRecord.c:103`, `dfanoutRecord.c:126`,
@@ -1069,8 +1089,15 @@ impl PvDatabase {
                         let parsed = crate::server::record::parse_output_link_v2(link_str);
                         match parsed {
                             crate::server::record::ParsedLink::Db(ref db) => {
-                                self.write_db_link_value(db, val.clone(), src_putf, visited, depth)
-                                    .await;
+                                self.write_db_link_value(
+                                    db,
+                                    val.clone(),
+                                    src_putf,
+                                    src_notify.as_ref(),
+                                    visited,
+                                    depth,
+                                )
+                                .await;
                             }
                             // External `ca://`/`pva://` OUTn — C
                             // `dbPutLink` routes a CA-link write through
@@ -1132,8 +1159,15 @@ impl PvDatabase {
                         // both through the link set's `putValue`
                         // (dbLink.c:434-448).
                         let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
-                        self.write_out_link_value(&lnk_parsed, value, src_putf, visited, depth)
-                            .await;
+                        self.write_out_link_value(
+                            &lnk_parsed,
+                            value,
+                            src_putf,
+                            src_notify.as_ref(),
+                            visited,
+                            depth,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1169,8 +1203,15 @@ impl PvDatabase {
                         // through the link set's `putValue`
                         // (dbLink.c:434-448).
                         let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
-                        self.write_out_link_value(&lnk_parsed, value, src_putf, visited, depth)
-                            .await;
+                        self.write_out_link_value(
+                            &lnk_parsed,
+                            value,
+                            src_putf,
+                            src_notify.as_ref(),
+                            visited,
+                            depth,
+                        )
+                        .await;
                     }
                 }
             }

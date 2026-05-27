@@ -14,7 +14,7 @@ pub use link::{
     CaLink, CalcLink, DbLink, HwLink, HwLinkKind, LinkAddress, LinkProcessPolicy, LinkType,
     MonitorSwitch, ParsedLink, link_field_type, parse_link, parse_link_v2, parse_output_link_v2,
 };
-pub use record_instance::RecordInstance;
+pub use record_instance::{NotifyWaitSet, RecordInstance};
 pub use record_trait::{
     CommonFieldPutResult, EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, ProcessAction, ProcessContext,
     ProcessOutcome, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,

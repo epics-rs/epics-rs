@@ -2665,13 +2665,14 @@ async fn test_sdis_disable_fires_put_notify_completion() {
             .unwrap();
     }
 
-    // Arm put_notify_tx on the disabled target. The disable path must
-    // take it (consume tx) and send completion, releasing the rx.
+    // Arm a put-notify wait-set on the disabled target (pending=1 for the
+    // originating record). The disable path must take it and `leave`,
+    // draining the set to zero and firing the completion oneshot.
     let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
     {
         let rec = db.get_record("DIS_NOT_TGT").await.unwrap();
         let mut inst = rec.write().await;
-        inst.put_notify_tx = Some(tx);
+        inst.notify = Some(NotifyWaitSet::new(tx));
     }
 
     let mut visited = HashSet::new();
@@ -2681,12 +2682,174 @@ async fn test_sdis_disable_fires_put_notify_completion() {
 
     // rx should be ready — completion was sent via the disable bail.
     rx.await
-        .expect("disable bail must fire put_notify_tx (C dbAccess.c:622)");
-    // tx must be taken (not left dangling for the next cycle).
+        .expect("disable bail must fire put-notify completion (C dbAccess.c:622)");
+    // membership must be taken (not left dangling for the next cycle).
     let rec = db.get_record("DIS_NOT_TGT").await.unwrap();
     assert!(
-        rec.read().await.put_notify_tx.is_none(),
-        "put_notify_tx must be cleared after firing"
+        rec.read().await.notify.is_none(),
+        "put-notify wait-set membership must be cleared after firing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Put-notify wait-set: CA WRITE_NOTIFY completion must wait for the WHOLE
+// chain — the originating record AND every FLNK/OUT PP target it drives,
+// synchronous or async — exactly like C `dbNotify.c` keeps every record in
+// the `waitList` until `dbNotifyCompletion` drains it to empty. The four
+// cases below are written per invariant boundary, not per narrative:
+//   * no async member in the chain   → completes synchronously (Ok(None))
+//   * async member reached via FLNK  → deferred (Ok(Some(rx)), fires later)
+//   * async member reached via OUT PP→ deferred (same, other dispatch edge)
+//   * second WRITE_NOTIFY in-flight  → refused (Ok→Err PutCallbackInProgress)
+// ---------------------------------------------------------------------------
+
+/// Boundary: a fully synchronous chain (originating record + a sync FLNK
+/// target) drains the wait-set within the put call, so the put reports
+/// immediate completion (`Ok(None)`) — no receiver is handed back.
+#[tokio::test]
+async fn test_put_notify_sync_chain_completes_immediately() {
+    let db = PvDatabase::new();
+    db.add_record("PN_SYNC_SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("PN_SYNC_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("PN_SYNC_SRC").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("FLNK", EpicsValue::String("PN_SYNC_TGT".into()))
+            .unwrap();
+    }
+
+    let result = db
+        .put_record_field_from_ca("PN_SYNC_SRC", "VAL", EpicsValue::Double(3.0))
+        .await
+        .expect("put must succeed");
+    assert!(
+        result.is_none(),
+        "a fully synchronous chain drains the wait-set in-call → Ok(None); \
+         got a deferred receiver instead"
+    );
+}
+
+/// Boundary (the finding): a synchronous originating record whose FLNK
+/// target is async must DEFER completion. Pre-fix the originating record
+/// fired its completion the instant its own sync cycle ended, reporting
+/// WRITE_NOTIFY done while the async FLNK target was still in flight. Now
+/// the put returns a receiver that fires only when the async target's
+/// `complete_async_record` runs.
+#[tokio::test]
+async fn test_put_notify_defers_for_async_flnk_target() {
+    let db = PvDatabase::new();
+    db.add_record("PN_FLNK_SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("PN_FLNK_TGT", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("PN_FLNK_SRC").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("FLNK", EpicsValue::String("PN_FLNK_TGT".into()))
+            .unwrap();
+    }
+
+    let result = db
+        .put_record_field_from_ca("PN_FLNK_SRC", "VAL", EpicsValue::Double(4.0))
+        .await
+        .expect("put must succeed");
+    let mut rx = match result {
+        Some(rx) => rx,
+        None => panic!(
+            "an async FLNK target must defer completion — \
+             the put returned immediate (Ok(None)) instead of a receiver"
+        ),
+    };
+    // The async FLNK target is in flight; completion MUST NOT have fired.
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(epics_base_rs::runtime::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "completion fired while the async FLNK target was still pending \
+         (the exact pre-fix defect)"
+    );
+    // Complete the async target — only now may the wait-set drain to zero.
+    db.complete_async_record("PN_FLNK_TGT").await.unwrap();
+    rx.await
+        .expect("completion must fire once the async FLNK target completes");
+}
+
+/// Boundary: same deferral, reached through an OUT `PP` link instead of
+/// FLNK — the other dispatch edge that calls `processTarget`/`dbNotifyAdd`.
+#[tokio::test]
+async fn test_put_notify_defers_for_async_out_pp_target() {
+    let db = PvDatabase::new();
+    db.add_record("PN_OUT_SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("PN_OUT_TGT", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("PN_OUT_SRC").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("PN_OUT_TGT PP".into()))
+            .unwrap();
+    }
+
+    let result = db
+        .put_record_field_from_ca("PN_OUT_SRC", "VAL", EpicsValue::Double(5.0))
+        .await
+        .expect("put must succeed");
+    let mut rx = match result {
+        Some(rx) => rx,
+        None => panic!(
+            "an async OUT PP target must defer completion — \
+             the put returned immediate (Ok(None)) instead of a receiver"
+        ),
+    };
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(epics_base_rs::runtime::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "completion fired while the async OUT PP target was still pending"
+    );
+    db.complete_async_record("PN_OUT_TGT").await.unwrap();
+    rx.await
+        .expect("completion must fire once the async OUT PP target completes");
+}
+
+/// Boundary: a second WRITE_NOTIFY on a record whose put-notify is still
+/// in flight is refused (C returns S_db_Blocked / ECA_PUTCBINPROG).
+/// Silently overwriting the wait-set would drop the prior `Sender`, waking
+/// the prior caller's receiver with a `RecvError` the CA dispatcher treats
+/// as success.
+#[tokio::test]
+async fn test_put_notify_refuses_second_in_flight() {
+    let db = PvDatabase::new();
+    db.add_record("PN_DBL", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // First put: the record goes async-pending and keeps its wait-set
+    // membership for the duration of the device round trip.
+    let first = db
+        .put_record_field_from_ca("PN_DBL", "VAL", EpicsValue::Double(1.0))
+        .await
+        .expect("first put must succeed");
+    assert!(
+        first.is_some(),
+        "async record's first put must return a deferred receiver"
+    );
+
+    // Second put while the first is still in flight → refused.
+    let second = db
+        .put_record_field_from_ca("PN_DBL", "VAL", EpicsValue::Double(2.0))
+        .await;
+    assert!(
+        matches!(second, Err(CaError::PutCallbackInProgress(_))),
+        "a second WRITE_NOTIFY on an in-flight record must be refused with \
+         PutCallbackInProgress; got {second:?}"
     );
 }
 

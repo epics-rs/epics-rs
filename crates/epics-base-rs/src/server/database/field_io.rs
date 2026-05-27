@@ -498,18 +498,19 @@ impl PvDatabase {
                 if !is_nonzero {
                     return Ok(None);
                 }
-                // Continue to the put_notify_tx setup + process below
+                // Continue to the put-notify setup + process below
                 // by jumping past the field-write step (the value
                 // itself isn't stored; PROC is a trigger).
                 let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
+                let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
                 {
                     let rec = self.inner.records.read().await;
                     if let Some(rec_arc) = rec.get(record_name) {
                         let mut guard = rec_arc.write().await;
-                        if guard.put_notify_tx.is_some() {
+                        if guard.notify.is_some() {
                             return Err(CaError::PutCallbackInProgress(record_name.to_string()));
                         }
-                        guard.put_notify_tx = Some(completion_tx);
+                        guard.notify = Some(notify.clone());
                     }
                 }
                 let mut visited = HashSet::new();
@@ -522,18 +523,15 @@ impl PvDatabase {
                 let _ = self
                     .process_record_with_links_already_locked(record_name, &mut visited, 0)
                     .await;
-                let pending = {
-                    let rec = self.inner.records.read().await;
-                    if let Some(rec_arc) = rec.get(record_name) {
-                        rec_arc.read().await.put_notify_tx.is_some()
-                    } else {
-                        false
-                    }
-                };
-                return if pending {
-                    Ok(Some(completion_rx))
-                } else {
+                // The wait-set fires the oneshot only after the whole
+                // FLNK/OUT chain (sync + async) settles. If it has
+                // already completed the chain was fully synchronous —
+                // report immediate success; otherwise hand the receiver
+                // to the CA layer to await the deferred completion.
+                return if notify.completed() {
                     Ok(None)
+                } else {
+                    Ok(Some(completion_rx))
                 };
             }
 
@@ -756,23 +754,25 @@ impl PvDatabase {
             return Ok(None);
         }
 
-        // Set up put_notify completion channel BEFORE processing.
-        // If process returns AsyncPendingNotify, the handler will take
-        // the sender and hold it until processing truly completes.
+        // Set up the put-notify wait-set BEFORE processing. The wait-set
+        // fires `completion_tx` only after the originating record AND
+        // every FLNK/OUT chain target it triggers (sync or async) has
+        // completed — C `dbNotify.c` `processNotify`/`dbNotifyCompletion`.
         // Refuse a second concurrent WRITE_NOTIFY on the same record:
         // C EPICS returns S_db_Blocked / ECA_PUTCBINPROG, and silently
-        // overwriting put_notify_tx would drop the prior Sender,
-        // waking the prior caller's rx with RecvError that the CA
-        // dispatcher treats as success.
+        // overwriting the wait-set would drop the prior Sender, waking
+        // the prior caller's rx with RecvError that the CA dispatcher
+        // treats as success.
         let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
+        let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
         {
             let rec = self.inner.records.read().await;
             if let Some(rec_arc) = rec.get(record_name) {
                 let mut guard = rec_arc.write().await;
-                if guard.put_notify_tx.is_some() {
+                if guard.notify.is_some() {
                     return Err(CaError::PutCallbackInProgress(record_name.to_string()));
                 }
-                guard.put_notify_tx = Some(completion_tx);
+                guard.notify = Some(notify.clone());
             }
         }
 
@@ -820,14 +820,17 @@ impl PvDatabase {
                 .await;
         }
 
-        // Check if sender is still in the record (async processing pending)
-        // or was already fired (synchronous completion in Complete path).
-        let pending = {
+        // Is the ORIGINATING record itself still async-pending? Its
+        // wait-set membership is taken + `leave`d at its own completion
+        // (sync-end, or later in `complete_async_record_inner`), so a
+        // lingering `notify` on its instance means its device round-trip
+        // is still in flight. This gates only the originating record's
+        // PUTF clear — independent of whether downstream chain targets
+        // are still pending.
+        let originating_pending = {
             let rec = self.inner.records.read().await;
             if let Some(rec_arc) = rec.get(record_name) {
-                // If sender is still present, async processing is pending.
-                // Leave it — it will be fired when processing completes.
-                rec_arc.read().await.put_notify_tx.is_some()
+                rec_arc.read().await.notify.is_some()
             } else {
                 false
             }
@@ -842,7 +845,7 @@ impl PvDatabase {
         // `complete_async_record_inner` (which runs FLNK as part of
         // the completion path) so the PUTF marker survives the
         // device-write round trip.
-        if !pending {
+        if !originating_pending {
             let rec = self.inner.records.read().await;
             if let Some(rec_arc) = rec.get(record_name) {
                 let mut guard = rec_arc.write().await;
@@ -852,10 +855,18 @@ impl PvDatabase {
             }
         }
 
-        if pending {
-            Ok(Some(completion_rx))
-        } else {
+        // CA completion gates on the WHOLE chain, not just the
+        // originating record: the put-notify must not report
+        // done until every FLNK/OUT target it drove — including an async
+        // FLNK target that the originating record's sync cycle merely
+        // kicked off — has settled. `completed()` is true iff the
+        // wait-set drained to zero during this call (fully synchronous
+        // chain); otherwise the receiver fires later from the last
+        // chain member's `leave`.
+        if notify.completed() {
             Ok(None)
+        } else {
+            Ok(Some(completion_rx))
         }
     }
 

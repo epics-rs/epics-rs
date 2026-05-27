@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::runtime::sync::mpsc;
 
@@ -17,6 +17,64 @@ use super::record_trait::{
     CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
 use super::scan::ScanType;
+
+/// Put-notify completion wait-set — the C `dbNotify.c` `processNotify`
+/// waitList analogue (`dbNotifyAdd` / `dbNotifyCompletion`).
+///
+/// A `ca_put_callback` / WRITE_NOTIFY completion must fire only after the
+/// originating (put-target) record AND every record reached through its
+/// FLNK / OUT / process-action dispatch chain (synchronous *or* async)
+/// has finished processing. A single wait-set owns the completion
+/// oneshot; only it fires, and only when the last chain member leaves.
+///
+/// Counting convention: [`Self::new`] arms `pending = 1` for the
+/// originating record (which always joins). Every additional PP target
+/// that will process under the active notify [`Self::enter`]s on join
+/// (C `dbNotifyAdd`), and every record [`Self::leave`]s when its
+/// processing completes (C `dbNotifyCompletion`). The oneshot fires on
+/// the `leave` that drops `pending` to zero.
+pub struct NotifyWaitSet {
+    pending: AtomicUsize,
+    tx: StdMutex<Option<crate::runtime::sync::oneshot::Sender<()>>>,
+}
+
+impl NotifyWaitSet {
+    /// Arm a wait-set whose `tx` fires when the chain settles. `pending`
+    /// starts at 1 for the originating record — its completion `leave`s
+    /// that implicit slot, so a put with no chain targets fires
+    /// immediately on the originating record's own completion.
+    pub fn new(tx: crate::runtime::sync::oneshot::Sender<()>) -> Arc<Self> {
+        Arc::new(Self {
+            pending: AtomicUsize::new(1),
+            tx: StdMutex::new(Some(tx)),
+        })
+    }
+
+    /// A PP target joined the chain (C `dbNotifyAdd`). Balanced by exactly
+    /// one [`Self::leave`].
+    pub fn enter(&self) {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A record finished its contribution (C `dbNotifyCompletion`). Fires
+    /// the completion oneshot on the `leave` that empties the set.
+    pub fn leave(&self) {
+        let prev = self.pending.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev >= 1, "NotifyWaitSet::leave underflow");
+        if prev == 1 {
+            if let Some(tx) = self.tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    /// True once every chain member has left (the completion has fired).
+    /// Used by the put entry to decide synchronous (return `None`) vs
+    /// async-pending (return the receiver) completion.
+    pub fn completed(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+    }
+}
 
 /// Cached metadata for a record.
 ///
@@ -117,8 +175,12 @@ pub struct RecordInstance {
     pub subroutine: Option<Arc<SubroutineFn>>,
     // Re-entrancy guard
     pub processing: AtomicBool,
-    // Deferred put_notify completion (fires when async processing completes)
-    pub put_notify_tx: Option<crate::runtime::sync::oneshot::Sender<()>>,
+    // Put-notify wait-set this record currently belongs to (C
+    // `precord->ppn`). Set when the record joins an active put-notify
+    // (originating put target, or a FLNK/OUT PP target via `dbNotifyAdd`);
+    // taken + `leave`d when the record's processing completes. `None`
+    // outside any put-notify. See [`NotifyWaitSet`].
+    pub notify: Option<Arc<NotifyWaitSet>>,
     // Last posted values for subscribed fields (generic change detection)
     pub last_posted: HashMap<String, EpicsValue>,
     /// Generation counter for ReprocessAfter timer cancellation.
@@ -213,7 +275,7 @@ impl RecordInstance {
             device: None,
             subroutine: None,
             processing: AtomicBool::new(false),
-            put_notify_tx: None,
+            notify: None,
             last_posted: HashMap::new(),
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             info: HashMap::new(),

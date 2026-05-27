@@ -436,6 +436,154 @@ async fn multi_tenant_gateway_routes_to_correct_upstream() {
     assert_eq!(v, 2.0);
 }
 
+/// A9-13 regression: a per-downstream ACL deny list installed via
+/// `downstream_access` must short-circuit a denied PV name before it
+/// reaches *any* of that downstream's upstreams — and an allowed name
+/// must still resolve. Pre-fix the multi-tenant builder wrapped each
+/// proxy in NO middleware (`Arc::new(src)` straight into the
+/// composite), so the deny list was silently inert and "SECRET:VAL"
+/// resolved.
+///
+/// Boundary cases (one assertion each):
+/// - denied name ("SECRET:VAL", upstream S) → must NOT resolve
+/// - allowed name ("OPEN:VAL", upstream O)  → must resolve to 5.0
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_tenant_downstream_acl_denies_pv() {
+    let (_us_s, addr_s, _pv_s) = spawn_upstream("SECRET:VAL", 3.0);
+    let (_us_o, addr_o, _pv_o) = spawn_upstream("OPEN:VAL", 5.0);
+
+    let client_s = Arc::new(
+        PvaClient::builder()
+            .server_addr(addr_s)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let client_o = Arc::new(
+        PvaClient::builder()
+            .server_addr(addr_o)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+
+    let pick = || {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let pick_udp = || {
+        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let server_config = PvaServerConfig {
+        tcp_port: pick(),
+        udp_port: pick_udp(),
+        ..PvaServerConfig::isolated()
+    };
+
+    let acl = epics_bridge_rs::pva_gateway::AclConfig::default()
+        .deny_regex(r"SECRET:.*")
+        .unwrap();
+
+    let gw = MultiTenantPvaGatewayBuilder::new()
+        .add_upstream("S", client_s)
+        .add_upstream("O", client_o)
+        .add_downstream("restricted", server_config, &["S", "O"], None)
+        .downstream_access(Some(acl), false, None)
+        .connect_timeout(Duration::from_secs(2))
+        .start()
+        .expect("multi-tenant start");
+
+    let server = gw
+        .downstream("restricted")
+        .expect("restricted server present");
+    let ds = server.client_config();
+
+    // Denied: the ACL short-circuits before reaching upstream S.
+    let denied = tokio::time::timeout(Duration::from_secs(3), ds.pvget_full("SECRET:VAL")).await;
+    match denied {
+        Ok(Ok(snap)) => panic!("ACL-denied PV must not resolve: got {:?}", snap.value),
+        Ok(Err(_)) | Err(_) => { /* denied / timed out — correct */ }
+    }
+
+    // Allowed: the same downstream still resolves an un-denied PV.
+    let snap = ds
+        .pvget_full("OPEN:VAL")
+        .await
+        .expect("OPEN:VAL via gateway");
+    let v = match snap.value {
+        PvField::Scalar(ScalarValue::Double(v)) => v,
+        PvField::Structure(s) => match s.get_field("value") {
+            Some(PvField::Scalar(ScalarValue::Double(v))) => *v,
+            other => panic!("unexpected OPEN:VAL shape: {other:?}"),
+        },
+        other => panic!("unexpected OPEN:VAL wrapper: {other:?}"),
+    };
+    assert_eq!(v, 5.0);
+}
+
+/// A9-13 regression: a per-downstream `read_only` flag set via
+/// `downstream_access` must reject every PUT on that downstream. Pre-fix
+/// the multi-tenant builder inserted no `ReadOnlyLayer`, so a `read_only`
+/// downstream silently forwarded PUTs upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_tenant_downstream_read_only_rejects_put() {
+    let (_us, us_addr, us_pv) = spawn_upstream("MT:RO:PV", 7.0);
+    let upstream = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+
+    let pick = || {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let pick_udp = || {
+        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let server_config = PvaServerConfig {
+        tcp_port: pick(),
+        udp_port: pick_udp(),
+        ..PvaServerConfig::isolated()
+    };
+
+    let gw = MultiTenantPvaGatewayBuilder::new()
+        .add_upstream("U", upstream)
+        .add_downstream("ro", server_config, &["U"], None)
+        .downstream_access(None, true, None)
+        .connect_timeout(Duration::from_secs(2))
+        .start()
+        .expect("multi-tenant start");
+
+    let server = gw.downstream("ro").expect("ro server present");
+    let ds = server.client_config();
+    let err = ds
+        .pvput("MT:RO:PV", "99")
+        .await
+        .expect_err("PUT through a read-only downstream must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("read-only"),
+        "rejection must come from the ReadOnly layer: {msg}"
+    );
+
+    // The upstream PV value is untouched — the PUT never reached it.
+    let current = us_pv.current();
+    match current.as_ref().and_then(scalar_double) {
+        Some(v) => assert_eq!(v, 7.0, "read-only downstream must not forward the PUT"),
+        None => panic!("unexpected upstream value: {current:?}"),
+    }
+}
+
 // ── CRITICAL-1: gateway middleware (ReadOnly / ACL / Audit) wiring ──
 
 /// Build a gateway config pinned at `upstream` with an isolated

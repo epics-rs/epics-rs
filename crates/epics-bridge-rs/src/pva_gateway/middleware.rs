@@ -25,7 +25,9 @@ use std::sync::Arc;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server_native::ChannelContext;
-use epics_pva_rs::server_native::source::{ChannelSource, RawMonitorEvent, WatermarkEvent};
+use epics_pva_rs::server_native::source::{
+    ChannelSource, DynSource, RawMonitorEvent, WatermarkEvent,
+};
 use tokio::sync::mpsc;
 
 /// Wrap a [`ChannelSource`] and produce a new one with extra
@@ -1285,6 +1287,46 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     // Idle↔Executing edge unchanged.
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
         self.inner.notify_monitor_start(name, ctx, start);
+    }
+}
+
+/// Wrap a gateway proxy source in the canonical access-control chain
+/// `Audit( ReadOnly?( Acl( source ) ) )` and type-erase it to a
+/// [`DynSource`].
+///
+/// This is the single owner of the chain *shape*, so every gateway
+/// topology that registers a proxy source through a `CompositeSource`
+/// enforces ACL / read-only / audit identically:
+///
+/// - `Acl` is innermost so a denied PV name short-circuits before the
+///   call reaches the proxy (no upstream search for a denied PV).
+/// - `ReadOnly` (only when `read_only`) sits above `Acl` so it rejects
+///   every PUT regardless of upstream policy.
+/// - `Audit` is outermost so it records the *final* outcome, including
+///   ACL / read-only denials, not just PUTs that reached the upstream.
+///
+/// `Acl` and `Audit` are always present (a permissive [`AclConfig`] /
+/// [`NoopAudit`] when not configured) so the chain shape is uniform;
+/// only `read_only` is a genuine branch. The single-tenant
+/// [`super::PvaGateway`] builds the same chain inline because its
+/// non-composite path threads the concrete layered type into
+/// `PvaServer::start::<S>` (which requires `S: ChannelSource`, a bound
+/// the type-erased `DynSource` does not satisfy); this helper serves
+/// the composite-only topologies such as the multi-tenant gateway.
+pub(crate) fn layer_access_control<S>(
+    source: S,
+    acl: AclConfig,
+    read_only: bool,
+    audit: Arc<dyn AuditSink>,
+) -> DynSource
+where
+    S: ChannelSource + 'static,
+{
+    let acl_layer = AclLayer::new(acl).layer(source);
+    if read_only {
+        Arc::new(AuditLayer::new(audit).layer(ReadOnlyLayer.layer(acl_layer))) as DynSource
+    } else {
+        Arc::new(AuditLayer::new(audit).layer(acl_layer)) as DynSource
     }
 }
 

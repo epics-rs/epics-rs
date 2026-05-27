@@ -75,6 +75,7 @@ use epics_pva_rs::server_native::{CompositeSource, PvaServer, PvaServerConfig};
 use super::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL};
 use super::control::ControlSource;
 use super::error::{GwError, GwResult};
+use super::middleware::{AclConfig, AuditSink, NoopAudit, layer_access_control};
 use super::source::GatewayChannelSource;
 
 /// One upstream tenant — a `PvaClient` (with its own connection pool
@@ -85,12 +86,21 @@ struct UpstreamTenant {
 }
 
 /// One downstream tenant — its `PvaServer` config, the labelled list
-/// of upstream tenants it proxies, and an optional control_prefix.
+/// of upstream tenants it proxies, an optional control_prefix, and its
+/// per-tenant access policy (ACL / read-only / audit). The access
+/// fields default to "permissive + no audit"; set them via
+/// [`MultiTenantPvaGatewayBuilder::downstream_access`].
 struct DownstreamSpec {
     label: String,
     config: PvaServerConfig,
     upstream_labels: Vec<String>,
     control_prefix: Option<String>,
+    /// `None` ⇒ permissive [`AclConfig::default`].
+    acl: Option<AclConfig>,
+    /// Reject every PUT on this downstream when set.
+    read_only: bool,
+    /// `None` ⇒ [`NoopAudit`].
+    audit: Option<Arc<dyn AuditSink>>,
 }
 
 /// Builder for [`MultiTenantPvaGateway`]. Add upstreams first, then
@@ -149,7 +159,37 @@ impl MultiTenantPvaGatewayBuilder {
             config,
             upstream_labels: upstream_labels.iter().map(|s| (*s).to_string()).collect(),
             control_prefix,
+            acl: None,
+            read_only: false,
+            audit: None,
         });
+        self
+    }
+
+    /// Set the access policy for the most-recently-added downstream
+    /// (the one from the preceding [`Self::add_downstream`] call). Every
+    /// upstream proxy of that downstream is wrapped in
+    /// `Audit( ReadOnly?( Acl( source ) ) )` — the same chain the
+    /// single-tenant [`super::PvaGateway`] applies — so migrating a
+    /// deployment to the multi-tenant topology does not silently drop
+    /// access control. The control/diagnostic source stays unwrapped
+    /// (its PVs are read-only diagnostics).
+    ///
+    /// `acl: None` ⇒ permissive; `audit: None` ⇒ no audit. Panics if
+    /// called before any [`Self::add_downstream`].
+    pub fn downstream_access(
+        mut self,
+        acl: Option<AclConfig>,
+        read_only: bool,
+        audit: Option<Arc<dyn AuditSink>>,
+    ) -> Self {
+        let spec = self
+            .downstreams
+            .last_mut()
+            .expect("downstream_access called before add_downstream");
+        spec.acl = acl;
+        spec.read_only = read_only;
+        spec.audit = audit;
         self
     }
 
@@ -261,24 +301,38 @@ impl MultiTenantPvaGatewayBuilder {
             // pick the first one for the control surface — the
             // operator can always disambiguate via the per-cache
             // diagnostic PVs in each control_prefix namespace.
+            // A9-13: this downstream's access policy wraps *every* one
+            // of its upstream proxies. Resolve the defaults once
+            // (permissive ACL / NoopAudit) and apply the same
+            // `Audit( ReadOnly?( Acl( source ) ) )` chain the
+            // single-tenant gateway applies, via the shared
+            // `layer_access_control` owner of the chain shape — so a
+            // multi-tenant deployment cannot silently lose access
+            // control. The audit sink is shared (`Arc`) across the
+            // downstream's proxies.
+            let acl_cfg = ds.acl.clone().unwrap_or_default();
+            let audit_sink: Arc<dyn AuditSink> =
+                ds.audit.clone().unwrap_or_else(|| Arc::new(NoopAudit));
             let mut first_gw_source: Option<GatewayChannelSource> = None;
             for (i, (label, cache)) in sources.iter().enumerate() {
                 let mut src = GatewayChannelSource::new(cache.clone());
                 src.connect_timeout = self.connect_timeout;
                 src.max_subscribers = self.max_subscribers;
                 if first_gw_source.is_none() {
+                    // The control source operates on the *unlayered*
+                    // proxy (its diagnostic PVs are not access-gated).
                     first_gw_source = Some(src.clone());
                 }
                 let order = i as i32; // earlier labels win
                 let name = format!("gateway:{label}");
-                composite
-                    .add_source(&name, Arc::new(src), order)
-                    .map_err(|e| {
-                        GwError::Other(format!(
-                            "downstream '{}' source '{name}' registration: {e}",
-                            ds.label
-                        ))
-                    })?;
+                let layered =
+                    layer_access_control(src, acl_cfg.clone(), ds.read_only, audit_sink.clone());
+                composite.add_source(&name, layered, order).map_err(|e| {
+                    GwError::Other(format!(
+                        "downstream '{}' source '{name}' registration: {e}",
+                        ds.label
+                    ))
+                })?;
             }
             if let (Some(prefix), Some(gw_src)) = (ds.control_prefix.as_ref(), first_gw_source) {
                 if !prefix.is_empty() {

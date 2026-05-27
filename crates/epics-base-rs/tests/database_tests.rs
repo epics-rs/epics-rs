@@ -2933,6 +2933,51 @@ async fn test_calc_multi_input_npp_does_not_process_source() {
     }
 }
 
+/// A **modifier-less** (bare) multi-input link must behave like NPP —
+/// C `dbParseLink` (`dbStaticLib.c:2252,2369-2371`) leaves `pvlOptPP`
+/// unset for a bare link, so `dbDbGetValue` (`dbDbLink.c:175`) does NOT
+/// process the passive source on read. Before the fix `parse_link_v2`
+/// defaulted a bare link to `ProcessPassive`, so `BARE_DST` would have
+/// spuriously processed `BARE_SRC` and read 42; after the fix it reads
+/// the stale 0.
+#[tokio::test]
+async fn test_calc_multi_input_bare_does_not_process_source() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+
+    let src = CalcRecord::new("42");
+    db.add_record("BARE_SRC", Box::new(src)).await.unwrap();
+
+    let mut dst = CalcRecord::new("A");
+    // No modifier — must default to NPP, NOT ProcessPassive.
+    dst.inpa = "BARE_SRC".to_string();
+    db.add_record("BARE_DST", Box::new(dst)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("BARE_DST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let val = db.get_pv("BARE_DST").await.unwrap();
+    match val {
+        EpicsValue::Double(v) => assert!(
+            v.abs() < 1e-10,
+            "bare multi-input link is NPP and must NOT process its source: expected 0, got {v}"
+        ),
+        other => panic!("expected Double(0.0), got {other:?}"),
+    }
+    // BARE_SRC must still hold its unprocessed default.
+    let src_val = db.get_pv("BARE_SRC").await.unwrap();
+    match src_val {
+        EpicsValue::Double(v) => assert!(
+            v.abs() < 1e-10,
+            "bare INP must leave BARE_SRC unprocessed, VAL={v}"
+        ),
+        other => panic!("expected Double(0.0), got {other:?}"),
+    }
+}
+
 /// Defect 1 regression (CRITICAL): two passive calc records whose
 /// `INPA` PP links point at each other (`A.INPA="B PP"`,
 /// `B.INPA="A PP"`) form a PP-link cycle. Before the fix
@@ -3358,10 +3403,10 @@ impl Record for CountingTarget {
 // driven via `dbPutLink` (`seqRecord.c:264`). `dbDbPutValue`
 // (`dbDbLink.c:388`) processes the target only when the link carries an
 // explicit `PP` modifier. A bare (modifier-less) seq LNKn is NPP — the
-// target value is written but the target is NOT processed. Before the
-// fix the `MultiOut::Seq` arm passed the bare link straight through
-// (`parse_link_v2` defaults bare → ProcessPassive), wrongly processing
-// the Passive target.
+// target value is written but the target is NOT processed.
+// `parse_link_v2`/`parse_output_link_v2` default a modifier-less link
+// to NPP (`NoProcess`) like C `dbParseLink`, so the `MultiOut::Seq` arm
+// needs no per-call downgrade.
 #[tokio::test]
 async fn test_seq_bare_lnk_does_not_process_passive_target() {
     use epics_base_rs::server::records::seq::SeqRecord;

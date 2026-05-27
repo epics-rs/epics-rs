@@ -462,7 +462,15 @@ fn try_parse_hw_link(s: &str) -> Option<ParsedLink> {
 /// `PP`/`MS`-style modifiers, so `force_ca` is recorded while `policy`
 /// and `ms` continue to capture the rest.
 fn strip_link_modifiers(s: &str) -> (&str, LinkProcessPolicy, MonitorSwitch, bool) {
-    let mut policy = LinkProcessPolicy::ProcessPassive;
+    // C `dbParseLink` (`dbStaticLib.c:2252,2369-2371`): the modifier set
+    // is `memset`-zeroed first, then `pvlOptPP` is set *only* on an
+    // explicit ` PP` token (` NPP` clears it back to 0). A modifier-less
+    // link is therefore NPP — for an INPUT link this means `dbDbGetValue`
+    // (`dbDbLink.c:175`) does NOT process the passive source on read, and
+    // for an OUTPUT link `dbDbPutValue` (`dbDbLink.c:387`) does NOT
+    // process the target. Default `NoProcess`; the explicit ` PP` arm
+    // below promotes it to `ProcessPassive`.
+    let mut policy = LinkProcessPolicy::NoProcess;
     let mut ms = MonitorSwitch::NoMaximize;
     let mut force_ca = false;
     let mut link_part = s;
@@ -627,49 +635,21 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     })
 }
 
-/// True when a link string carries an explicit `PP` (or `CP`/`CPP`)
-/// process modifier as a whitespace-separated token.
-///
-/// C `dbStaticLib.c::dbParseLink` sets the link's `pvlOptPP` flag only
-/// when the modifier string contains an explicit `PP` token. For a
-/// `DBF_OUTLINK` the absence of `PP` means NPP — `dbDbPutValue`
-/// (`dbDbLink.c:386-389`) writes the value but does **not** call
-/// `processTarget`.
-fn link_has_explicit_pp(raw: &str) -> bool {
-    raw.split_whitespace()
-        .any(|tok| tok == "PP" || tok == "CP" || tok == "CPP")
-}
-
 /// Parse an **output** link.
 ///
-/// Identical to [`parse_link_v2`] except for the process-policy
-/// default: C `dbDbPutValue` (`dbDbLink.c:386-389`) processes the
-/// target only when the destination field is `.PROC` **or** the link
-/// carries an explicit `pvlOptPP` flag (an explicit ` PP` token). A
-/// bare OUT link is NPP — the value is written but the target is not
-/// processed.
-///
-/// `parse_link_v2` defaults *every* modifier-less link to
-/// `ProcessPassive`, which is the right default for INPUT links (so a
-/// PP source is processed before its value is read) but wrong for
-/// OUTPUT links. This wrapper downgrades a bare `Db` OUT link's policy
-/// to `NoProcess` so the OUT-link write path does not spuriously
-/// process the target. Writing the destination's `.PROC` field is
-/// handled separately by the write path (C's `dbChannelField ==
-/// &pdest->proc` branch), so `.PROC` is left at `ProcessPassive`.
+/// Output and input links share [`parse_link_v2`]: C `dbParseLink`
+/// zeroes the modifier set for both link types (`dbStaticLib.c:2252`),
+/// so a modifier-less link is NPP (`NoProcess`) regardless of
+/// direction. The OUT-link target-processing decision — process when
+/// the link is explicit ` PP` **or** the destination field is `.PROC`
+/// — lives in the write path
+/// ([`crate::server::database::Database::write_db_link_value`]),
+/// matching C `dbDbPutValue` (`dbDbLink.c:387-390`); it is no longer
+/// encoded as a parse-time policy override. This entry point is
+/// retained as the OUT-link parse boundary named by `dbPutLink`
+/// callers (record `OUT` / dfanout `OUTn` / sseq `LNKn`).
 pub fn parse_output_link_v2(s: &str) -> ParsedLink {
-    let parsed = parse_link_v2(s);
-    if let ParsedLink::Db(ref db) = parsed {
-        if db.policy == LinkProcessPolicy::ProcessPassive
-            && db.field != "PROC"
-            && !link_has_explicit_pp(s)
-        {
-            let mut db = db.clone();
-            db.policy = LinkProcessPolicy::NoProcess;
-            return ParsedLink::Db(db);
-        }
-    }
-    parsed
+    parse_link_v2(s)
 }
 
 /// Determine the [`LinkType`] of a record's string link field directly
@@ -1020,16 +1000,42 @@ mod json_link_tests {
         }
     }
 
-    /// BUG 2 — an OUT link whose destination field is `.PROC` keeps
-    /// `ProcessPassive` even with no `PP` token: C processes the
-    /// target whenever the destination field is `&pdest->proc`.
+    /// A modifier-less OUT link to a `.PROC` field parses to the uniform
+    /// `NoProcess` default like any other bare link; the target-process
+    /// decision for `.PROC` lives in the write path
+    /// (`write_db_link_value`, C `dbDbPutValue` dbDbLink.c:387-390), not
+    /// in a parse-time policy. (Behaviour — that a `.PROC` write still
+    /// processes the target — is covered by the database-level
+    /// `*_proc_out_link_processes_target` test.)
     #[test]
-    fn parse_output_link_proc_field_keeps_process_passive() {
+    fn parse_output_link_proc_field_is_noprocess() {
         match parse_output_link_v2("TARGET.PROC") {
             ParsedLink::Db(db) => {
                 assert_eq!(db.field, "PROC");
-                assert_eq!(db.policy, LinkProcessPolicy::ProcessPassive);
+                assert_eq!(db.policy, LinkProcessPolicy::NoProcess);
             }
+            other => panic!("expected Db link, got {other:?}"),
+        }
+    }
+
+    /// A modifier-less **input** link defaults to NPP (`NoProcess`),
+    /// matching C `dbParseLink` (`dbStaticLib.c:2252` memset→0;
+    /// `pvlOptPP` set only on an explicit ` PP`). A bare INP must NOT
+    /// cause `dbDbGetValue` (`dbDbLink.c:175`) to process the passive
+    /// source on read.
+    #[test]
+    fn parse_input_link_bare_is_noprocess() {
+        match parse_link_v2("SRC.VAL") {
+            ParsedLink::Db(db) => {
+                assert_eq!(db.policy, LinkProcessPolicy::NoProcess);
+                assert_eq!(db.record, "SRC");
+                assert_eq!(db.field, "VAL");
+            }
+            other => panic!("expected Db link, got {other:?}"),
+        }
+        // An explicit ` PP` input link still promotes to ProcessPassive.
+        match parse_link_v2("SRC.VAL PP") {
+            ParsedLink::Db(db) => assert_eq!(db.policy, LinkProcessPolicy::ProcessPassive),
             other => panic!("expected Db link, got {other:?}"),
         }
     }

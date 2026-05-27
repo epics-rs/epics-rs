@@ -342,12 +342,15 @@ fn test_parse_link_v2() {
         ParsedLink::Constant("-1.5".to_string())
     );
 
+    // A modifier-less DB link defaults to NPP (`NoProcess`), matching
+    // C `dbParseLink` (memset→0; `pvlOptPP` only on explicit ` PP`).
+    // Was wrongly `ProcessPassive`.
     assert_eq!(
         parse_link_v2("TEMP"),
         ParsedLink::Db(DbLink {
             record: "TEMP".into(),
             field: "VAL".into(),
-            policy: LinkProcessPolicy::ProcessPassive,
+            policy: LinkProcessPolicy::NoProcess,
             monitor_switch: MonitorSwitch::NoMaximize,
         })
     );
@@ -357,7 +360,7 @@ fn test_parse_link_v2() {
         ParsedLink::Db(DbLink {
             record: "TEMP".into(),
             field: "EGU".into(),
-            policy: LinkProcessPolicy::ProcessPassive,
+            policy: LinkProcessPolicy::NoProcess,
             monitor_switch: MonitorSwitch::NoMaximize,
         })
     );

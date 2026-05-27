@@ -99,20 +99,6 @@ pub(crate) fn multi_output_dispatch_owned(record_type: &str) -> bool {
     matches!(record_type, "fanout" | "dfanout" | "seq" | "sseq")
 }
 
-/// True when a link string carries an explicit `PP` (or `CP`/`CPP`)
-/// process modifier as a whitespace-separated token.
-///
-/// C `dbStaticLib.c` sets the link's process-passive flag (`ln`)
-/// only when the modifier string contains `"PP"`. For a `DBF_OUTLINK`
-/// the absence of `PP` means NPP — `dbDbPutLink` writes the value but
-/// does not process the target. `parse_link_v2` wrongly defaults a
-/// bare link to `ProcessPassive`, so the dfanout dispatch consults
-/// this helper to recover the C-correct NPP-by-default for OUT links.
-fn link_has_explicit_pp(raw: &str) -> bool {
-    raw.split_whitespace()
-        .any(|tok| tok == "PP" || tok == "CP" || tok == "CPP")
-}
-
 impl PvDatabase {
     /// Read a value from a parsed link (DB, Constant, or external Ca/Pva).
     ///
@@ -554,7 +540,17 @@ impl PvDatabase {
         // lock set the chain already owns.
         let _ = self.put_pv_already_locked(&target_name, value).await;
 
-        if link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
+        // C `dbDbPutValue` (`dbDbLink.c:387-390`) processes the target
+        // when the destination field is `.PROC` **or** the link carries
+        // `pvlOptPP` (an explicit ` PP` token → `ProcessPassive`). The
+        // `.PROC` arm is independent of the PP flag, so it is checked
+        // here in the write path rather than encoded as a parse-time
+        // policy: a modifier-less link now defaults to `NoProcess`
+        // uniformly (INPUT and OUTPUT alike), and writing a value into a
+        // record's `.PROC` field still forces a process.
+        if link.field == "PROC"
+            || link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive
+        {
             // Alias-aware lookup: the link's target may be the alias
             // form. `process_record_with_links` itself also resolves
             // aliases at entry, so passing `link.record` raw is safe.
@@ -1056,42 +1052,25 @@ impl PvDatabase {
                         if link_str.is_empty() {
                             continue;
                         }
-                        let parsed = crate::server::record::parse_link_v2(link_str);
+                        // C `dfanoutRecord.c:323` drives each OUTn via
+                        // `dbPutLink` → `dbDbPutValue`: an `DBF_OUTLINK`
+                        // target is processed only when the link carries
+                        // an explicit ` PP` token or the destination is
+                        // `.PROC` (`dbDbLink.c:387-390`). A modifier-less
+                        // OUTn is NPP — the value is written but the
+                        // target is NOT re-processed (otherwise a
+                        // Soft-Channel ai target's `convert()` would
+                        // clobber the value just written). The NPP
+                        // default and the `.PROC`/`PP` processing rule
+                        // are both honoured by `parse_output_link_v2`
+                        // (uniform NoProcess default) +
+                        // `write_db_link_value` (write-path target
+                        // processing), so no per-call downgrade is needed.
+                        let parsed = crate::server::record::parse_output_link_v2(link_str);
                         match parsed {
                             crate::server::record::ParsedLink::Db(ref db) => {
-                                // C `dfanoutRecord.c:323` drives each OUTn
-                                // via `dbPutLink`, whose `DBF_OUTLINK`
-                                // target is processed by `dbDbPutLink`
-                                // only when the link carries an explicit
-                                // `PP` modifier (`dbDbLink.c:415` —
-                                // `pvlMask & ln`). The C default for an
-                                // out-link with no modifier is NPP: the
-                                // value is written but the target is NOT
-                                // processed. `parse_link_v2` defaults a
-                                // bare link to `ProcessPassive`, so
-                                // without this correction a bare `OUTn`
-                                // would re-process the target — and a
-                                // Soft-Channel ai target's `convert()`
-                                // would then clobber the value just
-                                // written. Honour C: process the dfanout
-                                // OUTn target only on an explicit `PP`
-                                // token.
-                                let explicit_pp = link_has_explicit_pp(link_str);
-                                let mut db = db.clone();
-                                if !explicit_pp
-                                    && db.policy
-                                        == crate::server::record::LinkProcessPolicy::ProcessPassive
-                                {
-                                    db.policy = crate::server::record::LinkProcessPolicy::NoProcess;
-                                }
-                                self.write_db_link_value(
-                                    &db,
-                                    val.clone(),
-                                    src_putf,
-                                    visited,
-                                    depth,
-                                )
-                                .await;
+                                self.write_db_link_value(db, val.clone(), src_putf, visited, depth)
+                                    .await;
                             }
                             // External `ca://`/`pva://` OUTn — C
                             // `dbPutLink` routes a CA-link write through

@@ -241,7 +241,10 @@ impl IocShell {
             } else {
                 crate::server::db_loader::substitute_macros(&line, macros)
             };
-            println!("{expanded}");
+            // `#-` silent comments are not echoed (iocsh.cpp:1196-1204).
+            if echoes_script_line(&expanded) {
+                println!("{expanded}");
+            }
             match self.execute_line(&expanded) {
                 Ok(CommandOutcome::Continue) => {}
                 Ok(CommandOutcome::Exit) => {
@@ -276,7 +279,10 @@ impl IocShell {
         for (line_num, line) in join_backslash_continuations(&content) {
             // Echo each logical line (C++ iocsh behavior — continuations
             // are already collapsed so the echo shows the joined line).
-            println!("{line}");
+            // `#-` silent comments are not echoed (iocsh.cpp:1196-1204).
+            if echoes_script_line(&line) {
+                println!("{line}");
+            }
             match self.execute_line(&line) {
                 Ok(CommandOutcome::Continue) => {}
                 Ok(CommandOutcome::Exit) => {
@@ -502,6 +508,16 @@ fn format_error(msg: &str, color: bool) -> String {
     }
 }
 
+/// Whether a script line should be echoed before execution. Mirrors C
+/// iocsh (`iocsh.cpp:1167-1204`): script lines are echoed, except a
+/// *silent comment* delimited with `#-` (after leading whitespace), which
+/// is suppressed. A plain `#` comment is still echoed; only `#-` is quiet.
+/// Both kinds are skipped from execution (`execute_line`), so this gate
+/// affects echoing only.
+fn echoes_script_line(line: &str) -> bool {
+    !line.trim_start().starts_with("#-")
+}
+
 ///
 /// Returns `(physical_line_number, logical_line)` pairs. The line
 /// number is the 1-based index of the *first* physical line in the
@@ -605,6 +621,26 @@ fn parse_redirect(line: &str) -> (&str, Option<Redirect>) {
 mod tests {
     use super::*;
     use crate::server::records::ai::AiRecord;
+
+    /// `#-` silent comments are not echoed; plain `#` comments and
+    /// commands are. Boundary cases: leading whitespace before `#-`, a
+    /// space between `#` and `-` (a plain comment, echoed), and the bare
+    /// `#-` token. Mirrors C iocsh `iocsh.cpp:1167-1204`.
+    #[test]
+    fn echoes_script_line_suppresses_only_hash_dash() {
+        // Silent comments — not echoed.
+        assert!(!echoes_script_line("#-"));
+        assert!(!echoes_script_line("#- a quiet note"));
+        assert!(!echoes_script_line("#-nospace"));
+        assert!(!echoes_script_line("   #- leading whitespace"));
+        // Plain comments — echoed.
+        assert!(echoes_script_line("#"));
+        assert!(echoes_script_line("# normal comment"));
+        assert!(echoes_script_line("# -space after hash"));
+        // Commands and blanks — echoed (unchanged behaviour).
+        assert!(echoes_script_line("dbLoadRecords(\"x.db\")"));
+        assert!(echoes_script_line(""));
+    }
 
     fn make_shell() -> IocShell {
         let rt = tokio::runtime::Runtime::new().unwrap();

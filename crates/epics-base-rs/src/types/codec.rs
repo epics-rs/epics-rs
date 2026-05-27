@@ -889,6 +889,25 @@ pub fn decode_dbr(dbr_type: u16, data: &[u8], count: usize) -> CaResult<Snapshot
         return Ok(snap);
     }
     let native = super::native_type_for_dbr(dbr_type)?;
+    // Guard a truncated metadata-prefixed payload before any decode_*
+    // helper slices `&data[meta..]`. `dbr_meta_size` is the exact count
+    // of metadata bytes preceding `value[0]` for this (type, native) — it
+    // equals the offset `decode_sts` / `decode_time` / `decode_gr_ctrl`
+    // advance to (including the latter's unconditional `off`-advancing
+    // loops), so this single check makes every value-slice site in-bounds.
+    // A short frame is a malformed/hostile CA payload, not a partial
+    // result: return `Protocol` rather than panicking with a
+    // slice-out-of-bounds (a remotely-triggerable client DoS on the
+    // monitor and GET-metadata decode paths). C casts the struct unchecked
+    // (heap over-read UB); we reject. For plain values (0..=6) the size is
+    // 0, so this is a no-op and `from_bytes_array` handles its own sizing.
+    let meta = dbr_meta_size(dbr_type, native);
+    if data.len() < meta {
+        return Err(CaError::Protocol(format!(
+            "DBR type {dbr_type} requires at least {meta} metadata bytes, got {}",
+            data.len()
+        )));
+    }
     match dbr_type {
         0..=6 => {
             let value = EpicsValue::from_bytes_array(native, data, count)?;
@@ -1156,9 +1175,52 @@ fn decode_enum_metadata(data: &[u8], off: usize) -> CaResult<(EnumInfo, usize)> 
 mod wire_format_tests {
     use super::*;
     use crate::types::dbr::{
-        DBR_CTRL_DOUBLE, DBR_DOUBLE, DBR_GR_DOUBLE, DBR_STS_DOUBLE, DBR_TIME_DOUBLE,
-        dbr_buffer_size,
+        DBR_CTRL_CHAR, DBR_CTRL_DOUBLE, DBR_DOUBLE, DBR_GR_DOUBLE, DBR_GR_ENUM, DBR_STS_CHAR,
+        DBR_STS_DOUBLE, DBR_TIME_DOUBLE, dbr_buffer_size, native_type_for_dbr,
     };
+
+    /// A truncated metadata-prefixed DBR payload must return `Err`, never
+    /// panic with a slice-out-of-bounds. Pre-fix `decode_sts` /
+    /// `decode_time` / `decode_gr_ctrl` sliced `&data[meta..]` after
+    /// proving only `data.len() >= 4`/`>= 12`, so a short frame from the
+    /// monitor / GET-metadata paths panicked — a remotely-triggerable
+    /// client DoS. Boundary per metadata category: exactly
+    /// `dbr_meta_size - 1` bytes is the largest payload that still must be
+    /// rejected; a full metadata payload still decodes.
+    #[test]
+    fn decode_dbr_truncated_metadata_rejected_not_panic() {
+        // One representative per metadata category (STS pad, TIME pad,
+        // GR enum-string region, CTRL char limits) plus the cited
+        // STS_DOUBLE / STS_CHAR / TIME_DOUBLE cases.
+        for dbr_type in [
+            DBR_STS_DOUBLE,
+            DBR_STS_CHAR,
+            DBR_TIME_DOUBLE,
+            DBR_GR_ENUM,
+            DBR_CTRL_CHAR,
+        ] {
+            let native = native_type_for_dbr(dbr_type).unwrap();
+            let meta = dbr_meta_size(dbr_type, native);
+            assert!(meta >= 1, "metadata types have a non-zero prefix");
+
+            // Every length in [0, meta) must be rejected (not panic).
+            for len in [0usize, meta - 1] {
+                let truncated = vec![0u8; len];
+                let r = decode_dbr(dbr_type, &truncated, 1);
+                assert!(
+                    matches!(r, Err(CaError::Protocol(_))),
+                    "dbr_type {dbr_type}: {len}-byte payload (meta={meta}) must be Protocol Err, got {r:?}"
+                );
+            }
+
+            // A full metadata + value payload still decodes.
+            let full = vec![0u8; meta + 64];
+            assert!(
+                decode_dbr(dbr_type, &full, 1).is_ok(),
+                "dbr_type {dbr_type}: full meta+value payload must decode"
+            );
+        }
+    }
 
     /// Structural invariant: the encoded DBR length must equal
     /// `dbr_buffer_size` for every (dbr_type, native, count). This pins

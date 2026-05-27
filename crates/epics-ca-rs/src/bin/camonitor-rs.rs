@@ -333,7 +333,13 @@ async fn monitor_pv(
     });
 
     // CA-FR-4: honour `-m <msk>` via the caller-resolved DBE_* mask.
-    let Ok(mut monitor) = channel.subscribe_with_mask(0.0, mask).await else {
+    // C `camonitor.c:156-160` requests DBR_TIME_STRING for an ENUM field
+    // unless `-n`, so the monitor delivers state labels by default.
+    let enum_as_string = !fmt.enum_as_number;
+    let Ok(mut monitor) = channel
+        .subscribe_with_mask_enum_as_string(0.0, mask, enum_as_string)
+        .await
+    else {
         return;
     };
     while let Some(result) = monitor.recv().await {

@@ -24,9 +24,38 @@ use crate::protocol::*;
 use crate::repeater;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
-use epics_base_rs::types::{DbFieldType, EpicsValue, decode_dbr};
+use epics_base_rs::types::{DBR_STRING, DBR_TIME_STRING, DbFieldType, EpicsValue, decode_dbr};
 
 pub use state::{ChannelState, ConnectionEvent};
+
+/// DBR type code to request for an ENUM field's *default* readback,
+/// mirroring the C CLI tools (`caget.c:177-182`, `camonitor.c:156-160`,
+/// `caput.c:147-151`): with `enum_as_string` set (the tool default for
+/// ENUM fields, off under `-n` and for the native library API), an ENUM
+/// field is read back in its STRING form so the value renders as the
+/// state label rather than the numeric index. `want_time` selects the
+/// TIME-class string (`DBR_TIME_STRING`, carrying timestamp + alarm, for
+/// `caget -a` / `camonitor` / `caput -l`) over the plain string
+/// (`DBR_STRING`, value only).
+///
+/// Returns `None` for non-ENUM fields and when `enum_as_string` is unset
+/// — the caller then keeps its native-type path (the plain library
+/// subscribe, and any field that already renders meaningfully).
+pub fn enum_string_readback_dbr(
+    native: DbFieldType,
+    want_time: bool,
+    enum_as_string: bool,
+) -> Option<u16> {
+    if enum_as_string && matches!(native, DbFieldType::Enum) {
+        Some(if want_time {
+            DBR_TIME_STRING
+        } else {
+            DBR_STRING
+        })
+    } else {
+        None
+    }
+}
 
 use state::ChannelInner;
 
@@ -313,6 +342,13 @@ enum CoordRequest {
         deadband: f64,
         callback_tx: mpsc::Sender<CaResult<Snapshot>>,
         coalesce_slot: std::sync::Arc<subscription::CoalesceSlot>,
+        /// When set, an ENUM field is subscribed in its `DBR_TIME_STRING`
+        /// form so monitor values arrive as state labels (the `camonitor`
+        /// default; C `camonitor.c:156-160`). The plain library subscribe
+        /// passes `false` to keep the native ENUM type. Applied by the
+        /// coordinator at connect-time type derivation, so it works even
+        /// though the subscribe is issued before the channel connects.
+        enum_as_string: bool,
         /// CA-FR-2: the coordinator owns the `subid` table, so it
         /// allocates the id (probing live subscriptions) and returns
         /// it here rather than accepting one minted at the call site.
@@ -1888,6 +1924,15 @@ impl CaChannel {
             .collect()
     }
 
+    /// The channel's native field type, known once connected. Mirrors
+    /// libca `ca_field_type(chid)` — the CLI tools read it after connect
+    /// to decide the readback DBR type (e.g. ENUM → STRING by default,
+    /// see [`enum_string_readback_dbr`]). Returns `Err(Disconnected)`
+    /// before the channel is operational.
+    pub fn native_field_type(&self) -> CaResult<DbFieldType> {
+        Ok(self.snapshot()?.native_type)
+    }
+
     pub async fn get_with_timeout(&self, timeout: Duration) -> CaResult<(DbFieldType, EpicsValue)> {
         let snap = self.snapshot()?;
 
@@ -2245,7 +2290,28 @@ impl CaChannel {
     /// is non-zero, so e.g. `DBE_ALARM` alone delivers only alarm
     /// transitions. `deadband` applies client-side deadband filtering as
     /// in [`Self::subscribe_with_deadband`].
+    ///
+    /// ENUM fields are monitored in their native type (numeric index).
+    /// For the `camonitor` state-label default use
+    /// [`Self::subscribe_with_mask_enum_as_string`].
     pub async fn subscribe_with_mask(&self, deadband: f64, mask: u16) -> CaResult<MonitorHandle> {
+        self.subscribe_with_mask_enum_as_string(deadband, mask, false)
+            .await
+    }
+
+    /// Like [`Self::subscribe_with_mask`], but when `enum_as_string` is
+    /// set an ENUM field is monitored in its `DBR_TIME_STRING` form so
+    /// values arrive as state labels — the `camonitor` default (C
+    /// `camonitor.c:156-160`, which requests `DBR_TIME_STRING` for enums
+    /// unless `-n`). The substitution is applied by the coordinator at
+    /// connect-time type derivation (and re-applied on reconnect), so it
+    /// holds even though the subscribe is issued before connect.
+    pub async fn subscribe_with_mask_enum_as_string(
+        &self,
+        deadband: f64,
+        mask: u16,
+        enum_as_string: bool,
+    ) -> CaResult<MonitorHandle> {
         let env = epics_base_rs::runtime::env::get("EPICS_CA_MONITOR_QUEUE")
             .and_then(|s| s.parse::<usize>().ok());
         let queue_size = resolve_monitor_queue_size(env);
@@ -2259,6 +2325,7 @@ impl CaChannel {
             deadband,
             callback_tx,
             coalesce_slot: coalesce_slot.clone(),
+            enum_as_string,
             reply: reply_tx,
         });
 
@@ -2683,7 +2750,7 @@ async fn run_coordinator(
                                 .push(reply);
                         }
                     }
-                    CoordRequest::Subscribe { cid, mask, deadband, callback_tx, coalesce_slot, reply } => {
+                    CoordRequest::Subscribe { cid, mask, deadband, callback_tx, coalesce_slot, enum_as_string, reply } => {
                         if let Some(ch) = channels.get(&cid) {
                             let server_addr = ch.server_addr.unwrap_or_else(|| {
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
@@ -2692,7 +2759,13 @@ async fn run_coordinator(
                             let connected = ch.state == ChannelState::Connected;
                             // `time_dbr_type()` (not `as u16 + 14`) for
                             // consistency with the rest of the codebase.
-                            let data_type = ch.native_type.map(|t| t.time_dbr_type());
+                            // `enum_as_string` (camonitor default) substitutes
+                            // DBR_TIME_STRING for an ENUM field so values
+                            // arrive as state labels (C camonitor.c:156-160).
+                            let data_type = ch.native_type.map(|t| {
+                                enum_string_readback_dbr(t, true, enum_as_string)
+                                    .unwrap_or_else(|| t.time_dbr_type())
+                            });
                             let count = ch.native_type.map(|_| ch.element_count);
 
                             // CA-FR-2: allocate the subid here, where the
@@ -2708,10 +2781,13 @@ async fn run_coordinator(
                                 data_type,
                                 count,
                                 // The public subscribe API auto-derives the
-                                // DBR type from the channel's native type;
-                                // no user-chosen type path exists yet, so
-                                // these must re-derive on NativeTypeChanged.
+                                // DBR type from the channel's native type, so
+                                // it must re-derive on NativeTypeChanged. The
+                                // `enum_as_string` preference is carried on
+                                // the record so the restore re-derivation
+                                // applies the same ENUM→STRING substitution.
                                 type_user_supplied: false,
+                                enum_as_string,
                                 mask,
                                 server_addr,
                                 priority,
@@ -3967,6 +4043,49 @@ fn append_auto_addr_entries(addrs: &mut Vec<AddrEntry>, bcasts: &[Ipv4Addr], ser
     let fallback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, server_port));
     if !addrs.iter().any(|e| e.sock == fallback) {
         addrs.push(AddrEntry::new(fallback, None, server_port));
+    }
+}
+
+#[cfg(test)]
+mod enum_readback_tests {
+    use super::*;
+
+    // A5-R2-1: the readback-type rule for the CLI tools. Covered by
+    // invariant boundary (ENUM vs not × want_time × enum_as_string),
+    // not by per-tool scenario.
+    #[test]
+    fn enum_string_when_opted_in() {
+        // ENUM + opt-in → STRING form; TIME class iff want_time.
+        assert_eq!(
+            enum_string_readback_dbr(DbFieldType::Enum, true, true),
+            Some(DBR_TIME_STRING)
+        );
+        assert_eq!(
+            enum_string_readback_dbr(DbFieldType::Enum, false, true),
+            Some(DBR_STRING)
+        );
+    }
+
+    #[test]
+    fn native_when_opted_out_or_not_enum() {
+        // ENUM but `-n` / library default → keep native (None).
+        assert_eq!(
+            enum_string_readback_dbr(DbFieldType::Enum, true, false),
+            None
+        );
+        assert_eq!(
+            enum_string_readback_dbr(DbFieldType::Enum, false, false),
+            None
+        );
+        // Non-ENUM fields are never substituted, even when opted in.
+        assert_eq!(
+            enum_string_readback_dbr(DbFieldType::Double, true, true),
+            None
+        );
+        assert_eq!(
+            enum_string_readback_dbr(DbFieldType::Long, false, true),
+            None
+        );
     }
 }
 

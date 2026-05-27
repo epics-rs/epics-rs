@@ -16,10 +16,11 @@
 
 use std::time::Duration;
 
+use epics_base_rs::server::records::bi::BiRecord;
 use epics_base_rs::server::records::stringin::StringinRecord;
 use epics_base_rs::server::records::waveform::WaveformRecord;
 use epics_base_rs::types::{
-    DBR_CHAR, DBR_CLASS_NAME, DBR_TIME_DOUBLE, DBR_TIME_FLOAT, DbFieldType,
+    DBR_CHAR, DBR_CLASS_NAME, DBR_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT, DbFieldType,
 };
 use epics_ca_rs::EpicsValue;
 use epics_ca_rs::client::CaClient;
@@ -76,6 +77,127 @@ async fn server_with_double_waveform(
         .await
         .expect("seed waveform");
     (client, ch)
+}
+
+/// Bring up a server holding one `bi` record with the given VAL index
+/// and ZNAM/ONAM state labels, returning a connected client channel.
+async fn server_with_bi(
+    pv: &'static str,
+    val: u16,
+    znam: &str,
+    onam: &str,
+) -> (CaClient, epics_ca_rs::client::CaChannel) {
+    let port = free_port();
+    let mut rec = BiRecord::new(val);
+    rec.znam = znam.to_string();
+    rec.onam = onam.to_string();
+    let server = CaServer::builder()
+        .port(port)
+        .record(pv, rec)
+        .build()
+        .await
+        .expect("build CA server");
+    let _h = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    point_client_at(port);
+    let client = CaClient::new().await.expect("client");
+    let ch = client.create_channel(pv);
+    ch.wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect");
+    (client, ch)
+}
+
+/// A5-R2-1 (caget default): the readback type the default `caget`
+/// front-end now issues for an ENUM field — `DBR_STRING` — must return
+/// the state LABEL, not the numeric index (C `caget.c:178-181`,
+/// server-side R58 `getEnumString`). `bi` VAL=1 with ONAM="On" → "On".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn enum_default_readback_is_state_label() {
+    let (_client, ch) = server_with_bi("A5R2:BI:LBL", 1, "Off", "On").await;
+
+    // What the default (no -d, no -n) caget path requests for an enum.
+    let snap = ch
+        .get_with_dbr_type(DBR_STRING, 0)
+        .await
+        .expect("DBR_STRING get on enum");
+    assert_eq!(
+        snap.value,
+        EpicsValue::String("On".to_string()),
+        "default enum readback must be the state label, not the index"
+    );
+}
+
+/// A5-R2-1 (caget -n): the `-n` (enum-as-number) path keeps the native
+/// type, so the value is the numeric ENUM index — the `caget -n`
+/// behaviour (C `enumAsNr` → `DBR_TIME_INT`). Proves the fix is opt-out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn enum_native_readback_is_numeric_index() {
+    let (_client, ch) = server_with_bi("A5R2:BI:NUM", 1, "Off", "On").await;
+
+    // The native GET is what `-n` / the plain library API uses.
+    let (dbf, value) = ch
+        .get_with_timeout(Duration::from_secs(3))
+        .await
+        .expect("native get");
+    assert_eq!(dbf, DbFieldType::Enum, "native field type is ENUM");
+    assert_eq!(
+        value,
+        EpicsValue::Enum(1),
+        "native enum readback must be the numeric index"
+    );
+}
+
+/// A5-R2-1 (camonitor default): `subscribe_with_mask_enum_as_string(.., true)`
+/// — the `camonitor` default — must deliver the ENUM value as its state
+/// LABEL string (C `camonitor.c:156-160` requests `DBR_TIME_STRING`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn enum_monitor_as_string_delivers_label() {
+    let (_client, ch) = server_with_bi("A5R2:BI:MONS", 1, "Off", "On").await;
+
+    let mut mon = ch
+        .subscribe_with_mask_enum_as_string(0.0, epics_ca_rs::protocol::DBE_VALUE, true)
+        .await
+        .expect("subscribe enum-as-string");
+    let snap = tokio::time::timeout(Duration::from_secs(3), mon.recv())
+        .await
+        .expect("monitor event within timeout")
+        .expect("monitor stream open")
+        .expect("monitor snapshot");
+    assert_eq!(
+        snap.value,
+        EpicsValue::String("On".to_string()),
+        "camonitor default must deliver the state label"
+    );
+}
+
+/// A5-R2-1 (library subscribe): the plain `subscribe_with_mask` keeps the
+/// native ENUM type — the opt-in flag is OFF, so existing library and
+/// gateway consumers still receive numeric enum indices (no silent
+/// behaviour change).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn enum_monitor_native_delivers_index() {
+    let (_client, ch) = server_with_bi("A5R2:BI:MONN", 1, "Off", "On").await;
+
+    let mut mon = ch
+        .subscribe_with_mask(0.0, epics_ca_rs::protocol::DBE_VALUE)
+        .await
+        .expect("subscribe native");
+    let snap = tokio::time::timeout(Duration::from_secs(3), mon.recv())
+        .await
+        .expect("monitor event within timeout")
+        .expect("monitor stream open")
+        .expect("monitor snapshot");
+    assert_eq!(
+        snap.value,
+        EpicsValue::Enum(1),
+        "plain library subscribe must keep the native numeric enum"
+    );
 }
 
 /// CA-FR-4 (1/2): a DOUBLE PV read with `-d DBR_TIME_FLOAT` returns a

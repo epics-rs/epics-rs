@@ -3,7 +3,7 @@ use clap::Parser;
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_ca_rs::CaError;
 use epics_ca_rs::cli::{PV_NAME_WIDTH, ValueFormat, format_value};
-use epics_ca_rs::client::CaClient;
+use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
 use std::time::SystemTime;
 
 fn format_server_timestamp(ts: SystemTime) -> String {
@@ -190,33 +190,54 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Determine the channel's native type. Long mode also wants the
-    // server timestamp + alarm pair captured BEFORE the put so the
-    // `Old :` line reflects the actual pre-put state — the regular
-    // path stays on the cheaper plain GET.
-    let (native_type, old_value, old_snap) = if args.long_mode {
-        match ch.get_with_metadata(DbrClass::Time).await {
-            Ok(snap) => (snap.value.dbr_type(), snap.value.clone(), Some(snap)),
-            Err(CaError::Timeout) => {
-                eprintln!("Read operation timed out: PV data was not read.");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
+    // The channel's native field type drives how the value to WRITE is
+    // encoded (C `ca_field_type`, caput.c:143) — it must stay the real
+    // native type even when the readback below is taken in STRING form.
+    let native_type = match ch.native_field_type() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
         }
-    } else {
-        match ch.get_with_timeout(timeout).await {
-            Ok((t, v)) => (t, v, None),
-            Err(CaError::Timeout) => {
-                eprintln!("Read operation timed out: PV data was not read.");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
+    };
+    // C caput.c:147-152: the readback (the `Old :`/`New :` display) is
+    // requested in the STRING form for an ENUM field unless `-n`, so the
+    // echoed value is the state label, not the index. `-l` keeps the
+    // TIME-class string so the timestamp + alarm line is still populated.
+    let enum_dbr = enum_string_readback_dbr(native_type, args.long_mode, !args.force_numeric);
+
+    // Read the pre-put value for the `Old :` display. Long mode also
+    // wants the server timestamp + alarm pair captured BEFORE the put so
+    // the `Old :` line reflects the actual pre-put state — the regular
+    // path stays on the cheaper plain GET.
+    let long_mode = args.long_mode;
+    let read_display = move |ch: CaChannel| async move {
+        match (long_mode, enum_dbr) {
+            // Long mode + ENUM default: DBR_TIME_STRING (label + ts/alarm).
+            (true, Some(rt)) => ch
+                .get_with_dbr_type(rt, 0)
+                .await
+                .map(|s| (s.value.clone(), Some(s))),
+            // Long mode, other fields: native DBR_TIME class.
+            (true, None) => ch
+                .get_with_metadata(DbrClass::Time)
+                .await
+                .map(|s| (s.value.clone(), Some(s))),
+            // Plain + ENUM default: DBR_STRING (label only).
+            (false, Some(rt)) => ch.get_with_dbr_type(rt, 0).await.map(|s| (s.value, None)),
+            // Plain, other fields: native plain GET.
+            (false, None) => ch.get_with_timeout(timeout).await.map(|(_t, v)| (v, None)),
+        }
+    };
+    let (old_value, old_snap) = match read_display(ch.clone()).await {
+        Ok(pair) => pair,
+        Err(CaError::Timeout) => {
+            eprintln!("Read operation timed out: PV data was not read.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
         }
     };
 
@@ -271,22 +292,14 @@ async fn main() {
     }
 
     // Re-read for echoing to stdout (matches C caput which always
-    // reads the PV back after the put). `echo_fallback` is the value
-    // shown if the post-put read fails — just what was written.
+    // reads the PV back after the put, caput.c:583). Same readback type
+    // selection as the `Old :` read above, so an ENUM `New :` value also
+    // echoes as the state label. `echo_fallback` is shown if the post-put
+    // read fails — just what was written.
     let echo_fallback = parsed_value.echo_fallback();
-    let (new_value, new_snap) = if args.long_mode {
-        match ch.get_with_metadata(DbrClass::Time).await {
-            Ok(snap) => (snap.value.clone(), Some(snap)),
-            Err(_) => (echo_fallback.clone(), None),
-        }
-    } else {
-        (
-            match ch.get_with_timeout(timeout).await {
-                Ok((_, val)) => val,
-                Err(_) => echo_fallback.clone(),
-            },
-            None,
-        )
+    let (new_value, new_snap) = match read_display(ch.clone()).await {
+        Ok(pair) => pair,
+        Err(_) => (echo_fallback.clone(), None),
     };
 
     let mut fmt = ValueFormat::default();

@@ -263,6 +263,12 @@ pub(crate) struct SubscriptionRecord {
     /// reports `NativeTypeChanged` on reconnect); user-supplied values
     /// are preserved across reconnects. See `restore_for_channel`.
     pub type_user_supplied: bool,
+    /// `camonitor` ENUM-as-state-label preference. When `true`, an ENUM
+    /// field's auto-derived monitor type is the `DBR_TIME_STRING` form
+    /// (C `camonitor.c:156-160`). Carried here so the reconnect
+    /// re-derivation in `restore_for_channel` re-applies the same
+    /// ENUM→STRING substitution against the (possibly new) native type.
+    pub enum_as_string: bool,
     pub mask: u16,
     pub server_addr: SocketAddr,
     /// CA-FR-3: the CA priority of the channel this subscription rides.
@@ -528,10 +534,18 @@ impl SubscriptionRegistry {
                     rec.data_type = None;
                     rec.count = None;
                 }
-                // native_type is the server-reported CA wire type (0..6),
-                // so `+ 14` always lands in the DBR_TIME range; Int64 (7)
-                // cannot reach here.
-                let data_type = *rec.data_type.get_or_insert(native_type + 14);
+                // Re-derive the DBR type from the fresh native type. The
+                // `enum_as_string` (camonitor) preference re-applies the
+                // ENUM→STRING substitution (C camonitor.c:156-160) so an
+                // ENUM monitor keeps delivering state labels across
+                // reconnects. native_type is the server-reported CA wire
+                // type (0..6), so the non-ENUM fallback `+ 14` always
+                // lands in the DBR_TIME range; Int64 (7) cannot reach here.
+                let derived = DbFieldType::from_u16(native_type)
+                    .ok()
+                    .and_then(|t| super::enum_string_readback_dbr(t, true, rec.enum_as_string))
+                    .unwrap_or(native_type + 14);
+                let data_type = *rec.data_type.get_or_insert(derived);
                 let count = *rec.count.get_or_insert(element_count);
                 let _ = transport_tx.send(TransportCommand::Subscribe {
                     sid: new_sid,
@@ -651,6 +665,7 @@ mod tests {
             data_type: None,
             count: None,
             type_user_supplied,
+            enum_as_string: false,
             mask: 1,
             server_addr: addr(),
             priority: 0,
@@ -767,6 +782,7 @@ mod tests {
             data_type: Some(DBR_TIME_LONG),
             count: Some(1),
             type_user_supplied: true,
+            enum_as_string: false,
             mask: 1,
             server_addr: addr(),
             priority: 0,

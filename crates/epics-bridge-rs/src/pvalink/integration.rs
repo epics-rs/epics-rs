@@ -1207,6 +1207,26 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
     match field {
         PvField::Scalar(sv) => Some(scalar_to_epics(sv)),
         PvField::Structure(s) => {
+            // NTEnum (pvxs `pvalink_lset.cpp:331`, gated on
+            // `value.id()=="enum_t"`): the value lives in the `index`
+            // int of the `enum_t` sub-structure, never a `value`
+            // scalar. The generic `value`-child collapse below would
+            // recurse into the `enum_t` struct, find no `value` child,
+            // and return `None` — leaving a record with a bare
+            // `pva://enumPV` INP (the default `field="value"`) stuck
+            // LINK/INVALID. Mirror pvxs `pvaGetValue`: read
+            // `value["index"]` as the enum index. The recursion reaches
+            // the `enum_t` struct here as its own `Structure` arm, so
+            // the check is uniform whether the caller hands us the NT
+            // wrapper or the `enum_t` directly.
+            if s.struct_id == "enum_t" {
+                if let Some(PvField::Scalar(sv)) = s.get_field("index") {
+                    return Some(match scalar_to_epics(sv) {
+                        EpicsValue::Enum(v) => EpicsValue::Enum(v),
+                        other => EpicsValue::Enum(other.to_f64().map(|f| f as u16).unwrap_or(0)),
+                    });
+                }
+            }
             for (name, sub) in &s.fields {
                 if name == "value" {
                     return pvfield_to_epics_value(sub);
@@ -1461,6 +1481,46 @@ mod tests {
         // a remote PVA `long` is 64-bit — it now maps to
         // `EpicsValue::Int64`, not a truncated `EpicsValue::Long`.
         assert_eq!(pvfield_to_epics_value(&f), Some(EpicsValue::Int64(42)));
+    }
+
+    #[test]
+    fn pvfield_ntenum_extracts_index() {
+        use epics_pva_rs::pvdata::PvStructure;
+        // An NTEnum's `value` child is an `enum_t` carrying the choice
+        // in its `index` int, with no `value` scalar of its own. A bare
+        // `pva://enumPV` INP (default `field="value"`) lands here.
+        // Before the enum_t branch the generic value-collapse recursed
+        // into `enum_t`, found no `value`, and returned `None` →
+        // record LINK/INVALID. pvxs `pvaGetValue` reads `value["index"]`.
+        let mut enum_t = PvStructure::new("enum_t");
+        enum_t
+            .fields
+            .push(("index".into(), PvField::Scalar(ScalarValue::Int(2))));
+        enum_t.fields.push((
+            "choices".into(),
+            PvField::ScalarArray(vec![
+                ScalarValue::String("Off".into()),
+                ScalarValue::String("On".into()),
+                ScalarValue::String("Reset".into()),
+            ]),
+        ));
+        let mut nt = PvStructure::new("epics:nt/NTEnum:1.0");
+        nt.fields.push(("value".into(), PvField::Structure(enum_t)));
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::Structure(nt)),
+            Some(EpicsValue::Enum(2))
+        );
+    }
+
+    #[test]
+    fn pvfield_non_enum_struct_without_value_is_none() {
+        use epics_pva_rs::pvdata::PvStructure;
+        // A non-`enum_t` struct lacking a `value` child still returns
+        // `None` — the enum_t branch must not change the fallback.
+        let mut s = PvStructure::new("epics:nt/NTTable:1.0");
+        s.fields
+            .push(("labels".into(), PvField::Scalar(ScalarValue::Int(1))));
+        assert_eq!(pvfield_to_epics_value(&PvField::Structure(s)), None);
     }
 
     /// string / float / short / char / typed-array shapes the

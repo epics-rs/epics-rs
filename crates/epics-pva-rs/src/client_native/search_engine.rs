@@ -29,7 +29,7 @@ use epics_base_rs::net::AsyncUdpV4;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::interval;
+use tokio::time::{Interval, interval};
 use tracing::{debug, warn};
 
 use crate::codec::PvaCodec;
@@ -675,6 +675,13 @@ struct Pending {
 /// second instead of letting every channel fire on its own backoff.
 const N_SEARCH_BUCKETS: usize = 30;
 
+/// pvxs `pokeHoldoff` (client.cpp:60): global minimum interval between two
+/// fast-search pokes. A beacon-driven poke is ignored unless at least this
+/// long has elapsed since the last granted poke, so a site-wide IOC reboot
+/// (many fresh `(server, guid)` beacons at once) cannot drive a sustained
+/// amplified UDP search-broadcast storm.
+const POKE_HOLDOFF: Duration = Duration::from_secs(30);
+
 /// Decide which bucket to drop a fresh search into based on the
 /// caller's intent. Pure function so the production handlers and
 /// the unit tests share the formula and can't drift apart.
@@ -781,6 +788,10 @@ async fn run_engine(
     // searches retry within 6 s instead of up to 30 s. Counter
     // decrements per fast tick; reaches 0 → revert to 1 s cadence.
     let mut fast_ticks_remaining: u32 = 0;
+    // Wall-clock of the last GRANTED poke (pvxs `lastPoke`, client.cpp:750).
+    // `None` = never poked, so the first poke is always allowed. Gates the
+    // `POKE_HOLDOFF` rate limit inside `maybe_poke`.
+    let mut last_poke: Option<Instant> = None;
     // (server, guid) pairs already announced via discover(). pvxs's
     // discover() fires Online once per new server identity; tracker
     // uses different (reconnect-throttle) semantics so we de-dup here.
@@ -959,33 +970,30 @@ async fn run_engine(
                     // Without the `first_announce` gate every periodic
                     // beacon would needlessly bring forward every pending
                     // search's retry deadline.
-                    if allow_reconnect && first_announce {
-                        // pvxs `poke()` (client.cpp:713). Switch the tick
-                        // ring to 200 ms cadence for one full revolution
-                        // (30 ticks ≈ 6 s) so every pending search retries
-                        // quickly without permanently spamming the net.
-                        if fast_ticks_remaining == 0 {
-                            tick = interval(Duration::from_millis(200));
-                            tick.tick().await; // skip immediate fire
-                        }
-                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
+                    // pvxs `poke()` (client.cpp:736-759): kick pending
+                    // searches only when the server identity is fresh AND
+                    // `maybe_poke` grants (not already poking, past the 30 s
+                    // holdoff). When granted it switches the tick ring to the
+                    // 200 ms fast cadence for one full revolution.
+                    if allow_reconnect
+                        && first_announce
+                        && maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await
+                    {
+                        let now = Instant::now();
                         for p in pending.values_mut() {
-                            p.last_attempt = Instant::now() - Duration::from_secs(60);
-                            // Reset `attempt` so the kicked retry
-                            // re-enters at the 1-bucket forward push
-                            // instead of inheriting the prior
-                            // escalation. NOTE: this is MORE aggressive
-                            // than pvxs `tickSearch` line 1194
-                            // (`if !poked`), which skips the nSearch
-                            // increment for one tick (search re-pushed
-                            // to SAME bucket). Our reset-to-0 means
-                            // post-poke retries cascade at the normal
-                            // 1, 2, 3, … bucket-forward pattern from
-                            // scratch, giving rapid retransmits during
-                            // the fast-tick window. Acceptable trade
-                            // for single-channel recovery; under
-                            // mass-disconnect cascades it spends more
-                            // UDP bandwidth than pvxs would.
+                            p.last_attempt = now - Duration::from_secs(60);
+                            // Reset `attempt` so the kicked retry re-enters at
+                            // the 1-bucket forward push instead of inheriting
+                            // the prior escalation. NOTE: this is MORE
+                            // aggressive than pvxs `tickSearch` line 1194
+                            // (`if !poked`), which skips the nSearch increment
+                            // for one tick (search re-pushed to SAME bucket).
+                            // Our reset-to-0 means post-poke retries cascade at
+                            // the normal 1, 2, 3, … bucket-forward pattern from
+                            // scratch, giving rapid retransmits during the
+                            // fast-tick window. Acceptable trade for single-
+                            // channel recovery; under mass-disconnect cascades
+                            // it spends more UDP bandwidth than pvxs would.
                             p.attempt = 0;
                         }
                     }
@@ -1011,24 +1019,23 @@ async fn run_engine(
                     let _ = responder.send(rx);
                 }
                 Some(SearchCommand::HurryUp) => {
-                    // Same effect as a fresh-server beacon: switch to
-                    // fast-tick mode for one revolution and reset
-                    // every pending search's retry counter so they
-                    // all retry within ~6 s. SEE NOTE in the
-                    // BeaconObserved arm above — our `attempt = 0`
-                    // reset is more aggressive than pvxs's `poked`
-                    // semantic (which preserves nSearch and just
-                    // skips the increment for one tick). Tradeoff is
+                    // Same effect as a fresh-server beacon, routed through the
+                    // rate-limited `maybe_poke`. pvxs `hurryUp()` calls the
+                    // same `poke()`, so it is equally subject to the 30 s
+                    // holdoff and the skip-while-active guard (poke() even
+                    // logs "Ignoring hurryUp()" when it declines). On grant,
+                    // reset every pending search's retry counter so they all
+                    // retry within ~6 s. SEE NOTE in the BeaconObserved arm
+                    // above — our `attempt = 0` reset is more aggressive than
+                    // pvxs's `poked` semantic (which preserves nSearch and
+                    // just skips the increment for one tick). Tradeoff is
                     // documented there.
-                    if fast_ticks_remaining == 0 {
-                        tick = interval(Duration::from_millis(200));
-                        tick.tick().await;
-                    }
-                    fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
-                    let now = Instant::now();
-                    for p in pending.values_mut() {
-                        p.last_attempt = now - Duration::from_secs(60);
-                        p.attempt = 0;
+                    if maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await {
+                        let now = Instant::now();
+                        for p in pending.values_mut() {
+                            p.last_attempt = now - Duration::from_secs(60);
+                            p.attempt = 0;
+                        }
                     }
                 }
                 Some(SearchCommand::CacheClear { pv_name }) => {
@@ -1086,12 +1093,10 @@ async fn run_engine(
                         }
                         pos = pos.saturating_add(consumed);
                     }
-                    if poke && fast_ticks_remaining == 0 {
-                        tick = interval(Duration::from_millis(200));
-                        tick.tick().await;
-                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
-                    } else if poke {
-                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
+                    if poke {
+                        // pvxs `poke()` (client.cpp:736-759): rate-limited.
+                        // Never extends a revolution already in flight.
+                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
                     }
                 }
             }
@@ -1114,12 +1119,10 @@ async fn run_engine(
                         }
                         pos = pos.saturating_add(consumed);
                     }
-                    if poke && fast_ticks_remaining == 0 {
-                        tick = interval(Duration::from_millis(200));
-                        tick.tick().await;
-                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
-                    } else if poke {
-                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
+                    if poke {
+                        // pvxs `poke()` (client.cpp:736-759): rate-limited.
+                        // Never extends a revolution already in flight.
+                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
                     }
                 }
             }
@@ -1141,13 +1144,10 @@ async fn run_engine(
                         }
                         pos = pos.saturating_add(consumed);
                     }
-                    if poke && fast_ticks_remaining == 0 {
-                        tick = interval(Duration::from_millis(200));
-                        tick.tick().await;
-                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
-                    } else if poke {
-                        // Already in fast mode: extend the revolution.
-                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
+                    if poke {
+                        // pvxs `poke()` (client.cpp:736-759): rate-limited.
+                        // Never extends a revolution already in flight.
+                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
                     }
                 }
             }
@@ -1171,12 +1171,10 @@ async fn run_engine(
                         }
                         pos = pos.saturating_add(consumed);
                     }
-                    if poke && fast_ticks_remaining == 0 {
-                        tick = interval(Duration::from_millis(200));
-                        tick.tick().await;
-                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
-                    } else if poke {
-                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
+                    if poke {
+                        // pvxs `poke()` (client.cpp:736-759): rate-limited.
+                        // Never extends a revolution already in flight.
+                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
                     }
                 }
             }
@@ -1358,6 +1356,46 @@ async fn run_engine(
             }
         }
     }
+}
+
+/// pvxs `ContextImpl::poke()` (client.cpp:736-759): the single, rate-limited
+/// gate for the fast search revolution. Every poke trigger (fresh-server
+/// beacon, `HurryUp`, or a `poke`-flagged SEARCH_RESPONSE / beacon datagram)
+/// routes through here, so the two pvxs guards hold by construction:
+///
+/// - **skip-while-active** (`if(nPoked) return`): if a fast revolution is
+///   still running (`*fast_ticks_remaining > 0`) the poke is declined — the
+///   current revolution is never re-armed or extended mid-flight.
+/// - **30 s holdoff** (`age < pokeHoldoff`): the poke is declined unless at
+///   least [`POKE_HOLDOFF`] has elapsed since the last GRANTED poke.
+///
+/// Returns `true` iff the poke was granted, in which case it has already
+/// recorded the poke time, switched `tick` to the 200 ms fast cadence, and
+/// armed one full revolution; the caller may then bring pending searches
+/// forward. Returns `false` (no side effects) when either guard declines —
+/// this is what stops a site-wide IOC reboot from amplifying into a sustained
+/// UDP search-broadcast storm.
+async fn maybe_poke(
+    tick: &mut Interval,
+    fast_ticks_remaining: &mut u32,
+    last_poke: &mut Option<Instant>,
+) -> bool {
+    if *fast_ticks_remaining != 0 {
+        // A revolution is in flight — let it finish (pvxs `if(nPoked) return`).
+        return false;
+    }
+    let now = Instant::now();
+    if let Some(prev) = *last_poke {
+        if now.duration_since(prev) < POKE_HOLDOFF {
+            // Inside the global holdoff window — ignore (pvxs `age < pokeHoldoff`).
+            return false;
+        }
+    }
+    *last_poke = Some(now);
+    *tick = interval(Duration::from_millis(200));
+    tick.tick().await; // skip the immediate fire so cadence doesn't double-tick
+    *fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
+    true
 }
 
 async fn broadcast(
@@ -1943,6 +1981,61 @@ fn _suppress(_: PvaHeader) {}
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    // ---- maybe_poke rate-limit invariant (pvxs pokeHoldoff, A8-R2-1) ----
+    //
+    // One case per invariant boundary of the single poke gate, asserting
+    // both the grant decision and the resulting state, so a regression in
+    // either guard (skip-while-active, 30 s holdoff) is caught. These are
+    // unit tests of the gate; the end-to-end fast-tick behaviour is covered
+    // by `hurry_up_kicks_pending_searches_at_fast_tick_cadence`.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn maybe_poke_first_poke_granted_arms_revolution() {
+        // last_poke == None, no active revolution → granted.
+        let mut tick = interval(Duration::from_secs(1));
+        let mut ftr = 0u32;
+        let mut last = None;
+        assert!(maybe_poke(&mut tick, &mut ftr, &mut last).await);
+        assert_eq!(ftr, N_SEARCH_BUCKETS as u32);
+        assert!(last.is_some(), "granted poke must record a poke time");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn maybe_poke_declines_while_revolution_active() {
+        // fast_ticks_remaining > 0 → skip-while-active, no re-arm/extend.
+        let mut tick = interval(Duration::from_secs(1));
+        let mut ftr = 5u32;
+        let mut last = None;
+        assert!(!maybe_poke(&mut tick, &mut ftr, &mut last).await);
+        assert_eq!(ftr, 5, "active revolution must not be re-armed or extended");
+        assert!(last.is_none(), "declined poke must not record a poke time");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn maybe_poke_declines_within_holdoff_window() {
+        // last_poke just now, no active revolution → inside 30 s holdoff.
+        let mut tick = interval(Duration::from_secs(1));
+        let mut ftr = 0u32;
+        let mut last = Some(Instant::now());
+        assert!(!maybe_poke(&mut tick, &mut ftr, &mut last).await);
+        assert_eq!(
+            ftr, 0,
+            "poke inside the holdoff window must not arm a revolution"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn maybe_poke_granted_once_holdoff_elapsed() {
+        // last_poke older than POKE_HOLDOFF, no active revolution → granted.
+        let mut tick = interval(Duration::from_secs(1));
+        let mut ftr = 0u32;
+        let prev = Instant::now() - (POKE_HOLDOFF + Duration::from_secs(1));
+        let mut last = Some(prev);
+        assert!(maybe_poke(&mut tick, &mut ftr, &mut last).await);
+        assert_eq!(ftr, N_SEARCH_BUCKETS as u32);
+        assert!(last.unwrap() > prev, "granted poke must advance last_poke");
+    }
 
     /// RAII guard for the process-global `EPICS_PVA_*` env vars the
     /// tests below set to pin search behaviour (suppress real broadcast

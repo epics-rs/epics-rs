@@ -4,11 +4,13 @@
 //!
 //! `pvxs::ServerGUID`, `pvxs::Escaper`, `pvxs::Indented`,
 //! `pvxs::Detailed`, `pvxs::SigInt`, `pvxs::Timer`, `pvxs::MPMCFIFO`
-//! map onto the items in this module. The existing internal
-//! [`tokio::sync::mpsc`] / [`tokio::time`] facilities cover the
-//! "MPMCFIFO" and timer roles for production code paths; this
-//! module re-exposes thin newtype wrappers so end-users writing
-//! against the public surface have a 1:1 named target.
+//! have named analogues here. Several are deliberately simplified
+//! rather than 1:1 — `Detailed` is a bool not a level, `Timer` is
+//! periodic-only, `Indented` is value-passing not an RAII stream
+//! guard, `ServerGuid` is a plain alias not a distinct type; see each
+//! type's docs. The existing internal [`tokio::sync::mpsc`] /
+//! [`tokio::time`] facilities cover the "MPMCFIFO" and timer roles for
+//! production code paths.
 //!
 //! These types are intentionally minimal — they exist for code
 //! authored against pvxs whose `using namespace pvxs;` translation
@@ -20,7 +22,9 @@
 use std::fmt;
 
 /// Server identity emitted in BEACON / SEARCH_RESPONSE frames.
-/// 12-byte opaque token chosen per server-instance.
+/// 12-byte opaque token chosen per server-instance. A plain alias, not
+/// a distinct type — pvxs `ServerGUID` is a `struct` with its own
+/// formatting `operator<<`; the rest of this crate uses bare `[u8; 12]`.
 pub type ServerGuid = [u8; 12];
 
 /// `<<` adapter that escapes a C-style string for safe logging.
@@ -51,15 +55,17 @@ impl fmt::Display for Escaper<'_> {
     }
 }
 
-/// RAII indenter for nested `format()` / `report()` output.
-/// Each `Indented` increases the indent level for the
-/// duration of its scope; `Display` impls wrap newline boundaries
-/// with the configured number of leading spaces.
+/// Indent-prefix helper for nested `format()` / `report()` output.
+/// Its `Display` writes the leading indent (`level * spaces_per_level`
+/// spaces) once — it does **not** see the content, so it cannot
+/// reindent interior newlines; emit it at the start of each line
+/// yourself (or via [`Indented::prefix`]).
 ///
 /// Use is "stateful inside a single closure" — track the current
 /// indent yourself and pass to nested formatters. The pvxs original
-/// uses thread-local state which doesn't translate cleanly to
-/// Rust's borrow model; this is the value-passing variant.
+/// is an RAII guard that pushes/pops thread-local stream state, which
+/// doesn't translate cleanly to Rust's borrow model; this is the
+/// value-passing variant.
 pub struct Indented {
     pub level: usize,
     pub spaces_per_level: usize,
@@ -95,10 +101,11 @@ impl fmt::Display for Indented {
 }
 
 /// Toggle "show every sub-field" mode for stream-insertion display.
-/// Mirrors `pvxs::Detailed`. Implementations of `Display`
-/// that change behaviour based on this flag should accept it as an
-/// explicit parameter rather than relying on thread-local state
-/// (Rust idiom).
+/// A simplified analogue of `pvxs::Detailed`, which carries an integer
+/// detail *level* (`Detailed::level(strm)`); this collapses that to an
+/// on/off bool and cannot express graded verbosity. `Display` impls
+/// that vary on it should take it as an explicit parameter rather than
+/// relying on thread-local state (Rust idiom).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Detailed(pub bool);
 
@@ -147,12 +154,11 @@ impl Drop for SigInt {
     }
 }
 
-/// Single-shot or periodic timer. Thin wrapper over
-/// [`tokio::time`]; provided so the public surface has a named
-/// type for the role pvxs `Timer` plays.
-///
-/// Prefer `tokio::time::interval` / `tokio::time::sleep` directly
-/// for new code. This wrapper exists for symbol-parity only.
+/// Periodic timer — a thin wrapper over [`tokio::time::Interval`].
+/// Unlike pvxs `Timer` it offers only the periodic role: there is no
+/// one-shot constructor and no `cancel()` (drop the `Timer` to stop
+/// ticking). Prefer `tokio::time::interval` / `sleep` directly in new
+/// code; this exists to give the public surface a named type.
 pub struct Timer {
     interval: tokio::time::Interval,
 }

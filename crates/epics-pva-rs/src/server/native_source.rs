@@ -14,6 +14,7 @@ use crate::server_native::ChannelSource;
 
 use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
+use epics_base_rs::server::recgbl::{alarm_condition_string, alarm_status};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
 use tokio::sync::RwLock;
@@ -329,9 +330,20 @@ fn build_alarm(snap: &Snapshot) -> PvField {
         "status".into(),
         PvField::Scalar(ScalarValue::Int(snap.alarm.status as i32)),
     ));
+    // pvxs `iocsource.cpp:226,236`: `alarm.message` is the alarm
+    // condition string for a non-zero status, "" when NO_ALARM. The
+    // amsg-preference path (DBR_AMSG → `meta.amsg`) is not reproduced
+    // here because `AlarmInfo`/`Snapshot` does not carry the record's
+    // explicit amsg — plumbing `CommonFields.amsg` through the snapshot
+    // builders is a separate base-rs change (see UNFIXED note).
+    let message = if snap.alarm.status == alarm_status::NO_ALARM {
+        String::new()
+    } else {
+        alarm_condition_string(snap.alarm.status).to_string()
+    };
     a.fields.push((
         "message".into(),
-        PvField::Scalar(ScalarValue::String(String::new())),
+        PvField::Scalar(ScalarValue::String(message)),
     ));
     PvField::Structure(a)
 }
@@ -860,6 +872,32 @@ mod tests {
         assert!(matches!(
             scalar(&d, "units"),
             ScalarValue::String(s) if s == "Torr"
+        ));
+    }
+
+    #[test]
+    fn build_alarm_message_is_condition_string() {
+        // pvxs `iocsource.cpp:226,236`: alarm.message is the condition
+        // string for a non-zero status, "" for NO_ALARM.
+        let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
+        snap.alarm.status = alarm_status::HIHI_ALARM;
+        snap.alarm.severity = 2;
+        let PvField::Structure(a) = build_alarm(&snap) else {
+            panic!("alarm must be a structure");
+        };
+        assert!(matches!(
+            scalar(&a, "message"),
+            ScalarValue::String(s) if s == "HIHI"
+        ));
+
+        // NO_ALARM keeps an empty message.
+        let ok = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
+        let PvField::Structure(a) = build_alarm(&ok) else {
+            panic!("alarm must be a structure");
+        };
+        assert!(matches!(
+            scalar(&a, "message"),
+            ScalarValue::String(s) if s.is_empty()
         ));
     }
 

@@ -30,6 +30,41 @@ pub mod alarm_status {
     pub const WRITE_ACCESS_ALARM: u16 = 21;
 }
 
+/// String name for an alarm status code, mirroring EPICS
+/// `epicsAlarmConditionStrings` (libcom/src/misc/alarmString.c:27-50).
+/// pvxs `iocsource.cpp:226,236` reports `alarm.message =
+/// epicsAlarmConditionStrings[status]` when the status is non-zero.
+/// The index is the [`alarm_status`] code; an out-of-range status
+/// returns `""` (the C array is sized `ALARM_NSTATUS`, so indexing past
+/// it would be undefined — we return empty instead).
+pub fn alarm_condition_string(status: u16) -> &'static str {
+    const STRINGS: [&str; 22] = [
+        "NO_ALARM",
+        "READ",
+        "WRITE",
+        "HIHI",
+        "HIGH",
+        "LOLO",
+        "LOW",
+        "STATE",
+        "COS",
+        "COMM",
+        "TIMEOUT",
+        "HWLIMIT",
+        "CALC",
+        "SCAN",
+        "LINK",
+        "SOFT",
+        "BAD_SUB",
+        "UDF",
+        "DISABLE",
+        "SIMM",
+        "READ_ACCESS",
+        "WRITE_ACCESS",
+    ];
+    STRINGS.get(status as usize).copied().unwrap_or("")
+}
+
 /// Event mask bits for monitor posting (matches EPICS DBE_*).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EventMask(u16);
@@ -215,6 +250,26 @@ pub fn rec_gbl_check_udf(common: &mut CommonFields) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alarm_condition_string_matches_c_table() {
+        // Spot-check the EPICS `epicsAlarmConditionStrings` ordering
+        // (alarmString.c:27-50) at the boundaries and a couple interior
+        // codes; out-of-range returns "".
+        assert_eq!(alarm_condition_string(alarm_status::NO_ALARM), "NO_ALARM");
+        assert_eq!(alarm_condition_string(alarm_status::HIHI_ALARM), "HIHI");
+        assert_eq!(
+            alarm_condition_string(alarm_status::HW_LIMIT_ALARM),
+            "HWLIMIT"
+        );
+        assert_eq!(alarm_condition_string(alarm_status::LINK_ALARM), "LINK");
+        assert_eq!(
+            alarm_condition_string(alarm_status::WRITE_ACCESS_ALARM),
+            "WRITE_ACCESS"
+        );
+        assert_eq!(alarm_condition_string(22), "");
+        assert_eq!(alarm_condition_string(9999), "");
+    }
 
     #[test]
     fn test_set_sevr_raises() {

@@ -44,7 +44,7 @@ fn alloc_ioid() -> u32 {
 /// Default pipeline window for monitors. Tuned to match pvxs.
 pub const DEFAULT_PIPELINE_SIZE: u32 = 4;
 
-/// C-G1 / Agent-C: drop-guard for the per-IOID router entry.
+/// Drop-guard for the per-IOID router entry.
 ///
 /// **Client-side**: `unregister_ioid` is always called, even on `?`
 /// early-returns from inside `op_*` helpers. The remove is idempotent,
@@ -305,7 +305,7 @@ async fn op_get_inner(
                 Err(PvaError::Protocol(format!("GET data: {:?}", d.status)))
             }
         }
-        // BFR-13: a data-phase failure now arrives as a status-only
+        // a data-phase failure now arrives as a status-only
         // reply (server echoes the request data subcmd, no bitset/value),
         // so it decodes to OpResponse::Status. Surface the server status
         // instead of mislabelling it "expected GET data, got Status".
@@ -1460,7 +1460,7 @@ impl SubscriptionHandle {
     }
 }
 
-/// Agent-C cleanup: when a SubscriptionHandle is dropped without an
+/// Drop-time cleanup: when a SubscriptionHandle is dropped without an
 /// explicit `stop()` / `stop_sync()`, signal the inner loop to bail and
 /// fire a best-effort DESTROY_REQUEST so the server releases the IOID
 /// slot rather than waiting for the TCP circuit to die. The send is
@@ -1536,7 +1536,7 @@ impl Pauser {
     }
 }
 
-/// BFR-11: classification of a frame arriving on the raw MONITOR
+/// classification of a frame arriving on the raw MONITOR
 /// stream. The control-frame policy lives here as one pure, testable
 /// decision so a malformed control frame cannot be silently skipped or
 /// reported as a clean end-of-stream — the two swallow bugs the raw
@@ -1559,7 +1559,7 @@ enum RawMonitorFrameKind {
     Fatal(PvaError),
 }
 
-/// BFR-11: classify a raw MONITOR stream frame. Mirrors the typed path's
+/// classify a raw MONITOR stream frame. Mirrors the typed path's
 /// `Status::decode` owner — a missing/malformed FINISH Status is an
 /// error, not a clean end. pvxs resets the connection when a monitor
 /// message decode is not good (`clientmon.cpp:596`).
@@ -1657,7 +1657,7 @@ where
     }
 }
 
-/// PG-G9 final form: like [`op_monitor_raw_frames`] but returns a
+/// Like [`op_monitor_raw_frames`] but returns a
 /// [`SubscriptionHandle`] for pause/resume/stats. The inner raw
 /// monitor loop runs in a spawned task so the bridge gateway can wire
 /// downstream watermark events into upstream pipeline-pause control
@@ -1815,7 +1815,7 @@ where
         ))));
     }
     let intro = init.introspection;
-    // PG-G9 raw-path Pauser support: honour the handle's prior
+    // raw-path Pauser support: honour the handle's prior
     // pause state so a SubscriptionHandle::pause() called before
     // reconnect stays paused after the resubscribe. Mirrors the
     // typed `run_monitor_loop` path.
@@ -1855,7 +1855,7 @@ where
                 return Err(MonitorEnd::ConnectionLost);
             }
         };
-        // BFR-11: classify the frame through the single control-frame
+        // classify the frame through the single control-frame
         // owner. A too-short frame and a FINISH with a missing/malformed
         // Status are fatal — never silently skipped (`continue`) nor
         // degraded to a clean end (`Ok(())`), which would hide upstream
@@ -3426,7 +3426,7 @@ mod tests {
         }
     }
 
-    // ---- BFR-11: raw monitor control-frame classification ----------
+    // ---- raw monitor control-frame classification ----------
     //
     // The raw loop previously had two swallow bugs: a frame shorter than
     // `ioid + subcmd` was skipped (`continue`), and a FINISH whose

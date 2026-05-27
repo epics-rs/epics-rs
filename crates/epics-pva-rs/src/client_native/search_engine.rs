@@ -374,7 +374,7 @@ impl SearchEngine {
 
     /// Most recent GUID this engine's BeaconTracker has observed for
     /// `addr`. Used by Channel::ensure_active to detect server
-    /// replacement at the same address (P-G12). None when the
+    /// replacement at the same address. None when the
     /// address has never produced a beacon (or we have no beacon
     /// listener for it).
     pub fn beacon_guid_for(&self, addr: SocketAddr) -> Option<[u8; 12]> {
@@ -852,7 +852,7 @@ async fn run_engine(
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(SearchCommand::Find { pv_name, responder, reason }) => {
-                    // P-G27: drop any prior pending search for the
+                    // drop any prior pending search for the
                     // same name so a tight retry loop doesn't grow
                     // pending / search_buckets without bound. The
                     // old responder gets dropped (oneshot Sender drops
@@ -899,7 +899,7 @@ async fn run_engine(
                     }
                 }
                 Some(SearchCommand::FindAll { pv_name, responder, reason }) => {
-                    // P-G27: same dedup as Find — drop any prior
+                    // same dedup as Find — drop any prior
                     // pending search for the same name.
                     if let Some(old_sid) = by_name.remove(&pv_name) {
                         if let Some(old) = pending.remove(&old_sid) {
@@ -1069,7 +1069,7 @@ async fn run_engine(
 
             res = search_socket.recv_from(&mut search_buf) => {
                 if let Ok((n, peer)) = res {
-                    // Multi-message drain (P-G10): pvxs packs many
+                    // Multi-message drain: pvxs packs many
                     // SEARCH messages per UDP datagram. Without the
                     // loop we'd parse only the first and silently
                     // drop the rest.
@@ -1127,7 +1127,7 @@ async fn run_engine(
             res = beacon_recv => {
                 if let Ok((n, from)) = res {
                     let mut poke = false;
-                    // Multi-message drain (P-G10): same rationale as
+                    // Multi-message drain: same rationale as
                     // search responses — beacons can be chained.
                     let mut pos = 0usize;
                     while pos < n {
@@ -1523,7 +1523,7 @@ fn flush_expired_pending(
 }
 
 /// Returns bytes consumed from `bytes` so the caller can advance to
-/// the next chained message in the same datagram (P-G10).
+/// the next chained message in the same datagram.
 /// `is_tcp`: true when the response arrived on a TCP name-server connection;
 /// enables pvxs procSearchReply port-0 rule (client.cpp:828-846).
 #[allow(clippy::too_many_arguments)]
@@ -1637,7 +1637,7 @@ fn handle_search_response(
 }
 
 /// Returns bytes consumed from `bytes` so the caller can advance to
-/// the next chained beacon in the same datagram (P-G10).
+/// the next chained beacon in the same datagram.
 #[allow(clippy::too_many_arguments)]
 fn handle_beacon(
     bytes: &[u8],

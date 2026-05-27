@@ -220,7 +220,7 @@ impl ReadExt for Cursor<&[u8]> {
         })
     }
     fn get_bytes(&mut self, n: usize) -> Result<Vec<u8>, DecodeError> {
-        // P-G22 (DoS): `n` is frequently a wire-supplied length (scalar
+        // DoS guard: `n` is frequently a wire-supplied length (scalar
         // arrays, BitSet, strings) up to u32::MAX. A `vec![0u8; n]`
         // before `read_exact` lets a ~20-byte frame trigger a multi-GB
         // allocation / OOM-abort. The cursor can only ever yield

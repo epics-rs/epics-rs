@@ -751,7 +751,7 @@ impl PvaServer {
     /// treated as fatal — an Err here means the server is no longer
     /// serving even if `stop()` wasn't called.
     pub async fn wait(mut self) -> PvaResult<()> {
-        // D-G2: select! drops the losing branch's JoinHandle, but
+        // select! drops the losing branch's JoinHandle, but
         // dropping a JoinHandle does NOT abort the task. Without an
         // explicit abort, a UDP-side panic leaves the TCP listener
         // orphaned (and vice versa). Use the per-server AbortHandles

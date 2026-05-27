@@ -5,7 +5,7 @@
 //!   SegMiddle / SegLast frames; Rust currently emits a single
 //!   large frame (PVA wire allows u32 payload size). Both forms
 //!   must be acceptable to the peer.
-//! - Client-side: P-G20 / P-G21 segmented-message reassembly
+//! - Client-side: segmented-message reassembly
 //!   path must hold for real pvxs server output.
 //!
 //! Tests use 100K elements of f64 (~800KB) — large enough to

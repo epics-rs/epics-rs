@@ -89,7 +89,7 @@ pub struct PvaServer {
     /// ChannelSource via `run_with_source` must install ACF
     /// themselves.
     ///
-    /// Round-28: `RwLock`-wrapped so [`Self::reload_acf_from`] can
+    /// `RwLock`-wrapped so [`Self::reload_acf_from`] can
     /// swap the policy at runtime (mirrors `CaServer::reload_acf`).
     /// All `PvDatabaseSource` ACF check sites pick the latest
     /// policy on their next read.
@@ -141,7 +141,7 @@ impl PvaServer {
         // this counter at spawn time) detect the change on their
         // next event and re-check ACL — peers that the new policy
         // denies see their subscriptions torn down with a MONITOR
-        // FINISH frame, matching the round-39 CA `reeval_access_rights`
+        // FINISH frame, matching CA `reeval_access_rights`
         // semantics.
         self.acl_version
             .fetch_add(1, std::sync::atomic::Ordering::Release);

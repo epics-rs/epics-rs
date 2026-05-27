@@ -121,7 +121,7 @@ impl BeaconTracker {
 
     /// Most recent GUID observed for `server`, or `None` if we
     /// haven't seen a beacon from it yet. Used by Channel reconnect
-    /// to detect server replacement at the same address (P-G12).
+    /// to detect server replacement at the same address.
     pub fn guid_for(&self, server: SocketAddr) -> Option<[u8; 12]> {
         self.inner.read().get(&server).map(|e| e.guid)
     }

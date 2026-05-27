@@ -217,7 +217,7 @@ async fn pva_service_accepts_direct_struct_request() {
     assert_eq!(v, 7);
 }
 
-/// BFR-13 (client end-to-end): a source that opens (descriptor
+/// Client end-to-end: a source that opens (descriptor
 /// present at INIT) but fails the value read at the data phase makes
 /// the server emit a data-phase error reply. Before the fix the
 /// server hardcoded the INIT subcmd `0x08` on that error, so the

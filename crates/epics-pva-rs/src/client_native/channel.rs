@@ -43,7 +43,7 @@ pub enum ChannelState {
         server: Arc<ServerConn>,
         sid: u32,
         /// GUID expected for this server, captured from the
-        /// SEARCH_RESPONSE that resolved the address. P-G12: on
+        /// SEARCH_RESPONSE that resolved the address. on
         /// reconnect via beacon-poke, we compare this against the
         /// current `BeaconTracker` view; if a different GUID is
         /// observed at the same address (server replacement at the
@@ -150,7 +150,7 @@ impl Resolver {
     /// has observed at `addr`, or None for direct-connect resolvers
     /// (we never learn a GUID for a hard-coded address). Used by
     /// `ChannelState::Active::expected_guid` to detect server
-    /// replacement at the same address (P-G12).
+    /// replacement at the same address.
     fn last_guid_for(&self, addr: std::net::SocketAddr) -> Option<[u8; 12]> {
         match self {
             Resolver::Search(se) => se.beacon_guid_for(addr),
@@ -554,7 +554,7 @@ impl Channel {
     /// Searching → Connecting as needed. Returns the live `(ServerConn, sid)`
     /// pair.
     pub async fn ensure_active(&self) -> PvaResult<(Arc<ServerConn>, u32)> {
-        // Quick happy-path check. P-G12: also verify that the
+        // Quick happy-path check. also verify that the
         // current server's GUID still matches the GUID we expected
         // for its address. If beacons report a different GUID at the
         // same address, the upstream server was replaced — drop the
@@ -797,7 +797,7 @@ impl Channel {
                         self.set_state(ChannelState::Active {
                             server: server.clone(),
                             sid,
-                            // P-G12: capture the GUID our search
+                            // capture the GUID our search
                             // engine recorded for this address. If a
                             // future reconnect to the same address
                             // observes a different beacon GUID, the

@@ -619,7 +619,7 @@ mod tests {
         }
     }
 
-    /// A-G1/A-G4: env-driven server caps fall back to safe defaults when
+    /// Env-driven server caps fall back to safe defaults when
     /// the var is unset, parses positive integers, and rejects 0 (which
     /// would otherwise let an operator misconfigure the cap to "no
     /// connections allowed").

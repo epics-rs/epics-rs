@@ -1060,7 +1060,7 @@ impl PvaClient {
         .await
     }
 
-    /// PG-G9 final form: like [`Self::pvmonitor_raw_frames`] but returns
+    /// Like [`Self::pvmonitor_raw_frames`] but returns
     /// a [`SubscriptionHandle`] for pause/resume/stats. The bridge
     /// `pva_gateway` uses this to forward downstream watermark events
     /// into upstream pipeline-pause control msgs without an

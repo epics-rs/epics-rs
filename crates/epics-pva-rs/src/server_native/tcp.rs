@@ -809,7 +809,7 @@ fn finish_exec_data_task(
     }
 }
 
-/// BFR-12: terminal signal a spawned MONITOR subscriber task sends to
+/// terminal signal a spawned MONITOR subscriber task sends to
 /// its read-loop owner when the task ends.
 ///
 /// The subscriber task owns no handle to `channels`, so it cannot remove
@@ -834,7 +834,7 @@ struct MonitorFinished {
     op_id: u64,
 }
 
-/// BFR-12: RAII finalizer held as a single local at the top of the
+/// RAII finalizer held as a single local at the top of the
 /// MONITOR subscriber task body. Its `Drop` reports completion to the
 /// read-loop owner on EVERY task exit — the normal source-close FINISH,
 /// an early `return` for an ACL-deny / descriptor-change / filter-
@@ -857,7 +857,7 @@ impl Drop for MonitorFinishGuard {
     }
 }
 
-/// BFR-12: read-loop owner side of a MONITOR subscriber's terminal
+/// read-loop owner side of a MONITOR subscriber's terminal
 /// signal. Mirrors [`handle_destroy_request`]'s removal — dropping the
 /// `OpState` drops `monitor_start_ctl` (terminal
 /// `notify_monitor_start(false)`) and `monitor_abort` (subscriber abort,
@@ -872,7 +872,7 @@ fn apply_monitor_finish(channels: &mut HashMap<u32, ChannelState>, fin: MonitorF
     }
 }
 
-/// BFR-15: in-flight state of a non-monitor (GET/PUT/RPC/PUT_GET/PROCESS)
+/// in-flight state of a non-monitor (GET/PUT/RPC/PUT_GET/PROCESS)
 /// data-phase op. pvxs models this as `ServerOp::state`
 /// (`serverget.cpp:467-476`, `:511-514`): a data-phase EXEC runs only when
 /// the op is `Idle`, flips it to `Executing`, and the op returns to `Idle`
@@ -886,7 +886,7 @@ enum ExecState {
     Executing,
 }
 
-/// BFR-15: begin a data-phase EXEC. Returns `Some(op_id)` when the op was
+/// begin a data-phase EXEC. Returns `Some(op_id)` when the op was
 /// `Idle` (now transitioned to `Executing`) and the caller may spawn the
 /// task, or `None` to IGNORE this EXEC — either the op is already
 /// `Executing` (pvxs `serverget.cpp:511-514`: log + drop, do NOT abort the
@@ -904,8 +904,8 @@ fn begin_exec(ch: &mut ChannelState, ioid: u32) -> Option<u64> {
     }
 }
 
-/// BFR-15: terminal signal a spawned data-phase task sends to its read-loop
-/// owner when the task ends (mirrors BFR-12's [`MonitorFinished`] for the
+/// terminal signal a spawned data-phase task sends to its read-loop
+/// owner when the task ends (mirrors [`MonitorFinished`] for the
 /// non-monitor lifecycle). The spawned task owns no handle to `channels`, so
 /// it cannot return its own op to `Idle` when its response is sent; it
 /// reports its identity here and the read-loop owner — the single actor that
@@ -924,7 +924,7 @@ struct ExecFinished {
     op_id: u64,
 }
 
-/// BFR-15: RAII finalizer held as a single local at the top of a data-phase
+/// RAII finalizer held as a single local at the top of a data-phase
 /// task body. Its `Drop` reports completion to the read-loop owner on EVERY
 /// task exit — the normal reply-then-return, an early `return` on an error
 /// reply, a panic, or an `AbortOnDrop`-driven cancellation (DESTROY / channel
@@ -945,7 +945,7 @@ impl Drop for ExecFinishGuard {
     }
 }
 
-/// BFR-15: read-loop owner side of a data-phase task's terminal signal.
+/// read-loop owner side of a data-phase task's terminal signal.
 /// Returns the op to `Idle` and clears its (now-inert) abort guard so a later
 /// explicit re-EXEC is accepted (pvxs `serverget.cpp:114-115`). Gated on the
 /// op-instance id so a stale signal cannot flip a re-INIT'd op that reused the
@@ -1000,7 +1000,7 @@ struct OpState {
     /// Drives the changed-bitset and partial-value encoding so the
     /// server only emits what was requested.
     mask: BitSet,
-    /// Pipeline credit window (P-G11). pvxs `MonitorOp::window` —
+    /// Pipeline credit window. pvxs `MonitorOp::window` —
     /// when pipeline mode is active, the server emits at most this
     /// many events before pausing until the client sends a
     /// MONITOR_ACK (subcmd 0x80) refilling the window. `None` when
@@ -1011,7 +1011,7 @@ struct OpState {
     /// Pulsed when `monitor_window` transitions from 0 → >0 so the
     /// subscriber loop can wake up and resume emission.
     monitor_window_notify: Option<Arc<tokio::sync::Notify>>,
-    /// MONITOR pause flag (P-G28). pvxs subcmd `0x04` (without the
+    /// MONITOR pause flag. pvxs subcmd `0x04` (without the
     /// `0x40` start bit) signals "stop emitting events but keep the
     /// op alive"; pvxs `Subscription::pause(true)` uses this. The
     /// subscriber task checks before emit and skips when `true`.
@@ -1111,7 +1111,7 @@ struct OpState {
     /// fires the terminal `notify_monitor_start(false)` iff still
     /// executing.
     monitor_start_ctl: Option<Arc<MonitorStartControl>>,
-    /// BFR-15: in-flight EXEC state for non-monitor (GET/PUT/RPC/PUT_GET/
+    /// in-flight EXEC state for non-monitor (GET/PUT/RPC/PUT_GET/
     /// PROCESS) ops. `Idle` at INIT; flipped to `Executing` by [`begin_exec`]
     /// when a data-phase EXEC is accepted, and back to `Idle` by
     /// [`apply_exec_finish`] when the spawned task's response is sent. A
@@ -1466,7 +1466,7 @@ pub async fn run_tcp_server_on_listener(
         .as_ref()
         .map(|cfg| tokio_rustls::TlsAcceptor::from(cfg.config.clone()));
 
-    // D-G1: track per-connection tasks in a JoinSet so they're
+    // track per-connection tasks in a JoinSet so they're
     // aborted as a unit when this accept-loop future is dropped (e.g.
     // PvaServer::stop() → tcp_handle.abort()). Without this, every
     // per-conn task ran detached and lingered until its internal
@@ -1577,7 +1577,7 @@ pub async fn run_tcp_server_on_listener(
                     peers_for_task.insert(peer, peer_entry.clone());
 
                     let result = match (acceptor, is_tls_client) {
-                        // Round 8 P-G15: cap the TLS handshake — a peer
+                        // cap the TLS handshake — a peer
                         // that completes TCP but stalls during ClientHello
                         // would otherwise hold a `max_connections` slot
                         // until OS keepalive reaps it (~30s).
@@ -1949,7 +1949,7 @@ async fn handle_connection_io(
             }
         }
     });
-    // P-G18: abort the writer + heartbeat tasks the moment the read
+    // abort the writer + heartbeat tasks the moment the read
     // loop returns. Without this, both linger up to `idle_timeout`
     // (default 45s) emitting ECHOes into a channel nobody is reading
     // and holding the writer half of the (now-disconnected) socket.
@@ -2043,7 +2043,7 @@ async fn handle_connection_io(
     let mut encode_type_cache = crate::pvdata::encode::EncodeTypeCache::new();
 
     let max_msg_size = config.max_message_size;
-    // P-G20: segmented-message reassembly state. pvxs conn.cpp:228-291
+    // segmented-message reassembly state. pvxs conn.cpp:228-291
     // accumulates SegFirst..SegMiddle..SegLast bodies into `segBuf`
     // before dispatching. Without this, our server would treat every
     // segment as a fresh message, decode garbage, and likely return
@@ -2059,7 +2059,7 @@ async fn handle_connection_io(
     // insertions into `channels` and emits wire responses in arrival
     // order (mpsc FIFO preserves the per-frame ordering guarantee).
     let (cc_tx, mut cc_rx) = mpsc::channel::<CreateChannelCompletion>(64);
-    // BFR-12: MONITOR subscriber-completion channel. A spawned subscriber
+    // MONITOR subscriber-completion channel. A spawned subscriber
     // task that ends (source close, descriptor change, ACL deny, filter
     // mismatch, raw re-encode terminal, panic, abort) signals its
     // `(sid, ioid, op_id)` here via `MonitorFinishGuard`; the select! arm
@@ -2069,7 +2069,7 @@ async fn handle_connection_io(
     // bounded in practice by the live op count, which `max_ops_per_channel`
     // already caps.
     let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
-    // BFR-15: a spawned GET/PUT/RPC/PUT_GET/PROCESS data-phase task signals
+    // a spawned GET/PUT/RPC/PUT_GET/PROCESS data-phase task signals
     // here when its response is sent so the owner can return the op to `Idle`
     // (see [`ExecFinished`]/[`apply_exec_finish`]). Same unbounded-so-Drop-
     // never-loses rationale as `mon_fin_tx`.
@@ -2084,7 +2084,7 @@ async fn handle_connection_io(
     // matching pvxs opByIOID cleanup (serverconn.cpp:366-382).
     let mut gf_abort_guards: Vec<AbortOnDrop> = Vec::new();
     loop {
-        // C-G2: if the writer task has died (send_timeout fired,
+        // if the writer task has died (send_timeout fired,
         // panic, etc.) the outbound mpsc is closed. Every subsequent
         // `let _ = tx.send(...).await` in the dispatch path silently
         // discards its frame and the client never sees the response,
@@ -2145,7 +2145,7 @@ async fn handle_connection_io(
                 continue;
             }
             fin_opt = mon_fin_rx.recv() => {
-                // BFR-12: a MONITOR subscriber task ended. Remove its op
+                // a MONITOR subscriber task ended. Remove its op
                 // through the owner — dropping the `OpState` fires
                 // `monitor_start_ctl` (terminal `notify_monitor_start(false)`)
                 // and `monitor_abort` (already-ended task), identical to
@@ -2165,7 +2165,7 @@ async fn handle_connection_io(
                 continue;
             }
             exec_opt = exec_fin_rx.recv() => {
-                // BFR-15: a GET/PUT/RPC/PUT_GET/PROCESS data-phase task sent
+                // a GET/PUT/RPC/PUT_GET/PROCESS data-phase task sent
                 // its response and ended. Return the op to `Idle` through the
                 // owner so a later explicit re-EXEC is accepted, gated on the
                 // op-instance id so a stale signal cannot flip a re-INIT'd op
@@ -2199,7 +2199,7 @@ async fn handle_connection_io(
             continue;
         }
 
-        // P-G20: segmentation gate. Mirrors pvxs conn.cpp:228-244.
+        // segmentation gate. Mirrors pvxs conn.cpp:228-244.
         //   continuation = SegLast bit set (true for mid OR last)
         //   * Violation when (continuation XOR expect_seg) — peer
         //     interleaved a fresh first/unsegmented frame inside a
@@ -2752,7 +2752,7 @@ async fn handle_put_get(
     encode_cache: &mut EncodeTypeCache,
     peer: std::net::SocketAddr,
     cred: &ClientCredentials,
-    // BFR-15: data-phase-completion sender (see [`handle_op`]). The spawned
+    // data-phase-completion sender (see [`handle_op`]). The spawned
     // PUT_GET exec task installs an `ExecFinishGuard` so the owner returns
     // the op to `Idle` when its readback reply is sent.
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
@@ -2954,7 +2954,7 @@ async fn handle_put_get(
 
     let src = source.clone();
     let tx_clone = tx.clone();
-    // BFR-15: run this PUT_GET exec only when the op is `Idle`, and ignore a
+    // run this PUT_GET exec only when the op is `Idle`, and ignore a
     // second EXEC while the first is in flight rather than aborting it (pvxs
     // `serverget.cpp:467-476`/`:511-514`).
     let op_id = match begin_exec(ch, ioid) {
@@ -2967,7 +2967,7 @@ async fn handle_put_get(
     let exec_fin = ExecFinished { sid, ioid, op_id };
     let exec_fin_tx_task = exec_fin_tx.clone();
     let join = tokio::spawn(async move {
-        // BFR-15: return this op to `Idle` (via the read-loop owner) when the
+        // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
         let _exec_fin_guard = ExecFinishGuard {
             tx: exec_fin_tx_task,
@@ -3080,7 +3080,7 @@ async fn handle_process(
     config: &PvaServerConfig,
     peer: std::net::SocketAddr,
     cred: &ClientCredentials,
-    // BFR-15: data-phase-completion sender (see [`handle_op`]). The spawned
+    // data-phase-completion sender (see [`handle_op`]). The spawned
     // PROCESS exec task installs an `ExecFinishGuard` so the owner returns
     // the op to `Idle` when its reply is sent.
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
@@ -3154,7 +3154,7 @@ async fn handle_process(
                 return Ok(());
             }
         };
-        // BFR-8: route the PROCESS INIT pvRequest through the SAME
+        // route the PROCESS INIT pvRequest through the SAME
         // structured boundary as the generic GET/PUT/MONITOR INIT path
         // (`decode_init_pv_request_value`). PROCESS transfers no value,
         // so the decoded pvRequest is discarded — but a present-but-
@@ -3244,7 +3244,7 @@ async fn handle_process(
     };
     let src = source.clone();
     let tx_clone = tx.clone();
-    // BFR-15: run this PROCESS exec only when the op is `Idle`, and ignore a
+    // run this PROCESS exec only when the op is `Idle`, and ignore a
     // second EXEC while the first is in flight rather than aborting it (pvxs
     // `serverget.cpp:467-476`/`:511-514`).
     let op_id = match begin_exec(ch, ioid) {
@@ -3257,7 +3257,7 @@ async fn handle_process(
     let exec_fin = ExecFinished { sid, ioid, op_id };
     let exec_fin_tx_task = exec_fin_tx.clone();
     let join = tokio::spawn(async move {
-        // BFR-15: return this op to `Idle` (via the read-loop owner) when the
+        // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
         let _exec_fin_guard = ExecFinishGuard {
             tx: exec_fin_tx_task,
@@ -3431,7 +3431,7 @@ async fn handle_create_channel(
             break;
         }
 
-        // A-G1 per-channel cap check: open channels + in-flight spawns
+        // per-channel cap check: open channels + in-flight spawns
         // from previous frames + already-batched names in this frame.
         if channels.len() + *pending_channel_spawns + batch.len() >= max_channels_per_connection {
             warn!(
@@ -3574,7 +3574,7 @@ async fn handle_destroy_channel(
 /// `MonitorOp` (and the source's onSubscribe state) stays alive so a
 /// later START restores Executing without re-issuing the subscription.
 ///
-/// Round 4 (cancel-vs-destroy refactor): previously the Rust handler
+/// Cancel-vs-destroy refactor: previously the Rust handler
 /// dropped `monitor_abort` and cleared `monitor_started`, which aborted
 /// the subscriber task and forced a full re-spawn on the next START.
 /// That heavy path: (1) re-subscribed at the source, potentially
@@ -3736,12 +3736,12 @@ async fn handle_op(
     encode_cache: &mut EncodeTypeCache,
     peer: std::net::SocketAddr,
     cred: &ClientCredentials,
-    // BFR-12: read-loop owner's MONITOR subscriber-completion sender. The
+    // read-loop owner's MONITOR subscriber-completion sender. The
     // spawned subscriber task installs a `MonitorFinishGuard` cloned from
     // this so its terminal op removal is routed back to the owner. Only the
     // MONITOR branch uses it.
     mon_fin_tx: &mpsc::UnboundedSender<MonitorFinished>,
-    // BFR-15: read-loop owner's data-phase-completion sender. Each spawned
+    // read-loop owner's data-phase-completion sender. Each spawned
     // GET/PUT/RPC data task installs an `ExecFinishGuard` cloned from this so
     // the owner returns the op to `Idle` when the response is sent.
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
@@ -3784,7 +3784,7 @@ async fn handle_op(
                 "duplicate INIT on live IOID {ioid} (pvxs serverget.cpp:378-384 protocol error)"
             )));
         }
-        // A-G1: per-channel concurrent-op cap — refuse fresh INITs
+        // per-channel concurrent-op cap — refuse fresh INITs
         // once the channel's `ops` map hits the configured ceiling
         // so a malicious peer can't accumulate IOID state forever
         // by sending INIT … INIT … without ever issuing DESTROY.
@@ -4124,7 +4124,7 @@ async fn handle_op(
             // context so QSRV group GET honors `record._options`
             // (e.g. `atomic`). Previously dropped here as `None`.
             let init_pv_request_t = init_pv_request.clone();
-            // BFR-15: pvxs `serverget.cpp:467-476` runs a data-phase EXEC
+            // pvxs `serverget.cpp:467-476` runs a data-phase EXEC
             // only when the op is `Idle`, flips it to `Executing`, and
             // IGNORES a second EXEC that arrives while the first task is in
             // flight (`:511-514`) — it does NOT abort the in-flight task.
@@ -4138,7 +4138,7 @@ async fn handle_op(
             let exec_fin = ExecFinished { sid, ioid, op_id };
             let exec_fin_tx_task = exec_fin_tx.clone();
             let join = tokio::spawn(async move {
-                // BFR-15: returns this op to `Idle` (via the read-loop owner)
+                // returns this op to `Idle` (via the read-loop owner)
                 // when the task ends, so a later explicit re-EXEC is accepted.
                 let _exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
@@ -4251,7 +4251,7 @@ async fn handle_op(
                 // readback GET context so the readback honors the
                 // same `record._options` the GET path would.
                 let init_pv_request_t = init_pv_request.clone();
-                // BFR-15: ignore a second EXEC while the readback task is in
+                // ignore a second EXEC while the readback task is in
                 // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
                 let op_id = match begin_exec(ch, ioid) {
                     Some(id) => id,
@@ -4376,7 +4376,7 @@ async fn handle_op(
             let cred_authority = cred.authority.clone();
             let cred_roles = cred.roles.clone();
             let init_pv_request_t = init_pv_request.clone();
-            // BFR-15: ignore a second PUT EXEC while the first write is in
+            // ignore a second PUT EXEC while the first write is in
             // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
             let op_id = match begin_exec(ch, ioid) {
                 Some(id) => id,
@@ -4488,7 +4488,7 @@ async fn handle_op(
             // Plain 0x00 also accepted for legacy compatibility.
             let is_ack = subcmd & 0x80 != 0;
             let is_start_or_ack = subcmd & 0x40 != 0 || is_ack || subcmd == 0x00;
-            // P-G28: subcmd 0x04 alone is PAUSE (pvxs Subscription::
+            // subcmd 0x04 alone is PAUSE (pvxs Subscription::
             // pause(true)). subcmd 0x44 (start | process bit) is
             // RESUME — clears the paused flag in addition to its
             // existing start handling. We honour PAUSE by setting
@@ -4531,7 +4531,7 @@ async fn handle_op(
                 }
             }
 
-            // ACK path: refill the pipeline window (P-G11). pvxs
+            // ACK path: refill the pipeline window. pvxs
             // servermon.cpp:111 reads the u32 ack-count; we add it
             // to the AtomicU32 and pulse the notify so a paused
             // subscriber wakes and resumes emission. ACKs can arrive
@@ -4772,7 +4772,7 @@ async fn handle_op(
                     && mask_clone.size() >= total_bits
                     && window.is_none()
                     && filters.is_empty();
-                // BFR-12: capture this op instance's terminal-signal payload
+                // capture this op instance's terminal-signal payload
                 // (sid + ioid + the process-unique `monitor_op_id`) before
                 // the move. The guard installed as the first statement of the
                 // task body reports it on EVERY exit so the read-loop owner
@@ -4784,7 +4784,7 @@ async fn handle_op(
                 };
                 let mon_fin_tx_task = mon_fin_tx.clone();
                 let join = tokio::spawn(async move {
-                    // BFR-12: terminal finalizer — see `MonitorFinishGuard`.
+                    // terminal finalizer — see `MonitorFinishGuard`.
                     // A single local at the top of the body so no exit (source
                     // close FINISH, ACL/descriptor/filter/raw terminal return,
                     // panic, abort) can skip notifying the owner.
@@ -4819,7 +4819,7 @@ async fn handle_op(
                     // byte-order mismatch or when the source returns
                     // None.
                     // Raw fast path must consult
-                    // the ACF too. The round-29 ACL gate covered
+                    // the ACF too. The earlier ACL gate covered
                     // `subscribe_ctx` only; ACF-aware sources can now
                     // override `subscribe_raw_ctx` to deny when the
                     // peer lacks READ. When the gateway denies (returns
@@ -4977,7 +4977,7 @@ async fn handle_op(
                             // negotiated byte orders silently lost every
                             // monitor update after the initial snapshot (the
                             // decoded-fallback path never sees those events
-                            // under raw subscription). BFR-14: a re-encode
+                            // under raw subscription). a re-encode
                             // failure (malformed upstream body) is now a
                             // terminal protocol boundary, not a silent drop —
                             // `raw_monitor_frame` owns that single policy so
@@ -5335,7 +5335,7 @@ async fn handle_op(
                                 return;
                             }
                         };
-                        // P-G11: pipeline window check, through the same
+                        // pipeline window check, through the same
                         // single owner the initial snapshot uses. When
                         // pipeline is active this waits for a free window
                         // slot, consumes one credit, and fires LOW on the
@@ -5449,7 +5449,7 @@ async fn handle_op(
                 roles: cred.roles.clone(),
                 pv_request: None,
             };
-            // BFR-15: ignore a second RPC EXEC while the first call is in
+            // ignore a second RPC EXEC while the first call is in
             // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
             let op_id = match begin_exec(ch, ioid) {
                 Some(id) => id,
@@ -5540,7 +5540,7 @@ async fn handle_get_field(
     let _sub = crate::proto::decode_string(&mut cur, order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
 
-    // P-G19: pvxs serverintrospect.cpp:159 silently returns on
+    // pvxs serverintrospect.cpp:159 silently returns on
     // unknown SID; without this we'd reply with a fabricated
     // Variant descriptor + status=OK, which is worse than a noop —
     // a stale client would build its decode tree against a wrong
@@ -5653,7 +5653,7 @@ async fn send_op_error(
     tx: &SrvTx,
     kind: OpKind,
     ioid: u32,
-    // BFR-13: the reply's sub-command byte. pvxs writes the operation's
+    // the reply's sub-command byte. pvxs writes the operation's
     // current subcmd into EVERY GET/PUT/RPC reply (`serverget.cpp:82-84`),
     // recording the data-phase subcmd on the op before the callback runs
     // (`serverget.cpp:475`). An error therefore preserves the request's
@@ -5912,7 +5912,7 @@ fn coalesce_monitor_update(
     }
 }
 
-/// BFR-14: outcome of turning one [`crate::server_native::RawMonitorEvent`]
+/// outcome of turning one [`crate::server_native::RawMonitorEvent`]
 /// into a downstream wire frame. Carries the single malformed-raw policy
 /// so the same-endian forward and the cross-endian re-encode cannot
 /// diverge: a frame that cannot be produced terminates the stream with
@@ -5926,7 +5926,7 @@ enum RawMonitorFrame {
     Terminate { frame: Vec<u8>, reason: String },
 }
 
-/// BFR-14: build the downstream wire frame for a single raw monitor
+/// build the downstream wire frame for a single raw monitor
 /// event, owning the malformed-body policy in one place.
 ///
 /// - Same-endian: forward the body verbatim (zero-copy memcpy via
@@ -5991,7 +5991,7 @@ fn reencode_raw_monitor(
         ev.byte_order,
     )
     .map_err(|e| format!("decode value with bitset: {e}"))?;
-    // BFR-9: the overrun bitset is part of the MONITOR DATA wire format,
+    // the overrun bitset is part of the MONITOR DATA wire format,
     // NOT optional. pvxs reads it unconditionally
     // (`clientmon.cpp:550` `from_wire(M, overrun)`) and disconnects when
     // the message is not good afterwards (`clientmon.cpp:596`). A failed
@@ -6101,7 +6101,7 @@ mod tests {
     use crate::client_native::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
 
-    /// BFR-12: a throwaway MONITOR-completion sender for `handle_op`
+    /// a throwaway MONITOR-completion sender for `handle_op`
     /// calls in tests that do not exercise the read-loop owner's removal
     /// arm. The receiver is dropped immediately, so the spawned subscriber
     /// task's `MonitorFinishGuard::drop` `send` is a harmless no-op (the
@@ -6112,7 +6112,7 @@ mod tests {
         mpsc::unbounded_channel().0
     }
 
-    /// BFR-15: a throwaway data-phase-completion sender for handler calls in
+    /// a throwaway data-phase-completion sender for handler calls in
     /// tests that do not exercise the read-loop owner's `Idle`-return arm.
     /// The receiver is dropped immediately, so the spawned task's
     /// `ExecFinishGuard::drop` `send` is a harmless no-op (the op keeps its
@@ -7492,7 +7492,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_request_pauses_monitor_without_aborting() {
-        // Round 4 cancel-vs-destroy parity: pvxs serverconn.cpp:262-289
+        // cancel-vs-destroy parity: pvxs serverconn.cpp:262-289
         // transitions Executing→Idle and fires onCancel, but the
         // underlying op + subscription stay alive. Our model: flip
         // `monitor_paused` so the subscriber suspends emission, leaving
@@ -7763,7 +7763,7 @@ mod tests {
         );
     }
 
-    /// BFR-4: an RPC EXEC argument body must classify as parameterless,
+    /// an RPC EXEC argument body must classify as parameterless,
     /// fully decoded, or fatally malformed — never silently fabricate a
     /// `Null` argument from a present-but-undecodable body. pvxs
     /// `serverget.cpp:443-447` decodes `from_wire_type_value` and
@@ -8154,7 +8154,7 @@ mod tests {
         );
     }
 
-    /// BFR-5: a GET EXEC that sets the last-request bit (`subcmd & 0x10`)
+    /// a GET EXEC that sets the last-request bit (`subcmd & 0x10`)
     /// must serialize its data response and then remove the op, matching
     /// pvxs `serverget.cpp:112-116` (`cleanup()` after the reply, recorded
     /// from `lastRequest = subcmd & 0x10` at `serverget.cpp:470-471`). The
@@ -9190,7 +9190,7 @@ mod tests {
         );
     }
 
-    /// BFR-8: a (sid → ChannelState) map with introspection but NO
+    /// a (sid → ChannelState) map with introspection but NO
     /// registered ops, so a PROCESS INIT frame exercises the INIT
     /// pvRequest decode + registration path.
     #[cfg(test)]
@@ -9210,7 +9210,7 @@ mod tests {
         channels
     }
 
-    /// BFR-8: build a PROCESS INIT frame `sid + ioid + 0x08 +
+    /// build a PROCESS INIT frame `sid + ioid + 0x08 +
     /// pv_request_bytes`.
     #[cfg(test)]
     fn process_init_frame(sid: u32, ioid: u32, pv_request: &[u8], order: ByteOrder) -> Frame {
@@ -9222,7 +9222,7 @@ mod tests {
         synth_frame(Command::Process, order, payload)
     }
 
-    /// BFR-8: drive `handle_process` for an INIT frame and return the
+    /// drive `handle_process` for an INIT frame and return the
     /// `(ops contains ioid, response status success)` pair.
     #[cfg(test)]
     async fn run_process_init(
@@ -9264,7 +9264,7 @@ mod tests {
         (registered, status.is_success())
     }
 
-    /// BFR-8 regression: a PROCESS INIT whose pvRequest VALUE is present
+    /// Regression: a PROCESS INIT whose pvRequest VALUE is present
     /// but truncated must be rejected (op-error) and MUST NOT register
     /// the IOID. The previous `decode_type_desc(..).ok().and_then(|d|
     /// decode_pv_field(..).ok())` swallowed the value error and
@@ -9281,15 +9281,15 @@ mod tests {
         let (registered, success) = run_process_init(1, 700, &req, order).await;
         assert!(
             !registered,
-            "BFR-8: a malformed PROCESS INIT pvRequest value must not register the IOID"
+            "a malformed PROCESS INIT pvRequest value must not register the IOID"
         );
         assert!(
             !success,
-            "BFR-8: a malformed PROCESS INIT pvRequest value must reply an error status"
+            "a malformed PROCESS INIT pvRequest value must reply an error status"
         );
     }
 
-    /// BFR-8 regression: a PROCESS INIT with no decodable pvRequest
+    /// Regression: a PROCESS INIT with no decodable pvRequest
     /// descriptor (empty body after subcmd) is rejected and not
     /// registered — the descriptor is required (mirrors the generic
     /// GET/PUT INIT descriptor-required policy; pvxs faults the buffer
@@ -9300,15 +9300,15 @@ mod tests {
         let (registered, success) = run_process_init(1, 701, &[], order).await;
         assert!(
             !registered,
-            "BFR-8: a PROCESS INIT with no pvRequest descriptor must not register the IOID"
+            "a PROCESS INIT with no pvRequest descriptor must not register the IOID"
         );
         assert!(
             !success,
-            "BFR-8: a PROCESS INIT with no pvRequest descriptor must reply an error status"
+            "a PROCESS INIT with no pvRequest descriptor must reply an error status"
         );
     }
 
-    /// BFR-8 control: a well-formed PROCESS INIT pvRequest (the Rust
+    /// Control: a well-formed PROCESS INIT pvRequest (the Rust
     /// client's shape — descriptor + value) is accepted, registers the
     /// IOID, and replies `Status::ok()`. Guards against the rejection
     /// path over-firing on valid input.
@@ -9326,14 +9326,8 @@ mod tests {
         );
 
         let (registered, success) = run_process_init(1, 702, &req, order).await;
-        assert!(
-            registered,
-            "BFR-8: a valid PROCESS INIT must register the IOID"
-        );
-        assert!(
-            success,
-            "BFR-8: a valid PROCESS INIT must reply Status::ok()"
-        );
+        assert!(registered, "a valid PROCESS INIT must register the IOID");
+        assert!(success, "a valid PROCESS INIT must reply Status::ok()");
     }
 
     /// Regression: the dedicated `handle_put_get` data phase must
@@ -9552,7 +9546,7 @@ mod tests {
 
     /// pvxs `serverintrospect.cpp:159`: GET_FIELD's guard is the
     /// composite `if(!chan || opByIOID.find(ioid)!=opByIOID.end())`.
-    /// Both arms log and silently return. Our prior fix (P-G19) only
+    /// Both arms log and silently return. Our prior fix only
     /// covered the !chan branch; an IOID collision with an active
     /// GET/PUT/MONITOR/RPC in the same channel still fired back a
     /// fabricated introspection reply, polluting the wire conversation
@@ -9679,7 +9673,7 @@ mod tests {
         assert!(resp.len() > PvaHeader::SIZE + 4);
     }
 
-    /// BFR-6: GET_FIELD slow path on a channel whose source returns no
+    /// GET_FIELD slow path on a channel whose source returns no
     /// descriptor must reply `Status::Error` with NO descriptor, matching
     /// pvxs `ServerIntrospectControl::error` → `doReply(nullptr, Status::
     /// Error)` (`serverintrospect.cpp:83-87`) and the `if(type)` guard at
@@ -9740,7 +9734,7 @@ mod tests {
         );
     }
 
-    /// BFR-6 companion: a successful GET_FIELD slow path still returns the
+    /// Companion: a successful GET_FIELD slow path still returns the
     /// exact descriptor the source provided (no regression from the
     /// error-path fix).
     #[tokio::test]
@@ -9807,7 +9801,7 @@ mod tests {
         );
     }
 
-    // ---- BFR-9: raw monitor re-encode must not fabricate a missing
+    // ---- raw monitor re-encode must not fabricate a missing
     // overrun bitset ------------------------------------------------
     //
     // `RawMonitorEvent.body_bytes` is the `changed | value | overrun`
@@ -9931,7 +9925,7 @@ mod tests {
         );
     }
 
-    // ---- BFR-14: a cross-endian raw monitor re-encode failure is a
+    // ---- a cross-endian raw monitor re-encode failure is a
     // terminal protocol boundary, not a silently dropped event -------
     //
     // `raw_monitor_frame` owns the single malformed-raw policy: a body
@@ -10057,7 +10051,7 @@ mod tests {
         }
     }
 
-    // ─── BFR-12: MONITOR FINISH op cleanup ───────────────────────────
+    // ─── MONITOR FINISH op cleanup ───────────────────────────
     //
     // Invariant (MUST): an op present in `ch.ops` with
     // `monitor_started == true` ⟺ its subscriber task is alive. When the
@@ -10069,7 +10063,7 @@ mod tests {
     // applies it via `apply_monitor_finish`, gated on the op-instance id
     // so a stale signal cannot evict a re-INIT'd op that reused the ioid.
 
-    /// Minimal BFR-12 source: serves one PV, records every
+    /// Minimal source: serves one PV, records every
     /// `notify_monitor_start` edge, and hands MONITOR a subscription that
     /// closes immediately so the subscriber task ends as on source close.
     struct Bfr12Source {
@@ -10420,7 +10414,7 @@ mod tests {
     }
 
     // ================================================================
-    // BFR-13: a data-phase GET/PUT error reply must echo the request's
+    // a data-phase GET/PUT error reply must echo the request's
     // data subcmd (`0x00` GET exec, `0x40` PUT readback), NOT the INIT
     // subcmd `0x08`. pvxs writes `op->subcmd` into EVERY reply
     // (`serverget.cpp:82-84`, recorded at `:475`) and emits a
@@ -10503,7 +10497,7 @@ mod tests {
         (subcmd, status)
     }
 
-    /// BFR-13: a GET whose source read fails during the data phase
+    /// a GET whose source read fails during the data phase
     /// replies with the request's data subcmd `0x00` and an error
     /// status — not an INIT `0x08` frame.
     #[tokio::test]
@@ -10581,7 +10575,7 @@ mod tests {
         );
     }
 
-    /// BFR-13: a PUT readback (`subcmd & 0x40`) whose readback GET
+    /// a PUT readback (`subcmd & 0x40`) whose readback GET
     /// fails replies with the request's `0x40` subcmd and an error
     /// status — not INIT `0x08`.
     #[tokio::test]
@@ -10660,7 +10654,7 @@ mod tests {
         );
     }
 
-    /// BFR-13 boundary: an INIT-phase negotiation failure (here a
+    /// Boundary: an INIT-phase negotiation failure (here a
     /// missing prototype) must still echo the INIT subcmd `0x08`. The
     /// fix makes error replies echo the *request* subcmd uniformly, so
     /// an INIT request stays `0x08` while a data request becomes
@@ -10715,7 +10709,7 @@ mod tests {
         );
     }
 
-    /// BFR-13 client side: a data-phase GET error reply is status-only
+    /// Client side: a data-phase GET error reply is status-only
     /// (`ioid + subcmd + status`, no bitset/value). The client decode
     /// must surface it as `OpResponse::Status` so `op_get` reports the
     /// server status, instead of faulting on the missing value body
@@ -10921,7 +10915,7 @@ mod r14_tests {
         let frame = synth_frame(Command::Get, order, payload);
 
         let t0 = tokio::time::Instant::now();
-        // BFR-12: this is a GET op, which never installs a MONITOR finish
+        // this is a GET op, which never installs a MONITOR finish
         // guard, so a throwaway completion sender with its receiver dropped
         // is sufficient. (`r14_tests` is a sibling module and cannot reach
         // `tests::discard_mon_fin`.)
@@ -10964,7 +10958,7 @@ mod r14_tests {
 
 #[cfg(test)]
 mod bfr15_tests {
-    //! BFR-15 regression: a data-phase EXEC runs only when the op is `Idle`,
+    //! Regression: a data-phase EXEC runs only when the op is `Idle`,
     //! flips it to `Executing`, and a *second* EXEC that arrives while the
     //! first task is in flight is IGNORED — the first task is NOT cancelled
     //! (pvxs `serverget.cpp:467-476` runs the EXEC only on `Idle`/sets

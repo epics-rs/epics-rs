@@ -615,7 +615,7 @@ async fn pva_fr_11_destroy_after_pause_does_not_double_fire() {
 
 /// pausing a server monitor must HOLD the latest value posted
 /// while paused (squash) and deliver it on resume — not drop it (the
-/// pre-fix P-G28 floor-drop). Mirrors pvxs queue-while-Idle +
+/// pre-fix floor-drop). Mirrors pvxs queue-while-Idle +
 /// drain-on-START.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_fr_8_pause_holds_latest_then_resume_delivers() {
@@ -712,7 +712,7 @@ async fn pva_fr_2_client_report_has_connection_byte_counters() {
     h.abort();
 }
 
-/// Regression: P-G11 (commit c3f286c) added a server-side pipeline
+/// Regression: commit c3f286c added a server-side pipeline
 /// credit window unconditionally for every Monitor op, but pvxs only
 /// applies flow control when the client's pvRequest explicitly
 /// negotiates `record[pipeline=true]`. Default `pvmonitor` callers

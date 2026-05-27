@@ -340,8 +340,8 @@ impl ServerConn {
         tokio::spawn(async move {
             let mut buf = rx_buf;
             let mut chunk = vec![0u8; 4096];
-            // P-G21: client-side segmented-message reassembly. Mirror
-            // of the server-side state machine added in P-G20. pvxs
+            // client-side segmented-message reassembly. Mirror
+            // of the server-side state machine. pvxs
             // sends large monitor events (NTNDArray frames, multi-MiB
             // arrays, big NTTable INIT descriptors) as
             // SegFirst..SegMiddle*..SegLast sequences; without
@@ -452,8 +452,8 @@ impl ServerConn {
                                     handle_control_frame(&frame, &writer_tx_reader, order_reader);
                                     continue;
                                 }
-                                // P-G21: segmentation gate (mirrors
-                                // server-side P-G20 / pvxs conn.cpp:
+                                // segmentation gate (mirrors
+                                // server-side pvxs conn.cpp:
                                 // 228-244). Validate continuation
                                 // invariants; accumulate until
                                 // SegLast (or unsegmented), then
@@ -886,7 +886,7 @@ async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
             rx_buf.drain(..n);
             return Ok(frame);
         }
-        // Same opt-in payload peek as the streaming reader (P-G8).
+        // Same opt-in payload peek as the streaming reader.
         // `None` = unbounded (pvxs parity); the handshake
         // read is `op_timeout`-deadlined regardless.
         if let Some(cap) = max_message_size {

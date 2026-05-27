@@ -15,7 +15,7 @@ pub use epics_base_rs::server::access_security::{AccessChecked, AccessGate};
 /// credential pass-through). Fields mirror what `CONNECTION_VALIDATION`
 /// established at handshake time, plus the peer's TCP socket address.
 ///
-/// PG-G10: gateways use this to pick the correct upstream client
+/// gateways use this to pick the correct upstream client
 /// when the gateway maintains a per-credential connection pool to
 /// the upstream IOC. Default trait methods that don't take a context
 /// remain available so existing implementations are unaffected.
@@ -96,7 +96,7 @@ pub struct MonitorOptions {
     /// which events are produced: a fanout gateway terminates the
     /// downstream pipeline on its own downstream connection and
     /// propagates backpressure upstream via the per-PV `Pauser`
-    /// (PG-G9). It therefore does NOT make a monitor non-transparent.
+    ///. It therefore does NOT make a monitor non-transparent.
     pub pipeline: bool,
     /// `record._options.queueSize` when the client set it explicitly
     /// (pvxs default 4). `None` means the client did not request a
@@ -181,7 +181,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// enforcement override to install a `Required` gate wrapping
     /// their `AcfCell`.
     ///
-    /// Round 40 (type-state ACF gate): the typed op methods take
+    /// Type-state ACF gate: the typed op methods take
     /// `AccessChecked` instead of `name: &str + ctx`. Because
     /// `AccessChecked` is unforgeable outside this gate's `check`,
     /// every wire op MUST flow through it — closing the missed-path
@@ -304,8 +304,8 @@ pub trait ChannelSource: Send + Sync + 'static {
 
     /// Type-state-enforced GET. The wire layer mints `checked` via
     /// `self.access().check(...)` once per op; the source then
-    /// inspects `checked.allows_read()` and dispatches. Round 43
-    /// deleted the `get_value_ctx` legacy path — every credential-
+    /// inspects `checked.allows_read()` and dispatches. The legacy
+    /// `get_value_ctx` path was deleted — every credential-
     /// aware GET now flows through this method and the AccessGate.
     /// The ctx is still passed so gateway-style sources can route
     /// to per-credential upstream connection pools.
@@ -848,15 +848,15 @@ pub trait ChannelSourceObj: Send + Sync {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>>;
-    /// Round 41: type-state-gated GET. Dyn forwarder.
+    /// Type-state-gated GET. Dyn forwarder.
     fn get_value_checked<'a>(
         &'a self,
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>>;
-    /// Round 41: per-source access gate. Dyn forwarder.
+    /// Per-source access gate. Dyn forwarder.
     fn access_gate(&self) -> &AccessGate;
-    /// Round 50 follow-up: monitor reload revalidation owner.
+    /// Monitor reload revalidation owner.
     fn revalidate_read<'a>(
         &'a self,
         pv_name: &'a str,
@@ -867,7 +867,7 @@ pub trait ChannelSourceObj: Send + Sync {
         name: &'a str,
         value: PvField,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
-    /// Round 42: dyn forwarder for type-state PUT.
+    /// Dyn forwarder for type-state PUT.
     fn put_value_checked<'a>(
         &'a self,
         checked: AccessChecked,
@@ -893,7 +893,7 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
     >;
-    /// Round 42: dyn forwarder for type-state MONITOR.
+    /// Dyn forwarder for type-state MONITOR.
     fn subscribe_checked<'a>(
         &'a self,
         checked: AccessChecked,
@@ -907,7 +907,7 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
     >;
-    /// Round 42: dyn forwarder for type-state raw MONITOR.
+    /// Dyn forwarder for type-state raw MONITOR.
     fn subscribe_raw_checked<'a>(
         &'a self,
         checked: AccessChecked,
@@ -953,7 +953,7 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'a>,
     >;
-    /// Round 42: dyn forwarder for type-state RPC.
+    /// Dyn forwarder for type-state RPC.
     fn rpc_checked<'a>(
         &'a self,
         checked: AccessChecked,

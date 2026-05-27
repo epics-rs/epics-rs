@@ -180,11 +180,11 @@ pub async fn run_udp_responder_with_config(
     // on interface change but we keep it static for now; restart the
     // server to pick up new NICs.
     //
-    // Round 26: when `auto_beacon=false` AND `destinations` is empty,
+    // when `auto_beacon=false` AND `destinations` is empty,
     // the operator has explicitly opted out of broadcast beaconing
     // (matching pvxs `EPICS_PVAS_AUTO_BEACON_ADDR_LIST=NO` semantics).
     // Pre-fix this branch fell through to limited broadcast, leaking
-    // beacon frames against site policy. Mirror round-25 CA fix.
+    // beacon frames against site policy. Mirror the CA fix.
     let mut beacon_destinations: Vec<SocketAddr> = if !destinations.is_empty() {
         destinations
     } else if auto_beacon {
@@ -240,7 +240,7 @@ pub async fn run_udp_responder_with_config(
         }
     }
     let beacon_join = tokio::spawn(async move {
-        // Burst-then-slowdown cadence (P-G17): emit `beacon_burst_count`
+        // Burst-then-slowdown cadence: emit `beacon_burst_count`
         // beacons at `beacon_period` (default 15s × 10), then drop to
         // `beacon_period_long` (default 180s) for steady state. Mirrors
         // pvxs `server.cpp:826-832`: after the burst every receiver in
@@ -1107,7 +1107,7 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
         }
     }
     let n = p.get_u16(order).ok()? as usize;
-    // P-G22 follow-up: cap pre-alloc against attacker-announced
+    // cap pre-alloc against attacker-announced
     // count. Each (cid u32, String) consumes >= 5 wire bytes; in
     // practice n is u16-bounded so the worst case is ~1.5MB but
     // capping at remaining-bytes keeps the small-datagram common

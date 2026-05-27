@@ -1,4 +1,4 @@
-//! Round 50 audit-3 regression test.
+//! Monitor-reload deny (composite source) regression test.
 //!
 //! Invariant: every monitor event after an ACL version mismatch MUST
 //! re-check READ access through the **inner** source's gate (the gate

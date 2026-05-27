@@ -149,7 +149,7 @@ pub fn decode_search_response(frame: &Frame) -> PvaResult<SearchResponse> {
     let count = cur
         .get_u16(order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    // A-G2: cap pre-allocation at remaining-bytes / 4 so a peer
+    // cap pre-allocation at remaining-bytes / 4 so a peer
     // can't trick us into reserving 256 KB up-front for cids that
     // the trailing payload could never supply. u16 already bounds
     // the worst case but the pattern matches `safe_capacity` in
@@ -232,7 +232,7 @@ pub fn decode_connection_validation_request(
             ));
         }
     };
-    // P-G22: cap allocation against attacker-controlled count. Each
+    // cap allocation against attacker-controlled count. Each
     // auth method string consumes at least 1 byte (Size + NUL); the
     // remaining cursor bytes bound how many can really arrive.
     let remaining = cur.get_ref().len().saturating_sub(cur.position() as usize);
@@ -493,7 +493,7 @@ pub fn decode_op_response_cached(
     } else {
         Status::ok()
     };
-    // BFR-13: a data-phase GET/PUT(/Get) error reply is status-only. pvxs
+    // a data-phase GET/PUT(/Get) error reply is status-only. pvxs
     // `serverget.cpp:84-94` writes `ioid + subcmd + status` and emits NO
     // bitset/value when `!sts.isSuccess()` — the value branch (`:102-104`)
     // runs only on success. Surface the failure status here (as the RPC
@@ -1010,7 +1010,7 @@ mod tests {
         }
     }
 
-    /// BFR-5: a GET data response carrying the last-request bit
+    /// a GET data response carrying the last-request bit
     /// (`subcmd & 0x10`) must still decode its value body. pvxs echoes the
     /// request subcmd on an otherwise normal data reply
     /// (`serverget.cpp:83,112-116`) and the client decodes by
@@ -1072,7 +1072,7 @@ mod tests {
         }
     }
 
-    /// BFR-5 companion: MONITOR FINISH (`subcmd & 0x10`) remains a
+    /// Companion: MONITOR FINISH (`subcmd & 0x10`) remains a
     /// status-only end-of-stream event. pvxs `servermon.cpp:148` emits
     /// only `ioid + subcmd + status`. This MONITOR-specific shape must not
     /// regress when GET/PUT/RPC stop treating `0x10` as status-only.

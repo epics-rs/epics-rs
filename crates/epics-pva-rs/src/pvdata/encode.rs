@@ -267,7 +267,7 @@ where
     let nbytes = n
         .checked_mul(N)
         .ok_or_else(|| decode_err!("scalar array element count × size overflows"))?;
-    // P-G22: a hostile peer can declare `n` up to u32::MAX; `get_bytes`
+    // a hostile peer can declare `n` up to u32::MAX; `get_bytes`
     // would eagerly `vec![0u8; nbytes]` (multi-GB) before `read_exact`
     // can fail. The frame can only ever carry `remaining` bytes, so a
     // declared length larger than that is unsatisfiable — reject it
@@ -338,7 +338,7 @@ use crate::proto::{
 const TAG_STRUCTURE: u8 = 0x80;
 const TAG_UNION: u8 = 0x81;
 
-/// P-G22: bound a `Vec::with_capacity` against an attacker-controlled
+/// bound a `Vec::with_capacity` against an attacker-controlled
 /// element count read from the wire. Every PVA decoded element must
 /// consume at least 1 byte, so capping at the cursor's remaining-byte
 /// count means a hostile peer announcing `n=0xFFFF_FFFF` allocates

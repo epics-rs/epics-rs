@@ -18,7 +18,7 @@ use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
 use tokio::sync::RwLock;
 
-/// Shared, mutable ACF cell. Round-28: changed from
+/// Shared, mutable ACF cell. Changed from
 /// `Arc<Option<AccessSecurityConfig>>` to `Arc<RwLock<...>>` so
 /// `PvaServer::reload_acf_from` can swap the policy at runtime
 /// (mirrors `CaServer::reload_acf`). All `PvDatabaseSource` ACF
@@ -30,7 +30,7 @@ pub type AcfCell = Arc<RwLock<Option<AccessSecurityConfig>>>;
 /// Native `ChannelSource` over a `PvDatabase`.
 pub struct PvDatabaseSource {
     db: Arc<PvDatabase>,
-    /// Round 41/43: the type-state access gate is the only ACF
+    /// The type-state access gate is the only ACF
     /// surface on this source. The gate holds an `Arc` clone of
     /// the caller's `AcfCell` (so hot-swap via that cell is
     /// visible) plus a per-name `(ASG, ASL)` resolver that reads
@@ -118,7 +118,7 @@ impl PvDatabaseSource {
         &self.db
     }
 
-    // Round 43: the ASG/ASL resolution moved into the AccessGate
+    // the ASG/ASL resolution moved into the AccessGate
     // builder (`Self::build_gate`). The duplicate `resolve_asg`
     // method that the deleted `*_ctx` overrides used is now gone.
 }
@@ -453,7 +453,7 @@ impl ChannelSource for PvDatabaseSource {
             // Aliases are independently addressable channel names —
             // a PVA client doing channelList must see them so it can
             // connect by alias. has_name and find_entry already
-            // resolve aliases on the server side (round 7).
+            // resolve aliases on the server side.
             names.extend(db.all_alias_names().await);
             names
         }
@@ -506,7 +506,7 @@ impl ChannelSource for PvDatabaseSource {
         }
     }
 
-    // Round 43: the legacy `get_value_ctx` / `subscribe_ctx` /
+    // the legacy `get_value_ctx` / `subscribe_ctx` /
     // `put_value_ctx` overrides were deleted. The trait's
     // `*_checked` defaults already enforce the AccessChecked level
     // before delegating to the ctx-less variants here, and the
@@ -685,8 +685,8 @@ mod tests {
         }
     }
 
-    /// Round 43: test-only compat layer that reproduces the
-    /// pre-Round-43 `*_ctx` shape on top of the new gate +
+    /// Test-only compat layer that reproduces the
+    /// pre-refactor `*_ctx` shape on top of the new gate +
     /// `*_checked` typed API. Production callers in `tcp.rs` go
     /// through the gate directly; only these regression tests
     /// retain the legacy call shape for clarity.
@@ -744,7 +744,7 @@ mod tests {
         PvField::Scalar(ScalarValue::Double(v))
     }
 
-    /// Round-17 regression: PVA PUT must be gated through ACF when
+    /// Regression: PVA PUT must be gated through ACF when
     /// the source was built with ACF enforcement. Pre-fix the PVA
     /// server stored ACF only as `#[allow(dead_code)]` and never
     /// called `check_access*` — every client could PUT regardless
@@ -803,7 +803,7 @@ ASG(SECURE) {
         );
     }
 
-    /// Round-18 regression: ACF must also gate READ. A peer with
+    /// Regression: ACF must also gate READ. A peer with
     /// NoAccess on the record's ASG must observe the same shape as
     /// "PV not found" (None) — the wire layer surfaces this as
     /// ECA_NORDACCESS-equivalent.
@@ -847,7 +847,7 @@ ASG(LOCKED) {
         assert!(v.is_none(), "intruder must be denied at READ time");
     }
 
-    /// Round-18: subscribe_ctx must also deny when peer has
+    /// subscribe_ctx must also deny when peer has
     /// NoAccess.
     #[tokio::test]
     async fn subscribe_ctx_denies_when_acf_no_access() {
@@ -884,10 +884,10 @@ ASG(LOCKED) {
         assert!(rx.is_none(), "intruder MONITOR must be denied");
     }
 
-    /// Round-28 regression: AcfCell swap takes effect on the next
+    /// Regression: AcfCell swap takes effect on the next
     /// ACF check. A subsequent PUT after the swap must use the new
     /// policy. Proves the RwLock-backed reload path actually
-    /// influences the source's behaviour (round-28 plumbed
+    /// influences the source's behaviour (the reload path plumbs
     /// `PvaServer::reload_acf_from` to write into this cell).
     #[tokio::test]
     async fn acf_swap_takes_effect_on_next_put() {
@@ -949,7 +949,7 @@ ASG(SECURE) {
             .expect("post-swap policy must allow PUT");
     }
 
-    /// Round-17: when the source is built without ACF, behaviour
+    /// When the source is built without ACF, behaviour
     /// matches the old `put_value` path — every PUT succeeds.
     #[tokio::test]
     async fn put_value_ctx_allows_when_no_acf() {
@@ -971,10 +971,10 @@ ASG(SECURE) {
             .expect("PUT must succeed when no ACF is attached");
     }
 
-    /// Round-41: type-state-gated GET. The wire-layer flow mints an
+    /// Type-state-gated GET. The wire-layer flow mints an
     /// [`AccessChecked`] via `source.access().check(...)`; the source
     /// then sees `NoAccess` in the token level and returns `None`.
-    /// Pre-Round-40 every GET handler had to *remember* to call the
+    /// Previously every GET handler had to *remember* to call the
     /// ACF check by hand — now the trait method signature forces it.
     #[tokio::test]
     async fn get_value_checked_denies_when_no_access() {

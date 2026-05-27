@@ -35,8 +35,8 @@ pub struct CompositeSource {
     entries: Arc<parking_lot::RwLock<Vec<SourceEntry>>>,
     /// The composite's gate is
     /// an aggregator whose `acl_version()` is the `wrapping_sum`
-    /// of every inner gate's version (NOT `max(...)` — see the
-    /// round-50 audit; a max-based aggregate produced false
+    /// of every inner gate's version (NOT `max(...)`: a
+    /// max-based aggregate produced false
     /// negatives when a smaller inner bumped under the existing
     /// peak). The aggregate is a **change signal only**: a tcp.rs
     /// monitor task compares the captured-at-subscribe version
@@ -55,7 +55,7 @@ impl Default for CompositeSource {
         let entries: Arc<parking_lot::RwLock<Vec<SourceEntry>>> =
             Arc::new(parking_lot::RwLock::new(Vec::new()));
         let entries_for_version = entries.clone();
-        // Round 50 follow-up (audit): the composite's aggregate
+        // the composite's aggregate
         // version is the `wrapping_sum` of every inner gate's
         // `acl_version()`. The earlier `max(...)` shape produced
         // false negatives — a monitor whose subscribe-time snapshot
@@ -416,7 +416,7 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    // Round 43: composite has no single gate of its own — each
+    // composite has no single gate of its own — each
     // inner source carries its own. The `*_checked` overrides
     // resolve the matched source by name, then mint a fresh
     // AccessChecked via THAT source's gate before invoking its
@@ -960,7 +960,7 @@ mod tests {
         assert_eq!(comp.monitor_watermarks("UNKNOWN:PV").await, None);
     }
 
-    /// Round 50 follow-up (audit): pre-fix the composite used
+    /// Pre-fix the composite used
     /// `max(inner.acl_version)` to aggregate. That's wrong — an
     /// inner that bumps but stays below the existing max produces
     /// the SAME aggregate, so the monitor's `live != stored`

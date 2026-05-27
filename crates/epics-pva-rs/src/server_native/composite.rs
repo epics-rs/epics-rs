@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::pvdata::{FieldDesc, PvField};
 
-use super::source::{AccessChecked, ChannelSource, DynSource, RawMonitorEvent};
+use super::source::{AccessChecked, ChannelSource, DynSource, OpError, RawMonitorEvent};
 
 /// One entry in the registry.
 #[derive(Clone)]
@@ -356,7 +356,7 @@ impl ChannelSource for CompositeSource {
         &self,
         name: &str,
         value: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let name = name.to_string();
         let this = self.snapshot();
         async move {
@@ -365,7 +365,7 @@ impl ChannelSource for CompositeSource {
                     return src.put_value(&name, value).await;
                 }
             }
-            Err(format!("no source serves '{name}'"))
+            Err(OpError::failed(format!("no source serves '{name}'")))
         }
     }
 
@@ -403,7 +403,7 @@ impl ChannelSource for CompositeSource {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
         let name = name.to_string();
         let this = self.snapshot();
         async move {
@@ -412,7 +412,7 @@ impl ChannelSource for CompositeSource {
                     return src.rpc(&name, request_desc, request_value).await;
                 }
             }
-            Err(format!("no source serves '{name}'"))
+            Err(OpError::failed(format!("no source serves '{name}'")))
         }
     }
 
@@ -443,7 +443,7 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         value: PvField,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -451,7 +451,7 @@ impl ChannelSource for CompositeSource {
                 Some((src, inner_checked)) => {
                     src.put_value_checked(inner_checked, value, ctx).await
                 }
-                None => Err(format!("no source serves '{name}'")),
+                None => Err(OpError::failed(format!("no source serves '{name}'"))),
             }
         }
     }
@@ -471,7 +471,7 @@ impl ChannelSource for CompositeSource {
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -480,7 +480,7 @@ impl ChannelSource for CompositeSource {
                     src.put_delta_checked(inner_checked, desc, changed, delta, ctx)
                         .await
                 }
-                None => Err(format!("no source serves '{name}'")),
+                None => Err(OpError::failed(format!("no source serves '{name}'"))),
             }
         }
     }
@@ -573,7 +573,7 @@ impl ChannelSource for CompositeSource {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -582,7 +582,7 @@ impl ChannelSource for CompositeSource {
                     src.rpc_checked(inner_checked, request_desc, request_value, ctx)
                         .await
                 }
-                None => Err(format!("no source serves '{name}'")),
+                None => Err(OpError::failed(format!("no source serves '{name}'"))),
             }
         }
     }
@@ -603,7 +603,7 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let name = name.to_string();
         let this = self.snapshot();
         async move {
@@ -612,7 +612,7 @@ impl ChannelSource for CompositeSource {
                     return src.process(&name).await;
                 }
             }
-            Err(format!("no source serves '{name}'"))
+            Err(OpError::failed(format!("no source serves '{name}'")))
         }
     }
 
@@ -620,13 +620,13 @@ impl ChannelSource for CompositeSource {
         &self,
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
             match Self::resolve_checked(this, &name, &ctx).await {
                 Some((src, inner_checked)) => src.process_checked(inner_checked, ctx).await,
-                None => Err(format!("no source serves '{name}'")),
+                None => Err(OpError::failed(format!("no source serves '{name}'"))),
             }
         }
     }
@@ -745,7 +745,7 @@ mod tests {
             &self,
             _: &str,
             _: PvField,
-        ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
             async { Ok(()) }
         }
         fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
@@ -803,7 +803,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: PvField,
-            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("n/a".into()) }
             }
             fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
@@ -897,7 +897,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: PvField,
-            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("n/a".into()) }
             }
             fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
@@ -1001,7 +1001,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: PvField,
-            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("n/a".into()) }
             }
             fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
@@ -1168,7 +1168,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: PvField,
-            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Ok(()) }
             }
             fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {

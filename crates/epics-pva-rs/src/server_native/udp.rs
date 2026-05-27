@@ -1135,6 +1135,7 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server_native::source::OpError;
 
     /// End-to-end forward path: `process_search_datagram` invoked
     /// with `Origin::Direct` and a unicast-flagged SEARCH MUST emit
@@ -1182,7 +1183,7 @@ mod tests {
                 &self,
                 _name: &str,
                 _value: PvField,
-            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("read-only test source".into()) }
             }
             fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
@@ -1302,7 +1303,7 @@ mod tests {
                 &self,
                 _name: &str,
                 _value: PvField,
-            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("read-only test source".into()) }
             }
             fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
@@ -1394,7 +1395,7 @@ mod tests {
                 &self,
                 _name: &str,
                 _value: PvField,
-            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("read-only".into()) }
             }
             fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
@@ -1565,7 +1566,7 @@ mod tests {
                 &self,
                 _name: &str,
                 _value: PvField,
-            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("read-only".into()) }
             }
             fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {

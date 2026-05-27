@@ -33,7 +33,7 @@ use tokio::sync::Mutex;
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, PvaServer, PvaServerConfig};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
 
 // ── A minimal put-capable in-memory source ───────────────────────────
 
@@ -101,7 +101,7 @@ impl ChannelSource for BenchSource {
         &self,
         name: &str,
         value: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let values = self.values.clone();
         let name = name.to_string();
         async move {

@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::proto::ByteOrder;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, PvaServerConfig, run_pva_server};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
 
 #[derive(Clone)]
 struct UInt32Source;
@@ -53,7 +53,7 @@ impl ChannelSource for UInt32Source {
         &self,
         _: &str,
         _: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async { Err("read-only".into()) }
     }
     fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {

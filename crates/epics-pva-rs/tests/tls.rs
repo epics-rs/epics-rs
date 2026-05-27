@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, mpsc};
 use epics_pva_rs::auth::{TlsClientConfig, TlsServerConfig};
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, PvaServerConfig, run_pva_server};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
 
 /// Server-side hook invoked once a peer's credentials are resolved.
 type AuthCompleteHook = Arc<
@@ -134,7 +134,7 @@ impl ChannelSource for StaticSource {
         &self,
         _name: &str,
         _value: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async { Ok(()) }
     }
     fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {

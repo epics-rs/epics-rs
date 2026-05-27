@@ -27,7 +27,7 @@ use epics_pva_rs::client::{AssertedIdentity, PvaClient};
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server::native_source::AcfCell;
 use epics_pva_rs::server_native::source::{
-    AccessChecked, ChannelContext, ChannelSource, WatermarkEvent, WatermarkKind,
+    AccessChecked, ChannelContext, ChannelSource, OpError, WatermarkEvent, WatermarkKind,
 };
 
 use super::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL};
@@ -909,16 +909,16 @@ impl ChannelSource for GatewayChannelSource {
     /// with empty/anonymous credentials (the only identity available
     /// on this path); when no ACF is installed the gate returns
     /// `ReadWrite`, preserving the legacy pass-through.
-    async fn put_value(&self, name: &str, value: PvField) -> Result<(), String> {
+    async fn put_value(&self, name: &str, value: PvField) -> Result<(), OpError> {
         let checked = self.gate.check(name, "", "", "anonymous", "").await;
         if !checked.allows_write() {
             tracing::debug!(
                 pv = %name,
                 "pva-gateway: ctx-less PUT denied by gateway ACF"
             );
-            return Err(format!(
+            return Err(OpError::denied(format!(
                 "PUT denied by gateway access security: PV '{name}' (anonymous)"
-            ));
+            )));
         }
         // Look up the entry to keep the upstream channel alive (and
         // confirm the PV exists) before issuing the PUT through the
@@ -928,7 +928,7 @@ impl ChannelSource for GatewayChannelSource {
             .cache
             .lookup(name, self.connect_timeout)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| OpError::failed(e.to_string()))?;
         // typed pass-through — forward the PvField as-is without
         // re-encoding through string form. pvxs serialises the PUT value
         // with to_wire_valid(R, temp) (pvxs/src/clientget.cpp:305) — no
@@ -937,7 +937,7 @@ impl ChannelSource for GatewayChannelSource {
             .client()
             .pvput_pv_field(name, &value)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| OpError::failed(e.to_string()))
     }
 
     /// Credential-aware PUT — migration to the
@@ -953,7 +953,7 @@ impl ChannelSource for GatewayChannelSource {
         checked: AccessChecked,
         value: PvField,
         ctx: ChannelContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), OpError> {
         if !checked.allows_write() {
             tracing::debug!(
                 pv = %checked.pv_name(),
@@ -961,14 +961,14 @@ impl ChannelSource for GatewayChannelSource {
                 method = %ctx.method,
                 "pva-gateway: PUT denied by gateway ACF"
             );
-            return Err(format!(
+            return Err(OpError::denied(format!(
                 "PUT denied by gateway access security: \
                  PV '{pv}' from {host}/{account}/{method}",
                 pv = checked.pv_name(),
                 host = ctx.host,
                 account = ctx.account,
                 method = ctx.method,
-            ));
+            )));
         }
 
         let name = checked.pv_name();
@@ -992,7 +992,7 @@ impl ChannelSource for GatewayChannelSource {
         client
             .pvput_pv_field(name, &value)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| OpError::failed(e.to_string()))
     }
 
     async fn is_writable(&self, name: &str) -> bool {
@@ -1018,12 +1018,12 @@ impl ChannelSource for GatewayChannelSource {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), String> {
+    ) -> Result<(FieldDesc, PvField), OpError> {
         let _entry = self
             .cache
             .lookup(name, self.connect_timeout)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| OpError::failed(e.to_string()))?;
         let result = tokio::time::timeout(
             self.rpc_timeout,
             self.cache
@@ -1033,8 +1033,8 @@ impl ChannelSource for GatewayChannelSource {
         .await;
         match result {
             Ok(Ok(pair)) => Ok(pair),
-            Ok(Err(e)) => Err(e.to_string()),
-            Err(_) => Err(format!("upstream rpc timeout for {name}")),
+            Ok(Err(e)) => Err(OpError::failed(e.to_string())),
+            Err(_) => Err(OpError::failed(format!("upstream rpc timeout for {name}"))),
         }
     }
 
@@ -1057,7 +1057,7 @@ impl ChannelSource for GatewayChannelSource {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> Result<(FieldDesc, PvField), String> {
+    ) -> Result<(FieldDesc, PvField), OpError> {
         if !checked.allows_write() {
             tracing::debug!(
                 pv = %checked.pv_name(),
@@ -1065,14 +1065,14 @@ impl ChannelSource for GatewayChannelSource {
                 method = %ctx.method,
                 "pva-gateway: RPC denied by gateway ACF"
             );
-            return Err(format!(
+            return Err(OpError::denied(format!(
                 "RPC denied by gateway access security: \
                  PV '{pv}' from {host}/{account}/{method}",
                 pv = checked.pv_name(),
                 host = ctx.host,
                 account = ctx.account,
                 method = ctx.method,
-            ));
+            )));
         }
         let name = checked.pv_name();
         // no shared-cache preflight (see put_value_checked).
@@ -1086,8 +1086,8 @@ impl ChannelSource for GatewayChannelSource {
         .await;
         match result {
             Ok(Ok(pair)) => Ok(pair),
-            Ok(Err(e)) => Err(e.to_string()),
-            Err(_) => Err(format!("upstream rpc timeout for {name}")),
+            Ok(Err(e)) => Err(OpError::failed(e.to_string())),
+            Err(_) => Err(OpError::failed(format!("upstream rpc timeout for {name}"))),
         }
     }
 
@@ -1098,17 +1098,17 @@ impl ChannelSource for GatewayChannelSource {
     /// actually triggers the upstream record. This override resolves
     /// the PV through the cache (confirming it exists) and forwards
     /// `pvprocess` through the shared client.
-    async fn process(&self, name: &str) -> Result<(), String> {
+    async fn process(&self, name: &str) -> Result<(), OpError> {
         let _entry = self
             .cache
             .lookup(name, self.connect_timeout)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| OpError::failed(e.to_string()))?;
         self.cache
             .client()
             .pvprocess(name)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| OpError::failed(e.to_string()))
     }
 
     /// Credential-aware PROCESS. pvxs treats PROCESS as a WRITE-class
@@ -1121,7 +1121,7 @@ impl ChannelSource for GatewayChannelSource {
         &self,
         checked: AccessChecked,
         ctx: ChannelContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), OpError> {
         if !checked.allows_write() {
             tracing::debug!(
                 pv = %checked.pv_name(),
@@ -1129,21 +1129,24 @@ impl ChannelSource for GatewayChannelSource {
                 method = %ctx.method,
                 "pva-gateway: PROCESS denied by gateway ACF"
             );
-            return Err(format!(
+            return Err(OpError::denied(format!(
                 "PROCESS denied by gateway access security: \
                  PV '{pv}' from {host}/{account}/{method}",
                 pv = checked.pv_name(),
                 host = ctx.host,
                 account = ctx.account,
                 method = ctx.method,
-            ));
+            )));
         }
         let name = checked.pv_name();
         // no shared-cache preflight (see put_value_checked).
         // PROCESS runs through the per-credential client, which resolves
         // existence and returns the upstream error itself.
         let client = self.upstream_client_for(&ctx);
-        client.pvprocess(name).await.map_err(|e| e.to_string())
+        client
+            .pvprocess(name)
+            .await
+            .map_err(|e| OpError::failed(e.to_string()))
     }
 
     async fn subscribe_raw(
@@ -1345,6 +1348,7 @@ impl ChannelSource for GatewayChannelSource {
 mod tests {
     use super::*;
     use epics_base_rs::server::access_security::parse_acf;
+    use epics_pva_rs::server_native::source::OpErrorKind;
 
     fn make_ctx(host: &str, account: &str, method: &str) -> ChannelContext {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1512,8 +1516,13 @@ ASG(DEFAULT) {
             .put_value_checked(token, dummy_value, ctx)
             .await
             .expect_err("PUT must be denied for non-admin under DEFAULT ASG");
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "gateway ACF write denial must classify as Denied: {err:?}"
+        );
         assert!(
-            err.contains("denied by gateway access security"),
+            err.message.contains("denied by gateway access security"),
             "denial reason must name the gateway as enforcement point: {err:?}",
         );
     }
@@ -1578,8 +1587,13 @@ ASG(DEFAULT) {
         let result = src.put_value_checked(allow_token, dummy_value, ctx).await;
         if let Err(msg) = result {
             assert!(
-                !msg.contains("denied by gateway access security"),
+                !msg.message.contains("denied by gateway access security"),
                 "post-swap PUT must NOT be ACL-denied: {msg:?}",
+            );
+            assert_eq!(
+                msg.kind,
+                OpErrorKind::Failed,
+                "forwarded upstream error must classify as Failed, not a gateway denial: {msg:?}"
             );
         }
     }
@@ -1710,8 +1724,13 @@ ASG(DEFAULT) {
             .rpc_checked(token, FieldDesc::Variant, PvField::Null, ctx)
             .await;
         let err = result.expect_err("RPC must be denied for NoAccess peer");
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "gateway ACF read-class RPC denial must classify as Denied: {err:?}"
+        );
         assert!(
-            err.contains("denied by gateway access security"),
+            err.message.contains("denied by gateway access security"),
             "denial message must name the gateway as enforcer: {err:?}",
         );
     }
@@ -1743,8 +1762,13 @@ ASG(DEFAULT) {
             .rpc_checked(token, FieldDesc::Variant, PvField::Null, ctx)
             .await
             .expect_err("read-only peer must be denied RPC (write-class)");
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "write-class RPC denial for read-only peer must classify as Denied: {err:?}"
+        );
         assert!(
-            err.contains("denied by gateway access security"),
+            err.message.contains("denied by gateway access security"),
             "read-only RPC must be ACL-denied at the gateway: {err:?}",
         );
     }
@@ -1766,8 +1790,13 @@ ASG(DEFAULT) {
             .put_value("any:pv", dummy)
             .await
             .expect_err("ctx-less PUT must be denied by the gateway ACF");
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "ctx-less PUT gateway ACF denial must classify as Denied: {err:?}"
+        );
         assert!(
-            err.contains("denied by gateway access security"),
+            err.message.contains("denied by gateway access security"),
             "denial must name the gateway as enforcer: {err:?}",
         );
     }
@@ -1782,8 +1811,13 @@ ASG(DEFAULT) {
         let dummy = PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(0.0));
         if let Err(msg) = src.put_value("any:pv", dummy).await {
             assert!(
-                !msg.contains("denied by gateway access security"),
+                !msg.message.contains("denied by gateway access security"),
                 "no-ACF PUT must NOT be ACL-denied: {msg:?}",
+            );
+            assert_eq!(
+                msg.kind,
+                OpErrorKind::Failed,
+                "forwarded upstream error must classify as Failed, not a gateway denial: {msg:?}"
             );
         }
     }
@@ -1805,8 +1839,14 @@ ASG(DEFAULT) {
             .process_checked(token, ctx)
             .await
             .expect_err("PROCESS must be denied for a non-write peer");
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "PROCESS gateway ACF denial must classify as Denied: {err:?}"
+        );
         assert!(
-            err.contains("PROCESS denied by gateway access security"),
+            err.message
+                .contains("PROCESS denied by gateway access security"),
             "denial must name the gateway as enforcer: {err:?}",
         );
     }
@@ -1824,8 +1864,13 @@ ASG(DEFAULT) {
         let token = check(&src, "some:pv", &ctx).await;
         if let Err(msg) = src.process_checked(token, ctx).await {
             assert!(
-                !msg.contains("denied by gateway access security"),
+                !msg.message.contains("denied by gateway access security"),
                 "WRITE-granted PROCESS must NOT be ACL-denied: {msg:?}",
+            );
+            assert_eq!(
+                msg.kind,
+                OpErrorKind::Failed,
+                "forwarded upstream error must classify as Failed, not a gateway denial: {msg:?}"
             );
         }
     }

@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver, parse_acf};
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, PvaServer, PvaServerConfig};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
 
 /// A writable NTScalar source. `put_value` stores **twice** the
 /// incoming value (a stand-in for a record that post-processes on
@@ -81,7 +81,7 @@ impl ChannelSource for DoublingSource {
         &self,
         _: &str,
         value: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let store = self.value.clone();
         async move {
             // Extract the `.value` int from the incoming structure and
@@ -110,7 +110,7 @@ impl ChannelSource for DoublingSource {
     ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
         async { None }
     }
-    fn process(&self, _: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    fn process(&self, _: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let store = self.value.clone();
         let count = self.process_count.clone();
         async move {
@@ -351,7 +351,7 @@ impl ChannelSource for DenySource {
         &self,
         _: &str,
         _value: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         // Records whether the mutating hook was reached. The ACF gate
         // must block this before it runs — the count must stay 0.
         self.put_hits.fetch_add(1, Ordering::SeqCst);
@@ -366,7 +366,7 @@ impl ChannelSource for DenySource {
     ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
         async { None }
     }
-    fn process(&self, _: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    fn process(&self, _: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         self.process_hits.fetch_add(1, Ordering::SeqCst);
         async { Ok(()) }
     }

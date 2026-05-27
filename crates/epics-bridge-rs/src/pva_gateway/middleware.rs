@@ -26,7 +26,7 @@ use std::sync::Arc;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server_native::ChannelContext;
 use epics_pva_rs::server_native::source::{
-    ChannelSource, DynSource, RawMonitorEvent, WatermarkEvent,
+    ChannelSource, DynSource, OpError, OpErrorKind, RawMonitorEvent, WatermarkEvent,
 };
 use tokio::sync::mpsc;
 
@@ -94,16 +94,16 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     async fn get_value(&self, name: &str) -> Option<PvField> {
         self.inner.get_value(name).await
     }
-    async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
-        Err("read-only mode: PUT rejected".into())
+    async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+        Err(OpError::denied("read-only mode: PUT rejected"))
     }
     async fn put_value_checked(
         &self,
         _checked: epics_pva_rs::server_native::source::AccessChecked,
         _value: PvField,
         _ctx: ChannelContext,
-    ) -> Result<(), String> {
-        Err("read-only mode: PUT rejected".into())
+    ) -> Result<(), OpError> {
+        Err(OpError::denied("read-only mode: PUT rejected"))
     }
     // A BitSet-delta PUT is still a PUT. Reject it here exactly the
     // way `put_value_checked` does — without this override the trait
@@ -118,15 +118,15 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         _changed: epics_pva_rs::proto::BitSet,
         _delta: PvField,
         _ctx: ChannelContext,
-    ) -> Result<(), String> {
-        Err("read-only mode: PUT rejected".into())
+    ) -> Result<(), OpError> {
+        Err(OpError::denied("read-only mode: PUT rejected"))
     }
     // PROCESS mutates upstream record state — it is a WRITE-class op,
     // so reject it here exactly the way `put_value` does. Without this
     // override the trait-default `process` (`Ok(())`) would falsely
     // report success and let a PROCESS slip past read-only mode.
-    async fn process(&self, _name: &str) -> Result<(), String> {
-        Err("read-only mode: PROCESS rejected".into())
+    async fn process(&self, _name: &str) -> Result<(), OpError> {
+        Err(OpError::denied("read-only mode: PROCESS rejected"))
     }
     // Typed PROCESS — same WRITE-class rejection as `process` above.
     // Without this override the trait-default `process_checked` would
@@ -137,8 +137,8 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         &self,
         _checked: epics_pva_rs::server_native::source::AccessChecked,
         _ctx: ChannelContext,
-    ) -> Result<(), String> {
-        Err("read-only mode: PROCESS rejected".into())
+    ) -> Result<(), OpError> {
+        Err(OpError::denied("read-only mode: PROCESS rejected"))
     }
     async fn is_writable(&self, _name: &str) -> bool {
         false
@@ -214,8 +214,8 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         _name: &str,
         _request_desc: FieldDesc,
         _request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), String> {
-        Err("read-only mode: RPC rejected".into())
+    ) -> Result<(FieldDesc, PvField), OpError> {
+        Err(OpError::denied("read-only mode: RPC rejected"))
     }
     async fn rpc_checked(
         &self,
@@ -223,8 +223,8 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         _request_desc: FieldDesc,
         _request_value: PvField,
         _ctx: ChannelContext,
-    ) -> Result<(FieldDesc, PvField), String> {
-        Err("read-only mode: RPC rejected".into())
+    ) -> Result<(FieldDesc, PvField), OpError> {
+        Err(OpError::denied("read-only mode: RPC rejected"))
     }
     // forward the per-PV watermark levels so the inner
     // gateway source's `monitor_watermarks` override is reachable
@@ -478,9 +478,9 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.get_value(name).await
     }
-    async fn put_value(&self, name: &str, value: PvField) -> Result<(), String> {
+    async fn put_value(&self, name: &str, value: PvField) -> Result<(), OpError> {
         if !self.config.allowed(name) {
-            return Err(format!("ACL: PV '{name}' denied"));
+            return Err(OpError::denied(format!("ACL: PV '{name}' denied")));
         }
         self.inner.put_value(name, value).await
     }
@@ -488,9 +488,9 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     // it by the layer's static allowlist BEFORE forwarding, exactly
     // the way `put_value` is gated. Without this override the trait
     // default `process` (`Ok(())`) bypasses the ACL entirely.
-    async fn process(&self, name: &str) -> Result<(), String> {
+    async fn process(&self, name: &str) -> Result<(), OpError> {
         if !self.config.allowed(name) {
-            return Err(format!("ACL: PV '{name}' denied"));
+            return Err(OpError::denied(format!("ACL: PV '{name}' denied")));
         }
         self.inner.process(name).await
     }
@@ -516,9 +516,12 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         value: PvField,
         ctx: ChannelContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), OpError> {
         if !self.config.allowed(checked.pv_name()) {
-            return Err(format!("ACL: PV '{}' denied", checked.pv_name()));
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                checked.pv_name()
+            )));
         }
         self.inner.put_value_checked(checked, value, ctx).await
     }
@@ -536,9 +539,12 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         changed: epics_pva_rs::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), OpError> {
         if !self.config.allowed(checked.pv_name()) {
-            return Err(format!("ACL: PV '{}' denied", checked.pv_name()));
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                checked.pv_name()
+            )));
         }
         self.inner
             .put_delta_checked(checked, desc, changed, delta, ctx)
@@ -613,9 +619,9 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), String> {
+    ) -> Result<(FieldDesc, PvField), OpError> {
         if !self.config.allowed(name) {
-            return Err(format!("ACL: PV '{name}' denied"));
+            return Err(OpError::denied(format!("ACL: PV '{name}' denied")));
         }
         self.inner.rpc(name, request_desc, request_value).await
     }
@@ -625,9 +631,12 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> Result<(FieldDesc, PvField), String> {
+    ) -> Result<(FieldDesc, PvField), OpError> {
         if !self.config.allowed(checked.pv_name()) {
-            return Err(format!("ACL: PV '{}' denied", checked.pv_name()));
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                checked.pv_name()
+            )));
         }
         self.inner
             .rpc_checked(checked, request_desc, request_value, ctx)
@@ -641,9 +650,12 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), OpError> {
         if !self.config.allowed(checked.pv_name()) {
-            return Err(format!("ACL: PV '{}' denied", checked.pv_name()));
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                checked.pv_name()
+            )));
         }
         self.inner.process_checked(checked, ctx).await
     }
@@ -831,26 +843,29 @@ pub enum AuditResult {
     Failed,
 }
 
-/// Build an [`AuditEvent`] from the inner-call outcome. Detects
-/// `Denied` vs `Failed` heuristically: error messages produced by
-/// [`AclLayer`] / [`ReadOnlyLayer`] / source-level ACF checks
-/// usually contain "denied" / "deny" / "ACL" / "read-only", so the
-/// downstream operator gets the right bucket without each layer
-/// having to invent a structured-error type.
-fn make_audit_event(name: &str, user: &str, host: &str, result: &Result<(), String>) -> AuditEvent {
+/// Build an [`AuditEvent`] from the inner-call outcome. The
+/// `Denied`-vs-`Failed` bucket is read directly from the typed
+/// [`OpErrorKind`] the inner layer set — an access-control refusal
+/// ([`AclLayer`] / [`ReadOnlyLayer`] / source-level gateway ACF) is
+/// constructed as [`OpErrorKind::Denied`], everything else as
+/// [`OpErrorKind::Failed`]. No substring matching of the message:
+/// an upstream failure whose text happens to contain "denied" is
+/// classified `Failed`, because only a gateway access decision sets
+/// the `Denied` kind.
+fn make_audit_event(
+    name: &str,
+    user: &str,
+    host: &str,
+    result: &Result<(), OpError>,
+) -> AuditEvent {
     let (kind, error) = match result {
         Ok(_) => (AuditResult::Ok, String::new()),
-        Err(msg) => {
-            let lower = msg.to_lowercase();
-            if lower.contains("deny")
-                || lower.contains("denied")
-                || lower.contains("acl:")
-                || lower.contains("read-only")
-            {
-                (AuditResult::Denied, msg.clone())
-            } else {
-                (AuditResult::Failed, msg.clone())
-            }
+        Err(e) => {
+            let bucket = match e.kind {
+                OpErrorKind::Denied => AuditResult::Denied,
+                OpErrorKind::Failed => AuditResult::Failed,
+            };
+            (bucket, e.message.clone())
         }
     };
     AuditEvent {
@@ -984,10 +999,10 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         if self.audit_get {
             // GET has no error path here — None means "missing" not
             // "denied" — so we model it as Ok with empty error.
-            let outcome: Result<(), String> = if result.is_some() {
+            let outcome: Result<(), OpError> = if result.is_some() {
                 Ok(())
             } else {
-                Err(format!("PV '{name}' not found"))
+                Err(OpError::failed(format!("PV '{name}' not found")))
             };
             let mut ev = make_audit_event(name, "", "", &outcome);
             ev.event = AuditEventKind::Get;
@@ -995,7 +1010,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    async fn put_value(&self, name: &str, value: PvField) -> Result<(), String> {
+    async fn put_value(&self, name: &str, value: PvField) -> Result<(), OpError> {
         let result = self.inner.put_value(name, value).await;
         self.sink.record(make_audit_event(name, "", "", &result));
         result
@@ -1007,7 +1022,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         value: PvField,
         ctx: ChannelContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), OpError> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
@@ -1031,7 +1046,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         changed: epics_pva_rs::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), OpError> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
@@ -1047,7 +1062,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     // row shape as PUT (`AuditEventKind::Process`), then forward.
     // Without this override the trait-default `process` would never
     // reach the inner source and no audit row would be emitted.
-    async fn process(&self, name: &str) -> Result<(), String> {
+    async fn process(&self, name: &str) -> Result<(), OpError> {
         let result = self.inner.process(name).await;
         let mut ev = make_audit_event(name, "", "", &result);
         ev.event = AuditEventKind::Process;
@@ -1061,7 +1076,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), OpError> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
@@ -1081,10 +1096,15 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         let host = ctx.host.clone();
         let result = self.inner.get_value_checked(checked, ctx).await;
         if self.audit_get {
-            let outcome: Result<(), String> = if result.is_some() {
+            // GET returns Option, which cannot distinguish "not found"
+            // from "read-denied" — the read gate enforces denial upstream
+            // by refusing to mint a readable token, so a None reaching
+            // here (after a permitted read) is operationally a miss
+            // (Failed), not an access denial.
+            let outcome: Result<(), OpError> = if result.is_some() {
                 Ok(())
             } else {
-                Err(format!("PV '{pv}' not found / denied"))
+                Err(OpError::failed(format!("PV '{pv}' not found")))
             };
             let mut ev = make_audit_event(&pv, &user, &host, &outcome);
             ev.event = AuditEventKind::Get;
@@ -1102,10 +1122,10 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         let host = ctx.host.clone();
         let result = self.inner.subscribe_checked(checked, ctx).await;
         if self.audit_subscribe {
-            let outcome: Result<(), String> = if result.is_some() {
+            let outcome: Result<(), OpError> = if result.is_some() {
                 Ok(())
             } else {
-                Err(format!("PV '{pv}' not subscribable"))
+                Err(OpError::failed(format!("PV '{pv}' not subscribable")))
             };
             let mut ev = make_audit_event(&pv, &user, &host, &outcome);
             ev.event = AuditEventKind::Subscribe;
@@ -1119,10 +1139,10 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
         let result = self.inner.subscribe(name).await;
         if self.audit_subscribe {
-            let outcome: Result<(), String> = if result.is_some() {
+            let outcome: Result<(), OpError> = if result.is_some() {
                 Ok(())
             } else {
-                Err(format!("PV '{name}' not subscribable"))
+                Err(OpError::failed(format!("PV '{name}' not subscribable")))
             };
             let mut ev = make_audit_event(name, "", "", &outcome);
             ev.event = AuditEventKind::Subscribe;
@@ -1136,10 +1156,12 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         // miss the audit event entirely.
         let result = self.inner.subscribe_raw(name).await;
         if self.audit_subscribe {
-            let outcome: Result<(), String> = if result.is_some() {
+            let outcome: Result<(), OpError> = if result.is_some() {
                 Ok(())
             } else {
-                Err(format!("PV '{name}' not subscribable (raw)"))
+                Err(OpError::failed(format!(
+                    "PV '{name}' not subscribable (raw)"
+                )))
             };
             let mut ev = make_audit_event(name, "", "", &outcome);
             ev.event = AuditEventKind::Subscribe;
@@ -1160,10 +1182,10 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         let host = ctx.host.clone();
         let result = self.inner.subscribe_raw_checked(checked, ctx).await;
         if self.audit_subscribe {
-            let outcome: Result<(), String> = if result.is_some() {
+            let outcome: Result<(), OpError> = if result.is_some() {
                 Ok(())
             } else {
-                Err(format!("PV '{pv}' not subscribable (raw)"))
+                Err(OpError::failed(format!("PV '{pv}' not subscribable (raw)")))
             };
             let mut ev = make_audit_event(&pv, &user, &host, &outcome);
             ev.event = AuditEventKind::Subscribe;
@@ -1190,10 +1212,10 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
             .subscribe_checked_opts_marked(checked, ctx, opts)
             .await;
         if self.audit_subscribe {
-            let outcome: Result<(), String> = if result.is_some() {
+            let outcome: Result<(), OpError> = if result.is_some() {
                 Ok(())
             } else {
-                Err(format!("PV '{pv}' not subscribable"))
+                Err(OpError::failed(format!("PV '{pv}' not subscribable")))
             };
             let mut ev = make_audit_event(&pv, &user, &host, &outcome);
             ev.event = AuditEventKind::Subscribe;
@@ -1215,10 +1237,10 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
             .subscribe_raw_checked_opts(checked, ctx, opts)
             .await;
         if self.audit_subscribe {
-            let outcome: Result<(), String> = if result.is_some() {
+            let outcome: Result<(), OpError> = if result.is_some() {
                 Ok(())
             } else {
-                Err(format!("PV '{pv}' not subscribable (raw)"))
+                Err(OpError::failed(format!("PV '{pv}' not subscribable (raw)")))
             };
             let mut ev = make_audit_event(&pv, &user, &host, &outcome);
             ev.event = AuditEventKind::Subscribe;
@@ -1231,10 +1253,10 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), String> {
+    ) -> Result<(FieldDesc, PvField), OpError> {
         let result = self.inner.rpc(name, request_desc, request_value).await;
         if self.audit_rpc {
-            let outcome: Result<(), String> = match &result {
+            let outcome: Result<(), OpError> = match &result {
                 Ok(_) => Ok(()),
                 Err(e) => Err(e.clone()),
             };
@@ -1253,7 +1275,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
-    ) -> Result<(FieldDesc, PvField), String> {
+    ) -> Result<(FieldDesc, PvField), OpError> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
@@ -1262,7 +1284,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
             .rpc_checked(checked, request_desc, request_value, ctx)
             .await;
         if self.audit_rpc {
-            let outcome: Result<(), String> = match &result {
+            let outcome: Result<(), OpError> = match &result {
                 Ok(_) => Ok(()),
                 Err(e) => Err(e.clone()),
             };
@@ -1530,7 +1552,12 @@ mod tests {
             )
             .await
             .expect_err("regex-denied PUT must fail at the ACL layer");
-        assert!(err.contains("denied"));
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "ACL denial must classify as Denied: {err:?}"
+        );
+        assert!(err.message.contains("denied"));
     }
 
     /// Audit-event classifier tags ACL/read-only error messages
@@ -1541,7 +1568,7 @@ mod tests {
             "MOTOR:VAL",
             "alice",
             "host1",
-            &Err("ACL: PV 'MOTOR:VAL' denied".into()),
+            &Err(OpError::denied("ACL: PV 'MOTOR:VAL' denied")),
         );
         assert_eq!(denied.result, AuditResult::Denied);
         assert!(!denied.error.is_empty());
@@ -1550,7 +1577,7 @@ mod tests {
             "MOTOR:VAL",
             "",
             "",
-            &Err("read-only mode: PUT rejected".into()),
+            &Err(OpError::denied("read-only mode: PUT rejected")),
         );
         assert_eq!(read_only.result, AuditResult::Denied);
 
@@ -1598,7 +1625,7 @@ mod tests {
         async fn get_value(&self, _name: &str) -> Option<PvField> {
             Some(PvField::Scalar(ScalarValue::Double(0.0)))
         }
-        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
+        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
             Ok(())
         }
         async fn put_value_checked(
@@ -1606,7 +1633,7 @@ mod tests {
             _checked: AccessChecked,
             _value: PvField,
             _ctx: ChannelContext,
-        ) -> Result<(), String> {
+        ) -> Result<(), OpError> {
             self.value_reached.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -1617,7 +1644,7 @@ mod tests {
             _changed: epics_pva_rs::proto::BitSet,
             _delta: PvField,
             _ctx: ChannelContext,
-        ) -> Result<(), String> {
+        ) -> Result<(), OpError> {
             self.delta_reached.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -1625,7 +1652,7 @@ mod tests {
         // applies the `allows_write()` gate then delegates here, so a
         // wrapper that correctly forwards `process_checked` lands in
         // this method and flips `process_reached`.
-        async fn process(&self, _name: &str) -> Result<(), String> {
+        async fn process(&self, _name: &str) -> Result<(), OpError> {
             self.process_reached.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -1717,7 +1744,12 @@ mod tests {
             )
             .await
             .expect_err("ACL-denied delta PUT must fail at the layer");
-        assert!(err.contains("denied"));
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "ACL denial must classify as Denied: {err:?}"
+        );
+        assert!(err.message.contains("denied"));
         assert!(!delta_reached.load(Ordering::SeqCst));
         assert!(!value_reached.load(Ordering::SeqCst));
     }
@@ -1796,7 +1828,12 @@ mod tests {
             )
             .await
             .expect_err("read-only delta PUT must be rejected");
-        assert!(err.contains("read-only"));
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "read-only refusal must classify as Denied: {err:?}"
+        );
+        assert!(err.message.contains("read-only"));
         assert!(!delta_reached.load(Ordering::SeqCst));
         assert!(!value_reached.load(Ordering::SeqCst));
     }
@@ -1842,7 +1879,7 @@ mod tests {
         async fn get_value(&self, _name: &str) -> Option<PvField> {
             Some(PvField::Scalar(ScalarValue::Double(0.0)))
         }
-        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
+        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
             Ok(())
         }
         async fn is_writable(&self, _name: &str) -> bool {
@@ -1925,7 +1962,7 @@ mod tests {
         async fn get_value(&self, _name: &str) -> Option<PvField> {
             Some(PvField::Scalar(ScalarValue::Double(0.0)))
         }
-        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
+        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
             Ok(())
         }
         async fn is_writable(&self, _name: &str) -> bool {
@@ -1993,7 +2030,12 @@ mod tests {
             .process_checked(checked_for("SECRET:KEY").await, test_ctx())
             .await
             .expect_err("ACL-denied PROCESS must fail at the layer");
-        assert!(err.contains("denied"));
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "ACL denial must classify as Denied: {err:?}"
+        );
+        assert!(err.message.contains("denied"));
         assert!(
             !process_reached.load(Ordering::SeqCst),
             "ACL-denied PROCESS must not reach the inner source"
@@ -2016,7 +2058,12 @@ mod tests {
             .process_checked(checked_for("X").await, test_ctx())
             .await
             .expect_err("read-only PROCESS must be rejected");
-        assert!(err.contains("read-only"));
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "read-only refusal must classify as Denied: {err:?}"
+        );
+        assert!(err.message.contains("read-only"));
         assert!(
             !process_reached.load(Ordering::SeqCst),
             "read-only PROCESS must not reach the inner source"
@@ -2026,7 +2073,12 @@ mod tests {
             .process("X")
             .await
             .expect_err("read-only ctx-less PROCESS must be rejected");
-        assert!(err.contains("read-only"));
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "read-only refusal must classify as Denied: {err:?}"
+        );
+        assert!(err.message.contains("read-only"));
         assert!(!process_reached.load(Ordering::SeqCst));
     }
 
@@ -2056,13 +2108,23 @@ mod tests {
             )
             .await
             .expect_err("read-only RPC must be rejected");
-        assert!(err.contains("read-only"), "err: {err}");
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "read-only refusal must classify as Denied: {err:?}"
+        );
+        assert!(err.message.contains("read-only"), "err: {err}");
 
         let err = ro
             .rpc("X", desc, val)
             .await
             .expect_err("read-only ctx-less RPC must be rejected");
-        assert!(err.contains("read-only"), "err: {err}");
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "read-only refusal must classify as Denied: {err:?}"
+        );
+        assert!(err.message.contains("read-only"), "err: {err}");
     }
 
     /// A PROCESS through the `Audited` wrapper must reach the inner
@@ -2164,7 +2226,7 @@ mod tests {
             .process_checked(checked_for("SECRET:KEY").await, test_ctx())
             .await
             .expect_err("ACL-denied PROCESS must fail through the layered stack");
-        assert!(err.contains("denied"));
+        assert!(err.message.contains("denied"));
         assert!(
             !process_reached.load(Ordering::SeqCst),
             "ACL-denied PROCESS must not reach the inner source"
@@ -2193,7 +2255,7 @@ mod tests {
         async fn get_value(&self, _name: &str) -> Option<PvField> {
             Some(PvField::Scalar(ScalarValue::Double(0.0)))
         }
-        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
+        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
             Ok(())
         }
         async fn is_writable(&self, _name: &str) -> bool {

@@ -29,7 +29,7 @@ use tokio::sync::{Mutex, mpsc};
 use epics_pva_rs::client_native::beacon_throttle::BeaconTracker;
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, PvaServerConfig, run_pva_server};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
 
 // ── A tiny in-memory ChannelSource we can pump events into ───────────
 
@@ -210,7 +210,7 @@ impl ChannelSource for MemSource {
         &self,
         name: &str,
         value: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let inner = self.inner.clone();
         let name = name.to_string();
         async move {

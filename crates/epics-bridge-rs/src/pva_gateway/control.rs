@@ -42,7 +42,7 @@
 use std::sync::Arc;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource};
+use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource, OpError};
 use tokio::sync::mpsc;
 
 use super::source::GatewayChannelSource;
@@ -374,13 +374,15 @@ impl ChannelSource for ControlSource {
         false
     }
 
-    async fn put_value(&self, name: &str, _value: PvField) -> Result<(), String> {
+    async fn put_value(&self, name: &str, _value: PvField) -> Result<(), OpError> {
+        // Wrong access method / read-only property — operational, not an
+        // authorization denial (Failed bucket).
         if self.is_control(name) {
-            Err(format!(
+            Err(OpError::failed(format!(
                 "control PV '{name}' is invoked via RPC (pvcall), not PUT"
-            ))
+            )))
         } else {
-            Err("control PVs are read-only".to_string())
+            Err(OpError::failed("control PVs are read-only"))
         }
     }
 
@@ -392,17 +394,18 @@ impl ChannelSource for ControlSource {
     /// PROCESS is refused the same way `put_value` refuses a PUT.
     /// `process_checked`'s default delegates here after its WRITE
     /// gate, so this one override covers both entry points.
-    async fn process(&self, name: &str) -> Result<(), String> {
+    async fn process(&self, name: &str) -> Result<(), OpError> {
+        // All operational (wrong method / read-only / not found) — Failed.
         if self.is_control(name) {
-            Err(format!(
+            Err(OpError::failed(format!(
                 "control PV '{name}' is invoked via RPC (pvcall), not PROCESS"
-            ))
+            )))
         } else if self.is_diag(name) {
-            Err(format!(
+            Err(OpError::failed(format!(
                 "'{name}' is a read-only diagnostic PV — PROCESS not supported"
-            ))
+            )))
         } else {
-            Err(format!("unknown control PV '{name}'"))
+            Err(OpError::failed(format!("unknown control PV '{name}'")))
         }
     }
 
@@ -415,17 +418,20 @@ impl ChannelSource for ControlSource {
         name: &str,
         _request_desc: FieldDesc,
         _request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), String> {
+    ) -> Result<(FieldDesc, PvField), OpError> {
         if self.is_control(name) {
-            // No ctx — no credentials to check. Refuse rather than
-            // run an unauthenticated mutation.
-            Err(format!(
+            // No ctx — no credentials to check. Refusing a mutation for
+            // lack of authentication is an authorization decision (Denied).
+            Err(OpError::denied(format!(
                 "control RPC '{name}' requires an authenticated request"
-            ))
+            )))
         } else if self.is_diag(name) {
-            Err(format!("'{name}' is a read-only diagnostic PV, not an RPC"))
+            // Wrong target kind / not found — operational (Failed).
+            Err(OpError::failed(format!(
+                "'{name}' is a read-only diagnostic PV, not an RPC"
+            )))
         } else {
-            Err(format!("unknown control PV '{name}'"))
+            Err(OpError::failed(format!("unknown control PV '{name}'")))
         }
     }
 
@@ -438,7 +444,7 @@ impl ChannelSource for ControlSource {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> Result<(FieldDesc, PvField), String> {
+    ) -> Result<(FieldDesc, PvField), OpError> {
         let name = checked.pv_name().to_string();
         if !self.is_control(&name) {
             // Diagnostic PVs and unknown names fall back to the
@@ -453,15 +459,20 @@ impl ChannelSource for ControlSource {
                 host = %ctx.host,
                 "pva-gateway: control RPC denied — credential check failed"
             );
-            return Err(format!(
+            return Err(OpError::denied(format!(
                 "control RPC '{name}' denied: {account}/{method} from {host} \
                  is not an authorised gateway operator",
                 account = ctx.account,
                 method = ctx.method,
                 host = ctx.host,
-            ));
+            )));
         }
-        self.run_control_rpc(&name, &request_value).await
+        // run_control_rpc validates arguments and executes the admin
+        // command; its errors are operational (bad argument, exec
+        // failure), so map them into the Failed bucket.
+        self.run_control_rpc(&name, &request_value)
+            .await
+            .map_err(OpError::failed)
     }
 
     async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
@@ -512,6 +523,7 @@ mod tests {
     use super::*;
     use crate::pva_gateway::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL};
     use epics_pva_rs::client::PvaClient;
+    use epics_pva_rs::server_native::source::OpErrorKind;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn make_source() -> GatewayChannelSource {
@@ -590,7 +602,10 @@ mod tests {
             .process("gw:flush")
             .await
             .expect_err("PROCESS of a control PV must be rejected");
-        assert!(err.contains("not PROCESS"), "control PV reason: {err:?}");
+        assert!(
+            err.message.contains("not PROCESS"),
+            "control PV reason: {err:?}"
+        );
 
         // Diagnostic PV (read-only).
         let err = ctrl
@@ -598,7 +613,7 @@ mod tests {
             .await
             .expect_err("PROCESS of a diagnostic PV must be rejected");
         assert!(
-            err.contains("PROCESS not supported"),
+            err.message.contains("PROCESS not supported"),
             "diag PV reason: {err:?}"
         );
 
@@ -609,7 +624,7 @@ mod tests {
             .await
             .expect_err("process_checked must reject even with a WRITE token");
         assert!(
-            err.contains("not PROCESS"),
+            err.message.contains("not PROCESS"),
             "process_checked reason: {err:?}"
         );
     }
@@ -630,10 +645,13 @@ mod tests {
             )
             .await;
         assert!(res.is_err(), "deny-all default must reject control RPC");
-        assert!(
-            res.unwrap_err()
-                .contains("not an authorised gateway operator")
+        let err = res.unwrap_err();
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "credential refusal must classify as Denied: {err:?}"
         );
+        assert!(err.message.contains("not an authorised gateway operator"));
     }
 
     #[tokio::test]
@@ -653,10 +671,13 @@ mod tests {
             )
             .await;
         assert!(res.is_err());
-        assert!(
-            res.unwrap_err()
-                .contains("requires an authenticated request")
+        let err = res.unwrap_err();
+        assert_eq!(
+            err.kind,
+            OpErrorKind::Denied,
+            "unauthenticated refusal must classify as Denied: {err:?}"
         );
+        assert!(err.message.contains("requires an authenticated request"));
     }
 
     #[tokio::test]
@@ -717,7 +738,7 @@ mod tests {
             )
             .await;
         assert!(res.is_err());
-        assert!(res.unwrap_err().contains("'pv' argument"));
+        assert!(res.unwrap_err().message.contains("'pv' argument"));
     }
 
     #[tokio::test]
@@ -757,7 +778,7 @@ mod tests {
             )
             .await;
         assert!(res.is_err());
-        assert!(res.unwrap_err().contains("'path' argument"));
+        assert!(res.unwrap_err().message.contains("'path' argument"));
     }
 
     #[tokio::test]

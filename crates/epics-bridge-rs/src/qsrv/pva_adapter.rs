@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure};
+use epics_pva_rs::server_native::source::OpError;
 
 use super::provider::{
     AnyChannel, BridgeProvider, Channel, ChannelProvider, ClientCreds, PvaMonitor,
@@ -384,21 +385,25 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         value: PvField,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let provider = self.provider.clone();
         async move {
             if !checked.allows_write() {
-                return Err(format!(
+                return Err(OpError::denied(format!(
                     "PUT denied by access security: '{}' from {}@{}",
                     checked.pv_name(),
                     ctx.account,
                     ctx.host
-                ));
+                )));
             }
             let name = checked.pv_name().to_string();
             let pv = match value {
                 PvField::Structure(s) => s,
-                other => return Err(format!("qsrv PUT expects a structure value, got {other}")),
+                other => {
+                    return Err(OpError::failed(format!(
+                        "qsrv PUT expects a structure value, got {other}"
+                    )));
+                }
             };
             // prefer the INIT pvRequest for `record._options`,
             // matching pvxs (`iocsource.cpp:429`). The data-phase value
@@ -425,12 +430,12 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             let channel = provider
                 .create_channel_with_creds(&name, ctx_to_creds(&ctx))
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| OpError::failed(e.to_string()))?;
             match channel {
                 crate::qsrv::AnyChannel::Single(single) => single
                     .put_with_options(&pv, opts)
                     .await
-                    .map_err(|e| e.to_string()),
+                    .map_err(|e| OpError::failed(e.to_string())),
                 crate::qsrv::AnyChannel::Group(group) => {
                     // `atomic` lives in the INIT pvRequest on the wire
                     // path; fall back to the value for in-process
@@ -443,7 +448,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     group
                         .put_with_options(&pv, opts, atomic_override)
                         .await
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| OpError::failed(e.to_string()))
                 }
             }
         }
@@ -461,27 +466,27 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// group / native PVA PVs have no processing semantics and are
     /// returned an unsupported-op error so callers don't silently
     /// trust a no-op.
-    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
         let name = name.to_string();
         async move {
             if pva_pvs.read().await.contains_key(&name) {
-                return Err(format!(
+                return Err(OpError::failed(format!(
                     "PROCESS not supported for native PVA PV '{name}' (no processing chain)"
-                ));
+                )));
             }
             if provider.groups().contains_key(&name) {
-                return Err(format!(
+                return Err(OpError::failed(format!(
                     "PROCESS not supported for group PV '{name}' (no record-level chain)"
-                ));
+                )));
             }
             let (record_name, _field) = epics_base_rs::server::database::parse_pv_name(&name);
             provider
                 .database()
                 .process_record(record_name)
                 .await
-                .map_err(|e| format!("PROCESS on '{name}': {e}"))
+                .map_err(|e| OpError::failed(format!("PROCESS on '{name}': {e}")))
         }
     }
 
@@ -499,15 +504,15 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
         async move {
             if !checked.allows_read() {
-                return Err(format!(
+                return Err(OpError::denied(format!(
                     "RPC denied by access security: '{}' from {}@{}",
                     checked.pv_name(),
                     ctx.account,
                     ctx.host,
-                ));
+                )));
             }
             // Inspect the request to determine whether it carries
             // query arguments that would land as a PUT inside
@@ -531,13 +536,13 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 _ => false,
             };
             if has_writes && !checked.allows_write() {
-                return Err(format!(
+                return Err(OpError::denied(format!(
                     "RPC write denied by access security: '{}' from {}@{} \
                      (RPC query arguments require WRITE access in QSRV)",
                     checked.pv_name(),
                     ctx.account,
                     ctx.host,
-                ));
+                )));
             }
             self.rpc(checked.pv_name(), request_desc, request_value)
                 .await
@@ -698,7 +703,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         &self,
         name: &str,
         value: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let name_owned = name.to_string();
         async move {
             let channel = self
@@ -707,9 +712,16 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 .ok_or_else(|| format!("PV not found: {name_owned}"))?;
             let pv = match value {
                 PvField::Structure(s) => s,
-                other => return Err(format!("qsrv PUT expects a structure value, got {other}")),
+                other => {
+                    return Err(OpError::failed(format!(
+                        "qsrv PUT expects a structure value, got {other}"
+                    )));
+                }
             };
-            channel.put(&pv).await.map_err(|e| e.to_string())
+            channel
+                .put(&pv)
+                .await
+                .map_err(|e| OpError::failed(e.to_string()))
         }
     }
 
@@ -759,7 +771,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
         let name_owned = name.to_string();
         let pva_pvs = self.pva_pvs.clone();
         async move {
@@ -773,10 +785,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 },
                 PvField::Null => Vec::new(),
                 other => {
-                    return Err(format!(
+                    return Err(OpError::failed(format!(
                         "qsrv RPC on {name_owned:?}: expected an NTURI or structure \
                          request, got {other}"
-                    ));
+                    )));
                 }
             };
 
@@ -784,10 +796,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // produced server-side and have no record to write into.
             if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned() {
                 if !query.is_empty() {
-                    return Err(format!(
+                    return Err(OpError::failed(format!(
                         "qsrv RPC on {name_owned:?}: native PVA PV is read-only, \
                          RPC query arguments are not accepted"
-                    ));
+                    )));
                 }
                 let value = handle.latest.lock().clone().ok_or_else(|| {
                     format!("qsrv RPC on {name_owned:?}: native PVA PV has no value yet")
@@ -825,10 +837,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     for (field, _) in &query {
                         let top = field.split('.').next().unwrap_or(field);
                         if top != "value" {
-                            return Err(format!(
+                            return Err(OpError::failed(format!(
                                 "qsrv RPC on {name_owned:?}: single-record channel \
                                  accepts only the `value` query field, got {field:?}"
-                            ));
+                            )));
                         }
                     }
                 }
@@ -1303,7 +1315,7 @@ mod tests {
             .await
             .expect_err("RPC on a missing PV must error");
         assert!(
-            err.contains("PV not found"),
+            err.message.contains("PV not found"),
             "error must name the missing PV: {err}"
         );
     }
@@ -1343,7 +1355,7 @@ mod tests {
             .await
             .expect_err("non-`value` query field must be rejected");
         assert!(
-            err.contains("freq") && err.contains("value"),
+            err.message.contains("freq") && err.message.contains("value"),
             "error must name the bad field and the accepted one: {err}"
         );
     }
@@ -1725,7 +1737,7 @@ mod tests {
             .await
             .expect_err("PROCESS on unknown PV must error");
         assert!(
-            err.contains("UNKNOWN:PV"),
+            err.message.contains("UNKNOWN:PV"),
             "error must name the PV; got: {err}"
         );
     }

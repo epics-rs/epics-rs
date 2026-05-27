@@ -32,7 +32,7 @@ use epics_base_rs::server::access_security::{
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{
-    ChannelSource, CompositeSource, DynSource, PvaServerConfig, run_pva_server,
+    ChannelSource, CompositeSource, DynSource, OpError, PvaServerConfig, run_pva_server,
 };
 
 /// Child source backing the composite. Its `subscribe_checked`
@@ -81,7 +81,7 @@ impl ChannelSource for VersionedChildSource {
         &self,
         _: &str,
         _: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async { Err("read-only".into()) }
     }
     fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {

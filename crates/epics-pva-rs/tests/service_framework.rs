@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, PvaServer, SharedSource};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, SharedSource};
 use epics_pva_rs::service::pva_service;
 
 #[derive(Default)]
@@ -246,7 +246,7 @@ impl ChannelSource for FailAtDataSource {
     async fn get_value(&self, _: &str) -> Option<PvField> {
         None
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), String> {
+    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
         Ok(())
     }
     async fn is_writable(&self, _: &str) -> bool {
@@ -307,7 +307,7 @@ impl ChannelSource for PanicSource {
     async fn get_value(&self, _: &str) -> Option<PvField> {
         panic!("get_value handler panicked on purpose");
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), String> {
+    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
         panic!("put_value handler panicked on purpose");
     }
     async fn is_writable(&self, _: &str) -> bool {

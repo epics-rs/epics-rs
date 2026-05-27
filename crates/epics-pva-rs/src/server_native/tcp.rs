@@ -35,7 +35,7 @@ use crate::pvdata::encode::{
 use crate::pvdata::{FieldDesc, PvField};
 
 use super::runtime::PvaServerConfig;
-use super::source::DynSource;
+use super::source::{DynSource, OpError};
 
 static NEXT_SID: AtomicU32 = AtomicU32::new(1);
 fn alloc_sid() -> u32 {
@@ -3014,6 +3014,7 @@ async fn handle_put_get(
                 ctx.clone(),
             ))
             .await
+            .map_err(|e| OpError::failed(e))
             .and_then(|r| r)
         };
         if let Err(msg) = put_result {
@@ -3292,6 +3293,7 @@ async fn handle_process(
         // reply instead of skipping the reply below.
         let result = catch_handler_panic(src.process_checked(checked, ctx))
             .await
+            .map_err(|e| OpError::failed(e))
             .and_then(|r| r);
 
         let mut payload = Vec::new();
@@ -4437,6 +4439,7 @@ async fn handle_op(
                         ctx.clone(),
                     ))
                     .await
+                    .map_err(|e| OpError::failed(e))
                     .and_then(|r| r)
                 };
                 let mut payload = Vec::new();
@@ -5499,6 +5502,7 @@ async fn handle_op(
                     rpc_ctx_val,
                 ))
                 .await
+                .map_err(|e| OpError::failed(e))
                 .and_then(|r| r);
 
                 let mut payload = Vec::new();
@@ -6205,7 +6209,7 @@ mod tests {
             async fn get_value(&self, _name: &str) -> Option<PvField> {
                 Some(PvField::Scalar(ScalarValue::Double(1.0)))
             }
-            async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
+            async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
                 Ok(())
             }
             async fn is_writable(&self, _name: &str) -> bool {
@@ -8412,7 +8416,7 @@ mod tests {
                 &self,
                 _: &str,
                 value: PvField,
-            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 *self.stored.lock() = Some(value);
                 async { Ok(()) }
             }
@@ -8909,7 +8913,7 @@ mod tests {
             &self,
             _: &str,
             value: PvField,
-        ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
             let (a, _, _) = three_field_extract(&value);
             *self.value.lock() = a;
             async { Ok(()) }
@@ -8920,7 +8924,10 @@ mod tests {
         async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
             None
         }
-        fn process(&self, _: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        fn process(
+            &self,
+            _: &str,
+        ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
             self.process_hits
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async { Ok(()) }
@@ -10170,7 +10177,7 @@ mod tests {
         async fn get_value(&self, _n: &str) -> Option<PvField> {
             Some(self.value.clone())
         }
-        async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), String> {
+        async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
             Ok(())
         }
         async fn is_writable(&self, _n: &str) -> bool {
@@ -10528,7 +10535,7 @@ mod tests {
         async fn get_value(&self, _: &str) -> Option<PvField> {
             None
         }
-        async fn put_value(&self, _: &str, _: PvField) -> Result<(), String> {
+        async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
             Ok(())
         }
         async fn is_writable(&self, _: &str) -> bool {
@@ -10950,7 +10957,7 @@ mod r14_tests {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             Some(PvField::Scalar(ScalarValue::Double(1.0)))
         }
-        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
+        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
             Ok(())
         }
         async fn is_writable(&self, _name: &str) -> bool {
@@ -11131,7 +11138,7 @@ mod bfr15_tests {
             }
             Some(nt_scalar_value(1.0))
         }
-        async fn put_value(&self, _: &str, _: PvField) -> Result<(), String> {
+        async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
             self.put_calls.fetch_add(1, Ordering::SeqCst);
             if self.block_put {
                 let _d = DropSignal(self.put_cancelled.clone());

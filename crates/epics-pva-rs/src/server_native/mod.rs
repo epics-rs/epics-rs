@@ -16,5 +16,5 @@ pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource};
 pub use shared_pv::{SharedPV, SharedSource};
 pub use source::{
     ChannelContext, ChannelSource, ChannelSourceObj, DynSource, MonitorOptions, MonitorUpdate,
-    RawMonitorEvent, plain_monitor_updates,
+    OpError, OpErrorKind, RawMonitorEvent, plain_monitor_updates,
 };

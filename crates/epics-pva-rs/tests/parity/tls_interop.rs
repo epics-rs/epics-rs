@@ -27,7 +27,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use epics_pva_rs::auth::TlsServerConfig;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, PvaServerConfig, run_pva_server};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
 
 fn pvxs_home() -> Option<PathBuf> {
     std::env::var("PVXS_HOME").ok().map(PathBuf::from)
@@ -147,7 +147,7 @@ impl ChannelSource for TlsScalarSource {
         &self,
         _: &str,
         _: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async { Err("read-only".into()) }
     }
     fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {

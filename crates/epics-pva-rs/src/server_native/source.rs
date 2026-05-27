@@ -174,6 +174,86 @@ pub struct WatermarkEvent {
 /// set of named PVs.
 // no on_channel_close hook — pvxs serverchan.cpp:57-59 fires onClose("") per channel;
 // this trait has no equivalent. Doc-only; fix requires a semver-minor breaking API change.
+/// Why a [`ChannelSource`] mutating op (`put_value*`, `process*`,
+/// `rpc*`) failed, carried as a typed value so audit / forwarding
+/// layers classify the outcome from a discriminant rather than
+/// substring-matching the human message. pvxs buckets the audit log
+/// into "Denied" (access-control refusal) vs "Failed" (everything
+/// else); [`OpErrorKind`] is that bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpError {
+    /// Classification bucket — drives the audit Denied/Failed split.
+    pub kind: OpErrorKind,
+    /// Human-readable message; this is the text serialised into the
+    /// PVA `Status` sent to the client.
+    pub message: String,
+}
+
+/// Outcome bucket for an [`OpError`]. Distinct from a free-text
+/// message so that a layer never has to guess "was this a denial?"
+/// from the words in the string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpErrorKind {
+    /// Access-control / policy refusal — ACF gate, gateway ACL, or
+    /// read-only mode. Maps to pvxs's audit "Denied" bucket.
+    Denied,
+    /// Any other operation failure: PV not found, malformed value,
+    /// upstream timeout, backend error. Maps to pvxs's "Failed".
+    Failed,
+}
+
+impl OpError {
+    /// An access-control / policy refusal (`Denied` bucket).
+    pub fn denied(message: impl Into<String>) -> Self {
+        Self {
+            kind: OpErrorKind::Denied,
+            message: message.into(),
+        }
+    }
+
+    /// A non-policy operation failure (`Failed` bucket).
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            kind: OpErrorKind::Failed,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for OpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for OpError {}
+
+/// A bare string error is an operation **Failure**, not a policy
+/// denial — denials must be built explicitly via [`OpError::denied`].
+/// This lets existing `?` / `Err(string)` failure paths convert
+/// unchanged while the audit layer still distinguishes refusals.
+impl From<String> for OpError {
+    fn from(message: String) -> Self {
+        Self::failed(message)
+    }
+}
+
+impl From<&str> for OpError {
+    fn from(message: &str) -> Self {
+        Self::failed(message)
+    }
+}
+
+/// Lossy back-conversion to the wire-status string: drops the kind,
+/// keeping only the message. The wire layer serialises only this
+/// human text into the PVA `Status`, so `Status::error(op_err)` works
+/// directly.
+impl From<OpError> for String {
+    fn from(e: OpError) -> Self {
+        e.message
+    }
+}
+
 pub trait ChannelSource: Send + Sync + 'static {
     /// Per-source access policy. Returns the [`AccessGate`] used by
     /// the wire layer to mint [`AccessChecked`] tokens for the typed
@@ -329,7 +409,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         &self,
         name: &str,
         value: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send;
 
     /// Type-state-enforced PUT. Refuses non-`ReadWrite` tokens; on
     /// `ReadWrite` it delegates to the legacy ctx-less `put_value`.
@@ -341,16 +421,16 @@ pub trait ChannelSource: Send + Sync + 'static {
         checked: AccessChecked,
         value: PvField,
         ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async move {
             if !checked.allows_write() {
-                return Err(format!(
+                return Err(OpError::denied(format!(
                     "PUT denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
                     ctx.host,
                     ctx.account,
                     ctx.method,
-                ));
+                )));
             }
             self.put_value(checked.pv_name(), value).await
         }
@@ -390,7 +470,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async move {
             // Default (non-atomic) merge for sources without a
             // contained merge primitive. Single-client correct.
@@ -551,9 +631,9 @@ pub trait ChannelSource: Send + Sync + 'static {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
         let _ = (name, request_desc, request_value);
-        async move { Err("RPC not supported by this source".to_string()) }
+        async move { Err(OpError::failed("RPC not supported by this source")) }
     }
 
     /// Type-state-enforced RPC. pvxs treats RPC as READ-class for
@@ -565,16 +645,16 @@ pub trait ChannelSource: Send + Sync + 'static {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
         async move {
             if !checked.allows_read() {
-                return Err(format!(
+                return Err(OpError::denied(format!(
                     "RPC denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
                     ctx.host,
                     ctx.account,
                     ctx.method,
-                ));
+                )));
             }
             self.rpc(checked.pv_name(), request_desc, request_value)
                 .await
@@ -593,7 +673,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// `SharedPV` with an `on_process` hook) override to actually run
     /// the processing chain. An `Err` surfaces to the client as a
     /// PROCESS error status.
-    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let _ = name;
         async move { Ok(()) }
     }
@@ -607,16 +687,16 @@ pub trait ChannelSource: Send + Sync + 'static {
         &self,
         checked: AccessChecked,
         ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async move {
             if !checked.allows_write() {
-                return Err(format!(
+                return Err(OpError::denied(format!(
                     "PROCESS denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
                     ctx.host,
                     ctx.account,
                     ctx.method,
-                ));
+                )));
             }
             self.process(checked.pv_name()).await
         }
@@ -867,14 +947,14 @@ pub trait ChannelSourceObj: Send + Sync {
         &'a self,
         name: &'a str,
         value: PvField,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
     /// Dyn forwarder for type-state PUT.
     fn put_value_checked<'a>(
         &'a self,
         checked: AccessChecked,
         value: PvField,
         ctx: ChannelContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
     /// Dyn forwarder for type-state atomic BitSet-delta PUT.
     fn put_delta_checked<'a>(
         &'a self,
@@ -883,7 +963,7 @@ pub trait ChannelSourceObj: Send + Sync {
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
     fn is_writable<'a>(
         &'a self,
         name: &'a str,
@@ -952,7 +1032,7 @@ pub trait ChannelSourceObj: Send + Sync {
         request_desc: FieldDesc,
         request_value: PvField,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send + 'a>,
     >;
     /// Dyn forwarder for type-state RPC.
     fn rpc_checked<'a>(
@@ -962,18 +1042,18 @@ pub trait ChannelSourceObj: Send + Sync {
         request_value: PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send + 'a>,
     >;
     fn process<'a>(
         &'a self,
         name: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
     /// Dyn forwarder for type-state PROCESS.
     fn process_checked<'a>(
         &'a self,
         checked: AccessChecked,
         ctx: ChannelContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
     fn monitor_emits_partial(&self, name: &str) -> bool;
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent);
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool);
@@ -1053,7 +1133,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         &'a self,
         name: &'a str,
         value: PvField,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::put_value(self, name, value))
     }
     fn put_value_checked<'a>(
@@ -1061,7 +1141,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         checked: AccessChecked,
         value: PvField,
         ctx: ChannelContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::put_value_checked(
             self, checked, value, ctx,
         ))
@@ -1073,7 +1153,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::put_delta_checked(
             self, checked, desc, changed, delta, ctx,
         ))
@@ -1164,7 +1244,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         request_desc: FieldDesc,
         request_value: PvField,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::rpc(
             self,
@@ -1180,7 +1260,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         request_value: PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::rpc_checked(
             self,
@@ -1193,14 +1273,14 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     fn process<'a>(
         &'a self,
         name: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::process(self, name))
     }
     fn process_checked<'a>(
         &'a self,
         checked: AccessChecked,
         ctx: ChannelContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::process_checked(self, checked, ctx))
     }
     fn monitor_emits_partial(&self, name: &str) -> bool {

@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::client_native::context::PvGetResult; // not used; kept for re-export hygiene
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use crate::server_native::ChannelSource;
+use crate::server_native::{ChannelSource, OpError};
 
 use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
@@ -535,19 +535,23 @@ impl ChannelSource for PvDatabaseSource {
         &self,
         name: &str,
         value: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let db = self.db.clone();
         let name = name.to_string();
         async move {
             // Extract the inner value field (NTScalar.value or top-level scalar).
+            // The WRITE gate ran in `put_value_checked` before reaching here,
+            // so every failure below is operational (Failed), not a denial.
             let scalar = match &value {
                 PvField::Structure(s) => s.get_field("value").cloned(),
                 _ => Some(value),
             };
-            let scalar = scalar.ok_or_else(|| "PUT missing 'value' field".to_string())?;
+            let scalar = scalar.ok_or_else(|| OpError::failed("PUT missing 'value' field"))?;
             let epics = pv_field_to_epics(&scalar)
-                .ok_or_else(|| "PUT value not representable as EpicsValue".to_string())?;
-            db.put_pv(&name, epics).await.map_err(|e| e.to_string())
+                .ok_or_else(|| OpError::failed("PUT value not representable as EpicsValue"))?;
+            db.put_pv(&name, epics)
+                .await
+                .map_err(|e| OpError::failed(e.to_string()))
         }
     }
 
@@ -761,7 +765,9 @@ mod tests {
                 .access()
                 .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
                 .await;
-            self.put_value_checked(checked, value, ctx).await
+            self.put_value_checked(checked, value, ctx)
+                .await
+                .map_err(String::from)
         }
         async fn get_value_ctx(&self, pv: &str, ctx: ChannelContext) -> Option<PvField> {
             let checked = self

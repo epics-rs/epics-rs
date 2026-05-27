@@ -32,6 +32,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::pvdata::{FieldDesc, PvField};
+use crate::server_native::source::OpError;
 
 /// User-provided put handler. Mirrors pvxs `SharedPV::onPut`
 /// (sharedpv.cpp:329). Handler receives the new value; returning Err
@@ -930,12 +931,12 @@ impl super::source::ChannelSource for SharedSource {
         &self,
         name: &str,
         value: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
         async move {
             match pv {
-                Some(p) => p.put(value),
-                None => Err(format!("no such PV: {name}")),
+                Some(p) => p.put(value).map_err(OpError::failed),
+                None => Err(OpError::failed(format!("no such PV: {name}"))),
             }
         }
     }
@@ -952,21 +953,24 @@ impl super::source::ChannelSource for SharedSource {
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: super::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let pv = self.pvs.lock().get(checked.pv_name()).cloned();
         async move {
             if !checked.allows_write() {
-                return Err(format!(
+                return Err(OpError::denied(format!(
                     "PUT denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
                     ctx.host,
                     ctx.account,
                     ctx.method,
-                ));
+                )));
             }
             match pv {
-                Some(p) => p.put_delta(&desc, &changed, delta),
-                None => Err(format!("no such PV: {}", checked.pv_name())),
+                Some(p) => p.put_delta(&desc, &changed, delta).map_err(OpError::failed),
+                None => Err(OpError::failed(format!(
+                    "no such PV: {}",
+                    checked.pv_name()
+                ))),
             }
         }
     }
@@ -1004,7 +1008,7 @@ impl super::source::ChannelSource for SharedSource {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
         let name = name.to_string();
         async move {
@@ -1014,19 +1018,22 @@ impl super::source::ChannelSource for SharedSource {
                 // registered by `#[pva_service]`) runs the user's
                 // future on this task's runtime — no block_on or
                 // block_in_place needed.
-                Some(p) => p.rpc_async(request_desc, request_value).await,
-                None => Err(format!("no such PV: {name}")),
+                Some(p) => p
+                    .rpc_async(request_desc, request_value)
+                    .await
+                    .map_err(OpError::failed),
+                None => Err(OpError::failed(format!("no such PV: {name}"))),
             }
         }
     }
 
-    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
         let name = name.to_string();
         async move {
             match pv {
-                Some(p) => p.process(),
-                None => Err(format!("no such PV: {name}")),
+                Some(p) => p.process().map_err(OpError::failed),
+                None => Err(OpError::failed(format!("no such PV: {name}"))),
             }
         }
     }

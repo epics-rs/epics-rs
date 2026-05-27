@@ -202,7 +202,7 @@ async fn pvxs_pvget_to_rust_server_get() {
     use tokio::sync::{Mutex, mpsc};
 
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-    use epics_pva_rs::server_native::{ChannelSource, PvaServerConfig, run_pva_server};
+    use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
 
     #[derive(Clone)]
     struct Source {
@@ -241,7 +241,7 @@ async fn pvxs_pvget_to_rust_server_get() {
             &self,
             _: &str,
             _: PvField,
-        ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
             async { Ok(()) }
         }
         fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
@@ -388,7 +388,7 @@ async fn pvxs_pvxget_to_rust_server_ntndarray() {
         nt_nd_array_desc, nt_nd_array_value,
     };
     use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarValue};
-    use epics_pva_rs::server_native::{ChannelSource, PvaServerConfig, run_pva_server};
+    use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
 
     /// Source serving a single 4x4 ubyte NTNDArray with a known pattern.
     #[derive(Clone)]
@@ -461,7 +461,7 @@ async fn pvxs_pvxget_to_rust_server_ntndarray() {
             &self,
             _: &str,
             _: PvField,
-        ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
             async { Err("read-only".into()) }
         }
         fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
@@ -535,7 +535,7 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
         nt_nd_array_desc, nt_nd_array_value,
     };
     use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarValue};
-    use epics_pva_rs::server_native::{ChannelSource, PvaServerConfig, run_pva_server};
+    use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
 
     #[derive(Clone)]
     struct ImageSource {}
@@ -587,7 +587,7 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
             &self,
             _: &str,
             _: PvField,
-        ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
             async { Err("read-only".into()) }
         }
         fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
@@ -726,7 +726,7 @@ async fn pvxs_pvxcall_to_rust_server_rpc() {
     use tokio::sync::{Mutex, mpsc};
 
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-    use epics_pva_rs::server_native::{ChannelSource, PvaServerConfig, run_pva_server};
+    use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
 
     /// RPC service: takes `{ a: double, b: double }` and returns
     /// `{ result: double }` where result = a + b.
@@ -764,8 +764,8 @@ async fn pvxs_pvxcall_to_rust_server_rpc() {
             &self,
             _: &str,
             _: PvField,
-        ) -> impl std::future::Future<Output = Result<(), String>> + Send {
-            async { Err("PUT not supported".to_string()) }
+        ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+            async { Err("PUT not supported".into()) }
         }
         fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
             async { false }
@@ -781,7 +781,7 @@ async fn pvxs_pvxcall_to_rust_server_rpc() {
             _name: &str,
             _request_desc: FieldDesc,
             request_value: PvField,
-        ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send
+        ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send
         {
             async move {
                 let mut a = 0.0f64;

@@ -36,7 +36,7 @@ use std::sync::Arc;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 
 use super::peers::PeerRegistry;
-use super::source::ChannelSource;
+use super::source::{ChannelSource, OpError};
 
 /// Canonical PV name the built-in source answers. pvxs `ServerSource`
 /// hardcodes the same string.
@@ -264,9 +264,16 @@ impl ChannelSource for ServerInfoSource {
         &self,
         name: &str,
         _value: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let name = name.to_string();
-        async move { Err(format!("'{name}' is read-only (built-in server source)")) }
+        // The `server` PV simply does not accept writes from anyone — a
+        // fixed property of the PV, not an authorization decision —
+        // so this is Failed, not Denied.
+        async move {
+            Err(OpError::failed(format!(
+                "'{name}' is read-only (built-in server source)"
+            )))
+        }
     }
 
     async fn is_writable(&self, _name: &str) -> bool {
@@ -286,15 +293,15 @@ impl ChannelSource for ServerInfoSource {
         name: &str,
         _request_desc: FieldDesc,
         request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
         let this = self.clone();
         let name = name.to_string();
         async move {
             if name != SERVER_PV_NAME {
-                return Err(format!("no such PV: {name}"));
+                return Err(OpError::failed(format!("no such PV: {name}")));
             }
             let op = Self::extract_op(&request_value)
-                .ok_or_else(|| "missing 'op' query argument".to_string())?;
+                .ok_or_else(|| OpError::failed("missing 'op' query argument"))?;
             match op.as_str() {
                 "channels" => {
                     let mut names = (this.channel_lister)().await;
@@ -306,9 +313,9 @@ impl ChannelSource for ServerInfoSource {
                     let (peers, channels) = this.live_counts().await;
                     Ok((Self::info_descriptor(), this.info_value(peers, channels)))
                 }
-                other => Err(format!(
+                other => Err(OpError::failed(format!(
                     "unknown op '{other}' (expected 'channels' or 'info')"
-                )),
+                ))),
             }
         }
     }
@@ -438,7 +445,10 @@ mod tests {
         let src = source_with(vec![]);
         let (desc, value) = nturi_op("frobnicate");
         let err = src.rpc("server", desc, value).await.unwrap_err();
-        assert!(err.contains("frobnicate"), "error names the bad op: {err}");
+        assert!(
+            err.message.contains("frobnicate"),
+            "error names the bad op: {err}"
+        );
     }
 
     #[tokio::test]
@@ -454,7 +464,10 @@ mod tests {
             .rpc("server", FieldDesc::Variant, PvField::Structure(root))
             .await
             .unwrap_err();
-        assert!(err.contains("op"), "error mentions missing op: {err}");
+        assert!(
+            err.message.contains("op"),
+            "error mentions missing op: {err}"
+        );
     }
 
     #[tokio::test]
@@ -500,6 +513,6 @@ mod tests {
     async fn put_is_rejected_read_only() {
         let src = source_with(vec![]);
         let err = src.put_value("server", PvField::Null).await.unwrap_err();
-        assert!(err.contains("read-only"), "put rejected: {err}");
+        assert!(err.message.contains("read-only"), "put rejected: {err}");
     }
 }

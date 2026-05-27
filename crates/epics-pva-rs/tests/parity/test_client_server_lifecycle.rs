@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, PvaServer, PvaServerConfig};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
 
 #[derive(Clone)]
 struct ConstSource;
@@ -49,7 +49,7 @@ impl ChannelSource for ConstSource {
         &self,
         _: &str,
         _: PvField,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async { Err("read-only".into()) }
     }
     fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {

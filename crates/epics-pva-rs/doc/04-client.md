@@ -51,11 +51,23 @@ concurrent calls converge on the same `Active` state via
 explicit interruption beyond the optional `MonitorEvent::Disconnected`
 event.
 
-Holdoff: after a connect or `CREATE_CHANNEL` failure, `holdoff_until`
-is set to `now + 10s × 2^connect_fail_count` (capped). Subsequent
-`ensure_active` returns immediately with an error until the deadline
-passes — prevents reconnect storms against a flapping server.
-Mirrors pvxs `Channel::disconnect` (client.cpp:155-163).
+Holdoff: after a full pass where every searched candidate failed to
+reach Active (TCP setup or `CREATE_CHANNEL` bounced), `holdoff_until`
+is set to `now + 2^min(connect_fail_count-1, 4)` seconds — an
+exponential `1 → 2 → 4 → 8 → 16`s ladder capped at 16s
+(`channel.rs:826-832`). A successful Active resets the counter and
+clears the holdoff, so the next disconnect restarts the ladder at 1s.
+Subsequent `ensure_active` calls return immediately with an error until
+the deadline passes — prevents reconnect storms against a flapping
+server.
+
+This is an intentional tuning deviation from pvxs, which applies a flat
+~10s holdoff *only* to a pre-`CREATE_CHANNEL` (`Connecting`-phase)
+failure — "likely lower level networking issue" — and `0` for
+`Creating`/`Active` disconnects, expressed as a search-bucket offset
+(`client.cpp:156-174,209-213`). pva-rs instead escalates on consecutive
+failures regardless of phase; both bound the reconnect rate and neither
+affects wire behaviour.
 
 Multi-server failover: `find_all` collects every responder for a PV
 within `MULTI_SERVER_WINDOW` (200ms). The fastest is tried first; the

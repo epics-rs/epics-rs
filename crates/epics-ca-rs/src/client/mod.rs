@@ -1327,6 +1327,37 @@ pub struct CaChannel {
     _lifecycle: Arc<ChannelLifecycle>,
 }
 
+#[cfg(test)]
+impl CaChannel {
+    /// Minimal throwaway channel for unit tests that need a
+    /// [`MonitorHandle::channel`] field but never exercise the channel
+    /// itself. Wires the provided `coord_tx` (so the lifecycle guard
+    /// targets a live receiver) and leaves every sidecar empty.
+    fn for_test(coord_tx: mpsc::UnboundedSender<CoordRequest>) -> Self {
+        let (conn_tx, _) = broadcast::channel(1);
+        let (transport_tx, _) = mpsc::unbounded_channel();
+        let cid = 0;
+        let lifecycle = Arc::new(ChannelLifecycle {
+            cid,
+            coord_tx: coord_tx.clone(),
+        });
+        CaChannel {
+            cid,
+            pv_name: Arc::from("test:pv"),
+            priority: 0,
+            coord_tx,
+            transport_tx,
+            in_flight: InFlightOps::new(),
+            snapshots: ChannelSnapshots::default(),
+            server_writers: DirectServerWriters::default(),
+            conn_tx,
+            cached_read: Arc::new(Mutex::new(None)),
+            search_attempts: types::SearchAttempts::default(),
+            _lifecycle: lifecycle,
+        }
+    }
+}
+
 impl CaChannel {
     pub async fn wait_connected(&self, timeout: Duration) -> CaResult<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2338,6 +2369,7 @@ impl CaChannel {
             callback_rx,
             coalesce_slot,
             coord_tx: self.coord_tx.clone(),
+            channel: self.clone(),
         })
     }
 
@@ -2475,9 +2507,25 @@ pub struct MonitorHandle {
     /// delivered. See [`subscription::CoalesceSlot`].
     coalesce_slot: std::sync::Arc<subscription::CoalesceSlot>,
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
+    /// Parent channel — kept so [`MonitorHandle::channel`] can return
+    /// the same handle libca's `ca_evid_to_chid(evid)` would. Cheap to
+    /// clone (CaChannel is Arc-internally).
+    channel: CaChannel,
 }
 
 impl MonitorHandle {
+    /// Recover the channel handle this subscription is attached to.
+    /// Mirrors libca `ca_evid_to_chid(evid)` (cadef.h:1220).
+    pub fn channel(&self) -> CaChannel {
+        self.channel.clone()
+    }
+
+    /// Subscription identifier (matches the libca `evid` opaque).
+    /// Useful for logging / diagnostic correlation across reconnects.
+    pub fn subid(&self) -> u32 {
+        self.subid
+    }
+
     /// Receive the next monitor update.
     ///
     /// Order of preference:
@@ -5004,6 +5052,7 @@ mod monitor_pause_tests {
             subid: 1,
             callback_rx,
             coalesce_slot: coalesce_slot.clone(),
+            channel: CaChannel::for_test(coord_tx.clone()),
             coord_tx,
         };
 
@@ -5082,6 +5131,7 @@ mod monitor_pause_tests {
             subid: 1,
             callback_rx,
             coalesce_slot,
+            channel: CaChannel::for_test(coord_tx.clone()),
             coord_tx,
         };
 

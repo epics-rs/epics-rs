@@ -1,10 +1,16 @@
-//! Copy-on-write array container. Mirrors `pvxs::shared_array<T>`.
+//! Copy-on-write array container, in the spirit of
+//! `pvxs::shared_array<T>` but deliberately a partial port: it shares
+//! pvxs's refcounted-buffer + copy-on-write idea, not its full API.
+//! Notably absent are pvxs's `freeze()` / `thaw()` const/non-const
+//! transfer (Rust's `&` / `&mut` enforce shared-immutability instead)
+//! and the `shared_array<void>` type-erased / `ArrayType` machinery —
+//! this type is monomorphic `SharedArray<T>` only.
 //!
 //! `SharedArray<T>` wraps `Arc<[T]>` so cloning is a refcount bump
 //! (no heap allocation, no element copy). When a writer needs to
-//! mutate, [`SharedArray::make_unique`] forks off a private copy
-//! the first time the refcount is shared, leaving every other
-//! holder pointing at the original buffer.
+//! mutate, [`SharedArray::make_mut`] forks off a private copy the
+//! first time the refcount is shared, leaving every other holder
+//! pointing at the original buffer.
 //!
 //! Use cases:
 //! - Fan-out a monitor data buffer to N downstream subscribers
@@ -15,8 +21,7 @@
 //! This is provided alongside the existing `Vec<T>`-backed
 //! `PvField::*Array` variants — not a replacement. Migration of
 //! the wire-protocol path to `SharedArray<T>` would be a separate
-//! cross-cutting change; this type unblocks new APIs that want
-//! pvxs-shape COW semantics today.
+//! cross-cutting change.
 
 use std::ops::Deref;
 use std::sync::Arc;
@@ -30,8 +35,9 @@ pub struct SharedArray<T> {
 }
 
 impl<T> SharedArray<T> {
-    /// Wrap an `Arc<[T]>` directly — useful when interop already
-    /// produced one (e.g. `Bytes::into_arc_slice`).
+    /// Wrap an `Arc<[T]>` directly — useful when another component
+    /// already holds one and wants to share the same buffer (a later
+    /// `make_mut` on either side then forks).
     pub fn from_arc(inner: Arc<[T]>) -> Self {
         Self { inner }
     }
@@ -76,9 +82,9 @@ impl<T> SharedArray<T> {
     }
 
     /// Number of strong references to the buffer. `1` after
-    /// [`Self::make_unique`] (or when this is the only holder).
-    /// Useful for tests and for opportunistic in-place mutation
-    /// without the make_unique overhead.
+    /// [`Self::make_mut`] (or when this is the only holder). Useful in
+    /// tests; note it is an instantaneous snapshot — another thread can
+    /// clone right after the read, so do not gate a mutation on it.
     pub fn ref_count(&self) -> usize {
         Arc::strong_count(&self.inner)
     }
@@ -91,8 +97,10 @@ impl<T> SharedArray<T> {
 
     /// Get a mutable slice. If the underlying `Arc<[T]>` is shared,
     /// this allocates a fresh private copy first (the COW step) so
-    /// other clones aren't disturbed.
-    pub fn make_unique(&mut self) -> &mut [T]
+    /// other clones aren't disturbed. Named after `Arc::make_mut`,
+    /// whose ensure-unique-then-borrow-mut behaviour it mirrors — not
+    /// pvxs `shared_array::make_unique` (which returns `void`).
+    pub fn make_mut(&mut self) -> &mut [T]
     where
         T: Clone,
     {
@@ -103,7 +111,7 @@ impl<T> SharedArray<T> {
         // By the time we get here, strong_count == 1, so there's no
         // other holder. `Arc::get_mut` is the safe API and returns
         // Some when unique.
-        Arc::get_mut(&mut self.inner).expect("shared array must be unique after make_unique")
+        Arc::get_mut(&mut self.inner).expect("shared array must be unique after make_mut")
     }
 
     /// Immutable iterator. Same as `<&[T] as IntoIterator>::iter`.
@@ -211,12 +219,12 @@ mod tests {
     }
 
     #[test]
-    fn make_unique_forks_when_shared() {
+    fn make_mut_forks_when_shared() {
         let mut a = SharedArray::from_vec(vec![1, 2, 3]);
         let b = a.clone();
         assert_eq!(a.ref_count(), 2);
         // First mutation forks
-        let slice = a.make_unique();
+        let slice = a.make_mut();
         slice[0] = 99;
         // a now sees the change, b still sees the original
         assert_eq!(a.as_slice(), &[99, 2, 3]);
@@ -227,13 +235,28 @@ mod tests {
     }
 
     #[test]
-    fn make_unique_when_already_unique_skips_copy() {
+    fn make_mut_when_already_unique_skips_copy() {
         let mut a = SharedArray::from_vec(vec![1, 2, 3]);
         let ptr_before = a.as_ptr();
-        let _ = a.make_unique();
+        let _ = a.make_mut();
         let ptr_after = a.as_ptr();
         // No fork happened — same allocation.
         assert_eq!(ptr_before, ptr_after);
+    }
+
+    #[test]
+    fn make_mut_on_buffer_shared_via_from_arc_forks() {
+        // Aliasing through an externally-held Arc: from_arc shares the
+        // same buffer, so make_mut on one side must fork and leave the
+        // other untouched. (The one COW path that depends on a refcount
+        // this type did not itself create.)
+        let arc: Arc<[i32]> = Arc::from(vec![1, 2, 3].into_boxed_slice());
+        let mut a = SharedArray::from_arc(arc.clone());
+        let b = SharedArray::from_arc(arc);
+        assert_eq!(a.ref_count(), 2);
+        a.make_mut()[0] = 42;
+        assert_eq!(a.as_slice(), &[42, 2, 3]);
+        assert_eq!(b.as_slice(), &[1, 2, 3]);
     }
 
     #[test]

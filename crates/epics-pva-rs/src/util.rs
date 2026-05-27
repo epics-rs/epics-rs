@@ -24,19 +24,25 @@ use std::fmt;
 pub type ServerGuid = [u8; 12];
 
 /// `<<` adapter that escapes a C-style string for safe logging.
-/// Mirrors `pvxs::Escaper` — replaces non-printable bytes
-/// with `\xNN` escapes.
+/// Mirrors `pvxs::Escaper` (`util.cpp` `operator<<`): C short escapes
+/// for `\a \b \f \n \r \t \v \\ \' \"`, printable bytes (`0x20..=0x7e`)
+/// verbatim, everything else as `\xNN` (lowercase hex).
 pub struct Escaper<'a>(pub &'a [u8]);
 
 impl fmt::Display for Escaper<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for &b in self.0 {
             match b {
-                b'\\' => f.write_str("\\\\")?,
-                b'"' => f.write_str("\\\"")?,
+                0x07 => f.write_str("\\a")?, // bell
+                0x08 => f.write_str("\\b")?, // backspace
+                0x0c => f.write_str("\\f")?, // form feed
                 b'\n' => f.write_str("\\n")?,
                 b'\r' => f.write_str("\\r")?,
                 b'\t' => f.write_str("\\t")?,
+                0x0b => f.write_str("\\v")?, // vertical tab
+                b'\\' => f.write_str("\\\\")?,
+                b'\'' => f.write_str("\\'")?,
+                b'"' => f.write_str("\\\"")?,
                 0x20..=0x7e => fmt::Write::write_char(f, b as char)?,
                 _ => write!(f, "\\x{b:02x}")?,
             }
@@ -192,6 +198,14 @@ mod tests {
     fn escaper_escapes_quote_and_backslash() {
         let s = Escaper(b"\"\\").to_string();
         assert_eq!(s, "\\\"\\\\");
+    }
+
+    #[test]
+    fn escaper_uses_c_short_escapes_like_pvxs() {
+        // pvxs util.cpp emits short escapes for these control bytes
+        // (not \xNN) and escapes the single quote.
+        assert_eq!(Escaper(b"\x07\x08\x0c\x0b").to_string(), "\\a\\b\\f\\v");
+        assert_eq!(Escaper(b"'").to_string(), "\\'");
     }
 
     #[test]

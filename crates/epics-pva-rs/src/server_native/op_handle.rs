@@ -28,8 +28,11 @@ use crate::pvdata::{FieldDesc, PvField};
 
 pub use super::source::ChannelContext as ClientCredentials;
 
-/// Server→client log-message severity. Maps to the `CMD_MESSAGE`
-/// `subcmd` byte in the PVA wire protocol (info=0, warn=1, error=2).
+/// Server→client log-message severity. Maps to the `mtype` byte in the
+/// `CMD_MESSAGE` *payload* (info=0, warn=1, error=2), which follows the
+/// `ioid` — not the message-header flags/subcommand byte. See pvxs
+/// `ServerConn::logRemote` (`serverconn.cpp`): `to_wire(ioid)` then
+/// `to_wire(level2mtype(lvl))` then `to_wire(msg)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageLevel {
     Info,
@@ -49,9 +52,15 @@ impl MessageLevel {
 
 /// Server→client log message. Emitted via [`RemoteLogger`] /
 /// [`ExecOp::info`] / `warn` / `error`. The runtime drains these onto
-/// the connection's outbound writer as `CMD_MESSAGE` frames.
+/// the connection's outbound writer as `CMD_MESSAGE` frames, whose
+/// payload is `ioid` (the operation the message pertains to), then the
+/// [`MessageLevel`] `mtype` byte, then the message string.
 #[derive(Debug, Clone)]
 pub struct OpMessage {
+    /// ioid of the operation this message is about — the first field of
+    /// the `CMD_MESSAGE` payload. Without it the frame cannot be
+    /// associated with a request.
+    pub ioid: u32,
     pub level: MessageLevel,
     pub message: String,
 }
@@ -64,6 +73,9 @@ pub struct OpMessage {
 #[derive(Clone)]
 pub struct RemoteLogger {
     sender: Option<tokio::sync::mpsc::Sender<OpMessage>>,
+    /// ioid stamped on every [`OpMessage`] this logger emits — the
+    /// operation the messages pertain to. One logger per op.
+    ioid: u32,
     /// Tag attached to fallback tracing events; usually the PV name
     /// or operation identifier.
     pub tag: Arc<str>,
@@ -71,10 +83,16 @@ pub struct RemoteLogger {
 
 impl RemoteLogger {
     /// Wire the logger to a connection-side outbox. Messages are
-    /// shipped as PVA `CMD_MESSAGE` frames by the runtime drain task.
-    pub fn new(sender: tokio::sync::mpsc::Sender<OpMessage>, tag: impl Into<Arc<str>>) -> Self {
+    /// shipped as PVA `CMD_MESSAGE` frames by the runtime drain task,
+    /// each stamped with `ioid` (the operation they belong to).
+    pub fn new(
+        sender: tokio::sync::mpsc::Sender<OpMessage>,
+        ioid: u32,
+        tag: impl Into<Arc<str>>,
+    ) -> Self {
         Self {
             sender: Some(sender),
+            ioid,
             tag: tag.into(),
         }
     }
@@ -83,9 +101,11 @@ impl RemoteLogger {
     /// surface as `tracing` events instead of `CMD_MESSAGE` frames.
     /// Useful for unit tests and for default-impl source authors who
     /// want pvxs-shape API without re-architecting their op flow.
+    /// `ioid` is unused on this path (no frame is built).
     pub fn log_only(tag: impl Into<Arc<str>>) -> Self {
         Self {
             sender: None,
+            ioid: 0,
             tag: tag.into(),
         }
     }
@@ -104,13 +124,21 @@ impl RemoteLogger {
 
     fn emit(&self, level: MessageLevel, message: String) {
         if let Some(tx) = &self.sender {
-            // Best-effort: a closing connection means the message
-            // doesn't reach the wire, but it still surfaces via the
-            // fallback tracing path below so server logs aren't blank.
-            let _ = tx.try_send(OpMessage {
-                level,
-                message: message.clone(),
-            });
+            // Wired path: ship to the connection outbox as a
+            // CMD_MESSAGE. On success we're done — a delivered message
+            // is not also written to local tracing (pvxs logRemote is
+            // wire-only). Only a failed send (closing connection) falls
+            // through to tracing so the message isn't lost entirely.
+            if tx
+                .try_send(OpMessage {
+                    ioid: self.ioid,
+                    level,
+                    message: message.clone(),
+                })
+                .is_ok()
+            {
+                return;
+            }
         }
         match level {
             MessageLevel::Info => tracing::info!(tag = %self.tag, "{}", message),
@@ -237,16 +265,16 @@ impl ExecOp {
         }
     }
 
-    /// Respond with an error string. Server packages this into the
-    /// op-error reply payload.
+    /// Respond with an error string. The server packages this into the
+    /// op-error reply payload (the `Status` of the operation's reply) —
+    /// matching pvxs `ExecOp::error`, which resolves the op and does
+    /// **not** also send a separate `CMD_MESSAGE`. A source author who
+    /// wants an out-of-band log line as well calls [`Self::warn`] /
+    /// the logger explicitly. Idempotent.
     pub fn error(&mut self, msg: impl Into<String>) {
-        let msg = msg.into();
-        // Surface through logger so the message reaches both the wire
-        // (CMD_MESSAGE error) and server tracing.
-        self.base.logger.error(msg.clone());
         if let Some(tx) = self.reply_tx.take() {
             self.base.close();
-            let _ = tx.send(ExecResult::Err(msg));
+            let _ = tx.send(ExecResult::Err(msg.into()));
         }
     }
 
@@ -349,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn remote_logger_with_sender_delivers_to_channel() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<OpMessage>(8);
-        let logger = RemoteLogger::new(tx, "TEST:PV");
+        let logger = RemoteLogger::new(tx, 77, "TEST:PV");
         logger.info("a");
         logger.warn("b");
         logger.error("c");
@@ -360,6 +388,28 @@ mod tests {
         assert_eq!(m2.level, MessageLevel::Warn);
         assert_eq!(m3.level, MessageLevel::Error);
         assert_eq!(m1.message, "a");
+        // Each frame carries the op's ioid (first CMD_MESSAGE payload
+        // field) so the client can associate it with the request.
+        assert_eq!(m1.ioid, 77);
+        assert_eq!(m3.ioid, 77);
+    }
+
+    #[tokio::test]
+    async fn exec_op_error_does_not_emit_side_channel_message() {
+        // ExecOp::error resolves the op via its reply (Status), and must
+        // NOT also push a CMD_MESSAGE — pvxs sends only the op-error
+        // reply. The wired logger's channel therefore stays empty.
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<OpMessage>(8);
+        let logger = RemoteLogger::new(msg_tx, 5, "TEST:PV");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let base = OpBase::new("TEST:PV", dummy_creds(), logger);
+        let mut op = ExecOp::new(base, tx);
+        op.error("nope");
+        assert!(matches!(rx.await.unwrap(), ExecResult::Err(m) if m == "nope"));
+        assert!(
+            msg_rx.try_recv().is_err(),
+            "error() must not emit a separate CMD_MESSAGE"
+        );
     }
 
     #[tokio::test]

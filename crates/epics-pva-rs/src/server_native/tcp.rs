@@ -2386,19 +2386,24 @@ async fn handle_connection_io(
                 let mut buf = Vec::new();
                 h.write_into(&mut buf);
                 buf.extend_from_slice(&payload);
-                let _ = tx.send(buf).await;
-                handshake_complete = true;
-                // record the validated credentials for the
-                // per-peer report.
+                // Commit the validated credential BEFORE the
+                // CONNECTION_VALIDATED frame leaves. pvxs finalises
+                // `cred` (serverconn.cpp:234) before `auth_complete()`
+                // enqueues CONNECTION_VALIDATED (serverconn.cpp:191), so
+                // any observer that has seen VALIDATED must already see
+                // the committed identity. Record it for the per-peer
+                // report and fire the user-installed `auth_complete`
+                // hook (pvxs serverconn.cpp:181 parity — peer addr +
+                // credentials snapshot; ACF integration goes here)
+                // first, then send. Sending first left a window where a
+                // client that observed VALIDATED could race ahead of the
+                // hook (the cause of the flaky auth-hook regression).
                 peer_entry.set_credentials(&cred.account, &cred.method);
-                // Fire user-installed `auth_complete` hook (pvxs
-                // serverconn.cpp:181 parity) once we've accepted the
-                // peer's identity claim. Hook signature mirrors pvxs
-                // — peer addr + credentials snapshot. ACF
-                // integration goes here.
                 if let Some(hook) = config.auth_complete.as_ref() {
                     hook(peer, &cred);
                 }
+                let _ = tx.send(buf).await;
+                handshake_complete = true;
                 continue;
             } else {
                 // Some clients send CREATE_CHANNEL right after SET_BYTE_ORDER

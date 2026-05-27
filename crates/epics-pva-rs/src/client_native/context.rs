@@ -1356,6 +1356,16 @@ impl PvaClient {
         }
     }
 
+    /// Begin building a custom pvRequest. Returns a fresh
+    /// [`crate::pv_request::PvRequestBuilder`] that callers can chain
+    /// `field()` / `record()` / `pv_request(str)` on, then materialize
+    /// with `.build()`. Mirrors pvxs `Context::request()` (client.h:553)
+    /// — included on the context for parity even though the builder is
+    /// stateless and could be constructed standalone.
+    pub fn request(&self) -> crate::pv_request::PvRequestBuilder {
+        crate::pv_request::PvRequestBuilder::new()
+    }
+
     /// Begin a `connect` builder for `pv_name`. Use this to attach
     /// onConnect/onDisconnect callbacks that fire whenever the channel
     /// transitions across the Active boundary. Mirrors pvxs's

@@ -26,6 +26,12 @@ pub struct AiRecord {
     // Deadband
     pub adel: f64,
     pub mdel: f64,
+    // Alarm-range time-constant filter (aiRecord.c::checkAlarms:355-401).
+    // AFTC > 0 enables an exponential smoothing of the integer alarmRange
+    // (1=Lolo..5=Hihi) so transient excursions don't immediately alarm.
+    // AFVL is the filter accumulator (sign encodes rounding hysteresis).
+    pub aftc: f64,
+    pub afvl: f64,
     // Runtime (alarm/monitor tracking)
     pub lalm: f64,
     pub alst: f64,
@@ -66,6 +72,8 @@ impl Default for AiRecord {
             smoo: 0.0,
             adel: 0.0,
             mdel: 0.0,
+            aftc: 0.0,
+            afvl: 0.0,
             lalm: 0.0,
             alst: 0.0,
             mlst: 0.0,
@@ -179,6 +187,17 @@ static FIELDS: &[FieldDesc] = &[
         name: "MDEL",
         dbf_type: DbFieldType::Double,
         read_only: false,
+    },
+    FieldDesc {
+        name: "AFTC",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        // aiRecord.dbd.pod: AFVL is special(SPC_NOMOD) — read-only to clients.
+        name: "AFVL",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
     },
     FieldDesc {
         name: "LALM",
@@ -320,6 +339,8 @@ impl Record for AiRecord {
             "SMOO" => Some(EpicsValue::Double(self.smoo)),
             "ADEL" => Some(EpicsValue::Double(self.adel)),
             "MDEL" => Some(EpicsValue::Double(self.mdel)),
+            "AFTC" => Some(EpicsValue::Double(self.aftc)),
+            "AFVL" => Some(EpicsValue::Double(self.afvl)),
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
@@ -474,6 +495,22 @@ impl Record for AiRecord {
             "MDEL" => match value {
                 EpicsValue::Double(v) => {
                     self.mdel = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "AFTC" => match value {
+                EpicsValue::Double(v) => {
+                    self.aftc = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            // AFVL is SPC_NOMOD (read-only to clients); this arm exists so
+            // the framework alarm-filter owner can write the accumulator back.
+            "AFVL" => match value {
+                EpicsValue::Double(v) => {
+                    self.afvl = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

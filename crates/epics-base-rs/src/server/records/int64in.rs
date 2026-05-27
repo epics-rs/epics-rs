@@ -26,6 +26,13 @@ pub struct Int64inRecord {
     pub adel: f64,
     #[field(type = "Double")]
     pub mdel: f64,
+    // Alarm-range time-constant filter (int64inRecord.c::checkAlarms:303-349).
+    // AFTC > 0 low-pass-filters the integer alarmRange so transient
+    // excursions don't immediately alarm; AFVL is the accumulator.
+    #[field(type = "Double")]
+    pub aftc: f64,
+    #[field(type = "Double")]
+    pub afvl: f64,
     #[field(type = "Double")]
     pub alst: f64,
     #[field(type = "Double")]
@@ -51,6 +58,8 @@ impl Default for Int64inRecord {
             lalm: 0.0,
             adel: 0.0,
             mdel: 0.0,
+            aftc: 0.0,
+            afvl: 0.0,
             alst: 0.0,
             mlst: 0.0,
             simm: 0,

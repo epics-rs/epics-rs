@@ -1432,6 +1432,167 @@ fn test_mbbi_aftc_writes_afvl_back_each_cycle() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Alarm-range AFTC filter parity for ai / longin / int64in.
+//
+// The 2009 EPICS Codeathon (epics-base `824d37811`) added the alarm
+// filter to ai, calc, longin and mbbi (later int64in). The framework's
+// `evaluate_analog_alarm` previously gated the filter to `calc` only;
+// these records carry AFTC/AFVL in C but the gate ignored them. The fix
+// adds the fields and broadens the gate to {calc, ai, longin, int64in}.
+// ---------------------------------------------------------------------------
+
+/// `ai` engages the alarm-range AFTC filter. aiRecord.c::checkAlarms:360-362
+/// seeds AFVL with the raw `alarmRange` on the first sample (AFVL==0), so
+/// a HIHI sample seeds AFVL=5.0 (range_Hihi) and passes MAJOR through.
+/// Before the fix the filter never ran for `ai`, so AFVL stayed 0.
+#[test]
+fn test_ai_aftc_filter_engages_and_seeds() {
+    let mut rec = AiRecord::new(150.0); // above HIHI
+    rec.aftc = 5.0;
+    rec.afvl = 0.0; // first sample
+    let mut inst = RecordInstance::new("AI:AFTC".into(), rec);
+    inst.common.udf = false;
+    inst.common.analog_alarm = Some(AnalogAlarmConfig {
+        hihi: 100.0,
+        high: 80.0,
+        low: -20.0,
+        lolo: -40.0,
+        hhsv: AlarmSeverity::Major,
+        hsv: AlarmSeverity::Minor,
+        lsv: AlarmSeverity::Minor,
+        llsv: AlarmSeverity::Major,
+    });
+
+    inst.evaluate_alarms();
+    epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
+
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Major,
+        "initial AFTC sample passes the raw HIHI severity through"
+    );
+    let afvl = inst
+        .record
+        .get_field("AFVL")
+        .and_then(|v| v.to_f64())
+        .expect("AFVL readable");
+    assert!(
+        (afvl - 5.0).abs() < 1e-9,
+        "AFVL must seed to the raw HIHI alarmRange 5.0 (filter engaged), got {afvl}"
+    );
+}
+
+/// `longin` engages the alarm-range AFTC filter (longinRecord.c:316-317
+/// seed). A HIHI integer sample seeds AFVL=5.0 and reports MAJOR.
+#[test]
+fn test_longin_aftc_filter_engages_and_seeds() {
+    use epics_base_rs::server::records::longin::LonginRecord;
+
+    let mut rec = LonginRecord::new(150); // above HIHI
+    rec.aftc = 5.0;
+    rec.afvl = 0.0;
+    let mut inst = RecordInstance::new("LONGIN:AFTC".into(), rec);
+    inst.common.udf = false;
+    inst.common.analog_alarm = Some(AnalogAlarmConfig {
+        hihi: 100.0,
+        high: 80.0,
+        low: -20.0,
+        lolo: -40.0,
+        hhsv: AlarmSeverity::Major,
+        hsv: AlarmSeverity::Minor,
+        lsv: AlarmSeverity::Minor,
+        llsv: AlarmSeverity::Major,
+    });
+
+    inst.evaluate_alarms();
+    epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
+
+    assert_eq!(inst.common.sevr, AlarmSeverity::Major);
+    let afvl = inst
+        .record
+        .get_field("AFVL")
+        .and_then(|v| v.to_f64())
+        .expect("AFVL readable");
+    assert!(
+        (afvl - 5.0).abs() < 1e-9,
+        "longin AFVL must seed to the raw HIHI alarmRange 5.0, got {afvl}"
+    );
+}
+
+/// `int64in` engages the alarm-range AFTC filter (int64inRecord.c:309-310
+/// seed). A HIHI integer sample seeds AFVL=5.0 and reports MAJOR.
+#[test]
+fn test_int64in_aftc_filter_engages_and_seeds() {
+    use epics_base_rs::server::records::int64in::Int64inRecord;
+
+    let mut rec = Int64inRecord::new(150); // above HIHI
+    rec.aftc = 5.0;
+    rec.afvl = 0.0;
+    let mut inst = RecordInstance::new("INT64IN:AFTC".into(), rec);
+    inst.common.udf = false;
+    inst.common.analog_alarm = Some(AnalogAlarmConfig {
+        hihi: 100.0,
+        high: 80.0,
+        low: -20.0,
+        lolo: -40.0,
+        hhsv: AlarmSeverity::Major,
+        hsv: AlarmSeverity::Minor,
+        lsv: AlarmSeverity::Minor,
+        llsv: AlarmSeverity::Major,
+    });
+
+    inst.evaluate_alarms();
+    epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
+
+    assert_eq!(inst.common.sevr, AlarmSeverity::Major);
+    let afvl = inst
+        .record
+        .get_field("AFVL")
+        .and_then(|v| v.to_f64())
+        .expect("AFVL readable");
+    assert!(
+        (afvl - 5.0).abs() < 1e-9,
+        "int64in AFVL must seed to the raw HIHI alarmRange 5.0, got {afvl}"
+    );
+}
+
+/// When AFTC <= 0 the filter is disabled. C `checkAlarms` initialises the
+/// local `afvl = 0` and unconditionally stores `prec->afvl = afvl`
+/// (aiRecord.c:356,402), so a disabled filter drives AFVL to 0. The
+/// framework owner does the same, so a stale accumulator from a prior
+/// AFTC>0 run cannot mis-seed a later re-enable.
+#[test]
+fn test_ai_aftc_disabled_resets_stale_afvl() {
+    let mut rec = AiRecord::new(0.0); // normal range, no alarm
+    rec.aftc = 0.0; // filter disabled
+    rec.afvl = 3.0; // stale accumulator left from a prior AFTC>0 run
+    let mut inst = RecordInstance::new("AI:AFTC".into(), rec);
+    inst.common.udf = false;
+    inst.common.analog_alarm = Some(AnalogAlarmConfig {
+        hihi: 100.0,
+        high: 80.0,
+        low: -20.0,
+        lolo: -40.0,
+        hhsv: AlarmSeverity::Major,
+        hsv: AlarmSeverity::Minor,
+        lsv: AlarmSeverity::Minor,
+        llsv: AlarmSeverity::Major,
+    });
+
+    inst.evaluate_alarms();
+
+    let afvl = inst
+        .record
+        .get_field("AFVL")
+        .and_then(|v| v.to_f64())
+        .expect("AFVL readable");
+    assert_eq!(
+        afvl, 0.0,
+        "AFTC<=0 must reset the stale AFVL accumulator to 0"
+    );
+}
+
 /// (PR #817 Fix #3) mbbi LALM must be updated on every val change
 /// even when COSV fires. The pre-fix C code wrote
 /// `if (val == lalm || recGblSetSevr(prec, COS_ALARM, prec->cosv)) return;`

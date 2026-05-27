@@ -1430,11 +1430,17 @@ impl RecordInstance {
             (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, val, 3u16)
         };
 
-        // C parity: calcRecord.c::checkAlarms applies the AFTC low-pass
-        // filter on `alarmRange` and re-maps. calcoutRecord.c does NOT
-        // (no AFTC field on calcout — confirmed via
-        // calcoutRecord.dbd.pod). Only `calc` runs the filter.
-        if self.record.record_type() == "calc" {
+        // C parity: the alarm-range AFTC low-pass filter
+        // (`{ai,longin,int64in,calc}Record.c::checkAlarms`) smooths the
+        // integer `alarmRange` and re-maps. Only records that carry the
+        // AFTC/AFVL fields run it — `ao`/`longout`/`int64out`/`calcout`
+        // have no AFTC field (confirmed via the respective `.dbd.pod`),
+        // so they are excluded.
+        let aftc_capable = matches!(
+            self.record.record_type(),
+            "calc" | "ai" | "longin" | "int64in"
+        );
+        if aftc_capable {
             let aftc = self
                 .record
                 .get_field("AFTC")
@@ -1470,9 +1476,16 @@ impl RecordInstance {
                     alarm_range = filtered_range;
                 }
             } else {
-                // aftc <= 0 disables filter; C also clears afvl on
-                // UDF/initial-pass — leave afvl untouched here (no
-                // active filter state to maintain).
+                // aftc <= 0 disables the filter. C `checkAlarms`
+                // (e.g. aiRecord.c:356,402) initialises the local
+                // `afvl = 0` and unconditionally stores `prec->afvl =
+                // afvl` at the end, so a disabled filter drives AFVL to
+                // 0. Mirror that here so a stale accumulator from a prior
+                // `aftc > 0` run cannot mis-seed the filter if AFTC is
+                // re-enabled later.
+                if afvl != 0.0 {
+                    let _ = self.record.put_field("AFVL", EpicsValue::Double(0.0));
+                }
             }
         }
         let _ = alarm_range; // suppress unused-var on non-calc paths

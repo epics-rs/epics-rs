@@ -60,7 +60,10 @@ Conventions:
 
 | pvxs | pva-rs | Status |
 |------|--------|--------|
-| `SharedPV()` / `open(...)` / `close()` | `SharedPV::new()` / `open` / `close` | ✅ |
+| `SharedPV()` (bare) | `SharedPV::new()` | ⚠️ default no-handler PUT differs (see note) |
+| `SharedPV::buildMailbox()` | `SharedPV::new()` (default behaviour) | ✅ |
+| `SharedPV::buildReadonly()` | `new()` + `on_put` returning an error | ⚠️ no built-in ctor |
+| `open(...)` / `close()` | `open` / `close` | ✅ |
 | `post(value)` | `try_post(value)` / `force_post(value)` | ✅ |
 | `current()` | `current()` | ✅ |
 | `onPut(handler)` | `on_put(...)` | ✅ |
@@ -68,6 +71,20 @@ Conventions:
 | `onFirstConnect(handler)` | `on_first_connect(...)` | ✅ |
 | `onLastDisconnect(handler)` | `on_last_disconnect(...)` | ✅ |
 | `attach()` / `fetch()` / `prune_subscribers()` | `attach()` / `fetch()` / `prune_subscribers()` | ✅ |
+
+> **Deviation — default no-handler PUT semantics.** `SharedPV::new()`
+> defaults to *mailbox* behaviour: a PUT received with no `on_put` handler
+> installed stores the value, posts it to subscribers, and replies success
+> (`shared_pv.rs:480-490`; the BitSet-delta path `put_delta` behaves the
+> same, `:555-579`). This matches pvxs `SharedPV::buildMailbox()`
+> (`sharedpv.cpp:106-133`), **not** a bare pvxs `SharedPV()`, whose default
+> `onPut` is empty and rejects the PUT with `"RPC not implemented by this
+> PV"` (`sharedpv.cpp:209-227`). The pva-rs default is intentional — the
+> common server-side use is a writable mailbox — and installing
+> `on_put(...)` overrides it exactly as pvxs `onPut(...)` does (return an
+> error from the handler for reject-by-default or read-only, the analog of
+> pvxs `buildReadonly()`). pva-rs has no separate reject-by-default
+> constructor.
 
 ## `pvxs::Value` ↔ `pva-rs::pvdata::Value`
 

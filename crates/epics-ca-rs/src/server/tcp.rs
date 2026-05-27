@@ -2065,11 +2065,29 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 let (dbr_type, element_count, target) = match entry {
                     PvEntry::Simple(pv) => {
                         let value = pv.get().await;
-                        (
-                            value.dbr_type(),
-                            value.count() as u32,
-                            ChannelTarget::SimplePv(pv),
-                        )
+                        // `$` long-string — C dbChannel.c:486-503 requires the
+                        // field to be DBF_STRING; other types get
+                        // S_dbLib_fieldNotFound (CREATE_CH_FAIL). When it is a
+                        // string C overrides the channel to DBF_CHAR with
+                        // `no_elements = field_size` (= 40). This must match the
+                        // RecordField arm below, because the channel stores
+                        // `long_string` and every delivery path runs
+                        // `apply_long_string` to convert the value to CHAR[40];
+                        // advertising the native DBR_STRING/1 here would
+                        // mis-size the client buffer against the delivered data.
+                        if long_string && !matches!(value, EpicsValue::String(_)) {
+                            let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
+                            fail.cid = client_cid;
+                            let mut w = writer.lock().await;
+                            w.write_all(&fail.to_bytes()).await?;
+                            return Ok(());
+                        }
+                        let (dbr_type_val, element_count) = if long_string {
+                            (DbFieldType::Char, 40u32)
+                        } else {
+                            (value.dbr_type(), value.count() as u32)
+                        };
+                        (dbr_type_val, element_count, ChannelTarget::SimplePv(pv))
                     }
                     PvEntry::Record(rec) => {
                         let instance = rec.read().await;
@@ -5488,6 +5506,120 @@ mod non_graceful_disconnect_teardown_tests {
         // A `$` long string is served as CHAR[40] (DbFieldType::Char == 4).
         assert_eq!(hdr.data_type, 4, "long-string channel advertises DBR_CHAR");
         assert_eq!(hdr.count, 40, "long-string channel advertises 40 elements");
+
+        drop(client);
+        handle.abort();
+    }
+
+    /// Regression: a `$` long-string channel on a string SimplePv must
+    /// advertise CHAR[40], not the native DBR_STRING/1. The channel stores
+    /// `long_string` and every delivery path runs `apply_long_string` to
+    /// emit CHAR[40], so the SimplePv arm must override the advertised
+    /// type/count to match — like the RecordField arm and C
+    /// dbChannel.c:486-492.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simple_pv_dollar_advertises_char_array() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("longstr:simple", EpicsValue::String("hi".to_string()))
+            .await
+            .expect("add string pv");
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:55224".parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                Some(conn_tx),
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(0xA1, "longstr:simple$"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+
+        let hdr = read_create_chan_result(&mut client, Duration::from_secs(3)).await;
+        assert_eq!(
+            hdr.cmmd, CA_PROTO_CREATE_CHAN,
+            "string SimplePv `$` must create the channel"
+        );
+        assert_eq!(hdr.data_type, 4, "long-string SimplePv advertises DBR_CHAR");
+        assert_eq!(hdr.count, 40, "long-string SimplePv advertises 40 elements");
+
+        drop(client);
+        handle.abort();
+    }
+
+    /// Regression: a `$` long-string channel on a non-string SimplePv must
+    /// be rejected with CREATE_CH_FAIL — C dbChannel.c:500-502 returns
+    /// S_dbLib_fieldNotFound for a `$` modifier on a non-DBF_STRING field,
+    /// matching the RecordField arm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simple_pv_dollar_on_non_string_fails() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("num:simple", EpicsValue::Double(1.0))
+            .await
+            .expect("add double pv");
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:55225".parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                Some(conn_tx),
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(0xA2, "num:simple$"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+
+        let hdr = read_create_chan_result(&mut client, Duration::from_secs(3)).await;
+        assert_eq!(
+            hdr.cmmd, CA_PROTO_CREATE_CH_FAIL,
+            "`$` on a non-string SimplePv must be rejected with CREATE_CH_FAIL"
+        );
 
         drop(client);
         handle.abort();

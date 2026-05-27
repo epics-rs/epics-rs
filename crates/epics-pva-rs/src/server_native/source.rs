@@ -35,12 +35,13 @@ pub struct ChannelContext {
     /// subject CommonName. Empty for non-TLS methods. ACF
     /// `AUTHORITY(...)` rule scopes match against this.
     pub authority: String,
-    /// Group / role claims advertised by the downstream peer's auth
-    /// method. parsed off the `ca` auth payload's
-    /// `groups`/`roles` array into `ClientCredentials::roles`, then
-    /// forwarded here so role-based ACF rules (`R member group:ops`,
-    /// `role/...` credential strings) can be enforced for native PVA
-    /// clients. Empty for methods that carry no role list.
+    /// Group / role memberships of the peer's `account`, re-derived
+    /// SERVER-SIDE from the local passwd/group DB into
+    /// `ClientCredentials::roles` (NEVER from the wire — pvxs
+    /// `ClientCredentials::roles()` / `osdGetRoles`) and forwarded here so
+    /// role-based ACF rules (`R member group:ops`, `role/...` credential
+    /// strings) can be enforced for native PVA clients. A client cannot
+    /// self-assign these to satisfy a group-gated rule.
     pub roles: Vec<String>,
     /// Decoded INIT pvRequest value for the current operation, when
     /// the wire layer captured one. PVA PUT INIT carries

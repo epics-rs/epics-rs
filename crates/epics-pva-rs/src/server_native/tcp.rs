@@ -1703,15 +1703,31 @@ pub struct ClientCredentials {
     /// non-TLS methods. ACF `RULE(... ){ AUTHORITY("...") }` scopes
     /// match against this.
     pub authority: String,
-    /// Group / role claims advertised by the auth method. Populated
-    /// by the `ca` method via [`crate::auth::posix_groups`] on the
-    /// client side; on the server side the same list is parsed off
-    /// the wire here. ACF rules of the form
+    /// Group / role memberships of [`Self::account`], re-derived
+    /// SERVER-SIDE from the local passwd/group DB by
+    /// [`Self::with_server_roles`] (pvxs `ClientCredentials::roles()` →
+    /// `osdGetRoles`, serverconn.cpp:33-37). ACF rules of the form
     /// `R member group:operators` match against this set.
+    ///
+    /// SECURITY: this is NEVER populated from the wire. A client
+    /// advertises a `groups`/`roles` field in CONNECTION_VALIDATION, but
+    /// trusting it would let `account="nobody", roles=["admin"]` satisfy
+    /// any group-gated rule — an ACL bypass. Every constructor funnels
+    /// through `with_server_roles`, so a wire value can never reach here.
     pub roles: Vec<String>,
 }
 
 impl ClientCredentials {
+    /// Re-derive [`Self::roles`] server-side from [`Self::account`]
+    /// against the local passwd/group DB (pvxs `ClientCredentials::roles`
+    /// → `osdGetRoles`). The single funnel every constructor / parse path
+    /// passes through, so `roles` is server-derived by construction and a
+    /// wire-advertised value can never reach the ACF gate.
+    fn with_server_roles(mut self) -> Self {
+        self.roles = crate::auth::osd_get_roles(&self.account);
+        self
+    }
+
     fn anonymous() -> Self {
         Self {
             method: "anonymous".into(),
@@ -1720,6 +1736,7 @@ impl ClientCredentials {
             authority: String::new(),
             roles: Vec::new(),
         }
+        .with_server_roles()
     }
 
     /// Build `x509` credentials from a verified TLS peer chain.
@@ -1734,6 +1751,7 @@ impl ClientCredentials {
             authority: creds.authority,
             roles: Vec::new(),
         }
+        .with_server_roles()
     }
 
     /// Format a one-line debug label for tracing / diagnostics.
@@ -1813,7 +1831,7 @@ fn parse_client_credentials(
         .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth desc peek: {e}")))?;
     if peek == 0xFF {
         // Null auth Value — empty creds, but the method is honoured.
-        return Ok(Some(creds));
+        return Ok(Some(creds.with_server_roles()));
     }
     // Rewind and decode the real descriptor.
     cur.set_position(pos);
@@ -1830,18 +1848,11 @@ fn parse_client_credentials(
                 ("host", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
                     creds.host = v.clone();
                 }
-                ("groups" | "roles", PvField::ScalarArray(arr)) => {
-                    creds.roles = arr
-                        .iter()
-                        .filter_map(|sv| {
-                            if let crate::pvdata::ScalarValue::String(s) = sv {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                }
+                // A `groups`/`roles` field MAY be advertised here, but the
+                // server MUST NOT trust it (ACL bypass — see the `roles`
+                // field doc). pvxs reads only `user`/`host` off the wire
+                // and re-derives roles via `osdGetRoles`. We ignore it and
+                // re-derive in `with_server_roles` before returning.
                 _ => {}
             }
         }
@@ -1855,7 +1866,10 @@ fn parse_client_credentials(
     if creds.method.eq_ignore_ascii_case("ca") && creds.account.is_empty() {
         return Ok(None);
     }
-    Ok(Some(creds))
+    // Roles are re-derived server-side from `account` (pvxs
+    // `ClientCredentials::roles()`); any wire-advertised `groups`/`roles`
+    // was ignored above.
+    Ok(Some(creds.with_server_roles()))
 }
 
 /// Type-erased read/write halves so the same handler works for plain TCP
@@ -8950,6 +8964,78 @@ mod tests {
             authority: authority.into(),
             roles: Vec::new(),
         }
+    }
+
+    /// Security regression: the server MUST NOT trust wire-advertised
+    /// `groups`/`roles`. A crafted `ca` client sends `user=<unknown acct>`
+    /// plus `groups=["admin","wheel"]`; `parse_client_credentials` must
+    /// ignore the wire groups and re-derive roles server-side from the
+    /// account (pvxs `ClientCredentials::roles()` → `osdGetRoles`). For an
+    /// account unknown to the local passwd DB that derivation yields
+    /// `{account}` — never the attacker's claim. Pre-fix the wire array
+    /// landed directly in `creds.roles`, so `member group:admin` matched.
+    #[test]
+    fn parse_client_credentials_ignores_wire_advertised_roles() {
+        let order = ByteOrder::Little;
+        // Unknown to any local passwd DB → osd_get_roles is the
+        // deterministic {account} fallback.
+        let fake_account = "pvxs_nobody_zz";
+        let wire_groups = ["admin", "wheel"];
+
+        // Mirror `build_client_connection_validation`'s inline AuthZ
+        // structure: user(str) + host(str) + groups(str[]).
+        let mut payload = Vec::new();
+        payload.put_u32(0x10000, order); // buffer_size
+        payload.put_u16(1, order); // intro_size
+        payload.put_u16(0, order); // qos
+        encode_string_into("ca", order, &mut payload);
+        payload.put_u8(0xFD);
+        payload.put_u16(1, order);
+        payload.put_u8(0x80);
+        payload.put_u8(0x00);
+        payload.put_u8(3); // n_fields
+        payload.put_u8(0x04);
+        payload.extend_from_slice(b"user");
+        payload.put_u8(0x60); // string
+        payload.put_u8(0x04);
+        payload.extend_from_slice(b"host");
+        payload.put_u8(0x60); // string
+        payload.put_u8(0x06);
+        payload.extend_from_slice(b"groups");
+        payload.put_u8(0x68); // string[]
+        encode_string_into(fake_account, order, &mut payload);
+        encode_string_into("h.example", order, &mut payload);
+        crate::proto::encode_size_into(wire_groups.len() as u32, order, &mut payload);
+        for g in wire_groups {
+            encode_string_into(g, order, &mut payload);
+        }
+
+        let header = PvaHeader::application(
+            false,
+            order,
+            Command::ConnectionValidation.code(),
+            payload.len() as u32,
+        );
+        let frame = Frame { header, payload };
+
+        let creds = parse_client_credentials(&frame, order)
+            .expect("decode must succeed")
+            .expect("ca with a user field yields Some");
+
+        assert_eq!(
+            creds.account, fake_account,
+            "account comes from wire `user`"
+        );
+        assert!(
+            !creds.roles.iter().any(|r| r == "admin" || r == "wheel"),
+            "wire-advertised roles leaked into the credential: {:?}",
+            creds.roles
+        );
+        assert_eq!(
+            creds.roles,
+            crate::auth::osd_get_roles(fake_account),
+            "roles must be re-derived server-side from the account"
+        );
     }
 
     /// Regression (Defect 1, native PROCESS handler): a peer whose

@@ -110,6 +110,132 @@ pub fn posix_groups() -> Vec<String> {
     }
 }
 
+/// Re-derive the POSIX group "roles" of a NAMED account, server-side,
+/// from the local passwd/group database. This is the exact source pvxs
+/// `server::ClientCredentials::roles()` uses (serverconn.cpp:33-37 →
+/// `osdGetRoles(account)`, osgroups.cpp:54): the account's passwd primary
+/// group (`pw_gid`) plus every supplementary group from `getgrouplist(3)`,
+/// each mapped to a name via `getgrgid(3)`. When the account is unknown to
+/// the local passwd DB (`getpwnam` miss) the account name itself is the
+/// only role — pvxs's "don't know who this is" fallback.
+///
+/// SECURITY: a PVA client advertises a `groups`/`roles` field in
+/// CONNECTION_VALIDATION, but the server MUST NOT trust it — doing so lets
+/// a crafted client (`account="nobody", roles=["admin"]`) satisfy any
+/// `member group:admin` ACF rule. pvxs never reads wire roles; the server
+/// re-derives them here from the account against its OWN group DB.
+///
+/// Distinct from [`posix_groups`]: that resolves the CURRENT process's
+/// groups via `getpwuid(getuid())` (the client advertising its own
+/// identity); this resolves an ARBITRARY named account via
+/// `getpwnam(account)` and uses the account's `pw_gid` (not the process
+/// `getgid()`).
+pub fn osd_get_roles(account: &str) -> Vec<String> {
+    #[cfg(unix)]
+    {
+        use std::ffi::{CStr, CString};
+
+        let account_cstr = match CString::new(account) {
+            Ok(c) => c,
+            // An embedded NUL cannot name a real passwd entry — treat as
+            // the getpwnam-miss fallback.
+            Err(_) => return vec![account.to_string()],
+        };
+        // getpwnam(account): the named account's passwd entry. A NULL
+        // result means the account is unknown locally — pvxs returns
+        // {account} ("don't know who this is").
+        // SAFETY: `account_cstr` is a valid NUL-terminated C string. We
+        // read the returned passwd's fields only while the pointer is
+        // valid (before any further NSS call) and copy them out at once.
+        let (pw_name, pw_gid) = unsafe {
+            let pw = libc::getpwnam(account_cstr.as_ptr());
+            if pw.is_null() {
+                return vec![account.to_string()];
+            }
+            let name = CStr::from_ptr((*pw).pw_name)
+                .to_str()
+                .ok()
+                .map(|s| s.to_string());
+            (name, (*pw).pw_gid)
+        };
+        let pw_name = match pw_name {
+            Some(n) => n,
+            None => return vec![account.to_string()],
+        };
+        let name_cstr = match CString::new(pw_name) {
+            Ok(c) => c,
+            Err(_) => return vec![account.to_string()],
+        };
+
+        // gids = primary `pw_gid` + supplementary groups. Darwin binds
+        // the groups pointer as `*mut c_int`, Linux as `*mut gid_t`
+        // (u32); use a raw `c_int` buffer and cast, matching
+        // `posix_groups`. The first call probes the required size.
+        let mut gids: Vec<libc::gid_t> = vec![pw_gid];
+        let mut ngroups: libc::c_int = 64;
+        let mut groups: Vec<libc::c_int> = vec![0; ngroups as usize];
+        // SAFETY: `name_cstr` is NUL-terminated; `groups` is a writable
+        // buffer of `ngroups` elements; the kernel writes at most that
+        // many and updates `ngroups`.
+        let rc = unsafe {
+            libc::getgrouplist(
+                name_cstr.as_ptr(),
+                pw_gid as _,
+                groups.as_mut_ptr() as *mut _,
+                &mut ngroups,
+            )
+        };
+        if rc < 0 {
+            // Buffer too small — `ngroups` now holds the real count;
+            // grow and retry once.
+            groups.resize(ngroups.max(0) as usize, 0);
+            // SAFETY: as above, with the now-correctly-sized buffer.
+            let rc2 = unsafe {
+                libc::getgrouplist(
+                    name_cstr.as_ptr(),
+                    pw_gid as _,
+                    groups.as_mut_ptr() as *mut _,
+                    &mut ngroups,
+                )
+            };
+            if rc2 >= 0 {
+                groups.truncate(ngroups.max(0) as usize);
+                gids.extend(groups.into_iter().map(|g| g as libc::gid_t));
+            }
+            // rc2 < 0: keep just the primary `pw_gid` (pvxs gives up on
+            // the supplementary list but still has the primary group).
+        } else {
+            groups.truncate(ngroups.max(0) as usize);
+            gids.extend(groups.into_iter().map(|g| g as libc::gid_t));
+        }
+
+        // gid -> group name via getgrgid.
+        let mut names: Vec<String> = Vec::with_capacity(gids.len());
+        for gid in gids {
+            // SAFETY: getgrgid returns a pointer valid until the next NSS
+            // call; the name is copied out immediately.
+            unsafe {
+                let gr = libc::getgrgid(gid);
+                if gr.is_null() {
+                    continue;
+                }
+                if let Ok(s) = CStr::from_ptr((*gr).gr_name).to_str() {
+                    names.push(s.to_string());
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+    #[cfg(not(unix))]
+    {
+        // No local group DB available (Windows LANMAN handled elsewhere;
+        // RTEMS / vxWorks): pvxs reports the account as its only role.
+        vec![account.to_string()]
+    }
+}
+
 /// Resolve the AuthZ host. Honours `EPICS_PVA_AUTH_HOST`, then the OS
 /// hostname, falling back to `"localhost"`.
 pub fn authnz_default_host() -> String {
@@ -137,5 +263,25 @@ mod tests {
     fn host_falls_back() {
         let h = authnz_default_host();
         assert!(!h.is_empty());
+    }
+
+    #[test]
+    fn osd_get_roles_unknown_account_is_self() {
+        // An account absent from the local passwd DB → pvxs "don't know
+        // who this is" fallback (osgroups.cpp:57-60): the account name is
+        // its only role. Deterministic regardless of host.
+        let acct = "pvxs_unknown_account_zzqq";
+        assert_eq!(osd_get_roles(acct), vec![acct.to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn osd_get_roles_known_account_is_nonempty() {
+        // `root` exists on every Unix host; its primary group maps to a
+        // name via getgrgid, so the server-derived role set is non-empty.
+        assert!(
+            !osd_get_roles("root").is_empty(),
+            "root must derive at least one group role from the local DB"
+        );
     }
 }

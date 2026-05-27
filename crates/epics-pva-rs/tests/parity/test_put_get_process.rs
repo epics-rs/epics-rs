@@ -1,4 +1,4 @@
-//! F11: end-to-end coverage for the PVA `PUT_GET` (cmd 12) and
+//! end-to-end coverage for the PVA `PUT_GET` (cmd 12) and
 //! `PROCESS` (cmd 16) operations.
 //!
 //! - `PUT_GET` round trip: the client PUTs a value and gets the
@@ -284,7 +284,7 @@ async fn process_triggers_hook() {
 }
 
 // ---------------------------------------------------------------------
-// F11: ACF-deny negative coverage for PUT_GET and PROCESS.
+// ACF-deny negative coverage for PUT_GET and PROCESS.
 //
 // Both PUT_GET (its PUT leg) and PROCESS are WRITE-class operations.
 // `DenySource` installs a `Required` AccessGate whose ACF grants only
@@ -372,7 +372,7 @@ impl ChannelSource for DenySource {
     }
 }
 
-/// F11: an ACF-denied peer issuing PUT_GET is rejected — the PUT leg
+/// an ACF-denied peer issuing PUT_GET is rejected — the PUT leg
 /// is WRITE-class, the gate denies it, and `pvput_get` returns an
 /// error. The source's `put_value` hook never runs.
 #[tokio::test]
@@ -419,7 +419,7 @@ async fn put_get_denied_for_read_only_peer() {
     let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }
 
-/// F11: an ACF-denied peer issuing PROCESS is rejected — PROCESS is
+/// an ACF-denied peer issuing PROCESS is rejected — PROCESS is
 /// WRITE-class, the gate denies it, and `pvprocess` returns an error.
 /// The source's `process` hook never runs.
 #[tokio::test]

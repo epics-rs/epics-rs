@@ -109,7 +109,7 @@ impl QosFlags {
     pub const DESTROY: u8 = 0x10;
     /// `0x40` — operation is a GET (set on PUT_GET to request value back).
     pub const GET: u8 = 0x40;
-    // R63: MONITOR_START and MONITOR_STOP hold wrong values — see doc/source-review-2026-05-26.md.
+    // MONITOR_START and MONITOR_STOP hold wrong values — see doc/source-review-2026-05-26.md.
     /// `0x44` — START a paused monitor (control bit `0x04` | GET bit `0x40`; subscriber → server).
     pub const MONITOR_START: u8 = 0x44;
     /// `0x04` — STOP a running monitor (control bit only; subscriber → server).

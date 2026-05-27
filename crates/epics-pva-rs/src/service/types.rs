@@ -70,7 +70,7 @@ impl_arg_scalar!(i64, Long, |s: &ScalarValue| match s {
     _ => None,
 });
 impl_arg_scalar!(i32, Int, |s: &ScalarValue| match s {
-    // F8: use try_from so a Long value outside i32 range surfaces
+    // use try_from so a Long value outside i32 range surfaces
     // as WrongArgType instead of silently truncating modulo 2^32.
     ScalarValue::Long(v) => i32::try_from(*v).ok(),
     ScalarValue::Short(v) => Some(*v as i32),

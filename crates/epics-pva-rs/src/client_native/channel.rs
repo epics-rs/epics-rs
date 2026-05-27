@@ -408,7 +408,7 @@ impl ConnectionPool {
     }
 
     /// Drop the cached connection for `addr` regardless of liveness
-    /// (F10). Called when a GUID mismatch is detected at the same
+    ///. Called when a GUID mismatch is detected at the same
     /// address — the previous code cleared its own Channel state but
     /// left the pool entry, so subsequent channels resolving to the
     /// same addr re-used the stale (wrong-GUID) ServerConn.
@@ -610,7 +610,7 @@ impl Channel {
             }
         }
         if force_research {
-            // F10: also drop the stale pool entry so other channels
+            // also drop the stale pool entry so other channels
             // resolving to the same addr don't reuse the wrong-GUID
             // ServerConn until they too discover the mismatch.
             if let ChannelState::Active { server, .. } = &*self.state.read() {
@@ -720,7 +720,7 @@ impl Channel {
                 //   caller-facing find() with a timeout. Adding
                 //   one was a foot-gun: the previous `MULTI_SERVER_WINDOW`
                 //   ceiling cancelled the SEARCH before its bucket
-                //   could fire (F6 dropped it as a zombie), and
+                //   could fire (dropped it as a zombie), and
                 //   recovery only happened when a beacon arrived
                 //   and a fresh retry cycle happened to align with
                 //   it. Without the timeout, the find() future

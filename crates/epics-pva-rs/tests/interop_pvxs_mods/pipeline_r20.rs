@@ -1,6 +1,6 @@
 //! Interop: pvxs C++ client builds the *typed* pipeline
 //! pvRequest (`Context::request().record("pipeline", true)`) and
-//! connects to a Rust PVA server hosting one PV. Pre-R20 the
+//! connects to a Rust PVA server hosting one PV. Previously the
 //! Rust server's `monitor_pipeline_options` parser only matched
 //! the parsed-string form (`record[pipeline=true]`) and silently
 //! disabled flow control whenever a real pvxs program drove the
@@ -276,7 +276,7 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
 
     // Discriminating assertion: the Rust server emits a debug event
     // `MONITOR INIT pipeline negotiated` only when the parser
-    // recognises the typed-Bool pipeline option. Pre-R20 the parser
+    // recognises the typed-Bool pipeline option. Previously the parser
     // returned None for typed-Bool, the event never fired, the server
     // still echoed events back to the client (no flow control), so
     // the helper would still exit 0 — only this log assertion

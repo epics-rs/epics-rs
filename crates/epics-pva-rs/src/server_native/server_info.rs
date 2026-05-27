@@ -20,7 +20,7 @@
 //! keeping [`ServerInfoSource::list_pvs`] empty so `server` never
 //! self-lists in `op=channels` output nor in beacon advertisements,
 //! AND by [`ServerInfoSource::searchable`] returning `false` so a UDP
-//! SEARCH for the literal name `server` is never answered (F6).
+//! SEARCH for the literal name `server` is never answered.
 //! `has_pv("server")` still returns `true`, which keeps the direct
 //! TCP-connect GET / RPC path working — matching pvxs exactly: the
 //! `server` PV is reachable by direct connect but invisible to

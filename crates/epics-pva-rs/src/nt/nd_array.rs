@@ -43,7 +43,7 @@
 //!     string   source
 //! ```
 
-// R82: the module-doc layout block above is kept in sync with
+// the module-doc layout block above is kept in sync with
 // nt_nd_array_desc()/pvxs nt.cpp:196-251 — it had drifted to a stale
 // pre-fix shape (trailing descriptor+display, 5-field attribute).
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, VariantValue};

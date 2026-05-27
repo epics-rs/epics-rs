@@ -3,10 +3,10 @@
 //! Rust PVA server hosts a matrix of PVs covering every NT shape
 //! pvxs ships built-in plus a deeply-nested generic structure.
 //! Real `pvxget` reads each one (via `EPICS_PVA_NAME_SERVERS` →
-//! R11 TCP search) and the test asserts the formatted output
+//! TCP search) and the test asserts the formatted output
 //! contains the expected values. Catches encoder bugs in Structure
 //! / ScalarArray / StructureArray / String paths that the simpler
-//! R1/R11/R20 tests (NTScalar Double only) cannot.
+//! NTScalar-Double-only tests cannot.
 //!
 //! When `UPDATE_GOLDENS=1` is set in the environment, this test
 //! additionally re-encodes each PV via the Rust encoder and writes

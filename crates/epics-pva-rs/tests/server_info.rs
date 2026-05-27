@@ -1,4 +1,4 @@
-//! F6 — built-in `server` PV / channel-list facility.
+//! Built-in `server` PV / channel-list facility.
 //!
 //! Mirrors pvxs `ServerSource` (`serversource.cpp`): every `PvaServer`
 //! auto-registers a low-priority `__server` source exposing the

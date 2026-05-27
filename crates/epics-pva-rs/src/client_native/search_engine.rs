@@ -44,7 +44,7 @@ use super::decode::{PeerRole, decode_search_response, try_parse_frame_role};
 
 /// Search retry intervals in seconds.
 ///
-/// R67: this constant is NOT used by the engine — actual retry scheduling
+/// this constant is NOT used by the engine — actual retry scheduling
 /// uses the 30-bucket ring in `run_engine`/`cascade_smoothed_next`
 /// (pvxs `client.cpp::tickSearch`), which caps at ~29 s. The values here
 /// do not appear in pvxs; the previous doc "matching pvxs clientdiscover.cpp"
@@ -1192,7 +1192,7 @@ async fn run_engine(
             ns_rsp = ns_response_rx.recv() => {
                 // SEARCH_RESPONSE received over a TCP name-server connection.
                 // pvxs client.cpp:984-995: procSearchReply with istcp=true.
-                // is_tcp=true so the R90 discovery-pong path does not fire here.
+                // is_tcp=true so the discovery-pong path does not fire here.
                 if let Some((bytes, ns_addr)) = ns_rsp {
                     let mut poke = false;
                     handle_search_response(
@@ -1264,7 +1264,7 @@ async fn run_engine(
                 let bucket_ids = std::mem::take(&mut search_buckets[current_bucket]);
                 for sid in bucket_ids {
                     let responder_dead = match pending.get(&sid) {
-                        // F6: drop searches whose oneshot responder
+                        // drop searches whose oneshot responder
                         // was already closed (caller cancelled their
                         // find() future via outer timeout / abort).
                         // Without this the bucket loop keeps
@@ -1546,7 +1546,7 @@ fn handle_search_response(
     let Ok(resp) = decode_search_response(&frame) else {
         return consumed;
     };
-    // R90: pvxs client.cpp:889 — when a UDP SEARCH_RESPONSE arrives with
+    // pvxs client.cpp:889 — when a UDP SEARCH_RESPONSE arrives with
     // found=false and no channel IDs it is a discovery pong: the server
     // acknowledged a DiscoverPing (MustReply SEARCH with zero channels).
     // Treat it as a fake beacon so the server enters the tracker and
@@ -2115,7 +2115,7 @@ mod tests {
         );
     }
 
-    /// R90 must still work: with an active `discover()` subscriber, a
+    /// Discovery must still work: with an active `discover()` subscriber, a
     /// `found=false`/zero-cid UDP reply IS a discovery pong — fake-beacon
     /// processing fires (announce + poke) and `Discovered::Online` is
     /// delivered to the subscriber.
@@ -2917,7 +2917,7 @@ mod tests {
             // ── Step 2: CONNECTION_VALIDATION request (server→client) ──────────
             {
                 let mut payload = Vec::new();
-                payload.put_u32(0x10000, order); // buffer_size (R62: match pvxs 0x10000)
+                payload.put_u32(0x10000, order); // buffer_size (match pvxs 0x10000)
                 payload.put_u16(32_767, order); // registry_size
                 payload.push(1u8); // auth_methods count (size-encoded, 1 < 254)
                 encode_string_into("anonymous", order, &mut payload);

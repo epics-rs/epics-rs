@@ -2376,7 +2376,7 @@ pub async fn op_rpc(
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
 
-    // R64: pvxs serverget.cpp:369 calls from_wire_type_value (type+value); type-only fails.
+    // pvxs serverget.cpp:369 calls from_wire_type_value (type+value); type-only fails.
     let mut pv_req = Vec::new();
     encode_type_desc(request_desc, order, &mut pv_req);
     encode_pv_field(request_value, request_desc, order, &mut pv_req);
@@ -2458,7 +2458,7 @@ pub async fn op_rpc(
 
 // ── PUT_GET (cmd 12) ────────────────────────────────────────────────────
 
-/// F11: PVA `PUT_GET` (cmd 12) — atomic put-then-get round trip.
+/// PVA `PUT_GET` (cmd 12) — atomic put-then-get round trip.
 ///
 /// Puts `value_str` to the channel's `.value` field, then receives the
 /// (possibly post-processed) value back, all in one operation. The
@@ -2614,7 +2614,7 @@ fn decode_put_get_data(
 
 // ── PROCESS (cmd 16) ────────────────────────────────────────────────────
 
-/// F11: PVA `PROCESS` (cmd 16) — trigger record processing without
+/// PVA `PROCESS` (cmd 16) — trigger record processing without
 /// transferring a value.
 ///
 /// Wire lifecycle:
@@ -2909,7 +2909,7 @@ fn build_put_value(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
     }
 }
 
-/// Build a union PUT value (`F4`). The variant is selected either
+/// Build a union PUT value. The variant is selected either
 /// explicitly — `value_str` of the form `variantName=payload` (or
 /// `variantName:payload`) — or implicitly by picking the first variant
 /// whose descriptor the bare payload parses against. An empty
@@ -2960,7 +2960,7 @@ fn build_put_union(variants: &[(String, FieldDesc)], value_str: &str) -> PvaResu
     )))
 }
 
-/// Build a variant ("any") PUT value (`F4`). The carried scalar type is
+/// Build a variant ("any") PUT value. The carried scalar type is
 /// inferred from the textual form — narrowest type wins: `bool` →
 /// `i64` → `f64` → `String`. An empty `value_str` produces the null
 /// variant (no embedded descriptor).
@@ -2989,7 +2989,7 @@ fn build_put_variant(value_str: &str) -> PvaResult<PvField> {
     })))
 }
 
-/// Build one element of a structure array (`F4`). The token is routed
+/// Build one element of a structure array. The token is routed
 /// into the element's `value` field if present, otherwise into its
 /// first scalar / scalar-array leaf; every other field is default-
 /// filled. Distinct from [`build_put_value`]'s `Structure` arm only in
@@ -3337,7 +3337,7 @@ mod tests {
         assert_round_trips(&desc, &v);
     }
 
-    /// F4 regression: the PUT EXEC DATA frame must encode a BitSet *delta*
+    /// Regression: the PUT EXEC DATA frame must encode a BitSet *delta*
     /// — only the fields whose bit is set — so a pvxs server's
     /// `from_wire_valid` (serverget.cpp:451) decodes the exact bytes the
     /// client emitted. Previously the BitSet marked only `value` while

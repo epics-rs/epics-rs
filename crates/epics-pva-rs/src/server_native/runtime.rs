@@ -458,7 +458,7 @@ impl PvaServer {
     ///
     /// The user-supplied `source` is wrapped in a
     /// [`super::CompositeSource`] together with the built-in
-    /// [`super::server_info::ServerInfoSource`] (F6). The built-in
+    /// [`super::server_info::ServerInfoSource`]. The built-in
     /// source is registered at `order = i32::MAX` — the lowest
     /// priority slot — so a user source serving a PV literally named
     /// `server` always wins, mirroring pvxs registering its

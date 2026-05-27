@@ -94,7 +94,7 @@ pub struct PvaServer {
     /// All `PvDatabaseSource` ACF check sites pick the latest
     /// policy on their next read.
     acf: crate::server::native_source::AcfCell,
-    /// Round 48 (R48-G3): monotonic ACL generation. Bumped by
+    /// Monotonic ACL generation. Bumped by
     /// `reload_acf_from` / `clear_acf`. The default
     /// `PvDatabaseSource` constructed in `run()` shares this `Arc`
     /// via `AccessGate::required_with_version`, so monitor tasks
@@ -136,7 +136,7 @@ impl PvaServer {
         let content = std::fs::read_to_string(path).map_err(epics_base_rs::error::CaError::Io)?;
         let cfg = access_security::parse_acf(&content)?;
         *self.acf.write().await = Some(cfg);
-        // R48-G3: bump the shared ACL generation so monitor tasks
+        // Bump the shared ACL generation so monitor tasks
         // spawned on the default `PvDatabaseSource` (which captured
         // this counter at spawn time) detect the change on their
         // next event and re-check ACL — peers that the new policy

@@ -42,7 +42,7 @@ fn alloc_sid() -> u32 {
     NEXT_SID.fetch_add(1, Ordering::Relaxed)
 }
 
-// R80: serverChannelID sentinel in a CREATE_CHANNEL failure reply. pvxs
+// serverChannelID sentinel in a CREATE_CHANNEL failure reply. pvxs
 // uses `sid = -1` (serverchan.cpp:273/338) and wires it as 0xFFFFFFFF;
 // `NEXT_SID` starts at 1, so this value can never be a live channel id.
 const CREATE_CHANNEL_NO_SID: u32 = u32::MAX;
@@ -1586,7 +1586,7 @@ pub async fn run_tcp_server_on_listener(
                                 .await
                             {
                                 Ok(Ok(tls_stream)) => {
-                                    // F8: derive the peer's x509 identity from
+                                    // derive the peer's x509 identity from
                                     // the *verified* certificate chain before
                                     // splitting the stream. rustls only
                                     // exposes `peer_certificates()` on the
@@ -1595,7 +1595,7 @@ pub async fn run_tcp_server_on_listener(
                                     // so this is the cryptographically-checked
                                     // identity (pvxs `fill_credentials`).
                                     //
-                                    // R68: use trust_roots so that `authority`
+                                    // use trust_roots so that `authority`
                                     // is populated even when the peer sends a
                                     // partial chain (leaf-only or leaf+CA),
                                     // matching pvxs SSL_get0_verified_chain.
@@ -1783,7 +1783,7 @@ fn parse_client_credentials(
     let method = crate::proto::decode_string(&mut cur, order)
         .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION method: {e}")))?
         .unwrap_or_default();
-    // R70: pvxs serverconn.cpp:223-231 — method/account are set from
+    // pvxs serverconn.cpp:223-231 — method/account are set from
     // the auth body ONLY for selected=="ca" with a valid user field;
     // every other path lands on method="anonymous"/account="anonymous"
     // via `if(C->method.empty())`. Mirror that: an empty method or an
@@ -1846,7 +1846,7 @@ fn parse_client_credentials(
             }
         }
     }
-    // R70: pvxs serverconn.cpp:223-231 — for "ca", the credential is
+    // pvxs serverconn.cpp:223-231 — for "ca", the credential is
     // only meaningful when a user field was present (the lambda sets
     // BOTH method and account). Without a user field the lambda never
     // fires, C->method stays empty, and the anonymous fallback triggers.
@@ -1898,7 +1898,7 @@ async fn handle_connection_io(
     peer: SocketAddr,
     config: PvaServerConfig,
     peer_entry: Arc<crate::server_native::peers::PeerEntry>,
-    // F8: x509 identity from the verified TLS peer chain, when this
+    // x509 identity from the verified TLS peer chain, when this
     // connection arrived over mutually-authenticated TLS. `None` for
     // plain TCP or TLS without a client cert. When present it is the
     // authoritative identity and overrides the CONNECTION_VALIDATION
@@ -2011,7 +2011,7 @@ async fn handle_connection_io(
     // Modern pvxs clients explicitly prefer `ca`; validation still
     // accepts both, only the wire order changes.
     const ADVERTISED_AUTH_METHODS: &[&str] = &["anonymous", "ca"];
-    // R62: match pvxs serverconn.cpp:103-104 — serverReceiveBufferSize = 0x10000 ("not used").
+    // match pvxs serverconn.cpp:103-104 — serverReceiveBufferSize = 0x10000 ("not used").
     let val_req =
         build_server_connection_validation(order, 0x10000, 32_767, ADVERTISED_AUTH_METHODS);
     let _ = tx.send(val_req).await;
@@ -2022,7 +2022,7 @@ async fn handle_connection_io(
     let mut handshake_complete = false;
     // Client identity carried for the rest of the connection lifetime.
     //
-    // F8 precedence (mirrors pvxs):
+    // Precedence (mirrors pvxs):
     //  - mTLS with a verified client cert → `x509` credentials derived
     //    from the cert chain. This is cryptographically verified and is
     //    the authoritative identity — the CONNECTION_VALIDATION reply
@@ -2079,7 +2079,7 @@ async fn handle_connection_io(
     // against the limit to prevent a burst of concurrent requests from
     // racing past it before the first completions arrive.
     let mut pending_channel_spawns: usize = 0;
-    // R65: abort guards for GET_FIELD slow-path introspect tasks. Dropping
+    // abort guards for GET_FIELD slow-path introspect tasks. Dropping
     // on connection close cancels any task whose source hasn't returned yet,
     // matching pvxs opByIOID cleanup (serverconn.cpp:366-382).
     let mut gf_abort_guards: Vec<AbortOnDrop> = Vec::new();
@@ -2125,7 +2125,7 @@ async fn handle_connection_io(
                         peer_entry
                             .set_channel_names(channels.values().map(|c| c.name.clone()).collect());
                     } else {
-                        // R80: CREATE_CHANNEL failure sid must be the
+                        // CREATE_CHANNEL failure sid must be the
                         // no-channel sentinel 0xFFFFFFFF (pvxs
                         // serverchan.cpp:349, sid=-1), not 0.
                         payload.put_u32(CREATE_CHANNEL_NO_SID, order);
@@ -2273,7 +2273,7 @@ async fn handle_connection_io(
                 // (string); when method == "ca", read the type+value of the
                 // auth Value and pull out the `user` / `host` fields. Pure
                 // metadata for audit/logging.
-                // F8: when the connection is mTLS-authenticated, the
+                // when the connection is mTLS-authenticated, the
                 // x509 identity from the verified cert chain wins — the
                 // client's CONNECTION_VALIDATION claim is parsed only
                 // for diagnostics and never replaces it.
@@ -2318,7 +2318,7 @@ async fn handle_connection_io(
                 // empty-method path inside parse_client_credentials);
                 // matches "No practical way to handle auth failure. So
                 // we accept all credentials, but may not grant rights."
-                // F8: an mTLS connection is authenticated by its
+                // an mTLS connection is authenticated by its
                 // verified certificate chain — `cred.method` is
                 // `"x509"` regardless of the CONNECTION_VALIDATION
                 // claim, and that is always a valid method when TLS is
@@ -2516,7 +2516,7 @@ async fn handle_connection_io(
                 handle_message(&frame, order, &peer)?;
             }
             Some(Command::PutGet) => {
-                // F11: atomic put-then-get. The PVA wire spec defines
+                // atomic put-then-get. The PVA wire spec defines
                 // PUT_GET as a separate command (cmd 12). pvxs leaves
                 // `handle_PUT_GET` empty, but we implement the full
                 // INIT/PUT/GET/DESTROY lifecycle on the Rust side so
@@ -2537,7 +2537,7 @@ async fn handle_connection_io(
                 .await?;
             }
             Some(Command::Process) => {
-                // F11: trigger record processing with no value
+                // trigger record processing with no value
                 // transfer (PVA cmd 16). Full INIT/PROCESS/DESTROY
                 // lifecycle — routed through the source's typed
                 // `process_checked` (WRITE-class ACF gate).
@@ -2725,7 +2725,7 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
     }
 }
 
-/// F11: PVA `PUT_GET` (cmd 12) handler — atomic put-then-get.
+/// PVA `PUT_GET` (cmd 12) handler — atomic put-then-get.
 ///
 /// Sub-command lifecycle, mirroring the GET / PUT handlers:
 /// - INIT  (`subcmd & 0x08`): decode the pvRequest, register the op,
@@ -2875,7 +2875,7 @@ async fn handle_put_get(
         ch.ops.insert(ioid, put_get_op);
 
         // INIT response: ioid + subcmd + status + putIF + getIF.
-        // R69: pvAccessJava protocol defines PUT_GET INIT with two type
+        // pvAccessJava protocol defines PUT_GET INIT with two type
         // descriptors (put-request structure, then get-response structure).
         // pvxs never implements PUT_GET (`handle_PUT_GET` is an empty stub
         // in serverconn.cpp). We serve the same channel introspection for
@@ -3060,7 +3060,7 @@ async fn handle_put_get(
     Ok(())
 }
 
-/// F11: PVA `PROCESS` (cmd 16) handler — trigger record processing
+/// PVA `PROCESS` (cmd 16) handler — trigger record processing
 /// with no value transfer.
 ///
 /// Sub-command lifecycle:
@@ -3211,7 +3211,7 @@ async fn handle_process(
     // PROCESS data phase — no payload to decode.
     match ch.ops.get(&ioid) {
         None => {
-            // R61: silently drop — pvxs serverget.cpp:423-428 and servermon.cpp:611-619
+            // silently drop — pvxs serverget.cpp:423-428 and servermon.cpp:611-619
             // return without reply here to handle the DESTROY_REQUEST race.
             return Ok(());
         }
@@ -3441,7 +3441,7 @@ async fn handle_create_channel(
             );
             let mut payload = Vec::new();
             payload.put_u32(cid, order);
-            // R80: CREATE_CHANNEL failure sid must be the no-channel sentinel
+            // CREATE_CHANNEL failure sid must be the no-channel sentinel
             // 0xFFFFFFFF (pvxs serverchan.cpp:349, sid=-1), not 0.
             payload.put_u32(CREATE_CHANNEL_NO_SID, order);
             Status::error("max channels per connection reached".to_string())
@@ -3758,7 +3758,7 @@ async fn handle_op(
     let ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
-            // R60: unknown SID on INIT must be connection-fatal (pvxs serverget.cpp:378-384
+            // unknown SID on INIT must be connection-fatal (pvxs serverget.cpp:378-384
             // calls bev.reset()); on data-phase it should silently drop (pvxs
             // serverget.cpp:423-428 just returns).
             if subcmd & 0x08 != 0 {
@@ -4100,7 +4100,7 @@ async fn handle_op(
             (o.intro, o.mask, o.pv_request)
         }
         None => {
-            // R61: silently drop — pvxs serverget.cpp:423-428 returns without reply here
+            // silently drop — pvxs serverget.cpp:423-428 returns without reply here
             // to handle the DESTROY_REQUEST/in-flight-frame race.
             return Ok(());
         }
@@ -4431,7 +4431,7 @@ async fn handle_op(
                 match result {
                     Ok(()) => {
                         if subcmd & 0x40 != 0 {
-                            // PUT_GET readback (R31-G7): build readback
+                            // PUT_GET readback: build readback
                             // before emitting status so we know whether
                             // READ was denied and can emit an empty
                             // bitset instead of truncating the wire.
@@ -4680,7 +4680,7 @@ async fn handle_op(
                     roles: cred.roles.clone(),
                     pv_request: init_pv_request.clone(),
                 };
-                // Round 42 + R49-G1: type-state MONITOR gate.
+                // Type-state MONITOR gate.
                 //
                 // Capture the ACL generation BEFORE the check.
                 // This guarantees the captured version is `≤` the
@@ -4795,7 +4795,7 @@ async fn handle_op(
                     // access gate check moved inside the spawn
                     // so the read loop is not blocked while the ACF
                     // policy resolves. The version capture must precede
-                    // the check (see R49-G1 audit note above).
+                    // the check (see audit note above).
                     let mon_acl_version_at_subscribe_cell = Arc::new(
                         std::sync::atomic::AtomicU64::new(src.access_gate().acl_version()),
                     );
@@ -4818,7 +4818,7 @@ async fn handle_op(
                     // forward. Falls back to the decoded path on
                     // byte-order mismatch or when the source returns
                     // None.
-                    // R31-G6 / Round-32A: raw fast path must consult
+                    // Raw fast path must consult
                     // the ACF too. The round-29 ACL gate covered
                     // `subscribe_ctx` only; ACF-aware sources can now
                     // override `subscribe_raw_ctx` to deny when the
@@ -4835,7 +4835,7 @@ async fn handle_op(
                             )
                             .await
                     {
-                        // R49-G1: revalidate ACL BEFORE sending the
+                        // Revalidate ACL BEFORE sending the
                         // initial snapshot. Between the spawn's
                         // initial `check()` and reaching this point
                         // a reload could have flipped the peer to
@@ -4848,7 +4848,7 @@ async fn handle_op(
                             != mon_acl_version_at_subscribe_cell
                                 .load(std::sync::atomic::Ordering::Acquire)
                         {
-                            // R50 audit-3: route the re-check
+                            // Route the re-check
                             // through the source's
                             // `revalidate_read` owner so composite
                             // sources resolve to the MATCHED inner
@@ -4929,7 +4929,7 @@ async fn handle_op(
                                 let _ = tx_clone.send(finish).await;
                                 return;
                             }
-                            // R48-G3 + R50 audit-3: ACL re-check on
+                            // ACL re-check on
                             // policy reload. The version compare uses
                             // the source's aggregate (composite =
                             // wrapping-sum of inner versions); the
@@ -5064,7 +5064,7 @@ async fn handle_op(
                             op_id: monitor_op_id,
                         }
                     });
-                    // R49-G1 + R50 audit-3: revalidate ACL BEFORE
+                    // Revalidate ACL BEFORE
                     // sending the initial snapshot on the decoded
                     // path. The re-check is routed through
                     // `revalidate_read` so composite sources resolve
@@ -5200,13 +5200,13 @@ async fn handle_op(
                             Some(v) => v,
                             None => break,
                         };
-                        // R48-G3: ACL re-check on policy reload (same
+                        // ACL re-check on policy reload (same
                         // shape as the raw-fast-path branch above).
                         // The gate's `acl_version` bumps on every
                         // PvaServer ACF swap; on mismatch we
                         // re-mint AccessChecked and tear down with
                         // a MONITOR FINISH if the new policy denies.
-                        // R48-G3 + R50 audit-3: decoded recv-loop
+                        // Decoded recv-loop
                         // re-check, routed through `revalidate_read`
                         // for composite-source correctness.
                         let live_v = src.access_gate().acl_version();
@@ -5520,7 +5520,7 @@ async fn handle_op(
 }
 
 /// Returns `Some(AbortOnDrop)` when a slow-path task was spawned so the
-/// caller can store it for connection-lifetime abort on teardown (R65).
+/// caller can store it for connection-lifetime abort on teardown.
 async fn handle_get_field(
     source: &DynSource,
     frame: &Frame,
@@ -5605,7 +5605,7 @@ async fn handle_get_field(
                 roles: cred.roles.clone(),
                 pv_request: None,
             };
-            // R65: return the abort handle so the caller stores it for
+            // return the abort handle so the caller stores it for
             // connection-lifetime abort on teardown, matching pvxs opByIOID
             // cleanup (serverconn.cpp:366-382).
             let join = tokio::spawn(async move {

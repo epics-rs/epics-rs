@@ -4,7 +4,7 @@
 //! (`cpp_helpers/reverse_server.cpp`) hosts the same matrix of
 //! NT shapes via `pvxs::server::Server` + `nt::NTScalar` /
 //! `NTEnum` / `NTTable` builders. The Rust `PvaClient` connects
-//! via `EPICS_PVA_NAME_SERVERS` (TCP search → R11 handler in the
+//! via `EPICS_PVA_NAME_SERVERS` (TCP search → handler in the
 //! pvxs server) and GETs each PV. Test asserts the decoded
 //! `PvField` value matches the value we know pvxs set on its
 //! side.

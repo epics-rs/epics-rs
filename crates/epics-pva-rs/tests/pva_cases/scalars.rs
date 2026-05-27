@@ -1,5 +1,5 @@
 //! Scalar `encode_pv_field` byte shapes — the baseline pvxs
-//! contract that R13 / R10 family rely on.
+//! contract the compound-array and transport wire-shape tests rely on.
 //!
 //! pvxs reference: `src/dataencode.cpp::to_wire_field` (scalar arms,
 //! ~lines 110-340). Wire output of a scalar is the type-natural

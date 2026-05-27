@@ -171,7 +171,7 @@ pub struct WatermarkEvent {
 
 /// A backend that can answer pvAccess GET / PUT / MONITOR requests for a
 /// set of named PVs.
-// R66: no on_channel_close hook — pvxs serverchan.cpp:57-59 fires onClose("") per channel;
+// no on_channel_close hook — pvxs serverchan.cpp:57-59 fires onClose("") per channel;
 // this trait has no equivalent. Doc-only; fix requires a semver-minor breaking API change.
 pub trait ChannelSource: Send + Sync + 'static {
     /// Per-source access policy. Returns the [`AccessGate`] used by
@@ -258,7 +258,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// Fetch the current value of a PV.
     fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send;
 
-    /// Round 50 follow-up (audit, R50-G3): re-check READ access for
+    /// Re-check READ access for
     /// `(pv_name, ctx)` through the SOURCE-SPECIFIC ACL gate that
     /// served the original subscription. Returns `Some(token)` on
     /// allow, `None` on deny.

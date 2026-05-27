@@ -122,7 +122,7 @@ async fn interop_r11_tcp_circuit_search_returns_matching_cid() {
     // the parser).
     use std::io::Write;
     let mut val_reply: Vec<u8> = Vec::new();
-    val_reply.put_u32(0x10000, order); // client buffer (R62: match pvxs 0x10000)
+    val_reply.put_u32(0x10000, order); // client buffer (match pvxs 0x10000)
     val_reply.put_u16(32_767, order); // intro registry size
     val_reply.put_u16(0, order); // qos
     val_reply.put_u8(0); // empty method string (Size=0)
@@ -198,11 +198,11 @@ async fn interop_r11_tcp_circuit_search_returns_matching_cid() {
     let _ = _seq;
 }
 
-/// Second R11 case: a real pvxs `pvxget` configured with
+/// Second TCP-search case: a real pvxs `pvxget` configured with
 /// `EPICS_PVA_NAME_SERVERS=<rust>:port` should resolve the PV and
 /// fetch its value. This proves the Rust server's TCP SEARCH
 /// handler interoperates with the actual pvxs client flow (not
-/// just a hand-built frame). Pre-R11 the client would never get
+/// just a hand-built frame). Previously the client would never get
 /// a SEARCH_RESPONSE on the TCP circuit and would time out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server() {

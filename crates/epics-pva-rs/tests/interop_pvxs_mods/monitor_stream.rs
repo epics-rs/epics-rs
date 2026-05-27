@@ -1,7 +1,7 @@
 //! MONITOR stream semantics cross-impl.
 //!
 //! Verifies the multi-event monitor flow across implementations
-//! (where the earlier R1/R20 tests only confirmed pipeline
+//! (where the earlier pipeline tests only confirmed pipeline
 //! negotiation happens, and the GET-based matrix only proves a
 //! single value round-trip):
 //!

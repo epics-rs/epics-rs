@@ -5,7 +5,7 @@
 //! Pre-existing tests covered:
 //!   - Rust↔Rust PUT (unit + parity tests)
 //!   - GET cross-impl (forward + reverse goldens)
-//!   - PUT bounds + PUTFAIL semantics (R2-14, R2-19)
+//!   - PUT bounds + PUTFAIL semantics
 //!
 //! Missing until this batch:
 //!   - The PUT wire path itself across implementations. A bug in

@@ -33,7 +33,7 @@ pub struct SourceEntry {
 /// [`crate::server_native::PvaServer::start`].
 pub struct CompositeSource {
     entries: Arc<parking_lot::RwLock<Vec<SourceEntry>>>,
-    /// Round 50 (R50-G1, audit-followups): the composite's gate is
+    /// The composite's gate is
     /// an aggregator whose `acl_version()` is the `wrapping_sum`
     /// of every inner gate's version (NOT `max(...)` — see the
     /// round-50 audit; a max-based aggregate produced false
@@ -179,12 +179,12 @@ impl ChannelSource for CompositeSource {
         &self.access_gate
     }
 
-    /// Round 50 follow-up (audit, R50-G3): monitor-reload READ
+    /// Monitor-reload READ
     /// revalidation owner for composite sources.
     ///
     /// The composite's `access()` gate is an `open_with_aggregator`
     /// — its `acl_version()` correctly reports "some inner moved"
-    /// (R50-G1 wrapping-sum aggregate), but its `check()` is the
+    /// (wrapping-sum aggregate), but its `check()` is the
     /// permissive `Open` variant and is NOT authoritative for
     /// allow/deny. Pre-fix tcp.rs's monitor reload loop called
     /// `src.access_gate().check(...)` on the composite after a
@@ -759,7 +759,7 @@ mod tests {
         }
     }
 
-    /// Round 50 (R50-G1, audit-followups): composite's top-level
+    /// Composite's top-level
     /// gate must reflect inner sub-gate version bumps. Pre-fix the
     /// composite inherited the default `Open` gate (always
     /// version=0); tcp.rs's monitor loop compared against that

@@ -10,7 +10,7 @@
 //! wildcard-advertising peer invisible to a Rust client.
 //!
 //! These tests don't exercise an encoder per se — they pin the
-//! decoder contract that R18 depended on.
+//! decoder contract that the unspecified-address decode depends on.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -31,7 +31,7 @@ fn golden_pvxs_ipv4_mapped_round_trip() {
 #[test]
 fn golden_pvxs_ipv6_unspecified_is_none_via_strict() {
     // Strict ip_from_bytes treats all-zero as "no address" —
-    // pre-R18 behaviour preserved for callers that want it.
+    // legacy behaviour preserved for callers that want it.
     assert_eq!(ip_from_bytes(&[0u8; 16]), None);
 }
 

@@ -230,7 +230,7 @@ async fn tls_client_to_tls_server_full_handshake() {
     server_handle.abort();
 }
 
-/// F8: a client presenting an X.509 client certificate over mTLS must
+/// a client presenting an X.509 client certificate over mTLS must
 /// have its connection credentials populated with `method = "x509"`,
 /// `account` = the client leaf cert's subject CommonName, and
 /// `authority` = the root CA's CommonName. Mirrors pvxs
@@ -349,7 +349,7 @@ async fn mtls_client_cert_populates_x509_credentials() {
     server_handle.abort();
 }
 
-/// R68: when the client sends only the leaf cert (no root CA in the chain),
+/// when the client sends only the leaf cert (no root CA in the chain),
 /// the server must still populate `authority` by walking its trust store.
 /// This mirrors pvxs `SSL_get0_verified_chain` which appends the root from
 /// the trust store even when the peer omits it.
@@ -380,7 +380,7 @@ async fn mtls_partial_chain_authority_resolved_from_trust_roots() {
         trust_roots,
     });
 
-    // Client sends only [leaf] — NO root CA in the chain (R68 scenario).
+    // Client sends only [leaf] — NO root CA in the chain (partial-chain scenario).
     let mut server_ca_roots = RootCertStore::empty();
     server_ca_roots.add(ca_der.clone()).unwrap();
     let client_cfg = ClientConfig::builder()
@@ -454,7 +454,7 @@ async fn mtls_partial_chain_authority_resolved_from_trust_roots() {
     assert_eq!(creds.1, "operator-alice", "account from leaf CN");
     assert_eq!(
         creds.2, "EPICS Test Root CA",
-        "R68: authority from trust store when peer sends partial chain"
+        "authority from trust store when peer sends partial chain"
     );
 
     server_handle.abort();

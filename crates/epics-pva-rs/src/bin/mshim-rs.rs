@@ -215,7 +215,7 @@ struct ForwardTarget {
 /// needed. For a multicast destination it is always `Some`: the
 /// override when present, otherwise the platform defaults (TTL 1,
 /// interface `INADDR_ANY`). Returning the defaults rather than `None`
-/// is the F3 fix — a multicast target WITHOUT overrides must still
+/// is the fix — a multicast target WITHOUT overrides must still
 /// reset the shared socket so a prior destination's state cannot
 /// bleed through. Mirrors pvxs `mcast_prep_sendto`, which runs for
 /// every multicast destination.
@@ -557,7 +557,7 @@ mod tests {
         }
     }
 
-    /// F3: a unicast destination needs no multicast setsockopt.
+    /// a unicast destination needs no multicast setsockopt.
     #[test]
     fn multicast_opts_none_for_unicast() {
         assert_eq!(multicast_opts_for(&fwd("192.168.1.10", None, None)), None);
@@ -568,7 +568,7 @@ mod tests {
         );
     }
 
-    /// F3: a multicast destination WITH overrides reports them verbatim.
+    /// a multicast destination WITH overrides reports them verbatim.
     #[test]
     fn multicast_opts_uses_override() {
         let iface = Ipv4Addr::new(192, 168, 1, 5);
@@ -578,7 +578,7 @@ mod tests {
         );
     }
 
-    /// F3 regression: a multicast destination WITHOUT overrides must
+    /// Regression: a multicast destination WITHOUT overrides must
     /// still report the platform defaults (TTL 1, INADDR_ANY) so the
     /// shared send socket is reset — it must NOT report `None`, which
     /// would let a prior destination's TTL/IF bleed through.
@@ -590,7 +590,7 @@ mod tests {
         );
     }
 
-    /// F3: mixed targets — an override target followed by a bare
+    /// mixed targets — an override target followed by a bare
     /// multicast target — each resolve to independent option sets, so
     /// forwarding to the bare target after the override target resets
     /// the socket instead of inheriting TTL 32 / the override iface.

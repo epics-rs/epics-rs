@@ -109,7 +109,7 @@ pub enum TlsConfigError {
 pub struct TlsServerConfig {
     pub config: Arc<ServerConfig>,
     pub require_client_cert: bool,
-    /// R68: trust anchors used to resolve the root CA's CN when the peer
+    /// trust anchors used to resolve the root CA's CN when the peer
     /// sends a partial chain (leaf-only or leaf+intermediate). Mirrors
     /// pvxs `SSL_get0_verified_chain` which includes trust-store roots
     /// even when the peer omits the root from its chain.
@@ -173,7 +173,7 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     let chain: Vec<CertificateDer<'static>> =
         certs.iter().chain(ca_certs.iter()).cloned().collect();
 
-    // R68: build the root CA store up front so we can (a) give it to the
+    // build the root CA store up front so we can (a) give it to the
     // WebPkiClientVerifier and (b) keep it in TlsServerConfig for
     // authority resolution when the peer sends a partial chain.
     let trust_roots = {
@@ -351,7 +351,7 @@ fn load_pem_keychain(path: &Path, bytes: &[u8]) -> Result<Keychain, TlsConfigErr
 /// with its key. The cert bag whose `localKeyID` matches the key
 /// bag's is the leaf; every other cert is a CA.
 ///
-/// F7: when the *cert* bags carry no `localKeyID` of their own, we
+/// when the *cert* bags carry no `localKeyID` of their own, we
 /// still pair reliably by reconstructing the OpenSSL `localKeyID`:
 /// OpenSSL sets a key bag's `localKeyID` to `SHA-1(leaf_cert_DER)`
 /// (see `p12` crate `PFX::new`), so the leaf is the cert whose DER
@@ -474,7 +474,7 @@ fn load_pkcs12_keychain(
 }
 
 /// Pick the leaf certificate's index among a PKCS#12 keychain's cert
-/// bags (F7). `cert_bags` is `(cert_DER, that bag's own localKeyID)`
+/// bags. `cert_bags` is `(cert_DER, that bag's own localKeyID)`
 /// in bag order; `key_local_id` is the private-key bag's `localKeyID`.
 ///
 /// Decision order:
@@ -534,7 +534,7 @@ fn select_leaf_index(
 /// SHA-1 digest of `bytes`. Used to reconstruct a PKCS#12
 /// `localKeyID`: OpenSSL stamps a key bag's `localKeyID` with the
 /// SHA-1 of its leaf certificate's DER, so `sha1_digest(cert_der)`
-/// equals the key bag's id for the leaf and nothing else (F7). SHA-1
+/// equals the key bag's id for the leaf and nothing else. SHA-1
 /// is used here purely as an identifier, not for any security
 /// property — it mirrors OpenSSL's keychain convention exactly.
 #[cfg(feature = "pkcs12")]
@@ -1196,7 +1196,7 @@ fn is_self_signed_ca(der: &[u8]) -> bool {
 /// explicitly includes the root CA in its chain. For the common case
 /// where the peer omits the root (RFC 5246 §7.4.2 allows this), call
 /// [`x509_credentials_from_chain_with_roots`] which walks the server
-/// trust store to find the root CA CN (R68).
+/// trust store to find the root CA CN.
 pub fn x509_credentials_from_chain(chain: &[CertificateDer<'_>]) -> Option<X509Credentials> {
     let leaf = chain.first()?;
     let account = subject_common_name(leaf)?;
@@ -1213,7 +1213,7 @@ pub fn x509_credentials_from_chain(chain: &[CertificateDer<'_>]) -> Option<X509C
 }
 
 /// Like [`x509_credentials_from_chain`] but also resolves the `authority`
-/// from the server trust store when the peer sends a partial chain (R68).
+/// from the server trust store when the peer sends a partial chain.
 ///
 /// pvxs uses `SSL_get0_verified_chain` (`ossl.cpp:423`) which appends the
 /// root CA from the trust store even when the peer omits it; this function
@@ -1231,7 +1231,7 @@ pub fn x509_credentials_from_chain_with_roots(
 }
 
 /// Resolve the root CA CN for a peer chain by walking the server trust
-/// store. Used when the peer omits the root from its chain (R68).
+/// store. Used when the peer omits the root from its chain.
 ///
 /// Finds the trust anchor whose subject CN matches the issuer CN of the
 /// last peer-provided cert, then returns that CN as the authority.
@@ -1694,7 +1694,7 @@ mod tests {
         }
     }
 
-    /// F7: `select_leaf_index` must NOT fall back to bag order when no
+    /// `select_leaf_index` must NOT fall back to bag order when no
     /// `localKeyID` pairs the key to a cert — that can pick a CA cert
     /// as the leaf. Covers all three decision paths.
     #[test]
@@ -1734,7 +1734,7 @@ mod tests {
         assert_eq!(select_leaf_index(&[(leaf.clone(), None)], None).unwrap(), 0,);
 
         // (5) No key localKeyID + multiple certs → ambiguous, hard
-        // error rather than guessing (the F7 silent-CA-as-leaf bug).
+        // error rather than guessing (the silent-CA-as-leaf bug).
         let err = select_leaf_index(&bags_no_attr, None)
             .expect_err("must hard-error on ambiguous multi-cert keychain");
         assert!(err.contains("no localKeyID"), "got: {err}");

@@ -2,7 +2,7 @@
 //! `softIocPVX` server, asserting that pvxs sees the pipeline
 //! option on the wire.
 //!
-//! Pre-R1 the Rust client honoured `PvaClientBuilder::pipeline_size`
+//! Previously the Rust client honoured `PvaClientBuilder::pipeline_size`
 //! locally but never put `record._options.pipeline` into the
 //! pvRequest, so pvxs ran the monitor in non-pipelined mode and
 //! we lost flow control. pvxs's `servermon.cpp:587` logs

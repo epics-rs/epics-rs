@@ -55,7 +55,7 @@ impl PvDatabaseSource {
         Self { db, gate }
     }
 
-    /// Round 48 (R48-G3): build with an externally-supplied
+    /// Build with an externally-supplied
     /// `acl_version` counter. `PvaServer` shares the same `Arc` so
     /// its `reload_acf_from` / `clear_acf` can bump the version
     /// that this source's gate exposes, forcing monitor tasks
@@ -1144,7 +1144,7 @@ ASG(LOCKED) {
         );
     }
 
-    /// Round-33A (R33-G4): the per-record ASL must gate `RULE(N, …)`
+    /// The per-record ASL must gate `RULE(N, …)`
     /// rules. With `RULE(0, READ) RULE(1, WRITE)`, an ASL=0 record
     /// must be read-only (the WRITE rule does NOT apply when
     /// `record_asl < 1`), and an ASL=1 record must be writable.

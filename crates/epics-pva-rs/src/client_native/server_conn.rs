@@ -803,7 +803,7 @@ impl ServerConn {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-// R62: match pvxs clientconn.cpp:292-293 — serverReceiveBufferSize = 0x10000 ("not used").
+// match pvxs clientconn.cpp:292-293 — serverReceiveBufferSize = 0x10000 ("not used").
 const DEFAULT_BUFFER_SIZE: u32 = 0x10000;
 const DEFAULT_REGISTRY_SIZE: u16 = 32_767;
 
@@ -1588,7 +1588,7 @@ mod tests {
 
             // Frame 2: CONNECTION_VALIDATION request (server→client).
             let mut payload = Vec::new();
-            payload.put_u32(0x10000, order); // buffer_size (R62: match pvxs 0x10000)
+            payload.put_u32(0x10000, order); // buffer_size (match pvxs 0x10000)
             payload.put_u16(32_767, order); // registry_size
             encode_size_into(1, order, &mut payload); // 1 auth method
             encode_string_into("anonymous", order, &mut payload);

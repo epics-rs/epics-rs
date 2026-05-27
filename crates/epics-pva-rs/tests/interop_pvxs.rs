@@ -7,17 +7,17 @@
 //!
 //! Targets the gaps that pure Rust↔Rust tests can't catch:
 //!
-//! - **R1** (pipeline negotiation phase): Rust `pvmonitor` with
+//! - **Pipeline negotiation phase**: Rust `pvmonitor` with
 //!   `pipeline_size > 0` against pvxs server, verified by inspecting
 //!   the server's logged `record._options.pipeline` value (or — when
 //!   we add a fault injection mode — the server's window emit /
 //!   ACK protocol).
-//! - **R20** (typed pipeline options): pvxs `pvget`-with-typed-
+//! - **Typed pipeline options**: pvxs `pvget`-with-typed-
 //!   pvRequest builder `.record("pipeline", true).record("queueSize",
 //!   N)` against the Rust server. Verifies the Rust server's
 //!   `monitor_pipeline_options` parser accepts the bool/int form, not
 //!   only the parsed-string form.
-//! - **R11** (TCP search on Rust server): pvxs client configured
+//! - **TCP search on Rust server**: pvxs client configured
 //!   with `EPICS_PVA_NAME_SERVERS=<rust>:port` sending a SEARCH on
 //!   the established TCP circuit, expecting the Rust server to
 //!   answer with SEARCH_RESPONSE on the same circuit.

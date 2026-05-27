@@ -228,7 +228,7 @@ pub async fn run_udp_responder_with_config(
     let beacon_socket_v6_for_task = beacon_socket_v6.clone();
     let beacon_guid = guid;
     let beacon_source = source.clone();
-    // F2: bind the JoinHandle to an AbortOnDrop guard scoped to this
+    // bind the JoinHandle to an AbortOnDrop guard scoped to this
     // function's stack so the beacon task is aborted when the parent
     // UDP responder unwinds (PvaServer Drop, listener task panic).
     // Without this the bound socket-cloning beacon task lingered
@@ -1448,7 +1448,7 @@ mod tests {
         );
     }
 
-    /// F6: a UDP SEARCH for the built-in `server` PV MUST NOT be
+    /// a UDP SEARCH for the built-in `server` PV MUST NOT be
     /// answered — pvxs `ServerSource::onSearch` is empty so `server`
     /// resolves only by direct TCP connect, never by broadcast
     /// discovery. The built-in `ServerInfoSource::searchable` returns

@@ -40,7 +40,7 @@ impl NTAttribute {
     /// NTNDArray's `attribute[]`).
     pub fn build() -> FieldDesc {
         FieldDesc::Structure {
-            // R81: pvxs defines only `epics:nt/NTAttribute:1.0` (nt.cpp:238);
+            // pvxs defines only `epics:nt/NTAttribute:1.0` (nt.cpp:238);
             // `:1.1` does not exist upstream and disagrees with the NTNDArray
             // embed in nd_array.rs.
             struct_id: "epics:nt/NTAttribute:1.0".into(),

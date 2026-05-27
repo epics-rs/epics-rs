@@ -1363,7 +1363,7 @@ async fn auth_method_unadvertised_returns_status_error() {
     // advertised by the server.
     let order = ByteOrder::Little;
     let mut payload: Vec<u8> = Vec::new();
-    payload.put_u32(0x10000, order); // client buffer hint (R62: match pvxs 0x10000)
+    payload.put_u32(0x10000, order); // client buffer hint (match pvxs 0x10000)
     payload.put_u16(32_767, order); // intro registry size
     payload.put_u16(0, order); // qos
     encode_string_into("x509", order, &mut payload);
@@ -1535,7 +1535,7 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
     h.abort();
 }
 
-/// R70 regression: pvxs clients send `method="anonymous"` (non-empty
+/// Regression: pvxs clients send `method="anonymous"` (non-empty
 /// string) + a null auth body (`0xFF`). Pre-fix Rust produced
 /// `account=""` for this case because the `is_empty()` early-return
 /// only triggered on a truly empty method string, not on "anonymous".
@@ -1611,16 +1611,16 @@ async fn r70_anonymous_method_yields_account_anonymous() {
 
     let observed = captured.lock().unwrap().clone();
     let (method, account) = observed.expect("auth_complete hook must have fired");
-    assert_eq!(method, "anonymous", "R70: method");
+    assert_eq!(method, "anonymous", "method");
     assert_eq!(
         account, "anonymous",
-        "R70: anonymous method must produce account=\"anonymous\", not \"\""
+        "anonymous method must produce account=\"anonymous\", not \"\""
     );
 
     h.abort();
 }
 
-/// R70 regression: `method="ca"` with no `user` field in the auth body
+/// Regression: `method="ca"` with no `user` field in the auth body
 /// must fall back to anonymous credentials (matches pvxs
 /// serverconn.cpp:223-231 — the ca lambda only fires when user is present;
 /// without it C->method stays empty → anonymous fallback).
@@ -1709,11 +1709,11 @@ async fn r70_ca_without_user_falls_back_to_anonymous() {
     let (method, account) = observed.expect("auth_complete hook must have fired");
     assert_eq!(
         method, "anonymous",
-        "R70: ca without user field must fall back to method=\"anonymous\""
+        "ca without user field must fall back to method=\"anonymous\""
     );
     assert_eq!(
         account, "anonymous",
-        "R70: ca without user field must fall back to account=\"anonymous\""
+        "ca without user field must fall back to account=\"anonymous\""
     );
 
     h.abort();

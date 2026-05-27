@@ -968,7 +968,7 @@ pub async fn run_udp_responder(
     run_udp_responder_proto(source, udp_port, tcp_port, guid, "tcp").await
 }
 
-pub(crate) fn build_beacon(
+fn build_beacon(
     guid: [u8; 12],
     tcp_port: u16,
     order: ByteOrder,

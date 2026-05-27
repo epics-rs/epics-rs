@@ -2,7 +2,6 @@
 
 pub mod composite;
 pub mod monitor_control;
-pub mod nameserver_publish;
 pub mod op_handle;
 pub mod peers;
 pub mod runtime;
@@ -14,7 +13,6 @@ pub mod udp;
 
 pub use composite::CompositeSource;
 pub use monitor_control::{MonitorControlOp, PostError};
-pub use nameserver_publish::{NameserverPublisher, spawn_nameserver_publishers};
 pub use op_handle::{
     ClientCredentials, ExecOp, ExecResult, MessageLevel, OpBase, OpMessage, RemoteLogger,
 };

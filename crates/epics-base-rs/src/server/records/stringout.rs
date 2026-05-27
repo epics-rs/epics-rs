@@ -234,7 +234,7 @@ impl Record for StringoutRecord {
 mod tests {
     use super::*;
 
-    /// H-10: a VAL longer than 39 chars truncates to 39 + NUL.
+    /// a VAL longer than 39 chars truncates to 39 + NUL.
     #[test]
     fn val_truncated_to_max_string_size() {
         let mut rec = StringoutRecord::default();
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(rec.val.len(), 39);
     }
 
-    /// M-7: IVOA=2 (set output to IVOV) copies IVOV into VAL.
+    /// IVOA=2 (set output to IVOV) copies IVOV into VAL.
     #[test]
     fn ivoa_set_to_ivov_copies_into_val() {
         let mut rec = StringoutRecord::default();

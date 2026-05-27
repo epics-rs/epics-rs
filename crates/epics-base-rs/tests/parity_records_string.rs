@@ -12,7 +12,7 @@ use epics_base_rs::server::records::stringout::StringoutRecord;
 use epics_base_rs::types::EpicsValue;
 
 // ---------------------------------------------------------------
-// C-1: compress put_field("VAL", DoubleArray) must not corrupt the
+// compress put_field("VAL", DoubleArray) must not corrupt the
 // circular buffer or panic linearise_val.
 // ---------------------------------------------------------------
 
@@ -40,7 +40,7 @@ fn c1_compress_val_array_put_does_not_panic_or_desync() {
 }
 
 // ---------------------------------------------------------------
-// C-2: histogram counter must wrap at UINT_MAX, never panic.
+// histogram counter must wrap at UINT_MAX, never panic.
 // ---------------------------------------------------------------
 
 #[test]
@@ -53,7 +53,7 @@ fn c2_histogram_counter_wraps_no_panic() {
 }
 
 // ---------------------------------------------------------------
-// H-8 / M-8: lsi/lso SIZV clamps to [16, 0x7fff]; LEN initialises 0.
+// lsi/lso SIZV clamps to [16, 0x7fff]; LEN initialises 0.
 // ---------------------------------------------------------------
 
 #[test]
@@ -76,7 +76,7 @@ fn m8_lsi_lso_len_initialises_zero() {
 }
 
 // ---------------------------------------------------------------
-// H-9: lsi/lso process() copies OVAL/OLEN only on change.
+// lsi/lso process() copies OVAL/OLEN only on change.
 // ---------------------------------------------------------------
 
 #[test]
@@ -95,7 +95,7 @@ fn h9_lso_process_olen_tracks_last_posted_length() {
 }
 
 // ---------------------------------------------------------------
-// H-10: stringin/stringout VAL truncates at MAX_STRING_SIZE (40).
+// stringin/stringout VAL truncates at MAX_STRING_SIZE (40).
 // ---------------------------------------------------------------
 
 #[test]
@@ -141,7 +141,7 @@ fn h10_lsi_dbr_string_put_capped_at_40_even_with_large_sizv() {
 }
 
 // ---------------------------------------------------------------
-// H-11: histogram CMD start/stop semantics.
+// histogram CMD start/stop semantics.
 // ---------------------------------------------------------------
 
 #[test]
@@ -166,7 +166,7 @@ fn h11_histogram_cmd_start_stop() {
 }
 
 // ---------------------------------------------------------------
-// H-6: printf %s formats the link's STRING value.
+// printf %s formats the link's STRING value.
 // ---------------------------------------------------------------
 
 #[test]
@@ -186,7 +186,7 @@ fn h6_printf_percent_s_uses_string_input() {
 }
 
 // ---------------------------------------------------------------
-// H-7: printf %*d / %ld / %ls / %c.
+// printf %*d / %ld / %ls / %c.
 // ---------------------------------------------------------------
 
 #[test]
@@ -208,7 +208,7 @@ fn h7_printf_star_width_and_modifiers() {
 }
 
 // ---------------------------------------------------------------
-// M-2: compress ILIL/IHIL skips only the leading out-of-limit run.
+// compress ILIL/IHIL skips only the leading out-of-limit run.
 // ---------------------------------------------------------------
 
 #[test]
@@ -230,7 +230,7 @@ fn m2_compress_ilil_ihil_leading_run_only() {
 }
 
 // ---------------------------------------------------------------
-// M-1: compress exposes CVB; scalar N-to-1 increments INX mid-cycle.
+// compress exposes CVB; scalar N-to-1 increments INX mid-cycle.
 // ---------------------------------------------------------------
 
 #[test]

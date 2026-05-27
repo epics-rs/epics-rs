@@ -31,7 +31,7 @@ pub(crate) fn register_builtins(registry: &mut CommandRegistry) {
     registry.register(cmd_after_ioc_running());
     registry.register(cmd_exit());
 
-    // H-5: core iocsh commands (echo, date, cd/pwd, epicsEnv*, ...)
+    // core iocsh commands (echo, date, cd/pwd, epicsEnv*, ...)
     // and the access-security `as*` family. Without these a stock
     // `st.cmd` errors on the first unknown command and access
     // security cannot be loaded from the shell.
@@ -280,7 +280,7 @@ fn cmd_dbpf() -> CommandDef {
                 }
             });
             put_result.map_err(|e| {
-                // Round-23: epics-base PR #689 — when the field
+                // epics-base PR #689 — when the field
                 // doesn't exist, suggest near-by names so a typo
                 // ("DSEC" instead of "DESC") is caught quickly.
                 let msg = format!("{e}");
@@ -400,7 +400,7 @@ fn cmd_dbpr() -> CommandDef {
                         fields.push(("LLSV".to_string(), format!("{:?}", alarm.llsv)));
                     }
                     fields.push(("ASG".to_string(), inst.common.asg.clone()));
-                    // Round-20: surface info(...) tags so admins can
+                    // Surface info(...) tags so admins can
                     // verify driver hints (asyn:READBACK, Q:group, …)
                     // landed on the record. Sorted for stable output.
                     let mut info_keys: Vec<&String> = inst.info.keys().collect();
@@ -428,7 +428,7 @@ fn cmd_dbpr() -> CommandDef {
 /// Mirrors epics-base PR #626 (rename `dbgrep` → `dbglob` with alias)
 /// and PR #613 (add fields argument). The `fields` argument is comma-
 /// separated; when present each matching record additionally dumps
-/// the listed field values. (H-6: `dbsr` is the *server report* — a
+/// the listed field values. (`dbsr` is the *server report* — a
 /// separate command — not this name search.)
 fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
     let pattern = args
@@ -457,8 +457,8 @@ fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
     // PvDatabase also serves `add_pv`-registered simple PVs (CA
     // gateway shadows, IOC-stat scratchpads). A user globbing for
     // every channel name would be confused if simple PVs were
-    // hidden. Field lookup via `get_record` follows alias→canonical
-    // (round 7); for simple PVs the field-dump branch silently
+    // hidden. Field lookup via `get_record` follows alias→canonical;
+    // for simple PVs the field-dump branch silently
     // skips since they're not records.
     let mut names = ctx.block_on(ctx.db().all_record_names());
     names.extend(ctx.block_on(ctx.db().all_alias_names()));
@@ -495,7 +495,7 @@ fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
 
 /// `dbsr [interest level]` — Database Server Report.
 ///
-/// H-6: C `dbIocRegister.c:142-144` registers `dbsr` as the *Database
+/// C `dbIocRegister.c:142-144` registers `dbsr` as the *Database
 /// Server Report* (`dbServerReport` — prints CA/PVA server status and
 /// connected-client information). The Rust port previously aliased
 /// `dbsr` to the record-name glob search, which is the wrong command

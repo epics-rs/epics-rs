@@ -5,11 +5,11 @@ use super::PvDatabase;
 impl PvDatabase {
     /// Update scan index when a record's SCAN or PHAS field changes.
     ///
-    /// Round-35 (R35-G1): takes `registration_mutex` so the read of
+    /// Takes `registration_mutex` so the read of
     /// the records map (to verify the record still exists) and the
     /// scan_index mutation are atomic vs. concurrent `remove_record`.
     ///
-    /// Round-48 (R48-G4): the `new_scan` / `new_phas` parameters
+    /// The `new_scan` / `new_phas` parameters
     /// the caller passes are advisory only. After acquiring the
     /// mutex we read the LIVE record's current scan/phas and insert
     /// based on those. Pre-fix a put-then-update sequence could
@@ -96,7 +96,7 @@ impl PvDatabase {
 
     /// Get all record names that have PINI=true.
     ///
-    /// Round-35 (R33-G1): snapshot the records map under the outer
+    /// Snapshot the records map under the outer
     /// read lock, then drop it before fanning out per-record reads.
     /// Pre-fix the outer `records.read()` lock was held across every
     /// `rec.read().await` — under contention with a pending

@@ -13,7 +13,7 @@ use crate::types::{DbFieldType, EpicsValue};
 // string, the numeric conversions read a number. The Rust framework
 // pre-fetches every INPn link into the matching value field A..J; we
 // therefore store the raw `EpicsValue` per slot so a `%s` conversion
-// can recover the string content (H-6) instead of stringifying a
+// can recover the string content instead of stringifying a
 // coerced f64.
 pub struct PrintfRecord {
     pub val: String,
@@ -305,7 +305,7 @@ impl PrintfRecord {
                     pad_string(ch.to_string(), width, left_align, false)
                 }
                 b's' => {
-                    // %s / %ls: print the link's STRING content (H-6).
+                    // %s / %ls: print the link's STRING content.
                     let mut s = arg.map(Self::val_as_string).unwrap_or_default();
                     // Precision caps the number of characters printed.
                     if precision != usize::MAX && s.chars().count() > precision {
@@ -657,7 +657,7 @@ mod tests {
         }
     }
 
-    /// H-6: `%s` prints the input link's STRING content, not a number.
+    /// `%s` prints the input link's STRING content, not a number.
     #[test]
     fn percent_s_formats_string_input() {
         let mut rec = rec_with("name=%s");
@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(rec.val, "name=motor1");
     }
 
-    /// H-6: a string input survives even when other slots are numeric.
+    /// a string input survives even when other slots are numeric.
     #[test]
     fn percent_s_with_width_padding() {
         let mut rec = rec_with("[%8s]");
@@ -675,7 +675,7 @@ mod tests {
         assert_eq!(rec.val, "[      ab]");
     }
 
-    /// H-7: `%*d` reads the field width from the next input link.
+    /// `%*d` reads the field width from the next input link.
     #[test]
     fn star_width_consumes_an_input() {
         let mut rec = rec_with("%*d");
@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(rec.val, "    42");
     }
 
-    /// H-7: `%ld` long modifier is consumed, not emitted literally.
+    /// `%ld` long modifier is consumed, not emitted literally.
     #[test]
     fn long_modifier_consumed() {
         let mut rec = rec_with("%ld");
@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(rec.val, "99");
     }
 
-    /// H-7: `%ls` long-string conversion prints the string input.
+    /// `%ls` long-string conversion prints the string input.
     #[test]
     fn long_string_conversion() {
         let mut rec = rec_with("%ls");
@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(rec.val, "hello");
     }
 
-    /// H-7: `%c` prints a single character.
+    /// `%c` prints a single character.
     #[test]
     fn percent_c_formats_char() {
         let mut rec = rec_with("%c");

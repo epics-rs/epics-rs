@@ -1,6 +1,6 @@
 //! Core iocsh commands beyond the database/record family.
 //!
-//! H-5: a stock `st.cmd` relies on a set of core commands
+//! a stock `st.cmd` relies on a set of core commands
 //! (`iocsh.cpp` / `libComRegister.c`) that the Rust port did not
 //! register, so an unmodified startup script errored on the first
 //! unknown command. This module registers the ones that are

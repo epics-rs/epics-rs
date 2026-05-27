@@ -437,7 +437,7 @@ impl Record for CompressRecord {
         Ok(ProcessOutcome::complete())
     }
 
-    // R52: CompressRecord missing egu/hopr/lopr/prec struct fields entirely;
+    // CompressRecord missing egu/hopr/lopr/prec struct fields entirely;
     // DBR_GR display limits zeroed for compress PVs (compressRecord.c:478-479,455).
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
@@ -611,7 +611,7 @@ impl Record for CompressRecord {
     /// record cannot read links itself; it asks the framework to pull
     /// `INP` into `VAL` before `process()`. The `VAL` put routes
     /// through `push_array`, so the data is ingested by the configured
-    /// compression algorithm (NOT a raw buffer overwrite — see C-1).
+    /// compression algorithm (NOT a raw buffer overwrite).
     fn pre_process_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
         if self.inp.is_empty() {
             return Vec::new();

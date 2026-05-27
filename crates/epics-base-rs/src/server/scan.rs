@@ -77,7 +77,7 @@ impl ScanScheduler {
         }
 
         // Spawn a task per periodic scan rate into a `JoinSet`.
-        // Round 45: the pre-fix code kept `handles.into_iter().next()`
+        // The pre-fix code kept `handles.into_iter().next()`
         // and dropped the remaining JoinHandles — Tokio's
         // `JoinHandle::drop` does NOT abort, it detaches. So 6 of
         // the 7 periodic scan tasks orphaned on every scheduler

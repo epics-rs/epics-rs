@@ -378,9 +378,9 @@ mod tests {
         assert_eq!(s, r#"["dbnd", "arr"]"#);
     }
 
-    // ---- BFR-7: monitor single-event post vs one-shot read context ----
+    // ---- monitor single-event post vs one-shot read context ----
 
-    /// BFR-7: a `dec` filter that decimates the first slot
+    /// a `dec` filter that decimates the first slot
     /// (`offset = 1`, so window position 0 is dropped) suppresses the
     /// EVENT-context single-event post (C `db_post_single_event` runs
     /// the pre-chain in `dbfl_context_event`) but is bypassed by the
@@ -408,7 +408,7 @@ mod tests {
         );
     }
 
-    /// BFR-7 (doc test #1): a `sync` filter gating `while` a cleared
+    /// Doc test #1: a `sync` filter gating `while` a cleared
     /// named state drops every event in EVENT context (`actstate ==
     /// false`), so the initial monitor snapshot is suppressed — while
     /// the same chain passes a one-shot READ unchanged.
@@ -428,7 +428,7 @@ mod tests {
         );
     }
 
-    /// BFR-7 (doc test #2): when a filter drops the single-event post,
+    /// Doc test #2: when a filter drops the single-event post,
     /// `apply_to_event_value` returns `None` — there is NO fallback to
     /// the unfiltered value (the CA call sites translate `None` into
     /// "send no frame").
@@ -444,7 +444,7 @@ mod tests {
         );
     }
 
-    /// BFR-7: an empty chain is the identity in BOTH contexts — the
+    /// an empty chain is the identity in BOTH contexts — the
     /// initial post is sent with the unmodified value (matching a CA
     /// channel that carried no `.{...}` filter suffix).
     #[test]
@@ -460,7 +460,7 @@ mod tests {
         ));
     }
 
-    /// BFR-7 (doc test #5): `arr` slicing is NOT context-gated, so the
+    /// Doc test #5: `arr` slicing is NOT context-gated, so the
     /// EVENT-context initial post still applies the array transform
     /// (only `dec`/`sync` distinguish read vs event context).
     #[test]

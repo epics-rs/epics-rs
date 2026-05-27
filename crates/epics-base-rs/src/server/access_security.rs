@@ -12,13 +12,13 @@ pub enum AccessLevel {
 
 /// Opaque proof that an access check has been performed.
 ///
-/// Round 40 (type-state ACF gate): every `ChannelSource` op that
+/// Type-state ACF gate: every `ChannelSource` op that
 /// touches a PV by name now demands an `AccessChecked` instead of
 /// raw `(name, ctx)`. The struct has only one public constructor —
 /// [`AccessGate::check`] — so it is impossible to call a gated op
 /// without first running the check. This is the structural fix for
-/// the missed-path pattern that surfaced across rounds 32-39
-/// (round-29 added ACF on three ops, then five subsequent rounds
+/// the missed-path pattern that surfaced as ACF coverage grew
+/// (ACF was first added on three ops, then later review
 /// uncovered four more wire paths that skipped the check).
 ///
 /// The private `_seal` field blocks external struct-literal
@@ -85,7 +85,7 @@ impl AccessChecked {
 ///
 /// * `Required` — an ACF cell is attached. The check evaluates it
 ///   under the read lock; absent ACF still produces a permissive
-///   token (matching pre-Round-40 behaviour for sources whose ACF
+///   token (matching the earlier behaviour for sources whose ACF
 ///   cell is `None`).
 /// * `Open` — the source explicitly opts out of ACF entirely
 ///   (e.g. test fixtures, in-process sources that never touch the
@@ -93,24 +93,24 @@ impl AccessChecked {
 #[derive(Clone)]
 pub struct AccessGate {
     inner: AccessGateInner,
-    /// Round 48 (R48-G3): generation counter bumped whenever the
+    /// Generation counter bumped whenever the
     /// gate's underlying ACF policy changes (reload / clear / hot
     /// swap). Long-lived consumers (PVA monitor tasks spawned at
     /// SUBSCRIBE time, gateway bridge tasks) capture the value at
     /// spawn and compare on each event; a mismatch forces a fresh
     /// `check()` so a peer that was allowed at subscribe time but
     /// is now `NoAccess` under the new policy sees its subscription
-    /// torn down on the next event (matching the round-39 CA-side
+    /// torn down on the next event (matching the CA-side
     /// `reeval_access_rights` semantics).
     ///
-    /// Round 50 (R50-G1): two backing shapes —
+    /// Two backing shapes —
     /// * `Atomic`: owned `AtomicU64` for terminal gates
     ///   (`Required`, `Open`). `bump_acl_version` `fetch_add`s.
     /// * `Aggregator`: a closure that returns a derived version
     ///   from sub-gates. `CompositeSource` uses this to expose a
     ///   gate whose `acl_version()` is the `wrapping_sum` of its
-    ///   inner sources' versions (NOT `max` — see the round-50
-    ///   audit follow-up: max produced false negatives when an
+    ///   inner sources' versions (NOT `max`: max produced
+    ///   false negatives when an
     ///   inner bumped to a value still under the existing peak),
     ///   so a bump on any inner (e.g. a
     ///   `GatewayChannelSource::set_acf` on a child) is visible at
@@ -123,7 +123,7 @@ pub struct AccessGate {
     ///   tcp.rs's monitor loop compared against that stale value,
     ///   missing every inner reload.
     acl_version: AclVersionSource,
-    /// CA-FR-1: optional `INP*`-link value resolver. When present,
+    /// optional `INP*`-link value resolver. When present,
     /// [`Self::check`] evaluates CALC-gated rules against live values;
     /// when absent, CALC rules fail closed (deny). Installed by the
     /// owning server via [`Self::with_inp_resolver`].
@@ -145,7 +145,7 @@ pub type AsgAslResolver = std::sync::Arc<
         + Sync,
 >;
 
-/// CA-FR-1: resolves an ASG `INP*` link string (typically a
+/// resolves an ASG `INP*` link string (typically a
 /// `record.field` PV name) to its current numeric value, or `None` when
 /// the input is unresolvable / disconnected (bad input → the CALC-gated
 /// rule denies). Installed on an [`AccessGate`] by the owning server so
@@ -209,7 +209,7 @@ impl AccessGate {
         }
     }
 
-    /// CA-FR-1: attach an `INP*`-link value resolver so CALC-gated ACF
+    /// attach an `INP*`-link value resolver so CALC-gated ACF
     /// rules are evaluated against live values instead of failing
     /// closed. The owning server installs one backed by its PV value
     /// registry.
@@ -239,7 +239,7 @@ impl AccessGate {
     /// per-inner version is monotonic via `fetch_add`, so the sum
     /// changes iff some inner moved). NOT `max(...)` — that shape
     /// produced false negatives when a smaller inner bumped under
-    /// the existing peak (see round-50 audit). This gate is only
+    /// the existing peak. This gate is only
     /// a **change signal** for the monitor reload loop; the
     /// allow/deny authority is the matched inner source's gate,
     /// reached via `ChannelSource::revalidate_read`.
@@ -294,7 +294,7 @@ impl AccessGate {
             .await
     }
 
-    /// PVA-FR-3 / CA-FR-1: like [`Self::check`] but with the client's
+    /// Like [`Self::check`] but with the client's
     /// `roles` (QSRV local-group-derived credentials) so a `role/<name>`
     /// UAG member can match, and with CALC-gated rules evaluated against
     /// the installed [`InpResolver`] (fail closed when none is set).
@@ -319,7 +319,7 @@ impl AccessGate {
                     None => (AccessLevel::ReadWrite, false),
                     Some(ref cfg) => {
                         let (asg, asl) = resolver(pv_name.clone()).await;
-                        // CA-FR-1: pre-resolve the ASG's INP* links up
+                        // pre-resolve the ASG's INP* links up
                         // front — the resolver is async (it reads the
                         // server DB). `Some(inputs)` when every declared
                         // link resolved; `None` when there is no resolver
@@ -435,7 +435,7 @@ ASG(DEFAULT) {
 /// `asAccessRights` enum (`asNOACCESS` / `asREAD` / `asWRITE`) used by
 /// `rule_head_mandatory` in `asLib.y:253-269`. The Rust port previously
 /// collapsed this to a `write: bool`, which turned `RULE(0, NONE)` —
-/// and any misspelled keyword — into a READ-granting rule (M-3).
+/// and any misspelled keyword — into a READ-granting rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RuleAccess {
     /// `RULE(N, NONE)` — grants `asNOACCESS`.
@@ -472,7 +472,7 @@ pub struct AccessRule {
     /// `TRAPWRITE` option, `false` for `NOTRAPWRITE` or no option.
     /// The grammar is honoured here; the `asTrapWrite` put-logging
     /// listener that consumes this mask is a separate subsystem not
-    /// present in this crate (see the H-2 UNFIXED note).
+    /// present in this crate (see the UNFIXED note).
     pub trap: bool,
     /// CALC condition expression (epics-base `asLib.y:294-299`,
     /// `RULE(...) { CALC("A=1") }`). `None` means an unconditional
@@ -484,7 +484,7 @@ pub struct AccessRule {
     /// for a RULE that contains an unsupported keyword. This port also
     /// sets it for a `CALC` clause that cannot be evaluated here (no
     /// `INP*` link resolution), so an un-evaluable conditional rule
-    /// fails CLOSED instead of becoming unconditional (H-3).
+    /// fails CLOSED instead of becoming unconditional.
     pub ignore: bool,
 }
 
@@ -636,7 +636,7 @@ impl AccessSecurityConfig {
             Some(a) => a,
             None => match self.asg.get("DEFAULT") {
                 Some(a) => a,
-                // C-2 fix: never grant ReadWrite on an ASG-lookup
+                // Never grant ReadWrite on an ASG-lookup
                 // miss. C resolves every miss to the always-present
                 // empty `DEFAULT` ⇒ `asNOACCESS`.
                 None => return (AccessLevel::NoAccess, false),
@@ -645,7 +645,7 @@ impl AccessSecurityConfig {
         // C `asComputePvt` (asLibRoutines.c:983) initialises
         // `access = asNOACCESS` and only ever *raises* it on a matching
         // RULE. An ASG with no RULE statements (`ASG(LOCKED) { }`)
-        // therefore denies every client. C-1 fix: never short-circuit
+        // therefore denies every client. Never short-circuit
         // an empty rule list to ReadWrite.
         //
         // An empty/unknown user or host cannot match a UAG/HAG-scoped
@@ -664,7 +664,7 @@ impl AccessSecurityConfig {
         })
     }
 
-    /// CA-FR-1 / PVA-FR-3: the single rule-matching loop, parameterised
+    /// The single rule-matching loop, parameterised
     /// by the client's `roles` (for `role/<name>` UAG members, QSRV
     /// `documentation/ioc.rst:181-188`) and a `calc_ok(expr)` evaluator
     /// — a CALC-gated rule grants only when it returns true.
@@ -707,7 +707,7 @@ impl AccessSecurityConfig {
             }
             // UAG: only consulted when the rule scopes one. An empty
             // UAG list means "any user" — including an empty username.
-            // PVA-FR-3: a `role/<name>` member matches when the client
+            // a `role/<name>` member matches when the client
             // holds that role (QSRV local-group-derived credentials);
             // a plain member matches the account string.
             let user_match = rule.uag.is_empty()
@@ -716,7 +716,7 @@ impl AccessSecurityConfig {
                         .get(g)
                         .map(|members| {
                             members.iter().any(|m| {
-                                // PVA-FR-3: a member matches the account
+                                // a member matches the account
                                 // string exactly (this also covers a
                                 // caller that pre-expands roles into
                                 // synthesised `role/<name>` credential
@@ -735,7 +735,7 @@ impl AccessSecurityConfig {
             if !user_match {
                 continue;
             }
-            // HAG: host comparison is case-insensitive (H-1). C stores
+            // HAG: host comparison is case-insensitive. C stores
             // every HAG host lowercased (`asHagAddHost`) and lowercases
             // the connecting client's host before `asComputePvt`.
             let host_lc = host.to_ascii_lowercase();
@@ -762,7 +762,7 @@ impl AccessSecurityConfig {
             if !authority_match {
                 continue;
             }
-            // CA-FR-1: a CALC-gated rule grants only while its expression
+            // a CALC-gated rule grants only while its expression
             // evaluates true against the resolved INP* link values. C
             // `asLibRoutines.c:957-1042` evaluates `calcPerform()` and
             // grants on a true result with good inputs. `calc_ok` returns
@@ -790,7 +790,7 @@ impl AccessSecurityConfig {
     /// canonical example is `RULE(0, READ) RULE(1, WRITE)` — every
     /// record is readable, but only records with ASL ≥ 1 are
     /// writable. Without this gate, a low-ASL record's protection
-    /// is silently equivalent to ASL 0 (closes C-G6).
+    /// is silently equivalent to ASL 0.
     pub fn check_access_asl(
         &self,
         asg_name: &str,
@@ -808,7 +808,7 @@ impl AccessSecurityConfig {
     }
 }
 
-/// R2-53: TRAPWRITE listener subsystem.
+/// TRAPWRITE listener subsystem.
 ///
 /// C `libcom/src/as/asLib.h:57-62` defines `asTrapWriteWithData` which
 /// is invoked unconditionally around every `dbChannel_put` in
@@ -840,7 +840,7 @@ pub enum TrapWriteOp {
 /// matches the C `asTrapWriteMessage` lifetime semantics
 /// (`libcom/src/as/asLib.h:51-56`).
 ///
-/// R2-85: the message now carries the wire-level `dbr_type` and
+/// the message now carries the wire-level `dbr_type` and
 /// `no_elements` that C's `asTrapWriteMessage` exposes
 /// (`asLib.h:34-56`), plus a monotonic `event_id` that pairs the
 /// `BeforeWrite` and `AfterWrite` for one put. libca passes
@@ -859,16 +859,16 @@ pub struct TrapWriteMessage<'a> {
     /// is being notified at audit-off cost (caller may pass `""` to
     /// avoid stringifying large arrays just for trap dispatch).
     pub value_str: &'a str,
-    /// R2-85: wire DBR type the put came in as (`DBR_*` constant
+    /// wire DBR type the put came in as (`DBR_*` constant
     /// from `db_access.h`). Listeners that want to log or filter
     /// by type read it here instead of reaching back through
     /// `serverSpecific`.
     pub dbr_type: u16,
-    /// R2-85: element count from the put header
+    /// element count from the put header
     /// (`asTrapWriteMessage::no_elements`). 1 for scalar, N for
     /// waveform.
     pub no_elements: u32,
-    /// R2-85: monotonic id that pairs the `BeforeWrite` and the
+    /// monotonic id that pairs the `BeforeWrite` and the
     /// matching `AfterWrite` for a single put. The C `userPvt`
     /// continuation slot is not a fit for `&` message — listeners
     /// that need per-event state should index a private map by
@@ -884,7 +884,7 @@ pub struct TrapWriteMessage<'a> {
     pub rule_was_trap: bool,
 }
 
-/// R2-85: monotonic id allocator for `TrapWriteMessage::event_id`.
+/// monotonic id allocator for `TrapWriteMessage::event_id`.
 /// Wraps at u64::MAX (~10^19 events; ~580 years at 1 Mput/s).
 static TRAP_WRITE_EVENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -955,7 +955,7 @@ pub fn has_trap_write_listeners() -> bool {
 /// check, no allocation. Called by the CA TCP dispatcher before and
 /// after every `dbChannel_put`-equivalent.
 ///
-/// R2-87 / R2-89: the listener list is *snapshotted* under the read
+/// the listener list is *snapshotted* under the read
 /// lock (a `Vec<Arc<...>>` clone — cheap, all `Arc`-bumps), then
 /// the lock is released before any listener runs. This means a
 /// listener may register or drop another listener handle mid-
@@ -966,7 +966,7 @@ pub fn has_trap_write_listeners() -> bool {
 /// listener-call duration; the writer waits at most for the Vec
 /// clone.
 ///
-/// R2-86: each listener call is wrapped in `catch_unwind` so a
+/// each listener call is wrapped in `catch_unwind` so a
 /// panicking listener does not unwind into the CA per-circuit task.
 /// The listener `Fn` type does NOT carry an `UnwindSafe` bound;
 /// `AssertUnwindSafe` is sound here because the dispatch shares no
@@ -1009,7 +1009,7 @@ pub fn dispatch_trap_write(msg: &TrapWriteMessage<'_>) {
     }
 }
 
-/// R2-54: ASG-field change notifier.
+/// ASG-field change notifier.
 ///
 /// C `database/src/ioc/as/asDbLib.c:107-110,144` registers
 /// `asSpcAsCallback` as the per-record `ASG` field's special
@@ -1070,7 +1070,7 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
 
     // C `asInitialize` (asLibRoutines.c:107) calls `asAsgAdd(DEFAULT)`
     // *before* parsing the file, so a `DEFAULT` ASG always exists.
-    // Synthesise it here unconditionally (C-2/C-3): any record whose
+    // Synthesise it here unconditionally: any record whose
     // `ASG` field names an unknown group resolves to this empty
     // `DEFAULT`, which has no RULEs ⇒ `asNOACCESS` ⇒ access denied.
     // A `DEFAULT` block declared in the file simply overwrites this
@@ -1096,7 +1096,7 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
             "HAG" => {
                 let name = read_paren_name(&mut chars)?;
                 let members = read_brace_list(&mut chars)?;
-                // H-1: store every HAG host lowercased — C
+                // store every HAG host lowercased — C
                 // `asHagAddHost` (asLibRoutines.c:1218-1256)
                 // `tolower()`s each host char so host matching is
                 // case-insensitive.
@@ -1137,7 +1137,7 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
                 }
             }
             other => {
-                // M-4: C `asLib.y:88-103` (`generic_item`) treats an
+                // C `asLib.y:88-103` (`generic_item`) treats an
                 // unrecognised top-level *block* as a *warning*
                 // (`yywarn "Ignoring unsupported TOP LEVEL block"`) and
                 // parsing continues — forward-compat with future/vendor
@@ -1241,7 +1241,7 @@ fn skip_unknown_top_level_block(
             )));
         }
     }
-    // Well-formed unknown block: warn and continue (M-4 parity).
+    // Well-formed unknown block: warn and continue.
     tracing::warn!(
         target: "epics_base_rs::access_security",
         keyword = %keyword,
@@ -1501,7 +1501,7 @@ fn parse_asg_body(
                     let rule = parse_rule(chars)?;
                     asg.rules.push(rule);
                 } else if let Some(stripped) = kw.strip_prefix("INP") {
-                    // H-4: `INP(A..U)("link")` — C `asLib_lex.l:48-52`
+                    // `INP(A..U)("link")` — C `asLib_lex.l:48-52`
                     // lexes `INP[A-U]` as one token whose `Int64`
                     // payload is the letter index (`yytext[3] - 'A'`).
                     // `asLib.y:234-243` then reads the parenthesised
@@ -1553,7 +1553,7 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         return Err(CaError::Protocol("ACF: expected '(' after RULE".into()));
     }
 
-    // Read level. M-2: C `asLib.y:253-258` requires `tokenINT64` and
+    // Read level. C `asLib.y:253-258` requires `tokenINT64` and
     // rejects a negative or non-numeric level with `yyerror`, which
     // fails the whole ACF load (a fail-safe abort). Accept an optional
     // leading sign so a `RULE(-1, ...)` is detected and rejected
@@ -1589,7 +1589,7 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         chars.next();
     }
 
-    // Read access keyword. M-3: C `asLib.y:259-267` distinguishes
+    // Read access keyword. C `asLib.y:259-267` distinguishes
     // `NONE`/`READ`/`WRITE`; any other keyword triggers
     // `yywarn "Ignoring RULE that contains an unsupported keyword"`
     // and the rule is dropped. We keep the rule but mark it `ignore`
@@ -1613,11 +1613,11 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     };
 
     // Optional log option: `RULE(level, access, TRAPWRITE)` /
-    // `RULE(level, access, NOTRAPWRITE)`. H-2: C `asLib.y:272-283`
+    // `RULE(level, access, NOTRAPWRITE)`. C `asLib.y:272-283`
     // (`rule_log_option`). The grammar is honoured and the trap mask
     // captured in `AccessRule::trap`; the `asTrapWrite` put-logging
     // listener that would consume the mask is a separate subsystem
-    // not present in this crate (see the H-2 UNFIXED note).
+    // not present in this crate (see the UNFIXED note).
     let mut trap = false;
     skip_ws_comments(chars);
     if chars.peek() == Some(&',') {
@@ -1672,7 +1672,7 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
                         // PR #563/#618: AUTHORITY("CA Issuer", ...)
                         authority.extend(read_paren_string_list(chars)?);
                     } else if kw == "CALC" {
-                        // H-3: `CALC("<expr>")` — C `asLib.y:294-299`.
+                        // `CALC("<expr>")` — C `asLib.y:294-299`.
                         // The expression gates the rule against the
                         // ASG's INP* link values. Take the *last*
                         // CALC clause if several are given (matches
@@ -1683,7 +1683,7 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
                         // Unknown punctuation — advance to avoid infinite loop.
                         chars.next();
                     } else {
-                        // M-3 / C `asLib.y:300-306`: a RULE body with
+                        // C `asLib.y:300-306`: a RULE body with
                         // an unsupported keyword is *disabled* by
                         // `asAsgRuleDisable`. Mark the rule inert and
                         // consume the keyword's `(...)` argument if
@@ -1705,7 +1705,7 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         }
     }
 
-    // H-3: a CALC clause must actually gate the rule. This crate's
+    // a CALC clause must actually gate the rule. This crate's
     // access-security layer has no `INP*` database-link resolution
     // (the `AsgInp` links are stored but never read), so the calc
     // expression cannot be evaluated at access-check time. C disables
@@ -1716,7 +1716,7 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     // here so a syntactically broken CALC is rejected exactly as C's
     // `postfix()` rejects it in `asAsgRuleCalc`.
     if let Some(ref expr) = calc {
-        // CA-FR-1: validate the CALC expression at parse (C `postfix()`
+        // validate the CALC expression at parse (C `postfix()`
         // rejects a broken one in `asAsgRuleCalc`). The rule is NOT
         // forced inert anymore: it is conditionally active and gated at
         // access-check time by `compute_rules`'s `calc_ok`, which
@@ -2144,9 +2144,9 @@ ASG(MIXED_CASE) {
         );
     }
 
-    // ----- C-1 / C-2 / C-3: access security must fail CLOSED -----
+    // ----- access security must fail CLOSED -----
 
-    /// C-1: an ASG declared with no RULE statements denies every
+    /// an ASG declared with no RULE statements denies every
     /// client. C `asComputePvt` starts `access = asNOACCESS` and only
     /// raises it on a matching RULE — an empty rule list never raises.
     #[test]
@@ -2159,7 +2159,7 @@ ASG(MIXED_CASE) {
         );
     }
 
-    /// C-2: a record whose ASG names a group not in the file resolves
+    /// a record whose ASG names a group not in the file resolves
     /// to the always-present (empty) `DEFAULT`, which denies access.
     #[test]
     fn unknown_asg_falls_back_to_empty_default_and_denies() {
@@ -2174,7 +2174,7 @@ ASG(MIXED_CASE) {
         );
     }
 
-    /// C-2 corner: even `DEFAULT` itself, when never declared with
+    /// Corner case: even `DEFAULT` itself, when never declared with
     /// rules, denies — the auto-synthesised placeholder is empty.
     #[test]
     fn default_asg_without_rules_denies() {
@@ -2185,7 +2185,7 @@ ASG(MIXED_CASE) {
         );
     }
 
-    /// C-3: an empty ACF file, or one with only comments / only
+    /// an empty ACF file, or one with only comments / only
     /// UAG/HAG blocks, yields a fail-closed config — every check
     /// denies, matching a C IOC whose only ASG is the empty DEFAULT.
     #[test]
@@ -2221,7 +2221,7 @@ ASG(MIXED_CASE) {
         );
     }
 
-    // ----- M-3: NONE keyword and unsupported keywords -----
+    // ----- NONE keyword and unsupported keywords -----
 
     /// `RULE(0, NONE)` grants asNOACCESS — it must not be treated as a
     /// READ-granting rule. With only a NONE rule, access stays denied.
@@ -2247,7 +2247,7 @@ ASG(MIXED_CASE) {
         );
     }
 
-    // ----- M-2: RULE level validation -----
+    // ----- RULE level validation -----
 
     #[test]
     fn rule_negative_level_is_rejected() {
@@ -2261,7 +2261,7 @@ ASG(MIXED_CASE) {
         assert!(err.is_err(), "non-numeric RULE level must fail the parse");
     }
 
-    // ----- M-4: unknown top-level block tolerated -----
+    // ----- unknown top-level block tolerated -----
 
     #[test]
     fn unknown_top_level_block_is_skipped_not_fatal() {
@@ -2378,7 +2378,7 @@ ASG(DEFAULT) { RULE(1, READ) }
         assert!(parse_acf("VENDOR(x) { unterminated").is_err());
     }
 
-    // ----- H-1: HAG host matching is case-insensitive -----
+    // ----- HAG host matching is case-insensitive -----
 
     #[test]
     fn hag_host_match_is_case_insensitive() {
@@ -2407,7 +2407,7 @@ ASG(C) {
         );
     }
 
-    // ----- H-2: TRAPWRITE / NOTRAPWRITE log option parses -----
+    // ----- TRAPWRITE / NOTRAPWRITE log option parses -----
 
     #[test]
     fn rule_trapwrite_log_option_parses() {
@@ -2431,7 +2431,7 @@ ASG(C) {
         assert!(parse_acf("ASG(T) { RULE(1, WRITE, BOGUS) }").is_err());
     }
 
-    // MR-R20: `check_access_method_trap` must return the trap mask of
+    // `check_access_method_trap` must return the trap mask of
     // the rule that resolved the access level — not a hard-coded
     // `true`. Mirrors C `asComputePvt`/`pasgclient->trapMask`
     // (`asLibRoutines.c:986`, `:1041-1042`, `:1048`).
@@ -2479,7 +2479,7 @@ ASG(LOCKED)    { }
         );
     }
 
-    // MR-R20: when several rules raise access, the trap mask must be
+    // when several rules raise access, the trap mask must be
     // the option of the *last* rule that set the level — C
     // `asComputePvt` copies `trapMask` together with `access` on
     // every raise (`asLibRoutines.c:1041-1042`).
@@ -2502,7 +2502,7 @@ ASG(LOCKED)    { }
         assert!(!trap, "NOTRAPWRITE on the access-raising rule must win");
     }
 
-    // ----- H-3: CALC clause gates (or disables) the rule -----
+    // ----- CALC clause gates (or disables) the rule -----
 
     /// A CALC condition must never let a rule become unconditional.
     /// This crate cannot resolve INP* link values, so a CALC rule is
@@ -2512,7 +2512,7 @@ ASG(LOCKED)    { }
         let config = parse_acf(r#"ASG(G) { INPA("ref") RULE(1, WRITE) { CALC("A=1") } }"#).unwrap();
         let rule = &config.asg["G"].rules[0];
         assert!(rule.calc.is_some(), "CALC clause must be parsed and stored");
-        // CA-FR-1: a CALC rule is no longer hard-disabled — it is
+        // a CALC rule is no longer hard-disabled — it is
         // conditionally active and gated at check time.
         assert!(
             !rule.ignore,
@@ -2527,7 +2527,7 @@ ASG(LOCKED)    { }
         );
     }
 
-    /// CA-FR-1: with an `INP*` resolver installed, a CALC-gated rule
+    /// with an `INP*` resolver installed, a CALC-gated rule
     /// grants when the expression is true, denies when false, denies on
     /// a bad input, and denies when no resolver is installed.
     #[tokio::test]
@@ -2569,7 +2569,7 @@ ASG(LOCKED)    { }
         );
     }
 
-    /// PVA-FR-3: a `role/<name>` UAG member matches a client that holds
+    /// a `role/<name>` UAG member matches a client that holds
     /// that role; a client without it does not match.
     #[test]
     fn uag_role_member_matches_client_role() {
@@ -2601,7 +2601,7 @@ ASG(LOCKED)    { }
         );
     }
 
-    // ----- H-4: INP(A..U) link declarations -----
+    // ----- INP(A..U) link declarations -----
 
     #[test]
     fn asg_inp_links_are_parsed() {

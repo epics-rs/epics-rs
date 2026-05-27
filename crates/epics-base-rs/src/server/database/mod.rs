@@ -110,7 +110,7 @@ pub type ExternalPvResolver = Arc<dyn Fn(&str) -> Option<EpicsValue> + Send + Sy
 /// The second argument is the downstream client's socket address when
 /// the lookup originates from a CA/PVA search or channel-create on
 /// behalf of an identified peer (`None` for host-less internal lookups:
-/// preload, iocsh, link processing). BRIDGE-FR-10: the CA gateway needs
+/// preload, iocsh, link processing). the CA gateway needs
 /// this to evaluate `.pvlist` `DENY FROM host` rules at search time, the
 /// way C ca-gateway's `pvExistTest` passes the client host to
 /// `gateAs::findEntry`.
@@ -197,7 +197,7 @@ struct PvDatabaseInner {
     /// related lookups consult this map after the canonical record
     /// table so an alias resolves transparently to its target.
     aliases: RwLock<HashMap<String, String>>,
-    /// Round-32C (R31-G9/10/11/12): single gate that serializes
+    /// Single gate that serializes
     /// every `add_pv` / `add_pv_with_hook` / `add_record` /
     /// `add_alias` / `remove_record` / `remove_simple_pv` /
     /// `remove_alias`. Without this, the per-method write-lock
@@ -239,7 +239,7 @@ struct PvDatabaseInner {
     /// interest on this before re-checking `pini_done` to avoid missing the
     /// signal (`notify_waiters` does not store a permit).
     pini_notify: tokio::sync::Notify,
-    /// BR-R15 / BR-R18: per-record advisory write gates — the Rust
+    /// Per-record advisory write gates — the Rust
     /// counterpart of the C-EPICS `dbScanLock` / `dbLocker`
     /// machinery. Every plain CA/PVA write, the QSRV atomic group
     /// PUT/GET, and the pvalink atomic scan-on-update epoch all
@@ -620,7 +620,7 @@ impl PvDatabase {
     /// want replace-on-overwrite semantics must first call
     /// `remove_simple_pv` / `remove_record` / `remove_alias`.
     ///
-    /// Round-32C: serialized through `registration_mutex` so the
+    /// Serialized through `registration_mutex` so the
     /// cross-namespace check is atomic with the insert and the lock
     /// order across all add_*/remove_* methods is identical (no
     /// cross-namespace deadlock).
@@ -656,7 +656,7 @@ impl PvDatabase {
         self.add_pv_with_hooks(name, initial, hook, None).await
     }
 
-    /// BRIDGE-FR-1: like [`Self::add_pv_with_hook`] but also installs an
+    /// like [`Self::add_pv_with_hook`] but also installs an
     /// optional [`AccessHook`](crate::server::pv::AccessHook) so the CA
     /// gateway can route this shadow PV's read/write access-rights
     /// decision through its own ACF. Both hooks are attached before the
@@ -689,7 +689,7 @@ impl PvDatabase {
     /// subscription doesn't leave a stale shadow PV (with a now-dead
     /// `WriteHook` capturing an aborted upstream channel).
     ///
-    /// Round-32C: also purges any aliases that pointed AT this name
+    /// Also purges any aliases that pointed AT this name
     /// (otherwise a re-add of the same alias name would fail with
     /// "already registered as an alias" even though its target is
     /// gone).
@@ -708,7 +708,7 @@ impl PvDatabase {
     /// simple PV, or alias. The C IOC's `dbLoadRecords` treats this as
     /// fatal; do not silently replace.
     ///
-    /// Round-32C: the records-map insert AND scan-index insert run
+    /// The records-map insert AND scan-index insert run
     /// under the same `registration_mutex` hold, eliminating the
     /// TOCTOU window where `remove_record` could land between them
     /// and leave a phantom scan entry.
@@ -820,7 +820,7 @@ impl PvDatabase {
         }
         drop(cp);
 
-        // 4) Round-32C (R31-G12): purge aliases that pointed AT the
+        // 4) Purge aliases that pointed AT the
         // removed record. Otherwise `find_pv("ALT")` returns None
         // (target gone) but `add_pv("ALT", ...)` still fails with
         // "already registered as an alias" — orphan blocks reuse.
@@ -832,7 +832,7 @@ impl PvDatabase {
 
     /// Internal: synchronous lookup without invoking the search resolver.
     async fn find_entry_no_resolve(&self, name: &str) -> Option<PvEntry> {
-        // CA-FR-8: a channel name may carry a `.{"arr":...}` filter
+        // a channel name may carry a `.{"arr":...}` filter
         // suffix. Strip it before lookup — the suffix is a per-channel
         // filter spec, not part of the PV identity. `split_channel_name`
         // is the single owner of "channel name → record_path" and is
@@ -867,7 +867,7 @@ impl PvDatabase {
     /// does not exist or the alias name is already in use anywhere
     /// in the database (records, simple PVs, or other aliases).
     ///
-    /// Round-32C (R31-G10): pre-fix the alias path checked only
+    /// Pre-fix the alias path checked only
     /// `records` and `aliases` — a simple-PV with the same name as
     /// the proposed alias was missed, leaving the database in a
     /// state where `find_pv(alias)` could resolve to either the
@@ -916,7 +916,7 @@ impl PvDatabase {
 
     /// Internal: synchronous existence check without resolver.
     async fn has_name_no_resolve(&self, name: &str) -> bool {
-        // CA-FR-8: strip the channel-filter suffix before lookup so a
+        // strip the channel-filter suffix before lookup so a
         // filtered channel (`SP.{"arr":...}` / `REC.{"dbnd":{"d":0.5}}`)
         // resolves to its underlying PV at UDP-search time. This is the
         // search-side twin of `find_entry_no_resolve`; without it a
@@ -956,7 +956,7 @@ impl PvDatabase {
     /// Like [`Self::find_entry`], but threads the downstream client's
     /// socket address into the search resolver. The CA TCP CREATE_CHANNEL
     /// handler passes the connection peer so the gateway can apply
-    /// host-scoped `.pvlist` admission (BRIDGE-FR-10).
+    /// host-scoped `.pvlist` admission.
     pub async fn find_entry_from(
         &self,
         name: &str,
@@ -988,7 +988,7 @@ impl PvDatabase {
     /// Like [`Self::has_name`], but threads the downstream client's
     /// socket address into the search resolver. The CA UDP search
     /// responder passes the datagram source address so the gateway can
-    /// apply host-scoped `.pvlist` admission (BRIDGE-FR-10).
+    /// apply host-scoped `.pvlist` admission.
     pub async fn has_name_from(&self, name: &str, peer: Option<std::net::SocketAddr>) -> bool {
         if self.has_name_no_resolve(name).await {
             return true;
@@ -1319,7 +1319,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_record_resolves_alias() {
-        // Round-7 regression: get_record must transparently resolve
+        // Regression: get_record must transparently resolve
         // aliases so dbpf / dbgf / dbpr / CA put paths see the same
         // record whether the caller uses the canonical name or the
         // alias.
@@ -1362,7 +1362,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_cp_link_normalises_alias_to_canonical() {
-        // Round-15 regression: CP link registration must store the
+        // Regression: CP link registration must store the
         // canonical record names. dispatch_cp_targets looks up by
         // canonical, so an alias-keyed entry is functionally dead.
         let db = PvDatabase::new();
@@ -1445,7 +1445,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_async_record_accepts_alias() {
-        // Round-12 invariant audit: complete_async_record (the
+        // Invariant audit: complete_async_record (the
         // entry point used by async device-support callbacks to
         // finish processing) must accept an alias name. Pre-fix it
         // walked `inner.records` directly and would
@@ -1467,7 +1467,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_record_accepts_alias() {
-        // Round-11 regression: process_record must accept an alias
+        // Regression: process_record must accept an alias
         // name. Pre-fix it walked `inner.records` directly.
         let db = PvDatabase::new();
         db.add_record(
@@ -1488,7 +1488,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_record_with_links_accepts_alias_and_avoids_cycle() {
-        // Round-11 regression: process_record_with_links normalises
+        // Regression: process_record_with_links normalises
         // the alias so that (a) the records-map lookup hits and
         // (b) the cycle-detection set doesn't treat alias and
         // canonical as two distinct entries (which would let a
@@ -1534,7 +1534,7 @@ mod tests {
         assert!(err.is_err(), "duplicate alias name must be rejected");
     }
 
-    /// Round-30B: `add_pv`, `add_pv_with_hook`, and `add_record` must
+    /// `add_pv`, `add_pv_with_hook`, and `add_record` must
     /// refuse to silently replace an existing registration. Mirrors
     /// epics-base C IOC which treats a duplicate `dbLoadRecords` name
     /// as a fatal load error.
@@ -1580,7 +1580,7 @@ mod tests {
         );
     }
 
-    /// Round-32C (R31-G12): removing a record must purge aliases
+    /// Removing a record must purge aliases
     /// that pointed AT it. Otherwise the alias name stays
     /// "registered" forever and `add_pv` / `add_record` rejecting
     /// reuse causes a permanent name leak.
@@ -1610,7 +1610,7 @@ mod tests {
         assert_eq!(db.resolve_alias("KEEPER").await, Some("OTHER".to_string()));
     }
 
-    /// Round-32C (R31-G10): `add_alias` must reject collisions with
+    /// `add_alias` must reject collisions with
     /// every namespace, including simple PVs (which the pre-fix
     /// code missed).
     #[tokio::test]
@@ -1626,7 +1626,7 @@ mod tests {
         assert!(db.add_alias("PVX", "TARGET").await.is_err());
     }
 
-    /// Round-32C (R31-G9): concurrent `add_pv` and `add_record` with
+    /// Concurrent `add_pv` and `add_record` with
     /// the same name must not deadlock and must serialize so that
     /// exactly one succeeds. Pre-fix the two methods grabbed
     /// different write locks first, opening a cross-lock-order

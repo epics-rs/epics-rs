@@ -1052,7 +1052,7 @@ fn simple_random() -> f64 {
 #[cfg(test)]
 mod parity_tests {
     //! C-parity regression tests for the string evaluator
-    //! (doc/parity-review/01-calc.md H-6, H-7).
+    //! (doc/parity-review/01-calc.md).
     use crate::calc::{StackValue, StringInputs, scalc};
 
     fn run_num(expr: &str) -> f64 {
@@ -1063,7 +1063,7 @@ mod parity_tests {
         }
     }
 
-    // H-6: `==` compares doubles exactly, not within an epsilon.
+    // `==` compares doubles exactly, not within an epsilon.
     #[test]
     fn h6_eq_is_exact() {
         // 1e-12 is not equal to 0 under exact IEEE comparison.
@@ -1080,7 +1080,7 @@ mod parity_tests {
         assert_eq!(run_num("2 > 1"), 1.0);
     }
 
-    // H-7: division by zero yields IEEE Inf/NaN, not forced NaN.
+    // division by zero yields IEEE Inf/NaN, not forced NaN.
     #[test]
     fn h7_div_by_zero_is_ieee() {
         assert_eq!(run_num("1/0"), f64::INFINITY);

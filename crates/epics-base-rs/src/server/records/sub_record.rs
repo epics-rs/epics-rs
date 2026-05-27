@@ -220,7 +220,7 @@ impl Record for SubRecord {
 mod tests {
     use super::*;
 
-    /// H-3: inputs M..U and INPM..INPU exist (C `INP_ARG_MAX == 21`).
+    /// inputs M..U and INPM..INPU exist (C `INP_ARG_MAX == 21`).
     #[test]
     fn inputs_m_through_u_present() {
         let mut rec = SubRecord::default();

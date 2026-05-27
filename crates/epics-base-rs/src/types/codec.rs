@@ -62,7 +62,7 @@ fn convert_and_serialize(native: DbFieldType, value: &EpicsValue) -> CaResult<Ve
     Ok(value.convert_to(native).to_bytes())
 }
 
-// R57: precision-aware `*_STRING` rendering of a numeric field.
+// precision-aware `*_STRING` rendering of a numeric field.
 //
 // A `*_STRING` DBR request of a Double/Float field is converted by the C
 // IOC with `cvtDoubleToString` / `cvtFloatToString` (libCom cvtFast.c)
@@ -107,7 +107,7 @@ fn convert_value_to_dbr_string(
         EpicsValue::FloatArray(a) => {
             EpicsValue::StringArray(a.iter().map(|v| cvt_float_to_string(*v, prec)).collect())
         }
-        // R58: C `getEnumString` (dbConvert.c, `[DBF_ENUM][DBR_STRING]`)
+        // C `getEnumString` (dbConvert.c, `[DBF_ENUM][DBR_STRING]`)
         // returns the state LABEL via `get_enum_str`, not the index. Map each
         // index to `snapshot.enums.strings[idx]`; see `enum_label`.
         EpicsValue::Enum(v) => EpicsValue::String(enum_label(snapshot, *v)),
@@ -118,7 +118,7 @@ fn convert_value_to_dbr_string(
     }
 }
 
-/// R58: render an enum index as its state label for a `*_STRING` request,
+/// render an enum index as its state label for a `*_STRING` request,
 /// matching C `get_enum_str`. The label array is the one already populated
 /// for DBR_GR_ENUM. An index past the configured states (or a channel with no
 /// enum metadata) falls back to the decimal index — the record-type-specific
@@ -292,7 +292,7 @@ pub(crate) fn time_pad(native: DbFieldType) -> &'static [u8] {
 }
 
 /// Metadata byte count that precedes `value[0]` for a GR (`ctrl=false`)
-/// or CTRL (`ctrl=true`) DBR struct. CA-FR-7: this is the single source
+/// or CTRL (`ctrl=true`) DBR struct. this is the single source
 /// of truth shared with [`serialize_gr_ctrl`] / [`encode_gr`] /
 /// [`encode_ctrl`] — every component below is the exact byte sequence
 /// those writers emit before the value, so the sizer cannot drift from
@@ -325,7 +325,7 @@ fn gr_ctrl_meta_size(native: DbFieldType, ctrl: bool) -> usize {
 
 /// Number of metadata bytes that precede `value[0]` for a DBR type —
 /// the single size owner mirrored from the serializers in this module.
-/// CA-FR-7: `dbr_buffer_size` derives payload sizing from this so the
+/// `dbr_buffer_size` derives payload sizing from this so the
 /// explicit-count pad/truncate and no-read-access frame paths match the
 /// bytes the encoder actually writes (C `dbr_size_n` parity), instead of
 /// a parallel table that drifted on TIME/GR/CTRL layouts.
@@ -484,7 +484,7 @@ pub fn encode_dbr(
         return Ok(buf.to_vec());
     }
     let native = super::native_type_for_dbr(dbr_type)?;
-    // R57: a `*_STRING` request of a Double/Float field must honor the
+    // a `*_STRING` request of a Double/Float field must honor the
     // record's precision (C `getDoubleString` → `cvtDoubleToString`).
     // `EpicsValue::convert_to(String)` (value.rs) has no record context, so
     // route string requests through the precision-aware converter here.
@@ -865,7 +865,7 @@ pub fn decode_dbr(dbr_type: u16, data: &[u8], count: usize) -> CaResult<Snapshot
     // `dbr_stsack_string` (db_access.h:184-190):
     //   status(2) severity(2) ackt(2) acks(2) value(40) = 48 bytes.
     // The inverse of the `encode_dbr` STSACK_STRING arm — without
-    // this the encode/decode pair is asymmetric (M-6).
+    // this the encode/decode pair is asymmetric.
     if dbr_type == super::DBR_STSACK_STRING {
         if data.len() < 48 {
             return Err(CaError::Protocol(format!(
@@ -1160,7 +1160,7 @@ mod wire_format_tests {
         dbr_buffer_size,
     };
 
-    /// CA-FR-7 structural invariant: the encoded DBR length must equal
+    /// Structural invariant: the encoded DBR length must equal
     /// `dbr_buffer_size` for every (dbr_type, native, count). This pins
     /// the sizer ([`dbr_meta_size`]) to the bytes the serializer
     /// actually writes, so the two can never drift again. Covers plain /
@@ -1250,7 +1250,7 @@ mod wire_format_tests {
         }
     }
 
-    /// C-1: `DBR_STS_DOUBLE` (type 13) wire layout is
+    /// `DBR_STS_DOUBLE` (type 13) wire layout is
     /// `status(2) + severity(2) + RISC_pad(4) + value(8)` — the
     /// `RISC_pad` is `dbr_long_t` (epicsInt32, 4 bytes) per
     /// `db_access.h:233-238`. Total 16 bytes, value at offset 8.
@@ -1279,7 +1279,7 @@ mod wire_format_tests {
         assert_eq!(&buf[8..16], &3.5f64.to_be_bytes());
     }
 
-    /// C-1: STS_DOUBLE encode→decode round-trips with the 4-byte pad.
+    /// STS_DOUBLE encode→decode round-trips with the 4-byte pad.
     #[test]
     fn sts_double_round_trip() {
         let v = EpicsValue::Double(-12.75);
@@ -1297,7 +1297,7 @@ mod wire_format_tests {
         assert_eq!(snap.alarm.severity, 3);
     }
 
-    /// C-1 cross-check: STS_CHAR keeps its 1-byte `RISC_pad`
+    /// Cross-check: STS_CHAR keeps its 1-byte `RISC_pad`
     /// (`dbr_sts_char`, db_access.h:218-223) — value at offset 5.
     #[test]
     fn sts_char_value_at_offset_5() {
@@ -1330,7 +1330,7 @@ mod wire_format_tests {
         assert_eq!(&buf[4..6], &0x1234i16.to_be_bytes());
     }
 
-    /// M-6: `DBR_STSACK_STRING` (37) must decode, not just encode.
+    /// `DBR_STSACK_STRING` (37) must decode, not just encode.
     /// Layout: status(2) severity(2) ackt(2) acks(2) value(40).
     #[test]
     fn stsack_string_decodes() {
@@ -1362,7 +1362,7 @@ mod wire_format_tests {
 
 #[cfg(test)]
 mod r57_string_precision_tests {
-    //! R57 — numeric→DBR_STRING must match C `cvtDoubleToString` /
+    //! Numeric→DBR_STRING must match C `cvtDoubleToString` /
     //! `cvtFloatToString` (libCom cvtFast.c), including the round-half-up
     //! fast path and the `%.*f` / `%*.*e` overflow fallbacks.
     use super::{cvt_double_to_string, cvt_float_to_string};
@@ -1423,7 +1423,7 @@ mod r57_string_precision_tests {
 
 #[cfg(test)]
 mod r58_enum_label_tests {
-    //! R58 — an enum value requested as a `*_STRING` DBR must render the
+    //! An enum value requested as a `*_STRING` DBR must render the
     //! state label (C `getEnumString` → `get_enum_str`), not the index.
     use super::{EpicsValue, convert_value_to_dbr_string};
     use crate::server::snapshot::{EnumInfo, Snapshot};

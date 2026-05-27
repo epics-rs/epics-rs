@@ -272,7 +272,7 @@ impl PvDatabase {
             // `MS`/`NMS`/`MSI` gate itself — a returned `Some(sev)` is
             // already gated and the caller folds it as `MaximizeStatus`.
             //
-            // CA (BRIDGE-FR-3): the `MS`/`NMS`/`MSI`/`MSS` modifier is
+            // CA: the `MS`/`NMS`/`MSI`/`MSS` modifier is
             // now carried in the `CaLink`, so the resolver returns the
             // *raw* remote alarm and record processing applies the gate
             // using `link.monitor_switch()`. Either way this fn just
@@ -293,7 +293,7 @@ impl PvDatabase {
         }
     }
 
-    /// BR-R19: latched upstream timestamp from the lset, when the
+    /// Latched upstream timestamp from the lset, when the
     /// link is configured with `time=true`. The lset gates internally
     /// (returning `None` for links without the `time` option), so a
     /// `Some` here is the authoritative remote timestamp the
@@ -345,7 +345,7 @@ impl PvDatabase {
                 if let Some(lset) = registry.get(&s) {
                     if let Some(sev) = lset.alarm_severity(name) {
                         return Some(LinkAlarm {
-                            // BRIDGE-FR-3: prefer the remote STAT for MSS;
+                            // prefer the remote STAT for MSS;
                             // fall back to LINK_ALARM when the lset has none.
                             stat: lset
                                 .alarm_status(name)
@@ -362,7 +362,7 @@ impl PvDatabase {
         let lset = self.inner.link_sets.read().await.get(scheme)?;
         let sev = lset.alarm_severity(body)?;
         Some(LinkAlarm {
-            // BRIDGE-FR-3: remote STAT for MSS, else LINK_ALARM.
+            // remote STAT for MSS, else LINK_ALARM.
             stat: lset
                 .alarm_status(body)
                 .map(|s| s as u16)
@@ -374,7 +374,7 @@ impl PvDatabase {
 
     /// Remote display / control / valueAlarm metadata for an external
     /// (`pva://` / `ca://`) link, resolved through the registered
-    /// lset's [`LinkSet::link_metadata`] hook (BR-R24).
+    /// lset's [`LinkSet::link_metadata`] hook.
     ///
     /// This is the DB-link-API entry point that exposes the linked PV
     /// metadata pvxs's pvalink lset surfaces through its
@@ -448,7 +448,7 @@ impl PvDatabase {
             let is_passive =
                 src.read().await.common.scan == crate::server::record::ScanType::Passive;
             if is_passive {
-                // MR-R5: recursive INP-link source processing within
+                // recursive INP-link source processing within
                 // one chain — gate held by the foreign entry record.
                 let _ = self
                     .process_record_with_links_recursive(&db.record, visited, depth + 1)
@@ -530,7 +530,7 @@ impl PvDatabase {
         } else {
             format!("{}.{}", link.record, link.field)
         };
-        // MR-R5: an OUT-link write-back is an internal step of the
+        // an OUT-link write-back is an internal step of the
         // processing chain that already holds the entry record's
         // advisory write gate (`dbScanLock` analogue). It must use the
         // `_already_locked` write so it does not re-acquire a gate: a
@@ -570,7 +570,7 @@ impl PvDatabase {
                     (tg.common.scan, !pact)
                 };
                 if should_process && target_scan == ScanType::Passive {
-                    // MR-R5: recursive OUT-link target processing within
+                    // recursive OUT-link target processing within
                     // one chain — gate held by the foreign entry record.
                     let _ = self
                         .process_record_with_links_recursive(&link.record, visited, depth + 1)
@@ -1030,7 +1030,7 @@ impl PvDatabase {
                                 (tg.common.scan, !pact)
                             };
                             if should_process && target_scan == ScanType::Passive {
-                                // MR-R5: recursive link-target processing
+                                // recursive link-target processing
                                 // within one chain — gate held by the
                                 // foreign entry record.
                                 let _ = self

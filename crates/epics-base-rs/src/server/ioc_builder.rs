@@ -376,7 +376,7 @@ mod tests {
         Box::new(crate::server::records::ai::AiRecord::new(0.0))
     }
 
-    /// Round-5 regression: an `alias("ALT")` directive in a .db file
+    /// Regression: an `alias("ALT")` directive in a .db file
     /// loaded through `IocBuilder::db_string` must be registered as
     /// an alias on the resulting `PvDatabase` so that lookup by the
     /// alias resolves to the same record as lookup by the canonical
@@ -405,7 +405,7 @@ record(ai, "REAL:NAME") {
         assert!(db.find_entry("PRETTY:NAME").await.is_some());
     }
 
-    /// Round-5 regression: `info("key", "value")` directives must be
+    /// Regression: `info("key", "value")` directives must be
     /// stored on the resulting RecordInstance. Pre-fix, no consumer
     /// existed for `def.info_tags` — every record's `info` map was
     /// silently empty after build.
@@ -433,7 +433,7 @@ record(ai, "AI:WITH:INFO") {
         assert_eq!(inst.get_info("missing"), None);
     }
 
-    /// Round-9 regression: IocBuilder must consult the dynamic
+    /// Regression: IocBuilder must consult the dynamic
     /// device-support factory when no static factory matches the
     /// record's DTYP — otherwise universal drivers (asyn
     /// `universal_asyn_factory`, areaDetector plugin dispatch) only
@@ -487,7 +487,7 @@ record(ai, "AI:DYN") {
         );
     }
 
-    /// Round-9: chaining preserves earlier dynamic factories. Newest
+    /// Chaining preserves earlier dynamic factories. Newest
     /// factory wins for matching DTYPs; non-matching DTYPs fall
     /// through to previously registered factories. Mirrors
     /// `IocApplication::register_dynamic_device_support` chaining.

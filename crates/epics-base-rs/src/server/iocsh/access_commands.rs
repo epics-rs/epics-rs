@@ -1,6 +1,6 @@
 //! Access-security iocsh commands — the `as*` family.
 //!
-//! H-5: C registers the whole `as*` command family in
+//! C registers the whole `as*` command family in
 //! `asIocRegister.c`. The Rust port previously registered none of
 //! them, so an ACF could not be loaded or inspected from the shell.
 //!
@@ -452,7 +452,7 @@ fn cmd_astac() -> CommandDef {
 ///
 /// C `ascar` walks the CA channels opened for `INP*` links. This
 /// crate stores the `INP*` link strings but does not open CA channels
-/// for them (CALC rules are disabled — see access_security.rs H-3), so
+/// for them (CALC rules are disabled — see access_security.rs), so
 /// the report lists the declared INP links and notes they are not
 /// connected. The `level` argument is accepted for syntax parity.
 fn cmd_ascar() -> CommandDef {

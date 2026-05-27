@@ -78,7 +78,7 @@ impl ScanSchedulerV2 {
         // Process PINI records at startup
         self.process_pini().await;
 
-        // Spawn periodic scan tasks into a JoinSet. Round 45:
+        // Spawn periodic scan tasks into a JoinSet.
         // tokio's JoinHandle drops without abort, so the previous
         // `handles.into_iter().next()` pattern orphaned every non-
         // first periodic scan task on scheduler shutdown. JoinSet

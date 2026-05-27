@@ -21,7 +21,7 @@ const SUFFIX: [char; NUM_ARGS] = [
 /// C `aSubRecord.c` exposes 21 input channels `A..U` (fed from
 /// `INPA..INPU`) and 21 output channels `VALA..VALU` (driven to
 /// `OUTA..OUTU`). Each channel has:
-///   * `FTx` / `FTVx` — `menuFtype` element type (H-5);
+///   * `FTx` / `FTVx` — `menuFtype` element type;
 ///   * `NOx` / `NOVx` — maximum element count;
 ///   * `NEx` / `NEVx` — elements actually used;
 ///
@@ -340,7 +340,7 @@ impl Record for ASubRecord {
 mod tests {
     use super::*;
 
-    /// H-4: input/output channels M..U exist (C `NUM_ARGS == 21`).
+    /// input/output channels M..U exist (C `NUM_ARGS == 21`).
     #[test]
     fn channels_m_through_u_present() {
         let mut rec = ASubRecord::default();
@@ -361,7 +361,7 @@ mod tests {
         }
     }
 
-    /// H-5: a non-double channel keeps its native type. `FTVA=STRING`
+    /// a non-double channel keeps its native type. `FTVA=STRING`
     /// with a string output value is represented faithfully.
     #[test]
     fn non_double_channel_keeps_native_type() {

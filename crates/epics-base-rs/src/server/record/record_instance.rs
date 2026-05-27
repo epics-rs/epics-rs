@@ -76,7 +76,7 @@ fn is_metadata_field(name: &str) -> bool {
 
 /// One alarm limit for a DBR_AL_DOUBLE response: the value when its
 /// severity threshold is enabled, `NaN` otherwise. Mirrors C
-/// `get_alarm_double`'s `prec->hhsv ? prec->hihi : epicsNAN` (R56).
+/// `get_alarm_double`'s `prec->hhsv ? prec->hihi : epicsNAN`.
 fn gated(severity: AlarmSeverity, limit: f64) -> f64 {
     if severity != AlarmSeverity::NoAlarm {
         limit
@@ -267,7 +267,7 @@ impl RecordInstance {
     /// don't need the change-detection (e.g. internal writers that
     /// know the field is non-metadata) can keep using
     /// [`notify_field_written`].
-    // R47: must post EventMask::PROPERTY to all field subscribers when metadata changes
+    // must post EventMask::PROPERTY to all field subscribers when metadata changes
     pub fn notify_field_written_if_changed(&self, field: &str, prev: Option<&EpicsValue>) {
         let upper = field.to_ascii_uppercase();
         if !is_metadata_field(&upper) {
@@ -276,7 +276,7 @@ impl RecordInstance {
         let now = self.record.get_field(&upper);
         if prev != now.as_ref() {
             self.invalidate_metadata_cache();
-            // R47: mirror C dbAccess.c:1396-1397 db_post_events(precord, NULL, DBE_PROPERTY).
+            // mirror C dbAccess.c:1396-1397 db_post_events(precord, NULL, DBE_PROPERTY).
             // Collect keys first to avoid a re-entrant immutable borrow on subscribers.
             let fields: Vec<String> = self.subscribers.keys().cloned().collect();
             for f in fields {
@@ -357,7 +357,7 @@ impl RecordInstance {
         // and not part of the per-record cache.
         self.populate_common_enum_info(field, &mut snap);
 
-        // BR-R35: apply `info(Q:time:tag, "nsec:lsb:N")` — pvxs
+        // apply `info(Q:time:tag, "nsec:lsb:N")` — pvxs
         // typeutils.cpp:79 splits the low N bits of the timestamp's
         // nanoseconds into `timeStamp.userTag` and clears those bits
         // from `nanoseconds`. Standard pvxs convention is `nsec:lsb:N`
@@ -373,7 +373,7 @@ impl RecordInstance {
         Some(snap)
     }
 
-    /// BR-R35: parse `info(Q:time:tag, "nsec:lsb:N")` and return `N`.
+    /// Parse `info(Q:time:tag, "nsec:lsb:N")` and return `N`.
     /// Returns `None` when the info tag is absent or malformed (pvxs
     /// silently ignores bad values; we match that by returning None
     /// so the timestamp is emitted unchanged).
@@ -464,7 +464,7 @@ impl RecordInstance {
                     .get_field("LOPR")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
-                // R56: longin/longout severity-gate (get_alarm_double);
+                // longin/longout severity-gate (get_alarm_double);
                 // int64in/int64out send the limits verbatim (C is
                 // unconditional for those two record types only).
                 let (hihi, high, low, lolo) = match rtype {
@@ -483,7 +483,7 @@ impl RecordInstance {
                     ..Default::default()
                 });
             }
-            // R52: waveform/aai/aao — HOPR/LOPR/PREC/EGU for VAL display limits.
+            // waveform/aai/aao — HOPR/LOPR/PREC/EGU for VAL display limits.
             // (waveformRecord.c:251-252,239; aaiRecord.c:280-281,268; aaoRecord.c:283-284)
             "waveform" | "aai" | "aao" => {
                 let egu = self
@@ -524,7 +524,7 @@ impl RecordInstance {
                     ..Default::default()
                 });
             }
-            // R52: compress — HOPR/LOPR/PREC/EGU for VAL display limits.
+            // compress — HOPR/LOPR/PREC/EGU for VAL display limits.
             // (compressRecord.c:478-479,464,455)
             "compress" => {
                 let egu = self
@@ -612,7 +612,7 @@ impl RecordInstance {
     fn populate_control_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         let rtype = self.record.record_type();
         match rtype {
-            // R51: ao unconditionally uses DRVH/DRVL (aoRecord.c:356-357).
+            // ao unconditionally uses DRVH/DRVL (aoRecord.c:356-357).
             "ao" => {
                 let upper = self
                     .record
@@ -629,7 +629,7 @@ impl RecordInstance {
                     lower_ctrl_limit: lower,
                 });
             }
-            // R51: longout/int64out use DRVH/DRVL only when drvh > drvl, else HOPR/LOPR
+            // longout/int64out use DRVH/DRVL only when drvh > drvl, else HOPR/LOPR
             // (longoutRecord.c:282-287, int64outRecord.c:265-270).
             "longout" | "int64out" => {
                 let drvh = self
@@ -679,7 +679,7 @@ impl RecordInstance {
                     lower_ctrl_limit: llm,
                 });
             }
-            // R50: int64in uses HOPR/LOPR as control limits (int64inRecord.c:226-227)
+            // int64in uses HOPR/LOPR as control limits (int64inRecord.c:226-227)
             "ai" | "int64in" | "longin" | "calc" | "calcout" => {
                 // Input records use HOPR/LOPR as control limits
                 let hopr = self
@@ -705,7 +705,7 @@ impl RecordInstance {
     fn populate_enum_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         let rtype = self.record.record_type();
         match rtype {
-            // R53: bi/bo/busy — C trims no_str to 1 when ZNAM set and ONAM empty (boRecord.c:342-352).
+            // bi/bo/busy — C trims no_str to 1 when ZNAM set and ONAM empty (boRecord.c:342-352).
             "bi" | "bo" | "busy" => {
                 let znam = self
                     .record
@@ -736,7 +736,7 @@ impl RecordInstance {
                 }
                 snap.enums = Some(super::super::snapshot::EnumInfo { strings });
             }
-            // R53: mbbi/mbbo — C uses highwater mark: last non-empty index + 1 (mbbiRecord.c:262-269).
+            // mbbi/mbbo — C uses highwater mark: last non-empty index + 1 (mbbiRecord.c:262-269).
             "mbbi" | "mbbo" => {
                 let state_fields = [
                     "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST",
@@ -793,7 +793,7 @@ impl RecordInstance {
     }
 
     /// Extract analog alarm limits from CommonFields.
-    // R56: DBR_GR_*/DBR_CTRL_* alarm limits MUST be severity-gated — C
+    // DBR_GR_*/DBR_CTRL_* alarm limits MUST be severity-gated — C
     // get_alarm_double returns `prec->hhsv ? prec->hihi : epicsNAN`
     // (aiRecord.c:295-298 and ao/longin/longout/calc/calcout). int64in/
     // int64out are the sole exception (unconditional, int64inRecord.c:239-243)
@@ -1146,7 +1146,7 @@ impl RecordInstance {
             "ASL" => {
                 // C dbCommon.ASL is `epicsUInt32` in the .dbd but
                 // only ever 0 or 1; accept Char / Short / Long for
-                // the common put paths and clamp to {0, 1}. R34-G1:
+                // the common put paths and clamp to {0, 1}.
                 // db_loader feeds every common field as
                 // `EpicsValue::String`; also accept that so a
                 // `.db` `field(ASL, "1")` directive isn't silently
@@ -1603,7 +1603,7 @@ impl RecordInstance {
         // unset INP). Without this, `process_local` on a soft input
         // with a preset VAL — e.g. NaN — would run `convert()` and
         // clobber it, after which the UDF check below would see a
-        // defined value and wrongly clear UDF (06-H-2). The
+        // defined value and wrongly clear UDF. The
         // `processing.rs` link path already does this; `process_local`
         // is the separate foreign-call path (`db.process_record`) and
         // needs the same skip. "Raw Soft Channel" has a distinct DTYP
@@ -1646,7 +1646,7 @@ impl RecordInstance {
         // most records pay zero cost here.
         if self.record.took_metadata_change() {
             self.invalidate_metadata_cache();
-            // R47: mirror C db_post_events(precord, NULL, DBE_PROPERTY) after record processing.
+            // mirror C db_post_events(precord, NULL, DBE_PROPERTY) after record processing.
             let fields: Vec<String> = self.subscribers.keys().cloned().collect();
             for f in fields {
                 self.notify_field_with_origin(&f, crate::server::recgbl::EventMask::PROPERTY, 0);
@@ -1893,7 +1893,7 @@ impl RecordInstance {
     /// `val=0.0` still fires on `NaN.is_nan() → true`. This
     /// sentinel-as-design is intentional, documented inside
     /// [`check_deadband`] (the `oldval.is_nan() → return true` short
-    /// circuit). It is NOT a deviation inherited from a Round-1/2
+    /// circuit). It is NOT a deviation inherited from an earlier
     /// silent compromise — `record_tests.rs::deadband_*` pins both
     /// the NaN-sentinel behaviour and the C four-quadrant transitions.
     pub fn check_deadband_ext(&mut self) -> (bool, bool) {
@@ -2002,7 +2002,7 @@ impl RecordInstance {
                             continue;
                         };
                         if sub.tx.try_send(event.clone()).is_err() {
-                            // BFR-10: route the coalesce overwrite through
+                            // route the coalesce overwrite through
                             // the single owner so a record-field monitor
                             // value lost to a slow consumer is counted in
                             // `dropped_monitor_events()`, exactly like a
@@ -2056,7 +2056,7 @@ impl RecordInstance {
                             continue;
                         };
                         if sub.tx.try_send(event.clone()).is_err() {
-                            // BFR-10: same single coalesce-overflow owner
+                            // same single coalesce-overflow owner
                             // as the snapshot path — record-field loss to
                             // a slow consumer must be counted, not silently
                             // overwritten.
@@ -2070,8 +2070,8 @@ impl RecordInstance {
 
     /// Add a subscriber for a specific field. Returns `None` when the
     /// per-field subscriber cap (`EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`)
-    /// is reached. C-G15: the parallel cap on `ProcessVariable`
-    /// (P-G14) defends against a misbehaving client opening many
+    /// is reached. the parallel cap on `ProcessVariable`
+    /// defends against a misbehaving client opening many
     /// MONITOR ops against one shared PV; the same defence is needed
     /// for record fields, which the CA server's
     /// `ChannelTarget::RecordField` path lands on.
@@ -2085,7 +2085,7 @@ impl RecordInstance {
         let cap = crate::server::pv::max_subscribers_per_pv();
         let field_str = field.to_string();
         let bucket = self.subscribers.entry(field_str.clone()).or_default();
-        // Round 46 (R46-G1, mirror): reap dead Senders before
+        // Reap dead Senders before
         // counting against the cap. A record field whose value
         // never changes (e.g. a quasi-static catalog field) never
         // triggers `notify_field_with_origin`'s retain-filter, so
@@ -2238,7 +2238,7 @@ mod metadata_cache_tests {
         RecordInstance::new("TEMP".to_string(), rec)
     }
 
-    /// BFR-10: a record-field monitor whose bounded queue is full and
+    /// a record-field monitor whose bounded queue is full and
     /// whose coalesce slot already holds an unobserved value must count
     /// the displaced value in the shared `dropped_monitor_events()`
     /// counter — the same accounting a `ProcessVariable` overflow uses.
@@ -2602,7 +2602,7 @@ mod metadata_cache_tests {
         assert!(inst.metadata_cache.lock().unwrap().is_some());
     }
 
-    // ── R47 regression: DBE_PROPERTY event delivery boundaries ──────────────
+    // ── Regression: DBE_PROPERTY event delivery boundaries ──────────────
 
     /// Boundary 1: metadata field written with a CHANGED value, subscriber
     /// mask includes PROPERTY → subscriber receives an event.

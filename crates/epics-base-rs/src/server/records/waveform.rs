@@ -152,7 +152,7 @@ impl WaveformRecord {
     /// existing element data** — shrink truncates, grow zero-pads, and
     /// NORD is clamped to the new length.
     ///
-    /// C parity (M-6): `waveformRecord` does not support a destructive
+    /// C parity: `waveformRecord` does not support a destructive
     /// run-time NELM change — `init_record` allocates `bptr` once and a
     /// freely-writable NELM that wiped VAL would lose the waveform
     /// contents a CA client just stored. Keeping the data on resize is
@@ -356,7 +356,7 @@ impl Record for WaveformRecord {
         self.kind.is_output()
     }
 
-    // R52: EGU/HOPR/LOPR/PREC not exposed in get_field or put_field; populate_display_info
+    // EGU/HOPR/LOPR/PREC not exposed in get_field or put_field; populate_display_info
     // gets None for all four, leaving DBR_GR display limits zeroed (waveformRecord.c:251-252).
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
@@ -457,7 +457,7 @@ impl Record for WaveformRecord {
                         self.nelm = if self.malm > 0 { n.min(self.malm) } else { n };
                         self.reallocate_val();
                     } else {
-                        // waveform/aai/aao: M-6 — preserve the existing
+                        // waveform/aai/aao: preserve the existing
                         // element data instead of wiping VAL.
                         self.nelm = n;
                         self.resize_val_preserving();
@@ -760,7 +760,7 @@ mod array_kind_tests {
 
     #[test]
     fn br_r13_waveform_ftvl_uint64_storage_and_field_type() {
-        // BR-R13: a `waveform` with `FTVL = UINT64` (menuFtype index 8)
+        // a `waveform` with `FTVL = UINT64` (menuFtype index 8)
         // must allocate a `UInt64Array` VAL buffer and advertise VAL as
         // `DbFieldType::UInt64`. On main FTVL 8 fell through to
         // `DoubleArray` / `DbFieldType::Double`, so unsigned-64 waveforms
@@ -810,7 +810,7 @@ mod array_kind_tests {
 
     #[test]
     fn br_r13_waveform_new_from_uint64_dbf_type() {
-        // BR-R13: `WaveformRecord::new(_, DbFieldType::UInt64)` must mint
+        // `WaveformRecord::new(_, DbFieldType::UInt64)` must mint
         // a UInt64Array VAL and FTVL index 8, not fall through to Double.
         let r = WaveformRecord::new(4, DbFieldType::UInt64);
         assert_eq!(r.ftvl, 8);

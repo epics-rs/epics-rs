@@ -164,7 +164,7 @@ impl DbFieldType {
 /// Calculate buffer size for a DBR type including metadata, matching C
 /// `dbr_size_n(TYPE, COUNT) = dbr_size[TYPE] + (COUNT-1)*dbr_value_size[TYPE]`.
 ///
-/// CA-FR-7: the metadata length is taken from
+/// the metadata length is taken from
 /// [`crate::types::codec::dbr_meta_size`] — the single owner that the
 /// serializers (`serialize_dbr` / `encode_dbr`) emit against — so the
 /// explicit-count pad/truncate and no-read-access frame paths size
@@ -274,7 +274,7 @@ pub fn dbr_text_to_type(text: &str) -> Option<u16> {
 mod buffer_size_tests {
     use super::*;
 
-    /// H-1: STS meta size is per-type. `dbr_sts_double` carries a
+    /// STS meta size is per-type. `dbr_sts_double` carries a
     /// 4-byte `dbr_long_t` RISC_pad (db_access.h:233-238) → meta 8.
     #[test]
     fn sts_double_meta_is_8() {
@@ -287,7 +287,7 @@ mod buffer_size_tests {
         );
     }
 
-    /// H-1: `dbr_sts_char` carries a 1-byte RISC_pad
+    /// `dbr_sts_char` carries a 1-byte RISC_pad
     /// (db_access.h:218-223) → meta 5.
     #[test]
     fn sts_char_meta_is_5() {
@@ -295,7 +295,7 @@ mod buffer_size_tests {
         assert_eq!(dbr_buffer_size(DBR_STS_CHAR, DbFieldType::Char, 10), 5 + 10);
     }
 
-    /// H-1: types with no STS RISC pad keep the flat 4-byte meta.
+    /// types with no STS RISC pad keep the flat 4-byte meta.
     #[test]
     fn sts_short_meta_is_4() {
         assert_eq!(dbr_buffer_size(DBR_STS_SHORT, DbFieldType::Short, 1), 6);
@@ -309,7 +309,7 @@ mod buffer_size_tests {
         assert_eq!(dbr_buffer_size(DBR_DOUBLE, DbFieldType::Double, 3), 24);
     }
 
-    /// CA-FR-7: TIME structs carry a per-type RISC pad before `value[0]`
+    /// TIME structs carry a per-type RISC pad before `value[0]`
     /// (C `dbr_time_*`, db_access.h:250-300). The pre-fix flat 12-byte
     /// TIME meta truncated double/short/enum/char bodies.
     #[test]
@@ -331,7 +331,7 @@ mod buffer_size_tests {
         );
     }
 
-    /// CA-FR-7: GR/CTRL metadata is per native type (the pre-fix single
+    /// GR/CTRL metadata is per native type (the pre-fix single
     /// broad formula over-padded short/char/float/long and dropped the
     /// enum `no_str` word).
     #[test]

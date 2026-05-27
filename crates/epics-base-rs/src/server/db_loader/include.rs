@@ -103,7 +103,7 @@ fn expand_includes_inner(
     for line in content.lines() {
         if let Some(subst_str) = parse_substitute_directive(line) {
             // Apply substitute overrides to local macros. Quote- and
-            // escape-aware splitting (M-4) matches C `macParseDefns`
+            // escape-aware splitting matches C `macParseDefns`
             // (macUtil.c): a `,` or `=` inside `'...'`/`"..."` or after
             // a `\` does not act as a separator.
             for (k, v) in parse_macro_defns(&subst_str) {
@@ -400,7 +400,7 @@ mod macro_defns_tests {
         );
     }
 
-    /// M-4: a comma inside a quoted value does NOT split the pair.
+    /// a comma inside a quoted value does NOT split the pair.
     #[test]
     fn quoted_comma_not_split() {
         assert_eq!(
@@ -409,7 +409,7 @@ mod macro_defns_tests {
         );
     }
 
-    /// M-4: an `=` inside a quoted value does not start a new value.
+    /// an `=` inside a quoted value does not start a new value.
     #[test]
     fn quoted_equals_not_split() {
         assert_eq!(

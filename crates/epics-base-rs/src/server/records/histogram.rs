@@ -309,7 +309,7 @@ impl Record for HistogramRecord {
 mod tests {
     use super::*;
 
-    /// C-2: a counter at the `UINT_MAX` bit pattern must wrap to 0,
+    /// a counter at the `UINT_MAX` bit pattern must wrap to 0,
     /// never panic the way a signed `i32 += 1` would at overflow.
     #[test]
     fn counter_wraps_at_u32_max_no_panic() {
@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(rec.val[0], 0, "epicsUInt32 counter wraps UINT_MAX -> 0");
     }
 
-    /// H-11: CMD=3 stops counting, CMD=2 resumes it.
+    /// CMD=3 stops counting, CMD=2 resumes it.
     #[test]
     fn cmd_start_stop_pauses_counting() {
         let mut rec = HistogramRecord::new(2, 0.0, 10.0);
@@ -334,7 +334,7 @@ mod tests {
         assert_eq!(rec.val[0], 1, "started histogram counts again");
     }
 
-    /// H-11: CMD<=1 clears all buckets.
+    /// CMD<=1 clears all buckets.
     #[test]
     fn cmd_clear_zeros_buckets() {
         let mut rec = HistogramRecord::new(2, 0.0, 10.0);
@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(rec.val, vec![0, 0]);
     }
 
-    /// M-3: closed-upper-edge bucket selection — a value exactly on an
+    /// closed-upper-edge bucket selection — a value exactly on an
     /// internal boundary lands in the lower bucket.
     #[test]
     fn bin_boundary_uses_closed_upper_edge() {

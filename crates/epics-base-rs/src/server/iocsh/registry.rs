@@ -288,7 +288,7 @@ fn find_closing_paren(s: &str) -> usize {
 /// Split comma-separated arguments, respecting quoted strings.
 /// Trims whitespace around each argument and strips outer quotes.
 ///
-/// M-1: both `"` and `'` open a quoted string; the quote is closed
+/// both `"` and `'` open a quoted string; the quote is closed
 /// only by the *same* character it was opened with — matching C
 /// `iocsh.cpp` `split()` (`if ((c == '"') || (c == '\'')) quote = c;`).
 fn split_comma_args(s: &str) -> Vec<String> {
@@ -375,7 +375,7 @@ fn split_comma_args(s: &str) -> Vec<String> {
 
 /// Split space/tab separated arguments, respecting quoted strings.
 ///
-/// M-1: both `"` and `'` delimit a quoted string; the quote is closed
+/// both `"` and `'` delimit a quoted string; the quote is closed
 /// only by the matching character — mirrors C `iocsh.cpp` `split()`.
 fn split_space_args(s: &str) -> Vec<String> {
     let mut args = Vec::new();
@@ -781,7 +781,7 @@ mod tests {
         assert!(parse_args(&tokens, &descs).is_err());
     }
 
-    /// A3-1: `iocshArgInt` must parse like C `strtol(arg, &endp, 0)`
+    /// `iocshArgInt` must parse like C `strtol(arg, &endp, 0)`
     /// (base-0: `0x` hex, leading `0` octal), with a `strtoul` overflow
     /// fallback and empty→0 — not Rust's decimal-only `parse::<i64>`.
     #[test]

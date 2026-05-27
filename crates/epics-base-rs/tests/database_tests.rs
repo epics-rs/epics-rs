@@ -777,7 +777,7 @@ async fn test_putf_stays_off_for_cp_chained_targets() {
 
 /// C `dbDbLink.c::processTarget:474` propagates `pdst->putf = psrc->putf`
 /// when writing through a DB OUT link to a non-pact target. Pre-fix
-/// Round 4 the Rust `write_db_link_value` only put the value and called
+/// the Rust `write_db_link_value` only put the value and called
 /// `process_record_with_links` without touching `target.putf` — so a
 /// CA put on an ao with OUT pointing at a passive ai left the ai's
 /// PUTF=0 during the chained process cycle. dbNotify completion
@@ -839,7 +839,7 @@ async fn test_putf_propagates_through_db_out_link_to_passive_target() {
 /// target lets us observe the bit between write_db_link_value's set
 /// and the eventual complete_async_record clear.
 ///
-/// Pre-fix Round 4 `write_db_link_value` only forwarded the value
+/// Pre-fix `write_db_link_value` only forwarded the value
 /// and dispatched process — never touched `target.putf`. So even
 /// when the source had `putf=1` from a CA put, the async target
 /// stayed at `putf=0` for the duration of the in-flight cycle.
@@ -1088,13 +1088,13 @@ async fn test_ao_ivoa_dont_drive() {
     }
 }
 
-/// Round-30C regression: IVOA=2 ("set outputs to IVOV") must route
+/// Regression: IVOA=2 ("set outputs to IVOV") must route
 /// IVOV into the C-conventional output field for each record type.
 /// Pre-fix the framework special-cased only `calcout` (OVAL) and fell
 /// back to `set_val` (VAL) — every other output record left OVAL/RVAL
 /// stale, so the soft-channel OUT writeback (which reads `OVAL.or(VAL)`)
 /// shipped the pre-IVOA value instead of IVOV.
-/// Round-34 (R34-G1): a `.db` file's `field(ASL, "1")` directive must
+/// A `.db` file's `field(ASL, "1")` directive must
 /// land in `common.asl`. `db_loader::apply_fields` feeds every common
 /// field as `EpicsValue::String`; the ASL handler must parse string
 /// numerics or the directive is silently dropped at IOC load.
@@ -1405,7 +1405,7 @@ async fn test_sdis_disable_skips_process() {
     );
 }
 
-/// A1-2: C `dbGetLink(&precord->sdis, DBR_SHORT, &precord->disa, 0, 0)`
+/// C `dbGetLink(&precord->sdis, DBR_SHORT, &precord->disa, 0, 0)`
 /// reads the SDIS link for ANY type. The pre-fix port refreshed `disa`
 /// only for a `ParsedLink::Db` SDIS, so a constant (and CA/PVA) SDIS was
 /// silently ignored — `disa` stayed at its default and a record meant to
@@ -2605,7 +2605,7 @@ async fn test_notify_field_respects_mask() {
 
 /// C `dbAccess.c:575-577` clears `precord->rpro = FALSE; precord->putf =
 /// FALSE` and arms `callNotifyCompletion = TRUE` BEFORE the alarm
-/// check whenever SDIS evaluates to DISV. Pre-fix Round 4 Rust only
+/// check whenever SDIS evaluates to DISV. Pre-fix Rust only
 /// reset nsta/nsev and updated the alarm — rpro/putf leaked into the
 /// next cycle and pending dbNotify completion callbacks stalled.
 #[tokio::test]
@@ -2647,7 +2647,7 @@ async fn test_sdis_disable_clears_rpro_and_putf() {
 /// C `dbAccess.c:622-623` runs `dbNotifyCompletion(precord)` at
 /// `all_done` for the disable bail path because `callNotifyCompletion
 /// = TRUE` was set at line 577. A CA WRITE_NOTIFY landing on a
-/// disabled record must release its caller. Pre-fix Round 4 the
+/// disabled record must release its caller. Pre-fix the
 /// put_notify_tx was never fired, stranding the call until socket
 /// disconnect.
 #[tokio::test]
@@ -5288,7 +5288,7 @@ async fn test_pp_out_link_processes_passive_target() {
     );
 }
 
-/// MR-R5 — formerly-bypassing path. A foreign full-processing entry
+/// Formerly-bypassing path. A foreign full-processing entry
 /// (`process_record_with_links`, the normal scan/event/FLNK-dispatch
 /// caller) must block while a multi-record transaction holds the
 /// member record's advisory write gate via `lock_records`. Before the
@@ -5335,7 +5335,7 @@ async fn mr_r5_foreign_process_blocks_on_held_epoch() {
     );
 }
 
-/// MR-R5 — owner path. A transaction owner holding a member's advisory
+/// Owner path. A transaction owner holding a member's advisory
 /// write gate via `lock_records` processes that member through the
 /// `_already_locked` full-processing entry. The gate `Mutex` is not
 /// reentrant, so using the gate-acquiring `process_record_with_links`
@@ -5365,7 +5365,7 @@ async fn mr_r5_already_locked_process_does_not_self_deadlock() {
     assert!(visited.contains("MR_R5_OWNED"));
 }
 
-/// BRIDGE-FR-3: a CA link carries its `MS`/`NMS`/`MSI`/`MSS` modifier in
+/// a CA link carries its `MS`/`NMS`/`MSI`/`MSS` modifier in
 /// the parsed model, and record processing applies the maximize-severity
 /// gate using that switch (uniform with DB links). The CA lset returns
 /// the RAW remote alarm (severity + status); processing decides what to

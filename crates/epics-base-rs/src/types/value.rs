@@ -304,7 +304,7 @@ impl EpicsValue {
 
     /// Deserialize an array value from raw bytes.
     ///
-    /// C-G16: `count` comes directly from the wire (CA `m_count`,
+    /// `count` comes directly from the wire (CA `m_count`,
     /// 16-bit native or 32-bit "extended"). A malicious peer can send
     /// `m_count = 0xFFFF_FFFF` with a tiny payload, and a naive
     /// `Vec::with_capacity(count)` allocates ~8 GiB for shorts /
@@ -1053,7 +1053,7 @@ mod parse_radix_tests {
 mod array_convert_tests {
     use super::*;
 
-    /// H-4: a numeric array converted to a different DBR native type
+    /// a numeric array converted to a different DBR native type
     /// must convert element-by-element, not collapse to one scalar.
     #[test]
     fn double_array_to_short_array() {

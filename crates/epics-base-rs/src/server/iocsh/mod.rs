@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 use crate::server::database::PvDatabase;
 use registry::*;
 
-/// Error-handling mode set by the `on error` command (M-6).
+/// Error-handling mode set by the `on error` command.
 /// Mirrors C `iocsh.cpp` `onCallFunc` (`continue` / `break` / `halt` /
 /// `wait`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -31,7 +31,7 @@ enum OnError {
 pub struct IocShell {
     registry: Arc<RwLock<CommandRegistry>>,
     ctx: CommandContext,
-    /// Error-handling mode for the running script (M-6). `Cell`
+    /// Error-handling mode for the running script. `Cell`
     /// because the shell drives one script at a time on a single
     /// thread; the `on error` command mutates it mid-script.
     on_error: std::cell::Cell<OnError>,
@@ -97,7 +97,7 @@ impl IocShell {
                         .execute_script_with_macros(&toks[1], &macros)
                         .map(|_| CommandOutcome::Continue);
                 }
-                // H-5: `iocshCmd("cmd")` runs a single command line;
+                // `iocshCmd("cmd")` runs a single command line;
                 // `iocshRun("c1; c2")` runs `;`-separated commands.
                 // Both re-enter `execute_line`, so they must be
                 // dispatched here (the registry handler signature has
@@ -127,7 +127,7 @@ impl IocShell {
                     }
                     return last;
                 }
-                // M-6: `on error continue|break|halt|wait <delay>` —
+                // `on error continue|break|halt|wait <delay>` —
                 // sets how the running script reacts to a failing
                 // line. Mirrors C `iocsh.cpp` `onCallFunc`.
                 Some("on") => {
@@ -250,7 +250,7 @@ impl IocShell {
                 Err(e) => {
                     eprintln!("{path}:{line_num}: Error: {e}");
                     let formatted = format!("{path}:{line_num}: {e}");
-                    // M-6: honour `on error break|halt` — stop the
+                    // honour `on error break|halt` — stop the
                     // script at the first failing line.
                     if self.react_to_error() {
                         return Err(formatted);
@@ -285,7 +285,7 @@ impl IocShell {
                 Err(e) => {
                     eprintln!("{path}:{line_num}: Error: {e}");
                     let formatted = format!("{path}:{line_num}: {e}");
-                    // M-6: honour `on error break|halt` — stop the
+                    // honour `on error break|halt` — stop the
                     // script at the first failing line instead of
                     // the hardcoded "continue, report at end".
                     if self.react_to_error() {
@@ -412,7 +412,7 @@ impl IocShell {
         Ok(())
     }
 
-    /// Handle the `on error ...` command (M-6). Tokens are the
+    /// Handle the `on error ...` command. Tokens are the
     /// already-tokenised line (`["on", "error", "<mode>", ...]`).
     fn handle_on_command(&self, toks: &[String]) -> CommandResult {
         if toks.get(1).map(|s| s.as_str()) != Some("error") {
@@ -619,7 +619,7 @@ mod tests {
         IocShell::new(db, handle)
     }
 
-    /// Round-16 regression: a CommandDef must be cloneable so the
+    /// Regression: a CommandDef must be cloneable so the
     /// post-init `afterIocRunning` shell can re-register
     /// site-specific user commands. Pre-fix the handler was
     /// `Box<dyn CommandHandler>` and CommandDef itself was not
@@ -642,7 +642,7 @@ mod tests {
         );
 
         // Cloning the CommandDef shares the same handler counter —
-        // the Arc<dyn CommandHandler> is what enables the round-16
+        // the Arc<dyn CommandHandler> is what enables the
         // afterIocRunning re-registration.
         let cmd_dup = cmd.clone();
 
@@ -1115,7 +1115,7 @@ mod tests {
         assert!(colored.contains("oops"));
     }
 
-    /// H-5: `iocshCmd("dbl")` runs a single command line by
+    /// `iocshCmd("dbl")` runs a single command line by
     /// re-entering the shell.
     #[test]
     fn test_iocsh_cmd_runs_single_command() {
@@ -1124,7 +1124,7 @@ mod tests {
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
     }
 
-    /// H-5: `iocshRun` runs `;`-separated commands.
+    /// `iocshRun` runs `;`-separated commands.
     #[test]
     fn test_iocsh_run_runs_multiple_commands() {
         let shell = make_shell();
@@ -1132,7 +1132,7 @@ mod tests {
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
     }
 
-    /// H-5: core commands `echo`, `pwd`, `date` are registered so a
+    /// core commands `echo`, `pwd`, `date` are registered so a
     /// stock `st.cmd` no longer errors on them.
     #[test]
     fn test_core_commands_registered() {
@@ -1145,7 +1145,7 @@ mod tests {
         }
     }
 
-    /// H-5: the `as*` family is registered — `asInit` without a
+    /// the `as*` family is registered — `asInit` without a
     /// filename is a success no-op (C `asInitCommon`, asDbLib.c:127-128:
     /// returns 0 with no ACF file, leaving access security disabled), so
     /// a startup script under `on error break` is not aborted.
@@ -1164,7 +1164,7 @@ mod tests {
         ));
     }
 
-    /// H-6: `dbsr` is the Database Server Report, not the name search.
+    /// `dbsr` is the Database Server Report, not the name search.
     #[test]
     fn test_dbsr_is_server_report() {
         let shell = make_shell();
@@ -1188,7 +1188,7 @@ mod tests {
         std::fs::remove_file(&tmp).ok();
     }
 
-    /// M-6: `on error break` stops the script at the first failing
+    /// `on error break` stops the script at the first failing
     /// line. Without it (default `continue`) the whole script runs.
     #[test]
     fn test_on_error_break_stops_script() {
@@ -1210,7 +1210,7 @@ mod tests {
         );
     }
 
-    /// M-1: single-quoted arguments tokenize as one token.
+    /// single-quoted arguments tokenize as one token.
     #[test]
     fn test_single_quote_tokenization() {
         assert_eq!(

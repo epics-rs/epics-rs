@@ -45,7 +45,7 @@
 //!   `process_record`) takes the single record's gate for the
 //!   duration of the write via [`PvDatabase::lock_record`].
 //! * A multi-record transaction — the QSRV atomic group PUT/GET
-//!   (BR-R15) and the pvalink atomic scan-on-update epoch (BR-R18) —
+//!   and the pvalink atomic scan-on-update epoch —
 //!   takes *all* member-record gates up-front via
 //!   [`PvDatabase::lock_records`], sorted by canonical record name so
 //!   two overlapping transactions acquire shared records in the same
@@ -55,7 +55,7 @@
 //! direct backing-record write blocks until the transaction owning
 //! that record finishes, and a QSRV atomic group PUT and a pvalink
 //! atomic scan can never interleave on a shared record — restoring
-//! the `DBManyLock` exclusion that BR-R15 and BR-R18 found missing.
+//! the `DBManyLock` exclusion that earlier review found missing.
 //!
 //! The gate is *advisory*: it does not replace the per-record
 //! `RwLock<RecordInstance>` that still guards the record's data. It

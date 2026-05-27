@@ -14,7 +14,7 @@ use epics_base_rs::server::records::event::EventRecord;
 use epics_base_rs::server::records::fanout::FanoutRecord;
 use epics_base_rs::types::EpicsValue;
 
-/// 04-H-1 — the fanout record has a `LNK0` field (C `NLINKS = 16`).
+/// The fanout record has a `LNK0` field (C `NLINKS = 16`).
 #[test]
 fn fanout_has_lnk0_field() {
     let mut rec = FanoutRecord::new();
@@ -34,7 +34,7 @@ fn fanout_has_lnk0_field() {
     );
 }
 
-/// 04-H-1 — `SELM=All` fans out through `LNK0`; the primary first
+/// `SELM=All` fans out through `LNK0`; the primary first
 /// slot is no longer silently dropped.
 #[tokio::test]
 async fn fanout_selm_all_processes_lnk0_target() {
@@ -61,7 +61,7 @@ async fn fanout_selm_all_processes_lnk0_target() {
     );
 }
 
-/// 04-H-2 / 07-C-2 — dfanout `SELM=Specified` is 1-based: `SELN=1`
+/// dfanout `SELM=Specified` is 1-based: `SELN=1`
 /// drives OUTA, `SELN=0` drives nothing.
 #[tokio::test]
 async fn dfanout_specified_is_one_based() {
@@ -104,7 +104,7 @@ async fn dfanout_specified_is_one_based() {
     );
 }
 
-/// 04-M-5 / 07-C-2 — an out-of-range `SELN` on a dfanout raises
+/// An out-of-range `SELN` on a dfanout raises
 /// SOFT_ALARM / INVALID_ALARM.
 #[tokio::test]
 async fn dfanout_specified_out_of_range_raises_invalid() {
@@ -133,7 +133,7 @@ async fn dfanout_specified_out_of_range_raises_invalid() {
     );
 }
 
-/// 05-H-2 / 07-H-1 — the event record's `VAL` is a string event name.
+/// The event record's `VAL` is a string event name.
 #[test]
 fn event_record_val_is_string() {
     let rec = EventRecord::new("myEvent");
@@ -144,7 +144,7 @@ fn event_record_val_is_string() {
     );
 }
 
-/// 05-H-1 / 07-H-2 — `post_event_named` routes by event number:
+/// `post_event_named` routes by event number:
 /// a record with `EVNT=5` fires only on event 5, not event 7.
 #[tokio::test]
 async fn event_scan_routes_by_event_number() {
@@ -197,7 +197,7 @@ async fn event_scan_routes_by_event_number() {
     );
 }
 
-/// 06-H-2 — UDF stays true when the processed value is NaN, so the
+/// UDF stays true when the processed value is NaN, so the
 /// record raises UDF_ALARM instead of reporting a garbage value.
 #[tokio::test]
 async fn udf_stays_true_on_nan_value() {
@@ -225,7 +225,7 @@ async fn udf_stays_true_on_nan_value() {
     );
 }
 
-/// 06-H-2 — UDF IS cleared when the processed value is a defined
+/// UDF IS cleared when the processed value is a defined
 /// (non-NaN) number — the fix must not over-suppress UDF clearing.
 #[tokio::test]
 async fn udf_cleared_on_defined_value() {
@@ -293,7 +293,7 @@ async fn fanout_lnk_skips_non_passive_target() {
 // ---------------------------------------------------------------------------
 // Single-owner invariant: sseq LNKn dispatched exactly once per cycle.
 //
-// Round-2 review found that an `sseq` record was dispatched by TWO
+// Review found that an `sseq` record was dispatched by TWO
 // owners every process cycle: `dispatch_multi_output`'s `MultiOut::Sseq`
 // arm AND the generic `multi_output_links` block (because `SseqRecord`
 // also implemented `Record::multi_output_links`). Each selected `LNKn`

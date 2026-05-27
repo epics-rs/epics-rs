@@ -337,7 +337,7 @@ mod tests {
         assert_eq!(unpack(out), vec![1.0]);
     }
 
-    /// MR-R25: a `UInt64Array` waveform must be sliced like every other
+    /// a `UInt64Array` waveform must be sliced like every other
     /// `*Array` variant. Before the fix the match had no `UInt64Array`
     /// arm, so DBF_UINT64 waveforms hit the scalar passthrough and the
     /// client received the full array. The values are above `i64::MAX`

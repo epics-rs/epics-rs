@@ -25,7 +25,7 @@ fn truncate_string(s: &str) -> String {
 /// C `stringinRecord.c`: `val`, `oval` and `sval` are fixed 40-byte
 /// buffers; `strncpy(..., sizeof(prec->val))` truncates every copy at
 /// 40. The Rust port uses `String`, so every VAL/OVAL write must be
-/// truncated to 39 chars + implicit NUL to match (H-10).
+/// truncated to 39 chars + implicit NUL to match.
 pub struct StringinRecord {
     pub val: String,
     pub oval: String,
@@ -171,7 +171,7 @@ impl Record for StringinRecord {
 mod tests {
     use super::*;
 
-    /// H-10: a VAL longer than 39 chars is truncated to 39 + NUL.
+    /// a VAL longer than 39 chars is truncated to 39 + NUL.
     #[test]
     fn val_truncated_to_max_string_size() {
         let long = "x".repeat(100);

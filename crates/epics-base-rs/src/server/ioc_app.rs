@@ -1076,9 +1076,9 @@ mod tests {
         assert_eq!(count, 0); // No DTYP set, so no wiring
     }
 
-    /// Round-8 regression: `wire_device_support` (the IocApplication
+    /// Regression: `wire_device_support` (the IocApplication
     /// startup-script device-support attach path) MUST forward
-    /// info(...) tags to the driver via `apply_record_info`. Round-6
+    /// info(...) tags to the driver via `apply_record_info`. An earlier fix
     /// only patched the IocBuilder path; without this fix, IOCs
     /// loaded entirely through iocsh `dbLoadRecords` lose every
     /// `info()` tag the driver depends on (e.g. asyn `asyn:READBACK`).
@@ -1144,7 +1144,7 @@ mod tests {
         assert_eq!(count, 1, "device support must have attached");
 
         // The recording driver should have observed both tags via
-        // apply_record_info — proves the round-6 hook fires from the
+        // apply_record_info — proves the hook fires from the
         // IocApplication batch-wiring path too.
         let observed = seen.lock().unwrap().clone();
         assert_eq!(observed.get("asyn:READBACK").map(String::as_str), Some("1"));

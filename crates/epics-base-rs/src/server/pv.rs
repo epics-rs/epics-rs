@@ -19,7 +19,7 @@ fn per_channel_event_depth() -> usize {
         .max(4)
 }
 
-/// Per-PV subscriber cap (P-G14). Default 1024 — comfortably above
+/// Per-PV subscriber cap. Default 1024 — comfortably above
 /// any realistic dashboard fan-out, small enough to bound the
 /// per-PV `Vec<Subscriber>` under abuse. Override via
 /// `EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`.
@@ -37,7 +37,7 @@ pub(crate) fn max_subscribers_per_pv() -> usize {
 /// [`Subscriber::coalesce_overflow`] owner. Mirrors the pattern of
 /// `dropped_monitors` on the client side (subscribe_with_deadband).
 ///
-/// BFR-10: read via [`dropped_monitor_events`]. That reader is not yet
+/// read via [`dropped_monitor_events`]. That reader is not yet
 /// wired to a live scrape surface — the `/queues` admin endpoint
 /// currently renders configured limits only, not this counter — so do
 /// not assume the value is observable through an endpoint until that
@@ -132,7 +132,7 @@ pub type WriteHook = Arc<
         + Sync,
 >;
 
-/// BRIDGE-FR-1: read/write access decision for a gateway shadow PV,
+/// read/write access decision for a gateway shadow PV,
 /// evaluated for a specific downstream `(user, host)`. Mirrors the CA
 /// access-rights model the server reports to the client and gates
 /// reads on.
@@ -144,7 +144,7 @@ pub struct AccessDecision {
     pub write: bool,
 }
 
-/// BRIDGE-FR-1: per-PV access hook installed by a proxy (the CA
+/// per-PV access hook installed by a proxy (the CA
 /// gateway) so the CA server routes a shadow PV's access-rights
 /// decision through the proxy's own ACF instead of the server's.
 /// Given the downstream client's `(user, host)`, it returns the
@@ -197,7 +197,7 @@ pub struct Subscriber {
 }
 
 impl Subscriber {
-    /// CA-FR-6: a monitor delivery is gated on the requested `DBE_*`
+    /// a monitor delivery is gated on the requested `DBE_*`
     /// mask. Returns true only when the post's event class intersects
     /// this subscriber's mask — the single rule C rsrv enforces with
     /// `caEventMask & pevent->select` (`dbEvent.c:892-900`) and the
@@ -207,7 +207,7 @@ impl Subscriber {
         post.is_empty() || crate::server::recgbl::EventMask::from_bits(self.mask).intersects(post)
     }
 
-    /// BFR-10: single owner of the slow-consumer coalesce overflow.
+    /// single owner of the slow-consumer coalesce overflow.
     /// Call after the bounded `tx` rejected a send: store the newest
     /// `event` in the coalesce slot, and — when it displaces a value the
     /// consumer never observed — record one dropped monitor event.
@@ -243,7 +243,7 @@ pub struct ProcessVariable {
     /// constant-time clone of the optional `Arc`. The hook itself
     /// is async (returns a `Future`); only the slot is sync.
     write_hook: parking_lot::RwLock<Option<WriteHook>>,
-    /// BRIDGE-FR-1: optional access hook consulted by the CA server's
+    /// optional access hook consulted by the CA server's
     /// `compute_access` to decide a downstream client's read/write
     /// rights for this PV. When set, it overrides the server's own ACF
     /// for this PV — the gateway uses it to enforce `.pvlist` ASG-based
@@ -263,7 +263,7 @@ impl ProcessVariable {
         }
     }
 
-    /// Install an access hook (BRIDGE-FR-1). Replaces any previously
+    /// Install an access hook. Replaces any previously
     /// installed hook.
     pub fn set_access_hook(&self, hook: AccessHook) {
         *self.access_hook.write() = Some(hook);
@@ -355,7 +355,7 @@ impl ProcessVariable {
         let value = self.value.read().await.clone();
         let mut subs = self.subscribers.lock().await;
         subs.retain(|sub| !sub.tx.is_closed());
-        // BR-R52: ALARM|LOG so DBE_LOG (archiver) subscribers receive alarm events.
+        // ALARM|LOG so DBE_LOG (archiver) subscribers receive alarm events.
         let post = EventMask::ALARM | EventMask::LOG;
         for sub in subs.iter() {
             // Skip subscribers that did not request alarm events
@@ -386,7 +386,7 @@ impl ProcessVariable {
                 continue;
             };
             if sub.tx.try_send(event.clone()).is_err() {
-                // L4 / BFR-10: an alarm event overwriting an unconsumed
+                // L4 / an alarm event overwriting an unconsumed
                 // coalesced slot is genuinely lost. Route through the
                 // single coalesce-overflow owner so alarm-event loss to
                 // a slow consumer is counted exactly like value events.
@@ -402,7 +402,7 @@ impl ProcessVariable {
         let mut subs = self.subscribers.lock().await;
         // Remove subscribers whose channel has been dropped
         subs.retain(|sub| !sub.tx.is_closed());
-        // BR-R52: VALUE|LOG so DBE_LOG (archiver) subscribers receive value events.
+        // VALUE|LOG so DBE_LOG (archiver) subscribers receive value events.
         let post = EventMask::VALUE | EventMask::LOG;
         for sub in subs.iter() {
             // Skip subscribers that did not request value events
@@ -447,7 +447,7 @@ impl ProcessVariable {
         use crate::server::recgbl::EventMask;
         let mut subs = self.subscribers.lock().await;
         subs.retain(|sub| !sub.tx.is_closed());
-        // BR-R52: C gateway fires postEvent(VALUE|ALARM|LOG) for every
+        // C gateway fires postEvent(VALUE|ALARM|LOG) for every
         // upstream event (gateVc.cc:374-376); widen to match so DBE_LOG
         // archivers and DBE_ALARM-only monitors receive gateway snapshot posts.
         let post = EventMask::VALUE | EventMask::LOG | EventMask::ALARM;
@@ -477,7 +477,7 @@ impl ProcessVariable {
 
     /// Add a subscriber. Returns the receiver for monitor events,
     /// or `None` when the per-PV subscriber cap has been reached
-    /// (P-G14: defends against a misbehaving client opening many
+    /// (defends against a misbehaving client opening many
     /// MONITOR ops against one shared PV; per-channel cap limits
     /// channels but not subscriber rows on a single PV). Operators
     /// override the cap via `EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`
@@ -506,7 +506,7 @@ impl ProcessVariable {
             filters: crate::server::database::filters::FilterChain::new(),
         };
         let mut subs = self.subscribers.lock().await;
-        // Round 46 (R46-G1): reap dead Senders BEFORE counting
+        // Reap dead Senders BEFORE counting
         // against the cap. `notify_subscribers` / `post_alarm`
         // already retain-filter on every emission, but a PV with
         // no value changes (e.g. a static catalog entry that
@@ -514,7 +514,7 @@ impl ProcessVariable {
         // reaper — a long-lived subscribe / disconnect storm could
         // pin the Vec at `cap` worth of closed `Sender`s and lock
         // out genuine new subscribers with a false-positive cap-
-        // reached warning. Same defect class as the round-37
+        // reached warning. Same defect class as the
         // NDPluginPva subscribe reaper (qsrv/pva_adapter.rs:247).
         subs.retain(|s| !s.tx.is_closed());
         if subs.len() >= cap {
@@ -530,7 +530,7 @@ impl ProcessVariable {
         Some(rx)
     }
 
-    /// CA-FR-8: attach a channel-filter chain to an already-added
+    /// attach a channel-filter chain to an already-added
     /// subscriber (looked up by `sid`). The CA server first
     /// `add_subscriber`s, then attaches the chain parsed from the
     /// channel's `.{...}` suffix — symmetric with the record-field
@@ -590,7 +590,7 @@ mod mask_gate_tests {
         ProcessVariable::new("test:pv".into(), EpicsValue::Double(0.0))
     }
 
-    /// CA-FR-6: a `DBE_ALARM`-only subscriber must not receive a plain
+    /// a `DBE_ALARM`-only subscriber must not receive a plain
     /// value set, but must receive an alarm post.
     #[tokio::test]
     async fn alarm_only_subscriber_skips_value_post() {
@@ -611,7 +611,7 @@ mod mask_gate_tests {
         );
     }
 
-    /// CA-FR-6: a `DBE_VALUE`-only subscriber must not receive a
+    /// a `DBE_VALUE`-only subscriber must not receive a
     /// `post_alarm`, but must receive value sets.
     #[tokio::test]
     async fn value_only_subscriber_skips_alarm_post() {
@@ -632,7 +632,7 @@ mod mask_gate_tests {
         );
     }
 
-    // --- BR-R52 regression: set_snapshot must reach DBE_LOG and DBE_ALARM-only subs ---
+    // --- Regression: set_snapshot must reach DBE_LOG and DBE_ALARM-only subs ---
 
     fn snapshot() -> Snapshot {
         Snapshot::new(
@@ -643,7 +643,7 @@ mod mask_gate_tests {
         )
     }
 
-    /// BR-R52: a DBE_LOG (archiver) subscriber must receive a set_snapshot post.
+    /// A DBE_LOG (archiver) subscriber must receive a set_snapshot post.
     #[tokio::test]
     async fn log_subscriber_receives_snapshot_post() {
         let pv = pv();
@@ -658,7 +658,7 @@ mod mask_gate_tests {
         );
     }
 
-    /// BR-R52: a DBE_ALARM-only subscriber must receive a set_snapshot post.
+    /// A DBE_ALARM-only subscriber must receive a set_snapshot post.
     #[tokio::test]
     async fn alarm_only_subscriber_receives_snapshot_post() {
         let pv = pv();
@@ -673,7 +673,7 @@ mod mask_gate_tests {
         );
     }
 
-    /// BR-R52: a DBE_VALUE subscriber must still receive a set_snapshot post.
+    /// A DBE_VALUE subscriber must still receive a set_snapshot post.
     #[tokio::test]
     async fn value_subscriber_receives_snapshot_post() {
         let pv = pv();
@@ -702,7 +702,7 @@ mod mask_gate_tests {
         assert!(rx.try_recv().is_ok(), "alarm post delivered to VALUE|ALARM");
     }
 
-    /// BR-R52: a DBE_LOG-only subscriber (archiver) must receive both value
+    /// A DBE_LOG-only subscriber (archiver) must receive both value
     /// events and alarm events.  Pre-fix: VALUE-only / ALARM-only post masks
     /// never intersected DBE_LOG(2), so archivers received silence.
     #[tokio::test]

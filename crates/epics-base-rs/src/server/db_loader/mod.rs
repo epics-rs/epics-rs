@@ -433,7 +433,7 @@ fn refer(
         None => (body, &body[body.len()..]),
     };
 
-    // M-5: the name itself may contain macro references — expand it.
+    // the name itself may contain macro references — expand it.
     let mut name = String::new();
     trans(name_chars, level + 1, macros, scopes, visiting, &mut name);
 
@@ -479,7 +479,7 @@ fn refer(
                 // break the cycle, rather than recursing forever.
                 out.push_str(&val);
             } else {
-                // M-1: re-scan the resolved value for further refs.
+                // re-scan the resolved value for further refs.
                 visiting.push(name.clone());
                 let val_chars: Vec<char> = val.chars().collect();
                 trans(&val_chars, level + 1, macros, scopes, visiting, out);
@@ -977,7 +977,7 @@ mod tests {
 
     #[test]
     fn test_quoted_string_escape() {
-        // C dbStatic parity (H-2): a quoted `tokenSTRING` keeps escape
+        // C dbStatic parity: a quoted `tokenSTRING` keeps escape
         // bytes RAW — only the surrounding quotes are stripped. A `.db`
         // field value `"hello \"world\""` therefore stores the literal
         // 15 chars `hello \"world\"`, NOT `hello "world"`. The `\"`
@@ -993,7 +993,7 @@ mod tests {
 
     #[test]
     fn test_quoted_string_keeps_escapes_raw() {
-        // H-2: `\n`, `\t`, `\\` are all kept verbatim for `.db` field
+        // `\n`, `\t`, `\\` are all kept verbatim for `.db` field
         // values — a C IOC stores the literal backslash sequences.
         let input = r#"
     record(stringin, "TEST") {
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn test_quoted_string_newline_aborts() {
-        // H-3: a literal newline inside a quoted string (missing
+        // a literal newline inside a quoted string (missing
         // closing quote) is a hard parse error in C (dbLex.l:131-133).
         let input = "record(stringin, \"TEST\") {\n    field(DESC, \"line1\nline2\")\n}\n";
         let res = parse_db(input, &HashMap::new());
@@ -1887,9 +1887,9 @@ mod tests {
         assert!(recs[0].aliases.is_empty());
     }
 
-    /// Round-9 regression: `info(asyn:READBACK, "1")` (unquoted tag,
+    /// Regression: `info(asyn:READBACK, "1")` (unquoted tag,
     /// quoted value) is the form ad-core templates use. Base accepts
-    /// it; round-5's parser fix tightened the grammar to require a
+    /// it; an earlier parser fix tightened the grammar to require a
     /// quoted tag, which broke all NDOverlayN / NDFile / NDArrayBase
     /// templates and the mini-beamline/xrt-beamline IOCs that load
     /// commonPlugins.cmd.
@@ -1955,7 +1955,7 @@ record(ai, "REC") {
         );
     }
 
-    // M-1 — resolved macro values are re-expanded (chained).
+    // Resolved macro values are re-expanded (chained).
     #[test]
     fn substitute_macros_chained_expansion() {
         // P=$(Q), Q=IOC:  →  $(P) expands to IOC:
@@ -1965,7 +1965,7 @@ record(ai, "REC") {
         assert_eq!(substitute_macros("$(P)TEMP", &macros), "IOC:TEMP");
     }
 
-    // M-2 — `$(name,key=val,...)` scoped macro definitions.
+    // `$(name,key=val,...)` scoped macro definitions.
     #[test]
     fn substitute_macros_scoped_definitions() {
         // INNER references A and B which are only defined for the
@@ -1985,7 +1985,7 @@ record(ai, "REC") {
         assert_eq!(out, "9|$(A,undefined)");
     }
 
-    // M-3 — macros are NOT expanded inside single quotes.
+    // Macros are NOT expanded inside single quotes.
     #[test]
     fn substitute_macros_suppressed_in_single_quotes() {
         let mut macros = HashMap::new();
@@ -1996,7 +1996,7 @@ record(ai, "REC") {
         assert_eq!(substitute_macros("\"$(X)\"", &macros), "\"VAL\"");
     }
 
-    // M-5 — the reference name is macro-expanded before lookup.
+    // The reference name is macro-expanded before lookup.
     #[test]
     fn substitute_macros_indirect_name() {
         // $($(WHICH)) — WHICH selects which macro to read.
@@ -2018,7 +2018,7 @@ record(ai, "REC") {
 
     #[test]
     fn substitute_macros_default_with_comma_is_c_parity() {
-        // C parity (M-2): `$(LIST=a,b,c)` — the name is LIST, the
+        // C parity: `$(LIST=a,b,c)` — the name is LIST, the
         // default is `a` (terminates at the first top-level comma),
         // and `b`/`c` are bare scoped names that define nothing.
         let macros = HashMap::new();
@@ -2027,7 +2027,7 @@ record(ai, "REC") {
 
     #[test]
     fn substitute_macros_self_reference_terminates() {
-        // M-1 re-expansion must not recurse forever on `A=$(A)`.
+        // Re-expansion must not recurse forever on `A=$(A)`.
         // The recursion guard emits the value once without re-scan.
         let mut macros = HashMap::new();
         macros.insert("A".to_string(), "$(A)".to_string());

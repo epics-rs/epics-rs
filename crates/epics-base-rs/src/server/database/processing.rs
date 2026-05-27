@@ -32,7 +32,7 @@ impl PvDatabase {
         self.process_record_inner(name, true).await
     }
 
-    /// BR-R15: `process_record` variant for a caller that already
+    /// `process_record` variant for a caller that already
     /// owns the record's advisory write gate — the QSRV atomic group
     /// PUT applying a `+proc` member. The gate `Mutex` is not
     /// reentrant; the atomic group path MUST use this entry. See
@@ -45,7 +45,7 @@ impl PvDatabase {
         let rec = self.get_record(name).await;
 
         if let Some(rec) = rec {
-            // BR-R15: advisory write gate (`dbScanLock` analogue). A
+            // advisory write gate (`dbScanLock` analogue). A
             // QSRV atomic group with a `+proc` member holds this
             // record's gate via `lock_records`; a direct
             // `process_record` on the same backing record must block
@@ -85,7 +85,7 @@ impl PvDatabase {
     /// process(PROC=1) etc. Hits the PACT entry guard (mirrors C `dbProcess`
     /// at `dbAccess.c:537-559`) when the record is mid-async.
     ///
-    /// MR-R5: this is a *foreign* full-processing entry, so it acquires
+    /// this is a *foreign* full-processing entry, so it acquires
     /// the record's advisory write gate (`dbScanLock` analogue) for the
     /// entry record before processing. A QSRV atomic group or pvalink
     /// atomic scan-on-update epoch that holds `lock_records` over the
@@ -108,7 +108,7 @@ impl PvDatabase {
         })
     }
 
-    /// MR-R5: full-processing entry for a caller that already owns the
+    /// full-processing entry for a caller that already owns the
     /// record's advisory write gate via [`PvDatabase::lock_records`] —
     /// the QSRV atomic group GET/PUT and the pvalink atomic
     /// scan-on-update epoch. The advisory gate `Mutex` is not
@@ -129,7 +129,7 @@ impl PvDatabase {
         })
     }
 
-    /// MR-R5: recursive FLNK / OUT / CP fan-out entry within a single
+    /// recursive FLNK / OUT / CP fan-out entry within a single
     /// processing chain. Does NOT re-acquire the advisory write gate:
     /// the chain is one transaction whose entry record's gate is
     /// already held by the foreign entry, and C `processTarget`
@@ -158,7 +158,7 @@ impl PvDatabase {
     /// `process_record_with_links` so FLNK / scan / CA put cannot race
     /// during the wait window.
     ///
-    /// MR-R5: the timer fire is a fresh task — the original cycle's
+    /// the timer fire is a fresh task — the original cycle's
     /// advisory gate was released when `process_record_with_links`
     /// returned async-pending. In C, `callbackRequestDelayed` dispatches
     /// through a callback that re-takes `dbScanLock(precord)` for the
@@ -222,7 +222,7 @@ impl PvDatabase {
             None => return Err(CaError::ChannelNotFound(name.to_string())),
         };
 
-        // MR-R5: advisory write gate (`dbScanLock(precord)` analogue).
+        // advisory write gate (`dbScanLock(precord)` analogue).
         // A foreign full-processing entry (scan loop, scan_event, FLNK
         // dispatch from another chain, CA put, PINI/startup) acquires
         // the entry record's gate so it cannot interleave with a QSRV
@@ -345,7 +345,7 @@ impl PvDatabase {
         // this point — regardless of whether the alarm transition
         // fires — because a disabled record must not leave behind
         // pending reprocess requests or stranded put_notify completion
-        // callbacks. Pre-fix Round 4 the Rust port only reset
+        // callbacks. Pre-fix the Rust port only reset
         // nsta/nsev and updated the alarm state, leaking rpro/putf
         // into the next cycle and stalling CA WRITE_NOTIFY callers
         // (the put_notify_tx never fired so the CA dispatcher waited
@@ -633,7 +633,7 @@ impl PvDatabase {
                     alarm.map(|a| (crate::server::record::MonitorSwitch::MaximizeStatus, a))
                 }
                 crate::server::record::ParsedLink::Ca(ref ca) => {
-                    // CA (BRIDGE-FR-3): apply the link's own
+                    // CA: apply the link's own
                     // MS/NMS/MSI/MSS gate at the fold boundary, uniform
                     // with the Db arm above — the resolver returned the
                     // *raw* remote alarm, not a gated one.
@@ -646,7 +646,7 @@ impl PvDatabase {
             None
         };
 
-        // BR-R19: if the single-INP link is an external `pva://` /
+        // if the single-INP link is an external `pva://` /
         // `ca://` link configured with `time=true`, the lset returns
         // the latched upstream NT timestamp here and we adopt it
         // into the owning record's `common.time`. The lset gates the
@@ -719,7 +719,7 @@ impl PvDatabase {
                         results.push((val_field.clone(), value));
                         resolved_link_fields.push(link_field);
                     }
-                    // B2 / BRIDGE-FR-3: multi-input alarm propagation
+                    // B2 / multi-input alarm propagation
                     // covers external links too. `Db` and `Ca` carry an
                     // explicit `MonitorSwitch` (CA's was parsed from its
                     // `MS`/`NMS`/`MSI`/`MSS` modifier); `Pva` is gated by
@@ -898,7 +898,7 @@ impl PvDatabase {
             // INP would run `convert()` and clobber a preset VAL — e.g.
             // a preset NaN would be rewritten to 0.0, then the framework
             // UDF check (`value_is_undefined()`) would see a defined 0.0
-            // and wrongly clear UDF (06-H-2 regression). `is_raw_soft`
+            // and wrongly clear UDF. `is_raw_soft`
             // (Raw Soft Channel, `devAiSoftRaw` returns 0) is excluded —
             // it deliberately wants the RVAL→VAL convert.
             //
@@ -1201,7 +1201,7 @@ impl PvDatabase {
                 }
             }
 
-            // BR-R19: pvalink `time=true` adopts the latched upstream
+            // pvalink `time=true` adopts the latched upstream
             // NT timestamp into the owning record. `external_link_time`
             // returned `None` unless the lset signalled the option, so
             // a `Some` here is the operator-requested remote timestamp.
@@ -1249,7 +1249,7 @@ impl PvDatabase {
                         // Set output to IVOV. Each record type knows
                         // which field its OUT writeback consumes — see
                         // [`Record::apply_invalid_output_value`]. The
-                        // pre-Round-30C path special-cased `calcout`
+                        // earlier path special-cased `calcout`
                         // (OVAL) and fell back to `set_val` (VAL) for
                         // every other record. That hid a real bug:
                         // ao/lso/bo/mbbo/busy left their OVAL/RVAL
@@ -1732,7 +1732,7 @@ impl PvDatabase {
                     (tg.common.scan, !pact)
                 };
                 if should_process && target_scan == crate::server::record::ScanType::Passive {
-                    // MR-R5: recursive FLNK within one chain — gate
+                    // recursive FLNK within one chain — gate
                     // already held by the foreign entry record.
                     let _ = self
                         .process_record_with_links_recursive(flnk, visited, depth + 1)
@@ -2198,7 +2198,7 @@ impl PvDatabase {
                 match ivoa {
                     1 => true,
                     2 => {
-                        // See Round-30C comment in
+                        // See the IVOA=2 comment in
                         // `process_record_with_links_inner` — IVOA=2
                         // delegates to the per-record
                         // `apply_invalid_output_value` so OVAL/RVAL/VAL
@@ -2369,7 +2369,7 @@ impl PvDatabase {
                     (tg.common.scan, !pact)
                 };
                 if should_process && target_scan == crate::server::record::ScanType::Passive {
-                    // MR-R5: recursive FLNK within one chain — gate
+                    // recursive FLNK within one chain — gate
                     // already held by the foreign entry record.
                     let _ = self
                         .process_record_with_links_recursive(flnk, visited, depth + 1)
@@ -2471,7 +2471,7 @@ impl PvDatabase {
             if skip {
                 continue;
             }
-            // MR-R5: recursive CP-target fan-out within one chain —
+            // recursive CP-target fan-out within one chain —
             // gate already held by the foreign entry record.
             let _ = self
                 .process_record_with_links_recursive(&target.record, visited, depth + 1)
@@ -2717,7 +2717,7 @@ impl PvDatabase {
                     }
                 };
                 if let Some(val) = out_val {
-                    // MR-R5: writing VAL to the SIOL target is an
+                    // writing VAL to the SIOL target is an
                     // internal step of this record's processing chain,
                     // which already holds the entry record's advisory
                     // write gate. Use the `_already_locked` write so a

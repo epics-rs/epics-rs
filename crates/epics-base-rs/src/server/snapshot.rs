@@ -71,7 +71,7 @@ pub struct Snapshot {
     pub class_name: Option<String>,
 }
 
-/// BR-R35: extract the low `n` bits of `snap.timestamp.nanoseconds`
+/// Extract the low `n` bits of `snap.timestamp.nanoseconds`
 /// into `snap.user_tag` and zero those bits in the timestamp.
 ///
 /// Mirrors pvxs `iocsource.cpp:240` — for a record with
@@ -150,7 +150,7 @@ impl DbrClass {
 mod tests {
     use super::*;
 
-    /// BR-R35: with N=20, the low 20 nanosecond bits land in userTag
+    /// With N=20, the low 20 nanosecond bits land in userTag
     /// and are cleared from the timestamp. Use a known nanosecond
     /// value so the bit math is easy to verify.
     #[test]
@@ -169,7 +169,7 @@ mod tests {
         assert_eq!(dur.subsec_nanos(), expected_nanos);
     }
 
-    /// BR-R35: N=1 splits the single LSB into the userTag.
+    /// N=1 splits the single LSB into the userTag.
     #[test]
     fn nsec_lsb_split_n1_keeps_high_bits() {
         use std::time::{Duration, UNIX_EPOCH};

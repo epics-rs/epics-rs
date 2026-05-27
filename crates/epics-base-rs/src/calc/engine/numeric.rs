@@ -492,7 +492,7 @@ mod parity_tests {
         calc(expr, &mut inp).unwrap()
     }
 
-    // C-1: malformed postfix leaving multiple residual values must error.
+    // malformed postfix leaving multiple residual values must error.
     #[test]
     fn c1_runtime_depth_multi_value_errors() {
         // Hand-built postfix: two PushConst, no operator, then End.
@@ -518,7 +518,7 @@ mod parity_tests {
         assert_eq!(eval(&compiled, &mut inp).unwrap(), 0.0);
     }
 
-    // H-1: compiler rejects net runtime depth != 1.
+    // compiler rejects net runtime depth != 1.
     #[test]
     fn h1_two_subexpressions_incomplete() {
         // `A;B` leaves two values on the runtime stack -> Incomplete.
@@ -556,7 +556,7 @@ mod parity_tests {
         assert!(compile("(A+B)*C").is_ok());
     }
 
-    // H-1 regression: the end-of-expression depth check must accept
+    // Regression: the end-of-expression depth check must accept
     // well-formed array/string extension opcodes. The arity of every
     // non-vararg function (incl. 0-arg ARNDM/IX, 2-arg CAT/NSMOO/NDERIV/
     // FITPOLY/FITQ, 3-arg FITMPOLY/FITMQ) is now modelled exactly.
@@ -591,7 +591,7 @@ mod parity_tests {
         }
     }
 
-    // H-1 regression: a genuinely malformed array expression is still
+    // Regression: a genuinely malformed array expression is still
     // rejected — too few operands for a 2-arg function leaves the
     // runtime stack short of exactly 1 value.
     #[test]
@@ -600,7 +600,7 @@ mod parity_tests {
         assert!(matches!(compile("CAT(AA)"), Err(CalcError::Incomplete)));
     }
 
-    // H-2: max/min NaN propagation matches C.
+    // max/min NaN propagation matches C.
     #[test]
     fn h2_max_nan_first_arg() {
         // C: max(nan,1) = nan (incoming operand decides).
@@ -624,7 +624,7 @@ mod parity_tests {
         assert!(run("MIN(5,0/0)").is_nan());
     }
 
-    // H-3: nint uses 32-bit wrap, not i64 saturation.
+    // nint uses 32-bit wrap, not i64 saturation.
     #[test]
     fn h3_nint_wraps_at_32bit() {
         // 3e9 rounds to 3000000000, wrapping into a negative epicsInt32.
@@ -638,7 +638,7 @@ mod parity_tests {
         assert_eq!(run("NINT(2.4)"), 2.0);
     }
 
-    // H-4: MODULO uses epicsInt32 truncation and zero detection.
+    // MODULO uses epicsInt32 truncation and zero detection.
     #[test]
     fn h4_mod_large_denominator_is_int32_zero() {
         // 4294967296 == 2^32 truncates to epicsInt32 0 -> NaN.
@@ -651,7 +651,7 @@ mod parity_tests {
         assert!(run("5 % 0").is_nan());
     }
 
-    // H-5: bitwise ops use d2i/d2ui (wrap), not saturating `as i32`.
+    // bitwise ops use d2i/d2ui (wrap), not saturating `as i32`.
     #[test]
     fn h5_bitand_high_bit_value() {
         // 3e9 has bit 31 set; 3e9 & 0xFFFFFFFF == 3e9 as epicsInt32 == -1294967296.
@@ -667,7 +667,7 @@ mod parity_tests {
         assert_eq!(f64_to_i32_wrap(f64::NAN), 0);
     }
 
-    // M-6: nested ternary branch selection matches C cond_search.
+    // nested ternary branch selection matches C cond_search.
     #[test]
     fn m6_nested_ternary_all_branches() {
         // a?(b?c:d):(e?f:g) — exercise each leaf.
@@ -688,14 +688,14 @@ mod parity_tests {
         }
     }
 
-    // M-3: hex literal must fit in 32 bits.
+    // hex literal must fit in 32 bits.
     #[test]
     fn m3_hex_literal_32bit() {
         assert_eq!(run("0xFFFFFFFF"), 4294967295.0);
         assert!(matches!(compile("0x1FFFFFFFF"), Err(CalcError::BadLiteral)));
     }
 
-    // M-5: numeric error codes and calcErrorStr.
+    // numeric error codes and calcErrorStr.
     #[test]
     fn m5_error_codes_and_strings() {
         assert_eq!(CalcError::TooMany.code(), 1);

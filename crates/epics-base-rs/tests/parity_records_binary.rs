@@ -1,10 +1,10 @@
 //! Parity tests for binary / multibit / sel / dfanout records.
 //!
 //! Covers the findings in `doc/parity-review/07-records-binary.md`:
-//! H-3 (mbbiDirect/mbboDirect 32-bit B0..B1F), H-4 (mbboDirect RBV),
-//! H-5..H-8 (bi/bo/busy/mbbi/mbbo STATE/COS/SOFT alarms), H-9 / M-1 /
-//! M-4 / M-5 (sel SELN range / UDF / SELN update / Median), M-3
-//! (dfanout limit alarms / deadband).
+//! mbbiDirect/mbboDirect 32-bit B0..B1F, mbboDirect RBV,
+//! bi/bo/busy/mbbi/mbbo STATE/COS/SOFT alarms,
+//! sel SELN range / UDF / SELN update / Median,
+//! dfanout limit alarms / deadband.
 
 #![allow(clippy::approx_constant)]
 
@@ -20,7 +20,7 @@ use epics_base_rs::server::records::mbbo_direct::MbboDirectRecord;
 use epics_base_rs::server::records::sel::SelRecord;
 use epics_base_rs::types::EpicsValue;
 
-// --- H-3: mbbiDirect / mbboDirect span 32 bits B0..B1F ---
+// --- mbbiDirect / mbboDirect span 32 bits B0..B1F ---
 
 #[test]
 fn mbbi_direct_exposes_upper_16_bits() {
@@ -62,7 +62,7 @@ fn mbbi_direct_nobt_above_16_sets_mask() {
     assert_eq!(rec.mask, (1i32 << 24) - 1);
 }
 
-// --- H-4: mbboDirect process must not force RBV = RVAL ---
+// --- mbboDirect process must not force RBV = RVAL ---
 
 #[test]
 fn mbbo_direct_process_keeps_device_rbv() {
@@ -80,7 +80,7 @@ fn mbbo_direct_process_keeps_device_rbv() {
     );
 }
 
-// --- H-5: bo STATE / COS alarms ---
+// --- bo STATE / COS alarms ---
 
 #[test]
 fn bo_state_alarm_osv() {
@@ -106,7 +106,7 @@ fn bo_high_one_shot_resets_val() {
     assert_eq!(rec.val, 0, "momentary bo returns to Done after HIGH");
 }
 
-// --- H-7: bi STATE alarm ---
+// --- bi STATE alarm ---
 
 #[test]
 fn bi_state_alarm_zsv() {
@@ -149,7 +149,7 @@ fn bi_cos_alarm_fires_on_change() {
     assert_eq!(common2.nsev, AlarmSeverity::NoAlarm);
 }
 
-// --- H-7: mbbi STATE alarm from per-state severity ---
+// --- mbbi STATE alarm from per-state severity ---
 
 #[test]
 fn mbbi_state_alarm_per_state() {
@@ -168,7 +168,7 @@ fn mbbi_state_alarm_per_state() {
     assert_eq!(common.nsta, alarm_status::STATE_ALARM);
 }
 
-// --- H-8: mbbo STATE alarm + SOFT_ALARM on illegal VAL ---
+// --- mbbo STATE alarm + SOFT_ALARM on illegal VAL ---
 
 #[test]
 fn mbbo_soft_alarm_on_illegal_val() {
@@ -192,7 +192,7 @@ fn mbbo_state_alarm_per_state() {
     assert_eq!(common.nsta, alarm_status::STATE_ALARM);
 }
 
-// --- H-9 / M-1: sel SELN range check + UDF propagation ---
+// --- sel SELN range check + UDF propagation ---
 
 #[test]
 fn sel_specified_out_of_range_raises_soft_alarm() {
@@ -237,7 +237,7 @@ fn sel_specified_selects_input_and_nan_marks_undefined() {
     assert!(rec.value_is_undefined());
 }
 
-// --- M-4: sel High/Low/Median update SELN ---
+// --- sel High/Low/Median update SELN ---
 
 #[test]
 fn sel_high_signal_updates_seln() {
@@ -275,7 +275,7 @@ fn sel_median_sets_seln_to_count() {
     assert_eq!(rec.seln, 3, "SELN = number of valid inputs");
 }
 
-// --- M-5: sel Median with no valid inputs → NaN / undefined ---
+// --- sel Median with no valid inputs → NaN / undefined ---
 
 #[test]
 fn sel_median_empty_yields_undefined() {
@@ -329,7 +329,7 @@ fn sel_low_empty_yields_pos_inf_udf_clear() {
     );
 }
 
-// --- M-2: sel limit alarms ---
+// --- sel limit alarms ---
 
 #[test]
 fn sel_high_limit_alarm() {
@@ -376,7 +376,7 @@ fn sel_hihi_limit_alarm_takes_priority() {
     assert_eq!(common.nsta, alarm_status::HIHI_ALARM);
 }
 
-// --- M-3: dfanout limit alarms ---
+// --- dfanout limit alarms ---
 
 #[test]
 fn dfanout_low_limit_alarm() {
@@ -458,7 +458,7 @@ fn dfanout_output_links_preserved() {
     assert_eq!(links, vec!["REC_A", "REC_P"]);
 }
 
-// --- M-3: dfanout MDEL/ADEL fields exposed for framework deadband ---
+// --- dfanout MDEL/ADEL fields exposed for framework deadband ---
 
 #[test]
 fn dfanout_exposes_deadband_fields() {

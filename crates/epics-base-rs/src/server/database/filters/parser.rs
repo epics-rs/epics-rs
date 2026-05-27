@@ -42,7 +42,7 @@ pub struct ParsedChannelName {
 
 /// Split a raw channel name into the `record_path` + JSON suffix.
 ///
-/// BR-R40 / pvxs `test:ai.VAL{"dbnd":{"d":0.0}}`: the suffix
+/// pvxs `test:ai.VAL{"dbnd":{"d":0.0}}`: the suffix
 /// begins at the first `{` regardless of whether a separating `.`
 /// precedes it. EPICS PV names never contain `{`, so the first
 /// `{` is unambiguous. Accepts every pvxs-compatible form:
@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"dbnd":{"d":0.5}}"#));
     }
 
-    /// BR-R40 / pvxs `test:ai.VAL{...}` (no separating `.`): the
+    /// pvxs `test:ai.VAL{...}` (no separating `.`): the
     /// first `{` always begins the suffix, the optional `.`
     /// immediately before it is consumed so the record_path is
     /// clean.
@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"dbnd":{"d":0.0}}"#));
     }
 
-    /// BR-R40: `RECORD{...}` without any field component.
+    /// `RECORD{...}` without any field component.
     #[test]
     fn split_record_directly_followed_by_filter() {
         let p = split_channel_name(r#"TEMP{"arr":{"s":0,"i":1,"e":4}}"#);

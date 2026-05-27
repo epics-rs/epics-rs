@@ -227,7 +227,7 @@ pub struct DbSubscription {
     /// `recv*` can pull any pending coalesced overflow event the
     /// producer stashed when the bounded mpsc was full. Without this,
     /// in-process consumers (pvalink, gateway, qsrv) silently dropped
-    /// the latest event of every burst-overrun (F8). The CA TCP
+    /// the latest event of every burst-overrun. The CA TCP
     /// dispatcher already drains coalesced via `pop_coalesced`; this
     /// puts every consumer on the same path.
     record: std::sync::Arc<tokio::sync::RwLock<crate::server::record::RecordInstance>>,
@@ -264,7 +264,7 @@ impl DbSubscription {
         Self::subscribe_with_mask_and_filters(db, pv_name, ignore_origin, mask, None).await
     }
 
-    /// BR-R40: subscribe with both a custom event mask and an
+    /// Subscribe with both a custom event mask and an
     /// optional pvxs-compatible channel filter chain. The chain's
     /// filters are attached to the new subscriber so the per-event
     /// filter framework gates / transforms events at posting time

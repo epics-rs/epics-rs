@@ -133,7 +133,7 @@ impl SubscriptionFilter for DeadbandFilter {
         // `recGblCheckDeadband` re-adds `mask & (DBE_VALUE|DBE_LOG)` only
         // when `delta > deadband`. So VALUE *and* LOG are deadband-gated;
         // only ALARM / PROPERTY (446e0d4a) bypass the deadband. Stripping
-        // LOG here too is what stops BR-R52's widened `VALUE|LOG` emission
+        // LOG here too is what stops the widened `VALUE|LOG` emission
         // mask from defeating the `.{dbnd}` filter on every value change.
         let bypass =
             EventMask::from_bits(event.mask.bits() & !(EventMask::VALUE | EventMask::LOG).bits());
@@ -288,7 +288,7 @@ mod tests {
         assert!(f.apply(ev(50.5, EventMask::VALUE)).is_none());
     }
 
-    /// BR-R52 regression — the value-change emission mask was widened
+    /// Regression — the value-change emission mask was widened
     /// to `VALUE|LOG` (C-faithful, gateVc.cc posts VALUE|ALARM|LOG).
     /// dbnd MUST strip LOG as well as VALUE before the deadband test
     /// (C `dbnd.c:84`: `send = pfl->mask & ~(DBE_VALUE|DBE_LOG)`);

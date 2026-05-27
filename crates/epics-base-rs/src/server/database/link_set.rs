@@ -147,7 +147,7 @@ pub trait LinkSet: Send + Sync {
     /// `0 = NO_ALARM`, `1 = READ`, … `17 = COMM`, …) from the upstream
     /// PV, when available.
     ///
-    /// BRIDGE-FR-3: used to honour the `MSS` (maximize-severity-and-
+    /// used to honour the `MSS` (maximize-severity-and-
     /// status) link modifier — the owning record then adopts the remote
     /// STAT instead of the generic `LINK_ALARM`. `None` means the lset
     /// cannot report a remote status (no cache, or the link set does not

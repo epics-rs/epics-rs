@@ -51,12 +51,12 @@ impl PvDatabase {
     /// Set a PV value or record field, notifying subscribers.
     /// Tries record put_field first, then put_common_field as fallback.
     ///
-    /// Acquires the record's BR-R15 advisory write gate.
+    /// Acquires the record's advisory write gate.
     pub async fn put_pv(&self, name: &str, value: EpicsValue) -> CaResult<()> {
         self.put_pv_inner(name, value, true).await
     }
 
-    /// BR-R15: `put_pv` variant for a caller already holding the
+    /// `put_pv` variant for a caller already holding the
     /// record's advisory write gate (QSRV atomic group PUT). See
     /// [`Self::put_record_field_from_ca_already_locked`].
     pub async fn put_pv_already_locked(&self, name: &str, value: EpicsValue) -> CaResult<()> {
@@ -86,7 +86,7 @@ impl PvDatabase {
                 .resolve_alias(base)
                 .await
                 .unwrap_or_else(|| base.to_string());
-            // BR-R15: advisory write gate (`dbScanLock` analogue) so a
+            // advisory write gate (`dbScanLock` analogue) so a
             // plain `put_pv` to a backing record cannot interleave
             // with an atomic group transaction holding the same gate.
             // Skipped when the caller already owns the gate.
@@ -173,7 +173,7 @@ impl PvDatabase {
                 CommonFieldPutResult::NoChange => {}
             }
 
-            // R2-91: mirror the CA-write path's ASG-field notifier so
+            // mirror the CA-write path's ASG-field notifier so
             // restore scripts / autosave / admin tools that go via
             // `put_pv` (not `put_record_field_from_ca`) also trigger
             // per-client `reeval_access_rights`. C `dbAccess.c::
@@ -257,7 +257,7 @@ impl PvDatabase {
         }
 
         if let Some(rec) = self.get_record(base).await {
-            // MR-R5: `put_pv_and_post` is a public record-write API —
+            // `put_pv_and_post` is a public record-write API —
             // it must take the same advisory write gate
             // (`dbScanLock` analogue) as `put_pv` /
             // `put_record_field_from_ca`, or a gateway/sequencer
@@ -381,7 +381,7 @@ impl PvDatabase {
                 }
             }
 
-            // R2-91: same SPC_AS parity as `put_pv` / `put_pv_no_process`
+            // same SPC_AS parity as `put_pv` / `put_pv_no_process`
             // / the CA-write path — a gateway mirroring `.ASG` via
             // `put_pv_and_post` must still trigger per-client
             // re-eval.
@@ -398,7 +398,7 @@ impl PvDatabase {
     /// CA client's unified entry point for record field put.
     /// Handles DISP/PROC/PACT/LCNT checks, field put, device write, and Passive process.
     ///
-    /// Acquires the record's BR-R15 advisory write gate
+    /// Acquires the record's advisory write gate
     /// (`dbScanLock` analogue) for the duration of the write.
     pub async fn put_record_field_from_ca(
         &self,
@@ -410,7 +410,7 @@ impl PvDatabase {
             .await
     }
 
-    /// BR-R15: variant for a caller that already owns the target
+    /// Variant for a caller that already owns the target
     /// record's advisory write gate — the QSRV atomic group PUT,
     /// which acquired every member-record gate up-front via
     /// [`Self::lock_records`]. The per-record `tokio::sync::Mutex`
@@ -456,7 +456,7 @@ impl PvDatabase {
             record_name
         };
 
-        // BR-R15: take the record's advisory write gate — the
+        // take the record's advisory write gate — the
         // `dbScanLock(precord)` analogue. While a QSRV atomic group
         // PUT/GET holds this record's gate via `lock_records`, this
         // plain write blocks here, so a direct backing-record write
@@ -513,7 +513,7 @@ impl PvDatabase {
                     }
                 }
                 let mut visited = HashSet::new();
-                // MR-R5: this PROC trigger already holds `record_name`'s
+                // this PROC trigger already holds `record_name`'s
                 // advisory write gate — either `_record_gate` above, or
                 // the QSRV atomic group's `lock_records` epoch when
                 // entered via `put_record_field_from_ca_already_locked`.
@@ -684,7 +684,7 @@ impl PvDatabase {
 
             common_result
         };
-        // R2-54: ASG-field change re-evaluation hook. C
+        // ASG-field change re-evaluation hook. C
         // `asDbLib.c:107-110,144` `asSpcAsCallback` invokes
         // `asChangeGroup` → `asAddMemberPvt` → `asComputePvt` for
         // every `ASGCLIENT` on `dbPut record.ASG NEW_ASG`. Pre-fix
@@ -809,7 +809,7 @@ impl PvDatabase {
         // Process the record after field put.
         {
             let mut visited = HashSet::new();
-            // MR-R5: `record_name`'s advisory write gate is already
+            // `record_name`'s advisory write gate is already
             // held by this `put` (the `_record_gate` taken above, or
             // the QSRV atomic group's `lock_records` epoch via
             // `put_record_field_from_ca_already_locked`). The gate
@@ -871,7 +871,7 @@ impl PvDatabase {
 
         // Records — alias-aware (epics-base PR #336).
         if let Some(rec) = self.get_record(base).await {
-            // MR-R5: `put_pv_no_process` is a public record-write API
+            // `put_pv_no_process` is a public record-write API
             // (autosave restore). It must take the advisory write gate
             // (`dbScanLock` analogue) so an autosave restore cannot
             // land between the member writes of a QSRV atomic group or
@@ -896,7 +896,7 @@ impl PvDatabase {
             // Invalidate metadata cache only if the metadata-class
             // field actually changed (faac1df1).
             instance.notify_field_written_if_changed(&field, prev_value.as_ref());
-            // R2-91: same SPC_AS parity as `put_pv` / the CA-write
+            // same SPC_AS parity as `put_pv` / the CA-write
             // path — autosave-style restores writing `.ASG` at IOC
             // startup must still trigger per-client re-eval.
             if field == "ASG" {
@@ -936,10 +936,10 @@ mod tests {
         assert!(matches!(pv.get().await, EpicsValue::Double(v) if v == 42.0));
     }
 
-    /// Round-10 regression: `get_pv`, `put_pv`, `put_pv_and_post`,
+    /// Regression: `get_pv`, `put_pv`, `put_pv_and_post`,
     /// and `put_pv_no_process` all bypassed `get_record` and walked
     /// `self.inner.records` directly, so alias names from epics-base
-    /// PR #336 silently returned `ChannelNotFound`. Round-7 closed
+    /// PR #336 silently returned `ChannelNotFound`. A later fix closed
     /// `get_record` but the same defect was hiding in field_io.rs.
     /// All four CA-server-and-bridge entry points must accept aliases.
     #[tokio::test]
@@ -979,7 +979,7 @@ mod tests {
         assert!(matches!(v, EpicsValue::Double(x) if x == 13.0));
     }
 
-    /// Round-10 regression: `put_record_field_from_ca` (the CA
+    /// Regression: `put_record_field_from_ca` (the CA
     /// server's main put fast path) must accept aliases. Pre-fix it
     /// only consulted `inner.records` directly. Also exercises the
     /// canonical-name normalisation that protects subsequent

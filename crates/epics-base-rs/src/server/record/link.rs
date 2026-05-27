@@ -131,7 +131,7 @@ pub struct DbLink {
 
 /// A Channel Access / PV Access external link to a remote PV.
 ///
-/// BRIDGE-FR-3: carries the parsed `MS`/`NMS`/`MSI`/`MSS` maximize-
+/// carries the parsed `MS`/`NMS`/`MSI`/`MSS` maximize-
 /// severity policy alongside the PV name, so the alarm gate is applied
 /// at the record-processing boundary (uniform with [`DbLink`]) rather
 /// than discarded as syntax. Mirrors the C link option parsed by
@@ -246,7 +246,7 @@ impl ParsedLink {
     /// PV name of an external (`Ca`/`Pva`) link, else `None`. Lets a
     /// caller read the remote name uniformly without matching the two
     /// variants' differing payload shapes (`Ca` carries a [`CaLink`],
-    /// `Pva` a bare `String`). BRIDGE-FR-3.
+    /// `Pva` a bare `String`).
     pub fn external_pv_name(&self) -> Option<&str> {
         match self {
             ParsedLink::Ca(ca) => Some(&ca.pv),
@@ -260,7 +260,6 @@ impl ParsedLink {
     /// encode it in a stripped `?sevr=` query the lset retains, so they
     /// report `None` here (the lset gate stands in). Used by record
     /// processing to apply the MS/NMS/MSI/MSS gate at the fold boundary.
-    /// BRIDGE-FR-3.
     pub fn monitor_switch(&self) -> Option<MonitorSwitch> {
         match self {
             ParsedLink::Db(db) => Some(db.monitor_switch),
@@ -318,7 +317,7 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
             let (pv, query) = extract_pv_and_opts_from_subobject(rest)?;
             if key == "ca" {
                 // JSON CA links carry no plain-text MS modifier; the
-                // alarm policy defaults to NoMaximize (BRIDGE-FR-3).
+                // alarm policy defaults to NoMaximize.
                 Some(ParsedLink::Ca(CaLink::new(pv)))
             } else if query.is_empty() {
                 Some(ParsedLink::Pva(pv))
@@ -455,7 +454,7 @@ fn try_parse_hw_link(s: &str) -> Option<ParsedLink> {
 /// switch, and whether a bare ` CA` modifier forced a CA link. Modifiers
 /// may appear in any order (`"REC.FIELD NPP NMS"`, `"REC CP"`, …).
 ///
-/// BRIDGE-FR-3: shared by the legacy plain-text path *and* the `ca://`
+/// shared by the legacy plain-text path *and* the `ca://`
 /// scheme path so `ca://PV MS` parses the `MS` modifier instead of
 /// folding it into the PV name. The bare ` CA` modifier forces a
 /// `pv_link` to a CA link (C `dbStaticLib.c:2372`); it may co-occur with
@@ -552,7 +551,7 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
         return ParsedLink::None;
     }
 
-    // CA/PVA protocol links. BRIDGE-FR-3: a `ca://PV MS` link carries
+    // CA/PVA protocol links. a `ca://PV MS` link carries
     // the same trailing maximize-severity modifiers as the legacy form,
     // so strip them off the scheme body before storing the PV name —
     // otherwise `MS` would be folded into the PV name (`"PV MS"`). The
@@ -582,7 +581,7 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     // remaining `link_part` (the `record.field` PV name) verbatim,
     // never as a Constant or local Db link.
     if force_ca {
-        // BRIDGE-FR-3: a bare ` CA`-forced link carries the same
+        // a bare ` CA`-forced link carries the same
         // maximize-severity policy as any other link — store the parsed
         // `ms` so e.g. `REC.VAL CA MS` keeps its `MS` gate instead of
         // discarding it.
@@ -858,7 +857,7 @@ mod json_link_tests {
 
     #[test]
     fn ca_modifier_combined_with_pp_ms() {
-        // BRIDGE-FR-3: `CA` may co-occur with PP/MS-style modifiers in
+        // `CA` may co-occur with PP/MS-style modifiers in
         // any order. The PV name is stripped clean, AND the `MS`-class
         // modifier is now CARRIED in the CaLink (pre-fix it was
         // discarded, reducing both forms to a bare `Ca("REC.VAL")`).
@@ -887,7 +886,7 @@ mod json_link_tests {
 
     #[test]
     fn ca_scheme_link_parses_ms_modifier() {
-        // BRIDGE-FR-3: `ca://PV MS` must strip the modifier off the
+        // `ca://PV MS` must strip the modifier off the
         // scheme body — pre-fix the PV name became `"PV MS"`.
         assert_eq!(
             parse_link_v2("ca://SR:DCCT MS"),
@@ -926,7 +925,7 @@ mod json_link_tests {
         assert_eq!(link_field_type("REC.VAL PP"), LinkType::Db);
     }
 
-    /// BR-R10: JSON pvalink options survive parse_link_v2.
+    /// JSON pvalink options survive parse_link_v2.
     /// Upstream parity: pvxs pvalink_jlif.cpp:24-41, :69-196.
     #[test]
     fn br_r10_json_pva_options_preserved_in_parsed_link() {
@@ -951,7 +950,7 @@ mod json_link_tests {
         assert!(stored.contains("Q=8"), "Q option lost: {stored}");
     }
 
-    /// BR-R10: bare pvalink JSON with no extra options is unchanged.
+    /// Bare pvalink JSON with no extra options is unchanged.
     #[test]
     fn br_r10_json_pva_bare_pv_unchanged() {
         assert_eq!(

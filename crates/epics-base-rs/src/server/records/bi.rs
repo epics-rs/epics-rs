@@ -1,81 +1,6 @@
-use std::time::SystemTime;
-
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
-
-/// AFTC low-pass alarm-severity filter shared by `bi` and `mbbi`.
-///
-/// Mirrors C `biRecord.c::checkAlarms` / `mbbiRecord.c::checkAlarms`
-/// (epics-base PR #817): when `aftc > 0` the raw state severity is
-/// run through an exponential filter so a momentary state change does
-/// not raise an alarm until the signal has been in the alarm range for
-/// roughly `aftc` seconds. Returns `(filtered_alarm, new_afvl)`.
-///
-/// The accumulator (`AFVL`) is a *signed* low-pass value: each cycle
-/// contributes a unit `±1` sign — `-1` when the raw sample is
-/// `NO_ALARM`, `+1` otherwise — never the raw severity number. The
-/// final gate is sign-based: `afvl < 0` suppresses the alarm
-/// (returns `NO_ALARM`), `afvl >= 0` keeps the raw severity verbatim.
-///
-/// C algorithm (`biRecord.c::checkAlarms`):
-/// ```text
-/// if (afvl != 0.0) {
-///     alpha = aftc / (t + aftc);
-///     afvl = alpha*afvl + (1-alpha) * (alarm==NO_ALARM ? -1 : 1);
-/// } else {                          /* seed */
-///     afvl = (alarm==NO_ALARM ? -1 : 1);
-/// }
-/// if (afvl < 0) alarm = NO_ALARM;   /* else keep raw severity */
-/// ```
-/// The seed always produces `±1` (never `0.0`), so the seed branch
-/// runs exactly once — on the first sample after `AFVL` is zeroed.
-pub fn aftc_filter(
-    raw_alarm: u16,
-    aftc: f64,
-    afvl_in: f64,
-    time_last: SystemTime,
-    time_now: SystemTime,
-) -> (u16, f64) {
-    // C `biRecord.c:45` — `#define THRESHOLD 0.6321` (≈ 1 - 1/e).
-    const THRESHOLD: f64 = 0.6321;
-    // C `biRecord.c:246-247` — `double afvl = 0;`. When `aftc <= 0`
-    // the filter is disabled: C never enters the `if (aftc > 0)`
-    // block, so `prec->afvl` is assigned the local `afvl` which is
-    // still 0, and `alarm` keeps the raw severity.
-    if aftc <= 0.0 {
-        return (raw_alarm, 0.0);
-    }
-    // C `biRecord.c:251-252` — `if (afvl == 0) afvl = (double) alarm;`.
-    // Seed branch: the accumulator is loaded with the RAW severity
-    // (0/1/2); C leaves `alarm` unchanged this cycle, so the raw
-    // severity is what `recGblSetSevr` sees.
-    if afvl_in == 0.0 {
-        return (raw_alarm, raw_alarm as f64);
-    }
-    // C `biRecord.c:254-262` — exponential smoothing of the integer
-    // severity with a signed contribution and a fold-back on the
-    // fractional part.
-    let dt = time_now
-        .duration_since(time_last)
-        .unwrap_or_default()
-        .as_secs_f64();
-    let alpha = aftc / (dt + aftc);
-    // `afvl = alpha*afvl + ((afvl>0) ? (1-alpha) : (alpha-1)) * alarm`
-    let mut afvl = alpha * afvl_in
-        + if afvl_in > 0.0 {
-            1.0 - alpha
-        } else {
-            alpha - 1.0
-        } * (raw_alarm as f64);
-    // `if (afvl - floor(afvl) > THRESHOLD) afvl = -afvl;`
-    if afvl - afvl.floor() > THRESHOLD {
-        afvl = -afvl;
-    }
-    // `alarm = abs((int)floor(afvl));`
-    let alarm = afvl.floor().abs() as u16;
-    (alarm, afvl)
-}
 
 /// Binary input record matching C biRecord behavior.
 /// RVAL from device support is converted to VAL (0 or 1).
@@ -293,7 +218,7 @@ impl Record for BiRecord {
         }
         let state_sev = if val == 0 { self.zsv } else { self.osv };
         // AFTC low-pass filter on the state severity (PR #817).
-        let (filtered, new_afvl) = aftc_filter(
+        let (filtered, new_afvl) = super::alarm_filter::aftc_filter(
             state_sev as u16,
             self.aftc,
             self.afvl,

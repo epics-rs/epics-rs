@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod alarm_filter;
 pub mod ao;
 pub mod asub_record;
 pub mod asyn_record;

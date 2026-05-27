@@ -1327,7 +1327,7 @@ fn test_bi_aftc_delays_alarm_clear() {
     use std::time::Duration;
 
     // Direct unit test of the filter primitive across cycles.
-    use epics_base_rs::server::records::bi::aftc_filter;
+    use epics_base_rs::server::records::alarm_filter::aftc_filter;
     let aftc = 10.0;
     let t0 = std::time::SystemTime::UNIX_EPOCH;
 

@@ -702,7 +702,7 @@ impl Record for MbbiRecord {
         } else {
             self.state_severities()[val as usize]
         };
-        let (filtered, new_afvl) = super::bi::aftc_filter(
+        let (filtered, new_afvl) = super::alarm_filter::aftc_filter(
             raw_sev as u16,
             self.aftc,
             self.afvl,

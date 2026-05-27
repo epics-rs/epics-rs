@@ -182,9 +182,18 @@ impl CommandRegistry {
 /// C++ syntax: `command("arg1", arg2, $(VAR))` — parens delimit args, commas separate.
 /// Legacy syntax: `command "arg1" arg2` — whitespace separates.
 ///
-/// `$(VAR)` references are resolved from environment variables in all tokens.
+/// `$(VAR)` references are resolved from environment variables.
+///
+/// C parity (`iocsh.cpp:1184` `macDefExpand` → `:1215` `tokenize.split`):
+/// macros are expanded across the WHOLE line *before* it is split into
+/// words, not per-token afterwards. So a macro whose value contains a
+/// separator (`$(CMD)` with `CMD="dbpr REC 2"`) is re-tokenized into
+/// multiple words, and a leading `$(MACRO)` at command position resolves
+/// before the command name is taken. (A per-token expansion would instead
+/// mis-split the leading `$(` and leave a multi-word value as one token.)
 pub(crate) fn tokenize(line: &str) -> Vec<String> {
-    let line = line.trim();
+    let expanded = substitute_env_vars(line);
+    let line = expanded.trim();
     if line.is_empty() {
         return Vec::new();
     }
@@ -208,7 +217,9 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    let mut tokens = vec![substitute_env_vars(cmd_name)];
+    // Macros were already expanded on the whole line above, so the
+    // tokens are pushed verbatim (no per-token substitution).
+    let mut tokens = vec![cmd_name.to_string()];
 
     if has_parens {
         // C++ syntax: command(arg1, arg2, ...)
@@ -220,14 +231,14 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
 
         if !args_str.trim().is_empty() {
             for arg in split_comma_args(args_str) {
-                tokens.push(substitute_env_vars(&arg));
+                tokens.push(arg);
             }
         }
     } else {
         // Legacy space-separated syntax
         let rest = &line[cmd_end..];
         for arg in split_space_args(rest) {
-            tokens.push(substitute_env_vars(&arg));
+            tokens.push(arg);
         }
     }
 
@@ -676,6 +687,23 @@ mod tests {
             tokenize(r#"cmd($(UNLIKELY_VAR_XYZ))"#),
             vec!["cmd", "$(UNLIKELY_VAR_XYZ)"]
         );
+    }
+
+    #[test]
+    fn test_tokenize_expands_whole_line_before_split() {
+        // C `iocsh.cpp:1184` macDefExpand runs on the whole line before
+        // `:1215` split, so a macro value containing separators is
+        // re-tokenized. A per-token expansion would leave "dbpr REC 2"
+        // as a single bad token and mis-split the leading "$(".
+        unsafe { std::env::set_var("_TEST_TOK_MULTIWORD", "dbpr REC 2") };
+        // Leading macro at command position expands then splits.
+        assert_eq!(tokenize("$(_TEST_TOK_MULTIWORD)"), vec!["dbpr", "REC", "2"]);
+        // …and trailing words after the macro are kept as separate tokens.
+        assert_eq!(
+            tokenize("$(_TEST_TOK_MULTIWORD) EXTRA"),
+            vec!["dbpr", "REC", "2", "EXTRA"]
+        );
+        unsafe { std::env::remove_var("_TEST_TOK_MULTIWORD") };
     }
 
     #[test]

@@ -663,7 +663,7 @@ impl BridgeProvider {
     pub fn set_access_control(&self, access: Arc<dyn AccessControl>) {
         // Storage is `Arc<RwLock<Arc<dyn AccessControl>>>` so an
         // immutable receiver is correct — `&mut self` blocked
-        // hot-reload through `Arc<BridgeProvider>` (P-G17).
+        // hot-reload through `Arc<BridgeProvider>`.
         *self.access_cell.write() = access;
     }
 

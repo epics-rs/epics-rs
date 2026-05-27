@@ -284,7 +284,7 @@ async fn drain_to_latest(
     last
 }
 
-/// G-G2: when `control_prefix` is set, downstream clients should be
+/// when `control_prefix` is set, downstream clients should be
 /// able to `pvget <prefix>:cacheSize` and read the live cache entry
 /// count without that name being forwarded upstream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -357,7 +357,7 @@ async fn gateway_control_prefix_cache_size() {
     assert!(v >= 1, "cacheSize should reflect the proxied PV; got {v}");
 }
 
-/// G-G1: a multi-tenant gateway with two upstreams (each holding a
+/// a multi-tenant gateway with two upstreams (each holding a
 /// distinct PV) and one downstream that proxies both. Verifies
 /// per-upstream isolation: PV "A:VAL" is only on upstream A, PV
 /// "B:VAL" only on B, and a single downstream client reaches both

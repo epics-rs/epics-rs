@@ -1,4 +1,4 @@
-//! G-G2: runtime-control PVs exposed under a configurable prefix.
+//! runtime-control PVs exposed under a configurable prefix.
 //!
 //! Mirrors `pva2pva` `ServerConfig::control_prefix` semantics — when an
 //! operator sets a non-empty prefix on the gateway, a small set of

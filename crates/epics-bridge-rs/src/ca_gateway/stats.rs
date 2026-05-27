@@ -27,7 +27,7 @@
 //! | `<prefix>readOnlyRejects` | Long | Puts rejected because read_only=true |
 //! | `<prefix>perHostConnections` | Long | Distinct downstream client hosts |
 //!
-//! C++ ca-gateway compatibility aliases (B-G10) — kept so dashboards
+//! C++ ca-gateway compatibility aliases — kept so dashboards
 //! and scripts written against the C source's `gateServer.cc:1903-1965`
 //! names keep working against the Rust gateway:
 //!
@@ -203,7 +203,7 @@ impl Stats {
             ("putCount", EpicsValue::Long(0)),
             ("readOnlyRejects", EpicsValue::Long(0)),
             ("perHostConnections", EpicsValue::Long(0)),
-            // B-G10: aliases matching C++ ca-gateway (gateServer.cc:
+            // aliases matching C++ ca-gateway (gateServer.cc:
             // 1903-1965) so dashboards/scripts written against the C
             // names keep working. Connected = active + inactive
             // (both are "upstream is alive"). pvtotal = total_pv (cache
@@ -264,7 +264,7 @@ impl Stats {
         }
 
         // Compute counts by state via the single-pass count_states
-        // helper (B-G13). Snapshot inside count_states releases the
+        // helper. Snapshot inside count_states releases the
         // per-entry Arc borrows once collected, so the outer
         // `cache.read().await` doesn't span the per-entry awaits.
         let cache_guard = cache.read().await;
@@ -332,7 +332,7 @@ impl Stats {
         let n_put = format!("{p}putCount");
         let n_readonly = format!("{p}readOnlyRejects");
         let n_hosts = format!("{p}perHostConnections");
-        // C++ ca-gateway aliases (B-G10).
+        // C++ ca-gateway aliases.
         let n_vctotal = format!("{p}vctotal");
         let n_pvtotal = format!("{p}pvtotal");
         let n_connected = format!("{p}connected");

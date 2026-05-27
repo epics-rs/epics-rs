@@ -82,7 +82,7 @@ pub struct GwPvEntry {
     pub state_since: Instant,
     /// Total events received from upstream (for stats).
     pub event_count: u64,
-    /// B-G14: cumulative time spent in any "upstream alive" state
+    /// cumulative time spent in any "upstream alive" state
     /// (Inactive or Active). Updated by `set_state` whenever the
     /// previous state was alive and we transition out.
     pub total_alive: Duration,
@@ -107,7 +107,7 @@ impl GwPvEntry {
     }
 
     /// Transition to a new state and reset the state timestamp.
-    /// B-G14: also accumulate the elapsed time into `total_alive`
+    /// also accumulate the elapsed time into `total_alive`
     /// or `total_dead` based on the previous state, so operators
     /// can read per-PV uptime histograms via gateway stats.
     pub fn set_state(&mut self, new: PvState) {
@@ -246,7 +246,7 @@ impl PvCache {
 
     /// Count entries by state.
     ///
-    /// B-G13: snapshots the per-entry Arcs first so the outer cache
+    /// snapshots the per-entry Arcs first so the outer cache
     /// `&self` borrow (and therefore any caller-held outer
     /// `RwLock<PvCache>` read guard) is released before we begin
     /// awaiting per-entry RwLocks. Without the snapshot, every

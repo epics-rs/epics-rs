@@ -49,7 +49,7 @@ pub struct PvaGatewayConfig {
     /// Hard cap on simultaneous downstream subscriber bridge tasks
     /// across all peers. Default 100 000.
     pub max_subscribers: usize,
-    /// G-G2: optional namespace prefix for runtime-control PVs. When
+    /// optional namespace prefix for runtime-control PVs. When
     /// `Some(prefix)`, the gateway exposes a small set of read-only
     /// diagnostic PVs alongside the proxied namespace:
     ///
@@ -229,7 +229,7 @@ impl PvaGateway {
 
         let acl_layer = AclLayer::new(acl_cfg).layer(source.clone());
 
-        // G-G2: when control_prefix is set, run the proxy and the
+        // when control_prefix is set, run the proxy and the
         // diagnostic PVs through a CompositeSource. The control source
         // is registered at order=-100 so its PV-name lookups always
         // win over the proxy (which would otherwise try to forward

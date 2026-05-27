@@ -965,7 +965,7 @@ impl ChannelCache {
                 pause_for_task.clear();
                 // upstream disconnected — emit INVALID alarm once per
                 // outage cycle so downstream PVA monitors see the disconnect
-                // via alarm severity (matching the CA gateway's B-G11
+                // via alarm severity (matching the CA gateway's
                 // INVALID+LINK_ALARM design). The subscription stays alive for
                 // transparent reconnect; the first real upstream event after
                 // reconnect overwrites the INVALID state via the normal

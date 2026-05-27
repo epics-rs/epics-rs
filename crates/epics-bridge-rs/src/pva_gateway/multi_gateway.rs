@@ -1,4 +1,4 @@
-//! G-G1: multi-tenant PVA gateway.
+//! multi-tenant PVA gateway.
 //!
 //! pva2pva-style "N upstream × M downstream" topology in a single
 //! process. Each downstream `PvaServer` selects a subset of the

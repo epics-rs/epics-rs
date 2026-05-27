@@ -78,7 +78,7 @@ pub struct CommandHandler {
     /// Upstream subscription manager. ReloadPvList walks this on a
     /// pvlist edit and unsubscribes any PVs that no longer match —
     /// without the unsubscribe step, removed entries leak shadow
-    /// PVs and upstream channels until restart (B-G12).
+    /// PVs and upstream channels until restart.
     upstream: Option<Arc<UpstreamManager>>,
     pvlist_path: Option<PathBuf>,
     access_path: Option<PathBuf>,
@@ -103,7 +103,7 @@ impl CommandHandler {
     }
 
     /// Attach the upstream manager so ReloadPvList can prune
-    /// subscriptions for removed PVs (B-G12). Must be called before
+    /// subscriptions for removed PVs. Must be called before
     /// the handler is used; cache-stat commands work without it.
     pub fn with_upstream(mut self, upstream: Arc<UpstreamManager>) -> Self {
         self.upstream = Some(upstream);
@@ -185,7 +185,7 @@ impl CommandHandler {
         }
     }
 
-    /// Reload the pvlist file and prune now-denied PVs (B-G12). Returns
+    /// Reload the pvlist file and prune now-denied PVs. Returns
     /// `Some((rule_count, pruned))` after a reload, or `None` if no
     /// pvlist path is configured.
     ///

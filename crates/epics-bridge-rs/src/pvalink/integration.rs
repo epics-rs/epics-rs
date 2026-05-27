@@ -909,7 +909,7 @@ impl LinkSet for PvaLinkResolver {
             lazy_register_out_opts(&self.out_link_options, full);
         }
         let cfg = self.out_cfg_for(full);
-        // P-G16: bypass the Display→string→parse round-trip for
+        // bypass the Display→string→parse round-trip for
         // ARRAYS (where Display alloc is O(N_elements * digits) and
         // pvput re-parses 25 MB strings on a 1 M-element waveform).
         // SCALARS keep the string path so the text is coerced against

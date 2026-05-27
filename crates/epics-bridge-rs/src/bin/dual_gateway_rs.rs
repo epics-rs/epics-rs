@@ -120,7 +120,7 @@ struct Args {
     #[arg(long, default_value_t = 30)]
     pva_cleanup_interval_secs: u64,
 
-    /// PVA control_prefix for runtime-diagnostic PVs (G-G2). Empty
+    /// PVA control_prefix for runtime-diagnostic PVs. Empty
     /// disables the feature.
     #[arg(long, default_value = "")]
     pva_control_prefix: String,

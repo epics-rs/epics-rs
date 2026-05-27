@@ -234,7 +234,7 @@ impl GatewayServer {
             .map(|p| Arc::new(PutLog::new(p.clone())));
 
         // Beacon anomaly throttle — constructed BEFORE UpstreamManager
-        // so every per-PV WriteHookEnv captures it (B-G9: the
+        // so every per-PV WriteHookEnv captures it (the
         // forwarding task fires `request()` on upstream reconnect to
         // tell other gateway-aware downstream clients to re-search).
         // The pulse handle (CaServer beacon-reset Notify) is wired in
@@ -394,7 +394,7 @@ impl GatewayServer {
                         return false;
                     }
 
-                    // 3. B-G9: trigger a beacon anomaly so other
+                    // 3. trigger a beacon anomaly so other
                     //    gateway-aware downstream clients re-search
                     //    and discover this gateway as the server for
                     //    the just-added PV. Mirrors C++ ca-gateway
@@ -682,7 +682,7 @@ impl GatewayServer {
         };
 
         // Run downstream CaServer until either the server returns
-        // (fatal I/O) or SIGINT/SIGTERM arrives (B-G15: graceful
+        // (fatal I/O) or SIGINT/SIGTERM arrives (graceful
         // shutdown). On signal we tear down upstream subscriptions
         // first so the upstream IOC sees a clean disconnect, then
         // abort the auxiliary tasks.

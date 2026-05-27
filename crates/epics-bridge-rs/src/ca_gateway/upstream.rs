@@ -105,7 +105,7 @@ struct WriteHookEnv {
     /// aware downstream clients re-search and discover this gateway as
     /// the server for the just-added PV) and from upstream-reconnect
     /// transitions in the forwarding task. Mirrors C++ ca-gateway's
-    /// `gateServer::generateBeaconAnomaly` (B-G9).
+    /// `gateServer::generateBeaconAnomaly`.
     beacon_anomaly: Arc<super::beacon::BeaconAnomaly>,
 }
 
@@ -517,7 +517,7 @@ impl UpstreamManager {
                         transitioned_from_disconnect = was_disconnect;
                     }
 
-                    // B-G9: trigger a beacon anomaly when the upstream
+                    // trigger a beacon anomaly when the upstream
                     // reconnects so other gateway-aware clients
                     // re-discover and the downstream side knows the
                     // gateway is alive again. Mirrors C++ ca-gateway
@@ -558,7 +558,7 @@ impl UpstreamManager {
                 // state, and surface an INVALID alarm on the shadow
                 // PV so downstream clients see the disconnect in
                 // their alarm severity rather than continuing to
-                // observe the last value at NoAlarm (B-G11). C++
+                // observe the last value at NoAlarm. C++
                 // ca-gateway deletes the VC on Active→Disconnect
                 // which yields ECA_DISCONN; the alarm-post route is
                 // less disruptive and equivalent in operator visibility.
@@ -921,7 +921,7 @@ async fn log_denial(env: &WriteHookEnv, ctx: &WriteContext, pv: &str, value: &st
 /// in operator-facing audits; full-fidelity tracing belongs
 /// elsewhere.
 fn format_value_for_audit(v: &EpicsValue, max_len: usize) -> String {
-    // B-G16: bound the formatted-string allocation BEFORE running
+    // bound the formatted-string allocation BEFORE running
     // Display::fmt over the whole value. The previous
     // `format!("{v}")` ran the full Display implementation first
     // (every element of a million-element waveform) then truncated

@@ -740,6 +740,29 @@ fn send_frame(
     }
 }
 
+/// Build one CA identity frame — `CA_PROTO_CLIENT_NAME` (user name) or
+/// `CA_PROTO_HOST_NAME` (host name) — carrying `value` as a NUL-padded
+/// string payload.
+///
+/// Single source of the on-wire identity-frame shape, used by the
+/// connect-time handshake ([`build_client_handshake`]). C
+/// `libca/tcpiiu.cpp::userNameSetRequest` / `hostNameSetRequest` route
+/// through `comQueSend::insertRequestHeader`; `set_payload_size` +
+/// `to_bytes_extended` reproduce its header, emitting the extended-size
+/// annex for payloads over 16 bits. In practice libca asserts
+/// `postSize < 0xffff` for these names and the IOC caps a name at 512
+/// bytes, so a real user/host never reaches the annex — the extended
+/// path is only defensive. The point of one shared builder is that the
+/// header encoding lives in exactly one place.
+pub(crate) fn build_identity_frame(cmd: u16, value: &str) -> Vec<u8> {
+    let payload = pad_string(value);
+    let mut hdr = CaHeader::new(cmd);
+    hdr.set_payload_size(payload.len(), 0);
+    let mut frame = hdr.to_bytes_extended();
+    frame.extend_from_slice(&payload);
+    frame
+}
+
 /// Build the three-frame CA client handshake (VERSION, CLIENT_NAME,
 /// HOST_NAME) for a circuit at `priority`.
 ///
@@ -755,36 +778,12 @@ fn send_frame(
 /// frame-byte-exact wire captures (Wireshark CA dissector, fuzzers)
 /// diverge.
 ///
-/// the VERSION message carries the requested CA priority in its
+/// The VERSION message carries the requested CA priority in its
 /// `m_dataType` field — libca `tcpiiu::versionMessage`
 /// (`tcpiiu.cpp:1393-1397`) passes `priority` as the dataType and
 /// `CA_MINOR_PROTOCOL_REVISION` as the count. Pre-fix Rust left dataType
 /// at 0 (priorityDefault), so a server could not see the client's
 /// requested priority.
-/// Build one CA identity frame — `CA_PROTO_CLIENT_NAME` (user name) or
-/// `CA_PROTO_HOST_NAME` (host name) — carrying `value` as a NUL-padded
-/// string payload.
-///
-/// Single source of the on-wire identity-frame shape, shared by both the
-/// connect-time handshake ([`build_client_handshake`]) and the
-/// runtime-rename broadcast (`CaClient::set_user_name` /
-/// `set_host_name`). C `libca/tcpiiu.cpp::userNameSetRequest` /
-/// `hostNameSetRequest` route through `comQueSend::insertRequestHeader`,
-/// which emits the extended-size annex when the payload exceeds 16 bits;
-/// `set_payload_size` + `to_bytes_extended` reproduce that. A separate
-/// hand-rolled builder that truncated the postsize via `as u16` while
-/// still writing the full payload is what desynchronised the circuit for
-/// an oversized USER/host value — keeping every identity frame on this
-/// one builder closes that family out.
-pub(crate) fn build_identity_frame(cmd: u16, value: &str) -> Vec<u8> {
-    let payload = pad_string(value);
-    let mut hdr = CaHeader::new(cmd);
-    hdr.set_payload_size(payload.len(), 0);
-    let mut frame = hdr.to_bytes_extended();
-    frame.extend_from_slice(&payload);
-    frame
-}
-
 fn build_client_handshake(priority: u8, identity: &super::types::ClientIdentitySlot) -> Vec<u8> {
     let mut handshake = Vec::new();
     let mut version_hdr = CaHeader::new(CA_PROTO_VERSION);
@@ -793,9 +792,9 @@ fn build_client_handshake(priority: u8, identity: &super::types::ClientIdentityS
     handshake.extend_from_slice(&version_hdr.to_bytes());
     // Snapshot the shared identity once. `CaClient::set_user_name` /
     // `set_host_name` mutate this slot at runtime, so a circuit formed
-    // after a rename handshakes with the new names; circuits already
-    // established are notified separately by an out-of-band identity
-    // frame.
+    // after a rename handshakes with the new names. Circuits already
+    // established keep their identity — the IOC rejects a name change
+    // once the circuit has created a channel.
     let (username, hostname) = {
         let id = identity.read();
         (id.user.clone(), id.host.clone())

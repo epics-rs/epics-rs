@@ -13,8 +13,10 @@
 //!
 //! Pipeline flow control: if `pipeline_size > 0`, the client periodically
 //! sends MONITOR_ACK (subcmd `0x80`) to keep the server's send window
-//! open. Default is 4 — every 4 events, ack 4. This matches pvxs's
-//! behaviour for pipelined monitors.
+//! open. The ACK is sent at the HALF-window mark (`ack_threshold`),
+//! matching pvxs's default `ackAt = queueSize/2` — replenishing only at
+//! the full window let the server window drain to 0 and stalled ~1 RTT
+//! every `pipeline_size` updates.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -43,6 +45,19 @@ fn alloc_ioid() -> u32 {
 
 /// Default pipeline window for monitors. Tuned to match pvxs.
 pub const DEFAULT_PIPELINE_SIZE: u32 = 4;
+
+/// MONITOR_ACK replenishment threshold for a pipeline window of
+/// `pipeline_size`. pvxs resolves `ackAt` to `queueSize/2` by default
+/// then clamps it to `[1, queueSize]` (`clientmon.cpp:801-808`), so the
+/// server's send window is replenished at the HALF-window mark — not
+/// when it has fully drained. Acking only at the full window let the
+/// window reach 0 and cost ~1 RTT of stall every `pipeline_size`
+/// updates under a sustained pipelined monitor. The `ackAny` pvRequest
+/// option (a server-chosen count / percent override) is not yet parsed
+/// by this client; the half-window default is the common case.
+fn ack_threshold(pipeline_size: u32) -> u32 {
+    (pipeline_size / 2).max(1)
+}
 
 /// Drop-guard for the per-IOID router entry.
 ///
@@ -1908,7 +1923,7 @@ where
                 st.max_queue = events_since_ack;
             }
         }
-        if pipeline_size > 0 && events_since_ack >= pipeline_size {
+        if pipeline_size > 0 && events_since_ack >= ack_threshold(pipeline_size) {
             let ack = codec.build_monitor_ack(sid, ioid, events_since_ack);
             if server.send(ack).await.is_err() {
                 server.unregister_ioid(ioid);
@@ -2326,7 +2341,7 @@ where
                     }
                 }
                 // (d was destructured above when computing `value`.)
-                if pipeline_size > 0 && events_since_ack >= pipeline_size {
+                if pipeline_size > 0 && events_since_ack >= ack_threshold(pipeline_size) {
                     let ack = codec.build_monitor_ack(sid, ioid, events_since_ack);
                     if server.send(ack).await.is_err() {
                         server.unregister_ioid(ioid);
@@ -3488,5 +3503,15 @@ mod tests {
             classify_raw_monitor_frame(&payload, ByteOrder::Little),
             RawMonitorFrameKind::Data
         ));
+    }
+
+    #[test]
+    fn ack_threshold_is_half_window_clamped_to_one() {
+        // pvxs default ackAt = queueSize/2, clamped to [1, queueSize].
+        assert_eq!(ack_threshold(1), 1); // 1/2 = 0 -> max(1, 0)
+        assert_eq!(ack_threshold(2), 1);
+        assert_eq!(ack_threshold(4), 2); // the DEFAULT_PIPELINE_SIZE case
+        assert_eq!(ack_threshold(8), 4);
+        assert_eq!(ack_threshold(33), 16);
     }
 }

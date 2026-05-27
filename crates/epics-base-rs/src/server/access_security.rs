@@ -1589,19 +1589,22 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         chars.next();
     }
 
-    // Read access keyword. C `asLib.y:259-267` distinguishes
-    // `NONE`/`READ`/`WRITE`; any other keyword triggers
+    // Read access keyword. C `asLib.y:259-264` matches `NONE`/`READ`/
+    // `WRITE` with `strcmp` (case-SENSITIVE); any other keyword triggers
     // `yywarn "Ignoring RULE that contains an unsupported keyword"`
-    // and the rule is dropped. We keep the rule but mark it `ignore`
-    // (inert) so a misspelled keyword fails CLOSED.
+    // and the rule is dropped. Match case-sensitively here too: a
+    // case variant like `write` is an unsupported keyword in C, so it
+    // must not build an active Write rule. We keep the rule but mark it
+    // `ignore` (inert) so any unsupported keyword fails CLOSED — the
+    // same effect as C dropping the rule.
     skip_ws_comments(chars);
     let mut access_str = String::new();
     read_word(chars, &mut access_str);
-    let (access, mut ignore) = if access_str.eq_ignore_ascii_case("WRITE") {
+    let (access, mut ignore) = if access_str == "WRITE" {
         (RuleAccess::Write, false)
-    } else if access_str.eq_ignore_ascii_case("READ") {
+    } else if access_str == "READ" {
         (RuleAccess::Read, false)
-    } else if access_str.eq_ignore_ascii_case("NONE") {
+    } else if access_str == "NONE" {
         (RuleAccess::None, false)
     } else {
         tracing::warn!(
@@ -2429,6 +2432,26 @@ ASG(C) {
     #[test]
     fn rule_bad_log_option_is_rejected() {
         assert!(parse_acf("ASG(T) { RULE(1, WRITE, BOGUS) }").is_err());
+    }
+
+    #[test]
+    fn rule_access_keyword_is_case_sensitive() {
+        // C `asLib.y:259-264` matches NONE/READ/WRITE with `strcmp`
+        // (case-SENSITIVE). A lowercase `write` is an unsupported
+        // keyword that C drops (`yywarn`, no rule added), so it must
+        // grant nothing — not build an active Write rule.
+        let cfg = parse_acf("ASG(L) { RULE(1, write) }").unwrap();
+        assert_eq!(
+            cfg.check_access_method("L", "h", "u", 0, "", ""),
+            AccessLevel::NoAccess,
+            "lowercase `write` is an unsupported keyword (C strcmp); grants nothing"
+        );
+        // Canonical uppercase still grants write at the rule's ASL.
+        let cfg = parse_acf("ASG(U) { RULE(1, WRITE) }").unwrap();
+        assert_eq!(
+            cfg.check_access_method("U", "h", "u", 0, "", ""),
+            AccessLevel::ReadWrite
+        );
     }
 
     // `check_access_method_trap` must return the trap mask of

@@ -217,7 +217,7 @@ fn proto_error_field_assignment_matches_c() {
     //                `exceptionRespAction` at `cac.cpp:1118` as
     //                `hdr.m_available`).
     //
-    // This test pins the field assignment so the round-3 fix of
+    // This test pins the field assignment so the fix of
     // `send_ca_error` (m_available carries status, not m_cid)
     // doesn't regress.
     let mut resp = CaHeader::new(CA_PROTO_ERROR);

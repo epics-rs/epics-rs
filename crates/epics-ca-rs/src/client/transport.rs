@@ -1606,7 +1606,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // denial.
                     //
                     // The Rust SERVER tears down subscriptions on
-                    // NoAccess (round-39), so Rust ↔ Rust never hits
+                    // NoAccess, so Rust ↔ Rust never hits
                     // this path. But Rust client ↔ C IOC does — C IOC
                     // delivers the no-read-access frame instead of
                     // tearing down. Gate matches libca.

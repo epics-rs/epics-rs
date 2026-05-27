@@ -1671,7 +1671,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
     // ECA_DEFUNCT hint lets the client decide whether to upgrade.
     //
     // Note: TCP VERSION with minor<4 already disconnects via
-    // round-12 dbb4b28, so this gate only triggers on clients
+    // dbb4b28, so this gate only triggers on clients
     // that skipped the VERSION handshake entirely OR on a peer
     // explicitly identifying as pre-V4.4.
     if hdr.cmmd != CA_PROTO_VERSION && state.client_minor_version < 4 {
@@ -2270,7 +2270,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // C `read_action` (camessage.c:608-610):
                     // `if (!pciu) { logBadId; return RSRV_ERROR; }` —
                     // silent disconnect, no wire reply. Matches the
-                    // EVENT_ADD silent-disconnect pattern (round-16
+                    // EVENT_ADD silent-disconnect pattern (commit
                     // 9fdbc37) where C's logBadId path is "log
                     // server-side, drop the connection". Pre-fix
                     // Rust sent ECA_BADCHID for READ_NOTIFY and
@@ -2553,7 +2553,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // `write_notify_action` (camessage.c:1642-1645):
                         // `if (!pciu) { logBadId; return RSRV_ERROR; }`
                         // — silent disconnect on missing channel. Same
-                        // family as round-16 EVENT_ADD bad-SID and the
+                        // family as the EVENT_ADD bad-SID and the
                         // matching READ branch below.
                         return Err(epics_base_rs::error::CaError::Protocol(format!(
                             "WRITE (ACKT/ACKS) on unknown SID {} \
@@ -3286,7 +3286,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // EVENT_ADD must also consult the
             // channel's access_rights. A NoAccess peer mounting a
             // subscription would receive every value update —
-            // identical leak to the round-32A `subscribe_raw` ACF
+            // identical leak to the `subscribe_raw` ACF
             // bypass on the PVA side. C IOC's `event_add_NoAccess`
             // returns ECA_NORDACCESS for the same reason.
             // Type-state EVENT_ADD gate. This closed the
@@ -3851,14 +3851,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // cross-check explicitly. If we skipped it, a peer
             // could send EVENT_CANCEL with wrong cid but valid
             // sub-id and erase a real subscription bound to a
-            // different channel — bypass of round-21's BAD-MONID
+            // different channel — bypass of the BAD-MONID
             // disconnect.
             let channel_matches = state
                 .subscriptions
                 .get(&sub_id)
                 .is_some_and(|s| s.channel_sid == req_channel_sid);
             if !channel_matches {
-                // Trigger the round-21 BAD-MONID path: emit
+                // Trigger the BAD-MONID path: emit
                 // ECA_BADMONID + disconnect. The SID is known to be
                 // valid here (silent close already happened above),
                 // so use entry_cid / entry_pv_name resolved from it.

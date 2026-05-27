@@ -3702,19 +3702,11 @@ async fn handle_tcp_search(
         return Ok(());
     };
 
-    // PVA-R10: filter by protocol. Default protocol on TCP is
-    // "tcp" (or "tls" when TLS is in use). Empty list tolerated
-    // as wildcard for legacy peers.
+    // Default protocol on TCP is "tcp" (or "tls" when TLS is in use).
+    // Protocol-gated match set, shared with the v4/v6 UDP responders.
+    // See `udp::search_matched_cids`.
     let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
-    let protocol_ok = req.protocols.is_empty() || req.protocols.iter().any(|p| p == protocol);
-    let mut matched: Vec<u32> = Vec::with_capacity(req.queries.len());
-    if protocol_ok {
-        for (cid, name) in &req.queries {
-            if source.searchable(name).await {
-                matched.push(*cid);
-            }
-        }
-    }
+    let matched = super::udp::search_matched_cids(source, &req, protocol).await;
     // pvxs `serverchan.cpp:240-249`: emit the response only when
     // there's a match OR MustReply was set. Skip otherwise to
     // avoid leaking server presence on every probe.

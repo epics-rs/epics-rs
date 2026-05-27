@@ -680,29 +680,9 @@ async fn process_search_datagram(
                     }
                 };
 
-                // PVA-R10: filter by protocol. pvxs
-                // `udp_collector.cpp:424-443` only queues channel
-                // matches when the SEARCH carried the advertised
-                // protocol ("tcp"). Pre-fix Rust answered every
-                // SEARCH regardless of what the client asked for.
-                // Empty protocol list = legacy peer that omitted the
-                // field — tolerate (treat as wildcard).
-                let protocol_ok =
-                    req.protocols.is_empty() || req.protocols.iter().any(|p| p == protocol);
-                let mut matched_cids: Vec<u32> = Vec::with_capacity(req.queries.len());
-                if protocol_ok {
-                    for (cid, name) in &req.queries {
-                        // `searchable` (not `has_pv`): a name hosted
-                        // only by a non-search-advertised source —
-                        // the built-in `ServerInfoSource` / `server`
-                        // PV — must not be answered to a broadcast
-                        // SEARCH. Direct TCP connect still resolves
-                        // it via `has_pv`.
-                        if source.searchable(name).await {
-                            matched_cids.push(*cid);
-                        }
-                    }
-                }
+                // Protocol-gated match set, shared with the v6 UDP and
+                // TCP-circuit responders. See `search_matched_cids`.
+                let matched_cids = search_matched_cids(source, &req, protocol).await;
                 // pvxs `server.cpp:730-732`: when `nreply==0` AND the
                 // SEARCH header did not set `MustReply`, drop the
                 // SEARCH silently. Honouring `MustReply` even with
@@ -867,15 +847,10 @@ async fn process_v6_search_datagram(
                 // the response on the same socket pair the SEARCH
                 // arrived on — natural for v6 unicast.
                 let reply_dest = udp_src;
-                let mut matched_cids: Vec<u32> = Vec::with_capacity(req.queries.len());
-                for (cid, name) in &req.queries {
-                    // `searchable` (not `has_pv`): non-search-advertised
-                    // built-in sources (the `server` PV) must stay
-                    // unanswered on broadcast SEARCH. See the v4 path.
-                    if source.searchable(name).await {
-                        matched_cids.push(*cid);
-                    }
-                }
+                // The v6 responder must apply the same protocol gate as
+                // v4/TCP — without it a TLS-only client gets `found=1`
+                // from a tcp-only server. Shared helper.
+                let matched_cids = search_matched_cids(source, &req, protocol).await;
                 // pvxs `server.cpp:730-732` (also reached for v6
                 // SEARCH via the same handler): honour `MustReply`
                 // with an empty (`found=0`, `nreply=0`) response so
@@ -905,6 +880,40 @@ async fn process_v6_search_datagram(
         }
         pos = pos.saturating_add(consumed);
     }
+}
+
+/// The CIDs in `req` whose names this server will answer, gated by the
+/// advertised transport protocol — the single match rule shared by the
+/// v4 UDP, v6 UDP, and TCP-circuit SEARCH responders.
+///
+/// pvxs `udp_collector.cpp:424-443` only collects a SEARCH's PV names
+/// when the request advertised the server's protocol ("tcp"; "tls" under
+/// TLS); a request asking for a protocol the server does not speak
+/// matches nothing — this is what stops a TLS-only client from getting
+/// `found=1` off a tcp-only server. An empty protocol list is tolerated
+/// as a wildcard (legacy peers that omitted the field). `searchable`
+/// (not `has_pv`) keeps non-advertised built-in sources (e.g. the
+/// `server` PV) out of broadcast SEARCH answers; a direct TCP connect
+/// still resolves them.
+///
+/// Returns an empty vec on protocol mismatch, so each responder's
+/// `found`/`MustReply` decision is identical regardless of family.
+pub(crate) async fn search_matched_cids(
+    source: &DynSource,
+    req: &SearchRequest,
+    protocol: &str,
+) -> Vec<u32> {
+    let protocol_ok = req.protocols.is_empty() || req.protocols.iter().any(|p| p == protocol);
+    if !protocol_ok {
+        return Vec::new();
+    }
+    let mut matched = Vec::with_capacity(req.queries.len());
+    for (cid, name) in &req.queries {
+        if source.searchable(name).await {
+            matched.push(*cid);
+        }
+    }
+    matched
 }
 
 /// Build a SEARCH_RESPONSE frame with explicit protocol name.
@@ -1514,6 +1523,91 @@ mod tests {
         assert!(
             r.is_err(),
             "UDP SEARCH for `server` must NOT be answered; sniffer got {r:?}"
+        );
+    }
+
+    /// The shared SEARCH match rule gates on the advertised protocol:
+    /// a matching protocol (or an empty/legacy list) yields the searchable
+    /// CIDs, a mismatched one yields nothing. This is the single rule the
+    /// v4 UDP, v6 UDP, and TCP-circuit responders all call — the v6 path
+    /// previously skipped it and would answer a TLS-only client off a
+    /// tcp-only server.
+    #[tokio::test]
+    async fn search_matched_cids_gates_on_protocol() {
+        use crate::pvdata::{FieldDesc, PvField, ScalarType};
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        struct PresentSource;
+        #[allow(clippy::manual_async_fn)]
+        impl ChannelSource for PresentSource {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { vec!["MY:PV".into()] }
+            }
+            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == "MY:PV";
+                async move { m }
+            }
+            fn get_introspection(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { Some(FieldDesc::Scalar(ScalarType::Double)) }
+            }
+            fn get_value(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _name: &str,
+                _value: PvField,
+            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+                async { Err("read-only".into()) }
+            }
+            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let source: DynSource = Arc::new(PresentSource);
+        let req = |protocols: Vec<String>| SearchRequest {
+            seq: 1,
+            byte_order: ByteOrder::Little,
+            queries: vec![(7, "MY:PV".into())],
+            reply_addr: None,
+            reply_port: 0,
+            unicast: false,
+            must_reply: false,
+            protocols,
+            consumed: 0,
+        };
+
+        // Server speaks "tcp". Matching protocol → searchable CID returned.
+        assert_eq!(
+            search_matched_cids(&source, &req(vec!["tcp".into()]), "tcp").await,
+            vec![7]
+        );
+        // Client asks for "tls" only → no match off a tcp server.
+        assert!(
+            search_matched_cids(&source, &req(vec!["tls".into()]), "tcp")
+                .await
+                .is_empty()
+        );
+        // Empty/legacy protocol list → wildcard, still matched.
+        assert_eq!(
+            search_matched_cids(&source, &req(vec![]), "tcp").await,
+            vec![7]
         );
     }
 

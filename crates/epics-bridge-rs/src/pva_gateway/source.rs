@@ -1038,15 +1038,19 @@ impl ChannelSource for GatewayChannelSource {
         }
     }
 
-    /// Credential-aware RPC. pvxs treats RPC as READ-class for ACF:
-    /// a `NoAccess` peer is refused at the gateway with a
+    /// Credential-aware RPC. RPC is treated as WRITE-class for ACF: a
+    /// peer without write access is refused at the gateway with a
     /// gateway-identifying error (so an unauthorised caller cannot
     /// trigger archiver-control / state-change RPCs on the upstream
-    /// IOC). On allow, the request is forwarded through the
-    /// per-(account, method) upstream client pool — the same
-    /// identity-preserving routing `put_value_checked` uses — so the
-    /// upstream IOC's ASG rules and audit logs see the real
-    /// downstream identity instead of the gateway's.
+    /// IOC). pva2pva classifies `createChannelRPC` write-class — it
+    /// blocks RPC under `p2pReadOnly` alongside Put/Process
+    /// (`channel.cpp:140-150`) — and pvxs `sharedpv.cpp:162-179` has no
+    /// built-in read-class RPC gate, so the prior READ-class gating let
+    /// a read-only peer drive state-changing RPCs. On allow, the request
+    /// is forwarded through the per-(account, method) upstream client
+    /// pool — the same identity-preserving routing `put_value_checked`
+    /// uses — so the upstream IOC's ASG rules and audit logs see the
+    /// real downstream identity instead of the gateway's.
     async fn rpc_checked(
         &self,
         checked: AccessChecked,
@@ -1054,7 +1058,7 @@ impl ChannelSource for GatewayChannelSource {
         request_value: PvField,
         ctx: ChannelContext,
     ) -> Result<(FieldDesc, PvField), String> {
-        if !checked.allows_read() {
+        if !checked.allows_write() {
             tracing::debug!(
                 pv = %checked.pv_name(),
                 account = %ctx.account,
@@ -1709,6 +1713,39 @@ ASG(DEFAULT) {
         assert!(
             err.contains("denied by gateway access security"),
             "denial message must name the gateway as enforcer: {err:?}",
+        );
+    }
+
+    /// RPC is WRITE-class for ACF (pva2pva blocks createChannelRPC under
+    /// readOnly alongside Put/Process; pvxs sharedpv has no built-in
+    /// read-class RPC gate). A peer holding only READ must be denied —
+    /// pre-fix the READ-class gate let a read-only peer drive
+    /// state-changing RPCs on the upstream IOC.
+    #[tokio::test]
+    async fn rpc_denied_for_read_only_peer() {
+        use epics_pva_rs::pvdata::{FieldDesc, PvField};
+        let src = make_source();
+        // alice has READ but no WRITE rule.
+        let cfg = parse_acf(
+            r#"
+UAG(ops) { alice }
+ASG(DEFAULT) {
+    RULE(1, READ) { UAG(ops) }
+}
+"#,
+        )
+        .unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        let ctx = make_ctx("anyhost", "alice", "anonymous");
+        let token = check(&src, "some:rpc", &ctx).await;
+        let err = src
+            .rpc_checked(token, FieldDesc::Variant, PvField::Null, ctx)
+            .await
+            .expect_err("read-only peer must be denied RPC (write-class)");
+        assert!(
+            err.contains("denied by gateway access security"),
+            "read-only RPC must be ACL-denied at the gateway: {err:?}",
         );
     }
 

@@ -45,7 +45,7 @@ pub struct GroupPvDef {
     /// the same group run strictly serially even during the up-front
     /// value-conversion phase before either reaches `lock_records`.
     ///
-    /// BR-R15: the non-group writer gap — a plain CA/PVA PUT to a
+    /// the non-group writer gap — a plain CA/PVA PUT to a
     /// record that also backs an atomic-group member interleaving
     /// between member writes — is now closed by the
     /// `DBManyLock`-equivalent `PvDatabase::lock_records` advisory
@@ -69,7 +69,7 @@ pub struct GroupMember {
     pub triggers: TriggerDef,
     /// Ordering for put operations.
     ///
-    /// BR-R30: pvxs defaults the missing-field sentinel to
+    /// pvxs defaults the missing-field sentinel to
     /// `i64::MIN` (`fieldconfig.h:37`) and treats that value as
     /// not-putable (`groupsource.cpp:503`). Wire parity therefore
     /// requires `Option<i32>` here, not a defaulted i32 — a
@@ -89,7 +89,7 @@ pub struct GroupMember {
 }
 
 impl GroupPvDef {
-    /// BR-R29: true iff this is a *pure self-trigger* group — every
+    /// true iff this is a *pure self-trigger* group — every
     /// member with a backing channel uses the default `+trigger`
     /// (self-trigger, [`TriggerDef::SelfOnly`]) or explicit silence
     /// ([`TriggerDef::None`]).
@@ -112,7 +112,7 @@ impl GroupPvDef {
         })
     }
 
-    /// BR-R58: resolve the provisional self-trigger default with
+    /// resolve the provisional self-trigger default with
     /// group-level context, mirroring pvxs `resolveTriggerReferences`
     /// (`groupconfigprocessor.cpp:317-339`). pvxs applies the self-trigger
     /// fallback to every channeled field ONLY when the whole group
@@ -151,7 +151,7 @@ pub enum TriggerDef {
     All,
     /// Named fields — update only these fields.
     Fields(Vec<String>),
-    /// BR-R29: missing `+trigger` — pvxs default is self-trigger
+    /// missing `+trigger` — pvxs default is self-trigger
     /// (`groupconfigprocessor.cpp:323`): the member triggers only
     /// its own field, NOT every other group field. Distinct from
     /// `All` (`"*"`) and from `None` (`""`, explicit silence). The
@@ -226,11 +226,11 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
         if let Some(existing_def) = existing.get_mut(&def.name) {
             // Merge members into existing group
             existing_def.members.extend(def.members);
-            // BR-R59: re-sort the combined member list — the merge appends
+            // re-sort the combined member list — the merge appends
             // a second source's members, so the canonical (put_order,
             // field_name) order must be re-established over the union.
             sort_members_canonical(&mut existing_def.members);
-            // BR-R58: the merge may have turned a previously pure
+            // the merge may have turned a previously pure
             // self-trigger group into a mixed-trigger group (a new member
             // carries `+trigger`). Re-resolve so any `SelfOnly` member is
             // demoted to silent, matching pvxs's group-level resolution.
@@ -272,7 +272,7 @@ fn default_atomic() -> bool {
     true
 }
 
-/// BR-R59: canonical group-member ordering — `put_order` primary,
+/// canonical group-member ordering — `put_order` primary,
 /// `field_name` secondary. `put_order` is `Option<i32>`; `None`
 /// (no `+putorder`, "not putable") sorts before any `Some`, matching
 /// pvxs's `i64::MIN` sentinel ordering (`fieldconfig.h:37`). The
@@ -300,7 +300,7 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         members.push(member);
     }
 
-    // BR-R59: total (put_order, field_name) order. The `fields` source is
+    // total (put_order, field_name) order. The `fields` source is
     // a `#[serde(flatten)]` HashMap (randomized iteration), so a
     // put_order-only stable sort left equal-put_order members (the common
     // case — only writable members carry +putorder) in arbitrary order,
@@ -356,7 +356,7 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         members,
         atomic_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     };
-    // BR-R58: resolve the per-member self-trigger default now that every
+    // resolve the per-member self-trigger default now that every
     // member of this (single-source) group is known. Re-run after merge.
     def.resolve_self_trigger_default();
     Ok(def)
@@ -409,7 +409,7 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
 
     // Parse constant value for Const mapping.
     //
-    // BR-R26: pvxs uses `+const` (test/qgroup.json:1, test/const.db:2);
+    // pvxs uses `+const` (test/qgroup.json:1, test/const.db:2);
     // older Rust drafts accepted only `+value`. Accept both spellings
     // so pvxs-authored configs load without rewriting. When both
     // keys are present `+const` wins (matches pvxs's authoritative
@@ -445,7 +445,7 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
     } else {
         match obj.get("+trigger").and_then(|v| v.as_str()) {
             Some("*") => TriggerDef::All,
-            // BR-R29: pvxs groupconfigprocessor.cpp:323 defaults a
+            // pvxs groupconfigprocessor.cpp:323 defaults a
             // missing `+trigger` to self-trigger (only this member's
             // own field re-emits in the group), not All. The Rust
             // path treated None as All and emitted a full-group
@@ -453,7 +453,7 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
             // pvxs's narrow self-trigger delta visible in
             // testqgroup.cpp:220 (NTEnum group: only `value.index`
             // bit set on a VAL update).
-            // BR-R58: this per-member default is only provisional. pvxs
+            // this per-member default is only provisional. pvxs
             // applies the self-trigger fallback at the GROUP level and only
             // when the whole group declares no triggers
             // (`groupconfigprocessor.cpp:317-339`). In a group where any
@@ -536,7 +536,7 @@ fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvFie
                 Ok(PvField::ScalarArray(scalars))
             } else if !elems.is_empty() && elems.iter().all(|e| matches!(e, PvField::Structure(_)))
             {
-                // PVA-FR-1: JSON array elements are all present, so each
+                // JSON array elements are all present, so each
                 // maps to a `Some` element.
                 let structs = elems
                     .into_iter()
@@ -637,15 +637,15 @@ mod tests {
         let groups = parse_group_config(json).unwrap();
         let m = &groups[0].members[0];
         assert_eq!(m.mapping, FieldMapping::Scalar); // default
-        // BR-R29: pvxs default for a missing `+trigger` is self-trigger
+        // pvxs default for a missing `+trigger` is self-trigger
         // (`groupconfigprocessor.cpp:323`), not All.
         assert!(matches!(m.triggers, TriggerDef::SelfOnly));
-        // BR-R30: missing `+putorder` → `None` (not putable),
+        // missing `+putorder` → `None` (not putable),
         // mirroring pvxs `fieldconfig.h:37` sentinel.
         assert_eq!(m.put_order, None);
     }
 
-    /// BR-R29 residual: a group whose members all use the default
+    /// A group whose members all use the default
     /// `+trigger` (self-trigger) is a *pure self-trigger* group — the
     /// PVA server may narrow its monitor changed-bitset. A group with
     /// any explicit `+trigger:"*"` or named-field member is NOT, so
@@ -692,7 +692,7 @@ mod tests {
         );
     }
 
-    /// BR-R58: in a group where any member carries an explicit
+    /// in a group where any member carries an explicit
     /// `+trigger`, a member WITHOUT one is silent in pvxs (empty trigger
     /// set), not self-triggering. The provisional `SelfOnly` default must
     /// be demoted to `None` for such mixed groups; a pure self-trigger
@@ -753,7 +753,7 @@ mod tests {
         }
     }
 
-    /// BR-R58: the same demotion must happen when a group is assembled
+    /// the same demotion must happen when a group is assembled
     /// across multiple sources via `merge_group_defs` — a later source
     /// adding an explicit-trigger member demotes the earlier no-trigger
     /// member.
@@ -783,7 +783,7 @@ mod tests {
         );
     }
 
-    /// BR-R59: member order must be a deterministic (put_order,
+    /// member order must be a deterministic (put_order,
     /// field_name) total order, not HashMap-iteration order. Members with
     /// no `+putorder` (`None`) sort first, then by put_order; ties broken
     /// by field name — matching pvxs's name-sorted-then-stable-putOrder
@@ -809,7 +809,7 @@ mod tests {
         assert_eq!(order, vec!["alpha", "zebra", "first", "mid"]);
     }
 
-    /// BR-R59: the canonical order is re-established over the union after
+    /// the canonical order is re-established over the union after
     /// a cross-source merge (members appended, then re-sorted).
     #[test]
     fn br_r59_merge_reestablishes_canonical_order() {
@@ -831,7 +831,7 @@ mod tests {
         assert_eq!(order, vec!["bravo", "yankee"]);
     }
 
-    /// BR-R29: an explicit `+trigger:"*"` is still parsed as `All`
+    /// an explicit `+trigger:"*"` is still parsed as `All`
     /// (distinct from the default self-trigger). Regression guard for
     /// the previous None→All collapse.
     #[test]
@@ -1014,7 +1014,7 @@ mod tests {
 
     #[test]
     fn trigger_validation_unknown_field_drops_ref_not_config() {
-        // A10-1: pvxs (groupconfigprocessor.cpp:396-397) logs an unknown
+        // pvxs (groupconfigprocessor.cpp:396-397) logs an unknown
         // trigger target and `continue`s — it drops only that reference,
         // never the group or its siblings. Pre-fix the Rust parser
         // returned Err, aborting the whole blob and dropping EVERY group.
@@ -1120,7 +1120,7 @@ mod tests {
         }
     }
 
-    /// BR-R26: pvxs's canonical key is `+const` (test/qgroup.json).
+    /// pvxs's canonical key is `+const` (test/qgroup.json).
     #[test]
     fn parse_const_mapping_pvxs_const_key() {
         let json = r#"{
@@ -1150,7 +1150,7 @@ mod tests {
         }
     }
 
-    /// BR-R26: `+const` wins when both keys are present.
+    /// `+const` wins when both keys are present.
     #[test]
     fn parse_const_mapping_const_key_wins_over_value() {
         let json = r#"{

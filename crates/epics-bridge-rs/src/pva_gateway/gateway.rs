@@ -44,10 +44,10 @@ pub struct PvaGatewayConfig {
     pub connect_timeout: Duration,
     /// Hard cap on the number of cached upstream entries. Past this,
     /// new lookups return `GwError::CacheFull` instead of growing the
-    /// cache further (PG-G1 DoS defence). Default 50 000.
+    /// cache further (DoS defence). Default 50 000.
     pub max_cache_entries: usize,
     /// Hard cap on simultaneous downstream subscriber bridge tasks
-    /// across all peers (PG-G3). Default 100 000.
+    /// across all peers. Default 100 000.
     pub max_subscribers: usize,
     /// G-G2: optional namespace prefix for runtime-control PVs. When
     /// `Some(prefix)`, the gateway exposes a small set of read-only
@@ -63,21 +63,21 @@ pub struct PvaGatewayConfig {
     /// Override via `EPICS_PVA_GW_CONTROL_PREFIX` env var.
     pub control_prefix: Option<String>,
 
-    /// CRITICAL-1: when `true`, every downstream PUT is rejected by a
+    /// when `true`, every downstream PUT is rejected by a
     /// [`ReadOnlyLayer`] before it can reach the upstream — a
     /// read-only proxy deployment. Pre-fix the `read_only` intent had
     /// no config surface at all and the middleware was dead code.
     /// Override via `EPICS_PVA_GW_READONLY` (`YES`/`1`/`true`).
     pub read_only: bool,
 
-    /// CRITICAL-1: optional pattern-matched access control. When
+    /// optional pattern-matched access control. When
     /// `Some`, an [`AclLayer`] filters every op (`has_pv`, GET, PUT,
     /// MONITOR, RPC, `list_pvs`) by the configured glob / regex
     /// deny / allow lists, short-circuiting denied PV names before
     /// they reach the upstream proxy. `None` installs no ACL layer.
     pub acl: Option<AclConfig>,
 
-    /// CRITICAL-1: optional PUT (and, if the sink opts in, GET /
+    /// optional PUT (and, if the sink opts in, GET /
     /// MONITOR / RPC) audit sink. When `Some`, an [`AuditLayer`]
     /// emits a structured [`super::middleware::AuditEvent`] for every
     /// PUT, carrying the downstream peer's credentials and the
@@ -87,7 +87,7 @@ pub struct PvaGatewayConfig {
 
 impl Default for PvaGatewayConfig {
     fn default() -> Self {
-        // PG-G13: gateways control both ends of the encode path
+        // gateways control both ends of the encode path
         // (server-side PVA, downstream pvxs/pvAccessJava clients
         // are common); enable type-cache marker emission so a
         // repeating-shape monitor stream collapses repeated 100+
@@ -157,7 +157,7 @@ impl PvaGatewayConfig {
                 self.control_prefix = Some(trimmed.to_string());
             }
         }
-        // CRITICAL-1: read-only deployments are commonly toggled by
+        // read-only deployments are commonly toggled by
         // env in containerised gateways; `acl` / `audit` carry
         // structured state and stay programmatic-only.
         if let Ok(s) = std::env::var("EPICS_PVA_GW_READONLY") {
@@ -186,7 +186,7 @@ impl PvaGateway {
     /// configured port; upstream channels are opened lazily on the
     /// first downstream search for each PV.
     ///
-    /// CRITICAL-1: the `read_only` / `acl` / `audit` config fields are
+    /// the `read_only` / `acl` / `audit` config fields are
     /// wired here into the [`super::middleware`] layer chain. The
     /// chain wrapping the proxy source is
     /// `Audit( ReadOnly?( Acl( GatewayChannelSource ) ) )`:

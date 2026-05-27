@@ -32,14 +32,14 @@ use epics_pva_rs::server_native::source::{
 
 use super::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL};
 
-/// F-G12: raw upstream MONITOR DATA body bytes flowing through the
+/// Raw upstream MONITOR DATA body bytes flowing through the
 /// per-entry broadcast channel. `body` is the wire-format
 /// `changed | value | overrun` triplet refcount-shared via `Bytes`.
 #[derive(Debug, Clone)]
 pub struct RawEvent {
     pub body: bytes::Bytes,
     pub byte_order: epics_pva_rs::proto::ByteOrder,
-    /// BR-R42: when set, this event signals an upstream descriptor
+    /// when set, this event signals an upstream descriptor
     /// change. The body is meaningless under the downstream's
     /// original INIT descriptor — the downstream wire layer must
     /// emit `MONITOR FINISH` rather than forwarding the body bytes,
@@ -48,7 +48,7 @@ pub struct RawEvent {
     pub type_changed: bool,
 }
 
-/// BRIDGE-FR-11: one downstream→upstream pause/resume command queued to
+/// one downstream→upstream pause/resume command queued to
 /// the gateway's single watermark applier (spawned in
 /// [`GatewayChannelSource::new`]).
 ///
@@ -63,7 +63,7 @@ pub struct RawEvent {
 ///   [`super::channel_cache::UpstreamEntry::apply_watermark_vote`], which
 ///   orders an op's own re-ordered transitions by `seq` (Finding 1) and
 ///   reference-counts pause votes across co-subscribers so the shared
-///   upstream pauses only when every live op wants pause (round-3 fix).
+///   upstream pauses only when every live op wants pause.
 struct WmCommand {
     cache: Arc<ChannelCache>,
     name: String,
@@ -75,7 +75,7 @@ struct WmCommand {
 /// PV-name → ASG-name resolver. Returns the ASG that the gateway
 /// should consult for the given downstream channel. Default impl
 /// (see `default_asg_resolver`) returns `"DEFAULT"` for every name —
-/// matching the legacy pre-Round-30D behaviour. Sites that want
+/// matching the legacy behaviour. Sites that want
 /// per-PV granularity (e.g. `set:.*` → `OPERATOR`, `dev:.*` → `DEV`)
 /// install a custom resolver via [`GatewayChannelSource::set_asg_resolver`].
 ///
@@ -89,7 +89,7 @@ fn default_asg_resolver() -> AsgResolver {
     Arc::new(|_pv| "DEFAULT".to_string())
 }
 
-/// MR-R16: identity key for the per-credential upstream `PvaClient`
+/// identity key for the per-credential upstream `PvaClient`
 /// and `ChannelCache` pools.
 ///
 /// Every field that the gateway forwards into the asserted upstream
@@ -152,7 +152,7 @@ impl<K: Eq + Hash + Clone, V> BoundedPool<K, V> {
     }
 
     /// Snapshot every live value (cloned). Used by the gateway's
-    /// all-layers cache administration (BRIDGE-FR-14) so a control
+    /// all-layers cache administration so a control
     /// flush/drop/diagnostic can reach the per-credential caches
     /// without holding the pool lock across the async cache calls.
     fn values(&self) -> Vec<V>
@@ -218,7 +218,7 @@ pub struct GatewayChannelSource {
     /// the count across the multiple `Arc<dyn ChannelSourceObj>`
     /// handles the runtime holds.
     subscriber_count: Arc<AtomicUsize>,
-    /// Per-`UpstreamIdentityKey` upstream PvaClient pool (PG-G10).
+    /// Per-`UpstreamIdentityKey` upstream PvaClient pool.
     /// When the downstream peer authenticates as `(alice, ca)` from a
     /// given host/authority the gateway reuses (or builds) a client
     /// whose CONNECTION_VALIDATION to upstream advertises that same
@@ -226,34 +226,34 @@ pub struct GatewayChannelSource {
     /// client identity, not the gateway. Anonymous / empty-account
     /// peers reuse the cache's shared client.
     ///
-    /// MR-R16: keyed by account, method, host, AND authority — see
+    /// keyed by account, method, host, AND authority — see
     /// [`UpstreamIdentityKey`].
     ///
-    /// BR-R7: bounded via `BoundedPool` — evicts LRU entry when
+    /// bounded via `BoundedPool` — evicts LRU entry when
     /// `max_upstream_identities` is reached, so a downstream client
     /// that presents unbounded distinct accounts cannot exhaust memory.
     upstream_pool: Arc<Mutex<BoundedPool<UpstreamIdentityKey, Arc<PvaClient>>>>,
-    /// Optional gateway-side ACF policy (round 29). When set, every
+    /// Optional gateway-side ACF policy. When set, every
     /// downstream GET / PUT / MONITOR is gated through
     /// `check_access_method` BEFORE the upstream forward, so the
     /// gateway can deny clients that the upstream IOC would also
     /// deny (or apply site-local policy on top of the upstream
     /// rules). Wrapped in an AcfCell so policy may be hot-swapped
     /// at runtime via `set_acf`. None means pass-through (legacy
-    /// pre-round-29 behaviour) — pvxs `pva2pva` parity for sites
+    /// behaviour) — pvxs `pva2pva` parity for sites
     /// that delegate all ACL to upstream.
     acf: AcfCell,
     /// PV→ASG resolver. Defaults to `DEFAULT` for every name; sites
     /// that want per-PV ASG granularity replace this via
     /// [`set_asg_resolver`].
     ///
-    /// Round-32D (R31-G8): wrapped in `RwLock` so the resolver can
+    /// Wrapped in `RwLock` so the resolver can
     /// be hot-swapped at runtime — the gateway is typically handed
     /// off to `PvaServer` behind an `Arc` (or its trait-object
     /// equivalent), so a `&mut self` setter is unreachable after
     /// installation. Mirrors the `acf` cell's hot-swap pattern.
     asg_resolver: Arc<RwLock<AsgResolver>>,
-    /// Round 41: type-state-enforced access gate. The closure
+    /// Type-state-enforced access gate. The closure
     /// captures the `asg_resolver` cell so a hot-swap of the
     /// resolver via [`set_asg_resolver`] is visible on the next
     /// `check`. ASL is fixed at 0 for gateway-side checks — the
@@ -261,7 +261,7 @@ pub struct GatewayChannelSource {
     /// site policy on the gateway is expected to use UAG/HAG
     /// gating rather than per-record ASL.
     gate: epics_base_rs::server::access_security::AccessGate,
-    /// BR-R21: per-`UpstreamIdentityKey` upstream ChannelCache pool.
+    /// per-`UpstreamIdentityKey` upstream ChannelCache pool.
     /// When a credentialed downstream peer issues a GET/MONITOR, the
     /// gateway routes through a cache backed by a per-credential
     /// PvaClient — so the upstream IOC sees the real downstream
@@ -270,12 +270,12 @@ pub struct GatewayChannelSource {
     /// Parallels `upstream_pool` which already provides per-credential
     /// routing for PUT / RPC / PROCESS.
     ///
-    /// MR-R16: keyed by account, method, host, AND authority — see
+    /// keyed by account, method, host, AND authority — see
     /// [`UpstreamIdentityKey`].
     ///
-    /// BR-R7: bounded via `BoundedPool` (same cap as `upstream_pool`).
+    /// bounded via `BoundedPool` (same cap as `upstream_pool`).
     upstream_caches: Arc<Mutex<BoundedPool<UpstreamIdentityKey, Arc<ChannelCache>>>>,
-    /// BRIDGE-FR-11: feeds the single watermark pause/resume applier
+    /// feeds the single watermark pause/resume applier
     /// task spawned in [`Self::new`]. The sync `notify_watermark_*`
     /// callbacks push a [`WmCommand`] here with NO per-callback
     /// `tokio::spawn`, so there is exactly one totally-ordered owner of
@@ -292,7 +292,7 @@ impl GatewayChannelSource {
         let acf: AcfCell = Arc::new(RwLock::new(None));
         let asg_resolver = Arc::new(RwLock::new(default_asg_resolver()));
         let gate = Self::build_gate(acf.clone(), asg_resolver.clone());
-        // BRIDGE-FR-11: one ordered watermark applier per logical
+        // one ordered watermark applier per logical
         // source. `new` is the only constructor and `Clone` just copies
         // the sender, so exactly one applier task exists no matter how
         // many `Arc<dyn ChannelSourceObj>` handles the runtime holds.
@@ -337,12 +337,12 @@ impl GatewayChannelSource {
     /// — typically a pre-built `HashMap` or compiled-regex table.
     /// Pass `None` to reset to the `DEFAULT`-everywhere default.
     ///
-    /// Round-32D: takes `&self` and writes through `RwLock`, so the
+    /// Takes `&self` and writes through `RwLock`, so the
     /// resolver may be replaced after the source has been handed to
     /// `PvaServer` behind an `Arc`.
     pub async fn set_asg_resolver(&self, resolver: Option<AsgResolver>) {
         *self.asg_resolver.write().await = resolver.unwrap_or_else(default_asg_resolver);
-        // R49-G2: bump the gate's ACL generation so monitor tasks
+        // bump the gate's ACL generation so monitor tasks
         // observing this gate detect the policy swap on their next
         // event and re-check. Without this, gateway monitors after
         // a resolver hot-swap kept running under the prior ASG
@@ -357,12 +357,12 @@ impl GatewayChannelSource {
     /// pass-through (upstream IOC remains the sole authority).
     pub async fn set_acf(&self, cfg: Option<AccessSecurityConfig>) {
         *self.acf.write().await = cfg;
-        // R49-G2: bump the gate's ACL generation — see comment on
+        // bump the gate's ACL generation — see comment on
         // `set_asg_resolver`.
         self.gate.bump_acl_version();
     }
 
-    // Round 49 follow-up: the `acf_cell()` accessor was removed. It
+    // the `acf_cell()` accessor was removed. It
     // returned a clone of the inner `Arc<RwLock<Option<...>>>` so an
     // external coordinator (e.g. a multi-source PvaServer) could
     // hot-swap the policy by writing the cell directly — but that
@@ -382,7 +382,7 @@ impl GatewayChannelSource {
     /// `AccessChecked` token so tests can inspect ACF behaviour
     /// without committing to a typed call.
     ///
-    /// Round 49 follow-up: gated on `#[cfg(test)]` so production
+    /// Gated on `#[cfg(test)]` so production
     /// code physically cannot bypass the gate by calling this
     /// alternate ACL path — the single owner of an ACL evaluation
     /// in a non-test build is `self.gate`.
@@ -392,7 +392,7 @@ impl GatewayChannelSource {
         match *guard {
             None => AccessLevel::ReadWrite,
             Some(ref cfg) => {
-                // Round-32D: read-lock the resolver cell; the closure
+                // read-lock the resolver cell; the closure
                 // runs while the read lock is held so the swap is
                 // serialized vs. in-flight evaluations. The closure
                 // itself should be O(1) — comment on `AsgResolver`
@@ -405,12 +405,12 @@ impl GatewayChannelSource {
     }
 
     /// Look up (or lazily build) the upstream client for the given
-    /// downstream credentials. PG-G10: each unique (account, method)
+    /// downstream credentials. Each unique (account, method)
     /// pair gets its own connection so upstream ASG rules see the
     /// real client identity. Empty/anonymous credentials fall through
     /// to the cache's shared client (no new connection allocated).
     ///
-    /// BR-R8: the pvAccess CONNECTION_VALIDATION handshake carries
+    /// the pvAccess CONNECTION_VALIDATION handshake carries
     /// only the `ca` / `anonymous` auth methods, and the `ca`
     /// credential carries solely `user` + `host` (pvxs
     /// `clientconn.cpp:217-305` — `handle_CONNECTION_VALIDATION`
@@ -436,7 +436,7 @@ impl GatewayChannelSource {
         if let Some(c) = pool.get(&key) {
             return c.clone();
         }
-        // BR-R8: a downstream method other than `ca` cannot be
+        // a downstream method other than `ca` cannot be
         // forwarded verbatim — the upstream `ca` credential is a
         // gateway assertion. Make that explicit in audit output.
         if ctx.method != "ca" {
@@ -467,7 +467,7 @@ impl GatewayChannelSource {
         client
     }
 
-    /// BR-R21: look up (or lazily build) the upstream ChannelCache for
+    /// look up (or lazily build) the upstream ChannelCache for
     /// `ctx`. Credentialed peers get a per-(account, method) cache backed
     /// by their own upstream PvaClient; anonymous peers reuse the shared
     /// `cache`. Parallels `upstream_client_for` which does the same for
@@ -517,7 +517,7 @@ impl GatewayChannelSource {
         *self.upstream_caches.lock() = BoundedPool::new(n);
     }
 
-    /// MR-R6: current upstream-identity pool cap. Reads the live
+    /// current upstream-identity pool cap. Reads the live
     /// `upstream_pool` capacity directly, so this accessor can never
     /// desync from the cap actually enforced — unlike the removed
     /// `pub max_upstream_identities` field, which `set_max_upstream_identities`
@@ -533,7 +533,7 @@ impl GatewayChannelSource {
         self.cache.entry_count().await
     }
 
-    /// BRIDGE-FR-14: flush the shared cache AND every per-credential
+    /// flush the shared cache AND every per-credential
     /// upstream cache, returning the total number of entries removed.
     /// The control `<prefix>:flush` RPC routes through here so an
     /// operator flush actually tears down credentialed upstream
@@ -549,7 +549,7 @@ impl GatewayChannelSource {
         removed
     }
 
-    /// BRIDGE-FR-14: drop one entry by name from the shared cache AND
+    /// drop one entry by name from the shared cache AND
     /// every per-credential upstream cache. Returns true if any layer
     /// held the entry. The control `<prefix>:drop` RPC routes through
     /// here so a credentialed upstream monitor for the named PV is also
@@ -563,7 +563,7 @@ impl GatewayChannelSource {
         dropped
     }
 
-    /// BRIDGE-FR-14: total cached entries across the shared cache AND
+    /// total cached entries across the shared cache AND
     /// every per-credential upstream cache. The control `cacheSize` /
     /// `upstreamCount` diagnostics route through here so the operator
     /// does not see zero while credentialed upstream monitors remain
@@ -577,21 +577,21 @@ impl GatewayChannelSource {
         total
     }
 
-    /// BRIDGE-FR-11: the single ordered owner of upstream pause/resume.
+    /// the single ordered owner of upstream pause/resume.
     /// Draining one mpsc with one task means every vote for a given entry
     /// is folded in one total order via
     /// [`super::channel_cache::UpstreamEntry::apply_watermark_vote`], which
     /// orders each op's own re-ordered transitions by `seq` (Finding 1)
     /// and reference-counts pause votes across co-subscribers — pausing
     /// the shared upstream only when every live downstream op wants pause
-    /// and resuming as soon as one has room (round-3 fix). `apply_..`
+    /// and resuming as soon as one has room. `apply_..`
     /// returns `Some(_)` only on a real aggregate edge; on an edge the
     /// applier calls `reconcile_pause`, which re-reads the level and drives
     /// the installed `Pauser` through the entry's single serialized owner.
     /// That owner is shared with the reconnect loop's Pauser re-install, so
     /// a fresh upstream subscription installed mid-backpressure is paused
     /// immediately rather than running unthrottled until the next HIGH→LOW
-    /// cycle (round-4 fix). Because this is the sole writer of the entry's
+    /// cycle. Because this is the sole writer of the entry's
     /// votes, the fold has no competing writer.
     fn spawn_watermark_applier(mut rx: mpsc::UnboundedReceiver<WmCommand>) {
         tokio::spawn(async move {
@@ -618,7 +618,7 @@ impl GatewayChannelSource {
         });
     }
 
-    /// BRIDGE-FR-11: the cache layer the subscription identified by
+    /// the cache layer the subscription identified by
     /// `ctx` monitors through, WITHOUT creating one. Anonymous /
     /// empty-account peers ride the shared `cache`; a credentialed peer
     /// rides its per-credential cache iff one already exists. Returns
@@ -637,7 +637,7 @@ impl GatewayChannelSource {
         self.upstream_caches.lock().get(&key).cloned()
     }
 
-    /// BRIDGE-FR-11: resolve the firing subscription's single cache
+    /// resolve the firing subscription's single cache
     /// layer (per-credential targeting) and enqueue a pause vote to the
     /// ordered applier. Synchronous and non-blocking
     /// (`UnboundedSender::send`) — no per-callback spawn — so two
@@ -664,7 +664,7 @@ impl GatewayChannelSource {
         self.subscriber_count.load(Ordering::Relaxed)
     }
 
-    /// BR-R21 test accessor: returns the upstream cache that would be
+    /// Test accessor: returns the upstream cache that would be
     /// selected for `ctx`. Exposed so tests can verify per-credential
     /// cache separation without a live upstream IOC.
     #[cfg(test)]
@@ -674,19 +674,19 @@ impl GatewayChannelSource {
 
     /// Internal raw-subscribe helper. Routes `subscribe_raw` and
     /// `subscribe_raw_checked` through a caller-supplied cache so
-    /// credentialed peers get per-credential upstream entries (BR-R21).
+    /// credentialed peers get per-credential upstream entries.
     async fn subscribe_raw_inner(
         &self,
         cache: Arc<ChannelCache>,
         name: &str,
     ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
-        // F-G12 default ON — opt out via EPICS_PVA_GW_RAW_FRAMES=NO.
+        // default ON — opt out via EPICS_PVA_GW_RAW_FRAMES=NO.
         if let Some(v) = epics_base_rs::runtime::env::get("EPICS_PVA_GW_RAW_FRAMES") {
             if v.eq_ignore_ascii_case("NO") || v.eq_ignore_ascii_case("FALSE") || v == "0" {
                 return None;
             }
         }
-        // R49-G4: bump counter before spawning forwarder.
+        // bump counter before spawning forwarder.
         let prev = self.subscriber_count.fetch_add(1, Ordering::Relaxed);
         if prev >= self.max_subscribers {
             self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
@@ -705,16 +705,16 @@ impl GatewayChannelSource {
                 return None;
             }
         };
-        // BR-R48: subscribe before snapshot to avoid losing events in the
+        // subscribe before snapshot to avoid losing events in the
         // gap, but the same gap can deliver event E to both the broadcast
         // receiver (created here) and snapshot_raw() (read below).
         // Dedup the first broadcast event by Bytes ptr when it matches.
         let mut bcast = entry.subscribe_raw();
-        // BR-R46: deliver cached initial snapshot to new raw subscriber.
+        // deliver cached initial snapshot to new raw subscriber.
         // pva2pva moncache.cpp:285-311 delivers `lastelem` on start();
         // the typed path (subscribe_inner) does the same via snapshot().
         let initial_raw = entry.snapshot_raw();
-        // BR-R48: capture the Bytes pointer of the initial snapshot so the
+        // capture the Bytes pointer of the initial snapshot so the
         // broadcast loop can skip the duplicate if the same event landed in
         // both the snapshot cache and the broadcast queue (the race window
         // between subscribe_raw() and snapshot_raw() above).
@@ -760,12 +760,12 @@ impl GatewayChannelSource {
                         if mpsc_tx.send(out).await.is_err() {
                             return;
                         }
-                        // BR-R42: type-change marker is end-of-stream.
+                        // type-change marker is end-of-stream.
                         if type_changed {
                             return;
                         }
                     }
-                    // BR-R61: dropped events under this receiver's own
+                    // dropped events under this receiver's own
                     // backpressure are skipped with NO overrun signal to the
                     // client. pva2pva coalesces into an overflowElement and
                     // sets the overrun bitset (moncache.cpp:157-174). Faithful
@@ -780,13 +780,13 @@ impl GatewayChannelSource {
     }
 
     /// Internal typed-subscribe helper. Routes `subscribe` and
-    /// `subscribe_checked` through a caller-supplied cache (BR-R21).
+    /// `subscribe_checked` through a caller-supplied cache.
     async fn subscribe_inner(
         &self,
         cache: Arc<ChannelCache>,
         name: &str,
     ) -> Option<mpsc::Receiver<PvField>> {
-        // Gateway-wide subscriber cap (PG-G3).
+        // Gateway-wide subscriber cap.
         let prev = self.subscriber_count.fetch_add(1, Ordering::Relaxed);
         if prev >= self.max_subscribers {
             self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
@@ -829,7 +829,7 @@ impl GatewayChannelSource {
                             return;
                         }
                     }
-                    // BR-R61: same as the raw path — drops under this
+                    // same as the raw path — drops under this
                     // receiver's backpressure carry no overrun signal
                     // (pva2pva moncache.cpp:157-174). Cross-crate, deferred.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -862,7 +862,7 @@ impl ChannelSource for GatewayChannelSource {
         entry.introspection()
     }
 
-    /// BRIDGE-FR-8: a credentialed downstream CREATE_CHANNEL resolves
+    /// a credentialed downstream CREATE_CHANNEL resolves
     /// existence against THAT peer's per-credential upstream cache, not
     /// the shared gateway cache, so channel setup never opens or refreshes
     /// upstream state under the shared identity. Anonymous peers fall back
@@ -876,7 +876,7 @@ impl ChannelSource for GatewayChannelSource {
             .is_ok()
     }
 
-    /// BRIDGE-FR-8: descriptor discovery for a credentialed downstream
+    /// descriptor discovery for a credentialed downstream
     /// peer (CREATE_CHANNEL GET-INIT / GET_FIELD) reads the upstream type
     /// through that peer's per-credential cache — the same cache
     /// `get_value_checked`/`subscribe_checked` use — so the upstream audit
@@ -929,7 +929,7 @@ impl ChannelSource for GatewayChannelSource {
             .lookup(name, self.connect_timeout)
             .await
             .map_err(|e| e.to_string())?;
-        // BR-R6: typed pass-through — forward the PvField as-is without
+        // typed pass-through — forward the PvField as-is without
         // re-encoding through string form. pvxs serialises the PUT value
         // with to_wire_valid(R, temp) (pvxs/src/clientget.cpp:305) — no
         // string round-trip in the reference implementation.
@@ -940,7 +940,7 @@ impl ChannelSource for GatewayChannelSource {
             .map_err(|e| e.to_string())
     }
 
-    /// Credential-aware PUT (PG-G10) — Round 43 migration to the
+    /// Credential-aware PUT — migration to the
     /// type-state API. Routes the put through a per-(account,
     /// method) upstream PvaClient so the upstream IOC's ASG rules
     /// see the real downstream identity instead of the gateway's.
@@ -972,7 +972,7 @@ impl ChannelSource for GatewayChannelSource {
         }
 
         let name = checked.pv_name();
-        // BRIDGE-FR-5: no shared-cache preflight. The earlier
+        // no shared-cache preflight. The earlier
         // `self.cache.lookup(...)` confirmed existence but warmed the
         // *shared* client's pool and opened an upstream monitor under
         // the gateway/shared identity — yet the PUT below runs through
@@ -988,7 +988,7 @@ impl ChannelSource for GatewayChannelSource {
             method = %ctx.method,
             "pva-gateway: forwarding PUT with downstream credentials"
         );
-        // BR-R6: typed pass-through (see put_value for rationale).
+        // typed pass-through (see put_value for rationale).
         client
             .pvput_pv_field(name, &value)
             .await
@@ -1071,7 +1071,7 @@ impl ChannelSource for GatewayChannelSource {
             ));
         }
         let name = checked.pv_name();
-        // BRIDGE-FR-5: no shared-cache preflight (see put_value_checked).
+        // no shared-cache preflight (see put_value_checked).
         // The RPC runs through the per-credential client, which resolves
         // existence and returns the upstream error itself.
         let client = self.upstream_client_for(&ctx);
@@ -1135,7 +1135,7 @@ impl ChannelSource for GatewayChannelSource {
             ));
         }
         let name = checked.pv_name();
-        // BRIDGE-FR-5: no shared-cache preflight (see put_value_checked).
+        // no shared-cache preflight (see put_value_checked).
         // PROCESS runs through the per-credential client, which resolves
         // existence and returns the upstream error itself.
         let client = self.upstream_client_for(&ctx);
@@ -1153,7 +1153,7 @@ impl ChannelSource for GatewayChannelSource {
         self.subscribe_inner(self.cache.clone(), name).await
     }
 
-    /// BR-R21: route GET through per-credential upstream cache so the
+    /// route GET through per-credential upstream cache so the
     /// upstream IOC sees the real downstream identity. Pre-fix the
     /// default trait impl called `self.get_value(name)` which used the
     /// shared cache regardless of downstream credentials.
@@ -1173,7 +1173,7 @@ impl ChannelSource for GatewayChannelSource {
         entry.snapshot()
     }
 
-    /// BR-R21: route MONITOR through per-credential upstream cache.
+    /// route MONITOR through per-credential upstream cache.
     async fn subscribe_checked(
         &self,
         checked: AccessChecked,
@@ -1186,7 +1186,7 @@ impl ChannelSource for GatewayChannelSource {
             .await
     }
 
-    /// BR-R21: route raw MONITOR through per-credential upstream cache.
+    /// route raw MONITOR through per-credential upstream cache.
     async fn subscribe_raw_checked(
         &self,
         checked: AccessChecked,
@@ -1199,7 +1199,7 @@ impl ChannelSource for GatewayChannelSource {
             .await
     }
 
-    /// BR-R14: decoded MONITOR with the downstream's event-affecting
+    /// decoded MONITOR with the downstream's event-affecting
     /// pvRequest options.
     ///
     /// The gateway fans **one** upstream monitor — opened with the
@@ -1249,7 +1249,7 @@ impl ChannelSource for GatewayChannelSource {
         self.subscribe_checked(checked, ctx).await
     }
 
-    /// BR-R14 raw-path counterpart of [`Self::subscribe_checked_opts`].
+    /// Raw-path counterpart of [`Self::subscribe_checked_opts`].
     /// Same reject-on-unsupported-option contract.
     async fn subscribe_raw_checked_opts(
         &self,
@@ -1273,7 +1273,7 @@ impl ChannelSource for GatewayChannelSource {
         self.subscribe_raw_checked(checked, ctx).await
     }
 
-    /// BRIDGE-FR-11: expose pipeline-window watermark levels so the
+    /// expose pipeline-window watermark levels so the
     /// server's monitor loop drives pause/resume on the feeding upstream
     /// monitor. Pre-FR-11 `GatewayChannelSource` did NOT override this,
     /// so the trait default `None` made the pause/resume callbacks
@@ -1311,11 +1311,11 @@ impl ChannelSource for GatewayChannelSource {
     /// installed by the auto-restart task in
     /// `channel_cache.rs::spawn_upstream_monitor`.
     ///
-    /// BRIDGE-FR-11 review: the vote is resolved to the *single* cache
-    /// layer this credential monitors through (per-credential targeting —
-    /// Finding 2) and queued to the single ordered applier with the
-    /// server's per-op crossing `seq` (deadlock-free ordering — Finding 1)
-    /// and `op_id` (cross-op reference counting — round-3 fix). Best
+    /// The vote is resolved to the *single* cache
+    /// layer this credential monitors through (per-credential targeting)
+    /// and queued to the single ordered applier with the
+    /// server's per-op crossing `seq` (deadlock-free ordering)
+    /// and `op_id` (cross-op reference counting). Best
     /// effort: if the entry isn't currently connected upstream the
     /// pause/resume is a no-op in the applier.
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
@@ -1372,7 +1372,7 @@ mod tests {
             .await
     }
 
-    /// BRIDGE-FR-14: operator cache administration must span the shared
+    /// operator cache administration must span the shared
     /// cache AND every per-credential upstream cache, not just the
     /// shared one. An entry living only in a credentialed cache must be
     /// counted, droppable, and flushable through the gateway-level
@@ -1399,7 +1399,7 @@ mod tests {
         assert_eq!(src.total_cached_entry_count().await, 0);
     }
 
-    /// BRIDGE-FR-11: the gateway source MUST expose pipeline-window
+    /// the gateway source MUST expose pipeline-window
     /// watermark levels so the server's monitor loop drives upstream
     /// pause/resume. Pre-FR-11 it inherited the trait default `None`,
     /// leaving the `Pauser` callbacks unreachable. `(0, 0)` is the
@@ -1415,7 +1415,7 @@ mod tests {
         );
     }
 
-    /// BRIDGE-FR-11 review (Finding 2): a watermark crossing must
+    /// A watermark crossing must
     /// pause/resume ONLY the cache layer the firing credential monitors
     /// through. `upstream_cache_peek_for` resolves that single layer
     /// (and never creates one), so one credential's backpressure cannot
@@ -1467,9 +1467,9 @@ mod tests {
         );
     }
 
-    /// Round-29 baseline: with no ACF attached, `acl_level` reports
+    /// Baseline: with no ACF attached, `acl_level` reports
     /// `ReadWrite` so the gateway's pre-existing pass-through fast
-    /// path stays hot. Pre-round-29 was the only behaviour.
+    /// path stays hot. This was previously the only behaviour.
     #[tokio::test]
     async fn acl_level_no_acf_is_readwrite() {
         let src = make_source();
@@ -1479,7 +1479,7 @@ mod tests {
         assert!(matches!(level, AccessLevel::ReadWrite));
     }
 
-    /// Round-29: with an ACF attached, downstream peers must match
+    /// With an ACF attached, downstream peers must match
     /// the DEFAULT ASG's rules. PUT is denied for callers not in
     /// the WRITE rule; GET still goes through when READ is granted
     /// (none of these tests hit `cache.lookup` because the ACL
@@ -1514,7 +1514,7 @@ ASG(DEFAULT) {
         );
     }
 
-    /// Round-29: a NoAccess rule denies GET and MONITOR (returns
+    /// A NoAccess rule denies GET and MONITOR (returns
     /// None — same shape as unknown PV at the wire layer).
     #[tokio::test]
     async fn get_and_subscribe_denied_when_acf_no_access() {
@@ -1545,8 +1545,8 @@ ASG(DEFAULT) {
         );
     }
 
-    /// Round-29: hot-swapping the ACF cell takes effect on the next
-    /// op. Mirrors the round-28 PVA-server-side AcfCell test.
+    /// Hot-swapping the ACF cell takes effect on the next
+    /// op. Mirrors the PVA-server-side AcfCell test.
     #[tokio::test]
     async fn acf_swap_takes_effect_on_next_op() {
         let src = make_source();
@@ -1580,7 +1580,7 @@ ASG(DEFAULT) {
         }
     }
 
-    /// Round-30D: the gateway no longer hard-codes the ASG name to
+    /// The gateway no longer hard-codes the ASG name to
     /// `DEFAULT`. An installed [`AsgResolver`] routes each channel
     /// through its own ASG, mirroring the per-record `ASG` field
     /// behaviour of a C IOC.
@@ -1644,7 +1644,7 @@ ASG(LOCKED) {
         assert_eq!(src.acl_level("dev:hwid", &guest).await, AccessLevel::Read);
     }
 
-    /// Round-32D (R31-G8): the resolver must be hot-swappable after
+    /// The resolver must be hot-swappable after
     /// the gateway is wrapped behind an Arc / handed to PvaServer.
     /// Pre-fix `set_asg_resolver(&mut self)` was unreachable in the
     /// production path; this confirms the `&self` + RwLock swap
@@ -1680,7 +1680,7 @@ ASG(LOCKED) {
         assert_eq!(src.acl_level("X", &ctx).await, AccessLevel::ReadWrite);
     }
 
-    /// Round-37 (R37-G1): RPC must consult the gateway ACF too.
+    /// RPC must consult the gateway ACF too.
     /// Pre-fix every PVA RPC reached the upstream IOC carrying the
     /// gateway's identity; a `NoAccess` peer could trigger
     /// archiver-control RPCs, custom-record state changes, or any
@@ -1793,10 +1793,10 @@ ASG(DEFAULT) {
         }
     }
 
-    /// Round-32A (R31-G6): the F-G12 raw-frame fast path must consult
+    /// The raw-frame fast path must consult
     /// the same ACF gate as the decoded `subscribe_ctx` path. Pre-fix
     /// a NoAccess peer could mount a `subscribe_raw` subscription
-    /// (since the round-29 gate covered `subscribe_ctx` only) and
+    /// (since the gate covered `subscribe_ctx` only) and
     /// receive every upstream MONITOR event byte-for-byte.
     #[tokio::test]
     async fn subscribe_raw_ctx_denies_when_acf_no_access() {
@@ -1823,7 +1823,7 @@ ASG(DEFAULT) {
         );
     }
 
-    /// BR-R8: a downstream peer authenticating with `x509` cannot be
+    /// a downstream peer authenticating with `x509` cannot be
     /// forwarded verbatim — the pvAccess CONNECTION_VALIDATION wire
     /// has no `x509` method and the `ca` credential carries only
     /// `user`/`host` (pvxs `clientconn.cpp:217-305`). The gateway
@@ -1863,7 +1863,7 @@ ASG(DEFAULT) {
         );
     }
 
-    /// BR-R8 companion: a first-party `ca` downstream is forwarded
+    /// Companion: a first-party `ca` downstream is forwarded
     /// verbatim — the wire carries the same `ca` method + `user`/
     /// `host` — so the recorded `AssertedIdentity` reports `ca` with
     /// no authority. This documents that the assertion record is not
@@ -1880,7 +1880,7 @@ ASG(DEFAULT) {
         assert_eq!(asserted.downstream_authority, "");
     }
 
-    /// BR-R14: the gateway fans one upstream monitor (opened with the
+    /// the gateway fans one upstream monitor (opened with the
     /// gateway's default pvRequest) out to N downstream subscribers.
     /// A downstream MONITOR pvRequest carrying a server-side `_filter`
     /// chain (pvxs `servermon.cpp:521-555`) changes *upstream event
@@ -1948,7 +1948,7 @@ ASG(DEFAULT) {
         );
     }
 
-    /// BR-R14 companion: an option set with no event-affecting option
+    /// Companion: an option set with no event-affecting option
     /// (`affects_upstream_events() == false`) is transparent through
     /// the gateway — the gateway does not reject it on the basis of
     /// options. (It still goes through the normal ACF + upstream
@@ -1969,7 +1969,7 @@ ASG(DEFAULT) {
         );
     }
 
-    /// BR-R21: GET/MONITOR must route through per-credential upstream
+    /// GET/MONITOR must route through per-credential upstream
     /// caches so the upstream IOC's ACF sees the real downstream
     /// identity. Pre-fix the default trait impls for `get_value_checked`,
     /// `subscribe_checked`, and `subscribe_raw_checked` called the
@@ -2017,7 +2017,7 @@ ASG(DEFAULT) {
         );
     }
 
-    /// MR-R16 regression: the upstream-identity pools must be keyed
+    /// Regression: the upstream-identity pools must be keyed
     /// by host and authority too, not only `(account, method)`.
     /// Pre-fix two downstream peers with the same account+method but
     /// different host (or x509 certificate authority) collided on the
@@ -2088,7 +2088,7 @@ ASG(DEFAULT) {
         );
     }
 
-    /// BR-R7: the upstream identity pools must be bounded. Pre-fix
+    /// the upstream identity pools must be bounded. Pre-fix
     /// `upstream_pool` and `upstream_caches` were plain `HashMap`s;
     /// a downstream client that varied `(account, method)` on every
     /// connection could grow them without limit. Post-fix both pools
@@ -2158,7 +2158,7 @@ ASG(DEFAULT) {
         );
     }
 
-    /// MR-R6 regression: the reported upstream-identity cap must
+    /// Regression: the reported upstream-identity cap must
     /// always reflect the cap actually enforced by the pools.
     /// Pre-fix `max_upstream_identities` was a `pub` field that
     /// `set_max_upstream_identities` never updated, so the reported

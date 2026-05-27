@@ -91,7 +91,7 @@ pub fn get_nested_field<'a>(pv: &'a PvStructure, path: &str) -> Option<Cow<'a, P
                 // StructureArray. Index into the Vec<PvStructure> and
                 // continue navigating.
                 if let PvField::StructureArray(items) = field {
-                    // PVA-FR-1: a null (`None`) element has no struct to
+                    // a null (`None`) element has no struct to
                     // navigate into — treat as not-found.
                     let element = items.get(idx as usize)?.as_ref()?;
                     current_struct = element;
@@ -125,7 +125,7 @@ pub fn get_nested_field<'a>(pv: &'a PvStructure, path: &str) -> Option<Cow<'a, P
     None
 }
 
-/// BR-R33: pvxs default monitor queue depth for groups — pvxs
+/// pvxs default monitor queue depth for groups — pvxs
 /// `MonitorOp::limit` defaults to `4u` (`servermon.cpp:66`), and a
 /// `record._options.queueSize` that fails to parse or is `< 2` leaves
 /// that default in place (`servermon.cpp:533-540`). Used for the GET
@@ -133,7 +133,7 @@ pub fn get_nested_field<'a>(pv: &'a PvStructure, path: &str) -> Option<Cow<'a, P
 /// MONITOR INIT pvRequest carries no usable `queueSize`.
 pub const GROUP_DEFAULT_QUEUE_SIZE: i32 = 4;
 
-/// BR-R33-RESIDUAL: resolve the *negotiated* monitor queue size from a
+/// resolve the *negotiated* monitor queue size from a
 /// MONITOR INIT pvRequest's `record._options.queueSize`.
 ///
 /// pvxs `servermon.cpp:533-540`: `uint32_t qSize = op->limit;` then
@@ -189,7 +189,7 @@ pub fn negotiated_queue_size(pv_request: &PvStructure) -> i32 {
     }
 }
 
-/// BR-R33: stamp `record._options.queueSize` (int) and
+/// stamp `record._options.queueSize` (int) and
 /// `record._options.atomic` (boolean) onto a group GET / MONITOR
 /// value. Adds them at the root, replacing the previous values if
 /// `_options` already exists (e.g. composed by an earlier read).
@@ -220,7 +220,7 @@ pub fn push_record_options(pv: &mut PvStructure, atomic: bool, queue_size: i32) 
     }
 }
 
-/// BR-R25: place a member's resolved value into the group structure.
+/// place a member's resolved value into the group structure.
 ///
 /// pvxs allows a `+type:"meta"` member with an empty key (`""`) to
 /// merge its `alarm` / `timeStamp` sub-fields into the *root* of the
@@ -316,7 +316,7 @@ fn get_or_create_struct_field<'a>(pv: &'a mut PvStructure, name: &str) -> &'a mu
     }
 }
 
-/// BR-R25 counterpart of [`set_member_field`] for the descriptor
+/// Counterpart of [`set_member_field`] for the descriptor
 /// builder. An empty-path Meta member flattens its `{alarm,
 /// timeStamp}` sub-descriptors onto the group root.
 pub fn set_member_field_desc(
@@ -448,7 +448,7 @@ async fn lock_group_records_read(
     guards
 }
 
-/// BR-R15: collect the **canonical** record names backing a group's
+/// collect the **canonical** record names backing a group's
 /// writable members, for the `DBManyLock`-equivalent write gate.
 ///
 /// pvxs builds `group.value.lock` (a `DBManyLock`) over every member
@@ -485,7 +485,7 @@ pub struct GroupChannel {
     db: Arc<PvDatabase>,
     def: GroupPvDef,
     access: super::provider::AccessContext,
-    /// BR-R33-RESIDUAL: negotiated monitor queue depth stamped into
+    /// negotiated monitor queue depth stamped into
     /// `record._options.queueSize`. `None` for the GET path (a GET
     /// has no subscription queue → [`GROUP_DEFAULT_QUEUE_SIZE`]);
     /// `Some(n)` when a `GroupMonitor` built this channel from the
@@ -509,7 +509,7 @@ impl GroupChannel {
         self
     }
 
-    /// BR-R33-RESIDUAL: set the negotiated monitor queue depth this
+    /// set the negotiated monitor queue depth this
     /// channel stamps into `record._options.queueSize`. Called by
     /// `GroupMonitor::start` with the value resolved from the MONITOR
     /// INIT pvRequest.
@@ -528,7 +528,7 @@ impl GroupChannel {
         self.read_group_atomic(self.def.atomic).await
     }
 
-    /// BR-R16: read with a caller-specified atomic mode, overriding
+    /// read with a caller-specified atomic mode, overriding
     /// the group default. Used by `Channel::get` when the operation
     /// pvRequest carries `record._options.atomic`.
     pub(crate) async fn read_group_atomic(&self, atomic: bool) -> BridgeResult<PvStructure> {
@@ -582,7 +582,7 @@ impl GroupChannel {
             }
         }
 
-        // BR-R33: pvxs `groupsource.cpp:359` stamps
+        // pvxs `groupsource.cpp:359` stamps
         // `record._options.queueSize` (negotiated monitor queue depth)
         // and `record._options.atomic` (operation atomicity) into the
         // group monitor value. Clients that introspect these branches
@@ -590,7 +590,7 @@ impl GroupChannel {
         // the negotiated queue — would otherwise see a structure-shape
         // mismatch and reject the operation.
         //
-        // BR-R33-RESIDUAL: `queueSize` is now the *per-operation
+        // `queueSize` is now the *per-operation
         // negotiated* depth. A `GroupMonitor` resolves it from the
         // MONITOR INIT pvRequest (`negotiated_queue_size`,
         // mirroring pvxs `servermon.cpp:533-540`) and threads it in
@@ -837,7 +837,7 @@ impl GroupChannel {
         }
     }
 
-    /// MR-R10: group PUT with explicit per-operation options.
+    /// group PUT with explicit per-operation options.
     ///
     /// pvAccess delivers PUT options (`record._options.process`,
     /// `record._options.atomic`, `record._options.block`) in the INIT
@@ -870,12 +870,12 @@ impl GroupChannel {
 
         let use_process = opts.process != super::channel::ProcessMode::Inhibit;
 
-        // BR-R16: pvRequest can override the group default atomicity
+        // pvRequest can override the group default atomicity
         // (`record._options.atomic = true|false`). Falls back to the
         // group default when the option is absent.
         let atomic = atomic_override.unwrap_or(self.def.atomic);
 
-        // BR-R30: only members with an explicit `+putorder` are
+        // only members with an explicit `+putorder` are
         // writable. pvxs sentinel `i64::MIN` (fieldconfig.h:37)
         // → "not putable" (groupsource.cpp:503); a member without
         // `+putorder` must be ignored, NOT written under an
@@ -890,7 +890,7 @@ impl GroupChannel {
         ordered.sort_by_key(|(_, po)| *po);
         let ordered: Vec<&GroupMember> = ordered.into_iter().map(|(m, _)| m).collect();
 
-        // BR-R31: pvxs's `groupsource.cpp:548` rejects group PUT
+        // pvxs's `groupsource.cpp:548` rejects group PUT
         // preparation for `DBF_INLINK..DBF_FWDLINK` fields —
         // writing into a record's link field via group PUT is
         // semantically meaningless (the link is metadata, not
@@ -908,7 +908,7 @@ impl GroupChannel {
             }
         }
 
-        // BR-R17: pvxs builds a per-field SecurityClient at group PUT
+        // pvxs builds a per-field SecurityClient at group PUT
         // (groupsource.cpp:161 + 515) so a group PV writable for the
         // caller doesn't tunnel writes into members the caller cannot
         // write directly. Re-check write access for each member's
@@ -933,13 +933,13 @@ impl GroupChannel {
             }
         }
 
-        // BR-R60: track whether any member write/proc actually fired so a
+        // track whether any member write/proc actually fired so a
         // marked PUT that writes nothing returns an error like pvxs
         // (groupsource.cpp:605-608) instead of silently succeeding.
         let mut did_something = false;
 
         if atomic {
-            // BR-R15: atomic PUT — `DBManyLock`-equivalent exclusion.
+            // atomic PUT — `DBManyLock`-equivalent exclusion.
             //
             // pvxs builds a `DBManyLock` over every group-member
             // record (`groupconfigprocessor.cpp:1165`
@@ -1023,13 +1023,13 @@ impl GroupChannel {
                     epics_base_rs::server::database::parse_pv_name(&member.channel);
 
                 if member.mapping == FieldMapping::Proc {
-                    // BR-R15: `_already_locked` — this atomic PUT owns
+                    // `_already_locked` — this atomic PUT owns
                     // every member-record gate via `lock_records`.
                     self.db
                         .process_record_already_locked(record_name)
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                    did_something = true; // BR-R60
+                    did_something = true;
                 } else if let Some(epics_val) = val {
                     if use_process {
                         self.db
@@ -1049,7 +1049,7 @@ impl GroupChannel {
                             .await
                             .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     }
-                    did_something = true; // BR-R60
+                    did_something = true;
                 }
             }
         } else {
@@ -1073,7 +1073,7 @@ impl GroupChannel {
                         .process_record(record_name)
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                    did_something = true; // BR-R60
+                    did_something = true;
                     continue;
                 }
 
@@ -1113,11 +1113,11 @@ impl GroupChannel {
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                 }
-                did_something = true; // BR-R60
+                did_something = true;
             }
         }
 
-        // BR-R60: pvxs returns a remote error "No fields changed" when the
+        // pvxs returns a remote error "No fields changed" when the
         // client marked fields but nothing was actually written
         // (groupsource.cpp:605-608, `!didSomething && value.isMarked`).
         // Approximate `value.isMarked` by "the client supplied at least one
@@ -1152,14 +1152,14 @@ impl super::provider::Channel for GroupChannel {
                 self.def.name, self.access.user, self.access.host
             )));
         }
-        // BR-R16: pvRequest can override the group default atomicity.
+        // pvRequest can override the group default atomicity.
         let atomic = super::channel::atomic_from_pv_request(request).unwrap_or(self.def.atomic);
         let full = self.read_group_atomic(atomic).await?;
         Ok(pvif::filter_by_request(&full, request))
     }
 
     async fn put(&self, value: &PvStructure) -> BridgeResult<()> {
-        // MR-R10: in-process / value-embedded callers (gateway, tests)
+        // in-process / value-embedded callers (gateway, tests)
         // carry per-operation options inside the data-phase structure.
         // The native PVA wire path uses `put_with_options` instead so
         // INIT-pvRequest options are honored — see that method.
@@ -1313,7 +1313,7 @@ pub struct GroupMonitor {
     priming: Vec<FieldPrimingState>,
     /// Whether the priming phase has completed.
     events_primed: bool,
-    /// BR-R33-RESIDUAL: negotiated monitor queue depth, resolved from
+    /// negotiated monitor queue depth, resolved from
     /// the MONITOR INIT pvRequest's `record._options.queueSize`
     /// ([`negotiated_queue_size`]). Stamped into every monitor
     /// value's `record._options.queueSize` via the internal
@@ -1322,7 +1322,7 @@ pub struct GroupMonitor {
     monitor_queue_size: i32,
 }
 
-/// BRIDGE-FR-12: how a member subscription event maps onto a group
+/// how a member subscription event maps onto a group
 /// monitor post — pvxs `groupsource.cpp:283-300` (value) /
 /// `:310-340` (property) / `subscriptionPost` `:207`.
 enum EventMark {
@@ -1330,7 +1330,7 @@ enum EventMark {
     /// (the resolved `+trigger` target set, assigned-not-changed).
     Marked(Vec<String>),
     /// Post the group; the server derives the changed-bitset (full
-    /// request mask, or BR-R29 diff for a pure self-trigger group).
+    /// request mask, or diff for a pure self-trigger group).
     Derive,
     /// No post — `TriggerDef::None`, or every named target dropped
     /// (pvxs `subscriptionPost` `if(empty && !first) return`).
@@ -1391,7 +1391,7 @@ impl GroupMonitor {
         self
     }
 
-    /// BR-R33-RESIDUAL: set the per-operation negotiated monitor queue
+    /// set the per-operation negotiated monitor queue
     /// depth, resolved from the MONITOR INIT pvRequest by the QSRV
     /// adapter ([`negotiated_queue_size`]). Threaded into the internal
     /// `GroupChannel` so every monitor value reports the depth the
@@ -1401,11 +1401,11 @@ impl GroupMonitor {
         self
     }
 
-    /// BRIDGE-FR-12: resolve the marked-leaf field paths for a *value*
+    /// resolve the marked-leaf field paths for a *value*
     /// event from `source_idx`, mirroring pvxs `groupsource.cpp:283`
     /// iterating `field.triggers` and marking each target.
     ///
-    /// A *pure self-trigger* group keeps the existing BR-R29 path
+    /// A *pure self-trigger* group keeps the existing path
     /// ([`EventMark::Derive`]) so the value-diff narrowing and its
     /// tests are untouched — this finding is about explicit `+trigger`
     /// graphs, where `SelfOnly`, `All`, and named `Fields` must stay
@@ -1443,7 +1443,7 @@ impl GroupMonitor {
             // Named targets: pvxs resolves only references that name an
             // existing field WITH A CHANNEL (`groupconfigprocessor.cpp:
             // 405-409`: a target whose `channel.empty()` is ignored).
-            // Unknown refs were warned + dropped at parse time (A10-1) and
+            // Unknown refs were warned + dropped at parse time and
             // are absent from `channeled` here too.
             TriggerDef::Fields(refs) => {
                 let channeled: std::collections::HashSet<&str> = def
@@ -1461,11 +1461,11 @@ impl GroupMonitor {
         Self::mark_or_derive(targets)
     }
 
-    /// BRIDGE-FR-12: a *property* event marks only the source field's
+    /// a *property* event marks only the source field's
     /// own mapping and never its triggers — pvxs `groupsource.cpp:325`
     /// ("we (may) only post changes to the field mapping in question.
     /// But never the triggered fields."). A pure self-trigger group
-    /// keeps the BR-R29 diff path.
+    /// keeps the diff path.
     fn property_event_mark(def: &GroupPvDef, source_idx: usize) -> EventMark {
         let Some(source) = def.members.get(source_idx) else {
             return EventMark::Skip;
@@ -1526,7 +1526,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
                 continue; // Structure/Const/Proc-without-channel — no backing channel
             }
 
-            // BRIDGE-FR-6: subscribe value events against the full
+            // subscribe value events against the full
             // `member.channel` (e.g. `REC.RVAL`), not the bare record
             // name. pvxs `field.cpp:25-26` builds both the value and
             // properties dbChannels from the same `def.channel`
@@ -1539,7 +1539,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
             // (`read_member`) re-parses `member.channel` for the
             // field it actually decodes.
             //
-            // BRIDGE-FR-7: choose the value mask per member mapping.
+            // choose the value mask per member mapping.
             // pvxs `groupsource.cpp:386` subscribes `Meta` value-side
             // events with `DBE_ALARM` only; `groupsource.cpp:389` uses
             // `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE` for non-meta
@@ -1590,7 +1590,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
 
             // Property subscription (DBE_PROPERTY) — only for Scalar/Meta
             // mappings that include metadata. Plain/Any/Proc don't need it.
-            // BRIDGE-FR-6: target the same `member.channel` as the value
+            // target the same `member.channel` as the value
             // subscription (pvxs `field.cpp:26` derives the properties
             // dbChannel from the identical `def.channel`); the record
             // default would mis-scope members configured on a non-`VAL`
@@ -1630,7 +1630,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
         // Propagate the same access context so any subsequent reads triggered
         // by trigger evaluation also honor read enforcement.
         //
-        // BR-R33-RESIDUAL: thread the per-operation negotiated monitor
+        // thread the per-operation negotiated monitor
         // queue depth so every monitor value stamps
         // `record._options.queueSize` with the client-requested depth
         // (pvxs `groupsource.cpp:359` `stats.limitQueue`).
@@ -1703,7 +1703,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
                 continue;
             }
 
-            // BRIDGE-FR-12: resolve which group field paths this event
+            // resolve which group field paths this event
             // marks, instead of treating every trigger kind identically.
             // pvxs iterates `field.triggers` (value) or the source field
             // alone (property), refreshes those targets, then posts the
@@ -1776,7 +1776,7 @@ pub enum AnyMonitor {
 }
 
 impl AnyMonitor {
-    /// BR-R33-RESIDUAL: apply the per-operation negotiated monitor
+    /// apply the per-operation negotiated monitor
     /// queue depth (resolved from the MONITOR INIT pvRequest's
     /// `record._options.queueSize`). Only a group monitor stamps
     /// `record._options.queueSize` into its values — a single-record
@@ -1817,7 +1817,7 @@ impl super::provider::PvaMonitor for AnyMonitor {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// BR-R31: pvxs `groupsource.cpp:548` refuses group PUT
+/// pvxs `groupsource.cpp:548` refuses group PUT
 /// preparation for `DBF_INLINK..DBF_FWDLINK` fields. EPICS link
 /// fields share a small, stable set of names — `FLNK` /
 /// `DOL` / `SDIS` / `INP` / `OUT` plus the alphabet-suffix
@@ -1985,7 +1985,7 @@ fn build_alarm_from_snapshot(snapshot: &epics_base_rs::server::snapshot::Snapsho
         "severity".into(),
         PvField::Scalar(ScalarValue::Int(snapshot.alarm.severity as i32)),
     ));
-    // BR-R62: PVA alarm.status is the status CLASS and alarm.message is
+    // PVA alarm.status is the status CLASS and alarm.message is
     // the condition string (pvxs iocsource.cpp:187-236), not the raw
     // condition code / empty string.
     alarm.fields.push((
@@ -2061,7 +2061,7 @@ mod tests {
         assert!(pv.get_field("x").is_some());
     }
 
-    /// A10-2: a `+trigger` target without a backing channel (Const /
+    /// a `+trigger` target without a backing channel (Const /
     /// Structure member) must NOT be marked in the changed-bitset. pvxs
     /// filters channel-less members out of BOTH the `*` expansion
     /// (`groupconfigprocessor.cpp:387-388`) and named-target resolution
@@ -2393,7 +2393,7 @@ mod tests {
         (db, def)
     }
 
-    /// BRIDGE-FR-6 / BRIDGE-FR-7 regression. Two boundaries in one
+    /// Regression. Two boundaries in one
     /// fixture:
     ///
     /// FR-6 — a member configured on a non-`VAL` field (`RVAL`) must
@@ -2679,9 +2679,9 @@ mod tests {
         }
     }
 
-    // ---- BR-R15: atomic group PUT is DBManyLock-equivalent ----
+    // ---- atomic group PUT is DBManyLock-equivalent ----
 
-    /// BR-R15 regression: a QSRV atomic group PUT must exclude a
+    /// Regression: a QSRV atomic group PUT must exclude a
     /// *direct* CA/PVA write to a backing member record for the whole
     /// member-write loop — pvxs holds a `DBManyLocker`
     /// (`groupsource.cpp:569`) over the same per-record locks a plain
@@ -2740,7 +2740,7 @@ mod tests {
         }
     }
 
-    /// BR-R15 regression: the real `GroupChannel::put` atomic path
+    /// Regression: the real `GroupChannel::put` atomic path
     /// itself acquires the member-record gate set. Holding the gates
     /// externally must block an atomic group PUT from entering its
     /// member-write loop, and the PUT must complete once released.

@@ -209,7 +209,7 @@ impl GatewayServer {
 
         // Load .access (optional). `ArcSwap` for the same lock-free
         // hot-reload pattern as `pvlist`.
-        // BR-R63: no .access file defaults to READ-ONLY (C ca-gateway
+        // no .access file defaults to READ-ONLY (C ca-gateway
         // installs `ASG(DEFAULT) { RULE(1,READ) }`, gateAs.cc:735-737) —
         // allow_all() would fail open, forwarding writes upstream.
         let access = if let Some(path) = &config.access_path {
@@ -348,7 +348,7 @@ impl GatewayServer {
                 let stats = stats.clone();
                 let beacon_anomaly = beacon_anomaly.clone();
                 Box::pin(async move {
-                    // 1. Check pvlist. BRIDGE-FR-10: when the downstream
+                    // 1. Check pvlist. when the downstream
                     //    client address is known, evaluate `.pvlist`
                     //    admission host-aware so `DENY FROM host` rules
                     //    are honored at search/create time (parity with C
@@ -371,13 +371,13 @@ impl GatewayServer {
 
                     // 2. Subscribe upstream — this also adds the PV to the
                     //    shadow database via UpstreamManager::ensure_subscribed.
-                    //    BR-R64: ensure_subscribed must only succeed when the
+                    //    ensure_subscribed must only succeed when the
                     //    upstream actually connects, else this positive reply
                     //    black-holes a non-existent PV (C answers does-not-exist
                     //    via gatePvData::death(), gatePv.cc:622).
                     //    Pass the matched ASG/ASL through so the per-PV
                     //    WriteHook can do the right ACL check.
-                    //    BRIDGE-FR-2: serve under the searched name (`name`,
+                    //    serve under the searched name (`name`,
                     //    the alias) while connecting upstream to the resolved
                     //    real PV (`m.resolved_name`), so an alias search
                     //    yields a downstream entry under the alias.
@@ -442,7 +442,7 @@ impl GatewayServer {
                 None => continue, // Denied or not in list
             };
 
-            // BRIDGE-FR-2: serve under the preload-file name (which may be
+            // serve under the preload-file name (which may be
             // an alias) while connecting to the resolved real PV.
             self.upstream
                 .ensure_subscribed(name, &m.resolved_name, m.asg.clone(), m.effective_asl())

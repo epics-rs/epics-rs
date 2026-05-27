@@ -174,7 +174,7 @@ impl AcfAccessControl {
         use epics_base_rs::server::access_security::AccessLevel;
         let (asg, asl) = self.resolve_asg_and_asl_blocking(channel);
         let cred_strings = Self::credential_strings(creds);
-        // MR-R12: a QSRV access context built through the legacy
+        // a QSRV access context built through the legacy
         // no-method constructors (`AccessContext::anonymous`,
         // `with_identity`, `create_channel`/`create_channel_for`, or
         // the 3-arg `AccessControl::can_read`/`can_write`) carries an
@@ -405,11 +405,11 @@ pub trait Channel: Send + Sync {
     ) -> impl std::future::Future<Output = BridgeResult<super::group::AnyMonitor>> + Send;
 }
 
-/// BRIDGE-FR-12: the result of a [`PvaMonitor::poll`] — the snapshot
+/// the result of a [`PvaMonitor::poll`] — the snapshot
 /// plus an optional explicit marked-leaf set.
 ///
 /// `marked == None`: the server derives the wire changed-bitset itself
-/// — the full request mask, or the BR-R29 value-diff for a pure
+/// — the full request mask, or the value-diff for a pure
 /// self-trigger group / single-record monitor. Single-record monitors
 /// and the group priming snapshot use this.
 ///
@@ -432,7 +432,7 @@ pub struct MonitorPoll {
 
 impl MonitorPoll {
     /// A snapshot with no explicit marked set — the server derives the
-    /// changed-bitset (full mask, or BR-R29 diff for a partial source).
+    /// changed-bitset (full mask, or diff for a partial source).
     pub fn derive(value: PvStructure) -> Self {
         Self {
             value,
@@ -778,7 +778,7 @@ impl BridgeProvider {
         self.groups.read().contains_key(name)
     }
 
-    /// BR-R29: true iff `name` is a registered group PV whose every
+    /// true iff `name` is a registered group PV whose every
     /// member uses the default self-trigger (`+trigger` absent →
     /// [`crate::qsrv::group_config::TriggerDef::SelfOnly`]) or
     /// explicit silence. Such a group's monitor events are *partial*
@@ -908,7 +908,7 @@ impl ChannelProvider for BridgeProvider {
         // PR #336 aliases are independently addressable channel
         // names — a PVA client running channelList expects them so
         // it can connect by alias. `channel_find` / `create_channel`
-        // already resolve aliases via has_name/get_record (round 7).
+        // already resolve aliases via has_name/get_record.
         names.extend(self.db.all_alias_names().await);
         names.extend(self.groups.read().keys().cloned());
         names.sort();
@@ -968,11 +968,11 @@ impl BridgeProvider {
             ));
         }
 
-        // Single record (or `record.FIELD`) channel — BR-R2.
+        // Single record (or `record.FIELD`) channel.
         // Cache by the full requested name so field PVs do not
         // poison the record's VAL-shaped cache entry.
         //
-        // BR-R40: peel off any pvxs `PV.VAL{...}` channel-filter
+        // peel off any pvxs `PV.VAL{...}` channel-filter
         // JSON suffix before record/field resolution. The filter
         // chain stays on `BridgeChannel`; resolution and cache
         // lookup use the record-path-only form.
@@ -1049,7 +1049,7 @@ mod tests {
         }
     }
 
-    /// Round-19 regression: AcfAccessControl bridges qsrv's
+    /// Regression: AcfAccessControl bridges qsrv's
     /// `AccessControl` trait to epics-base ACF so a BridgeProvider
     /// configured from a parsed `.acf` file enforces the same
     /// policy as the CA / PVA servers. Pre-fix, qsrv's AccessControl
@@ -1089,7 +1089,7 @@ ASG(SECURE) {
         assert!(!acl.can_write("AI:SEC", "guest", "anywhere"));
     }
 
-    /// BR-R4 regression: AcfAccessControl must honor method, authority,
+    /// Regression: AcfAccessControl must honor method, authority,
     /// roles, and field ASL on all four axes independently.
     ///
     /// Upstream parity:
@@ -1466,7 +1466,7 @@ ASG(ROLE_GATED) {
         );
     }
 
-    /// MR-R12: a QSRV access context built through the legacy
+    /// a QSRV access context built through the legacy
     /// no-method path (`AccessContext::anonymous`, `with_identity`,
     /// the 3-arg `AccessControl::can_read`/`can_write`) carries an
     /// empty `method`. pvxs sets an unauthenticated client's method

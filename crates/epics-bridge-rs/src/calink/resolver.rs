@@ -57,7 +57,7 @@ pub struct CaLink {
     /// precision, units) plus the channel's native DBF type and element
     /// count. `None` until the first attribute fetch completes; the
     /// connection-event watcher re-fetches on every (re)connection.
-    /// BRIDGE-FR-4 — mirrors C `dbCa.c`: `connectionCallback`
+    /// Mirrors C `dbCa.c`: `connectionCallback`
     /// (`dbCa.c:833`) schedules `CA_GET_ATTRIBUTES` on connect, and
     /// `getAttribEventCallback` (`dbCa.c:1080`) caches the
     /// `DBR_CTRL_DOUBLE` reply that `getControlLimits`/`getGraphicLimits`
@@ -130,7 +130,7 @@ impl CaLink {
     }
 
     /// Cached alarm *status* code (the EPICS `alarm_status` enum), or
-    /// `None` when the link is not connected. BRIDGE-FR-3: lets an
+    /// `None` when the link is not connected. lets an
     /// `MSS`-modified CA link propagate the remote STAT into the owning
     /// record instead of the generic `LINK_ALARM`. Gated on `connected`
     /// exactly like [`Self::alarm_severity`].
@@ -159,7 +159,7 @@ impl CaLink {
 
     /// Cached remote metadata (display/control/alarm limits, precision,
     /// units, DBF type, element count), or `None` when the link is not
-    /// connected. BRIDGE-FR-4. Gated on `connected` exactly like
+    /// connected. Gated on `connected` exactly like
     /// [`Self::value`]/[`Self::alarm_severity`] — C `pcaGetCheck`
     /// (`dbCa.c:650`) returns `-1` from every metadata getter while the
     /// CA link is disconnected, so the owning record keeps its local
@@ -223,7 +223,7 @@ impl CaLinkResolver {
             return Ok(existing);
         }
         let channel = Arc::new(self.client.create_channel(pv_name));
-        // BRIDGE-FR-4: subscribe the connection-event stream BEFORE the
+        // subscribe the connection-event stream BEFORE the
         // `subscribe()` round-trip that drives the circuit connect, so the
         // watcher cannot miss the `Connected` event — that event is what
         // kicks off the one-shot CTRL attribute fetch (mirroring C
@@ -246,7 +246,7 @@ impl CaLinkResolver {
         // real circuit state so `is_connected()` reflects upstream
         // disconnects (mirrors `pvalink`'s `monitor_connected` flag), and
         // re-fetches the remote CTRL attributes into `meta` on each
-        // connect (BRIDGE-FR-4).
+        // connect.
         let conn_task = self.handle.spawn(run_connection_watcher(
             conn_rx,
             connected.clone(),
@@ -370,7 +370,7 @@ async fn run_monitor(
 /// reflected by `CaLink::is_connected()`. Mirrors `dbCa.c`'s
 /// `connectionCallback` setting `pca->connected`.
 ///
-/// BRIDGE-FR-4: on every `Connected` the watcher also (re)fetches the
+/// on every `Connected` the watcher also (re)fetches the
 /// remote CTRL attributes into `meta`, mirroring `connectionCallback`
 /// scheduling `CA_GET_ATTRIBUTES` (`dbCa.c:910`). The fetch is detached
 /// so a slow or hung CTRL get never delays the watcher from observing a
@@ -389,7 +389,7 @@ async fn run_connection_watcher(
     loop {
         match conn_rx.recv().await {
             // A fresh `Connected` transition kicks off the CTRL attribute
-            // refetch (BRIDGE-FR-4); detached so a hung get never stalls
+            // refetch; detached so a hung get never stalls
             // the watcher from seeing a later disconnect.
             Ok(evt) => {
                 if note_conn_event(&evt, &connected) {
@@ -575,7 +575,7 @@ impl LinkSet for CaLinkResolver {
     }
 
     fn alarm_status(&self, name: &str) -> Option<i32> {
-        // BRIDGE-FR-3: surface the remote STAT for `MSS` propagation.
+        // surface the remote STAT for `MSS` propagation.
         // Record processing only consults this when the alarm is
         // actually propagated (severity > 0 via `alarm_severity`), so
         // no severity gate is needed here.
@@ -589,7 +589,7 @@ impl LinkSet for CaLinkResolver {
     }
 
     fn link_metadata(&self, name: &str) -> Option<LinkMetadata> {
-        // BRIDGE-FR-4: surface the remote display/control/alarm limits,
+        // surface the remote display/control/alarm limits,
         // precision, units, DBF type and element count through the DB
         // link API so a record with a CA INP link inherits them, matching
         // the pvalink metadata path. Reads the cached CTRL attributes —
@@ -665,7 +665,7 @@ mod tests {
     /// calls it). A disconnect MUST flip the flag false; pre-fix
     /// `is_connected()` keyed off cache presence alone and stayed `true`
     /// forever once any event had been cached, so an upstream IOC restart
-    /// was invisible and stale data was served. BRIDGE-FR-4: a
+    /// was invisible and stale data was served. a
     /// `Connected` transition additionally returns `true` to signal the
     /// CTRL attribute refetch; the clearing/neutral events return `false`.
     #[test]
@@ -777,7 +777,7 @@ mod tests {
         snap
     }
 
-    /// BRIDGE-FR-4: a numeric PV's CTRL attributes map into every
+    /// a numeric PV's CTRL attributes map into every
     /// `LinkMetadata` field. Pins the alarm-limit order to
     /// `(lolo, lo, hi, hihi)` (C `getAlarmLimits`), graphic/control to
     /// `(lower, upper)`, and the channel info to dbf type + element
@@ -795,7 +795,7 @@ mod tests {
         assert_eq!(md.units.as_deref(), Some("degC"));
     }
 
-    /// BRIDGE-FR-4: a CTRL reply with no `display`/`control` (a
+    /// a CTRL reply with no `display`/`control` (a
     /// String/Enum PV) yields only the channel-info fields; every limit
     /// stays `None` so the owning record keeps its local default.
     #[test]
@@ -816,7 +816,7 @@ mod tests {
         assert_eq!(md.units, None);
     }
 
-    /// BRIDGE-FR-4: when the channel info fetch failed (`None` dbf /
+    /// when the channel info fetch failed (`None` dbf /
     /// count) and there is no CTRL reply, every field is `None` — the
     /// link reports "no metadata yet" rather than fabricating zeros.
     #[test]
@@ -825,7 +825,7 @@ mod tests {
         assert_eq!(md, LinkMetadata::default());
     }
 
-    /// BRIDGE-FR-4: an empty `units` string is dropped to `None` (the
+    /// an empty `units` string is dropped to `None` (the
     /// remote carried no engineering units), not surfaced as `Some("")`.
     #[test]
     fn build_link_metadata_empty_units_omitted() {
@@ -846,7 +846,7 @@ mod tests {
         assert_eq!(md.precision, Some(0));
     }
 
-    /// BRIDGE-FR-4: every CA native field type maps to its
+    /// every CA native field type maps to its
     /// `LinkDbfType`.
     #[test]
     fn map_dbf_type_covers_every_variant() {

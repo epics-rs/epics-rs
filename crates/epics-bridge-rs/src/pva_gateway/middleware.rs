@@ -60,7 +60,7 @@ impl<S: ChannelSource> Layer<S> for ReadOnlyLayer {
 }
 
 impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
-    // Round 43: forward the inner source's AccessGate so the wire
+    // forward the inner source's AccessGate so the wire
     // layer's `gate.check` flows to the actual policy holder, not
     // a permissive Open singleton.
     fn access(&self) -> &epics_pva_rs::server_native::source::AccessGate {
@@ -75,7 +75,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     async fn get_introspection(&self, name: &str) -> Option<FieldDesc> {
         self.inner.get_introspection(name).await
     }
-    // BRIDGE-FR-8: forward the credential-aware existence/introspection
+    // forward the credential-aware existence/introspection
     // variants to the inner. Without these, the trait default would
     // delegate to THIS layer's ctx-less `has_pv`/`get_introspection`,
     // dropping the downstream peer's identity before it reaches a
@@ -175,7 +175,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
         self.inner.subscribe_raw_checked(checked, ctx).await
     }
-    // BRIDGE-FR-12: forward the cooked (marked) event-affecting-options
+    // forward the cooked (marked) event-affecting-options
     // MONITOR — the entry point the PVA server dispatches on — to the
     // inner. Without this the wrapper's `_marked` falls to the trait
     // default, which routes through this layer's own
@@ -221,7 +221,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
             .rpc_checked(checked, request_desc, request_value, ctx)
             .await
     }
-    // BRIDGE-FR-11: forward the per-PV watermark levels so the inner
+    // forward the per-PV watermark levels so the inner
     // gateway source's `monitor_watermarks` override is reachable
     // through the wrapper stack. Without this the server's monitor loop
     // sees the trait default `None` and never fires the pause/resume
@@ -233,7 +233,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         self.inner.notify_watermark(name, ctx, ev);
     }
-    // PVA-FR-11: same wrapper-severs-override defect family as
+    // same wrapper-severs-override defect family as
     // `notify_watermark`/`monitor_watermarks` above — a transparent
     // middleware layer that forwards one notify_* sibling but not the
     // other would sever the inner source's monitor-start (onStart)
@@ -445,7 +445,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.get_introspection(name).await
     }
-    // BRIDGE-FR-8: gate the credential-aware existence/introspection
+    // gate the credential-aware existence/introspection
     // variants by the same static allowlist as `has_pv`/
     // `get_introspection`, then forward to the inner's `*_checked` so a
     // gateway inner source resolves under THIS peer's identity. Without
@@ -489,7 +489,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.process(name).await
     }
-    // Round 43: type-state op variants gate by the layer's static
+    // type-state op variants gate by the layer's static
     // allowlist BEFORE delegating. The inner source still gets the
     // full AccessChecked + ctx and may apply its own ACF / per-
     // credential routing on top.
@@ -574,7 +574,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.subscribe_raw_checked(checked, ctx).await
     }
-    // BRIDGE-FR-12: forward the cooked (marked) event-affecting-options
+    // forward the cooked (marked) event-affecting-options
     // MONITOR — the server's dispatch entry point — applying the same ACL
     // deny-list gate as `subscribe_*_checked`.
     async fn subscribe_checked_opts_marked(
@@ -642,7 +642,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.process_checked(checked, ctx).await
     }
-    // BRIDGE-FR-11: forward the per-PV watermark levels so the inner
+    // forward the per-PV watermark levels so the inner
     // gateway source's `monitor_watermarks` override is reachable
     // through the wrapper stack. Without this the server's monitor loop
     // sees the trait default `None` and never fires the pause/resume
@@ -654,7 +654,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         self.inner.notify_watermark(name, ctx, ev);
     }
-    // PVA-FR-11: same wrapper-severs-override defect family as
+    // same wrapper-severs-override defect family as
     // `notify_watermark`/`monitor_watermarks` above — a transparent
     // middleware layer that forwards one notify_* sibling but not the
     // other would sever the inner source's monitor-start (onStart)
@@ -958,7 +958,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     async fn get_introspection(&self, name: &str) -> Option<FieldDesc> {
         self.inner.get_introspection(name).await
     }
-    // BRIDGE-FR-8: pure pass-through of the credential-aware variants,
+    // pure pass-through of the credential-aware variants,
     // matching the unaudited `has_pv`/`get_introspection` above
     // (existence/descriptor probes carry no audit row). Without these
     // the trait default would route through this layer's ctx-less
@@ -995,7 +995,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         self.sink.record(make_audit_event(name, "", "", &result));
         result
     }
-    // Round 43: typed PUT — emits a credential-aware audit row and
+    // typed PUT — emits a credential-aware audit row and
     // forwards through the inner's gate-enforced path.
     async fn put_value_checked(
         &self,
@@ -1126,7 +1126,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         result
     }
     async fn subscribe_raw(&self, name: &str) -> Option<mpsc::Receiver<RawMonitorEvent>> {
-        // Audit on subscribe_raw too, since the F-G12 zero-copy
+        // Audit on subscribe_raw too, since the zero-copy
         // path bypasses the typed `subscribe` and would otherwise
         // miss the audit event entirely.
         let result = self.inner.subscribe_raw(name).await;
@@ -1142,7 +1142,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    // Round 43: typed raw MONITOR — populate audit row with peer
+    // typed raw MONITOR — populate audit row with peer
     // credentials and forward through the inner's gate-enforced
     // path.
     async fn subscribe_raw_checked(
@@ -1166,7 +1166,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    // BRIDGE-FR-12: forward the cooked (marked) event-affecting-options
+    // forward the cooked (marked) event-affecting-options
     // MONITOR — the server's dispatch entry point — recording the same
     // Subscribe audit row as `subscribe_*_checked`. The audit layer is
     // outermost, so it records the attempt even when the inner gateway
@@ -1239,7 +1239,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    // Round 43: typed RPC — populate audit row with peer
+    // typed RPC — populate audit row with peer
     // credentials and forward through the inner's gate-enforced
     // path.
     async fn rpc_checked(
@@ -1267,7 +1267,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    // BRIDGE-FR-11: forward the per-PV watermark levels so the inner
+    // forward the per-PV watermark levels so the inner
     // gateway source's `monitor_watermarks` override is reachable
     // through the wrapper stack. Without this the server's monitor loop
     // sees the trait default `None` and never fires the pause/resume
@@ -1279,7 +1279,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         self.inner.notify_watermark(name, ctx, ev);
     }
-    // PVA-FR-11: same wrapper-severs-override defect family as
+    // same wrapper-severs-override defect family as
     // `notify_watermark`/`monitor_watermarks` above — a transparent
     // middleware layer that forwards one notify_* sibling but not the
     // other would sever the inner source's monitor-start (onStart)
@@ -1345,7 +1345,7 @@ mod tests {
 
     #[test]
     fn pattern_matching_interior_wildcard() {
-        // A9-10: an interior `*` must behave as a wildcard, not a
+        // an interior `*` must behave as a wildcard, not a
         // literal. Previously `MOTOR:*:JOG` matched only the literal
         // string `MOTOR:*:JOG`.
         assert!(matches_pattern("MOTOR:*:JOG", "MOTOR:X:JOG"));
@@ -1367,7 +1367,7 @@ mod tests {
         assert!(!matches_pattern("MOTOR:*:JOG", "MOTOR:*:JOGX"));
     }
 
-    /// A9-10: an interior-wildcard glob now works directly in the
+    /// an interior-wildcard glob now works directly in the
     /// allow/deny lists, without needing the `deny_regex` workaround.
     #[test]
     fn acl_interior_glob_in_allow_and_deny() {
@@ -1796,7 +1796,7 @@ mod tests {
         assert!(!value_reached.load(Ordering::SeqCst));
     }
 
-    // ── BRIDGE-FR-8: credentialed existence / introspection forwarding ──
+    // ── credentialed existence / introspection forwarding ──
 
     /// Records whether the credential-free (`has_pv`/`get_introspection`)
     /// or the credentialed (`*_checked`) path was reached, plus the
@@ -1901,7 +1901,7 @@ mod tests {
         );
     }
 
-    /// BRIDGE-FR-11: a source's `monitor_watermarks` levels must survive
+    /// a source's `monitor_watermarks` levels must survive
     /// the full `Audited<ReadOnly<Acl<S>>>` wrapper stack. Without the
     /// per-layer forwarder each wrapper returns the trait default `None`,
     /// so the server's monitor loop never fires the pause/resume
@@ -2134,7 +2134,7 @@ mod tests {
         assert_eq!(recorded[0].result, AuditResult::Denied);
     }
 
-    /// BR-R14 regression: minimal source that records whether its
+    /// Regression: minimal source that records whether its
     /// event-affecting-options MONITOR variant was reached.
     struct OptsRecordingSource {
         opts_reached: Arc<AtomicBool>,
@@ -2182,7 +2182,7 @@ mod tests {
         }
     }
 
-    /// BRIDGE-FR-12: the `Audit` / `ReadOnly` / `Acl` middleware wrappers
+    /// the `Audit` / `ReadOnly` / `Acl` middleware wrappers
     /// must forward `subscribe_checked_opts_marked` (the server's cooked
     /// dispatch entry point) / `subscribe_raw_checked_opts` to the inner
     /// source. Without the override the wrapper inherits the trait

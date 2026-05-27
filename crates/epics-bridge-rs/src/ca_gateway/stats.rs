@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(stats.read_only_rejects.load(Ordering::Relaxed), 1);
     }
 
-    /// A9-3: a `pvExistTest` (search resolution) must bump only the
+    /// a `pvExistTest` (search resolution) must bump only the
     /// separate `exist_count` (C `existTestRate`), never the upstream
     /// event counters. Pre-fix the resolver called `record_event()`,
     /// inflating total_events / eventRate / clientEventCount with search
@@ -657,7 +657,7 @@ mod tests {
         }
     }
 
-    /// A9-4: `vctotal` must count only cache entries with an attached
+    /// `vctotal` must count only cache entries with an attached
     /// downstream client (C `total_vc`, gateVc.cc:406,472), NOT the
     /// whole cache. `pvtotal` (C `total_pv`, gatePv.cc:183) remains the
     /// cache size. Pre-fix both were posted from `cache_size`, so a
@@ -708,7 +708,7 @@ mod tests {
         );
     }
 
-    /// A9-5: the `disconnected` alias must report the Disconnect-state
+    /// the `disconnected` alias must report the Disconnect-state
     /// count (C `statDisconnected`, gatePv.cc:607,616), NOT the Dead
     /// count; and `unconnected` (C `statUnconnected`) must include
     /// Disconnect alongside Connecting and Dead (gatePv.cc:315,328,608,
@@ -758,7 +758,7 @@ mod tests {
         );
     }
 
-    /// A9-6: every C-name compat-alias stat PV must be served as
+    /// every C-name compat-alias stat PV must be served as
     /// DBR_DOUBLE (C ca-gateway `gateStat.cc:27` `#define STAT_DOUBLE` →
     /// `bestExternalType()` = aitEnumFloat64, gateStat.cc:235-238).
     /// Pre-fix they were registered as DBR_LONG, so a downstream client

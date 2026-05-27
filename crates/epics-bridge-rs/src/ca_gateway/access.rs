@@ -42,7 +42,7 @@ use crate::error::{BridgeError, BridgeResult};
 
 /// The gateway's access policy. Modelled as one sum type so the
 /// "no rules" state cannot simultaneously mean allow-all and read-only
-/// (BR-R63): each variant gives `can_read`/`can_write` exactly one
+///: each variant gives `can_read`/`can_write` exactly one
 /// meaning.
 enum Mode {
     /// Read-only default — reads allowed, writes denied. Installed when no
@@ -72,7 +72,7 @@ impl AccessConfig {
     }
 
     /// Construct an "allow all" config with no underlying rules. Explicit
-    /// opt-in only — the no-file default is [`Self::read_only`] (BR-R63).
+    /// opt-in only — the no-file default is [`Self::read_only`].
     pub fn allow_all() -> Self {
         Self {
             mode: Mode::AllowAll,
@@ -96,7 +96,7 @@ impl AccessConfig {
 
     /// Whether reading the given (asg, asl, user, host) tuple is allowed.
     ///
-    /// The ASL is now passed to the underlying ACF check (C-G6 fix);
+    /// The ASL is now passed to the underlying ACF check;
     /// rules with a level below `asl` are skipped, matching epics-base
     /// `asLibRoutines.c::asCompute`. Negative or zero ASL is treated
     /// as level 0 (most-restrictive).
@@ -118,7 +118,7 @@ impl AccessConfig {
     pub fn can_write(&self, asg: &str, asl: i32, user: &str, host: &str) -> bool {
         match &self.mode {
             Mode::AllowAll => true,
-            // BR-R63: the read-only default denies writes (C parity).
+            // the read-only default denies writes (C parity).
             Mode::ReadOnly => false,
             Mode::Rules(cfg) => {
                 let asl = asl.max(0).min(u8::MAX as i32) as u8;
@@ -138,7 +138,7 @@ impl AccessConfig {
 
 impl Default for AccessConfig {
     fn default() -> Self {
-        // BR-R63: the no-config default is read-only, not allow-all.
+        // the no-config default is read-only, not allow-all.
         Self::read_only()
     }
 }
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn br_r63_default_is_read_only() {
-        // BR-R63: no-config default must allow reads but DENY writes,
+        // no-config default must allow reads but DENY writes,
         // matching C ca-gateway's `ASG(DEFAULT) { RULE(1,READ) }`.
         let acc = AccessConfig::default();
         assert!(!acc.has_rules());

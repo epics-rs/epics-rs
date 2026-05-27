@@ -251,7 +251,7 @@ impl PvaLink {
         if matches!(self.config.direction, LinkDirection::Out) {
             return Err(PvaLinkError::NotReadable);
         }
-        // BRIDGE-FR-13: a monitor link serves its cached value ONLY
+        // a monitor link serves its cached value ONLY
         // while the subscription is live. When the upstream monitor is
         // down — an IOC restart / transient I/O, or before the first
         // event has ever arrived — the cache is not a valid current
@@ -301,7 +301,7 @@ impl PvaLink {
         if matches!(self.config.direction, LinkDirection::Out) || !self.config.monitor {
             return None;
         }
-        // BRIDGE-FR-13: same disconnect gate as `read_with_field` — the
+        // same disconnect gate as `read_with_field` — the
         // sync fast path must never serve a stale cached value while the
         // monitor subscription is down. Returning `None` makes the lset
         // `get_value` fall through to the (also-gated) slow path and
@@ -328,7 +328,7 @@ impl PvaLink {
     /// instead of surfacing an error. Mirrors pvxs `pvaPutValue`
     /// (pvalink_lset.cpp:647 `if(!self->defer) lchan->put()`).
     ///
-    /// BR-R11: delegates to [`Self::write_with_block`] with `block=false`.
+    /// delegates to [`Self::write_with_block`] with `block=false`.
     pub async fn write(&self, value_str: &str) -> PvaLinkResult<()> {
         self.write_with_block(value_str, false).await
     }
@@ -375,7 +375,7 @@ impl PvaLink {
     ///
     /// B4: same `defer` / `retry` semantics as [`Self::write`].
     ///
-    /// BR-R11: delegates to [`Self::write_pv_field_with_block`] with
+    /// delegates to [`Self::write_pv_field_with_block`] with
     /// `block=false`.
     pub async fn write_pv_field(&self, value: &PvField) -> PvaLinkResult<()> {
         self.write_pv_field_with_block(value, false).await
@@ -396,7 +396,7 @@ impl PvaLink {
             return self.enqueue_put(QueuedPut::Field(value.clone()));
         }
         let req = build_put_request(self.config.proc, block);
-        // MR-R4: a typed write to a query-bearing OUT link
+        // a typed write to a query-bearing OUT link
         // (`pva://PV?field=someArray`) must target the selected
         // sub-field, not the root `value`. Mirrors pvxs `linkBuildPut`
         // (`pvalink_channel.cpp:138`): `top[fieldName]` when
@@ -458,7 +458,7 @@ impl PvaLink {
         let mut sent = 0usize;
         for (idx, value) in queued.iter().enumerate() {
             // Replay each queued Put through the same pvRequest path the
-            // immediate Put would have used (BR-R11: include process/block
+            // immediate Put would have used (include process/block
             // options, honor field targeting). block=false for deferred
             // replay — the caller did not request a blocking wait at
             // queue time and there is no caller to signal completion to.
@@ -481,7 +481,7 @@ impl PvaLink {
                     }
                 }
                 QueuedPut::Field(f) => {
-                    // MR-R4: replay typed field writes to the selected
+                    // replay typed field writes to the selected
                     // sub-field, same targeting as the immediate path.
                     if is_subfield(&self.config.field) {
                         self.client
@@ -569,7 +569,7 @@ impl PvaLink {
         }
     }
 
-    /// BRIDGE-FR-13: true iff this monitor link previously delivered a
+    /// true iff this monitor link previously delivered a
     /// value but its subscription is now down — the cached `latest` is
     /// stale. This is the precise "disconnected after connect" state
     /// that must contribute LINK_ALARM/INVALID through the alarm hooks.
@@ -606,7 +606,7 @@ impl PvaLink {
     /// caller-supplied `sevr` mode instead of this link's
     /// `self.config.sevr`.
     ///
-    /// MR-R15: the registry can return a cached INP `PvaLink` whose
+    /// the registry can return a cached INP `PvaLink` whose
     /// `config.sevr` belongs to whichever caller opened it first.
     /// Two INP links to the same remote PV with different `sevr`
     /// options would otherwise share one link's `MS`/`NMS`/`MSI`
@@ -614,7 +614,7 @@ impl PvaLink {
     /// each link applies its own maximize-severity mode (pvxs
     /// `pvaLinkConfig::sevr` is per-link, `pvxs/ioc/pvalink.h:65`).
     pub fn link_alarm_severity_with(&self, sevr: super::config::SevrMode) -> Option<i32> {
-        // BRIDGE-FR-13: a disconnected monitor link is INVALID
+        // a disconnected monitor link is INVALID
         // regardless of the MS/NMS/MSI gate — a broken link is a local
         // failure, not a remote-severity propagation that NMS would
         // suppress. pvxs `pvaGetValue` sets LINK_ALARM/INVALID_ALARM
@@ -656,11 +656,11 @@ impl PvaLink {
     /// Like [`Self::alarm_message`] but gates on a caller-supplied
     /// `sevr` mode instead of this link's `self.config.sevr`.
     ///
-    /// MR-R15: same rationale as [`Self::link_alarm_severity_with`] —
+    /// same rationale as [`Self::link_alarm_severity_with`] —
     /// the alarm-message gate must use the caller's per-link `sevr`,
     /// not whichever cached link's mode happens to be shared.
     pub fn alarm_message_with(&self, sevr: super::config::SevrMode) -> Option<String> {
-        // BRIDGE-FR-13: disconnect dominates — report the link failure,
+        // disconnect dominates — report the link failure,
         // not the stale remote alarm message. Pairs with the INVALID
         // severity `link_alarm_severity_with` returns for the same
         // state, so the owning record's LINK_ALARM carries a disconnect
@@ -700,7 +700,7 @@ impl PvaLink {
     /// the cached value carries one. Mirrors pvxs
     /// `pvaGetTimeStampTag`.
     pub fn time_stamp(&self) -> Option<(i64, i32)> {
-        // BRIDGE-FR-13: a disconnected monitor link must not serve its
+        // a disconnected monitor link must not serve its
         // stale latched timestamp — pvxs gates every lset getter
         // through `CHECK_VALID` (`valid() = connected && root`), so
         // `pvaGetTimeStampTag` returns no-data once the channel drops
@@ -760,7 +760,7 @@ impl PvaLink {
     /// count from a caller-supplied `field` path instead of this
     /// link's `self.config.field`.
     ///
-    /// MR-R15: the registry can return a cached INP `PvaLink` whose
+    /// the registry can return a cached INP `PvaLink` whose
     /// `config.field` belongs to whichever caller opened it first, so
     /// two INP links to the same remote PV with different `field`
     /// options would otherwise report the same DBF type / element
@@ -773,7 +773,7 @@ impl PvaLink {
     ) -> Option<epics_base_rs::server::database::LinkMetadata> {
         use epics_base_rs::server::database::LinkMetadata;
 
-        // BRIDGE-FR-13: same gate as the value/timestamp getters — a
+        // same gate as the value/timestamp getters — a
         // disconnected monitor link must not surface its stale latched
         // display/control/valueAlarm metadata, DBF type or element
         // count. pvxs's `CHECK_VALID` (`valid() = connected && root`)
@@ -924,7 +924,7 @@ fn is_disconnect(e: &epics_pva_rs::error::PvaError) -> bool {
                 || m.contains("disconnect")
         }
         PvaError::InvalidValue(_) | PvaError::Decode(_) => false,
-        // PVA-FR-9: an interrupted *wait* is not a disconnect. The
+        // an interrupted *wait* is not a disconnect. The
         // channel stays connected and the underlying Put keeps running,
         // recoverable by a later `wait` (`epics-pva-rs` error.rs:11-16) —
         // it is neither a "not connected yet" condition nor a value
@@ -943,7 +943,7 @@ fn is_disconnect(e: &epics_pva_rs::error::PvaError) -> bool {
 ///     (`Default → "passive"`, `Npp → "false"`, `Pp`/`Cp`/`Cpp → "true"`)
 ///   - `block`                   → `"true"` / `"false"` (pvxs `wait`)
 ///
-/// BRIDGE-FR-16: the process value is the three-way wire string the
+/// the process value is the three-way wire string the
 /// `ProcMode` enum derives, not a two-way bool — `Default` and `Npp`
 /// were previously indistinguishable (`"passive"` for both), and
 /// `Cp`/`Cpp` could not request remote processing on PUT.
@@ -972,7 +972,7 @@ fn is_subfield(field: &str) -> bool {
     !field.is_empty() && field != "value"
 }
 
-/// BR-R43: build the pvRequest for an INP+monitor link.
+/// build the pvRequest for an INP+monitor link.
 ///
 /// pvxs `pvaLink::makeRequest` (`pvalink_link.cpp:47-65`) ALWAYS
 /// emits three fields on every INP monitor request:
@@ -1315,14 +1315,14 @@ mod tests {
 
     // ---- B4: monitor_request (Q / pipeline) ----
 
-    /// BR-R43: pvxs `pvaLink::makeRequest` always emits pipeline +
+    /// pvxs `pvaLink::makeRequest` always emits pipeline +
     /// atomic + queueSize even on a defaults-only INP monitor.
     /// Regression for the prior `None`-for-defaults shortcut that
     /// silently let the remote server fall back to its own defaults.
     #[test]
     fn b4_monitor_request_always_carries_pvxs_options() {
         let cfg = PvaLinkConfig::defaults_for("X", LinkDirection::Inp);
-        let req = monitor_request(&cfg).expect("BR-R43: defaults still yield a request");
+        let req = monitor_request(&cfg).expect("defaults still yield a request");
         // pipeline = false on default config; queueSize = pvxs default 4;
         // atomic = forced true.
         assert!(
@@ -1334,13 +1334,13 @@ mod tests {
             req.record_options
                 .iter()
                 .any(|(k, v)| k == "atomic" && v == "true"),
-            "BR-R43: atomic must be hard-coded true on remote pvalink monitor requests"
+            "atomic must be hard-coded true on remote pvalink monitor requests"
         );
         assert!(
             req.record_options
                 .iter()
                 .any(|(k, v)| k == "queueSize" && v == "4"),
-            "BR-R43: queueSize must default to pvxs's 4 on no-options links"
+            "queueSize must default to pvxs's 4 on no-options links"
         );
     }
 
@@ -1543,7 +1543,7 @@ mod tests {
         assert!(link.is_connected(), "re-subscribe restores connected");
     }
 
-    // ---- BRIDGE-FR-13: disconnected monitor must not serve stale ----
+    // ---- disconnected monitor must not serve stale ----
     // Tested by invariant boundary, not by narrative: the four
     // (cached, connected) corners each get one case.
 
@@ -1650,7 +1650,7 @@ mod tests {
     /// `link_metadata` (`pvaGetGraphicLimits`/`pvaGetDBFtype`/…) must
     /// report no-data while the snapshot is retained — exactly like the
     /// value read. Pre-fix these two getters served the stale latched
-    /// metadata/timestamp. The existing BR-R24 `for_test(None)` case
+    /// metadata/timestamp. The existing `for_test(None)` case
     /// only covers cached=None; this covers cached=Some+disconnected.
     #[tokio::test]
     async fn fr13_disconnected_monitor_metadata_and_timestamp_refuse_stale() {
@@ -1743,7 +1743,7 @@ mod tests {
         assert!(!is_disconnect(&PvaError::Decode("x".into())));
     }
 
-    // ---- BR-R24: pvalink DB-link metadata hooks ----
+    // ---- pvalink DB-link metadata hooks ----
 
     /// Build a numeric `display` sub-structure with limitLow/limitHigh,
     /// units, description and precision.
@@ -1798,7 +1798,7 @@ mod tests {
         PvField::Structure(v)
     }
 
-    /// BR-R24: a pvalink must surface the linked PV's remote
+    /// a pvalink must surface the linked PV's remote
     /// display / control / valueAlarm metadata, DBF type and element
     /// count through the DB-link metadata hook — the Rust counterpart
     /// of the pvxs pvalink lset metadata getters installed at
@@ -1848,7 +1848,7 @@ mod tests {
         );
     }
 
-    /// BR-R24: a not-yet-connected link (no cached value) reports no
+    /// a not-yet-connected link (no cached value) reports no
     /// metadata — the record then keeps its local defaults. And an
     /// NTEnum value maps to `DBF_ENUM` with element count 1.
     #[test]
@@ -1883,7 +1883,7 @@ mod tests {
         assert_eq!(meta.element_count, Some(1), "enum index element count");
     }
 
-    /// BR-R11: pvalink OUT writes must carry proc/block/field options in
+    /// pvalink OUT writes must carry proc/block/field options in
     /// the PUT pvRequest.
     ///
     /// On main: `build_put_request` did not exist — no pvRequest was built
@@ -1906,7 +1906,7 @@ mod tests {
             "proc=PP must produce process=true in pvRequest"
         );
 
-        // proc=Default → process="passive" (BRIDGE-FR-16: distinct from NPP)
+        // proc=Default → process="passive" (distinct from NPP)
         let req = build_put_request(ProcMode::Default, false);
         assert!(
             req.record_options
@@ -1966,7 +1966,7 @@ mod tests {
         assert_eq!(link.pending_put_count(), 1, "one entry queued");
     }
 
-    /// MR-R4: a typed (`PvField`) OUT write to a query-bearing link
+    /// a typed (`PvField`) OUT write to a query-bearing link
     /// `pva://PV?field=<subfield>` must land the typed value on the
     /// selected sub-field, not on the root `value`. Pre-fix
     /// `write_pv_field` always routed through `pvput_pv_field_*`

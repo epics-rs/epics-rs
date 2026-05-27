@@ -35,7 +35,7 @@ use crate::error::{BridgeError, BridgeResult};
 pub struct BridgeMonitor {
     db: Arc<PvDatabase>,
     record_name: String,
-    /// Bound field (uppercased; defaults to `VAL`). BR-R2.
+    /// Bound field (uppercased; defaults to `VAL`).
     field: String,
     nt_type: NtType,
     /// VALUE | ALARM subscription — matches pvxs QSRV default DBE mask
@@ -49,12 +49,12 @@ pub struct BridgeMonitor {
     /// Without the second subscription, downstream PVA clients never see
     /// EGU / HOPR / LOPR / enum-string updates pushed through a monitor.
     property_subscription: Option<DbSubscription>,
-    /// BR-R5: override mask for the value subscription. `None` means
-    /// "use the pvxs-parity default VALUE|ALARM" (per BR-R36). Set by
+    /// override mask for the value subscription. `None` means
+    /// "use the pvxs-parity default VALUE|ALARM". Set by
     /// `with_value_mask` when the client provides
     /// `record._options.DBE` in the INIT pvRequest.
     value_mask_override: Option<u16>,
-    /// BR-R40: filter chain to install on the value subscription
+    /// filter chain to install on the value subscription
     /// when it's opened. Empty chain = no filtering. Sourced from
     /// the pvxs-compatible `PV.VAL{...}` JSON suffix on the
     /// channel name (parsed once by `BridgeChannel::new`).
@@ -88,7 +88,7 @@ impl BridgeMonitor {
         }
     }
 
-    /// BR-R40: attach the pvxs-compatible channel filter chain
+    /// attach the pvxs-compatible channel filter chain
     /// extracted from the `PV.VAL{...}` JSON suffix. Called by
     /// `BridgeChannel::create_monitor_with_value_mask` before
     /// `start()` opens the subscription.
@@ -108,7 +108,7 @@ impl BridgeMonitor {
         self
     }
 
-    /// BR-R5: override the value-subscription DBE mask.
+    /// override the value-subscription DBE mask.
     ///
     /// pvxs reads `record._options.DBE` from the MONITOR INIT
     /// pvRequest (singlesource.cpp:115). The wire layer extracts that
@@ -142,13 +142,13 @@ impl PvaMonitor for BridgeMonitor {
             )));
         }
 
-        // BR-R36: pvxs QSRV default mask is VALUE | ALARM, not
+        // pvxs QSRV default mask is VALUE | ALARM, not
         // VALUE | LOG. Subscribe explicitly so the Bridge does
         // not inherit DbSubscription::subscribe's CA-leaning
         // VALUE|LOG default, which would deliver archive-LOG
         // events while missing alarm transitions.
         //
-        // BR-R2: subscribe to the bound field (`record.FIELD`), not
+        // subscribe to the bound field (`record.FIELD`), not
         // unconditionally to `VAL`. `DbSubscription::subscribe_with_mask`
         // parses the PV name via `parse_pv_name`, so passing
         // `record.FIELD` binds the subscriber slot to that field's
@@ -157,7 +157,7 @@ impl PvaMonitor for BridgeMonitor {
         let value_mask = self
             .value_mask_override
             .unwrap_or_else(|| (EventMask::VALUE | EventMask::ALARM).bits());
-        // BR-R40: attach the channel-filter chain to the value
+        // attach the channel-filter chain to the value
         // subscription. Property subscription stays unfiltered;
         // pvxs-style filters only gate value-class events.
         let filters_opt = if self.filters.is_empty() {
@@ -175,7 +175,7 @@ impl PvaMonitor for BridgeMonitor {
         .await
         .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
-        // BR-R36: pvxs QSRV opens a second subscription with the
+        // pvxs QSRV opens a second subscription with the
         // PROPERTY mask (singlesource.cpp:161) so a PVA monitor
         // is woken when EGU / HOPR / LOPR / enum-string change,
         // not just when VAL changes. The full snapshot is rebuilt
@@ -206,13 +206,13 @@ impl PvaMonitor for BridgeMonitor {
             return Some(super::provider::MonitorPoll::derive(initial));
         }
 
-        // BR-R36: wake on either the VALUE|ALARM subscription or
+        // wake on either the VALUE|ALARM subscription or
         // the PROPERTY subscription — whichever the record posts
         // first. snapshot_to_pv_structure rebuilds the full NT
         // structure (with display/control/enums) on every wake,
         // so either firing pushes fresh metadata to the client.
         //
-        // BRIDGE-FR-12: a single-record monitor has no `+trigger`
+        // a single-record monitor has no `+trigger`
         // graph, so each update derives its own changed-bitset
         // (`marked: None`).
         match (
@@ -314,7 +314,7 @@ mod tests {
         mon2.stop().await;
     }
 
-    /// BR-R36: a PROPERTY-only post must wake `poll()` even when no
+    /// a PROPERTY-only post must wake `poll()` even when no
     /// value/alarm event ever fires. Regression for the prior
     /// behaviour where `BridgeMonitor` opened only one VALUE|LOG
     /// subscription and so PROPERTY-class metadata changes (EGU /
@@ -350,7 +350,7 @@ mod tests {
             .expect("PROPERTY event must wake poll within 500ms")
             .expect("snapshot delivered");
         // Snapshot is a full NT structure; sanity-check that we got one.
-        // BRIDGE-FR-12: a single-record monitor carries no marked set.
+        // a single-record monitor carries no marked set.
         assert!(
             snap.marked.is_none(),
             "single-record monitor must not carry an explicit marked set"

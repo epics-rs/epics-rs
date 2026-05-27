@@ -67,7 +67,7 @@ pub struct UpstreamEntry {
     /// fresh `broadcast::Receiver` from `subscribe()`. Holding the
     /// sender keeps the channel alive across re-subscribes.
     tx: broadcast::Sender<PvField>,
-    /// F-G12 raw-frame fan-out. Carries the upstream MONITOR DATA
+    /// Raw-frame fan-out. Carries the upstream MONITOR DATA
     /// body (`changed | value | overrun`) as a refcounted
     /// `bytes::Bytes` so N downstream subscribers all share the
     /// same allocation. Server-side `subscribe_raw` returns a
@@ -75,7 +75,7 @@ pub struct UpstreamEntry {
     /// `tx` (decoded PvField, for `subscribe()` and snapshot) and
     /// `tx_raw` (raw bytes) per upstream event.
     tx_raw: broadcast::Sender<crate::pva_gateway::source::RawEvent>,
-    /// BR-R46: cached latest raw event. Populated after the first
+    /// cached latest raw event. Populated after the first
     /// upstream monitor event so `subscribe_raw_inner` can deliver it
     /// as the initial snapshot to new raw subscribers. Cleared on
     /// type-change so stale bytes from the old descriptor are not
@@ -88,7 +88,7 @@ pub struct UpstreamEntry {
     _monitor_task: AbortOnDrop,
     /// Sticky "recently used" bit, lowered by the cleanup tick.
     drop_poke: parking_lot::Mutex<bool>,
-    /// BRIDGE-FR-11: single owner of upstream backpressure for this entry —
+    /// single owner of upstream backpressure for this entry —
     /// the per-op pause votes, the pause/resume handle on the *current*
     /// upstream subscription, and the lock that serializes every physical
     /// drive of it. Shared (`Arc`) between the spawned monitor task (which
@@ -129,7 +129,7 @@ impl PauseSink {
     }
 }
 
-/// BRIDGE-FR-11: the single owner of one upstream entry's backpressure.
+/// the single owner of one upstream entry's backpressure.
 ///
 /// **Invariant:** at every settled point, the currently-installed sink's
 /// physical pause-state equals [`Self::all_voting_paused`] over `votes` —
@@ -347,7 +347,7 @@ fn apply_monitor_event(
     }
 }
 
-/// BR-R57: synthesise a `changed | value` monitor body marking only the
+/// synthesise a `changed | value` monitor body marking only the
 /// `alarm` sub-struct as changed, setting `severity=3 (INVALID)` and
 /// `status=3 (UNDEFINED)`. Returns the modified [`PvField`] (for the typed
 /// broadcast channel) alongside the encoded [`crate::pva_gateway::source::RawEvent`]
@@ -438,7 +438,7 @@ impl UpstreamEntry {
         self.tx.subscribe()
     }
 
-    /// F-G12: raw-frame subscriber. Receives upstream MONITOR DATA
+    /// Raw-frame subscriber. Receives upstream MONITOR DATA
     /// body bytes verbatim. Server uses this to skip its own
     /// `encode_pv_field` step.
     pub fn subscribe_raw(&self) -> broadcast::Receiver<crate::pva_gateway::source::RawEvent> {
@@ -446,7 +446,7 @@ impl UpstreamEntry {
         self.tx_raw.subscribe()
     }
 
-    /// BR-R46: latest cached raw upstream frame. Returns `None` until
+    /// latest cached raw upstream frame. Returns `None` until
     /// the first upstream monitor event has been received (or after a
     /// type-change resets the cache).
     pub fn snapshot_raw(&self) -> Option<crate::pva_gateway::source::RawEvent> {
@@ -483,7 +483,7 @@ impl UpstreamEntry {
         *self.drop_poke.lock() = true;
     }
 
-    /// BRIDGE-FR-11: fold one downstream op's watermark transition into
+    /// fold one downstream op's watermark transition into
     /// this shared entry's pause votes and return the resulting upstream
     /// pause-state transition, if any.
     ///
@@ -511,7 +511,7 @@ impl UpstreamEntry {
         self.pause.apply_vote(op_id, seq, kind)
     }
 
-    /// BRIDGE-FR-11: drive the installed upstream Pauser to the current
+    /// drive the installed upstream Pauser to the current
     /// aggregate vote. Called by the gateway's single applier task after a
     /// vote edge, and by the reconnect loop after re-installing the Pauser
     /// (via [`PauseControl::install`]). Level-triggered and serialized — see
@@ -687,7 +687,7 @@ impl ChannelCache {
                 (existing.clone(), false)
             } else {
                 if map.len() >= self.max_entries {
-                    // PG-G11 spurious-reject mitigation: pre-sweep the
+                    // spurious-reject mitigation: pre-sweep the
                     // entries the periodic `cleanup_tick` would also evict —
                     // no remaining `drop_poke` grace AND no live downstream
                     // subscriber. Shares the `is_retained` keep-predicate
@@ -730,7 +730,7 @@ impl ChannelCache {
                 if !self.armed {
                     return;
                 }
-                // F-G1/F-G6: also record a negative-cache hit so a
+                // also record a negative-cache hit so a
                 // cancellation race (caller's outer timeout / abort
                 // dropping the future before await_first_event
                 // returns Err) doesn't leave the next lookup
@@ -809,7 +809,7 @@ impl ChannelCache {
         let join = tokio::spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
-            // BR-R57: emit INVALID alarm once per outage cycle, not once per
+            // emit INVALID alarm once per outage cycle, not once per
             // backoff iteration. Reset when a new connection starts successfully
             // (Ok(h) arm below) so the next disconnect emits a fresh alarm.
             let mut disconnected_alarm_sent = false;
@@ -819,7 +819,7 @@ impl ChannelCache {
                 let first_event_inner = first_event_for_task.clone();
                 let _pv_name_for_cb = pv_name_owned.clone();
 
-                // F-G12 final form: TRUE wire-bytes forwarding via
+                // final form: TRUE wire-bytes forwarding via
                 // `pvmonitor_raw_frames_handle` — the upstream monitor
                 // task never decodes the value. The body bytes flow
                 // straight from upstream socket → broadcast →
@@ -829,7 +829,7 @@ impl ChannelCache {
                 // callers, which today are unused for the gateway
                 // path).
                 //
-                // PG-G9 Pauser: the `_handle` variant returns a
+                // Pauser: the `_handle` variant returns a
                 // SubscriptionHandle whose `pauser()` we hand to
                 // `pause_for_task.install(..)` below. Downstream watermark
                 // events fold into the entry's vote map and the applier
@@ -838,7 +838,7 @@ impl ChannelCache {
                 let tx_raw_inner = tx_raw_for_task.clone();
                 let pv_clone = pv_name_owned.clone();
                 let latest_raw_inner = latest_raw_for_task.clone();
-                // BR-R41: tx_inner moves into the callback so decoded
+                // tx_inner moves into the callback so decoded
                 // events fan out to typed subscribers (subscribe_inner /
                 // subscribe_checked fallback path). Pre-fix this sender
                 // was dropped here before the closure captured it, so
@@ -855,7 +855,7 @@ impl ChannelCache {
                                  emitting type-change boundary to downstream monitors \
                                  (cache descriptor reset)"
                             );
-                            // BR-R42: pvxs treats reconnect/type-change as
+                            // pvxs treats reconnect/type-change as
                             // a subscription boundary
                             // (pvalink_channel.cpp:342-351 `onTypeChange()`).
                             // Forwarding the new body under the downstream's
@@ -866,7 +866,7 @@ impl ChannelCache {
                             // downstream dispatch path sends MONITOR FINISH
                             // and the client knows to reopen with a fresh
                             // INIT against the new descriptor.
-                            // BR-R46: clear stale bytes so new raw
+                            // clear stale bytes so new raw
                             // subscribers don't replay the old descriptor.
                             *latest_raw_inner.write() = None;
                             let _ = tx_raw_inner.send(RawEvent {
@@ -877,13 +877,13 @@ impl ChannelCache {
                             // Skip the normal body forward — the bytes are
                             // for the NEW descriptor; sending them under
                             // the old INIT descriptor is exactly the
-                            // BR-R42 bug.
+                            // bug.
                             return;
                         }
                         if outcome.was_first {
                             first_event_inner.notify_waiters();
                         }
-                        // BR-R41: fan out decoded value to typed subscribers
+                        // fan out decoded value to typed subscribers
                         // (subscribe/subscribe_checked fallback path).
                         // Guard: skip the initial event (`was_first`) because
                         // subscribe_inner always delivers it via snapshot().
@@ -897,7 +897,7 @@ impl ChannelCache {
                                 let _ = tx_inner.send(val);
                             }
                         }
-                        // BR-R46: cache latest raw event for initial
+                        // cache latest raw event for initial
                         // snapshot delivery to new raw subscribers.
                         // Clone is cheap (Bytes is refcounted).
                         let raw_ev = RawEvent {
@@ -931,7 +931,7 @@ impl ChannelCache {
                             backoff_ms = backoff.as_millis() as u64,
                             "pva-gateway: raw upstream monitor failed to start, will retry"
                         );
-                        // BR-R57: emit INVALID alarm once on this outage cycle
+                        // emit INVALID alarm once on this outage cycle
                         // so downstream monitors see the connection failure
                         // rather than observing stale data at NoAlarm.
                         if !disconnected_alarm_sent {
@@ -945,7 +945,7 @@ impl ChannelCache {
                             }
                             disconnected_alarm_sent = true;
                         }
-                        // BR-R50: guard removed — cleanup_tick aborts via AbortOnDrop.
+                        // guard removed — cleanup_tick aborts via AbortOnDrop.
                         tokio::time::sleep(backoff).await;
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                         continue;
@@ -963,7 +963,7 @@ impl ChannelCache {
                 pause_for_task.install(handle.pauser()).await;
                 let raw_result = handle.wait().await;
                 pause_for_task.clear();
-                // BR-R57: upstream disconnected — emit INVALID alarm once per
+                // upstream disconnected — emit INVALID alarm once per
                 // outage cycle so downstream PVA monitors see the disconnect
                 // via alarm severity (matching the CA gateway's B-G11
                 // INVALID+LINK_ALARM design). The subscription stays alive for
@@ -988,7 +988,7 @@ impl ChannelCache {
                         backoff_ms = backoff.as_millis() as u64,
                         "pva-gateway: raw upstream monitor failed, will retry"
                     );
-                    // BR-R50: guard removed — cleanup_tick aborts via AbortOnDrop.
+                    // guard removed — cleanup_tick aborts via AbortOnDrop.
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, max_backoff);
                     continue;
@@ -996,12 +996,12 @@ impl ChannelCache {
                 backoff = Duration::from_millis(250);
 
                 // Both typed (PvField) and raw-frame channels feed
-                // downstreams; F-G12 raw-forwarding is default-on so
+                // downstreams; raw-forwarding is default-on so
                 // most production subscribers ride tx_raw and tx is
                 // empty. Only exit when BOTH have no live receivers,
                 // otherwise upstream IOC restart silently kills every
                 // raw-path downstream monitor.
-                // BR-R50: guard removed — cleanup_tick evicts idle entries
+                // guard removed — cleanup_tick evicts idle entries
                 // (subscriber_count==0 && !drop_poke) and aborts this task
                 // via AbortOnDrop. Keeping the task alive until eviction
                 // prevents new subscribers from joining a dead broadcast.
@@ -1110,7 +1110,7 @@ impl ChannelCache {
 
     /// Test-only: insert a synthetic, parked entry under `pv_name` so
     /// cache-administration paths (`entry_count` / `flush` /
-    /// `drop_entry`, and the gateway's all-layers BRIDGE-FR-14
+    /// `drop_entry`, and the gateway's all-layers
     /// aggregation across shared + per-credential caches) can be
     /// exercised without a live upstream IOC.
     #[cfg(test)]
@@ -1172,7 +1172,7 @@ mod tests {
         body
     }
 
-    /// BRIDGE-FR-11 review (Finding 1): within ONE op, a LOW and HIGH that
+    /// Within ONE op, a LOW and HIGH that
     /// reach the applier reordered (they fire from the server emission loop
     /// vs the ACK path) must resolve to the op's truly-last crossing. The
     /// per-op `seq` is the gate: only a strictly-newer transition for that
@@ -1228,7 +1228,7 @@ mod tests {
         assert_eq!(entry.wm_vote_count(), 0, "withdraw clears the op vote");
     }
 
-    /// BRIDGE-FR-11 review (round 3): the shared upstream entry must
+    /// The shared upstream entry must
     /// reference-count pause votes across co-subscribers — pause iff EVERY
     /// live op wants pause, resume as soon as ANY has room. This is the
     /// multi-op composition the old last-writer-wins single-seq gate could
@@ -1280,7 +1280,7 @@ mod tests {
         assert_eq!(entry.wm_vote_count(), 0, "all votes withdrawn");
     }
 
-    /// BRIDGE-FR-11 review (round 4, the finding): an upstream reconnect
+    /// An upstream reconnect
     /// installs a fresh, UNPAUSED Pauser, but co-subscribers' standing pause
     /// votes survive the disconnect and no watermark edge re-fires after
     /// reconnect. The fresh Pauser must therefore be reconciled to the
@@ -1312,7 +1312,7 @@ mod tests {
         );
     }
 
-    /// BRIDGE-FR-11 review (round 4): the reconcile is level-triggered, so a
+    /// The reconcile is level-triggered, so a
     /// reconnect while the aggregate is "resumed" must NOT spuriously pause
     /// the fresh subscription. Boundary: a co-subscriber has room (aggregate
     /// resumed) at reconnect → the new sink is driven to unpaused.
@@ -1357,7 +1357,7 @@ mod tests {
         );
     }
 
-    /// BRIDGE-FR-11 review (round 4): `reconcile` with no installed sink
+    /// `reconcile` with no installed sink
     /// (upstream between connections) is a no-op — it must not panic and
     /// records nothing.
     #[tokio::test]
@@ -1378,7 +1378,7 @@ mod tests {
         );
     }
 
-    /// BRIDGE-FR-11 review (round 4, two-driver invariant): the whole point
+    /// Two-driver invariant: the whole point
     /// of routing every physical drive through one `drive`-serialized,
     /// level-triggered `reconcile` is that a reconnect re-install and the
     /// applier's edge-drive can run CONCURRENTLY without stranding the
@@ -1519,7 +1519,7 @@ mod tests {
         );
     }
 
-    /// BR-R42: `apply_monitor_event` flags a descriptor change so
+    /// `apply_monitor_event` flags a descriptor change so
     /// the gateway loop can emit a type-change marker event instead
     /// of forwarding the now-mismatched body. Prior code logged a
     /// warning and forwarded the bytes anyway; the downstream
@@ -1554,7 +1554,7 @@ mod tests {
         let o3 = apply_monitor_event(&state, &desc2, &body3, ByteOrder::Little);
         assert!(
             o3.type_changed,
-            "introspection change must be flagged for the BR-R42 marker path"
+            "introspection change must be flagged for the marker path"
         );
         assert!(
             o3.value.is_some(),
@@ -1591,7 +1591,7 @@ mod tests {
         assert!(*entry.drop_poke.lock(), "subscribe must poke");
     }
 
-    /// A9-1: both eviction paths share `is_retained`. Boundaries — idle &
+    /// both eviction paths share `is_retained`. Boundaries — idle &
     /// unsubscribed → evictable; poked → kept (one-tick grace); subscribed
     /// → kept even when `drop_poke == false` and `Arc::strong_count == 1`
     /// (a subscriber holds only a `broadcast::Receiver`). The old
@@ -1642,7 +1642,7 @@ mod tests {
         );
     }
 
-    /// BR-R57: `build_invalid_alarm_event` must return `None` when no prior
+    /// `build_invalid_alarm_event` must return `None` when no prior
     /// snapshot exists (first-connect, `latest_raw` is `None`). Nothing to
     /// invalidate — the first real upstream event will establish state.
     #[test]
@@ -1655,7 +1655,7 @@ mod tests {
         );
     }
 
-    /// BR-R57: `build_invalid_alarm_event` must return `None` for a non-NT
+    /// `build_invalid_alarm_event` must return `None` for a non-NT
     /// scalar type that has no `alarm` sub-struct. Only NTScalar-shaped PVs
     /// carry `alarm`; raw scalars must be left untouched.
     #[test]
@@ -1743,7 +1743,7 @@ mod tests {
         None
     }
 
-    /// BR-R57: for an NTScalar value, `build_invalid_alarm_event` must return
+    /// for an NTScalar value, `build_invalid_alarm_event` must return
     /// a PvField with alarm.severity=3 (INVALID) and alarm.status=3 (UNDEFINED),
     /// while the value field is preserved unchanged.
     #[test]
@@ -1787,7 +1787,7 @@ mod tests {
         }
     }
 
-    /// BR-R57: on reconnect, the normal upstream monitor event must overwrite
+    /// on reconnect, the normal upstream monitor event must overwrite
     /// the INVALID alarm state so the indicator does not stick after recovery.
     /// Verifies via `apply_monitor_event` — the same path the real monitor task uses.
     #[test]

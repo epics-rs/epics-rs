@@ -53,7 +53,7 @@ impl Default for PutOptions {
     }
 }
 
-/// BR-R5: parse `record._options.DBE` from a MONITOR INIT
+/// parse `record._options.DBE` from a MONITOR INIT
 /// pvRequest. Returns the DBE bitmask as an EPICS event mask
 /// (`EventMask::VALUE | ALARM | LOG | PROPERTY`), or `None` if
 /// the option is absent / unparseable.
@@ -111,7 +111,7 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
     }
 }
 
-/// BR-R16: parse `record._options.atomic` from a group operation
+/// parse `record._options.atomic` from a group operation
 /// pvRequest. Returns `Some(true|false)` when the option is set,
 /// `None` when absent — the caller then falls back to the group's
 /// default atomicity. pvxs accepts either a boolean scalar
@@ -190,7 +190,7 @@ impl PutOptions {
 
 /// A PVA channel backed by a single EPICS database record.
 ///
-/// BR-R2: a channel binds to `record.FIELD`, not just `record`.
+/// a channel binds to `record.FIELD`, not just `record`.
 /// `pv_name` is the full client-facing PV identity (used by ACF,
 /// monitor identity, error messages); `record_name` is the resolved
 /// canonical record; `field` is the uppercased field name used by
@@ -206,9 +206,9 @@ pub struct BridgeChannel {
     /// Uppercased field name. Defaults to `"VAL"`.
     field: String,
     nt_type: NtType,
-    /// The DBF type of the bound field (not always VAL — BR-R2).
+    /// The DBF type of the bound field (not always VAL).
     value_dbf: DbFieldType,
-    /// BR-R40: parsed pvxs-compatible channel-filter chain from the
+    /// parsed pvxs-compatible channel-filter chain from the
     /// trailing JSON suffix on the PV name (`PV.VAL{"dbnd":{"d":2.0}}`
     /// etc.). Empty chain when the name carries no suffix. Attached to
     /// the monitor subscription so the same subscription's events go
@@ -268,7 +268,7 @@ impl BridgeChannel {
     /// DBF type, and derives the NormativeType from the field-vs-VAL
     /// shape.
     ///
-    /// BR-R40: also peels off any trailing pvxs channel-filter JSON
+    /// also peels off any trailing pvxs channel-filter JSON
     /// suffix (e.g. `test:ai.VAL{"dbnd":{"d":0.0}}`) via
     /// `split_channel_name` before record/field resolution, and
     /// stashes the parsed filter chain on the channel so the next
@@ -342,7 +342,7 @@ impl BridgeChannel {
         &self.field
     }
 
-    /// BR-R3: PUT with caller-supplied options.
+    /// PUT with caller-supplied options.
     ///
     /// pvxs reads `record._options.process` and `record._options.block`
     /// from the INIT pvRequest (`iocsource.cpp:429`), not from the
@@ -371,7 +371,7 @@ impl BridgeChannel {
         })?;
 
         // Use typed conversion to match the bound field's actual DBF
-        // type. MR-R22: `UInt64`/`Int64` MUST be in this scalar arm.
+        // type. `UInt64`/`Int64` MUST be in this scalar arm.
         // `pv_structure_to_epics` now preserves a scalar PVA `ulong`
         // as `EpicsValue::UInt64` (and `long` as `Int64`) instead of
         // folding it into `Double`; routing it back through
@@ -402,7 +402,7 @@ impl BridgeChannel {
             _ => raw_val,
         };
 
-        // BR-R20: pvxs distinguishes Force vs Passive — both write the
+        // pvxs distinguishes Force vs Passive — both write the
         // bound field, but Force *also* triggers an explicit
         // process-record afterwards.
         match opts.process {
@@ -442,7 +442,7 @@ impl BridgeChannel {
 
 impl Channel for BridgeChannel {
     fn channel_name(&self) -> &str {
-        // BR-R2: report the full PV identity (`record.FIELD`) so ACF
+        // report the full PV identity (`record.FIELD`) so ACF
         // checks and error messages distinguish field PVs from the
         // record PV.
         &self.pv_name
@@ -479,7 +479,7 @@ impl Channel for BridgeChannel {
         // Backward-compat entry: parses options from the value
         // structure (the legacy location). New callers should
         // prefer [`BridgeChannel::put_with_options`] and pass options
-        // extracted from the INIT pvRequest (BR-R3).
+        // extracted from the INIT pvRequest.
         let opts = PutOptions::from_pv_request(value);
         self.put_with_options(value, opts).await
     }
@@ -495,7 +495,7 @@ impl Channel for BridgeChannel {
 }
 
 impl BridgeChannel {
-    /// BR-R5: create a monitor with an explicit value-subscription DBE
+    /// create a monitor with an explicit value-subscription DBE
     /// mask. Called by `QsrvPvStore::subscribe_checked` after parsing
     /// `record._options.DBE` from the MONITOR INIT pvRequest. `None`
     /// uses the pvxs-parity default (`VALUE | ALARM`).
@@ -519,7 +519,7 @@ impl BridgeChannel {
             self.nt_type,
         )
         .with_access(self.access.clone())
-        // BR-R40: thread the channel's parsed filter chain (from the
+        // thread the channel's parsed filter chain (from the
         // pvxs `PV.VAL{...}` JSON suffix) into the monitor so its
         // subscription installs the filters at the dbChannel level.
         .with_filters(self.monitor_filters.clone());
@@ -612,7 +612,7 @@ mod tests {
         req
     }
 
-    /// BR-R5: pvxs-style flag string with `|`-separated tokens
+    /// pvxs-style flag string with `|`-separated tokens
     /// resolves to the corresponding EPICS event mask bits.
     #[test]
     fn dbe_mask_parses_value_alarm() {
@@ -622,7 +622,7 @@ mod tests {
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
-    /// BR-R5: `DBE_` prefix and `ARCHIVE` alias for LOG are accepted.
+    /// `DBE_` prefix and `ARCHIVE` alias for LOG are accepted.
     #[test]
     fn dbe_mask_accepts_dbe_prefix_and_archive_alias() {
         use epics_base_rs::server::recgbl::EventMask;
@@ -636,7 +636,7 @@ mod tests {
         );
     }
 
-    /// BR-R5: numeric integer DBE option is accepted as the raw mask.
+    /// numeric integer DBE option is accepted as the raw mask.
     #[test]
     fn dbe_mask_accepts_integer_form() {
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(5)));
@@ -644,7 +644,7 @@ mod tests {
         assert_eq!(mask, 5);
     }
 
-    /// BR-R5: missing DBE option resolves to None so the monitor
+    /// missing DBE option resolves to None so the monitor
     /// falls back to the pvxs-parity default mask.
     #[test]
     fn dbe_mask_absent_returns_none() {
@@ -665,7 +665,7 @@ mod tests {
         req
     }
 
-    /// BR-R16: boolean `record._options.atomic = true` resolves to
+    /// boolean `record._options.atomic = true` resolves to
     /// `Some(true)` so the group operation overrides the default.
     #[test]
     fn atomic_option_parses_boolean_true() {
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(atomic_from_pv_request(&req), Some(true));
     }
 
-    /// BR-R16: string form (`"false"`) is also accepted, matching
+    /// string form (`"false"`) is also accepted, matching
     /// pvxs's lenient option parsing.
     #[test]
     fn atomic_option_parses_string_false() {
@@ -681,7 +681,7 @@ mod tests {
         assert_eq!(atomic_from_pv_request(&req), Some(false));
     }
 
-    /// BR-R16: absent option resolves to None so callers fall back to
+    /// absent option resolves to None so callers fall back to
     /// the group default.
     #[test]
     fn atomic_option_absent_returns_none() {

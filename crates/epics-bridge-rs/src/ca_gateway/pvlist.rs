@@ -31,7 +31,7 @@
 //! - The DENY `FROM host` clause is host-scoped: it denies only when the
 //!   requester host matches. It is enforced at the put-hook path via
 //!   [`PvList::is_host_denied`] and at downstream search/create
-//!   resolution via [`PvList::match_name_for_host`] (BRIDGE-FR-10, the
+//!   resolution via [`PvList::match_name_for_host`] (the
 //!   parity equivalent of C `gateServer::pvExistTest` →
 //!   `gateAs::findEntry(pvname, hostname)`). Host-less callers (preload,
 //!   pvlist-reload prune) use [`PvList::match_name`], which by design
@@ -97,7 +97,7 @@ impl PvListEntry {
     /// A DENY rule with NO `FROM host …` list — an unconditional
     /// (global) deny that participates in host-less [`PvList::match_name`].
     ///
-    /// BRIDGE-FR-10: a host-targeted `pattern DENY FROM host …` rule is
+    /// a host-targeted `pattern DENY FROM host …` rule is
     /// NOT a global deny. It applies only when the requester host
     /// matches, via the host-aware path ([`PvList::match_name_for_host`]
     /// / [`PvList::is_host_denied`]) — mirroring C ca-gateway's
@@ -271,7 +271,7 @@ impl PvList {
     /// Returns `Some(PvListMatch)` if the name should be served (allowed,
     /// possibly via alias), or `None` if the name is denied.
     ///
-    /// BRIDGE-FR-10: only *global* DENY rules (`pattern DENY`, no `FROM`)
+    /// only *global* DENY rules (`pattern DENY`, no `FROM`)
     /// participate here. Host-targeted `pattern DENY FROM host …` rules
     /// are excluded from the deny set — they cannot be evaluated without
     /// a host, and treating them as global denies is the FR-10 defect.
@@ -337,7 +337,7 @@ impl PvList {
     /// Host-aware name admission for downstream CA search/create
     /// resolution.
     ///
-    /// BRIDGE-FR-10: this is the parity equivalent of C ca-gateway's
+    /// this is the parity equivalent of C ca-gateway's
     /// `gateServer::pvExistTest` calling `gateAs::findEntry(pvname,
     /// hostname)` (gateServer.cc:1537). A host-targeted `pattern DENY
     /// FROM host …` rule is evaluated FIRST and unconditionally: if the
@@ -481,7 +481,7 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
                 if t.eq_ignore_ascii_case("FROM") {
                     for h in tokens {
                         // Stored as-is here; PvList::resolve_hosts() converts
-                        // hostnames to IP strings at load time (BR-R53 fix),
+                        // hostnames to IP strings at load time,
                         // mirroring C aToIPAddr (gateAs.cc:488-506).
                         from_hosts.push(h.to_string());
                     }
@@ -538,7 +538,7 @@ fn build_pattern(pat: &str, lineno: usize) -> BridgeResult<Regex> {
 mod tests {
     use super::*;
 
-    /// A9-2: an omitted `.pvlist` ASL must default to C ca-gateway's
+    /// an omitted `.pvlist` ASL must default to C ca-gateway's
     /// `int lev=1` (gateAs.cc), not 0. The call sites previously used
     /// `unwrap_or(0)`, which over-permitted: AS activates a rule iff
     /// `client_asl <= rule.level`, so a level-0 default applies a
@@ -732,7 +732,7 @@ mod tests {
         assert!(list.match_name("Other:pv").is_none());
     }
 
-    // ---- BRIDGE-FR-10: host-aware DENY FROM admission ----
+    // ---- host-aware DENY FROM admission ----
 
     #[test]
     fn fr10_host_targeted_deny_is_not_a_global_deny() {
@@ -855,7 +855,7 @@ mod tests {
         assert_eq!(result, "prefix_hello_suffix");
     }
 
-    // --- BR-R53: resolve_hosts converts DENY FROM hostnames to IPs ---
+    // --- resolve_hosts converts DENY FROM hostnames to IPs ---
 
     /// An IP literal in DENY FROM is preserved verbatim after resolve_hosts.
     #[tokio::test]

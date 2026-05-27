@@ -59,7 +59,7 @@ pub fn scalar_to_epics(val: &ScalarValue) -> EpicsValue {
         ScalarValue::Float(v) => EpicsValue::Float(*v),
         ScalarValue::Double(v) => EpicsValue::Double(*v),
         ScalarValue::Int(v) => EpicsValue::Long(*v),
-        // MR-R22: `Long`/`ULong` are 64-bit; folding them into
+        // `Long`/`ULong` are 64-bit; folding them into
         // `EpicsValue::Double` loses integer precision above the exact
         // `f64` integer range (2^53). `EpicsValue::Int64`/`UInt64`
         // exist now, so preserve the full 64-bit range — this is the
@@ -284,7 +284,7 @@ pub fn epics_to_pv_field(val: &EpicsValue) -> PvField {
 
 /// Extract EpicsValue from a PvField.
 pub fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
-    // F-G11 transition: typed scalar arrays land here too. Convert
+    // transition: typed scalar arrays land here too. Convert
     // back through `to_scalar_values` so the existing per-type
     // dispatch keeps working without duplicating the logic.
     if let PvField::ScalarArrayTyped(arr) = field {
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn br_r13_uint64_field_maps_to_pva_ulong() {
-        // BR-R13: a C `DBF_UINT64` field must map to PVA `ulong`, and a
+        // a C `DBF_UINT64` field must map to PVA `ulong`, and a
         // value above `i64::MAX` must survive conversion in both
         // directions. On main `DbFieldType::UInt64` / `EpicsValue::UInt64`
         // did not exist, so unsigned-64 fields could not be represented.
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn f9_dbf_char_signed_roundtrip() {
-        // F9: DBF_CHAR maps to pvByte (signed). A negative value (-1 stored
+        // DBF_CHAR maps to pvByte (signed). A negative value (-1 stored
         // as 0xFF) must serialize as ScalarValue::Byte(-1), then round-trip
         // back to the same byte pattern in EpicsValue::Char.
         let orig = EpicsValue::Char(0xFFu8); // bit pattern for -1 as i8
@@ -583,7 +583,7 @@ mod tests {
         assert_eq!(ev, EpicsValue::Short(200));
     }
 
-    /// MR-R22: a scalar PVA `ulong` extracted through the context-free
+    /// a scalar PVA `ulong` extracted through the context-free
     /// fallback `scalar_to_epics` must preserve the full unsigned
     /// 64-bit range. The branch folded `ScalarValue::ULong` into
     /// `EpicsValue::Double(v as f64)`, losing integer precision above
@@ -611,7 +611,7 @@ mod tests {
         assert_eq!(ev_i, EpicsValue::Int64(big_i));
     }
 
-    /// MR-R22: the single-record QSRV PUT conversion chain. A native
+    /// the single-record QSRV PUT conversion chain. A native
     /// PVA client sends an NTScalar carrying a `ulong` value;
     /// `BridgeChannel::put_with_options` extracts it via
     /// `pv_structure_to_epics`, then re-types it against the bound

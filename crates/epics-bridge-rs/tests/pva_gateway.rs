@@ -436,7 +436,7 @@ async fn multi_tenant_gateway_routes_to_correct_upstream() {
     assert_eq!(v, 2.0);
 }
 
-/// A9-13 regression: a per-downstream ACL deny list installed via
+/// Regression: a per-downstream ACL deny list installed via
 /// `downstream_access` must short-circuit a denied PV name before it
 /// reaches *any* of that downstream's upstreams — and an allowed name
 /// must still resolve. Pre-fix the multi-tenant builder wrapped each
@@ -524,7 +524,7 @@ async fn multi_tenant_downstream_acl_denies_pv() {
     assert_eq!(v, 5.0);
 }
 
-/// A9-13 regression: a per-downstream `read_only` flag set via
+/// Regression: a per-downstream `read_only` flag set via
 /// `downstream_access` must reject every PUT on that downstream. Pre-fix
 /// the multi-tenant builder inserted no `ReadOnlyLayer`, so a `read_only`
 /// downstream silently forwarded PUTs upstream.
@@ -584,7 +584,7 @@ async fn multi_tenant_downstream_read_only_rejects_put() {
     }
 }
 
-// ── CRITICAL-1: gateway middleware (ReadOnly / ACL / Audit) wiring ──
+// ── gateway middleware (ReadOnly / ACL / Audit) wiring ──
 
 /// Build a gateway config pinned at `upstream` with an isolated
 /// random-port downstream server.
@@ -619,7 +619,7 @@ fn gateway_cfg(upstream: Arc<PvaClient>) -> PvaGatewayConfig {
     }
 }
 
-/// CRITICAL-1 regression: a `read_only` gateway must reject every
+/// Regression: a `read_only` gateway must reject every
 /// downstream PUT. Pre-fix the `ReadOnlyLayer` was never inserted by
 /// `PvaGateway::start`, so a `read_only` deployment silently
 /// forwarded PUTs to the upstream.
@@ -655,7 +655,7 @@ async fn critical1_read_only_gateway_rejects_put() {
     }
 }
 
-/// CRITICAL-1 regression: an ACL deny list installed on the gateway
+/// Regression: an ACL deny list installed on the gateway
 /// config must short-circuit a denied PV name before it reaches the
 /// upstream — `has_pv` / GET return "not found" at the `AclLayer`.
 /// Pre-fix the `AclLayer` was never inserted, so the deny list was
@@ -686,7 +686,7 @@ async fn critical1_acl_layer_denies_pv() {
     }
 }
 
-/// CRITICAL-1 regression: an audit sink installed on the gateway
+/// Regression: an audit sink installed on the gateway
 /// config receives a PUT audit event. The gateway is also `read_only`
 /// here, which exercises layer ORDERING: `Audit` is outermost, so it
 /// records the PUT even though the inner `ReadOnly` layer rejected it
@@ -732,7 +732,7 @@ async fn critical1_audit_layer_records_put() {
     );
 }
 
-/// BR-R6: typed PUT pass-through. Pre-fix the gateway re-encoded every
+/// typed PUT pass-through. Pre-fix the gateway re-encoded every
 /// upstream PUT through `pvfield_to_pvput_string`; the function recursed
 /// into the "value" sub-field and joined String array elements with spaces
 /// before passing to `pvput`, which splits on commas —
@@ -748,13 +748,13 @@ async fn critical1_audit_layer_records_put() {
 /// Passes after fix: `pvput_pv_field` sends the typed structure intact.
 ///
 /// Calls `GatewayChannelSource::put_value` directly to avoid the
-/// per-credential upstream-client routing issue (BR-R8): when the downstream
+/// per-credential upstream-client routing issue: when the downstream
 /// client sends "ca" auth with a non-empty OS username, `upstream_client_for`
 /// creates a new client without `server_addr`, which falls through to
 /// `Resolver::Search` and times out against the isolated test server.
 /// Testing via the source directly stays on the shared cache client
 /// (Direct resolver → always works) and still exercises the exact
-/// `put_value` code path changed by BR-R6.
+/// `put_value` code path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn br_r6_gateway_typed_put_passthrough() {
     // Upstream: a structure with a "value: String[]" sub-field.
@@ -863,7 +863,7 @@ async fn br_r6_gateway_typed_put_passthrough() {
     );
 }
 
-/// BR-R41: typed-subscribe fallback delivers live updates.
+/// typed-subscribe fallback delivers live updates.
 ///
 /// `GatewayChannelSource::subscribe` routes through `subscribe_inner`
 /// which bridges a `broadcast::Receiver<PvField>` (from `entry.subscribe()`)

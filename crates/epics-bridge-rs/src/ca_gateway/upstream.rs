@@ -73,7 +73,7 @@ struct UpstreamSubscription {
     asg: Option<String>,
     /// Resolved access security level (paired with `asg`).
     asl: i32,
-    /// BR-R51: watcher that keeps `upstream_write` in the access hook
+    /// watcher that keeps `upstream_write` in the access hook
     /// closure up-to-date. Aborted on drop (when the subscription is
     /// removed via `unsubscribe`).
     _access_rights_watcher: EventWatcher,
@@ -235,7 +235,7 @@ impl UpstreamManager {
     /// 5. Spawn forwarding task with auto-restart
     /// 6. Install per-PV WriteHook on the shadow PV
     ///
-    /// BRIDGE-FR-2: `served_name` is the downstream-facing identity the
+    /// `served_name` is the downstream-facing identity the
     /// client searched for (a `.pvlist` `ALIAS` name, or — for a plain
     /// `ALLOW` match — the same string as `upstream_name`). The shadow
     /// PV, subscription dedup key, cache entry, and monitor fan-out all
@@ -319,7 +319,7 @@ impl UpstreamManager {
         // exactly once when the subscription is dropped.
         let channel = Arc::new(self.client.create_channel(upstream_name));
 
-        // BR-R64: only register a shadow PV once the upstream channel
+        // only register a shadow PV once the upstream channel
         // actually connects. Without this gate the get() below times out,
         // falls back to Double(0.0), and we register a placeholder the
         // search resolver then advertises as existing — black-holing a
@@ -341,7 +341,7 @@ impl UpstreamManager {
                 served = served_name,
                 error = %e,
                 "ca-gateway-rs: upstream did not connect within connect_timeout; \
-                 treating search as a miss (BR-R64)"
+                 treating search as a miss"
             );
             return Err(BridgeError::PutRejected(format!(
                 "upstream PV did not connect: {upstream_name}"
@@ -355,7 +355,7 @@ impl UpstreamManager {
         // value either way. The timeout/error is logged at INFO so
         // an operator chasing type-mismatch confusion can correlate
         // a confused downstream introspect with its upstream miss.
-        // BR-R49: channel.get() returns (DbFieldType, EpicsValue)
+        // channel.get() returns (DbFieldType, EpicsValue)
         // only — no DBR_CTRL_* metadata (units/precision/limits).
         // A DBR_CTRL GET + DBE_PROPERTY subscription is needed so
         // downstream DBR_CTRL_* and DBR_GR_* reads return real
@@ -381,7 +381,7 @@ impl UpstreamManager {
             }
         };
 
-        // BR-R51: read initial upstream write-access and create a flag
+        // read initial upstream write-access and create a flag
         // the access hook AND write-hook closures share. `channel.info()`
         // reads a cached snapshot — no round-trip — and succeeds here
         // because `channel.get()` above already waited for connection.
@@ -409,7 +409,7 @@ impl UpstreamManager {
             asl,
             self.write_env.clone(),
         );
-        // BRIDGE-FR-1: install the read/write access hook alongside the
+        // install the read/write access hook alongside the
         // write hook, capturing the same ACF authority + this PV's
         // `.pvlist` ASG/ASL, so the CA server gates downstream reads
         // through `can_read` instead of granting every shadow PV a
@@ -426,7 +426,7 @@ impl UpstreamManager {
         // re-registering. A genuine collision with a non-gateway
         // record/alias surfaces as `Err` and we propagate.
         //
-        // BRIDGE-FR-2: registered under `served_name` (the alias) so a
+        // registered under `served_name` (the alias) so a
         // downstream lookup of the alias resolves; the hook above still
         // forwards puts to `upstream_name` (the real PV).
         self.shadow_db.remove_simple_pv(served_name).await;
@@ -453,7 +453,7 @@ impl UpstreamManager {
             }
         };
 
-        // BR-R51: keep upstream_write up-to-date when the IOC's write-
+        // keep upstream_write up-to-date when the IOC's write-
         // access changes (e.g. ASG protection lockout). The C gateway's
         // accessCB (gatePv.cc:1851-1852) calls setWriteAccess + postAccessRights;
         // runtime re-notification to connected downstream clients requires a
@@ -475,7 +475,7 @@ impl UpstreamManager {
         let channel_for_task = channel.clone();
         let stats_for_task = self.write_env.stats.clone();
         let beacon_anomaly_for_task = self.write_env.beacon_anomaly.clone();
-        // BRIDGE-FR-2: the forwarding task addresses the cache entry,
+        // the forwarding task addresses the cache entry,
         // shadow PV, and alarm post by `served_name` — the same key the
         // shadow PV and cache were registered under above.
         let name = served_name.to_string();
@@ -565,7 +565,7 @@ impl UpstreamManager {
                 if let Some(entry_arc) = cache_clone.read().await.get(&name) {
                     entry_arc.write().await.set_state(PvState::Disconnect);
                 }
-                // 3 = INVALID severity. BR-R47: LINK_ALARM (14) is the
+                // 3 = INVALID severity. LINK_ALARM (14) is the
                 // correct EPICS status for a link-disconnect alarm;
                 // upstream disconnect is visible to downstream monitors
                 // both via severity and via the correct status code.
@@ -620,7 +620,7 @@ impl UpstreamManager {
             }
         });
 
-        // BRIDGE-FR-2: subscription dedup keys on `served_name` so a
+        // subscription dedup keys on `served_name` so a
         // repeat search for the same alias is a no-op (fast path above)
         // and a `.pvlist` reload prunes by the served name it admits.
         self.subs.lock().insert(
@@ -643,7 +643,7 @@ impl UpstreamManager {
     /// that opened the channel before the eviction landed.
     /// Mirrors C ca-gateway's `gatePvData::deactivate` cleanup.
     ///
-    /// BRIDGE-FR-2: keyed by the *served* name — both `subs` and the
+    /// keyed by the *served* name — both `subs` and the
     /// shadow PV are registered under the downstream-facing name (alias
     /// or real), so callers (`.pvlist` reload prune, `sweep_orphaned`)
     /// pass the served name they read from the cache / subs map.
@@ -741,7 +741,7 @@ impl UpstreamManager {
     }
 }
 
-/// BRIDGE-FR-1: build the per-PV access hook the CA server's
+/// build the per-PV access hook the CA server's
 /// `compute_access` consults to report read/write rights and gate
 /// downstream reads. Symmetric to [`build_write_hook`]: it captures the
 /// same single `ArcSwap<AccessConfig>` and the PV's `.pvlist` ASG/ASL,
@@ -756,7 +756,7 @@ impl UpstreamManager {
 /// the access-rights report matches what the write hook will actually
 /// enforce.
 ///
-/// BR-R51: `upstream_write` mirrors the upstream IOC's `ca_write_access(chID)`,
+/// `upstream_write` mirrors the upstream IOC's `ca_write_access(chID)`,
 /// set at connect time and kept live by `on_access_rights_change`. The write
 /// decision is now `local_acf_write && upstream_write`, matching C
 /// `gateVcChan::writeAccess` (gateVc.cc:341): `asclient->writeAccess() && vc->writeAccess()`.
@@ -1112,7 +1112,7 @@ mod tests {
         let _ = super::super::cache::GwPvEntry::new_connecting("X");
     }
 
-    /// BRIDGE-FR-1: the access hook reports read/write rights through
+    /// the access hook reports read/write rights through
     /// the gateway's ACF + `.pvlist` ASG, so the CA server can gate a
     /// downstream `caget`/`camonitor` the same way the write hook gates
     /// `caput`. ACF grants READ to `alice` only and WRITE to nobody.
@@ -1149,7 +1149,7 @@ ASG(DEFAULT) {
         assert!(!anon.write, "empty user + rules → write force-denied");
     }
 
-    /// BRIDGE-FR-1: with no ACF (allow-all), the hook grants both —
+    /// with no ACF (allow-all), the hook grants both —
     /// the gateway's default permissive posture is unchanged.
     #[test]
     fn br_fr1_access_hook_allow_all_grants_both() {
@@ -1160,7 +1160,7 @@ ASG(DEFAULT) {
         assert!(d.read && d.write, "allow-all must grant read and write");
     }
 
-    /// BR-R51: when upstream write-access is denied (e.g. upstream IOC
+    /// when upstream write-access is denied (e.g. upstream IOC
     /// ACF), the access hook must report write=false regardless of local
     /// ACF — mirrors C gateVcChan::writeAccess (gateVc.cc:341):
     /// asclient->writeAccess() && vc->writeAccess().
@@ -1183,13 +1183,13 @@ ASG(DEFAULT) {
         assert!(d2.write, "write must be granted once upstream restores it");
     }
 
-    /// BRIDGE-FR-2: when a downstream client searches for a `.pvlist`
+    /// when a downstream client searches for a `.pvlist`
     /// ALIAS, the gateway must register the shadow PV under the *served*
     /// (alias) name so the client's `CREATE_CHANNEL`/read resolves, while
     /// the upstream subscription targets the *real* PV. Pre-fix the shadow
     /// PV was keyed by the real name, so an alias lookup missed.
     ///
-    /// BR-R64 now gates registration on a live upstream connection, so this
+    /// Registration is now gated on a live upstream connection, so this
     /// test hosts a real `CaServer` serving the *real* name; the served
     /// (alias) name is what the shadow PV must be keyed by.
     #[tokio::test(flavor = "multi_thread")]
@@ -1242,7 +1242,7 @@ ASG(DEFAULT) {
         mgr.shutdown().await;
     }
 
-    /// BRIDGE-FR-2: a plain (non-alias) ALLOW match passes served == real,
+    /// a plain (non-alias) ALLOW match passes served == real,
     /// so the shadow PV is keyed by the same name — the pre-FR-2 behavior
     /// for non-alias names is preserved exactly.
     #[tokio::test(flavor = "multi_thread")]
@@ -1274,7 +1274,7 @@ ASG(DEFAULT) {
         mgr.shutdown().await;
     }
 
-    /// BR-R64: when the upstream never connects, `ensure_subscribed` must
+    /// when the upstream never connects, `ensure_subscribed` must
     /// treat the search as a miss — return `Err`, register no shadow PV,
     /// and track no subscription — so the gateway answers does-not-exist
     /// instead of black-holing a name that merely matches a `.pvlist`

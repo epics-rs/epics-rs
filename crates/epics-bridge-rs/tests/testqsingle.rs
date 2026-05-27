@@ -191,7 +191,7 @@ async fn waveform_array_round_trips() {
 
 /// `BridgeChannel::channel_name` reports the full requested PV name —
 /// the record name when no field suffix is given, and the full
-/// `record.FIELD` string when one is (BR-R2).
+/// `record.FIELD` string when one is.
 #[test]
 fn channel_name_matches_record() {
     let db = Arc::new(PvDatabase::new());
@@ -218,12 +218,12 @@ fn channel_name_matches_record() {
     assert_eq!(ch_field.field(), "DESC");
 }
 
-/// BR-R40: a pvxs-compatible channel-filter suffix `PV.VAL{...}`
+/// a pvxs-compatible channel-filter suffix `PV.VAL{...}`
 /// strips off cleanly during record/field resolution, so the
 /// returned channel name reflects the full filtered identity but
 /// `record_name()` / `field()` resolve to the un-suffixed form.
 /// The filter chain attaches to the monitor subscription (not
-/// covered by this in-process test, but BR-R40's parser tests in
+/// covered by this in-process test, but the parser tests in
 /// epics-base-rs exercise the chain construction).
 #[tokio::test]
 async fn channel_filter_suffix_strips_before_resolution() {
@@ -256,7 +256,7 @@ async fn channel_filter_suffix_strips_before_resolution() {
     assert!(matches!(value, PvField::Scalar(ScalarValue::Double(v)) if (*v - 1.5).abs() < 1e-9));
 }
 
-/// BR-R2: a `record.FIELD` PV name binds to that field, not to VAL.
+/// a `record.FIELD` PV name binds to that field, not to VAL.
 /// GET on `test:ai.EGU` returns the EGU string, not the AI VAL double.
 /// PUT through the channel writes EGU, not VAL.
 #[tokio::test]

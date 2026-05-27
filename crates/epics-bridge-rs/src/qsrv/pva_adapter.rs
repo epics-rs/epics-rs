@@ -148,14 +148,14 @@ fn root_kind_name_desc(d: &FieldDesc) -> &'static str {
 ///
 /// Carries method/authority/roles through so `AcfAccessControl` can
 /// evaluate METHOD/AUTHORITY rules and role-based UAG entries — fixing the
-/// BR-R4 defect where these were hardcoded to `"anonymous"` / `""`.
+/// defect where these were hardcoded to `"anonymous"` / `""`.
 fn ctx_to_creds(ctx: &epics_pva_rs::server_native::source::ChannelContext) -> ClientCreds {
     ClientCreds {
         user: ctx.account.clone(),
         host: ctx.host.clone(),
         method: ctx.method.clone(),
         authority: ctx.authority.clone(),
-        // MR-R11: forward the native PVA peer's parsed role/group
+        // forward the native PVA peer's parsed role/group
         // claims so `AcfAccessControl` can evaluate role-based UAG
         // entries (`R member group:ops`). Previously hardcoded empty,
         // so role-scoped ACF rules denied real over-the-wire clients.
@@ -233,7 +233,7 @@ impl QsrvPvStore {
         self.channel_for(name, "", "").await
     }
 
-    /// BR-R1: create a channel for the supplied identity. No
+    /// create a channel for the supplied identity. No
     /// `channels` cache — caching an `AnyChannel` keyed by PV
     /// name only reused one peer's `AccessContext` for every
     /// subsequent peer and silently bypassed any ACF policy the
@@ -261,7 +261,7 @@ enum OpenedMonitor {
     Db(super::group::AnyMonitor),
 }
 
-/// BRIDGE-FR-12: resolve a started monitor for a read-authorized PV.
+/// resolve a started monitor for a read-authorized PV.
 /// Factored out of `subscribe_checked` so `subscribe_checked_opts_marked`
 /// (which carries the `+trigger` marked set to the wire) reuses the
 /// exact same native-PVA / channel / DBE / queue-depth resolution.
@@ -288,7 +288,7 @@ async fn open_monitor(
         .create_channel_with_creds(&name, ctx_to_creds(&ctx))
         .await
         .ok()?;
-    // BR-R5: honor `record._options.DBE` from the MONITOR INIT
+    // honor `record._options.DBE` from the MONITOR INIT
     // pvRequest. Single-record channels route through
     // `BridgeChannel::create_monitor_with_value_mask`; group
     // and pva_pv-registered channels fall through to the
@@ -297,7 +297,7 @@ async fn open_monitor(
         Some(PvField::Structure(ref req)) => crate::qsrv::channel::dbe_mask_from_pv_request(req),
         _ => None,
     };
-    // BR-R33-RESIDUAL: resolve the per-operation negotiated monitor
+    // resolve the per-operation negotiated monitor
     // queue depth from the MONITOR INIT pvRequest's
     // `record._options.queueSize` — pvxs `servermon.cpp:533` then
     // `groupsource.cpp:359` stamps `stats.limitQueue`.
@@ -327,7 +327,7 @@ async fn open_monitor(
 // (no spvirit_server runtime involvement).
 
 impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
-    // BR-R1 / BR-R4: thread identity through the type-state
+    // thread identity through the type-state
     // `_checked` overrides so every wire op runs against the
     // ACF policy with the correct user/host.
 
@@ -354,7 +354,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 .create_channel_with_creds(&name, ctx_to_creds(&ctx))
                 .await
                 .ok()?;
-            // MR-R13: forward the decoded INIT pvRequest so QSRV group
+            // forward the decoded INIT pvRequest so QSRV group
             // GET honors `record._options` (e.g. `atomic`). The native
             // wire layer now threads `init_pv_request` into the GET /
             // PUT-readback `ChannelContext`. Fall back to an empty
@@ -400,14 +400,14 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 PvField::Structure(s) => s,
                 other => return Err(format!("qsrv PUT expects a structure value, got {other}")),
             };
-            // BR-R3: prefer the INIT pvRequest for `record._options`,
+            // prefer the INIT pvRequest for `record._options`,
             // matching pvxs (`iocsource.cpp:429`). The data-phase value
             // is just the delta; per-operation options live in the
             // INIT pvRequest and reach us via `ChannelContext`. Fall
             // back to value-embedded options for callers that did not
             // come through the wire (in-process tests, gateway).
             //
-            // MR-R10: the group arm previously called `other.put(&pv)`,
+            // the group arm previously called `other.put(&pv)`,
             // which re-parses options from the data-phase value — so a
             // native PVA group PUT/PUT_GET whose `record._options.atomic`
             // lives only in the INIT pvRequest was silently ignored.
@@ -449,7 +449,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
-    /// BR-R38: PVA `PROCESS` against a QSRV record runs the record's
+    /// PVA `PROCESS` against a QSRV record runs the record's
     /// `dbProcess`-equivalent path. The default `ChannelSource::process`
     /// returns `Ok(())` unconditionally — a client calling
     /// `pvput -P` (or any wire-level PROCESS) would observe a false
@@ -485,7 +485,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
-    /// BR-R37: RPC-with-query is a record WRITE in QSRV's
+    /// RPC-with-query is a record WRITE in QSRV's
     /// "set fields, read back" idiom. The default trait
     /// `rpc_checked` gates only on READ access, so a READ-only
     /// client could mutate records through `pvcall PV
@@ -573,7 +573,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
-    /// BRIDGE-FR-12: the cooked MONITOR entry the native PVA server
+    /// the cooked MONITOR entry the native PVA server
     /// actually uses. QSRV overrides it to carry each event's resolved
     /// `+trigger` target set (`MonitorPoll::marked`) into the
     /// `MonitorUpdate` stream, so the server emits a wire changed-bitset
@@ -718,7 +718,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let pva_pvs = self.pva_pvs.clone();
         let name = name.to_string();
         async move {
-            // F-G3: previously returned `true` for any existing PV via
+            // previously returned `true` for any existing PV via
             // channel_find, lying for read-only records (DISP=1) and
             // delaying the PUT refusal until the actual write attempt.
             // Now consult provider.is_writable (DISP-aware), and treat
@@ -899,7 +899,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
-    /// BR-R29: a QSRV *pure self-trigger* group monitor emits partial
+    /// a QSRV *pure self-trigger* group monitor emits partial
     /// updates — each event re-reads only the member whose record
     /// processed, so the PVA server narrows the wire changed-bitset
     /// by diffing consecutive snapshots. Returns `true` only for
@@ -944,13 +944,13 @@ pub async fn run_ca_pva_qsrv_ioc(
     // ── QSRV bridge ──
     let provider = Arc::new(BridgeProvider::new(db.clone()));
 
-    // BR-R9: install the IOC-wide ACF on the QSRV bridge so PVA
+    // install the IOC-wide ACF on the QSRV bridge so PVA
     // single-record / group operations enforce the same policy as
     // the CA server (which gets `config.acf` via
     // `CaServer::from_parts` below). Without this, an IOC launched
     // with `config.acf = Some(...)` would protect CA but leave the
     // PVA QSRV path on `AllowAllAccess` — the documented
-    // configuration trap in BR-R9.
+    // configuration trap.
     if let Some(acf_cfg) = config.acf.clone() {
         let acf = Arc::new(super::provider::AcfAccessControl::new(db.clone(), acf_cfg));
         provider.set_access_control(acf);
@@ -1360,7 +1360,7 @@ mod tests {
         use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
         use epics_pva_rs::server_native::ChannelSource;
 
-        // BR-R30: members must declare `+putorder` to be writable
+        // members must declare `+putorder` to be writable
         // through group PUT/RPC. Without it pvxs (and now Rust)
         // skip the write silently with a warning.
         const GROUP_JSON: &str = r#"{
@@ -1473,7 +1473,7 @@ mod tests {
         );
     }
 
-    /// BR-R3: PUT INIT pvRequest `record._options.process=true` reaches
+    /// PUT INIT pvRequest `record._options.process=true` reaches
     /// the bridge via `ChannelContext::pv_request` and is honored as
     /// `ProcessMode::Force`, even when the data-phase value carries no
     /// `_options` substructure. Regression for the prior shape where
@@ -1547,7 +1547,7 @@ mod tests {
         // VAL must reflect the put. ProcessMode::Force routes through
         // put_pv + process_record; under either ProcessMode the value
         // lands at 2.5 here — the per-mode semantic divergence is
-        // exercised in BR-R20's tests. The point of THIS test is that
+        // exercised in dedicated tests. The point of THIS test is that
         // option routing from ctx.pv_request reached the bridge: a
         // process=true with no record._options in the value resolves
         // to Force, not silently degraded to Passive.
@@ -1562,7 +1562,7 @@ mod tests {
         );
     }
 
-    /// MR-R13 regression: `get_value_checked` must forward the INIT
+    /// Regression: `get_value_checked` must forward the INIT
     /// pvRequest carried on `ChannelContext::pv_request` into
     /// `channel.get(...)`. Before the fix it always passed an empty
     /// `PvStructure::new("")`, so the request's `field` projection (and
@@ -1629,7 +1629,7 @@ mod tests {
         );
     }
 
-    /// MR-R11 regression: a native PVA peer's parsed role/group claims
+    /// Regression: a native PVA peer's parsed role/group claims
     /// must survive `ChannelContext` -> `ClientCreds` conversion so
     /// `AcfAccessControl` can enforce role-scoped UAG rules. Before the
     /// fix `ctx_to_creds` hardcoded `roles: Vec::new()`, so role-based
@@ -1657,7 +1657,7 @@ mod tests {
         assert_eq!(creds.method, "ca");
     }
 
-    /// BR-R38: PVA `PROCESS` against a QSRV-backed record actually
+    /// PVA `PROCESS` against a QSRV-backed record actually
     /// runs the record's processing chain (regression vs. the default
     /// trait that silently returned Ok without processing). We verify
     /// by counting the change in `processed_count` after PROCESS.
@@ -1699,16 +1699,16 @@ mod tests {
         );
         // If TIME is unchanged the clock granularity hid the
         // processing; in that case the test cannot discriminate the
-        // BR-R38 fix from the silent-Ok bug. Treat that as a hard
+        // fix from the silent-Ok bug. Treat that as a hard
         // fail so a flaky clock doesn't silently lose the regression.
         assert!(
             after > before,
             "TIME must strictly advance after PROCESS (clock too \
-             coarse to discriminate the BR-R38 fix): {before:?} -> {after:?}"
+             coarse to discriminate the fix): {before:?} -> {after:?}"
         );
     }
 
-    /// BR-R38: PROCESS on a group PV / unknown PV must NOT pretend to
+    /// PROCESS on a group PV / unknown PV must NOT pretend to
     /// succeed — operators using PROCESS for side-effects need an
     /// honest failure when the operation has no effect.
     #[tokio::test]
@@ -1730,7 +1730,7 @@ mod tests {
         );
     }
 
-    /// MR-R10: a native PVA group PUT must honor INIT pvRequest
+    /// a native PVA group PUT must honor INIT pvRequest
     /// options. pvxs reads `record._options` from
     /// `putOperation->pvRequest()` (`groupsource.cpp:540`,
     /// `:181` `setForceProcessingFlag`), not from the data-phase

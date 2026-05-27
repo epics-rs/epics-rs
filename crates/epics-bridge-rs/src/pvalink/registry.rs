@@ -19,7 +19,7 @@ use super::link::{PvaLink, PvaLinkResult};
 /// pvRequest)` where pvRequest encodes `pipeline` and `queueSize`
 /// (`pvxs/ioc/pvalink_lset.cpp:49-65`, `pvxs/ioc/pvalink.h:116`).
 ///
-/// MR-R14: `out_opts` carries the per-link OUT behavior options
+/// `out_opts` carries the per-link OUT behavior options
 /// (`field`, `process`, `defer`, `retry`). The earlier key excluded
 /// these, so two OUT links to the same remote PV with different
 /// query options collapsed onto one cached [`PvaLink`] and the later
@@ -67,7 +67,7 @@ impl OutOpts {
 #[derive(Default)]
 pub struct PvaLinkRegistry {
     map: RwLock<HashMap<RegistryKey, Arc<PvaLink>>>,
-    /// Round-36 (R36-G1): in-flight open dedup. The original
+    /// In-flight open dedup. The original
     /// `get_or_open` used a textbook DCL — read-lock → open →
     /// write-lock → DCL drop loser. Two concurrent first-callers
     /// both reached `PvaLink::open` (which spawns a monitor task
@@ -130,7 +130,7 @@ impl PvaLinkRegistry {
         // In-flight dedup. Either we claim the slot and open, or we
         // grab a Notify and await another task's completion.
         //
-        // R49-G3: re-check the cache UNDER the `pending.write()`
+        // re-check the cache UNDER the `pending.write()`
         // lock. The fast path (line 56-58) reads `self.map` without
         // any synchronization vs. the winner's publish-then-clear
         // sequence: a late caller could see a fast-path miss, then
@@ -161,7 +161,7 @@ impl PvaLinkRegistry {
             // Loser path: wait for the winner to finish, then read
             // the cached entry.
             //
-            // R48-G1: must register as a waiter BEFORE re-checking
+            // must register as a waiter BEFORE re-checking
             // the map. Tokio `Notify::notify_waiters()` does not
             // buffer permits, so the winner's guard drop can wake
             // every currently-registered waiter and then leave a
@@ -264,7 +264,7 @@ impl PvaLinkRegistry {
         self.len() == 0
     }
 
-    /// BRIDGE-FR-15: distinct upstream PV names of every opened INP
+    /// distinct upstream PV names of every opened INP
     /// link, sorted for a stable order.
     ///
     /// The base iocInit external-link wait
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(reg.len(), 0);
     }
 
-    /// BRIDGE-FR-15: `inp_link_names` feeds the base iocInit
+    /// `inp_link_names` feeds the base iocInit
     /// external-link wait. It must (a) report each opened INP upstream
     /// PV exactly once even when two option-variants of the same PV are
     /// cached under distinct registry keys, and (b) exclude OUT links
@@ -342,7 +342,7 @@ mod tests {
         );
     }
 
-    /// MR-R14: two OUT links to the same remote PV with different
+    /// two OUT links to the same remote PV with different
     /// behavior-changing query options (`field`, `proc`, `defer`,
     /// `retry`) must resolve to *distinct* cached [`PvaLink`]s, each
     /// owning its own config. Pre-fix the registry key was

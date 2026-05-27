@@ -233,7 +233,7 @@ impl ControlSource {
         if name == names[0] {
             // <prefix>:flush — drop every cached upstream entry across
             // the shared cache AND all per-credential caches
-            // (BRIDGE-FR-14).
+            //.
             let removed = self.gateway_source.flush_all_caches().await as i64;
             tracing::info!(
                 gateway_control = %name,
@@ -253,7 +253,7 @@ impl ControlSource {
                 return Err("drop RPC 'pv' argument must not be empty".to_string());
             }
             // Drop from the shared cache AND every per-credential cache
-            // (BRIDGE-FR-14).
+            //.
             let dropped = self.gateway_source.drop_entry_all_caches(&target).await;
             tracing::info!(
                 gateway_control = %name,
@@ -345,7 +345,7 @@ impl ChannelSource for ControlSource {
         }
         // Live snapshot: pulled at every GET. Cheap — no upstream
         // round-trip, just a HashMap len() under a tokio::Mutex plus
-        // an atomic load for the bridge-task count. BRIDGE-FR-14:
+        // an atomic load for the bridge-task count.
         // aggregate across the shared cache AND every per-credential
         // cache so the operator does not see zero while credentialed
         // upstream monitors remain alive.

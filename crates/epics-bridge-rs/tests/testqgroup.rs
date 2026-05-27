@@ -14,7 +14,7 @@ use epics_base_rs::server::records::longin::LonginRecord;
 use epics_bridge_rs::qsrv::{BridgeProvider, Channel, group::GroupChannel};
 use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
-// BR-R30: members need `+putorder` to be writable. pvxs's
+// members need `+putorder` to be writable. pvxs's
 // `MappingInfo::putOrder` default is `i64::MIN` → silently
 // not-putable (fieldconfig.h:37 / groupsource.cpp:503). The
 // PUT tests below explicitly opt members in.
@@ -35,7 +35,7 @@ const GROUP_JSON_NONATOMIC: &str = r#"{
     }
 }"#;
 
-// BR-R60: members WITHOUT `+putorder` are not putable, so a PUT that
+// members WITHOUT `+putorder` are not putable, so a PUT that
 // supplies their fields writes nothing. pvxs returns "No fields changed".
 const GROUP_JSON_READONLY: &str = r#"{
     "TEST:grp_ro": {
@@ -45,7 +45,7 @@ const GROUP_JSON_READONLY: &str = r#"{
     }
 }"#;
 
-// BRIDGE-FR-12: explicit cross-named `+trigger` graph — `level`
+// explicit cross-named `+trigger` graph — `level`
 // triggers only `count`, `count` triggers only `level`. Neither is a
 // self-trigger and neither is `"*"`, so the group is NOT pure
 // self-trigger and a member event must mark only its named target.
@@ -179,7 +179,7 @@ async fn group_nonatomic_put_updates_all_members() {
     assert_eq!(extract_long(&result, "count"), Some(99));
 }
 
-/// BR-R60: a PUT that supplies a member field which is not putable
+/// a PUT that supplies a member field which is not putable
 /// (no `+putorder`) writes nothing and must return a "No fields changed"
 /// error, matching pvxs `groupsource.cpp:605-608`. An empty PUT (no
 /// member field supplied) stays a silent no-op.
@@ -215,7 +215,7 @@ async fn br_r60_put_with_no_writable_field_errors() {
     ch.put(&empty).await.expect("empty PUT is a silent no-op");
 }
 
-/// BR-R34: a `DBE_LOG`-only post against a backing record (archive
+/// a `DBE_LOG`-only post against a backing record (archive
 /// deadband fires without a value change) wakes the group monitor,
 /// matching pvxs `groupsource.cpp:389` which subscribes group value
 /// events with `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE`.
@@ -279,7 +279,7 @@ async fn group_monitor_subscribes_archive_log_events() {
     mon.stop().await;
 }
 
-/// BR-R33: a group GET / MONITOR value carries
+/// a group GET / MONITOR value carries
 /// `record._options.queueSize` and `record._options.atomic` at
 /// its root. pvxs `groupsource.cpp:359` stamps these into every
 /// posted value; strict pvRequest clients and archiver appliances
@@ -348,7 +348,7 @@ async fn group_get_carries_record_options_queue_size_and_atomic() {
     }
 }
 
-/// BR-R33-RESIDUAL: a group monitor stamps the *per-operation
+/// a group monitor stamps the *per-operation
 /// negotiated* `record._options.queueSize` — the value resolved
 /// from the MONITOR INIT pvRequest — not a hardcoded constant.
 /// pvxs `servermon.cpp:533-540` parses `record._options.queueSize`
@@ -460,7 +460,7 @@ async fn br_r33_group_monitor_stamps_negotiated_queue_size() {
     );
 }
 
-/// BR-R17: a per-member ACF denial fails the group PUT even when the
+/// a per-member ACF denial fails the group PUT even when the
 /// group PV itself is writable. Mirrors pvxs's per-field
 /// SecurityClient gating (groupsource.cpp:161 + 515) — "any
 /// member denied → operation rejected".
@@ -497,7 +497,7 @@ async fn group_put_member_acf_denial_rejects_entire_put() {
     put.fields
         .push(("count".into(), PvField::Scalar(ScalarValue::Long(13))));
     let result = ch.put(&put).await;
-    let err = result.expect_err("group PUT must be rejected per BR-R17");
+    let err = result.expect_err("group PUT must be rejected");
     let msg = format!("{err}");
     assert!(
         msg.contains("TEST:count.VAL"),
@@ -518,7 +518,7 @@ async fn group_put_member_acf_denial_rejects_entire_put() {
     );
 }
 
-/// BR-R25: a group root meta member `""` flattens its meta sub-fields
+/// a group root meta member `""` flattens its meta sub-fields
 /// (`alarm`, `timeStamp`) into the group root, matching pvxs
 /// (test/ntenum.db:6, test/testqgroup.cpp:168). The earlier path
 /// silently no-oped on the empty member-path, dropping root meta.
@@ -570,7 +570,7 @@ async fn group_root_meta_member_flattens_into_root() {
     );
 }
 
-/// BRIDGE-FR-12: an explicit named `+trigger` graph marks only the
+/// an explicit named `+trigger` graph marks only the
 /// named target field on a member event — not the source field, and
 /// not the whole group. `level` triggers `count` and vice versa, so a
 /// `level` post marks exactly `["count"]` and a `count` post marks
@@ -653,7 +653,7 @@ async fn br_fr12_named_trigger_marks_only_target() {
     mon.stop().await;
 }
 
-/// BRIDGE-FR-12: a pure self-trigger group keeps the BR-R29
+/// A pure self-trigger group keeps the
 /// value-diff path — every member defaults `+trigger`, so the monitor
 /// derives the changed-bitset (`marked: None`) instead of carrying an
 /// explicit set. This guards that the new marked-set path does not

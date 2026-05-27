@@ -138,12 +138,12 @@ fn limit_scalar(t: ScalarType, v: f64) -> ScalarValue {
 pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
     let mut pv = PvStructure::new("epics:nt/NTScalar:1.0");
 
-    // F6: an empty array landing in NTScalar conversion can't yield a real
+    // an empty array landing in NTScalar conversion can't yield a real
     // scalar — `epics_to_scalar` will fall back to 0/0.0/"". Surface that as
     // INVALID/UDF so clients don't treat the placeholder as a valid reading.
     let empty_array = is_empty_array(&snapshot.value);
 
-    // BR-R12: metadata limit fields take the value's scalar type, and the
+    // metadata limit fields take the value's scalar type, and the
     // metadata field *set* depends on whether that type is numeric.
     let scalar_type = value_scalar_type(&snapshot.value);
     let numeric = is_numeric_scalar(scalar_type);
@@ -205,7 +205,7 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
 /// Structure ID: `epics:nt/NTEnum:1.0`
 /// Fields: value{index, choices}, alarm, timeStamp, display{description}
 ///
-/// BR-R22: pvxs's QSRV NTEnum (testqsingle.cpp:174) uses
+/// pvxs's QSRV NTEnum (testqsingle.cpp:174) uses
 /// `value.index int32_t` (not ushort) and includes a trailing
 /// `display.description` field. Aligning the runtime shape and
 /// descriptor with that prevents pvxs clients from seeing
@@ -247,7 +247,7 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
         "timeStamp".into(),
         PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
     ));
-    // BR-R22: trailing `display.description` is part of pvxs's
+    // trailing `display.description` is part of pvxs's
     // QSRV NTEnum shape; populate from the DESC field when
     // available, otherwise emit an empty string so the field
     // is present (pvxs always emits the leaf).
@@ -273,14 +273,14 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
 /// Structure ID: `epics:nt/NTScalarArray:1.0`
 /// Fields: value[], alarm, timeStamp, display, control, valueAlarm.
 ///
-/// BR-R12: pvxs builds NTScalarArray with the *same* `NTScalar` builder as
+/// pvxs builds NTScalarArray with the *same* `NTScalar` builder as
 /// the scalar case — `value.isarray()` only flips the struct id — so a
 /// numeric array carries `control` and `valueAlarm` just like a scalar
 /// (pvxs `src/nt.cpp:44-112`, confirmed by `test/testqsingle.cpp:354-397`).
 pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
     let mut pv = PvStructure::new("epics:nt/NTScalarArray:1.0");
 
-    // BR-R12: array metadata limits take the element scalar type.
+    // array metadata limits take the element scalar type.
     let scalar_type = value_scalar_type(&snapshot.value);
     let numeric = is_numeric_scalar(scalar_type);
 
@@ -454,7 +454,7 @@ fn filter_by_spec(pv: &PvStructure, spec: &PvStructure) -> PvStructure {
 
 /// Build a PVA FieldDesc for an NTScalar with the given scalar type.
 ///
-/// BR-R12: `display`/`control`/`valueAlarm` limits take `scalar_type`, and
+/// `display`/`control`/`valueAlarm` limits take `scalar_type`, and
 /// `control`/`valueAlarm` are omitted for non-numeric (string) values —
 /// matching pvxs `NTScalar::build` (`src/nt.cpp:37-114`).
 pub fn build_nt_scalar_desc(scalar_type: ScalarType) -> FieldDesc {
@@ -477,7 +477,7 @@ pub fn build_nt_scalar_desc(scalar_type: ScalarType) -> FieldDesc {
 
 /// Build a PVA FieldDesc for an NTEnum.
 ///
-/// BR-R22: `value.index` is `Int` (matches pvxs QSRV
+/// `value.index` is `Int` (matches pvxs QSRV
 /// `testqsingle.cpp:174` `value.index int32_t`); the shape
 /// includes a trailing `display.description` field.
 pub fn build_nt_enum_desc() -> FieldDesc {
@@ -509,7 +509,7 @@ pub fn build_nt_enum_desc() -> FieldDesc {
 
 /// Build a PVA FieldDesc for an NTScalarArray with the given element type.
 ///
-/// BR-R12: pvxs reuses the `NTScalar` builder for arrays, so a numeric
+/// pvxs reuses the `NTScalar` builder for arrays, so a numeric
 /// array descriptor carries `control` and `valueAlarm` with element-typed
 /// limits (pvxs `src/nt.cpp:44-112`, `test/testqsingle.cpp:354-397`).
 pub fn build_nt_scalar_array_desc(element_type: ScalarType) -> FieldDesc {
@@ -549,7 +549,7 @@ fn build_alarm(snapshot: &Snapshot) -> PvStructure {
         "severity".into(),
         PvField::Scalar(ScalarValue::Int(snapshot.alarm.severity as i32)),
     ));
-    // BR-R62: PVA alarm.status is the status CLASS, and alarm.message is
+    // PVA alarm.status is the status CLASS, and alarm.message is
     // the condition string (pvxs iocsource.cpp:187-236) — not the raw
     // condition code / severity name.
     alarm.fields.push((
@@ -580,7 +580,7 @@ fn build_alarm_overlay(snapshot: &Snapshot, severity: u16, status: u16) -> PvStr
         "severity".into(),
         PvField::Scalar(ScalarValue::Int(eff_severity as i32)),
     ));
-    // BR-R62: status CLASS + condition-string message (pvxs
+    // status CLASS + condition-string message (pvxs
     // iocsource.cpp:187-236), using the escalated `eff_status`.
     alarm.fields.push((
         "status".into(),
@@ -648,7 +648,7 @@ fn build_timestamp(time: SystemTime, user_tag: i32) -> PvStructure {
 
 /// Build the `enum_t` sub-structure for `display.form`.
 ///
-/// BR-R12: pvxs models `display.form` as an `enum_t` (`{int32 index,
+/// pvxs models `display.form` as an `enum_t` (`{int32 index,
 /// string[] choices}`), not a scalar `int`. `index` is the `Q:form` info
 /// tag value; `choices` is the fixed seven-entry menu.
 /// Mirrors pvxs `src/nt.cpp:71-74` and `ioc/iocsource.cpp:42-62`.
@@ -672,7 +672,7 @@ fn build_form(form: i16) -> PvStructure {
 
 /// Build the `display` sub-structure.
 ///
-/// BR-R12: for numeric values pvxs emits `{limitLow, limitHigh,
+/// for numeric values pvxs emits `{limitLow, limitHigh,
 /// description, units, precision, form}` with limits typed as the value's
 /// scalar type and `form` as an `enum_t`; for non-numeric (string) values
 /// only `{description, units}` is emitted (pvxs `src/nt.cpp:58-85`).
@@ -792,7 +792,7 @@ fn control_desc(scalar_type: ScalarType) -> FieldDesc {
 
 /// Build the `valueAlarm` sub-structure.
 ///
-/// BR-R12: pvxs `valueAlarm` carries the full field set — `active` (bool),
+/// pvxs `valueAlarm` carries the full field set — `active` (bool),
 /// the four alarm/warning limits typed as the value's scalar type, the
 /// four `*Severity` fields (int32), and `hysteresis` (float64). The four
 /// `*Severity` fields and `active`/`hysteresis` are not represented in the
@@ -874,7 +874,7 @@ fn value_alarm_desc(scalar_type: ScalarType) -> FieldDesc {
     }
 }
 
-/// BR-R62: map a raw EPICS `epicsAlarmCondition` (0–21, `alarm.h`) to the
+/// map a raw EPICS `epicsAlarmCondition` (0–21, `alarm.h`) to the
 /// PVA `alarm_t.status` **status class**. PVA carries the alarm *class*
 /// (NONE/DEVICE/DRIVER/RECORD/DB/UNDEFINED), not the raw DB condition
 /// code — mirrors pvxs `ioc/iocsource.cpp:187-223`.
@@ -898,7 +898,7 @@ pub(crate) fn alarm_status_class(condition: u16) -> i32 {
     }
 }
 
-/// BR-R62: the EPICS alarm **condition string** for a raw
+/// the EPICS alarm **condition string** for a raw
 /// `epicsAlarmCondition` (`epicsAlarmConditionStrings`,
 /// `libcom/src/misc/alarmString.c:27-50`), or `""` for `NO_ALARM` /
 /// out-of-range. pvxs uses this for `alarm.message`
@@ -1045,10 +1045,10 @@ mod tests {
 
     #[test]
     fn nt_scalar_empty_array_marks_invalid_udf() {
-        // F6: when an empty array reaches NTScalar conversion, value cannot
+        // when an empty array reaches NTScalar conversion, value cannot
         // be recovered — alarm must escalate to INVALID severity / UDF status
         // so clients don't read the placeholder zero as a valid sample.
-        // BR-R62: alarm.status is the PVA status CLASS — UDF maps to DRIVER
+        // alarm.status is the PVA status CLASS — UDF maps to DRIVER
         // (2) — and alarm.message is the condition string "UDF".
         let snap = test_snapshot(EpicsValue::DoubleArray(vec![]));
         let pv = snapshot_to_nt_scalar(&snap);
@@ -1078,7 +1078,7 @@ mod tests {
         }
     }
 
-    /// BR-R22: pvxs QSRV NTEnum uses int32_t index +
+    /// pvxs QSRV NTEnum uses int32_t index +
     /// `display.description` (testqsingle.cpp:174).
     #[test]
     fn nt_enum_structure() {
@@ -1107,7 +1107,7 @@ mod tests {
             panic!("expected value structure");
         }
 
-        // BR-R22: display.description is part of pvxs's NTEnum shape.
+        // display.description is part of pvxs's NTEnum shape.
         if let Some(PvField::Structure(d)) = pv.get_field("display") {
             assert!(
                 matches!(
@@ -1255,7 +1255,7 @@ mod tests {
 
     #[test]
     fn br_r12_array_metadata_shape_matches_pvxs() {
-        // BR-R12: an int32 NTScalarArray must carry `control` and
+        // an int32 NTScalarArray must carry `control` and
         // `valueAlarm` (pvxs reuses the NTScalar builder for arrays —
         // src/nt.cpp:44-112, test/testqsingle.cpp:354-397), the
         // display/control/valueAlarm limits must be typed as the element
@@ -1345,7 +1345,7 @@ mod tests {
 
     #[test]
     fn br_r12_string_value_omits_numeric_metadata() {
-        // BR-R12: a non-numeric (string) NTScalar carries only
+        // a non-numeric (string) NTScalar carries only
         // `display = {description, units}` — no limits, no form, no
         // control, no valueAlarm (pvxs src/nt.cpp:78-85).
         let snap = test_snapshot(EpicsValue::String("Analog input".into()));
@@ -1380,7 +1380,7 @@ mod tests {
 
     #[test]
     fn br_r13_uint64_array_qsrv_descriptor_uses_ulong() {
-        // BR-R13: a `waveform` with `FTVL = UINT64` must be advertised
+        // a `waveform` with `FTVL = UINT64` must be advertised
         // through QSRV as `ulong[]` with `uint64_t`-typed metadata limits,
         // matching pvxs test/testqsingle.cpp:530-546. On main there was no
         // `EpicsValue::UInt64Array`, so the value collapsed into
@@ -1434,7 +1434,7 @@ mod tests {
         }
     }
 
-    /// BR-R22: descriptor uses Int (not UShort) for `value.index`
+    /// descriptor uses Int (not UShort) for `value.index`
     /// and includes a trailing `display.description` leaf.
     #[test]
     fn field_desc_nt_enum_index_int() {

@@ -301,7 +301,7 @@ impl MultiTenantPvaGatewayBuilder {
             // pick the first one for the control surface — the
             // operator can always disambiguate via the per-cache
             // diagnostic PVs in each control_prefix namespace.
-            // A9-13: this downstream's access policy wraps *every* one
+            // this downstream's access policy wraps *every* one
             // of its upstream proxies. Resolve the defaults once
             // (permissive ACL / NoopAudit) and apply the same
             // `Audit( ReadOnly?( Acl( source ) ) )` chain the

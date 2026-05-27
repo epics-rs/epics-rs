@@ -304,7 +304,7 @@ mod tests {
         assert!(out.contains("0 PVs"));
     }
 
-    /// A9-7: the `AS` command must reload BOTH the access file and the
+    /// the `AS` command must reload BOTH the access file and the
     /// pvlist, matching C `gateServer::newAs` →
     /// `gateAs::reInitialize(accessFile, listFile)` (gateAs.cc:678-719).
     /// Pre-fix `AS` reloaded only the ACF, leaving pvlist reload to the

@@ -70,7 +70,7 @@ impl SevrMode {
 /// pvxs pvalink `proc` mode — the five-state enum the JSON / legacy
 /// parser preserves (`pvalink_jlif.cpp:69-166`).
 ///
-/// BRIDGE-FR-16: the OUT-side process behaviour and the INP-side
+/// the OUT-side process behaviour and the INP-side
 /// scan-on-update behaviour are *related but distinct* (pvxs derives
 /// INP scan at `pvalink_link.cpp:122` and the PUT process request at
 /// `pvalink_channel.cpp:237-263` from the same enum). Collapsing this
@@ -134,7 +134,7 @@ pub struct PvaLinkConfig {
     /// True iff the link should keep an active monitor open instead of
     /// re-reading on each access (INP only).
     pub monitor: bool,
-    /// BRIDGE-FR-16: pvxs `proc` mode (`Default`/`PP`/`NPP`/`CP`/`CPP`),
+    /// pvxs `proc` mode (`Default`/`PP`/`NPP`/`CP`/`CPP`),
     /// preserved as a five-state enum. Drives the OUT-side PUT process
     /// request ([`ProcMode::put_process_request`]) and, for `CP`/`CPP`,
     /// the INP scan-on-update flags below (set at parse time via
@@ -149,7 +149,7 @@ pub struct PvaLinkConfig {
     /// (pvalink_link.cpp:122). Default `false` — record must be
     /// scanned externally.
     pub scan_on_update: bool,
-    /// BR-R28: when true, the `scan_on_update` processing fires only
+    /// when true, the `scan_on_update` processing fires only
     /// when the owning record's `SCAN` is `Passive`. Distinguishes
     /// pvxs `CPP` (`scanOnUpdatePassive`, pvalink_link.cpp:122 →
     /// pvalink_channel.cpp:313) from `CP` (`scanOnUpdateYes`, which
@@ -196,7 +196,7 @@ pub struct PvaLinkConfig {
     /// `-1024..=1024`. Lower values process first. Mirrors pvxs
     /// `pvaLinkConfig::monorder`.
     pub monorder: i32,
-    /// BR-R19: when true, the owning record's TIME is adopted from
+    /// when true, the owning record's TIME is adopted from
     /// the linked PV's NT `timeStamp` on each read. Mirrors pvxs
     /// `pvaLinkConfig::time` (`pvalink_jlif.cpp:35` / parsing at
     /// `:104`; consumer at `pvalink_lset.cpp:427`). Default `false`
@@ -258,7 +258,7 @@ impl PvaLinkConfig {
             cfg.monitor = parse_bool(v)?;
         }
         if let Some(v) = opts.get("proc") {
-            // BRIDGE-FR-16: pvxs `proc` is a five-state enum
+            // pvxs `proc` is a five-state enum
             // (`pvalink_jlif.cpp:69-166`): boolean true→PP / false→NPP,
             // plus the strings NPP/PP/CP/CPP. `CP`/`CPP` additionally
             // imply an open monitor and INP scan-on-update. Store the
@@ -321,7 +321,7 @@ impl PvaLinkConfig {
             // pvxs clamps to [-1024, 1024].
             cfg.monorder = n.clamp(-1024, 1024) as i32;
         }
-        // BR-R19: `time` adopts the linked PV's NT timestamp on read.
+        // `time` adopts the linked PV's NT timestamp on read.
         if let Some(v) = opts.get("time") {
             cfg.time = parse_bool(v)?;
         }
@@ -329,7 +329,7 @@ impl PvaLinkConfig {
         // Apply legacy bare modifiers
         for m in legacy_mods {
             match m.as_str() {
-                // BRIDGE-FR-16: legacy bare modifiers map to the same
+                // legacy bare modifiers map to the same
                 // five-state `ProcMode`; CP/CPP additionally drive the
                 // INP scan flags via `inp_scan`.
                 "PP" | "pp" => cfg.proc = ProcMode::Pp,
@@ -440,11 +440,11 @@ mod tests {
         assert_eq!(c.field, "value");
         assert!(!c.monitor);
         assert_eq!(c.proc, ProcMode::Default);
-        // BR-R19: `time` defaults to false to match pvxs.
+        // `time` defaults to false to match pvxs.
         assert!(!c.time);
     }
 
-    /// BR-R19: `?time=true` enables remote-timestamp adoption.
+    /// `?time=true` enables remote-timestamp adoption.
     #[test]
     fn time_option_parses_true() {
         let c = PvaLinkConfig::parse("pva://X?time=true", LinkDirection::Inp).unwrap();
@@ -453,7 +453,7 @@ mod tests {
         assert!(!c.time, "time=false must parse");
     }
 
-    /// BR-R28: `CP` sets scan_on_update without scan_on_passive;
+    /// `CP` sets scan_on_update without scan_on_passive;
     /// `CPP` sets both. The legacy bare `CP` / `CPP` modifier path
     /// follows the same rule.
     #[test]
@@ -511,7 +511,7 @@ mod tests {
         assert_eq!(c.proc.put_process_request(), "true");
     }
 
-    /// BRIDGE-FR-16: the five pvxs `proc` states are preserved through
+    /// the five pvxs `proc` states are preserved through
     /// parsing and each derives the correct PUT `process` wire value.
     /// `Default` (`"passive"`) and `NPP` (`"false"`) are distinct;
     /// `CP`/`CPP` request remote processing (`"true"`) on PUT even
@@ -539,7 +539,7 @@ mod tests {
         }
     }
 
-    /// BRIDGE-FR-16: `Default` and `NPP` must NOT collapse — pre-fix
+    /// `Default` and `NPP` must NOT collapse — pre-fix
     /// both produced `"passive"`; an explicit `NPP` must send `"false"`.
     #[test]
     fn fr16_default_and_npp_are_distinct_on_the_wire() {
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(npp.proc.put_process_request(), "false");
     }
 
-    /// BRIDGE-FR-16: `CP`/`CPP` derive INP scan-on-update from the same
+    /// `CP`/`CPP` derive INP scan-on-update from the same
     /// enum (`inp_scan`), independent of the PUT process request — they
     /// are related but distinct outputs (pvxs `pvalink_link.cpp:122` vs
     /// `pvalink_channel.cpp:237`).
@@ -567,7 +567,7 @@ mod tests {
         assert_eq!(cpp.proc.put_process_request(), "true");
     }
 
-    /// BRIDGE-FR-16: `PASSIVE` is the wire request string for `Default`,
+    /// `PASSIVE` is the wire request string for `Default`,
     /// not a pvxs `proc` enum value, so it must be rejected — pre-fix it
     /// was silently accepted as process-on-PUT.
     #[test]

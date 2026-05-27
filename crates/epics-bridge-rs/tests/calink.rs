@@ -288,7 +288,7 @@ async fn ca_link_out_write_accepts_scheme_prefix() {
     }
 }
 
-/// BRIDGE-FR-4 end-to-end — a CA link inherits the remote PV's
+/// End-to-end — a CA link inherits the remote PV's
 /// display/control limits, precision, units, DBF type and element count
 /// through `LinkSet::link_metadata`. The upstream `ai` record carries
 /// EGU/PREC/HOPR/LOPR; a `DBR_CTRL` get on connect caches them, mirroring

@@ -2426,6 +2426,15 @@ impl CaChannel {
         reply_rx.await.ok().flatten()
     }
 
+    /// Server supports CA v4.2+ features (notably asynchronous
+    /// `ACCESS_RIGHTS` events delivered without a request from the
+    /// client). Mirrors libca `ca_v42_ok(chid)` (cadef.h:1853).
+    /// Returns `false` when the channel is still searching/connecting
+    /// or the server's minor protocol version is below 2.
+    pub async fn v42_ok(&self) -> bool {
+        matches!(self.host_minor_protocol().await, Some(v) if v >= 2)
+    }
+
     /// Time since the underlying TCP virtual circuit last received
     /// any message from the server. Mirrors libca
     /// `ca_receive_watchdog_delay(chid)` (oldChannelNotify.cpp:703) —

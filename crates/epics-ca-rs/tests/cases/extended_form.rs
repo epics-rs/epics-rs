@@ -9,7 +9,7 @@
 //! - `rsrv/camessage.c:2452` validates the 8-byte alignment of
 //!   `m_postsize` *after* the extended form is unfolded.
 //!
-//! R2-19 / R2-23 / R2-28 / R2-32 all cited shape variants of this
+//! Several findings cited shape variants of this
 //! annex. Goldens here pin the exact 24-byte layout for a CLIENT_NAME
 //! whose body exceeds 0xFFFF bytes (forcing extended form) and for an
 //! oversized WRITE whose `count` does the same.

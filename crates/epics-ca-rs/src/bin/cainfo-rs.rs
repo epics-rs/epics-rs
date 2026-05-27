@@ -57,7 +57,7 @@ async fn main() {
             .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
     );
 
-    // CA-FR-3/CA-FR-4: -p selects the priority virtual circuit.
+    // -p selects the priority virtual circuit.
     let priority = args.priority.unwrap_or(0);
     let mut failed = false;
     for pv_name in &args.pv_names {
@@ -109,7 +109,7 @@ async fn main() {
         }
     }
 
-    // CA-FR-4: `-s <level>` is the `ca_client_status(level)` analog —
+    // `-s <level>` is the `ca_client_status(level)` analog —
     // emit the client diagnostics (the Rust equivalent), as `--diag`
     // does, and without requiring PV names.
     if args.diag || args.stat_level.is_some() || args.pv_names.is_empty() {

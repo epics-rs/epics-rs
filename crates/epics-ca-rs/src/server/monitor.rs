@@ -129,13 +129,13 @@ impl FlowControlGate {
 /// `tokio::net::tcp::OwnedWriteHalf` and the TLS-wrapped
 /// `WriteHalf<TlsStream<TcpStream>>` produced by the server's TLS
 /// dispatch path.
-/// R2-12: `data_count` is the original EVENT_ADD request count. When
+/// `data_count` is the original EVENT_ADD request count. When
 /// non-zero, every monitor delivery echoes this in the header and
 /// zero-pads short payloads up to `dbr_buffer_size(type, native,
 /// count)` — matches C `read_reply` which keeps the request count
 /// and pads (or uses `snapshot.value.count()` when the request was
 /// autosize=0).
-// R55 (fixed): `long_string` propagated from `ChannelEntry`; monitor events
+// `long_string` propagated from `ChannelEntry`; monitor events
 // for `$`-suffix channels are converted from `EpicsValue::String` to
 // `EpicsValue::CharArray` inside `send_event` (C dbChannel.c:483-507).
 #[allow(clippy::too_many_arguments)]
@@ -200,7 +200,7 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     writer: &Arc<Mutex<BufWriter<W>>>,
     long_string: bool,
 ) -> std::io::Result<()> {
-    // R55: for `$` long-string channels convert String → CharArray+NUL
+    // for `$` long-string channels convert String → CharArray+NUL
     // before encoding. Clone only when needed (most channels are not `$`).
     let ls_snap;
     let snapshot = if long_string {
@@ -222,13 +222,13 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     // class_name stays None and the body is 40 zero bytes — matches
     // IOC behaviour for synthetic channels.
     //
-    // R2-12: when the EVENT_ADD request set an explicit count, every
+    // when the EVENT_ADD request set an explicit count, every
     // monitor delivery echoes that count and zero-pads the payload up
     // to `dbr_buffer_size(type, native, count)` (C `read_reply`
     // `rsrv/camessage.c:507-571` parity). The helper returns the
     // header count to use; `data_count == 0` means autosize (use the
     // live snapshot count).
-    // R2-12 refinement: enforce request count in BOTH directions —
+    // Enforce request count in BOTH directions —
     // pad when requested > actual AND truncate when requested <
     // actual. C `read_reply` (`rsrv/camessage.c:507-571`) sizes
     // the payload to `dbr_size_n(type, request_count)` either way.
@@ -353,7 +353,7 @@ mod tests {
         };
 
         // data_count = 0 means autosize (use snapshot's actual count);
-        // matches every pre-R2-12 producer caller.
+        // matches every producer caller.
         send_event(DBR_LONG, 0, 7, &event, &writer, false)
             .await
             .expect("send_event must succeed");

@@ -329,7 +329,7 @@ pub fn issuer_from_cert(cert: &CertificateDer<'_>) -> Option<String> {
 /// as `admin\0.evil` would otherwise pass through into an ACF identity
 /// and be matched/logged inconsistently — the NUL-prefix
 /// identity-confusion class (CVE-2009-2408). Mirrors pvxs
-/// `SSLContext::commonName()` (PVXS-SR-13, pvxs @b16b945), which rejects
+/// `SSLContext::commonName()` (pvxs @b16b945), which rejects
 /// BOTH an embedded NUL (the length must round-trip through `strlen()`)
 /// AND a `len <= 0` (no usable CN). An unusable name is never a
 /// legitimate identity, so the caller falls back to the safe SHA-256
@@ -410,7 +410,7 @@ mod nul_identity_tests {
         CertificateDer::from(cert.der().to_vec())
     }
 
-    /// PVXS-SR-13 / CVE-2009-2408: a peer-cert CN with an embedded NUL
+    /// CVE-2009-2408: a peer-cert CN with an embedded NUL
     /// must not become the ACF identity. Without the guard
     /// `parse_san_dns_or_cn` returns `"admin\0.evil"`; with it the name is
     /// rejected and `identity_from_cert` falls back to the SHA-256

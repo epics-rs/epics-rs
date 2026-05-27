@@ -46,7 +46,7 @@ impl fmt::Display for ChannelState {
 pub(crate) struct ChannelInner {
     pub cid: u32,
     pub pv_name: String,
-    /// CA-FR-3: CA priority (0..=99) this channel was created at. Fixed
+    /// CA priority (0..=99) this channel was created at. Fixed
     /// for the channel's lifetime; combined with `server_addr` it forms
     /// the [`crate::client::types::CircuitKey`] the channel rides on, so
     /// every `TransportCommand` the coordinator builds for this channel

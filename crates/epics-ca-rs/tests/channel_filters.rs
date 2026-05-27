@@ -1,4 +1,4 @@
-//! CA-FR-8 regression tests: channel filters must run on every value
+//! Regression tests: channel filters must run on every value
 //! delivery path, not only the record-field `EVENT_ADD` callback.
 //!
 //! epics-base attaches the parsed filter chain to the database channel
@@ -91,7 +91,7 @@ async fn recv_value(mon: &mut MonitorHandle) -> EpicsValue {
         .value
 }
 
-/// CA-FR-8 (1/4): a filtered record-field `READ_NOTIFY` applies the
+/// A filtered record-field `READ_NOTIFY` applies the
 /// `arr` transform before DBR encoding. Pre-fix the `READ` /
 /// `READ_NOTIFY` path called `get_full_snapshot()` and encoded it
 /// directly, never consulting `entry.filter_suffix`.
@@ -158,7 +158,7 @@ async fn ca_fr_8_record_field_read_notify_applies_arr() {
     );
 }
 
-/// CA-FR-8 (2/4): a filtered record-field monitor still applies the
+/// A filtered record-field monitor still applies the
 /// same chain on updates, not only on the first `EVENT_ADD` frame.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
@@ -209,7 +209,7 @@ async fn ca_fr_8_record_field_monitor_applies_arr_on_updates() {
     );
 }
 
-/// CA-FR-8 (3/4): a filtered `SimplePv` monitor applies `arr` instead
+/// A filtered `SimplePv` monitor applies `arr` instead
 /// of the empty chain it received pre-fix. The `SimplePv` subscription
 /// path created the subscriber via `ProcessVariable::add_subscriber()`
 /// without passing the channel's filter suffix, so `pv.rs` gave every
@@ -309,7 +309,7 @@ async fn ca_fr_8_arr_on_scalar_channel_is_noop() {
     }
 }
 
-/// CA-FR-8 (4/4): a malformed filter suffix preserves the permissive
+/// A malformed filter suffix preserves the permissive
 /// "empty chain with warning" behaviour — the read returns the full
 /// unfiltered value rather than failing the subscription.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -355,7 +355,7 @@ async fn ca_fr_8_malformed_suffix_preserves_unfiltered_read() {
     );
 }
 
-/// CA-FR-8 (5/5): a filter suffix whose JSON contains a `.` (e.g.
+/// A filter suffix whose JSON contains a `.` (e.g.
 /// `dbnd` with `{"d":0.5}`) must still resolve the channel at UDP
 /// search and CREATE_CHAN. This is the boundary that motivated the
 /// structural fix in `Database::{has_name,find_entry}_no_resolve`:

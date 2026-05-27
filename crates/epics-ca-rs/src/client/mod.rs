@@ -279,7 +279,7 @@ pub struct CaClient {
     /// here directly; the per-server read loop removes and fulfils
     /// them on response arrival without a coordinator round-trip.
     in_flight: InFlightOps,
-    /// CA-FR-2: cid allocator with a live-set. `create_channel`
+    /// cid allocator with a live-set. `create_channel`
     /// reserves; the coordinator releases at `DropChannel`. Shared
     /// (cloned) into the coordinator task so both sides draw from /
     /// retire to one id space.
@@ -326,7 +326,7 @@ enum CoordRequest {
     RegisterChannel {
         cid: u32,
         pv_name: String,
-        /// CA-FR-3: CA priority the channel was created at; stored on
+        /// CA priority the channel was created at; stored on
         /// the coordinator's `ChannelInner` and threaded into every
         /// `TransportCommand` the coordinator builds for this channel.
         priority: u8,
@@ -349,7 +349,7 @@ enum CoordRequest {
         /// coordinator at connect-time type derivation, so it works even
         /// though the subscribe is issued before the channel connects.
         enum_as_string: bool,
-        /// CA-FR-2: the coordinator owns the `subid` table, so it
+        /// the coordinator owns the `subid` table, so it
         /// allocates the id (probing live subscriptions) and returns
         /// it here rather than accepting one minted at the call site.
         reply: oneshot::Sender<CaResult<u32>>,
@@ -497,7 +497,7 @@ impl CaClient {
         // Run repeater registration in background — don't block client startup.
         epics_base_rs::runtime::task::spawn(async { repeater::ensure_repeater().await });
 
-        // Round 50 (R50-G2): build the address list with hostname
+        // Build the address list with hostname
         // info preserved so the search-engine refresh task can
         // re-resolve entries whose DNS name maps to a different IP
         // after IOC migration. Pre-fix `parse_addr_list()` returned
@@ -547,9 +547,9 @@ impl CaClient {
 
         let nameserver_entries = parse_nameserver_list();
         // Build the per-address SNI map. Two sources:
-        // 1. EPICS_CA_NAME_SERVERS hostnames (added in F-G0).
+        // 1. EPICS_CA_NAME_SERVERS hostnames.
         // 2. EPICS_CA_TLS_SNI_MAP for IPs reached via UDP search
-        //    (F-G6). The CA SEARCH wire protocol carries no
+        //   . The CA SEARCH wire protocol carries no
         //    hostname, so a UDP-discovered TLS IOC otherwise has to
         //    fall back to the IP literal. Operators populate this map
         //    with `EPICS_CA_TLS_SNI_MAP="10.0.0.1=ioc1.lab.example.com 10.0.0.2:5064=ioc2.lab.example.com"`
@@ -819,7 +819,7 @@ impl CaClient {
     /// Create a persistent channel at a specific CA priority (`0..=99`,
     /// libca `cacChannel::priorityMax`).
     ///
-    /// CA-FR-3: priority is part of the virtual-circuit identity. Two
+    /// priority is part of the virtual-circuit identity. Two
     /// channels to the same IOC at different priorities open independent
     /// TCP circuits (libca `ca_create_channel` priority parameter,
     /// `cadef.h:498-508`), so bulk and latency-sensitive traffic can be
@@ -832,12 +832,12 @@ impl CaClient {
     }
 
     fn create_channel_expanded(&self, pv_name: String, priority: u8) -> CaChannel {
-        // CA-FR-2: reserve the cid against the live-set. Released by the
+        // reserve the cid against the live-set. Released by the
         // coordinator at `DropChannel` (the single channel-removal site).
         let cid = self.cid_alloc.allocate();
         let (conn_tx, _) = broadcast::channel(16);
 
-        // R2-18: C `cac::createChannel` rejects empty names with
+        // C `cac::createChannel` rejects empty names with
         // ECA_BADSTR, and `tcpiiu::createChannelRequest` rejects
         // padded postCnt >= 0xffff with ECA_UNAVAILINSERV before
         // anything reaches the wire. Pre-fix Rust truncated postsize
@@ -1234,7 +1234,7 @@ pub(crate) struct CachedRead {
     pub(crate) slot: types::WarmReplySlot,
 }
 
-/// R2-19: C `nciu::write` (`libca/nciu.cpp`) and its write-callback
+/// C `nciu::write` (`libca/nciu.cpp`) and its write-callback
 /// overload reject `countIn > this->count` before queueing the
 /// request, surfacing as `ECA_BADCOUNT`. Pre-fix Rust forwarded any
 /// caller-supplied count to the server, which the server would then
@@ -1252,7 +1252,7 @@ fn validate_put_count(snap: &types::ChannelSnapshotPublic, count: u32) -> CaResu
     Ok(())
 }
 
-/// R2-19: C `nciu::stringVerify` rejects DBR_STRING elements that
+/// C `nciu::stringVerify` rejects DBR_STRING elements that
 /// exceed `MAX_STRING_SIZE` (40 bytes including the NUL terminator)
 /// with `ECA_STRTOBIG`. Pre-fix Rust silently truncated long strings
 /// to 39 bytes + NUL inside `EpicsValue::to_bytes()`, so a
@@ -1291,7 +1291,7 @@ fn validate_put_strings(value: &EpicsValue) -> CaResult<()> {
 pub struct CaChannel {
     cid: u32,
     pv_name: Arc<str>,
-    /// CA-FR-3: CA priority (0..=99) this channel was created at. With
+    /// CA priority (0..=99) this channel was created at. With
     /// the channel's resolved `server_addr` it forms the
     /// [`types::CircuitKey`] every hot-path `TransportCommand` targets,
     /// and the key the `server_writers` sidecar is looked up by.
@@ -1383,7 +1383,7 @@ impl CaChannel {
     }
 
     fn direct_writer(&self, server_addr: SocketAddr) -> Option<DirectServerWriter> {
-        // CA-FR-3: the writer sidecar is keyed by circuit, so look up
+        // the writer sidecar is keyed by circuit, so look up
         // this channel's `(server_addr, priority)` — a sibling channel
         // to the same server at another priority owns a different
         // circuit and writer.
@@ -1457,7 +1457,7 @@ impl CaChannel {
         count: u32,
         ioid: u32,
     ) -> CaResult<()> {
-        // R2-31: C `libca/nciu.cpp::read()` rejects before queueing
+        // C `libca/nciu.cpp::read()` rejects before queueing
         // when `!accessRightState.readPermit()` (ECA_NORDACCESS).
         // Pre-fix Rust forwarded the request anyway and let the
         // server (or a timeout) surface the denial; the cached
@@ -1499,7 +1499,7 @@ impl CaChannel {
         ioid: u32,
         payload: Vec<u8>,
     ) -> CaResult<()> {
-        // R2-31: C `libca/nciu.cpp::write()` rejects before queueing
+        // C `libca/nciu.cpp::write()` rejects before queueing
         // when `!accessRightState.writePermit()` (ECA_NOWTACCESS).
         if !snap.access_rights.write {
             return Err(CaError::Protocol(format!(
@@ -1540,7 +1540,7 @@ impl CaChannel {
         count: u32,
         payload: Vec<u8>,
     ) -> CaResult<()> {
-        // R2-31: cached-access write gate (see send_write_notify_fast).
+        // cached-access write gate (see send_write_notify_fast).
         // The nowait variant otherwise returned Ok(()) after putting
         // an oversized / forbidden request on the wire.
         if !snap.access_rights.write {
@@ -1629,7 +1629,7 @@ impl CaChannel {
 
         let mut results: Vec<Option<CaResult<(DbFieldType, EpicsValue)>>> =
             (0..channels.len()).map(|_| None).collect();
-        // CA-FR-3: batch by circuit `(server_addr, priority)`, not by
+        // batch by circuit `(server_addr, priority)`, not by
         // server alone — channels to the same IOC at different
         // priorities ride independent circuits with independent writers,
         // so their READ_NOTIFY frames must not be coalesced onto one.
@@ -2043,7 +2043,7 @@ impl CaChannel {
         request_type: u16,
         count: u32,
     ) -> CaResult<Snapshot> {
-        // R2-32: C `libca/nciu.cpp::read()` rejects `countIn >
+        // C `libca/nciu.cpp::read()` rejects `countIn >
         // this->count` with ECA_BADCOUNT before queueing the read.
         // Pre-fix Rust silently clamped with `.min(snap.element_count)`,
         // so a caller bug requesting 100 elements from a 10-element PV
@@ -2097,7 +2097,7 @@ impl CaChannel {
 
     pub async fn put(&self, value: &EpicsValue) -> CaResult<()> {
         let snap = self.snapshot()?;
-        // R2-19: C `nciu::write` rejects countIn > channel count with
+        // C `nciu::write` rejects countIn > channel count with
         // ECA_BADCOUNT before queueing the request. Pre-fix Rust sent
         // an oversized write that the server would either accept past
         // its array bound or reject asynchronously.
@@ -2285,7 +2285,7 @@ impl CaChannel {
             .await
     }
 
-    /// Subscribe with an explicit `DBE_*` event mask (CA-FR-4: `camonitor
+    /// Subscribe with an explicit `DBE_*` event mask (`camonitor
     /// -m`). The server queues an EVENT only when `mask & post_select`
     /// is non-zero, so e.g. `DBE_ALARM` alone delivers only alarm
     /// transitions. `deadband` applies client-side deadband filtering as
@@ -2329,7 +2329,7 @@ impl CaChannel {
             reply: reply_tx,
         });
 
-        // CA-FR-2: the coordinator allocates the subid against its live
+        // the coordinator allocates the subid against its live
         // subscription table and returns it on success.
         let subid = reply_rx.await.map_err(|_| CaError::Shutdown)??;
 
@@ -2603,7 +2603,7 @@ const FLOW_CONTROL_OFF_THRESHOLD: usize = 10;
 
 /// Resolve the per-subscription bounded-queue size from the optional
 /// `EPICS_CA_MONITOR_QUEUE` value. Defaults to 256 and is clamped to at
-/// least [`FLOW_CONTROL_OFF_THRESHOLD`] (F4): slot overflow is out of
+/// least [`FLOW_CONTROL_OFF_THRESHOLD`]: slot overflow is out of
 /// flow control (I1), so a queue smaller than the threshold could fill
 /// and coalesce forever without a lone subscription ever tripping
 /// `EVENTS_OFF`.
@@ -2684,10 +2684,10 @@ async fn run_coordinator(
     // Reverse index: circuit `(server_addr, priority)` -> set of cids
     // last seen on that circuit. Keep disconnected channels indexed so
     // beacon anomalies can trigger immediate re-search for the affected
-    // IOC. CA-FR-3: keyed by circuit so tearing down one priority
+    // IOC. keyed by circuit so tearing down one priority
     // circuit only re-searches its own channels.
     let mut server_channels: HashMap<types::CircuitKey, HashSet<u32>> = HashMap::new();
-    // CA-FR-3: per-circuit flow control. EVENTS_OFF/ON is a per-tcpiiu
+    // per-circuit flow control. EVENTS_OFF/ON is a per-tcpiiu
     // CA message, so the outstanding-event count and the on/off gate
     // are tracked per `(server_addr, priority)`.
     let mut flow_control: HashMap<types::CircuitKey, FlowControlState> = HashMap::new();
@@ -2768,7 +2768,7 @@ async fn run_coordinator(
                             });
                             let count = ch.native_type.map(|_| ch.element_count);
 
-                            // CA-FR-2: allocate the subid here, where the
+                            // allocate the subid here, where the
                             // live subscription table lives, so the wrap
                             // probe sees every active subscription. The
                             // immutable `alloc_subid` borrow ends before
@@ -2907,7 +2907,7 @@ async fn run_coordinator(
                             }
                         }
                         channels.remove(&cid);
-                        // CA-FR-2: release the cid back to the allocator at
+                        // release the cid back to the allocator at
                         // the single channel-removal site, in lockstep with
                         // `channels.remove`, so the live-set never lags the
                         // authoritative table.
@@ -3081,7 +3081,7 @@ async fn run_coordinator(
                             pending_found.insert(cid, server_addr);
                         }
                     }
-                    // R2-67: deliver ECA_DBLCHNL via the registered
+                    // deliver ECA_DBLCHNL via the registered
                     // exception handler so library users see the
                     // multiply-defined-PV condition the same way they
                     // see it under libca (`pvMultiplyDefinedNotify`
@@ -3244,7 +3244,7 @@ async fn run_coordinator(
                                 server_addr,
                             });
                         } else {
-                            // R2-25: CREATE_CHAN response arrived for
+                            // CREATE_CHAN response arrived for
                             // an unknown CID — the user dropped the
                             // channel after CREATE_CHAN went out but
                             // before the server reply landed. C
@@ -3498,7 +3498,7 @@ async fn run_coordinator(
                         diag.record(DiagEvent::Unresponsive { server: server_addr });
                         tracing::warn!(server = %server_addr, priority, "circuit unresponsive (echo timeout)");
                         metrics::counter!("ca_client_unresponsive_total", "server" => server_addr.to_string()).increment(1);
-                        // R2-38: C `tcpiiu::unresponsiveCircuitNotify`
+                        // C `tcpiiu::unresponsiveCircuitNotify`
                         // (`libca/tcpiiu.cpp:899-941`) fires the global
                         // exception hook with ECA_UNRESPTMO, then walks
                         // every connected channel and calls
@@ -3544,12 +3544,12 @@ async fn run_coordinator(
                         }
                         // Fan ECA_DISCONN out to in-flight reads /
                         // writes / subscriptions (libca
-                        // `disconnectAllIO` parity). R2-37 covers the
+                        // `disconnectAllIO` parity). This covers the
                         // subscription side via mark_disconnected.
                         if !affected_cids.is_empty() {
                             let cid_set: HashSet<u32> = affected_cids.iter().copied().collect();
                             drain_waiters_for_cids(&cid_set, &in_flight);
-                            // F3: apply the flow-control delta. Earlier
+                            // apply the flow-control delta. Earlier
                             // this discarded the returned map, so the
                             // forgotten channel items left the circuit
                             // outstanding count high — EVENTS_ON could
@@ -3569,7 +3569,7 @@ async fn run_coordinator(
                     TransportEvent::CircuitResponsive { server_addr, priority } => {
                         diag.record(DiagEvent::Responsive { server: server_addr });
                         tracing::info!(server = %server_addr, priority, "circuit responsive again");
-                        // R2-39: C `tcpiiu::responsiveCircuitNotify`
+                        // C `tcpiiu::responsiveCircuitNotify`
                         // (`libca/tcpiiu.cpp:861-877`) walks every
                         // formerly-unresponsive channel, calls
                         // `pChan->connect()` to move it through
@@ -3660,7 +3660,7 @@ fn handle_disconnect(
     let mut affected_cids = Vec::new();
     let now = std::time::Instant::now();
 
-    // CA-FR-3: only channels on THIS circuit `(server_addr, priority)`
+    // only channels on THIS circuit `(server_addr, priority)`
     // are torn down — a sibling circuit to the same server at another
     // priority keeps its channels connected.
     for ch in channels.values_mut() {
@@ -3823,7 +3823,7 @@ where
 /// circuits — so two channels to the same IOC at different CA
 /// priorities are two circuits. We therefore dedup on the full
 /// [`types::CircuitKey`] `(addr, priority)`, not the address alone
-/// (which under-counted after CA-FR-3 split circuits by priority).
+/// (which under-counted once circuits are split by priority).
 /// Extracted as a free function so the count is unit-testable without
 /// standing up the coordinator (mirrors `beacon_arrival_targets`).
 fn operational_circuit_count<I>(channel_states: I) -> usize
@@ -3903,7 +3903,7 @@ impl AddrEntry {
     /// SocketAddr. Returns `Ok(self.sock)` unchanged when there's
     /// nothing to refresh (literal IP entry).
     ///
-    /// Round 50 (R50-G2): wired into the search engine's periodic
+    /// Wired into the search engine's periodic
     /// refresh task. The task runs every `EPICS_CA_DNS_REFRESH_SECS`
     /// (default 60 s) and calls this on every `AddrEntry`; a
     /// changed resolution updates `self.sock` so the next
@@ -3919,7 +3919,7 @@ impl AddrEntry {
 }
 
 /// `parse_addr_list` variant that retains hostname per entry.
-/// Round 50 (R50-G2): this is the live caller from
+/// This is the live caller from
 /// `new_with_config()`; the search engine periodically calls
 /// `AddrEntry::refresh_dns` on each entry so that an
 /// `EPICS_CA_ADDR_LIST` hostname whose DNS resolution changes
@@ -3979,14 +3979,14 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
         }
     }
 
-    // Round 50 (R50-G2): mirror the legacy `parse_addr_list`'s
+    // Mirror the legacy `parse_addr_list`'s
     // AUTO_ADDR_LIST + broadcast-fallback behaviour. Without these
     // the new live caller would silently drop UDP broadcast
     // discovery for multi-NIC clients and the limited-broadcast
     // last-resort fallback. The added entries are IP literals
     // (`hostname = None`) so the periodic refresh task short-
     // circuits them.
-    // R2-57: C `ca/src/client/iocinf.cpp:186-193` uses substring
+    // C `ca/src/client/iocinf.cpp:186-193` uses substring
     // semantics: `yes = true; if (strstr(pstr,"no") || strstr(pstr,
     // "NO")) yes = false`. Any value not containing "no"/"NO" keeps
     // auto-discovery enabled — so `"1"`, `"true"`, `"on"`, `"bogus"`
@@ -4050,7 +4050,7 @@ fn append_auto_addr_entries(addrs: &mut Vec<AddrEntry>, bcasts: &[Ipv4Addr], ser
 mod enum_readback_tests {
     use super::*;
 
-    // A5-R2-1: the readback-type rule for the CLI tools. Covered by
+    // the readback-type rule for the CLI tools. Covered by
     // invariant boundary (ENUM vs not × want_time × enum_as_string),
     // not by per-tool scenario.
     #[test]
@@ -4302,7 +4302,7 @@ fn expand_shell_vars(s: &str) -> String {
 /// The CA SEARCH wire protocol carries no hostname information, so a
 /// UDP-discovered TLS IOC at e.g. `10.0.0.1:5064` cannot be reached
 /// with a hostname-bound cert unless operators provide an explicit
-/// IP→hostname mapping. F-G6 (April 2026): adds this env so multi-IOC
+/// IP→hostname mapping. This env (added April 2026) lets multi-IOC
 /// TLS deployments work for both EPICS_CA_NAME_SERVERS-listed IOCs
 /// and UDP-broadcast-discovered IOCs.
 ///
@@ -4370,7 +4370,7 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
     let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_NAME_SERVERS") else {
         return Vec::new();
     };
-    // R2-59: C `cac.cpp:259` defaults bare-hostname entries to
+    // C `cac.cpp:259` defaults bare-hostname entries to
     // `_serverPort` (from `EPICS_CA_SERVER_PORT`, default 5064),
     // not the hardcoded protocol constant. Pre-fix Rust used
     // `CA_SERVER_PORT` (compile-time 5064) for the bare-hostname
@@ -4407,7 +4407,7 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
         } else {
             // Bare hostname (no port) — treat as DNS name even if it
             // happens to look like an IP literal (caller intent is
-            // unambiguous when no port is specified). R2-59: default
+            // unambiguous when no port is specified). default
             // port from EPICS_CA_SERVER_PORT (matches libca).
             if let Ok(addr) = resolve_host(entry, default_server_port) {
                 let hostname = if entry.parse::<std::net::IpAddr>().is_ok() {
@@ -4422,7 +4422,7 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
     out
 }
 
-// Round 50 (R50-G2): legacy `parse_addr_list() -> Vec<SocketAddr>`
+// Legacy `parse_addr_list() -> Vec<SocketAddr>`
 // removed. The hostname-preserving `parse_addr_list_with_hostnames()`
 // (line ~2944) is the only live caller — it carries DNS context
 // for the search engine's periodic refresh loop and matches the
@@ -5023,7 +5023,7 @@ mod monitor_pause_tests {
         assert_eq!(v2.value, EpicsValue::Long(2), "held latest after resume");
     }
 
-    /// F4: a configured queue smaller than FLOW_CONTROL_OFF_THRESHOLD is
+    /// a configured queue smaller than FLOW_CONTROL_OFF_THRESHOLD is
     /// clamped up so a lone subscription's full channel can still reach
     /// the threshold and trip EVENTS_OFF (slot overflow is out of flow
     /// control, so an unclamped small queue would coalesce forever).

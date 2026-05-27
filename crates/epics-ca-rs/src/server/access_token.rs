@@ -1,8 +1,8 @@
-//! Round 44 — CA-side type-state ACF gate.
+//! CA-side type-state ACF gate.
 //!
 //! The CA `tcp.rs` handles every wire op (READ / WRITE / EVENT_ADD /
 //! PUT_ACKT) as an inline arm of a single `match hdr.cmmd { … }`.
-//! Pre-Round 44, each arm had to *remember* to look up the cached
+//! Previously each arm had to *remember* to look up the cached
 //! [`epics_base_rs::server::access_security::AccessLevel`] in
 //! `state.channel_access` and compare it against the op's
 //! requirement — five separate rounds of self-review (rounds 38, 39)
@@ -29,7 +29,7 @@
 //! convention is now "every op opens with
 //! `state.lookup_access(sid).require_<read|write>()?`" — a single
 //! shape that's grep-auditable and visually consistent across all
-//! arms. The Round 43 PVA refactor that *was* trait-driven made
+//! arms. The PVA refactor that *was* trait-driven made
 //! "forgetting" a compile error; this CA shape requires the author
 //! to actively bypass the helper.
 
@@ -44,7 +44,7 @@ use crate::protocol::{ECA_NORDACCESS, ECA_NOWTACCESS};
 #[derive(Debug, Clone, Copy)]
 pub struct CaAccessChecked {
     level: AccessLevel,
-    /// MR-R20: write-trap mask of the ACF rule that resolved `level`.
+    /// write-trap mask of the ACF rule that resolved `level`.
     /// Threaded into [`WriteGranted`] so TRAPWRITE put-logging
     /// dispatch can honour `TRAPWRITE` / `NOTRAPWRITE` instead of
     /// hard-coding every accepted write as trapped. Mirrors C
@@ -67,7 +67,7 @@ pub struct ReadGranted {
 /// Witness type returned by [`CaAccessChecked::require_write`].
 #[derive(Debug, Clone, Copy)]
 pub struct WriteGranted {
-    /// MR-R20: write-trap mask of the ACF rule that authorised this
+    /// write-trap mask of the ACF rule that authorised this
     /// write. The CA write handler sets
     /// `TrapWriteMessage::rule_was_trap` from this value so a
     /// `NOTRAPWRITE` rule (or a rule with no trap option) is not

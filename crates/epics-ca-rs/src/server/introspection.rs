@@ -95,7 +95,7 @@ impl IntrospectionState {
     ///
     /// Returns the original Arc unchanged if the Arc has already
     /// been cloned (configuration must precede sharing). Logs a
-    /// warning instead of panicking — CR-14 fixed the previous
+    /// warning instead of panicking — this avoids the previous
     /// `Arc::get_mut(&mut self).expect(...)` panic on shared Arc.
     pub fn with_reload_token(mut self: Arc<Self>, token: String) -> Arc<Self> {
         if let Some(inner) = Arc::get_mut(&mut self) {
@@ -184,7 +184,7 @@ pub async fn run_introspection(
                 continue;
             }
         };
-        // Concurrency cap (CR-5). Without this, a peer opening N
+        // Concurrency cap. Without this, a peer opening N
         // trickle connections holds N tasks for the per-line read
         // timeout × header count = ~2.5 minutes each. The semaphore
         // permit lives for the duration of the spawned handler.
@@ -282,7 +282,7 @@ async fn handle_request(stream: TcpStream, state: Arc<IntrospectionState>) -> st
         ("GET", "/clients") => (200, render_clients(&state).await),
         ("GET", "/queues") => (200, render_queues(&state)),
         ("POST", route) if matches!(route, "/drain" | "/reload-acf" | "/reload-tls") => {
-            // Authn (CR-7). When reload_token is configured, every
+            // Authn. When reload_token is configured, every
             // mutating POST must present X-Reload-Token. Without
             // configuration the routes fall through to the legacy
             // unauthenticated path; bind on loopback or trusted
@@ -308,7 +308,7 @@ async fn handle_request(stream: TcpStream, state: Arc<IntrospectionState>) -> st
                     }
                     "/reload-acf" => match state.reload_acf.clone() {
                         Some(f) => {
-                            // CR-6: closure does blocking std::fs reads;
+                            // closure does blocking std::fs reads;
                             // run on the blocking pool so a slow NFS
                             // mount doesn't freeze the worker.
                             match tokio::task::spawn_blocking(move || f()).await {

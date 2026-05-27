@@ -13,7 +13,7 @@
 //! ca_sg_delete(gid);
 //! ```
 //!
-//! CA-FR-5: each scheduled `get`/`put` spawns its op immediately (it is
+//! each scheduled `get`/`put` spawns its op immediately (it is
 //! "in flight" the moment it is scheduled, matching libca), and the
 //! group tracks the outstanding tasks. [`Self::block`] takes `&mut self`
 //! and waits only for the requests issued since the last successful
@@ -254,7 +254,7 @@ mod tests {
         assert!(r.gets.is_empty() && r.puts.is_empty());
     }
 
-    /// CA-FR-5: a successful `block` clears the batch and the same group
+    /// a successful `block` clears the batch and the same group
     /// then accepts a second batch and waits only for it.
     #[tokio::test]
     async fn reusable_block_waits_only_for_current_batch() {

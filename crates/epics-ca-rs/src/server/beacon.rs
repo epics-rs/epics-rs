@@ -45,7 +45,7 @@ pub async fn run_beacon_emitter(
     // are unaffected. Beacon_addrs frequently includes multicast
     // groups when a site fans out beacons across routed segments.
     let _ = socket.set_multicast_ttl_v4(epics_base_rs::runtime::net::ca_mcast_ttl());
-    // R2-78: C `caservertask.c:307-318` `rsrv_init` explicitly
+    // C `caservertask.c:307-318` `rsrv_init` explicitly
     // `setsockopt(beaconSocket, IPPROTO_IP, IP_MULTICAST_LOOP, &flag=1)`
     // on the beacon socket. Linux default is loop=1 so behaviour
     // happens to match, but non-Linux (BSD/macOS/Windows) and Linux

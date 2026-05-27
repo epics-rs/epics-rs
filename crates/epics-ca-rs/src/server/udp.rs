@@ -11,7 +11,7 @@ use epics_base_rs::server::database::PvDatabase;
 /// Decide the UDP responder sockets to open: one `(bind_ip,
 /// mcast_groups)` spec per CA `casIntfAddrList` interface entry.
 ///
-/// **MR-R8 invariant.** C `caservertask.c:621-668` opens exactly
+/// **Invariant.** C `caservertask.c:621-668` opens exactly
 /// ONE UDP socket per `casIntfAddrList` entry — `conf->udp`, bound
 /// to that entry's address (a specific IP *or* `INADDR_ANY`) — and
 /// joins every `casMCastAddrList` group on THAT SAME socket via
@@ -106,7 +106,7 @@ async fn run_single_responder(
     mcast_groups: Vec<Ipv4Addr>,
 ) -> CaResult<()> {
     let socket = bind_responder_socket(bind_ip, port)?;
-    // R2-74 + R2-75 + MR-R8: join each multicast group on this
+    // Join each multicast group on this
     // responder's own socket via `IP_ADD_MEMBERSHIP` with
     // `imr_interface = bind_ip`. C `caservertask.c:633-665` joins
     // every `casMCastAddrList` group on the single `conf->udp`
@@ -254,7 +254,7 @@ fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
     Ok(socket)
 }
 
-// MR-R8: the standalone `run_multicast_responder` (R2-60) was
+// the standalone `run_multicast_responder` was
 // removed. It bound a *second* `0.0.0.0:port` socket per multicast
 // group; with `SO_REUSEADDR`/`SO_REUSEPORT` datagram fanout that
 // extra socket also caught ordinary unicast/broadcast CA SEARCH
@@ -287,7 +287,7 @@ async fn recv_loop(
     // socket. Logged on transitions only — pvxs `udp_collector.cpp:55-67`.
     let mut prev_drops: u32 = 0;
 
-    // R2-79: secondary buffer for peek-and-drain across queued
+    // secondary buffer for peek-and-drain across queued
     // inbounds. Heap-allocated once and reused on every iteration.
     let mut peek_buf = vec![0u8; 64 * 1024];
 
@@ -321,7 +321,7 @@ async fn recv_loop(
             continue;
         }
 
-        // R2-79: per-(src, batch) state that survives across queued
+        // per-(src, batch) state that survives across queued
         // same-src inbounds. Pre-fix Rust created a fresh send_buf
         // per inbound and flushed immediately, so a search storm of
         // N small datagrams from the same client yielded N reply
@@ -344,7 +344,7 @@ async fn recv_loop(
         // the older non-flagged form; the reply VERSION then carries
         // the default zero seq with the flag cleared.
         let mut client_seq: Option<u32> = None;
-        // R2-80: largest VERSION minor seen in this inbound. C
+        // largest VERSION minor seen in this inbound. C
         // `udp_version_action` sets `pclient->minor_version_number`
         // unconditionally on every CA_VSUPPORTED VERSION; `cas_send_
         // dg_msg` consults `CA_V411(minor_version_number)` at flush
@@ -353,7 +353,7 @@ async fn recv_loop(
         // `dataType == sequenceNoIsValid`, missing the case where a
         // V4.13 client sends `m_count >= 11` without the seq flag.
         let mut client_minor: Option<u16> = None;
-        // R2-48 + R2-80: accumulator for the single outbound
+        // accumulator for the single outbound
         // datagram. C `cast_server.c:163-281` + `caserverio.c:185-201`
         // reuse one send buffer across all SEARCH matches and flush
         // once via `cas_send_dg_msg`. We pre-seed a VERSION
@@ -362,7 +362,7 @@ async fn recv_loop(
         // final seq fields (CA_V411 peer) or strip the first 16 bytes
         // (pre-V4.11 peer), matching `cas_send_dg_msg`'s gate.
         let mut send_buf: Vec<u8> = Vec::new();
-        // R2-82: match C's `MAX_UDP_SEND = 1024` (`caProto.h:66`).
+        // match C's `MAX_UDP_SEND = 1024` (`caProto.h:66`).
         // `cas_copy_in_header` (`caserverio.c:280-294`) flushes when
         // the next message would push `stk > maxstk`, so C never
         // builds a UDP reply datagram larger than ~1024 bytes.
@@ -423,7 +423,7 @@ async fn recv_loop(
                     // populate its VERSION echo and match
                     // `cas_send_dg_msg` byte-for-byte.
                     //
-                    // R2-10: C `udp_version_action` returns RSRV_ERROR on
+                    // C `udp_version_action` returns RSRV_ERROR on
                     // `!CA_VSUPPORTED(m_count)` and the UDP dispatcher
                     // breaks out of the current datagram on any non-OK
                     // status. Pre-fix Rust accepted any VERSION and
@@ -436,7 +436,7 @@ async fn recv_loop(
                     if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
                         break;
                     }
-                    // R2-80: track the largest VERSION minor seen so the
+                    // track the largest VERSION minor seen so the
                     // flush-time placeholder strip/keep decision matches
                     // `CA_V411(minor_version_number)` regardless of
                     // whether the inbound's leading frame is VERSION,
@@ -456,7 +456,7 @@ async fn recv_loop(
                     // different layout; emitting our V4.13 reply confuses
                     // them or worse, fabricates a usable channel they
                     // can't actually open.
-                    // R2-10: C `search_reply_udp` (camessage.c:2151-2154)
+                    // C `search_reply_udp` (camessage.c:2151-2154)
                     // returns RSRV_ERROR on unsupported minor version and
                     // the UDP dispatcher breaks out of the datagram. Pre-
                     // fix Rust skipped only the offending SEARCH and kept
@@ -490,7 +490,7 @@ async fn recv_loop(
                     let payload = &current_buf[payload_start..payload_end];
 
                     // Extract PV name (null-terminated)
-                    // R2-33: C `search_reply_udp` forces
+                    // C `search_reply_udp` forces
                     // `pName[mp->m_postsize - 1] = '\0'`. Cap the
                     // NUL search at `postsize - 1` so an unterminated
                     // peer name is treated as a `postsize - 1` byte
@@ -502,7 +502,7 @@ async fn recv_loop(
                         .position(|&b| b == 0)
                         .unwrap_or(scan_end);
                     if let Ok(pv_name) = std::str::from_utf8(&payload[..pv_name_end]) {
-                        // BRIDGE-FR-10: thread the datagram source address
+                        // thread the datagram source address
                         // into the search resolver so the CA gateway can
                         // apply host-scoped `.pvlist` `DENY FROM host`
                         // admission at search time (parity with C
@@ -539,13 +539,13 @@ async fn recv_loop(
                             // Placeholder VERSION header — `cid` and
                             // `data_type` get patched at flush time once
                             // we know whether the inbound carried a
-                            // CA_V411 VERSION (R2-80).
+                            // CA_V411 VERSION.
 
                             let resp_bytes = resp.to_bytes();
                             let mut search_payload = [0u8; 8];
                             search_payload[0..2].copy_from_slice(&CA_MINOR_VERSION.to_be_bytes());
 
-                            // R2-48 + R2-80: accumulate into send_buf
+                            // accumulate into send_buf
                             // and ALWAYS pre-seed a VERSION placeholder
                             // at byte 0 of a fresh batch — matching
                             // `rsrv_version_reply`'s up-front seed.
@@ -593,7 +593,7 @@ async fn recv_loop(
 
                 offset += msg_len;
             }
-            // R2-79: peek for queued inbounds. C `cast_server.c:266-281`
+            // peek for queued inbounds. C `cast_server.c:266-281`
             // calls `socket_ioctl(FIONREAD, &nchars)` after each
             // `camessage()` and ONLY flushes `cas_send_dg_msg` when
             // `nchars == 0` or the peer changes. Mirror that — drain
@@ -602,7 +602,7 @@ async fn recv_loop(
             // outbound, not N. Different-src peeks flush the current
             // batch and start a fresh one for the new src.
             //
-            // MR-R7: a queued datagram that is rejected (short header,
+            // a queued datagram that is rejected (short header,
             // ignore-list, rate limit) must NOT restart the parser
             // over the *previous* datagram's bytes still sitting in
             // `current_buf`, and must NOT leave `current_src` pointing
@@ -664,7 +664,7 @@ async fn recv_loop(
                     // Replace `current_buf` with the accepted
                     // datagram's bytes BEFORE re-entering `'parse` so
                     // the parser never reprocesses the previous
-                    // datagram under a new `current_src` (MR-R7).
+                    // datagram under a new `current_src`.
                     current_buf.clear();
                     current_buf.extend_from_slice(&peek_buf[..peek_len]);
                     continue 'parse;
@@ -672,7 +672,7 @@ async fn recv_loop(
                 None => break 'parse, // recv queue drained
             }
         } // 'parse
-        // R2-48 + R2-79 + R2-80 + R2-81: flush the accumulated SEARCH
+        // flush the accumulated SEARCH
         // replies as a single outbound datagram. `cas_send_dg_msg`
         // does the same after each batch is fully parsed.
         if !send_buf.is_empty() {
@@ -689,7 +689,7 @@ async fn recv_loop(
     }
 }
 
-/// R2-80 + R2-81: send the accumulated SEARCH-reply batch.
+/// send the accumulated SEARCH-reply batch.
 ///
 /// If `client_minor >= 11` (CA_V411 peer), patch bytes 0..16 of
 /// `send_buf` with the final VERSION header (cid = client seq if
@@ -804,7 +804,7 @@ impl UdpRateLimiter {
 
 #[cfg(test)]
 mod mr_r8_responder_plan_tests {
-    //! MR-R8: a wildcard interface configuration must produce exactly
+    //! a wildcard interface configuration must produce exactly
     //! one responder socket — the single owner of ordinary
     //! unicast/broadcast SEARCH traffic — even when multicast groups
     //! are configured. No extra per-multicast-group `0.0.0.0:port`
@@ -825,7 +825,7 @@ mod mr_r8_responder_plan_tests {
             specs.len(),
             1,
             "wildcard config must produce exactly ONE responder \
-             socket, not one-per-multicast-group (MR-R8 fanout)"
+             socket, not one-per-multicast-group"
         );
         let (bind_ip, mcast) = &specs[0];
         assert_eq!(*bind_ip, Ipv4Addr::UNSPECIFIED);

@@ -113,7 +113,7 @@ impl CoalesceSlot {
     /// Route a value snapshot. Goes to the bounded channel ONLY when the
     /// slot is entirely empty AND not paused; any pending `error` or
     /// `ready` (or being paused) means the value must coalesce into the
-    /// slot rather than jump ahead via the channel — F1: a value must
+    /// slot rather than jump ahead via the channel — a value must
     /// never overtake a buffered error, and order is preserved.
     /// (`gated` is empty when not paused by the invariant.) Out of flow
     /// control (I1).
@@ -235,7 +235,7 @@ impl CoalesceSlot {
 /// and decrements on the matching channel-drain `MonitorConsumed`.
 pub(crate) enum MonitorDeliveryOutcome {
     /// Written to the bounded channel — counts toward flow control.
-    /// CA-FR-3: the [`CircuitKey`] identifies the priority circuit so
+    /// the [`CircuitKey`] identifies the priority circuit so
     /// the coordinator bumps the right per-circuit outstanding count.
     Queued(CircuitKey),
     /// Buffered in the coalesce slot (overflow `ready`, during-pause
@@ -271,7 +271,7 @@ pub(crate) struct SubscriptionRecord {
     pub enum_as_string: bool,
     pub mask: u16,
     pub server_addr: SocketAddr,
-    /// CA-FR-3: the CA priority of the channel this subscription rides.
+    /// the CA priority of the channel this subscription rides.
     /// Fixed at channel creation and preserved across reconnects (only
     /// `server_addr` can change). `(server_addr, priority)` is the
     /// circuit this subscription's flow control accounts against.
@@ -299,7 +299,7 @@ pub(crate) struct SubscriptionRecord {
 
 pub(crate) struct SubscriptionRegistry {
     subscriptions: HashMap<u32, SubscriptionRecord>,
-    /// CA-FR-2: monotonic `subid` source owned by the registry that
+    /// monotonic `subid` source owned by the registry that
     /// holds the live subscriptions. [`Self::alloc_subid`] probes
     /// `subscriptions` so a counter wrapping through 2^32 cannot
     /// reissue a subid that an active subscription still uses — a
@@ -317,7 +317,7 @@ impl SubscriptionRegistry {
     }
 
     /// Allocate a `subid` not currently held by any live subscription.
-    /// CA-FR-2 owner-side allocation: the coordinator (sole mutator of
+    /// Owner-side allocation: the coordinator (sole mutator of
     /// this registry) calls this when registering a new subscription,
     /// so the live-table probe and the subsequent [`Self::add`] happen
     /// in the same single-threaded context with no other allocator.
@@ -442,7 +442,7 @@ impl SubscriptionRegistry {
     /// Mark all subscriptions for a given server's channels as needing restore.
     /// Returns the cids that were affected.
     ///
-    /// R2-37: also deliver one `Err(CaError::ServerError(ECA_DISCONN))`
+    /// also deliver one `Err(CaError::ServerError(ECA_DISCONN))`
     /// per affected subscription's callback channel — libca
     /// `cac::disconnectAllIO()` (`modules/ca/src/client/cac.cpp:678-698`)
     /// iterates every in-flight IO on the channel (including
@@ -454,7 +454,7 @@ impl SubscriptionRegistry {
     /// many bounded-channel items were "forgotten" (abandoned for
     /// flow-control purposes) so the coordinator can decrement the
     /// circuit's outstanding count. Every disconnect path MUST apply
-    /// this delta (the F3 fix).
+    /// this delta.
     ///
     /// The disconnect error goes ALWAYS into the error cell (never the
     /// bounded channel), so it never bumps `pending` — this keeps the
@@ -469,7 +469,7 @@ impl SubscriptionRegistry {
                 rec.needs_restore = true;
                 // Forget the bounded-channel items for flow control:
                 // they stay in the channel for the consumer to drain
-                // (R2-37), but draining them won't re-decrement
+                //, but draining them won't re-decrement
                 // outstanding because `pending` is now 0
                 // (`mark_consumed` returns `None`).
                 let old_pending = rec.pending_deliveries;
@@ -692,7 +692,7 @@ mod tests {
         }
     }
 
-    /// CA-FR-2: a subid counter that wraps onto a still-live
+    /// a subid counter that wraps onto a still-live
     /// subscription must skip it, or a stale `EVENT_ADD`/`EVENT_CANCEL`
     /// for the wrapped id would be routed to the wrong record.
     #[test]
@@ -858,7 +858,7 @@ mod tests {
         assert!(coalesce_slot.take_raw().is_none(), "slot is single-entry");
     }
 
-    /// F1 regression: a new value MUST NOT enter the bounded channel
+    /// Regression: a new value MUST NOT enter the bounded channel
     /// while the value slot is occupied — otherwise the consumer
     /// (channel first, then slot) sees the newer value before the older
     /// slotted one. Order inversion.
@@ -907,7 +907,7 @@ mod tests {
         assert_eq!(reg.get(1).expect("rec").nreplace, 2);
     }
 
-    /// F2 regression: when the bounded channel is full at disconnect
+    /// Regression: when the bounded channel is full at disconnect
     /// time, `ECA_DISCONN` must land in the (separate) error slot — not
     /// silently drop. The consumer must learn the circuit died.
     #[test]
@@ -937,7 +937,7 @@ mod tests {
             "DISCONN parked in the error slot (out of flow control)",
         );
 
-        // Channel still has pre-disconnect data (R2-37). Drain it.
+        // Channel still has pre-disconnect data. Drain it.
         let _v1 = rx.try_recv().expect("v1");
         let _v2 = rx.try_recv().expect("v2");
         assert!(rx.try_recv().is_err(), "channel drained");
@@ -972,7 +972,7 @@ mod tests {
         assert_eq!(released.expect("Ok").value, EpicsValue::Long(7));
     }
 
-    /// F2 / I2: a value arriving during pause must NOT overwrite or hide
+    /// A value arriving during pause must NOT overwrite or hide
     /// a pending error. The error sits in its own slot and bypasses the
     /// pause gate.
     #[test]
@@ -1009,7 +1009,7 @@ mod tests {
         );
     }
 
-    /// F3 / I3: a value buffered BEFORE pause (overflow) stays
+    /// A value buffered BEFORE pause (overflow) stays
     /// deliverable while paused; only during-pause values are gated.
     #[test]
     fn prepause_overflow_value_deliverable_while_paused() {
@@ -1070,7 +1070,7 @@ mod tests {
         );
     }
 
-    /// F2 boundary: `mark_disconnected` with `old_pending == 0` (no
+    /// Boundary: `mark_disconnected` with `old_pending == 0` (no
     /// channel items) yields no flow-control delta and never bumps
     /// `pending` — the DISCONN goes to the error cell only, never the
     /// channel.
@@ -1099,7 +1099,7 @@ mod tests {
         }
     }
 
-    /// New-finding F1: a pending error in the error cell must keep a
+    /// New-finding a pending error in the error cell must keep a
     /// later value from jumping ahead via a partially-drained channel.
     /// route_value treats `error.is_some()` as slot-occupied, so the
     /// value coalesces into the slot and is delivered AFTER the error.

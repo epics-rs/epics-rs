@@ -431,7 +431,7 @@ pub struct CaServer {
     /// for its open channels. Mirrors RSRV `sendAllUpdateAS`
     /// (caservertask.c:1224) — the broadcast that keeps already-open
     /// channels in sync with rule changes.
-    // R49: no public `notify_access_change` method to fire this broadcast
+    // no public `notify_access_change` method to fire this broadcast
     acf_reload_tx: tokio::sync::broadcast::Sender<()>,
     autosave_config: Option<autosave::SaveSetConfig>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
@@ -605,7 +605,7 @@ impl CaServer {
         acf: &Arc<tokio::sync::RwLock<Option<access_security::AccessSecurityConfig>>>,
         reload_tx: &tokio::sync::broadcast::Sender<()>,
     ) -> CaResult<()> {
-        // F9: std::fs::read_to_string blocks the worker thread on slow
+        // std::fs::read_to_string blocks the worker thread on slow
         // NFS / FUSE / network FS. Run it on the blocking pool so
         // concurrent CA TCP traffic on the same worker doesn't stall
         // for the duration of the read.
@@ -642,7 +642,7 @@ impl CaServer {
     /// `asComputeAllAsg()` (asCa.c:205) — prompts every active TCP
     /// connection to run `reeval_access_rights`, which re-pushes
     /// `CA_PROTO_ACCESS_RIGHTS` only when the computed level changed
-    /// (`oldaccess != access` filter, R2-51 parity).
+    /// (`oldaccess != access` filter, libca parity).
     ///
     /// Use this after programmatic access-security state changes the
     /// server cannot detect automatically — for example, when INP* link

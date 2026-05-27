@@ -106,7 +106,7 @@ pub enum AuditFormat {
     /// Modern one-line JSON (default).
     #[default]
     Json,
-    /// libca asLib-compatible single-line text format. CA-G3 parity.
+    /// libca asLib-compatible single-line text format.
     LegacyAslog,
 }
 
@@ -240,7 +240,7 @@ impl AuditLogger {
         Self::new_with_format(sink, AuditFormat::Json)
     }
 
-    /// Like [`Self::new`] but emits in the chosen format. CA-G3:
+    /// Like [`Self::new`] but emits in the chosen format —
     /// pass [`AuditFormat::LegacyAslog`] to feed an existing
     /// libca-asLib-compatible audit pipeline.
     pub fn new_with_format(sink: AuditSink, format: AuditFormat) -> Self {
@@ -289,7 +289,7 @@ mod tests {
         assert!(s.contains("\"result\":\"ok\""));
     }
 
-    /// CA-G3: libca asLib-compatible text format. Verifies the line
+    /// libca asLib-compatible text format. Verifies the line
     /// shape, op-letter mapping, identity composition, and
     /// pv=value rendering for `caput`.
     #[test]

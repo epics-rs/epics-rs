@@ -20,7 +20,7 @@ pub use tcp::ServerConnectionEvent;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::ioc_app::IocRunConfig;
 
-/// R55: Convert a `$`-channel snapshot value from `EpicsValue::String` to
+/// Convert a `$`-channel snapshot value from `EpicsValue::String` to
 /// `EpicsValue::CharArray` of exactly `MAX_STRING_SIZE` (= 40) elements,
 /// matching C `dbChannel.c:489` which sets `no_elements = field_size` (= 40)
 /// and `dbr_field_type = DBR_CHAR`.  The string bytes are written first,

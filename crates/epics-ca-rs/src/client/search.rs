@@ -156,7 +156,7 @@ const MAX_SEARCH_PERIOD_DEFAULT_SECS: f64 = 300.0;
 /// `maxSearchPeriodLowerLimit = 60.0`).
 const MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS: f64 = 60.0;
 
-/// EX-R2 / R2-62: `EPICS_CA_MAX_SEARCH_PERIOD` resolution, faithful
+/// `EPICS_CA_MAX_SEARCH_PERIOD` resolution, faithful
 /// to C `udpiiu.cpp::getMaxPeriod` (`epics-base:modules/ca/src/client/udpiiu.cpp:68-94`):
 ///
 /// - env unset → the documented default of 300 s.
@@ -288,13 +288,13 @@ struct SearchEngineState {
     /// for O(1) lookup; updated only at engine start (env changes
     /// mid-run are not picked up to keep the hot path lock-free).
     ignored_servers: std::collections::HashSet<Ipv4Addr>,
-    /// R2-43 (partial) + R2-66: per-cid resolved-server tracker for
+    /// Per-cid resolved-server tracker for
     /// multiply-defined-PV detection. libca
     /// `cac.cpp::transferChanToVirtCircuit` (lines 591-661) consults
     /// the channel's currently-resolved circuit address on EVERY
     /// SEARCH reply for a known cid — the detection window extends
     /// until the `nciu` is destroyed (Cancel / channel drop), not
-    /// just until first CREATE_CHAN ack. Pre-R2-66 Rust cleared this
+    /// just until first CREATE_CHAN ack. Earlier Rust cleared this
     /// map on `remove_channel` which fired from `ConnectResult{
     /// success:true}` too, closing the detection window at the very
     /// moment the duplicate-detect was most useful (a slower second
@@ -335,7 +335,7 @@ impl SearchEngineState {
             self.buckets[p.bucket].retain(|x| *x != cid);
         }
         self.attempts.remove(&cid);
-        // R2-66: drop the multiply-defined tracker only on Cancel /
+        // drop the multiply-defined tracker only on Cancel /
         // channel destruction. A new CREATE_CHAN for the same cid
         // (which only happens via reuse after cancel) is a fresh
         // lifecycle. NOT cleared on `ConnectResult{success:true}`
@@ -346,7 +346,7 @@ impl SearchEngineState {
         self.resolved.remove(&cid);
     }
 
-    /// R2-66: bookkeeping hook called on connect-success (the cid
+    /// bookkeeping hook called on connect-success (the cid
     /// stays in `resolved` so post-handshake duplicate SEARCH replies
     /// from a *different* server still fire the multiply-defined
     /// diagnostic, matching libca's connected-lifetime detection
@@ -463,7 +463,7 @@ pub(crate) async fn run_search_engine(
     tick.tick().await; // skip immediate fire
     let mut tick_is_fast = false;
 
-    // Round 50 (R50-G2): periodic DNS refresh for `EPICS_CA_ADDR_LIST`
+    // Periodic DNS refresh for `EPICS_CA_ADDR_LIST`
     // entries whose `hostname` was set at startup (i.e. non-IP-literal
     // entries). On each tick the engine walks `addr_list` and calls
     // `AddrEntry::refresh_dns`; a changed resolution updates the
@@ -501,7 +501,7 @@ pub(crate) async fn run_search_engine(
 
             result = socket.recv_with_meta_with_drops(&mut recv_buf) => {
                 let Ok((meta, drops)) = result else { continue };
-                // MR-R3: drain any queued `SearchRequest` before parsing
+                // drain any queued `SearchRequest` before parsing
                 // this datagram. A `Schedule{Reconnect}` enqueued by the
                 // coordinator (mod.rs ServerDisconnect / TcpClosed paths)
                 // invalidates the `resolved` multiply-defined tracker via
@@ -537,7 +537,7 @@ pub(crate) async fn run_search_engine(
 
             tcp_dgram = tcp_response_rx.recv() => {
                 let Some((bytes, src)) = tcp_dgram else { continue };
-                // MR-R3: same ordering guarantee as the UDP arm — drain
+                // same ordering guarantee as the UDP arm — drain
                 // queued `SearchRequest`s (notably `Schedule{Reconnect}`)
                 // so a stale `resolved` entry cannot survive into the
                 // multiply-defined check for this nameserver reply.
@@ -546,7 +546,7 @@ pub(crate) async fn run_search_engine(
                 if !immediate.is_empty() {
                     fire_searches(&mut state, &immediate, &addr_list, &socket, &nameserver_send_txs).await;
                 }
-                // R2-26: TCP nameserver path uses the libca-equivalent
+                // TCP nameserver path uses the libca-equivalent
                 // SEARCH-reply contract (no per-reply VERSION header).
                 handle_tcp_response(&mut state, &bytes, src, &response_tx);
             }
@@ -559,7 +559,7 @@ pub(crate) async fn run_search_engine(
             }
 
             _ = dns_refresh.tick() => {
-                // R50-G2: re-resolve every hostname entry. The
+                // re-resolve every hostname entry. The
                 // `refresh_dns()` call is a no-op for IP-literal
                 // entries; for DNS entries it does a fresh
                 // `to_socket_addrs()` and replaces the cached IP
@@ -644,7 +644,7 @@ async fn run_nameserver_connection(
         let user = epics_base_rs::runtime::env::get("USER")
             .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
             .unwrap_or_else(|| "unknown".to_string());
-        // R2-28: extended-form headers when the USER / hostname
+        // extended-form headers when the USER / hostname
         // payload exceeds 16-bit postsize (libca's
         // `insertRequestHeader` parity). See the matching note in
         // `client/transport.rs` connect path.
@@ -701,7 +701,7 @@ async fn run_nameserver_connection(
                     if accumulated.len() - consumed < CaHeader::SIZE {
                         break;
                     }
-                    // CR-11: handle extended postsize (postsize=0xFFFF,
+                    // handle extended postsize (postsize=0xFFFF,
                     // count=0 → 8 extra header bytes + true u32 size).
                     // Pure 16-byte parse would consume 65,540 bytes for
                     // a frame whose true size is 24 + payload.
@@ -828,7 +828,7 @@ async fn run_nameserver_connection(
 /// inline (they need mutable access to `addr_list` which
 /// `handle_request` doesn't have) and delegates everything else.
 ///
-/// Round 50 (R50-G2): `addr_list` is `Vec<AddrEntry>` so the
+/// `addr_list` is `Vec<AddrEntry>` so the
 /// engine carries the original hostname (if any) for DNS
 /// re-resolution. Programmatic adds via `SearchRequest::AddAddress`
 /// arrive as `SocketAddr` (no hostname context) and are wrapped
@@ -877,13 +877,13 @@ fn handle_request_or_addr(
     }
 }
 
-/// MR-R3: drain every `SearchRequest` already queued on `request_rx`
+/// drain every `SearchRequest` already queued on `request_rx`
 /// into `state`, appending any cid that needs an immediate first-attempt
 /// SEARCH to `immediate`.
 ///
 /// Called both from the request-handling `select!` arm (so a burst of
 /// `Schedule` messages all land before the next tick) and at the top of
-/// the UDP / TCP response arms. The latter use is the MR-R3 fix: it
+/// the UDP / TCP response arms. The latter use: it
 /// guarantees a `Schedule{Reconnect}` — which invalidates the
 /// `resolved` multiply-defined tracker through `remove_channel` — is
 /// applied before a SEARCH reply for the same cid is parsed, so a
@@ -995,7 +995,7 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
             server_addr,
         } => {
             if success {
-                // R2-66: take this cid out of the *search* state
+                // take this cid out of the *search* state
                 // (pending, buckets, attempts) but KEEP the
                 // multiply-defined `resolved` entry so a late SEARCH
                 // reply from a second IOC announcing the same PV
@@ -1051,7 +1051,7 @@ fn handle_udp_response(
     handle_search_response(state, data, src, response_tx, /*is_tcp=*/ false);
 }
 
-/// R2-26: C `libca/tcpiiu.cpp::searchRespNotify` accepts TCP search
+/// C `libca/tcpiiu.cpp::searchRespNotify` accepts TCP search
 /// replies directly — TCP search replies from
 /// `rsrv/camessage.c::search_reply_tcp` carry no per-reply VERSION
 /// header. The UDP freshness check (`last_valid_seq`) does not
@@ -1080,7 +1080,7 @@ fn handle_search_response(
         return;
     }
 
-    // R2-11: C `udpiiu.cpp::postMsg` resets `lastReceivedSeqNoIsValid`
+    // C `udpiiu.cpp::postMsg` resets `lastReceivedSeqNoIsValid`
     // and `lastReceivedSeqNo` at the start of every UDP datagram so a
     // VERSION-bearing reply in datagram N cannot mark datagram N+1's
     // SEARCH-only reply as fresh. Pre-fix Rust kept `last_valid_seq`
@@ -1089,7 +1089,7 @@ fn handle_search_response(
     // bearing response set the marker. Reset here to keep the
     // freshness check datagram-local.
     //
-    // R2-26: TCP replies carry no VERSION; pre-seed `last_valid_seq`
+    // TCP replies carry no VERSION; pre-seed `last_valid_seq`
     // to `Some(0)` so the SEARCH-required-VERSION gate further
     // below treats every TCP search reply as valid (libca
     // `searchRespNotify` does no seq check on TCP).
@@ -1178,7 +1178,7 @@ fn handle_search_response(
                     }
                 }
 
-                // R2-68, R2-69: multiply-defined-PV detection runs
+                // multiply-defined-PV detection runs
                 // BEFORE the penalty / breaker / `last_valid_seq`
                 // gates. libca `cac.cpp:591-661` runs this check on
                 // every SEARCH reply for a known cid with no per-
@@ -1190,7 +1190,7 @@ fn handle_search_response(
                 // does not consume any reply state, so it is safe to
                 // fire even on stale/penalized datagrams. Note:
                 // resolved entries live past `ConnectResult{success}`
-                // for the channel's connected lifetime (R2-66).
+                // for the channel's connected lifetime.
                 if let Some((pv_name, prev_addr)) = state.resolved.get(&cid) {
                     if *prev_addr != server_addr {
                         let pv_name = pv_name.clone();
@@ -1204,7 +1204,7 @@ fn handle_search_response(
                             "Channel multiply defined: PV is also hosted on a second server"
                         );
                         metrics::counter!("ca_client_multiply_defined_pv_total").increment(1);
-                        // R2-67: dispatch ECA_DBLCHNL via the
+                        // dispatch ECA_DBLCHNL via the
                         // exception-handler path so library users
                         // who registered a `set_exception_handler`
                         // (the documented analog of libca
@@ -1286,7 +1286,7 @@ fn handle_search_response(
                         pv = %pv_name, cid, server = %server_addr,
                         "PV search resolved"
                     );
-                    // R2-43: record the resolved server so a second
+                    // record the resolved server so a second
                     // SEARCH reply for the same cid (from a different
                     // IOC) can be diagnosed as multiply-defined.
                     if state.resolved.len() >= MULTIPLY_DEFINED_RESOLVED_CAP {
@@ -1297,9 +1297,8 @@ fn handle_search_response(
                     state.resolved.insert(cid, (pv_name, server_addr));
                     let _ = response_tx.send(SearchResponse::Found { cid, server_addr });
                 }
-                // R2-43 duplicate-detect was here; moved above the
-                // penalty / breaker / `last_valid_seq` gates per
-                // R2-68 / R2-69.
+                // Duplicate-detect was here; moved above the
+                // penalty / breaker / `last_valid_seq` gates.
             }
             CA_PROTO_NOT_FOUND => {
                 // Server explicitly told us the PV is not on it. We don't
@@ -1555,7 +1554,7 @@ fn build_search_payload(cid: u32, pv_name: &str) -> Vec<u8> {
 
     let mut search_hdr = CaHeader::new(CA_PROTO_SEARCH);
     search_hdr.postsize = pv_payload.len() as u16;
-    // R2-30: C `libca/udpiiu.cpp::searchMsg()` sets
+    // C `libca/udpiiu.cpp::searchMsg()` sets
     // `m_dataType = DONTREPLY`. The TCP search path on the server
     // only sends CA_PROTO_NOT_FOUND when `DOREPLY` is set, and
     // libca's TCP response table treats CA_PROTO_NOT_FOUND as a
@@ -1592,7 +1591,7 @@ mod tests {
         );
     }
 
-    /// EX-R2: `EPICS_CA_MAX_SEARCH_PERIOD` must follow the C
+    /// `EPICS_CA_MAX_SEARCH_PERIOD` must follow the C
     /// `udpiiu.cpp::getMaxPeriod` semantics — default 300 s when
     /// unset, lower-limited at 60 s when explicitly set below it,
     /// default kept on a non-numeric value.
@@ -2193,17 +2192,17 @@ mod tests {
     /// cid-hashed bucket a full ring away and never fired within a
     /// reasonable window.
     ///
-    /// EX-R2: the production tick cadence is now `normal_tick()` =
+    /// the production tick cadence is now `normal_tick()` =
     /// `EPICS_CA_MAX_SEARCH_PERIOD / N_SEARCH_BUCKETS`. The test
     /// pins the env var to C's 60 s lower limit so the tick is the
     /// fastest the C-faithful clamp allows — 2 s — and asserts
-    /// against that, not the pre-EX-R2 1 s tick.
+    /// against that, not the earlier 1 s tick.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn reconnect_search_broadcasts_within_one_tick() {
         use std::net::Ipv4Addr;
 
-        // EX-R2: pin the search period to C's 60 s lower bound so
+        // pin the search period to C's 60 s lower bound so
         // the tick is the minimum the clamp allows (60/30 = 2 s).
         // SAFETY: serial_test::serial guarantees no concurrent env
         // access; the var is restored before the test returns.
@@ -2293,7 +2292,7 @@ mod tests {
     /// only this test catches an accumulator drift between the
     /// pure fn and the live `current_bucket`-advancing tick loop.
     ///
-    /// EX-R2: with `EPICS_CA_MAX_SEARCH_PERIOD` pinned to C's 60 s
+    /// with `EPICS_CA_MAX_SEARCH_PERIOD` pinned to C's 60 s
     /// lower bound the tick is 60/30 = 2 s. Expected SEARCH arrival
     /// times (relative to Schedule submission):
     ///   #1 at ~2 s   (first tick after Schedule lands)
@@ -2307,7 +2306,7 @@ mod tests {
     async fn retry_escalation_pvxs_pattern() {
         use std::net::Ipv4Addr;
 
-        // EX-R2: pin the search period to C's 60 s lower bound →
+        // pin the search period to C's 60 s lower bound →
         // 2 s tick. SAFETY: serial_test::serial guarantees no
         // concurrent env access; restored before return.
         let restore = std::env::var("EPICS_CA_MAX_SEARCH_PERIOD").ok();
@@ -2411,7 +2410,7 @@ mod tests {
         buf
     }
 
-    /// MR-R3 regression: after a channel connected to server A is torn
+    /// Regression: after a channel connected to server A is torn
     /// down (ServerDisconnect / TcpClosed) and re-searched, a SEARCH
     /// reply from a legitimately-different server B must resolve as a
     /// normal `Found`, NOT a false `MultiplyDefined` (`ECA_DBLCHNL`).
@@ -2465,7 +2464,7 @@ mod tests {
         );
         assert!(
             state.resolved.contains_key(&cid),
-            "resolved entry kept past ConnectResult{{success}} (R2-66)"
+            "resolved entry kept past ConnectResult{{success}}"
         );
 
         // 2. Server A disconnects — coordinator enqueues a reconnect

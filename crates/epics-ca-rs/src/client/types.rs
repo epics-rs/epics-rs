@@ -11,7 +11,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 use crate::channel::AccessRights;
 use crate::client::state::ChannelState;
 
-// --- Virtual-circuit identity (CA-FR-3) ---
+// --- Virtual-circuit identity ---
 
 /// Identity of one CA virtual circuit: the server address paired with
 /// the CA priority the channel was created at. libca keys its circuit
@@ -44,7 +44,7 @@ pub(crate) type CircuitKey = (SocketAddr, u8);
 /// transport keep the stamp current and the coordinator (which is
 /// the one answering `ca_receive_watchdog_delay`) read it directly.
 ///
-/// CA-FR-3: keyed by [`CircuitKey`] so each priority circuit to one
+/// keyed by [`CircuitKey`] so each priority circuit to one
 /// server keeps an independent receive timestamp — libca's
 /// `tcpRecvWatchdog` is per-circuit.
 pub(crate) type ServerLastRxAt = Arc<DashMap<CircuitKey, Instant>>;
@@ -77,7 +77,7 @@ impl DirectServerWriter {
 
         self.pending_frames.fetch_add(1, Ordering::Relaxed);
         if self.write_tx.send(frame).is_err() {
-            // R2-22: same accounting fix as write_loop — use atomic
+            // same accounting fix as write_loop — use atomic
             // CAS instead of load + store so a concurrent
             // `send_frame` increment cannot be silently overwritten.
             // The send-failure rollback decrements exactly one frame
@@ -105,7 +105,7 @@ impl DirectServerWriter {
 /// Shared server-writer registry. Transport manager publishes; channel hot
 /// paths read.
 ///
-/// CA-FR-3: keyed by [`CircuitKey`]. A channel's hot path looks up its
+/// keyed by [`CircuitKey`]. A channel's hot path looks up its
 /// writer by `(server_addr, priority)`, so two priorities to one server
 /// write to their own circuits.
 pub(crate) type DirectServerWriters = Arc<DashMap<CircuitKey, DirectServerWriter>>;
@@ -319,7 +319,7 @@ impl ReadWaiter {
 pub(crate) struct InFlightOps {
     pub(crate) reads: Arc<DashMap<u32, ReadWaiter>>,
     pub(crate) writes: Arc<DashMap<u32, (u32, WriteReplyTx)>>,
-    /// CA-FR-2: monotonic `ioid` source owned by the same registry
+    /// monotonic `ioid` source owned by the same registry
     /// that holds the live ids. Keeping the counter here (rather than
     /// a process-global static) lets [`Self::alloc_ioid`] probe
     /// `reads`/`writes` so a counter that wraps through 2^32 cannot
@@ -339,7 +339,7 @@ impl InFlightOps {
     }
 
     /// Allocate an `ioid` that is not currently live in either
-    /// in-flight table. CA-FR-2: the monotonic counter alone can wrap
+    /// in-flight table. the monotonic counter alone can wrap
     /// onto an id whose operation is still pending (≈11.9 h at 100k
     /// ops/s); a late response for the stale op would then wake the
     /// wrong waiter. Probing `reads`/`writes` skips any live id. Two
@@ -360,7 +360,7 @@ impl InFlightOps {
     }
 }
 
-// --- cid allocator (CA-FR-2) ---
+// --- cid allocator ---
 
 /// `cid` allocator with a live-set. Unlike `ioid`/`subid` — whose
 /// owning tables are reachable where they are allocated — the cid is
@@ -574,7 +574,7 @@ pub(crate) enum SearchResponse {
         cid: u32,
         server_addr: SocketAddr,
     },
-    /// R2-67: dispatched when a second SEARCH reply for the same cid
+    /// dispatched when a second SEARCH reply for the same cid
     /// names a different server (the libca
     /// `cac.cpp::msgForMultiplyDefinedPV` condition). The coordinator
     /// fans this out to the exception handler as `ECA_DBLCHNL`,
@@ -637,7 +637,7 @@ pub(crate) enum TransportCommand {
         /// Original requested element count from the EVENT_ADD that
         /// installed this subscription. C `libca/tcpiiu.cpp::
         /// subscriptionCancelRequest()` includes the subscription's
-        /// stored count in the CANCEL request; R2-23 echoes the same
+        /// stored count in the CANCEL request; we echo the same
         /// shape so strict CA dissectors / replay tooling see the
         /// libca-equivalent frame.
         count: u32,
@@ -661,7 +661,7 @@ pub(crate) enum TransportCommand {
     /// immediate echo probe — under load that immediate probe was the
     /// trigger for spurious 5-s echo timeouts and reconnect storms.
     ///
-    /// CA-FR-3: a beacon is a per-server UDP signal, but the watchdog it
+    /// a beacon is a per-server UDP signal, but the watchdog it
     /// pets lives on each circuit, so the notify fans out to every
     /// priority circuit for `server_addr` (see `process_command`).
     BeaconArrivalNotify {
@@ -686,7 +686,7 @@ pub(crate) enum TransportEvent {
         element_count: u32,
         access: AccessRights,
         server_addr: SocketAddr,
-        /// CA-FR-3: priority of the circuit the CREATE_CH_RESP arrived
+        /// priority of the circuit the CREATE_CH_RESP arrived
         /// on. Lets the coordinator clear a late response for an
         /// already-dropped cid on the right circuit.
         priority: u8,
@@ -731,7 +731,7 @@ pub(crate) enum TransportEvent {
     },
     TcpClosed {
         server_addr: SocketAddr,
-        /// CA-FR-3: which priority circuit closed. Only channels on
+        /// which priority circuit closed. Only channels on
         /// `(server_addr, priority)` are torn down; sibling circuits to
         /// the same server at other priorities are untouched.
         priority: u8,

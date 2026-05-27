@@ -10,13 +10,13 @@
 //!     m_postsize = 16 (echoed request header, no string body)
 //!     m_dataType = 0
 //!     m_count    = 0
-//!     m_cid      = client channel CID (R2-15 / R2-36 fix)
+//!     m_cid      = client channel CID
 //!     m_available = ECA status
 //!   payload:
 //!     16 bytes — verbatim copy of the offending request header
 //! ```
 //!
-//! R2-36 audit confirmed: the original frame uses cmd 11 (not the
+//! The audit confirmed: the original frame uses cmd 11 (not the
 //! cmd of the rejected request) and the status sits in
 //! `m_available`. Pre-fix Rust used cmd_error (zero-payload
 //! EVENT_ADD with status in `m_cid`) which libca decodes as a
@@ -44,10 +44,10 @@ fn golden_ext_event_add_admission_error_nord_access() {
     err.postsize = echoed.len() as u16; // 16
     err.data_type = 0;
     err.count = 0;
-    // R2-15: channel-scoped errors echo the client CID, not SID.
+    // channel-scoped errors echo the client CID, not SID.
     // For EVENT_ADD admission the audit landed on using the
     // request's `m_cid` (which the server stored as the SID slot —
-    // R2-23 refinement preserves the count). Mirror that.
+    // the refinement preserves the count). Mirror that.
     err.cid = 0x0000_002A;
     err.available = ECA_NORDACCESS;
 

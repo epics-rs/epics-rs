@@ -146,7 +146,7 @@ async fn main() {
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");
-    // CA-FR-3/CA-FR-4: -p selects the priority virtual circuit.
+    // -p selects the priority virtual circuit.
     let priority = args.priority.unwrap_or(0);
 
     let connected_flags: Vec<Arc<AtomicBool>> = args
@@ -160,7 +160,7 @@ async fn main() {
     // prefix on `reqElems || nElems > 1`; `reqElems` is non-zero iff
     // the user passed `-#`.
     let req_elems_present = args.max_elements.is_some();
-    // CA-FR-4: resolve the `-m <msk>` DBE_* mask + `-t` timestamp mode
+    // resolve the `-m <msk>` DBE_* mask + `-t` timestamp mode
     // once for all PVs. `prev_all`/`start` back the relative and
     // incremental timestamp renderings.
     let mask = parse_event_mask(args.event_mask.as_deref());
@@ -332,7 +332,7 @@ async fn monitor_pv(
         }
     });
 
-    // CA-FR-4: honour `-m <msk>` via the caller-resolved DBE_* mask.
+    // honour `-m <msk>` via the caller-resolved DBE_* mask.
     // C `camonitor.c:156-160` requests DBR_TIME_STRING for an ENUM field
     // unless `-n`, so the monitor delivers state labels by default.
     let enum_as_string = !fmt.enum_as_number;
@@ -345,7 +345,7 @@ async fn monitor_pv(
     while let Some(result) = monitor.recv().await {
         match result {
             Ok(snap) => {
-                // CA-FR-4: capture the client receive time as close to
+                // capture the client receive time as close to
                 // arrival as possible — this is the `c` (client) source,
                 // distinct from the server-supplied `snap.timestamp`.
                 let recv_time = SystemTime::now();
@@ -406,7 +406,7 @@ async fn monitor_pv(
     }
 }
 
-/// CA-FR-4: parse a `camonitor -m <msk>` mask string into `DBE_*` bits,
+/// parse a `camonitor -m <msk>` mask string into `DBE_*` bits,
 /// mirroring C `camonitor.c:40,285-301`.
 ///
 /// With no `-m` the mask is the C default `DBE_VALUE | DBE_ALARM` (NOT
@@ -440,7 +440,7 @@ fn parse_event_mask(m: Option<&str>) -> u16 {
     mask
 }
 
-/// CA-FR-4: `camonitor -t <key>` rendering KIND — orthogonal to the
+/// `camonitor -t <key>` rendering KIND — orthogonal to the
 /// timestamp SOURCE (`camonitor.c:235-253`). C keys this off `tsType`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TimestampKind {
@@ -454,7 +454,7 @@ enum TimestampKind {
     IncrChan,
 }
 
-/// CA-FR-4: a `-t` spec is two orthogonal axes — which SOURCE(s) to show
+/// a `-t` spec is two orthogonal axes — which SOURCE(s) to show
 /// (`s` = CA server / remote stamp, `c` = CA client / local receive time,
 /// shown in `()`), and the rendering KIND. C carries these as the
 /// independent `tsSrcServer` / `tsSrcClient` flags plus `tsType`; the

@@ -120,7 +120,7 @@ fn send_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(5))
 }
 
-/// Cap on `TlsAcceptor::accept` duration. Round 8 C-G12: without this
+/// Cap on `TlsAcceptor::accept` duration. Without this
 /// a peer that completes TCP but stalls during ClientHello holds a
 /// connection slot until OS-level keepalive (15s/5s probes) reaps it
 /// (~30s); coordinated peers can tie up listener resources. Default
@@ -208,7 +208,7 @@ enum ChannelTarget {
 /// payload conversion, trap-write `BeforeWrite` dispatch, or the
 /// actual `dbProcessNotify` side effect. The flag is cleared in the
 /// completion callback (`putNotifyCompletion`) or by the timeout/
-/// cancel branch (`camessage.c:1691`). MR-R1: Rust must acquire the
+/// cancel branch (`camessage.c:1691`). Rust must acquire the
 /// gate on the same boundary so a second same-channel WRITE_NOTIFY
 /// arriving while the first is pending cannot mutate the PV/device
 /// or alarm-ack state and then be told it was rejected.
@@ -270,7 +270,7 @@ struct ChannelEntry {
     /// `CA_PROTO_EVENT_ADD` so the filter chain attaches to the
     /// fresh subscriber.
     filter_suffix: Option<String>,
-    /// R2-9: per-channel WRITE_NOTIFY busy gate. C
+    /// per-channel WRITE_NOTIFY busy gate. C
     /// `write_notify_action` (`rsrv/camessage.c:1660-1707`) stores
     /// one `pciu->pPutNotify` per channel; a second
     /// `CA_PROTO_WRITE_NOTIFY` while one is still running waits up
@@ -283,7 +283,7 @@ struct ChannelEntry {
     /// the task finishes (`Arc` so the spawned task can clear it
     /// without re-borrowing `state.channels`).
     put_notify_busy: Arc<AtomicBool>,
-    /// R55: client appended `$` to the field name, requesting the
+    /// client appended `$` to the field name, requesting the
     /// full string as a `DBR_CHAR` array (C `dbChannel.c:483-507`
     /// long-string convention). When true, every GET/monitor
     /// delivery converts `EpicsValue::String` → `EpicsValue::CharArray`
@@ -294,7 +294,7 @@ struct ChannelEntry {
 }
 
 impl ChannelEntry {
-    /// CA-FR-8: parse a FRESH channel-filter chain from this channel's
+    /// parse a FRESH channel-filter chain from this channel's
     /// stored `.{...}` suffix. Returns an empty (identity) chain when
     /// the channel carried no suffix or the suffix was malformed
     /// (`parse_filter_chain` is permissive and warns — finding's
@@ -307,7 +307,7 @@ impl ChannelEntry {
     /// This is the single owner of filter parsing for every delivery
     /// path — READ / READ_NOTIFY, the monitor initial snapshot, and
     /// monitor updates — so the chain is applied uniformly instead of
-    /// only on the record-field `EVENT_ADD` path (the CA-FR-8 gap).
+    /// only on the record-field `EVENT_ADD` path (the prior gap).
     fn filter_chain(&self) -> epics_base_rs::server::database::filters::FilterChain {
         match self.filter_suffix.as_deref() {
             Some(json) => epics_base_rs::server::database::filters::parse_filter_chain(json),
@@ -323,8 +323,8 @@ struct SubscriptionEntry {
     data_type: u16,
     /// Original requested element count from the EVENT_ADD that
     /// installed this subscription. C `event_add_action` stores
-    /// `pevext->msg.m_count`; monitor delivery (R2-12) and the
-    /// EVENT_CANCEL ack (R2-23) both echo it.
+    /// `pevext->msg.m_count`; monitor delivery and the
+    /// EVENT_CANCEL ack both echo it.
     data_count: u32,
     /// Gate flipped by `reeval_access_rights` when read access is
     /// revoked / restored for `channel_sid`. While `true`, the
@@ -335,7 +335,7 @@ struct SubscriptionEntry {
     /// access can resume the same camonitor).
     denied: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
-    /// R55: mirrors `ChannelEntry::long_string`; stored here so the
+    /// mirrors `ChannelEntry::long_string`; stored here so the
     /// access-restore path and `reeval_access_rights` can apply the
     /// same `EpicsValue::String` → `EpicsValue::CharArray` conversion
     /// without re-borrowing the channel entry.
@@ -346,7 +346,7 @@ struct ClientState {
     channels: HashMap<u32, ChannelEntry>,
     subscriptions: HashMap<u32, SubscriptionEntry>,
     channel_access: HashMap<u32, AccessLevel>,
-    /// MR-R20: per-SID write-trap mask of the ACF rule that resolved
+    /// per-SID write-trap mask of the ACF rule that resolved
     /// the channel's access level. Kept parallel to `channel_access`
     /// (same key set, inserted/removed together) because the trap
     /// flag has no `CA_PROTO_ACCESS_RIGHTS` wire representation — it
@@ -355,7 +355,7 @@ struct ClientState {
     /// `pasgclient->trapMask` (`asLibRoutines.c:1048`).
     channel_trap: HashMap<u32, bool>,
     next_sid: AtomicU32,
-    /// Recycled SIDs from channels destroyed via CLEAR_CHANNEL. C-G9:
+    /// Recycled SIDs from channels destroyed via CLEAR_CHANNEL —
     /// without recycling, `next_sid` would wrap after 2³² channel
     /// creations and start handing out SIDs that collide with live
     /// channels. epics-base `rsrv/camessage.c` uses
@@ -378,7 +378,7 @@ struct ClientState {
     /// Empty for plaintext peers.
     auth_authority: String,
     acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
-    /// CA-FR-1: record database, for resolving ACF `INP*` links to live
+    /// record database, for resolving ACF `INP*` links to live
     /// values when evaluating CALC-gated rules in `compute_access`.
     db: Arc<PvDatabase>,
     tcp_port: u16,
@@ -478,7 +478,7 @@ impl ClientState {
     }
 
     fn alloc_sid(&mut self) -> u32 {
-        // C-G9: prefer recycled SIDs from CLEAR_CHANNEL'd channels.
+        // prefer recycled SIDs from CLEAR_CHANNEL'd channels.
         // Falls back to monotonic counter only when the free list is
         // empty, which prevents wraparound collisions on long-uptime
         // high-churn servers (epics-base rsrv `freeListItemPvt`
@@ -494,7 +494,7 @@ impl ClientState {
         self.free_sids.push(sid);
     }
 
-    /// Round 44: return the type-state-wrapped access token for a
+    /// Return the type-state-wrapped access token for a
     /// SID. Op handlers MUST consult this — direct reads of the
     /// underlying `channel_access` HashMap bypass the typed gate
     /// and recreate the missed-path defects fixed in rounds 38-39.
@@ -504,7 +504,7 @@ impl ClientState {
         use crate::server::access_token::CaAccessChecked;
         match self.channel_access.get(&sid).copied() {
             Some(level) => {
-                // MR-R20: the trap mask is kept in a parallel map
+                // the trap mask is kept in a parallel map
                 // populated alongside `channel_access`. A missing
                 // entry means the rule carried no trap option.
                 let rule_was_trap = self.channel_trap.get(&sid).copied().unwrap_or(false);
@@ -516,10 +516,10 @@ impl ClientState {
 
     /// Compute access rights bits for a channel target, together with
     /// the write-trap mask of the ACF rule that resolved the level
-    /// (MR-R20). The trap flag is `false` for `SimplePv`/`RecordField`
+    ///. The trap flag is `false` for `SimplePv`/`RecordField`
     /// targets whose access was not resolved through a `TRAPWRITE`
     /// rule — including the no-ACF permissive fallback.
-    /// CA-FR-1: resolve an ASG's `INP*` links to live numeric values
+    /// resolve an ASG's `INP*` links to live numeric values
     /// (A..U) from the record database. `None` when a declared link is
     /// unresolvable / bad — the CALC-gated rule then fails closed.
     /// Caller must NOT hold a record read-guard that a link could point
@@ -548,7 +548,7 @@ impl ClientState {
         Some(inputs)
     }
 
-    /// CA-FR-1: evaluate `cfg`'s rules for `asg_name`, with CALC clauses
+    /// evaluate `cfg`'s rules for `asg_name`, with CALC clauses
     /// gated against the resolved `INP*` values.
     async fn access_for_asg(
         &self,
@@ -583,7 +583,7 @@ impl ClientState {
     async fn compute_access(&self, target: &ChannelTarget) -> (u32, bool) {
         match target {
             ChannelTarget::SimplePv(pv) => {
-                // BRIDGE-FR-1: a gateway shadow PV carries an access
+                // a gateway shadow PV carries an access
                 // hook routing the decision through the gateway's own
                 // ACF (`.pvlist` ASG + `AccessConfig::can_read/write`)
                 // for this downstream `(user, host)`. When present it
@@ -609,7 +609,7 @@ impl ClientState {
                     // names that never went through `dbAddMember`.
                     // PR #641: pass auth method/authority so
                     // METHOD("x509") / AUTHORITY(<issuer>) rules
-                    // can gate mTLS-authenticated peers. CA-FR-1: CALC
+                    // can gate mTLS-authenticated peers. CALC
                     // rules are evaluated against resolved INP* links.
                     let (level, rule_was_trap) = self.access_for_asg(acf_cfg, "DEFAULT", 0).await;
                     let bits = match level {
@@ -625,7 +625,7 @@ impl ClientState {
                 }
             }
             ChannelTarget::RecordField { record, field: f } => {
-                // CA-FR-1: extract is_ro/asg/asl and DROP the record
+                // extract is_ro/asg/asl and DROP the record
                 // read-guard before resolving ACF INP* links, so a CALC
                 // input pointing back at this record can't re-acquire the
                 // same lock.
@@ -640,7 +640,7 @@ impl ClientState {
                         .unwrap_or(false);
                     (is_ro, instance.common.asg.clone(), instance.common.asl)
                 };
-                // R48-G2 (Round 48): read-only field-ness must AND
+                // Read-only field-ness must AND
                 // with ACF, never replace it. Pre-fix the read-only
                 // branch returned `Read`(1) unconditionally — a
                 // peer whose ACF resolved to `NoAccess` could still
@@ -650,9 +650,9 @@ impl ClientState {
                 // only strips the WRITE bit from the result.
                 let guard = self.acf.read().await;
                 let (acf_level, rule_was_trap) = if let Some(ref acf_cfg) = *guard {
-                    // Round-33A (R33-G4): thread the per-record ASL so
+                    // Thread the per-record ASL so
                     // `RULE(N, …)` gates correctly. PR #641: method/
-                    // authority for mTLS rules. CA-FR-1: CALC rules are
+                    // authority for mTLS rules. CALC rules are
                     // evaluated against resolved INP* links.
                     self.access_for_asg(acf_cfg, &asg, asl).await
                 } else {
@@ -702,7 +702,7 @@ pub async fn run_tcp_listener(
     >,
     #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
 ) -> CaResult<()> {
-    // C-G11 (R11): honour every interface in `EPICS_CAS_INTF_ADDR_LIST`,
+    // honour every interface in `EPICS_CAS_INTF_ADDR_LIST`,
     // not just the first. C `rsrv_init` (caservertask.c:603-712) iterates
     // `casIntfAddrList` and spawns one `CAS-TCP` accept thread per
     // entry, all bound to the same TCP port. Binding to a *specific*
@@ -784,7 +784,7 @@ pub async fn run_tcp_listener(
     // are aborted via JoinSet::Drop.
     let mut accept_tasks: tokio::task::JoinSet<CaResult<()>> = tokio::task::JoinSet::new();
 
-    // R2-54 + R2-88: ASG-field-change forwarder. C
+    // ASG-field-change forwarder. C
     // `database/src/ioc/as/asDbLib.c:107-110,144` `asSpcAsCallback`
     // is wired by `asInitCommon` as the per-record `ASG` field
     // special callback and re-evaluates access rights for every
@@ -793,7 +793,7 @@ pub async fn run_tcp_listener(
     // per-client dispatch but the downstream `oldaccess != access`
     // filter in `reeval_access_rights` keeps wire traffic bounded.
     //
-    // R2-88: the forwarder is spawned INTO the `accept_tasks`
+    // the forwarder is spawned INTO the `accept_tasks`
     // JoinSet so it's cancelled together with the accept loops on
     // `run_tcp_listener` cancellation. Pre-fix Rust did
     // `tokio::spawn(...)` and dropped the JoinHandle, leaving the
@@ -911,7 +911,7 @@ async fn accept_loop(
     >,
     #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
 ) -> CaResult<()> {
-    // D-G1: track per-connection tasks in a JoinSet so they're
+    // track per-connection tasks in a JoinSet so they're
     // aborted as a unit when this accept-loop future is dropped (e.g.
     // CaServer shutdown via tcp_abort.abort()). Without this, every
     // per-conn task ran detached and lingered until its internal
@@ -1012,7 +1012,7 @@ async fn accept_loop(
                 #[cfg(feature = "experimental-rust-tls")]
                 {
                     if let Some(acceptor) = tls_acceptor {
-                        // C-G12: cap the TLS handshake. A peer that
+                        // cap the TLS handshake. A peer that
                         // completes TCP but stalls during ClientHello
                         // would otherwise hold a connection slot until
                         // OS keepalive reaps it (~30s).
@@ -1240,7 +1240,7 @@ where
     state.rate_limit_strike_threshold = rl_cfg.strike_threshold;
     state.audit("connect", "", "", "ok").await;
 
-    // R2-47: C `rsrv/caservertask.c::create_tcp_client:1525` calls
+    // C `rsrv/caservertask.c::create_tcp_client:1525` calls
     // `rsrv_version_reply(client)` immediately after `db_start_events`,
     // so the server's first wire frame on any new TCP connection is
     // an unsolicited `CA_PROTO_VERSION` (cmmd=0, count=
@@ -1610,7 +1610,7 @@ where
         }
     }
 
-    // Abort any in-flight WRITE_NOTIFY completion tasks (CR-3). A
+    // Abort any in-flight WRITE_NOTIFY completion tasks. A
     // stuck async record (motor hung, asyn device unresponsive) would
     // otherwise hold the spawned task and its captured writer Arc
     // forever after the client disconnects.
@@ -1894,7 +1894,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         Ok(claims) => {
                             tracing::debug!(peer = %state.peer, sub = %claims.sub,
                                 "cap-token verified");
-                            // R2-52: propagate auth_method / authority so
+                            // propagate auth_method / authority so
                             // ACF rules of the form
                             // `RULE(1, WRITE) { METHOD("cap-token")
                             //                   AUTHORITY("ops-issuer-1") }`
@@ -1940,7 +1940,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             if hdr.actual_postsize() <= 1 {
                 return Ok(());
             }
-            // R2-55: C `rsrv/camessage.c:1190-1199` `claim_ciu_action`
+            // C `rsrv/camessage.c:1190-1199` `claim_ciu_action`
             // unconditionally executes `client->minor_version_number
             // = mp->m_available;` — the protocol comment is explicit:
             // "The available field is used (abused) here to
@@ -2010,7 +2010,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 ));
             }
 
-            // R2-33: C `claim_ciu_action` (`rsrv/camessage.c`) forces
+            // C `claim_ciu_action` (`rsrv/camessage.c`) forces
             // `pName[mp->m_postsize - 1] = '\0'` after rejecting
             // `m_postsize <= 1`. Effect: an unterminated name of
             // exactly `postsize` non-NUL bytes is treated as a
@@ -2037,7 +2037,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let record_path = parsed_channel.record_path;
             let filter_suffix = parsed_channel.json_suffix;
             let (_base, field_raw) = parse_pv_name(&record_path);
-            // R55: detect the `$` long-string suffix (C dbChannel.c:483-507).
+            // detect the `$` long-string suffix (C dbChannel.c:483-507).
             // Strip it before the field lookup; set `long_string` so every
             // delivery path converts the value to DBR_CHAR with a NUL
             // terminator.
@@ -2048,7 +2048,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             };
             let field = field_bare.to_ascii_uppercase();
 
-            // BRIDGE-FR-10: thread the connection peer into the search
+            // thread the connection peer into the search
             // resolver so the CA gateway applies host-scoped `.pvlist`
             // `DENY FROM host` admission on CREATE_CHANNEL (parity with C
             // `pvExistTest` → `gateAs::findEntry(pvname, hostname)`).
@@ -2070,7 +2070,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let value = instance.resolve_field(&field);
                         match value {
                             Some(v) => {
-                                // R55: `$` long-string — C dbChannel.c:483-507
+                                // `$` long-string — C dbChannel.c:483-507
                                 // requires the field to be DBF_STRING
                                 // (EpicsValue::String). Other field types get
                                 // S_dbLib_fieldNotFound (CREATE_CH_FAIL parity).
@@ -2081,7 +2081,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     w.write_all(&fail.to_bytes()).await?;
                                     return Ok(());
                                 }
-                                // R55: override type and count for `$` channels.
+                                // override type and count for `$` channels.
                                 // C sets `paddr->field_type = DBF_CHAR`,
                                 // `paddr->dbr_field_type = DBR_CHAR`, and
                                 // `paddr->no_elements = paddr->field_size` (= 40).
@@ -2127,14 +2127,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     }
                 };
 
-                // CA-FR-8: advertise the filter-FINAL element count
+                // advertise the filter-FINAL element count
                 // (C `dbChannelFinalElements`). A count-reshaping filter
                 // (`arr` slice) shrinks how many elements the channel can
                 // ever deliver; the client must learn that count so its
                 // READ / monitor request count — and buffer allocation —
                 // match the filtered payload. Without this the client
                 // requests the native count and the server zero-pads the
-                // slice back up to it (R2-13). An empty / value-gating-only
+                // slice back up to it. An empty / value-gating-only
                 // chain folds to the identity, so unfiltered channels keep
                 // their native count unchanged.
                 let element_count = match &filter_suffix {
@@ -2165,7 +2165,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     },
                 );
                 state.channel_access.insert(sid, access_level);
-                // MR-R20: keep the trap-mask map in lockstep with
+                // keep the trap-mask map in lockstep with
                 // `channel_access` so `lookup_access` always finds a
                 // consistent pair for this SID.
                 state.channel_trap.insert(sid, rule_was_trap);
@@ -2235,7 +2235,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let requested_type = hdr.data_type;
             let requested_count = hdr.actual_count();
 
-            // R2-34: the two read commands differ in WHERE the
+            // the two read commands differ in WHERE the
             // `INVALID_DB_REQ(m_dataType)` type check sits relative to
             // the channel lookup.
             //
@@ -2306,7 +2306,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 )));
             }
 
-            // R38-G2 / Round 38, Round 44 type-state:
+            // Type-state:
             // `state.lookup_access(sid)` is the only path to the
             // access cache. `require_read()` returns a witness on
             // success and an `AccessDenied` carrying the matching
@@ -2316,7 +2316,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 Ok(g) => g,
                 Err(denied) => {
                     if is_notify {
-                        // R2-7: C `read_notify_action` →
+                        // C `read_notify_action` →
                         // `read_reply` → `no_read_access_event`
                         // (`rsrv/camessage.c:450-480`) builds a
                         // CA_PROTO_READ_NOTIFY frame with the
@@ -2346,7 +2346,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // CA_PROTO_READ on read denial. Pre-fix Rust
                         // silently returned, so a libca client saw a
                         // timeout instead of the C error callback.
-                        // R2-15: outer cid is `pciu->cid` per
+                        // outer cid is `pciu->cid` per
                         // `vsend_err` (camessage.c:160-170).
                         let audit_pv = match &entry.target {
                             ChannelTarget::SimplePv(pv) => pv.name.clone(),
@@ -2374,7 +2374,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
                 return Ok(());
             };
-            // CA-FR-8: run the channel filter chain on the read value
+            // run the channel filter chain on the read value
             // before DBR encoding. epics-base `dbChannelRunPreChain`
             // (db_access.c:160-167 / dbChannel.c:640-649) runs the same
             // pre-chain on a filtered read channel. `apply_to_read_value`
@@ -2390,7 +2390,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     snapshot.value = v;
                 }
             }
-            // R55: convert String → CharArray of exactly 40 elements BEFORE the
+            // convert String → CharArray of exactly 40 elements BEFORE the
             // requested-count clamp. C read_reply sizes the payload to
             // dbr_size_n(DBR_CHAR, request_count) after the channel reports
             // no_elements=40; the clamp must see the 40-element array so
@@ -2446,7 +2446,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // is the direct parallel of INVALID_DB_REQ —
                     // emit the error + drop the connection.
                     //
-                    // R2-6: C `read_notify_action`
+                    // C `read_notify_action`
                     // (`rsrv/camessage.c:693-697`) returns
                     // `RSRV_ERROR` on `INVALID_DB_REQ` WITHOUT
                     // emitting any wire frame — only the deprecated
@@ -2457,7 +2457,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // before EOF that rsrv never produces. Mirror C:
                     // notify path is silent; only the deprecated
                     // READ path emits CA_PROTO_ERROR.
-                    // R2-15: outer cid is `pciu->cid`.
+                    // outer cid is `pciu->cid`.
                     if !is_notify {
                         send_ca_error(writer, hdr, ECA_BADTYPE, entry.cid, "bad READ data type")
                             .await?;
@@ -2474,7 +2474,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // records, snapshot.value.count() can be N, which would
             // make C clients parse 40 * N bytes of body and fail.
             //
-            // R2-13: C `read_reply` (`rsrv/camessage.c:507-571`) keeps
+            // C `read_reply` (`rsrv/camessage.c:507-571`) keeps
             // the request count in the header and zero-fills the
             // payload when fewer elements are returned than requested
             // (`autosize = mp->m_count == 0` is the exception:
@@ -2562,14 +2562,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         )));
                     }
                 };
-                // R39-G1 / Round 39: alarm-acknowledge PUTs travel
+                // Alarm-acknowledge PUTs travel
                 // the same WRITE wire opcodes but pre-fix bypassed
                 // the access_rights check that the regular WRITE
                 // path performs below. ACKT/ACKS mutate alarm-handler
                 // state — a `NoAccess` peer could silence alarms on
                 // any record they could open. Mirror the regular
                 // WRITE gate.
-                // R39-G1 / Round 44 type-state: alarm-ack PUTs go
+                // Type-state: alarm-ack PUTs go
                 // through the same gate as regular WRITE. Token's
                 // `require_write` returns the matching ECA code on
                 // denial.
@@ -2593,7 +2593,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             // notify WRITE. DBR_PUT_ACKT/DBR_PUT_ACKS
                             // travel the same WRITE opcodes, so this
                             // branch covers alarm-acknowledge PUTs too.
-                            // R2-15: outer cid is `pciu->cid`.
+                            // outer cid is `pciu->cid`.
                             let audit_pv = match &entry.target {
                                 ChannelTarget::SimplePv(pv) => pv.name.clone(),
                                 ChannelTarget::RecordField { record, field } => {
@@ -2616,7 +2616,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 } else {
                     "ACKS"
                 };
-                // MR-R1: DBR_PUT_ACKT/ACKS WRITE_NOTIFY travels C
+                // DBR_PUT_ACKT/ACKS WRITE_NOTIFY travels C
                 // `write_notify_action`, so it is subject to the same
                 // per-channel busy gate as a regular WRITE_NOTIFY. The
                 // alarm-ack write below mutates ACKT/ACKS record state;
@@ -2665,14 +2665,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     };
                     send_put_notify_response(writer, hdr.data_type, hdr.actual_count(), eca, ioid)
                         .await?;
-                    // MR-R1: alarm-ack PUT_ACKT/ACKS completes
+                    // alarm-ack PUT_ACKT/ACKS completes
                     // synchronously; release the per-channel
                     // WRITE_NOTIFY gate now that the reply is on the
                     // wire so the next put-notify on this channel can
                     // proceed.
                     drop(ackt_busy_guard);
                 } else if let Err(e) = &result {
-                    // R2-14: deprecated CA_PROTO_WRITE for DBR_PUT_ACKT/
+                    // deprecated CA_PROTO_WRITE for DBR_PUT_ACKT/
                     // DBR_PUT_ACKS must surface put failure via
                     // CA_PROTO_ERROR per C `write_action`
                     // (`rsrv/camessage.c:781-789`). Pre-fix the
@@ -2691,7 +2691,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 return Ok(());
             }
 
-            // R2-16: C `write_action` (`rsrv/camessage.c:735-739`) and
+            // C `write_action` (`rsrv/camessage.c:735-739`) and
             // `write_notify_action` (`camessage.c:1641-1645`) call
             // `MPTOPCIU(mp)` BEFORE any DBR-type check, so a bad SID
             // path goes through `logBadId` + RSRV_ERROR (silent drop)
@@ -2710,7 +2710,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     )));
                 }
             };
-            // R2-15: channel-scoped CA_PROTO_ERROR replies must echo
+            // channel-scoped CA_PROTO_ERROR replies must echo
             // `pciu->cid` (the CLIENT cid the libca peer allocated),
             // not the server-side SID we received in `hdr.cid`. C
             // `vsend_err` (`rsrv/camessage.c:160-170`) looks up the
@@ -2742,7 +2742,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // for protocol weaknesses; either way the right
                     // response is to drop.
                     if is_notify {
-                        // R2-8: C `putNotifyErrorReply` (`camessage.c:
+                        // C `putNotifyErrorReply` (`camessage.c:
                         // 1482-1501`) preserves `m_dataType` and
                         // `m_count` from the request — `caHdrLargeArray`
                         // count is the 32-bit decoded value re-emitted
@@ -2765,14 +2765,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             };
 
-            // Round 44 type-state WRITE gate. `lookup_access` is
+            // Type-state WRITE gate. `lookup_access` is
             // the only path to the cache; the witness type ensures
             // the matching ECA code reaches the wire.
             let write_grant = match state.lookup_access(sid).require_write() {
                 Ok(g) => g,
                 Err(denied) => {
                     if is_notify {
-                        // R2-46: route through the R2-8 refinement
+                        // route through the refinement
                         // helper so large-array put-callbacks
                         // refused by ACF carry the extended-form
                         // count instead of the u16 marker.
@@ -2801,7 +2801,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             };
 
-            // MR-R20: the write-trap mask of the ACF rule that
+            // the write-trap mask of the ACF rule that
             // authorised this write. C `asTrapWriteWithData`
             // (`rsrv/camessage.c:768-779`) consults
             // `pasgclient->trapMask` so a `NOTRAPWRITE` rule — or a
@@ -2810,7 +2810,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // `rule_was_trap: true` for every accepted write.
             let rule_was_trap = write_grant.rule_was_trap();
 
-            // MR-R1: acquire the per-channel WRITE_NOTIFY busy gate
+            // acquire the per-channel WRITE_NOTIFY busy gate
             // here — after the SID/type/access checks and *before* any
             // side effect (payload conversion, trap-write `BeforeWrite`
             // dispatch, the database/PV write, or the async device
@@ -2850,7 +2850,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             };
 
             let count = hdr.actual_count() as usize;
-            // R2-8 refinement: echo the FULL 32-bit count
+            // Echo the FULL 32-bit count
             // (`hdr.actual_count()`); pre-fix used `hdr.count`
             // which is the 0 marker for extended requests and
             // therefore lost the count on large array put-callbacks.
@@ -2864,7 +2864,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // drop the connection. C `caNetConvert` failure
                     // in `write_action` returns RSRV_ERROR.
                     if is_notify {
-                        // R2-8 same `putNotifyErrorReply` shape.
+                        // Same `putNotifyErrorReply` shape.
                         send_put_notify_response(
                             writer,
                             hdr.data_type,
@@ -2895,7 +2895,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // peer can't pin the dispatch task on `format!`-ing a
             // peer-controlled array of millions of elements.
             //
-            // R2-53: TRAPWRITE listeners also need a string form. We
+            // TRAPWRITE listeners also need a string form. We
             // render once when *either* audit or a trap-write listener
             // is registered; the truncated form is cheap and lets
             // listeners avoid touching the raw `EpicsValue`.
@@ -2907,7 +2907,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 String::new()
             };
 
-            // R2-85: pair the matching Before/After of this put with a
+            // pair the matching Before/After of this put with a
             // monotonic event_id so listeners can correlate without
             // racing on (peer, pv).
             let trap_event_id = if trap_listeners_active {
@@ -2916,7 +2916,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 0
             };
 
-            // R2-53 + R2-85 + R2-90: BeforeWrite notification.
+            // BeforeWrite notification.
             // Pre-fix BeforeWrite fired unconditionally before the
             // put was attempted, so write_hook rejections (and
             // pre-storage record rejections inside
@@ -2973,7 +2973,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .audit("caput", &audit_pv, &display_value, audit_result)
                 .await;
 
-            // R2-84: for the SYNCHRONOUS write paths (no async record
+            // for the SYNCHRONOUS write paths (no async record
             // completion pending), dispatch AfterWrite immediately
             // with the now-known status. The async path defers
             // AfterWrite into the background task that awaits
@@ -2998,7 +2998,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 );
             }
 
-            // R2-14: C `write_action` (`rsrv/camessage.c:781-789`):
+            // C `write_action` (`rsrv/camessage.c:781-789`):
             // even the deprecated fire-and-forget `CA_PROTO_WRITE`
             // surfaces a failed `dbChannel_put` to the client via
             // `send_err(mp, ECA_PUTFAIL, ...)`. Pre-fix Rust dropped
@@ -3015,7 +3015,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             }
 
-            // F1: CA_PROTO_WRITE (cmd=4) is fire-and-forget — no response
+            // CA_PROTO_WRITE (cmd=4) is fire-and-forget — no response
             if is_notify {
                 let eca_status = match &write_result {
                     Ok(_) => ECA_NORMAL,
@@ -3030,7 +3030,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     write_result.unwrap_or_default();
 
                 if let Some(rx) = completion_rx {
-                    // MR-R1: the per-channel WRITE_NOTIFY busy gate was
+                    // the per-channel WRITE_NOTIFY busy gate was
                     // already acquired above, before any side effect.
                     // The async device kickoff has now produced a
                     // completion receiver, so ownership of clearing the
@@ -3059,7 +3059,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         }
                     };
                     let writer_c = writer.clone();
-                    // R2-84: snapshot the trap-dispatch inputs so the
+                    // snapshot the trap-dispatch inputs so the
                     // async task can fire AfterWrite at *real*
                     // completion time (matches C
                     // `write_notify_reply:1400` semantics: the after-
@@ -3084,7 +3084,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         )
                     });
                     let join = tokio::spawn(async move {
-                        // MR-R1: own the per-channel WRITE_NOTIFY busy
+                        // own the per-channel WRITE_NOTIFY busy
                         // gate for the lifetime of this completion
                         // task. Its `Drop` clears the gate on every
                         // exit — normal completion, `rx` sender drop,
@@ -3102,7 +3102,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             Err(_) => ECA_PUTFAIL,
                         };
 
-                        // R2-84: dispatch AfterWrite NOW, after real
+                        // dispatch AfterWrite NOW, after real
                         // device-side completion. `status` carries
                         // "ok" for ECA_NORMAL or the ECA-code form
                         // for anything else so listeners can filter
@@ -3145,14 +3145,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let _ = w.flush().await;
                         drop(w);
                         // `_busy_guard` drops here, clearing the
-                        // per-channel WRITE_NOTIFY gate (MR-R1).
+                        // per-channel WRITE_NOTIFY gate.
                     });
-                    // Track for connection-scoped cleanup (CR-3): a stuck
+                    // Track for connection-scoped cleanup: a stuck
                     // async record would otherwise pin this task and the
                     // captured writer Arc forever after the client drops.
                     // Reap finished handles opportunistically so the Vec
                     // doesn't grow unbounded over a long-lived connection
-                    // that issues many WRITE_NOTIFYs (F1). The `sid` tag
+                    // that issues many WRITE_NOTIFYs. The `sid` tag
                     // also lets `CA_PROTO_CLEAR_CHANNEL` drain only the
                     // tasks owned by the cleared channel (C parity:
                     // `rsrvFreePutNotify` per-channel cleanup).
@@ -3176,7 +3176,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let sid = hdr.cid;
             let sub_id = hdr.available;
             let requested_type = hdr.data_type;
-            // R2-12: store the request's element count so each monitor
+            // store the request's element count so each monitor
             // delivery and the EVENT_CANCEL ack can echo it (matches
             // C `event_add_action` capturing `pevext->msg` for later
             // `read_reply` / `event_cancel_reply` use).
@@ -3189,7 +3189,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .filter(|s| s.channel_sid == sid)
                 .count();
             if subs_for_channel >= max_subs_per_channel() {
-                // R2-36: C `event_add_action` sends admission
+                // C `event_add_action` sends admission
                 // failures through `send_err(ECA_ALLOCMEM, ...)`
                 // i.e. CA_PROTO_ERROR — libca's
                 // `cac::eventRespAction` returns immediately for
@@ -3254,7 +3254,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             };
 
-            // R46: C `db_add_event` (dbEvent.c:437-439) returns NULL when
+            // C `db_add_event` (dbEvent.c:437-439) returns NULL when
             // select==0, which propagates as ECA_ALLOCMEM + disconnect
             // (`camessage.c:1814-1822`). A zero mask installs a subscription
             // that never triggers — match C by rejecting it immediately.
@@ -3281,19 +3281,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // `state.subscriptions` so the entry borrow has to be
             // released before then).
             let sub_pv_name = entry.pv_name.clone();
-            let long_string = entry.long_string; // R55
+            let long_string = entry.long_string;
 
-            // R38-G3 / Round 38: EVENT_ADD must also consult the
+            // EVENT_ADD must also consult the
             // channel's access_rights. A NoAccess peer mounting a
             // subscription would receive every value update —
             // identical leak to the round-32A `subscribe_raw` ACF
             // bypass on the PVA side. C IOC's `event_add_NoAccess`
             // returns ECA_NORDACCESS for the same reason.
-            // Round 44 type-state EVENT_ADD gate. R38-G3 closed the
+            // Type-state EVENT_ADD gate. This closed the
             // missing per-op check; the typed `require_read` shape
             // is the path every future MONITOR-class op should
             // mirror.
-            // R2-5: C `event_add_action` (`rsrv/camessage.c:1762-1880`)
+            // C `event_add_action` (`rsrv/camessage.c:1762-1880`)
             // installs the event unconditionally and conditionally
             // enables it via `db_event_enable` only when
             // `asCheckGet(pciu->asClientPVT)` allows reads; on no-read
@@ -3318,10 +3318,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     sub_id,
                     "EVENT_ADD refused: sub_id already in use on this connection"
                 );
-                // R2-50: use CA_PROTO_ERROR (libca exception path)
+                // use CA_PROTO_ERROR (libca exception path)
                 // instead of zero-payload EVENT_ADD which
                 // `cac::eventRespAction` treats as a cancel-ack
-                // no-op (see R2-27/R2-36 family). The libca peer
+                // no-op. The libca peer
                 // otherwise silently swallows the refusal and
                 // waits forever for monitor updates.
                 send_ca_error(writer, hdr, ECA_BADMONID, entry.cid, "duplicate sub_id").await?;
@@ -3332,8 +3332,8 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     ChannelTarget::SimplePv(pv) => {
                         let rx_opt = pv.add_subscriber(sub_id, native_type, mask).await;
                         let Some(rx) = rx_opt else {
-                            // C-G14: per-PV subscriber cap reached.
-                            // Round 12: previously dropped silently
+                            // per-PV subscriber cap reached.
+                            // Previously dropped silently
                             // (let the client time out). Now sends
                             // ECA_ALLOCMEM so the client surfaces the
                             // refusal immediately and can fall back to
@@ -3347,7 +3347,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 sub_id,
                                 "EVENT_ADD refused: PV subscriber cap reached"
                             );
-                            // R2-36: CA_PROTO_ERROR for the
+                            // CA_PROTO_ERROR for the
                             // admission failure (see comment above
                             // on the per-channel cap branch).
                             send_ca_error(
@@ -3361,7 +3361,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             return Ok(());
                         };
 
-                        // CA-FR-8: attach the channel filter chain to the
+                        // attach the channel filter chain to the
                         // just-added SimplePv subscriber so update delivery
                         // (`ProcessVariable::notify_subscribers`) runs the
                         // SAME chain as a record-field monitor. Pre-fix a
@@ -3375,13 +3375,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             .await;
 
                         let denied = Arc::new(AtomicBool::new(access_denied));
-                        // R2-5: initial event is the snapshot when read
+                        // initial event is the snapshot when read
                         // access is granted, `no_read_access_event` when
                         // denied (C `event_add_action` → `read_reply`
                         // routes denial through `no_read_access_event`,
                         // `rsrv/camessage.c:529-534`).
                         if access_denied {
-                            // EX-R6: an autosize (`count == 0`) request
+                            // an autosize (`count == 0`) request
                             // must be normalised to the target's live
                             // element count before sizing the zero-
                             // filled denial payload. C `read_reply`
@@ -3394,7 +3394,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             // by the client before the `ECA_NORDACCESS`
                             // status is read (`cac.cpp` eventRespAction
                             // returns on `m_postsize == 0`).
-                            // BFR-7: C calls `db_post_single_event`
+                            // C calls `db_post_single_event`
                             // unconditionally at monitor creation
                             // (`camessage.c:1853`, BEFORE the access
                             // check at 1858), so even the initial
@@ -3424,7 +3424,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             }
                         } else {
                             let mut snap = pv.snapshot().await;
-                            // BFR-7: the initial monitor event is a
+                            // the initial monitor event is a
                             // CA monitor single-event post (C
                             // `db_post_single_event` →
                             // `db_create_event_log` with
@@ -3443,11 +3443,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             match init_chain.apply_to_event_value(snap.value.clone()) {
                                 Some(v) => {
                                     snap.value = v;
-                                    // R55: convert for `$` long-string channels.
+                                    // convert for `$` long-string channels.
                                     if long_string {
                                         super::apply_long_string(&mut snap);
                                     }
-                                    // EX-R9: the initial event honours
+                                    // the initial event honours
                                     // the EVENT_ADD request count for
                                     // BOTH directions —
                                     // `send_monitor_snapshot` now pads
@@ -3511,8 +3511,8 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let mut instance = record.write().await;
                         let Some(rx) = instance.add_subscriber(field, sub_id, native_type, mask)
                         else {
-                            // C-G15: record-field subscriber cap reached.
-                            // Symmetric with C-G14 (SimplePv path); send
+                            // record-field subscriber cap reached.
+                            // Symmetric with the SimplePv path; send
                             // ECA_ALLOCMEM so the client surfaces the
                             // refusal instead of timing out silently.
                             tracing::warn!(
@@ -3522,7 +3522,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 "EVENT_ADD refused: record-field subscriber cap reached"
                             );
                             drop(instance);
-                            // R2-36: CA_PROTO_ERROR for admission
+                            // CA_PROTO_ERROR for admission
                             // failure (libca's eventRespAction
                             // treats zero-payload EVENT_ADD as a
                             // cancel ack, so the prior
@@ -3550,12 +3550,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             instance.attach_filter_to_last_subscriber(field, filt.clone());
                         }
 
-                        // R2-5: snapshot when read access granted,
+                        // snapshot when read access granted,
                         // no_read_access_event when denied. Drop the
                         // instance write lock before await on the
                         // writer so the producer task can pick it up.
                         //
-                        // EX-R6: even on the denied path we must read
+                        // even on the denied path we must read
                         // the field's live element count under the
                         // lock, so an autosize (`count == 0`) denial
                         // frame can be sized to a nonzero DBR body
@@ -3568,7 +3568,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     snap.class_name =
                                         Some(instance.record.record_type().to_string());
                                 }
-                                // BFR-7: the initial record-field monitor
+                                // the initial record-field monitor
                                 // event is an EVENT-context single-event
                                 // post (see the SimplePv branch) — run the
                                 // event-context chain (`dec`/`sync` apply)
@@ -3583,7 +3583,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 match init_chain.apply_to_event_value(snap.value.clone()) {
                                     Some(v) => {
                                         snap.value = v;
-                                        // R55: convert for `$` long-string channels.
+                                        // convert for `$` long-string channels.
                                         if long_string {
                                             super::apply_long_string(&mut snap);
                                         }
@@ -3593,7 +3593,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 }
                             })
                         };
-                        // EX-R6 + BFR-7: derive the field's element
+                        // Derive the field's element
                         // count for the autosize-denial frame AND run
                         // the event-context chain under the lock (the
                         // value is needed for both). `snapshot_for_field`
@@ -3624,7 +3624,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         };
                         drop(instance);
                         if access_denied {
-                            // EX-R6: normalise autosize before sizing
+                            // normalise autosize before sizing
                             // the zero-filled denial payload. See the
                             // SimplePv branch above for the C
                             // `read_reply` (`camessage.c:507-509`)
@@ -3643,7 +3643,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 .await?;
                             }
                         } else if let Some(snap) = initial_snap {
-                            // EX-R9: initial event honours the
+                            // initial event honours the
                             // EVENT_ADD request count in both
                             // directions — `send_monitor_snapshot`
                             // pads an over-requested count and
@@ -3718,7 +3718,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                             .to_string(),
                                     );
                                 }
-                                // R55: convert String → CharArray+NUL for
+                                // convert String → CharArray+NUL for
                                 // `$` long-string channels before encoding.
                                 if long_string {
                                     super::apply_long_string(&mut event.snapshot);
@@ -3730,7 +3730,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     };
                                 // CA-268: see GET path note — fixed 1.
                                 //
-                                // R2-12: C `read_reply`
+                                // C `read_reply`
                                 // (`rsrv/camessage.c:507-571`) uses the
                                 // ORIGINAL request count as the header
                                 // value (autosize=0 case) and pads the
@@ -3818,7 +3818,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         CA_PROTO_EVENT_CANCEL => {
             let sub_id = hdr.available;
             let req_channel_sid = hdr.cid;
-            // R2-24: C `event_cancel_reply` (`camessage.c:1998-2021`)
+            // C `event_cancel_reply` (`camessage.c:1998-2021`)
             // calls `MPTOPCIU(mp)` first. If the request's channel id
             // is unknown or belongs to another client, rsrv calls
             // `logBadId` and returns RSRV_ERROR WITHOUT sending a
@@ -3901,7 +3901,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     });
                 }
 
-                // R2-23 refinement: C `event_cancel_reply`
+                // C `event_cancel_reply`
                 // (`camessage.c:2002-2014`) calls cas_copy_in_header
                 // with `pevext->msg.m_dataType`, `pevext->msg.m_count`,
                 // `pevext->msg.m_cid` (the SID stored on the original
@@ -4064,7 +4064,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             if hdr.postsize <= 1 {
                 return Ok(());
             }
-            // R2-33: C `search_reply_tcp` forces NUL at postsize-1.
+            // C `search_reply_tcp` forces NUL at postsize-1.
             let scan_end = payload.len().saturating_sub(1).max(0);
             let end = payload[..scan_end]
                 .iter()
@@ -4149,7 +4149,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             }
             if let Some(entry) = state.channels.remove(&sid) {
                 state.channel_access.remove(&sid);
-                // MR-R20: drop the parallel trap-mask entry so a
+                // drop the parallel trap-mask entry so a
                 // recycled SID never inherits a stale trap flag.
                 state.channel_trap.remove(&sid);
                 state.release_sid(sid);
@@ -4248,7 +4248,7 @@ async fn get_full_snapshot(
 /// Send an initial / access-restore monitor snapshot as a
 /// `CA_PROTO_EVENT_ADD` frame.
 ///
-/// EX-R9: `requested_count` is the element count from the originating
+/// `requested_count` is the element count from the originating
 /// `CA_PROTO_EVENT_ADD` request. The encoded DBR payload is routed
 /// through [`pad_dbr_to_requested_count`] so a request count *larger*
 /// than the live element count is zero-padded to the requested shape
@@ -4278,7 +4278,7 @@ async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
     let element_count = if data_type == epics_base_rs::types::DBR_CLASS_NAME {
         1
     } else {
-        // EX-R9: pad (or truncate) the encoded DBR to the requested
+        // pad (or truncate) the encoded DBR to the requested
         // element count before the 8-byte alignment resize, so the
         // header count and payload shape match a non-autosize
         // request. `pad_dbr_to_requested_count` returns the header
@@ -4344,7 +4344,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
     // pre-fix `insert`-without-comparison behaviour for freshly
     // created channels).
     //
-    // R2-51: C `libcom/src/as/asLibRoutines.c:1047-1051` fires
+    // C `libcom/src/as/asLibRoutines.c:1047-1051` fires
     // `pclient->pcallback(... asClientCOAR)` (the COAR callback
     // that calls `casAccessRightsCB` → `access_rights_reply`)
     // ONLY when `oldaccess != access`. An ACF reload that leaves
@@ -4368,7 +4368,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                 .channel_access
                 .insert(sid, new_level)
                 .unwrap_or(AccessLevel::NoAccess);
-            // MR-R20: an ACF reload can change which rule grants
+            // an ACF reload can change which rule grants
             // access (e.g. a new TRAPWRITE rule), so the trap mask
             // must be refreshed alongside the level.
             state.channel_trap.insert(sid, new_rule_was_trap);
@@ -4412,7 +4412,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
             // in m_cid plus a `dbr_size_n(type, count)` zero-filled
             // payload sized from the stored EVENT_ADD request) then
             // db_event_disable. Pre-fix Rust sent a header-only
-            // frame; R2-1 refinement: use `send_no_read_access_event`
+            // frame; use `send_no_read_access_event`
             // so the wire frame matches C byte-for-byte (the stored
             // request count drives the zero-fill).
             for sub_id in &affected {
@@ -4428,7 +4428,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                         sub.target.clone(),
                     )
                 };
-                // BFR-7: C posts the access-revoked event through
+                // C posts the access-revoked event through
                 // `db_post_single_event` (event-context pre-chain)
                 // BEFORE `db_event_disable` (`camessage.c:1090-1092`);
                 // the ECA_NORDACCESS frame is only sent when the chain
@@ -4450,7 +4450,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                 if dropped_by_filter {
                     continue;
                 }
-                // EX-R6: an autosize (`data_count == 0`) subscription
+                // an autosize (`data_count == 0`) subscription
                 // revoked here must also be normalised to the live
                 // element count, otherwise the access-revoked
                 // notification is the same zero-payload
@@ -4484,7 +4484,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
             // event the moment access comes back (rather than
             // waiting for the next natural update).
             //
-            // EX-R9: the restore snapshot honours the stored
+            // the restore snapshot honours the stored
             // EVENT_ADD request count in BOTH directions.
             // `send_monitor_snapshot` pads when the request asked
             // for more elements than the PV currently holds and
@@ -4510,7 +4510,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                     )
                 };
                 if let Some(mut snap) = get_full_snapshot(&target).await {
-                    // BFR-7: C enables the event (`db_event_enable`)
+                    // C enables the event (`db_event_enable`)
                     // THEN posts the current value through the
                     // event-context pre-chain
                     // (`db_post_single_event`, `camessage.c:1086-1088`);
@@ -4530,7 +4530,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                             None => continue,
                         }
                     }
-                    // R55: convert for `$` long-string channels.
+                    // convert for `$` long-string channels.
                     if sub_long_string {
                         super::apply_long_string(&mut snap);
                     }
@@ -4562,7 +4562,7 @@ async fn send_cmd_error<W: AsyncWrite + Unpin + Send + 'static>(
     Ok(())
 }
 
-/// R2-8 refinement: CA_PROTO_WRITE_NOTIFY reply with extended-form
+/// CA_PROTO_WRITE_NOTIFY reply with extended-form
 /// count support. C `putNotifyErrorReply` / `write_notify_reply`
 /// (`rsrv/camessage.c:1482-1501` / `1731+`) call
 /// `cas_copy_in_header` with `mp->m_count` / `msgtmp.m_count` from
@@ -4593,7 +4593,7 @@ async fn send_put_notify_response<W: AsyncWrite + Unpin + Send + 'static>(
     Ok(())
 }
 
-/// EX-R6: normalise an EVENT_ADD request count for a no-read-access
+/// normalise an EVENT_ADD request count for a no-read-access
 /// denial frame. C `read_reply` (`rsrv/camessage.c:507-509`) treats a
 /// zero element count as autosize and substitutes `paddr->no_elements`
 /// — the target's live element count. The `no_read_access_event`
@@ -4629,7 +4629,7 @@ fn no_read_access_count(requested_count: u32, actual_count: u32) -> u32 {
 /// type so libca-style clients see the correct callback metadata even
 /// on the error path.
 ///
-/// EX-R6: callers on the EVENT_ADD denial path must pass a `count`
+/// callers on the EVENT_ADD denial path must pass a `count`
 /// already normalised through [`no_read_access_count`] so an autosize
 /// (`count == 0`) request does not produce a zero-payload frame.
 async fn send_no_read_access_event<W: AsyncWrite + Unpin + Send + 'static>(
@@ -4666,7 +4666,7 @@ async fn send_no_read_access_event<W: AsyncWrite + Unpin + Send + 'static>(
 /// header count to `mp->m_count` (non-autosize) and sizes the
 /// payload to `dbr_size_n(type, request_count)`: extra bytes are
 /// zero-filled, and a response that decoded fewer elements than
-/// requested is still framed at the request count. R2-12 refinement
+/// requested is still framed at the request count. This refinement
 /// covers BOTH directions: pad when requested > actual, truncate
 /// when requested < actual. Returns the header element count to
 /// use (`requested_count` when non-zero, `actual_count` when
@@ -4774,7 +4774,7 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     message: &str,
 ) -> CaResult<()> {
     let error_msg_bytes = pad_string(truncate_diag(message));
-    // R45: payload_size must use the echo header's ACTUAL byte length (16 or 24
+    // payload_size must use the echo header's ACTUAL byte length (16 or 24
     // for extended), not the constant CaHeader::SIZE=16.  Compute orig_bytes first.
     let orig_bytes = original_hdr.to_bytes_extended();
     let payload_size = orig_bytes.len() + error_msg_bytes.len();
@@ -4802,7 +4802,7 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     // 16 bytes otherwise), so an extended READ/WRITE error
     // round-trips byte-for-byte with libca.
     let resp_bytes = resp.to_bytes_extended();
-    // orig_bytes computed above (before payload_size) for R45.
+    // orig_bytes computed above (before payload_size).
     let mut frame = Vec::with_capacity(resp_bytes.len() + orig_bytes.len() + error_msg_bytes.len());
     frame.extend_from_slice(&resp_bytes);
     frame.extend_from_slice(&orig_bytes);
@@ -4894,7 +4894,7 @@ mod write_notify_drain_tests {
 
 #[cfg(test)]
 mod mr_r1_put_notify_gate_tests {
-    //! MR-R1: the per-channel `CA_PROTO_WRITE_NOTIFY` busy gate must
+    //! the per-channel `CA_PROTO_WRITE_NOTIFY` busy gate must
     //! be acquired *before* any side effect and reject a concurrent
     //! WRITE_NOTIFY on the same channel.
     use super::PutNotifyBusyGuard;
@@ -5071,7 +5071,7 @@ mod multi_nic_listener_tests {
 
     /// Confirm `INTF_ADDR_LIST=127.0.0.1` results in a listener that
     /// accepts on 127.0.0.1. This is the "single specific IP" path
-    /// which already worked pre-R11 — the test guards against a
+    /// which already worked before — the test guards against a
     /// regression in the refactor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
@@ -5108,7 +5108,7 @@ mod multi_nic_listener_tests {
     /// the port; the second must bind on the same port. Use
     /// `127.0.0.1` for both — POSIX rejects two identical
     /// (addr,port) binds, so the second bind on the same loopback IP
-    /// fails. The R11 contract is that a failed *subsequent* bind is
+    /// fails. The contract is that a failed *subsequent* bind is
     /// logged-and-skipped (matching C `cleanup: continue;`), and the
     /// listener as a whole still serves the first interface.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5648,7 +5648,7 @@ mod single_write_all_framing_tests {
         );
     }
 
-    /// R45 regression: when the original request used an extended
+    /// Regression: when the original request used an extended
     /// 24-byte header, the outer CA_PROTO_ERROR reply must declare
     /// `m_postsize = 24 + diag_len`, not `16 + diag_len`.
     #[tokio::test]
@@ -5668,7 +5668,7 @@ mod single_write_all_framing_tests {
             &original,
             ECA_INTERNAL,
             0xFFFF_FFFF,
-            "R45 regression test",
+            "Regression test",
         )
         .await
         .expect("send_ca_error succeeds");
@@ -5727,7 +5727,7 @@ mod single_write_all_framing_tests {
         );
     }
 
-    /// EX-R9: an initial monitor snapshot for an EVENT_ADD whose
+    /// an initial monitor snapshot for an EVENT_ADD whose
     /// request count exceeds the live element count must be framed at
     /// the requested count with a zero-padded payload — the same
     /// shape the READ path and later monitor updates use. Pre-fix the
@@ -5763,7 +5763,7 @@ mod single_write_all_framing_tests {
         let count = u16::from_be_bytes([frame[6], frame[7]]) as u32;
         assert_eq!(
             count, requested_count,
-            "EX-R9: the initial monitor frame must carry the REQUESTED \
+            "the initial monitor frame must carry the REQUESTED \
              element count (8), not the live count (3)"
         );
 
@@ -5774,7 +5774,7 @@ mod single_write_all_framing_tests {
         let value_bytes = requested_count as usize * elem;
         assert!(
             postsize >= value_bytes,
-            "EX-R9: payload ({postsize}) must be padded to at least the \
+            "payload ({postsize}) must be padded to at least the \
              requested {requested_count} elements ({value_bytes} bytes)"
         );
         // The three live elements come first, then zero padding.
@@ -5783,11 +5783,11 @@ mod single_write_all_framing_tests {
         assert_eq!(&body[8..12], &30i32.to_be_bytes(), "element 2 preserved");
         assert!(
             body[3 * elem..value_bytes].iter().all(|&b| b == 0),
-            "EX-R9: over-requested elements must be zero-filled"
+            "over-requested elements must be zero-filled"
         );
     }
 
-    /// EX-R9: a request count SMALLER than the live element count
+    /// a request count SMALLER than the live element count
     /// still truncates — `send_monitor_snapshot` must own both
     /// directions of the count contract.
     #[tokio::test]
@@ -5809,10 +5809,10 @@ mod single_write_all_framing_tests {
         let guard = writer.lock().await;
         let frame = &guard.get_ref().batches[0];
         let count = u16::from_be_bytes([frame[6], frame[7]]) as u32;
-        assert_eq!(count, 2, "EX-R9: under-requested count must truncate to 2");
+        assert_eq!(count, 2, "under-requested count must truncate to 2");
     }
 
-    /// EX-R9: `requested_count == 0` is autosize — the frame keeps the
+    /// `requested_count == 0` is autosize — the frame keeps the
     /// live element count, unchanged behaviour.
     #[tokio::test]
     async fn ex_r9_autosize_keeps_live_count() {
@@ -5833,13 +5833,13 @@ mod single_write_all_framing_tests {
         let guard = writer.lock().await;
         let frame = &guard.get_ref().batches[0];
         let count = u16::from_be_bytes([frame[6], frame[7]]) as u32;
-        assert_eq!(count, 4, "EX-R9: autosize (count==0) keeps the live count");
+        assert_eq!(count, 4, "autosize (count==0) keeps the live count");
     }
 }
 
 #[cfg(test)]
 mod ex_r6_no_read_access_count_tests {
-    //! EX-R6: an autosize (`count == 0`) no-read-access EVENT_ADD
+    //! an autosize (`count == 0`) no-read-access EVENT_ADD
     //! denial must be sized to a nonzero DBR body. A zero-payload
     //! `CA_PROTO_EVENT_ADD` is the historical subscription-cancel
     //! confirmation no-op; the CA client drops it before reading the
@@ -5884,15 +5884,15 @@ mod ex_r6_no_read_access_count_tests {
             dbr_buffer_size(DBR_DOUBLE, DbFieldType::Double, 0),
             0,
             "regression baseline: a raw count==0 plain-DBR denial is \
-             zero-payload — the cancel-ack shape EX-R6 fixes"
+             zero-payload — the cancel-ack shape later normalised"
         );
-        // After EX-R6 normalisation the denial frame carries a real
+        // After normalisation the denial frame carries a real
         // DBR body, so the client sees the ECA_NORDACCESS status.
         let normalised = no_read_access_count(0, 4) as usize;
         let payload = dbr_buffer_size(DBR_DOUBLE, DbFieldType::Double, normalised);
         assert!(
             payload > 0,
-            "EX-R6: a normalised autosize denial must have a nonzero \
+            "a normalised autosize denial must have a nonzero \
              DBR payload so the client does not drop it as a cancel-ack"
         );
         assert_eq!(payload, 4 * DbFieldType::Double.element_size());
@@ -5901,7 +5901,7 @@ mod ex_r6_no_read_access_count_tests {
 
 #[cfg(test)]
 mod bfr7_event_context_filter_tests {
-    //! BFR-7: a CA monitor initial single-event post
+    //! a CA monitor initial single-event post
     //! (`db_post_single_event`, `rsrv/camessage.c:1853`) runs the
     //! channel filter chain in EVENT context (`db_create_event_log` →
     //! `dbfl_context_event`), NOT in one-shot READ context. `dec`/`sync`
@@ -6048,7 +6048,7 @@ mod bfr7_event_context_filter_tests {
         frames
     }
 
-    /// BFR-7 regression: a `sync` filter gating `while` a never-set
+    /// Regression: a `sync` filter gating `while` a never-set
     /// state drops the initial monitor post in EVENT context, so the
     /// server sends NO `CA_PROTO_EVENT_ADD` data frame. Pre-fix the
     /// initial post ran in READ context (`apply_to_read_value`), where
@@ -6064,7 +6064,7 @@ mod bfr7_event_context_filter_tests {
             .collect();
         assert!(
             event_adds.is_empty(),
-            "BFR-7: the event-context `sync` gate must suppress the \
+            "the event-context `sync` gate must suppress the \
              initial EVENT_ADD post — no fallback to the unfiltered \
              value (got {event_adds:?})"
         );
@@ -6088,7 +6088,7 @@ mod bfr7_event_context_filter_tests {
         );
     }
 
-    /// BFR-7: a `dec` filter whose window offset skips slot 0
+    /// a `dec` filter whose window offset skips slot 0
     /// (`offset = 1`) drops the FIRST event in EVENT context — the
     /// initial monitor post lands on a fresh decimator counter at
     /// position 0, which is decimated away. READ context would bypass
@@ -6103,7 +6103,7 @@ mod bfr7_event_context_filter_tests {
             .collect();
         assert!(
             event_adds.is_empty(),
-            "BFR-7: the event-context decimator must drop the initial \
+            "the event-context decimator must drop the initial \
              EVENT_ADD post (offset 1 skips window slot 0): got {event_adds:?}"
         );
     }
@@ -6111,13 +6111,13 @@ mod bfr7_event_context_filter_tests {
 
 #[cfg(test)]
 mod r46_zero_mask_event_add_tests {
-    //! R46: EVENT_ADD with mask=0 must be rejected with CA_PROTO_ERROR
+    //! EVENT_ADD with mask=0 must be rejected with CA_PROTO_ERROR
     //! (ECA_ALLOCMEM) + connection close.
     //!
     //! C reference: `db_add_event` (dbEvent.c:437-439) returns NULL when
     //! `select==0`; `event_add_action` (camessage.c:1814-1822) then calls
     //! `send_err(ECA_ALLOCMEM)` and returns `RSRV_ERROR`, closing the
-    //! connection.  Before R46 the Rust server silently installed a dead
+    //! connection.  Previously the Rust server silently installed a dead
     //! subscription whose `Subscriber::accepts` always returned false, so
     //! no events ever arrived after the initial snapshot.
     use super::non_graceful_disconnect_teardown_tests::{
@@ -6130,7 +6130,7 @@ mod r46_zero_mask_event_add_tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Build a CA_PROTO_EVENT_ADD request with mask=0 (the R46 defect input).
+    /// Build a CA_PROTO_EVENT_ADD request with mask=0 (the defect input).
     fn event_add_zero_mask_frame(sid: u32, sub_id: u32) -> Vec<u8> {
         let mut h = CaHeader::new(CA_PROTO_EVENT_ADD);
         h.data_type = epics_base_rs::types::DBR_TIME_DOUBLE;
@@ -6235,7 +6235,7 @@ mod r46_zero_mask_event_add_tests {
         }
         assert!(
             got_error,
-            "R46: zero-mask EVENT_ADD must produce a CA_PROTO_ERROR (ECA_ALLOCMEM) \
+            "zero-mask EVENT_ADD must produce a CA_PROTO_ERROR (ECA_ALLOCMEM) \
              reply before the connection closes (received {} bytes: {acc:?})",
             acc.len()
         );
@@ -6247,7 +6247,7 @@ mod r46_zero_mask_event_add_tests {
             .expect("join ok");
         assert!(
             res.is_err(),
-            "R46: zero-mask EVENT_ADD must close the connection with Err \
+            "zero-mask EVENT_ADD must close the connection with Err \
              (matches C RSRV_ERROR), got {res:?}"
         );
     }
@@ -6358,7 +6358,7 @@ mod r46_zero_mask_event_add_tests {
         }
         assert!(
             !got_error,
-            "R46 guard ordering: EVENT_ADD on an unknown SID with mask=0 must be a \
+            "Guard ordering: EVENT_ADD on an unknown SID with mask=0 must be a \
              silent drop (C logBadId + RSRV_ERROR), but a CA_PROTO_ERROR frame was \
              emitted (received {} bytes: {acc:?})",
             acc.len()
@@ -6371,7 +6371,7 @@ mod r46_zero_mask_event_add_tests {
             .expect("join ok");
         assert!(
             res.is_err(),
-            "R46 guard ordering: unknown-SID EVENT_ADD must close the connection with \
+            "Guard ordering: unknown-SID EVENT_ADD must close the connection with \
              Err (matches C RSRV_ERROR), got {res:?}"
         );
     }
@@ -6433,7 +6433,7 @@ mod r46_zero_mask_event_add_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deprecated_read_unknown_sid_bad_type_drops_silently() {
-        // A4-1: C `read_action` (`rsrv/camessage.c:608-619`) resolves
+        // C `read_action` (`rsrv/camessage.c:608-619`) resolves
         // the channel BEFORE checking the DBR type, so an unknown SID
         // is a silent `logBadId` drop even when the requested type is
         // also invalid. Pre-fix Rust checked the type first and emitted
@@ -6494,7 +6494,7 @@ mod r46_zero_mask_event_add_tests {
         let acc = drain_to_eof(&mut client, Duration::from_secs(3)).await;
         assert!(
             first_ca_proto_error(&acc).is_none(),
-            "A4-1: deprecated READ on an unknown SID with a bad type must be a silent \
+            "deprecated READ on an unknown SID with a bad type must be a silent \
              drop (C read_action logBadId), but a CA_PROTO_ERROR frame was emitted \
              (received {} bytes: {acc:?})",
             acc.len()
@@ -6512,7 +6512,7 @@ mod r46_zero_mask_event_add_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deprecated_read_known_sid_bad_type_sends_badtype_with_real_cid() {
-        // A4-1: with a VALID channel, C `read_action`
+        // with a VALID channel, C `read_action`
         // (`rsrv/camessage.c:616-619`) sends ECA_BADTYPE carrying the
         // channel's real cid (`pciu->cid`) + record name — never the
         // 0xFFFFFFFF sentinel the pre-fix code used.
@@ -6567,7 +6567,7 @@ mod r46_zero_mask_event_add_tests {
 
         let acc = drain_to_eof(&mut client, Duration::from_secs(3)).await;
         let err = first_ca_proto_error(&acc)
-            .expect("A4-1: deprecated READ with a valid SID + bad type must emit a CA_PROTO_ERROR");
+            .expect("deprecated READ with a valid SID + bad type must emit a CA_PROTO_ERROR");
         assert_eq!(
             err.available, ECA_BADTYPE,
             "status must be ECA_BADTYPE, got {:#x}",
@@ -6576,7 +6576,7 @@ mod r46_zero_mask_event_add_tests {
         assert_ne!(
             err.cid,
             u32::MAX,
-            "A4-1: BADTYPE cid must be the channel's real cid, not the 0xFFFFFFFF sentinel"
+            "BADTYPE cid must be the channel's real cid, not the 0xFFFFFFFF sentinel"
         );
         assert_eq!(
             err.cid, 1,

@@ -110,7 +110,7 @@ fn max_accumulated() -> usize {
 /// Default echo interval (matches C EPICS CA_CONN_VERIFY_PERIOD).
 /// Overridden by EPICS_CA_CONN_TMO environment variable.
 ///
-/// R2-63: C `cac.cpp:186-194` parses CONN_TMO as `double` and falls
+/// C `cac.cpp:186-194` parses CONN_TMO as `double` and falls
 /// back to the default (30 s) on parse failure, on `<= 0.0`, AND on
 /// any value libca's bookkeeping treats as a sentinel for "use the
 /// default". Pre-fix Rust used `.max(1.0) as u64` which (a) rounded
@@ -199,7 +199,7 @@ pub(crate) async fn run_transport_manager(
     // literal. Empty when no name servers were given by hostname.
     #[cfg(feature = "experimental-rust-tls")] sni_overrides: HashMap<SocketAddr, String>,
 ) {
-    // CA-FR-3: circuits are keyed by `(SocketAddr, priority)`, so two
+    // circuits are keyed by `(SocketAddr, priority)`, so two
     // channels to the same IOC at different priorities own independent
     // TCP circuits (libca `caServerID`).
     let mut connections: HashMap<CircuitKey, ServerConnection> = HashMap::new();
@@ -225,7 +225,7 @@ pub(crate) async fn run_transport_manager(
     //   1. Exact (ip:port) match — EPICS_CA_NAME_SERVERS hostname or
     //      EPICS_CA_TLS_SNI_MAP "ip:port=host" entry.
     //   2. Wildcard (ip:0) match — EPICS_CA_TLS_SNI_MAP "ip=host"
-    //      entry (any port). F-G6: lets operators map an IOC's IP
+    //      entry (any port). lets operators map an IOC's IP
     //      once and have it apply to every port the search engine
     //      finds it on.
     //   3. Global EPICS_CA_TLS_SERVER_NAME fallback.
@@ -613,7 +613,7 @@ fn process_command(
         } => {
             let mut hdr = CaHeader::new(CA_PROTO_EVENT_CANCEL);
             hdr.data_type = data_type;
-            // R2-23 refinement: include the subscription's original
+            // Include the subscription's original
             // count, and serialise in extended form for counts
             // >= 0xFFFF. libca
             // `tcpiiu.cpp::subscriptionCancelRequest` routes through
@@ -662,7 +662,7 @@ fn process_command(
             // its own schedule and probes the circuit then,
             // rather than firing an immediate probe under load.
             //
-            // CA-FR-3: one UDP beacon pets every priority circuit to
+            // one UDP beacon pets every priority circuit to
             // that server — fan out to all circuits whose key matches
             // `server_addr` (libca delivers `beaconArrivalNotify` to
             // each tcpiiu on the bhe's circuit list).
@@ -749,7 +749,7 @@ fn send_frame(
 /// frame-byte-exact wire captures (Wireshark CA dissector, fuzzers)
 /// diverge.
 ///
-/// CA-FR-3: the VERSION message carries the requested CA priority in its
+/// the VERSION message carries the requested CA priority in its
 /// `m_dataType` field — libca `tcpiiu::versionMessage`
 /// (`tcpiiu.cpp:1393-1397`) passes `priority` as the dataType and
 /// `CA_MINOR_PROTOCOL_REVISION` as the count. Pre-fix Rust left dataType
@@ -764,7 +764,7 @@ fn build_client_handshake(priority: u8) -> Vec<u8> {
     let username = epics_base_rs::runtime::env::get("USER")
         .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
         .unwrap_or_else(|| "unknown".to_string());
-    // R2-28: C `libca/tcpiiu.cpp::userNameSetRequest` and
+    // C `libca/tcpiiu.cpp::userNameSetRequest` and
     // `hostNameSetRequest` route through `comQueSend::
     // insertRequestHeader` which emits the extended annex when
     // the payload exceeds 16 bits. Pre-fix Rust truncated the
@@ -859,7 +859,7 @@ async fn connect_server(
             }
         };
         let connector = TlsConnector::from(tls_cfg.clone());
-        // C-G13: cap the client-side TLS handshake. A misbehaving (or
+        // cap the client-side TLS handshake. A misbehaving (or
         // hostile) server that completes TCP but stalls during
         // ServerHello would otherwise leave the client awaiting
         // forever. Pairs with the existing TCP-connect timeout above.
@@ -967,7 +967,7 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     pending_frames: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    // R2-40 / MR-R17: send watchdog deadline. C `tcpSendWatchdog`
+    // Send watchdog deadline. C `tcpSendWatchdog`
     // (`libca/tcpSendWatchdog.cpp:43-64`) fires after `connTMO`
     // (`EPICS_CA_CONN_TMO`, default 30 s) and calls
     // `iiu.sendTimeoutNotify` → `unresponsiveCircuitNotify`. The
@@ -983,7 +983,7 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     // *cancelled*, possibly after a prefix of a CA frame has already
     // reached the socket. Continuing to write later batches on the
     // same stream would append after that truncated frame and
-    // desynchronize the server's parser. R2-40 changed this arm to
+    // desynchronize the server's parser. This arm was changed to
     // emit `CircuitUnresponsive` and keep the socket — that is only
     // safe for the read-side echo watchdog, where no bytes were
     // corrupted, not for a cancelled write. So on write timeout we
@@ -1007,7 +1007,7 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
         match tokio::time::timeout(send_timeout, writer.write_all(&batch)).await {
             Ok(Ok(())) => {
                 batch.clear();
-                // R2-22: `pending_frames` is the local backpressure
+                // `pending_frames` is the local backpressure
                 // counter that decides when `send_frame` should treat
                 // a stalled circuit as disconnected. Pre-fix the
                 // decrement used `load` + `store(prev - drained)`,
@@ -1047,7 +1047,7 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
                 return;
             }
             Err(_) => {
-                // MR-R17: write-side timeout. `write_all` was
+                // write-side timeout. `write_all` was
                 // cancelled by `timeout`, so a prefix of a CA frame
                 // may already be on the wire. The TCP stream is no
                 // longer a clean message boundary — keeping it and
@@ -1147,19 +1147,19 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // mid-stream on ACF reload), only the most recent is kept.
     let mut pending_access: std::collections::HashMap<u32, AccessRights> =
         std::collections::HashMap::new();
-    // R2-65: cids the server has acknowledged via CREATE_CHAN. An
+    // cids the server has acknowledged via CREATE_CHAN. An
     // ACCESS_RIGHTS frame for a known cid is a *post-create* update
     // (ACF reload, server-side rule change) and must fire the event.
     // An ACCESS_RIGHTS frame for an unknown cid is a *pre-create*
     // stash — the matching CREATE_CHAN reply consumes it and the
     // ChannelCreated event already carries the access, so no
     // AccessRightsChanged is needed in that path. Pre-fix Rust
-    // emitted the event in both cases; combined with R2-42's stash
+    // emitted the event in both cases; combined with the stash
     // cap, a stray-ACCESS_RIGHTS-flood from a hostile server loaded
     // the unbounded event_tx mpsc one message per stray frame even
     // though the coordinator's downstream filter dropped them all.
     let mut known_cids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    // R2-64: rate-limit the cap-hit warning so a hostile flood does
+    // rate-limit the cap-hit warning so a hostile flood does
     // not also flood the logs. One warn per circuit lifetime is
     // enough — the metric `ca_client_pending_access_evictions_total`
     // carries the running count for observability.
@@ -1359,7 +1359,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     break;
                 }
                 Err(e) => {
-                    // R2-45: C `libca/tcpiiu.cpp:1269-1284` logs ONCE
+                    // C `libca/tcpiiu.cpp:1269-1284` logs ONCE
                     // and skips an oversized message (`m_postsize >
                     // curDataMax` with realloc failure) via
                     // `recvQue.removeBytes` — circuit kept alive.
@@ -1465,7 +1465,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // coordinator's update-by-cid is a no-op
                     // pre-channel).
                     //
-                    // R2-42: bound the stash size. C `libca/cac.cpp:
+                    // bound the stash size. C `libca/cac.cpp:
                     // 1121-1136` `accessRightsRespAction` looks up by
                     // m_cid and silently returns if not found — never
                     // accumulates state. Pre-fix Rust grew the map on
@@ -1476,7 +1476,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // 1024 is well past the per-client channel cap
                     // any realistic deployment hits; well below the
                     // memory pressure threshold.
-                    // R2-65: post-create ACCESS_RIGHTS goes straight
+                    // post-create ACCESS_RIGHTS goes straight
                     // to the coordinator as an update event; the
                     // pre-create path stashes for the CREATE_CHAN
                     // consumer (which folds it into ChannelCreated).
@@ -1486,7 +1486,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                             access,
                         });
                     } else {
-                        // R2-42: bound the stash size. C
+                        // bound the stash size. C
                         // `libca/cac.cpp:1121-1136`
                         // `accessRightsRespAction` looks up by m_cid
                         // and silently returns if not found — never
@@ -1499,7 +1499,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                                 pending_access.remove(&victim);
                                 metrics::counter!("ca_client_pending_access_evictions_total")
                                     .increment(1);
-                                // R2-64: log the cap-hit ONCE per
+                                // log the cap-hit ONCE per
                                 // circuit so operators can correlate
                                 // with a misbehaving server. C never
                                 // accumulates so this condition can't
@@ -1532,7 +1532,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     let access = pending_access
                         .remove(&hdr.cid)
                         .unwrap_or(AccessRights::from_u32(0));
-                    // R2-65: now that the server has named this cid,
+                    // now that the server has named this cid,
                     // subsequent ACCESS_RIGHTS frames for it are
                     // legitimate post-create updates that must fire
                     // AccessRightsChanged.
@@ -1611,7 +1611,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // delivers the no-read-access frame instead of
                     // tearing down. Gate matches libca.
                     //
-                    // R2-27: C `libca/cac.cpp::eventRespAction()`
+                    // C `libca/cac.cpp::eventRespAction()`
                     // returns immediately when `!hdr.m_postsize`,
                     // BEFORE the status/payload handling. Rsrv's
                     // `event_cancel_reply` intentionally sends a
@@ -1687,7 +1687,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // `hdr.m_available` as the status to the per-cmd
                     // exception stub — `m_available` is authoritative.
                     //
-                    // Round-2 21240ad fixed the same field-swap on the
+                    // Commit 21240ad fixed the same field-swap on the
                     // Rust SERVER side; this round closes it on the
                     // Rust CLIENT side. Pre-fix Rust read `hdr.cid` as
                     // the ECA status, so a CA_PROTO_ERROR from a C IOC
@@ -1735,7 +1735,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     } else {
                         String::new()
                     };
-                    // R2-17: route to the in-flight operation registry
+                    // route to the in-flight operation registry
                     // matching the echoed request command. libca
                     // `cac::exceptionRespAction` (`cac.cpp:1081-1119`)
                     // dispatches by original command through
@@ -1804,7 +1804,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     });
                 }
                 CA_PROTO_SERVER_DISCONN => {
-                    // R2-65: server retired this cid — drop it from
+                    // server retired this cid — drop it from
                     // the post-create set so a same-cid CREATE_CHAN
                     // reuse later in the circuit starts fresh.
                     known_cids.remove(&hdr.cid);
@@ -1814,9 +1814,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         server_addr,
                     });
                 }
-                // R2-41: opcodes that C `libca/cac.cpp:60-89`
+                // opcodes that C `libca/cac.cpp:60-89`
                 // dispatches through its TCP jump table but Rust
-                // didn't have a per-opcode arm for. R2-29 made
+                // didn't have a per-opcode arm for. Rust once made
                 // unknown opcodes lethal (close circuit), so
                 // benign frames from a gateway / name-server
                 // / legacy IOC ended up tearing the Rust circuit
@@ -1844,7 +1844,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     );
                 }
                 unknown => {
-                    // R2-29: C `libca/cac.cpp::executeResponse()`
+                    // C `libca/cac.cpp::executeResponse()`
                     // dispatches unknown opcodes to
                     // `badTCPRespAction()`, which logs and returns
                     // false; `tcpiiu.cpp` treats
@@ -2252,7 +2252,7 @@ mod malformed_header_close_tests {
         ));
 
         // 24-byte extended header: postsize=0xFFFF (extended marker),
-        // extended postsize set above the R2-45 sanity cap (2x
+        // extended postsize set above the sanity cap (2x
         // max_payload_size()) so the skip-and-continue recovery
         // can't apply and the loop still closes the circuit.
         // Values <= 2x max_payload_size() are now treated as
@@ -2332,7 +2332,7 @@ mod malformed_header_close_tests {
 
 #[cfg(test)]
 mod write_loop_timeout_tests {
-    //! MR-R17: a write-side timeout in `write_loop` must close the
+    //! a write-side timeout in `write_loop` must close the
     //! circuit (`TcpClosed`) rather than emit `CircuitUnresponsive`
     //! and keep writing on the same TCP stream. `tokio`'s
     //! `timeout(.., write_all(&batch))` cancels the `write_all`
@@ -2388,7 +2388,7 @@ mod write_loop_timeout_tests {
         "127.0.0.1:5064".parse().unwrap()
     }
 
-    /// MR-R17 regression: a stalled write that has already accepted a
+    /// Regression: a stalled write that has already accepted a
     /// partial frame must make `write_loop` emit `TcpClosed` and
     /// exit — NOT `CircuitUnresponsive` while keeping the socket.
     ///
@@ -2454,7 +2454,7 @@ mod write_loop_timeout_tests {
 
 #[cfg(test)]
 mod priority_circuit_tests {
-    //! CA-FR-3: priority is part of the virtual-circuit identity. Two
+    //! priority is part of the virtual-circuit identity. Two
     //! channels to the same IOC at different priorities open independent
     //! TCP circuits (libca `caServerID = (addr, priority)`), the VERSION
     //! message carries the priority in its `m_dataType` field, and

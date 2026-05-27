@@ -1,4 +1,4 @@
-//! CA-FR-4 regression tests: `caget -d <type>` must request the EXACT
+//! Regression tests: `caget -d <type>` must request the EXACT
 //! DBR type code, not collapse it to a metadata class and re-derive the
 //! value type from the channel's native type.
 //!
@@ -109,10 +109,10 @@ async fn server_with_bi(
     (client, ch)
 }
 
-/// A5-R2-1 (caget default): the readback type the default `caget`
+/// (caget default): the readback type the default `caget`
 /// front-end now issues for an ENUM field — `DBR_STRING` — must return
 /// the state LABEL, not the numeric index (C `caget.c:178-181`,
-/// server-side R58 `getEnumString`). `bi` VAL=1 with ONAM="On" → "On".
+/// server-side `getEnumString`). `bi` VAL=1 with ONAM="On" → "On".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn enum_default_readback_is_state_label() {
@@ -130,7 +130,7 @@ async fn enum_default_readback_is_state_label() {
     );
 }
 
-/// A5-R2-1 (caget -n): the `-n` (enum-as-number) path keeps the native
+/// (caget -n): the `-n` (enum-as-number) path keeps the native
 /// type, so the value is the numeric ENUM index — the `caget -n`
 /// behaviour (C `enumAsNr` → `DBR_TIME_INT`). Proves the fix is opt-out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -151,7 +151,7 @@ async fn enum_native_readback_is_numeric_index() {
     );
 }
 
-/// A5-R2-1 (camonitor default): `subscribe_with_mask_enum_as_string(.., true)`
+/// (camonitor default): `subscribe_with_mask_enum_as_string(.., true)`
 /// — the `camonitor` default — must deliver the ENUM value as its state
 /// LABEL string (C `camonitor.c:156-160` requests `DBR_TIME_STRING`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -175,7 +175,7 @@ async fn enum_monitor_as_string_delivers_label() {
     );
 }
 
-/// A5-R2-1 (library subscribe): the plain `subscribe_with_mask` keeps the
+/// (library subscribe): the plain `subscribe_with_mask` keeps the
 /// native ENUM type — the opt-in flag is OFF, so existing library and
 /// gateway consumers still receive numeric enum indices (no silent
 /// behaviour change).
@@ -200,7 +200,7 @@ async fn enum_monitor_native_delivers_index() {
     );
 }
 
-/// CA-FR-4 (1/2): a DOUBLE PV read with `-d DBR_TIME_FLOAT` returns a
+/// A DOUBLE PV read with `-d DBR_TIME_FLOAT` returns a
 /// FLOAT value, proving the exact requested code is honoured rather
 /// than re-derived to the native `DBR_TIME_DOUBLE`. The companion
 /// `DBR_TIME_DOUBLE` request returns DOUBLE, so the two codes are not
@@ -231,7 +231,7 @@ async fn caget_dbr_type_honors_exact_value_type() {
     }
 }
 
-/// CA-FR-4 (2/2): `-d DBR_CLASS_NAME` (38) reaches the record-class
+/// `-d DBR_CLASS_NAME` (38) reaches the record-class
 /// introspection type and returns the record's type name. Pre-fix the
 /// `38` code fell into the `_ => Plain` band and never reached the
 /// server's `DBR_CLASS_NAME` handler.
@@ -251,7 +251,7 @@ async fn caget_dbr_type_reaches_class_name() {
     );
 }
 
-/// R55 boundary 1: autosize GET on a `$`-suffix channel returns exactly
+/// Boundary 1: autosize GET on a `$`-suffix channel returns exactly
 /// `MAX_STRING_SIZE` (= 40) bytes — string, NUL terminator, zero-padded.
 /// C `dbChannel.c:489` sets `no_elements = field_size` (= 40); the Rust
 /// server must advertise 40 on CREATE_CHAN and deliver 40 on every read.
@@ -302,7 +302,7 @@ async fn long_string_autosize_returns_40_nul_padded() {
     );
 }
 
-/// R55 boundary 2: a count-clamped GET on a `$` channel trims the 40-byte
+/// Boundary 2: a count-clamped GET on a `$` channel trims the 40-byte
 /// array to the requested count (C `read_reply` dbr_size_n parity).
 /// Pre-fix the clamp ran BEFORE apply_long_string so it saw
 /// `EpicsValue::String::count() == 1` and the predicate `count < 1`

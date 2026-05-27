@@ -9,7 +9,7 @@
 //! → count).
 //!
 //! Failure path: same opcode but `m_dataType = m_count = 0` and the
-//! SID slot carries an ECA status. R2-25 / R2-26 audit cited this
+//! SID slot carries an ECA status. The audit cited this
 //! shape; the wire byte order is the part golden tests pin.
 
 use epics_ca_rs::protocol::{CaHeader, ECA_ALLOCMEM};
@@ -59,7 +59,7 @@ fn golden_ext_create_chan_reply_array_short() {
 #[test]
 fn golden_ext_create_chan_reply_failure_alloc() {
     // pvxs/rsrv failure path: dataType=count=0, available carries
-    // the ECA code. R2-15 audit ensured channel-scoped errors use
+    // the ECA code. The audit ensured channel-scoped errors use
     // the client cid in m_cid; this golden pins that arrangement.
     let mut h = CaHeader::new(CA_PROTO_CREATE_CHAN);
     h.data_type = 0;

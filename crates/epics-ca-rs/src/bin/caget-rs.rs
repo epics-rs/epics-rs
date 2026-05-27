@@ -240,7 +240,7 @@ async fn main() {
             .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
     );
 
-    // CA-FR-3/CA-FR-4: route -p into the priority circuit (libca
+    // Route -p into the priority circuit (libca
     // `tool_lib.c` passes `caPriority` to `ca_create_channel`).
     let priority = args.priority.unwrap_or(0);
     let channels: Vec<_> = args
@@ -261,7 +261,7 @@ async fn main() {
     // default readback requests the STRING form (state label), see the
     // per-PV get below (C `caget.c:178-181`).
     let enum_as_number = args.enum_as_number;
-    // CA-FR-4: resolve `-d <type>` ONCE here, mirroring C `caget.c`'s
+    // resolve `-d <type>` ONCE here, mirroring C `caget.c`'s
     // getopt-time resolution (`caget.c:416-434`). The "out of range or
     // invalid" diagnostic prints exactly once (not per PV), and an
     // unresolved/invalid token reverts to the plain native GET, exactly
@@ -500,7 +500,7 @@ fn scan_leading_i64(s: &str) -> Option<i64> {
         .map(|n| if neg { -n } else { n })
 }
 
-/// CA-FR-4: resolve a `caget -d <type>` token to an EXACT DBR type code,
+/// resolve a `caget -d <type>` token to an EXACT DBR type code,
 /// mirroring C `caget.c:416-434`. The token is resolved as:
 ///
 /// 1. `sscanf("%d")` — a leading integer is the type code verbatim.

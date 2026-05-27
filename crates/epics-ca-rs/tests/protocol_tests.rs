@@ -834,7 +834,7 @@ async fn server_echo_round_trips_request_header_and_payload() {
         .expect("connect");
 
     // Handshake: send VERSION, drain BOTH server VERSION frames
-    // (R2-47: unsolicited VERSION on accept + VERSION reply = 32 bytes).
+    // (unsolicited VERSION on accept + VERSION reply = 32 bytes).
     let mut ver = CaHeader::new(CA_PROTO_VERSION);
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
@@ -915,7 +915,7 @@ async fn server_echo_round_trips_request_header_and_payload() {
     );
 }
 
-/// R2-24: C `event_cancel_reply` (`rsrv/camessage.c:1998-2021`)
+/// C `event_cancel_reply` (`rsrv/camessage.c:1998-2021`)
 /// calls `MPTOPCIU(mp)` first. If the request's channel id is
 /// unknown or belongs to another client, rsrv calls `logBadId` and
 /// returns RSRV_ERROR WITHOUT sending a wire error frame. Only
@@ -961,7 +961,7 @@ async fn server_event_cancel_unknown_sid_closes_silently() {
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
 
-    // R2-47: server emits an unsolicited VERSION when the circuit
+    // server emits an unsolicited VERSION when the circuit
     // becomes ready in addition to the handshake VERSION echo, so the
     // post-handshake drain must consume up to 2 VERSION frames
     // (32 bytes total) before the bad-SID cancel is written. Drain
@@ -983,7 +983,7 @@ async fn server_event_cancel_unknown_sid_closes_silently() {
         "expected 2 VERSION frames (32 bytes); got {drained} bytes"
     );
 
-    // Send EVENT_CANCEL with an SID that was never opened. Per R2-24
+    // Send EVENT_CANCEL with an SID that was never opened. The
     // server must close the connection without emitting a wire frame
     // (C `event_cancel_reply` MPTOPCIU → logBadId silent path).
     let mut cancel = CaHeader::new(CA_PROTO_EVENT_CANCEL);
@@ -1049,7 +1049,7 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
         .await
         .expect("connect");
 
-    // R2-47: server now emits an unsolicited VERSION immediately
+    // server now emits an unsolicited VERSION immediately
     // after accept (libca `rsrv_version_reply` parity). The client
     // therefore receives two CA_PROTO_VERSION frames before any
     // command-specific reply: one unsolicited, one in response to
@@ -1161,7 +1161,7 @@ async fn server_tcp_version_below_minimum_drops_connection() {
         .await
         .expect("connect");
 
-    // R2-47: server emits an unsolicited VERSION on accept. Drain
+    // server emits an unsolicited VERSION on accept. Drain
     // exactly 16 bytes before sending our (unsupported) VERSION,
     // then verify the connection closes WITHOUT a second wire
     // frame (libca tcp_version_action parity: bad version
@@ -1278,7 +1278,7 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     sock.write_all(&frame).await.unwrap();
 
     // Drain server frames and walk header-by-header to find the
-    // CREATE_CHAN reply. R2-47 added an unsolicited VERSION on
+    // CREATE_CHAN reply. The server adds an unsolicited VERSION on
     // accept, so the byte offset of CREATE_CHAN is no longer
     // fixed (it depends on TCP segmentation + whether
     // ACCESS_RIGHTS lands separately). Scan instead of indexing.
@@ -1361,7 +1361,7 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     );
 }
 
-/// MR-R7: the R2-79 UDP batching loop must not re-parse a stale
+/// The UDP batching loop must not re-parse a stale
 /// datagram. When `try_recv_from` drains a queued datagram that is
 /// rejected (short sub-header, ignore-list, or rate-limited), pre-fix
 /// Rust `continue 'parse`d WITHOUT replacing `current_buf` — so the
@@ -1477,7 +1477,7 @@ async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
 
     // Every valid SEARCH cid must be answered exactly once. A cid
     // answered twice means the server re-parsed a stale `current_buf`
-    // after draining a rejected short datagram (MR-R7).
+    // after draining a rejected short datagram.
     let duplicated: Vec<(u32, u32)> = counts
         .iter()
         .filter(|&(_, &c)| c > 1)
@@ -1485,7 +1485,7 @@ async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
         .collect();
     assert!(
         duplicated.is_empty(),
-        "MR-R7: {} SEARCH cid(s) answered more than once — stale `current_buf` \
+        "{} SEARCH cid(s) answered more than once — stale `current_buf` \
          reparsed after a rejected queued datagram: {:?}",
         duplicated.len(),
         duplicated,
@@ -1503,7 +1503,7 @@ async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
 /// (data_type > LAST_BUFFER_TYPE = 38) returns RSRV_ERROR WITHOUT
 /// emitting any wire frame — only the deprecated `read_action`
 /// (`camessage.c:616-620`) calls `send_err(ECA_BADTYPE)` here.
-/// R2-6: pre-fix Rust sent a CA_PROTO_READ_NOTIFY error frame for
+/// pre-fix Rust sent a CA_PROTO_READ_NOTIFY error frame for
 /// the notify path too, an extra wire frame before EOF that rsrv
 /// never produces. Test asserts the silent-close behaviour: no
 /// wire frame, just connection drop.
@@ -1539,7 +1539,7 @@ async fn server_read_notify_bad_type_closes_silently() {
     let mut ver = CaHeader::new(CA_PROTO_VERSION);
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
-    // R2-47: drain BOTH server VERSION frames (unsolicited + reply).
+    // drain BOTH server VERSION frames (unsolicited + reply).
     let mut hello = [0u8; 64];
     let mut got_hello = 0;
     while got_hello < 32 {
@@ -1579,7 +1579,7 @@ async fn server_read_notify_bad_type_closes_silently() {
     frame.extend_from_slice(&create.to_bytes());
     frame.extend_from_slice(&create_body);
     sock.write_all(&frame).await.unwrap();
-    // Walk frames to find CREATE_CHAN reply (R2-47 changed offsets).
+    // Walk frames to find CREATE_CHAN reply (offsets shifted).
     let mut buf = [0u8; 256];
     let mut got = 0;
     let sid = loop {
@@ -1617,7 +1617,7 @@ async fn server_read_notify_bad_type_closes_silently() {
     bad.available = 0xFADE_FADE; // ioid
     sock.write_all(&bad.to_bytes()).await.unwrap();
 
-    // R2-6: server must drop the connection WITHOUT emitting a
+    // server must drop the connection WITHOUT emitting a
     // wire frame — C `read_notify_action` returns RSRV_ERROR
     // silently on INVALID_DB_REQ. Reading should observe EOF
     // (n=0) directly, never any header bytes.
@@ -1672,7 +1672,7 @@ async fn server_read_sync_echoes_request_header() {
     let mut ver = CaHeader::new(CA_PROTO_VERSION);
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
-    // R2-47: drain both VERSION frames (unsolicited + reply).
+    // drain both VERSION frames (unsolicited + reply).
     let mut hello = [0u8; 64];
     let mut got_hello = 0;
     while got_hello < 32 {

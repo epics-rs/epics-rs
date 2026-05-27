@@ -183,7 +183,7 @@ async fn main() {
             .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
     );
 
-    // CA-FR-3/CA-FR-4: -p selects the priority virtual circuit.
+    // -p selects the priority virtual circuit.
     let ch = client.create_channel_with_priority(&pv_name, args.priority.unwrap_or(0));
     if let Err(e) = ch.wait_connected(timeout).await {
         eprintln!("error: {e}");
@@ -241,7 +241,7 @@ async fn main() {
         }
     };
 
-    // CA-FR-4: build the value to write in C's precedence order — `-S`
+    // build the value to write in C's precedence order — `-S`
     // (long string) resolved before any native-type parse. See
     // `build_write_value`.
     let parsed_value = match build_write_value(

@@ -3,7 +3,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// CA-FR-2: allocate the next non-zero id from `counter`, skipping any
+/// allocate the next non-zero id from `counter`, skipping any
 /// value that `is_live` reports as still in use. C libca assigns IO
 /// identifiers through owned tables (`ioTable.idAssignAdd` in
 /// `libca/cac.cpp::writeNotifyRequest()` / `readNotifyRequest()`) and

@@ -284,7 +284,7 @@ async fn run_beacon_monitor_inner(
             // length runs past the datagram. Otherwise the
             // post-advance slice clamp would silently hand the
             // verifier a truncated body and the parser would
-            // continue from a misaligned offset (CR-10/F6).
+            // continue from a misaligned offset.
             if offset.saturating_add(frame_len) > len {
                 break;
             }
@@ -393,7 +393,7 @@ async fn run_beacon_monitor_inner(
                 let max_age = std::time::Duration::from_secs(v.max_age_secs.max(1));
                 let now = std::time::Instant::now();
                 verified_tuples.retain(|_, t| now.duration_since(*t) <= max_age);
-                // Round 8: anchor the lookup on `hdr.available` so the
+                // Anchor the lookup on `hdr.available` so the
                 // key matches the companion-side insert under the
                 // standard production topology (client receives via
                 // the CA repeater on LOCALHOST). The CA server emits
@@ -408,7 +408,7 @@ async fn run_beacon_monitor_inner(
                 // line up regardless of whether the matching beacon
                 // arrives directly or via a repeater.
                 //
-                // Round 7's `meta.src.ip()` keying was correct in
+                // The earlier `meta.src.ip()` keying was correct in
                 // synthetic direct-LAN tests but broke production: a
                 // loopback-bound monitor socket only ever sees
                 // `meta.src = 127.0.0.1:<repeater_port>` from the
@@ -1787,7 +1787,7 @@ mod tests {
         assert_eq!(s.count, 50);
     }
 
-    /// Round 8 regression: under the standard production topology the
+    /// Regression: under the standard production topology the
     /// client receives beacons via the CA repeater on LOCALHOST (see
     /// `run_beacon_monitor_inner` bind at line 160). The repeater
     /// rewrites `m_available` on the regular `CA_PROTO_RSRV_IS_UP`
@@ -1800,7 +1800,7 @@ mod tests {
     /// (`(signed_ip, signed_port, signed_beacon_id)`) without needing
     /// the L3 source IP to equal the announced server IP.
     ///
-    /// Round 7 used `meta.src.ip()` for the lookup, which produced
+    /// An earlier version used `meta.src.ip()` for the lookup, which produced
     /// `127.0.0.1` under this topology — every legitimate signed
     /// beacon was dropped (`EPICS_CA_BEACON_REQUIRE_SIGNED=YES`,
     /// default). This test fixes the failure mode in place.
@@ -1856,7 +1856,7 @@ mod tests {
         let mut verified_tuples: HashMap<(u32, u16, u32), Instant> = HashMap::new();
         verified_tuples.insert((verified_ip, verified_port, verified_bid), Instant::now());
 
-        // Lookup as the regular-beacon path does (post-Round-8 fix:
+        // Lookup as the regular-beacon path does (post-fix:
         // keyed by `hdr.available`, which the repeater rewrites to
         // the real server IP — equal to `verified_ip` here).
         let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
@@ -1878,7 +1878,7 @@ mod tests {
              the repeater must hit the companion-inserted tuple"
         );
 
-        // Sanity: the Round-7 key shape (meta.src.ip(), count, cid)
+        // Sanity: the earlier key shape (meta.src.ip(), count, cid)
         // would have missed under the repeater topology.
         let r7_key = (
             u32::from_be_bytes(meta_src_via_repeater.octets()),
@@ -1887,14 +1887,14 @@ mod tests {
         );
         assert!(
             !verified_tuples.contains_key(&r7_key),
-            "documents Round-7 failure mode: meta.src=127.0.0.1 key never matches"
+            "documents the earlier failure mode: meta.src=127.0.0.1 key never matches"
         );
     }
 
     /// Direct-LAN fallback: when no repeater rewrites
     /// `hdr.available`, the lookup falls back to `meta.src.ip()` so
     /// the key still aligns with the companion-side insert. This is
-    /// the original Round-7 scenario, preserved for the case where
+    /// the original failure scenario, preserved for the case where
     /// a future caller binds the monitor socket to a non-loopback
     /// NIC.
     #[cfg(feature = "cap-tokens")]

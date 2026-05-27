@@ -22,7 +22,7 @@ pub struct CasUdpConfig {
     pub ignore_addrs: Vec<Ipv4Addr>,
     /// Steady-state beacon interval (post-ramp).
     pub beacon_period: Duration,
-    /// R2-60: multicast groups (224.0.0.0/4) extracted from
+    /// multicast groups (224.0.0.0/4) extracted from
     /// `EPICS_CAS_INTF_ADDR_LIST`. C `rsrv/caservertask.c:367-371,
     /// 633-668` keeps these in `casMCastAddrList` and joins each
     /// group via `IP_ADD_MEMBERSHIP` from a wildcard-bound socket;
@@ -49,7 +49,7 @@ impl Default for CasUdpConfig {
 /// UDP configuration. Falls back to sensible defaults (single 0.0.0.0
 /// interface, broadcast-only beacon, 15s period) when nothing is set.
 ///
-/// R2-76: returns `Err` when `EPICS_CAS_INTF_ADDR_LIST` mixes
+/// returns `Err` when `EPICS_CAS_INTF_ADDR_LIST` mixes
 /// `0.0.0.0` with specific interface IPs — C
 /// `rsrv/caservertask.c:390-392` `cantProceed`s on this combination
 /// (which kills the IOC process). The error propagates to the
@@ -63,7 +63,7 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
 
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_INTF_ADDR_LIST") {
         let parsed = parse_ipv4_list(&list);
-        // R2-60: C `rsrv/caservertask.c:367-371, 633-668` splits
+        // C `rsrv/caservertask.c:367-371, 633-668` splits
         // multicast (224.0.0.0/4) entries off into
         // `casMCastAddrList` and joins each group via
         // `IP_ADD_MEMBERSHIP` on a wildcard-bound socket; trying
@@ -145,7 +145,7 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
         None | Some("") => true,
         Some(s) => s.eq_ignore_ascii_case("YES"),
     };
-    // R2-76: mixed-0.0.0.0+specific check runs UNCONDITIONALLY, not
+    // mixed-0.0.0.0+specific check runs UNCONDITIONALLY, not
     // just under `if auto_on`. C `rsrv/caservertask.c:390-392`
     // `cantProceed`s on this combination regardless of
     // `EPICS_CAS_AUTO_BEACON_ADDR_LIST` (the per-iteration
@@ -172,7 +172,7 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
         ));
     }
     if auto_on {
-        // R2-61: C `rsrv/caservertask.c:374-388` filters auto-beacon
+        // C `rsrv/caservertask.c:374-388` filters auto-beacon
         // expansion by `casIntfAddrList` when specific (non-wildcard)
         // interface IPs are listed — beacons only go out via those
         // NICs' broadcasts. Pre-fix Rust unconditionally walked every
@@ -365,7 +365,7 @@ pub fn broadcast_for_ip(match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
                 return Some(b);
             }
         }
-        // R2-77: `if_addrs` only fills `broadcast` for `IFF_BROADCAST`
+        // `if_addrs` only fills `broadcast` for `IFF_BROADCAST`
         // interfaces. For `IFF_POINTOPOINT` (VPN tun, PPP, WireGuard)
         // C `osdNetIfAddrs.c:130-151` substitutes `ifa_dstaddr` —
         // beacons go to the remote tunnel endpoint. Fall through to a
@@ -382,7 +382,7 @@ pub fn broadcast_for_ip(match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
     None
 }
 
-/// R2-77: walk `getifaddrs(3)` directly to extract `ifa_dstaddr`
+/// walk `getifaddrs(3)` directly to extract `ifa_dstaddr`
 /// for the interface whose `ifa_addr` matches `match_ip` AND
 /// carries `IFF_POINTOPOINT`. The `if_addrs` crate only exposes
 /// `broadcast` for `IFF_BROADCAST` interfaces; P2P interfaces

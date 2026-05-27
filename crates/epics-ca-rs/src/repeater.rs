@@ -31,7 +31,7 @@ impl RepeaterClient {
     }
 
     fn send_message(&self, data: &[u8]) -> bool {
-        // R4-2: distinguish error kinds. The previous version
+        // distinguish error kinds. The previous version
         // returned `false` for everything (including transient
         // WouldBlock on a saturated kernel UDP buffer), causing the
         // outer loop to drop the client. Now: keep alive on
@@ -156,13 +156,13 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
         // C CA clients send a zero-length UDP packet for repeater
         // registration (backward compat with pre-3.12 repeaters).
         //
-        // R2-20: C `register_new_client` (`repeater.cpp:374-424`)
+        // C `register_new_client` (`repeater.cpp:374-424`)
         // applies the same locality gate to BOTH the zero-length
         // legacy form and `CA_PROTO_REPEATER_REGISTER`. Pre-fix
         // Rust registered any zero-length datagram regardless of
         // source.
         //
-        // R2-35: C accepts loopback OR any source IP that belongs
+        // C accepts loopback OR any source IP that belongs
         // to a local interface (the bind-test compatibility quirk
         // for clients alternating between loopback and the first
         // non-loopback interface). Use the same `is_local_source`
@@ -217,7 +217,7 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
             // transition); modern libca always uses 127.0.0.1
             // (`repeater.cpp:466-478` `caRepeaterRegistrationMessage`
             // sets the destination to loopback explicitly).
-            // R2-35: accept loopback OR any source IP that
+            // accept loopback OR any source IP that
             // belongs to a local interface (C bind-test
             // compatibility, `repeater.cpp::register_new_client`
             // accepts a non-loopback source if `bind()` to that
@@ -263,7 +263,7 @@ struct DatagramAction {
     fanout: Option<Vec<u8>>,
 }
 
-/// R2-35: C `repeater.cpp::register_new_client` accepts a registration
+/// C `repeater.cpp::register_new_client` accepts a registration
 /// when the source IP is loopback OR when `bind()` to that address
 /// succeeds locally (the 3.13-era compatibility quirk that allows
 /// clients which alternate between loopback and the first non-
@@ -408,7 +408,7 @@ fn register_client(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr) 
 
     // Cap-and-prune: when full, drop entries whose verify() fails
     // (peer process exited / port reused) to make room. This is the
-    // C-G7 fix — without it a misbehaving local process can grow the
+    // Without it a misbehaving local process can grow the
     // HashMap up to 65 535 entries.
     if clients.len() >= MAX_REPEATER_CLIENTS {
         let dead: Vec<u16> = clients
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn fan_out_skips_on_full_address_not_port_alone() {
-        // A5-2: C `fanOut` (repeater.cpp:340-349) skips the originating
+        // C `fanOut` (repeater.cpp:340-349) skips the originating
         // client by FULL address (`identicalAddress` = family + port +
         // IP). A client registered on loopback:P must still receive a
         // beacon whose SOURCE is a server at a different IP but the same

@@ -778,6 +778,15 @@ impl Drop for AbortOnDrop {
     }
 }
 
+impl AbortOnDrop {
+    /// True once the guarded task has finished (completed, panicked, or
+    /// was aborted). Used to prune guards for one-shot ops that have no
+    /// op-map slot to be removed from on completion.
+    fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+}
+
 /// Apply the data-phase op continuation after a GET/PUT/RPC EXEC task
 /// has been spawned.
 ///
@@ -2506,6 +2515,16 @@ async fn handle_connection_io(
                 if let Some(guard) =
                     handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred).await?
                 {
+                    // GET_FIELD is a one-shot op with no IOID-keyed slot to
+                    // be removed from on completion, so its guard cannot be
+                    // dropped by the op lifecycle the way data_task_abort /
+                    // monitor_abort are. Drop guards whose introspect task
+                    // has already finished before pushing the new one, so
+                    // the vec tracks only in-flight GET_FIELD ops — mirrors
+                    // pvxs removing the op from opByIOID on completion
+                    // (serverconn.cpp:366-382). Without this, completed
+                    // guards accumulate for the life of the connection.
+                    gf_abort_guards.retain(|g| !g.is_finished());
                     gf_abort_guards.push(guard);
                 }
             }

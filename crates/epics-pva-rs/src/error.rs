@@ -37,6 +37,14 @@ pub enum PvaError {
     // returning the discrete struct (then `?` into PvaError via the
     // `From` impls); existing call sites can keep matching the enum
     // until migration finishes. (`Interrupted` already exists above.)
+    //
+    // Status: these four are scaffolding for that migration and are not
+    // yet produced by the client operations. Server op-errors still
+    // surface as `Protocol(...)` and circuit drops as `Io(...)` /
+    // `ConnectionRefused`, so a `match` on `RemoteError` / `Disconnected`
+    // / `Finished` / `Connected` will not fire today — they are reachable
+    // only by constructing the `errors::*` types directly. Wiring the
+    // producers (ops_v2 result mapping) is a separate change.
     /// Channel was previously connected but the underlying TCP
     /// virtual circuit dropped. Mirrors pvxs `client::Disconnect`.
     #[error("channel disconnected")]

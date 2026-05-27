@@ -35,15 +35,20 @@ For `"ca"`, the payload is a Variant of:
 struct {
     string user
     string host
-    string[] groups   (optional — pvxs ca-auth advertises POSIX groups
-                                 via getgrouplist(2); reader-side
-                                 accepts both `groups` and `roles`)
+    string[] groups   (optional; this client advertises its own POSIX
+                       groups via getgrouplist(3), but the SERVER ignores
+                       the field — see below. pvxs sends no groups field.)
 }
 ```
 
-`server_native/tcp.rs::parse_client_credentials` (`tcp.rs:213`)
-extracts the fields. The result is passed to the
-`PvaServerConfig::auth_complete` hook, where ACF / ACL belongs.
+`server_native/tcp.rs::parse_client_credentials` extracts `user` and
+`host` only. It deliberately does **not** read the wire `groups`/`roles`
+field: trusting client-advertised roles would let any client self-assign
+group membership to satisfy an ACF `member group:X` rule (ACL bypass).
+Instead the server re-derives the account's roles itself from the local
+passwd/group database (`auth::osd_get_roles`, mirroring pvxs
+`ClientCredentials::roles()` → `osdGetRoles`). The credential is passed to
+the `PvaServerConfig::auth_complete` hook, where ACF / ACL belongs.
 The protocol layer always `Status::ok()`s.
 
 For `"anonymous"`, no payload follows the method string. The server

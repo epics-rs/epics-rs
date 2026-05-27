@@ -434,7 +434,7 @@ impl NDArray {
                         }
                     }
                 }
-                // R3: C++ getInfo gates the color-dimension block on
+                // C++ getInfo gates the color-dimension block on
                 // `ndims == 3` exactly. For 4-D and higher arrays it leaves
                 // colorSize/colorDim/colorStride at 0 and only fills xDim/yDim
                 // from the first two dimensions — same as the 2-D case.
@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_ndarray_info_4d_not_color() {
-        // R3: C++ getInfo gates the color block on `ndims == 3` exactly.
+        // C++ getInfo gates the color block on `ndims == 3` exactly.
         // A 4-D array must leave color_size / color_dim / color_stride at 0
         // and only fill x/y from the first two dimensions.
         let dims = vec![

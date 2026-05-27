@@ -2713,7 +2713,7 @@ mod tests {
 
     #[test]
     fn test_process_plugin_skips_throttled_input() {
-        // R2: a MinCallbackTime-throttled frame must NOT be cached as the
+        // a MinCallbackTime-throttled frame must NOT be cached as the
         // ProcessPlugin input. After array 1 is processed and array 2 is
         // dropped by the throttle, ProcessPlugin must re-inject array 1
         // (the last *processed* array), not the dropped array 2.

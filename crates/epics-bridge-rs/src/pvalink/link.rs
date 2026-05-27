@@ -913,7 +913,10 @@ fn is_disconnect(e: &epics_pva_rs::error::PvaError) -> bool {
         PvaError::Io(_)
         | PvaError::Timeout
         | PvaError::ChannelNotFound(_)
-        | PvaError::ConnectionRefused => true,
+        | PvaError::ConnectionRefused
+        // The explicit disconnect variant: the virtual circuit dropped
+        // after connecting, so a `retry` link queues the Put for replay.
+        | PvaError::Disconnected => true,
         // The client reports a failed name search as a Protocol
         // error ("no servers found for PV ..."); that is a
         // not-connected condition, not a protocol violation.
@@ -932,6 +935,12 @@ fn is_disconnect(e: &epics_pva_rs::error::PvaError) -> bool {
         // is still in flight, so replaying on the next connect would
         // duplicate the write.
         PvaError::Interrupted => false,
+        // `RemoteError` is a server-side rejection on a *connected*
+        // channel (not transport-down); `Finished` / `Connected` are
+        // lifecycle sentinels, never a "not connected yet" condition. A
+        // `retry` link must not queue on any of them — the server has
+        // already answered, or the channel is up.
+        PvaError::RemoteError(_) | PvaError::Finished | PvaError::Connected => false,
     }
 }
 

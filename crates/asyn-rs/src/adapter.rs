@@ -1145,7 +1145,7 @@ pub fn register_asyn_device_support(
 
 /// IocBuilder companion to [`register_asyn_device_support`] —
 /// installs the universal asyn factory on the pure-Rust build path
-/// (round-9 added `register_dynamic_device_support` to IocBuilder).
+/// (added `register_dynamic_device_support` to IocBuilder).
 /// Without this helper, callers using `IocBuilder` instead of
 /// `IocApplication` would have to wire `universal_asyn_factory`
 /// manually; that asymmetry is exactly what `register_asyn_device_support`
@@ -1160,7 +1160,7 @@ pub fn register_asyn_device_support_for_builder(
 mod tests {
     use super::*;
 
-    /// Round-22 regression: the IocBuilder companion helper exists
+    /// Regression: the IocBuilder companion helper exists
     /// and accepts a pure-Rust builder. Pre-fix, `register_asyn_device_support`
     /// only accepted IocApplication, so an IocBuilder caller had to
     /// expose `universal_asyn_factory` themselves.

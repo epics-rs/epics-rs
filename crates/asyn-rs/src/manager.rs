@@ -334,7 +334,7 @@ mod tests {
         assert!((handle.port_handle().read_float64_blocking(0, 0).unwrap() - 98.6).abs() < 1e-10);
     }
 
-    /// Round-4 follow-up: asynRecord OEOS/IEOS writes now go through
+    /// asynRecord OEOS/IEOS writes now go through
     /// `RequestOp::SetInputEos / SetOutputEos` which routes through
     /// the actor and calls `PortDriver::set_input_eos /
     /// set_output_eos`. Previously the option-key route stored bytes
@@ -350,7 +350,7 @@ mod tests {
         let handle = mgr.register_port(drv).unwrap();
 
         // Drive through the public handle helper — same path as
-        // asynRecord's IEOS / OEOS writes after the round-4
+        // asynRecord's IEOS / OEOS writes after the
         // SetInputEos/SetOutputEos rewiring. Round-trip success
         // proves the actor accepted the op, drove the driver trait
         // hook, and the trait default mutated `PortDriverBase::

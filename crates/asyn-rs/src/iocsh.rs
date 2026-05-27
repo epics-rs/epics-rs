@@ -639,7 +639,7 @@ mod tests {
         ctx
     }
 
-    /// Round 5 fix: `asynSetTraceIOMask` / `asynSetTraceInfoMask` /
+    /// `asynSetTraceIOMask` / `asynSetTraceInfoMask` /
     /// `asynSetTraceFile` previously discarded their `addr` arg
     /// (`let _addr = arg_int(args, 1)`), so an `asynSetTraceIOMask
     /// MYPORT 3 "ESCAPE"` invocation degraded into a port-wide write

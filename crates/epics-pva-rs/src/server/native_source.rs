@@ -369,11 +369,15 @@ fn build_timestamp(snap: &Snapshot) -> PvField {
 
 fn build_display(snap: &Snapshot) -> PvField {
     let mut d = PvStructure::new("display_t");
+    // pvxs `iocsource.cpp:306-308` sets `display.description` from the
+    // record's DESC field; in Rust it is `DisplayInfo.description`,
+    // one field over from the limits/units this already reads. It was
+    // hardcoded empty even when the snapshot carried a description.
     let (lo, hi, desc, units, prec) = if let Some(disp) = &snap.display {
         (
             disp.lower_disp_limit,
             disp.upper_disp_limit,
-            String::new(),
+            disp.description.clone(),
             disp.units.clone(),
             disp.precision as i32,
         )
@@ -833,6 +837,30 @@ mod tests {
         assert_eq!(get("lowWarningLimit"), -5.0);
         assert_eq!(get("highWarningLimit"), 5.0);
         assert_eq!(get("highAlarmLimit"), 10.0);
+    }
+
+    #[test]
+    fn build_display_emits_description() {
+        // pvxs `iocsource.cpp:306-308`: display.description carries the
+        // record DESC; in Rust it is DisplayInfo.description, not "".
+        use epics_base_rs::server::snapshot::DisplayInfo;
+        let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
+        snap.display = Some(DisplayInfo {
+            description: "chamber pressure".into(),
+            units: "Torr".into(),
+            ..Default::default()
+        });
+        let PvField::Structure(d) = build_display(&snap) else {
+            panic!("display must be a structure");
+        };
+        assert!(matches!(
+            scalar(&d, "description"),
+            ScalarValue::String(s) if s == "chamber pressure"
+        ));
+        assert!(matches!(
+            scalar(&d, "units"),
+            ScalarValue::String(s) if s == "Torr"
+        ));
     }
 
     /// Regression: PVA PUT must be gated through ACF when

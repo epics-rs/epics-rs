@@ -12,6 +12,18 @@
 //! 2026-04-09T14:35:21.123Z user@host TEMP:setpoint 25.0 old=24.8 OK
 //! 2026-04-09T14:35:22.456Z guest@1.2.3.4 PRESSURE:cmd 100.0 old=? DENIED
 //! ```
+//!
+//! ## Deviation from C ca-gateway (intentional, broader audit)
+//!
+//! C logs a put only for PVs whose access-security client has the
+//! `TRAPWRITE` / `trapMask` flag set (`gateVc.cc:236`), and only the
+//! write *attempt* — a put rejected by access security before
+//! `gateVcChan::write` is reached is never logged. pva-rs has no per-PV
+//! `trapMask` concept: it logs **every** client put and records the
+//! outcome (`OK` / `FAILED` / `DENIED`), including access-denied and
+//! upstream-failed writes. This is a deliberately broader, fail-loud
+//! audit trail — every write attempt against the gateway is recorded,
+//! not only those an operator pre-flagged with `TRAPWRITE`.
 
 use std::path::PathBuf;
 

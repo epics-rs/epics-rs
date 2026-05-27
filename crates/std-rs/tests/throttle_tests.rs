@@ -711,7 +711,7 @@ fn test_dly_huge_finite_rejected() {
 
 #[test]
 fn test_dly_huge_finite_does_not_panic_process() {
-    // Regression for the round-2 review bug: a CA put of DLY = 1e300
+    // Regression: a CA put of DLY = 1e300
     // (finite, so it slipped past the old `is_finite()` guard) was
     // stored and then panicked the record task at
     // `Duration::from_secs_f64(self.dly)` because `self.dly > 0.0` is

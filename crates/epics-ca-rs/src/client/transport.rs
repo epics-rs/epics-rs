@@ -189,6 +189,9 @@ pub(crate) async fn run_transport_manager(
     in_flight: super::types::InFlightOps,
     server_writers: DirectServerWriters,
     last_rx_at: super::types::ServerLastRxAt,
+    // Shared client identity (user / host). Cloned per connect so each
+    // new circuit handshakes with the value current at connect time.
+    client_identity: super::types::ClientIdentitySlot,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<ClientTlsConfig>,
     #[cfg(feature = "experimental-rust-tls")] tls_server_name: Option<String>,
     // Per-server SNI / cert-verification overrides built from the
@@ -296,6 +299,7 @@ pub(crate) async fn run_transport_manager(
                         let sni = pick_sni(server_addr);
                         let in_flight_clone = in_flight.clone();
                         let last_rx_clone = last_rx_at.clone();
+                        let identity_clone = client_identity.clone();
                         pending_connects.spawn(async move {
                             #[cfg(feature = "experimental-rust-tls")]
                             let conn = connect_server(
@@ -304,6 +308,7 @@ pub(crate) async fn run_transport_manager(
                                 event_tx_clone,
                                 in_flight_clone,
                                 last_rx_clone,
+                                identity_clone,
                                 tls_clone.as_ref(),
                                 sni.as_deref(),
                             )
@@ -315,6 +320,7 @@ pub(crate) async fn run_transport_manager(
                                 event_tx_clone,
                                 in_flight_clone,
                                 last_rx_clone,
+                                identity_clone,
                             )
                             .await;
                             (circuit, conn)
@@ -755,35 +761,47 @@ fn send_frame(
 /// `CA_MINOR_PROTOCOL_REVISION` as the count. Pre-fix Rust left dataType
 /// at 0 (priorityDefault), so a server could not see the client's
 /// requested priority.
-fn build_client_handshake(priority: u8) -> Vec<u8> {
+/// Build one CA identity frame — `CA_PROTO_CLIENT_NAME` (user name) or
+/// `CA_PROTO_HOST_NAME` (host name) — carrying `value` as a NUL-padded
+/// string payload.
+///
+/// Single source of the on-wire identity-frame shape, shared by both the
+/// connect-time handshake ([`build_client_handshake`]) and the
+/// runtime-rename broadcast (`CaClient::set_user_name` /
+/// `set_host_name`). C `libca/tcpiiu.cpp::userNameSetRequest` /
+/// `hostNameSetRequest` route through `comQueSend::insertRequestHeader`,
+/// which emits the extended-size annex when the payload exceeds 16 bits;
+/// `set_payload_size` + `to_bytes_extended` reproduce that. A separate
+/// hand-rolled builder that truncated the postsize via `as u16` while
+/// still writing the full payload is what desynchronised the circuit for
+/// an oversized USER/host value — keeping every identity frame on this
+/// one builder closes that family out.
+pub(crate) fn build_identity_frame(cmd: u16, value: &str) -> Vec<u8> {
+    let payload = pad_string(value);
+    let mut hdr = CaHeader::new(cmd);
+    hdr.set_payload_size(payload.len(), 0);
+    let mut frame = hdr.to_bytes_extended();
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+fn build_client_handshake(priority: u8, identity: &super::types::ClientIdentitySlot) -> Vec<u8> {
     let mut handshake = Vec::new();
     let mut version_hdr = CaHeader::new(CA_PROTO_VERSION);
     version_hdr.count = CA_MINOR_VERSION;
     version_hdr.data_type = priority as u16;
     handshake.extend_from_slice(&version_hdr.to_bytes());
-    let username = epics_base_rs::runtime::env::get("USER")
-        .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
-        .unwrap_or_else(|| "unknown".to_string());
-    // C `libca/tcpiiu.cpp::userNameSetRequest` and
-    // `hostNameSetRequest` route through `comQueSend::
-    // insertRequestHeader` which emits the extended annex when
-    // the payload exceeds 16 bits. Pre-fix Rust truncated the
-    // postsize via `as u16` while still writing the full payload,
-    // so an unusually large USER/USERNAME env value or hostname
-    // produced a frame the server parses as if the excess bytes
-    // were the next CA header — desynchronising the circuit
-    // before channel creation.
-    let user_payload = pad_string(&username);
-    let mut user_hdr = CaHeader::new(CA_PROTO_CLIENT_NAME);
-    user_hdr.set_payload_size(user_payload.len(), 0);
-    handshake.extend_from_slice(&user_hdr.to_bytes_extended());
-    handshake.extend_from_slice(&user_payload);
-    let hostname = epics_base_rs::runtime::env::hostname();
-    let host_payload = pad_string(&hostname);
-    let mut host_hdr = CaHeader::new(CA_PROTO_HOST_NAME);
-    host_hdr.set_payload_size(host_payload.len(), 0);
-    handshake.extend_from_slice(&host_hdr.to_bytes_extended());
-    handshake.extend_from_slice(&host_payload);
+    // Snapshot the shared identity once. `CaClient::set_user_name` /
+    // `set_host_name` mutate this slot at runtime, so a circuit formed
+    // after a rename handshakes with the new names; circuits already
+    // established are notified separately by an out-of-band identity
+    // frame.
+    let (username, hostname) = {
+        let id = identity.read();
+        (id.user.clone(), id.host.clone())
+    };
+    handshake.extend_from_slice(&build_identity_frame(CA_PROTO_CLIENT_NAME, &username));
+    handshake.extend_from_slice(&build_identity_frame(CA_PROTO_HOST_NAME, &hostname));
     handshake
 }
 
@@ -794,6 +812,7 @@ async fn connect_server(
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     in_flight: super::types::InFlightOps,
     last_rx_at: super::types::ServerLastRxAt,
+    identity: super::types::ClientIdentitySlot,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<&ClientTlsConfig>,
     #[cfg(feature = "experimental-rust-tls")] tls_server_name: Option<&str>,
 ) -> Option<ServerConnection> {
@@ -833,7 +852,7 @@ async fn connect_server(
     let (beacon_arrival_tx, beacon_arrival_rx) = mpsc::unbounded_channel::<bool>();
 
     // Build initial CA handshake.
-    let handshake = build_client_handshake(priority);
+    let handshake = build_client_handshake(priority, &identity);
     pending_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _ = write_tx.send(handshake);
 
@@ -2468,13 +2487,23 @@ mod priority_circuit_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
+    /// Identity slot resolved from this process's env — the same source
+    /// the production `CaClient` uses, so handshake byte lengths in these
+    /// tests match what the manager emits.
+    fn test_identity() -> crate::client::types::ClientIdentitySlot {
+        Arc::new(parking_lot::RwLock::new(
+            crate::client::types::ClientIdentity::from_env(),
+        ))
+    }
+
     /// Test 2 (deterministic, no sockets): the VERSION frame the client
     /// emits puts the requested priority in `m_dataType` and the minor
     /// version in `m_count` — exactly libca's `versionMessage` layout.
     #[test]
     fn version_message_carries_priority_in_data_type() {
+        let identity = test_identity();
         for pri in [0u8, 1, 7, 99] {
-            let hs = build_client_handshake(pri);
+            let hs = build_client_handshake(pri, &identity);
             let hdr = CaHeader::from_bytes(&hs[..16]).expect("parse VERSION header");
             assert_eq!(
                 hdr.cmmd, CA_PROTO_VERSION,
@@ -2491,6 +2520,52 @@ mod priority_circuit_tests {
         }
     }
 
+    /// `build_identity_frame` must reproduce libca's extended-size annex:
+    /// a sub-0xFFFF payload stays in the 16-byte header with `postsize`
+    /// set directly; a payload at/over 0xFFFF pegs `postsize` to 0xFFFF
+    /// and appends the real size in the 8-byte annex. A builder writing
+    /// `len as u16` would truncate the size and desync the circuit — this
+    /// guards both the handshake and the runtime-rename broadcast that
+    /// share this builder.
+    #[test]
+    fn identity_frame_uses_extended_annex_for_oversized_payload() {
+        let small = build_identity_frame(crate::protocol::CA_PROTO_CLIENT_NAME, "operator");
+        let (hdr, consumed) = CaHeader::from_bytes_extended(&small).expect("parse small frame");
+        assert_eq!(hdr.cmmd, crate::protocol::CA_PROTO_CLIENT_NAME);
+        assert_eq!(consumed, 16, "small payload stays in the 16-byte header");
+        assert!(hdr.extended_postsize.is_none());
+        assert_eq!(hdr.postsize as usize, small.len() - consumed);
+
+        let big_value = "h".repeat(0x1_0000); // 65536 > 0xFFFF
+        let big = build_identity_frame(crate::protocol::CA_PROTO_HOST_NAME, &big_value);
+        let (hdr, consumed) = CaHeader::from_bytes_extended(&big).expect("parse big frame");
+        assert_eq!(hdr.cmmd, crate::protocol::CA_PROTO_HOST_NAME);
+        assert_eq!(consumed, 24, "oversized payload carries the 8-byte annex");
+        assert_eq!(hdr.postsize, 0xFFFF);
+        assert_eq!(hdr.extended_postsize, Some((big.len() - consumed) as u32));
+    }
+
+    /// A rename written to the shared identity slot is reflected in the
+    /// next circuit handshake: the CLIENT_NAME frame carries the new user
+    /// name, not the env value the slot was seeded with.
+    #[test]
+    fn handshake_reflects_renamed_identity_slot() {
+        let identity = test_identity();
+        identity.write().user = "renamed-operator".to_string();
+        let hs = build_client_handshake(0, &identity);
+
+        let (vhdr, vconsumed) = CaHeader::from_bytes_extended(&hs).expect("parse VERSION");
+        assert_eq!(vhdr.cmmd, CA_PROTO_VERSION);
+        let (chdr, cconsumed) =
+            CaHeader::from_bytes_extended(&hs[vconsumed..]).expect("parse CLIENT_NAME");
+        assert_eq!(chdr.cmmd, crate::protocol::CA_PROTO_CLIENT_NAME);
+
+        let payload_start = vconsumed + cconsumed;
+        let payload = &hs[payload_start..payload_start + chdr.postsize as usize];
+        let name = String::from_utf8_lossy(payload);
+        assert_eq!(name.trim_end_matches('\0'), "renamed-operator");
+    }
+
     /// Spawn a transport manager wired to fresh channels; return its
     /// command sender, event receiver, and the (observable) per-circuit
     /// writer registry.
@@ -2505,6 +2580,7 @@ mod priority_circuit_tests {
         let server_writers: DirectServerWriters = Arc::new(dashmap::DashMap::new());
         let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
         let observable = server_writers.clone();
+        let identity = test_identity();
         #[cfg(not(feature = "experimental-rust-tls"))]
         tokio::spawn(run_transport_manager(
             cmd_rx,
@@ -2512,6 +2588,7 @@ mod priority_circuit_tests {
             in_flight,
             server_writers,
             last_rx_at,
+            identity,
         ));
         #[cfg(feature = "experimental-rust-tls")]
         tokio::spawn(run_transport_manager(
@@ -2520,6 +2597,7 @@ mod priority_circuit_tests {
             in_flight,
             server_writers,
             last_rx_at,
+            identity,
             None,
             None,
             HashMap::new(),
@@ -2542,7 +2620,7 @@ mod priority_circuit_tests {
         let hdr = CaHeader::from_bytes(&head).expect("parse VERSION");
         assert_eq!(hdr.cmmd, CA_PROTO_VERSION);
         let pri = hdr.data_type as u8;
-        let total = build_client_handshake(pri).len();
+        let total = build_client_handshake(pri, &test_identity()).len();
         let mut rest = vec![0u8; total - 16];
         stream
             .read_exact(&mut rest)

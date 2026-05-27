@@ -215,6 +215,42 @@ pub(crate) fn dispatch_exception(slot: &CaExceptionSlot, exc: CaException) {
     }
 }
 
+// --- Client identity (user / host advertised on circuit handshakes) ---
+
+/// User and host names advertised to servers on every CA virtual-circuit
+/// handshake (`CA_PROTO_CLIENT_NAME` / `CA_PROTO_HOST_NAME`).
+///
+/// libca resolves these once at context creation — user from `$USER`
+/// (then `$USERNAME` on Windows), host from the local hostname — and the
+/// `tcpiiu` constructor (`tcpiiu.cpp:755-762`) queues them on every new
+/// circuit. This port keeps them in a shared slot instead so the names
+/// can be overridden at runtime; the handshake builder reads the slot
+/// rather than the environment.
+#[derive(Clone, Debug)]
+pub(crate) struct ClientIdentity {
+    pub(crate) user: String,
+    pub(crate) host: String,
+}
+
+impl ClientIdentity {
+    /// Resolve the identity from the environment the way libca does:
+    /// user from `$USER` falling back to `$USERNAME`, host from the
+    /// local hostname.
+    pub(crate) fn from_env() -> Self {
+        let user = epics_base_rs::runtime::env::get("USER")
+            .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let host = epics_base_rs::runtime::env::hostname();
+        Self { user, host }
+    }
+}
+
+/// Shared, runtime-mutable [`ClientIdentity`]. Owned by the `CaClient`;
+/// cloned into the transport manager so every new circuit handshake
+/// reads the current value, and mutated by `CaClient::set_user_name` /
+/// `set_host_name`.
+pub(crate) type ClientIdentitySlot = Arc<parking_lot::RwLock<ClientIdentity>>;
+
 // --- Direct in-flight op registries (Option C) ---
 
 pub(crate) enum ReadReply {

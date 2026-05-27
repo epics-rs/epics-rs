@@ -304,6 +304,12 @@ pub struct CaClient {
     /// [`types::dispatch_exception`] for OOB / unrecoverable errors;
     /// callers register via [`CaClient::set_exception_handler`].
     exception_slot: types::CaExceptionSlot,
+    /// Runtime-mutable client identity (user + host) advertised on every
+    /// CA virtual-circuit handshake. Cloned into the transport manager so
+    /// new circuits handshake with the current value;
+    /// [`CaClient::set_user_name`] / [`CaClient::set_host_name`] mutate it
+    /// and notify already-connected circuits out of band.
+    client_identity: types::ClientIdentitySlot,
     _coordinator: tokio::task::JoinHandle<()>,
     _search_task: tokio::task::JoinHandle<()>,
     _transport_task: tokio::task::JoinHandle<()>,
@@ -664,6 +670,8 @@ impl CaClient {
         let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
         let server_writers: DirectServerWriters = Arc::new(dashmap::DashMap::new());
         let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
+        let client_identity: types::ClientIdentitySlot =
+            Arc::new(parking_lot::RwLock::new(types::ClientIdentity::from_env()));
 
         let transport_task = {
             #[cfg(feature = "experimental-rust-tls")]
@@ -674,6 +682,7 @@ impl CaClient {
                     in_flight.clone(),
                     server_writers.clone(),
                     last_rx_at.clone(),
+                    client_identity.clone(),
                     tls_arc,
                     config.tls_server_name.clone(),
                     sni_overrides,
@@ -687,6 +696,7 @@ impl CaClient {
                     in_flight.clone(),
                     server_writers.clone(),
                     last_rx_at.clone(),
+                    client_identity.clone(),
                 ))
             }
         };
@@ -730,6 +740,7 @@ impl CaClient {
             diagnostics,
             search_attempts,
             exception_slot,
+            client_identity,
             _coordinator: coordinator,
             _search_task: search_task,
             _transport_task: transport_task,
@@ -776,6 +787,43 @@ impl CaClient {
     /// surface through `tracing::error!` (the default behaviour).
     pub fn clear_exception_handler(&self) -> Option<types::CaExceptionHandler> {
         self.exception_slot.write().take()
+    }
+
+    /// Override the user name this client advertises to servers
+    /// (`CA_PROTO_CLIENT_NAME`). libca takes the user name from `$USER`
+    /// at context creation; this lets it be changed at runtime.
+    ///
+    /// Every circuit opened after this call handshakes with `user`
+    /// (the shared identity slot is read at connect time). Each circuit
+    /// already established is sent an out-of-band CLIENT_NAME frame so
+    /// the server re-evaluates access control with the new identity.
+    pub fn set_user_name(&self, user: impl Into<String>) {
+        let user = user.into();
+        self.client_identity.write().user = user.clone();
+        self.broadcast_identity_frame(crate::protocol::CA_PROTO_CLIENT_NAME, &user);
+    }
+
+    /// Override the host name this client advertises to servers
+    /// (`CA_PROTO_HOST_NAME`). Propagation is identical to
+    /// [`CaClient::set_user_name`]: new circuits read the updated slot at
+    /// handshake time, existing circuits get an out-of-band HOST_NAME
+    /// frame.
+    pub fn set_host_name(&self, host: impl Into<String>) {
+        let host = host.into();
+        self.client_identity.write().host = host.clone();
+        self.broadcast_identity_frame(crate::protocol::CA_PROTO_HOST_NAME, &host);
+    }
+
+    /// Push a single CLIENT_NAME / HOST_NAME identity frame to every
+    /// live virtual circuit so a runtime rename reaches already-connected
+    /// servers. New circuits instead read the value from the shared slot
+    /// at handshake time. Best-effort: a circuit whose writer has gone
+    /// away (teardown in flight) is silently skipped.
+    fn broadcast_identity_frame(&self, cmd: u16, value: &str) {
+        let frame = transport::build_identity_frame(cmd, value);
+        for entry in self.server_writers.iter() {
+            let _ = entry.value().send_frame(frame.clone());
+        }
     }
 
     /// Number of distinct operational CA virtual circuits this client

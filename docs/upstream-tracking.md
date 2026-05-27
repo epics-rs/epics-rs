@@ -172,7 +172,7 @@ Ranked by ratio of (epics-rs regression risk) to (verification cost):
 1. **PR #732 NTNDArray::getValueSize** — wire-format bug. Read pvxs commit, diff against `crates/epics-pva-rs/src/nt/nd_array.rs`, add a byte-level regression test mirroring pvxs reference vector. Self-contained, decisive.
 2. **Issue #867 / #868 dbEvent queue policy** — read epics-base 7.0 commit referenced in the issue, compare with `crates/epics-base-rs/src/server/db/event*` queue add + drop paths.
 3. **Issue #855 dbCa duplicate subscriptions on CA_MONITOR_STRING** — review client subscribe path for the string-DBR branch; add regression test.
-4. **PR #817 bi/mbbi AFTC** — record-level correctness; bounded scope.
+4. ~~**PR #817 bi/mbbi AFTC**~~ — **CORRECTED (ledger A2-R2-4):** the "bi/mbbi AFTC" premise was wrong. `biRecord.c` has no `AFTC`/`AFVL` and no alarm filter; the alarm-range filter is the 2009 EPICS Codeathon work (`824d37811`, ai/calc/longin/mbbi, + later int64in). The bi over-port this entry motivated has been removed; the filter now lives in `records/alarm_filter.rs` and is engaged for ai/calc/longin/int64in. No bi/mbbi AFTC porting remains.
 5. **PR #655 calc A–U inputs** — record correctness; mechanical extension.
 6. **PR #856 / #768 iocInit dbCa wait** — broader semantic change to IOC startup; sequence with #855.
 7. **Issue #488 DNS-changed disconnect** — validate client reconnect re-resolves DNS (gateway side already handled).

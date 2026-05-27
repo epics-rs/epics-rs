@@ -71,10 +71,11 @@ C ref: `epics-base/modules/database/src/std/rec/`
 - Runtime impact: Invalid-state outputs are still driven to hardware (safety-relevant for busy used as an interlock); HIGH-based auto-clear of the busy flag never happens.
 
 ### H-7. bi/mbbi: state alarm (ZSV/OSV, ZRSV..FFSV, UNSV) and COS alarm not evaluated in process()
-- Rust: `bi.rs:176-189` `process()` does only RVAL→VAL and `oraw` update. `mbbi.rs:558-569` similar. The AFTC/AFVL alarm-filter fields and ZSV/OSV/COSV/UNSV severities are stored but no `process()` code reads them.
-- C: `biRecord.c:227-275` `checkAlarms` — UDF, STATE alarm (zsv/osv) with the AFTC low-pass filter (`THRESHOLD 0.6321`), COS alarm. `mbbiRecord.c:293-349` same for the 16-state severities + UNSV.
-- Diverges: The Rust bi/mbbi `process()` never computes STATE_ALARM or COS_ALARM, and the AFTC alarm filter (the `afvl` accumulator, the whole reason `aftc`/`afvl` exist) is dead code. Unless the framework re-implements this elsewhere (no evidence found — these fields are record-local), a bi with ZSV=MAJOR never goes into alarm.
-- Runtime impact: Binary inputs configured with state-based alarm severity produce no alarm; change-of-state alarms never fire; AFTC filtering absent. Wrong/missing alarms.
+- Rust: `bi.rs:176-189` `process()` does only RVAL→VAL and `oraw` update. `mbbi.rs:558-569` similar. The ZSV/OSV/COSV/UNSV severities are stored but no `process()` code reads them.
+- C: `biRecord.c:220-243` `checkAlarms` — UDF, STATE alarm (zsv/osv), COS alarm. `mbbiRecord.c:293-349` same for the 16-state severities + UNSV; the mbbi path additionally has an AFTC alarm-range filter block.
+- Diverges: The Rust bi/mbbi `process()` never computes STATE_ALARM or COS_ALARM, so a bi with ZSV=MAJOR never goes into alarm.
+- Runtime impact: Binary inputs configured with state-based alarm severity produce no alarm; change-of-state alarms never fire. Wrong/missing alarms.
+- **CORRECTION (root error, see ledger A2-R2-4):** the original wording of this finding claimed `biRecord.c` runs an AFTC low-pass filter (`THRESHOLD 0.6321`) — it does **not**. `biRecord.c` (and `boRecord.c`) carry no `AFTC`/`AFVL` fields at all; the alarm-range filter is by Eric Norum at the 2009 EPICS Codeathon (`824d37811`) and covers `ai`/`calc`/`longin`/`mbbi` (+ later `int64in`) only. The STATE/COS gap *was* real and has been fixed by adding a `Record::check_alarms` hook to bi/mbbi. The false bi-AFTC premise caused a bi over-port (an invented `AFTC`/`AFVL` field + filter) that has since been removed.
 
 ### H-8. mbbo checkAlarms / convert SOFT_ALARM not implemented
 - Rust: `mbbo.rs:599-607` `process()` calls only `convert()`. `convert()` (`:188-201`) for `val>15` with SDEF just `return`s — no alarm.

@@ -16,14 +16,6 @@ pub struct BiRecord {
     pub zsv: i16,
     pub osv: i16,
     pub cosv: i16,
-    /// Alarm filter time constant (seconds). 0 = filter disabled.
-    /// Mirrors epics-base PR #817: a low-pass filter on alarm severity
-    /// that delays reporting until the signal has been in the alarm
-    /// range for AFTC seconds.
-    pub aftc: f64,
-    /// Alarm filter accumulator. Carries low-pass filter state between
-    /// process cycles; 0 means "initial sample, no prior filter state".
-    pub afvl: f64,
     pub lalm: u16, // last alarm value (for COS alarm)
     // Monitor
     pub mlst: u16, // last monitored value
@@ -48,8 +40,6 @@ impl Default for BiRecord {
             zsv: 0,
             osv: 0,
             cosv: 0,
-            aftc: 0.0,
-            afvl: 0.0,
             lalm: 0,
             mlst: 0,
             simm: 0,
@@ -115,16 +105,6 @@ static FIELDS: &[FieldDesc] = &[
         name: "COSV",
         dbf_type: DbFieldType::Short,
         read_only: false,
-    },
-    FieldDesc {
-        name: "AFTC",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "AFVL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
     },
     FieldDesc {
         name: "LALM",
@@ -198,12 +178,13 @@ impl Record for BiRecord {
         true
     }
 
-    /// C `biRecord.c::checkAlarms` — UDF alarm, STATE alarm (ZSV/OSV
-    /// with the AFTC low-pass filter) and COS alarm (COSV). C
-    /// `checkAlarms:232-235` raises `UDF_ALARM/udfs` and returns early
-    /// when `udf` is set; we mirror that here (raising UDF is
-    /// idempotent with the framework's own `rec_gbl_check_udf`, which
-    /// also runs on the process path).
+    /// C `biRecord.c::checkAlarms` (biRecord.c:220-243) — UDF alarm,
+    /// STATE alarm (ZSV/OSV) and COS alarm (COSV). C `checkAlarms:225-227`
+    /// raises `UDF_ALARM/udfs` and returns early when `udf` is set; we
+    /// mirror that here (raising UDF is idempotent with the framework's
+    /// own `rec_gbl_check_udf`, which also runs on the process path).
+    /// biRecord has no AFTC/AFVL alarm filter (the 2009 Codeathon filter
+    /// `824d37811` covered ai/calc/longin/mbbi only, never bi).
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
@@ -216,17 +197,9 @@ impl Record for BiRecord {
         if val > 1 {
             return;
         }
+        // C biRecord.c:232-235 — raw state severity, no filter.
         let state_sev = if val == 0 { self.zsv } else { self.osv };
-        // AFTC low-pass filter on the state severity (PR #817).
-        let (filtered, new_afvl) = super::alarm_filter::aftc_filter(
-            state_sev as u16,
-            self.aftc,
-            self.afvl,
-            common.time,
-            crate::runtime::general_time::get_current(),
-        );
-        self.afvl = new_afvl;
-        let sev = AlarmSeverity::from_u16(filtered);
+        let sev = AlarmSeverity::from_u16(state_sev as u16);
         if sev != AlarmSeverity::NoAlarm {
             recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, sev);
         }
@@ -270,8 +243,6 @@ impl Record for BiRecord {
             "ZSV" => Some(EpicsValue::Short(self.zsv)),
             "OSV" => Some(EpicsValue::Short(self.osv)),
             "COSV" => Some(EpicsValue::Short(self.cosv)),
-            "AFTC" => Some(EpicsValue::Double(self.aftc)),
-            "AFVL" => Some(EpicsValue::Double(self.afvl)),
             "LALM" => Some(EpicsValue::Enum(self.lalm)),
             "MLST" => Some(EpicsValue::Enum(self.mlst)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
@@ -364,34 +335,6 @@ impl Record for BiRecord {
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
-            },
-            "AFTC" => match value {
-                EpicsValue::Double(v) => {
-                    self.aftc = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.aftc = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch(name.into()))
-                    }
-                }
-            },
-            "AFVL" => match value {
-                EpicsValue::Double(v) => {
-                    self.afvl = v;
-                    Ok(())
-                }
-                v => {
-                    if let Some(f) = v.to_f64() {
-                        self.afvl = f;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch(name.into()))
-                    }
-                }
             },
             "LALM" => match value {
                 EpicsValue::Enum(v) => {

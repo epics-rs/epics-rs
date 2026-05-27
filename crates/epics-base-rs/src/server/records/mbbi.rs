@@ -683,7 +683,8 @@ impl Record for MbbiRecord {
 
     /// C `mbbiRecord.c::checkAlarms` — UDF alarm, STATE alarm from the
     /// per-state severity (ZRSV..FFSV, or UNSV for an unknown state)
-    /// with the AFTC low-pass filter (PR #817), and COS alarm (COSV).
+    /// with the AFTC alarm-range low-pass filter (2009 Codeathon
+    /// `824d37811`; mbbiRecord.c:319-337), and COS alarm (COSV).
     /// C `checkAlarms:300-305` raises `UDF_ALARM/udfs`, zeroes AFVL,
     /// and returns early when `udf` is set; we mirror that (raising
     /// UDF is idempotent with the framework's `rec_gbl_check_udf`).

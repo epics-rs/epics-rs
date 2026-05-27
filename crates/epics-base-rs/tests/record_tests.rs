@@ -1255,143 +1255,29 @@ fn test_snapshot_alarm_state() {
 }
 
 // ---------------------------------------------------------------------------
-// epics-base PR #817 integration regression tests.
+// Alarm STATE/COS + AFTC-writeback regression tests for bi / mbbi.
 //
-// PR #817 (commit c9817fa59) bundled three changes:
-//   (1) Add AFTC alarm-severity low-pass filter to bi record.
-//   (2) Fix mbbi: write the new filter accumulator back to AFVL
-//       (originally the local was discarded, so the filter never
-//        retained state between cycles).
-//   (3) Fix mbbi COSV/LALM: the `if (val == lalm || recGblSetSevr(...))
-//       return;` short-circuit ate `recGblSetSevr`'s return as a
-//       boolean and skipped the LALM update when COSV was non-zero,
-//       so subsequent transitions were silently dropped.
+// These pin two behaviours against the C sources:
+//   (1) mbbi AFVL writeback — `mbbiRecord.c::checkAlarms` computes the
+//       AFTC accumulator into a local; the Rust port persists it via
+//       `record.put_field("AFVL", …)` each cycle.
+//   (2) mbbi / bi LALM update around the COS_ALARM check
+//       (`mbbiRecord.c:339-340`, `biRecord.c:239-240`).
 //
-// In epics-rs the filter is centralised in
-// `RecordInstance::aftc_filter` and plumbed through `evaluate_alarms`.
-// AFVL writeback and the LALM-always-update structure are already in
-// place. These tests pin the post-PR-817 contract end-to-end.
+// The shared AFTC alarm-range filter primitive itself is covered by the
+// `records::alarm_filter` pure-function tests. `bi` has NO AFTC filter
+// (biRecord.c carries no AFTC/AFVL — the 2009 Codeathon filter
+// `824d37811` covered ai/calc/longin/mbbi only), so there is no bi AFTC
+// test here.
 // ---------------------------------------------------------------------------
 
-/// (PR #817) bi record AFTC integration. C `biRecord.c::checkAlarms`
-/// (biRecord.c:249-263) seeds the AFVL accumulator with the RAW
-/// severity number — `afvl = (double) alarm;` (biRecord.c:252) — NOT
-/// a unit sign. On the first (seed) sample `alarm` is left unchanged
-/// so the raw severity passes through `recGblSetSevr` verbatim.
-#[test]
-fn test_bi_aftc_seeds_afvl_on_initial_sample() {
-    let mut rec = BiRecord::new(0); // val=0 → ZSV path
-    rec.zsv = AlarmSeverity::Major as i16;
-    rec.aftc = 5.0;
-    rec.afvl = 0.0; // signals "first sample"
-
-    let mut inst = RecordInstance::new("BI:AFTC".into(), rec);
-    inst.common.udf = false;
-
-    // AFTC alarm filter runs inside `Record::check_alarms` (C
-    // `biRecord.c::checkAlarms`), the hook `process_local` invokes.
-    inst.record.check_alarms(&mut inst.common);
-    inst.evaluate_alarms();
-    epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
-
-    // Initial sample: C `biRecord.c:251-252` `if (afvl == 0) afvl =
-    // (double) alarm;` leaves `alarm` unchanged → raw severity passes
-    // through.
-    assert_eq!(
-        inst.common.sevr,
-        AlarmSeverity::Major,
-        "initial AFTC sample must pass raw severity through"
-    );
-    // C `biRecord.c:252` — AFVL is seeded with the RAW severity number
-    // (2.0 for MAJOR), NOT a unit sign.
-    let afvl = inst
-        .record
-        .get_field("AFVL")
-        .and_then(|v| v.to_f64())
-        .expect("AFVL readable");
-    assert!(
-        (afvl - 2.0).abs() < 1e-9,
-        "AFVL seed must be the raw severity 2.0 for a MAJOR sample, got {afvl}"
-    );
-}
-
-/// (PR #817) The AFTC filter delays the CLEARING of an alarm. C
-/// `biRecord.c::checkAlarms` (biRecord.c:249-263): once AFVL holds a
-/// non-zero severity, a NO_ALARM sample decays it by
-/// `afvl = alpha*afvl + (1-alpha)*0` and the fold-back
-/// `if (afvl - floor(afvl) > THRESHOLD) afvl = -afvl;` keeps
-/// `abs(floor(afvl))` reporting the prior MAJOR until enough
-/// NO_ALARM time has elapsed. A sustained MAJOR holds AFVL at 2.0.
-#[test]
-fn test_bi_aftc_delays_alarm_clear() {
-    use std::time::Duration;
-
-    // Direct unit test of the filter primitive across cycles.
-    use epics_base_rs::server::records::alarm_filter::aftc_filter;
-    let aftc = 10.0;
-    let t0 = std::time::SystemTime::UNIX_EPOCH;
-
-    // Cycle 1: seed with a MAJOR sample. C `biRecord.c:251-252`
-    // `if (afvl == 0) afvl = (double) alarm;` → afvl = 2.0, alarm = 2.
-    let (a1, afvl1) = aftc_filter(2, aftc, 0.0, t0, t0);
-    assert_eq!(a1, 2, "MAJOR seed must report the raw MAJOR severity");
-    assert!(
-        (afvl1 - 2.0).abs() < 1e-9,
-        "MAJOR seed must set afvl=2.0 (raw severity), got {afvl1}"
-    );
-
-    // Cycle 2: a single NO_ALARM sample 1s later. C
-    // `biRecord.c:255-262`: alpha = 10/(1+10) ≈ 0.909,
-    // afvl = 0.909*2 + 0.0 ≈ 1.818; fractional part 0.818 > 0.6321
-    // → afvl = -1.818; alarm = abs(floor(-1.818)) = abs(-2) = 2.
-    // The momentary clear is FILTERED — still reports MAJOR.
-    let t1 = t0 + Duration::from_secs(1);
-    let (a2, afvl2) = aftc_filter(0, aftc, afvl1, t0, t1);
-    assert!(
-        (afvl2 - (-1.0 * (10.0 / 11.0) * 2.0)).abs() < 1e-9,
-        "one NO_ALARM sample must fold afvl to -1.818..., got {afvl2}"
-    );
-    assert_eq!(
-        a2, 2,
-        "a momentary alarm-clear must be FILTERED (still reports MAJOR)"
-    );
-
-    // Sustained NO_ALARM: feed NO_ALARM repeatedly until the reported
-    // severity finally drops to 0.
-    let mut afvl = afvl2;
-    let mut t = t1;
-    let mut reported = 2u16;
-    for _ in 0..400 {
-        let prev = t;
-        t += Duration::from_secs(1);
-        let (a, v) = aftc_filter(0, aftc, afvl, prev, t);
-        afvl = v;
-        reported = a;
-        if reported == 0 {
-            break;
-        }
-    }
-    assert_eq!(
-        reported, 0,
-        "after sustained NO_ALARM the filter eventually clears the alarm"
-    );
-
-    // A sustained MAJOR holds the accumulator at 2.0 — C smoothing
-    // `afvl = alpha*2 + (1-alpha)*2 = 2` is a fixed point.
-    let (a3, afvl3) = aftc_filter(2, aftc, 2.0, t0, t1);
-    assert_eq!(a3, 2, "sustained MAJOR keeps reporting MAJOR");
-    assert!(
-        (afvl3 - 2.0).abs() < 1e-9,
-        "sustained MAJOR holds afvl at the fixed point 2.0, got {afvl3}"
-    );
-}
-
-/// (PR #817 Fix #2) mbbi must write the new filter accumulator back
-/// to AFVL on every evaluate_alarms call when AFTC>0. The pre-fix
-/// C code computed the new value into a local but never assigned
-/// `prec->afvl = afvl;` so the filter never retained state between
-/// process cycles. The Rust port routes through
-/// `record.put_field("AFVL", …)` after `aftc_filter`.
+/// mbbi persists the AFTC accumulator back to AFVL each cycle.
+/// `mbbiRecord.c::checkAlarms` (mbbiRecord.c:319-337) computes the new
+/// accumulator into a local but — unlike `aiRecord.c` etc. — never
+/// stores `prec->afvl = afvl`, so the C mbbi filter is inert (it
+/// re-seeds from AFVL==0 every cycle). The Rust port routes through
+/// `record.put_field("AFVL", …)` after `aftc_filter`, so its filter
+/// retains state. This test pins the Rust writeback behaviour.
 #[test]
 fn test_mbbi_aftc_writes_afvl_back_each_cycle() {
     use epics_base_rs::server::records::mbbi::MbbiRecord;
@@ -1593,27 +1479,26 @@ fn test_ai_aftc_disabled_resets_stale_afvl() {
     );
 }
 
-/// (PR #817 Fix #3) mbbi LALM must be updated on every val change
-/// even when COSV fires. The pre-fix C code wrote
-/// `if (val == lalm || recGblSetSevr(prec, COS_ALARM, prec->cosv)) return;`
-/// — `recGblSetSevr` returns the previous severity as a small int,
-/// which when COSV≠0 was treated as truthy by the `||`, taking the
-/// early return and skipping `prec->lalm = val`. The downstream
-/// effect was that subsequent val transitions saw a stale LALM and
-/// COSV failed to fire on the next change.
-///
-/// The Rust port already has the post-fix shape: the
-/// `val != lalm` branch unconditionally writes LALM after firing
-/// COS_ALARM. This test pins both halves of the bug:
+/// Pins the Rust port's "LALM always advances on a VAL transition"
+/// behaviour. C `mbbiRecord.c:339-340` is
+/// `if (val == prec->lalm || recGblSetSevr(prec, COS_ALARM, prec->cosv)) return; prec->lalm = val;`
+/// — `recGblSetSevr` returns TRUE when it raises the severity
+/// (`recGbl.c:252-255`), so when COSV≠0 raises COS_ALARM the `||`
+/// short-circuits to the early `return` and `prec->lalm = val` is
+/// skipped. The Rust port instead writes LALM unconditionally in the
+/// `val != lalm` branch after firing COS_ALARM. This test pins that
+/// Rust behaviour end-to-end:
 ///   (a) one transition with COSV≠NoAlarm bumps LALM to the new val;
 ///   (b) a subsequent transition still fires COS because LALM was
 ///       updated, and LALM advances again.
+/// (The Rust-vs-C divergence on the skipped-LALM path is a separate
+/// parity question, not addressed here.)
 #[test]
 fn test_mbbi_lalm_updates_when_cosv_set() {
     use epics_base_rs::server::records::mbbi::MbbiRecord;
 
     let mut rec = MbbiRecord::new(0);
-    rec.cosv = AlarmSeverity::Major as i16; // pre-fix bug trigger
+    rec.cosv = AlarmSeverity::Major as i16; // COSV raises COS_ALARM
     rec.put_field("LALM", EpicsValue::Enum(0)).unwrap();
 
     let mut inst = RecordInstance::new("MBBI:LALM".into(), rec);
@@ -1638,10 +1523,10 @@ fn test_mbbi_lalm_updates_when_cosv_set() {
         "LALM must advance to new val even when COSV fires"
     );
 
-    // Transition 2 → 0: LALM must advance to 0. The pre-fix C bug
-    // would have left LALM at 0 from the start, so this second
-    // transition would have looked like "val == lalm" and the COS
-    // path would have returned early without updating either.
+    // Transition 2 → 0: LALM must advance to 0. Had LALM not advanced
+    // to 2 in the first cycle (the C skipped-LALM path), it would still
+    // read 0 here, this transition would look like "val == lalm", and
+    // the COS path would return early without updating either.
     inst.record.set_val(EpicsValue::Enum(0)).unwrap();
     inst.record.check_alarms(&mut inst.common);
     inst.evaluate_alarms();

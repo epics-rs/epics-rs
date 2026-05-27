@@ -336,21 +336,34 @@ fn build_alarm(snap: &Snapshot) -> PvField {
     PvField::Structure(a)
 }
 
-fn build_timestamp(_snap: &Snapshot) -> PvField {
-    let now = std::time::SystemTime::now()
+fn build_timestamp(snap: &Snapshot) -> PvField {
+    // pvxs `iocsource.cpp:240-248`: `timeStamp` carries the record's
+    // acquisition time and userTag, NOT the serialization wall-clock.
+    // `Snapshot.timestamp` is the acquisition `SystemTime` (POSIX epoch;
+    // the codec already added POSIX_TIME_AT_EPICS_EPOCH on decode) and
+    // `Snapshot.user_tag` is the nsec-LSB / pulse-id tag that
+    // `apply_nsec_lsb_split` strips out of `nanoseconds` (mirroring
+    // pvxs `meta.time.nsec & ~info.nsecMask` for the wire nanoseconds and
+    // `meta.time.nsec & info.nsecMask` for userTag). Using `now()` here
+    // overwrote the acquisition time with serialization time and zeroed
+    // the userTag on every record-backed GET/MONITOR.
+    let dur = snap
+        .timestamp
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let mut t = PvStructure::new("time_t");
     t.fields.push((
         "secondsPastEpoch".into(),
-        PvField::Scalar(ScalarValue::Long(now.as_secs() as i64)),
+        PvField::Scalar(ScalarValue::Long(dur.as_secs() as i64)),
     ));
     t.fields.push((
         "nanoseconds".into(),
-        PvField::Scalar(ScalarValue::Int(now.subsec_nanos() as i32)),
+        PvField::Scalar(ScalarValue::Int(dur.subsec_nanos() as i32)),
     ));
-    t.fields
-        .push(("userTag".into(), PvField::Scalar(ScalarValue::Int(0))));
+    t.fields.push((
+        "userTag".into(),
+        PvField::Scalar(ScalarValue::Int(snap.user_tag)),
+    ));
     PvField::Structure(t)
 }
 
@@ -742,6 +755,42 @@ mod tests {
         // Top-level scalar PvField — put_value / put_value_ctx accept
         // both NTScalar and bare scalar.
         PvField::Scalar(ScalarValue::Double(v))
+    }
+
+    /// Look up a scalar sub-field of a `time_t`/`display_t`/`valueAlarm_t`
+    /// structure by name, for the NT-meta synthesizer regression tests.
+    fn scalar(s: &PvStructure, name: &str) -> ScalarValue {
+        match &s
+            .fields
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("missing field {name}"))
+            .1
+        {
+            PvField::Scalar(v) => v.clone(),
+            other => panic!("field {name} is not a scalar: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_timestamp_uses_snapshot_acquisition_time_and_user_tag() {
+        // pvxs `iocsource.cpp:240-248`: timeStamp carries the record's
+        // acquisition time + userTag, not the serialization wall-clock.
+        let ts = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789);
+        let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, ts);
+        snap.user_tag = 42;
+        let PvField::Structure(t) = build_timestamp(&snap) else {
+            panic!("timeStamp must be a structure");
+        };
+        assert!(matches!(
+            scalar(&t, "secondsPastEpoch"),
+            ScalarValue::Long(1_700_000_000)
+        ));
+        assert!(matches!(
+            scalar(&t, "nanoseconds"),
+            ScalarValue::Int(123_456_789)
+        ));
+        assert!(matches!(scalar(&t, "userTag"), ScalarValue::Int(42)));
     }
 
     /// Regression: PVA PUT must be gated through ACF when

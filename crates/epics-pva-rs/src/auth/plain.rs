@@ -14,6 +14,61 @@ pub fn authnz_default_user() -> String {
         .unwrap_or_else(|_| "anonymous".to_string())
 }
 
+/// Run `getgrouplist(3)` for `name`/`basegid`, returning `basegid` plus
+/// every supplementary group id.
+///
+/// The required buffer size is not portably knowable up front: glibc
+/// updates `*ngroups` to the real count on overflow, but Darwin does NOT
+/// (the count stays equal to the buffer size). pvxs `osgroups.cpp:82-118`
+/// handles both by looping — double the buffer when the count was not
+/// updated (Darwin), resize to the reported count when it was (glibc), and
+/// give up (keeping just `basegid`) on an invalid or decreasing count. A
+/// single grow-and-retry loses the Darwin case for any account in more
+/// groups than the initial guess, silently dropping its extra roles.
+#[cfg(unix)]
+fn getgrouplist_ids(name: &std::ffi::CStr, basegid: libc::gid_t) -> Vec<libc::gid_t> {
+    // Darwin binds the groups pointer as `*mut c_int`, Linux as
+    // `*mut gid_t` (u32); use a raw `c_int` buffer and cast on the way
+    // out so the signature matches both platforms. The buffer is seeded
+    // with the pvxs initial guess of 16.
+    let mut gids: Vec<libc::gid_t> = vec![basegid];
+    let mut groups: Vec<libc::c_int> = vec![-1; 16];
+    loop {
+        let mut ngroups: libc::c_int = groups.len() as libc::c_int;
+        let len = ngroups;
+        // SAFETY: `name` is NUL-terminated; `groups` is a writable buffer of
+        // `ngroups` elements; the kernel writes at most that many and (on
+        // glibc) updates `ngroups`.
+        let rc = unsafe {
+            libc::getgrouplist(
+                name.as_ptr(),
+                basegid as _,
+                groups.as_mut_ptr() as *mut _,
+                &mut ngroups,
+            )
+        };
+        if rc >= 0 && ngroups >= 0 && ngroups <= len {
+            // Success: `ngroups` entries written.
+            groups.truncate(ngroups as usize);
+            gids.extend(groups.iter().map(|&g| g as libc::gid_t));
+            break;
+        } else if rc >= 0 {
+            // Success but an invalid count — keep just `basegid`.
+            break;
+        } else if ngroups == len {
+            // Too small, count not updated (Darwin): double and retry.
+            groups.resize(groups.len().saturating_mul(2), -1);
+        } else if ngroups > len {
+            // Too small, count holds the real size: resize and retry.
+            groups.resize(ngroups as usize, -1);
+        } else {
+            // Too small, but the count shrank — give up (keep `basegid`).
+            break;
+        }
+    }
+    gids
+}
+
 /// Enumerate the current process's POSIX group names. Mirrors pvxs
 /// `osdGetRoles()` (osgroups.cpp:54). On non-POSIX targets returns an
 /// empty list. The `ca` auth method advertises these as the user's
@@ -51,54 +106,23 @@ pub fn posix_groups() -> Vec<String> {
         if user.is_empty() {
             return Vec::new();
         }
-        // Step 2: getgrouplist(3) — first call probes the size.
-        // SAFETY: We pass cstr-terminated `user` and a writable
-        // groups slice big enough for the kernel's reply.
+        // Step 2: supplementary groups via the shared getgrouplist(3)
+        // doubling loop. The basegid is the account's passwd primary group
+        // (`pw_gid`), matching pvxs `osdGetRoles` (osgroups.cpp:65,88 seed
+        // getgrouplist with `user->pw_gid`). Only when getpwuid missed (the
+        // $USER-env fallback, no passwd entry) do we fall back to the
+        // process `getgid()`.
         let user_cstr = match std::ffi::CString::new(user) {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
-        // Darwin's libc binding uses `*mut c_int` for the groups
-        // pointer; Linux uses `*mut gid_t` (u32). Use a raw c_int
-        // buffer and cast on the way out so the signature matches
-        // both platforms.
-        //
-        // The basegid is the account's passwd primary group (`pw_gid`),
-        // matching pvxs `osdGetRoles` (osgroups.cpp:65,88 seed
-        // getgrouplist with `user->pw_gid`). Only when getpwuid missed
-        // (the $USER-env fallback, no passwd entry) do we fall back to
-        // the process `getgid()`.
-        let primary = pw_gid.unwrap_or_else(|| unsafe { libc::getgid() }) as libc::c_int;
-        let mut ngroups: libc::c_int = 64;
-        let mut groups: Vec<libc::c_int> = vec![0; ngroups as usize];
-        let rc = unsafe {
-            libc::getgrouplist(
-                user_cstr.as_ptr(),
-                primary as _,
-                groups.as_mut_ptr() as *mut _,
-                &mut ngroups,
-            )
-        };
-        if rc < 0 {
-            groups.resize(ngroups as usize, 0);
-            let rc2 = unsafe {
-                libc::getgrouplist(
-                    user_cstr.as_ptr(),
-                    primary as _,
-                    groups.as_mut_ptr() as *mut _,
-                    &mut ngroups,
-                )
-            };
-            if rc2 < 0 {
-                return Vec::new();
-            }
-        }
-        groups.truncate(ngroups as usize);
+        let primary = pw_gid.unwrap_or_else(|| unsafe { libc::getgid() }) as libc::gid_t;
+        let gids = getgrouplist_ids(&user_cstr, primary);
         // Step 3: gid → group name via getgrgid.
-        let mut names: Vec<String> = Vec::with_capacity(groups.len());
-        for gid in groups {
+        let mut names: Vec<String> = Vec::with_capacity(gids.len());
+        for gid in gids {
             unsafe {
-                let gr = libc::getgrgid(gid as libc::gid_t);
+                let gr = libc::getgrgid(gid);
                 if gr.is_null() {
                     continue;
                 }
@@ -175,47 +199,9 @@ pub fn osd_get_roles(account: &str) -> Vec<String> {
             Err(_) => return vec![account.to_string()],
         };
 
-        // gids = primary `pw_gid` + supplementary groups. Darwin binds
-        // the groups pointer as `*mut c_int`, Linux as `*mut gid_t`
-        // (u32); use a raw `c_int` buffer and cast, matching
-        // `posix_groups`. The first call probes the required size.
-        let mut gids: Vec<libc::gid_t> = vec![pw_gid];
-        let mut ngroups: libc::c_int = 64;
-        let mut groups: Vec<libc::c_int> = vec![0; ngroups as usize];
-        // SAFETY: `name_cstr` is NUL-terminated; `groups` is a writable
-        // buffer of `ngroups` elements; the kernel writes at most that
-        // many and updates `ngroups`.
-        let rc = unsafe {
-            libc::getgrouplist(
-                name_cstr.as_ptr(),
-                pw_gid as _,
-                groups.as_mut_ptr() as *mut _,
-                &mut ngroups,
-            )
-        };
-        if rc < 0 {
-            // Buffer too small — `ngroups` now holds the real count;
-            // grow and retry once.
-            groups.resize(ngroups.max(0) as usize, 0);
-            // SAFETY: as above, with the now-correctly-sized buffer.
-            let rc2 = unsafe {
-                libc::getgrouplist(
-                    name_cstr.as_ptr(),
-                    pw_gid as _,
-                    groups.as_mut_ptr() as *mut _,
-                    &mut ngroups,
-                )
-            };
-            if rc2 >= 0 {
-                groups.truncate(ngroups.max(0) as usize);
-                gids.extend(groups.into_iter().map(|g| g as libc::gid_t));
-            }
-            // rc2 < 0: keep just the primary `pw_gid` (pvxs gives up on
-            // the supplementary list but still has the primary group).
-        } else {
-            groups.truncate(ngroups.max(0) as usize);
-            gids.extend(groups.into_iter().map(|g| g as libc::gid_t));
-        }
+        // gids = primary `pw_gid` + supplementary groups, via the shared
+        // getgrouplist(3) doubling loop (osgroups.cpp:82-118).
+        let gids = getgrouplist_ids(&name_cstr, pw_gid);
 
         // gid -> group name via getgrgid.
         let mut names: Vec<String> = Vec::with_capacity(gids.len());

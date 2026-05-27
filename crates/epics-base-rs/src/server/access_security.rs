@@ -1533,13 +1533,18 @@ fn parse_asg_body(
 
 /// Parse the `A..U` selector suffix of an `INP` token into a 0-based
 /// letter index. `"A"` → 0, .. `"U"` → 20. Anything else → `None`.
+///
+/// Case-SENSITIVE: C `asLib_lex.l:21,47` lexes the selector with the
+/// flex pattern `INP[A-U]` (uppercase range only), so `INPa` does not
+/// match the `tokenINP` rule — it is a syntax error in C, not selector
+/// index 0. Matching only uppercase here keeps that behaviour; a
+/// lowercase suffix returns `None` and the caller rejects the ASG.
 fn parse_inp_index(suffix: &str) -> Option<u8> {
     let mut it = suffix.chars();
     let c = it.next()?;
     if it.next().is_some() {
         return None; // INP selector is exactly one letter
     }
-    let c = c.to_ascii_uppercase();
     if ('A'..='U').contains(&c) {
         Some((c as u8) - b'A')
     } else {
@@ -2668,6 +2673,17 @@ ASG(G) {
     fn asg_inp_bad_selector_is_rejected() {
         // INPZ is out of the A..U range.
         assert!(parse_acf(r#"ASG(G) { INPZ("x") }"#).is_err());
+    }
+
+    #[test]
+    fn asg_inp_selector_is_case_sensitive() {
+        // C `asLib_lex.l:21,47` lexes the selector as `INP[A-U]`
+        // (uppercase range only), so a lowercase `INPa` is not a valid
+        // INP token — a syntax error, not selector index 0.
+        assert!(
+            parse_acf(r#"ASG(G) { INPa("x") }"#).is_err(),
+            "lowercase INP selector must be rejected (C flex [A-U])"
+        );
     }
 
     // ----- L-4: parenthesised name robustness -----

@@ -96,34 +96,48 @@ impl fmt::Display for Indented {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Detailed(pub bool);
 
-/// RAII Ctrl-C handler matching pvxs `SigInt`.
-/// Wraps the existing `tokio::signal::ctrl_c` so callers
-/// can `await` it like a one-shot. Drop handlers in pvxs unregister
-/// the SIGINT trap; here we rely on `tokio::signal` lifecycle.
+/// RAII Ctrl-C handler matching pvxs `SigInt`. Wraps
+/// `tokio::signal::ctrl_c` so callers can `await` it like a one-shot.
+///
+/// Like pvxs's `SigInt`, the trap is undone on drop: dropping the
+/// `SigInt` aborts the background signal task. The task holds only the
+/// shared `Notify` (not the `SigInt` itself), so there is no
+/// strong-reference cycle keeping it alive.
+///
+/// Must be constructed inside a Tokio runtime — [`SigInt::new`] spawns a
+/// task, so calling it with no reactor panics (standard `tokio::spawn`
+/// precondition).
 pub struct SigInt {
-    pub triggered: tokio::sync::Notify,
+    triggered: std::sync::Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl SigInt {
     pub fn new() -> std::sync::Arc<Self> {
-        let s = std::sync::Arc::new(Self {
-            triggered: tokio::sync::Notify::new(),
-        });
-        let s_clone = s.clone();
-        tokio::spawn(async move {
+        let triggered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notify = triggered.clone();
+        let task = tokio::spawn(async move {
             // tokio::signal::ctrl_c only succeeds on platforms with
             // signal support (Unix/Windows). Errors are non-fatal:
             // SigInt simply never fires.
             if (tokio::signal::ctrl_c().await).is_ok() {
-                s_clone.triggered.notify_waiters();
+                notify.notify_waiters();
             }
         });
-        s
+        std::sync::Arc::new(Self { triggered, task })
     }
 
     /// Block until SIGINT (or Ctrl-C on Windows) is received.
     pub async fn wait(&self) {
         self.triggered.notified().await;
+    }
+}
+
+impl Drop for SigInt {
+    fn drop(&mut self) {
+        // Undo the trap: stop the background ctrl_c task so it doesn't
+        // outlive the SigInt (pvxs restores the handler in its dtor).
+        self.task.abort();
     }
 }
 
@@ -198,5 +212,15 @@ mod tests {
     fn detailed_default_is_false() {
         let d = Detailed::default();
         assert!(!d.0);
+    }
+
+    #[tokio::test]
+    async fn sigint_waits_without_spurious_fire_and_drops_clean() {
+        let sig = SigInt::new();
+        // No Ctrl-C arrives, so wait() must not complete in the window.
+        let r = tokio::time::timeout(std::time::Duration::from_millis(50), sig.wait()).await;
+        assert!(r.is_err(), "wait() must not fire without a signal");
+        // RAII: dropping aborts the background task, must not panic.
+        drop(sig);
     }
 }

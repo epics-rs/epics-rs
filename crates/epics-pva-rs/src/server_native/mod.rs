@@ -2,6 +2,7 @@
 
 pub mod composite;
 pub mod monitor_control;
+pub mod op_handle;
 pub mod peers;
 pub mod runtime;
 pub mod server_info;
@@ -12,6 +13,9 @@ pub mod udp;
 
 pub use composite::CompositeSource;
 pub use monitor_control::{MonitorControlOp, PostError};
+pub use op_handle::{
+    ClientCredentials, ExecOp, ExecResult, MessageLevel, OpBase, OpMessage, RemoteLogger,
+};
 pub use peers::{PeerEntry, PeerRegistry, PeerSnapshot};
 pub use runtime::{PvaServer, PvaServerConfig, run_pva_server};
 pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource};

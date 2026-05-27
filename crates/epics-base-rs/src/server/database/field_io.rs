@@ -658,10 +658,26 @@ impl PvDatabase {
             // `complete_async_record` (async completion).
 
             instance.cleanup_subscribers();
-            // Non-VAL fields get VALUE|LOG immediately regardless of scan type.
-            // VAL is handled by the processing cycle (deadband check + snapshot).
-            // C dbPut:1409-1414: !(isValueField && process_passive) — only VAL suppressed.
-            if field != "VAL" {
+            // C `dbPut:1408-1414` posts DBE_VALUE|DBE_LOG for the put field
+            // unless `(isValueField && pfldDes->process_passive)` — the
+            // immediate post is suppressed for the value field ONLY when that
+            // field is `pp(TRUE)`, because then the reprocess cycle
+            // (`dbPutField:1265-1268`) re-posts it via the deadband snapshot.
+            // For a value field that is NOT `pp` (calc/calcout/aSub VAL), C
+            // posts here and does not reprocess; the port must do the same,
+            // because the `should_process` gate below skips the cycle for a
+            // non-`pp` value field — without this post a direct VAL put would
+            // fire no monitor at all.
+            let suppress_value_field_post = field == instance.record.primary_field()
+                && match instance.record.process_passive_fields() {
+                    Some(pp) => pp.iter().any(|f| f.eq_ignore_ascii_case(&field)),
+                    // Un-modeled record types keep the legacy "process on every
+                    // put" behavior (`should_process = true` below), so the
+                    // reprocess cycle posts the value field — suppress the
+                    // immediate post here to avoid a duplicate event.
+                    None => true,
+                };
+            if !suppress_value_field_post {
                 instance.notify_field(
                     &field,
                     crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
@@ -1015,5 +1031,37 @@ mod tests {
         // right record.
         let v = db.get_pv("CANON.VAL").await.unwrap();
         assert!(matches!(v, EpicsValue::Double(x) if x == 2.5));
+    }
+
+    /// Regression: a direct CA put to a record whose value field VAL is NOT
+    /// `pp(TRUE)` (calc / calcout / aSub) must still fire a DBE_VALUE monitor.
+    /// C `dbAccess.c::dbPut:1408-1414` posts the value field immediately
+    /// unless it is `pp(TRUE)`. The port previously suppressed the immediate
+    /// post for every `VAL` and — with the `should_process` gate — skipped
+    /// the reprocess cycle for a non-`pp` VAL, so the operator's write fired
+    /// no monitor at all. calc's VAL is not in its `pp` field set, so the
+    /// immediate post is the only event that can fire.
+    #[tokio::test]
+    async fn ca_put_to_non_pp_val_posts_monitor() {
+        use crate::server::database::db_access::DbSubscription;
+        use crate::server::records::calc::CalcRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("CALC1", Box::new(CalcRecord::new("0")))
+            .await
+            .unwrap();
+
+        let mut sub = DbSubscription::subscribe(&db, "CALC1.VAL")
+            .await
+            .expect("subscribe to CALC1.VAL");
+
+        db.put_record_field_from_ca("CALC1", "VAL", EpicsValue::Double(5.0))
+            .await
+            .expect("CA put to CALC1.VAL must succeed");
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv_f64())
+            .await
+            .expect("a DBE_VALUE monitor must fire for a direct VAL put to a non-pp record");
+        assert_eq!(got, Some(5.0));
     }
 }

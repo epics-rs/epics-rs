@@ -57,16 +57,24 @@ pub fn expand_dollar_vars(input: &str) -> String {
     out
 }
 
-/// Apply a name→value map of EPICS_PVA / EPICS_PVAS overrides on top
-/// of the process environment. Mirrors pvxs `Config::applyDefs(map)`
-/// (server.h:205) — an `st.cmd`-style helper for callers that have a
-/// dictionary of overrides (e.g. parsed from a config file) and want
-/// them visible to subsequent `*_from_env`-style reads.
+/// Seed a name→value map of EPICS_PVA / EPICS_PVAS overrides into the
+/// process environment so subsequent `*_from_env`-style reads pick them
+/// up. An `st.cmd`-style helper for callers holding a dictionary of
+/// overrides (e.g. parsed from a config file).
+///
+/// This is **not** pvxs `Config::applyDefs`: pvxs reads the map *into a
+/// `Config` struct's fields* (it never touches `getenv`/`setenv`, has no
+/// replace-vs-fill toggle, and returns the `Config`). This crate reads
+/// its configuration from the environment via the `*_from_env` readers,
+/// so the equivalent injection point is the process environment — hence
+/// this writes there instead.
 ///
 /// Semantics: for each `(name, value)` pair, sets `name=value` in the
-/// process environment when `name` isn't already set, OR replaces
-/// the existing value when `replace_existing` is true. Returns the
-/// number of variables that were actually written.
+/// process environment when `name` isn't already set, OR replaces the
+/// existing value when `replace_existing` is true. Returns the number of
+/// variables that were actually written. Keys are written verbatim with
+/// no validation — caller is responsible for using real EPICS_PVA[S]_*
+/// names.
 pub fn apply_defs(map: &HashMap<String, String>, replace_existing: bool) -> usize {
     let mut applied = 0usize;
     for (name, value) in map {

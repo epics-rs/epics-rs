@@ -22,25 +22,25 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.18.5"
+version = "0.18.6"
 authors = ["Sang Woo Kim <sngwkim915@gmail.com>"]
 license = "EPICS"
 repository = "https://github.com/epics-rs/epics-rs"
 
 [workspace.dependencies]
-ad-core-rs = { path = "crates/ad-core-rs", version = "0.18.5" }
-ad-plugins-rs = { path = "crates/ad-plugins-rs", version = "0.18.5" }
-asyn-rs = { path = "crates/asyn-rs", version = "0.18.5" }
-epics-base-rs = { path = "crates/epics-base-rs", version = "0.18.5" }
-epics-ca-rs = { path = "crates/epics-ca-rs", version = "0.18.5" }
-epics-macros-rs = { path = "crates/epics-macros-rs", version = "0.18.5" }
-epics-pva-rs = { path = "crates/epics-pva-rs", version = "0.18.5" }
-epics-bridge-rs = { path = "crates/epics-bridge-rs", version = "0.18.5" }
-motor-rs = { path = "crates/motor-rs", version = "0.18.5" }
-std-rs = { path = "crates/std-rs", version = "0.18.5" }
-scaler-rs = { path = "crates/scaler-rs", version = "0.18.5" }
-optics-rs = { path = "crates/optics-rs", version = "0.18.5" }
-mqtt-rs = { path = "crates/mqtt-rs", version = "0.18.5" }
-modbus-rs = { path = "crates/modbus-rs", version = "0.18.5", package = "epics-modbus-rs" }
-epics-tools-rs = { path = "crates/epics-tools-rs", version = "0.18.5" }
+ad-core-rs = { path = "crates/ad-core-rs", version = "0.18.6" }
+ad-plugins-rs = { path = "crates/ad-plugins-rs", version = "0.18.6" }
+asyn-rs = { path = "crates/asyn-rs", version = "0.18.6" }
+epics-base-rs = { path = "crates/epics-base-rs", version = "0.18.6" }
+epics-ca-rs = { path = "crates/epics-ca-rs", version = "0.18.6" }
+epics-macros-rs = { path = "crates/epics-macros-rs", version = "0.18.6" }
+epics-pva-rs = { path = "crates/epics-pva-rs", version = "0.18.6" }
+epics-bridge-rs = { path = "crates/epics-bridge-rs", version = "0.18.6" }
+motor-rs = { path = "crates/motor-rs", version = "0.18.6" }
+std-rs = { path = "crates/std-rs", version = "0.18.6" }
+scaler-rs = { path = "crates/scaler-rs", version = "0.18.6" }
+optics-rs = { path = "crates/optics-rs", version = "0.18.6" }
+mqtt-rs = { path = "crates/mqtt-rs", version = "0.18.6" }
+modbus-rs = { path = "crates/modbus-rs", version = "0.18.6", package = "epics-modbus-rs" }
+epics-tools-rs = { path = "crates/epics-tools-rs", version = "0.18.6" }
 

@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.18.6 — 2026-05-27
+
+A parity-hardening release. Multiple rounds of C/C++ parity audit against
+EPICS base, libca, and pvxs land fixes across all four core crates;
+server/client TLS identity handling is tightened; the two `0.18.5`
+breaking API changes are reverted to their `0.18.4` shapes; and a batch
+of additive helpers is added for source/client authors.
+
+**API compatibility.** The two breaking changes introduced in `0.18.5`
+are reverted to their `0.18.4` shapes — `ArrayFilterConfig.incr` is a
+`pub` field again (still held `>= 1`, now via the clamping `incr()` read
+accessor), and `ChannelSource::subscribe_checked_opts` returns
+`Receiver<PvField>` again. Code written against `0.18.4` builds
+unchanged; code that adapted to the `0.18.5` shapes must revert those two
+call sites. Everything else new in this release is additive.
+
+### Parity fixes (EPICS base / libca / pvxs)
+
+- **epics-base-rs** — post `DBE_PROPERTY` on metadata-field writes;
+  post `VALUE|LOG` for non-VAL writes on Passive-scan records and strip
+  `VALUE|LOG` (not only `VALUE`) on deadband bypass; honor CPP vs CP link
+  scan-gates; populate control-info limits for `int64in`, `ao`/`longout`/
+  `int64out`, and `waveform`/`aai`/`aao`/`compress`; defer CA
+  `WRITE_NOTIFY` completion until the whole link chain settles; iocsh
+  macro/redirect/`#-` fixes.
+- **epics-ca-rs** — implement the `$` long-string channel suffix; reject
+  `EVENT_ADD` masks of 0 or above `UCHAR_MAX` (after channel lookup);
+  honor record precision and enum state-labels in `DBR_STRING`
+  conversion; correct `send_ca_error` payload size for extended-header
+  requests.
+- **epics-pva-rs** — RPC `INIT` sends type + full value; `GET_FIELD`
+  slow path cancels on teardown; `CONNECTION_VALIDATION` buffer size,
+  server-derived roles, and anonymous/ca credentials; correct
+  `QosFlags` `MONITOR_START`/`STOP`; NT type-ids and
+  timeStamp/valueAlarm/display/alarm fields; beacon, SEARCH /
+  SEARCH_RESPONSE, and discovery-pong handling; monitor flow-control.
+- **epics-bridge-rs (gateway)** — ACF/access enforcement and read-only
+  defaults; preserve upstream alarm/timestamp on forwarding; qsrv
+  trigger resolution, deterministic group field order, and group-PUT
+  validation; pvlist `DENY FROM` fail-closed; RPC gated as WRITE-class.
+
+### TLS hardening
+
+- Reject embedded-NUL and empty CN/SAN/issuer in cert identity mapping.
+- Request a client certificate by default, matching pvxs
+  `SSL_VERIFY_PEER`.
+- Resolve server keychain + options PVAS-first, closing a fail-open gap.
+- Populate the x509 authority from the trust store on a partial chain.
+
+### New API surface (additive)
+
+- **epics-pva-rs** — `SharedArray<T>` copy-on-write container; `util`
+  module (Escaper / SigInt / Indented / Detailed / Timer / MPMCFIFO
+  analogues); `MonitorControlOp` + `PostError` and the op-handle surface
+  for source authors; discrete `errors::*` exception types alongside the
+  `PvaError` enum; `config::apply_defs` env-override helper;
+  `PvaClient::request()` pvRequest-builder entry point.
+- **epics-ca-rs** — `ca_version()` version string; `CaChannel::v42_ok()`
+  capability check; `MonitorHandle::channel()` / `subid()`; a `CaChannel`
+  user-data slot (set/get/clear); runtime client user/host-name override
+  (applies to new circuits only).
+
 ## v0.18.5 — 2026-05-22
 
 The largest functional-review batch to date, plus a broad CA/PVA

@@ -5,7 +5,7 @@
 //! Each test captures the hex bytes pvxs (`f8d6192`,
 //! `~/codes/pvxs`) emits for a known fixture and asserts the Rust
 //! encoder produces the same bytes. Catches divergences of the
-//! shape PVA-R13 / R10 / R18 caught manually — per-element presence
+//! shape caught manually — per-element presence
 //! byte, unspecified-address encoding, etc.
 //!
 //! Captures are documented inline (function comment cites the pvxs

@@ -77,7 +77,7 @@ pub struct ConnConfig {
     /// TCP idle timeout governing the heartbeat task (pvxs
     /// `effective.tcpTimeout`, clientconn.cpp:73-74).
     pub tcp_timeout: Duration,
-    /// PVXS-SR-9: optional opt-in cap on a single inbound message's
+    /// optional opt-in cap on a single inbound message's
     /// payload length. `None` = **unbounded**, matching pvxs, which
     /// deliberately keeps no client-side RX message-size limit. The
     /// streaming reader stays bounded regardless via incremental 4 KiB
@@ -119,7 +119,7 @@ pub struct ServerConn {
     cancel: CancellationToken,
     alive: Arc<AtomicBool>,
     last_rx_nanos: Arc<AtomicU64>,
-    /// PVA-FR-2: total bytes read off / written to this connection's
+    /// total bytes read off / written to this connection's
     /// socket, for `PvaClient::report`. Shared with the reader/writer
     /// tasks.
     bytes_rx: Arc<AtomicU64>,
@@ -132,7 +132,7 @@ pub struct ServerConn {
     by_sid_close: Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>>,
     /// Reverse map ioid → sid for DESTROY_CHANNEL cleanup.
     ioid_to_sid: Arc<DashMap<u32, u32>>,
-    /// PVA-R23: command (`Command` code) the IOID was opened with.
+    /// command (`Command` code) the IOID was opened with.
     /// Set on every `register_ioid_*` call; consulted in
     /// `route_frame` so an inbound frame's command must match the
     /// expected one before the payload is delivered to the sink. A
@@ -312,7 +312,7 @@ impl ServerConn {
                             if writer_owned.write_all(&batch).await.is_err() {
                                 break;
                             }
-                            // PVA-FR-2: count bytes written to the socket.
+                            // count bytes written to the socket.
                             bytes_tx_writer
                                 .fetch_add(batch.len() as u64, Ordering::Relaxed);
                             batch.clear();
@@ -371,16 +371,16 @@ impl ServerConn {
                         Ok(n) => {
                             buf.extend_from_slice(&chunk[..n]);
                             last_rx_reader.store(now_nanos(), Ordering::SeqCst);
-                            // PVA-FR-2: count bytes read off the socket.
+                            // count bytes read off the socket.
                             bytes_rx_reader.fetch_add(n as u64, Ordering::Relaxed);
                             // Peek the header once we have 8 bytes — when
                             // the client opted into a cap, drop the
                             // connection if the announced payload exceeds
-                            // it (PVXS-SR-9; `None` = unbounded, pvxs
+                            // it (`None` = unbounded, pvxs
                             // parity). Defends a hardened client against a
                             // compromised server announcing a 4 GiB header.
                             if buf.len() >= crate::proto::PvaHeader::SIZE {
-                                // PVA-R7: decode the prefix to enforce
+                                // decode the prefix to enforce
                                 // the payload cap. An undecodable
                                 // header here would have been
                                 // swallowed by `if let Ok` pre-fix —
@@ -394,7 +394,7 @@ impl ServerConn {
                                     &mut std::io::Cursor::new(&buf[..])
                                 ) {
                                     Ok(hdr) => {
-                                        // PVXS-SR-9: only enforce when the
+                                        // only enforce when the
                                         // client opted into a cap; `None`
                                         // is unbounded (pvxs parity).
                                         if let Some(cap) = max_message_size {
@@ -421,7 +421,7 @@ impl ServerConn {
                                     }
                                 }
                             }
-                            // PVA-R7: split frame-parse result. `Ok(None)`
+                            // split frame-parse result. `Ok(None)`
                             // keeps buffering for more bytes; `Ok(Some(..))`
                             // drains + dispatches; `Err(e)` closes the
                             // connection. Pre-fix `while let Ok(Some(..))`
@@ -490,7 +490,7 @@ impl ServerConn {
                                 // into a cap; a peer that streams
                                 // SegFirst → SegMiddle … forever would
                                 // grow seg_buf without bound otherwise.
-                                // PVXS-SR-9: `None` = unbounded (pvxs
+                                // `None` = unbounded (pvxs
                                 // parity).
                                 if let Some(cap) = max_message_size {
                                     if seg_buf.len().saturating_add(frame.payload.len()) > cap {
@@ -626,7 +626,7 @@ impl ServerConn {
         self.alive.load(Ordering::SeqCst)
     }
 
-    /// PVA-FR-2: snapshot `(bytes_rx, bytes_tx)` for this connection,
+    /// snapshot `(bytes_rx, bytes_tx)` for this connection,
     /// optionally zeroing them after the read (pvxs `report(bool zero)`
     /// delta semantics).
     pub fn byte_counters(&self, zero: bool) -> (u64, u64) {
@@ -887,7 +887,7 @@ async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
             return Ok(frame);
         }
         // Same opt-in payload peek as the streaming reader (P-G8).
-        // PVXS-SR-9: `None` = unbounded (pvxs parity); the handshake
+        // `None` = unbounded (pvxs parity); the handshake
         // read is `op_timeout`-deadlined regardless.
         if let Some(cap) = max_message_size {
             if rx_buf.len() >= crate::proto::PvaHeader::SIZE {
@@ -969,7 +969,7 @@ fn route_frame(
                 .map(|r| *r.key())
                 .collect();
             for ioid in &matching {
-                // MR-R19: CMD_DESTROY_CHANNEL cleanup is the same owner
+                // CMD_DESTROY_CHANNEL cleanup is the same owner
                 // boundary as `unregister_ioid` and must remove ALL three
                 // IOID maps. Leaving `ioid_to_cmd` behind leaks a stale
                 // command expectation for the connection's lifetime, and
@@ -1002,7 +1002,7 @@ fn route_frame(
     if cmd == Command::CreateChannel.code() {
         if let Some(cid) = peek_u32(&frame.payload, 0, order) {
             if let Some((_, tx)) = by_cid.remove(&cid) {
-                // PVA-R26: even when we have a waiter, the receiver
+                // even when we have a waiter, the receiver
                 // might have already been dropped (timeout race).
                 // pvxs `clientconn.cpp:359-379` checks the same case
                 // and on Status::isSuccess sends CMD_DESTROY_CHANNEL
@@ -1014,7 +1014,7 @@ fn route_frame(
                 }
                 return;
             }
-            // PVA-R26: no waiter at all — the caller timed out,
+            // no waiter at all — the caller timed out,
             // dropped its receiver, and CID was already evicted.
             // pvxs still sends DESTROY_CHANNEL so the server's
             // ChannelState is reaped. Pre-fix Rust silently dropped
@@ -1027,7 +1027,7 @@ fn route_frame(
 
     // Application op responses (GET/PUT/MONITOR/RPC/GET_FIELD) route by IOID.
     if let Some(ioid) = peek_u32(&frame.payload, 0, order) {
-        // PVA-R23: verify the incoming frame's command matches the
+        // verify the incoming frame's command matches the
         // command the IOID was opened with. Mirrors pvxs
         // `clientget.cpp:463-470` / `clientmon.cpp:570-579` per-op
         // command checks. A mismatch is protocol-fatal: cancel the
@@ -1115,7 +1115,7 @@ fn peek_u32(payload: &[u8], offset: usize, order: ByteOrder) -> Option<u32> {
     })
 }
 
-/// PVA-R26: when a CREATE_CHANNEL response arrives with no waiter
+/// when a CREATE_CHANNEL response arrives with no waiter
 /// (the caller timed out or dropped its receiver), check the
 /// status. If success, the server has a live channel we'll never
 /// use — send CMD_DESTROY_CHANNEL to release the server-side
@@ -1259,7 +1259,7 @@ mod tests {
         p
     }
 
-    /// A8-1: pvxs `clientconn.cpp:303-313` logs "Trying to proceed w/o
+    /// pvxs `clientconn.cpp:303-313` logs "Trying to proceed w/o
     /// cred" and proceeds (`ready = true; createChannels()`) after a
     /// non-success CONNECTION_VALIDATED — the server refused the offered
     /// credentials but may still serve PVs anonymously. Only a malformed
@@ -1481,7 +1481,7 @@ mod tests {
         assert!(ioid_to_sid.contains_key(&1003));
     }
 
-    /// MR-R19 regression: `CMD_DESTROY_CHANNEL` cleanup must remove ALL
+    /// Regression: `CMD_DESTROY_CHANNEL` cleanup must remove ALL
     /// three IOID maps — `by_ioid`, `ioid_to_sid`, AND `ioid_to_cmd` —
     /// for every IOID belonging to the destroyed sid, the same owner
     /// boundary as `unregister_ioid`.
@@ -1560,7 +1560,7 @@ mod tests {
         assert!(ioid_to_cmd.contains_key(&2003));
     }
 
-    /// PVA-R2 regression: `tcp_timeout` passed to `ServerConn::connect` must
+    /// Regression: `tcp_timeout` passed to `ServerConn::connect` must
     /// govern the heartbeat idle timeout, not the process environment.
     ///
     /// Setup: a mock server completes the PVA handshake then goes silent.

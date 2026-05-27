@@ -1,4 +1,4 @@
-//! PVA-R5 + PVA-R9 + PVA-R16 helper: check that a [`PvField`] value
+//! Check that a [`PvField`] value
 //! structurally matches a [`FieldDesc`].
 //!
 //! pvxs `dataencode.cpp` is descriptor-driven: every wire encode uses
@@ -10,11 +10,11 @@
 //! error.
 //!
 //! Rust pre-fix routed descriptor-mismatched value/desc pairs through
-//! `pvdata::encode::encode_pv_field`'s "(F-G10) Generic fallback"
+//! `pvdata::encode::encode_pv_field`'s "Generic fallback"
 //! which silently emits a default/coerced wire shape under the
 //! advertised descriptor. That converts an upstream producer bug
-//! into a valid-looking PVA response — exactly what PVA-R5 / PVA-R9
-//! flag.
+//! into a valid-looking PVA response — exactly the descriptor
+//! mismatch this check rejects.
 //!
 //! The check walks the value and descriptor trees together, mirroring
 //! the encoder's coercion surface: at every leaf where the encoder
@@ -55,7 +55,7 @@ pub enum ValueDescMismatch {
 }
 
 /// True iff `value` can be encoded under `desc` without taking the
-/// `encode::encode_pv_field` "F-G10 generic fallback" silent-coerce
+/// `encode::encode_pv_field` "generic fallback" silent-coerce
 /// path. Used by the server wire layer (and `SharedPV::try_post`) to
 /// reject producer-side descriptor/value mismatches before the bytes
 /// hit the wire — matching pvxs' "throw on mismatch" contract.

@@ -789,7 +789,7 @@ fn decode_array_valid(scalar_type: ScalarType, wire: &[u8]) -> Vec<ScalarValue> 
     };
     match s.get_field("value") {
         Some(PvField::ScalarArray(items)) => items.clone(),
-        // F-G10: decode now lands on the typed variant by default.
+        // decode now lands on the typed variant by default.
         // Convert back to the legacy form so the per-test ScalarValue
         // assertions still apply.
         Some(PvField::ScalarArrayTyped(arr)) => arr.to_scalar_values(),

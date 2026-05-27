@@ -5,7 +5,7 @@
 //!
 //! Expected bytes come from `tools/pvxs-golden-capture/fixtures.txt`
 //! (captured from pvxs's own `to_wire(shared_array<E>)` at run time).
-//! Touched by MR-R25 (DBF_UINT64 arr-filter slicing) — the ULong
+//! The DBF_UINT64 arr-filter slicing path — the ULong
 //! array fixture in particular locks the contract for the
 //! UInt64Array waveform path.
 
@@ -164,7 +164,7 @@ fn golden_pvxs_scalar_array_long_be() {
 
 #[test]
 fn golden_pvxs_scalar_array_ulong_be() {
-    // MR-R25 contract — the UInt64Array waveform path round-trips
+    // The UInt64Array waveform path round-trips
     // through this wire shape.
     assert_eq!(
         encode_array(

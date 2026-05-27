@@ -6,7 +6,7 @@
 //! (`:354-393`). Per element the wire begins with a presence byte:
 //! `0x00` = null (no body follows); `0x01` = present (body follows).
 //!
-//! PVA-FR-1: `PvField::{StructureArray,UnionArray,VariantArray}` now
+//! `PvField::{StructureArray,UnionArray,VariantArray}` now
 //! hold `Vec<Option<_>>`, so a `None` element encodes as pvxs's `0x00`
 //! null shape — distinct from a *present* element whose body carries an
 //! inner null sentinel. The expected bytes are the libpvxs captures in
@@ -102,7 +102,7 @@ fn golden_pvxs_variant_array_null_descriptor() {
     assert_eq!(hex(&out), golden("variant_array_null_descriptor"));
 }
 
-/// PVA-FR-1 identity: decoding the libpvxs `present, null, present`
+/// Identity: decoding the libpvxs `present, null, present`
 /// capture must recover `Some/None/Some` (not collapse the null into an
 /// empty struct), and re-encoding must reproduce the captured bytes.
 #[test]

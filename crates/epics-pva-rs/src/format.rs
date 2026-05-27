@@ -208,7 +208,7 @@ fn write_raw_field(out: &mut String, name: &str, desc: &FieldDesc, value: &PvFie
             };
             let _ = writeln!(out, "{indent}{id}[] {name}");
             for s in items {
-                // PVA-FR-1: a `None` element is a null (absent) element.
+                // a `None` element is a null (absent) element.
                 let Some(s) = s else {
                     let _ = writeln!(out, "{indent}    (null)");
                     continue;
@@ -413,7 +413,7 @@ fn value_to_json(value: &PvField) -> String {
         }
         PvField::Structure(s) => structure_to_json(s),
         PvField::StructureArray(items) => {
-            // PVA-FR-1: a `None` element renders as JSON `null`.
+            // a `None` element renders as JSON `null`.
             let parts: Vec<String> = items
                 .iter()
                 .map(|s| match s {

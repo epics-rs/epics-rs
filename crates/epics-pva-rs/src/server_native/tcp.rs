@@ -90,7 +90,7 @@ fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> u32 {
             ScalarValue::String(s) => {
                 if let Some(pct) = s.strip_suffix('%').filter(|p| !p.is_empty()) {
                     if let Ok(percent) = pct.trim().parse::<f64>() {
-                        // PVXS-SR-5: pvxs `servermon.cpp:563` historically
+                        // pvxs `servermon.cpp:563` historically
                         // computed `clamp(percent,0,100) * limit` with NO
                         // `/ 100`, so any percent >= 1% saturated to the full
                         // queue after the `[1, limit]` clamp below, defeating
@@ -146,7 +146,7 @@ fn clamp_watermarks(levels: Option<(usize, usize)>, ack_at: Option<u32>) -> Opti
 ///
 /// Currently extracts:
 /// * The value leaf as an `EpicsValue` — scalar OR array. Arrays are
-///   carried losslessly (EX-R12) so the `arr` transformation filter
+///   carried losslessly so the `arr` transformation filter
 ///   sees the real array to slice. Returns `None` (fails closed) when
 ///   the leaf has no faithful `EpicsValue` representation — the
 ///   previous `Double(0.0)` fallback fabricated a stand-in value that
@@ -157,7 +157,7 @@ fn clamp_watermarks(levels: Option<(usize, usize)>, ack_at: Option<u32>) -> Opti
 ///   which subfields changed.
 ///
 /// The transformed event is bridged back to the wire by
-/// [`apply_filter_transform`]; see EX-R12.
+/// [`apply_filter_transform`].
 ///
 /// Returns `None` when the value leaf cannot be carried faithfully:
 /// PVA `Boolean`, signed `Byte`, `UShort`, and `UInt` (and their
@@ -190,7 +190,7 @@ fn pv_field_to_filter_event(
 /// Extract the value leaf of a PVA monitor `PvField` as an
 /// `EpicsValue`, looking through an NT-style structure's `value`
 /// member. Scalars and scalar arrays are both carried; returns
-/// `None` for shapes with no representable value leaf (EX-R12: the
+/// `None` for shapes with no representable value leaf (the
 /// `arr` filter needs the real array, not a scalar fallback).
 fn pv_value_leaf_to_epics(f: &PvField) -> Option<epics_base_rs::types::EpicsValue> {
     use crate::pvdata::ScalarValue;
@@ -269,7 +269,7 @@ fn pv_value_leaf_to_epics(f: &PvField) -> Option<epics_base_rs::types::EpicsValu
                     })
                     .collect(),
             ),
-            // PF-R1: a PVA `ulong[]` monitor value must reach the
+            // a PVA `ulong[]` monitor value must reach the
             // `arr` filter as `UInt64Array` (mirrors the `scalar`
             // helper's `ULong -> UInt64`); without this arm a filtered
             // `DBF_UINT64` waveform fell through to a scalar `Double`
@@ -312,7 +312,7 @@ fn pv_value_leaf_to_epics(f: &PvField) -> Option<epics_base_rs::types::EpicsValu
     }
 }
 
-/// EX-R12: bridge a filter-chain-transformed `FilteredMonitorEvent`
+/// bridge a filter-chain-transformed `FilteredMonitorEvent`
 /// back to the wire `PvField`. Substitutes the transformed value leaf
 /// into the original monitor `PvField` (looking through an NT-style
 /// `value` member) so transformation filters such as `arr` (array
@@ -659,7 +659,7 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
         PvField::Structure(s) => s,
         _ => return None,
     };
-    // PVA-R20: pvxs `servermon.cpp:523-540` parses `pipeline` via
+    // pvxs `servermon.cpp:523-540` parses `pipeline` via
     // `Value::as(bool)` and `queueSize` via the analogous scalar
     // conversion. A pvxs client using the typed builder form
     // (`.record("pipeline", true).record("queueSize", N)`) sends a
@@ -961,7 +961,7 @@ fn apply_exec_finish(channels: &mut HashMap<u32, ChannelState>, fin: ExecFinishe
     }
 }
 
-/// PVXS-SR-21: await a user-supplied source handler so that a panic inside it
+/// await a user-supplied source handler so that a panic inside it
 /// becomes a recoverable `Err` instead of unwinding the spawned exec task.
 ///
 /// Each data-phase exec task builds and sends its single client reply *after*
@@ -1018,7 +1018,7 @@ struct OpState {
     /// Pulsed via the same notify as the credit window so the loop
     /// wakes on resume.
     monitor_paused: Arc<std::sync::atomic::AtomicBool>,
-    /// PVA-FR-8: pulsed on RESUME so the subscriber loop wakes and
+    /// pulsed on RESUME so the subscriber loop wakes and
     /// flushes the value it squashed while paused — for both pipelined
     /// and non-pipelined monitors (the credit `monitor_window_notify`
     /// is `None` for non-pipelined, so resume needs its own wake). pvxs
@@ -1026,7 +1026,7 @@ struct OpState {
     /// START (`servermon.cpp:211-220,671-688`); the Rust equivalent is
     /// "hold the squashed latest value, emit on resume".
     monitor_resume: Arc<tokio::sync::Notify>,
-    /// PVA-FR-4 / BRIDGE-FR-11: per-PV pipeline-window watermark levels
+    /// Per-PV pipeline-window watermark levels
     /// `(low, high)` for this monitor op (from
     /// [`crate::server_native::ChannelSource::monitor_watermarks`]), or
     /// `None` when the source exposes none. Captured at INIT so both the
@@ -1042,20 +1042,20 @@ struct OpState {
     /// each crossing (see [`cross_watermark`]). Starts `1` (odd: the
     /// window begins full, above high).
     ///
-    /// BRIDGE-FR-11: HIGH MUST fire from the ACK path. A gateway source
+    /// HIGH MUST fire from the ACK path. A gateway source
     /// pauses its single upstream monitor on LOW; while paused no further
     /// events arrive, so firing HIGH from the event loop (the pre-FR-11
     /// behaviour) could never re-fire — the upstream would stay paused
     /// forever. pvxs fires `onHighMark` from the ACK handler
     /// (`servermon.cpp:653-666`).
     ///
-    /// BRIDGE-FR-11 review: the value is also threaded to the source's
+    /// the value is also threaded to the source's
     /// `notify_watermark` as an ordering token so a gateway applying
     /// pause/resume out of process can discard a re-ordered command —
     /// closing a residual race where a resume could be lost behind a
     /// stale pause across the two firing tasks.
     monitor_wm_seq: Arc<std::sync::atomic::AtomicU64>,
-    /// BRIDGE-FR-11 review (round 3): process-unique id for THIS monitor
+    /// process-unique id for THIS monitor
     /// op, minted once at INIT via [`next_op_id`]. A fanout gateway shares
     /// one upstream monitor across N downstream ops of the same
     /// PV+credential; it reference-counts their pause votes keyed on this
@@ -1081,7 +1081,7 @@ struct OpState {
     /// client's autoExec setting. We keep the field for diagnostic
     /// echoing but DO NOT gate write commits on it.
     put_auto_exec: bool,
-    /// BR-R3: full INIT pvRequest value (decoded). PVA PUT INIT
+    /// full INIT pvRequest value (decoded). PVA PUT INIT
     /// carries per-operation options (`record._options.process` /
     /// `block`, etc.) that the data-phase payload does NOT carry.
     /// We stash the value here at INIT so the data-phase PUT can
@@ -1089,13 +1089,13 @@ struct OpState {
     /// letting sources like the QSRV bridge honor process/block
     /// without re-parsing the value (where they no longer live).
     pv_request: Option<PvField>,
-    /// BR-R14: event-affecting MONITOR pvRequest options
+    /// event-affecting MONITOR pvRequest options
     /// (`pipeline` / `queueSize` / `_filter`) decoded at INIT. Passed
     /// to the source's `subscribe_*_checked_opts` at START so a
     /// fanout source (PVA gateway) can reject options it cannot honor
     /// transparently across a shared upstream monitor.
     monitor_options: crate::server_native::source::MonitorOptions,
-    /// PVA-R14: abort guard for the spawned data-phase task (GET /
+    /// abort guard for the spawned data-phase task (GET /
     /// PUT / RPC / PUT_GET / PROCESS exec). When a DESTROY_REQUEST
     /// arrives, dropping the Op removes this Arc; once the last clone
     /// is dropped, `AbortOnDrop::drop()` fires and the task is
@@ -1103,7 +1103,7 @@ struct OpState {
     /// client after DESTROY. Idle (INIT-only) and MONITOR ops leave
     /// this as `None`.
     data_task_abort: Option<Arc<AbortOnDrop>>,
-    /// PVA-FR-11: single owner of this MONITOR op's Executing<->Idle edge
+    /// single owner of this MONITOR op's Executing<->Idle edge
     /// (see [`MonitorStartControl`]). `Some` once the subscriber task is
     /// spawned; `None` for GET/PUT/RPC ops and for a MONITOR op that has
     /// been INIT'd but never STARTed. Dropping the `OpState` (DESTROY /
@@ -1121,7 +1121,7 @@ struct OpState {
     exec_state: ExecState,
 }
 
-/// BRIDGE-FR-11: atomically cross a pipeline-window watermark and mint
+/// atomically cross a pipeline-window watermark and mint
 /// an ordering token in ONE transition over `state`
 /// ([`OpState::monitor_wm_seq`]).
 ///
@@ -1192,7 +1192,7 @@ impl MonitorPipelineCredit<'_> {
     ///
     /// Must be called exactly once per monitor DATA frame, AFTER the
     /// pause / filter gates (a held or filtered event produces no wire
-    /// frame, so it must not consume a slot — EX-R1).
+    /// frame, so it must not consume a slot).
     async fn acquire(&self) {
         use std::sync::atomic::Ordering;
         let (Some(w), Some(n)) = (self.window, self.window_notify) else {
@@ -1221,8 +1221,8 @@ impl MonitorPipelineCredit<'_> {
             }
             notified.await;
         }
-        // PVA-FR-4: LOW fires when consuming this credit drained the
-        // window to `<= low` (pvxs `onLowMark`). BRIDGE-FR-11:
+        // LOW fires when consuming this credit drained the
+        // window to `<= low` (pvxs `onLowMark`).
         // `cross_watermark` checks-and-marks the above→below crossing AND
         // mints the ordering token in one CAS, returning `Some(seq)`
         // exactly on the edge so LOW fires once per crossing even though
@@ -1256,7 +1256,7 @@ fn next_op_id() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// BRIDGE-FR-11 review: finalizer that withdraws this monitor op's
+/// finalizer that withdraws this monitor op's
 /// upstream pause vote when its subscriber task ends — for ANY reason
 /// (normal completion, early `return`, or `AbortOnDrop` cancelling the
 /// task on DESTROY_REQUEST / channel teardown / disconnect).
@@ -1304,7 +1304,7 @@ impl Drop for WatermarkWithdrawOnDrop {
     }
 }
 
-/// PVA-FR-11: single owner of one MONITOR op's Executing<->Idle edge.
+/// single owner of one MONITOR op's Executing<->Idle edge.
 /// pvxs fires `MonitorControlOp::onStart(bool)` once when a monitor
 /// begins producing and once when it stops (`servermon.cpp:677-683`); we
 /// mirror that through [`ChannelSource::notify_monitor_start`], firing
@@ -1432,7 +1432,7 @@ pub async fn run_tcp_server(
 }
 
 /// Run the TCP listener with an externally-shared
-/// [`PeerRegistry`](crate::server_native::PeerRegistry). F-G7: lets [`crate::server_native::PvaServer::report`]
+/// [`PeerRegistry`](crate::server_native::PeerRegistry). lets [`crate::server_native::PvaServer::report`]
 /// observe per-connection stats.
 pub async fn run_tcp_server_with_peers(
     source: DynSource,
@@ -1569,7 +1569,7 @@ pub async fn run_tcp_server_on_listener(
                         }
                     };
 
-                    // F-G7: register this connection in the peer registry
+                    // register this connection in the peer registry
                     // so PvaServer::report() can surface it. Deferred to
                     // here (post-peek) so the `tls` flag reflects the
                     // actual protocol, not the server config.
@@ -1658,7 +1658,7 @@ pub async fn run_tcp_server_on_listener(
                         debug!(?peer, "connection ended: {e}");
                     }
                     active_dec.fetch_sub(1, Ordering::SeqCst);
-                    // F-G7: drop the per-peer entry whether the
+                    // drop the per-peer entry whether the
                     // connection ended cleanly or via I/O error.
                     peers_for_task.remove(peer);
                 });
@@ -1752,7 +1752,7 @@ impl ClientCredentials {
 /// Layout: `buffer_size:u32 + intro_size:u16 + qos:u16 + method:String +
 /// auth_type + auth_value`.
 ///
-/// PVA-R22: pvxs `serverconn.cpp:204-216` always decodes the auth
+/// pvxs `serverconn.cpp:204-216` always decodes the auth
 /// Value via `from_wire_type_value`, then `if(!M.good()) bev.reset()`
 /// — a truncated/invalid auth body is connection-fatal. Pre-fix Rust
 /// wrapped the decode in `if let Ok` and still returned
@@ -1874,7 +1874,7 @@ type SrvWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 /// observes the dead socket and tears down.
 type SrvTx = tokio::sync::mpsc::Sender<Vec<u8>>;
 
-/// PVA-R14: result of a spawned CREATE_CHANNEL resolver task. The read
+/// result of a spawned CREATE_CHANNEL resolver task. The read
 /// loop's `channels` HashMap is owned by the loop task; spawned
 /// resolver tasks cannot touch it directly. Instead they send this
 /// completion record through a dedicated mpsc, and the read loop's
@@ -1931,7 +1931,7 @@ async fn handle_connection_io(
         while let Some(frame) = rx.recv().await {
             match tokio::time::timeout(send_tmo, writer_raw.write_all(&frame)).await {
                 Ok(Ok(())) => {
-                    // F-G7: bytes_out counter for PvaServer::report().
+                    // bytes_out counter for PvaServer::report().
                     peer_entry_writer.touch_tx(frame.len());
                 }
                 Ok(Err(e)) => {
@@ -2000,7 +2000,7 @@ async fn handle_connection_io(
     let _ = tx.send(set_bo).await;
 
     // Step 2: send CONNECTION_VALIDATION request (server → client).
-    // PVA-R8: pvxs `serverconn.cpp:108-114` writes "anonymous" first,
+    // pvxs `serverconn.cpp:108-114` writes "anonymous" first,
     // then "ca", with a comment explaining that older pvAccess
     // clients took the LAST known plugin on the wire. The reverse-
     // priority order matters: an old client picks the last
@@ -2054,7 +2054,7 @@ async fn handle_connection_io(
     let mut seg_buf: Vec<u8> = Vec::new();
     let mut seg_cmd: u8 = 0;
     let mut expect_seg = false;
-    // PVA-R14: CREATE_CHANNEL completion channel. Spawned resolver
+    // CREATE_CHANNEL completion channel. Spawned resolver
     // tasks send results here; the read loop's select! arm applies
     // insertions into `channels` and emits wire responses in arrival
     // order (mpsc FIFO preserves the per-frame ordering guarantee).
@@ -2098,7 +2098,7 @@ async fn handle_connection_io(
         if tx.is_closed() {
             return Ok(());
         }
-        // PVA-R14: select! between CREATE_CHANNEL completions (from
+        // select! between CREATE_CHANNEL completions (from
         // spawned resolver tasks) and new frames from the socket.
         // Servicing completions here rather than inline in the
         // CREATE_CHANNEL handler lets the read loop stay unblocked
@@ -2121,7 +2121,7 @@ async fn handle_connection_io(
                             ops: HashMap::new(),
                         });
                         peer_entry.channel_added();
-                        // PVA-FR-2: mirror live channel names for the report.
+                        // mirror live channel names for the report.
                         peer_entry
                             .set_channel_names(channels.values().map(|c| c.name.clone()).collect());
                     } else {
@@ -2179,7 +2179,7 @@ async fn handle_connection_io(
                 frame_result?
             }
         };
-        // F-G7: bytes_in counter (header + payload). Drives
+        // bytes_in counter (header + payload). Drives
         // PvaServer::report() throughput diagnostics.
         peer_entry.touch_rx(PvaHeader::SIZE + frame.payload.len());
         last_rx.store(now_nanos(), Ordering::SeqCst);
@@ -2226,7 +2226,7 @@ async fn handle_connection_io(
         // Cap reassembly when an opt-in `max_message_size` is set.
         // read_frame already enforces it per-frame; without this an
         // adversary streams SegFirst → SegMiddle … forever, growing
-        // seg_buf without bound. PVXS-SR-9: `None` = unbounded (pvxs
+        // seg_buf without bound. `None` = unbounded (pvxs
         // parity), so this guard only fires for hardened deployments
         // that opted into a ceiling.
         if let Some(cap) = max_msg_size {
@@ -2278,7 +2278,7 @@ async fn handle_connection_io(
                 // client's CONNECTION_VALIDATION claim is parsed only
                 // for diagnostics and never replaces it.
                 if x509_locked {
-                    // PVA-R22: a decode fault here is still fatal —
+                    // a decode fault here is still fatal —
                     // log + propagate. Pre-fix swallowed; pvxs
                     // `serverconn.cpp:211-216` calls `bev.reset()`.
                     match parse_client_credentials(&frame, order)? {
@@ -2296,7 +2296,7 @@ async fn handle_connection_io(
                         ),
                     }
                 } else {
-                    // PVA-R22: a decode fault is now connection-fatal
+                    // a decode fault is now connection-fatal
                     // (matches pvxs `serverconn.cpp:211-216`
                     // bev.reset). An anonymous handshake (empty
                     // method) returns Ok(None) and keeps the
@@ -2337,7 +2337,7 @@ async fn handle_connection_io(
                         method = %cred.method,
                         "PVA client selects unadvertised auth method — replying Status::Error"
                     );
-                    // EX-R7: the client picked an auth method the
+                    // the client picked an auth method the
                     // server never advertised. The handshake completes
                     // (pvxs keeps the connection open) but the claimed
                     // credential MUST NOT survive — the server is about
@@ -2365,7 +2365,7 @@ async fn handle_connection_io(
                 buf.extend_from_slice(&payload);
                 let _ = tx.send(buf).await;
                 handshake_complete = true;
-                // PVA-FR-2: record the validated credentials for the
+                // record the validated credentials for the
                 // per-peer report.
                 peer_entry.set_credentials(&cred.account, &cred.method);
                 // Fire user-installed `auth_complete` hook (pvxs
@@ -2387,7 +2387,7 @@ async fn handle_connection_io(
         // Application messages
         match Command::from_code(frame.header.command) {
             Some(Command::CreateChannel) => {
-                // PVA-R14: spawning version. Resolver tasks run
+                // spawning version. Resolver tasks run
                 // has_pv() + get_introspection() in the background;
                 // results arrive via cc_rx and are applied at the top
                 // of the loop. channel_added() is called there, so we
@@ -2411,7 +2411,7 @@ async fn handle_connection_io(
                 handle_destroy_channel(&frame, &tx, &mut channels, order).await?;
                 if channels.len() < before {
                     peer_entry.channel_removed();
-                    // PVA-FR-2: keep the report's channel-name mirror current.
+                    // keep the report's channel-name mirror current.
                     peer_entry
                         .set_channel_names(channels.values().map(|c| c.name.clone()).collect());
                 }
@@ -2496,7 +2496,7 @@ async fn handle_connection_io(
                 }
             }
             Some(Command::Search) => {
-                // PVA-R11: TCP-circuit SEARCH (pvxs
+                // TCP-circuit SEARCH (pvxs
                 // `serverchan.cpp:173-255`). Required for
                 // name-server-redirect deployments where pvxs
                 // clients send SEARCH over the established TCP
@@ -2789,7 +2789,7 @@ async fn handle_put_get(
     }
 
     if subcmd & QosFlags::INIT != 0 {
-        // PVA-R21: duplicate INIT on a live IOID is connection-fatal
+        // duplicate INIT on a live IOID is connection-fatal
         // (mirror of `handle_op`).
         if ch.ops.contains_key(&ioid) {
             return Err(PvaError::Decode(format!(
@@ -2808,7 +2808,7 @@ async fn handle_put_get(
             .await?;
             return Ok(());
         }
-        // PVA-R16: PUT_GET also requires a descriptor.
+        // PUT_GET also requires a descriptor.
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
@@ -2848,7 +2848,7 @@ async fn handle_put_get(
                 return Ok(());
             }
         };
-        // PVA-R19: empty mask is an INIT error.
+        // empty mask is an INIT error.
         let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
             Ok(m) => m,
             Err(e) => {
@@ -2865,7 +2865,7 @@ async fn handle_put_get(
             }
         };
 
-        // MR-R10: stash the INIT pvRequest so the data phase can
+        // stash the INIT pvRequest so the data phase can
         // forward `record._options` (process/block, group `atomic`)
         // through `ChannelContext.pv_request` to the source. The
         // dedicated PUT_GET path otherwise dropped it, so QSRV group
@@ -2903,7 +2903,7 @@ async fn handle_put_get(
     let op = ch.ops.get(&ioid).cloned();
     let (intro, mask, init_pv_request) = match op {
         Some(o) => {
-            // EX-R5: the data-phase command must match the operation
+            // the data-phase command must match the operation
             // kind bound at INIT. pvxs `serverget.cpp:421-436` resets
             // the connection when an IOID is driven by the wrong
             // operation class. Without this check a client could INIT
@@ -2990,7 +2990,7 @@ async fn handle_put_get(
                     &ctx.authority,
                 )
                 .await;
-            // PVXS-SR-21: a panic in the user PUT handler becomes an error
+            // a panic in the user PUT handler becomes an error
             // reply instead of skipping the reply below.
             catch_handler_panic(src.put_delta_checked(
                 checked,
@@ -3025,7 +3025,7 @@ async fn handle_put_get(
                 &ctx.authority,
             )
             .await;
-        // PVXS-SR-21: a panic in the user GET handler becomes an error reply
+        // a panic in the user GET handler becomes an error reply
         // instead of skipping the reply below.
         match catch_handler_panic(src.get_value_checked(read_checked, ctx)).await {
             Ok(Some(v)) => {
@@ -3116,7 +3116,7 @@ async fn handle_process(
     }
 
     if subcmd & QosFlags::INIT != 0 {
-        // PVA-R21: duplicate INIT on a live IOID is connection-fatal.
+        // duplicate INIT on a live IOID is connection-fatal.
         if ch.ops.contains_key(&ioid) {
             return Err(PvaError::Decode(format!(
                 "duplicate PROCESS INIT on live IOID {ioid}"
@@ -3134,7 +3134,7 @@ async fn handle_process(
             .await?;
             return Ok(());
         }
-        // PVA-R16: PROCESS still requires a descriptor — even though
+        // PROCESS still requires a descriptor — even though
         // PROCESS has no value payload, the source must commit to
         // *some* introspection at channel creation. A missing
         // descriptor means the source can't describe what PROCESS
@@ -3216,7 +3216,7 @@ async fn handle_process(
             return Ok(());
         }
         Some(o) => {
-            // EX-R5: the data-phase command must match the operation
+            // the data-phase command must match the operation
             // kind bound at INIT. pvxs `serverget.cpp:421-436` resets
             // the connection when an IOID is driven by the wrong
             // operation class. Without this check any live IOID on
@@ -3274,7 +3274,7 @@ async fn handle_process(
                 &ctx.authority,
             )
             .await;
-        // PVXS-SR-21: a panic in the user PROCESS handler becomes an error
+        // a panic in the user PROCESS handler becomes an error
         // reply instead of skipping the reply below.
         let result = catch_handler_panic(src.process_checked(checked, ctx))
             .await
@@ -3317,7 +3317,7 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
         }
         // Peek the header length once we have 8 bytes — if an opt-in
         // `max_msg_size` is set and the peer claimed more, drop the
-        // connection before growing rx_buf any further. PVXS-SR-9:
+        // connection before growing rx_buf any further.
         // `None` = unbounded (pvxs parity, which keeps no RX cap).
         // Even unbounded, the read stays incremental (4 KiB chunks)
         // and `op_timeout`-deadlined, so a stalled or oversized peer
@@ -3382,7 +3382,7 @@ fn build_server_connection_validation(
     out
 }
 
-/// PVA-R14: spawn-based CREATE_CHANNEL handler. For each (cid, name)
+/// spawn-based CREATE_CHANNEL handler. For each (cid, name)
 /// pair in the frame, cap-exceeded pairs are rejected synchronously
 /// (no source call needed); all others spawn a background resolver
 /// task that calls `has_pv` + `get_introspection` and sends the result
@@ -3416,7 +3416,7 @@ async fn handle_create_channel(
     let mut batch: Vec<(u32, u32, String)> = Vec::new(); // (cid, sid, name)
 
     for _ in 0..count {
-        // PVA-R28: truncated CID / malformed string is a protocol-
+        // truncated CID / malformed string is a protocol-
         // fatal decode error. pvxs `serverchan.cpp:364-368`.
         let cid = cur
             .get_u32(order)
@@ -3470,7 +3470,7 @@ async fn handle_create_channel(
         *pending_channel_spawns += batch.len();
         let src = source.clone();
         let cc = cc_tx.clone();
-        // BRIDGE-FR-8: resolve existence + introspection under the
+        // resolve existence + introspection under the
         // downstream connection's identity so a gateway opens upstream
         // state under THIS peer's credentials, not the shared identity.
         // pvxs builds `ServerChannelControl` with `conn->cred`
@@ -3594,7 +3594,7 @@ fn handle_cancel_request(
     order: ByteOrder,
 ) -> PvaResult<()> {
     let mut cur = frame.cursor();
-    // PVA-R28: pvxs `serverconn.cpp:262-270` throws on truncated
+    // pvxs `serverconn.cpp:262-270` throws on truncated
     // CANCEL_REQUEST (`if(!M.good()) throw ...`), which the conn
     // loop turns into a connection reset. Pre-fix Rust silently
     // returned. Mirror pvxs — bubble as a fatal decode error.
@@ -3615,7 +3615,7 @@ fn handle_cancel_request(
             // the MONITOR path).
             op.monitor_paused
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            // PVA-FR-11: CANCEL_REQUEST is Executing->Idle. Route through
+            // CANCEL_REQUEST is Executing->Idle. Route through
             // the op's single start-control owner so notify_monitor_start(
             // false) fires once on the edge (no-op if already paused or
             // never started). DESTROY's terminal stop comes from Drop.
@@ -3632,7 +3632,7 @@ fn handle_cancel_request(
 /// surface them through the `tracing` crate at the matching level.
 fn handle_message(frame: &Frame, order: ByteOrder, peer: &SocketAddr) -> PvaResult<()> {
     let mut cur = frame.cursor();
-    // PVA-R28: pvxs `serverconn.cpp:323-336` throws on malformed
+    // pvxs `serverconn.cpp:323-336` throws on malformed
     // MESSAGE; conn loop turns into a reset. Pre-fix Rust silently
     // returned (string-decode also substituted "").
     let ioid = cur
@@ -3659,7 +3659,7 @@ fn handle_destroy_request(
     order: ByteOrder,
 ) -> PvaResult<()> {
     let mut cur = frame.cursor();
-    // PVA-R28: pvxs `serverconn.cpp:297-305` throws on malformed
+    // pvxs `serverconn.cpp:297-305` throws on malformed
     // DESTROY_REQUEST. Pre-fix Rust silently returned.
     let sid = cur
         .get_u32(order)
@@ -3675,7 +3675,7 @@ fn handle_destroy_request(
     Ok(())
 }
 
-/// PVA-R11: handle `Command::Search` arriving on an established
+/// handle `Command::Search` arriving on an established
 /// TCP virtual circuit. pvxs `serverchan.cpp:173-255` accepts this
 /// path so a client configured with `EPICS_PVA_NAME_SERVERS=<srv>`
 /// can resolve PVs without UDP. The wire body is identical to the
@@ -3771,7 +3771,7 @@ async fn handle_op(
     };
 
     if subcmd & 0x08 != 0 {
-        // PVA-R21: duplicate INIT on a live IOID is connection-fatal
+        // duplicate INIT on a live IOID is connection-fatal
         // per pvxs. `serverget.cpp:378-384` and `servermon.cpp:505-511`
         // reset the connection on `op->state != Created`; we model
         // "already created" as `ch.ops.contains_key(&ioid)`. Pre-fix
@@ -3801,7 +3801,7 @@ async fn handle_op(
             return Ok(());
         }
 
-        // PVA-R16: pvxs `serverget.cpp:182-193` rejects missing
+        // pvxs `serverget.cpp:182-193` rejects missing
         // prototype for non-RPC operations with "Must provide
         // prototype". Rust's previous fallback turned a source bug
         // (no `get_introspection`) into a successful GET/PUT/MONITOR
@@ -3822,7 +3822,7 @@ async fn handle_op(
         // clientget.cpp:351-352) and translate it to a field mask the
         // emit side will consult.
         //
-        // PVA-R19: pvxs `serverget.cpp:367-375` and
+        // pvxs `serverget.cpp:367-375` and
         // `servermon.cpp:491-502` treat an invalid pvRequest type/value
         // decode as bad INIT and close the connection;
         // `pvrequest.cpp:61-62` throws on an empty mask. Pre-fix Rust
@@ -3849,7 +3849,7 @@ async fn handle_op(
                 return Ok(());
             }
         };
-        // PVA-R19: descriptor decode failure already routed through
+        // descriptor decode failure already routed through
         // `send_op_error` above. For the VALUE body, distinguish an
         // ABSENT body (the Rust client's RPC INIT sends only the
         // descriptor — tolerated for interop) from a PRESENT but
@@ -3977,7 +3977,7 @@ async fn handle_op(
             true
         };
 
-        // BR-R3 / BR-R5: stash the INIT pvRequest so the data-phase
+        // Stash the INIT pvRequest so the data-phase
         // dispatch can forward it through `ChannelContext.pv_request`.
         // PUT needs `record._options.process|block`; MONITOR needs
         // `record._options.DBE` (and other per-op stream tuning that
@@ -3990,7 +3990,7 @@ async fn handle_op(
             _ => None,
         };
 
-        // BR-R14: capture the event-affecting MONITOR pvRequest
+        // capture the event-affecting MONITOR pvRequest
         // options so the START path can hand them to the source's
         // `subscribe_*_checked_opts`. `pipeline_opt` was already
         // filtered to `enabled`; `queue_size` is recorded only when
@@ -4008,7 +4008,7 @@ async fn handle_op(
             crate::server_native::source::MonitorOptions::default()
         };
 
-        // PVA-FR-4 / BRIDGE-FR-11: capture the source's pipeline-window
+        // Capture the source's pipeline-window
         // watermark levels at INIT so the subscriber loop (LOW) and the
         // ACK dispatch (HIGH) evaluate the same `(low, high)` against the
         // shared hysteresis flag. pvxs `servermon.cpp:332-333`: the
@@ -4081,7 +4081,7 @@ async fn handle_op(
     let op = ch.ops.get(&ioid).cloned();
     let (intro, mask, init_pv_request) = match op {
         Some(o) => {
-            // PVA-R24: data/control frames must match the operation
+            // data/control frames must match the operation
             // kind bound at INIT. pvxs `serverget.cpp:421-436`
             // resets the connection when a GET/PUT/RPC IOID is hit
             // by the wrong operation class, and `servermon.cpp:
@@ -4108,7 +4108,7 @@ async fn handle_op(
 
     match kind {
         OpKind::Get => {
-            // PVA-R14: spawn the data-phase work so the read loop can
+            // spawn the data-phase work so the read loop can
             // continue parsing frames while the source future runs.
             let pv_name = ch.name.clone();
             let src = source.clone();
@@ -4120,7 +4120,7 @@ async fn handle_op(
             let cred_host = cred.host.clone();
             let cred_authority = cred.authority.clone();
             let cred_roles = cred.roles.clone();
-            // MR-R13: forward the decoded INIT pvRequest into the GET
+            // forward the decoded INIT pvRequest into the GET
             // context so QSRV group GET honors `record._options`
             // (e.g. `atomic`). Previously dropped here as `None`.
             let init_pv_request_t = init_pv_request.clone();
@@ -4164,7 +4164,7 @@ async fn handle_op(
                         &ctx.authority,
                     )
                     .await;
-                // PVXS-SR-21: a panic in the user GET handler becomes a
+                // a panic in the user GET handler becomes a
                 // data-phase error reply instead of skipping the reply below.
                 let value = match catch_handler_panic(src.get_value_checked(checked, ctx)).await {
                     Ok(Some(v)) => v,
@@ -4186,7 +4186,7 @@ async fn handle_op(
                         return;
                     }
                 };
-                // PVA-R9: source-side mismatch gate.
+                // source-side mismatch gate.
                 if let Err(e) = crate::pvdata::value_matches_descriptor(&value, &intro_t) {
                     let _ = send_op_error(
                         &tx_clone,
@@ -4235,7 +4235,7 @@ async fn handle_op(
             // body, killing the connection before any actual PUT
             // landed.
             if subcmd & 0x40 != 0 {
-                // PVA-R14: spawn GET-for-PUT-readback — blocks on
+                // spawn GET-for-PUT-readback — blocks on
                 // source.get_value_checked which can be slow.
                 let pv_name = ch.name.clone();
                 let src = source.clone();
@@ -4247,7 +4247,7 @@ async fn handle_op(
                 let cred_host = cred.host.clone();
                 let cred_authority = cred.authority.clone();
                 let cred_roles = cred.roles.clone();
-                // MR-R13: forward the INIT pvRequest into the PUT
+                // forward the INIT pvRequest into the PUT
                 // readback GET context so the readback honors the
                 // same `record._options` the GET path would.
                 let init_pv_request_t = init_pv_request.clone();
@@ -4287,7 +4287,7 @@ async fn handle_op(
                             &ctx.authority,
                         )
                         .await;
-                    // PVXS-SR-21: a panic in the user GET (PUT readback)
+                    // a panic in the user GET (PUT readback)
                     // handler becomes a data-phase error reply instead of
                     // skipping the reply below.
                     let value = match catch_handler_panic(src.get_value_checked(checked, ctx)).await
@@ -4364,7 +4364,7 @@ async fn handle_op(
             let delta = decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, order)
                 .map_err(|e| PvaError::Decode(format!("PUT requires a value payload: {e}")))?;
             let pv_name = ch.name.clone();
-            // PVA-R14: spawn PUT exec — put_delta_checked can be slow.
+            // spawn PUT exec — put_delta_checked can be slow.
             // Decode frame data synchronously (above) so the cursor is
             // consumed before returning; source calls happen in the task.
             let src = source.clone();
@@ -4413,7 +4413,7 @@ async fn handle_op(
                             &ctx.authority,
                         )
                         .await;
-                    // PVXS-SR-21: a panic in the user PUT handler becomes an
+                    // a panic in the user PUT handler becomes an
                     // error reply instead of skipping the reply below.
                     catch_handler_panic(src.put_delta_checked(
                         checked,
@@ -4446,7 +4446,7 @@ async fn handle_op(
                                     &ctx.authority,
                                 )
                                 .await;
-                            // PVXS-SR-21: a panic in the user GET (PUT_GET
+                            // a panic in the user GET (PUT_GET
                             // readback) handler becomes an error reply instead
                             // of skipping the reply below.
                             match catch_handler_panic(src.get_value_checked(read_checked, ctx))
@@ -4500,7 +4500,7 @@ async fn handle_op(
                 if is_pause {
                     op.monitor_paused
                         .store(true, std::sync::atomic::Ordering::Relaxed);
-                    // PVA-FR-11: Executing->Idle. The op's single
+                    // Executing->Idle. The op's single
                     // start-control owner fires notify_monitor_start(false)
                     // on the edge so a gateway can suspend its upstream.
                     if let Some(ctl) = &op.monitor_start_ctl {
@@ -4514,14 +4514,14 @@ async fn handle_op(
                         if let Some(n) = op.monitor_window_notify.as_ref() {
                             n.notify_waiters();
                         }
-                        // PVA-FR-8: wake the subscriber loop so it flushes
+                        // wake the subscriber loop so it flushes
                         // the value squashed during the pause (works for
                         // non-pipelined ops too, which have no window
                         // notify). `notify_one` stores a permit when the
                         // loop isn't waiting yet, so a resume that races
                         // ahead of the loop's `notified()` is not lost.
                         op.monitor_resume.notify_one();
-                        // PVA-FR-11: Idle->Executing. `prev` gates this to a
+                        // Idle->Executing. `prev` gates this to a
                         // genuine resume — a START on a monitor that was not
                         // actually paused does not re-fire on_start(true).
                         if let Some(ctl) = &op.monitor_start_ctl {
@@ -4537,7 +4537,7 @@ async fn handle_op(
             // subscriber wakes and resumes emission. ACKs can arrive
             // before OR after the START — we always honour them.
             if is_ack {
-                // BRIDGE-FR-11: fire HIGH (resume) from the ACK path —
+                // fire HIGH (resume) from the ACK path —
                 // pvxs `servermon.cpp:653-666` fires `onHighMark` when
                 // ACKs add enough credit. A gateway source that paused
                 // its single upstream monitor on LOW receives no further
@@ -4619,7 +4619,7 @@ async fn handle_op(
                     }
                 }
                 if let Some((seq, op_id)) = fire_high {
-                    // BRIDGE-FR-11 review: thread this connection's
+                    // thread this connection's
                     // credential context so a gateway scopes the resume to
                     // the firing credential's own upstream cache layer, the
                     // crossing `seq` so it orders this op's transitions, and
@@ -4665,10 +4665,10 @@ async fn handle_op(
                 // so the spawned task can consult ctx-aware
                 // subscribe/get_value paths. Sources without ACF
                 // delegate to the legacy methods.
-                // BR-R5: forward the INIT pvRequest so the source can
+                // forward the INIT pvRequest so the source can
                 // honor `record._options.DBE` (per-op database event-
-                // mask selection — pvxs singlesource.cpp:115). Like
-                // BR-R3 for PUT, the data-phase START/ACK frames are
+                // mask selection — pvxs singlesource.cpp:115). As
+                // with PUT, the data-phase START/ACK frames are
                 // pure stream control; per-operation options live in
                 // the INIT pvRequest only.
                 let mon_ctx = crate::server_native::source::ChannelContext {
@@ -4702,7 +4702,7 @@ async fn handle_op(
                 // re-checking on every subsequent event.
                 // Snapshot the window + notify so the spawned task can
                 // share state with this dispatch path's ACK handler.
-                // BR-R14: also lift the event-affecting monitor
+                // also lift the event-affecting monitor
                 // options so they reach the source's
                 // `subscribe_*_checked_opts`.
                 let (
@@ -4726,14 +4726,14 @@ async fn handle_op(
                             s.monitor_resume.clone(),
                             s.monitor_filters.clone(),
                             s.monitor_options.clone(),
-                            // BRIDGE-FR-11: the LOW callback in the loop
+                            // the LOW callback in the loop
                             // below crosses this shared counter back to
                             // "below"; the HIGH callback in the ACK dispatch
                             // crosses it to "above". Sharing it keeps the
                             // pause/resume hysteresis AND the monotonic
                             // ordering token coherent across the two paths.
                             s.monitor_wm_seq.clone(),
-                            // BRIDGE-FR-11 review: same op identity the ACK
+                            // same op identity the ACK
                             // HIGH uses, so both votes (and the teardown
                             // Withdraw) reference-count under one key.
                             s.monitor_op_id,
@@ -4792,7 +4792,7 @@ async fn handle_op(
                         tx: mon_fin_tx_task,
                         fin: mon_fin,
                     };
-                    // PVA-R14: access gate check moved inside the spawn
+                    // access gate check moved inside the spawn
                     // so the read loop is not blocked while the ACF
                     // policy resolves. The version capture must precede
                     // the check (see R49-G1 audit note above).
@@ -4810,7 +4810,7 @@ async fn handle_op(
                             &mon_ctx.authority,
                         )
                         .await;
-                    // F-G12: raw-frame fast path. When the source can
+                    // raw-frame fast path. When the source can
                     // hand us pre-encoded MONITOR DATA bytes (e.g.
                     // pva_gateway upstream-monitor task already
                     // received them on the wire), emit them with only
@@ -4889,7 +4889,7 @@ async fn handle_op(
                                 return;
                             }
                         }
-                        // PVA-FR-8: raw fast path honors the pause gate
+                        // raw fast path honors the pause gate
                         // through the same owner as the decoded path.
                         // `held_raw` carries the latest squashed event
                         // across a pause; `type_changed` is a boundary
@@ -4910,7 +4910,7 @@ async fn handle_op(
                         )
                         .await
                         {
-                            // BR-R42: an upstream descriptor change
+                            // an upstream descriptor change
                             // arrives as a `type_changed=true` marker
                             // event. The body bytes are encoded for
                             // the NEW upstream descriptor but this
@@ -4958,7 +4958,7 @@ async fn handle_op(
                                 mon_acl_version_at_subscribe_cell
                                     .store(live_v, std::sync::atomic::Ordering::Release);
                             }
-                            // PVA-FR-8: a pause that began after the
+                            // a pause that began after the
                             // owner handed back this event (during the
                             // ACL revalidation await above) must HOLD it
                             // — squash to latest and resume-flush —
@@ -4969,7 +4969,7 @@ async fn handle_op(
                                 held_raw = Some(ev);
                                 continue;
                             }
-                            // BR-R44: on byte-order mismatch we decode the
+                            // on byte-order mismatch we decode the
                             // raw event under the upstream order and
                             // re-encode under the downstream order. Earlier
                             // code dropped the event with `continue`, so any
@@ -4989,7 +4989,7 @@ async fn handle_op(
                                     debug!(
                                         pv = %pv_name,
                                         error = %reason,
-                                        "F-G12 raw monitor reencode failed — terminating monitor with error"
+                                        "Raw monitor reencode failed — terminating monitor with error"
                                     );
                                     let _ = tx_clone.send(frame).await;
                                     return;
@@ -5016,9 +5016,9 @@ async fn handle_op(
                     };
                     // Diagnostic-only outbound-queue-depth crossing flag.
                     let mut queue_over_high = false;
-                    // PVA-FR-4: per-PV pipeline-window watermark levels
+                    // per-PV pipeline-window watermark levels
                     // `(low, high)` in credit units. `None` when the source
-                    // exposes no per-PV levels. BRIDGE-FR-11: the hysteresis
+                    // exposes no per-PV levels. the hysteresis
                     // state + ordering token is the SHARED `wm_seq` counter
                     // (crossed to "above" by the ACK dispatch, back to
                     // "below" here) so a gateway upstream paused on LOW can
@@ -5045,7 +5045,7 @@ async fn handle_op(
                         pv_name: &pv_name,
                         mon_ctx: &mon_ctx,
                     };
-                    // BRIDGE-FR-11 review: arm the withdraw-on-teardown
+                    // arm the withdraw-on-teardown
                     // finalizer for flow-controlled (gateway) ops only.
                     // Held live for the rest of the task so every exit
                     // path — normal end, early `return`, or AbortOnDrop
@@ -5088,7 +5088,7 @@ async fn handle_op(
                                 .store(live_v0, std::sync::atomic::Ordering::Release);
                         }
                     }
-                    // BR-R29: does this source emit *partial* monitor
+                    // does this source emit *partial* monitor
                     // updates (QSRV group monitor with a self-trigger)?
                     // When it does, every event after the first carries
                     // a wire changed-bitset narrowed to the leaves that
@@ -5132,7 +5132,7 @@ async fn handle_op(
                                 }
                             };
                         if let Some(initial) = initial {
-                            // BR-R39: pvxs `servermon.cpp:261` always lets
+                            // pvxs `servermon.cpp:261` always lets
                             // the first update enter the queue (it bypasses
                             // the change-or-mask gate), but `:174` still
                             // encodes the wire BitSet with
@@ -5171,7 +5171,7 @@ async fn handle_op(
                     // events between writes, keeping only the most recent
                     // value if more than `queue_depth` events stack up.
                     let mut squashing = false;
-                    // PVA-FR-8: value squashed while paused, flushed on
+                    // value squashed while paused, flushed on
                     // resume. `None` between batches.
                     let mut held: Option<crate::server_native::MonitorUpdate> = None;
                     loop {
@@ -5184,7 +5184,7 @@ async fn handle_op(
                         // drains on START). The decoded path has no
                         // subscription-boundary event, so nothing is
                         // yielded early while paused (`|_| false`).
-                        // BRIDGE-FR-12: events coalesced during a pause
+                        // events coalesced during a pause
                         // union their marked-leaf sets via
                         // `coalesce_monitor_update`.
                         let mut value = match next_monitor_event(
@@ -5228,7 +5228,7 @@ async fn handle_op(
                         }
                         // Drain extras; keep the latest value but union
                         // the coalesced events' marked-leaf sets
-                        // (BRIDGE-FR-12).
+                        //.
                         let mut squashed = 0usize;
                         loop {
                             match rx.try_recv() {
@@ -5247,7 +5247,7 @@ async fn handle_op(
                             debug!(pv = %pv_name, squashed, "monitor squashed events");
                             squashing = false;
                         }
-                        // PVA-FR-4: outbound-queue depth is a SERVER
+                        // outbound-queue depth is a SERVER
                         // diagnostic only — it is no longer used to fire
                         // the SharedPV watermark callbacks. pvxs ties
                         // `onHighMark`/`onLowMark` to the pipeline flow-
@@ -5267,7 +5267,7 @@ async fn handle_op(
                             queue_over_high = false;
                             debug!(pv = %pv_name, "monitor outbound queue drained");
                         }
-                        // EX-R1: pause and filter suppression MUST run
+                        // pause and filter suppression MUST run
                         // before pipeline credit is consumed. Pipeline
                         // credit accounts for monitor DATA frames sent
                         // to the client (pvxs `servermon.cpp:192`
@@ -5278,7 +5278,7 @@ async fn handle_op(
                         // a client with a finite pipeline window stalls
                         // waiting to ACK frames it never received.
                         //
-                        // PVA-FR-8: a pause that began while this value was
+                        // a pause that began while this value was
                         // already in hand must HOLD it (squash to latest),
                         // not drop it — resume flushes the held value. This
                         // mirrors pvxs keeping posts in the monitor queue
@@ -5289,7 +5289,7 @@ async fn handle_op(
                             held = Some(value);
                             continue;
                         }
-                        // BRIDGE-FR-12: past the pause gate the wire frame is
+                        // past the pause gate the wire frame is
                         // built from the PvField snapshot; the explicit
                         // marked-leaf set (when the source carries one) drives
                         // the changed-bitset below. `take()` leaves the moved
@@ -5300,7 +5300,7 @@ async fn handle_op(
                         // chain drops this event. Empty chain (the
                         // default) is a no-op pass-through.
                         //
-                        // EX-R12: a filter chain may TRANSFORM the
+                        // a filter chain may TRANSFORM the
                         // event (e.g. `arr` slices the array, `ts`
                         // rewrites the value). The transformed value
                         // from `FilterChain::apply` is bridged back
@@ -5343,9 +5343,9 @@ async fn handle_op(
                         // it is a no-op (mpsc backpressure stays the only
                         // gate). It runs after the pause/filter gates above
                         // so credit is consumed only for events that will
-                        // produce a DATA frame (EX-R1).
+                        // produce a DATA frame.
                         credit.acquire().await;
-                        // BRIDGE-FR-12: an explicit marked-leaf set from the
+                        // an explicit marked-leaf set from the
                         // source (a QSRV group `+trigger` target graph) takes
                         // precedence over both server-derived bitsets — pvxs
                         // `groupsource.cpp:288` marks each trigger target
@@ -5354,7 +5354,7 @@ async fn handle_op(
                         // turns the declared paths into the wire bitset
                         // intersected with the request mask.
                         //
-                        // BR-R29: otherwise, for a partial-emitting source,
+                        // otherwise, for a partial-emitting source,
                         // narrow the wire changed-bitset to exactly the leaves
                         // that differ from the previously emitted snapshot,
                         // intersected with the request mask — pvxs
@@ -5396,7 +5396,7 @@ async fn handle_op(
                     let finish = build_monitor_finish(ioid, order);
                     let _ = tx_clone.send(finish).await;
                 });
-                // PVA-FR-11: install the single-owner Executing<->Idle edge
+                // install the single-owner Executing<->Idle edge
                 // tracker for this op (see `MonitorStartControl`). The ctx is
                 // credential-scoped (no pv_request), matching the watermark
                 // path, so a fanout gateway can scope the upstream
@@ -5476,7 +5476,7 @@ async fn handle_op(
                         &rpc_ctx_val.authority,
                     )
                     .await;
-                // PVXS-SR-21: a panic in the user RPC handler becomes an error
+                // a panic in the user RPC handler becomes an error
                 // reply instead of skipping the reply below.
                 let result = catch_handler_panic(src.rpc_checked(
                     rpc_checked,
@@ -5590,7 +5590,7 @@ async fn handle_get_field(
             let pv_name = chan.name.clone();
             let src = source.clone();
             let tx_clone = tx.clone();
-            // BRIDGE-FR-8: introspect under the downstream connection's
+            // introspect under the downstream connection's
             // identity. pvxs builds the GET_FIELD ConnectOp with
             // `conn->cred` (`serverintrospect.cpp:66`); a gateway must
             // resolve the upstream type against THIS peer's credentials,
@@ -5685,7 +5685,7 @@ async fn send_op_error(
 use crate::proto::ReadExt;
 const _: u8 = PVA_VERSION;
 
-/// PVA-FR-8: single owner of the monitor pause/hold/squash transition.
+/// single owner of the monitor pause/hold/squash transition.
 ///
 /// Both the decoded and the raw-frame monitor forward loops acquire
 /// their next event through this helper so the pause gate is enforced
@@ -5709,7 +5709,7 @@ async fn next_monitor_event<T>(
     paused: &std::sync::atomic::AtomicBool,
     resume: &tokio::sync::Notify,
     is_boundary: impl Fn(&T) -> bool,
-    // BRIDGE-FR-12: combine an already-held event with a newer one when
+    // combine an already-held event with a newer one when
     // multiple events squash into `held` during a pause. The raw path
     // keeps the latest frame (`|_old, new| new`); the cooked path
     // unions the per-event marked-leaf sets so a coalesced burst still
@@ -5774,7 +5774,7 @@ fn build_monitor_payload(
     buf
 }
 
-/// BR-R29: build a MONITOR data frame whose wire changed-bitset is
+/// build a MONITOR data frame whose wire changed-bitset is
 /// narrowed to exactly the leaves that differ between `prev` and
 /// `value`, intersected with the request `mask`.
 ///
@@ -5834,7 +5834,7 @@ fn build_monitor_payload_partial(
     buf
 }
 
-/// BRIDGE-FR-12: build a MONITOR data frame whose wire changed-bitset
+/// build a MONITOR data frame whose wire changed-bitset
 /// is the explicit set of `marked_paths` (a QSRV group `+trigger`
 /// target set), intersected with the request `mask`.
 ///
@@ -5885,7 +5885,7 @@ fn build_monitor_payload_marked(
     buf
 }
 
-/// BRIDGE-FR-12: coalesce two cooked monitor updates when the server
+/// coalesce two cooked monitor updates when the server
 /// squashes events under back-pressure or pause. The newer value wins;
 /// the marked-leaf sets union so the emitted frame still marks every
 /// field that changed across the coalesced burst. A `None` on either
@@ -5964,7 +5964,7 @@ fn raw_monitor_frame(
     }
 }
 
-/// BR-R44: decode a raw MONITOR event captured under upstream
+/// decode a raw MONITOR event captured under upstream
 /// byte-order and re-encode it under the downstream connection's
 /// byte-order. Used when a gateway forwards raw events between
 /// peers with different negotiated byte orders.
@@ -6031,7 +6031,7 @@ fn reencode_raw_monitor(
     Ok(buf)
 }
 
-/// F-G12 raw-frame variant: build a MONITOR data frame from a
+/// Raw-frame variant: build a MONITOR data frame from a
 /// pre-encoded [`crate::server_native::RawMonitorEvent`]. The body
 /// (`changed | value | overrun`) is reused verbatim with a single
 /// `extend_from_slice` (memcpy); only the per-subscription PVA
@@ -6068,7 +6068,7 @@ fn build_monitor_finish(ioid: u32, order: ByteOrder) -> Vec<u8> {
     buf
 }
 
-/// EX-R12: build a MONITOR error frame — subcmd `0x10` (finish) plus
+/// build a MONITOR error frame — subcmd `0x10` (finish) plus
 /// a non-success `Status`. Used when a server-side transformation
 /// filter produces a value that cannot be represented in the
 /// monitor's negotiated wire descriptor; the stream ends with an
@@ -6123,7 +6123,7 @@ mod tests {
         mpsc::unbounded_channel().0
     }
 
-    /// BRIDGE-FR-11 review: `cross_watermark` is the primitive that
+    /// `cross_watermark` is the primitive that
     /// closes the residual pause/resume reorder. Tested by invariant
     /// boundary, not by narrative — it must fire once per real crossing
     /// (`None` when already in the requested state), encode the
@@ -6161,7 +6161,7 @@ mod tests {
         );
     }
 
-    /// BRIDGE-FR-11 review: the withdraw-on-teardown finalizer
+    /// the withdraw-on-teardown finalizer
     /// ([`WatermarkWithdrawOnDrop`]) closes the cross-op strand — a monitor
     /// op destroyed while it held its *shared* upstream paused must
     /// withdraw its vote when its subscriber task drops, or it can starve
@@ -6257,7 +6257,7 @@ mod tests {
         );
     }
 
-    /// PF-R1: a PVA `ulong[]` monitor value must reach the `arr`
+    /// a PVA `ulong[]` monitor value must reach the `arr`
     /// server-side filter as `EpicsValue::UInt64Array`. Before the
     /// fix `pv_value_leaf_to_epics`'s `array` helper had no `ULong`
     /// arm, so a wire-decoded `ScalarArrayTyped::ULong` fell through
@@ -6504,7 +6504,7 @@ mod tests {
         }
     }
 
-    /// BRIDGE-FR-12: coalescing two cooked updates under pause/squash.
+    /// coalescing two cooked updates under pause/squash.
     /// Tested by the marked-set boundaries, not by narrative: the newer
     /// value always wins; `Some+Some` unions (so a coalesced burst still
     /// marks every field that changed across it, deduped), and any
@@ -6545,7 +6545,7 @@ mod tests {
         );
     }
 
-    /// PVA-FR-8 owner: invariant boundaries of [`next_monitor_event`],
+    /// Owner: invariant boundaries of [`next_monitor_event`],
     /// the single owner of the monitor pause/hold/squash transition that
     /// both the decoded and the raw-frame forward loops acquire through.
     /// Tested by boundary (paused vs not, held empty vs set, boundary vs
@@ -6672,7 +6672,7 @@ mod tests {
         }
     }
 
-    /// PVA-R20: server pipeline parser accepts the typed-bool /
+    /// server pipeline parser accepts the typed-bool /
     /// typed-int shape pvxs `Context::request().record("pipeline",
     /// true)` produces, not just the string `"true"` form.
     fn make_pipeline_request(value_pipe: PvField, queue: PvField) -> PvField {
@@ -6964,7 +6964,7 @@ mod tests {
 
     #[test]
     fn ack_at_percentage_is_true_percentage_of_queue() {
-        // PVXS-SR-5: `ackAny="N%"` is a true percentage of the queue,
+        // `ackAny="N%"` is a true percentage of the queue,
         // computed as `clamp(percent,0,100) / 100 * limit` then clamped
         // to [1, limit]. (Pre-fix pvxs `servermon.cpp:563` omitted the
         // `/ 100`, saturating any percent >= 1% to the full queue.)
@@ -7473,12 +7473,12 @@ mod tests {
             payload.put_u8(mtype);
             crate::proto::encode_string_into("hello from client", order, &mut payload);
             let frame = synth_frame(Command::Message, order, payload);
-            // PVA-R28: MESSAGE handler now returns PvaResult; well-formed
+            // MESSAGE handler now returns PvaResult; well-formed
             // payload must succeed.
             handle_message(&frame, order, &peer).expect("well-formed MESSAGE");
         }
 
-        // PVA-R28: truncated MESSAGE is now a protocol-fatal decode
+        // truncated MESSAGE is now a protocol-fatal decode
         // error (matches pvxs `serverconn.cpp:323-336` throw). The
         // server loop turns this into a connection reset.
         let frame_short = synth_frame(Command::Message, order, vec![0x01, 0x02]);
@@ -7639,7 +7639,7 @@ mod tests {
         }
     }
 
-    /// BR-R29 residual regression: `build_monitor_payload_partial`
+    /// Residual regression: `build_monitor_payload_partial`
     /// narrows the wire changed-bitset to exactly the leaves that
     /// differ from the previous snapshot, intersected with the
     /// request mask — pvxs `servermon.cpp:174`
@@ -7693,7 +7693,7 @@ mod tests {
         );
         assert!(
             !data.changed.get(2),
-            "member `b` (bit 2) unchanged — must NOT be marked (BR-R29 narrowing)"
+            "member `b` (bit 2) unchanged — must NOT be marked (narrowing)"
         );
 
         // Full builder: marks both members — confirms the old
@@ -8333,7 +8333,7 @@ mod tests {
         (get("a"), get("b"), get("c"))
     }
 
-    /// EX-R3 regression: the default `ChannelSource::put_delta_checked`
+    /// Regression: the default `ChannelSource::put_delta_checked`
     /// merges the sparse delta over the PV's prior value. The
     /// prior-value read MUST run through `get_value_checked` (the
     /// credentialed path) — not the ctx-less `get_value` — so an
@@ -8445,12 +8445,12 @@ mod tests {
         assert_eq!(
             (a, b, c),
             (10, 99, 30),
-            "EX-R3: default put_delta_checked must merge the delta over the \
+            "default put_delta_checked must merge the delta over the \
              credentialed prior (10,20,30); got ({a},{b},{c})"
         );
         assert!(
             !used_ctxless.load(Ordering::SeqCst),
-            "EX-R3: the prior-value read must NOT go through the ctx-less get_value"
+            "the prior-value read must NOT go through the ctx-less get_value"
         );
     }
 
@@ -9072,7 +9072,7 @@ mod tests {
     }
 
     /// Build a channel whose `ioid` op was initialised as `kind`,
-    /// so an EX-R5 wrong-kind data frame can be driven against it.
+    /// so a wrong-kind data frame can be driven against it.
     #[cfg(test)]
     fn primed_channels_with_kind(sid: u32, ioid: u32, kind: OpKind) -> HashMap<u32, ChannelState> {
         let intro = three_field_intro();
@@ -9093,7 +9093,7 @@ mod tests {
         channels
     }
 
-    /// EX-R5 regression: the dedicated `handle_process` data phase must
+    /// Regression: the dedicated `handle_process` data phase must
     /// reject a frame whose IOID was initialised as a different
     /// operation class. Before the fix it only checked
     /// `ch.ops.contains_key(ioid)`, so a client could INIT a GET (or
@@ -9136,16 +9136,16 @@ mod tests {
         .await;
         assert!(
             res.is_err(),
-            "EX-R5: PROCESS data against a GET-initialised IOID must be a protocol error"
+            "PROCESS data against a GET-initialised IOID must be a protocol error"
         );
         assert_eq!(
             process_hits.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "EX-R5: record processing must NOT run for a wrong-kind PROCESS frame"
+            "record processing must NOT run for a wrong-kind PROCESS frame"
         );
     }
 
-    /// EX-R5 regression: `handle_process` must also reject a PROCESS
+    /// Regression: `handle_process` must also reject a PROCESS
     /// data frame against a MONITOR-initialised IOID.
     #[tokio::test]
     async fn ex_r5_process_data_rejects_monitor_initialised_ioid() {
@@ -9181,12 +9181,12 @@ mod tests {
         .await;
         assert!(
             res.is_err(),
-            "EX-R5: PROCESS data against a MONITOR-initialised IOID must be a protocol error"
+            "PROCESS data against a MONITOR-initialised IOID must be a protocol error"
         );
         assert_eq!(
             process_hits.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "EX-R5: record processing must NOT run for a wrong-kind PROCESS frame"
+            "record processing must NOT run for a wrong-kind PROCESS frame"
         );
     }
 
@@ -9336,7 +9336,7 @@ mod tests {
         );
     }
 
-    /// EX-R5 regression: the dedicated `handle_put_get` data phase must
+    /// Regression: the dedicated `handle_put_get` data phase must
     /// reject a frame whose IOID was initialised as a different
     /// operation class (here a GET). Before the fix it extracted
     /// `(intro, mask)` from whatever op existed and performed a
@@ -9389,11 +9389,11 @@ mod tests {
         .await;
         assert!(
             res.is_err(),
-            "EX-R5: PUT_GET data against a GET-initialised IOID must be a protocol error"
+            "PUT_GET data against a GET-initialised IOID must be a protocol error"
         );
     }
 
-    /// EX-R5 regression: `handle_put_get` must also reject a PUT_GET
+    /// Regression: `handle_put_get` must also reject a PUT_GET
     /// data frame against a PUT-initialised IOID.
     #[tokio::test]
     async fn ex_r5_put_get_data_rejects_put_initialised_ioid() {
@@ -9442,7 +9442,7 @@ mod tests {
         .await;
         assert!(
             res.is_err(),
-            "EX-R5: PUT_GET data against a PUT-initialised IOID must be a protocol error"
+            "PUT_GET data against a PUT-initialised IOID must be a protocol error"
         );
     }
 
@@ -10838,7 +10838,7 @@ mod autoexec_tests {
 
 #[cfg(test)]
 mod r14_tests {
-    //! PVA-R14 regression: source calls must not block the TCP read loop.
+    //! Regression: source calls must not block the TCP read loop.
     //!
     //! A SlowGetSource delays `get_value` by 500 ms. After the fix, `handle_op`
     //! spawns the source call and returns in < 50 ms. On main (pre-fix), `handle_op`

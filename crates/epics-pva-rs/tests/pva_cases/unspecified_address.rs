@@ -1,4 +1,4 @@
-//! PVA-R18 wire-shape: 16-byte unspecified address decode.
+//! Wire-shape: 16-byte unspecified address decode.
 //!
 //! pvxs `src/evhelper.cpp:911-937` decodes the all-zero 16-byte
 //! address as IPv6 unspecified (`SockAddr::isAny()` true).
@@ -37,7 +37,7 @@ fn golden_pvxs_ipv6_unspecified_is_none_via_strict() {
 
 #[test]
 fn golden_pvxs_ipv6_unspecified_is_wildcard_via_allow_unspec() {
-    // PVA-R18 helper: returns IPv6 :: so caller can apply
+    // Helper: returns IPv6 :: so caller can apply
     // pvxs-style UDP-source substitution.
     let ip = ip_from_bytes_allow_unspec(&[0u8; 16]);
     assert_eq!(ip, IpAddr::V6(Ipv6Addr::UNSPECIFIED));

@@ -141,7 +141,7 @@ impl CompositeSource {
             .collect()
     }
 
-    /// BRIDGE-FR-8: single owner of credentialed inner-source selection
+    /// single owner of credentialed inner-source selection
     /// for every `*_checked` operation. Resolves the matched source via
     /// `has_pv_checked` — never the credential-free `has_pv` — so a
     /// gateway inner source opens/refreshes upstream state under THIS
@@ -208,7 +208,7 @@ impl ChannelSource for CompositeSource {
         let snapshot = self.snapshot();
         async move {
             for src in snapshot {
-                // BRIDGE-FR-8: select under the downstream peer's identity
+                // select under the downstream peer's identity
                 // (`has_pv_checked`), not credential-free `has_pv` — a
                 // gateway inner source must resolve the revalidation target
                 // against THIS peer's upstream state, matching the
@@ -296,7 +296,7 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    /// BRIDGE-FR-8: the find-loop itself routes through the inner
+    /// the find-loop itself routes through the inner
     /// `has_pv_checked` so a gateway source resolves existence under the
     /// downstream peer's identity — calling the credential-free `has_pv`
     /// here would re-open the shared-identity upstream cache that this
@@ -318,7 +318,7 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    /// BRIDGE-FR-8: credential-aware introspection routed to the matched
+    /// credential-aware introspection routed to the matched
     /// inner source via `has_pv_checked`/`get_introspection_checked`, so
     /// descriptor discovery for a credentialed downstream peer never
     /// opens upstream state under the shared gateway identity.
@@ -511,7 +511,7 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    /// BR-R14: forward the downstream monitor options to the matched
+    /// forward the downstream monitor options to the matched
     /// inner source. A composite over a gateway source must carry
     /// `opts` through so the gateway can reject options it cannot
     /// honor across a fanout monitor. Decoded-`PvField` form, retained
@@ -530,7 +530,7 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    /// BRIDGE-FR-12: cooked (`MonitorUpdate`) counterpart of
+    /// cooked (`MonitorUpdate`) counterpart of
     /// [`Self::subscribe_checked_opts`] — the server's monitor dispatch
     /// path. Resolves the owning inner source and forwards `opts` so a
     /// gateway can reject options it cannot honor across a fanout monitor.
@@ -551,7 +551,7 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    /// BR-R14 raw-path counterpart of [`Self::subscribe_checked_opts`].
+    /// Raw-path counterpart of [`Self::subscribe_checked_opts`].
     fn subscribe_raw_checked_opts(
         &self,
         checked: AccessChecked,
@@ -635,7 +635,7 @@ impl ChannelSource for CompositeSource {
         &self,
         name: &str,
     ) -> impl std::future::Future<Output = Option<(usize, usize)>> + Send {
-        // BRIDGE-FR-11: surface the watermark levels of the inner source
+        // surface the watermark levels of the inner source
         // that serves `name`, so the server monitor loop drives the
         // pause/resume hysteresis and reaches the per-source
         // notify_watermark callback below.
@@ -685,7 +685,7 @@ impl ChannelSource for CompositeSource {
         ctx: &crate::server_native::source::ChannelContext,
         start: bool,
     ) {
-        // PVA-FR-11: same wrapper-severs-override defect family as
+        // same wrapper-severs-override defect family as
         // `notify_watermark`/`monitor_watermarks` above. The server's
         // MonitorStartControl fires the Idle↔Executing edge against the
         // *bound* source, which `PvaServer::start` makes a CompositeSource.
@@ -853,7 +853,7 @@ mod tests {
         );
     }
 
-    /// BRIDGE-FR-11 + watermark-routing fix: the composite must report
+    /// Watermark-routing fix: the composite must report
     /// the `monitor_watermarks` levels of the source that **owns** the
     /// name (resolved by `has_pv`, registration order), not the first
     /// source that reports any levels. Pre-fix the composite used
@@ -1105,7 +1105,7 @@ mod tests {
         assert_eq!(pvs, vec!["alpha".to_string(), "beta".to_string()]);
     }
 
-    /// BRIDGE-FR-8: every composite `*_checked` op must select the
+    /// every composite `*_checked` op must select the
     /// inner source through `has_pv_checked` — carrying the downstream
     /// peer's credentials — never the credential-free `has_pv`. For a
     /// gateway inner source the plain `has_pv` opens the shared-identity

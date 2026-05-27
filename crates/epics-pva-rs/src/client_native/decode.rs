@@ -164,7 +164,7 @@ pub fn decode_search_response(frame: &Frame) -> PvaResult<SearchResponse> {
         );
     }
 
-    // PVA-R18: a wildcard/unspecified server address means "use the
+    // a wildcard/unspecified server address means "use the
     // datagram source IP". pvxs `client.cpp:841-843` does the
     // substitution; we carry the raw advertised address through here
     // and let the search engine apply the substitution on receipt
@@ -213,7 +213,7 @@ pub fn decode_connection_validation_request(
     let server_registry_size = cur
         .get_u16(order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    // PVA-R25: pvxs `pvaproto.h:284-305` rejects the `0xFF` null
+    // pvxs `pvaproto.h:284-305` rejects the `0xFF` null
     // marker for a `Size` decode unless the caller passes
     // `allow_null=true`. The CONNECTION_VALIDATION auth-method count
     // is a non-null Size: pvxs `clientconn.cpp:228-232` decodes via
@@ -317,7 +317,7 @@ pub struct OpDataResponse {
     pub status: Status,
     pub changed: BitSet,
     pub value: PvField,
-    /// PVA-FR-10: MONITOR DATA carries an overrun bitset after the value
+    /// MONITOR DATA carries an overrun bitset after the value
     /// — the server sets bits for fields it coalesced/squashed because
     /// the client fell behind. Non-empty ⟹ a server-side squash
     /// occurred (pvxs `clientmon.cpp:549-558` sets `servSquash` when any
@@ -514,7 +514,7 @@ pub fn decode_op_response_cached(
     )
     .map_err(|e| PvaError::Decode(e.to_string()))?;
     // MONITOR data carries the overrun BitSet after the partial value.
-    // PVA-FR-10: preserve it (a non-empty set means the server squashed)
+    // preserve it (a non-empty set means the server squashed)
     // instead of decoding-and-discarding. GET/PUT carry none → empty.
     let overrun = if cmd == Command::Monitor {
         BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?
@@ -962,7 +962,7 @@ mod tests {
         }
     }
 
-    /// PVA-FR-10: a MONITOR DATA frame ends with an overrun bitset; the
+    /// a MONITOR DATA frame ends with an overrun bitset; the
     /// decoder must preserve it on `OpDataResponse` (non-empty ⟹ the
     /// server squashed) instead of decoding-and-discarding it. An empty
     /// `changed` bitset means no value bytes follow, so this exercises
@@ -1098,7 +1098,7 @@ mod tests {
         }
     }
 
-    /// PVA-FR-10: `stats(true)` resets `n_srv_squash` (and the other
+    /// `stats(true)` resets `n_srv_squash` (and the other
     /// running counters) while preserving the configured `limit_queue`.
     #[test]
     fn stats_reset_clears_srv_squash_keeps_limit() {

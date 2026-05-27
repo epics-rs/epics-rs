@@ -924,7 +924,7 @@ pub(crate) async fn search_matched_cids(
 /// still a valid frame — used as an answer to `MustReply`-flagged
 /// SEARCHes (pvlist-style discovery probes) so the requester can build
 /// its server list.
-// PVA-R11: exposed for tcp.rs so the TCP-circuit SEARCH handler
+// exposed for tcp.rs so the TCP-circuit SEARCH handler
 // reuses the same wire shape the UDP responder emits.
 pub(crate) fn build_search_response_proto(
     guid: [u8; 12],
@@ -985,7 +985,7 @@ fn build_beacon(
     let addr = ip_to_bytes(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     payload.extend_from_slice(&addr);
     payload.put_u16(tcp_port, order);
-    // PVA-R10: beacons advertise the runtime transport. Pre-fix
+    // beacons advertise the runtime transport. Pre-fix
     // Rust hard-coded "tcp" even when SEARCH_RESPONSE said "tls",
     // making discovery inconsistent across the two announcement
     // channels. pvxs `server.cpp:738-745, 773-781` keeps both
@@ -999,7 +999,7 @@ fn build_beacon(
     out
 }
 
-// PVA-R11: exposed pub(crate) so the TCP-circuit SEARCH handler in
+// exposed pub(crate) so the TCP-circuit SEARCH handler in
 // tcp.rs can reuse this struct + the parser below. The fields are
 // read-only after parse; TCP only consults `queries` and `protocols`
 // (and `seq` for the response echo).
@@ -1026,7 +1026,7 @@ pub(crate) struct SearchRequest {
     /// `nreply==0`. pvxs honours it at `server.cpp:730-732`
     /// (`if(nreply==0 && !msg.mustReply) return;`).
     pub(crate) must_reply: bool,
-    /// PVA-R10: the transport protocols the client requested in this
+    /// the transport protocols the client requested in this
     /// SEARCH. pvxs `udp_collector.cpp:408-421` records whether
     /// "tcp" appeared and `:424-443` only queues channel matches
     /// when it did. Empty = legacy SEARCH that omitted the field
@@ -1093,7 +1093,7 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     };
     let reply_port = p.get_u16(order).ok()?;
     let n_proto = decode_size(&mut p, order).ok().flatten()? as usize;
-    // PVA-R10: collect the requested protocol list so the responder
+    // collect the requested protocol list so the responder
     // can filter to PVs whose transport matches. pvxs
     // `udp_collector.cpp:408-421` records whether the SEARCH
     // included "tcp" and `:424-443` only queues matches when it

@@ -157,7 +157,7 @@ pub async fn op_get_raw(
 
 /// Bound the search-and-connect phase by the operation's overall
 /// timeout. Now that `Channel::ensure_active` has no caller-side
-/// timeout for *any* reason (PVA-FR-12: `Initial` and `Reconnect`
+/// timeout for *any* reason (`Initial` and `Reconnect`
 /// both stay pending until a SEARCH_RESPONSE arrives — pvxs
 /// `Channel::disconnect` parity, the search engine drives recovery
 /// indefinitely), one-shot ops like `pvget` / `pvput` / `pvrpc` /
@@ -170,7 +170,7 @@ pub async fn op_get_raw(
 /// including the byte-order pre-read that `context.rs` does to
 /// encode a custom `pvRequest` before the op proper — through here,
 /// so the invariant "a one-shot op's resolve is bounded by
-/// `op_timeout`" holds at every call site. (Before PVA-FR-12 the
+/// `op_timeout`" holds at every call site. (Previously, the
 /// 200 ms `MULTI_SERVER_WINDOW` cap inside `ensure_active` masked
 /// those pre-reads; removing it exposed every bare-`ensure_active`
 /// one-shot site as an unbounded hang.) `pvmonitor*` loops keep
@@ -222,7 +222,7 @@ async fn op_get_inner(
                     return Ok(((*pv.0).clone(), pv.1));
                 }
                 Ok(None) | Err(_) => {
-                    // PVA-R12: warm-GET failure abandoned the cached
+                    // warm-GET failure abandoned the cached
                     // (sid, ioid) without cleanup. The server's
                     // per-channel op slot for that IOID stayed alive
                     // until TCP close, and the per-circuit Reusable
@@ -597,7 +597,7 @@ fn assign_at_path(root: &mut PvField, parts: &[&str], leaf: PvField) {
 /// supplies the INIT pvRequest (e.g. `-r record[process=true]`); when
 /// `None`, the request selects exactly the assigned field paths.
 ///
-/// PVA-FR-6: one prototype-based PUT, not one round-trip per field and
+/// one prototype-based PUT, not one round-trip per field and
 /// not a single string concatenated into `.value`.
 pub async fn op_put_fields(
     channel: &Arc<Channel>,
@@ -1057,7 +1057,7 @@ pub async fn op_put_value(
     // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
     // only the fields whose bit is set. Encode consistently.
     // Wrap a bare-leaf `value` at the `value` path when `intro` is a
-    // structure (MR-R23: pvalink OUT arrays arrive as a bare
+    // structure (pvalink OUT arrays arrive as a bare
     // `ScalarArray`, which would otherwise encode to zero bytes).
     let put_value = coerce_typed_put_value(&intro, value)?;
     encode_pv_field_with_bitset(&put_value, &intro, &changed, 0, order, &mut payload);
@@ -1139,7 +1139,7 @@ pub async fn op_put_value_raw(
         changed.set(0);
     }
     changed.write_into(order, &mut payload);
-    // MR-R23: wrap a bare-leaf `value` (pvalink OUT arrays) at the
+    // wrap a bare-leaf `value` (pvalink OUT arrays) at the
     // `value` path so the encoder sees a structurally-matching value.
     let put_value = coerce_typed_put_value(&intro, value)?;
     encode_pv_field_with_bitset(&put_value, &intro, &changed, 0, order, &mut payload);
@@ -1595,7 +1595,7 @@ fn classify_raw_monitor_frame(payload: &[u8], order: ByteOrder) -> RawMonitorFra
     RawMonitorFrameKind::Skip
 }
 
-/// F-G12 raw-frame monitor entry: like [`op_monitor`] but the
+/// Raw-frame monitor entry: like [`op_monitor`] but the
 /// callback receives the **raw MONITOR DATA body bytes** (the
 /// `changed | value | overrun` triplet from the wire) instead of a
 /// decoded [`PvField`]. Bridge gateways feed these directly into
@@ -1754,7 +1754,7 @@ where
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
-    // PVA-R1: when `pipeline_size > 0`, inject
+    // when `pipeline_size > 0`, inject
     // `record._options.pipeline = "true"` + `queueSize` into the
     // pvRequest and set the MONITOR INIT pipeline bit + initial
     // nack trailer. Server-side credit window is keyed on the
@@ -1868,7 +1868,7 @@ where
             RawMonitorFrameKind::Skip => continue,
             RawMonitorFrameKind::FinishOk => {
                 server.unregister_ioid(ioid);
-                // PVA-R17: clear the handle's `active` tuple on FINISH so
+                // clear the handle's `active` tuple on FINISH so
                 // a later `pause()` / `resume()` / `drop()` doesn't act on
                 // a (sid, ioid) the client has already unregistered and the
                 // server has already finalised. pvxs `clientmon.cpp:720-729`
@@ -1896,7 +1896,7 @@ where
         if let Some(s) = &state {
             let mut st = s.stats.lock();
             st.n_delivered += 1;
-            // PVA-FR-10: this raw forwarding path's contract is to relay
+            // this raw forwarding path's contract is to relay
             // the body (changed | value | overrun) downstream WITHOUT an
             // intermediate decode, so it does not parse the trailing
             // overrun bitset and `n_srv_squash` is not derived here.
@@ -2192,7 +2192,7 @@ where
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
 
-    // PVA-R1: same pipeline-injection treatment as op_monitor_raw_frames.
+    // same pipeline-injection treatment as op_monitor_raw_frames.
     // A caller-supplied `raw_pv_req` overrides — it already has the
     // pipeline options the caller wants (or doesn't); auto-injection
     // only applies on the default-pvRequest path.
@@ -2218,7 +2218,7 @@ where
 
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Monitor.code());
 
-    // INIT (with pipeline negotiation when applicable — PVA-R1).
+    // INIT (with pipeline negotiation when applicable).
     let init_req = codec.build_monitor_init(
         sid,
         ioid,
@@ -2301,7 +2301,7 @@ where
         };
         match decode_op_response(&frame, Some(&intro)) {
             Ok(OpResponse::Data(d)) => {
-                // PVA-FR-10: a non-empty overrun bitset means the server
+                // a non-empty overrun bitset means the server
                 // coalesced updates because we fell behind. Capture it
                 // before `d.value` is moved below.
                 let srv_squash = !d.overrun.is_empty();
@@ -2736,7 +2736,7 @@ fn sentinel_all_fields() -> &'static [u8] {
 /// carries the parsed value; every other field gets a default. Mirrors
 /// pvxs `PutBuilder::set("alarm.severity", val)` semantics — the
 /// matching changed-bitset must be built separately via
-/// [`crate::pvdata::FieldDesc::bit_for_path`]. F-G5.
+/// [`crate::pvdata::FieldDesc::bit_for_path`].
 fn build_put_value_for_path(
     desc: &FieldDesc,
     field_path: &[&str],

@@ -654,7 +654,7 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
                         assert_eq!(n, 1023);
                     }
                 }
-                // F-G10: typed fast-path landing.
+                // typed fast-path landing.
                 PvField::ScalarArrayTyped(arr) => {
                     let ints = arr.as_ints().expect("expected int array");
                     assert_eq!(ints.len(), 1024);
@@ -916,7 +916,7 @@ async fn rust_client_ntscalar_array_get_from_pvxs() {
                     assert!((d - 10.5).abs() < 1e-6);
                 }
             }
-            // F-G10: typed fast-path landing.
+            // typed fast-path landing.
             Some(PvField::ScalarArrayTyped(arr)) => {
                 let doubles = arr.as_doubles().expect("expected double array");
                 assert_eq!(doubles.len(), 10);

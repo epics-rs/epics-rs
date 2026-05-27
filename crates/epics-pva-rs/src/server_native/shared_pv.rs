@@ -97,7 +97,7 @@ pub type LifecycleFn = Arc<dyn Fn(&SharedPV) + Send + Sync>;
 /// ```
 pub type WatermarkFn = Arc<dyn Fn(&SharedPV) + Send + Sync>;
 
-/// PVA-FR-11: monitor start/stop callback. Fired with `true` when a
+/// monitor start/stop callback. Fired with `true` when a
 /// downstream client begins or resumes MONITOR updates and `false` when
 /// it pauses, cancels, disconnects, or destroys the subscription.
 /// Mirrors pvxs `MonitorControlOp::onStart(std::function<void(bool)>)`
@@ -130,7 +130,7 @@ struct MonitorQueueShared {
     /// Set in MonitorInbox::drop; post() checks this to decide whether to remove
     /// the outbox from the subscriber list.
     receiver_dropped: AtomicBool,
-    /// Live `MonitorOutbox` endpoints for this queue. MR-R2: closure
+    /// Live `MonitorOutbox` endpoints for this queue. closure
     /// (`producer_done`) must be tied to the *last* producer endpoint
     /// disappearing, not to any single cloned endpoint dropping. A
     /// temporary clone made for a lock-free post (e.g. `put_delta`'s
@@ -141,7 +141,7 @@ struct MonitorQueueShared {
 
 /// Sender half of a per-subscriber queue. Held by `SharedPV::subscribers`.
 ///
-/// MR-R2: `Clone` is implemented by hand (not derived) so each clone
+/// `Clone` is implemented by hand (not derived) so each clone
 /// increments `producer_count`. The invariant — "a monitor queue
 /// becomes `producer_done` only when its *last* `MonitorOutbox`
 /// endpoint drops" — is enforced structurally here and in `Drop`,
@@ -211,7 +211,7 @@ impl MonitorOutbox {
 
 impl Clone for MonitorOutbox {
     fn clone(&self) -> Self {
-        // MR-R2: every live endpoint counts. A clone made for a
+        // every live endpoint counts. A clone made for a
         // lock-free post is a producer endpoint until it drops.
         self.shared.producer_count.fetch_add(1, Ordering::AcqRel);
         Self {
@@ -222,7 +222,7 @@ impl Clone for MonitorOutbox {
 
 impl Drop for MonitorOutbox {
     fn drop(&mut self) {
-        // MR-R2: signal `producer_done` only when the *last* producer
+        // signal `producer_done` only when the *last* producer
         // endpoint for this queue drops. A transient clone (e.g. the
         // `put_delta` snapshot) drops first while the canonical outbox
         // held in `SharedPV::subscribers` is still alive, so the
@@ -307,7 +307,7 @@ struct Inner {
     /// Outbox drained back to zero (or below `low_watermark`).
     /// Producer un-throttle hint.
     on_low_mark: Option<WatermarkFn>,
-    /// PVA-FR-11: monitor start/stop hook (pvxs `onStart`). See
+    /// monitor start/stop hook (pvxs `onStart`). See
     /// [`OnStartFn`].
     on_start: Option<OnStartFn>,
 }
@@ -387,7 +387,7 @@ impl SharedPV {
     /// updates when a subscriber's outbox is full. Returns the number
     /// of subscribers we successfully sent to.
     ///
-    /// PVA-R5: a descriptor/value mismatch is logged at warn level
+    /// a descriptor/value mismatch is logged at warn level
     /// and the post is dropped (returns 0). The shape is "best
     /// effort" because `-> usize` predates Result-typed posts;
     /// internal callers that can handle a Result should use
@@ -411,7 +411,7 @@ impl SharedPV {
         g.subscribers.len()
     }
 
-    /// Result-typed post with descriptor enforcement. PVA-R5:
+    /// Result-typed post with descriptor enforcement.
     /// mirrors pvxs `sharedpv.cpp:417-431`. Returns `Err` when the
     /// PV is not yet opened, or when the value's runtime shape
     /// does not fit the opened descriptor. Subscribers see the new
@@ -553,7 +553,7 @@ impl SharedPV {
                     value: merged,
                 },
                 None => {
-                    // PVA-R5: descriptor enforcement for the
+                    // descriptor enforcement for the
                     // no-handler store path. Without a check the
                     // merged value could carry a shape unrelated
                     // to the opened descriptor (pvxs `sharedpv.cpp:
@@ -790,7 +790,7 @@ impl SharedPV {
         (g.on_high_mark.clone(), g.on_low_mark.clone())
     }
 
-    /// PVA-FR-11: install a monitor start/stop callback. Fired with
+    /// install a monitor start/stop callback. Fired with
     /// `true` when a downstream client begins or resumes MONITOR updates
     /// and `false` when it pauses, cancels, disconnects, or destroys the
     /// subscription. Mirrors pvxs `MonitorControlOp::onStart`. Use it to
@@ -1063,7 +1063,7 @@ impl super::source::ChannelSource for SharedSource {
         }
     }
 
-    /// PVA-FR-11: override default no-op to fire the per-PV `on_start`
+    /// override default no-op to fire the per-PV `on_start`
     /// callback so a producer can start/stop work as clients begin and
     /// stop consuming. Mirrors pvxs `MonitorControlOp::onStart`. As with
     /// the watermark callbacks, credential scoping (`_ctx`) carries no
@@ -1081,7 +1081,7 @@ impl super::source::ChannelSource for SharedSource {
         }
     }
 
-    /// PVA-FR-4: expose the per-PV `(low, high)` watermark levels so the
+    /// expose the per-PV `(low, high)` watermark levels so the
     /// monitor loop fires the callbacks off the pipeline window rather
     /// than server-queue occupancy.
     async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
@@ -1156,7 +1156,7 @@ mod tests {
         }
     }
 
-    /// PVA-R6 regression: when a subscriber's queue is full, a normal post
+    /// Regression: when a subscriber's queue is full, a normal post
     /// must replace the queue TAIL (squash-to-tail, pvxs servermon.cpp:283-286),
     /// NOT drop the new value.
     ///
@@ -1209,7 +1209,7 @@ mod tests {
         assert_eq!(pv.watermarks(), (8, 128));
     }
 
-    /// PVA-FR-4: the source exposes per-PV `(low, high)` watermark
+    /// the source exposes per-PV `(low, high)` watermark
     /// levels to the monitor loop (which fires the callbacks off the
     /// pipeline window), and `set_*_watermark` retunes them. An unknown
     /// PV / level-less source returns `None`.
@@ -1226,7 +1226,7 @@ mod tests {
         assert_eq!(src.monitor_watermarks("nope").await, None);
     }
 
-    /// MR-R2 regression: a no-handler `put_delta` to a `SharedPV` with
+    /// Regression: a no-handler `put_delta` to a `SharedPV` with
     /// a live subscriber clones `g.subscribers` for a lock-free post.
     /// Before the fix, the cloned `MonitorOutbox` vector dropped at
     /// function exit and each clone's `Drop` set `producer_done = true`,
@@ -1275,7 +1275,7 @@ mod tests {
         assert_eq!(extract_int(&v2.unwrap()), 22);
     }
 
-    /// MR-R2: explicit `close()` must still terminate the subscriber
+    /// explicit `close()` must still terminate the subscriber
     /// inbox — closure is an owner action, and the invariant only
     /// forbids *internal clone drops* from closing the queue.
     #[tokio::test]

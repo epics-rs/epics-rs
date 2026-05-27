@@ -36,14 +36,14 @@ pub struct ChannelContext {
     /// `AUTHORITY(...)` rule scopes match against this.
     pub authority: String,
     /// Group / role claims advertised by the downstream peer's auth
-    /// method. MR-R11: parsed off the `ca` auth payload's
+    /// method. parsed off the `ca` auth payload's
     /// `groups`/`roles` array into `ClientCredentials::roles`, then
     /// forwarded here so role-based ACF rules (`R member group:ops`,
     /// `role/...` credential strings) can be enforced for native PVA
     /// clients. Empty for methods that carry no role list.
     pub roles: Vec<String>,
     /// Decoded INIT pvRequest value for the current operation, when
-    /// the wire layer captured one. BR-R3: PVA PUT INIT carries
+    /// the wire layer captured one. PVA PUT INIT carries
     /// `record._options.process`/`block`; the data-phase payload is
     /// just the delta, so sources that interpret per-operation
     /// options must consult this rather than the value.
@@ -59,7 +59,7 @@ pub struct ChannelContext {
 /// pvRequest, surfaced to [`ChannelSource`] implementors that need to
 /// reason about whether they can honor them.
 ///
-/// BR-R14: a PVA-to-PVA gateway fans one upstream monitor out to N
+/// a PVA-to-PVA gateway fans one upstream monitor out to N
 /// downstream subscribers. The upstream monitor is opened with the
 /// gateway's *default* pvRequest, so a downstream option that changes
 /// *upstream event production* is not transparent through the fanout:
@@ -129,7 +129,7 @@ impl MonitorOptions {
     }
 }
 
-/// BRIDGE-FR-11: which pipeline-window watermark transition a downstream
+/// which pipeline-window watermark transition a downstream
 /// monitor op just made. A gateway fans ONE upstream monitor out to N
 /// downstream subscribers of the same PV+credential and must
 /// reference-count their pause votes — pausing the shared upstream only
@@ -149,7 +149,7 @@ pub enum WatermarkKind {
     Withdraw,
 }
 
-/// BRIDGE-FR-11: a downstream monitor op's pipeline-window watermark
+/// a downstream monitor op's pipeline-window watermark
 /// transition, carrying the op identity + ordering token a gateway needs
 /// to compose pause votes across co-subscribers of one shared upstream
 /// entry. See [`ChannelSource::notify_watermark`].
@@ -221,7 +221,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// Credential-aware [`Self::has_pv`], called at CREATE_CHANNEL time
     /// with the downstream connection's [`ChannelContext`].
     ///
-    /// BRIDGE-FR-8: a gateway must resolve a credentialed downstream
+    /// a gateway must resolve a credentialed downstream
     /// channel's existence against that peer's own upstream identity, not
     /// the shared gateway identity — otherwise the upstream cache/monitor
     /// is opened under the wrong audit identity as a side effect of
@@ -241,7 +241,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// CREATE_CHANNEL and GET_FIELD time with the downstream connection's
     /// [`ChannelContext`].
     ///
-    /// BRIDGE-FR-8: descriptor discovery for a credentialed downstream
+    /// descriptor discovery for a credentialed downstream
     /// peer must open/refresh upstream state under that peer's identity,
     /// not the shared gateway identity (pvxs builds the GET_FIELD
     /// `ConnectOp` with `conn->cred`, `serverintrospect.cpp:66`). The
@@ -286,7 +286,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         let account = ctx.account.clone();
         let method = ctx.method.clone();
         let authority = ctx.authority.clone();
-        // PVA-FR-3: forward the peer's role claims so `role/<name>` UAG
+        // forward the peer's role claims so `role/<name>` UAG
         // members can match.
         let roles = ctx.roles.clone();
         let name = pv_name.to_string();
@@ -394,7 +394,7 @@ pub trait ChannelSource: Send + Sync + 'static {
             // Default (non-atomic) merge for sources without a
             // contained merge primitive. Single-client correct.
             //
-            // EX-R3: the prior-value read MUST run under the same
+            // the prior-value read MUST run under the same
             // authenticated identity as the write. Reading the prior
             // through the ctx-less `get_value` would let an
             // access-controlled or credential-routed source resolve
@@ -444,7 +444,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
-    /// Optional **raw-frame subscribe** (F-G12). When the source can
+    /// Optional **raw-frame subscribe**. When the source can
     /// hand the server pre-encoded MONITOR DATA payloads (e.g. the
     /// pva_gateway upstream-monitor task already received them on the
     /// wire and never decoded them), the server skips its own
@@ -481,7 +481,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
-    /// BR-R14: MONITOR with the downstream's event-affecting pvRequest
+    /// MONITOR with the downstream's event-affecting pvRequest
     /// options, decoded-`PvField` form. The default impl ignores `opts`
     /// and delegates to [`Self::subscribe_checked`] — correct for any
     /// source that owns the record directly, since it applies pipeline /
@@ -507,7 +507,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         self.subscribe_checked(checked, ctx)
     }
 
-    /// BRIDGE-FR-12: MONITOR with event-affecting pvRequest options,
+    /// MONITOR with event-affecting pvRequest options,
     /// **cooked** form — the stream carries [`MonitorUpdate`] so a
     /// `+trigger` graph can mark which members changed. The default impl
     /// delegates to [`Self::subscribe_checked_opts`] and wraps each value
@@ -528,7 +528,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
-    /// BR-R14 raw-path counterpart of [`Self::subscribe_checked_opts`].
+    /// Raw-path counterpart of [`Self::subscribe_checked_opts`].
     /// Default impl ignores `opts` and delegates to
     /// [`Self::subscribe_raw_checked`].
     fn subscribe_raw_checked_opts(
@@ -621,7 +621,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
-    /// BR-R29: does this source emit *partial* monitor updates for
+    /// does this source emit *partial* monitor updates for
     /// `name` — i.e. each event changes only a subset of the
     /// structure's leaves, not the whole value?
     ///
@@ -652,7 +652,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// overrides to fire the per-PV `on_high_mark` callback.
     /// Mirrors pvxs `MonitorControlOp::onHighMark`.
     ///
-    /// BRIDGE-FR-11: a downstream monitor op crossed a pipeline-window
+    /// a downstream monitor op crossed a pipeline-window
     /// watermark (`ev.kind`: [`WatermarkKind::Pause`] on the LOW edge,
     /// [`WatermarkKind::Resume`] on the HIGH edge) or its subscriber task
     /// ended ([`WatermarkKind::Withdraw`]). Default no-op;
@@ -674,7 +674,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         let _ = (name, ctx, ev);
     }
 
-    /// PVA-FR-11: a downstream MONITOR op crossed the Executing<->Idle
+    /// a downstream MONITOR op crossed the Executing<->Idle
     /// boundary. `start == true` when the op begins or resumes producing
     /// (MONITOR START / RESUME); `start == false` when it stops (MONITOR
     /// PAUSE / CANCEL_REQUEST / DESTROY / disconnect). Mirrors pvxs
@@ -696,7 +696,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         let _ = (name, ctx, start);
     }
 
-    /// PVA-FR-4: the per-PV pipeline-window watermark levels `(low,
+    /// the per-PV pipeline-window watermark levels `(low,
     /// high)` for `name`, in window-credit units. The monitor loop fires
     /// [`Self::notify_watermark`] with [`WatermarkKind::Resume`] when an
     /// ACK refills the window above `high` and [`WatermarkKind::Pause`]
@@ -724,7 +724,7 @@ pub trait ChannelSource: Send + Sync + 'static {
 /// upstream server emitted, ready to be re-emitted downstream after
 /// the per-subscription PVA header has been prepended. Used by
 /// [`ChannelSource::subscribe_raw`] to skip the server-side
-/// `encode_pv_field` round-trip (F-G12).
+/// `encode_pv_field` round-trip.
 ///
 /// `body_bytes` is the **`changed bitset | value bytes | overrun
 /// bitset`** triplet exactly as it sat on the upstream wire (after
@@ -736,7 +736,7 @@ pub trait ChannelSource: Send + Sync + 'static {
 /// downstream connection negotiated the opposite endian (rare, but
 /// matters for cross-host gateways). On mismatch, dispatch falls
 /// back to the decoded `subscribe` path.
-/// BRIDGE-FR-12: a cooked MONITOR update — the new value plus an
+/// a cooked MONITOR update — the new value plus an
 /// optional explicit set of changed field paths.
 ///
 /// `marked == None` means the server derives the wire changed-bitset
@@ -797,7 +797,7 @@ pub struct RawMonitorEvent {
     /// default for both pva-rs and pvxs; only relevant when the
     /// server's downstream connection negotiated `Big`.
     pub byte_order: crate::proto::ByteOrder,
-    /// BR-R42: when `true`, this event signals an upstream
+    /// when `true`, this event signals an upstream
     /// descriptor change. `body_bytes` is meaningless (and may be
     /// empty); the downstream wire layer must NOT forward it under
     /// the original MONITOR INIT descriptor. The downstream
@@ -832,13 +832,13 @@ pub trait ChannelSourceObj: Send + Sync {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>>;
-    /// BRIDGE-FR-8: dyn forwarder for credential-aware existence.
+    /// dyn forwarder for credential-aware existence.
     fn has_pv_checked<'a>(
         &'a self,
         name: &'a str,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
-    /// BRIDGE-FR-8: dyn forwarder for credential-aware introspection.
+    /// dyn forwarder for credential-aware introspection.
     fn get_introspection_checked<'a>(
         &'a self,
         name: &'a str,
@@ -915,7 +915,7 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
     >;
-    /// BR-R14: dyn forwarder for MONITOR with event-affecting options
+    /// dyn forwarder for MONITOR with event-affecting options
     /// (decoded `PvField` form; the stable entry point retained for API
     /// compatibility).
     fn subscribe_checked_opts<'a>(
@@ -926,7 +926,7 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
     >;
-    /// BRIDGE-FR-12: dyn forwarder for the cooked (`MonitorUpdate`) MONITOR
+    /// dyn forwarder for the cooked (`MonitorUpdate`) MONITOR
     /// with event-affecting options. The server's monitor dispatch uses this.
     fn subscribe_checked_opts_marked<'a>(
         &'a self,
@@ -936,7 +936,7 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<MonitorUpdate>>> + Send + 'a>,
     >;
-    /// BR-R14: dyn forwarder for raw MONITOR with event-affecting options.
+    /// dyn forwarder for raw MONITOR with event-affecting options.
     fn subscribe_raw_checked_opts<'a>(
         &'a self,
         checked: AccessChecked,

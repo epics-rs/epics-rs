@@ -156,7 +156,7 @@ pub fn server_broadcast_port() -> u16 {
 
 /// `EPICS_PVA_SERVER_PORT` (default 5075).
 ///
-/// PVA-R15: pvxs `config.cpp:568-578` lets the client TCP port come
+/// pvxs `config.cpp:568-578` lets the client TCP port come
 /// from `EPICS_PVAS_SERVER_PORT` when `EPICS_PVA_SERVER_PORT` is not
 /// set, so a site that only configured the server-specific var still
 /// has a coherent default for client name-server lookups.
@@ -168,7 +168,7 @@ pub fn server_port() -> u16 {
         .unwrap_or(5075)
 }
 
-/// PVA-R15: server-side TCP port helper that mirrors pvxs
+/// server-side TCP port helper that mirrors pvxs
 /// `config.cpp:402-408` `PickOne` precedence — server-specific
 /// `EPICS_PVAS_SERVER_PORT` first, then shared `EPICS_PVA_SERVER_PORT`,
 /// finally the compiled default. Pre-fix Rust read only the shared
@@ -196,7 +196,7 @@ pub fn auto_addr_list_enabled() -> bool {
 /// beacons fan out to each interface's limited broadcast (255.255.255.255
 /// scoped to the NIC).
 ///
-/// PVA-R15: pvxs `config.cpp:426-431` falls back to
+/// pvxs `config.cpp:426-431` falls back to
 /// `EPICS_PVA_AUTO_ADDR_LIST` when the server-specific var is unset
 /// so shared deployment config still drives the server's beacon
 /// auto-discovery.
@@ -472,7 +472,7 @@ pub fn server_ignore_addr_list() -> Vec<(IpAddr, u16)> {
 /// (default port = `EPICS_PVAS_BROADCAST_PORT`). Falls back to empty
 /// when unset (caller should auto-discover NIC broadcasts).
 ///
-/// PVA-R15: pvxs `config.cpp:426-431` falls back to
+/// pvxs `config.cpp:426-431` falls back to
 /// `EPICS_PVA_ADDR_LIST` when the server-specific list isn't set
 /// (shared deployment config). Pre-fix Rust read only the
 /// `EPICS_PVAS_*` var, so a site that listed beacon targets in
@@ -639,7 +639,7 @@ mod tests {
         assert_eq!(max_ops_per_channel(), 64);
     }
 
-    /// A6-1: server TLS options resolve PVAS-first, then shared PVA (pvxs
+    /// server TLS options resolve PVAS-first, then shared PVA (pvxs
     /// `pickone({EPICS_PVAS_TLS_OPTIONS, EPICS_PVA_TLS_OPTIONS})`,
     /// config.cpp:501) — first present wins, no merge.
     #[test]
@@ -676,7 +676,7 @@ mod tests {
         }
     }
 
-    /// A6-1: server TLS keychain resolves PVAS-first, then shared PVA (pvxs
+    /// server TLS keychain resolves PVAS-first, then shared PVA (pvxs
     /// `pickone({EPICS_PVAS_TLS_KEYCHAIN, EPICS_PVA_TLS_KEYCHAIN})`,
     /// config.cpp:497). The client path stays PVA-only (config.cpp:672).
     #[test]

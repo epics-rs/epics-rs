@@ -1,4 +1,4 @@
-//! PVA-R20 interop: pvxs C++ client builds the *typed* pipeline
+//! Interop: pvxs C++ client builds the *typed* pipeline
 //! pvRequest (`Context::request().record("pipeline", true)`) and
 //! connects to a Rust PVA server hosting one PV. Pre-R20 the
 //! Rust server's `monitor_pipeline_options` parser only matched
@@ -268,7 +268,7 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "PVA-R20: pvxs typed-pipeline client did not receive the expected \
+        "pvxs typed-pipeline client did not receive the expected \
          events from the Rust server. Helper exit={:?}\n\
          stdout: {stdout}\nstderr: {stderr}",
         output.status,
@@ -288,7 +288,7 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
     };
     assert!(
         captured.contains("MONITOR INIT pipeline negotiated"),
-        "PVA-R20 regression: Rust server did not log \
+        "Regression: Rust server did not log \
          `MONITOR INIT pipeline negotiated` for the typed-Bool pipeline \
          pvRequest. monitor_pipeline_options either failed to match the \
          typed shape or short-circuited before installing the window. \

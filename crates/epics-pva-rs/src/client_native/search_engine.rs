@@ -1590,7 +1590,7 @@ fn handle_search_response(
         }
         return consumed;
     }
-    // PVA-R10: pvxs `client.cpp:849-880` ignores SEARCH_RESPONSE
+    // pvxs `client.cpp:849-880` ignores SEARCH_RESPONSE
     // frames whose `proto != "tcp"`. The Rust UDP search engine
     // only opens plain TCP connections to resolved servers; a
     // server advertising a non-tcp transport (tls without an
@@ -1690,7 +1690,7 @@ fn handle_beacon(
     guid_arr.copy_from_slice(&guid);
     let mut addr_arr = [0u8; 16];
     addr_arr.copy_from_slice(&addr_bytes);
-    // PVA-R18: accept all-zero (IPv6 unspecified) too — pvxs
+    // accept all-zero (IPv6 unspecified) too — pvxs
     // `udp_collector.cpp:471-476` substitutes the UDP source for any
     // wildcard BEACON. Pre-fix Rust returned early and dropped the
     // beacon, so an IPv6-capable server advertising wildcard via the
@@ -2875,7 +2875,7 @@ mod tests {
         assert_eq!(observed, guid, "tracker must record the exact GUID");
     }
 
-    /// PVA-R4 regression: TCP name servers must resolve PVs via persistent
+    /// Regression: TCP name servers must resolve PVs via persistent
     /// SEARCH/SEARCH_RESPONSE, not merely as direct-connect fallbacks.
     ///
     /// Spawns a mock TCP name-server that performs the full PVA handshake

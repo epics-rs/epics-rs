@@ -1,9 +1,9 @@
-//! PVA-R11 integration: TCP-circuit SEARCH on an established
+//! Integration: TCP-circuit SEARCH on an established
 //! virtual circuit.
 //!
 //! Sends a raw `Command::Search` frame over TCP to a Rust PVA
 //! server and asserts the server replies with a `Command::Search
-//! Response` carrying the matching cid. Pre-PVA-R11 the dispatcher
+//! Response` carrying the matching cid. Previously the dispatcher
 //! had no `Command::Search` arm and the frame fell through
 //! silently — a pvxs client doing name-server-redirect would hang
 //! waiting for the response.
@@ -119,7 +119,7 @@ async fn interop_r11_tcp_circuit_search_returns_matching_cid() {
 
     // Step 3: send a CONNECTION_VALIDATION reply with empty/
     // anonymous method (server accepts the null type Variant via
-    // PVA-R22's parser).
+    // the parser).
     use std::io::Write;
     let mut val_reply: Vec<u8> = Vec::new();
     val_reply.put_u32(0x10000, order); // client buffer (R62: match pvxs 0x10000)

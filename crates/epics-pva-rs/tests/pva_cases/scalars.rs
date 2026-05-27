@@ -212,7 +212,7 @@ fn golden_pvxs_scalar_long_le() {
 
 #[test]
 fn golden_pvxs_scalar_ulong_be() {
-    // MR-R25 territory: DBF_UINT64 round-trip locked here.
+    // DBF_UINT64 round-trip locked here.
     assert_eq!(
         encode(
             PvField::Scalar(ScalarValue::ULong(0xFFEE_DDCC_BBAA_9988)),

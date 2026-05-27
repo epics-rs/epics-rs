@@ -47,7 +47,7 @@ pub struct PvGetResult {
 /// that authenticated with a method this client cannot forward
 /// verbatim on the wire.
 ///
-/// BR-R8: the pvAccess CONNECTION_VALIDATION handshake only carries
+/// the pvAccess CONNECTION_VALIDATION handshake only carries
 /// the `ca` / `anonymous` auth methods (pvxs `clientconn.cpp:217-305`
 /// — `handle_CONNECTION_VALIDATION` selects only `"ca"` / `"anonymous"`
 /// and the `ca` credential carries solely `user` + `host`). There is
@@ -97,12 +97,12 @@ pub struct PvaClientBuilder {
     /// holding multiple UDP search sockets when the user wires up
     /// per-purpose Contexts.
     share_udp: bool,
-    /// BR-R8: set by a gateway when this client's `user`/`host`
+    /// set by a gateway when this client's `user`/`host`
     /// credentials are an assertion derived from a downstream peer
     /// whose auth method (e.g. `x509`) cannot be forwarded verbatim
     /// on the pvAccess wire. `None` for first-party clients.
     asserted_identity: Option<AssertedIdentity>,
-    /// PVXS-SR-9: optional opt-in cap on a single inbound message's
+    /// optional opt-in cap on a single inbound message's
     /// payload length. `None` (the default) is **unbounded**, matching
     /// pvxs, which keeps no client-side RX message-size limit. `Some(n)`
     /// drops any connection whose server announces a payload over `n`.
@@ -144,7 +144,7 @@ impl PvaClientBuilder {
         self
     }
 
-    /// PVXS-SR-9: opt in to a hard cap on a single inbound message's
+    /// opt in to a hard cap on a single inbound message's
     /// payload length. By default the client is **unbounded** (pvxs
     /// parity — pvxs keeps no client-side RX message-size limit), since
     /// the streaming reader stays bounded by incremental 4 KiB reads
@@ -205,7 +205,7 @@ impl PvaClientBuilder {
         self
     }
 
-    /// BR-R8: declare that this client's `user`/`host` credentials are
+    /// declare that this client's `user`/`host` credentials are
     /// a gateway assertion derived from a downstream peer that
     /// authenticated with `downstream_method`. When the downstream
     /// method is not `"ca"` the upstream `ca` credential cannot be a
@@ -232,7 +232,7 @@ impl PvaClientBuilder {
         if self.tls.is_some() {
             pool.set_tls(self.tls.clone());
         }
-        // PVXS-SR-9: thread the opt-in cap into the pool so every dialed
+        // thread the opt-in cap into the pool so every dialed
         // connection enforces it (default `None` = unbounded).
         pool.set_max_message_size(self.max_message_size);
         PvaClient {
@@ -292,11 +292,11 @@ struct ClientInner {
     /// engine. Routes [`PvaClient::search_engine`] through the static
     /// `SHARED_SEARCH_ENGINE` instead of spawning per-client.
     share_udp: bool,
-    /// BR-R8: present when this client's credentials are a gateway
+    /// present when this client's credentials are a gateway
     /// assertion of a downstream identity. Surfaced through
     /// [`PvaClient::asserted_identity`].
     asserted_identity: Option<AssertedIdentity>,
-    /// PVXS-SR-9: opt-in inbound message-size cap (`None` = unbounded).
+    /// opt-in inbound message-size cap (`None` = unbounded).
     /// Stored so `with_asserted_identity` can carry it onto the derived
     /// client's fresh pool. Set on the pool at `build()` time.
     max_message_size: Option<usize>,
@@ -331,7 +331,7 @@ impl PvaClient {
         Ok(Self::builder().build())
     }
 
-    /// BR-R8: the gateway-asserted downstream identity behind this
+    /// the gateway-asserted downstream identity behind this
     /// client's credentials, if any. `None` for a first-party client.
     /// `Some` means the client's `ca` `user`/`host` are an assertion
     /// the gateway made on behalf of a downstream peer whose auth
@@ -344,7 +344,7 @@ impl PvaClient {
     /// the same transport** as `self`, but presents a different
     /// (gateway-asserted) identity.
     ///
-    /// BR-R8 / BR-R21: a PVA gateway keeps one upstream client per
+    /// A PVA gateway keeps one upstream client per
     /// distinct downstream credential so the upstream IOC's access
     /// security sees the real identity. Every such client must still
     /// resolve the *same* upstream — only `user` / `host` /
@@ -515,7 +515,7 @@ impl PvaClient {
     /// pool. Returns the resolved server address.
     pub async fn pvconnect(&self, pv_name: &str) -> PvaResult<SocketAddr> {
         let ch = self.channel(pv_name).await?;
-        // PVA-FR-12: pvconnect is a one-shot user op (pvxs
+        // pvconnect is a one-shot user op (pvxs
         // `Context::connect(name)` waits up to the caller's timeout),
         // so bound the resolve through the single op-timeout owner —
         // never bare `ensure_active`, which would hang forever against
@@ -531,7 +531,7 @@ impl PvaClient {
     /// `ConnectBuilder::server(addr).exec()`.
     pub async fn pvconnect_from(&self, pv_name: &str, server: SocketAddr) -> PvaResult<SocketAddr> {
         let ch = self.channel_with_forced(pv_name, Some(server)).await?;
-        // PVA-FR-12: one-shot user op — bound through the op-timeout
+        // one-shot user op — bound through the op-timeout
         // owner (see `pvconnect`); a pinned-but-dead server must fail at
         // `op_timeout`, not hang.
         let (sc, _sid) =
@@ -616,7 +616,7 @@ impl PvaClient {
     }
 
     /// Start a GET and return a [`PvaOperation`](crate::client_native::PvaOperation) handle the caller can
-    /// `wait()`, `cancel()`, or `interrupt()` from any task. F-G8 —
+    /// `wait()`, `cancel()`, or `interrupt()` from any task.
     /// pvxs `Operation` parity for callers that need to start now and
     /// wait later from a different context, or be able to cancel from
     /// outside the awaiting task.
@@ -635,7 +635,7 @@ impl PvaClient {
         )
     }
 
-    /// Start a PUT and return a [`PvaOperation`](crate::client_native::PvaOperation) handle. F-G8.
+    /// Start a PUT and return a [`PvaOperation`](crate::client_native::PvaOperation) handle.
     pub fn start_put(
         &self,
         pv_name: &str,
@@ -649,7 +649,7 @@ impl PvaClient {
         })
     }
 
-    /// Start an RPC and return a [`PvaOperation`](crate::client_native::PvaOperation) handle. F-G8.
+    /// Start an RPC and return a [`PvaOperation`](crate::client_native::PvaOperation) handle.
     pub fn start_rpc(
         &self,
         pv_name: &str,
@@ -931,7 +931,7 @@ impl PvaClient {
     }
 
     /// PUT multiple `field=value` assignments as one prototype-based
-    /// delta (PVA-FR-6). Each `(field_path, value_str)` is applied by
+    /// delta. Each `(field_path, value_str)` is applied by
     /// dotted path and only the assigned fields are marked. `request`
     /// supplies the INIT pvRequest (e.g. `record[process=true]`); when
     /// `None` the request selects exactly the assigned paths. Mirrors
@@ -1041,7 +1041,7 @@ impl PvaClient {
         .await
     }
 
-    /// F-G12: monitor that surfaces **raw MONITOR DATA body bytes**
+    /// monitor that surfaces **raw MONITOR DATA body bytes**
     /// (`changed | value | overrun` triplet from the wire) instead of
     /// a decoded [`PvField`]. Used by bridge `pva_gateway` upstream
     /// task to skip the decode-and-re-encode round-trip when fanning
@@ -1099,7 +1099,7 @@ impl PvaClient {
         F: FnMut(&PvField) + Send,
     {
         let ch = self.channel(pv_name).await?;
-        // PVA-FR-12 (distinct from the one-shot pre-reads): a monitor's
+        // Distinct from the one-shot pre-reads: a monitor's
         // resolve is NOT bounded by `op_timeout`. `pvmonitor*` stays
         // pending until the server answers (or the caller drops the
         // future); its natural cancel path is `SubscriptionHandle` drop,
@@ -1196,8 +1196,8 @@ impl PvaClient {
 
     /// Fetch the channel's introspection (FieldDesc) using PVA's
     /// dedicated GET_FIELD message — cheaper than [`Self::pvget`]
-    /// because no value bytes are transferred. F-G4 (April 2026):
-    /// previously implemented as a full GET that discarded the value;
+    /// because no value bytes are transferred. Previously
+    /// it was implemented as a full GET that discarded the value;
     /// now uses the proper introspection-only path matching pvxs
     /// `Context::info(name).exec()`. Critical for large NTNDArray /
     /// NTTable PVs where pvinfo() was paying a multi-MiB transfer
@@ -1299,7 +1299,7 @@ impl PvaClient {
         self.report_zeroed(false)
     }
 
-    /// PVA-FR-2: like [`Self::report`] but, when `zero` is true, resets
+    /// like [`Self::report`] but, when `zero` is true, resets
     /// each connection's byte counters after the snapshot — pvxs
     /// `Context::report(bool zero)`, so a subsequent report returns the
     /// per-connection deltas since this one.
@@ -1503,7 +1503,7 @@ impl PvaClient {
                 }
             }
         }
-        // EX-R4: Phase-2 send failures must be tracked in their own set,
+        // Phase-2 send failures must be tracked in their own set,
         // keyed by `warm_reqs` index. The result vector is initialized to
         // `Err(PvaError::Timeout)` for every slot, so using
         // `results[idx].is_err()` as the Phase-3 skip predicate skipped
@@ -1516,7 +1516,7 @@ impl PvaClient {
                     failed_warm.insert(wi);
                     let req = &warm_reqs[wi];
                     req.warm.slot.lock().take();
-                    // PVA-R27: the cached warm GET this `warm` was
+                    // the cached warm GET this `warm` was
                     // taken from already became stale (server send
                     // failed). Restoring it later would re-use the
                     // dead (sid, ioid) on the next pvget_many call.
@@ -1549,7 +1549,7 @@ impl PvaClient {
                 rx,
                 intro,
             } = req;
-            // EX-R4 / PVA-R27: skip await + DO NOT restore cache only for
+            // Skip await + DO NOT restore cache only for
             // warm reqs whose Phase-2 send actually failed. The skip
             // predicate is the dedicated `failed_warm` set — using
             // `results[idx].is_err()` here would skip every warm request
@@ -1575,7 +1575,7 @@ impl PvaClient {
                 Ok(Err(_)) => Err(PvaError::Protocol("warm GET channel closed".into())),
                 Err(_) => Err(PvaError::Timeout),
             };
-            // PVA-R27: only restore cache on a successful DATA
+            // only restore cache on a successful DATA
             // response. Pre-fix Rust restored after timeout, decode
             // error, wrong response kind, channel-closed one-shot,
             // and non-success GET status — leaking dead (sid, ioid)
@@ -1641,12 +1641,12 @@ pub struct ClientReport {
     pub name_servers: usize,
     /// True when the client is in direct-server mode (no UDP search).
     pub direct_mode: bool,
-    /// PVA-FR-2: live per-server-connection byte counters. pvxs
+    /// live per-server-connection byte counters. pvxs
     /// `Context::report` parity at the "connection list" level.
     pub connections: Vec<ConnReport>,
 }
 
-/// PVA-FR-2: one entry in [`ClientReport::connections`] — a live
+/// one entry in [`ClientReport::connections`] — a live
 /// connection to a PVA server with its byte counters.
 #[derive(Debug, Clone)]
 pub struct ConnReport {
@@ -1811,7 +1811,7 @@ impl Drop for ConnectHandle {
 mod tests {
     use super::*;
 
-    // MR-R9 regression: a client built with both `share_udp(true)` and a
+    // Regression: a client built with both `share_udp(true)` and a
     // non-empty `name_servers` list must NOT be routed through the
     // process-wide `SHARED_SEARCH_ENGINE` singleton — that singleton is
     // spawned with an empty name-server list and would silently drop the
@@ -1856,7 +1856,7 @@ mod tests {
         );
     }
 
-    /// PVA-FR-12 regression at the *context* layer: a one-shot client op
+    /// Regression at the *context* layer: a one-shot client op
     /// against a never-resolving server must fail at the operation-level
     /// timeout, NOT hang. This is the bypass the 200 ms
     /// `MULTI_SERVER_WINDOW` removal exposed — `pvconnect` (connect-and-
@@ -1898,7 +1898,7 @@ mod tests {
             .await
             .expect(
                 "pvconnect hung past 20 s — one-shot resolve is not bounded \
-                 by op_timeout (PVA-FR-12 bypass reintroduced in context.rs)",
+                 by op_timeout (bypass reintroduced in context.rs)",
             );
         let connect_elapsed = t0.elapsed();
         assert!(connect.is_err(), "pvconnect to a missing PV must error");
@@ -1920,7 +1920,7 @@ mod tests {
         .await
         .expect(
             "pvget_with_request hung past 20 s — the byte-order pre-read \
-             bypassed the op-timeout owner (PVA-FR-12)",
+             bypassed the op-timeout owner",
         );
         let get_elapsed = t1.elapsed();
         assert!(

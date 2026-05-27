@@ -24,7 +24,7 @@ fn build(fields: &[&str], order: ByteOrder) -> Vec<u8> {
     // Split dotted paths (`value.index`) into nested sub-structures via
     // `build_nested` so the server's `request_to_mask` resolves them
     // field-by-field. A flat member literally named `"value.index"`
-    // matches no top-level field, and post-PVA-R19 the server rejects
+    // matches no top-level field, and a strict server rejects
     // that as an empty mask ("pvRequest selected no existing fields")
     // instead of falling back to all-fields.
     let owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
@@ -75,7 +75,7 @@ pub fn build_pv_request_fields(fields: &[&str], big_endian: bool) -> Vec<u8> {
     build(fields, order)
 }
 
-/// PVA-R1: build a pvRequest that includes
+/// build a pvRequest that includes
 /// `record._options.pipeline = "true"` and
 /// `record._options.queueSize = "<queue_size>"` alongside the
 /// requested `fields`. pvxs `servermon.cpp:523-552` only enables the
@@ -1291,7 +1291,7 @@ mod tests {
         // Regression: build_pv_request_fields("value.index") must emit a
         // nested `field { value { index {} } }`, not a flat member
         // literally named "value.index". A flat name matches no
-        // top-level field and a strict server (PVA-R19) rejects the
+        // top-level field and a strict server rejects the
         // PUT INIT with EmptyMask ("pvRequest selected no existing
         // fields") — this broke NTEnum int puts.
         use crate::pvdata::ScalarType;
@@ -1363,7 +1363,7 @@ mod tests {
 
     #[test]
     fn request_to_mask_field_as_scalar_errors() {
-        // A8-2: pvxs `request2mask` (pvrequest.cpp) — when `field` is
+        // pvxs `request2mask` (pvrequest.cpp) — when `field` is
         // present but is NOT a sub-structure, the trailing `else`
         // leaves `foundrequested == false` and it throws "pvRequest
         // must select at least one field". A scalar `field` must error,
@@ -1738,7 +1738,7 @@ mod tests {
         assert!(!be.is_empty() && be[0] == 0x80);
     }
 
-    /// EX-R11 regression: the pvRequest string parser must be able to
+    /// Regression: the pvRequest string parser must be able to
     /// express the `record._options._filter` JSON carrier the PVA
     /// server expects. The bare value lexer accepts only
     /// alphanumerics plus `_ . : - +`, so it rejects `{`, `}`, `,`,

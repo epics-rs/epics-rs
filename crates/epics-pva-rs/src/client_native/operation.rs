@@ -13,7 +13,7 @@
 //!   `Operation::interrupt`.
 //!
 //! The handle is constructed from any future that returns
-//! `PvaResult<T>`. F-G8 (April 2026).
+//! `PvaResult<T>`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +42,7 @@ enum WaitOutcome<T> {
 pub struct PvaOperation<T: Send + 'static> {
     /// Spawned task running the underlying op.
     join: JoinHandle<()>,
-    /// Receiver for the op's final result. PVA-FR-7: held by value (not
+    /// Receiver for the op's final result. held by value (not
     /// `take`-n out per wait) and polled by `&mut`, so a `wait` that
     /// times out or is interrupted leaves the receiver in place and a
     /// later `wait` can still collect the result — matching pvxs
@@ -53,7 +53,7 @@ pub struct PvaOperation<T: Send + 'static> {
     /// final-result policy). A timeout/interrupt does NOT set this.
     done: bool,
     /// Pulsed by [`Self::interrupt`]; `wait*` selects on this and
-    /// returns `PvaError::Interrupted` (PVA-FR-9) — a distinct variant
+    /// returns `PvaError::Interrupted` — a distinct variant
     /// from `PvaError::Timeout` so callers can tell an operator-driven
     /// wake-up from a real deadline.
     interrupt: Arc<Notify>,
@@ -91,7 +91,7 @@ impl<T: Send + 'static> PvaOperation<T> {
     /// forever, or `Some(d)` for a deadline. Returns
     /// `PvaError::Timeout` when the deadline expires and the distinct
     /// `PvaError::Interrupted` when woken by [`Self::interrupt`]
-    /// (PVA-FR-9). Neither consumes the result — a later `wait` can
+    ///. Neither consumes the result — a later `wait` can
     /// still collect it.
     pub async fn wait(&mut self, timeout: Option<Duration>) -> PvaResult<T> {
         if self.done {
@@ -106,7 +106,7 @@ impl<T: Send + 'static> PvaOperation<T> {
         let interrupt = self.interrupt.clone();
         let cancelled = self.cancelled.clone();
         // Borrow the receiver by `&mut` so a timeout/interrupt leaves it
-        // in place for a later `wait` (PVA-FR-7). `oneshot::Receiver`
+        // in place for a later `wait`. `oneshot::Receiver`
         // is `Unpin`, so `&mut rx` is itself a `Future`.
         let rx = &mut self.result_rx;
         let body = async {
@@ -134,7 +134,7 @@ impl<T: Send + 'static> PvaOperation<T> {
                 r
             }
             // Interrupt/timeout do not consume; a later `wait` retries.
-            // PVA-FR-9: interrupt is its own variant, not Timeout.
+            // interrupt is its own variant, not Timeout.
             WaitOutcome::Interrupted => Err(PvaError::Interrupted),
             WaitOutcome::Cancelled => Err(PvaError::Protocol("Operation cancelled".into())),
             WaitOutcome::Aborted => Err(PvaError::Protocol("Operation aborted".into())),
@@ -151,7 +151,7 @@ impl<T: Send + 'static> PvaOperation<T> {
     }
 
     /// Wake a pending [`Self::wait`] without cancelling the operation
-    /// — the wait returns `PvaError::Interrupted` (PVA-FR-9) and the
+    /// — the wait returns `PvaError::Interrupted` and the
     /// underlying op keeps running. Mirrors pvxs `Operation::interrupt`.
     pub fn interrupt(&self) {
         self.interrupt.notify_waiters();
@@ -212,20 +212,20 @@ mod tests {
             interrupter.notify_waiters();
         });
         let r = op.wait(Some(Duration::from_secs(5))).await;
-        // PVA-FR-9: interrupt is its own variant, not Timeout.
+        // interrupt is its own variant, not Timeout.
         assert!(matches!(r, Err(PvaError::Interrupted)));
         assert!(
             !matches!(r, Err(PvaError::Timeout)),
             "interrupt must not be reported as a deadline timeout"
         );
-        // PVA-FR-7: interrupt does NOT consume the result. The op
+        // interrupt does NOT consume the result. The op
         // completes and a second wait still collects its value.
         let v = op.wait(Some(Duration::from_secs(1))).await.unwrap();
         assert_eq!(v, 7);
         assert!(op.is_done());
     }
 
-    /// PVA-FR-9: a real deadline expiry and an explicit interrupt must
+    /// a real deadline expiry and an explicit interrupt must
     /// surface as distinct variants so timeout-specific caller logic
     /// does not match an interrupt.
     #[tokio::test]
@@ -265,7 +265,7 @@ mod tests {
         assert!(matches!(r, Err(PvaError::Protocol(_))));
     }
 
-    /// PVA-FR-7 regression: a `wait` that times out while the op is
+    /// Regression: a `wait` that times out while the op is
     /// still in-progress must leave the result recoverable by a later
     /// `wait` (pvxs `Operation::wait` is retriable after a timeout).
     #[tokio::test]

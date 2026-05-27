@@ -22,7 +22,7 @@ pub enum PvField {
     /// [`PvField::scalar_array_double`], `_float`, `_int`, etc.
     ScalarArrayTyped(TypedScalarArray),
     Structure(PvStructure),
-    /// Structure array. PVA-FR-1: each element is `Option` — `None` is a
+    /// Structure array. each element is `Option` — `None` is a
     /// pvxs `0x00` null element (absent), `Some(s)` a `0x01`-present
     /// element. This is distinct from a *present* element whose body is
     /// empty; overloading an inner sentinel could not express that.
@@ -35,7 +35,7 @@ pub enum PvField {
         variant_name: String,
         value: Box<PvField>,
     },
-    /// Union array. PVA-FR-1: `None` is a `0x00` null element (absent);
+    /// Union array. `None` is a `0x00` null element (absent);
     /// `Some(item)` is a present element, which may itself carry a
     /// null-selector union (`selector == -1`) — a distinct state from an
     /// absent element.
@@ -43,7 +43,7 @@ pub enum PvField {
     /// "Any" — variant carries its own [`FieldDesc`]. Empty descriptor +
     /// null value indicates "no value".
     Variant(Box<VariantValue>),
-    /// Variant ("any") array. PVA-FR-1: `None` is a `0x00` null element
+    /// Variant ("any") array. `None` is a `0x00` null element
     /// (absent); `Some(v)` is a present element, which may itself carry a
     /// descriptor-less empty value — a distinct state from absent.
     VariantArray(Vec<Option<VariantValue>>),
@@ -256,7 +256,7 @@ impl PvField {
     /// Like [`Self::descriptor`] but **wire-faithful or nothing**:
     /// returns `Some(desc)` only when the descriptor can be fully
     /// recovered from the value, and `None` for the lossy shapes
-    /// [`Self::descriptor`] documents (PVA-FR-5). Used by the `any`
+    /// [`Self::descriptor`] documents. Used by the `any`
     /// encoder so a bare value never advertises a degraded/wrong
     /// schema on the wire — see `encode.rs` `FieldDesc::Variant`.
     ///
@@ -394,7 +394,7 @@ impl fmt::Display for PvStructure {
 mod tests {
     use super::*;
 
-    /// PVA-FR-5: `wire_descriptor` is `Some` only for shapes whose
+    /// `wire_descriptor` is `Some` only for shapes whose
     /// descriptor is fully recoverable from the value, `None` for the
     /// lossy ones (so the `any` encoder won't emit a wrong schema).
     #[test]

@@ -1,11 +1,11 @@
-//! PVA-R13 wire-shape: compound-array per-element presence byte.
+//! Wire-shape: compound-array per-element presence byte.
 //!
 //! pvxs reference: `src/dataencode.cpp`
 //! - `:354-365` StructA encode (presence 0x00 | 0x01 + body)
 //! - `:368-378` UnionA  encode (presence 0x00 | 0x01 + selector + value)
 //! - `:382-393` AnyA    encode (presence 0x00 | 0x01 + descriptor + value)
 //!
-//! Pre-PVA-R13 Rust emitted the selector / descriptor inline with
+//! Earlier Rust emitted the selector / descriptor inline with
 //! `0xFF` as the null sentinel — a pvxs peer reads that as the
 //! presence byte (≠ 0/1 → protocol fault). These goldens lock the
 //! per-element shape so a future encoder refactor can't regress.

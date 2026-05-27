@@ -9,7 +9,7 @@ pub enum PvaError {
     Timeout,
 
     /// A `wait` was woken by [`crate::client_native::PvaOperation::interrupt`]
-    /// rather than by a deadline. PVA-FR-9: pvxs distinguishes
+    /// rather than by a deadline. pvxs distinguishes
     /// `Interrupted` from `Timeout`, and conflating them hid the cause
     /// (operator-driven wake-up vs. real deadline) from callers. The
     /// underlying operation keeps running and its result stays

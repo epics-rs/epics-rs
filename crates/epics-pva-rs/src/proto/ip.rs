@@ -36,7 +36,7 @@ pub fn ip_from_bytes(addr: &[u8; 16]) -> Option<IpAddr> {
     Some(IpAddr::V6(Ipv6Addr::from(*addr)))
 }
 
-/// PVA-R18: decode a 16-byte PVA address treating the all-zero
+/// decode a 16-byte PVA address treating the all-zero
 /// pattern as the unspecified IPv6 address (`::`) rather than as
 /// "decode failed". pvxs `evhelper.cpp:911-937` accepts it as
 /// `SockAddr::isAny()` and `util.cpp:552-558` classifies IPv6

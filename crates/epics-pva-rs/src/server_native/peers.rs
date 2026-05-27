@@ -45,11 +45,11 @@ pub struct PeerEntry {
     /// Whether TLS is in effect for this connection (recorded at
     /// accept). pvxs surfaces `secure` similarly.
     pub tls: bool,
-    /// PVA-FR-2: peer credentials `(account, method)` once the
+    /// peer credentials `(account, method)` once the
     /// connection-validation handshake establishes them. pvxs
     /// `Server::report` includes `ReportInfo`/credentials per peer.
     pub(crate) credentials: parking_lot::Mutex<Option<(String, String)>>,
-    /// PVA-FR-2: live PV names of the channels currently open on this
+    /// live PV names of the channels currently open on this
     /// connection, mirrored from the per-connection channel table on
     /// every create/destroy so the report carries per-channel detail.
     pub(crate) channel_names: parking_lot::Mutex<Vec<String>>,
@@ -80,13 +80,13 @@ impl PeerEntry {
         self.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
     }
 
-    /// PVA-FR-2: record the validated peer credentials (set once at
+    /// record the validated peer credentials (set once at
     /// connection validation).
     pub(crate) fn set_credentials(&self, account: &str, method: &str) {
         *self.credentials.lock() = Some((account.to_string(), method.to_string()));
     }
 
-    /// PVA-FR-2: mirror the connection's current open-channel PV names
+    /// mirror the connection's current open-channel PV names
     /// (the per-connection channel table is the source of truth; this
     /// snapshot is read by the report).
     pub(crate) fn set_channel_names(&self, names: Vec<String>) {
@@ -135,7 +135,7 @@ impl PeerRegistry {
         self.snapshot_zeroed(false)
     }
 
-    /// PVA-FR-2: snapshot, then optionally zero each peer's byte
+    /// snapshot, then optionally zero each peer's byte
     /// counters (pvxs `Server::report(bool zero)` — the next report
     /// returns deltas since this one). `connected_at`, channel counts,
     /// and credentials are NOT reset; only the byte counters.
@@ -180,10 +180,10 @@ pub struct PeerSnapshot {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub tls: bool,
-    /// PVA-FR-2: validated peer credentials `(account, method)`, or
+    /// validated peer credentials `(account, method)`, or
     /// `None` before the connection-validation handshake completes.
     pub credentials: Option<(String, String)>,
-    /// PVA-FR-2: PV names of the channels currently open on this peer.
+    /// PV names of the channels currently open on this peer.
     pub channel_names: Vec<String>,
 }
 
@@ -234,7 +234,7 @@ mod tests {
         assert!(reg.is_empty());
     }
 
-    /// PVA-FR-2: the snapshot carries per-peer credentials and live
+    /// the snapshot carries per-peer credentials and live
     /// channel names, and `snapshot_zeroed(true)` resets only the byte
     /// counters (not channels/credentials) so the next report is a delta.
     #[test]
@@ -276,7 +276,7 @@ mod tests {
         );
     }
 
-    /// PVA-FR-2: `snapshot_zeroed(true)` must not lose a byte increment
+    /// `snapshot_zeroed(true)` must not lose a byte increment
     /// that lands concurrently with the reset. Summing every drained
     /// delta against a writer thread must equal the total written —
     /// `swap(0)` guarantees this; a `load` then `store(0)` would drop the

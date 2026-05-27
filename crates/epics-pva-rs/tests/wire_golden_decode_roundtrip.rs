@@ -50,7 +50,7 @@ fn normalise_array_variants(v: &mut PvField) {
             }
         }
         PvField::StructureArray(items) => {
-            // PVA-FR-1: present elements only; `None` is a null element.
+            // present elements only; `None` is a null element.
             for child in items.iter_mut().flatten() {
                 for (_, leaf) in child.fields.iter_mut() {
                     normalise_array_variants(leaf);

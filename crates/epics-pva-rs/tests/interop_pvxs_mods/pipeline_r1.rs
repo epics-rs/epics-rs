@@ -1,4 +1,4 @@
-//! PVA-R1 interop: Rust client (pipeline_size > 0) → pvxs
+//! Interop: Rust client (pipeline_size > 0) → pvxs
 //! `softIocPVX` server, asserting that pvxs sees the pipeline
 //! option on the wire.
 //!
@@ -137,7 +137,7 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
     // `op->pipeline == true` (servermon.cpp:587).
     assert!(
         log_text.contains("Monitor INIT pipeline ioid="),
-        "PVA-R1 regression: pvxs server did not log `Monitor INIT pipeline …`. \
+        "Regression: pvxs server did not log `Monitor INIT pipeline …`. \
          The pipeline option was either absent from pvRequest or pvxs failed \
          to parse it as true. Full pvxs stderr:\n{log_text}",
     );

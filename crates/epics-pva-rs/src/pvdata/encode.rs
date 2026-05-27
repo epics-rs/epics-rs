@@ -141,7 +141,7 @@ pub(crate) fn encode_typed_scalar_array(
 /// currently exercises that branch — pvData has exactly 12 scalar codes
 /// and all are covered here, so the typed fast path is total. The
 /// matching *encode*-side generic fallback ([`encode_pv_field_generic`])
-/// is the one that handles obscure value/descriptor combinations. F-G10.
+/// is the one that handles obscure value/descriptor combinations.
 #[inline]
 pub(crate) fn decode_typed_scalar_array(
     st: ScalarType,
@@ -870,7 +870,7 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
         (FieldDesc::ScalarArray(st), PvField::ScalarArrayTyped(arr))
             if arr.scalar_type() == *st =>
         {
-            // F-G9 fast path: typed array → bulk memcpy when host
+            // Fast path: typed array → bulk memcpy when host
             // endian == wire endian, per-element byte-swap loop
             // otherwise (still O(n) but no enum match per element).
             // pvxs `to_wire(shared_array)` parity (pvaproto.h:477).
@@ -902,7 +902,7 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
         }
         (FieldDesc::StructureArray { fields, .. }, PvField::StructureArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
-            // PVA-FR-1: each element is preceded by a presence byte —
+            // each element is preceded by a presence byte —
             // 0x00 for a null (absent) element, 0x01 followed by the
             // body for a present one (pvxs dataencode.cpp:354-365).
             for s in items {
@@ -944,7 +944,7 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
             encode_size_into(items.len() as u32, order, out);
             // pvxs `dataencode.cpp:368-378` encodes UnionA elements as a
             // per-element presence byte (`0x00` null/absent, `0x01`
-            // followed by the union body for present). PVA-FR-1: a
+            // followed by the union body for present). a
             // `None` element is the absent (`0x00`) case; a present
             // element's union body is `selector + value`, where an
             // out-of-range/`-1` selector routes through the inner
@@ -979,7 +979,7 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
             encode_size_into(items.len() as u32, order, out);
             // pvxs `dataencode.cpp:382-393` encodes AnyA as a presence
             // byte (`0x00` null/absent, `0x01 + descriptor + value` for
-            // present). PVA-FR-1: a `None` element is the absent (`0x00`)
+            // present). a `None` element is the absent (`0x00`)
             // case; a present element whose descriptor is `None` is the
             // present-but-empty "any" shape, emitted as `0x01` + the
             // Null type tag (`0xFF`) — distinct from element-absent.
@@ -1002,7 +1002,7 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
         (FieldDesc::BoundedString(_), PvField::Scalar(ScalarValue::String(s))) => {
             encode_string_into(s, order, out);
         }
-        // ── Generic fallback (F-G10) ────────────────────────────────────
+        // ── Generic fallback ────────────────────────────────────
         //
         // The typed arms above cover the case where the value variant
         // structurally matches its descriptor. pvData itself is purely
@@ -1019,7 +1019,7 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
 /// Descriptor-driven encode for value/descriptor pairs the typed arms of
 /// [`encode_pv_field`] do not match. Every shape pvxs `to_wire_field`
 /// can emit is reachable here; the function never emits zero bytes for a
-/// non-empty descriptor, so the wire stream cannot desync. F-G10.
+/// non-empty descriptor, so the wire stream cannot desync.
 ///
 /// Handled "obscure" combinations:
 ///
@@ -1109,7 +1109,7 @@ fn encode_pv_field_generic(value: &PvField, desc: &FieldDesc, order: ByteOrder, 
             // `to_wire_full(fld)`; a bare value carries no stored
             // descriptor so we recover one from the value.
             //
-            // PVA-FR-5: only emit a descriptor that is *wire-faithful*.
+            // only emit a descriptor that is *wire-faithful*.
             // A bare descriptor-sensitive value (empty/untyped array,
             // union, union array, null) cannot be faithfully described
             // from the value alone, and emitting a degraded descriptor
@@ -1293,7 +1293,7 @@ pub fn canonical_changed_bitset(
     out
 }
 
-/// BR-R29: structural diff of two `PvField` snapshots against their
+/// structural diff of two `PvField` snapshots against their
 /// shared `desc`, producing the per-event **changed bitset** — the
 /// leaves whose value differs between `prev` and `curr`.
 ///
@@ -1361,7 +1361,7 @@ pub fn diff_changed_bitset(
     out
 }
 
-/// BRIDGE-FR-12: build a wire *selection* bitset that marks every bit
+/// build a wire *selection* bitset that marks every bit
 /// under each field path in `marked_paths`.
 ///
 /// Paths are dot-separated and relative to the root structure — for a
@@ -1763,7 +1763,7 @@ fn decode_pv_field_at_depth(
             let n = decode_size(cur, order)?
                 .ok_or_else(|| decode_err!("scalar array length cannot be null"))?
                 as usize;
-            // F-G10 fast path: decode straight into a typed Arc<[T]>
+            // Fast path: decode straight into a typed Arc<[T]>
             // when the element is a fixed-size POD primitive. Single
             // memcpy when host endian matches wire; per-element
             // byte-swap loop otherwise. Same semantics as pvxs
@@ -1796,7 +1796,7 @@ fn decode_pv_field_at_depth(
                 // protocol violation.
                 let presence = cur.get_u8()?;
                 match presence {
-                    // PVA-FR-1: 0x00 is a null (absent) element — push
+                    // 0x00 is a null (absent) element — push
                     // `None`, not an empty struct, so the absent-vs-
                     // present-empty distinction survives the round trip.
                     0x00 => {
@@ -1854,13 +1854,13 @@ fn decode_pv_field_at_depth(
                 as usize;
             let mut items = Vec::with_capacity(safe_capacity(n, cur));
             for _ in 0..n {
-                // PVA-R13: pvxs `dataencode.cpp:624-650` reads a per-
+                // pvxs `dataencode.cpp:624-650` reads a per-
                 // element presence byte before the union body. 0x00
                 // = null element; 0x01 = present (then selector +
                 // value). Pre-fix Rust read the selector directly.
                 let presence = cur.get_u8()?;
                 match presence {
-                    // PVA-FR-1: 0x00 = null (absent) element → `None`.
+                    // 0x00 = null (absent) element → `None`.
                     0x00 => items.push(None),
                     // 0x01 = present; the union body may still carry a
                     // null selector (`-1`) — a present null-selector
@@ -1927,7 +1927,7 @@ fn decode_pv_field_at_depth(
                 as usize;
             let mut items = Vec::with_capacity(safe_capacity(n, cur));
             for _ in 0..n {
-                // PVA-R13: pvxs `dataencode.cpp:656-674` reads a per-
+                // pvxs `dataencode.cpp:656-674` reads a per-
                 // element presence byte before the inner descriptor.
                 // 0x00 = null element; 0x01 = present (then descriptor
                 // + value). Pre-fix Rust read the descriptor tag
@@ -1936,7 +1936,7 @@ fn decode_pv_field_at_depth(
                 // protocol fault).
                 let presence = cur.get_u8()?;
                 match presence {
-                    // PVA-FR-1: 0x00 = null (absent) element → `None`.
+                    // 0x00 = null (absent) element → `None`.
                     0x00 => items.push(None),
                     0x01 => {
                         // Present element. Inner descriptor may itself be
@@ -2026,7 +2026,7 @@ mod tests {
     use super::*;
     use crate::pvdata::{UnionItem, VariantValue};
 
-    /// PVA-FR-5: a bare descriptor-sensitive value encoded against an
+    /// a bare descriptor-sensitive value encoded against an
     /// `any` (FieldDesc::Variant) must NOT advertise a degraded schema;
     /// the encoder emits a null `any` (0xFF) instead.
     #[test]
@@ -2225,7 +2225,7 @@ mod tests {
         encode_pv_field(&v, &desc, ByteOrder::Little, &mut buf);
         let mut cur = Cursor::new(buf.as_slice());
         let dec = decode_pv_field(&desc, &mut cur, ByteOrder::Little).unwrap();
-        // After F-G10 the decoder lands the typed fast path.
+        // The decoder lands the typed fast path.
         match dec {
             PvField::ScalarArrayTyped(arr) => {
                 assert_eq!(arr.as_ints().unwrap(), &[1, 2, 3]);
@@ -2532,7 +2532,7 @@ mod tests {
         );
     }
 
-    /// PVXS-SR-11 (value-decode recursion): a chain of nested `Any`
+    /// Value-decode recursion: a chain of nested `Any`
     /// *values* must be bounded by the same depth cap as the descriptor
     /// decoder. Each `0x82` (`TAG_VARIANT`) byte costs exactly one wire
     /// byte but one `decode_pv_field_at_depth` stack frame, so an
@@ -2560,7 +2560,7 @@ mod tests {
         let too_deep = vec![TAG_VARIANT; 64];
         let mut cur2 = Cursor::new(too_deep.as_slice());
         let err = decode_pv_field(&FieldDesc::Variant, &mut cur2, ByteOrder::Little)
-            .expect_err("a >20-deep nested Any value must be rejected (PVXS-SR-11)");
+            .expect_err("a >20-deep nested Any value must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("MAX_FIELD_DEPTH"),
@@ -2568,7 +2568,7 @@ mod tests {
         );
     }
 
-    // ── F-G10: generic encode fallback ──────────────────────────────────
+    // ── generic encode fallback ──────────────────────────────────
 
     /// `PvField::Null` against a Union descriptor must emit the `0xFF`
     /// null selector — not zero bytes — so the stream stays in sync.
@@ -2889,7 +2889,7 @@ mod tests {
         }
     }
 
-    /// BR-R29: `diff_changed_bitset` marks exactly the leaf bits
+    /// `diff_changed_bitset` marks exactly the leaf bits
     /// whose value differs between two snapshots, and leaves
     /// structure bits clear. Bit numbering for `nested_alarm_desc`:
     /// root=0, value=1, alarm(struct)=2, alarm.severity=3,
@@ -2924,7 +2924,7 @@ mod tests {
         assert_eq!(diff3.count(), 0, "no change → empty changed-bitset");
     }
 
-    /// BRIDGE-FR-12: `marked_changed_bitset` marks each named path's
+    /// `marked_changed_bitset` marks each named path's
     /// whole subtree (assigned-not-changed), independent of any value
     /// diff. Structure desc: root=0, value(leaf)=1, alarm(struct)=2,
     /// alarm.severity=3, alarm.status=4.
@@ -3066,7 +3066,7 @@ mod tests {
         }
     }
 
-    /// PVA-R3 regression: a Variant whose inner descriptor is a 0xFE
+    /// Regression: a Variant whose inner descriptor is a 0xFE
     /// back-reference must resolve against the connection-scope cache, not
     /// a fresh empty cache. Wire layout:
     ///   peek(0xFE) != 0xFF → push back → decode_type_desc_cached reads

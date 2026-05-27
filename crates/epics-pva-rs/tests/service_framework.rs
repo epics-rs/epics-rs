@@ -278,7 +278,7 @@ async fn bfr13_client_get_surfaces_data_phase_error() {
     );
 }
 
-/// PVXS-SR-21: a source handler that PANICS (not returns Err) must still
+/// a source handler that PANICS (not returns Err) must still
 /// produce a client reply. Before the fix the panic unwound the spawned exec
 /// task and skipped the reply-build; the op returned to Idle but the client
 /// received nothing and waited out its full operation timeout. The fix wraps
@@ -305,10 +305,10 @@ impl ChannelSource for PanicSource {
         })
     }
     async fn get_value(&self, _: &str) -> Option<PvField> {
-        panic!("get_value handler panicked on purpose (PVXS-SR-21 regression)");
+        panic!("get_value handler panicked on purpose");
     }
     async fn put_value(&self, _: &str, _: PvField) -> Result<(), String> {
-        panic!("put_value handler panicked on purpose (PVXS-SR-21 regression)");
+        panic!("put_value handler panicked on purpose");
     }
     async fn is_writable(&self, _: &str) -> bool {
         true

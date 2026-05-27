@@ -1142,7 +1142,7 @@ pub struct X509Credentials {
 /// CN is not a usable account name (empty or containing an embedded NUL).
 ///
 /// The usability rejection mirrors pvxs `SSLContext::commonName()`
-/// (PVXS-SR-13, pvxs @b16b945), which rejects BOTH an embedded NUL and a
+/// (pvxs @b16b945), which rejects BOTH an embedded NUL and a
 /// `len <= 0` CN. `attr.as_str()` returns the CN's raw `ASN1_STRING`
 /// bytes and a NUL is valid UTF-8, so a CN such as `admin\0.evil` would
 /// otherwise become a Rust `String` that downstream ACF matching/logging
@@ -1766,7 +1766,7 @@ mod tests {
         assert!(!cfg.require_client_cert);
     }
 
-    /// A6-2: pvxs `ossl.cpp:355` sets `SSL_VERIFY_PEER` on the server for
+    /// pvxs `ossl.cpp:355` sets `SSL_VERIFY_PEER` on the server for
     /// `Default`/`Optional`/`Require` alike, so even the default TLS
     /// server requests a client cert and verifies it if presented. The
     /// pre-fix port took `with_no_client_auth()` for the default (no
@@ -1834,7 +1834,7 @@ mod tests {
         }
     }
 
-    /// A6-1 fail-open regression: a server-only
+    /// Fail-open regression: a server-only
     /// `EPICS_PVAS_TLS_OPTIONS=client_cert=require` must be honoured even
     /// when the shared `EPICS_PVA_TLS_OPTIONS` is unset (pvxs PVAS-first
     /// `pickone`, config.cpp:501). Reading only the shared form dropped the
@@ -1866,7 +1866,7 @@ mod tests {
         );
     }
 
-    /// A6-1: pvxs `Config::server()` resolves the keychain via
+    /// pvxs `Config::server()` resolves the keychain via
     /// `pickone({PVAS, PVA})` (config.cpp:497), so a server configured with
     /// only the shared `EPICS_PVA_TLS_KEYCHAIN` must still enable TLS.
     /// Reading the server-specific form alone left it silently disabled.
@@ -2016,7 +2016,7 @@ mod tests {
         assert_eq!(subject_common_name(&leaf).as_deref(), Some("my-account"));
     }
 
-    /// PVXS-SR-13: a peer-certificate CN with an embedded NUL must not be
+    /// a peer-certificate CN with an embedded NUL must not be
     /// mapped to an ACF account. Without the rejection `subject_common_name`
     /// returns the full `"admin\0.evil"` string and the credential is built
     /// as that confused identity; the guard drops it so no `x509` credential
@@ -2046,7 +2046,7 @@ mod tests {
         assert_eq!(creds.authority, "");
     }
 
-    /// PVXS-SR-13 (len<=0 arm): an empty CN is not a usable account
+    /// The `len <= 0` arm: an empty CN is not a usable account
     /// either — pvxs `commonName()` rejects `len <= 0`, so the Rust port
     /// must drop it rather than build an empty-account credential.
     #[test]

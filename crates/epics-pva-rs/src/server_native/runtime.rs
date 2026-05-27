@@ -14,7 +14,7 @@ use super::udp::{random_guid, run_udp_responder_v6, run_udp_responder_with_confi
 pub struct PvaServerConfig {
     pub tcp_port: u16,
     pub udp_port: u16,
-    /// PVA-R11: server identity propagated into the TCP-circuit
+    /// server identity propagated into the TCP-circuit
     /// `Command::Search` reply (`pvxs serverchan.cpp:215-235`). UDP
     /// SEARCH_RESPONSE uses the same guid emitted by the UDP
     /// responder. The runtime fills this from `random_guid()` before
@@ -159,11 +159,11 @@ pub struct PvaServerConfig {
     /// arbitrarily large structures (the design point that replaced
     /// CA's `EPICS_CA_MAX_ARRAY_BYTES`). `read_frame` and the
     /// segment-reassembly path stay bounded regardless via incremental
-    /// 4 KiB reads, the `op_timeout` deadline, and `safe_capacity`
-    /// (PVXS-SR-8), so the absence of a cap is not itself an
+    /// 4 KiB reads, the `op_timeout` deadline, and `safe_capacity`,
+    /// so the absence of a cap is not itself an
     /// amplification vector. Set `Some(n)` to opt in to a hard ceiling
     /// (e.g. a hardened deployment that wants to reject any header
-    /// claiming more than `n` bytes and drop the connection). PVXS-SR-9.
+    /// claiming more than `n` bytes and drop the connection).
     pub max_message_size: Option<usize>,
     /// Inbound peer ACL. Each entry is `(IpAddr, port_or_zero)` —
     /// matching connections (TCP) and search packets (UDP) are silently
@@ -283,7 +283,7 @@ impl PvaServerConfig {
     /// touched — others stay at their existing values.
     pub fn with_env(mut self) -> Self {
         use crate::config::env;
-        // PVA-R15: server respects EPICS_PVAS_SERVER_PORT first, then
+        // server respects EPICS_PVAS_SERVER_PORT first, then
         // falls back to EPICS_PVA_SERVER_PORT (pvxs config.cpp:
         // 402-408 PickOne precedence).
         self.tcp_port = env::pvas_server_port();
@@ -374,7 +374,7 @@ pub struct PvaServer {
     /// Programmatic interrupt for [`Self::run`]. Not used by `wait()`.
     interrupt: Arc<tokio::sync::Notify>,
     /// Per-peer book-keeping registry shared with `run_tcp_server`'s
-    /// per-connection task (F-G7). The accept loop registers an entry
+    /// per-connection task. The accept loop registers an entry
     /// on connect; the connection task updates `last_rx_at` and
     /// `channels` periodically; the entry is removed on disconnect.
     /// `PvaServer::report()` snapshots the registry to surface per-
@@ -471,7 +471,7 @@ impl PvaServer {
         S: ChannelSource + 'static,
     {
         let guid = random_guid();
-        // PVA-R11: the TCP-circuit SEARCH handler reads this guid
+        // the TCP-circuit SEARCH handler reads this guid
         // out of the per-connection config copy to populate the
         // SEARCH_RESPONSE body. Stamp it onto a local mut copy so
         // every per-conn task sees the same identity the UDP path
@@ -702,7 +702,7 @@ impl PvaServer {
         self.report_zeroed(false)
     }
 
-    /// PVA-FR-2: like [`Self::report`] but, when `zero` is true, resets
+    /// like [`Self::report`] but, when `zero` is true, resets
     /// each peer's byte counters after the snapshot — pvxs
     /// `Server::report(bool zero)`, so a subsequent report returns the
     /// deltas since this one. Channel counts and credentials are not
@@ -803,7 +803,7 @@ pub struct ServerReport {
     pub udp_v6_alive: bool,
     pub tcp_alive: bool,
     /// Live per-connection counters captured under the registry's
-    /// read lock (F-G7). pvxs `Server::report()` parity at the
+    /// read lock. pvxs `Server::report()` parity at the
     /// "live peers + per-peer channel/op/byte counters" level.
     pub peers: Vec<(SocketAddr, crate::server_native::peers::PeerSnapshot)>,
     /// Total currently-active connections.
@@ -1143,7 +1143,7 @@ mod tcp_fallback_tests {
 
 #[cfg(test)]
 mod sr9_message_size_tests {
-    //! PVXS-SR-9: the inbound message-size cap defaults to unbounded
+    //! the inbound message-size cap defaults to unbounded
     //! (`None`), matching pvxs which deliberately keeps no RX cap. A
     //! deployment opts into a hard ceiling by setting `Some(n)`.
     use super::*;
@@ -1153,7 +1153,7 @@ mod sr9_message_size_tests {
         assert_eq!(
             PvaServerConfig::default().max_message_size,
             None,
-            "PVXS-SR-9: default server config must be unbounded (None), not a fixed cap"
+            "default server config must be unbounded (None), not a fixed cap"
         );
         // `isolated()` inherits the default via `..Default::default()`.
         assert_eq!(PvaServerConfig::isolated().max_message_size, None);

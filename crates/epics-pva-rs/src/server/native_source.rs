@@ -93,7 +93,7 @@ impl PvDatabaseSource {
                 ("DEFAULT".to_string(), 0u8)
             })
         });
-        // CA-FR-1: resolve an ACF `INP*` link (`record.field`) to its
+        // resolve an ACF `INP*` link (`record.field`) to its
         // current numeric value from the live database, so CALC-gated
         // rules evaluate against real values instead of failing closed.
         let inp_db = db.clone();
@@ -566,9 +566,9 @@ fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
     match field {
         PvField::Scalar(sv) => Some(scalar_to_epics(sv)),
         PvField::ScalarArray(items) => scalar_array_to_epics(items),
-        // PF-R2: the PVA wire decoder delivers a decoded scalar array
+        // the PVA wire decoder delivers a decoded scalar array
         // as the refcount-shared `ScalarArrayTyped` form, not the
-        // generic `ScalarArray`. The MR-R24 arm only matched
+        // generic `ScalarArray`. The earlier arm only matched
         // `ScalarArray`, so a real wire `ulong[]` (or any typed
         // array) PUT fell through to `None` and was rejected. Route
         // the typed form through the same converter.
@@ -618,7 +618,7 @@ fn scalar_array_to_epics(items: &[ScalarValue]) -> Option<EpicsValue> {
                 })
                 .collect(),
         )),
-        // MR-R24: PVA `ulong[]` has no array arm here, so a
+        // PVA `ulong[]` has no array arm here, so a
         // `DBF_UINT64` waveform PUT fell through to `None` and was
         // rejected as "PUT value not representable as EpicsValue".
         // Preserve the unsigned 64-bit elements as
@@ -647,7 +647,7 @@ fn scalar_to_epics(v: &ScalarValue) -> EpicsValue {
         ScalarValue::UByte(x) => EpicsValue::Char(*x),
         ScalarValue::UShort(x) => EpicsValue::Enum(*x),
         ScalarValue::UInt(x) => EpicsValue::Long(*x as i32),
-        // MR-R21: PVA `ulong` is unsigned 64-bit. Narrowing it to
+        // PVA `ulong` is unsigned 64-bit. Narrowing it to
         // `EpicsValue::Long` (i32) here drops the upper 32 bits before
         // `PvDatabase::put_pv` can coerce to the target `DBF_UINT64`
         // field. Preserve the full width as `EpicsValue::UInt64`; the
@@ -1031,7 +1031,7 @@ ASG(LOCKED) {
         assert!(val.is_none(), "intruder must be denied via type-state gate");
     }
 
-    /// MR-R21 regression: a native PVA scalar `ulong` PUT into a
+    /// Regression: a native PVA scalar `ulong` PUT into a
     /// `DBF_UINT64`-backed PV must preserve the full unsigned 64-bit
     /// range. Pre-fix `scalar_to_epics` collapsed `ScalarValue::ULong`
     /// to `EpicsValue::Long(x as i32)`, discarding the upper 32 bits
@@ -1067,7 +1067,7 @@ ASG(LOCKED) {
         );
     }
 
-    /// MR-R24 regression: a native PVA `ulong[]` PUT into a
+    /// Regression: a native PVA `ulong[]` PUT into a
     /// `DBF_UINT64`-backed waveform must round-trip. Pre-fix
     /// `pv_field_to_epics` had no `ScalarValue::ULong` array arm, so
     /// the PUT fell through to `None` and was rejected as
@@ -1105,7 +1105,7 @@ ASG(LOCKED) {
         );
     }
 
-    /// PF-R2: a real PVA wire `ulong[]` PUT decodes to
+    /// a real PVA wire `ulong[]` PUT decodes to
     /// `PvField::ScalarArrayTyped`, not the hand-built untyped
     /// `ScalarArray` that `mr_r24` used. Before the fix
     /// `pv_field_to_epics` had only a `ScalarArray` arm, so the

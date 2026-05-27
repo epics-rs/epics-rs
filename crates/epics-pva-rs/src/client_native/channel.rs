@@ -181,7 +181,7 @@ pub struct ConnectionPool {
     /// default) means **unbounded** — pvxs keeps no client-side RX cap,
     /// and the streaming reader stays bounded by incremental 4 KiB reads
     /// plus the `op_timeout` deadline regardless. `Some(n)` rejects (and
-    /// drops) any server header announcing more than `n` bytes. PVXS-SR-9.
+    /// drops) any server header announcing more than `n` bytes.
     max_message_size: parking_lot::Mutex<Option<usize>>,
     /// Set by `PvaClient::close` (pvxs `Context::close`). Once true,
     /// reconnect attempts (especially the name-server fallback in
@@ -231,13 +231,13 @@ impl ConnectionPool {
         *self.tls.lock() = tls;
     }
 
-    /// PVXS-SR-9: set the opt-in inbound message-size cap applied to
+    /// set the opt-in inbound message-size cap applied to
     /// every subsequent connect call. `None` (the default) is unbounded.
     pub fn set_max_message_size(&self, cap: Option<usize>) {
         *self.max_message_size.lock() = cap;
     }
 
-    /// PVA-FR-2: per-connection `(peer, bytes_rx, bytes_tx, alive)`
+    /// per-connection `(peer, bytes_rx, bytes_tx, alive)`
     /// snapshot for `PvaClient::report`. When `zero` is true each
     /// connection's byte counters are reset after the read (pvxs
     /// `report(bool zero)` delta semantics).
@@ -700,7 +700,7 @@ impl Channel {
                 //   microseconds, AND places the SEARCH at
                 //   `current_bucket+1` so a slow server is retried on
                 //   the pvxs-style `nSearch+1` escalation. No outer
-                //   timeout (PVA-FR-12): a fresh resolve stays pending
+                //   timeout: a fresh resolve stays pending
                 //   until a server answers; the operation-level timeout
                 //   surfaces "no server" for one-shot ops (a wrong PV
                 //   name fails when the caller's op timeout elapses,
@@ -736,7 +736,7 @@ impl Channel {
                 // to single-server `find()`.
                 match &self.resolver {
                     Resolver::Search(engine) => {
-                        // PVA-FR-12: no inner timeout for either reason.
+                        // no inner timeout for either reason.
                         // Both `find()` calls stay pending until a
                         // SEARCH_RESPONSE arrives; the engine drives
                         // recovery via the bucket scheduler (Initial
@@ -1009,7 +1009,7 @@ mod tests {
         assert!(!ch.is_active(), "still Idle, still not active");
     }
 
-    /// PVA-FR-12 regression: a fresh channel's initial search must NOT
+    /// Regression: a fresh channel's initial search must NOT
     /// fail with "no servers found" at the 200 ms `MULTI_SERVER_WINDOW`.
     /// The inner cap is gone; `ensure_active` stays pending until a
     /// SEARCH_RESPONSE arrives or the caller's operation-level timeout
@@ -1069,8 +1069,8 @@ mod tests {
         assert!(
             res.is_err(),
             "ensure_active resolved before the op timeout — the 200 ms \
-             MULTI_SERVER_WINDOW initial-search ceiling was reintroduced \
-             (PVA-FR-12); outcome: {outcome}"
+             MULTI_SERVER_WINDOW initial-search ceiling was reintroduced; \
+             outcome: {outcome}"
         );
         assert!(
             elapsed >= op_timeout,

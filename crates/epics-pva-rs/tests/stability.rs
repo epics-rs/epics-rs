@@ -42,7 +42,7 @@ struct MemSourceInner {
     state: Mutex<MemState>,
     /// Subscribers per PV — every push fans out to all of them.
     subs: Mutex<std::collections::HashMap<String, Vec<mpsc::Sender<PvField>>>>,
-    /// PVA-FR-11: ordered log of every `notify_monitor_start(name, start)`
+    /// ordered log of every `notify_monitor_start(name, start)`
     /// the server fires, so a test can assert the Executing<->Idle edges.
     /// Sync mutex because `notify_monitor_start` is a sync trait method.
     monitor_starts: parking_lot::Mutex<Vec<(String, bool)>>,
@@ -65,7 +65,7 @@ impl MemSource {
         }
     }
 
-    /// PVA-FR-11: snapshot the ordered start/stop edges recorded for a
+    /// snapshot the ordered start/stop edges recorded for a
     /// PV by [`ChannelSource::notify_monitor_start`].
     fn monitor_starts(&self, name: &str) -> Vec<bool> {
         self.inner
@@ -87,7 +87,7 @@ impl MemSource {
             .insert(name.to_string(), pv);
     }
 
-    /// EX-R12: register an NTScalarArray PV holding a Double array.
+    /// register an NTScalarArray PV holding a Double array.
     async fn add_array_pv(&self, name: &str, vals: &[f64]) {
         let pv = make_nt_double_array(vals);
         self.inner
@@ -185,7 +185,7 @@ impl ChannelSource for MemSource {
         let inner = self.inner.clone();
         let name = name.to_string();
         async move {
-            // EX-R12: derive the descriptor from the stored value's
+            // derive the descriptor from the stored value's
             // shape so an NTScalarArray PV reports an array descriptor.
             match inner.state.lock().await.values.get(&name) {
                 Some(PvField::Structure(s))
@@ -296,7 +296,7 @@ fn client_for(tcp_port: u16) -> PvaClient {
         .build()
 }
 
-/// PVXS-SR-9: a client that opts into a 1-byte inbound message-size cap.
+/// a client that opts into a 1-byte inbound message-size cap.
 /// Any real PVA frame (even the server's CONNECTION_VALIDATION) carries a
 /// payload over 1 byte, so the reader drops the connection and every
 /// operation fails — proving the opt-in cap is enforced.
@@ -312,7 +312,7 @@ fn capped_client_for(tcp_port: u16, cap: usize) -> PvaClient {
         .build()
 }
 
-/// PVXS-SR-9: spawn a server that opts into a tiny inbound cap. The
+/// spawn a server that opts into a tiny inbound cap. The
 /// client's CONNECTION_VALIDATION reply exceeds `cap` bytes, so the
 /// server drops the circuit during the handshake.
 async fn spawn_server_capped(
@@ -387,7 +387,7 @@ async fn p2_auto_reconnect_after_server_restart() {
     let _ = h2.await;
 }
 
-/// PVXS-SR-9: the default client is **unbounded** (pvxs parity — no
+/// the default client is **unbounded** (pvxs parity — no
 /// RX message-size cap), while a client that opts into a tiny cap drops
 /// the connection and fails every op. Same server, two clients: proves
 /// both the new default and that the opt-in knob is still enforced.
@@ -423,7 +423,7 @@ async fn sr9_client_default_unbounded_opt_in_cap_enforced() {
     let _ = h.await;
 }
 
-/// PVXS-SR-9: the server side of the opt-in cap. A server that opts into
+/// the server side of the opt-in cap. A server that opts into
 /// a 1-byte cap drops the client during the handshake (its
 /// CONNECTION_VALIDATION reply exceeds 1 byte), so the GET fails.
 #[tokio::test]
@@ -524,7 +524,7 @@ async fn wait_starts(source: &MemSource, name: &str, want_len: usize) -> Vec<boo
     source.monitor_starts(name)
 }
 
-/// PVA-FR-11: a server-side monitor exposes pvxs `onStart(bool)` to the
+/// a server-side monitor exposes pvxs `onStart(bool)` to the
 /// source. MONITOR START fires `on_start(true)`; MONITOR PAUSE fires
 /// `on_start(false)` without tearing the op down; MONITOR RESUME fires
 /// `on_start(true)` once; DESTROY (handle drop) fires the terminal
@@ -576,7 +576,7 @@ async fn pva_fr_11_on_start_fires_across_start_pause_resume_destroy() {
     h.abort();
 }
 
-/// PVA-FR-11: DESTROY after a prior PAUSE must NOT double-fire
+/// DESTROY after a prior PAUSE must NOT double-fire
 /// `on_start(false)`. The op is already Idle, so
 /// `MonitorStartControl::drop` sees `executing == false` and stays
 /// silent — closing the dual-fire edge the single-owner design exists
@@ -613,7 +613,7 @@ async fn pva_fr_11_destroy_after_pause_does_not_double_fire() {
     h.abort();
 }
 
-/// PVA-FR-8: pausing a server monitor must HOLD the latest value posted
+/// pausing a server monitor must HOLD the latest value posted
 /// while paused (squash) and deliver it on resume — not drop it (the
 /// pre-fix P-G28 floor-drop). Mirrors pvxs queue-while-Idle +
 /// drain-on-START.
@@ -673,7 +673,7 @@ async fn pva_fr_8_pause_holds_latest_then_resume_delivers() {
     h.abort();
 }
 
-/// PVA-FR-2: the client report lists each live server connection with
+/// the client report lists each live server connection with
 /// its byte counters, and `report_zeroed(true)` resets them so the next
 /// report is a delta (pvxs `Context::report(bool zero)`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -953,7 +953,7 @@ async fn server_side_filter_pva_dec_wire_through() {
     h.abort();
 }
 
-/// EX-R12 regression: a server-side TRANSFORMATION filter (`arr`)
+/// Regression: a server-side TRANSFORMATION filter (`arr`)
 /// must actually change the emitted monitor value. Before the fix
 /// the PVA monitor emit loop called `FilterChain::apply` only to
 /// check `is_none()` for pass/drop and then built the wire payload
@@ -1034,7 +1034,7 @@ async fn ex_r12_server_side_arr_filter_slices_monitor_value() {
     let observed = seen.lock().clone();
     assert!(
         observed.len() >= 2,
-        "EX-R12: expected the initial snapshot plus the pushed event, got {}",
+        "expected the initial snapshot plus the pushed event, got {}",
         observed.len()
     );
     // Finding #2: the INITIAL snapshot must be sliced too. Pre-fix it went
@@ -1057,19 +1057,19 @@ async fn ex_r12_server_side_arr_filter_slices_monitor_value() {
     assert_eq!(
         pushed,
         &vec![10.0, 12.0, 14.0, 16.0],
-        "EX-R12: arr filter did not slice the emitted monitor value — got {pushed:?}"
+        "arr filter did not slice the emitted monitor value — got {pushed:?}"
     );
     assert_eq!(
         pushed.len(),
         4,
-        "EX-R12: arr-sliced monitor value must have 4 elements"
+        "arr-sliced monitor value must have 4 elements"
     );
 
     monitor_handle.abort();
     h.abort();
 }
 
-/// EX-R1 regression: pipeline credit must be consumed only for
+/// Regression: pipeline credit must be consumed only for
 /// monitor DATA frames actually sent to the client. A pipelined
 /// monitor (`pipeline=true,queueSize=N`) combined with a server-side
 /// `dec` filter that drops most events must still stream the events
@@ -1144,14 +1144,14 @@ async fn ex_r1_pipeline_credit_not_consumed_by_filtered_events() {
     // the filter-dropped events.
     assert!(
         last.is_some_and(|v| v >= (N as f64) - 6.0),
-        "EX-R1 regression: pipelined monitor stalled — last value {last:?} \
+        "Regression: pipelined monitor stalled — last value {last:?} \
          (expected close to {N}); filter-dropped events consumed window credit"
     );
     // And more than the window's worth of frames were delivered, which
     // is impossible if credit never refilled.
     assert!(
         seen > 4,
-        "EX-R1 regression: only {seen} frames delivered — window never refilled"
+        "Regression: only {seen} frames delivered — window never refilled"
     );
 
     monitor_handle.abort();
@@ -1425,7 +1425,7 @@ async fn auth_method_unadvertised_returns_status_error() {
     h.abort();
 }
 
-/// EX-R7 regression: when a plain-TCP client selects an auth method
+/// Regression: when a plain-TCP client selects an auth method
 /// the server never advertised (`x509`) and includes a non-empty
 /// `user` in its auth body, the server returns `Status::Error` AND
 /// must revert the connection credential to anonymous. Before the fix
@@ -1525,11 +1525,11 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
     let (method, account) = observed.expect("auth_complete hook must have fired");
     assert_eq!(
         method, "anonymous",
-        "EX-R7: rejected unadvertised method must not survive on the connection"
+        "rejected unadvertised method must not survive on the connection"
     );
     assert_eq!(
         account, "anonymous",
-        "EX-R7: rejected claimed account `alice` must not survive on the connection"
+        "rejected claimed account `alice` must not survive on the connection"
     );
 
     h.abort();
@@ -1719,7 +1719,7 @@ async fn r70_ca_without_user_falls_back_to_anonymous() {
     h.abort();
 }
 
-/// EX-R4 regression: PVA `pvget_many` warm path.
+/// Regression: PVA `pvget_many` warm path.
 ///
 /// `pvget_many` initializes every result slot to `Err(PvaError::Timeout)`.
 /// The first call per channel pays the cold INIT+GET cost and warms the

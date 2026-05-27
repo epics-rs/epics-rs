@@ -591,9 +591,9 @@ impl GatewayServer {
         // recovers the exact missed events from a bounded ring buffer
         // before resuming the live stream. The consumer below never
         // sees a silent gap, so the per-PV refcounts stay correct.
-        // The only residual lossy case — a lag that overflows the
-        // replay log — surfaces as `ConnEventRecv::GapTruncated` and
-        // is logged.
+        // Any genuinely unrecoverable hole — a lag that overflows the
+        // replay log, or the forwarder skipping a span on its own raw
+        // lag — surfaces as `ConnEventRecv::GapTruncated` and is logged.
         let conn_rx = downstream.connection_events().await;
         let conn_handle = if let Some(mut rx) = conn_rx {
             let stats_for_conn = stats.clone();
@@ -624,11 +624,13 @@ impl GatewayServer {
                     let event = match rx.recv().await {
                         ConnEventRecv::Event(ev) => ev,
                         ConnEventRecv::GapTruncated { missed } => {
-                            // A lag overflowed the replay ring buffer
-                            // — the only case where events are
-                            // genuinely unrecoverable. Far rarer than
-                            // the channel-depth lag that replay
-                            // covers; warn so the operator notices.
+                            // The event sequence jumped — either a lag
+                            // overflowed the replay ring buffer or the
+                            // forwarder skipped a span on its own raw
+                            // lag. Either way those events are
+                            // unrecoverable. Far rarer than the
+                            // channel-depth lag that replay covers;
+                            // warn so the operator notices.
                             tracing::warn!(
                                 missed,
                                 "ca-gateway-rs: connection-event lag exceeded the \

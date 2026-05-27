@@ -159,12 +159,19 @@ pub struct ReplayingReceiver {
     rx: broadcast::Receiver<SeqConnEvent>,
     replay: Arc<ConnEventReplay>,
     /// Sequence number of the last event handed to the caller. Used
-    /// as the lower bound for `events_since` on lag recovery.
+    /// as the lower bound for `events_since` on lag recovery and as the
+    /// reference for the discontinuity gate in `recv`.
     last_seq: u64,
-    /// Events recovered from the replay log on the most recent lag,
-    /// not yet handed to the caller. Drained front-first before the
-    /// next `rx.recv()`.
-    pending: VecDeque<ServerConnectionEvent>,
+    /// Events recovered from the replay log on the most recent lag, each
+    /// tagged with its sequence number so the discontinuity gate in
+    /// `recv` runs on every one. Drained front-first before the next
+    /// `rx.recv()`.
+    pending: VecDeque<SeqConnEvent>,
+    /// An event whose preceding gap was already reported via
+    /// [`ConnEventRecv::GapTruncated`] on the prior `recv` call. It has
+    /// passed the discontinuity gate and is delivered as the next
+    /// `Event` without re-checking.
+    staged: Option<ServerConnectionEvent>,
 }
 
 /// Outcome of [`ReplayingReceiver::recv`].
@@ -175,11 +182,15 @@ pub enum ConnEventRecv {
     /// The broadcast sender was dropped and the log is drained; the
     /// consumer loop should terminate.
     Closed,
-    /// A lag overflowed the replay log: `missed` events before the
-    /// next delivered event are genuinely unrecoverable. The next
-    /// `recv` resumes the live stream. The consumer should treat the
-    /// affected PVs' refcounts as approximate until the next
-    /// CREATE/CLEAR cycle and log the gap.
+    /// `missed` events before the next delivered event are genuinely
+    /// unrecoverable — either a lag overflowed the replay ring buffer,
+    /// or the forwarder skipped a span on its own raw-broadcast lag
+    /// (`seq += n`) so those events were never recorded. Reported on
+    /// *any* positive discontinuity in the delivered sequence, not only
+    /// at a head-of-log overflow. The next `recv` delivers the event
+    /// that follows the gap. The consumer should treat the affected
+    /// PVs' refcounts as approximate until the next CREATE/CLEAR cycle
+    /// and log the gap.
     GapTruncated { missed: u64 },
 }
 
@@ -189,59 +200,66 @@ impl ReplayingReceiver {
     ///
     /// Returns [`ConnEventRecv::Event`] for each event (live or
     /// replayed), [`ConnEventRecv::Closed`] once the stream ends, and
-    /// [`ConnEventRecv::GapTruncated`] only in the residual case where
-    /// a lag exceeded the replay log capacity.
+    /// [`ConnEventRecv::GapTruncated`] whenever the sequence number
+    /// jumps past `last_seq + 1` — i.e. any unrecoverable hole, whether
+    /// from a ring-buffer overflow or from the forwarder skipping a span
+    /// on its own raw-broadcast lag (`seq += n`).
     pub async fn recv(&mut self) -> ConnEventRecv {
+        // An event whose preceding gap was reported on the prior call
+        // has already passed the discontinuity gate — deliver it now.
+        if let Some(ev) = self.staged.take() {
+            return ConnEventRecv::Event(ev);
+        }
         loop {
-            // Drain any events recovered from the replay log first.
-            if let Some(ev) = self.pending.pop_front() {
-                return ConnEventRecv::Event(ev);
-            }
-            match self.rx.recv().await {
-                Ok((seq, ev)) => {
-                    // Skip events already handed to the caller via the
-                    // replay log. After a lag recovery the broadcast
-                    // channel still has its buffered tail (the events
-                    // it did NOT drop); those overlap the replayed
-                    // span, so without this guard the caller would see
-                    // them twice and double-count the refcount.
-                    if seq <= self.last_seq {
+            // Next sequenced event: recovered events from the replay log
+            // first, then the live broadcast. On a consumer-side lag,
+            // refill `pending` from the log and re-enter the loop; any
+            // unrecoverable head/interior gap is caught by the single
+            // discontinuity gate below, not special-cased here.
+            let (seq, ev) = match self.pending.pop_front() {
+                Some(se) => se,
+                None => match self.rx.recv().await {
+                    Ok(se) => se,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // The `_truncated` head-of-log flag is subsumed
+                        // by the discontinuity gate: a ring overflow
+                        // makes the first recovered seq jump past
+                        // last_seq+1 exactly like a forwarder skip.
+                        let (missed, _truncated) = self.replay.events_since(self.last_seq);
+                        self.pending.extend(missed);
                         continue;
                     }
-                    self.last_seq = seq;
-                    return ConnEventRecv::Event(ev);
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // The channel dropped events for this slow
-                    // consumer. Recover the exact gap from the replay
-                    // log: every event with seq > last_seq.
-                    let (missed, truncated) = self.replay.events_since(self.last_seq);
-                    if truncated {
-                        // The gap overflowed the ring buffer. Report
-                        // how many events are unrecoverable, advance
-                        // `last_seq` past them so the next recovery
-                        // does not double-count, then continue with
-                        // whatever the log still holds.
-                        let recovered_lo =
-                            missed.first().map(|(s, _)| *s).unwrap_or(self.last_seq + 1);
-                        let lost = recovered_lo.saturating_sub(self.last_seq + 1);
-                        for (seq, ev) in missed {
-                            self.last_seq = seq;
-                            self.pending.push_back(ev);
-                        }
-                        return ConnEventRecv::GapTruncated { missed: lost };
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return ConnEventRecv::Closed;
                     }
-                    for (seq, ev) in missed {
-                        self.last_seq = seq;
-                        self.pending.push_back(ev);
-                    }
-                    // Loop: drain `pending`, then resume live recv.
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    return ConnEventRecv::Closed;
-                }
+                },
+            };
+            // Dedup events already handed to the caller via the replay
+            // log. After a lag recovery the broadcast channel still has
+            // its buffered tail (the events it did NOT drop); those
+            // overlap the replayed span, so without this guard the
+            // caller would see them twice and double-count the refcount.
+            if seq <= self.last_seq {
+                continue;
             }
+            // Uniform discontinuity rule: any jump past `last_seq + 1`
+            // means events were dropped and never recorded — the
+            // forwarder skipped a span on its own raw-broadcast lag
+            // (`seq += n` + `advance_high_water`), or a ring-buffer
+            // overflow exceeded the replay log. Either way those events
+            // are unrecoverable. Report the hole once (with `last_seq`
+            // advanced so it is not re-counted), then deliver this event
+            // on the next call. This catches an interior hole the old
+            // head-of-log-only check missed — including one inside a
+            // recovered set on a double (forwarder + consumer) lag.
+            if seq > self.last_seq + 1 {
+                let missed = seq - self.last_seq - 1;
+                self.last_seq = seq;
+                self.staged = Some(ev);
+                return ConnEventRecv::GapTruncated { missed };
+            }
+            self.last_seq = seq;
+            return ConnEventRecv::Event(ev);
         }
     }
 }
@@ -369,6 +387,7 @@ impl DownstreamServer {
             replay: state.replay.clone(),
             last_seq: state.replay.high_water(),
             pending: VecDeque::new(),
+            staged: None,
         })
     }
 
@@ -571,6 +590,7 @@ mod tests {
             replay: replay.clone(),
             last_seq: 0,
             pending: VecDeque::new(),
+            staged: None,
         };
         for i in 1..=3u64 {
             let sequenced = (i, ev("PV", i as u32));
@@ -603,6 +623,7 @@ mod tests {
             replay: replay.clone(),
             last_seq: 0,
             pending: VecDeque::new(),
+            staged: None,
         };
         // Push 20 events: the channel (cap 4) drops the older 16 for
         // this un-drained receiver, but every one is in the replay log.
@@ -664,6 +685,7 @@ mod tests {
             replay: replay.clone(),
             last_seq: replay.high_water(),
             pending: VecDeque::new(),
+            staged: None,
         };
 
         // Now 20 NEW events arrive. The cap-4 channel drops the older
@@ -769,6 +791,7 @@ mod tests {
             replay: replay.clone(),
             last_seq: 0,
             pending: VecDeque::new(),
+            staged: None,
         };
 
         for i in 1..=N {
@@ -789,5 +812,109 @@ mod tests {
         }
         assert_eq!(seen, (1..=N).collect::<Vec<_>>());
         forwarder.abort();
+    }
+
+    /// A9-R3-3: when the forwarder skips a span on its own raw-broadcast
+    /// lag (`seq += n` + `advance_high_water`, never recording the
+    /// dropped events), the live stream jumps. The consumer must observe
+    /// `GapTruncated{missed}` for the hole — pre-fix the Ok branch
+    /// silently accepted the jumped seq and the dropped CREATE/CLEAR
+    /// events skewed the connection refcount.
+    #[tokio::test]
+    async fn forwarder_skip_reports_interior_gap_on_live_stream() {
+        let replay = Arc::new(ConnEventReplay::new());
+        let (tx, rx) = broadcast::channel::<SeqConnEvent>(REPLAY_CHANNEL_CAPACITY);
+        let mut recv = ReplayingReceiver {
+            rx,
+            replay: replay.clone(),
+            last_seq: 0,
+            pending: VecDeque::new(),
+            staged: None,
+        };
+
+        // Record + broadcast 1, 2.
+        for i in 1..=2u64 {
+            let s = (i, ev("PV", i as u32));
+            replay.record(s.clone());
+            tx.send(s).unwrap();
+        }
+        // Forwarder raw-lag: events 3, 4 dropped and never recorded; the
+        // next real event is seq 5.
+        replay.advance_high_water(4);
+        let s5 = (5u64, ev("PV", 5));
+        replay.record(s5.clone());
+        tx.send(s5).unwrap();
+
+        // 1, 2 delivered live, contiguous.
+        for i in 1..=2u32 {
+            match recv.recv().await {
+                ConnEventRecv::Event(ServerConnectionEvent::ChannelCreated { cid, .. }) => {
+                    assert_eq!(cid, i)
+                }
+                other => panic!("expected event {i}, got {other:?}"),
+            }
+        }
+        // The 3, 4 hole is surfaced.
+        match recv.recv().await {
+            ConnEventRecv::GapTruncated { missed } => assert_eq!(missed, 2),
+            other => panic!("expected GapTruncated{{missed:2}}, got {other:?}"),
+        }
+        // Event 5 follows the gap.
+        match recv.recv().await {
+            ConnEventRecv::Event(ServerConnectionEvent::ChannelCreated { cid, .. }) => {
+                assert_eq!(cid, 5)
+            }
+            other => panic!("expected event 5, got {other:?}"),
+        }
+        drop(tx);
+        assert!(matches!(recv.recv().await, ConnEventRecv::Closed));
+    }
+
+    /// A9-R3-3: an interior hole inside a *recovered* set, on a double
+    /// (forwarder + consumer) lag. The log holds 1,2,5,6 (3,4 skipped by
+    /// the forwarder) and the consumer also lags so it recovers the
+    /// whole set from the log. The single discontinuity gate must still
+    /// report the 3,4 hole — the old head-of-log-only check (`truncated`)
+    /// would not, because the log front (seq 1) is not past `last_seq+1`.
+    #[tokio::test]
+    async fn double_lag_reports_interior_gap_within_recovered_set() {
+        let replay = Arc::new(ConnEventReplay::new());
+        // cap-2 channel so the un-drained consumer lags.
+        let (tx, rx) = broadcast::channel::<SeqConnEvent>(2);
+        let mut recv = ReplayingReceiver {
+            rx,
+            replay: replay.clone(),
+            last_seq: 0,
+            pending: VecDeque::new(),
+            staged: None,
+        };
+
+        for i in 1..=2u64 {
+            let s = (i, ev("PV", i as u32));
+            replay.record(s.clone());
+            let _ = tx.send(s);
+        }
+        replay.advance_high_water(4); // forwarder skipped 3, 4
+        for i in 5..=6u64 {
+            let s = (i, ev("PV", i as u32));
+            replay.record(s.clone());
+            let _ = tx.send(s);
+        }
+        drop(tx);
+
+        let mut events = Vec::new();
+        let mut gaps = Vec::new();
+        loop {
+            match recv.recv().await {
+                ConnEventRecv::Event(ServerConnectionEvent::ChannelCreated { cid, .. }) => {
+                    events.push(cid)
+                }
+                ConnEventRecv::Event(_) => {}
+                ConnEventRecv::GapTruncated { missed } => gaps.push(missed),
+                ConnEventRecv::Closed => break,
+            }
+        }
+        assert_eq!(events, vec![1, 2, 5, 6], "all recoverable events delivered");
+        assert_eq!(gaps, vec![2], "the 3,4 interior hole reported exactly once");
     }
 }

@@ -98,6 +98,11 @@ struct WriteHookEnv {
     pvlist: Arc<ArcSwap<PvList>>,
     /// Optional put-event log.
     putlog: Option<Arc<PutLog>>,
+    /// Gateway PV cache, keyed by `served_name`. The write hook reads
+    /// `GwPvEntry.cached` (the last upstream monitor value) for the
+    /// put-audit `old=` field — the analog of C ca-gateway's
+    /// `vc->eventData()`. Only read when `putlog` is configured.
+    cache: Arc<RwLock<PvCache>>,
     /// Stats counters.
     stats: Arc<Stats>,
     /// Beacon-anomaly trigger handle. Fires from
@@ -197,13 +202,14 @@ impl UpstreamManager {
             .map_err(|e| BridgeError::PutRejected(format!("CaClient init: {e}")))?;
         Ok(Self {
             client: Arc::new(client),
-            cache: cfg.cache,
+            cache: cfg.cache.clone(),
             shadow_db: cfg.shadow_db,
             write_env: WriteHookEnv {
                 read_only: cfg.read_only,
                 access: cfg.access,
                 pvlist: cfg.pvlist,
                 putlog: cfg.putlog,
+                cache: cfg.cache,
                 stats: cfg.stats,
                 beacon_anomaly: cfg.beacon_anomaly,
             },
@@ -403,6 +409,7 @@ impl UpstreamManager {
         // hook isn't yet bound (which would silently drop the put
         // into the local `pv.set()` fallback).
         let hook = build_write_hook(
+            served_name.to_string(),
             upstream_name.to_string(),
             channel.clone(),
             asg.clone(),
@@ -785,6 +792,10 @@ fn build_access_hook(
 /// on the shadow `ProcessVariable` so every client `caput` runs this
 /// pipeline.
 ///
+/// `served_name` is the cache/shadow-DB key (== `upstream_name` when no
+/// alias) used to read the prior cached value for the putlog `old=`
+/// field; `pv_name` is the upstream PV name written to the putlog.
+///
 /// Pipeline (matches C ca-gateway `gatePvData::putCB` ordering):
 /// 1. Read-only mode → reject + record stat + putlog
 /// 2. Host-based DENY (pvlist `FROM host`) → reject + putlog
@@ -792,6 +803,7 @@ fn build_access_hook(
 /// 4. Forward `caput` to upstream via the shared channel
 /// 5. Putlog the outcome (Ok/Failed) and bump put-count stat
 fn build_write_hook(
+    served_name: String,
     pv_name: String,
     channel: Arc<CaChannel>,
     asg: Option<String>,
@@ -799,6 +811,7 @@ fn build_write_hook(
     env: WriteHookEnv,
 ) -> WriteHook {
     Arc::new(move |new_value: EpicsValue, ctx: WriteContext| {
+        let served_name = served_name.clone();
         let pv_name = pv_name.clone();
         let channel = channel.clone();
         let asg = asg.clone();
@@ -812,10 +825,23 @@ fn build_write_hook(
             // separate binary trace if ever needed.
             let value_str = format_value_for_audit(&new_value, 256);
 
+            // Prior cached value for the audit `old=` field. C ca-gateway
+            // logs `vc->eventData()` — the virtual connection's cached
+            // monitor value — as the put's `old` value
+            // (gateResources.cc:486-492). Read once up-front, keyed by
+            // `served_name` (the cache key, upstream.rs:313/481), so every
+            // log path (denial branches + forward outcome) records the
+            // same pre-put value, and only when a putlog is configured.
+            let old_str = if env.putlog.is_some() {
+                cached_old_for_audit(&env, &served_name).await
+            } else {
+                String::new()
+            };
+
             // 1. read-only mode — gateway-wide flag.
             if env.read_only {
                 env.stats.record_readonly_reject();
-                log_denial(&env, &ctx, &pv_name, &value_str).await;
+                log_denial(&env, &ctx, &pv_name, &value_str, &old_str).await;
                 return Err(CaError::ReadOnlyField(format!(
                     "{pv_name} (gateway in read-only mode)"
                 )));
@@ -827,7 +853,7 @@ fn build_write_hook(
             let pvlist = env.pvlist.load_full();
             if pvlist.is_host_denied(&pv_name, &ctx.host) {
                 env.stats.record_readonly_reject();
-                log_denial(&env, &ctx, &pv_name, &value_str).await;
+                log_denial(&env, &ctx, &pv_name, &value_str, &old_str).await;
                 return Err(CaError::PutDisabled(format!(
                     "{pv_name} (host {} denied by pvlist)",
                     ctx.host
@@ -844,7 +870,7 @@ fn build_write_hook(
             let access = env.access.load_full();
             if ctx.user.is_empty() && access.has_rules() {
                 env.stats.record_readonly_reject();
-                log_denial(&env, &ctx, &pv_name, &value_str).await;
+                log_denial(&env, &ctx, &pv_name, &value_str, &old_str).await;
                 return Err(CaError::ReadOnlyField(format!(
                     "{pv_name} (no client identity)"
                 )));
@@ -852,7 +878,7 @@ fn build_write_hook(
             let asg_ref = asg.as_deref().unwrap_or("DEFAULT");
             if !access.can_write(asg_ref, asl, &ctx.user, &ctx.host) {
                 env.stats.record_readonly_reject();
-                log_denial(&env, &ctx, &pv_name, &value_str).await;
+                log_denial(&env, &ctx, &pv_name, &value_str, &old_str).await;
                 return Err(CaError::ReadOnlyField(format!(
                     "{pv_name} (asg {asg_ref}, user {})",
                     ctx.user
@@ -874,7 +900,9 @@ fn build_write_hook(
                     PutOutcome::Failed
                 };
                 if let Err(e) = pl
-                    .log(&ctx.user, &ctx.host, &pv_name, &value_str, outcome)
+                    .log(
+                        &ctx.user, &ctx.host, &pv_name, &value_str, &old_str, outcome,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -892,16 +920,35 @@ fn build_write_hook(
     })
 }
 
+/// Read the gateway's last-cached upstream value for `key` and render it
+/// for the put-audit `old=` field. Mirrors C ca-gateway, which logs
+/// `vc->eventData()` (the virtual connection's cached monitor value) as
+/// the put's `old` value (gateResources.cc:486-492). `key` is the
+/// `served_name` the cache and forwarding task register under
+/// (upstream.rs:313/481). Returns `"?"` when no monitor update has
+/// populated the cache yet, matching C's `old_value == NULL` →
+/// `acOldVal = "?"` (gateResources.cc:476-480).
+async fn cached_old_for_audit(env: &WriteHookEnv, key: &str) -> String {
+    let entry = env.cache.read().await.get(key);
+    if let Some(entry) = entry
+        && let Some(snap) = &entry.read().await.cached
+    {
+        return format_value_for_audit(&snap.value, 256);
+    }
+    "?".to_string()
+}
+
 /// Helper: emit a single `Denied` putlog line. Called from each
 /// rejection branch in the WriteHook so the structure is uniform
-/// (timestamp, user@host, pv, value, DENIED). Errors from the log
-/// write itself are surfaced via `tracing` (debounced via target)
-/// so a disk-full putlog doesn't silently disappear the audit
+/// (timestamp, user@host, pv, value, old, DENIED). `old` is the prior
+/// cached value the caller read up-front (see [`cached_old_for_audit`]).
+/// Errors from the log write itself are surfaced via `tracing` (debounced
+/// via target) so a disk-full putlog doesn't silently disappear the audit
 /// trail.
-async fn log_denial(env: &WriteHookEnv, ctx: &WriteContext, pv: &str, value: &str) {
+async fn log_denial(env: &WriteHookEnv, ctx: &WriteContext, pv: &str, value: &str, old: &str) {
     if let Some(pl) = &env.putlog
         && let Err(e) = pl
-            .log(&ctx.user, &ctx.host, pv, value, PutOutcome::Denied)
+            .log(&ctx.user, &ctx.host, pv, value, old, PutOutcome::Denied)
             .await
     {
         tracing::warn!(
@@ -990,9 +1037,40 @@ mod tests {
             access: Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all())),
             pvlist: Arc::new(ArcSwap::from_pointee(PvList::new())),
             putlog: None,
+            cache: Arc::new(RwLock::new(PvCache::new())),
             stats: Arc::new(Stats::new("gw:".into())),
             beacon_anomaly: Arc::new(crate::ca_gateway::beacon::BeaconAnomaly::new()),
         }
+    }
+
+    /// Boundary coverage for the put-audit `old=` source
+    /// ([`cached_old_for_audit`]): cache miss, entry-without-snapshot, and
+    /// entry-with-snapshot. Mirrors C ca-gateway's `?` for a NULL
+    /// `vc->eventData()` versus the rendered cached value.
+    #[tokio::test]
+    async fn cached_old_for_audit_boundaries() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        let env = dummy_env();
+
+        // (a) no cache entry under the key → "?" (C: old_value == NULL).
+        assert_eq!(cached_old_for_audit(&env, "GW:MISS").await, "?");
+
+        // (b) entry exists but no monitor value cached yet → "?".
+        env.cache.write().await.get_or_create("GW:PV");
+        assert_eq!(cached_old_for_audit(&env, "GW:PV").await, "?");
+
+        // (c) entry with a cached snapshot → rendered value.
+        {
+            let cache = env.cache.read().await;
+            let entry = cache.get("GW:PV").expect("entry created above");
+            entry.write().await.update(Snapshot::new(
+                EpicsValue::Double(24.8),
+                0,
+                0,
+                std::time::SystemTime::now(),
+            ));
+        }
+        assert_eq!(cached_old_for_audit(&env, "GW:PV").await, "24.8");
     }
 
     /// Reserve a free TCP port by binding ephemeral then dropping.

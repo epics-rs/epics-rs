@@ -3,11 +3,14 @@
 //! Records all client put operations to a log file. Corresponds to
 //! C++ ca-gateway's `-putlog` option.
 //!
-//! Each put generates one line in the log:
+//! Each put generates one line in the log. The `old=` field carries the
+//! gateway's last cached upstream value before the put (C ca-gateway logs
+//! `vc->eventData()` here; `old=?` when no monitor value has been cached
+//! yet):
 //!
 //! ```text
-//! 2026-04-09T14:35:21.123Z user@host TEMP:setpoint 25.0 OK
-//! 2026-04-09T14:35:22.456Z guest@1.2.3.4 PRESSURE:cmd 100.0 DENIED
+//! 2026-04-09T14:35:21.123Z user@host TEMP:setpoint 25.0 old=24.8 OK
+//! 2026-04-09T14:35:22.456Z guest@1.2.3.4 PRESSURE:cmd 100.0 old=? DENIED
 //! ```
 
 use std::path::PathBuf;
@@ -85,22 +88,31 @@ impl PutLog {
     }
 
     /// Log a put event.
+    ///
+    /// `old` is the gateway's last cached upstream value before this put,
+    /// rendered into the `old=` field — the C ca-gateway logs
+    /// `vc->eventData()` (the virtual connection's cached monitor value)
+    /// in the same position (gateResources.cc:486-492). Callers pass
+    /// `"?"` when no monitor value has been cached, matching C's
+    /// `old_value == NULL` → `acOldVal = "?"` (gateResources.cc:476-480).
     pub async fn log(
         &self,
         user: &str,
         host: &str,
         pv: &str,
         value: &str,
+        old: &str,
         outcome: PutOutcome,
     ) -> BridgeResult<()> {
         let timestamp = Utc::now().to_rfc3339();
         let line = format!(
-            "{} {}@{} {} {} {}\n",
+            "{} {}@{} {} {} old={} {}\n",
             timestamp,
             user,
             host,
             pv,
             value,
+            old,
             outcome.as_str()
         );
 
@@ -175,13 +187,13 @@ mod tests {
         let _ = std::fs::remove_file(&temp);
 
         let log = PutLog::new(temp.clone());
-        log.log("alice", "host1", "TEMP", "25.0", PutOutcome::Ok)
+        log.log("alice", "host1", "TEMP", "25.0", "24.8", PutOutcome::Ok)
             .await
             .unwrap();
-        log.log("bob", "host2", "PRESS", "100", PutOutcome::Denied)
+        log.log("bob", "host2", "PRESS", "100", "?", PutOutcome::Denied)
             .await
             .unwrap();
-        log.log("eve", "host3", "VAC", "1e-6", PutOutcome::Failed)
+        log.log("eve", "host3", "VAC", "1e-6", "2e-6", PutOutcome::Failed)
             .await
             .unwrap();
 
@@ -189,9 +201,9 @@ mod tests {
         let content = std::fs::read_to_string(&temp).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 3);
-        assert!(lines[0].contains("alice@host1 TEMP 25.0 OK"));
-        assert!(lines[1].contains("bob@host2 PRESS 100 DENIED"));
-        assert!(lines[2].contains("eve@host3 VAC 1e-6 FAILED"));
+        assert!(lines[0].contains("alice@host1 TEMP 25.0 old=24.8 OK"));
+        assert!(lines[1].contains("bob@host2 PRESS 100 old=? DENIED"));
+        assert!(lines[2].contains("eve@host3 VAC 1e-6 old=2e-6 FAILED"));
 
         let _ = std::fs::remove_file(&temp);
     }

@@ -7,6 +7,7 @@
 //! corresponding client-side variable when the `EPICS_PVAS_*` form is
 //! not set, matching pvxs's `Config::server()` behavior.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// Expand `$(VAR)` and `${VAR}` references in `input` against the
@@ -54,6 +55,37 @@ pub fn expand_dollar_vars(input: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// Apply a name→value map of EPICS_PVA / EPICS_PVAS overrides on top
+/// of the process environment. Mirrors pvxs `Config::applyDefs(map)`
+/// (server.h:205) — an `st.cmd`-style helper for callers that have a
+/// dictionary of overrides (e.g. parsed from a config file) and want
+/// them visible to subsequent `*_from_env`-style reads.
+///
+/// Semantics: for each `(name, value)` pair, sets `name=value` in the
+/// process environment when `name` isn't already set, OR replaces
+/// the existing value when `replace_existing` is true. Returns the
+/// number of variables that were actually written.
+pub fn apply_defs(map: &HashMap<String, String>, replace_existing: bool) -> usize {
+    let mut applied = 0usize;
+    for (name, value) in map {
+        let exists = std::env::var(name).is_ok();
+        if exists && !replace_existing {
+            continue;
+        }
+        // SAFETY: std::env::set_var is unsafe in the 2024 edition because
+        // POSIX `setenv` isn't thread-safe relative to `getenv` from
+        // other threads. PVA Config setup is called once at startup
+        // before background tasks read env, matching pvxs Config
+        // semantics — callers must uphold that single-threaded-setup
+        // lifecycle.
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        applied += 1;
+    }
+    applied
 }
 
 /// Parse a `EPICS_PVA_ADDR_LIST`-style string (comma/whitespace
@@ -511,6 +543,35 @@ pub fn list_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_defs_writes_when_unset_and_skips_when_set_unless_replace() {
+        unsafe {
+            std::env::remove_var("EPICS_RS_AUDIT_DEFS_A");
+            std::env::set_var("EPICS_RS_AUDIT_DEFS_B", "preset");
+        }
+        let mut map = HashMap::new();
+        map.insert("EPICS_RS_AUDIT_DEFS_A".to_string(), "from-defs".to_string());
+        map.insert(
+            "EPICS_RS_AUDIT_DEFS_B".to_string(),
+            "would-replace".to_string(),
+        );
+        let written = apply_defs(&map, false);
+        assert_eq!(written, 1, "B should not be replaced when not asked");
+        assert_eq!(std::env::var("EPICS_RS_AUDIT_DEFS_A").unwrap(), "from-defs");
+        assert_eq!(std::env::var("EPICS_RS_AUDIT_DEFS_B").unwrap(), "preset");
+        // replace_existing = true overwrites
+        let written2 = apply_defs(&map, true);
+        assert_eq!(written2, 2);
+        assert_eq!(
+            std::env::var("EPICS_RS_AUDIT_DEFS_B").unwrap(),
+            "would-replace"
+        );
+        unsafe {
+            std::env::remove_var("EPICS_RS_AUDIT_DEFS_A");
+            std::env::remove_var("EPICS_RS_AUDIT_DEFS_B");
+        }
+    }
 
     #[test]
     fn parse_bool_yes_y_1_true() {

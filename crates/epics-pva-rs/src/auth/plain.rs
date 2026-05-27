@@ -32,15 +32,17 @@ pub fn posix_groups() -> Vec<String> {
         // SAFETY: getuid is always safe; geteuid returns the
         // current effective uid.
         let uid = unsafe { libc::getuid() };
-        // Look up login name via getpwuid_r (re-entrant). Falls
-        // back to `$USER` env when the lookup misses.
-        let name = unsafe {
+        // Look up the login name AND the passwd primary group
+        // (`pw_gid`) via getpwuid. Both fields are read and copied out
+        // while the returned pointer is still valid. Falls back to the
+        // `$USER` env when the lookup misses (then no `pw_gid` exists).
+        let (name, pw_gid) = unsafe {
             let pw = libc::getpwuid(uid);
             if pw.is_null() {
-                None
+                (None, None)
             } else {
                 let cs = CStr::from_ptr((*pw).pw_name);
-                cs.to_str().ok().map(|s| s.to_string())
+                (cs.to_str().ok().map(|s| s.to_string()), Some((*pw).pw_gid))
             }
         };
         let user = name
@@ -60,7 +62,13 @@ pub fn posix_groups() -> Vec<String> {
         // pointer; Linux uses `*mut gid_t` (u32). Use a raw c_int
         // buffer and cast on the way out so the signature matches
         // both platforms.
-        let primary = unsafe { libc::getgid() } as libc::c_int;
+        //
+        // The basegid is the account's passwd primary group (`pw_gid`),
+        // matching pvxs `osdGetRoles` (osgroups.cpp:65,88 seed
+        // getgrouplist with `user->pw_gid`). Only when getpwuid missed
+        // (the $USER-env fallback, no passwd entry) do we fall back to
+        // the process `getgid()`.
+        let primary = pw_gid.unwrap_or_else(|| unsafe { libc::getgid() }) as libc::c_int;
         let mut ngroups: libc::c_int = 64;
         let mut groups: Vec<libc::c_int> = vec![0; ngroups as usize];
         let rc = unsafe {
@@ -272,6 +280,37 @@ mod tests {
         // its only role. Deterministic regardless of host.
         let acct = "pvxs_unknown_account_zzqq";
         assert_eq!(osd_get_roles(acct), vec![acct.to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_groups_includes_passwd_primary_group() {
+        use std::ffi::CStr;
+        // Derive the current user's passwd primary-group NAME the way
+        // pvxs osdGetRoles seeds getgrouplist — from `pw_gid`, not the
+        // process `getgid()`. getgrouplist returns the basegid in its
+        // list, so that primary group must appear in posix_groups().
+        // If this env has no passwd entry or the gid has no name
+        // mapping, there is nothing to assert.
+        let primary_name: Option<String> = unsafe {
+            let pw = libc::getpwuid(libc::getuid());
+            if pw.is_null() {
+                None
+            } else {
+                let gr = libc::getgrgid((*pw).pw_gid);
+                if gr.is_null() {
+                    None
+                } else {
+                    Some(CStr::from_ptr((*gr).gr_name).to_string_lossy().into_owned())
+                }
+            }
+        };
+        if let Some(name) = primary_name {
+            assert!(
+                posix_groups().contains(&name),
+                "posix_groups() must include the passwd primary group {name:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

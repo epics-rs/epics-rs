@@ -202,24 +202,29 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
             .subscribe_raw_checked_opts(checked, ctx, opts)
             .await
     }
+    // RPC is commonly state-mutating and pva2pva blocks
+    // `createChannelRPC` under `p2pReadOnly` exactly the way it blocks
+    // Put/Process/PutGet (`channel.cpp:140-150`, the `if(!p2pReadOnly)`
+    // guard; only Get/Monitor are unconditional). Reject it here as
+    // PUT/PROCESS are, rather than forwarding to the inner source —
+    // without this override a read-only gateway forwarded downstream
+    // RPCs straight to the upstream server.
     async fn rpc(
         &self,
-        name: &str,
-        request_desc: FieldDesc,
-        request_value: PvField,
+        _name: &str,
+        _request_desc: FieldDesc,
+        _request_value: PvField,
     ) -> Result<(FieldDesc, PvField), String> {
-        self.inner.rpc(name, request_desc, request_value).await
+        Err("read-only mode: RPC rejected".into())
     }
     async fn rpc_checked(
         &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        request_desc: FieldDesc,
-        request_value: PvField,
-        ctx: ChannelContext,
+        _checked: epics_pva_rs::server_native::source::AccessChecked,
+        _request_desc: FieldDesc,
+        _request_value: PvField,
+        _ctx: ChannelContext,
     ) -> Result<(FieldDesc, PvField), String> {
-        self.inner
-            .rpc_checked(checked, request_desc, request_value, ctx)
-            .await
+        Err("read-only mode: RPC rejected".into())
     }
     // forward the per-PV watermark levels so the inner
     // gateway source's `monitor_watermarks` override is reachable
@@ -2023,6 +2028,41 @@ mod tests {
             .expect_err("read-only ctx-less PROCESS must be rejected");
         assert!(err.contains("read-only"));
         assert!(!process_reached.load(Ordering::SeqCst));
+    }
+
+    /// RPC through the `ReadOnly` wrapper must be rejected at the layer.
+    /// pva2pva blocks `createChannelRPC` under `p2pReadOnly` the same way
+    /// it blocks Put/Process (`channel.cpp:140-150`). The override
+    /// returns the read-only error without touching the inner source, so
+    /// the "read-only" message distinguishes rejection from forwarding
+    /// (a forwarded RPC would surface the inner source's own error).
+    #[tokio::test]
+    async fn read_only_rejects_rpc() {
+        let inner = RecordingSource {
+            delta_reached: Arc::new(AtomicBool::new(false)),
+            value_reached: Arc::new(AtomicBool::new(false)),
+            process_reached: Arc::new(AtomicBool::new(false)),
+        };
+        let ro = ReadOnlyLayer.layer(inner);
+        let desc = FieldDesc::Scalar(ScalarType::Double);
+        let val = PvField::Scalar(ScalarValue::Double(1.0));
+
+        let err = ro
+            .rpc_checked(
+                checked_for("X").await,
+                desc.clone(),
+                val.clone(),
+                test_ctx(),
+            )
+            .await
+            .expect_err("read-only RPC must be rejected");
+        assert!(err.contains("read-only"), "err: {err}");
+
+        let err = ro
+            .rpc("X", desc, val)
+            .await
+            .expect_err("read-only ctx-less RPC must be rejected");
+        assert!(err.contains("read-only"), "err: {err}");
     }
 
     /// A PROCESS through the `Audited` wrapper must reach the inner

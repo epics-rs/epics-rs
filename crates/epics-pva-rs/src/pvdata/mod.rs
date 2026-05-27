@@ -3,6 +3,7 @@
 
 mod field;
 mod scalar;
+mod shared_array;
 mod structure;
 mod typed_array;
 mod value;
@@ -12,6 +13,7 @@ pub mod encode;
 
 pub use field::{FieldDesc, Member, TypeDef};
 pub use scalar::{ScalarType, ScalarValue};
+pub use shared_array::SharedArray;
 pub use structure::{PvField, PvStructure, UnionItem, VariantValue};
 pub use typed_array::TypedScalarArray;
 pub use value::{FromScalarValue, IntoScalarValue, Value, ValueError};

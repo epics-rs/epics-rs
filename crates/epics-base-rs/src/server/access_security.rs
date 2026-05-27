@@ -1617,10 +1617,14 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
 
     // Optional log option: `RULE(level, access, TRAPWRITE)` /
     // `RULE(level, access, NOTRAPWRITE)`. C `asLib.y:272-283`
-    // (`rule_log_option`). The grammar is honoured and the trap mask
-    // captured in `AccessRule::trap`; the `asTrapWrite` put-logging
-    // listener that would consume the mask is a separate subsystem
-    // not present in this crate (see the UNFIXED note).
+    // (`rule_log_option`) matches both with `strcmp` (case-SENSITIVE):
+    // a lowercase `trapwrite` matches neither and hits
+    // `yyerror "Log options must be TRAPWRITE or NOTRAPWRITE"`, which
+    // fails the whole ACF load. Match case-sensitively here too so a
+    // case variant is rejected rather than silently accepted. The trap
+    // mask is captured in `AccessRule::trap`; the `asTrapWrite`
+    // put-logging listener that would consume it is a separate
+    // subsystem not present in this crate (see the UNFIXED note).
     let mut trap = false;
     skip_ws_comments(chars);
     if chars.peek() == Some(&',') {
@@ -1628,9 +1632,9 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         skip_ws_comments(chars);
         let mut log_opt = String::new();
         read_word(chars, &mut log_opt);
-        if log_opt.eq_ignore_ascii_case("TRAPWRITE") {
+        if log_opt == "TRAPWRITE" {
             trap = true;
-        } else if !log_opt.eq_ignore_ascii_case("NOTRAPWRITE") {
+        } else if log_opt != "NOTRAPWRITE" {
             return Err(CaError::Protocol(format!(
                 "ACF: RULE log option must be TRAPWRITE or NOTRAPWRITE, got '{log_opt}'"
             )));
@@ -2432,6 +2436,22 @@ ASG(C) {
     #[test]
     fn rule_bad_log_option_is_rejected() {
         assert!(parse_acf("ASG(T) { RULE(1, WRITE, BOGUS) }").is_err());
+    }
+
+    #[test]
+    fn rule_log_option_is_case_sensitive() {
+        // C `asLib.y:274,278` matches TRAPWRITE/NOTRAPWRITE with
+        // `strcmp`; a lowercase variant matches neither and hits
+        // `yyerror`, failing the whole ACF load. Reject case variants
+        // here too rather than silently accepting them.
+        assert!(
+            parse_acf("ASG(T) { RULE(1, WRITE, trapwrite) }").is_err(),
+            "lowercase `trapwrite` is not a valid log option (C strcmp)"
+        );
+        assert!(
+            parse_acf("ASG(T) { RULE(1, WRITE, notrapwrite) }").is_err(),
+            "lowercase `notrapwrite` is not a valid log option (C strcmp)"
+        );
     }
 
     #[test]

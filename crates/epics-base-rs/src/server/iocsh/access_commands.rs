@@ -108,10 +108,17 @@ fn cmd_as_init() -> CommandDef {
                 (st.filename.clone(), st.substitutions.clone())
             };
             let Some(filename) = filename else {
-                // C `asInit` with no filename disables access security
-                // (asInitialize(NULL)); report it rather than silently
-                // succeeding.
-                return Err("asInit: no ACF file set — call asSetFilename first".into());
+                // C `asInitCommon` (asDbLib.c:127-128): on the first call with
+                // no ACF file set (`!pacf`), it `return(0)` — success — leaving
+                // access security disabled ("will NEVER be turned on"). It is
+                // not an error: a startup script that runs `asInit` without a
+                // prior `asSetFilename` must continue, so this returns a no-op
+                // Continue rather than aborting the script under `on error break`.
+                ctx.println(
+                    "asInit: no ACF file set — access security not enabled \
+                     (call asSetFilename first to enable it)",
+                );
+                return Ok(CommandOutcome::Continue);
             };
             let raw = std::fs::read_to_string(&filename)
                 .map_err(|e| format!("asInit: cannot read '{filename}': {e}"))?;
@@ -502,16 +509,28 @@ mod tests {
         *st = AsState::default();
     }
 
-    /// asInit before asSetFilename must error (no silent success).
+    /// asInit before asSetFilename is a success no-op: C `asInitCommon`
+    /// (asDbLib.c:127-128) returns 0 with no filename, leaving access
+    /// security disabled rather than failing. It must return Continue so
+    /// a startup script under `on error break` is not aborted, and must
+    /// not install any config.
     #[test]
-    fn as_init_without_filename_errors() {
+    fn as_init_without_filename_is_noop_success() {
         reset_state();
         let (_db, ctx) = make_ctx();
         let mut reg = CommandRegistry::new();
         register(&mut reg);
         let cmd = reg.get("asInit").unwrap();
         let args = parse_args(&[], &cmd.args).unwrap();
-        assert!(cmd.handler.call(&args, &ctx).is_err());
+        let outcome = cmd.handler.call(&args, &ctx);
+        assert!(
+            matches!(outcome, Ok(CommandOutcome::Continue)),
+            "asInit with no filename must be a Continue no-op, not an error"
+        );
+        assert!(
+            as_state().lock().unwrap().config.is_none(),
+            "no filename must leave access security disabled (no config)"
+        );
     }
 
     /// asSetFilename + asInit loads an ACF; asprules then dumps it.

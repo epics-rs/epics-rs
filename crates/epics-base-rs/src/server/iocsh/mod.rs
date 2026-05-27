@@ -1146,12 +1146,17 @@ mod tests {
     }
 
     /// H-5: the `as*` family is registered — `asInit` without a
-    /// filename errors (it does not silently succeed).
+    /// filename is a success no-op (C `asInitCommon`, asDbLib.c:127-128:
+    /// returns 0 with no ACF file, leaving access security disabled), so
+    /// a startup script under `on error break` is not aborted.
     #[test]
     fn test_as_commands_registered() {
         let shell = make_shell();
-        // asInit without asSetFilename must error.
-        assert!(shell.execute_line("asInit").is_err());
+        // asInit without asSetFilename leaves AS disabled and continues.
+        assert!(matches!(
+            shell.execute_line("asInit"),
+            Ok(CommandOutcome::Continue)
+        ));
         // asprules with no config loaded prints a notice, returns Ok.
         assert!(matches!(
             shell.execute_line("asprules"),

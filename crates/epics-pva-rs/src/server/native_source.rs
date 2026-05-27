@@ -411,20 +411,36 @@ fn build_control(snap: &Snapshot) -> PvField {
     PvField::Structure(c)
 }
 
-fn build_value_alarm(_snap: &Snapshot) -> PvField {
+fn build_value_alarm(snap: &Snapshot) -> PvField {
+    // pvxs `iocsource.cpp:300-303` fills the four valueAlarm limits from
+    // DBR_AL_DOUBLE; in Rust they live in
+    // `DisplayInfo.{lower,upper}_{alarm,warning}_limit`. These were
+    // hardcoded 0.0 here even when the snapshot carried them. The
+    // per-limit severities / `active` / `hysteresis` are not part of
+    // DBR_AL_DOUBLE (pvxs leaves them untouched in this path), so they
+    // remain 0/false until a record exposes LSV/HSV etc.
     let mut v = PvStructure::new("valueAlarm_t");
     v.fields.push((
         "active".into(),
         PvField::Scalar(ScalarValue::Boolean(false)),
     ));
-    for name in [
-        "lowAlarmLimit",
-        "lowWarningLimit",
-        "highWarningLimit",
-        "highAlarmLimit",
-    ] {
+    let limits: [(&str, f64); 4] = match &snap.display {
+        Some(d) => [
+            ("lowAlarmLimit", d.lower_alarm_limit),
+            ("lowWarningLimit", d.lower_warning_limit),
+            ("highWarningLimit", d.upper_warning_limit),
+            ("highAlarmLimit", d.upper_alarm_limit),
+        ],
+        None => [
+            ("lowAlarmLimit", 0.0),
+            ("lowWarningLimit", 0.0),
+            ("highWarningLimit", 0.0),
+            ("highAlarmLimit", 0.0),
+        ],
+    };
+    for (name, val) in limits {
         v.fields
-            .push((name.into(), PvField::Scalar(ScalarValue::Double(0.0))));
+            .push((name.into(), PvField::Scalar(ScalarValue::Double(val))));
     }
     for name in [
         "lowAlarmSeverity",
@@ -791,6 +807,32 @@ mod tests {
             ScalarValue::Int(123_456_789)
         ));
         assert!(matches!(scalar(&t, "userTag"), ScalarValue::Int(42)));
+    }
+
+    #[test]
+    fn build_value_alarm_uses_display_alarm_limits() {
+        // pvxs `iocsource.cpp:300-303`: valueAlarm limits come from
+        // DBR_AL_DOUBLE (DisplayInfo alarm/warning limits), not 0.0.
+        use epics_base_rs::server::snapshot::DisplayInfo;
+        let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
+        snap.display = Some(DisplayInfo {
+            lower_alarm_limit: -10.0,
+            lower_warning_limit: -5.0,
+            upper_warning_limit: 5.0,
+            upper_alarm_limit: 10.0,
+            ..Default::default()
+        });
+        let PvField::Structure(v) = build_value_alarm(&snap) else {
+            panic!("valueAlarm must be a structure");
+        };
+        let get = |name: &str| match scalar(&v, name) {
+            ScalarValue::Double(x) => x,
+            other => panic!("{name} not Double: {other:?}"),
+        };
+        assert_eq!(get("lowAlarmLimit"), -10.0);
+        assert_eq!(get("lowWarningLimit"), -5.0);
+        assert_eq!(get("highWarningLimit"), 5.0);
+        assert_eq!(get("highAlarmLimit"), 10.0);
     }
 
     /// Regression: PVA PUT must be gated through ACF when

@@ -2034,25 +2034,32 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // EVENT_ADD can build a `FilterChain` from it later.
             let parsed_channel =
                 epics_base_rs::server::database::filters::split_channel_name(&pv_name);
-            let record_path = parsed_channel.record_path;
+            let record_path_raw = parsed_channel.record_path;
             let filter_suffix = parsed_channel.json_suffix;
-            let (_base, field_raw) = parse_pv_name(&record_path);
-            // detect the `$` long-string suffix (C dbChannel.c:483-507).
-            // Strip it before the field lookup; set `long_string` so every
-            // delivery path converts the value to DBR_CHAR with a NUL
+            // detect the `$` long-string modifier (C dbChannel.c:482-507).
+            // C strips it AFTER the record/field name lookup, so it modifies
+            // the resolved field — the explicit `.FIELD` or, for a bare
+            // `REC$`, the default VAL. Strip it from the whole channel name
+            // first so a record-level `REC$` (no explicit `.FIELD`) is handled
+            // too, not only `REC.FIELD$`: leaving `$` on the record key made
+            // `find_entry_from` miss the record and return CREATE_CH_FAIL,
+            // where C serves the field's long string. `long_string` makes
+            // every delivery path convert the value to DBR_CHAR with a NUL
             // terminator.
-            let (field_bare, long_string) = if let Some(stripped) = field_raw.strip_suffix('$') {
-                (stripped, true)
+            let long_string = record_path_raw.ends_with('$');
+            let record_path = if long_string {
+                &record_path_raw[..record_path_raw.len() - 1]
             } else {
-                (field_raw, false)
+                record_path_raw.as_str()
             };
-            let field = field_bare.to_ascii_uppercase();
+            let (_base, field_raw) = parse_pv_name(record_path);
+            let field = field_raw.to_ascii_uppercase();
 
             // thread the connection peer into the search
             // resolver so the CA gateway applies host-scoped `.pvlist`
             // `DENY FROM host` admission on CREATE_CHANNEL (parity with C
             // `pvExistTest` → `gateAs::findEntry(pvname, hostname)`).
-            if let Some(entry) = db.find_entry_from(&record_path, Some(peer)).await {
+            if let Some(entry) = db.find_entry_from(record_path, Some(peer)).await {
                 let sid = state.alloc_sid();
 
                 let (dbr_type, element_count, target) = match entry {
@@ -5382,6 +5389,108 @@ mod non_graceful_disconnect_teardown_tests {
                 offset += msg_len;
             }
         }
+    }
+
+    /// Read frames until a CREATE_CHAN (success) or CREATE_CH_FAIL response
+    /// is seen, then return that header so the caller can distinguish the
+    /// two outcomes and inspect the advertised type/count.
+    pub(super) async fn read_create_chan_result<R: tokio::io::AsyncRead + Unpin>(
+        client: &mut R,
+        timeout: Duration,
+    ) -> CaHeader {
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 512];
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for CREATE_CHAN result"
+            );
+            let n = tokio::time::timeout(remaining, client.read(&mut buf))
+                .await
+                .expect("read within timeout")
+                .expect("read ok");
+            assert!(n > 0, "server closed before CREATE_CHAN result");
+            acc.extend_from_slice(&buf[..n]);
+            let mut offset = 0;
+            while offset + CaHeader::SIZE <= acc.len() {
+                let (hdr, hdr_size) = CaHeader::from_bytes_extended(&acc[offset..])
+                    .expect("server response header parses");
+                let msg_len = hdr_size + hdr.actual_postsize();
+                if offset + msg_len > acc.len() {
+                    break;
+                }
+                if hdr.cmmd == CA_PROTO_CREATE_CHAN || hdr.cmmd == CA_PROTO_CREATE_CH_FAIL {
+                    return hdr;
+                }
+                offset += msg_len;
+            }
+        }
+    }
+
+    /// Regression: a record-level `$` long-string channel — `REC$` with no
+    /// explicit `.FIELD` — must resolve and create as a CHAR[40] channel.
+    /// C dbChannel.c:482-507 strips the `$` modifier AFTER the record/field
+    /// name lookup, so it applies to the default VAL field. The port
+    /// previously stripped `$` only from an explicit `.FIELD`, leaving it on
+    /// the record key so `find_entry_from` missed the record and returned
+    /// CREATE_CH_FAIL where C serves the field's long string.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_level_dollar_creates_long_string_channel() {
+        use epics_base_rs::server::records::stringin::StringinRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("longstr:rec", Box::new(StringinRecord::new("hello")))
+            .await
+            .expect("add stringin record");
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:55223".parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                Some(conn_tx),
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+        client.write_all(&version_frame()).await.expect("version");
+        // Record-level `$`: no explicit `.FIELD`.
+        client
+            .write_all(&create_chan_frame(0xAA, "longstr:rec$"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+
+        let hdr = read_create_chan_result(&mut client, Duration::from_secs(3)).await;
+        assert_eq!(
+            hdr.cmmd, CA_PROTO_CREATE_CHAN,
+            "record-level `REC$` must create the channel, not CREATE_CH_FAIL"
+        );
+        // A `$` long string is served as CHAR[40] (DbFieldType::Char == 4).
+        assert_eq!(hdr.data_type, 4, "long-string channel advertises DBR_CHAR");
+        assert_eq!(hdr.count, 40, "long-string channel advertises 40 elements");
+
+        drop(client);
+        handle.abort();
     }
 
     /// A client that opens a subscription and then sends a misaligned

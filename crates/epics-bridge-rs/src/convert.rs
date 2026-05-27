@@ -79,31 +79,73 @@ pub fn scalar_to_epics(val: &ScalarValue) -> EpicsValue {
     }
 }
 
+/// A string scalar could not be parsed into the target numeric field.
+///
+/// Mirrors pvxs `parseTo<T>` (`util.cpp:769-817`), which throws
+/// `NoConvert` on invalid input / out-of-range / trailing characters
+/// rather than substituting a default. Returned by the typed PUT
+/// conversion so the gateway/QSRV PUT path rejects the operation with a
+/// client-visible error instead of silently writing 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalarConvertError {
+    /// The offending string value, as received from the client.
+    pub value: String,
+    /// The numeric kind the parse was attempted into (`f64`/`i64`/`u64`).
+    pub target: &'static str,
+}
+
+impl std::fmt::Display for ScalarConvertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot convert string \"{}\" to {}",
+            self.value, self.target
+        )
+    }
+}
+
+impl std::error::Error for ScalarConvertError {}
+
 /// Context-aware conversion: PVA ScalarValue → EpicsValue using target DBF type.
 ///
 /// Unlike `scalar_to_epics()`, this uses the target field type to produce the
 /// correct EpicsValue variant, matching C++ PVIF behavior where conversions are
 /// guided by `dbChannelFinalFieldType()`.
-pub fn scalar_to_epics_typed(val: &ScalarValue, target: DbFieldType) -> EpicsValue {
-    match target {
-        DbFieldType::Double => EpicsValue::Double(scalar_to_f64(val)),
-        DbFieldType::Float => EpicsValue::Float(scalar_to_f64(val) as f32),
-        DbFieldType::Long => EpicsValue::Long(scalar_to_i64(val) as i32),
-        DbFieldType::Int64 => EpicsValue::Int64(scalar_to_i64(val)),
-        DbFieldType::UInt64 => EpicsValue::UInt64(scalar_to_u64(val)),
-        DbFieldType::Short => EpicsValue::Short(scalar_to_i64(val) as i16),
-        DbFieldType::Char => EpicsValue::Char(scalar_to_i64(val) as u8),
-        DbFieldType::Enum => EpicsValue::Enum(scalar_to_i64(val) as u16),
+///
+/// A string source bound for a numeric field is parsed strictly: an
+/// unparseable / out-of-range / trailing-garbage string returns
+/// [`ScalarConvertError`] so the caller rejects the PUT, matching pvxs
+/// `parseTo<T>` (`util.cpp:769-817`) which throws `NoConvert` rather
+/// than writing a default 0.
+pub fn scalar_to_epics_typed(
+    val: &ScalarValue,
+    target: DbFieldType,
+) -> Result<EpicsValue, ScalarConvertError> {
+    Ok(match target {
+        DbFieldType::Double => EpicsValue::Double(scalar_to_f64(val)?),
+        DbFieldType::Float => EpicsValue::Float(scalar_to_f64(val)? as f32),
+        DbFieldType::Long => EpicsValue::Long(scalar_to_i64(val)? as i32),
+        DbFieldType::Int64 => EpicsValue::Int64(scalar_to_i64(val)?),
+        DbFieldType::UInt64 => EpicsValue::UInt64(scalar_to_u64(val)?),
+        DbFieldType::Short => EpicsValue::Short(scalar_to_i64(val)? as i16),
+        DbFieldType::Char => EpicsValue::Char(scalar_to_i64(val)? as u8),
+        DbFieldType::Enum => EpicsValue::Enum(scalar_to_i64(val)? as u16),
         DbFieldType::String => match val {
             ScalarValue::String(s) => EpicsValue::String(s.clone()),
             other => EpicsValue::String(other.to_string()),
         },
-    }
+    })
 }
 
 /// Extract f64 from any ScalarValue.
-fn scalar_to_f64(val: &ScalarValue) -> f64 {
-    match val {
+///
+/// A `String` source is parsed strictly (leading/trailing whitespace
+/// tolerated to match `std::stod`); a non-numeric / out-of-range /
+/// trailing-garbage string returns [`ScalarConvertError`] instead of
+/// silently coercing to 0.0 — see pvxs `parseTo<double>`
+/// (`util.cpp:769`).
+fn scalar_to_f64(val: &ScalarValue) -> Result<f64, ScalarConvertError> {
+    Ok(match val {
         ScalarValue::Double(v) => *v,
         ScalarValue::Float(v) => *v as f64,
         ScalarValue::Int(v) => *v as f64,
@@ -121,13 +163,21 @@ fn scalar_to_f64(val: &ScalarValue) -> f64 {
                 0.0
             }
         }
-        ScalarValue::String(s) => s.parse().unwrap_or(0.0),
-    }
+        ScalarValue::String(s) => s.trim().parse().map_err(|_| ScalarConvertError {
+            value: s.clone(),
+            target: "f64",
+        })?,
+    })
 }
 
 /// Extract i64 from any ScalarValue.
-fn scalar_to_i64(val: &ScalarValue) -> i64 {
-    match val {
+///
+/// A `String` source is parsed strictly; a non-numeric / out-of-range /
+/// trailing-garbage string returns [`ScalarConvertError`] instead of
+/// silently coercing to 0 — see pvxs `parseTo<int64_t>`
+/// (`util.cpp:803`).
+fn scalar_to_i64(val: &ScalarValue) -> Result<i64, ScalarConvertError> {
+    Ok(match val {
         ScalarValue::Int(v) => *v as i64,
         ScalarValue::Long(v) => *v,
         ScalarValue::Short(v) => *v as i64,
@@ -145,16 +195,19 @@ fn scalar_to_i64(val: &ScalarValue) -> i64 {
                 0
             }
         }
-        ScalarValue::String(s) => s.parse().unwrap_or(0),
-    }
+        ScalarValue::String(s) => s.trim().parse().map_err(|_| ScalarConvertError {
+            value: s.clone(),
+            target: "i64",
+        })?,
+    })
 }
 
 /// Extract u64 from any ScalarValue, preserving the full unsigned range
 /// when the source is itself an unsigned 64-bit value. Used for
 /// `DBF_UINT64` PUT conversion — routing through `scalar_to_i64` would
 /// reject `ulong` values above `i64::MAX`.
-fn scalar_to_u64(val: &ScalarValue) -> u64 {
-    match val {
+fn scalar_to_u64(val: &ScalarValue) -> Result<u64, ScalarConvertError> {
+    Ok(match val {
         ScalarValue::ULong(v) => *v,
         ScalarValue::Long(v) => *v as u64,
         ScalarValue::Int(v) => *v as u64,
@@ -172,8 +225,11 @@ fn scalar_to_u64(val: &ScalarValue) -> u64 {
                 0
             }
         }
-        ScalarValue::String(s) => s.parse().unwrap_or(0),
-    }
+        ScalarValue::String(s) => s.trim().parse().map_err(|_| ScalarConvertError {
+            value: s.clone(),
+            target: "u64",
+        })?,
+    })
 }
 
 /// Resolve an enum string to its index using a list of choice strings.
@@ -241,31 +297,58 @@ pub fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
             if arr.is_empty() {
                 return Some(EpicsValue::DoubleArray(vec![]));
             }
+            // Numeric arms dispatch on the homogeneous element type, so a
+            // `String` element never reaches `scalar_to_{f64,i64,u64}`
+            // here — but should a non-numeric string slip into a
+            // numeric-typed array, `.ok()?` rejects the whole conversion
+            // (→ `None`, surfaced as a PUT error by the caller) rather
+            // than silently substituting 0, matching pvxs `parseTo<T>`.
             match &arr[0] {
                 ScalarValue::Double(_) => Some(EpicsValue::DoubleArray(
-                    arr.iter().map(scalar_to_f64).collect(),
+                    arr.iter()
+                        .map(scalar_to_f64)
+                        .collect::<Result<_, _>>()
+                        .ok()?,
                 )),
                 ScalarValue::Float(_) => Some(EpicsValue::FloatArray(
-                    arr.iter().map(|v| scalar_to_f64(v) as f32).collect(),
+                    arr.iter()
+                        .map(|v| scalar_to_f64(v).map(|n| n as f32))
+                        .collect::<Result<_, _>>()
+                        .ok()?,
                 )),
                 ScalarValue::Short(_) => Some(EpicsValue::ShortArray(
-                    arr.iter().map(|v| scalar_to_i64(v) as i16).collect(),
+                    arr.iter()
+                        .map(|v| scalar_to_i64(v).map(|n| n as i16))
+                        .collect::<Result<_, _>>()
+                        .ok()?,
                 )),
                 ScalarValue::Int(_) => Some(EpicsValue::LongArray(
-                    arr.iter().map(|v| scalar_to_i64(v) as i32).collect(),
+                    arr.iter()
+                        .map(|v| scalar_to_i64(v).map(|n| n as i32))
+                        .collect::<Result<_, _>>()
+                        .ok()?,
                 )),
                 // Canonical: DBF_CHAR ↔ pvByte (signed).
                 ScalarValue::Byte(_) => Some(EpicsValue::CharArray(
-                    arr.iter().map(|v| scalar_to_i64(v) as u8).collect(),
+                    arr.iter()
+                        .map(|v| scalar_to_i64(v).map(|n| n as u8))
+                        .collect::<Result<_, _>>()
+                        .ok()?,
                 )),
                 // Legacy: pvUByte arrays widen to Short to preserve the
                 // unsigned range; never silently fold into the new signed
                 // DBF_CHAR mapping.
                 ScalarValue::UByte(_) => Some(EpicsValue::ShortArray(
-                    arr.iter().map(|v| scalar_to_i64(v) as i16).collect(),
+                    arr.iter()
+                        .map(|v| scalar_to_i64(v).map(|n| n as i16))
+                        .collect::<Result<_, _>>()
+                        .ok()?,
                 )),
                 ScalarValue::UShort(_) => Some(EpicsValue::EnumArray(
-                    arr.iter().map(|v| scalar_to_i64(v) as u16).collect(),
+                    arr.iter()
+                        .map(|v| scalar_to_i64(v).map(|n| n as u16))
+                        .collect::<Result<_, _>>()
+                        .ok()?,
                 )),
                 ScalarValue::String(_) => Some(EpicsValue::StringArray(
                     arr.iter()
@@ -278,10 +361,16 @@ pub fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
                 // PVA `ulong[]` ↔ C `DBF_UINT64[]` — preserve the full
                 // unsigned range instead of folding into DoubleArray.
                 ScalarValue::ULong(_) => Some(EpicsValue::UInt64Array(
-                    arr.iter().map(scalar_to_u64).collect(),
+                    arr.iter()
+                        .map(scalar_to_u64)
+                        .collect::<Result<_, _>>()
+                        .ok()?,
                 )),
                 _ => Some(EpicsValue::DoubleArray(
-                    arr.iter().map(scalar_to_f64).collect(),
+                    arr.iter()
+                        .map(scalar_to_f64)
+                        .collect::<Result<_, _>>()
+                        .ok()?,
                 )),
             }
         }
@@ -320,7 +409,7 @@ mod tests {
         assert_eq!(sv, ScalarValue::ULong(big));
 
         // PUT path: ScalarValue::ULong → EpicsValue::UInt64 (typed)
-        let ev = scalar_to_epics_typed(&ScalarValue::ULong(big), DbFieldType::UInt64);
+        let ev = scalar_to_epics_typed(&ScalarValue::ULong(big), DbFieldType::UInt64).unwrap();
         assert_eq!(ev, EpicsValue::UInt64(big));
 
         // Array path: UInt64Array ↔ ulong[] round-trip, full range
@@ -390,22 +479,71 @@ mod tests {
     #[test]
     fn typed_conversion_double() {
         let sv = ScalarValue::Int(42);
-        let ev = scalar_to_epics_typed(&sv, DbFieldType::Double);
+        let ev = scalar_to_epics_typed(&sv, DbFieldType::Double).unwrap();
         assert_eq!(ev, EpicsValue::Double(42.0));
     }
 
     #[test]
     fn typed_conversion_enum() {
         let sv = ScalarValue::Int(5);
-        let ev = scalar_to_epics_typed(&sv, DbFieldType::Enum);
+        let ev = scalar_to_epics_typed(&sv, DbFieldType::Enum).unwrap();
         assert_eq!(ev, EpicsValue::Enum(5));
     }
 
     #[test]
     fn typed_conversion_string_from_numeric() {
         let sv = ScalarValue::Double(2.5);
-        let ev = scalar_to_epics_typed(&sv, DbFieldType::String);
+        let ev = scalar_to_epics_typed(&sv, DbFieldType::String).unwrap();
         assert!(matches!(ev, EpicsValue::String(_)));
+    }
+
+    /// A numeric string PUT into a numeric field parses to the value
+    /// (pvxs `parseTo<T>` accepts it); surrounding whitespace is
+    /// tolerated to match `std::stod`/`stoull`.
+    #[test]
+    fn string_to_numeric_put_parses_valid() {
+        assert_eq!(
+            scalar_to_epics_typed(&ScalarValue::String("42".into()), DbFieldType::Double).unwrap(),
+            EpicsValue::Double(42.0)
+        );
+        assert_eq!(
+            scalar_to_epics_typed(&ScalarValue::String("  -7  ".into()), DbFieldType::Long)
+                .unwrap(),
+            EpicsValue::Long(-7)
+        );
+        assert_eq!(
+            scalar_to_epics_typed(&ScalarValue::String("255".into()), DbFieldType::UInt64).unwrap(),
+            EpicsValue::UInt64(255)
+        );
+    }
+
+    /// An unparseable / trailing-garbage / out-of-range string PUT into a
+    /// numeric field must be rejected (`ScalarConvertError`), matching
+    /// pvxs `parseTo<T>` which throws `NoConvert` — NOT silently written
+    /// as 0. Before the fix `scalar_to_*` did `parse().unwrap_or(0)`, so
+    /// the gateway/QSRV PUT path wrote 0 and reported success.
+    #[test]
+    fn string_to_numeric_put_rejects_unconvertible() {
+        // Non-numeric.
+        assert!(
+            scalar_to_epics_typed(&ScalarValue::String("abc".into()), DbFieldType::Double).is_err()
+        );
+        // Trailing garbage after a number.
+        assert!(
+            scalar_to_epics_typed(&ScalarValue::String("42abc".into()), DbFieldType::Long).is_err()
+        );
+        // Integer out-of-range (exceeds i64).
+        assert!(
+            scalar_to_epics_typed(
+                &ScalarValue::String("99999999999999999999".into()),
+                DbFieldType::Int64
+            )
+            .is_err()
+        );
+        // Empty string is not 0.
+        assert!(
+            scalar_to_epics_typed(&ScalarValue::String("".into()), DbFieldType::Short).is_err()
+        );
     }
 
     #[test]
@@ -507,7 +645,7 @@ mod tests {
         // bound field — `epics_to_scalar` then `scalar_to_epics_typed`.
         let sv = epics_to_scalar(&raw_val);
         assert_eq!(sv, ScalarValue::ULong(big));
-        let typed = scalar_to_epics_typed(&sv, DbFieldType::UInt64);
+        let typed = scalar_to_epics_typed(&sv, DbFieldType::UInt64).unwrap();
         assert_eq!(
             typed,
             EpicsValue::UInt64(big),

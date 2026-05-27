@@ -392,7 +392,11 @@ impl BridgeChannel {
             | EpicsValue::Enum(_)
             | EpicsValue::String(_) => {
                 let sv = crate::convert::epics_to_scalar(&raw_val);
+                // A string value bound for a numeric field that cannot be
+                // parsed is rejected here (pvxs `parseTo<T>` →
+                // `NoConvert`), not silently written as 0.
                 scalar_to_epics_typed(&sv, self.value_dbf)
+                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?
             }
             // Arrays pass through directly
             _ => raw_val,

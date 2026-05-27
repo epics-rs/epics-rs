@@ -823,7 +823,11 @@ impl GroupChannel {
         match pv_field {
             PvField::Scalar(sv) => {
                 let target = self.member_dbf_type(member).await;
-                Some(crate::convert::scalar_to_epics_typed(sv, target))
+                // A non-numeric string bound for a numeric member yields
+                // `None` here, which the caller treats as an unconvertible
+                // member and rejects the whole group PUT (pvxs `parseTo<T>`
+                // → `NoConvert`), rather than silently writing 0.
+                crate::convert::scalar_to_epics_typed(sv, target).ok()
             }
             // Arrays and structures: defer to the fallback array converter.
             // C++ QSRV uses dbChannelFinalNoElements + DBR types for arrays;

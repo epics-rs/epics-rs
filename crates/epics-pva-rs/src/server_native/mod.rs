@@ -12,7 +12,7 @@ pub mod tcp;
 pub mod udp;
 
 pub use composite::CompositeSource;
-pub use monitor_control::{MonitorControlOp, PostError};
+pub use monitor_control::{MonitorControlOp, MonitorReceiver, PostError};
 pub use op_handle::{
     ClientCredentials, ExecOp, ExecResult, MessageLevel, OpBase, OpMessage, RemoteLogger,
 };

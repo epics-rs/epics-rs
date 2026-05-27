@@ -1,16 +1,23 @@
-//! `MonitorControlOp` surface for custom [`super::source::ChannelSource`]
-//! authors. Mirrors `pvxs::server::MonitorControlOp`:
+//! `MonitorControlOp` — a producer-side monitor output for custom
+//! [`super::source::ChannelSource`] authors. It is *inspired by*
+//! `pvxs::server::MonitorControlOp` but is deliberately a simpler
+//! primitive: a bounded mpsc queue with one advisory high/low watermark
+//! pair. It does NOT reproduce pvxs's full `servermon` flow control —
+//! there is no separate queue-`limit` vs pipeline-`window`, no
+//! coalesce-to-tail `post()`, and `force_post` cannot over-fill past the
+//! channel cap (tokio mpsc has no over-fill). Source authors who need
+//! exact pvxs monitor semantics must layer those on top.
 //!
 //! - `try_post(value)` — non-blocking send subject to the high
-//!   watermark: `Err(OverHighWatermark)` when the producer-side
-//!   count is at-or-over the configured high watermark,
-//!   `Err(ChannelFull)` at the hard channel cap, `Err(ReceiverGone)`
-//!   when the receiver was dropped. Mirrors pvxs `tryPost`.
-//! - `force_post(value)` — unconditional send; ignores the high
-//!   watermark (still `Err(ChannelFull)` / `Err(ReceiverGone)` at the
-//!   hard cap or on drop). Mirrors pvxs `forcePost`.
-//! - `set_high_watermark` / `set_low_watermark` — adjust the
-//!   producer-side throttle thresholds at runtime.
+//!   watermark: `Err(OverHighWatermark)` when `pending` is at-or-over
+//!   the configured high watermark, `Err(ChannelFull)` at the hard
+//!   channel cap, `Err(ReceiverGone)` when the receiver was dropped.
+//! - `force_post(value)` — send ignoring the high watermark (still
+//!   `Err(ChannelFull)` / `Err(ReceiverGone)` at the hard cap or on
+//!   drop).
+//! - `set_high_watermark` / `set_low_watermark` — adjust the advisory
+//!   thresholds at runtime. The caller is responsible for keeping
+//!   `low <= high`; they are independent stores.
 //! - `is_paused()` / `set_paused(bool)` — observed flag the server's
 //!   TCP loop flips via [`super::source::ChannelSource::notify_watermark`]
 //!   ([`super::source::WatermarkKind::Pause`] on the LOW edge,
@@ -18,12 +25,24 @@
 //!   Producers should consult before `try_post` to avoid spinning on
 //!   a full outbox.
 //!
+//! `pending` accounting is symmetric and automatic on the `channel()`
+//! path: a successful `try_post` / `force_post` increments it, and the
+//! paired [`MonitorReceiver`]'s `recv` / `try_recv` decrements it when
+//! the consumer pulls a value off the queue. So `pending` tracks queue
+//! occupancy (sent-but-not-yet-consumed) and the high-watermark gate
+//! reopens by itself as the consumer drains — no manual bookkeeping. The
+//! watermark is advisory: under concurrent producer clones the load-then-
+//! send is not atomic, so `pending` can momentarily overshoot the
+//! watermark, but never the hard channel cap (`ChannelFull` is the real
+//! ceiling).
+//!
 //! Construct one per subscriber on the source side, hand the returned
-//! `mpsc::Receiver<T>` to the server via the `subscribe()` return
-//! path, and keep the `MonitorControlOp` for the producer-side. The
-//! mpsc channel's bounded capacity is the hard backpressure ceiling;
-//! the configured high/low watermarks are advisory thresholds the
-//! runtime uses to drive the `notify_watermark` callback.
+//! [`MonitorReceiver`] to the server via the `subscribe()` return path,
+//! and keep the `MonitorControlOp` for the producer side. The
+//! [`MonitorControlOp::from_sender`] path is for when the source already
+//! owns an mpsc `Sender` (a pre-existing fan-out registry); there the
+//! receiver is not owned by this type, so the external consumer must
+//! call [`MonitorControlOp::note_consumed`] to decrement `pending`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -54,10 +73,10 @@ pub enum PostError<T> {
 /// pvxs `MonitorControlOp` parity for source authors.
 pub struct MonitorControlOp<T> {
     tx: mpsc::Sender<T>,
-    /// Outstanding-event count visible to producers. Bumped on every
-    /// successful `try_post` / `force_post`; producers can decrement
-    /// it by hand when their internal accounting (e.g. ACK arrival)
-    /// says the consumer drained N events.
+    /// Outstanding-event count (sent but not yet consumed). Bumped on
+    /// every successful `try_post` / `force_post`; decremented by the
+    /// paired [`MonitorReceiver`] on `recv` (channel path) or by hand
+    /// via `note_consumed` (from_sender path).
     pending: Arc<AtomicUsize>,
     /// Producer-side advisory ceiling. `try_post` bails when
     /// `pending >= high_watermark`. Must be ≤ the bounded channel
@@ -76,23 +95,28 @@ pub struct MonitorControlOp<T> {
 
 impl<T> MonitorControlOp<T> {
     /// Build a control op with a bounded mpsc channel of the given
-    /// capacity. Returns the control op (give to the producer) and
-    /// the receiver (give to the server).
-    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<T>) {
+    /// capacity. Returns the control op (give to the producer) and the
+    /// [`MonitorReceiver`] (give to the server) whose `recv` decrements
+    /// `pending`, keeping the watermark accounting symmetric.
+    pub fn channel(capacity: usize) -> (Self, MonitorReceiver<T>) {
         let (tx, rx) = mpsc::channel(capacity);
+        let pending = Arc::new(AtomicUsize::new(0));
         let op = Self {
             tx,
-            pending: Arc::new(AtomicUsize::new(0)),
+            pending: pending.clone(),
             high_watermark: Arc::new(AtomicUsize::new(capacity / 2)),
             low_watermark: Arc::new(AtomicUsize::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
         };
-        (op, rx)
+        (op, MonitorReceiver { rx, pending })
     }
 
     /// Build a control op around an externally-created channel. Use
     /// when the source already owns the mpsc Sender (e.g. a
-    /// pre-existing fan-out registry).
+    /// pre-existing fan-out registry). The receiver is not owned by this
+    /// type, so the external consumer must call [`Self::note_consumed`]
+    /// to keep `pending` accurate — there is no [`MonitorReceiver`] to
+    /// decrement it automatically.
     pub fn from_sender(tx: mpsc::Sender<T>, watermark: usize) -> Self {
         Self {
             tx,
@@ -103,10 +127,10 @@ impl<T> MonitorControlOp<T> {
         }
     }
 
-    /// Non-blocking send subject to the high watermark gate. Mirrors
-    /// pvxs `MonitorControlOp::tryPost`. Returns `Ok(())` when
-    /// delivered, `Err(_)` when refused — caller should back off and
-    /// retry once `is_paused()` clears.
+    /// Non-blocking send subject to the high-watermark gate. Returns
+    /// `Ok(())` when delivered, `Err(_)` when refused — caller should
+    /// back off and retry once `is_paused()` clears or the consumer
+    /// drains below the watermark.
     pub fn try_post(&self, value: T) -> Result<(), PostError<T>> {
         let p = self.pending.load(Ordering::Relaxed);
         let hw = self.high_watermark.load(Ordering::Relaxed);
@@ -123,10 +147,10 @@ impl<T> MonitorControlOp<T> {
         }
     }
 
-    /// Unconditional send (ignores the high watermark). Will still
-    /// fail if the bounded channel is at hard capacity — the
-    /// underlying mpsc has no "force overwrite" semantics. Mirrors
-    /// pvxs `MonitorControlOp::forcePost`.
+    /// Send ignoring the high watermark. Unlike pvxs `forcePost` it
+    /// cannot over-fill: it still fails with `ChannelFull` at the hard
+    /// channel cap, since the underlying tokio mpsc has no over-fill /
+    /// force-overwrite semantics.
     pub fn force_post(&self, value: T) -> Result<(), PostError<T>> {
         match self.tx.try_send(value) {
             Ok(()) => {
@@ -158,16 +182,20 @@ impl<T> MonitorControlOp<T> {
         self.low_watermark.load(Ordering::Relaxed)
     }
 
-    /// Current producer-side pending count. Decrement via
-    /// [`Self::note_consumed`] when the runtime / consumer ACKs N
-    /// events. Used by the high-watermark gate.
+    /// Current pending count — values sent but not yet consumed. On the
+    /// [`Self::channel`] path the paired [`MonitorReceiver`] keeps this
+    /// current automatically; see [`Self::note_consumed`] for the
+    /// [`Self::from_sender`] path.
     pub fn pending(&self) -> usize {
         self.pending.load(Ordering::Relaxed)
     }
 
-    /// Tell the control op N events have been consumed downstream.
-    /// Decrements the pending counter; the high-watermark gate
-    /// reopens once `pending < high_watermark`.
+    /// Manually tell the control op N events were consumed downstream.
+    /// Needed **only** on the [`Self::from_sender`] path, where the
+    /// receiver is owned externally and cannot decrement `pending`
+    /// itself. On the [`Self::channel`] path the [`MonitorReceiver`]
+    /// already decrements on `recv`/`try_recv`, so calling this there
+    /// would double-count.
     pub fn note_consumed(&self, n: usize) {
         // Saturating subtract — never go negative.
         let mut cur = self.pending.load(Ordering::Relaxed);
@@ -210,6 +238,54 @@ impl<T> Clone for MonitorControlOp<T> {
     }
 }
 
+/// Consumer end of a [`MonitorControlOp::channel`]. Wraps the mpsc
+/// `Receiver` and owns the *decrement* half of the `pending` accounting:
+/// every value pulled off the queue drops `pending` by one, so the
+/// producer's high-watermark gate reopens as the consumer drains without
+/// any manual `note_consumed`. This is the symmetric counterpart to the
+/// `try_post` / `force_post` increment — the same actor that performs the
+/// real reverse operation (consume) owns the reverse accounting.
+pub struct MonitorReceiver<T> {
+    rx: mpsc::Receiver<T>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl<T> MonitorReceiver<T> {
+    /// Decrement `pending` (saturating at 0) for one consumed value.
+    fn note_one(&self) {
+        let mut cur = self.pending.load(Ordering::Relaxed);
+        loop {
+            let new = cur.saturating_sub(1);
+            match self
+                .pending
+                .compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Await the next value. Decrements `pending` when one is returned;
+    /// `None` (channel closed and drained) leaves the counter untouched.
+    pub async fn recv(&mut self) -> Option<T> {
+        let v = self.rx.recv().await;
+        if v.is_some() {
+            self.note_one();
+        }
+        v
+    }
+
+    /// Non-blocking pull. Decrements `pending` only on a delivered value.
+    pub fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
+        let r = self.rx.try_recv();
+        if r.is_ok() {
+            self.note_one();
+        }
+        r
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,14 +325,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn note_consumed_drops_pending_for_subsequent_try_post() {
-        let (op, _rx) = MonitorControlOp::<i32>::channel(8);
-        op.set_high_watermark(2);
+    async fn note_consumed_drops_pending_on_from_sender_path() {
+        // from_sender owns no MonitorReceiver, so the external consumer
+        // decrements via note_consumed.
+        let (tx, _rx) = mpsc::channel::<i32>(8);
+        let op = MonitorControlOp::from_sender(tx, 2);
         op.try_post(1).expect("first");
         op.try_post(2).expect("second");
+        assert!(matches!(
+            op.try_post(3),
+            Err(PostError::OverHighWatermark(_))
+        ));
         op.note_consumed(2);
         assert_eq!(op.pending(), 0);
         op.try_post(3).expect("after consumed");
+    }
+
+    #[tokio::test]
+    async fn recv_decrements_pending_and_reopens_gate_without_manual_note() {
+        // Boundary: the high-watermark gate must reopen as the consumer
+        // drains, with no note_consumed call. (Regression: the receiver
+        // used to be a bare mpsc::Receiver, so pending only fell via a
+        // manual note_consumed that nothing called — the gate latched
+        // closed permanently once pending first reached the watermark.)
+        let (op, mut rx) = MonitorControlOp::<i32>::channel(8);
+        op.set_high_watermark(2);
+        op.try_post(1).expect("first");
+        op.try_post(2).expect("second");
+        assert_eq!(op.pending(), 2);
+        assert!(matches!(
+            op.try_post(3),
+            Err(PostError::OverHighWatermark(_))
+        ));
+
+        // Consumer pulls one value off the queue — pending drops by one
+        // on recv alone.
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(op.pending(), 1, "recv must decrement pending");
+
+        // Gate reopened without any note_consumed.
+        op.try_post(3).expect("gate reopened after recv");
+        assert_eq!(op.pending(), 2);
+    }
+
+    #[tokio::test]
+    async fn try_recv_also_decrements_pending() {
+        let (op, mut rx) = MonitorControlOp::<i32>::channel(8);
+        op.try_post(10).expect("post");
+        assert_eq!(op.pending(), 1);
+        assert_eq!(rx.try_recv().expect("try_recv"), 10);
+        assert_eq!(op.pending(), 0, "try_recv must decrement pending");
+        assert!(rx.try_recv().is_err(), "empty after drain");
+        assert_eq!(op.pending(), 0, "empty try_recv must not underflow");
     }
 
     #[tokio::test]

@@ -1,6 +1,5 @@
 //! Small utility types — Rust-idiom analogues of the pvxs `util.h`
-//! helpers. Surfaced for parity with PVA-561..566 of the reference
-//! feature map; most are thin convenience wrappers rather than
+//! helpers. Most are thin convenience wrappers rather than
 //! load-bearing infrastructure.
 //!
 //! `pvxs::ServerGUID`, `pvxs::Escaper`, `pvxs::Indented`,
@@ -20,12 +19,12 @@
 
 use std::fmt;
 
-/// Server identity emitted in BEACON / SEARCH_RESPONSE frames
-/// (PVA-560). 12-byte opaque token chosen per server-instance.
+/// Server identity emitted in BEACON / SEARCH_RESPONSE frames.
+/// 12-byte opaque token chosen per server-instance.
 pub type ServerGuid = [u8; 12];
 
-/// `<<` adapter that escapes a C-style string for safe logging
-/// (PVA-561). Mirrors `pvxs::Escaper` — replaces non-printable bytes
+/// `<<` adapter that escapes a C-style string for safe logging.
+/// Mirrors `pvxs::Escaper` — replaces non-printable bytes
 /// with `\xNN` escapes.
 pub struct Escaper<'a>(pub &'a [u8]);
 
@@ -46,8 +45,8 @@ impl fmt::Display for Escaper<'_> {
     }
 }
 
-/// RAII indenter for nested `format()` / `report()` output
-/// (PVA-562). Each `Indented` increases the indent level for the
+/// RAII indenter for nested `format()` / `report()` output.
+/// Each `Indented` increases the indent level for the
 /// duration of its scope; `Display` impls wrap newline boundaries
 /// with the configured number of leading spaces.
 ///
@@ -89,16 +88,16 @@ impl fmt::Display for Indented {
     }
 }
 
-/// Toggle "show every sub-field" mode for stream-insertion display
-/// (PVA-563). Mirrors `pvxs::Detailed`. Implementations of `Display`
+/// Toggle "show every sub-field" mode for stream-insertion display.
+/// Mirrors `pvxs::Detailed`. Implementations of `Display`
 /// that change behaviour based on this flag should accept it as an
 /// explicit parameter rather than relying on thread-local state
 /// (Rust idiom).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Detailed(pub bool);
 
-/// RAII Ctrl-C handler matching pvxs `SigInt`
-/// (PVA-564). Wraps the existing `tokio::signal::ctrl_c` so callers
+/// RAII Ctrl-C handler matching pvxs `SigInt`.
+/// Wraps the existing `tokio::signal::ctrl_c` so callers
 /// can `await` it like a one-shot. Drop handlers in pvxs unregister
 /// the SIGINT trap; here we rely on `tokio::signal` lifecycle.
 pub struct SigInt {
@@ -128,7 +127,7 @@ impl SigInt {
     }
 }
 
-/// Single-shot or periodic timer (PVA-565). Thin wrapper over
+/// Single-shot or periodic timer. Thin wrapper over
 /// [`tokio::time`]; provided so the public surface has a named
 /// type for the role pvxs `Timer` plays.
 ///
@@ -150,7 +149,7 @@ impl Timer {
     }
 }
 
-/// Multi-producer / multi-consumer FIFO (PVA-566). pvxs's
+/// Multi-producer / multi-consumer FIFO. pvxs's
 /// `MPMCFIFO` is essentially what `tokio::sync::mpsc` already
 /// provides; this newtype is a clarifying re-export rather than
 /// a re-implementation.

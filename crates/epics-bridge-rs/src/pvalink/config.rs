@@ -238,7 +238,7 @@ impl PvaLinkConfig {
 
         // Split off ?key=value&key=value
         let (pv_name, opts) = match body.split_once('?') {
-            Some((pv, q)) => (pv, parse_query(q)?),
+            Some((pv, q)) => (pv, parse_query(pv, q)),
             None => (body, HashMap::new()),
         };
         if pv_name.is_empty() {
@@ -254,25 +254,28 @@ impl PvaLinkConfig {
         if let Some(v) = opts.get("field") {
             cfg.field = v.clone();
         }
-        if let Some(v) = opts.get("monitor") {
-            cfg.monitor = parse_bool(v)?;
-        }
+        // `monitor` is handled before `proc` so a `proc=CP`/`CPP` (which
+        // forces an open monitor below) takes precedence over an explicit
+        // `monitor=false` on the same link, matching the prior ordering.
+        apply_or_warn(pv_name, "monitor", &opts, &mut cfg.monitor, parse_bool);
         if let Some(v) = opts.get("proc") {
             // pvxs `proc` is a five-state enum
             // (`pvalink_jlif.cpp:69-166`): boolean true→PP / false→NPP,
             // plus the strings NPP/PP/CP/CPP. `CP`/`CPP` additionally
             // imply an open monitor and INP scan-on-update. Store the
-            // enum and derive the scan flags from it; `PASSIVE` is NOT
+            // enum and derive the scan flags from it. `PASSIVE` is NOT
             // a pvxs `proc` enum value (it is only the later wire
-            // request string for `Default`), so reject it rather than
-            // silently treating it as process-on-PUT.
-            cfg.proc = match v.as_str() {
-                "TRUE" | "true" | "1" | "PP" | "pp" => ProcMode::Pp,
-                "FALSE" | "false" | "0" | "NPP" | "npp" => ProcMode::Npp,
-                "CP" | "cp" => ProcMode::Cp,
-                "CPP" | "cpp" => ProcMode::Cpp,
-                other => return Err(PvaLinkParseError::BadOption(other.to_string())),
-            };
+            // request string for `Default`); an unknown value is warned
+            // and the prior (default) mode is kept — pvxs does the same
+            // (`log_warn_printf` + `jlif_continue`, pvalink_jlif.cpp:156-170)
+            // rather than failing the whole link.
+            match v.as_str() {
+                "TRUE" | "true" | "1" | "PP" | "pp" => cfg.proc = ProcMode::Pp,
+                "FALSE" | "false" | "0" | "NPP" | "npp" => cfg.proc = ProcMode::Npp,
+                "CP" | "cp" => cfg.proc = ProcMode::Cp,
+                "CPP" | "cpp" => cfg.proc = ProcMode::Cpp,
+                _ => warn_ignored_option(pv_name, "proc", v),
+            }
             let (sou, sop) = cfg.proc.inp_scan();
             if sou {
                 cfg.monitor = true;
@@ -280,51 +283,37 @@ impl PvaLinkConfig {
                 cfg.scan_on_passive = sop;
             }
         }
-        if let Some(v) = opts.get("notify") {
-            cfg.notify = parse_bool(v)?;
-        }
-        if let Some(v) = opts.get("scan_on_update") {
-            cfg.scan_on_update = parse_bool(v)?;
-        }
-        if let Some(v) = opts.get("sevr") {
-            cfg.sevr = parse_sevr(v)?;
-        }
-        if let Some(v) = opts.get("always") {
-            cfg.always = parse_bool(v)?;
-        }
+        apply_or_warn(pv_name, "notify", &opts, &mut cfg.notify, parse_bool);
+        apply_or_warn(
+            pv_name,
+            "scan_on_update",
+            &opts,
+            &mut cfg.scan_on_update,
+            parse_bool,
+        );
+        apply_or_warn(pv_name, "sevr", &opts, &mut cfg.sevr, parse_sevr);
+        apply_or_warn(pv_name, "always", &opts, &mut cfg.always, parse_bool);
         if let Some(v) = opts.get("Q").or_else(|| opts.get("queueSize")) {
-            let n: i64 = v
-                .parse()
-                .map_err(|_| PvaLinkParseError::BadOption(format!("Q={v}")))?;
-            // pvxs clamps `Q < 1` to 1.
-            cfg.queue_size = if n < 1 { 1 } else { n as usize };
+            match v.parse::<i64>() {
+                // pvxs clamps `Q < 1` to 1.
+                Ok(n) => cfg.queue_size = if n < 1 { 1 } else { n as usize },
+                Err(_) => warn_ignored_option(pv_name, "Q", v),
+            }
         }
-        if let Some(v) = opts.get("pipeline") {
-            cfg.pipeline = parse_bool(v)?;
-        }
-        if let Some(v) = opts.get("defer") {
-            cfg.defer = parse_bool(v)?;
-        }
-        if let Some(v) = opts.get("retry") {
-            cfg.retry = parse_bool(v)?;
-        }
-        if let Some(v) = opts.get("local") {
-            cfg.local = parse_bool(v)?;
-        }
-        if let Some(v) = opts.get("atomic") {
-            cfg.atomic = parse_bool(v)?;
-        }
+        apply_or_warn(pv_name, "pipeline", &opts, &mut cfg.pipeline, parse_bool);
+        apply_or_warn(pv_name, "defer", &opts, &mut cfg.defer, parse_bool);
+        apply_or_warn(pv_name, "retry", &opts, &mut cfg.retry, parse_bool);
+        apply_or_warn(pv_name, "local", &opts, &mut cfg.local, parse_bool);
+        apply_or_warn(pv_name, "atomic", &opts, &mut cfg.atomic, parse_bool);
         if let Some(v) = opts.get("monorder") {
-            let n: i64 = v
-                .parse()
-                .map_err(|_| PvaLinkParseError::BadOption(format!("monorder={v}")))?;
-            // pvxs clamps to [-1024, 1024].
-            cfg.monorder = n.clamp(-1024, 1024) as i32;
+            match v.parse::<i64>() {
+                // pvxs clamps to [-1024, 1024].
+                Ok(n) => cfg.monorder = n.clamp(-1024, 1024) as i32,
+                Err(_) => warn_ignored_option(pv_name, "monorder", v),
+            }
         }
         // `time` adopts the linked PV's NT timestamp on read.
-        if let Some(v) = opts.get("time") {
-            cfg.time = parse_bool(v)?;
-        }
+        apply_or_warn(pv_name, "time", &opts, &mut cfg.time, parse_bool);
 
         // Apply legacy bare modifiers
         for m in legacy_mods {
@@ -396,15 +385,64 @@ fn strip_legacy_mods(body: &str) -> (&str, Vec<String>) {
     (head, mods)
 }
 
-fn parse_query(q: &str) -> Result<HashMap<String, String>, PvaLinkParseError> {
+fn parse_query(pv: &str, q: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for chunk in q.split('&').filter(|s| !s.is_empty()) {
-        let (k, v) = chunk
-            .split_once('=')
-            .ok_or_else(|| PvaLinkParseError::BadOption(chunk.to_string()))?;
-        out.insert(k.to_string(), v.to_string());
+        match chunk.split_once('=') {
+            Some((k, v)) => {
+                out.insert(k.to_string(), v.to_string());
+            }
+            // pvxs warns on a malformed token and keeps parsing the rest
+            // (`pvalink_jlif.cpp` parse callbacks return `jlif_continue`).
+            // A segment without `=` is skipped so the link's valid
+            // `key=value` siblings are still applied rather than the whole
+            // link being discarded.
+            None => tracing::warn!(
+                target: "pvalink",
+                pv = %pv,
+                segment = %chunk,
+                "pvalink: ignoring malformed query segment (no '='); \
+                 remaining options on the link are still applied"
+            ),
+        }
     }
-    Ok(out)
+    out
+}
+
+/// Apply a parsed option value to `slot`, or warn-and-keep-default when
+/// the value does not parse. Reads `key` from `opts`; a missing key
+/// leaves the default untouched. pvxs parity: an unparseable option value
+/// is logged and ignored, never failing the whole link
+/// (`pvalink_jlif.cpp:90-194`, `log_warn_printf` + `jlif_continue`).
+fn apply_or_warn<T>(
+    pv: &str,
+    key: &str,
+    opts: &HashMap<String, String>,
+    slot: &mut T,
+    parse: impl Fn(&str) -> Result<T, PvaLinkParseError>,
+) {
+    if let Some(v) = opts.get(key) {
+        match parse(v) {
+            Ok(val) => *slot = val,
+            Err(_) => warn_ignored_option(pv, key, v),
+        }
+    }
+}
+
+/// Warn that an option value could not be parsed and was ignored, leaving
+/// the field at its default. pvxs parity (`pvalink_jlif.cpp:90-194`):
+/// each parse callback `log_warn_printf`s an unknown/unparseable key or
+/// value and returns `jlif_continue`, so one bad option never discards
+/// the rest of the link.
+fn warn_ignored_option(pv: &str, key: &str, value: &str) {
+    tracing::warn!(
+        target: "pvalink",
+        pv = %pv,
+        key = %key,
+        value = %value,
+        "pvalink: ignoring unparseable option value (keeping default); \
+         remaining options on the link are still applied"
+    );
 }
 
 /// Parse a `sevr` option value. Accepts the pvxs string forms
@@ -567,19 +605,22 @@ mod tests {
         assert_eq!(cpp.proc.put_process_request(), "true");
     }
 
-    /// `PASSIVE` is the wire request string for `Default`,
-    /// not a pvxs `proc` enum value, so it must be rejected — pre-fix it
-    /// was silently accepted as process-on-PUT.
+    /// `PASSIVE` is the wire request string for `Default`, not a pvxs
+    /// `proc` enum value. pvxs warns on an unknown `proc` value and keeps
+    /// the prior (default) mode rather than failing the link
+    /// (pvalink_jlif.cpp:156-170), so the link parses Ok with
+    /// `proc == Default` and the bad value ignored — not as
+    /// process-on-PUT.
     #[test]
-    fn fr16_passive_is_not_a_valid_proc_value() {
-        assert!(matches!(
-            PvaLinkConfig::parse("pva://X?proc=PASSIVE", LinkDirection::Out),
-            Err(PvaLinkParseError::BadOption(_))
-        ));
-        assert!(matches!(
-            PvaLinkConfig::parse("pva://X?proc=passive", LinkDirection::Out),
-            Err(PvaLinkParseError::BadOption(_))
-        ));
+    fn fr16_passive_proc_ignored_keeps_default() {
+        for link in ["pva://X?proc=PASSIVE", "pva://X?proc=passive"] {
+            let c = PvaLinkConfig::parse(link, LinkDirection::Out).unwrap();
+            assert_eq!(
+                c.proc,
+                ProcMode::Default,
+                "{link}: unknown proc ignored, default kept"
+            );
+        }
     }
 
     #[test]
@@ -774,15 +815,53 @@ mod tests {
         assert_eq!(c.monorder, 0);
     }
 
+    /// pvxs parity: an unparseable option value is warned and ignored,
+    /// the field keeps its default, and the link still parses (it is NOT
+    /// rejected). Mirrors `pvalink_jlif.cpp:90-194` (`log_warn_printf` +
+    /// `jlif_continue`).
     #[test]
-    fn bad_option_value_rejected() {
-        assert!(matches!(
-            PvaLinkConfig::parse("pva://X?Q=notanumber", LinkDirection::Inp),
-            Err(PvaLinkParseError::BadOption(_))
-        ));
-        assert!(matches!(
-            PvaLinkConfig::parse("pva://X?sevr=BOGUS", LinkDirection::Inp),
-            Err(PvaLinkParseError::BadOption(_))
-        ));
+    fn bad_option_value_ignored_keeps_default() {
+        let c = PvaLinkConfig::parse("pva://X?Q=notanumber", LinkDirection::Inp).unwrap();
+        assert_eq!(
+            c.queue_size, DEFAULT_QUEUE_SIZE,
+            "unparseable Q ignored → default queue size kept"
+        );
+        let c = PvaLinkConfig::parse("pva://X?sevr=BOGUS", LinkDirection::Inp).unwrap();
+        assert_eq!(
+            c.sevr,
+            SevrMode::Nms,
+            "unparseable sevr ignored → default NMS kept"
+        );
+    }
+
+    /// The core of the fix: a single bad option must not discard the
+    /// valid siblings on the same link. Pre-fix, `parse` returned `Err`
+    /// on the bad option and the call site's `if let Ok(cfg)`
+    /// (integration.rs) dropped the *entire* link, defaulting every
+    /// option. pvxs parity — the bad option is warned+ignored and every
+    /// valid option is still applied.
+    #[test]
+    fn bad_option_keeps_valid_siblings() {
+        let c = PvaLinkConfig::parse(
+            "pva://X?proc=BOGUS&field=alarm.severity&Q=8&monitor=true",
+            LinkDirection::Inp,
+        )
+        .expect("a link with one bad option must still parse");
+        assert_eq!(c.proc, ProcMode::Default, "bad proc ignored → default");
+        assert_eq!(c.field, "alarm.severity", "valid field applied");
+        assert_eq!(c.queue_size, 8, "valid Q applied");
+        assert!(c.monitor, "valid monitor applied");
+    }
+
+    /// A malformed query segment (no `=`) is warned and skipped while the
+    /// valid `key=value` siblings are still applied (pvxs warn+continue
+    /// parity). Pre-fix the missing `=` returned `Err(BadOption)` and the
+    /// whole link was discarded.
+    #[test]
+    fn malformed_query_segment_skipped_keeps_valid_siblings() {
+        let c = PvaLinkConfig::parse("pva://X?garbage&field=value.index&Q=2", LinkDirection::Inp)
+            .expect("a malformed query segment must not fail the whole link");
+        assert_eq!(c.field, "value.index", "valid field after bad segment");
+        assert_eq!(c.queue_size, 2, "valid Q after bad segment");
     }
 }

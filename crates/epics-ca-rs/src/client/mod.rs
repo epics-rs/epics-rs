@@ -793,37 +793,26 @@ impl CaClient {
     /// (`CA_PROTO_CLIENT_NAME`). libca takes the user name from `$USER`
     /// at context creation; this lets it be changed at runtime.
     ///
-    /// Every circuit opened after this call handshakes with `user`
-    /// (the shared identity slot is read at connect time). Each circuit
-    /// already established is sent an out-of-band CLIENT_NAME frame so
-    /// the server re-evaluates access control with the new identity.
+    /// Applies to circuits opened **after** this call: the shared
+    /// identity slot is read when each new circuit handshakes (before its
+    /// first channel), so the server accepts the name. Circuits already
+    /// established keep their original user name — the EPICS server
+    /// rejects `CA_PROTO_CLIENT_NAME` once a circuit has created any
+    /// channel (`rsrv/camessage.c` `client_name_action`: `chanCount != 0`
+    /// → `ECA_INTERNAL`, name ignored), so there is no in-band way to
+    /// rename a live circuit.
     pub fn set_user_name(&self, user: impl Into<String>) {
-        let user = user.into();
-        self.client_identity.write().user = user.clone();
-        self.broadcast_identity_frame(crate::protocol::CA_PROTO_CLIENT_NAME, &user);
+        self.client_identity.write().user = user.into();
     }
 
     /// Override the host name this client advertises to servers
-    /// (`CA_PROTO_HOST_NAME`). Propagation is identical to
-    /// [`CaClient::set_user_name`]: new circuits read the updated slot at
-    /// handshake time, existing circuits get an out-of-band HOST_NAME
-    /// frame.
+    /// (`CA_PROTO_HOST_NAME`). Same scope as [`CaClient::set_user_name`]:
+    /// new circuits read the updated slot at handshake time; existing
+    /// circuits keep their host name (the EPICS server ignores
+    /// `CA_PROTO_HOST_NAME` after the first channel — `host_name_action`,
+    /// `chanCount != 0` → `ECA_INTERNAL`).
     pub fn set_host_name(&self, host: impl Into<String>) {
-        let host = host.into();
-        self.client_identity.write().host = host.clone();
-        self.broadcast_identity_frame(crate::protocol::CA_PROTO_HOST_NAME, &host);
-    }
-
-    /// Push a single CLIENT_NAME / HOST_NAME identity frame to every
-    /// live virtual circuit so a runtime rename reaches already-connected
-    /// servers. New circuits instead read the value from the shared slot
-    /// at handshake time. Best-effort: a circuit whose writer has gone
-    /// away (teardown in flight) is silently skipped.
-    fn broadcast_identity_frame(&self, cmd: u16, value: &str) {
-        let frame = transport::build_identity_frame(cmd, value);
-        for entry in self.server_writers.iter() {
-            let _ = entry.value().send_frame(frame.clone());
-        }
+        self.client_identity.write().host = host.into();
     }
 
     /// Number of distinct operational CA virtual circuits this client

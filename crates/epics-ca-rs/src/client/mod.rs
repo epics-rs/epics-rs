@@ -898,6 +898,7 @@ impl CaClient {
             conn_tx,
             cached_read: Arc::new(Mutex::new(None)),
             search_attempts: self.search_attempts.clone(),
+            user_data: Arc::new(Mutex::new(None)),
             _lifecycle: lifecycle,
         }
     }
@@ -1323,6 +1324,11 @@ pub struct CaChannel {
     /// the SearchEngine bumps on every fanout (immediate + retransmit);
     /// cleared when the channel transitions to Connected.
     search_attempts: types::SearchAttempts,
+    /// Opaque per-channel user data — Rust analog of libca
+    /// `ca_set_puser`/`ca_puser` `void *` (cadef.h:243/251). Wrapped
+    /// in an `Arc<Mutex<>>` so independent clones of the same channel
+    /// see the same slot (the libca contract is "one PUSER per chid").
+    user_data: Arc<Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>>,
     /// Refcounted lifecycle guard — see [`ChannelLifecycle`].
     _lifecycle: Arc<ChannelLifecycle>,
 }
@@ -1353,6 +1359,7 @@ impl CaChannel {
             conn_tx,
             cached_read: Arc::new(Mutex::new(None)),
             search_attempts: types::SearchAttempts::default(),
+            user_data: Arc::new(Mutex::new(None)),
             _lifecycle: lifecycle,
         }
     }
@@ -2465,6 +2472,29 @@ impl CaChannel {
     /// or the server's minor protocol version is below 2.
     pub async fn v42_ok(&self) -> bool {
         matches!(self.host_minor_protocol().await, Some(v) if v >= 2)
+    }
+
+    /// Stash an arbitrary `Arc<T: Any+Send+Sync>` on this channel —
+    /// Rust analog of libca `ca_set_puser(chid, void*)` (cadef.h:243).
+    /// All clones of the same channel share one slot.
+    pub fn set_user_data<T: std::any::Any + Send + Sync>(&self, data: Arc<T>) {
+        *self.user_data.lock() = Some(data);
+    }
+
+    /// Retrieve the user-data slot if present, downcast to `T`.
+    /// Returns `None` if the slot is empty or the stored type does
+    /// not match. Mirrors libca `ca_puser(chid)` (cadef.h:251) modulo
+    /// the type-tag.
+    pub fn user_data<T: std::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.user_data
+            .lock()
+            .as_ref()
+            .and_then(|any| Arc::clone(any).downcast::<T>().ok())
+    }
+
+    /// Clear the user-data slot. Returns the previous contents (if any).
+    pub fn clear_user_data(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.user_data.lock().take()
     }
 
     /// Time since the underlying TCP virtual circuit last received
@@ -5025,6 +5055,36 @@ mod typed_string_put_tests {
             "string-array put must wire DBR_STRING (0)"
         );
         assert_eq!(hdr.count, 3, "count must be the element count");
+    }
+}
+
+#[cfg(test)]
+mod user_data_tests {
+    use super::*;
+
+    #[test]
+    fn set_get_downcast_clone_share_and_clear() {
+        let (coord_tx, _rx) = mpsc::unbounded_channel();
+        let ch = CaChannel::for_test(coord_tx);
+
+        // Empty slot to start.
+        assert!(ch.user_data::<u32>().is_none());
+
+        // Store, then read back with the matching type.
+        ch.set_user_data(Arc::new(42u32));
+        assert_eq!(ch.user_data::<u32>().as_deref(), Some(&42u32));
+
+        // A wrong-type downcast misses rather than panicking.
+        assert!(ch.user_data::<String>().is_none());
+
+        // Clones share the one slot (libca "one PUSER per chid").
+        let ch2 = ch.clone();
+        assert_eq!(ch2.user_data::<u32>().as_deref(), Some(&42u32));
+
+        // Clear returns the previous contents and empties the shared slot.
+        assert!(ch.clear_user_data().is_some());
+        assert!(ch.user_data::<u32>().is_none());
+        assert!(ch2.user_data::<u32>().is_none());
     }
 }
 

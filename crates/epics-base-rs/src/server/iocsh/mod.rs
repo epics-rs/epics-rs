@@ -150,39 +150,45 @@ impl IocShell {
 
     /// Execute a command, optionally redirecting output to a file.
     fn execute_command(&self, line: &str, redirect: Option<&Redirect>) -> CommandResult {
-        if let Some(redir) = redirect {
-            // C parity: iocsh.cpp supports fd-numbered redirects 1..9
-            // (`2>file` for stderr, etc.). Only fd 1 (stdout) is plumbed
-            // through CommandContext::with_output today; fd 2+ is parsed
-            // for syntax compatibility (so an st.cmd that says
-            // `dbl 2>/dev/null` doesn't error) but the captured output
-            // still routes through the stdout sink. Emit a diagnostic
-            // so operators know the fd-2 capture is approximate.
-            if redir.fd != 1 {
-                eprintln!(
-                    "iocsh: fd {} redirect not fully plumbed — routing to stdout sink",
-                    redir.fd
-                );
-            }
-            let file_result = if redir.append {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&redir.path)
-            } else {
-                File::create(&redir.path)
-            };
-            match file_result {
-                Ok(file) => self
-                    .ctx
-                    .with_output(file, || self.execute_command_inner(line)),
-                Err(e) => {
-                    eprintln!("cannot open '{}': {}", redir.path, e);
-                    Ok(CommandOutcome::Continue)
-                }
-            }
+        let Some(redir) = redirect else {
+            return self.execute_command_inner(line);
+        };
+
+        // C parity (iocsh.cpp:401-428 startRedirect): each fd-numbered
+        // redirect reroutes ONLY its own stream — `case 1` → stdout,
+        // `case 2` → stderr, fd 3-9 open the file but redirect nothing.
+        // CommandContext models only the stdout sink, so a `>`/`1>`
+        // redirect reroutes it via `with_output`; a `2>` (or higher) must
+        // leave stdout ALONE. Routing stdout into the fd-N file would send
+        // e.g. a `dbl 2>/dev/null` listing (which is stdout) to the file
+        // and lose it entirely. fd≠1 capture (stderr) is not plumbed
+        // through CommandContext, so the command runs with stdout intact
+        // and a diagnostic notes the fd-N capture is unsupported.
+        if redir.fd != 1 {
+            eprintln!(
+                "iocsh: fd {} redirect (stderr/other) not plumbed — \
+                 stdout left intact, '{}' not captured",
+                redir.fd, redir.path
+            );
+            return self.execute_command_inner(line);
+        }
+
+        let file_result = if redir.append {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&redir.path)
         } else {
-            self.execute_command_inner(line)
+            File::create(&redir.path)
+        };
+        match file_result {
+            Ok(file) => self
+                .ctx
+                .with_output(file, || self.execute_command_inner(line)),
+            Err(e) => {
+                eprintln!("cannot open '{}': {}", redir.path, e);
+                Ok(CommandOutcome::Continue)
+            }
         }
     }
 
@@ -529,12 +535,12 @@ struct Redirect {
     path: String,
     append: bool,
     /// File descriptor target. C iocsh (iocsh.cpp:287-303) accepts
-    /// `1>` through `9>` (and `1>>` ... `9>>`). The Rust port currently
-    /// only plumbs through stdout (fd 1) — `with_output` captures
-    /// `ctx.println` / `print_fmt` writes. Tracking the fd here lets
-    /// us recognize the C syntax without erroring; non-1 fds emit a
-    /// diagnostic but otherwise route to stdout (best-effort) so an
-    /// st.cmd `2>/dev/null` doesn't fail-fast.
+    /// `1>` through `9>` (and `1>>` ... `9>>`). The Rust port only plumbs
+    /// the stdout sink (fd 1) — `with_output` captures `ctx.println` /
+    /// `print_fmt` writes. Tracking the fd here lets us recognize the C
+    /// syntax without erroring; fd≠1 (e.g. `2>`) leaves stdout untouched
+    /// (the fd-N stream is not plumbed) so `dbl 2>/dev/null` keeps its
+    /// stdout listing rather than misrouting it into the file.
     fd: u8,
 }
 
@@ -748,6 +754,31 @@ mod tests {
         let content = std::fs::read_to_string(&tmp).unwrap();
         assert!(content.starts_with("existing\n"));
         assert!(content.contains("TEST_REC"));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// A `2>` (fd≠1) redirect must NOT capture the command's stdout. C
+    /// `iocsh.cpp:401-428` (startRedirect) reroutes only the named
+    /// stream — `case 1` stdout, `case 2` stderr — so `dbl 2>FILE` keeps
+    /// its listing (stdout) on the terminal and only stderr (unplumbed
+    /// here) would go to FILE. The previous code replaced the stdout sink
+    /// for any fd, diverting the listing into FILE and losing it.
+    #[test]
+    fn test_redirect_fd2_leaves_stdout_intact() {
+        let shell = make_shell();
+        let tmp = std::env::temp_dir().join("iocsh_test_fd2_redirect.txt");
+        let _ = std::fs::remove_file(&tmp);
+        let line = format!("dbl 2> {}", tmp.display());
+        let result = shell.execute_line(&line);
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+        // The dbl listing is stdout; a 2> redirect must not divert it
+        // into the file (the fd-2 stream is not plumbed, so the file is
+        // not even written).
+        let captured = std::fs::read_to_string(&tmp).unwrap_or_default();
+        assert!(
+            !captured.contains("TEST_REC"),
+            "fd-2 redirect must not capture stdout, got: {captured}"
+        );
         std::fs::remove_file(&tmp).ok();
     }
 

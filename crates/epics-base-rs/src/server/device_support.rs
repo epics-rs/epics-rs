@@ -116,6 +116,20 @@ pub trait DeviceSupport: Send + Sync + 'static {
         None
     }
 
+    /// Return the userTag the driver attached to its reading, as the
+    /// 64-bit `epicsUTag`. `None` means the driver provides no userTag
+    /// and `common.utag` is left untouched.
+    ///
+    /// This is the channel a timing receiver (event system) uses to
+    /// deliver a pulse-id / event tag: `epicsTimeStamp` itself carries
+    /// no tag and the generalTime event path (`epicsTimeGetEvent`)
+    /// delivers only the timestamp, so the tag must come through device
+    /// support — mirroring C device support writing `prec->utag`
+    /// directly during `read()` (alongside `prec->time`, TSE=-2).
+    fn last_utag(&self) -> Option<u64> {
+        None
+    }
+
     /// Called by the framework immediately before [`read()`](DeviceSupport::read)
     /// to push a read-only snapshot of framework-owned `CommonFields`
     /// state ([`crate::server::record::ProcessContext`]) that the device

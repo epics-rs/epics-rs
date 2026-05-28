@@ -1803,6 +1803,63 @@ async fn test_input_record_no_device_write() {
     assert_eq!(write_count.load(Ordering::SeqCst), 0);
 }
 
+// Device support that attaches a fixed userTag to its reading, like a
+// timing receiver delivering a pulse-id. `epicsTimeStamp` carries no
+// tag, so C device support writes `prec->utag` directly during
+// `read()` (alongside `prec->time`, TSE=-2); the Rust framework picks
+// it up from `last_utag()`.
+struct UtagDeviceSupport {
+    utag: u64,
+}
+
+impl epics_base_rs::server::device_support::DeviceSupport for UtagDeviceSupport {
+    fn read(
+        &mut self,
+        _record: &mut dyn Record,
+    ) -> epics_base_rs::error::CaResult<epics_base_rs::server::device_support::DeviceReadOutcome>
+    {
+        Ok(epics_base_rs::server::device_support::DeviceReadOutcome::ok())
+    }
+    fn write(&mut self, _record: &mut dyn Record) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn dtyp(&self) -> &str {
+        "UtagDev"
+    }
+    fn last_utag(&self) -> Option<u64> {
+        Some(self.utag)
+    }
+}
+
+#[tokio::test]
+async fn test_device_support_utag_adopted_into_common() {
+    // A device that reports a userTag via `last_utag()` must have it
+    // adopted into `common.utag` when the record is processed, mirroring
+    // C device support writing `prec->utag` directly. Bit 31 set
+    // (0x9000_0000) guards against any narrowing/sign mishandling on the
+    // adoption path.
+    let db = PvDatabase::new();
+    db.add_record("AI_UTAG", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("AI_UTAG").await {
+        let mut inst = rec.write().await;
+        inst.common.dtyp = "UtagDev".to_string();
+        inst.device = Some(Box::new(UtagDeviceSupport { utag: 0x9000_0000 }));
+    }
+    let mut visited = HashSet::new();
+    db.process_record_with_links("AI_UTAG", &mut visited, 0)
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("AI_UTAG").await {
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.common.utag, 0x9000_0000,
+            "device-reported userTag must be adopted into common.utag"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_non_passive_output_ca_put_defers_write_until_scan() {
     // C `dbAccess.c::dbPutField:1263-1266` only processes a record on a

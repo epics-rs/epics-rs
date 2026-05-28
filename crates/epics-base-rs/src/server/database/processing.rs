@@ -1236,10 +1236,10 @@ impl PvDatabase {
 
             // Device support alarm/timestamp override
             if !is_soft {
-                let (dev_alarm, dev_ts) = if let Some(ref dev) = instance.device {
-                    (dev.last_alarm(), dev.last_timestamp())
+                let (dev_alarm, dev_ts, dev_utag) = if let Some(ref dev) = instance.device {
+                    (dev.last_alarm(), dev.last_timestamp(), dev.last_utag())
                 } else {
-                    (None, None)
+                    (None, None, None)
                 };
                 if let Some((stat, sevr)) = dev_alarm {
                     use crate::server::recgbl::rec_gbl_set_sevr;
@@ -1251,6 +1251,15 @@ impl PvDatabase {
                 }
                 if let Some(ts) = dev_ts {
                     instance.common.time = ts;
+                }
+                // C device support writes `prec->utag` directly during
+                // `read()` — the event-system pulse-id path, since
+                // `epicsTimeStamp` carries no tag. Adopt the device's
+                // userTag when it supplies one; read in the same `dev`
+                // borrow as the timestamp above so the time/tag pair is a
+                // single consistent device snapshot.
+                if let Some(utag) = dev_utag {
+                    instance.common.utag = utag;
                 }
             }
 
@@ -2154,10 +2163,10 @@ impl PvDatabase {
 
             // Device support alarm/timestamp override
             if !is_soft {
-                let (dev_alarm, dev_ts) = if let Some(ref dev) = instance.device {
-                    (dev.last_alarm(), dev.last_timestamp())
+                let (dev_alarm, dev_ts, dev_utag) = if let Some(ref dev) = instance.device {
+                    (dev.last_alarm(), dev.last_timestamp(), dev.last_utag())
                 } else {
-                    (None, None)
+                    (None, None, None)
                 };
                 if let Some((stat, sevr)) = dev_alarm {
                     crate::server::recgbl::rec_gbl_set_sevr(
@@ -2168,6 +2177,15 @@ impl PvDatabase {
                 }
                 if let Some(ts) = dev_ts {
                     instance.common.time = ts;
+                }
+                // C device support writes `prec->utag` directly during
+                // `read()` — the event-system pulse-id path, since
+                // `epicsTimeStamp` carries no tag. Adopt the device's
+                // userTag when it supplies one; read in the same `dev`
+                // borrow as the timestamp above so the time/tag pair is a
+                // single consistent device snapshot.
+                if let Some(utag) = dev_utag {
+                    instance.common.utag = utag;
                 }
             }
 

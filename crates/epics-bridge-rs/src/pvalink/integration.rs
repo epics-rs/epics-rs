@@ -987,7 +987,7 @@ impl LinkSet for PvaLinkResolver {
         link.link_alarm_severity_with(sevr)
     }
 
-    fn time_stamp(&self, name: &str) -> Option<(i64, i32)> {
+    fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
         let full = strip_scheme(name)?;
         let bare = link_pv_name(full);
         if full != bare {
@@ -2678,6 +2678,12 @@ mod tests {
         ));
         ts.fields
             .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(42))));
+        // bit-31 userTag: confirms the zero-extended 64-bit tag survives
+        // the full resolver/trait chain, not just the link-level read.
+        ts.fields.push((
+            "userTag".into(),
+            PvField::Scalar(ScalarValue::Int(0x9000_0000u32 as i32)),
+        ));
         let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
         root.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(3.0))));
@@ -2730,8 +2736,9 @@ mod tests {
         );
         assert_eq!(
             LinkSet::time_stamp(&resolver, "pva://MR_R15:PV?time=true"),
-            Some((1_700_000_000, 42)),
-            "a time=true caller must adopt the upstream timestamp"
+            Some((1_700_000_000, 42, 0x0000_0000_9000_0000)),
+            "a time=true caller must adopt the upstream timestamp and the \
+             zero-extended userTag"
         );
     }
 

@@ -159,9 +159,12 @@ pub trait LinkSet: Send + Sync {
         None
     }
 
-    /// `(seconds_past_epoch, nanoseconds)` from the upstream PV's
-    /// timestamp slot, when available.
-    fn time_stamp(&self, _name: &str) -> Option<(i64, i32)> {
+    /// `(seconds_past_epoch, nanoseconds, userTag)` from the upstream
+    /// PV's timestamp slot, when available. The `userTag` is the remote
+    /// `timeStamp.userTag` widened to the 64-bit `epicsUTag` tag without
+    /// sign extension, or `0` when the source carries none (CA links, or
+    /// a PVA source whose timeStamp omits the field).
+    fn time_stamp(&self, _name: &str) -> Option<(i64, i32, u64)> {
         None
     }
 

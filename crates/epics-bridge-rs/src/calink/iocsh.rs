@@ -106,7 +106,7 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
                             if let Some(sev) = alarm {
                                 ctx.println(&format!("        alarmSeverity={sev}"));
                             }
-                            if let Some((s, n)) = ts {
+                            if let Some((s, n, _)) = ts {
                                 ctx.println(&format!("        timeStamp={s}.{n:09}"));
                             }
                         }

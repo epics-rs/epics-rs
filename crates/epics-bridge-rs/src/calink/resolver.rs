@@ -145,16 +145,18 @@ impl CaLink {
             .map(|s| s.alarm.status as i32)
     }
 
-    /// Cached timestamp as `(seconds_past_epoch, nanoseconds)`, or
-    /// `None` when the link is not connected.
-    pub fn time_stamp(&self) -> Option<(i64, i32)> {
+    /// Cached timestamp as `(seconds_past_epoch, nanoseconds, userTag)`,
+    /// or `None` when the link is not connected. The Channel Access wire
+    /// protocol's `DBR_TIME_*` payload carries no user tag, so the tag is
+    /// always `0` — only PVA links can adopt a remote `timeStamp.userTag`.
+    pub fn time_stamp(&self) -> Option<(i64, i32, u64)> {
         if !self.connected.load(Ordering::Acquire) {
             return None;
         }
         let snap = self.cache.load();
         let snap = snap.as_ref().as_ref()?;
         let dur = snap.timestamp.duration_since(std::time::UNIX_EPOCH).ok()?;
-        Some((dur.as_secs() as i64, dur.subsec_nanos() as i32))
+        Some((dur.as_secs() as i64, dur.subsec_nanos() as i32, 0))
     }
 
     /// Cached remote metadata (display/control/alarm limits, precision,
@@ -583,7 +585,7 @@ impl LinkSet for CaLinkResolver {
         self.link_for(name)?.alarm_status()
     }
 
-    fn time_stamp(&self, name: &str) -> Option<(i64, i32)> {
+    fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
         let name = strip_ca_scheme(name);
         self.link_for(name)?.time_stamp()
     }

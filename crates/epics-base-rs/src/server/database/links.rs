@@ -299,12 +299,16 @@ impl PvDatabase {
     /// (returning `None` for links without the `time` option), so a
     /// `Some` here is the authoritative remote timestamp the
     /// processing path should adopt into the owning record's
-    /// `common.time`. Mirrors pvxs `pvalink_lset.cpp:427`.
+    /// `common.time` and `common.utag`. Mirrors pvxs
+    /// `pvalink_lset.cpp:427`.
     ///
-    /// Returns `(seconds_since_epoch, nanoseconds)` exactly as the
-    /// lset reports them; the caller folds them into the record's
-    /// `SystemTime` via `UNIX_EPOCH + Duration::new(...)`.
-    pub(crate) async fn external_link_time(&self, name: &str) -> Option<(i64, i32)> {
+    /// Returns `(seconds_since_epoch, nanoseconds, userTag)` exactly as
+    /// the lset reports them; the caller folds the time into the
+    /// record's `SystemTime` via `UNIX_EPOCH + Duration::new(...)` and
+    /// adopts the `userTag` into `common.utag`. The `userTag` is the
+    /// remote `timeStamp.userTag` widened without sign extension, or `0`
+    /// when the source carries none.
+    pub(crate) async fn external_link_time(&self, name: &str) -> Option<(i64, i32, u64)> {
         let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
             ("pva", rest)
         } else if let Some(rest) = name.strip_prefix("ca://") {

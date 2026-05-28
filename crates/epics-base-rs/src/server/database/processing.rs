@@ -692,11 +692,12 @@ impl PvDatabase {
         // if the single-INP link is an external `pva://` /
         // `ca://` link configured with `time=true`, the lset returns
         // the latched upstream NT timestamp here and we adopt it
-        // into the owning record's `common.time`. The lset gates the
-        // option internally (returns `None` unless `time=true`), so a
-        // bare connected link without the flag still produces local
-        // processing time. Mirrors pvxs `pvalink_lset.cpp:427`.
-        let inp_link_remote_time: Option<(i64, i32)> = match inp_parsed.external_pv_name() {
+        // into the owning record's `common.time` and `common.utag`. The
+        // lset gates the option internally (returns `None` unless
+        // `time=true`), so a bare connected link without the flag still
+        // produces local processing time. Mirrors pvxs
+        // `pvalink_lset.cpp:427`.
+        let inp_link_remote_time: Option<(i64, i32, u64)> = match inp_parsed.external_pv_name() {
             Some(name) => self.external_link_time(name).await,
             None => None,
         };
@@ -1251,11 +1252,19 @@ impl PvDatabase {
             // Apply BEFORE `apply_timestamp` so the upstream value
             // survives the soft-channel TSE=0 default (`apply_timestamp`
             // would otherwise stamp wall-clock-now on top).
-            if let Some((secs, ns)) = inp_link_remote_time {
+            if let Some((secs, ns, utag)) = inp_link_remote_time {
                 let secs = secs.max(0) as u64;
                 let ns = ns.max(0) as u32;
                 instance.common.time =
                     std::time::UNIX_EPOCH + std::time::Duration::new(secs, ns.min(999_999_999));
+                // adopt the upstream `timeStamp.userTag` alongside the
+                // time, mirroring pvxs PR-added `precord->utag = snap_tag`
+                // next to `precord->time = snap_time` in the `time=true`
+                // branch. The tag is already widened without sign
+                // extension by the lset; `0` when the source carries
+                // none. `apply_timestamp` never touches `utag`, so this
+                // survives regardless of the TSE branch below.
+                instance.common.utag = utag;
                 // TSE=-2 marks "device-set time" — `apply_timestamp`
                 // honours this by leaving `common.time` untouched,
                 // mirroring the device-support timestamp branch above.

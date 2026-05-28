@@ -696,10 +696,12 @@ impl PvaLink {
         self.latest.lock().clone()
     }
 
-    /// Latest `(seconds, nanoseconds)` from the NT timeStamp slot, if
-    /// the cached value carries one. Mirrors pvxs
-    /// `pvaGetTimeStampTag`.
-    pub fn time_stamp(&self) -> Option<(i64, i32)> {
+    /// Latest `(seconds, nanoseconds, userTag)` from the NT timeStamp
+    /// slot, if the cached value carries one. Mirrors pvxs
+    /// `pvaGetTimeStampTag`. The `userTag` is the remote
+    /// `timeStamp.userTag` widened to the 64-bit tag WITHOUT sign
+    /// extension (see the read below); `0` when the field is absent.
+    pub fn time_stamp(&self) -> Option<(i64, i32, u64)> {
         // a disconnected monitor link must not serve its
         // stale latched timestamp — pvxs gates every lset getter
         // through `CHECK_VALID` (`valid() = connected && root`), so
@@ -728,7 +730,19 @@ impl PvaLink {
             PvField::Scalar(ScalarValue::UInt(v)) => *v as i32,
             _ => return None,
         };
-        Some((secs, nsec))
+        // pvxs `pvalink_lset.cpp:406-409` reads `timeStamp.userTag` into
+        // the snapshot tag, falling back to 0 when the field is absent
+        // (`if(self->fld_usertag) snap_tag = ...; else snap_tag = 0;`).
+        // The wire field is a signed int32; zero-extend (`as u32 as u64`)
+        // rather than sign-extend so a bit-31 tag like 0x9000_0000 widens
+        // to 0x0000_0000_9000_0000, not 0xFFFF_FFFF_9000_0000 (the
+        // pvData `as<uint32_t>()` reinterpret, not `as<epicsUTag>()`).
+        let utag = match t.get_field("userTag") {
+            Some(PvField::Scalar(ScalarValue::Int(v))) => *v as u32 as u64,
+            Some(PvField::Scalar(ScalarValue::UInt(v))) => *v as u64,
+            _ => 0,
+        };
+        Some((secs, nsec, utag))
     }
 
     /// Remote display / control / valueAlarm metadata snapshot for
@@ -1690,8 +1704,9 @@ mod tests {
         flag.store(true, Ordering::Release);
         assert_eq!(
             link.time_stamp(),
-            Some((1_700_000_000, 42)),
-            "connected monitor surfaces the cached timestamp"
+            Some((1_700_000_000, 42, 0)),
+            "connected monitor surfaces the cached timestamp; no userTag \
+             field in the fixture, so the tag defaults to 0"
         );
         assert!(
             link.link_metadata().is_some(),
@@ -1712,6 +1727,74 @@ mod tests {
         assert!(
             link.latest_value().is_some(),
             "snapshot retained (pvxs keeps root; CHECK_VALID gates the getters)"
+        );
+    }
+
+    /// The remote `timeStamp.userTag` is a signed int32 on the wire, but
+    /// the adopted record tag is a 64-bit `epicsUTag`. Widening must
+    /// zero-extend (`as u32 as u64`), never sign-extend: a bit-31 tag
+    /// like 0x9000_0000 must widen to 0x0000_0000_9000_0000, not
+    /// 0xFFFF_FFFF_9000_0000. This is the pvData `as<uint32_t>()` (not
+    /// `as<epicsUTag>()`) read at `pvalink_lset.cpp:406-409`. Boundaries:
+    /// absent tag, small positive, and the bit-31 sign boundary on both
+    /// the signed `Int` and unsigned `UInt` carriers.
+    #[tokio::test]
+    async fn pvalink_usertag_widens_without_sign_extension() {
+        // Build a connected monitor link whose cached NT value carries a
+        // timeStamp with the given userTag field, then read the tag.
+        let read_tag = |usertag: Option<PvField>| -> Option<u64> {
+            let mut ts = PvStructure::new("time_t");
+            ts.fields.push((
+                "secondsPastEpoch".into(),
+                PvField::Scalar(ScalarValue::Long(1_700_000_000)),
+            ));
+            ts.fields
+                .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(42))));
+            if let Some(f) = usertag {
+                ts.fields.push(("userTag".into(), f));
+            }
+            let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+            root.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+            root.fields
+                .push(("timeStamp".into(), PvField::Structure(ts)));
+            let (link, flag) = PvaLink::for_test_with_monitor_flag(
+                inp_cfg(SevrMode::Nms),
+                Some(PvField::Structure(root)),
+            );
+            flag.store(true, Ordering::Release);
+            link.time_stamp().map(|(_, _, utag)| utag)
+        };
+
+        // Absent userTag → 0 (pvxs `else snap_tag = 0`).
+        assert_eq!(read_tag(None), Some(0), "absent userTag adopts tag 0");
+        // Small positive signed tag → identity.
+        assert_eq!(
+            read_tag(Some(PvField::Scalar(ScalarValue::Int(5)))),
+            Some(5),
+            "small positive userTag widens to itself"
+        );
+        // bit-31 set on the signed `Int` carrier: 0x9000_0000 as i32 is
+        // negative, so a naive `as u64` would sign-extend.
+        assert_eq!(
+            read_tag(Some(PvField::Scalar(ScalarValue::Int(
+                0x9000_0000u32 as i32
+            )))),
+            Some(0x0000_0000_9000_0000),
+            "bit-31 signed userTag must zero-extend, not sign-extend to \
+             0xFFFF_FFFF_9000_0000"
+        );
+        // int32 -1 widens to 0xFFFF_FFFF, not u64::MAX.
+        assert_eq!(
+            read_tag(Some(PvField::Scalar(ScalarValue::Int(-1)))),
+            Some(0x0000_0000_FFFF_FFFF),
+            "int32 -1 userTag must widen to 0xFFFF_FFFF, not 0xFFFF_FFFF_FFFF_FFFF"
+        );
+        // Same boundary on the unsigned `UInt` carrier.
+        assert_eq!(
+            read_tag(Some(PvField::Scalar(ScalarValue::UInt(0x9000_0000)))),
+            Some(0x0000_0000_9000_0000),
+            "bit-31 unsigned userTag widens cleanly"
         );
     }
 

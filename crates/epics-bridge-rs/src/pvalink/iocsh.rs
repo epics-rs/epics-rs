@@ -132,7 +132,7 @@ pub fn dbpvxr_command(resolver: PvaLinkResolver) -> CommandDef {
                                 if let Some(a) = alarm {
                                     ctx.println(&format!("        alarm={a:?}"));
                                 }
-                                if let Some((s, n)) = ts {
+                                if let Some((s, n, _)) = ts {
                                     ctx.println(&format!("        timeStamp={s}.{n:09}"));
                                 }
                             }

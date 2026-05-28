@@ -4144,6 +4144,63 @@ async fn test_tsel_cp_link_registration() {
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
 }
 
+/// a record whose `TSEL` is a time-link at another record's `.TIME`
+/// field (`DBLINK_FLAG_TSELisTIME`) adopts the source's timestamp AND
+/// userTag, mirroring C `recGblGetTimeStampSimm` (recGbl.c:317) copying
+/// both through `dbGetTimeStampTag(plink, &prec->time, &prec->utag)`.
+/// Pre-fix only `common.time` was copied and the source's `utag` was
+/// dropped.
+#[tokio::test]
+async fn test_tsel_time_link_copies_source_time_and_utag() {
+    let db = PvDatabase::new();
+    db.add_record("TSE_SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("TS_DST", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Source carries a known timestamp and a bit-31 userTag; the bit-31
+    // value pins that the u64 utag is copied verbatim (no narrowing or
+    // reset on the way through processing).
+    let src_time = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123);
+    let src_utag: u64 = 0x9000_0000;
+    {
+        let rec = db.get_record("TSE_SRC").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.time = src_time;
+        inst.common.utag = src_utag;
+    }
+
+    // Target's TSEL points at the source's `.TIME` field.
+    {
+        let rec = db.get_record("TS_DST").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.tsel = "TSE_SRC.TIME".to_string();
+        inst.parsed_tsel = parse_link_v2(&inst.common.tsel);
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("TS_DST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("TS_DST").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.time, src_time,
+        "TSEL .TIME link must adopt the source's timestamp"
+    );
+    assert_eq!(
+        inst.common.utag, src_utag,
+        "TSEL .TIME link must also adopt the source's utag (recGbl.c:317)"
+    );
+    assert_eq!(
+        inst.common.tse, -2,
+        "adopting device/link time marks TSE=-2"
+    );
+}
+
 #[tokio::test]
 async fn test_new_common_fields_get_put() {
     let db = PvDatabase::new();

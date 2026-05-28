@@ -500,9 +500,18 @@ impl PvDatabase {
             if tsel_is_time {
                 if let crate::server::record::ParsedLink::Db(ref link) = tsel_link {
                     if let Some(src) = self.get_record(&link.record).await {
-                        let src_time = src.read().await.common.time;
+                        // C `recGblGetTimeStampSimm` (recGbl.c:317) copies
+                        // BOTH the TSEL-pointed link's time AND utag via
+                        // `dbGetTimeStampTag(plink, &prec->time, &prec->utag)`.
+                        // Read the pair under one guard so it is a single
+                        // consistent snapshot.
+                        let (src_time, src_utag) = {
+                            let g = src.read().await;
+                            (g.common.time, g.common.utag)
+                        };
                         let mut instance = rec.write().await;
                         instance.common.time = src_time;
+                        instance.common.utag = src_utag;
                         instance.common.tse = -2;
                     }
                 }

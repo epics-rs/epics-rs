@@ -2027,7 +2027,11 @@ fn build_timestamp_from_snapshot_masked(
     let user_tag = if nsec_mask != 0 {
         (raw_nanos & nsec_mask) as i32
     } else {
-        0
+        // No group `+nsecmask`: serve the snapshot's userTag, which the
+        // record snapshot builder defaults to `common.utag` (pvxs
+        // `iocsource.cpp:245`). Pre-fix this hard-coded 0, dropping the
+        // record's utag on group serve.
+        snapshot.user_tag
     };
     ts.fields.push((
         "secondsPastEpoch".into(),
@@ -2059,6 +2063,47 @@ mod tests {
             PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(42)),
         );
         assert!(pv.get_field("x").is_some());
+    }
+
+    /// a group `meta` timeStamp serves the record's userTag (carried in
+    /// `Snapshot.user_tag`, which the record snapshot builder defaults to
+    /// `common.utag`) when the group field has no `+nsecmask` — pvxs
+    /// `iocsource.cpp:245`. Pre-fix the no-mask branch hard-coded 0,
+    /// dropping the record's tag. A `+nsecmask` overrides with the masked
+    /// nanosecond bits (:247). The bit-31 tag also pins that the
+    /// snapshot's i32 userTag passes through unchanged.
+    #[test]
+    fn group_timestamp_serves_record_usertag_without_nsecmask() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::EpicsValue;
+        use epics_pva_rs::pvdata::{PvField, ScalarValue};
+        use std::time::UNIX_EPOCH;
+
+        let tag = |s: &PvStructure| match s.get_field("userTag") {
+            Some(PvField::Scalar(ScalarValue::Int(v))) => *v,
+            other => panic!("userTag must be Int, got {other:?}"),
+        };
+
+        let mut snap = Snapshot::new(
+            EpicsValue::Double(1.0),
+            0,
+            0,
+            UNIX_EPOCH + Duration::new(1_700_000_000, 0x0000_00FF),
+        );
+        snap.user_tag = 0x9000_0000u32 as i32;
+
+        // No `+nsecmask` → serve the snapshot's (record) userTag, not 0.
+        assert_eq!(
+            tag(&build_timestamp_from_snapshot_masked(&snap, 0)),
+            0x9000_0000u32 as i32,
+            "no-nsecmask group member must serve the record's utag"
+        );
+        // `+nsecmask` → userTag is the masked nanosecond bits (override).
+        assert_eq!(
+            tag(&build_timestamp_from_snapshot_masked(&snap, 0xFF)),
+            0x0000_00FF,
+            "nsecmask group member must serve the masked nanosecond bits"
+        );
     }
 
     /// a `+trigger` target without a backing channel (Const /

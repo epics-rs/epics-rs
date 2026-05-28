@@ -406,6 +406,15 @@ impl RecordInstance {
             self.common.sevr as u16,
             self.common.time,
         );
+        // Default the served `timeStamp.userTag` to the record's `utag`,
+        // mirroring pvxs `iocsource.cpp:245` (`auto utag = meta.utag;`).
+        // The 64-bit `epicsUTag` narrows to the int32 NT wire field by
+        // truncating to the low 32 bits — pvxs assigns the same uint64
+        // straight into the `Int32` `timeStamp.userTag`. The `Q:time:tag`
+        // nsec-LSB split below overrides this when configured, matching
+        // pvxs `if(info.nsecMask) utag = meta.time.nsec & info.nsecMask;`
+        // (:247).
+        snap.user_tag = self.common.utag as i32;
 
         // Pull display/control/enums from the metadata cache (build on
         // first call, hit thereafter until invalidated by a metadata-class
@@ -2023,6 +2032,12 @@ impl RecordInstance {
             self.common.sevr as u16,
             self.common.time,
         );
+        // Carry the record's `utag` into the monitor update's
+        // `timeStamp.userTag`, same as the GET path
+        // (`snapshot_for_field`) and pvxs `iocsource.cpp:245`. Narrows
+        // the 64-bit `epicsUTag` to the int32 wire field by low-32-bit
+        // truncation.
+        snap.user_tag = self.common.utag as i32;
         let meta = self.cached_metadata();
         snap.display = meta.display;
         snap.control = meta.control;
@@ -2376,6 +2391,34 @@ mod metadata_cache_tests {
 
         // Cache is now populated
         assert!(inst.metadata_cache.lock().unwrap().is_some());
+    }
+
+    /// the served `timeStamp.userTag` defaults to the record's `utag`
+    /// (pvxs `iocsource.cpp:245`), on both the GET (`snapshot_for_field`)
+    /// and MONITOR (`make_monitor_snapshot`) paths. Pre-fix both hard-set
+    /// it to 0, dropping the record's tag. A bit-31 utag also pins the
+    /// `u64 -> i32` narrowing: the low 32 bits' pattern is preserved
+    /// (no clamp), matching pvxs assigning `epicsUTag` into the `Int32`
+    /// wire field.
+    #[test]
+    fn snapshot_serves_record_utag_as_timestamp_usertag() {
+        let mut inst = ai_instance();
+        // no `info(Q:time:tag, ...)` on this record, so the nsec-LSB
+        // override never fires and the utag default is what is served.
+        inst.common.utag = 0x9000_0000;
+        let want = 0x9000_0000u32 as i32;
+
+        let get = inst.snapshot_for_field("VAL").unwrap();
+        assert_eq!(
+            get.user_tag, want,
+            "GET path must serve the record's utag as timeStamp.userTag"
+        );
+
+        let mon = inst.make_monitor_snapshot(EpicsValue::Double(1.0));
+        assert_eq!(
+            mon.user_tag, want,
+            "MONITOR path must carry the record's utag too"
+        );
     }
 
     #[test]

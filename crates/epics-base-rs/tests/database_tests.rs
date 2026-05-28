@@ -4259,6 +4259,70 @@ async fn test_tsel_time_link_copies_source_time_and_utag() {
 }
 
 #[tokio::test]
+async fn test_tsel_ca_time_link_copies_source_time() {
+    // C `TSEL_modified` (dbLink.c:80-86) sets DBLINK_FLAG_TSELisTIME for
+    // ANY PV_LINK TSEL whose pvname contains `.TIME`, set before the
+    // DB-vs-CA decision (dbLink.c:118) — so a CA TSEL `.TIME` link copies
+    // the link's cached timestamp via dbGetTimeStampTag (recGbl.c:317),
+    // exactly like a local-DB link. CA wire carries no userTag, so utag
+    // stays 0.
+    use epics_base_rs::server::database::LinkSet;
+    struct TimeCaLset {
+        secs: i64,
+        nsec: i32,
+    }
+    impl LinkSet for TimeCaLset {
+        fn is_connected(&self, _: &str) -> bool {
+            true
+        }
+        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+            Some(EpicsValue::Double(1.0))
+        }
+        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+            // Only the source record name (with `.TIME` stripped) should
+            // reach the lset, mirroring C `TSEL_modified` truncating the
+            // pvname at `.TIME`.
+            assert_eq!(name, "TSE_SRC", "TSEL .TIME must strip the .TIME suffix");
+            Some((self.secs, self.nsec, 0))
+        }
+    }
+
+    let db = PvDatabase::new();
+    db.register_link_set(
+        "ca",
+        Arc::new(TimeCaLset {
+            secs: 1_700_000_000,
+            nsec: 456,
+        }),
+    )
+    .await;
+    db.add_record("TS_CADST", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("TS_CADST").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.tsel = "ca://TSE_SRC.TIME".to_string();
+        inst.parsed_tsel = parse_link_v2(&inst.common.tsel);
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("TS_CADST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("TS_CADST").await.unwrap();
+    let inst = rec.read().await;
+    let expected = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 456);
+    assert_eq!(
+        inst.common.time, expected,
+        "CA TSEL .TIME link must adopt the CA link's cached timestamp"
+    );
+    assert_eq!(inst.common.utag, 0, "CA wire carries no userTag");
+    assert_eq!(inst.common.tse, -2, "adopting link time marks TSE=-2");
+}
+
+#[tokio::test]
 async fn test_new_common_fields_get_put() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))

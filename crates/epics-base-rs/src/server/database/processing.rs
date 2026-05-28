@@ -37,6 +37,21 @@ fn complete_put_notify(inst: &mut RecordInstance) {
     }
 }
 
+/// If a CA TSEL link's pvname targets a record's `.TIME` field, return
+/// the record name with the `.TIME` suffix stripped; otherwise `None`.
+///
+/// Mirrors C `TSEL_modified` (dbLink.c:80-86): a `PV_LINK` tsel whose
+/// pvname contains `.TIME` is flagged `DBLINK_FLAG_TSELisTIME` and the
+/// name is truncated at `.TIME` to address the record. Matched on the
+/// `.TIME` suffix (the realistic spelling) case-insensitively, to stay
+/// consistent with the DB branch's `field.eq_ignore_ascii_case("TIME")`.
+fn ca_tsel_time_record(pv: &str) -> Option<&str> {
+    let idx = pv.len().checked_sub(".TIME".len())?;
+    pv[idx..]
+        .eq_ignore_ascii_case(".TIME")
+        .then_some(&pv[..idx])
+}
+
 /// The source record's put-propagation context for the forward-link tail.
 /// C `processTarget` (dbDbLink.c:460-474) carries `psrc->putf` and
 /// `psrc->ppn` to each target as a unit — the PUTF bit and the put-notify
@@ -487,33 +502,72 @@ impl PvDatabase {
                 let instance = rec.read().await;
                 instance.parsed_tsel.clone()
             };
-            // TSEL pointing at a `.TIME` field is DB-specific (C
-            // `DBLINK_FLAG_TSELisTIME`, set only for a DB link targeting
-            // another record's `.TIME`): copy that record's timestamp
-            // into `time` and mark TSE=-2 so `apply_timestamp` leaves it
-            // alone.
-            let tsel_is_time = matches!(
-                &tsel_link,
-                crate::server::record::ParsedLink::Db(link)
-                    if link.field.eq_ignore_ascii_case("TIME")
-            );
+            // A TSEL link pointing at a `.TIME` field copies that record's
+            // timestamp+utag into `time`/`utag` and marks TSE=-2 so
+            // `apply_timestamp` leaves them alone. C `TSEL_modified`
+            // (dbLink.c:71-87) sets `DBLINK_FLAG_TSELisTIME` for ANY
+            // `PV_LINK` tsel whose pvname contains `.TIME`, set BEFORE the
+            // DB-vs-CA decision (dbLink.c:118) — so a local-DB link AND a
+            // CA link both qualify. `recGblGetTimeStampSimm`
+            // (recGbl.c:316-321) then copies the link's time+utag via
+            // `dbGetTimeStampTag` and RETURNS, never loading TSE from the
+            // value (even when the read fails). A pva link is a
+            // `JSON_LINK` and returns early from `dbInitLink`
+            // (dbLink.c:107) before `TSEL_modified`, so C never flags it;
+            // pva TSEL `.TIME` is intentionally excluded here.
+            let tsel_is_time = match &tsel_link {
+                crate::server::record::ParsedLink::Db(link) => {
+                    link.field.eq_ignore_ascii_case("TIME")
+                }
+                crate::server::record::ParsedLink::Ca(ca) => ca_tsel_time_record(&ca.pv).is_some(),
+                _ => false,
+            };
             if tsel_is_time {
-                if let crate::server::record::ParsedLink::Db(ref link) = tsel_link {
-                    if let Some(src) = self.get_record(&link.record).await {
-                        // C `recGblGetTimeStampSimm` (recGbl.c:317) copies
-                        // BOTH the TSEL-pointed link's time AND utag via
-                        // `dbGetTimeStampTag(plink, &prec->time, &prec->utag)`.
-                        // Read the pair under one guard so it is a single
-                        // consistent snapshot.
-                        let (src_time, src_utag) = {
-                            let g = src.read().await;
-                            (g.common.time, g.common.utag)
-                        };
-                        let mut instance = rec.write().await;
-                        instance.common.time = src_time;
-                        instance.common.utag = src_utag;
-                        instance.common.tse = -2;
+                // C `dbGetTimeStampTag(plink, &prec->time, &prec->utag)`
+                // (recGbl.c:317) copies BOTH the link's time AND utag.
+                // Read the pair as one consistent snapshot per source.
+                let src_time = match &tsel_link {
+                    crate::server::record::ParsedLink::Db(link) => {
+                        match self.get_record(&link.record).await {
+                            Some(src) => {
+                                let g = src.read().await;
+                                Some((g.common.time, g.common.utag))
+                            }
+                            None => None,
+                        }
                     }
+                    crate::server::record::ParsedLink::Ca(ca) => {
+                        // Strip `.TIME` (C dbLink.c:82-84) and read the CA
+                        // link's cached timestamp. `external_link_time`
+                        // routes `ca://` to the ungated CA lset
+                        // `time_stamp` (CA has no `time=` option; gated
+                        // only on `connected`, like C `dbGetTimeStamp`
+                        // failing on a disconnected link). CA wire carries
+                        // no userTag, so the source contributes utag 0.
+                        match ca_tsel_time_record(&ca.pv) {
+                            Some(rec_name) => self
+                                .external_link_time(&format!("ca://{rec_name}"))
+                                .await
+                                .map(|(secs, ns, utag)| {
+                                    let secs = secs.max(0) as u64;
+                                    let ns = (ns.max(0) as u32).min(999_999_999);
+                                    let t =
+                                        std::time::UNIX_EPOCH + std::time::Duration::new(secs, ns);
+                                    (t, utag)
+                                }),
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                };
+                // C returns after the TSELisTIME branch even when the read
+                // fails (recGbl.c:317-320): keep the record's current time
+                // rather than falling through to load TSE from the value.
+                if let Some((src_time, src_utag)) = src_time {
+                    let mut instance = rec.write().await;
+                    instance.common.time = src_time;
+                    instance.common.utag = src_utag;
+                    instance.common.tse = -2;
                 }
             } else if let Some(val) = self.read_link_value_no_process(&tsel_link).await {
                 // Non-`.TIME` TSEL: C `dbGetLink(&tsel, DBR_SHORT,

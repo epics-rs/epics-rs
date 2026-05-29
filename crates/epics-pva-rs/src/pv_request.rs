@@ -394,6 +394,25 @@ impl PvRequestExpr {
         Ok(out)
     }
 
+    /// Parse using the strict pvxs `PVRParser` grammar
+    /// (`/Users/stevek/codes/epics-modules/pvxs/src/clientreq.cpp:137-283`).
+    ///
+    /// This rejects the lenient pvDataCPP extensions that [`parse`] accepts
+    /// — brace member groups (`field(v{a,b})`), per-field option brackets
+    /// (`field(v[deadband=abs:1.0])`), quoted option values, and option
+    /// values containing `:`/`-`/`+` — so a request string accepted here is
+    /// also accepted by pvxs `RequestBuilder::pvRequest()`. Use it on call
+    /// sites that advertise pvxs request-builder compatibility; use
+    /// [`parse`] where the extended pvData filter syntax is intended.
+    ///
+    /// [`parse`]: Self::parse
+    pub fn parse_pvxs_compat(input: &str) -> Result<Self, PvRequestParseError> {
+        let mut p = Parser::new_strict(input);
+        let mut out = PvRequestExpr::default();
+        p.parse(&mut out)?;
+        Ok(out)
+    }
+
     /// True iff the expression selects a specific subset of fields.
     /// (Empty fields list = select-all.)
     pub fn has_field_selectors(&self) -> bool {
@@ -744,11 +763,39 @@ enum Token {
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
+    /// When `true`, restrict the accepted grammar to pvxs `PVRParser`
+    /// (`/Users/stevek/codes/epics-modules/pvxs/src/clientreq.cpp:137-283`):
+    /// names are `[A-Za-z0-9._]+`, the only syntax tokens are `[](),=`,
+    /// `field(name,...)` and `record[name=name,...]` are the only shapes,
+    /// and option *values* are themselves `name` tokens. That parser has
+    /// no brace member groups, no per-field option brackets (its
+    /// `parse_fields` accepts only `name`/`,` until `)`), and no quoted or
+    /// `:`/`-`/`+`-bearing option values.
+    ///
+    /// Default (`false`) keeps the lenient pvDataCPP `createRequest`
+    /// superset — brace groups, per-field `[...]` option brackets, and
+    /// `:`-bearing / quoted option values — because the server-side field
+    /// filter and `record[_filter="{...}"]` JSON payloads depend on it.
+    strict: bool,
 }
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+        Self {
+            input,
+            pos: 0,
+            strict: false,
+        }
+    }
+
+    /// Parser restricted to the pvxs `PVRParser` grammar (see
+    /// [`Parser::strict`]).
+    fn new_strict(input: &'a str) -> Self {
+        Self {
+            input,
+            pos: 0,
+            strict: true,
+        }
     }
 
     fn peek_char(&self) -> Option<char> {
@@ -924,10 +971,26 @@ impl<'a> Parser<'a> {
         let save = self.pos;
         let tok = self.lex()?;
         if tok == Token::LBrace {
+            // pvxs `PVRParser::parse_fields` (clientreq.cpp:230-243) accepts
+            // only `name`/`,` until `)` — a `{` is outside its grammar.
+            if self.strict {
+                return Err(PvRequestParseError::UnexpectedChar {
+                    pos: save,
+                    chr: "{ (brace member group not in pvxs grammar)".to_string(),
+                });
+            }
             // Nested member group. Recurse with the joined path as the
             // new prefix. The leaf paths are pushed by the recursion.
             self.parse_brace_group(&joined, out)?;
         } else if tok == Token::LBracket {
+            // Per-field option brackets are likewise outside pvxs
+            // `parse_fields`; pvxs allows options only on `record[...]`.
+            if self.strict {
+                return Err(PvRequestParseError::UnexpectedChar {
+                    pos: save,
+                    chr: "[ (per-field option bracket not in pvxs grammar)".to_string(),
+                });
+            }
             // `name[opt=val,...]` — the field is selected itself, and
             // its options hang under `joined._options`.
             out.fields.push(joined.clone());
@@ -1019,6 +1082,12 @@ impl<'a> Parser<'a> {
     /// malformed. An empty quoted string (`key=""`) is valid.
     fn lex_value(&mut self) -> Result<String, PvRequestParseError> {
         self.skip_whitespace();
+        if self.strict {
+            // pvxs `parse_options` (clientreq.cpp:255-268) requires the value
+            // to be a `name` token (`[A-Za-z0-9._]+`); quoted strings and
+            // `:`/`-`/`+`-bearing runs are outside its grammar.
+            return self.lex_value_strict();
+        }
         if self.peek_char() == Some('"') {
             return self.lex_quoted_value();
         }
@@ -1034,6 +1103,33 @@ impl<'a> Parser<'a> {
             return Err(PvRequestParseError::Expected {
                 pos: self.pos,
                 want: "option value".into(),
+                got: self
+                    .peek_char()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "EOF".into()),
+            });
+        }
+        Ok(self.input[start..self.pos].to_string())
+    }
+
+    /// Lex an option value under the strict pvxs grammar: a single `name`
+    /// token (`[A-Za-z0-9._]+`). Rejects quoted strings and any run that
+    /// stops on a non-`name` character (`:`, `-`, `+`), matching pvxs
+    /// `parse_options` requiring `lextok==name` for the value
+    /// (clientreq.cpp:262-263).
+    fn lex_value_strict(&mut self) -> Result<String, PvRequestParseError> {
+        let start = self.pos;
+        while let Some(c) = self.peek_char() {
+            if is_ident(c) {
+                self.advance(c.len_utf8());
+            } else {
+                break;
+            }
+        }
+        if self.pos == start {
+            return Err(PvRequestParseError::Expected {
+                pos: self.pos,
+                want: "name option value (pvxs grammar)".into(),
                 got: self
                     .peek_char()
                     .map(|c| c.to_string())
@@ -1815,5 +1911,87 @@ mod tests {
                 ("pipeline".to_string(), "true".to_string()),
             ]
         );
+    }
+
+    // ── strict pvxs `PVRParser` grammar (parse_pvxs_compat) ───────────
+    //
+    // Parity with pvxs `clientreq.cpp:137-283`: the strict mode must
+    // reject every lenient pvDataCPP extension while still accepting the
+    // `field(name,...)` + `record[name=name,...]` core grammar.
+
+    /// The pvxs core forms still parse in strict mode.
+    #[test]
+    fn pvxs_compat_accepts_core_field_and_record_forms() {
+        let f = PvRequestExpr::parse_pvxs_compat("field(value,alarm.severity)")
+            .expect("field(name,name) is pvxs grammar");
+        assert_eq!(f.fields, ["value", "alarm.severity"]);
+
+        let bare = PvRequestExpr::parse_pvxs_compat("value")
+            .expect("bare-name short-hand is pvxs grammar");
+        assert_eq!(bare.fields, ["value"]);
+
+        let r = PvRequestExpr::parse_pvxs_compat("record[k=v,pipeline=true]")
+            .expect("record[name=name] is pvxs grammar");
+        assert_eq!(
+            r.record_options,
+            [
+                ("k".to_string(), "v".to_string()),
+                ("pipeline".to_string(), "true".to_string()),
+            ]
+        );
+
+        // Combined field + record, like a real pvxs request string.
+        let both = PvRequestExpr::parse_pvxs_compat("field(value)record[block=true]")
+            .expect("field(...)record[...] is pvxs grammar");
+        assert_eq!(both.fields, ["value"]);
+        assert_eq!(
+            both.record_options,
+            [("block".to_string(), "true".to_string())]
+        );
+    }
+
+    /// Brace member groups are a pvDataCPP extension — strict mode rejects
+    /// them; lenient mode still accepts them.
+    #[test]
+    fn pvxs_compat_rejects_brace_member_group() {
+        assert!(
+            PvRequestExpr::parse_pvxs_compat("field(value{a,b})").is_err(),
+            "pvxs parse_fields accepts only name/comma until ')'"
+        );
+        // Lenient mode unchanged.
+        assert!(PvRequestExpr::parse("field(value{a,b})").is_ok());
+    }
+
+    /// Per-field option brackets are a pvDataCPP extension — strict mode
+    /// rejects them; lenient mode still accepts them.
+    #[test]
+    fn pvxs_compat_rejects_per_field_option_bracket() {
+        assert!(
+            PvRequestExpr::parse_pvxs_compat("field(value[deadband=abs:1.0])").is_err(),
+            "pvxs allows options only on record[...], not per-field"
+        );
+        assert!(PvRequestExpr::parse("field(value[deadband=abs:1.0])").is_ok());
+    }
+
+    /// Quoted option values are a Rust/pvDataCPP extension — strict mode
+    /// rejects them; lenient mode still accepts them.
+    #[test]
+    fn pvxs_compat_rejects_quoted_option_value() {
+        assert!(
+            PvRequestExpr::parse_pvxs_compat(r#"record[_filter="{}"]"#).is_err(),
+            "pvxs parse_options requires the value to be a bare name token"
+        );
+        assert!(PvRequestExpr::parse(r#"record[_filter="{}"]"#).is_ok());
+    }
+
+    /// A `:`-bearing bare option value (`abs:1.0`) is outside the pvxs
+    /// `name` grammar — strict mode rejects it; lenient mode accepts it.
+    #[test]
+    fn pvxs_compat_rejects_colon_bearing_option_value() {
+        assert!(
+            PvRequestExpr::parse_pvxs_compat("record[deadband=abs:1.0]").is_err(),
+            "pvxs value is a name token; ':' ends it and the trailing run is a parse error"
+        );
+        assert!(PvRequestExpr::parse("record[deadband=abs:1.0]").is_ok());
     }
 }

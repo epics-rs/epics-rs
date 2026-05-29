@@ -9,9 +9,10 @@
 //! - **Writer**: drains a `mpsc<Vec<u8>>` queue and writes to the socket.
 //!   Owning a single writer task lets every channel/op share the connection
 //!   safely without holding an `AsyncMutex` across awaits.
-//! - **Heartbeat**: sends `ECHO_REQUEST` every `max(1, min(15, tcp_timeout×3/8))` s
-//!   (pvxs clientconn.cpp:163-165); if no `last_rx` update has happened for
-//!   `tcp_timeout`, declares the connection dead (pvxs clientconn.cpp:73-74).
+//! - **Heartbeat**: sends an application `CMD_ECHO` every
+//!   `max(1, min(15, tcp_timeout×3/8))` s (pvxs clientconn.cpp:163-165,496);
+//!   if no `last_rx` update has happened for `tcp_timeout`, declares the
+//!   connection dead (pvxs clientconn.cpp:73-74).
 //!
 //! When any task exits (read EOF, write error, or heartbeat timeout) the
 //! cancellation token fires and the connection is torn down. Channels
@@ -44,7 +45,7 @@ use super::decode::{
     try_parse_frame_role,
 };
 
-/// How often we send heartbeat ECHO_REQUEST.
+/// How often we send the heartbeat application CMD_ECHO.
 ///
 /// Resolved at call time from `EPICS_PVA_CONN_TMO`: pvxs convention is
 /// ECHO every `CONN_TMO / 2` so two heartbeats fit inside the timeout
@@ -612,8 +613,18 @@ impl ServerConn {
                             warn!("PVA connection idle > {hb_timeout:?}, closing");
                             break;
                         }
-                        // Send ECHO_REQUEST control message.
-                        let h = PvaHeader::control(false, order_hb, ControlCommand::EchoRequest.code(), 0);
+                        // Heartbeat probe = application CMD_ECHO with an
+                        // empty payload, matching pvxs clientconn.cpp:496
+                        // (`Header{CMD_ECHO, 0, 0}`); the server echoes it
+                        // back (serverconn.cpp:166-178). A *control*
+                        // EchoRequest is drained and ignored by pvxs
+                        // (conn.cpp:180-194), so on an idle
+                        // Rust-client→pvxs-server link the probe drew no
+                        // reply and `last_rx` went stale, tearing down a
+                        // healthy connection. Any inbound frame — including
+                        // the echo reply — refreshes `last_rx`; control echo
+                        // stays supported inbound as a Rust-only extension.
+                        let h = PvaHeader::application(false, order_hb, Command::Echo.code(), 0);
                         let mut bytes = Vec::with_capacity(8);
                         h.write_into(&mut bytes);
                         if writer_tx_hb.send(bytes).is_err() {
@@ -2002,5 +2013,121 @@ mod tests {
         .expect("connection must be declared dead within 4 s (tcp_timeout=500ms)");
 
         assert!(!conn.is_alive());
+    }
+
+    /// Regression (PVA-RS-2026-05-28-71): the client heartbeat must use an
+    /// application `CMD_ECHO`, which pvxs servers answer, NOT a control
+    /// EchoRequest, which pvxs drains and ignores (conn.cpp:180-194). A
+    /// pvxs-shaped peer that replies only to application echo must keep a
+    /// Rust client alive past several heartbeat intervals; before the fix
+    /// the control probe drew no reply, `last_rx` went stale, and the
+    /// connection was torn down despite a healthy server.
+    #[tokio::test]
+    async fn pva_rs_71_app_echo_keeps_pvxs_link_alive() {
+        use crate::proto::encode_size_into;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let order = ByteOrder::Little;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+
+        // pvxs-shaped server: complete the handshake, then drain control
+        // frames and reply ONLY to application CMD_ECHO with a
+        // server-direction CMD_ECHO (serverconn.cpp:166-178).
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+
+            // Handshake frame 1+2: SET_BYTE_ORDER + CONNECTION_VALIDATION.
+            let mut hs = Vec::new();
+            PvaHeader::control(true, order, ControlCommand::SetByteOrder.code(), 0)
+                .write_into(&mut hs);
+            let mut vpayload = Vec::new();
+            vpayload.put_u32(0x10000, order);
+            vpayload.put_u16(32_767, order);
+            encode_size_into(1, order, &mut vpayload);
+            encode_string_into("anonymous", order, &mut vpayload);
+            PvaHeader::application(
+                true,
+                order,
+                Command::ConnectionValidation.code(),
+                vpayload.len() as u32,
+            )
+            .write_into(&mut hs);
+            hs.extend_from_slice(&vpayload);
+            if sock.write_all(&hs).await.is_err() {
+                return;
+            }
+
+            // Drain the client's CONNECTION_VALIDATION reply.
+            let mut drain = [0u8; 512];
+            let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut drain)).await;
+
+            // CONNECTION_VALIDATED (Status::ok()).
+            let mut vd = Vec::new();
+            PvaHeader::application(true, order, Command::ConnectionValidated.code(), 1)
+                .write_into(&mut vd);
+            vd.push(0xFFu8);
+            if sock.write_all(&vd).await.is_err() {
+                return;
+            }
+
+            // Echo pump.
+            let mut hdr = [0u8; 8];
+            while let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_secs(6), sock.read_exact(&mut hdr)).await
+            {
+                let payload_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+                if payload_len > 0 {
+                    let mut body = vec![0u8; payload_len];
+                    if sock.read_exact(&mut body).await.is_err() {
+                        break;
+                    }
+                }
+                let is_control = hdr[2] & HeaderFlags::CONTROL != 0;
+                // A control EchoRequest (the pre-fix probe) is drained with
+                // no reply, exactly like pvxs.
+                if !is_control && hdr[3] == Command::Echo.code() {
+                    let mut reply = Vec::with_capacity(8);
+                    PvaHeader::application(true, order, Command::Echo.code(), 0)
+                        .write_into(&mut reply);
+                    if sock.write_all(&reply).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // tcp_timeout = 2 s → hb_interval = max(1, 2×3/8) = 1 s,
+        // hb_timeout = 2 s. With application echo answered each interval,
+        // `last_rx` is refreshed ~every 1 s and the link survives. Without
+        // the fix (control probe, no reply) `last_rx` would go stale and
+        // the heartbeat declares the connection dead at ~3 s.
+        let conn = ServerConn::connect(
+            addr,
+            "testuser",
+            "testhost",
+            ConnConfig {
+                op_timeout: Duration::from_secs(2),
+                tcp_timeout: Duration::from_secs(2),
+                max_message_size: None,
+            },
+        )
+        .await
+        .expect("handshake must succeed");
+
+        assert!(conn.is_alive(), "connection must be alive after handshake");
+
+        // Past three heartbeat intervals (3 s): the pre-fix control probe
+        // would have torn the link down by now.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert!(
+            conn.is_alive(),
+            "application-echo heartbeat must keep the pvxs-shaped link alive"
+        );
     }
 }

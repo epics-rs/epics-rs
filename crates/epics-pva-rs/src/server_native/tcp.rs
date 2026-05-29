@@ -29,8 +29,8 @@ use crate::proto::{
     Status, WriteExt, encode_size_into, encode_string_into,
 };
 use crate::pvdata::encode::{
-    EncodeTypeCache, decode_pv_field, decode_pv_field_with_bitset, decode_type_desc,
-    encode_pv_field, encode_type_desc, encode_type_desc_cached,
+    EncodeTypeCache, TypeCache, decode_pv_field_cached, decode_pv_field_with_bitset_cached,
+    decode_type_desc_cached, encode_pv_field, encode_type_desc, encode_type_desc_cached,
 };
 use crate::pvdata::{FieldDesc, PvField};
 
@@ -1933,6 +1933,7 @@ async fn process_connection_validation(
     peer: SocketAddr,
     peer_entry: &crate::server_native::peers::PeerEntry,
     config: &PvaServerConfig,
+    decode_cache: &mut TypeCache,
 ) -> PvaResult<()> {
     // Parse the client's auth payload: skip buffer_size (u32),
     // introspection_size (u16), qos (u16); read selected method
@@ -1947,7 +1948,7 @@ async fn process_connection_validation(
         // a decode fault here is still fatal —
         // log + propagate. Pre-fix swallowed; pvxs
         // `serverconn.cpp:211-216` calls `bev.reset()`.
-        match parse_client_credentials(frame)? {
+        match parse_client_credentials(frame, decode_cache)? {
             Some(claimed) => debug!(
                 ?peer,
                 x509_account = %cred.account,
@@ -1968,7 +1969,7 @@ async fn process_connection_validation(
         // method) returns Ok(None) and keeps the
         // existing anonymous credential. Only a fully
         // decoded auth structure replaces `cred`.
-        if let Some(claimed) = parse_client_credentials(frame)? {
+        if let Some(claimed) = parse_client_credentials(frame, decode_cache)? {
             *cred = claimed;
         }
     }
@@ -2046,7 +2047,10 @@ async fn process_connection_validation(
     Ok(())
 }
 
-fn parse_client_credentials(frame: &Frame) -> PvaResult<Option<ClientCredentials>> {
+fn parse_client_credentials(
+    frame: &Frame,
+    decode_cache: &mut TypeCache,
+) -> PvaResult<Option<ClientCredentials>> {
     // Inbound application payloads are decoded with the frame's own header
     // byte order (pvxs latches `peerBE` per received message,
     // conn.cpp:195-198), never the server's configured outbound order.
@@ -2110,9 +2114,14 @@ fn parse_client_credentials(frame: &Frame) -> PvaResult<Option<ClientCredentials
     if peek != 0xFF {
         // Rewind and decode the real descriptor.
         cur.set_position(pos);
-        let desc = decode_type_desc(&mut cur, order)
+        // Route through the connection-scope decode cache so a client that
+        // advertises its auth structure with a `0xFD <slot>` define here can
+        // later reference it by `0xFE <slot>` from a pvRequest/EXEC body, and
+        // vice versa — pvxs shares one connection `rxRegistry` (conn.h:23)
+        // across every inbound decode, including CONNECTION_VALIDATION.
+        let desc = decode_type_desc_cached(&mut cur, order, decode_cache)
             .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth desc: {e}")))?;
-        let value = decode_pv_field(&desc, &mut cur, order)
+        let value = decode_pv_field_cached(&desc, &mut cur, order, decode_cache)
             .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth value: {e}")))?;
         if let PvField::Structure(s) = value {
             for (name, field) in &s.fields {
@@ -2395,6 +2404,17 @@ async fn handle_connection_io(
     // `config.emit_type_cache` is true (off by default for pvAccessCPP
     // compatibility — that client does not parse 0xFD/0xFE markers).
     let mut encode_type_cache = crate::pvdata::encode::EncodeTypeCache::new();
+    // Per-connection inbound (decode-side) TypeStore — the receiver mirror
+    // of `encode_type_cache`. pvxs keeps one connection-scoped `rxRegistry`
+    // (conn.h:23) shared by every inbound decode; a client may define a
+    // descriptor with `0xFD <slot> <desc>` in one frame (auth body,
+    // pvRequest INIT, RPC/PUT EXEC value) and reference it with `0xFE <slot>`
+    // in any later frame on the same connection. The read loop dispatches
+    // every frame synchronously in wire order, so a define is always folded
+    // into this cache before a later reference resolves against it — the
+    // read loop is the single owner of inbound type-cache state, exactly as
+    // the connection reader task owns it client-side.
+    let mut rx_type_cache = TypeCache::new();
 
     let max_msg_size = config.max_message_size;
     // segmented-message reassembly state. pvxs conn.cpp:228-291
@@ -2669,6 +2689,7 @@ async fn handle_connection_io(
                     peer,
                     &peer_entry,
                     &config,
+                    &mut rx_type_cache,
                 )
                 .await?;
                 handshake_complete = true;
@@ -2722,6 +2743,7 @@ async fn handle_connection_io(
                     OpKind::Get,
                     &config,
                     &mut encode_type_cache,
+                    &mut rx_type_cache,
                     peer,
                     &cred,
                     &mon_fin_tx,
@@ -2739,6 +2761,7 @@ async fn handle_connection_io(
                     OpKind::Put,
                     &config,
                     &mut encode_type_cache,
+                    &mut rx_type_cache,
                     peer,
                     &cred,
                     &mon_fin_tx,
@@ -2756,6 +2779,7 @@ async fn handle_connection_io(
                     OpKind::Monitor,
                     &config,
                     &mut encode_type_cache,
+                    &mut rx_type_cache,
                     peer,
                     &cred,
                     &mon_fin_tx,
@@ -2773,6 +2797,7 @@ async fn handle_connection_io(
                     OpKind::Rpc,
                     &config,
                     &mut encode_type_cache,
+                    &mut rx_type_cache,
                     peer,
                     &cred,
                     &mon_fin_tx,
@@ -2824,6 +2849,7 @@ async fn handle_connection_io(
                     order,
                     &config,
                     &mut encode_type_cache,
+                    &mut rx_type_cache,
                     peer,
                     &cred,
                     &exec_fin_tx,
@@ -2842,6 +2868,7 @@ async fn handle_connection_io(
                     &mut channels,
                     order,
                     &config,
+                    &mut rx_type_cache,
                     peer,
                     &cred,
                     &exec_fin_tx,
@@ -2915,6 +2942,7 @@ async fn handle_connection_io(
                     peer,
                     &peer_entry,
                     &config,
+                    &mut rx_type_cache,
                 )
                 .await?;
             }
@@ -2960,11 +2988,12 @@ fn decode_init_pv_request_value(
     cur: &mut std::io::Cursor<&[u8]>,
     req_desc: &FieldDesc,
     order: ByteOrder,
+    decode_cache: &mut TypeCache,
 ) -> Result<Option<PvField>, String> {
     if cur.position() as usize >= cur.get_ref().len() {
         return Ok(None);
     }
-    decode_pv_field(req_desc, cur, order)
+    decode_pv_field_cached(req_desc, cur, order, decode_cache)
         .map(Some)
         .map_err(|e| format!("invalid pvRequest value: {e}"))
 }
@@ -3005,6 +3034,7 @@ fn decode_init_pv_request_value(
 fn decode_rpc_exec_arg(
     cur: &mut std::io::Cursor<&[u8]>,
     order: ByteOrder,
+    decode_cache: &mut TypeCache,
 ) -> Result<(FieldDesc, PvField), String> {
     // Absent body (no payload after subcmd): parameterless RPC.
     if cur.position() as usize >= cur.get_ref().len() {
@@ -3020,9 +3050,9 @@ fn decode_rpc_exec_arg(
     // Present, non-null descriptor: decode type + full value or fail
     // fatally — a present-but-undecodable body is a protocol error, not
     // a parameterless call.
-    let desc = decode_type_desc(cur, order)
+    let desc = decode_type_desc_cached(cur, order, decode_cache)
         .map_err(|e| format!("invalid RPC argument descriptor: {e}"))?;
-    let value = decode_pv_field(&desc, cur, order)
+    let value = decode_pv_field_cached(&desc, cur, order, decode_cache)
         .map_err(|e| format!("invalid RPC argument value: {e}"))?;
     Ok((desc, value))
 }
@@ -3085,6 +3115,8 @@ async fn handle_put_get(
     order: ByteOrder,
     config: &PvaServerConfig,
     encode_cache: &mut EncodeTypeCache,
+    // Connection-scope inbound decode cache (pvxs `rxRegistry`, conn.h:23).
+    decode_cache: &mut TypeCache,
     peer: std::net::SocketAddr,
     cred: &ClientCredentials,
     // data-phase-completion sender (see [`handle_op`]). The spawned
@@ -3177,7 +3209,7 @@ async fn handle_put_get(
         // A peer wire-decode fault of the INIT pvRequest type/value is
         // connection-fatal (pvxs `serverget.cpp:371-375` bev.reset()), not
         // a per-op Status — the empty-mask case below stays op-level.
-        let req_desc = match decode_type_desc(&mut cur, inbound_order) {
+        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
             Ok(d) => d,
             Err(e) => {
                 return Err(PvaError::Decode(format!(
@@ -3185,14 +3217,15 @@ async fn handle_put_get(
                 )));
             }
         };
-        let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order) {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(PvaError::Decode(format!(
-                    "PUT_GET INIT pvRequest value: {e}"
-                )));
-            }
-        };
+        let req_value =
+            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(PvaError::Decode(format!(
+                        "PUT_GET INIT pvRequest value: {e}"
+                    )));
+                }
+            };
         // empty mask is an INIT error.
         let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
             Ok(m) => m,
@@ -3285,8 +3318,15 @@ async fn handle_put_get(
     // Decode the put payload inline (cursor is borrowed from the stack frame).
     let changed =
         BitSet::decode(&mut cur, inbound_order).map_err(|e| PvaError::Decode(e.to_string()))?;
-    let put_delta = decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, inbound_order)
-        .map_err(|e| PvaError::Decode(format!("PUT_GET requires a value payload: {e}")))?;
+    let put_delta = decode_pv_field_with_bitset_cached(
+        &intro,
+        &changed,
+        0,
+        &mut cur,
+        inbound_order,
+        decode_cache,
+    )
+    .map_err(|e| PvaError::Decode(format!("PUT_GET requires a value payload: {e}")))?;
 
     let ctx = crate::server_native::source::ChannelContext {
         peer,
@@ -3432,6 +3472,10 @@ async fn handle_process(
     channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
     config: &PvaServerConfig,
+    // Connection-scope inbound decode cache (pvxs `rxRegistry`, conn.h:23).
+    // PROCESS transfers no value but its INIT pvRequest descriptor is still
+    // decoded, so it shares the same cache as every other inbound decode.
+    decode_cache: &mut TypeCache,
     peer: std::net::SocketAddr,
     cred: &ClientCredentials,
     // data-phase-completion sender (see [`handle_op`]). The spawned
@@ -3537,7 +3581,7 @@ async fn handle_process(
         // descriptor or value is connection-fatal (the read loop closes
         // the circuit, no op reply), uniform with the generic INIT path.
         // An ABSENT value body is still tolerated for Rust↔Rust interop.
-        let req_desc = match decode_type_desc(&mut cur, inbound_order) {
+        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
             Ok(d) => d,
             Err(e) => {
                 return Err(PvaError::Decode(format!(
@@ -3545,7 +3589,9 @@ async fn handle_process(
                 )));
             }
         };
-        if let Err(e) = decode_init_pv_request_value(&mut cur, &req_desc, inbound_order) {
+        if let Err(e) =
+            decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache)
+        {
             return Err(PvaError::Decode(format!(
                 "PROCESS INIT pvRequest value: {e}"
             )));
@@ -4258,6 +4304,10 @@ async fn handle_op(
     kind: OpKind,
     config: &PvaServerConfig,
     encode_cache: &mut EncodeTypeCache,
+    // Connection-scope inbound decode cache (pvxs `rxRegistry`, conn.h:23).
+    // Threaded so a 0xFD-defined descriptor in the pvRequest/EXEC body of one
+    // op resolves a later 0xFE reference on the same connection.
+    decode_cache: &mut TypeCache,
     peer: std::net::SocketAddr,
     cred: &ClientCredentials,
     // read-loop owner's MONITOR subscriber-completion sender. The
@@ -4394,7 +4444,7 @@ async fn handle_op(
         // `onOp` (`serverget.cpp:198-203`), whose throw is caught and
         // signalled as a remote *op* error (`serverget.cpp:407-413`),
         // so that stays an op-level Status reply.
-        let req_desc = match decode_type_desc(&mut cur, inbound_order) {
+        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
             Ok(d) => d,
             Err(e) => {
                 return Err(PvaError::Decode(format!("INIT pvRequest descriptor: {e}")));
@@ -4404,12 +4454,13 @@ async fn handle_op(
         // INIT sends only the descriptor — interop), but a PRESENT but
         // malformed one is the same `!M.good()` bev.reset() wire fault as
         // the descriptor above, so it is likewise connection-fatal.
-        let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order) {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(PvaError::Decode(format!("INIT pvRequest value: {e}")));
-            }
-        };
+        let req_value =
+            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(PvaError::Decode(format!("INIT pvRequest value: {e}")));
+                }
+            };
         let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
             Ok(m) => m,
             Err(e) => {
@@ -4926,9 +4977,15 @@ async fn handle_op(
             // for whether the PUT EXEC fires automatically after INIT
             // or waits for `reExec()`. Each EXEC frame still carries
             // exactly one value and triggers exactly one write.
-            let delta =
-                decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, inbound_order)
-                    .map_err(|e| PvaError::Decode(format!("PUT requires a value payload: {e}")))?;
+            let delta = decode_pv_field_with_bitset_cached(
+                &intro,
+                &changed,
+                0,
+                &mut cur,
+                inbound_order,
+                decode_cache,
+            )
+            .map_err(|e| PvaError::Decode(format!("PUT requires a value payload: {e}")))?;
             let pv_name = ch.name.clone();
             // spawn PUT exec — put_delta_checked can be slow.
             // Decode frame data synchronously (above) so the cursor is
@@ -6037,8 +6094,8 @@ async fn handle_op(
             // RPC; a present-but-malformed descriptor or value is a
             // connection-fatal decode error (pvxs `serverget.cpp:454-458`
             // `bev.reset()`), not a fabricated `Null` argument.
-            let (req_desc, req_value) =
-                decode_rpc_exec_arg(&mut cur, inbound_order).map_err(PvaError::Decode)?;
+            let (req_desc, req_value) = decode_rpc_exec_arg(&mut cur, inbound_order, decode_cache)
+                .map_err(PvaError::Decode)?;
             let pv_name = ch.name.clone();
             let _ = intro;
             let src = source.clone();
@@ -7603,7 +7660,12 @@ mod tests {
             let buf: &[u8] = &[];
             let mut cur = std::io::Cursor::new(buf);
             assert!(matches!(
-                decode_init_pv_request_value(&mut cur, &desc, ByteOrder::Little),
+                decode_init_pv_request_value(
+                    &mut cur,
+                    &desc,
+                    ByteOrder::Little,
+                    &mut TypeCache::new()
+                ),
                 Ok(None)
             ));
         }
@@ -7615,7 +7677,12 @@ mod tests {
             let buf: &[u8] = &[42, 0, 0, 0]; // i32 LE = 42
             let mut cur = std::io::Cursor::new(buf);
             assert_eq!(
-                decode_init_pv_request_value(&mut cur, &desc, ByteOrder::Little),
+                decode_init_pv_request_value(
+                    &mut cur,
+                    &desc,
+                    ByteOrder::Little,
+                    &mut TypeCache::new()
+                ),
                 Ok(Some(PvField::Scalar(ScalarValue::Int(42)))),
             );
         }
@@ -7629,7 +7696,13 @@ mod tests {
             let buf: &[u8] = &[1, 2]; // truncated i32
             let mut cur = std::io::Cursor::new(buf);
             assert!(
-                decode_init_pv_request_value(&mut cur, &desc, ByteOrder::Little).is_err(),
+                decode_init_pv_request_value(
+                    &mut cur,
+                    &desc,
+                    ByteOrder::Little,
+                    &mut TypeCache::new()
+                )
+                .is_err(),
                 "a present-but-truncated value body must error, not collapse to None",
             );
         }
@@ -7700,6 +7773,7 @@ mod tests {
                 kind,
                 &config,
                 &mut encode_cache,
+                &mut TypeCache::new(),
                 peer,
                 &cred,
                 &discard_mon_fin(),
@@ -8061,6 +8135,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8085,6 +8160,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8187,6 +8263,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8282,6 +8359,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8321,6 +8399,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8342,6 +8421,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8363,6 +8443,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8463,6 +8544,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8514,6 +8596,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8565,6 +8648,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9045,7 +9129,7 @@ mod tests {
         // does not advance.
         let mut cur = std::io::Cursor::new([].as_slice());
         assert_eq!(
-            decode_rpc_exec_arg(&mut cur, order).unwrap(),
+            decode_rpc_exec_arg(&mut cur, order, &mut TypeCache::new()).unwrap(),
             (FieldDesc::Variant, PvField::Null)
         );
         assert_eq!(cur.position(), 0);
@@ -9057,7 +9141,7 @@ mod tests {
         let buf = [0xFFu8, 0xAA, 0xBB];
         let mut cur = std::io::Cursor::new(buf.as_slice());
         assert_eq!(
-            decode_rpc_exec_arg(&mut cur, order).unwrap(),
+            decode_rpc_exec_arg(&mut cur, order, &mut TypeCache::new()).unwrap(),
             (FieldDesc::Variant, PvField::Null)
         );
         assert_eq!(
@@ -9076,7 +9160,7 @@ mod tests {
         encode_pv_field(&value, &desc, order, &mut wire);
         let mut cur = std::io::Cursor::new(wire.as_slice());
         assert_eq!(
-            decode_rpc_exec_arg(&mut cur, order).unwrap(),
+            decode_rpc_exec_arg(&mut cur, order, &mut TypeCache::new()).unwrap(),
             (desc.clone(), value.clone())
         );
         assert_eq!(cur.position() as usize, wire.len());
@@ -9085,13 +9169,15 @@ mod tests {
         // is a connection-fatal decode error, not a parameterless call.
         let buf = [0x80u8]; // TAG_STRUCTURE, no id/field body
         let mut cur = std::io::Cursor::new(buf.as_slice());
-        decode_rpc_exec_arg(&mut cur, order).expect_err("truncated RPC descriptor must be fatal");
+        decode_rpc_exec_arg(&mut cur, order, &mut TypeCache::new())
+            .expect_err("truncated RPC descriptor must be fatal");
 
         // Valid descriptor plus a truncated value (a 4-byte Int cut to
         // two bytes) is also fatal.
         let truncated = &wire[..desc_len + 2];
         let mut cur = std::io::Cursor::new(truncated);
-        decode_rpc_exec_arg(&mut cur, order).expect_err("truncated RPC value must be fatal");
+        decode_rpc_exec_arg(&mut cur, order, &mut TypeCache::new())
+            .expect_err("truncated RPC value must be fatal");
     }
 
     /// pvxs `serverchan.cpp:382-386`: when the SID in DESTROY_CHANNEL
@@ -9265,6 +9351,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9460,6 +9547,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9495,6 +9583,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9586,6 +9675,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9619,6 +9709,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9723,6 +9814,7 @@ mod tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9782,6 +9874,7 @@ mod tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9810,6 +9903,325 @@ mod tests {
             ExecState::Idle,
             "a completed non-last-request EXEC returns the op to Idle"
         );
+    }
+
+    /// A client may advertise an inbound descriptor once with a
+    /// `0xFD <slot>` define and reference it later on the *same connection*
+    /// with `0xFE <slot>` — pvxs keeps one connection-scope `rxRegistry`
+    /// (conn.h:23) shared by every inbound decode. The native server's read
+    /// loop owns one `rx_type_cache` threaded through every handler, so an
+    /// INIT pvRequest descriptor defined by one operation resolves the
+    /// reference made by a later operation. The negative control proves the
+    /// shared cache is what closes the gap: a *fresh* cache (the pre-fix
+    /// per-call behaviour) rejects the reference with a typecache miss.
+    #[tokio::test]
+    async fn init_pv_request_descriptor_resolves_cached_reference_across_ops() {
+        use crate::pvdata::FieldDesc;
+        use crate::pvdata::encode::{decode_type_desc_cached, encode_type_desc};
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0));
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // The "empty pvRequest" structure (no `field` child) → wildcard
+        // mask. Its only role here is to be a real descriptor the client can
+        // cache and reference.
+        let req_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: Vec::new(),
+        };
+        const SLOT: u16 = 0x0001;
+
+        // GET INIT #1 (ioid 801): pvRequest descriptor is a `0xFD <slot>`
+        // define carrying the full inline descriptor.
+        let ioid1: u32 = 801;
+        let mut def_payload = Vec::new();
+        def_payload.put_u32(sid, order);
+        def_payload.put_u32(ioid1, order);
+        def_payload.put_u8(0x08); // INIT
+        def_payload.put_u8(0xFD);
+        def_payload.put_u16(SLOT, order);
+        encode_type_desc(&req_desc, order, &mut def_payload);
+        let def_frame = synth_frame(Command::Get, order, def_payload);
+
+        // GET INIT #2 (ioid 802): pvRequest descriptor is a bare `0xFE <slot>`
+        // reference to the descriptor defined by INIT #1.
+        let ioid2: u32 = 802;
+        let mut ref_payload = Vec::new();
+        ref_payload.put_u32(sid, order);
+        ref_payload.put_u32(ioid2, order);
+        ref_payload.put_u8(0x08); // INIT
+        ref_payload.put_u8(0xFE);
+        ref_payload.put_u16(SLOT, order);
+        let ref_frame = synth_frame(Command::Get, order, ref_payload);
+
+        // Shared connection cache: INIT #1 defines, INIT #2 resolves.
+        let mut decode_cache = TypeCache::new();
+        handle_op(
+            &def_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            &mut decode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("GET INIT defining the pvRequest descriptor must succeed");
+        let _ = rx.recv().await.expect("INIT #1 reply");
+        assert!(
+            decode_cache.contains_key(&SLOT),
+            "INIT #1 must fold the 0xFD define into the connection cache"
+        );
+
+        handle_op(
+            &ref_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            &mut decode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("GET INIT referencing the cached pvRequest descriptor must succeed");
+        let _ = rx.recv().await.expect("INIT #2 reply");
+        assert!(
+            channels.get(&sid).unwrap().ops.contains_key(&ioid2),
+            "INIT #2's 0xFE reference resolved against the shared cache and registered the op"
+        );
+
+        // Negative control: a fresh per-call cache (pre-fix behaviour) cannot
+        // resolve the reference — the INIT is rejected as connection-fatal.
+        let mut empty_channels: HashMap<u32, ChannelState> = HashMap::new();
+        empty_channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops: HashMap::new(),
+            },
+        );
+        let mut fresh_cache = TypeCache::new();
+        let err = handle_op(
+            &ref_frame,
+            &tx,
+            &mut empty_channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            &mut fresh_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect_err("a 0xFE reference with no prior define must be a decode error");
+        assert!(
+            matches!(err, PvaError::Decode(_)),
+            "unresolved type-cache reference is a connection-fatal decode error, got {err:?}"
+        );
+
+        // Sanity: the descriptor a fresh cache decodes from the *define*
+        // frame matches the one stored from the connection cache, proving the
+        // reference resolved to the same type.
+        let mut probe = std::io::Cursor::new(&def_frame.payload[9..]);
+        let defined = decode_type_desc_cached(&mut probe, order, &mut TypeCache::new())
+            .expect("define frame descriptor decodes");
+        assert_eq!(
+            decode_cache.get(&SLOT),
+            Some(&defined),
+            "cached slot holds exactly the descriptor the define carried"
+        );
+    }
+
+    /// RPC EXEC argument descriptors share the same connection cache as the
+    /// pvRequest INIT descriptors (pvxs decodes both through the one
+    /// `rxRegistry`). A define seen on an earlier frame must resolve a `0xFE`
+    /// reference in a later RPC EXEC argument. `decode_rpc_exec_arg` is the
+    /// exact decoder the RPC EXEC branch of `handle_op` invokes with the
+    /// read-loop cache.
+    #[test]
+    fn rpc_exec_arg_resolves_cached_descriptor_reference() {
+        use crate::pvdata::encode::{decode_type_desc_cached, encode_pv_field, encode_type_desc};
+        use crate::pvdata::{FieldDesc, ScalarType, ScalarValue};
+
+        let order = ByteOrder::Little;
+        const SLOT: u16 = 0x0007;
+        let arg_desc = FieldDesc::Scalar(ScalarType::Int);
+        let arg_val = PvField::Scalar(ScalarValue::Int(42));
+
+        // Frame 1: a `0xFD <slot>` define + value (a fully self-contained RPC
+        // argument that also populates the cache).
+        let mut def_buf = Vec::new();
+        def_buf.put_u8(0xFD);
+        def_buf.put_u16(SLOT, order);
+        encode_type_desc(&arg_desc, order, &mut def_buf);
+        encode_pv_field(&arg_val, &arg_desc, order, &mut def_buf);
+
+        // Frame 2: a `0xFE <slot>` reference + value.
+        let mut ref_buf = Vec::new();
+        ref_buf.put_u8(0xFE);
+        ref_buf.put_u16(SLOT, order);
+        encode_pv_field(&arg_val, &arg_desc, order, &mut ref_buf);
+
+        let mut cache = TypeCache::new();
+        let mut cur1 = std::io::Cursor::new(def_buf.as_slice());
+        let (d1, v1) =
+            decode_rpc_exec_arg(&mut cur1, order, &mut cache).expect("define frame decodes");
+        assert_eq!(d1, arg_desc);
+        assert_eq!(v1, arg_val);
+
+        let mut cur2 = std::io::Cursor::new(ref_buf.as_slice());
+        let (d2, v2) = decode_rpc_exec_arg(&mut cur2, order, &mut cache)
+            .expect("reference frame resolves against the shared cache");
+        assert_eq!(d2, arg_desc, "0xFE resolved to the defined descriptor");
+        assert_eq!(v2, arg_val);
+
+        // Negative control: a fresh cache rejects the reference.
+        let mut cur_fresh = std::io::Cursor::new(ref_buf.as_slice());
+        decode_rpc_exec_arg(&mut cur_fresh, order, &mut TypeCache::new())
+            .expect_err("a 0xFE reference with no prior define must be fatal");
+
+        // Make the cross-frame intent explicit: pre-seeding only the cache
+        // (no value bytes) is enough for the reference to resolve.
+        let mut seed = TypeCache::new();
+        let mut seed_cur = std::io::Cursor::new(&def_buf[..3 + 1]); // 0xFD + slot + 1-byte scalar code
+        let _ = decode_type_desc_cached(&mut seed_cur, order, &mut seed).expect("seed define");
+        let mut cur3 = std::io::Cursor::new(ref_buf.as_slice());
+        let (d3, _) = decode_rpc_exec_arg(&mut cur3, order, &mut seed)
+            .expect("reference resolves against a cache seeded by a prior define-only frame");
+        assert_eq!(d3, arg_desc);
+    }
+
+    /// A PUT EXEC payload whose value embeds an `any` (Variant) field may
+    /// carry the variant's element descriptor as a `0xFE <slot>` reference to
+    /// a descriptor defined earlier on the connection.
+    /// `decode_pv_field_with_bitset_cached` is the exact decoder the PUT EXEC
+    /// branch of `handle_op` now invokes with the read-loop cache; it must
+    /// resolve the embedded reference rather than fault the stream.
+    #[test]
+    fn put_exec_any_value_resolves_cached_variant_descriptor() {
+        use crate::pvdata::encode::{
+            decode_pv_field_with_bitset_cached, decode_type_desc_cached, encode_scalar_value,
+            encode_type_desc,
+        };
+        use crate::pvdata::{FieldDesc, ScalarType, ScalarValue};
+
+        let order = ByteOrder::Little;
+        const SLOT: u16 = 0x0003;
+
+        // Value type: a structure with a single `any` (Variant) leaf.
+        // Bit numbering: root=0, `v`=1.
+        let intro = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("v".into(), FieldDesc::Variant)],
+        };
+        let inner_desc = FieldDesc::Scalar(ScalarType::Int);
+        let inner_val = ScalarValue::Int(7);
+
+        // Prior frame defines the variant's element descriptor in the cache.
+        let mut def_buf = Vec::new();
+        def_buf.put_u8(0xFD);
+        def_buf.put_u16(SLOT, order);
+        encode_type_desc(&inner_desc, order, &mut def_buf);
+        let mut cache = TypeCache::new();
+        let mut def_cur = std::io::Cursor::new(def_buf.as_slice());
+        decode_type_desc_cached(&mut def_cur, order, &mut cache).expect("define inner descriptor");
+
+        // PUT EXEC delta: changed bitset selects the `v` leaf (bit 1); the
+        // variant body is `0xFE <slot>` + the inner scalar value.
+        let mut changed = crate::proto::BitSet::new();
+        changed.set(1);
+        let mut delta_buf = Vec::new();
+        delta_buf.put_u8(0xFE);
+        delta_buf.put_u16(SLOT, order);
+        encode_scalar_value(&inner_val, order, &mut delta_buf);
+
+        let mut cur = std::io::Cursor::new(delta_buf.as_slice());
+        let decoded =
+            decode_pv_field_with_bitset_cached(&intro, &changed, 0, &mut cur, order, &mut cache)
+                .expect("PUT EXEC any value with a cached variant descriptor decodes");
+        let PvField::Structure(s) = decoded else {
+            panic!("expected a structure, got {decoded:?}");
+        };
+        let (_, v) = s
+            .fields
+            .iter()
+            .find(|(n, _)| n == "v")
+            .expect("field v present");
+        // The `any` leaf carries its resolved element descriptor + value; the
+        // 0xFE reference must have resolved to the cached `Int` descriptor.
+        let PvField::Variant(var) = v else {
+            panic!("expected an `any`/Variant leaf, got {v:?}");
+        };
+        assert_eq!(
+            var.desc.as_ref(),
+            Some(&inner_desc),
+            "the 0xFE reference resolved to the cached Int descriptor"
+        );
+        assert_eq!(
+            var.value,
+            PvField::Scalar(ScalarValue::Int(7)),
+            "the variant value decoded against the resolved descriptor"
+        );
+
+        // Negative control: a fresh cache cannot resolve the reference.
+        let mut cur_fresh = std::io::Cursor::new(delta_buf.as_slice());
+        decode_pv_field_with_bitset_cached(
+            &intro,
+            &changed,
+            0,
+            &mut cur_fresh,
+            order,
+            &mut TypeCache::new(),
+        )
+        .expect_err("a 0xFE variant reference with no prior define must fault");
     }
 
     /// Build a flat 3-field NTScalar-like structure descriptor with
@@ -10050,6 +10462,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -10090,6 +10503,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -10174,6 +10588,7 @@ mod tests {
             order,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_exec_fin(),
@@ -10209,6 +10624,7 @@ mod tests {
             order,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_exec_fin(),
@@ -10538,7 +10954,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame)
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
             .expect("decode must succeed")
             .expect("ca with a user field yields Some");
 
@@ -10582,7 +10998,8 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let parsed = parse_client_credentials(&frame).expect("decode must succeed");
+        let parsed =
+            parse_client_credentials(&frame, &mut TypeCache::new()).expect("decode must succeed");
         assert!(
             parsed.is_none(),
             "ca + null auth must yield the anonymous fallback (None), \
@@ -10625,7 +11042,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame)
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
             .expect("decode must succeed")
             .expect("non-anonymous method yields Some");
         assert_eq!(
@@ -10663,7 +11080,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame)
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
             .expect("decode must succeed")
             .expect("mixed-case `Ca` is not the exact `ca` fallback → Some");
         assert_eq!(
@@ -10701,7 +11118,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame)
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
             .expect("decode must succeed")
             .expect("capitalized `Anonymous` is not the exact fold → Some");
         assert_eq!(
@@ -10749,6 +11166,7 @@ mod tests {
             &mut channels,
             order,
             &config,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -10806,6 +11224,7 @@ mod tests {
             &mut channels,
             order,
             &config,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("OtherCA"),
             &discard_exec_fin(),
@@ -10896,6 +11315,7 @@ mod tests {
             &mut channels,
             order,
             &config,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -10940,6 +11360,7 @@ mod tests {
             &mut channels,
             order,
             &config,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -11014,6 +11435,7 @@ mod tests {
             &mut channels,
             order,
             &config,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -11154,6 +11576,7 @@ mod tests {
             order,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -11206,6 +11629,7 @@ mod tests {
             order,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -11287,6 +11711,7 @@ mod tests {
             order,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -11356,6 +11781,7 @@ mod tests {
             &mut channels,
             order,
             &config,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &exec_fin_tx,
@@ -11468,6 +11894,7 @@ mod tests {
             order,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &exec_fin_tx,
@@ -12544,6 +12971,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon_fin_tx,
@@ -12571,6 +12999,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon_fin_tx,
@@ -12750,6 +13179,7 @@ mod tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -12773,6 +13203,7 @@ mod tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -12858,6 +13289,7 @@ mod tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -12937,6 +13369,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -12961,6 +13394,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -13015,6 +13449,7 @@ mod tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -13130,6 +13565,9 @@ mod tests {
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let mut cred = ClientCredentials::anonymous();
+        // One connection-scope inbound decode cache shared across both
+        // validation frames, mirroring the read loop's single `rx_type_cache`.
+        let mut decode_cache = TypeCache::new();
 
         // First (initial) handshake: identity becomes alice.
         let f1 = build_ca_validation_frame(order, "alice");
@@ -13142,6 +13580,7 @@ mod tests {
             peer,
             &peer_entry,
             &config,
+            &mut decode_cache,
         )
         .await
         .expect("initial validation");
@@ -13169,6 +13608,7 @@ mod tests {
             peer,
             &peer_entry,
             &config,
+            &mut decode_cache,
         )
         .await
         .expect("re-auth validation");
@@ -13386,6 +13826,7 @@ mod r14_tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon_fin_tx,
@@ -13644,6 +14085,7 @@ mod bfr15_tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,
@@ -13664,6 +14106,7 @@ mod bfr15_tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,
@@ -13724,6 +14167,7 @@ mod bfr15_tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,
@@ -13743,6 +14187,7 @@ mod bfr15_tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,
@@ -13800,6 +14245,7 @@ mod bfr15_tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,
@@ -13856,6 +14302,7 @@ mod bfr15_tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,
@@ -13881,6 +14328,7 @@ mod bfr15_tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,

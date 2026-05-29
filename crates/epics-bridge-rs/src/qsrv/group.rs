@@ -1937,38 +1937,51 @@ impl super::provider::PvaMonitor for AnyMonitor {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// pvxs `groupsource.cpp:548` refuses group PUT
-/// preparation for `DBF_INLINK..DBF_FWDLINK` fields. EPICS link
-/// fields share a small, stable set of names — `FLNK` /
-/// `DOL` / `SDIS` / `INP` / `OUT` plus the alphabet-suffix
-/// `INPA..INPL` / `OUTA..OUTL` families. Match on the parsed
-/// field suffix of a member's channel to enforce the same
-/// rejection.
+/// pvxs `groupsource.cpp:596-606` refuses group PUT preparation for any
+/// field whose `dbChannelFinalFieldType` is in `DBF_INLINK..DBF_FWDLINK`
+/// — a DBF-class rule, not a name rule.
+///
+/// The durable fix classifies by DBF type. `epics-base-rs` does not yet
+/// expose a link-field DBF class (`DbFieldType` has no
+/// `INLINK`/`OUTLINK`/`FWDLINK` variants; link fields surface as
+/// `String`), so this is a NAME-based stopgap. It is intentionally a
+/// superset and is INCOMPLETE: a custom record type with a link field
+/// outside these families is not caught, and the real close requires
+/// `epics-base-rs` to expose the field's DBF class (tracked as a
+/// cross-crate follow-up). Until then we enumerate the standard EPICS
+/// Base link-field name families so the common record types reject
+/// link writes the same way pvxs does.
+///
+/// Covered families (all `DBF_INLINK`/`DBF_OUTLINK`/`DBF_FWDLINK` in
+/// EPICS Base `*.dbd.pod`):
+///   - `FLNK` (forward), `SDIS` (disable), `DOL`, `INP`, `OUT`
+///   - simulation links `SIOL` / `SIML` and `selRecord` `NVL`,
+///     `histogramRecord` `SVL`
+///   - indexed/lettered families: `INP*` / `OUT*` (calc/aSub),
+///     `DOL*` (`seqRecord` `DOL0..DOL9`/`DOLA`/`DOLF`), and
+///     `LNK*` (`seqRecord` `LNK0..LNK9`/`LNKF`) where `*` is a single
+///     alphanumeric character.
 fn member_targets_link_field(channel: &str) -> bool {
     let (_, field) = epics_base_rs::server::database::parse_pv_name(channel);
     let f = field.to_ascii_uppercase();
-    if matches!(f.as_str(), "FLNK" | "DOL" | "SDIS" | "INP" | "OUT") {
+    if matches!(
+        f.as_str(),
+        "FLNK" | "DOL" | "SDIS" | "INP" | "OUT" | "NVL" | "SVL" | "SIOL" | "SIML"
+    ) {
         return true;
     }
-    // INPA..INPL, INPM..INPZ, OUTA..OUTZ are link fields on
-    // most record types (calc/calcout/aSub/etc.). Single
-    // alpha suffix after `INP` or `OUT` is the recognisable
-    // shape; this is a superset (record-type specific
-    // semantics may treat `INPx` as non-link on a handful of
-    // records) but rejecting them through group PUT is the
-    // safe direction — the pvxs rule is "never write a link
-    // through a group".
-    if let Some(rest) = f.strip_prefix("INP")
-        && rest.len() == 1
-        && rest.chars().next().unwrap().is_ascii_uppercase()
-    {
-        return true;
-    }
-    if let Some(rest) = f.strip_prefix("OUT")
-        && rest.len() == 1
-        && rest.chars().next().unwrap().is_ascii_uppercase()
-    {
-        return true;
+    // Indexed/lettered link families: a known link prefix followed by
+    // exactly one alphanumeric suffix character. This is a superset
+    // (record-type specifics may treat a given `INPx` as non-link) but
+    // rejecting it through group PUT is the safe direction — pvxs's rule
+    // is "never write a link through a group".
+    for prefix in ["INP", "OUT", "DOL", "LNK"] {
+        if let Some(rest) = f.strip_prefix(prefix)
+            && rest.len() == 1
+            && rest.chars().next().unwrap().is_ascii_alphanumeric()
+        {
+            return true;
+        }
     }
     false
 }
@@ -1980,6 +1993,23 @@ mod link_field_tests {
     #[test]
     fn link_class_field_names_rejected() {
         for f in ["FLNK", "DOL", "SDIS", "INP", "OUT", "INPA", "OUTL", "INPZ"] {
+            assert!(
+                member_targets_link_field(&format!("REC.{f}")),
+                "expected {f} to be classified as a link field"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_record_link_families_rejected() {
+        // The families the original name subset missed, each defined as
+        // a link field in EPICS Base `*.dbd.pod`:
+        //   seqRecord DOL0 (INLINK) / LNK0 (OUTLINK) / DOLA / DOLF / LNKF
+        //   selRecord NVL (INLINK); histogramRecord SVL (INLINK)
+        //   boRecord SIOL (OUTLINK) / SIML (INLINK)
+        for f in [
+            "DOL0", "LNK0", "DOLA", "DOLF", "LNKF", "NVL", "SVL", "SIOL", "SIML",
+        ] {
             assert!(
                 member_targets_link_field(&format!("REC.{f}")),
                 "expected {f} to be classified as a link field"

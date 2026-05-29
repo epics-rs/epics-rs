@@ -2685,7 +2685,7 @@ async fn handle_connection_io(
                 handle_cancel_request(&frame, &mut channels, order)?;
             }
             Some(Command::Message) => {
-                handle_message(&frame, order, &peer)?;
+                handle_message(&frame, &channels, order, &peer)?;
             }
             Some(Command::PutGet) => {
                 // atomic put-then-get. The PVA wire spec defines
@@ -3915,9 +3915,23 @@ fn handle_cancel_request(
 }
 
 /// Handle MESSAGE (cmd 18). pvxs serverconn.cpp:323 — clients send
-/// log messages tagged with severity (Info/Warning/Error/Fatal). We
-/// surface them through the `tracing` crate at the matching level.
-fn handle_message(frame: &Frame, order: ByteOrder, peer: &SocketAddr) -> PvaResult<()> {
+/// log messages tagged with severity (Info/Warning/Error/Fatal) bound
+/// to an operation IOID. We surface them through the `tracing` crate
+/// at the matching level.
+///
+/// pvxs (`serverconn.cpp:338-354`) looks the IOID up in the
+/// connection-wide `opByIOID` FIRST: a MESSAGE for an IOID no operation
+/// owns is logged only at debug and dropped — it never reaches the
+/// warning/error severity path. Only a live IOID gets the severity
+/// mapping, with the owning channel name in the log line. Without this
+/// gate a peer could emit warning/error-level server logs for an
+/// arbitrary IOID it never opened.
+fn handle_message(
+    frame: &Frame,
+    channels: &HashMap<u32, ChannelState>,
+    order: ByteOrder,
+    peer: &SocketAddr,
+) -> PvaResult<()> {
     let mut cur = frame.cursor();
     // pvxs `serverconn.cpp:323-336` throws on malformed
     // MESSAGE; conn loop turns into a reset. Pre-fix Rust silently
@@ -3931,11 +3945,23 @@ fn handle_message(frame: &Frame, order: ByteOrder, peer: &SocketAddr) -> PvaResu
     let msg = crate::proto::decode_string(&mut cur, order)
         .map_err(|e| PvaError::Decode(format!("MESSAGE string: {e}")))?
         .unwrap_or_default();
+    // IOID lookup gate (pvxs serverconn.cpp:338-342): absent → debug
+    // only, no severity escalation.
+    let channel = op_owner_sid(channels, ioid).and_then(|sid| channels.get(&sid));
+    let Some(channel) = channel else {
+        debug!(
+            ?peer,
+            ioid, mtype, message = %msg,
+            "client MESSAGE for unknown IOID: dropping (no owning operation)"
+        );
+        return Ok(());
+    };
+    let pv = channel.name.as_str();
     match mtype {
-        0 => debug!(?peer, ioid, message = %msg, "client info"),
-        1 => warn!(?peer, ioid, message = %msg, "client warning"),
-        2 | 3 => error!(?peer, ioid, message = %msg, "client error"),
-        _ => debug!(?peer, ioid, mtype, message = %msg, "client message (unknown type)"),
+        0 => debug!(?peer, ioid, pv, message = %msg, "client info"),
+        1 => warn!(?peer, ioid, pv, message = %msg, "client warning"),
+        2 | 3 => error!(?peer, ioid, pv, message = %msg, "client error"),
+        _ => debug!(?peer, ioid, pv, mtype, message = %msg, "client message (unknown type)"),
     }
     Ok(())
 }
@@ -8133,9 +8159,12 @@ mod tests {
         // Wire layout: ioid (u32) + messageType (u8) + message (string).
         // We can't easily inspect tracing output here, so the assertion is
         // simply that the handler tolerates each severity level without
-        // panicking and consumes the cursor cleanly.
+        // panicking and consumes the cursor cleanly. With an empty op
+        // map the IOID is unknown, so each MESSAGE is dropped at debug
+        // (pvxs serverconn.cpp:338-342) — still Ok.
         let order = ByteOrder::Little;
         let peer = "127.0.0.1:5075".parse::<SocketAddr>().unwrap();
+        let channels: HashMap<u32, ChannelState> = HashMap::new();
         for mtype in [0u8, 1, 2, 3, 9] {
             let mut payload = Vec::new();
             payload.put_u32(0xDEADBEEF, order); // ioid
@@ -8144,19 +8173,68 @@ mod tests {
             let frame = synth_frame(Command::Message, order, payload);
             // MESSAGE handler now returns PvaResult; well-formed
             // payload must succeed.
-            handle_message(&frame, order, &peer).expect("well-formed MESSAGE");
+            handle_message(&frame, &channels, order, &peer).expect("well-formed MESSAGE");
         }
 
         // truncated MESSAGE is now a protocol-fatal decode
         // error (matches pvxs `serverconn.cpp:323-336` throw). The
         // server loop turns this into a connection reset.
         let frame_short = synth_frame(Command::Message, order, vec![0x01, 0x02]);
-        let err =
-            handle_message(&frame_short, order, &peer).expect_err("truncated MESSAGE must Err");
+        let err = handle_message(&frame_short, &channels, order, &peer)
+            .expect_err("truncated MESSAGE must Err");
         assert!(
             matches!(err, PvaError::Decode(_)),
             "expected Decode error, got {err:?}"
         );
+    }
+
+    /// pvxs gates inbound MESSAGE on the connection-wide op map: a
+    /// MESSAGE for an IOID no operation owns is dropped (debug only),
+    /// while a MESSAGE for a live IOID is accepted and (in pvxs) tagged
+    /// with the owning channel name. Both return Ok here; the
+    /// regression pins that an unknown IOID does NOT error and a live
+    /// IOID resolves its owning channel.
+    #[test]
+    fn handle_message_gates_on_live_ioid() {
+        let order = ByteOrder::Little;
+        let peer = "127.0.0.1:5075".parse::<SocketAddr>().unwrap();
+
+        // Build a channel with a live op for ioid 7.
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut ops = HashMap::new();
+        ops.insert(
+            7u32,
+            non_monitor_op_state(
+                FieldDesc::Scalar(ScalarType::Int),
+                OpKind::Get,
+                BitSet::new(),
+            ),
+        );
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            1,
+            ChannelState {
+                name: "dut:pv".into(),
+                cid: 0,
+                sid: 1,
+                introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
+                source,
+                ops,
+            },
+        );
+
+        let msg = |ioid: u32| -> PvaResult<()> {
+            let mut payload = Vec::new();
+            payload.put_u32(ioid, order);
+            payload.put_u8(1); // warning
+            crate::proto::encode_string_into("hi", order, &mut payload);
+            let frame = synth_frame(Command::Message, order, payload);
+            handle_message(&frame, &channels, order, &peer)
+        };
+        // Live IOID: accepted.
+        msg(7).expect("MESSAGE on live IOID accepted");
+        // Unknown IOID: dropped, not an error, no severity escalation.
+        msg(999).expect("MESSAGE on unknown IOID dropped, not an error");
     }
 
     #[tokio::test]

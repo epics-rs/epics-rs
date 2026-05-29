@@ -6,7 +6,7 @@
 
 use std::fmt::Write as _;
 
-use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 
 // ─── pvinfo formatting (type descriptor) ────────────────────────────────────
 
@@ -455,12 +455,8 @@ fn format_nt_enum(pv_name: &str, s: &PvStructure) -> String {
                 .get_field("index")
                 .map(format_value_inline)
                 .unwrap_or_else(|| "0".to_string());
-            let choice = if let Some(PvField::ScalarArray(items)) = es.get_field("choices") {
-                let n: usize = i.parse().unwrap_or(0);
-                items.get(n).map(enum_choice_text).unwrap_or_default()
-            } else {
-                String::new()
-            };
+            let n: usize = i.parse().unwrap_or(0);
+            let choice = enum_choice_for_index(es.get_field("choices"), n);
             (i, choice)
         }
         _ => ("0".to_string(), String::new()),
@@ -772,13 +768,36 @@ fn format_enum_summary(s: &PvStructure) -> String {
         .get_field("index")
         .map(format_value_inline)
         .unwrap_or_else(|| "0".to_string());
-    let choice = if let Some(PvField::ScalarArray(items)) = s.get_field("choices") {
-        let n: usize = idx.parse().unwrap_or(0);
-        items.get(n).map(enum_choice_text).unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let n: usize = idx.parse().unwrap_or(0);
+    let choice = enum_choice_for_index(s.get_field("choices"), n);
     format!("({idx}) {choice}")
+}
+
+/// Extract the NTEnum choice text for `index` from a `choices` field that
+/// may be either an untyped [`PvField::ScalarArray`] (the in-crate builder
+/// shape) or a wire-decoded
+/// [`PvField::ScalarArrayTyped`]`(`[`TypedScalarArray::String`]`)`. The
+/// descriptor-driven decoder returns string arrays in the typed form, so a
+/// branch that only matched `ScalarArray` printed an empty choice for real
+/// interop data (a pvxs/QSRV `enum_t`). Mirrors EPICS Base `printEnumT`
+/// (pvData printer.cpp:168-175): an in-range index renders the
+/// `maybeQuote`-escaped choice, an out-of-range index renders `<undefined>`.
+fn enum_choice_for_index(choices: Option<&PvField>, index: usize) -> String {
+    match choices {
+        Some(PvField::ScalarArray(items)) => items
+            .get(index)
+            .map(enum_choice_text)
+            .unwrap_or_else(|| "<undefined>".to_string()),
+        Some(PvField::ScalarArrayTyped(TypedScalarArray::String(items))) => items
+            .get(index)
+            .map(|s| maybe_quote(s))
+            .unwrap_or_else(|| "<undefined>".to_string()),
+        // No `choices`, or a non-string array (a malformed enum_t): Base's
+        // `getSubField<PVStringArray>` would be null and `printEnumT`
+        // returns false; here the caller is already committed to the enum
+        // line, so emit no choice text.
+        _ => String::new(),
+    }
 }
 
 /// Render an NTEnum choice for display, mirroring EPICS Base `printEnumT`
@@ -1409,6 +1428,40 @@ mod tests {
             ]),
         );
         assert_eq!(format_enum_summary(&e), "(1) \"on hold\"");
+    }
+
+    /// A wire-decoded `enum_t.choices` is a typed string array
+    /// (`ScalarArrayTyped(String)`), not the untyped builder shape. The
+    /// formatter must still render the selected choice — regression: the
+    /// `ScalarArray`-only branch printed an empty choice for real
+    /// pvxs/QSRV interop data.
+    #[test]
+    fn nt_enum_choice_from_typed_string_array() {
+        let mut e = PvStructure::new("enum_t");
+        e.set("index", PvField::Scalar(ScalarValue::Int(1)));
+        e.set(
+            "choices",
+            PvField::ScalarArrayTyped(TypedScalarArray::String(
+                vec!["OFF".to_string(), "ON".to_string()].into(),
+            )),
+        );
+        assert_eq!(format_enum_summary(&e), "(1) ON");
+    }
+
+    /// An out-of-range index renders `<undefined>`, matching EPICS Base
+    /// `printEnumT` (pvData printer.cpp:171-172).
+    #[test]
+    fn nt_enum_out_of_range_index_is_undefined() {
+        let mut e = PvStructure::new("enum_t");
+        e.set("index", PvField::Scalar(ScalarValue::Int(5)));
+        e.set(
+            "choices",
+            PvField::ScalarArray(vec![
+                ScalarValue::String("off".into()),
+                ScalarValue::String("on".into()),
+            ]),
+        );
+        assert_eq!(format_enum_summary(&e), "(5) <undefined>");
     }
 
     /// A raw double scalar prints with six significant digits, matching

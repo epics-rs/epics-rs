@@ -177,32 +177,31 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
         PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
     ));
 
-    // display
-    if let Some(ref disp) = snapshot.display {
+    // pvxs always emits the metadata fields the NTScalar descriptor
+    // advertises: `display` for every value, plus `control`/`valueAlarm`
+    // for numeric values (src/nt.cpp:58-112). When the record's metadata
+    // cache never populated display/control (e.g. stringin/stringout, and
+    // histogram — record types absent from the metadata allowlist), the
+    // fields are still present with descriptor defaults rather than
+    // disappearing (iocsource.cpp:254-309). Emitting them only when the
+    // snapshot carried metadata made the runtime value shape diverge from
+    // the `getField` descriptor; build them unconditionally from the
+    // snapshot metadata or its default so value and descriptor agree.
+    let disp = snapshot.display.clone().unwrap_or_default();
+    pv.fields.push((
+        "display".into(),
+        PvField::Structure(build_display(&disp, scalar_type, numeric)),
+    ));
+    if numeric {
+        let ctrl = snapshot.control.clone().unwrap_or_default();
         pv.fields.push((
-            "display".into(),
-            PvField::Structure(build_display(disp, scalar_type, numeric)),
+            "control".into(),
+            PvField::Structure(build_control(&ctrl, scalar_type)),
         ));
-    }
-
-    // control — pvxs emits this only for numeric values (src/nt.cpp:87).
-    if numeric {
-        if let Some(ref ctrl) = snapshot.control {
-            pv.fields.push((
-                "control".into(),
-                PvField::Structure(build_control(ctrl, scalar_type)),
-            ));
-        }
-    }
-
-    // valueAlarm — pvxs emits this only for numeric values (src/nt.cpp:97).
-    if numeric {
-        if let Some(ref disp) = snapshot.display {
-            pv.fields.push((
-                "valueAlarm".into(),
-                PvField::Structure(build_value_alarm(disp, scalar_type)),
-            ));
-        }
+        pv.fields.push((
+            "valueAlarm".into(),
+            PvField::Structure(build_value_alarm(&disp, scalar_type)),
+        ));
     }
 
     pv
@@ -306,32 +305,28 @@ pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
         PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
     ));
 
-    // display
-    if let Some(ref disp) = snapshot.display {
+    // Same descriptor/value consistency rule as the scalar builder:
+    // pvxs reuses the NTScalar builder for arrays, so a numeric array
+    // value carries `display` plus `control`/`valueAlarm` unconditionally
+    // (with descriptor defaults when the record has no metadata, e.g.
+    // histogram), and a string array carries `display` only. Emitting
+    // them only when the snapshot had metadata diverged from the
+    // `getField` descriptor (src/nt.cpp:44-112, iocsource.cpp:254-309).
+    let disp = snapshot.display.clone().unwrap_or_default();
+    pv.fields.push((
+        "display".into(),
+        PvField::Structure(build_display(&disp, scalar_type, numeric)),
+    ));
+    if numeric {
+        let ctrl = snapshot.control.clone().unwrap_or_default();
         pv.fields.push((
-            "display".into(),
-            PvField::Structure(build_display(disp, scalar_type, numeric)),
+            "control".into(),
+            PvField::Structure(build_control(&ctrl, scalar_type)),
         ));
-    }
-
-    // control — numeric arrays only (pvxs src/nt.cpp:87).
-    if numeric {
-        if let Some(ref ctrl) = snapshot.control {
-            pv.fields.push((
-                "control".into(),
-                PvField::Structure(build_control(ctrl, scalar_type)),
-            ));
-        }
-    }
-
-    // valueAlarm — numeric arrays only (pvxs src/nt.cpp:97).
-    if numeric {
-        if let Some(ref disp) = snapshot.display {
-            pv.fields.push((
-                "valueAlarm".into(),
-                PvField::Structure(build_value_alarm(disp, scalar_type)),
-            ));
-        }
+        pv.fields.push((
+            "valueAlarm".into(),
+            PvField::Structure(build_value_alarm(&disp, scalar_type)),
+        ));
     }
 
     pv
@@ -1481,6 +1476,58 @@ mod tests {
         } else {
             panic!("expected structure descriptor");
         }
+    }
+
+    /// BR-112: a record whose metadata cache was never populated
+    /// (`display`/`control` are `None`, as for stringin/stringout and
+    /// histogram) must still emit exactly the metadata members its
+    /// `getField` descriptor advertises — built from descriptor defaults
+    /// — so the runtime GET value shape equals the descriptor shape.
+    #[test]
+    fn metadata_absent_value_member_set_matches_descriptor() {
+        let names = |pv: &PvStructure| -> Vec<String> {
+            pv.fields.iter().map(|(n, _)| n.clone()).collect()
+        };
+        let desc_names = |d: &FieldDesc| -> Vec<String> {
+            match d {
+                FieldDesc::Structure { fields, .. } => {
+                    fields.iter().map(|(n, _)| n.clone()).collect()
+                }
+                other => panic!("expected structure descriptor, got {other:?}"),
+            }
+        };
+
+        // Numeric scalar, no display/control metadata.
+        let snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, UNIX_EPOCH);
+        assert!(snap.display.is_none() && snap.control.is_none());
+        let pv = snapshot_to_nt_scalar(&snap);
+        assert_eq!(
+            names(&pv),
+            desc_names(&build_field_desc_for_nt(NtType::Scalar, ScalarType::Double)),
+            "numeric scalar value member set must equal descriptor"
+        );
+
+        // Numeric array (histogram-like), no metadata.
+        let snap_arr = Snapshot::new(EpicsValue::LongArray(vec![1, 2, 3]), 0, 0, UNIX_EPOCH);
+        let pv_arr = snapshot_to_nt_scalar_array(&snap_arr);
+        assert_eq!(
+            names(&pv_arr),
+            desc_names(&build_field_desc_for_nt(
+                NtType::ScalarArray,
+                ScalarType::Int
+            )),
+            "numeric array value member set must equal descriptor"
+        );
+
+        // String scalar (stringin-like), no metadata: `display` present,
+        // no numeric `control`/`valueAlarm`.
+        let snap_s = Snapshot::new(EpicsValue::String("x".into()), 0, 0, UNIX_EPOCH);
+        let pv_s = snapshot_to_nt_scalar(&snap_s);
+        assert_eq!(
+            names(&pv_s),
+            desc_names(&build_field_desc_for_nt(NtType::Scalar, ScalarType::String)),
+            "string scalar value member set must equal descriptor"
+        );
     }
 
     #[test]

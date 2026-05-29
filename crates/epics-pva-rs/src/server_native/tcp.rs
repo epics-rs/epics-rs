@@ -3786,23 +3786,46 @@ fn handle_cancel_request(
         }
     };
     if let Some(ch) = channels.get_mut(&osid)
-        && let Some(op) = ch.ops.get(&ioid)
+        && let Some(op) = ch.ops.get_mut(&ioid)
     {
-        // Suspend without aborting the subscriber task. pvxs
-        // models cancel as Executing→Idle; the subscriber stays
-        // around for the next START to flip back to Executing.
-        // Only MONITOR has a long-lived subscriber to pause —
-        // GET/PUT/RPC are two-shot so the field is effectively a
-        // no-op for them (`monitor_paused` is never consulted off
-        // the MONITOR path).
-        op.monitor_paused
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        // CANCEL_REQUEST is Executing->Idle. Route through
-        // the op's single start-control owner so notify_monitor_start(
-        // false) fires once on the edge (no-op if already paused or
-        // never started). DESTROY's terminal stop comes from Drop.
-        if let Some(ctl) = &op.monitor_start_ctl {
-            ctl.set(false);
+        // pvxs `serverconn.cpp:262-295` applies CANCEL_REQUEST to EVERY
+        // executing op kind by flipping `ServerOp::state` to `Idle`. The
+        // transition differs by kind, so split here:
+        if op.kind == OpKind::Monitor {
+            // MONITOR has a long-lived subscriber: suspend it WITHOUT
+            // aborting the task, so the next START flips it back to
+            // Executing. Route the Executing→Idle edge through the op's
+            // single start-control owner so `notify_monitor_start(false)`
+            // fires once (no-op if already paused / never started);
+            // DESTROY's terminal stop comes from `Drop`.
+            op.monitor_paused
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(ctl) = &op.monitor_start_ctl {
+                ctl.set(false);
+            }
+        } else if op.exec_state == ExecState::Executing {
+            // Non-monitor (GET/PUT/RPC/PUT_GET/PROCESS) in flight. pvxs
+            // sets the op `Idle`, after which a late reply is dropped
+            // because the op is no longer Executing (`serverget.cpp:37-49`
+            // names remote Cancel as the cause) and a subsequent EXEC is
+            // accepted (`serverget.cpp:511-514`). Close all three here:
+            //   1. return the op to `Idle`;
+            //   2. mint a fresh op-instance id so the in-flight task's
+            //      terminal `ExecFinished` is ignored by the
+            //      `apply_exec_finish` ABA guard (it must not later flip a
+            //      re-EXEC'd op or remove it on a stale `last_request`);
+            //   3. clear `last_request` — Cancel is not a teardown, the op
+            //      survives for re-EXEC;
+            //   4. drop the abort guard — aborting the spawned task both
+            //      prevents its late reply AND drops the in-flight source
+            //      future, which is the Rust structured-concurrency
+            //      equivalent of pvxs `ExecOp::onCancel`
+            //      (`serverget.cpp:266-321`): cancelling the task cancels
+            //      the source call, with no separate source-facing hook.
+            op.exec_state = ExecState::Idle;
+            op.monitor_op_id = next_op_id();
+            op.last_request = false;
+            op.data_task_abort = None;
         }
     }
     Ok(())
@@ -7810,6 +7833,91 @@ mod tests {
         assert!(
             outcome.unwrap_err().is_cancelled(),
             "task should abort only on DESTROY (OpState drop), not on cancel"
+        );
+    }
+
+    /// pvxs `serverconn.cpp:262-295` applies CANCEL_REQUEST to NON-monitor
+    /// executing ops too: it sets the op `Idle`, the in-flight task's late
+    /// reply is dropped (`serverget.cpp:37-49`), and a subsequent EXEC is
+    /// accepted (`serverget.cpp:511-514`). Regression for the pre-fix
+    /// handler that only paused monitors and left GET/PUT/RPC/PROCESS
+    /// `Executing`, still able to emit a stale reply and blocking re-EXEC.
+    #[tokio::test]
+    async fn cancel_request_returns_non_monitor_exec_to_idle_and_aborts_task() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 5;
+        let ioid: u32 = 77;
+
+        // A long-running task standing in for an in-flight GET data phase.
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        let abort = Arc::new(AbortOnDrop(task.abort_handle()));
+
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut op = non_monitor_op_state(FieldDesc::Variant, OpKind::Get, BitSet::new());
+        op.exec_state = ExecState::Executing;
+        op.data_task_abort = Some(abort);
+        op.last_request = true; // a last-request EXEC that is now cancelled
+        let old_op_id = op.monitor_op_id;
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut ops = HashMap::new();
+        ops.insert(ioid, op);
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(FieldDesc::Variant),
+                source,
+                ops,
+            },
+        );
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        let frame = synth_frame(Command::CancelRequest, order, payload);
+        handle_cancel_request(&frame, &mut channels, order).expect("well-formed CancelRequest");
+
+        let op = channels
+            .get_mut(&sid)
+            .and_then(|c| c.ops.get_mut(&ioid))
+            .expect("op preserved across cancel — cancel is not a teardown");
+        assert_eq!(
+            op.exec_state,
+            ExecState::Idle,
+            "cancel must return the executing op to Idle"
+        );
+        assert!(
+            op.data_task_abort.is_none(),
+            "cancel must drop the abort guard so the in-flight task is aborted"
+        );
+        assert_ne!(
+            op.monitor_op_id, old_op_id,
+            "cancel must mint a fresh op-instance id so the stale ExecFinished is ignored"
+        );
+        assert!(
+            !op.last_request,
+            "cancel clears last_request — the op survives for re-EXEC"
+        );
+
+        // A subsequent EXEC is accepted now that the op is Idle.
+        assert!(
+            begin_exec(channels.get_mut(&sid).unwrap(), ioid).is_some(),
+            "a second EXEC must be accepted after cancel (pvxs serverget.cpp:511-514)"
+        );
+
+        // Dropping the abort guard aborted the original in-flight task.
+        let join = tokio::time::timeout(Duration::from_millis(500), task).await;
+        let outcome = join.expect("aborted task should finish quickly");
+        assert!(
+            outcome.unwrap_err().is_cancelled(),
+            "cancel must abort the in-flight non-monitor task"
         );
     }
 

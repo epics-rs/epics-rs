@@ -163,9 +163,17 @@ impl PvList {
     /// time (`gateAs.cc:488–509`):
     ///
     /// - Tokens that are already IP-address literals are kept verbatim.
-    /// - Hostnames are resolved via `tokio::net::lookup_host`; a hostname
-    ///   that resolves to multiple addresses expands into one IP entry per
-    ///   address.
+    /// - Hostnames are resolved via `tokio::net::lookup_host` and reduced to a
+    ///   **single IPv4 address — the first one returned**. C ca-gateway resolves
+    ///   each DENY FROM token through `aToIPAddr` → `hostToIPAddr`, which sets
+    ///   an `AF_INET` hint and breaks after the first `getaddrinfo` result
+    ///   (`osdSock.c:250-267`), then stores exactly one dotted-decimal IPv4
+    ///   address (`gateAs.cc:493-503`). Expanding a multi-homed name into one
+    ///   entry per address — including secondary A records and IPv6 — would
+    ///   deny strictly more peers than C, so we keep only the first IPv4 to
+    ///   match C's single-address selection. A name with no IPv4 record
+    ///   resolves to nothing in C (the `AF_INET` lookup fails) and is dropped
+    ///   here for the same reason.
     /// - A hostname that fails to resolve is logged at `WARN` level and
     ///   dropped from this rule's host set, mirroring C's pass-1 omission
     ///   (`gateAs.cc:504-507` — the unresolved host is simply not appended).
@@ -191,22 +199,23 @@ impl PvList {
                         from_hosts.push(token);
                         continue;
                     }
-                    // Hostname — resolve to IP(s). Append `:0` as the
-                    // required port sentinel for lookup_host.
+                    // Hostname — resolve to a single IPv4 address. Append `:0`
+                    // as the required port sentinel for lookup_host. C's
+                    // hostToIPAddr is AF_INET and keeps only the first result
+                    // (osdSock.c:250-267 / gateAs.cc:493-503), so take the
+                    // first IPv4 address and ignore the rest (including any
+                    // IPv6 records, which C's AF_INET lookup never returns).
                     match tokio::net::lookup_host(format!("{token}:0")).await {
                         Ok(addrs) => {
-                            let mut resolved_any = false;
-                            for sa in addrs {
-                                from_hosts.push(sa.ip().to_string());
-                                resolved_any = true;
-                            }
-                            if !resolved_any {
-                                tracing::warn!(
+                            match addrs.map(|sa| sa.ip()).find(std::net::IpAddr::is_ipv4) {
+                                Some(ip) => from_hosts.push(ip.to_string()),
+                                None => tracing::warn!(
                                     hostname = %token,
-                                    "pvlist DENY FROM: hostname resolved to no addresses \
-                                     — host dropped; if it is the rule's only host the \
-                                     rule collapses to a global deny (matches C gateAs.cc:540-556)"
-                                );
+                                    "pvlist DENY FROM: hostname resolved to no IPv4 address \
+                                     — host dropped (C hostToIPAddr is AF_INET-only); if it is \
+                                     the rule's only host the rule collapses to a global deny \
+                                     (matches C gateAs.cc:540-556)"
+                                ),
                             }
                         }
                         Err(e) => {
@@ -1282,11 +1291,39 @@ mod tests {
                     "resolved entry must be an IP string, got {h:?}"
                 );
             }
-            // The resolved IPs (127.0.0.1 and/or ::1) must deny the peer.
+            // The resolved IP (127.0.0.1) must deny the peer.
             let denied = from_hosts.iter().any(|ip| list.is_host_denied("PV:x", ip));
             assert!(denied, "resolved IP must be denied");
         } else {
             panic!("expected Deny");
+        }
+    }
+
+    /// C ca-gateway resolves each DENY FROM hostname to a SINGLE IPv4 address
+    /// (`hostToIPAddr` is AF_INET and breaks after the first getaddrinfo
+    /// result, osdSock.c:250-267; gateAs.cc:493-503 stores one dotted IP).
+    /// `resolve_hosts` must therefore store at most one address per hostname,
+    /// and that address must be IPv4 — never the multi-address / IPv6 fan-out
+    /// that would deny strictly more peers than C.
+    #[tokio::test]
+    async fn resolve_hosts_hostname_keeps_single_ipv4() {
+        let mut list = parse_pvlist("PV.* DENY FROM localhost").unwrap();
+        list.resolve_hosts().await;
+        let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] else {
+            panic!("expected Deny");
+        };
+        // At most one address (C keeps only the first); on any normal host
+        // `localhost` has an IPv4 record so exactly one is expected.
+        assert!(
+            from_hosts.len() <= 1,
+            "DENY FROM hostname must store a single address, got {from_hosts:?}"
+        );
+        for h in from_hosts {
+            let ip: std::net::IpAddr = h.parse().expect("resolved entry is an IP");
+            assert!(
+                ip.is_ipv4(),
+                "resolved DENY FROM address must be IPv4, got {ip}"
+            );
         }
     }
 

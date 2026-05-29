@@ -140,7 +140,7 @@ pub fn format_value(
 ) -> String {
     let sep = fmt.field_separator;
     match v {
-        EpicsValue::String(s) => s.clone(),
+        EpicsValue::String(s) => escape_from_raw(s.as_bytes()),
         EpicsValue::Short(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::Long(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::Int64(n) => format_int_wide(n.to_string(), *n as u64, fmt.int_style),
@@ -209,9 +209,10 @@ pub fn format_value(
             // `charArrAsStr && (reqElems || nElems > 1)` — a 1-element
             // CHAR array with `-S` but no `-#` falls through to numeric.
             if fmt.char_array_as_string && (req_elems_present || arr.len() > 1) {
-                // Long-string convention: bytes up to first NUL.
+                // Long-string convention: bytes up to first NUL, then
+                // EPICS-escaped (caget.c:322-327 escapes the prefix).
                 let end = arr.iter().position(|&b| b == 0).unwrap_or(arr.len());
-                String::from_utf8_lossy(&arr[..end]).into_owned()
+                escape_from_raw(&arr[..end])
             } else {
                 render_array_int(
                     arr.iter().map(|&b| (b as i8) as i64),
@@ -228,7 +229,7 @@ pub fn format_value(
                 parts.push(arr.len().to_string());
             }
             let take = fmt.max_elements.unwrap_or(arr.len()).min(arr.len());
-            parts.extend(arr[..take].iter().cloned());
+            parts.extend(arr[..take].iter().map(|s| escape_from_raw(s.as_bytes())));
             parts.join(&sep.to_string())
         }
     }
@@ -277,6 +278,43 @@ fn format_enum(idx: i64, fmt: &ValueFormat, enum_strings: Option<&[String]>) -> 
         return strs[idx as usize].clone();
     }
     format_int_i64(idx, fmt.int_style)
+}
+
+/// Port of EPICS `epicsStrnEscapedFromRaw` (`epicsString.c:120-159`):
+/// render raw bytes as printable text for CA CLI readback. The C control
+/// escapes (`\a \b \f \n \r \t \v \\ \' \" \0`) map to their two-char
+/// form, ASCII-printable bytes (0x20-0x7E) pass through, and every other
+/// byte becomes `\xHH` (lowercase hex). C `val2str` runs every DBR_STRING
+/// element through this (tool_lib.c:135), and `caget -S` escapes the
+/// long-string byte prefix (caget.c:322-327). Operates per byte so
+/// multi-byte UTF-8 is escaped exactly as C escapes the raw char buffer,
+/// rather than emitting real control/non-printable bytes into the stream.
+fn escape_from_raw(src: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(src.len());
+    for &c in src {
+        match c {
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x0c => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x0b => out.push_str("\\v"),
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            b'"' => out.push_str("\\\""),
+            0 => out.push_str("\\0"),
+            0x20..=0x7e => out.push(c as char),
+            _ => {
+                out.push('\\');
+                out.push('x');
+                out.push(HEX[(c >> 4) as usize] as char);
+                out.push(HEX[(c & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 /// Format a CA classic integer (`DBR_INT`/`DBR_LONG`/`DBR_CHAR`, an ENUM
@@ -591,6 +629,32 @@ mod tests {
         let mut fmt = fmt_default();
         fmt.char_array_as_string = true;
         assert_eq!(format_value(&v, &fmt, None, false), "hello");
+    }
+
+    #[test]
+    fn cli_readback_escapes_raw_string_bytes() {
+        // C val2str runs every DBR_STRING element through
+        // epicsStrnEscapedFromRaw (tool_lib.c:135); caget -S escapes the
+        // long-string byte prefix (caget.c:322-327). Control chars,
+        // backslash, quotes and non-printable bytes escape; ASCII passes.
+        assert_eq!(escape_from_raw(b"a\tb\nc"), "a\\tb\\nc");
+        assert_eq!(escape_from_raw(b"a\\b\"c'd"), "a\\\\b\\\"c\\'d");
+        assert_eq!(escape_from_raw(&[0x00, 0x01, b'A', 0x7f]), "\\0\\x01A\\x7f");
+        // 'é' = UTF-8 0xC3 0xA9: each raw byte escapes as \xHH, like C.
+        assert_eq!(escape_from_raw(&[0xc3, 0xa9]), "\\xc3\\xa9");
+        // String scalar through format_value is escaped.
+        assert_eq!(
+            format_value(&EpicsValue::String("x\ty".to_string()), &fmt_default(), None, false),
+            "x\\ty"
+        );
+        // StringArray elements escaped; count prefix preserved.
+        let a = EpicsValue::StringArray(vec!["a\nb".to_string(), "c".to_string()]);
+        assert_eq!(format_value(&a, &fmt_default(), None, false), "2 a\\nb c");
+        // `-S` long-string: escape the printable prefix up to NUL.
+        let mut sfmt = fmt_default();
+        sfmt.char_array_as_string = true;
+        let cv = EpicsValue::CharArray(b"hi\tthere\0junk".to_vec());
+        assert_eq!(format_value(&cv, &sfmt, None, true), "hi\\tthere");
     }
 
     #[test]

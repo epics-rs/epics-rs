@@ -117,6 +117,7 @@ impl PvDatabase {
             crate::server::record::ParsedLink::None => None,
             crate::server::record::ParsedLink::Ca(ca) => self.resolve_external_pv(&ca.pv).await,
             crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name).await,
+            crate::server::record::ParsedLink::PvaJson(j) => self.resolve_external_pv(&j.pv).await,
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
             crate::server::record::ParsedLink::Db(db) => {
                 // PP: process source record if Passive before reading.
@@ -168,6 +169,7 @@ impl PvDatabase {
             crate::server::record::ParsedLink::None => None,
             crate::server::record::ParsedLink::Ca(ca) => self.resolve_external_pv(&ca.pv).await,
             crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name).await,
+            crate::server::record::ParsedLink::PvaJson(j) => self.resolve_external_pv(&j.pv).await,
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
             crate::server::record::ParsedLink::Db(db) => {
                 let pv_name = if db.field == "VAL" {
@@ -282,10 +284,11 @@ impl PvDatabase {
             // carrying a remote MINOR/MAJOR severity never folded into
             // the owning record's LINK_ALARM (B2).
             crate::server::record::ParsedLink::Pva(_)
+            | crate::server::record::ParsedLink::PvaJson(_)
             | crate::server::record::ParsedLink::Ca(_) => {
                 let name = link
                     .external_pv_name()
-                    .expect("Ca/Pva link carries a PV name");
+                    .expect("Ca/Pva/PvaJson link carries a PV name");
                 let value = self.resolve_external_pv(name).await;
                 let alarm = self.external_link_alarm(name).await;
                 (value, alarm)
@@ -489,11 +492,12 @@ impl PvDatabase {
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
+            | crate::server::record::ParsedLink::PvaJson(_)
                 if is_soft =>
             {
                 let name = link
                     .external_pv_name()
-                    .expect("Ca/Pva link carries a PV name");
+                    .expect("Ca/Pva/PvaJson link carries a PV name");
                 self.resolve_external_pv(name).await
             }
             // lnkCalc evaluates regardless of `is_soft` — the input
@@ -688,10 +692,11 @@ impl PvDatabase {
                     .await;
             }
             crate::server::record::ParsedLink::Ca(_)
-            | crate::server::record::ParsedLink::Pva(_) => {
+            | crate::server::record::ParsedLink::Pva(_)
+            | crate::server::record::ParsedLink::PvaJson(_) => {
                 let name = link
                     .external_pv_name()
-                    .expect("Ca/Pva link carries a PV name");
+                    .expect("Ca/Pva/PvaJson link carries a PV name");
                 if let Err(e) = self.write_external_pv(name, value).await {
                     eprintln!("OUT-link write to external PV '{name}' failed: {e}");
                 }
@@ -1111,10 +1116,11 @@ impl PvDatabase {
                             // record processes on its own IOC), so route
                             // straight through the link set.
                             crate::server::record::ParsedLink::Ca(_)
-                            | crate::server::record::ParsedLink::Pva(_) => {
+                            | crate::server::record::ParsedLink::Pva(_)
+                            | crate::server::record::ParsedLink::PvaJson(_) => {
                                 let name = parsed
                                     .external_pv_name()
-                                    .expect("Ca/Pva link carries a PV name");
+                                    .expect("Ca/Pva/PvaJson link carries a PV name");
                                 if let Err(e) = self.write_external_pv(name, val.clone()).await {
                                     eprintln!(
                                         "dfanout OUT-link write to external PV '{name}' failed: {e}"

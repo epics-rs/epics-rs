@@ -730,7 +730,8 @@ impl PvDatabase {
                     let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
                     alarm.map(|a| (db.monitor_switch, a))
                 }
-                crate::server::record::ParsedLink::Pva(_) => {
+                crate::server::record::ParsedLink::Pva(_)
+                | crate::server::record::ParsedLink::PvaJson(_) => {
                     // PVA: the lset already applied the MS/NMS/MSI gate,
                     // so the returned severity is final — fold it as
                     // MaximizeStatus to preserve the remote stat+msg
@@ -840,7 +841,8 @@ impl PvDatabase {
                             crate::server::record::ParsedLink::Ca(ca) => {
                                 link_alarms.push((ca.monitor_switch, alarm));
                             }
-                            crate::server::record::ParsedLink::Pva(_) => {
+                            crate::server::record::ParsedLink::Pva(_)
+                            | crate::server::record::ParsedLink::PvaJson(_) => {
                                 link_alarms.push((
                                     crate::server::record::MonitorSwitch::MaximizeStatus,
                                     alarm,
@@ -933,6 +935,7 @@ impl PvDatabase {
                     crate::server::record::ParsedLink::Db(_)
                         | crate::server::record::ParsedLink::Ca(_)
                         | crate::server::record::ParsedLink::Pva(_)
+                        | crate::server::record::ParsedLink::PvaJson(_)
                 )
             {
                 // epics-base PR #4737901: soft-channel `read_xxx` must

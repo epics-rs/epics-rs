@@ -76,7 +76,21 @@ pub enum ParsedLink {
     Constant(String),
     Db(DbLink),
     Ca(CaLink),
+    /// PVA (`pvalink`) link whose payload is a verbatim channel name —
+    /// the string shorthand `{pva:"name"}` or the `pva://name` scheme
+    /// form. Per pvxs `pva_parse_string` (pvalink_jlif.cpp:143-149) a
+    /// string pvalink IS the channel name: any `?`/`&` in it is link
+    /// DATA, not option syntax. The structured JSON longhand with
+    /// options is [`ParsedLink::PvaJson`] instead, so this variant's
+    /// `String` has exactly one meaning (a channel name) on every path.
     Pva(String),
+    /// PVA (`pvalink`) link parsed from the structured JSON longhand
+    /// `{pva:{pv:"name", field:"f", proc:"CP", …}}`. Carries the options
+    /// as structured JLink members so the pvalink consumer reconstructs
+    /// the `PvaLinkConfig` from map keys (pvalink_jlif.cpp:69-196), not
+    /// from a `?key=value` URI query that pvxs never parses. See
+    /// [`PvaJsonLink`].
+    PvaJson(PvaJsonLink),
     /// `@dev arg1 …` or `#Cn Sn` hardware link (epics-base PR #213).
     Hw(HwLink),
     /// epics-base PR `e3c9d590` / `20404003`: a `lnkCalc` JSON link
@@ -87,6 +101,30 @@ pub enum ParsedLink {
     /// — `time` is the input letter (A-L) whose timestamp the result
     /// should carry. `time` may be omitted (no timestamp passthrough).
     Calc(CalcLink),
+}
+
+/// A PVA (`pvalink`) external link parsed from the structured JSON
+/// longhand `{pva:{pv:"name", field:"f", proc:"CP", …}}`.
+///
+/// pvxs parses pvalink options only as JLink map keys / typed values
+/// (pvalink_jlif.cpp:69-196): booleans (`pipeline`/`time`/`retry`/
+/// `local`/`atomic`), integers (`Q`/`monorder`), strings (`field`/
+/// `proc`/`sevr`). There is no `?key=value` URI query parser in the
+/// JLink callback table (pvalink_jlif.cpp:286-300). Preserving the
+/// options as structured pairs here keeps that provenance: the consumer
+/// reads JLink members directly instead of re-parsing a synthetic query
+/// string (which is exactly the non-pvxs syntax this representation
+/// avoids).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PvaJsonLink {
+    /// Channel name from the `pv` member.
+    pub pv: String,
+    /// Non-`pv` JLink options in source order with original key case
+    /// (`field`, `proc`, `sevr`, `Q`, `pipeline`, `time`, `retry`,
+    /// `local`, `atomic`, `monorder`, …). Empty when the map carried
+    /// only `pv` — in that case [`parse_link_v2`] yields a plain
+    /// [`ParsedLink::Pva`] rather than this variant.
+    pub options: Vec<(String, String)>,
 }
 
 /// Configuration for a `lnkCalc` link.
@@ -199,7 +237,7 @@ impl ParsedLink {
             ParsedLink::None => LinkType::Empty,
             ParsedLink::Constant(_) => LinkType::Constant,
             ParsedLink::Db(_) => LinkType::Db,
-            ParsedLink::Ca(_) | ParsedLink::Pva(_) => LinkType::Ca,
+            ParsedLink::Ca(_) | ParsedLink::Pva(_) | ParsedLink::PvaJson(_) => LinkType::Ca,
             ParsedLink::Hw(_) | ParsedLink::Calc(_) => LinkType::Other,
         }
     }
@@ -239,25 +277,28 @@ impl ParsedLink {
     pub fn is_writable_out_link(&self) -> bool {
         matches!(
             self,
-            ParsedLink::Db(_) | ParsedLink::Ca(_) | ParsedLink::Pva(_)
+            ParsedLink::Db(_) | ParsedLink::Ca(_) | ParsedLink::Pva(_) | ParsedLink::PvaJson(_)
         )
     }
 
-    /// PV name of an external (`Ca`/`Pva`) link, else `None`. Lets a
-    /// caller read the remote name uniformly without matching the two
-    /// variants' differing payload shapes (`Ca` carries a [`CaLink`],
-    /// `Pva` a bare `String`).
+    /// PV name of an external (`Ca`/`Pva`/`PvaJson`) link, else `None`.
+    /// Lets a caller read the remote channel name uniformly without
+    /// matching the variants' differing payload shapes (`Ca` carries a
+    /// [`CaLink`], `Pva` a bare channel-name `String`, `PvaJson` a
+    /// [`PvaJsonLink`] with its `pv` member).
     pub fn external_pv_name(&self) -> Option<&str> {
         match self {
             ParsedLink::Ca(ca) => Some(&ca.pv),
             ParsedLink::Pva(name) => Some(name),
+            ParsedLink::PvaJson(j) => Some(&j.pv),
             _ => None,
         }
     }
 
     /// Maximize-severity policy carried by this link's parsed modifier.
-    /// `Db`/`Ca` links carry an explicit [`MonitorSwitch`]; `Pva` links
-    /// encode it in a stripped `?sevr=` query the lset retains, so they
+    /// `Db`/`Ca` links carry an explicit [`MonitorSwitch`]; PVA links
+    /// keep their `sevr` as link data (a `Pva` channel-name string or a
+    /// `PvaJson` `sevr` option) for the pvalink lset to apply, so they
     /// report `None` here (the lset gate stands in). Used by record
     /// processing to apply the MS/NMS/MSI/MSS gate at the fold boundary.
     pub fn monitor_switch(&self) -> Option<MonitorSwitch> {
@@ -313,11 +354,15 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
             // documents the string shorthand; pva_parse_string at :143-149
             // takes a string value at depth 0 as the channel name and a `pv`
             // string inside a map):
-            //   shorthand  { pva: "name" }             — string IS the PV name
+            //   shorthand  { pva: "name" }             — string IS the channel
+            //              name verbatim; any `?`/`&` in it is link DATA, not
+            //              option syntax (pvalink_jlif.cpp:143-149).
             //   longhand   { pva: { pv: "name", ... } } — map with a `pv`
-            //              member; for PVA the other keys are preserved as a
-            //              query string so the pvalink bridge can reconstruct
-            //              the full PvaLinkConfig (pvalink_jlif.cpp:69-196).
+            //              member; the other keys are STRUCTURED JLink options
+            //              (pvalink_jlif.cpp:69-196), preserved as such so the
+            //              pvalink bridge reconstructs PvaLinkConfig from map
+            //              keys rather than from a synthetic `?key=value` query
+            //              (which pvxs has no parser for — :286-300).
             // For CA only the PV name matters (CA links bypass pvalink).
             //
             // Branch on the value's JSON shape so the recognized string
@@ -325,25 +370,38 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
             // through to legacy DB parsing (which would treat the raw JSON
             // text as a record name).
             let value = rest.trim_end_matches(',').trim();
-            let (pv, query) = if value.starts_with('{') {
-                extract_pv_and_opts_from_subobject(rest)?
+            let is_subobject = value.starts_with('{');
+            if key == "ca" {
+                // JSON CA links carry no plain-text MS modifier and ignore
+                // pvalink options; take only the PV name. Alarm policy
+                // defaults to NoMaximize.
+                let pv = if is_subobject {
+                    extract_pv_and_opts_from_subobject(value)?.0
+                } else {
+                    let name = value.trim_matches('"').trim_matches('\'').trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    name.to_string()
+                };
+                Some(ParsedLink::Ca(CaLink::new(pv)))
+            } else if is_subobject {
+                // PVA longhand: keep the options as structured JLink members.
+                let (pv, options) = extract_pv_and_opts_from_subobject(value)?;
+                if options.is_empty() {
+                    Some(ParsedLink::Pva(pv))
+                } else {
+                    Some(ParsedLink::PvaJson(PvaJsonLink { pv, options }))
+                }
             } else {
-                // String shorthand: the value itself is the PV name. Strip the
-                // surrounding quotes; an empty name is not a usable link.
+                // PVA string shorthand: the value is the verbatim channel
+                // name. Do NOT split `?` — it is link data (pvxs treats a
+                // string pvalink as the channel name in full).
                 let name = value.trim_matches('"').trim_matches('\'').trim();
                 if name.is_empty() {
                     return None;
                 }
-                (name.to_string(), String::new())
-            };
-            if key == "ca" {
-                // JSON CA links carry no plain-text MS modifier; the
-                // alarm policy defaults to NoMaximize.
-                Some(ParsedLink::Ca(CaLink::new(pv)))
-            } else if query.is_empty() {
-                Some(ParsedLink::Pva(pv))
-            } else {
-                Some(ParsedLink::Pva(format!("{pv}?{query}")))
+                Some(ParsedLink::Pva(name.to_string()))
             }
         }
         "calc" => {
@@ -395,18 +453,21 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
 }
 
 /// Extract the `pv` name and all other key-value options from a
-/// JSON-ish sub-object body. Returns `(pv_name, query_string)` where
-/// `query_string` encodes every non-pv key as `k=v&…` (empty when
-/// there are no extra options). Accepts unquoted keys, single or
-/// double quotes around values.
+/// JSON-ish sub-object body. Returns `(pv_name, options)` where
+/// `options` is every non-`pv` key as a structured `(key, value)` pair
+/// in source order (empty when there are no extra options). Accepts
+/// unquoted keys, single or double quotes around values.
 ///
-/// pvxs parity: pvalink_jlif.cpp:24-41 (supported keys),
-/// :69-196 (per-key parsing). Key case is preserved so
-/// `PvaLinkConfig::parse` can parse `Q` (uppercase).
-fn extract_pv_and_opts_from_subobject(body: &str) -> Option<(String, String)> {
+/// The options are kept STRUCTURED — not flattened into a `?k=v&…`
+/// query string — so the pvalink consumer reconstructs `PvaLinkConfig`
+/// from JLink map members (pvalink_jlif.cpp:69-196), matching pvxs,
+/// which has no URI-query parser in its JLink callback table
+/// (pvalink_jlif.cpp:286-300). Key case is preserved so a case-sensitive
+/// key like `Q` survives.
+fn extract_pv_and_opts_from_subobject(body: &str) -> Option<(String, Vec<(String, String)>)> {
     let body = body.trim_start_matches('{').trim_end_matches('}').trim();
     let mut pv: Option<String> = None;
-    let mut opts: Vec<String> = Vec::new();
+    let mut opts: Vec<(String, String)> = Vec::new();
     for entry in body.split(',') {
         let entry = entry.trim();
         if entry.is_empty() {
@@ -433,10 +494,10 @@ fn extract_pv_and_opts_from_subobject(body: &str) -> Option<(String, String)> {
         } else {
             // Preserve original key case for PvaLinkConfig::parse
             // (which is case-sensitive for keys like `Q`).
-            opts.push(format!("{k_raw}={v_raw}"));
+            opts.push((k_raw.to_string(), v_raw.to_string()));
         }
     }
-    Some((pv?, opts.join("&")))
+    Some((pv?, opts))
 }
 
 /// Recognize a hardware (`@dev …` / `#Cn Sn`) link. Mirrors epics-base
@@ -781,12 +842,16 @@ mod json_link_tests {
     }
 
     #[test]
-    fn json_pva_link_longhand_still_preserves_options() {
-        // The longhand map form must keep working unchanged: a `pv` member
-        // plus options preserved as a query string.
+    fn json_pva_link_longhand_preserves_options_structurally() {
+        // The longhand map form keeps a `pv` member plus its options as
+        // STRUCTURED JLink pairs (not a `?Q=4` query) so the consumer
+        // reconstructs PvaLinkConfig from map keys, matching pvxs.
         assert_eq!(
             parse_link_v2(r#"{pva: { pv: "FOO:bar", Q: "4" }}"#),
-            ParsedLink::Pva("FOO:bar?Q=4".to_string())
+            ParsedLink::PvaJson(PvaJsonLink {
+                pv: "FOO:bar".to_string(),
+                options: vec![("Q".to_string(), "4".to_string())],
+            })
         );
     }
 
@@ -986,29 +1051,68 @@ mod json_link_tests {
         assert_eq!(link_field_type("REC.VAL PP"), LinkType::Db);
     }
 
-    /// JSON pvalink options survive parse_link_v2.
-    /// Upstream parity: pvxs pvalink_jlif.cpp:24-41, :69-196.
+    /// JSON pvalink options survive parse_link_v2 as STRUCTURED JLink
+    /// members (pv + ordered (key,value) pairs), not as a `?key=value`
+    /// URI query — pvxs has no query parser (pvalink_jlif.cpp:286-300);
+    /// options are JLink map keys (:69-196).
     #[test]
     fn br_r10_json_pva_options_preserved_in_parsed_link() {
-        // All options present: field, proc (CPP), sevr (MS), Q, pipeline.
+        // All options present: field, proc (CPP), sevr (MS), Q.
         let link = parse_link_v2(
             r#"{pva: {pv: "TARGET:AI", field: "display.precision", proc: "CPP", sevr: "MS", Q: 8}}"#,
         );
-        let stored = match link {
-            ParsedLink::Pva(ref s) => s.as_str(),
-            other => panic!("expected Pva, got {other:?}"),
+        let j = match link {
+            ParsedLink::PvaJson(j) => j,
+            other => panic!("expected PvaJson, got {other:?}"),
         };
+        assert_eq!(j.pv, "TARGET:AI", "pv must be the bare channel name");
+        // No re-encoded query syntax anywhere in the channel name.
         assert!(
-            stored.starts_with("TARGET:AI?"),
-            "options must be encoded as query: {stored}"
+            !j.pv.contains('?'),
+            "pv must not carry a `?` query: {}",
+            j.pv
         );
-        assert!(
-            stored.contains("field=display.precision"),
-            "field option lost: {stored}"
+        // Options preserved in source order with original key case.
+        assert_eq!(
+            j.options,
+            vec![
+                ("field".to_string(), "display.precision".to_string()),
+                ("proc".to_string(), "CPP".to_string()),
+                ("sevr".to_string(), "MS".to_string()),
+                ("Q".to_string(), "8".to_string()),
+            ]
         );
-        assert!(stored.contains("proc=CPP"), "proc option lost: {stored}");
-        assert!(stored.contains("sevr=MS"), "sevr option lost: {stored}");
-        assert!(stored.contains("Q=8"), "Q option lost: {stored}");
+    }
+
+    /// A PVA string shorthand keeps the channel name verbatim — a `?` in
+    /// it is link DATA, not option syntax (pvxs pva_parse_string,
+    /// pvalink_jlif.cpp:143-149). It must NOT become a PvaJson with
+    /// parsed options.
+    #[test]
+    fn json_pva_string_shorthand_keeps_query_chars_verbatim() {
+        assert_eq!(
+            parse_link_v2(r#"{pva: "TARGET:AI?field=x"}"#),
+            ParsedLink::Pva("TARGET:AI?field=x".to_string())
+        );
+    }
+
+    /// The `pva://` scheme form is likewise a verbatim channel name; a
+    /// `?` is not split out as options.
+    #[test]
+    fn pva_scheme_keeps_query_chars_verbatim() {
+        assert_eq!(
+            parse_link_v2("pva://TARGET:AI?field=x"),
+            ParsedLink::Pva("TARGET:AI?field=x".to_string())
+        );
+    }
+
+    /// `external_pv_name` reads the channel name from a PvaJson link.
+    #[test]
+    fn pva_json_external_pv_name() {
+        let link = parse_link_v2(r#"{pva: {pv: "TARGET:AI", proc: "CP"}}"#);
+        assert_eq!(link.external_pv_name(), Some("TARGET:AI"));
+        assert_eq!(link.link_type(), LinkType::Ca);
+        assert!(link.is_writable_out_link());
     }
 
     /// Bare pvalink JSON with no extra options is unchanged.

@@ -419,9 +419,13 @@ fn build_alarm(snap: &Snapshot) -> PvField {
         "severity".into(),
         PvField::Scalar(ScalarValue::Int(snap.alarm.severity as i32)),
     ));
+    // pvxs `iocsource.cpp:187-223`: PVA `alarm.status` carries the alarm
+    // *class* (NONE/DEVICE/DRIVER/RECORD/DB/UNDEFINED, 0–6), not the raw
+    // EPICS condition code. Map before emitting so native clients never
+    // see e.g. `LINK_ALARM = 14` in a field whose NT contract is 0–6.
     a.fields.push((
         "status".into(),
-        PvField::Scalar(ScalarValue::Int(snap.alarm.status as i32)),
+        PvField::Scalar(ScalarValue::Int(alarm_status_class(snap.alarm.status))),
     ));
     // pvxs `iocsource.cpp:226,236`: `alarm.message` is the alarm
     // condition string for a non-zero status, "" when NO_ALARM. The
@@ -439,6 +443,35 @@ fn build_alarm(snap: &Snapshot) -> PvField {
         PvField::Scalar(ScalarValue::String(message)),
     ));
     PvField::Structure(a)
+}
+
+/// Map a raw EPICS `epicsAlarmCondition` (0–21, `alarm.h`) to the PVA
+/// `alarm_t.status` **status class** (NONE/DEVICE/DRIVER/RECORD/DB,
+/// otherwise UNDEFINED). PVA NT alarm status is a class field in the
+/// 0–6 range, not the raw DB condition code — mirrors pvxs
+/// `ioc/iocsource.cpp:187-223`. The same mapping exists in the QSRV
+/// bridge path (`epics_bridge_rs::qsrv::pvif::alarm_status_class`); the
+/// two are kept in lock-step until a shared home for the condition→class
+/// table lands in `epics_base_rs::server::recgbl` alongside
+/// [`alarm_condition_string`].
+fn alarm_status_class(condition: u16) -> i32 {
+    use alarm_status as a;
+    match condition {
+        a::NO_ALARM => 0, // NONE
+        a::READ_ALARM
+        | a::WRITE_ALARM
+        | a::HIHI_ALARM
+        | a::HIGH_ALARM
+        | a::LOLO_ALARM
+        | a::LOW_ALARM
+        | a::STATE_ALARM
+        | a::COS_ALARM
+        | a::HW_LIMIT_ALARM => 1, // DEVICE
+        a::COMM_ALARM | a::TIMEOUT_ALARM | a::UDF_ALARM => 2, // DRIVER
+        a::CALC_ALARM | a::SCAN_ALARM | a::LINK_ALARM | a::SOFT_ALARM | a::BAD_SUB_ALARM => 3, // RECORD
+        a::DISABLE_ALARM | a::SIMM_ALARM | a::READ_ACCESS_ALARM | a::WRITE_ACCESS_ALARM => 4,  // DB
+        _ => 6, // UNDEFINED
+    }
 }
 
 fn build_timestamp(snap: &Snapshot) -> PvField {
@@ -1220,6 +1253,35 @@ mod tests {
             scalar(&a, "message"),
             ScalarValue::String(s) if s.is_empty()
         ));
+    }
+
+    #[test]
+    fn build_alarm_status_is_pva_class_not_raw_condition() {
+        // pvxs `iocsource.cpp:187-223`: emit the alarm *class* (0–6), not
+        // the raw EPICS condition. A `LINK_ALARM = 14` must surface as
+        // class 3 (RECORD), never 14.
+        let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
+        snap.alarm.status = alarm_status::LINK_ALARM;
+        let PvField::Structure(a) = build_alarm(&snap) else {
+            panic!("alarm must be a structure");
+        };
+        assert!(
+            matches!(scalar(&a, "status"), ScalarValue::Int(3)),
+            "LINK_ALARM (14) must map to status class 3 (RECORD)"
+        );
+
+        // Whole condition→class table, one representative per class.
+        assert_eq!(alarm_status_class(alarm_status::NO_ALARM), 0); // NONE
+        assert_eq!(alarm_status_class(alarm_status::HIGH_ALARM), 1); // DEVICE
+        assert_eq!(alarm_status_class(alarm_status::HW_LIMIT_ALARM), 1); // DEVICE
+        assert_eq!(alarm_status_class(alarm_status::COMM_ALARM), 2); // DRIVER
+        assert_eq!(alarm_status_class(alarm_status::UDF_ALARM), 2); // DRIVER
+        assert_eq!(alarm_status_class(alarm_status::CALC_ALARM), 3); // RECORD
+        assert_eq!(alarm_status_class(alarm_status::SCAN_ALARM), 3); // RECORD
+        assert_eq!(alarm_status_class(alarm_status::DISABLE_ALARM), 4); // DB
+        assert_eq!(alarm_status_class(alarm_status::WRITE_ACCESS_ALARM), 4); // DB
+        // Out-of-range / unmapped → UNDEFINED.
+        assert_eq!(alarm_status_class(99), 6);
     }
 
     #[test]

@@ -37,8 +37,7 @@ use crate::pvdata::{
 
 use super::channel::Channel;
 use super::decode::{
-    Frame, GetFieldResponse, OpResponse, decode_get_field_response, decode_op_response,
-    decode_op_response_cached,
+    Frame, GetFieldResponse, OpResponse, decode_get_field_response, decode_op_response_cached,
 };
 use super::server_conn::ServerConn;
 
@@ -52,16 +51,29 @@ use super::server_conn::ServerConn;
 /// (it is data, not a fault) and is surfaced per-op by the caller. Closing
 /// here matters because a circuit left alive after a bad frame would carry a
 /// corrupted peer / type-cache state into later ops on the same connection.
+///
+/// The decode is threaded through the connection-scoped `TypeCache`
+/// (`server.type_cache()`) so a data-phase `any` / `variant` value whose
+/// inner descriptor is a `0xFE <slot>` back-reference resolves against the
+/// slot a *prior* frame defined with `0xFD`. pvxs decodes both INIT
+/// descriptors and DATA values through the same connection `rxRegistry`
+/// (`clientget.cpp:410-451`, `clientmon.cpp:485-552`); decoding DATA with a
+/// fresh empty cache here would report a spurious slot miss the moment a
+/// peer starts using the descriptor cache.
 fn decode_op_or_reset(
     server: &ServerConn,
     frame: &Frame,
     introspection: Option<&FieldDesc>,
 ) -> PvaResult<OpResponse> {
-    decode_op_response(frame, introspection).inspect_err(|_| server.close())
+    let cache = server.type_cache();
+    decode_op_response_cached(frame, introspection, &mut cache.lock())
+        .inspect_err(|_| server.close())
 }
 
-/// `TypeCache`-threaded variant of [`decode_op_or_reset`] for INIT frames
-/// (0xFD/0xFE marker resolution). Same connection-fatal contract.
+/// Like [`decode_op_or_reset`] but takes the connection `TypeCache` by
+/// reference, for INIT callers that already hold it locked-and-reused
+/// across the INIT/DATA legs of the same op. Same connection-fatal
+/// contract and same cache semantics.
 fn decode_op_cached_or_reset(
     server: &ServerConn,
     frame: &Frame,
@@ -2536,7 +2548,14 @@ where
                 }
             },
         };
-        match decode_op_response(&frame, Some(&intro)) {
+        // Decode DATA through the connection `TypeCache` (same cache the
+        // MONITOR INIT used above) so `0xFE <slot>` back-references inside
+        // `any`/`variant` values resolve, mirroring pvxs `clientmon.cpp:
+        // 485-552` which reuses one `rxRegistry` for the INIT type and
+        // every DATA value. The lock is scoped to the decode so the
+        // non-`Send` parking_lot guard is dropped before the awaits below.
+        let decoded = decode_op_response_cached(&frame, Some(&intro), &mut cache.lock());
+        match decoded {
             Ok(OpResponse::Data(d)) => {
                 // a non-empty overrun bitset means the server
                 // coalesced updates because we fell behind. Capture it

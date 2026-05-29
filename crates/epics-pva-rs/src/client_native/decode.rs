@@ -347,14 +347,21 @@ pub enum OpResponse {
     Status(OpStatusResponse),
 }
 
-/// Decode any GET/PUT/MONITOR response. The caller passes the introspection
-/// from a prior INIT response so we can decode data payloads; for INIT
-/// responses themselves, pass `None`.
+/// Decode any GET/PUT/MONITOR response against a **fresh empty**
+/// `TypeCache`. The caller passes the introspection from a prior INIT
+/// response so we can decode data payloads; for INIT responses
+/// themselves, pass `None`.
 ///
-/// `type_cache` is a per-connection [`TypeCache`](crate::pvdata::encode::TypeCache) used to resolve
-/// 0xFD (define) / 0xFE (lookup) markers in INIT responses. Pass an
-/// empty cache initially; the same cache must be reused across all
-/// frames on a single connection for cache references to resolve.
+/// This wrapper cannot resolve `0xFD`/`0xFE` type-cache markers that
+/// reference a slot defined by an *earlier* frame on the connection,
+/// because each call starts from an empty cache. Production op paths
+/// MUST therefore use [`decode_op_response_cached`] with the
+/// connection-scoped cache (`ServerConn::type_cache()`); pvxs decodes
+/// INIT descriptors and DATA values through one shared connection
+/// `rxRegistry` (`clientget.cpp:410-451`). This empty-cache form exists
+/// only for fuzz/test harnesses that intentionally start from a clean
+/// connection and for self-contained frames known to carry no nested
+/// cache references.
 pub fn decode_op_response(
     frame: &Frame,
     introspection: Option<&FieldDesc>,
@@ -960,6 +967,77 @@ mod tests {
                 other => panic!("{label}: expected init, got {other:?}"),
             }
         }
+    }
+
+    /// A data-phase value carrying an `any`/`variant` `0xFE <slot>`
+    /// back-reference must resolve against the connection-scoped
+    /// `TypeCache` that an earlier frame populated — exactly what pvxs does
+    /// by decoding every DATA value through the same connection
+    /// `rxRegistry` (`clientget.cpp:445-451`, `dataencode.cpp:542-557`).
+    /// `decode_op_response_cached` must thread that cache into the value
+    /// body, not just the top-level INIT descriptor; the empty-cache
+    /// `decode_op_response` wrapper cannot and reports a spurious slot miss
+    /// (the defect this closes).
+    #[test]
+    fn op_data_variant_value_resolves_via_connection_type_cache() {
+        use crate::proto::WriteExt;
+        use crate::pvdata::{PvField, ScalarType, ScalarValue};
+
+        let order = ByteOrder::Little;
+        // GET introspection: a structure with one `any` (Variant) leaf.
+        let intro = FieldDesc::Structure {
+            struct_id: "x".into(),
+            fields: vec![("v".into(), FieldDesc::Variant)],
+        };
+
+        // GET DATA frame: ioid + subcmd(0x00) + changed bitset (bit 0 marks
+        // the whole structure present) + value. The Variant value body is
+        // `0xFE <slot=5> <Int 42 LE>` — a back-reference to a slot a *prior*
+        // frame on the connection defined with `0xFD`.
+        let build = || -> Frame {
+            let mut payload = Vec::new();
+            payload.put_u32(9, order); // ioid
+            payload.put_u8(0x00); // subcmd = DATA
+            // GET data begins with a Status, then the changed bitset, then
+            // the value (decode.rs GET/PUT branch).
+            Status::ok().write_into(order, &mut payload);
+            let mut changed = BitSet::new();
+            changed.set(0);
+            payload.extend_from_slice(&changed.encode(order));
+            payload.extend_from_slice(&[0xFE, 0x05, 0x00, 0x2A, 0x00, 0x00, 0x00]);
+            let header =
+                PvaHeader::application(true, order, Command::Get.code(), payload.len() as u32);
+            Frame { header, payload }
+        };
+
+        // Connection cache already holds slot 5 = Int (an earlier 0xFD
+        // define on this connection).
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        cache.insert(5, FieldDesc::Scalar(ScalarType::Int));
+        match decode_op_response_cached(&build(), Some(&intro), &mut cache).unwrap() {
+            OpResponse::Data(d) => match d.value {
+                PvField::Structure(s) => {
+                    assert_eq!(s.fields.len(), 1);
+                    match &s.fields[0].1 {
+                        PvField::Variant(vv) => {
+                            assert_eq!(vv.desc, Some(FieldDesc::Scalar(ScalarType::Int)));
+                            assert!(matches!(vv.value, PvField::Scalar(ScalarValue::Int(42))));
+                        }
+                        other => panic!("expected Variant leaf, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Structure value, got {other:?}"),
+            },
+            other => panic!("expected Data, got {other:?}"),
+        }
+
+        // A fresh empty cache (what the production empty-wrapper path used
+        // before this fix) cannot resolve slot 5 → decode error.
+        let mut empty = crate::pvdata::encode::TypeCache::new();
+        assert!(
+            decode_op_response_cached(&build(), Some(&intro), &mut empty).is_err(),
+            "0xFE slot-5 reference must miss without the connection cache that defined it"
+        );
     }
 
     /// a MONITOR DATA frame ends with an overrun bitset; the

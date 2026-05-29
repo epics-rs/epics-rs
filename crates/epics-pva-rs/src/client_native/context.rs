@@ -841,9 +841,12 @@ impl PvaClient {
     }
 
     /// Replace the server-GUID blocklist used by the search engine.
-    /// Beacons and search responses from any listed GUID are silently
-    /// dropped. Mirrors pvxs `Context::ignoreServerGUIDs`
-    /// (client.cpp:453). Pass an empty `Vec` to clear the list.
+    /// SEARCH_RESPONSE frames (including discovery pongs) from a listed
+    /// GUID are silently dropped; BEACONs from that server are still
+    /// reported through `discover()` and still drive reconnect pokes.
+    /// Mirrors pvxs `Context::ignoreServerGUIDs` — "Ignore any search
+    /// replies with these GUIDs" (client.h:593-595, client.cpp:880).
+    /// Pass an empty `Vec` to clear the list.
     pub async fn ignore_server_guids(&self, guids: Vec<[u8; 12]>) {
         if let Ok(engine) = self.search_engine().await {
             engine.ignore_server_guids(guids).await;
@@ -1431,10 +1434,17 @@ impl PvaClient {
     /// Snapshot of the client's current state — channel cache size,
     /// connection-pool peers, name-server count, and per-connection /
     /// per-channel byte counters. Mirrors pvxs `Context::report`
-    /// (client.h:599 / client.cpp:464-501): each [`ConnReport`] carries its
-    /// [`ConnReport::channels`] list with per-channel RX/TX counters.
+    /// (client.h:597-599 / client.cpp:464-501): each [`ConnReport`] carries
+    /// its [`ConnReport::channels`] list with per-channel RX/TX counters.
+    ///
+    /// Like pvxs `Report report(bool zero=true)`, the no-argument form
+    /// **zeros** the byte counters after snapshotting, so periodic
+    /// `report()` calls yield per-interval deltas rather than ever-growing
+    /// cumulative totals (client.cpp:464-500 resets `statTx`/`statRx` when
+    /// `zero`). Use [`Self::report_zeroed`]`(false)` for a non-resetting
+    /// cumulative snapshot.
     pub fn report(&self) -> ClientReport {
-        self.report_zeroed(false)
+        self.report_zeroed(true)
     }
 
     /// like [`Self::report`] but, when `zero` is true, resets
@@ -1719,15 +1729,28 @@ impl PvaClient {
             }
             let frame_res = tokio::time::timeout(op_timeout, rx).await;
             let value = match frame_res {
-                Ok(Ok(frame)) => match super::decode::decode_op_response(&frame, Some(&intro)) {
-                    Ok(OpResponse::Data(d)) if d.status.is_success() => Ok(d.value),
-                    Ok(OpResponse::Data(d)) => {
-                        Err(PvaError::Protocol(format!("warm GET data: {:?}", d.status)))
-                    }
-                    Ok(other) => Err(PvaError::Protocol(format!(
-                        "expected GET data, got {other:?}"
-                    ))),
-                    Err(e) => Err(e),
+                // Decode through the same connection-scoped `TypeCache` the
+                // warm op's circuit owns, so a GET DATA value carrying an
+                // `any`/`variant` `0xFE <slot>` back-reference resolves
+                // against the slot a prior frame defined (pvxs reuses one
+                // `rxRegistry` for every value, `clientget.cpp:445-451`).
+                // If the circuit is already gone the warm op cannot complete.
+                Ok(Ok(frame)) => match warm.server.upgrade() {
+                    Some(srv) => match super::decode::decode_op_response_cached(
+                        &frame,
+                        Some(&intro),
+                        &mut srv.type_cache().lock(),
+                    ) {
+                        Ok(OpResponse::Data(d)) if d.status.is_success() => Ok(d.value),
+                        Ok(OpResponse::Data(d)) => {
+                            Err(PvaError::Protocol(format!("warm GET data: {:?}", d.status)))
+                        }
+                        Ok(other) => Err(PvaError::Protocol(format!(
+                            "expected GET data, got {other:?}"
+                        ))),
+                        Err(e) => Err(e),
+                    },
+                    None => Err(PvaError::Protocol("warm GET server gone".into())),
                 },
                 Ok(Err(_)) => Err(PvaError::Protocol("warm GET channel closed".into())),
                 Err(_) => Err(PvaError::Timeout),
@@ -1810,8 +1833,8 @@ pub struct ClientReport {
 pub struct ConnReport {
     /// Server endpoint this connection talks to.
     pub peer: std::net::SocketAddr,
-    /// Bytes read off this connection's socket (since the last
-    /// `report_zeroed(true)`).
+    /// Bytes read off this connection's socket (since the last zeroing
+    /// report — `report()` or `report_zeroed(true)`).
     pub bytes_rx: u64,
     /// Bytes written to this connection's socket.
     pub bytes_tx: u64,
@@ -1833,7 +1856,7 @@ pub struct ChanReport {
     /// Server-assigned channel id (SID).
     pub sid: u32,
     /// Bytes received for this channel's operations (since the last
-    /// `report_zeroed(true)`).
+    /// zeroing report — `report()` or `report_zeroed(true)`).
     pub bytes_rx: u64,
     /// Bytes transmitted for this channel's operations.
     pub bytes_tx: u64,

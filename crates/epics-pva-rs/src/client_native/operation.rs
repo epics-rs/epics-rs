@@ -6,8 +6,10 @@
 //!
 //! - You want to start an operation now and `.wait(timeout)` for it
 //!   later from a different task.
-//! - You want a single thread-safe `cancel()` that unblocks the waiter
-//!   from elsewhere (pvxs `Operation::cancel`).
+//! - You want a `cancel()` that mirrors pvxs `Operation::cancel`: it
+//!   reports whether the operation was still active and acts as a
+//!   synchronization point, blocking until the spawned task has fully
+//!   torn down before it returns (pvxs `client.h:127-130`).
 //! - You want a thread-safe `interrupt()` that wakes a `wait()`
 //!   without cancelling the underlying operation, mirroring pvxs
 //!   `Operation::interrupt`.
@@ -18,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::{PvaError, PvaResult};
@@ -60,22 +62,40 @@ pub struct PvaOperation<T: Send + 'static> {
     /// One-shot cancellation flag. When set, `wait*` short-circuits
     /// returning the abort error and the spawned task is aborted.
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// Receiver whose paired `watch::Sender` lives **inside** the spawned
+    /// task. The sender is the operation's RAII termination guard: when
+    /// the task's future stops running for any reason (normal completion,
+    /// `abort()`, or panic-unwind) the sender drops and this receiver
+    /// observes the channel as closed. It is the single source of truth
+    /// for "the operation is no longer running"; [`Self::cancel`] awaits
+    /// closure to provide pvxs's "blocks until the in-progress callback
+    /// has completed" guarantee. `watch` is lost-wakeup-safe: a closure
+    /// that races registration is reported by the next `changed()`/
+    /// `has_changed()` rather than missed.
+    terminated_rx: watch::Receiver<()>,
 }
 
 impl<T: Send + 'static> PvaOperation<T> {
-    /// Spawn `fut` and return a handle. The future runs to completion
-    /// regardless of handle drops unless [`Self::cancel`] is called
-    /// explicitly. (Drop only loses the handle's view of the result;
-    /// the spawned task continues. To make drop also cancel, call
-    /// `cancel()` first.)
+    /// Spawn `fut` and return a handle. Dropping the handle aborts the
+    /// spawned task — pvxs RAII `~Operation` performs the same implied
+    /// cancel (client.cpp:314-320). [`Self::cancel`] is the explicit,
+    /// awaitable form that also reports whether the operation was still
+    /// active and blocks until the task has terminated.
     pub fn spawn<F>(fut: F) -> Self
     where
         F: std::future::Future<Output = PvaResult<T>> + Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
+        // The sender moves into the task and is its RAII termination guard:
+        // it drops exactly when the future stops running (completion,
+        // abort, or panic-unwind), closing the channel.
+        let (term_tx, terminated_rx) = watch::channel(());
         let join = tokio::spawn(async move {
+            let _term_tx = term_tx;
             let v = fut.await;
             let _ = tx.send(v);
+            // `_term_tx` drops here (or on abort/unwind), closing the
+            // watch channel and unblocking any `cancel()` waiter.
         });
         Self {
             join,
@@ -83,6 +103,7 @@ impl<T: Send + 'static> PvaOperation<T> {
             done: false,
             interrupt: Arc::new(Notify::new()),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            terminated_rx,
         }
     }
 
@@ -141,13 +162,34 @@ impl<T: Send + 'static> PvaOperation<T> {
         }
     }
 
-    /// Cancel the operation. Safe to call from any task; idempotent.
-    /// Mirrors pvxs `Operation::cancel`. Aborts the spawned task and
-    /// causes any pending [`Self::wait`] to return `PvaError::Protocol("Operation cancelled")`.
-    pub fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::Release);
+    /// Cancel the operation. Idempotent. Mirrors pvxs `Operation::cancel`
+    /// (client.h:127-130, clientget.cpp:173-203):
+    ///
+    /// - Returns whether the operation was **still active** — `true` iff
+    ///   it had neither already completed nor already been cancelled.
+    /// - Acts as a **synchronization point**: it `.await`s until the
+    ///   spawned task has fully torn down, so once it returns no callback
+    ///   captured by the operation future can still be running. A later
+    ///   [`Self::wait`] then reports `PvaError::Protocol("Operation
+    ///   cancelled")` via the cancellation flag.
+    pub async fn cancel(&self) -> bool {
+        // `swap` makes the "was active" decision exactly once across
+        // repeated cancels: only the first cancel that finds the flag
+        // clear AND the task still running (channel still open) reports
+        // active. `has_changed()` returns `Err` once the task's sender has
+        // dropped — i.e. the operation already terminated.
+        let already_cancelled = self
+            .cancelled
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        let was_active = !already_cancelled && self.terminated_rx.has_changed().is_ok();
         self.join.abort();
+        // Synchronization point: wait until the task's `watch::Sender` has
+        // dropped (channel closed), so cancel() returning means the
+        // operation future is provably no longer running. We never send a
+        // value, so `changed()` resolves only with `Err` on close.
+        let mut rx = self.terminated_rx.clone();
+        while rx.changed().await.is_ok() {}
+        was_active
     }
 
     /// Wake a pending [`Self::wait`] without cancelling the operation
@@ -260,9 +302,90 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(60)).await;
             Ok(0)
         });
-        op.cancel();
+        // Cancelling an in-flight op reports it was active and, as a
+        // synchronization point, returns only after the task has stopped.
+        let was_active = op.cancel().await;
+        assert!(
+            was_active,
+            "cancel of a running op must report it was active"
+        );
+        assert!(
+            op.is_done(),
+            "cancel() must not return until the spawned task has terminated"
+        );
         let r = op.wait(Some(Duration::from_secs(1))).await;
         assert!(matches!(r, Err(PvaError::Protocol(_))));
+    }
+
+    /// pvxs `Operation::cancel()` returns `false` once the operation has
+    /// already completed (clientget.cpp:173-184 reports the prior active
+    /// state). A second cancel is also `false` (idempotent).
+    #[tokio::test]
+    async fn cancel_after_completion_reports_not_active() {
+        let mut op = PvaOperation::spawn(async { Ok::<i32, _>(11) });
+        assert_eq!(op.wait(Some(Duration::from_secs(1))).await.unwrap(), 11);
+        // Already completed → not active.
+        assert!(
+            !op.cancel().await,
+            "cancel after a completed op must report not-active"
+        );
+        // Idempotent: a second cancel is also not-active.
+        assert!(!op.cancel().await, "repeated cancel must be idempotent");
+    }
+
+    /// cancel() is a synchronization point: a resource held by the
+    /// operation future must be observably released by the time cancel()
+    /// returns (pvxs "blocks until any in-progress callback has finished").
+    #[tokio::test]
+    async fn cancel_is_a_sync_point_resource_released() {
+        use std::sync::Arc as StdArc;
+        let held = StdArc::new(());
+        let inner = held.clone();
+        let op = PvaOperation::<()>::spawn(async move {
+            // Keep the Arc alive until the task is dropped/aborted.
+            let _inner = inner;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        });
+        assert_eq!(StdArc::strong_count(&held), 2, "task holds the resource");
+        let was_active = op.cancel().await;
+        assert!(was_active);
+        // After cancel() returns, the task future (and its captured Arc)
+        // is gone — strong count is back to 1.
+        assert_eq!(
+            StdArc::strong_count(&held),
+            1,
+            "cancel() must block until the operation future has been dropped"
+        );
+    }
+
+    /// Dropping an in-flight handle aborts the spawned task (pvxs RAII
+    /// `~Operation`). The captured resource is released after the task is
+    /// scheduled off — assert the abort actually happens.
+    #[tokio::test]
+    async fn drop_aborts_in_flight_op() {
+        use std::sync::Arc as StdArc;
+        let held = StdArc::new(());
+        let inner = held.clone();
+        let op = PvaOperation::<()>::spawn(async move {
+            let _inner = inner;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        });
+        assert_eq!(StdArc::strong_count(&held), 2);
+        drop(op);
+        // Give the runtime a moment to process the abort + drop the future.
+        for _ in 0..100 {
+            if StdArc::strong_count(&held) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            StdArc::strong_count(&held),
+            1,
+            "dropping the handle must abort the task and release its resources"
+        );
     }
 
     /// Regression: a `wait` that times out while the op is

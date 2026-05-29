@@ -540,3 +540,57 @@ async fn common_field_descriptor_matches_value_type() {
         );
     }
 }
+
+/// BR-60 parity: a non-VAL enum/menu field (`REC.SCAN`) must be served
+/// as NTEnum (value.index + value.choices), not forced into NTScalar.
+/// pvxs builds the single-record prototype from
+/// `dbChannelFinalFieldType(chan)`, so DBF_ENUM/MENU/DEVICE fields select
+/// nt::NTEnum regardless of the field name (singlesource.cpp:189-205,
+/// dbAccess.c:88-90). A non-VAL scalar field stays NTScalar (no
+/// over-promotion).
+#[tokio::test]
+async fn non_val_enum_field_is_ntenum() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:ai", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+
+    // `.SCAN` is a DBF_MENU/ENUM common field → NTEnum.
+    let scan = BridgeChannel::new(db.clone(), "TEST:ai.SCAN")
+        .await
+        .expect("new");
+    assert_eq!(scan.nt_type(), NtType::Enum, ".SCAN must be NTEnum");
+
+    // GET yields an `enum_t` value with an int32 index and the SCAN menu
+    // choices — the path that the prior NTScalar classification dropped.
+    let result = scan.get(&empty_request()).await.expect("get");
+    match extract_value(&result).expect("NTEnum value") {
+        PvField::Structure(s) => {
+            let has_index = s
+                .fields
+                .iter()
+                .any(|(n, f)| n == "index" && matches!(f, PvField::Scalar(ScalarValue::Int(_))));
+            let choices_len = s
+                .fields
+                .iter()
+                .find(|(n, _)| n == "choices")
+                .and_then(|(_, f)| match f {
+                    PvField::ScalarArray(a) => Some(a.len()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            assert!(has_index, ".SCAN value.index must be an int32");
+            assert!(
+                choices_len > 0,
+                ".SCAN value.choices must enumerate the SCAN menu"
+            );
+        }
+        other => panic!("expected enum_t value structure, got {other:?}"),
+    }
+
+    // A non-VAL scalar common field is NOT promoted — it stays NTScalar.
+    let desc = BridgeChannel::new(db.clone(), "TEST:ai.DESC")
+        .await
+        .expect("new");
+    assert_eq!(desc.nt_type(), NtType::Scalar, ".DESC must stay NTScalar");
+}

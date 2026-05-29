@@ -1486,16 +1486,13 @@ mod tests {
     /// `get_value("server")` — the direct-connect GET path — still
     /// returns the server-info structure.
     #[tokio::test]
-    async fn server_pv_not_answered_to_udp_search_but_direct_get_works() {
-        use crate::server_native::peers::PeerRegistry;
+    async fn server_pv_not_answered_to_udp_search_but_direct_connect_works() {
         use crate::server_native::server_info::{SERVER_PV_NAME, ServerInfoSource};
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
         use std::time::Duration;
 
-        let peers = PeerRegistry::new();
-        let server_src =
-            ServerInfoSource::new([0xCD; 12], peers, || async { Vec::<String>::new() });
+        let server_src = ServerInfoSource::new(|| async { Vec::<String>::new() });
 
         // Direct-connect path still resolves `server`.
         assert!(
@@ -1506,9 +1503,11 @@ mod tests {
             !server_src.searchable(SERVER_PV_NAME).await,
             "`server` must NOT be UDP-search-advertised"
         );
+        // pvxs `server` has no GET surface (onRPC only); the direct
+        // path reaches it via RPC, and a GET returns no prototype/value.
         assert!(
-            server_src.get_value(SERVER_PV_NAME).await.is_some(),
-            "direct GET of `server` must still return the info structure"
+            server_src.get_value(SERVER_PV_NAME).await.is_none(),
+            "`server` has no GET surface (pvxs onRPC-only)"
         );
 
         // UDP search path: a broadcast SEARCH naming `server` must

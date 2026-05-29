@@ -501,17 +501,13 @@ impl PvaServer {
         // — harmless since its `list_pvs` is empty, but enumerating
         // the user half keeps the intent explicit).
         let user_source: DynSource = source as Arc<dyn ChannelSourceObj>;
-        let server_info = Arc::new(super::server_info::ServerInfoSource::new(
-            guid,
-            peers.clone(),
-            {
+        let server_info = Arc::new(super::server_info::ServerInfoSource::new({
+            let user_source = user_source.clone();
+            move || {
                 let user_source = user_source.clone();
-                move || {
-                    let user_source = user_source.clone();
-                    async move { user_source.list_pvs().await }
-                }
-            },
-        ));
+                async move { user_source.list_pvs().await }
+            }
+        }));
 
         // Composite registry: built-in `__server` at order -1, BEFORE
         // default-order (0) user sources, matching pvxs registering its

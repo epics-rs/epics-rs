@@ -4,15 +4,21 @@
 //! single internal source at `(order = -1, "__server")` (server.cpp:542-547),
 //! consulted BEFORE default-order user sources since the lowest order is
 //! called first (server.h:108-118), that exposes one special PV
-//! named `server`. That PV answers:
+//! named `server`. That PV answers RPC only — pvxs `ServerSource::onCreate`
+//! installs *only* `handle->onRPC(...)` and never an `onOp` (GET/PUT)
+//! handler (serversource.cpp:30-94). A GET against `server` therefore fails
+//! the same way any PV with no operation handler fails, and we mirror that
+//! by returning `None` from [`ServerInfoSource::get_introspection`] /
+//! [`ServerInfoSource::get_value`] — there is no GET surface on `server`.
 //!
-//! - **GET** — returns a structure describing the server: GUID,
-//!   implementation language, version string, and live peer counts.
-//! - **RPC** — accepts an NTURI request whose `query.op` field selects
-//!   the response:
-//!   - `op=channels` → `NTScalarArray` of currently-hosted channel
-//!     names (the union of every user source's `list_pvs()`).
-//!   - `op=info` → the same server-info structure GET returns.
+//! The RPC handler unwraps an NTURI `query` structure, then:
+//!
+//! - a request carrying a `help` field replies with an `NTScalar` string
+//!   (serversource.cpp:46-51), before any `op` is consulted;
+//! - `op=channels` → `NTScalarArray` of currently-hosted channel names
+//!   (the union of every user source's `list_pvs()`);
+//! - `op=info` → a bare structure with exactly `implLang` and `version`
+//!   (serversource.cpp:19-22, :83-90), no extra fields.
 //!
 //! This is what `pvxlist` / `pvlist` query to enumerate the channels a
 //! server hosts. pvxs's `ServerSource::onSearch` is intentionally empty
@@ -23,7 +29,7 @@
 //! AND by [`ServerInfoSource::searchable`] returning `false` so a UDP
 //! SEARCH for the literal name `server` is never answered.
 //! `has_pv("server")` still returns `true`, which keeps the direct
-//! TCP-connect GET / RPC path working — matching pvxs exactly: the
+//! TCP-connect RPC path working — matching pvxs exactly: the
 //! `server` PV is reachable by direct connect but invisible to
 //! broadcast discovery.
 //!
@@ -38,7 +44,6 @@ use std::sync::Arc;
 
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 
-use super::peers::PeerRegistry;
 use super::source::{ChannelSource, OpError};
 
 /// Canonical PV name the built-in source answers. pvxs `ServerSource`
@@ -54,13 +59,6 @@ pub const SERVER_SOURCE_NAME: &str = "__server";
 /// field is `Arc`-shared or `Copy`.
 #[derive(Clone)]
 pub struct ServerInfoSource {
-    /// Server GUID — the same 12 bytes the UDP responder advertises in
-    /// SEARCH_RESPONSE and beacons. Rendered as a 24-char hex string
-    /// in the `guid` field of the server-info structure.
-    guid: [u8; 12],
-    /// Per-peer registry shared with the TCP accept loop. Snapshotted
-    /// on each GET / `op=info` to report live connection counts.
-    peers: Arc<PeerRegistry>,
     /// Channel-list provider: a closure returning every PV name hosted
     /// by the *user* sources. Boxed so `ServerInfoSource` doesn't have
     /// to be generic over the composite; the registration code in
@@ -77,65 +75,41 @@ type ChannelLister = dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Outpu
 impl ServerInfoSource {
     /// Build the built-in source.
     ///
-    /// `guid` is the server's identity (must equal what the UDP
-    /// responder advertises). `peers` is the live peer registry.
     /// `channel_lister` returns the union of every user source's PV
     /// names — `runtime.rs` passes a closure over the user-source
     /// `CompositeSource`.
-    pub fn new<F, Fut>(guid: [u8; 12], peers: Arc<PeerRegistry>, channel_lister: F) -> Self
+    pub fn new<F, Fut>(channel_lister: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Vec<String>> + Send + 'static,
     {
         Self {
-            guid,
-            peers,
             channel_lister: Arc::new(move || Box::pin(channel_lister())),
         }
     }
 
-    /// Lower-cased 24-char hex rendering of the GUID. pvxs prints the
-    /// GUID upper-cased in `pvxlist`; the wire field value is just an
-    /// opaque identifier so the case is cosmetic — we use lower-case
-    /// to match the rest of epics-pva-rs's hex rendering. Distinct
-    /// servers still compare unequal.
-    fn guid_hex(&self) -> String {
-        use std::fmt::Write;
-        let mut s = String::with_capacity(24);
-        for b in &self.guid {
-            write!(&mut s, "{b:02x}").expect("write to String never fails");
-        }
-        s
-    }
-
-    /// FieldDesc for the server-info structure returned by GET and by
-    /// `op=info`. A plain (non-NT) structure, matching pvxs
-    /// `ServerSource::info` which also uses a bare `Struct`. We add
-    /// `guid` and the peer counters on top of pvxs's `implLang` /
-    /// `version` pair — extra fields are backward-compatible (a client
-    /// only reads the fields it knows).
+    /// FieldDesc for the `op=info` structure. A bare (non-NT) structure
+    /// holding exactly `implLang` and `version`, byte-for-byte matching
+    /// pvxs `ServerSource::info` (serversource.cpp:19-22). pvxs adds no
+    /// other fields, so we add none either — a richer Rust-only
+    /// structure would make any client that prints the whole returned
+    /// value diverge from pvxs output.
     pub fn info_descriptor() -> FieldDesc {
         FieldDesc::Structure {
             struct_id: String::new(),
             fields: vec![
-                ("guid".into(), FieldDesc::Scalar(ScalarType::String)),
                 ("implLang".into(), FieldDesc::Scalar(ScalarType::String)),
                 ("version".into(), FieldDesc::Scalar(ScalarType::String)),
-                ("peerCount".into(), FieldDesc::Scalar(ScalarType::UInt)),
-                ("channelCount".into(), FieldDesc::Scalar(ScalarType::UInt)),
             ],
         }
     }
 
-    /// Build the server-info value. `channel_count` is the number of
-    /// currently-hosted PV names; `peer_count` the live connection
-    /// count.
-    fn info_value(&self, peer_count: u32, channel_count: u32) -> PvField {
+    /// Build the `op=info` value: `implLang` and `version` only. pvxs
+    /// reports `implLang="cpp"`; this is a Rust server, so we report
+    /// `"rust"` truthfully — the field name and structure shape match
+    /// pvxs, only the honest language token differs.
+    fn info_value() -> PvField {
         let mut s = PvStructure::new("");
-        s.fields.push((
-            "guid".into(),
-            PvField::Scalar(ScalarValue::String(self.guid_hex())),
-        ));
         s.fields.push((
             "implLang".into(),
             PvField::Scalar(ScalarValue::String("rust".into())),
@@ -144,15 +118,27 @@ impl ServerInfoSource {
             "version".into(),
             PvField::Scalar(ScalarValue::String(crate::VERSION.to_string())),
         ));
-        s.fields.push((
-            "peerCount".into(),
-            PvField::Scalar(ScalarValue::UInt(peer_count)),
-        ));
-        s.fields.push((
-            "channelCount".into(),
-            PvField::Scalar(ScalarValue::UInt(channel_count)),
-        ));
         PvField::Structure(s)
+    }
+
+    /// FieldDesc + value for a `help` reply — an `NTScalar` string, the
+    /// same NT type pvxs `ServerSource` replies with for a request that
+    /// carries a `help` field (serversource.cpp:46-51).
+    fn help_response() -> (FieldDesc, PvField) {
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
+        };
+        let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+        s.fields.push((
+            "value".into(),
+            PvField::Scalar(ScalarValue::String(
+                "server PV: RPC op=channels lists hosted PVs, op=info reports \
+                 implLang/version"
+                    .into(),
+            )),
+        ));
+        (desc, PvField::Structure(s))
     }
 
     /// FieldDesc for the `op=channels` response — an `NTScalarArray`
@@ -176,11 +162,21 @@ impl ServerInfoSource {
         PvField::Structure(s)
     }
 
-    /// Snapshot live counts: `(peer_count, channel_count)`.
-    async fn live_counts(&self) -> (u32, u32) {
-        let peer_count = self.peers.len() as u32;
-        let channels = (self.channel_lister)().await;
-        (peer_count, channels.len() as u32)
+    /// Whether the request carries a `help` field (after NTURI `query`
+    /// unwrapping), mirroring pvxs `args["help"].valid()`
+    /// (serversource.cpp:46). Any present field named `help` triggers
+    /// the help reply regardless of its value/type.
+    fn has_help(request: &PvField) -> bool {
+        let root = match request {
+            PvField::Structure(s) => s,
+            _ => return false,
+        };
+        if let Some(PvField::Structure(query)) = root.get_field("query")
+            && query.get_field("help").is_some()
+        {
+            return true;
+        }
+        root.get_field("help").is_some()
     }
 
     /// Extract the `op` argument from an RPC request. Handles both the
@@ -236,30 +232,19 @@ impl ChannelSource for ServerInfoSource {
         false
     }
 
-    fn get_introspection(
-        &self,
-        name: &str,
-    ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
-        let matches = name == SERVER_PV_NAME;
-        async move {
-            if matches {
-                Some(Self::info_descriptor())
-            } else {
-                None
-            }
-        }
+    /// `None` for every name. pvxs `ServerSource::onCreate` installs no
+    /// `onOp` handler, so `server` has no GET surface — there is no
+    /// introspection prototype to negotiate. Returning `None` makes a
+    /// GET (or GET_FIELD) INIT against `server` fail rather than
+    /// returning a Rust-only structure pvxs would never serve over GET.
+    async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+        None
     }
 
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
-        let this = self.clone();
-        let matches = name == SERVER_PV_NAME;
-        async move {
-            if !matches {
-                return None;
-            }
-            let (peers, channels) = this.live_counts().await;
-            Some(this.info_value(peers, channels))
-        }
+    /// `None` for every name — `server` answers RPC only, not GET
+    /// (pvxs has no `onOp` for it). See [`Self::get_introspection`].
+    async fn get_value(&self, _name: &str) -> Option<PvField> {
+        None
     }
 
     /// The `server` PV is read-only — like a pvxs readonly SharedPV.
@@ -303,6 +288,13 @@ impl ChannelSource for ServerInfoSource {
             if name != SERVER_PV_NAME {
                 return Err(OpError::failed(format!("no such PV: {name}")));
             }
+            // pvxs `ServerSource::onRPC` answers a `help`-bearing request
+            // FIRST, before reading `op` (serversource.cpp:46-51), so
+            // `pvcall server help=true` returns a help string rather than
+            // failing for a missing `op`.
+            if Self::has_help(&request_value) {
+                return Ok(Self::help_response());
+            }
             let op = Self::extract_op(&request_value)
                 .ok_or_else(|| OpError::failed("missing 'op' query argument"))?;
             match op.as_str() {
@@ -312,10 +304,7 @@ impl ChannelSource for ServerInfoSource {
                     names.dedup();
                     Ok((Self::channels_descriptor(), Self::channels_value(names)))
                 }
-                "info" => {
-                    let (peers, channels) = this.live_counts().await;
-                    Ok((Self::info_descriptor(), this.info_value(peers, channels)))
-                }
+                "info" => Ok((Self::info_descriptor(), Self::info_value())),
                 other => Err(OpError::failed(format!(
                     "unknown op '{other}' (expected 'channels' or 'info')"
                 ))),
@@ -362,8 +351,7 @@ mod tests {
     }
 
     fn source_with(channels: Vec<String>) -> ServerInfoSource {
-        let peers = PeerRegistry::new();
-        ServerInfoSource::new([0xAB; 12], peers, move || {
+        ServerInfoSource::new(move || {
             let c = channels.clone();
             async move { c }
         })
@@ -413,7 +401,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_info_returns_guid_and_version() {
+    async fn rpc_info_returns_only_impllang_and_version() {
+        // pvxs `op=info` is a bare struct with exactly implLang+version
+        // (serversource.cpp:19-22). No guid/peerCount/channelCount.
         let src = source_with(vec!["one".into(), "two".into()]);
         let (desc, value) = nturi_op("info");
         let (_, resp) = src.rpc("server", desc, value).await.expect("rpc ok");
@@ -421,25 +411,61 @@ mod tests {
             PvField::Structure(s) => s,
             other => panic!("unexpected info wrapper: {other:?}"),
         };
-        match s.get_field("guid") {
-            Some(PvField::Scalar(ScalarValue::String(g))) => {
-                assert_eq!(g, &"ab".repeat(12));
-            }
-            other => panic!("unexpected guid field: {other:?}"),
-        }
         match s.get_field("version") {
             Some(PvField::Scalar(ScalarValue::String(v))) => {
                 assert_eq!(v, crate::VERSION);
             }
             other => panic!("unexpected version field: {other:?}"),
         }
-        match s.get_field("channelCount") {
-            Some(PvField::Scalar(ScalarValue::UInt(n))) => assert_eq!(*n, 2),
-            other => panic!("unexpected channelCount field: {other:?}"),
-        }
         match s.get_field("implLang") {
             Some(PvField::Scalar(ScalarValue::String(l))) => assert_eq!(l, "rust"),
             other => panic!("unexpected implLang field: {other:?}"),
+        }
+        // Rust-only fields are gone (pvxs parity).
+        assert!(s.get_field("guid").is_none(), "guid must not be present");
+        assert!(
+            s.get_field("peerCount").is_none(),
+            "peerCount must not be present"
+        );
+        assert!(
+            s.get_field("channelCount").is_none(),
+            "channelCount must not be present"
+        );
+        // Exactly two fields, in pvxs order.
+        let names: Vec<&str> = s.fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["implLang", "version"]);
+    }
+
+    #[tokio::test]
+    async fn rpc_help_returns_ntscalar_string() {
+        // pvxs answers a help-bearing request with an NTScalar<string>
+        // BEFORE reading `op` (serversource.cpp:46-51) — so a request
+        // with `help` and no `op` succeeds rather than failing.
+        let src = source_with(vec![]);
+        let mut query = PvStructure::new("");
+        query.fields.push((
+            "help".into(),
+            PvField::Scalar(ScalarValue::String("".into())),
+        ));
+        let mut root = PvStructure::new("epics:nt/NTURI:1.0");
+        root.fields
+            .push(("query".into(), PvField::Structure(query)));
+        let (desc, resp) = src
+            .rpc("server", FieldDesc::Variant, PvField::Structure(root))
+            .await
+            .expect("help rpc ok");
+        match desc {
+            FieldDesc::Structure { struct_id, .. } => {
+                assert_eq!(struct_id, "epics:nt/NTScalar:1.0");
+            }
+            other => panic!("unexpected help descriptor: {other:?}"),
+        }
+        match resp {
+            PvField::Structure(s) => match s.get_field("value") {
+                Some(PvField::Scalar(ScalarValue::String(_))) => {}
+                other => panic!("unexpected help value: {other:?}"),
+            },
+            other => panic!("unexpected help wrapper: {other:?}"),
         }
     }
 
@@ -499,17 +525,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_value_returns_info_structure() {
+    async fn get_has_no_surface_on_server() {
+        // pvxs installs no `onOp` for `server`, so it has no GET surface
+        // (serversource.cpp:30-94). Both the introspection prototype and
+        // the value read return `None`, which makes a GET INIT against
+        // `server` fail rather than returning a Rust-only structure.
         let src = source_with(vec!["a".into()]);
-        let v = src.get_value("server").await.expect("get value");
-        match v {
-            PvField::Structure(s) => {
-                assert!(s.get_field("guid").is_some());
-                assert!(s.get_field("version").is_some());
-            }
-            other => panic!("unexpected get value: {other:?}"),
-        }
-        assert!(src.get_value("not:server").await.is_none());
+        assert!(src.get_introspection("server").await.is_none());
+        assert!(src.get_value("server").await.is_none());
     }
 
     #[tokio::test]

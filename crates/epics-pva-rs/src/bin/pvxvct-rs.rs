@@ -8,14 +8,18 @@
 //! relevant level (decoded frames, no raw hex dump).
 //!
 //! ```text
-//! pvxvct-rs                     # listen for both SEARCH and BEACON
-//! pvxvct-rs -C                  # only SEARCH
-//! pvxvct-rs -S                  # only BEACON
-//! pvxvct-rs -H 192.168.1.5      # filter by source IP (repeatable)
+//! pvxvct-rs                       # listen for both SEARCH and BEACON
+//! pvxvct-rs -C                    # only SEARCH
+//! pvxvct-rs -S                    # only BEACON
+//! pvxvct-rs -H 10.0.0.0/24        # filter by source subnet (repeatable)
+//! pvxvct-rs -P somePv             # filter SEARCH by PV name (repeatable)
+//! pvxvct-rs -B 192.168.1.5:5076   # bind a specific interface (repeatable)
+//! pvxvct-rs -B 224.0.0.1@10.0.0.2 # join a multicast group on an iface
 //! ```
 
 use std::io::Cursor;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket as StdUdpSocket};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use clap::Parser;
@@ -36,9 +40,13 @@ struct Args {
     #[arg(short = 'S', conflicts_with = "client_only")]
     server_only: bool,
 
-    /// Filter by source IP. Repeatable; entries OR-combined.
+    /// Filter by source host. Accepts a hostname/IP, optionally with a
+    /// CIDR prefix (`10.0.0.0/24`) or dotted netmask
+    /// (`10.0.0.0/255.255.255.0`). Repeatable; entries OR-combined.
+    /// pvxs `tools/pvxvct.cpp:36-78` (`parsePeer`) parses exactly these
+    /// forms and matches `(peer & mask) == addr`.
     #[arg(short = 'H', long = "host")]
-    hosts: Vec<IpAddr>,
+    hosts: Vec<String>,
 
     /// Filter SEARCH frames by PV name. Repeatable; a frame is shown if any
     /// of its names matches any `-P` value. pvxs `pvxvct` parity (commit
@@ -46,12 +54,179 @@ struct Args {
     #[arg(short = 'P', long = "pv")]
     pvnames: Vec<String>,
 
+    /// Listen on the given interface(s). Repeatable; one listener per
+    /// bind. Form `host[:port]` for a unicast/wildcard interface, or
+    /// `mcast[,ttl][@iface][:port]` to join a multicast group. pvxs
+    /// `tools/pvxvct.cpp:152-153,171-173,235-241` accepts repeated `-B`
+    /// and binds `0.0.0.0:5076` only when none is given.
+    #[arg(short = 'B', long = "bind")]
+    binds: Vec<String>,
+
+    /// Verbose: log bind endpoints and active filters to stderr. pvxs
+    /// `tools/pvxvct.cpp:144-145,172` raises the `pvxvct` logger to
+    /// Debug under `-v`; the decoded SEARCH/BEACON lines print
+    /// regardless.
+    #[arg(short = 'v')]
+    verbose: bool,
+
     /// UDP port to bind. Defaults to EPICS_PVA_BROADCAST_PORT or 5076.
+    /// Used as the default for `-B` endpoints that omit `:port`.
     #[arg(short = 'p', long = "port")]
     port: Option<u16>,
 }
 
-fn bind_udp(port: u16) -> std::io::Result<UdpSocket> {
+/// A parsed `-H` source filter: an address and netmask, both as
+/// host-order `u32`, with `addr` already masked. Matching mirrors pvxs
+/// `opts.allowPeer` (`tools/pvxvct.cpp:115-126`): `(peer & mask) == addr`,
+/// and any non-IPv4 peer is rejected when a filter is present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PeerFilter {
+    addr: u32,
+    mask: u32,
+}
+
+/// A parsed `-B` bind endpoint. `iface` is the multicast join
+/// interface (`UNSPECIFIED` lets the kernel choose); it is ignored for
+/// unicast/wildcard binds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BindEndpoint {
+    addr: Ipv4Addr,
+    port: u16,
+    iface: Ipv4Addr,
+}
+
+/// The frame-display filters shared by every listener task.
+struct Filters {
+    client_only: bool,
+    server_only: bool,
+    peers: Vec<PeerFilter>,
+    pvnames: Vec<String>,
+}
+
+impl Filters {
+    /// pvxs `allowPeer` (`tools/pvxvct.cpp:115-126`): no filters → allow
+    /// all; otherwise the peer must be IPv4 and match one stored
+    /// `(addr, mask)` pair. A non-IPv4 peer is dropped when any filter
+    /// is set (pvxs `peer.family()!=AF_INET → return false`).
+    fn allow_peer(&self, ip: IpAddr) -> bool {
+        if self.peers.is_empty() {
+            return true;
+        }
+        match ip {
+            IpAddr::V4(v4) => {
+                let p = u32::from(v4);
+                self.peers.iter().any(|f| (p & f.mask) == f.addr)
+            }
+            IpAddr::V6(_) => false,
+        }
+    }
+}
+
+/// pvxs `searchCB` PV-name gate (`tools/pvxvct.cpp:201-214`): with no
+/// `-P` filter, show every SEARCH; with a filter, show only when some
+/// frame name matches. A zero-name discovery SEARCH therefore yields
+/// `false` (no name can match) and is hidden — it does NOT bypass the
+/// filter. This is the structural rule, not a special case for the
+/// empty-name frame.
+fn pv_filter_allows(pvnames: &[String], names: &[String]) -> bool {
+    if pvnames.is_empty() {
+        return true;
+    }
+    names.iter().any(|n| pvnames.iter().any(|p| p == n))
+}
+
+/// Resolve a host token to an IPv4 address. A literal IPv4 string is
+/// parsed directly; otherwise the name is resolved and the first IPv4
+/// result is used. pvxs `parsePeer` uses `hostToIPAddr`, which likewise
+/// resolves names to an `in_addr`.
+fn resolve_ipv4(host: &str) -> Result<Ipv4Addr, String> {
+    if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        return Ok(v4);
+    }
+    (host, 0u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {host:?}: {e}"))?
+        .find_map(|sa| match sa.ip() {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
+        .ok_or_else(|| format!("no IPv4 address for {host:?}"))
+}
+
+/// Parse a `-H` value (`host[/bits | /dotted.mask]`) into a
+/// [`PeerFilter`]. Mirrors pvxs `parsePeer` (`tools/pvxvct.cpp:36-78`):
+/// no mask → exact host match (`INADDR_BROADCAST`); `/N` → high-N-bits
+/// mask; `/a.b.c.d` → dotted mask. The address is masked at parse time
+/// so `1.2.3.4/24` becomes `1.2.3.0/24`.
+fn parse_peer(spec: &str) -> Result<PeerFilter, String> {
+    let (host, mask_spec) = match spec.split_once('/') {
+        Some((h, m)) => (h, Some(m)),
+        None => (spec, None),
+    };
+    let addr = resolve_ipv4(host)?;
+    let mask: u32 = match mask_spec {
+        // pvxs default: INADDR_BROADCAST (all ones) → exact match.
+        None => 0xffff_ffff,
+        Some(m) if m.contains('.') => {
+            let mv4: Ipv4Addr = m
+                .parse()
+                .map_err(|_| format!("invalid netmask {m:?} in -H {spec:?}"))?;
+            u32::from(mv4)
+        }
+        Some(m) => {
+            let nbit: u32 = m
+                .parse()
+                .map_err(|_| format!("invalid prefix length {m:?} in -H {spec:?}"))?;
+            if nbit > 32 {
+                return Err(format!("prefix length out of range in -H {spec:?}: {nbit}"));
+            }
+            // `0xffffffff << 32` panics in Rust (C leaves it UB); pvxs
+            // computes the same value, so special-case /0 → match all.
+            if nbit == 0 {
+                0
+            } else {
+                0xffff_ffffu32 << (32 - nbit)
+            }
+        }
+    };
+    Ok(PeerFilter {
+        addr: u32::from(addr) & mask,
+        mask,
+    })
+}
+
+/// Parse a `-B` value into a [`BindEndpoint`]. Grammar mirrors pvxs
+/// `SockEndpoint` (`tools/pvxvct.cpp:152-153`): `addr[,ttl][@iface][:port]`.
+/// The `ttl` is accepted for grammar compatibility but does not affect a
+/// pure listener, so it is validated and discarded. `iface` must be an
+/// IPv4 address (interface-name lookup is not supported here).
+fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
+    let mut rest = spec;
+    let mut port = default_port;
+    // `:port` — only consume the trailing colon segment if it parses as
+    // a port, so a bare address is left intact.
+    if let Some((head, tail)) = rest.rsplit_once(':')
+        && let Ok(p) = tail.parse::<u16>()
+    {
+        port = p;
+        rest = head;
+    }
+    let mut iface = Ipv4Addr::UNSPECIFIED;
+    if let Some((head, tail)) = rest.rsplit_once('@') {
+        iface = resolve_ipv4(tail)?;
+        rest = head;
+    }
+    if let Some((head, tail)) = rest.rsplit_once(',') {
+        // Validate the TTL even though a listener does not use it.
+        tail.parse::<u32>()
+            .map_err(|_| format!("invalid ttl {tail:?} in -B {spec:?}"))?;
+        rest = head;
+    }
+    let addr = resolve_ipv4(rest)?;
+    Ok(BindEndpoint { addr, port, iface })
+}
+
+fn bind_endpoint(ep: &BindEndpoint) -> std::io::Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
     #[cfg(unix)]
@@ -60,8 +235,20 @@ fn bind_udp(port: u16) -> std::io::Result<UdpSocket> {
     }
     sock.set_broadcast(true)?;
     sock.set_nonblocking(true)?;
-    let bind: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-    sock.bind(&bind.into())?;
+
+    let is_mcast = ep.addr.is_multicast();
+    // Multicast: bind the wildcard so the group can be joined and shared;
+    // unicast/wildcard: bind the requested interface address directly.
+    let bind_addr = if is_mcast {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ep.port)
+    } else {
+        SocketAddr::new(IpAddr::V4(ep.addr), ep.port)
+    };
+    sock.bind(&bind_addr.into())?;
+    if is_mcast {
+        sock.join_multicast_v4(&ep.addr, &ep.iface)?;
+    }
+
     let std_sock: StdUdpSocket = sock.into();
     UdpSocket::from_std(std_sock)
 }
@@ -88,24 +275,11 @@ fn fmt_guid(g: &[u8]) -> String {
     s
 }
 
-#[tokio::main]
-async fn main() {
-    let args = Args::parse();
-    let port = args.port.unwrap_or_else(|| {
-        std::env::var("EPICS_PVA_BROADCAST_PORT")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(5076)
-    });
-    let socket = match bind_udp(port) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("pvxvct-rs: bind 0.0.0.0:{port}: {e}");
-            std::process::exit(1);
-        }
-    };
-    eprintln!("pvxvct-rs: listening on 0.0.0.0:{port}");
-
+/// Decode and print SEARCH/BEACON frames arriving on one bound socket,
+/// applying the shared display filters. One of these runs per `-B`
+/// endpoint (pvxs starts one search/beacon listener pair per bind,
+/// `tools/pvxvct.cpp:235-241`).
+async fn run_listener(socket: UdpSocket, filters: Arc<Filters>) {
     let mut buf = vec![0u8; 4096];
     loop {
         let (n, peer) = match socket.recv_from(&mut buf).await {
@@ -115,7 +289,7 @@ async fn main() {
                 continue;
             }
         };
-        if !args.hosts.is_empty() && !args.hosts.contains(&peer.ip()) {
+        if !filters.allow_peer(peer.ip()) {
             continue;
         }
 
@@ -127,7 +301,7 @@ async fn main() {
         let order = frame.header.flags.byte_order();
 
         match cmd {
-            Some(Command::Beacon) if !args.client_only => {
+            Some(Command::Beacon) if !filters.client_only => {
                 // Re-decode the beacon body to surface the advertised
                 // server address + GUID + proto string.
                 let mut cur = Cursor::new(frame.payload.as_slice());
@@ -157,7 +331,7 @@ async fn main() {
                     fmt_guid(&guid)
                 );
             }
-            Some(Command::Search) if !args.server_only => {
+            Some(Command::Search) if !filters.server_only => {
                 // Header + payload-tail decode: SEARCH carries
                 // (seq:u32, flags:u8, reserved:u24, response_addr:16,
                 // response_port:u16, n_protocols:u8, ...). For
@@ -185,17 +359,10 @@ async fn main() {
                         names.push(name);
                     }
                 }
-                // -P filter: if any -P values were given, only print
-                // frames whose name set overlaps the filter set.
-                // Empty `names` means a discover SEARCH (channel
-                // count = 0 in pvxs `tickSearch(SearchKind::
-                // discover)`); always show those — `-P` is for
-                // narrowing per-PV searches, not for hiding the
-                // network's discover heartbeat.
-                if !args.pvnames.is_empty()
-                    && !names.is_empty()
-                    && !names.iter().any(|n| args.pvnames.iter().any(|p| p == n))
-                {
+                // `-P` gate (pvxs `searchCB`): a zero-name discovery
+                // SEARCH is hidden when a filter is set, since no name
+                // can match — see `pv_filter_allows`.
+                if !pv_filter_allows(&filters.pvnames, &names) {
                     continue;
                 }
                 println!(
@@ -204,7 +371,7 @@ async fn main() {
                 );
             }
             _ => {
-                if !args.client_only && !args.server_only {
+                if !filters.client_only && !filters.server_only {
                     println!(
                         "{} OTHER    peer={peer:21} cmd_code={}",
                         now_iso(),
@@ -213,5 +380,216 @@ async fn main() {
                 }
             }
         }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+    let default_port = args.port.unwrap_or_else(|| {
+        std::env::var("EPICS_PVA_BROADCAST_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(5076)
+    });
+
+    let peers = match args
+        .hosts
+        .iter()
+        .map(|h| parse_peer(h))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("pvxvct-rs: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // pvxs binds `0.0.0.0:<port>` only when no `-B` is given
+    // (`tools/pvxvct.cpp:171-173`).
+    let bind_specs: Vec<String> = if args.binds.is_empty() {
+        vec!["0.0.0.0".to_string()]
+    } else {
+        args.binds.clone()
+    };
+    let endpoints = match bind_specs
+        .iter()
+        .map(|b| parse_bind(b, default_port))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("pvxvct-rs: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let filters = Arc::new(Filters {
+        client_only: args.client_only,
+        server_only: args.server_only,
+        peers,
+        pvnames: args.pvnames,
+    });
+
+    if args.verbose {
+        for f in &filters.peers {
+            eprintln!(
+                "pvxvct-rs: peer filter {}/{}",
+                Ipv4Addr::from(f.addr),
+                Ipv4Addr::from(f.mask)
+            );
+        }
+        for p in &filters.pvnames {
+            eprintln!("pvxvct-rs: pv filter {p:?}");
+        }
+    }
+
+    let mut handles = Vec::with_capacity(endpoints.len());
+    for ep in endpoints {
+        let socket = match bind_endpoint(&ep) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("pvxvct-rs: bind {}:{}: {e}", ep.addr, ep.port);
+                std::process::exit(1);
+            }
+        };
+        if ep.addr.is_multicast() {
+            eprintln!(
+                "pvxvct-rs: listening on {}:{} (multicast, iface {})",
+                ep.addr, ep.port, ep.iface
+            );
+        } else {
+            eprintln!("pvxvct-rs: listening on {}:{}", ep.addr, ep.port);
+        }
+        let f = filters.clone();
+        handles.push(tokio::spawn(run_listener(socket, f)));
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `-H` with no mask is an exact-host match (pvxs default
+    /// `INADDR_BROADCAST`).
+    #[test]
+    fn parse_peer_exact_host() {
+        let f = parse_peer("192.168.1.5").unwrap();
+        assert_eq!(f.mask, 0xffff_ffff);
+        assert_eq!(f.addr, u32::from(Ipv4Addr::new(192, 168, 1, 5)));
+    }
+
+    /// `/N` masks the high N bits and the address is masked at parse
+    /// time: `1.2.3.4/24` == `1.2.3.0/24`.
+    #[test]
+    fn parse_peer_cidr_masks_address() {
+        let f = parse_peer("1.2.3.4/24").unwrap();
+        assert_eq!(f.mask, 0xffff_ff00);
+        assert_eq!(f.addr, u32::from(Ipv4Addr::new(1, 2, 3, 0)));
+    }
+
+    /// A dotted netmask is equivalent to the matching prefix length.
+    #[test]
+    fn parse_peer_dotted_netmask() {
+        let cidr = parse_peer("10.0.0.0/16").unwrap();
+        let dotted = parse_peer("10.0.0.0/255.255.0.0").unwrap();
+        assert_eq!(cidr, dotted);
+    }
+
+    /// `/0` matches everything and must not panic on the `<< 32` edge.
+    #[test]
+    fn parse_peer_zero_prefix_matches_all() {
+        let f = parse_peer("0.0.0.0/0").unwrap();
+        assert_eq!(f.mask, 0);
+        assert_eq!(f.addr, 0);
+    }
+
+    #[test]
+    fn parse_peer_rejects_bad_prefix() {
+        assert!(parse_peer("10.0.0.0/33").is_err());
+        assert!(parse_peer("10.0.0.0/abc").is_err());
+    }
+
+    /// `allow_peer` mirrors pvxs masked matching, and drops non-IPv4
+    /// peers only when a filter is present.
+    #[test]
+    fn allow_peer_subnet_match() {
+        let filters = Filters {
+            client_only: false,
+            server_only: false,
+            peers: vec![parse_peer("10.0.0.0/24").unwrap()],
+            pvnames: vec![],
+        };
+        assert!(filters.allow_peer("10.0.0.42".parse().unwrap()));
+        assert!(!filters.allow_peer("10.0.1.42".parse().unwrap()));
+        // IPv6 peer is rejected when an IPv4 filter is set.
+        assert!(!filters.allow_peer("::1".parse().unwrap()));
+
+        // No filter → allow everything, including IPv6.
+        let open = Filters {
+            client_only: false,
+            server_only: false,
+            peers: vec![],
+            pvnames: vec![],
+        };
+        assert!(open.allow_peer("10.0.1.42".parse().unwrap()));
+        assert!(open.allow_peer("::1".parse().unwrap()));
+    }
+
+    /// The `-P` gate hides zero-name discovery SEARCH frames when a
+    /// filter is active — the core finding-19 correctness fix.
+    #[test]
+    fn pv_filter_hides_zero_name_discovery_when_set() {
+        // No filter → show everything, including the discovery frame.
+        assert!(pv_filter_allows(&[], &[]));
+        assert!(pv_filter_allows(&[], &["any".to_string()]));
+
+        let filter = vec!["wanted".to_string()];
+        // Matching name shows.
+        assert!(pv_filter_allows(&filter, &["wanted".to_string()]));
+        assert!(pv_filter_allows(
+            &filter,
+            &["other".to_string(), "wanted".to_string()]
+        ));
+        // Non-matching name hidden.
+        assert!(!pv_filter_allows(&filter, &["other".to_string()]));
+        // Zero-name discovery SEARCH hidden (was wrongly shown before).
+        assert!(!pv_filter_allows(&filter, &[]));
+    }
+
+    #[test]
+    fn parse_bind_unicast_default_port() {
+        let ep = parse_bind("192.168.1.5", 5076).unwrap();
+        assert_eq!(ep.addr, Ipv4Addr::new(192, 168, 1, 5));
+        assert_eq!(ep.port, 5076);
+        assert_eq!(ep.iface, Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[test]
+    fn parse_bind_explicit_port() {
+        let ep = parse_bind("0.0.0.0:5077", 5076).unwrap();
+        assert_eq!(ep.addr, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(ep.port, 5077);
+    }
+
+    /// Multicast form `mcast,ttl@iface:port` parses all segments; the
+    /// ttl is validated and discarded (a listener ignores it).
+    #[test]
+    fn parse_bind_multicast_full_form() {
+        let ep = parse_bind("224.0.1.1,5@10.0.0.2:5078", 5076).unwrap();
+        assert_eq!(ep.addr, Ipv4Addr::new(224, 0, 1, 1));
+        assert!(ep.addr.is_multicast());
+        assert_eq!(ep.iface, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(ep.port, 5078);
+    }
+
+    #[test]
+    fn parse_bind_rejects_bad_ttl() {
+        assert!(parse_bind("224.0.1.1,abc", 5076).is_err());
     }
 }

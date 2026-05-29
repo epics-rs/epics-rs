@@ -22,11 +22,18 @@ struct Args {
     #[arg(short = 'v', action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Wait time in seconds
+    /// Connect/operation timeout in seconds (bounds the initial
+    /// connect, not the monitor duration). pvxs `tools/monitor.cpp:56`
+    /// has no `-w`; a monitor runs until interrupted. Kept as a
+    /// Rust-only connect-timeout control threaded into the client.
     #[arg(short = 'w', default_value = "5.0")]
     timeout: f64,
 
-    /// Quiet mode, print only error messages
+    /// Deprecated, ignored. pvAccessCPP routes `pvmonitor` through the
+    /// same `pvget.cpp` that treats `-q` as a deprecated no-op
+    /// (`pvtoolsSrc/pvget.cpp:332-338`, included via `pvmonitor.cpp`)
+    /// and still prints monitor updates; pvxs `tools/monitor.cpp` has
+    /// no such option. Accepted for legacy compatibility, no effect.
     #[arg(short = 'q')]
     quiet: bool,
 
@@ -67,18 +74,22 @@ async fn main() {
         } else {
             args.mode.clone()
         };
-        let quiet = args.quiet;
         let request = request.clone();
+        let timeout = args.timeout;
         let handle = tokio::spawn(async move {
-            let client = PvaClient::new().expect("failed to create PVA client");
+            // `-w` bounds the connect/operation timeout (pvxs monitor
+            // has none; thread it into the client per finding 23's
+            // connect-timeout option) rather than being silently dropped.
+            let client = PvaClient::builder()
+                .timeout(epics_pva_rs::cli::timeout_duration(timeout))
+                .build();
 
             // Get introspection once for typed formatting
             let desc = client.pvinfo(&pv_name).await.ok();
 
             let render = |value: &epics_pva_rs::pvdata::PvField| {
-                if quiet {
-                    return;
-                }
+                // `-q` is a deprecated no-op (see Args::quiet); monitor
+                // updates are always printed, matching pvAccessCPP.
                 let output = if let Some(ref d) = desc {
                     match mode.as_str() {
                         "json" => format::format_json(&pv_name, value),
@@ -105,5 +116,31 @@ async fn main() {
 
     for handle in handles {
         let _ = handle.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `-q` is accepted but a deprecated no-op: monitor updates must
+    /// still print (pvAccessCPP pvget.cpp:332-338, shared by pvmonitor).
+    /// This locks the flag; the print-always behavior is enforced
+    /// structurally in the render closure.
+    #[test]
+    fn quiet_flag_is_accepted_as_deprecated_noop() {
+        let args = Args::parse_from(["pvmonitor-rs", "-q", "PV"]);
+        assert!(args.quiet);
+    }
+
+    /// `-w` parses to a real value that is threaded into the client
+    /// connect timeout (finding 23 — it must not be silently dropped).
+    #[test]
+    fn wait_flag_parses_as_timeout() {
+        let args = Args::parse_from(["pvmonitor-rs", "-w", "2.5", "PV"]);
+        assert_eq!(args.timeout, 2.5);
+        // Default mirrors the other PVA CLIs (5s).
+        let dflt = Args::parse_from(["pvmonitor-rs", "PV"]);
+        assert_eq!(dflt.timeout, 5.0);
     }
 }

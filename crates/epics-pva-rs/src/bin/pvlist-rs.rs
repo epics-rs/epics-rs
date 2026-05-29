@@ -2,9 +2,10 @@
 //! mirroring pvxs `tools/list.cpp`.
 //!
 //! ```text
-//! pvlist-rs                  # discover servers (passive beacon listen)
+//! pvlist-rs                  # discover servers (active: broadcast ping + listen)
 //! pvlist-rs -w 5             # discover for 5 seconds, then exit
-//! pvlist-rs --ping           # actively ping (DiscoverBuilder::pingAll)
+//! pvlist-rs -p               # passive discovery (beacon listen only)
+//! pvlist-rs -A               # active discovery (explicit; the default)
 //! pvlist-rs --verbose        # include guid + proto + peer
 //! pvlist-rs <ip[:port]>      # query one server for its hosted channels
 //! pvlist-rs -i <ip[:port]>   # query one server for its serverInfo
@@ -16,11 +17,13 @@
 //! expose this `ServerSource` PV; the query therefore works against
 //! them even though the Rust server does not yet host the `server` PV.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use clap::Parser;
+use futures_util::future::join_all;
+
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::search_engine::{Discovered, SearchEngine};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -36,9 +39,17 @@ struct Args {
     #[arg(short = 'w', default_value = "5.0")]
     timeout: f64,
 
-    /// Actively ping discoverable servers (DiscoverBuilder::pingAll).
-    #[arg(short = 'p', long = "ping")]
-    ping: bool,
+    /// Active discovery mode (default): send a broadcast ping, then
+    /// keep listening for beacons. pvxs `tools/list.cpp:50-52,83-85`
+    /// documents `-A` as active and initializes `active = true`.
+    #[arg(short = 'A', long = "active")]
+    active: bool,
+
+    /// Passive discovery mode: only listen for server beacons, no
+    /// broadcast ping. pvxs `tools/list.cpp:53,86-88` makes `-p` set
+    /// `active = false`.
+    #[arg(short = 'p', long = "passive", conflicts_with = "active")]
+    passive: bool,
 
     /// Verbose output — include GUID, proto, and beacon peer address.
     #[arg(short = 'v', long = "verbose")]
@@ -54,6 +65,16 @@ struct Args {
     servers: Vec<String>,
 }
 
+impl Args {
+    /// Resolve the active/passive discovery flag the way pvxs does:
+    /// active by default, `-A` keeps it active, `-p` clears it. pvxs
+    /// `tools/list.cpp:71` initializes `active = true` and passes it to
+    /// `.pingAll(active)` (`:151`); only `-p` flips it off (`:86-88`).
+    fn active_discovery(&self) -> bool {
+        !self.passive
+    }
+}
+
 fn fmt_guid(guid: &[u8; 12]) -> String {
     let mut s = String::with_capacity(24);
     for b in guid {
@@ -63,9 +84,26 @@ fn fmt_guid(guid: &[u8; 12]) -> String {
     s
 }
 
-/// Parse `ip[:port]`, defaulting to the PVA server TCP port (5075,
-/// or `$EPICS_PVA_SERVER_PORT`). IPv6 literals must be bracketed
-/// (`[::1]:5075`) to disambiguate the colon.
+/// Resolve `host` to a single [`SocketAddr`] at `port`, mirroring the
+/// synchronous DNS fallback in pvxs `SockAddr::setAddress`
+/// (`src/util.cpp:523-549`): when the token is not a literal IP it is
+/// resolved through the system resolver. The first returned address is
+/// used (pvxs likewise takes the first `getaddrinfo` result).
+fn resolve_host_port(host: &str, port: u16) -> Result<SocketAddr, String> {
+    (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {host:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("no address found for {host:?}"))
+}
+
+/// Parse `host[:port]`, defaulting to the PVA server TCP port (5075, or
+/// `$EPICS_PVA_SERVER_PORT`). A literal IPv4/IPv6 is used directly;
+/// anything else is resolved through DNS, matching pvxs `pvxlist`, which
+/// passes the raw argument into `forceServer.setAddress(...)`
+/// (`src/client.cpp:347-359`) where `SockAddr::setAddress`
+/// (`src/util.cpp:523-549`) resolves hostnames. IPv6 literals must be
+/// bracketed (`[::1]:5075`) to disambiguate the colon.
 fn parse_server_addr(s: &str, default_port: u16) -> Result<SocketAddr, String> {
     // Already a full socket address (handles bracketed IPv6 + port).
     if let Ok(addr) = s.parse::<SocketAddr>() {
@@ -82,17 +120,18 @@ fn parse_server_addr(s: &str, default_port: u16) -> Result<SocketAddr, String> {
     if let Ok(ip) = s.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, default_port));
     }
-    // `ipv4:port`.
-    if let Some((host, port)) = s.rsplit_once(':') {
-        let port: u16 = port
-            .parse()
-            .map_err(|e| format!("port {port:?} invalid: {e}"))?;
-        let ip: std::net::IpAddr = host
-            .parse()
-            .map_err(|e| format!("ip {host:?} invalid: {e}"))?;
-        return Ok(SocketAddr::new(ip, port));
+    // `host:port` — explicit port on an IPv4 literal or a hostname.
+    if let Some((host, port_str)) = s.rsplit_once(':')
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        return match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => Ok(SocketAddr::new(ip, port)),
+            // Not a literal IP → resolve the hostname (pvxs setAddress).
+            Err(_) => resolve_host_port(host, port),
+        };
     }
-    Err(format!("address {s:?} is not a valid ip[:port]"))
+    // Bare hostname (no port) — resolve with the default port.
+    resolve_host_port(s, default_port)
 }
 
 /// Build the NTURI RPC request that the pvxs/Java `server` PV expects:
@@ -169,15 +208,13 @@ fn channel_names(value: &PvField) -> Vec<String> {
 }
 
 /// Query one server's `server` PV and print either its info or its
-/// hosted-channel list. Returns `Ok(())` so a failing server doesn't
-/// abort enumeration of the remaining ones.
-async fn query_server(
-    client: &PvaClient,
-    raw: &str,
-    addr: SocketAddr,
-    info: bool,
-    verbose: bool,
-) -> Result<(), ()> {
+/// hosted-channel list. A failing server reports the error to stderr
+/// but does NOT fail the command: pvxs `pvxlist` query mode catches the
+/// per-server exception, prints `From <server> : <error>`, and never
+/// updates the process return code (`tools/list.cpp:162-194`), returning
+/// 0 unconditionally after the wait (`:200-205`). Only invalid
+/// invocation (a parse error, handled in `main`) is a command failure.
+async fn query_server(client: &PvaClient, raw: &str, addr: SocketAddr, info: bool, verbose: bool) {
     let op = if info { "info" } else { "channels" };
     let (desc, value) = build_server_query(op);
     match client.pvrpc_from("server", addr, &desc, &value).await {
@@ -205,16 +242,92 @@ async fn query_server(
                     println!("{name}");
                 }
             }
-            Ok(())
         }
         Err(e) => {
             eprintln!("pvlist-rs: from {raw}: {e}");
-            Err(())
         }
     }
 }
 
-/// Discovery mode — passive beacon listen + optional active ping.
+/// Decides what `pvlist-rs` prints for each discovery event, matching
+/// pvxs `tools/list.cpp:129-148`.
+///
+/// Non-verbose mode is pipe-compatible: it emits only the raw TCP
+/// server address (so `pvlist-rs $(pvlist-rs -w 5)` works — the address
+/// feeds straight back into query mode), prints one address per
+/// `(guid, proto)` even when a server is reachable through several
+/// interfaces (`:139-147`), and suppresses Timeout/offline events
+/// (`:136`). Verbose mode keeps the detailed `ONLINE`/`OFFLINE` status
+/// lines.
+struct DiscoveryPrinter {
+    verbose: bool,
+    /// Non-verbose dedup: one printed address per `(guid, proto)`.
+    tcp_seen: HashSet<([u8; 12], String)>,
+    /// Verbose dedup + "servers seen" summary count, keyed `(server, guid)`.
+    online_seen: HashMap<(SocketAddr, [u8; 12]), ()>,
+}
+
+impl DiscoveryPrinter {
+    fn new(verbose: bool) -> Self {
+        Self {
+            verbose,
+            tcp_seen: HashSet::new(),
+            online_seen: HashMap::new(),
+        }
+    }
+
+    /// Line to print for an `Online` event, or `None` to suppress.
+    fn on_online(
+        &mut self,
+        server: SocketAddr,
+        guid: [u8; 12],
+        peer: SocketAddr,
+        proto: &str,
+    ) -> Option<String> {
+        if self.verbose {
+            // Detailed status line; dedup by (server, guid).
+            if self.online_seen.insert((server, guid), ()).is_some() {
+                return None;
+            }
+            Some(format!(
+                "ONLINE   {server:24}  guid={}  proto={proto}  peer={peer}",
+                fmt_guid(&guid)
+            ))
+        } else if proto == "tcp" {
+            // pvxs prints just one interface per (guid, proto) because
+            // the list is piped back to fetch PVs (list.cpp:139-147).
+            if self.tcp_seen.insert((guid, proto.to_string())) {
+                Some(server.to_string())
+            } else {
+                None
+            }
+        } else {
+            // Non-verbose suppresses non-TCP endpoints (list.cpp:133).
+            None
+        }
+    }
+
+    /// Line to print for a `Timeout` (offline) event, or `None`.
+    fn on_timeout(&mut self, server: SocketAddr, guid: [u8; 12]) -> Option<String> {
+        if self.verbose {
+            Some(format!("OFFLINE  {server:24}  guid={}", fmt_guid(&guid)))
+        } else {
+            // pvxs erases the (guid, "tcp") entry on Timeout so a later
+            // re-Online reprints the address (list.cpp:136). Our Timeout
+            // event carries no proto and non-verbose only tracks tcp.
+            self.tcp_seen.remove(&(guid, "tcp".to_string()));
+            None
+        }
+    }
+
+    /// Distinct servers seen, for the verbose summary line.
+    fn seen_count(&self) -> usize {
+        self.online_seen.len()
+    }
+}
+
+/// Discovery mode — active by default (broadcast ping + beacon
+/// listen); `-p` makes it passive (beacon listen only).
 async fn discover_mode(args: &Args) {
     let engine = match SearchEngine::spawn(Vec::new(), Vec::new()).await {
         Ok(e) => e,
@@ -230,12 +343,14 @@ async fn discover_mode(args: &Args) {
             std::process::exit(1);
         }
     };
-    if args.ping {
+    // pvxs always calls `.pingAll(active)`; with active=false it skips
+    // the broadcast probe. We gate the equivalent `ping_all()` on the
+    // resolved flag, which is active by default (tools/list.cpp:151).
+    if args.active_discovery() {
         engine.ping_all().await;
     }
 
-    // De-dup by (server, guid) so a chatty IOC doesn't spam.
-    let mut seen: HashMap<(SocketAddr, [u8; 12]), bool> = HashMap::new();
+    let mut printer = DiscoveryPrinter::new(args.verbose);
     // `args.timeout <= 0` means "wait forever" by design. Non-finite
     // (NaN / ±Inf) also collapses to "no deadline".
     let deadline = if args.timeout.is_finite() && args.timeout > 0.0 {
@@ -263,30 +378,20 @@ async fn discover_mode(args: &Args) {
                 peer,
                 proto,
             } => {
-                if seen.insert((server, guid), true).is_some() {
-                    continue;
-                }
-                if args.verbose {
-                    println!(
-                        "ONLINE   {server:24}  guid={}  proto={proto}  peer={peer}",
-                        fmt_guid(&guid)
-                    );
-                } else {
-                    println!("ONLINE   {server}");
+                if let Some(line) = printer.on_online(server, guid, peer, &proto) {
+                    println!("{line}");
                 }
             }
             Discovered::Timeout { server, guid } => {
-                if args.verbose {
-                    println!("OFFLINE  {server:24}  guid={}", fmt_guid(&guid));
-                } else {
-                    println!("OFFLINE  {server}");
+                if let Some(line) = printer.on_timeout(server, guid) {
+                    println!("{line}");
                 }
             }
         }
     }
 
-    if args.verbose && !seen.is_empty() {
-        println!("\n{} server(s) seen.", seen.len());
+    if args.verbose && printer.seen_count() > 0 {
+        println!("\n{} server(s) seen.", printer.seen_count());
     }
 }
 
@@ -320,16 +425,180 @@ async fn main() {
         .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
         .build();
 
-    let mut had_error = false;
-    for (raw, addr) in &addrs {
-        if query_server(&client, raw, *addr, args.info, args.verbose)
-            .await
-            .is_err()
-        {
-            had_error = true;
-        }
+    // pvxs `tools/list.cpp:156-197` `exec()`s every server RPC before
+    // waiting, then waits once on a shared event bounded by a single
+    // command-level timeout (`:200-203`). Launch all queries
+    // concurrently and await them as one batch so a slow or
+    // unreachable earlier server cannot delay or block later servers;
+    // the shared `client` timeout bounds the whole batch to one wait
+    // window instead of `N * -w`.
+    //
+    // Per-server RPC failures are reported by `query_server` but do not
+    // fail the command — pvxs query mode returns 0 unconditionally
+    // (`:200-205`), so `pvlist-rs good bad` still prints `good`'s
+    // channels and exits 0. Only invalid invocation (the parse loop
+    // above, exit 2) is a command failure.
+    join_all(
+        addrs
+            .iter()
+            .map(|(raw, addr)| query_server(&client, raw, *addr, args.info, args.verbose)),
+    )
+    .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// pvxs `tools/list.cpp:71` defaults `active = true`: no-argument
+    /// discovery actively pings.
+    #[test]
+    fn discovery_is_active_by_default() {
+        let args = Args::parse_from(["pvlist-rs"]);
+        assert!(args.active_discovery());
     }
-    if had_error {
-        std::process::exit(1);
+
+    /// pvxs `-p` (`tools/list.cpp:86-88`) sets `active = false`.
+    #[test]
+    fn passive_flag_disables_active_discovery() {
+        let args = Args::parse_from(["pvlist-rs", "-p"]);
+        assert!(!args.active_discovery());
+        let long = Args::parse_from(["pvlist-rs", "--passive"]);
+        assert!(!long.active_discovery());
+    }
+
+    /// pvxs `-A` (`tools/list.cpp:83-85`) keeps active mode.
+    #[test]
+    fn active_flag_keeps_active_discovery() {
+        let args = Args::parse_from(["pvlist-rs", "-A"]);
+        assert!(args.active_discovery());
+    }
+
+    /// `-A` and `-p` are mutually exclusive, mirroring the single
+    /// `active` bool in pvxs that the two options write.
+    #[test]
+    fn active_and_passive_conflict() {
+        assert!(Args::try_parse_from(["pvlist-rs", "-A", "-p"]).is_err());
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// Non-verbose discovery prints only the raw TCP address (no
+    /// ONLINE/OFFLINE label), and that line round-trips through
+    /// query-mode address parsing — the `pvlist-rs $(pvlist-rs)` form.
+    #[test]
+    fn nonverbose_prints_pipeable_tcp_address() {
+        let mut p = DiscoveryPrinter::new(false);
+        let line = p
+            .on_online(
+                addr("10.0.0.5:5075"),
+                [1u8; 12],
+                addr("10.0.0.5:34000"),
+                "tcp",
+            )
+            .expect("new tcp server prints its address");
+        assert_eq!(line, "10.0.0.5:5075");
+        // The printed token must parse back as a query-mode address.
+        assert_eq!(
+            parse_server_addr(&line, 5075).unwrap(),
+            addr("10.0.0.5:5075")
+        );
+    }
+
+    /// Non-verbose mode prints one address per (guid, proto), even
+    /// across interfaces, and suppresses Timeout/offline events.
+    #[test]
+    fn nonverbose_dedups_and_suppresses_offline() {
+        let mut p = DiscoveryPrinter::new(false);
+        let guid = [2u8; 12];
+        assert!(
+            p.on_online(addr("10.0.0.5:5075"), guid, addr("10.0.0.5:1"), "tcp")
+                .is_some()
+        );
+        // Same (guid, proto) via a different interface address: suppressed.
+        assert!(
+            p.on_online(addr("192.168.1.5:5075"), guid, addr("192.168.1.5:1"), "tcp")
+                .is_none()
+        );
+        // Offline event prints nothing in non-verbose mode.
+        assert!(p.on_timeout(addr("10.0.0.5:5075"), guid).is_none());
+        // After timeout cleared the entry, a re-Online reprints.
+        assert!(
+            p.on_online(addr("10.0.0.5:5075"), guid, addr("10.0.0.5:1"), "tcp")
+                .is_some()
+        );
+    }
+
+    /// Non-verbose mode suppresses non-TCP endpoints (e.g. tls).
+    #[test]
+    fn nonverbose_suppresses_non_tcp() {
+        let mut p = DiscoveryPrinter::new(false);
+        assert!(
+            p.on_online(addr("10.0.0.5:5076"), [3u8; 12], addr("10.0.0.5:1"), "tls")
+                .is_none()
+        );
+    }
+
+    /// A numeric IPv4 with no port takes the default port (no DNS).
+    #[test]
+    fn parse_addr_numeric_ipv4_default_port() {
+        assert_eq!(
+            parse_server_addr("1.2.3.4", 5075).unwrap(),
+            addr("1.2.3.4:5075")
+        );
+        assert_eq!(
+            parse_server_addr("1.2.3.4:5099", 5075).unwrap(),
+            addr("1.2.3.4:5099")
+        );
+    }
+
+    /// A bracketed IPv6 with explicit port parses without DNS.
+    #[test]
+    fn parse_addr_bracketed_ipv6_with_port() {
+        assert_eq!(
+            parse_server_addr("[::1]:5075", 5075).unwrap(),
+            addr("[::1]:5075")
+        );
+        // Bracketed IPv6 without a port takes the default.
+        assert_eq!(
+            parse_server_addr("[::1]", 5075).unwrap(),
+            addr("[::1]:5075")
+        );
+    }
+
+    /// finding 66: a hostname must resolve (pvxs setAddress DNS
+    /// fallback), not be rejected. `localhost` resolves offline via
+    /// the hosts file, with and without an explicit port.
+    #[test]
+    fn parse_addr_resolves_hostname() {
+        let bare = parse_server_addr("localhost", 5075).expect("localhost resolves");
+        assert!(bare.ip().is_loopback(), "got {bare}");
+        assert_eq!(bare.port(), 5075);
+
+        let with_port = parse_server_addr("localhost:5099", 5075).expect("localhost:port resolves");
+        assert!(with_port.ip().is_loopback(), "got {with_port}");
+        assert_eq!(with_port.port(), 5099);
+    }
+
+    /// An invalid bracketed address yields a diagnostic, not a panic
+    /// (the synchronous failure path; hostname resolution failures use
+    /// the same `Result`-based reporting).
+    #[test]
+    fn parse_addr_invalid_is_error() {
+        assert!(parse_server_addr("[not-an-ip]", 5075).is_err());
+    }
+
+    /// Verbose mode keeps the detailed ONLINE/OFFLINE status lines.
+    #[test]
+    fn verbose_keeps_status_labels() {
+        let mut p = DiscoveryPrinter::new(true);
+        let on = p
+            .on_online(addr("10.0.0.5:5075"), [4u8; 12], addr("10.0.0.5:1"), "tcp")
+            .unwrap();
+        assert!(on.starts_with("ONLINE"));
+        let off = p.on_timeout(addr("10.0.0.5:5075"), [4u8; 12]).unwrap();
+        assert!(off.starts_with("OFFLINE"));
     }
 }

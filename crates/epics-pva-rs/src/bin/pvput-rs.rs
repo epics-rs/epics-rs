@@ -2,7 +2,7 @@ use clap::Parser;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::format;
 use epics_pva_rs::pv_request::PvRequestExpr;
-use epics_pva_rs::pvdata::{PvField, PvStructure};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure};
 
 const VERSION_INFO: &str = concat!("pvput-rs ", env!("CARGO_PKG_VERSION"));
 
@@ -27,22 +27,35 @@ struct Args {
     #[arg(short = 'w', default_value = "5.0")]
     timeout: f64,
 
-    /// Default provider name (parity-only; we always speak PVA).
+    /// Provider name. pvAccessCPP defaults this to `pva`
+    /// (`pvtoolsSrc/pvutils.cpp:32`); only the native PVA provider is
+    /// supported here, so a non-`pva` value is rejected rather than
+    /// silently performing a PVA write.
     #[arg(short = 'p', long = "provider", default_value = "pva")]
     provider: String,
 
-    /// Output mode: `nt` (default), `raw`, or `json`. Currently the
-    /// post-put echo always uses the legacy NT shape.
+    /// Output mode: `nt` (default), `raw`, or `json`. Selects how the
+    /// `--read-back` Old:/New: echo renders values, mirroring
+    /// `pvget-rs` (pvAccessCPP pvput.cpp:299-310, 403-428).
     #[arg(short = 'M', long = "mode", default_value = "nt")]
     mode: String,
 
-    /// Show entire structure in raw mode (legacy `-v` shorthand).
+    /// Show entire structure in raw mode (legacy `-v` shorthand);
+    /// implies `-M raw` for the `--read-back` echo (pvput.cpp:281-283).
     #[arg(short = 'v', action = clap::ArgAction::Count)]
     verbose: u8,
 
     /// Quiet mode — print only error messages.
     #[arg(short = 'q')]
     quiet: bool,
+
+    /// Read the value before and after the PUT and print `Old :` /
+    /// `New :` echo lines. Rust-specific and off by default: pvxs
+    /// `pvxput` issues only the PUT and never reads back
+    /// (`tools/put.cpp:115-158`), so the default command does not GET a
+    /// write-only or read-restricted PV.
+    #[arg(long = "read-back")]
+    read_back: bool,
 
     /// Enable debug log output (currently a no-op; kept for parity).
     #[arg(short = 'd')]
@@ -70,6 +83,14 @@ async fn main() {
     if args.version {
         println!("{VERSION_INFO}");
         return;
+    }
+
+    // Only the native PVA provider is implemented. pvAccessCPP would
+    // route `-p ca` through its CA provider (pvput.cpp:368-399); we
+    // cannot, so reject it instead of silently writing over PVA.
+    if let Err(e) = check_provider(&args.provider) {
+        eprintln!("pvput-rs: {e}");
+        std::process::exit(1);
     }
 
     let pv_name = args.pv_name.expect("clap enforces required");
@@ -106,10 +127,19 @@ async fn main() {
         }
     };
 
-    // 1. Read old NTScalar (with timestamp) for the `Old :` echo line.
-    //    Errors are tolerated — legacy pvput emits an "Error:" line in
-    //    the gap and continues to the put.
-    let old_get = client.pvget_full(&pv_name).await;
+    // pvxs `pvxput` issues a single PUT and prints nothing on success
+    // (tools/put.cpp:115-158): no pre- or post-PUT GET. The Old:/New:
+    // readback below is a Rust-only convenience gated behind
+    // `--read-back`, so the default command matches pvxs and never
+    // GETs a write-only PV.
+    //
+    // 1. Optional pre-PUT read for the `Old :` echo line. Errors are
+    //    tolerated — the echo prints an "Old : ***" line and continues.
+    let old_get = if args.read_back {
+        Some(client.pvget_full(&pv_name).await)
+    } else {
+        None
+    };
 
     // 2. Do the put. Field assignments build one prototype-based delta;
     //    a bare value targets `.value` via the existing helpers.
@@ -129,38 +159,69 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // 3. Read new NTScalar (with timestamp) for the `New :` echo line.
-    let new_get = client.pvget_full(&pv_name).await;
-
-    if args.quiet {
+    // pvxs-faithful default: the PUT is the whole command. Without
+    // `--read-back` there is no post-PUT GET and success is silent.
+    if !args.read_back {
         return;
     }
 
-    let echo_line = |label: &str, value: &PvField| -> Option<String> {
-        let s = match value {
-            PvField::Structure(s) => s,
-            _ => return None,
-        };
-        Some(format_old_new_line(label, s))
+    // 3. Post-PUT read for the `New :` echo line.
+    let new_get = client.pvget_full(&pv_name).await;
+
+    // pvAccessCPP formats both the old and new readback values through
+    // the same `stream().format(outmode)` path (pvput.cpp:403-428), and
+    // `-v` selects raw mode (pvput.cpp:281-283). Mirror `pvget-rs`'s
+    // mode dispatch so `-M raw`/`-M json`/`-v` actually change the echo
+    // shape instead of always emitting the legacy NT form.
+    let mode = resolve_output_mode(&args.mode, args.verbose);
+    let render = |label: &str, value: &PvField, desc: &FieldDesc| -> String {
+        match mode {
+            "json" => format::format_json(label, value),
+            "raw" => format::format_raw(label, desc, value),
+            // Default `-M nt`: legacy compact `<label><ts>  <val>` shape.
+            _ => match value {
+                PvField::Structure(s) => format_old_new_line(label, s),
+                _ => format!("{label}(non-NT value)\n"),
+            },
+        }
     };
 
-    match &old_get {
-        Ok(r) => match echo_line("Old : ", &r.value) {
-            Some(line) => print!("{line}"),
-            None => println!("Old : (non-NT value)"),
-        },
-        Err(e) => println!("Old : *** {e}"),
+    // pvAccessCPP `pvput -q` (pvput.cpp:403-428) suppresses the `Old :`
+    // line and the `New :` label but still prints the post-PUT value.
+    // So quiet drops the old echo entirely and prints the new value
+    // with an empty label, while a non-quiet run keeps both labels.
+    if !args.quiet
+        && let Some(old_get) = &old_get
+    {
+        match old_get {
+            Ok(r) => print!("{}", render("Old : ", &r.value, &r.introspection)),
+            Err(e) => println!("Old : *** {e}"),
+        }
     }
+    let new_label = new_echo_label(args.quiet);
     match &new_get {
-        Ok(r) => match echo_line("New : ", &r.value) {
-            Some(line) => print!("{line}"),
-            None => println!("New : (non-NT value)"),
-        },
+        Ok(r) => print!("{}", render(new_label, &r.value, &r.introspection)),
+        // A readback GET failure is not the PUT result (already checked);
+        // report it to stderr so quiet's stdout stays value-only.
+        Err(e) if args.quiet => eprintln!("pvput-rs: readback failed: {e}"),
         Err(e) => println!("New : *** {e}"),
     }
 
-    // Suppress unused-warning for parity-only flags.
-    let _ = (args.provider, args.mode, args.verbose, args.debug);
+    // Suppress unused-warning for the remaining parity-only flag.
+    let _ = args.debug;
+}
+
+/// Validate the requested provider. Only the native PVA provider is
+/// supported; pvAccessCPP's `-p ca` CA-provider path (pvput.cpp:368-399)
+/// is not implemented, so it is rejected rather than silently dropped.
+fn check_provider(provider: &str) -> Result<(), String> {
+    if provider == "pva" {
+        Ok(())
+    } else {
+        Err(format!(
+            "provider {provider:?} not supported (only \"pva\")"
+        ))
+    }
 }
 
 /// Parsed CLI value tokens. pvxs `pvxput` accepts either one bare
@@ -197,6 +258,20 @@ fn parse_put_args(values: &[String]) -> Result<PutInput, String> {
         }
     }
     Ok(PutInput::Fields(assignments))
+}
+
+/// Resolve the effective output mode for the `--read-back` echo. `-v`
+/// implies raw mode (pvAccessCPP pvput.cpp:281-283); otherwise the
+/// `-M` value is used, matching `pvget-rs`.
+fn resolve_output_mode(mode: &str, verbose: u8) -> &str {
+    if verbose > 0 { "raw" } else { mode }
+}
+
+/// Label for the post-PUT `New :` echo line. pvAccessCPP `pvput -q`
+/// (pvput.cpp:403-428) drops the `New :` label but still prints the
+/// value, so quiet mode uses an empty label.
+fn new_echo_label(quiet: bool) -> &'static str {
+    if quiet { "" } else { "New : " }
 }
 
 /// Render an `Old :` / `New :` echo line in legacy `pvput.cpp` shape:
@@ -252,5 +327,52 @@ mod tests {
     fn mixed_bare_and_field_is_rejected() {
         let err = parse_put_args(&v(&["42", "alarm.severity=2"])).unwrap_err();
         assert!(err.contains("expected <field>=<value>"), "got: {err}");
+    }
+
+    #[test]
+    fn pva_provider_is_accepted() {
+        assert!(check_provider("pva").is_ok());
+    }
+
+    #[test]
+    fn non_pva_provider_is_rejected() {
+        // pvxs has no provider switch; pvAccessCPP `-p ca` is unsupported.
+        assert!(check_provider("ca").is_err());
+        assert!(check_provider("").is_err());
+    }
+
+    /// pvxs `pvxput` issues only the PUT — no readback. The default
+    /// command must not read back, so a write-only PV is never GET'd.
+    #[test]
+    fn readback_is_off_by_default() {
+        let args = Args::parse_from(["pvput-rs", "PV", "42"]);
+        assert!(!args.read_back);
+    }
+
+    /// `--read-back` opts in to the Rust-only Old:/New: echo.
+    #[test]
+    fn read_back_flag_enables_readback() {
+        let args = Args::parse_from(["pvput-rs", "--read-back", "PV", "42"]);
+        assert!(args.read_back);
+    }
+
+    /// pvAccessCPP `pvput -q` drops the `New :` label but still prints
+    /// the value, so quiet uses an empty label and non-quiet keeps it.
+    #[test]
+    fn quiet_suppresses_new_label_only() {
+        assert_eq!(new_echo_label(false), "New : ");
+        assert_eq!(new_echo_label(true), "");
+    }
+
+    /// `-M` selects the readback echo formatter; `-v` overrides it to
+    /// raw (pvput.cpp:281-283), matching pvget-rs.
+    #[test]
+    fn output_mode_honors_mode_and_verbose() {
+        assert_eq!(resolve_output_mode("nt", 0), "nt");
+        assert_eq!(resolve_output_mode("json", 0), "json");
+        assert_eq!(resolve_output_mode("raw", 0), "raw");
+        // -v forces raw regardless of -M.
+        assert_eq!(resolve_output_mode("nt", 1), "raw");
+        assert_eq!(resolve_output_mode("json", 2), "raw");
     }
 }

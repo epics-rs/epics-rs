@@ -29,7 +29,10 @@ struct Args {
     #[arg(short = 'w', default_value = "5.0")]
     timeout: f64,
 
-    /// Quiet mode, print only error messages
+    /// Deprecated, ignored. pvAccessCPP `pvget` treats `-q` as a
+    /// deprecated no-op (`pvtoolsSrc/pvget.cpp:332-338`) and still
+    /// prints successful values; pvxs `tools/get.cpp` has no such
+    /// option. Accepted for legacy CLI compatibility, but has no effect.
     #[arg(short = 'q')]
     quiet: bool,
 }
@@ -73,9 +76,8 @@ async fn main() {
         };
         match result {
             Ok(result) => {
-                if args.quiet {
-                    continue;
-                }
+                // `-q` is a deprecated no-op (see Args::quiet); successful
+                // values are always printed, matching pvAccessCPP pvget.
                 let output = match mode {
                     "json" => format::format_json(pv_name, &result.value),
                     "raw" => format::format_raw(pv_name, &result.introspection, &result.value),
@@ -91,5 +93,20 @@ async fn main() {
     }
     if failed {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `-q` is accepted for legacy compatibility but is a deprecated
+    /// no-op: it must not gate successful output (pvAccessCPP
+    /// pvget.cpp:332-338). This locks the flag's presence; the
+    /// print-always behavior is enforced structurally in `main`.
+    #[test]
+    fn quiet_flag_is_accepted_as_deprecated_noop() {
+        let args = Args::parse_from(["pvget-rs", "-q", "PV"]);
+        assert!(args.quiet);
     }
 }

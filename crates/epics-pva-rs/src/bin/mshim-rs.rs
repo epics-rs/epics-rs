@@ -99,6 +99,17 @@ fn parse_endpoint(s: &str, default_port: u16) -> Result<Endpoint, String> {
     let ip: IpAddr = ip_str
         .parse()
         .map_err(|e| format!("ip {ip_str:?} invalid: {e}"))?;
+    // pvxs `mshim` is an IPv4 multicast shim: `parseEP()` rejects any
+    // non-AF_INET address (mshim.cpp:56-68) and a zero port number
+    // (mshim.cpp:70-72). Reject both here so a misconfigured IPv6 /
+    // `:0` endpoint fails at parse time instead of surviving startup
+    // and then failing on every socket bind / datagram send.
+    if !ip.is_ipv4() {
+        return Err(format!("only IPv4 addresses are supported, not {ip_str:?}"));
+    }
+    if port == 0 {
+        return Err("non-zero port number required".into());
+    }
     Ok(Endpoint {
         ip,
         port,
@@ -240,6 +251,14 @@ async fn main() {
                 .and_then(|s| s.parse().ok())
         })
         .unwrap_or(5076);
+
+    // pvxs rejects a zero port for the fallback too — a 0 default
+    // (`-p 0` or `EPICS_PVA_BROADCAST_PORT=0`) cannot be a meaningful
+    // PVA broadcast/search port (mshim.cpp:70-72).
+    if default_port == 0 {
+        eprintln!("mshim-rs: non-zero port number required (got -p/EPICS_PVA_BROADCAST_PORT 0)");
+        std::process::exit(2);
+    }
 
     let listen: Vec<Endpoint> = match args
         .listen
@@ -511,6 +530,22 @@ mod tests {
     #[test]
     fn parse_endpoint_rejects_bad_port() {
         assert!(parse_endpoint("127.0.0.1:notaport", 5076).is_err());
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_ipv6() {
+        // pvxs mshim is IPv4-only (mshim.cpp:56-68).
+        assert!(parse_endpoint("::1", 5076).is_err());
+        assert!(parse_endpoint("fe80::1", 5076).is_err());
+        assert!(parse_endpoint("[::1]:5076", 5076).is_err());
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_zero_port() {
+        // Explicit `:0` endpoint port (mshim.cpp:70-72).
+        assert!(parse_endpoint("127.0.0.1:0", 5076).is_err());
+        // Zero default port (the `-p 0` fallback) also yields port 0.
+        assert!(parse_endpoint("127.0.0.1", 0).is_err());
     }
 
     #[test]

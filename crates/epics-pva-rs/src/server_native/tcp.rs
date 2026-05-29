@@ -1899,7 +1899,14 @@ fn parse_client_credentials(
     // (account="anonymous"). pvxs clients always send the string
     // "anonymous" — not empty — so the is_empty() guard alone left
     // account="" for every pvxs anonymous handshake.
-    if method.is_empty() || method.eq_ignore_ascii_case("anonymous") {
+    //
+    // Byte-exact match: pvxs advertises exactly "anonymous"/"ca"
+    // (serverconn.cpp:108-114) and compares the selected method as a raw
+    // string (serverconn.cpp:202-231). A non-exact spelling like
+    // "Anonymous" is NOT the advertised method — it falls through and is
+    // rejected as unadvertised by the caller (serverconn.cpp:238-241),
+    // rather than being case-folded into a clean anonymous handshake.
+    if method.is_empty() || method == "anonymous" {
         return Ok(None);
     }
     // Auth value: type descriptor + full value. pvxs requires both to
@@ -1959,7 +1966,12 @@ fn parse_client_credentials(
     // Mirror that: ca with a missing or empty user field (including the
     // null-auth body above) returns Ok(None) so the caller falls back to
     // ClientCredentials::anonymous().
-    if creds.method.eq_ignore_ascii_case("ca") && creds.account.is_empty() {
+    //
+    // Byte-exact "ca" (pvxs serverconn.cpp:221-231 keys on selected=="ca"):
+    // a non-exact spelling like "CA" is not "ca", so this fallback does not
+    // fire; it returns the claimed credential and the caller rejects it as
+    // an unadvertised method, reverting the identity to anonymous.
+    if creds.method == "ca" && creds.account.is_empty() {
         return Ok(None);
     }
     // Roles are re-derived server-side from `account` (pvxs
@@ -2447,10 +2459,15 @@ async fn handle_connection_io(
                 // in use (pvxs advertises `x509` for TLS transports).
                 // So the unadvertised-method rejection only applies to
                 // the plain-TCP `ca`/`anonymous` negotiation.
-                let advertised = x509_locked
-                    || ADVERTISED_AUTH_METHODS
-                        .iter()
-                        .any(|m| m.eq_ignore_ascii_case(&cred.method));
+                // Byte-exact membership in the advertised set. pvxs
+                // advertises exactly "anonymous"/"ca" (serverconn.cpp:108-114)
+                // and rejects any other spelling — including case variants
+                // like "CA" — as unadvertised auth (serverconn.cpp:238-241).
+                // A case-insensitive compare here would admit "CA"/"Anonymous"
+                // that pvxs refuses, letting an unadvertised method's account
+                // reach the ACF gate.
+                let advertised =
+                    x509_locked || ADVERTISED_AUTH_METHODS.iter().any(|m| *m == cred.method);
                 let validated_status = if advertised {
                     Status::ok()
                 } else {
@@ -9520,6 +9537,131 @@ mod tests {
             parsed.is_none(),
             "ca + null auth must yield the anonymous fallback (None), \
              not a blank-account CA credential: {parsed:?}"
+        );
+    }
+
+    /// pvxs advertises exactly `anonymous`/`ca` (`serverconn.cpp:108-114`)
+    /// and keys the auth lambda on the raw string `selected=="ca"`
+    /// (`serverconn.cpp:221-231`). An uppercase `CA` is therefore NOT the
+    /// advertised method: the lambda never fires to fold it into a trusted
+    /// ca identity, the parser returns the spelling verbatim, and the caller
+    /// rejects it as unadvertised (`serverconn.cpp:238-241`). A
+    /// case-insensitive compare would fold `CA`+user into a clean ca
+    /// credential the client never legitimately negotiated.
+    #[test]
+    fn parse_client_credentials_uppercase_ca_is_not_advertised_method() {
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(0x10000, order); // buffer_size
+        payload.put_u16(1, order); // intro_size
+        payload.put_u16(0, order); // qos
+        encode_string_into("CA", order, &mut payload);
+        // AuthZ structure carrying a single `user` field.
+        payload.put_u8(0xFD);
+        payload.put_u16(1, order);
+        payload.put_u8(0x80);
+        payload.put_u8(0x00);
+        payload.put_u8(1); // n_fields
+        payload.put_u8(0x04);
+        payload.extend_from_slice(b"user");
+        payload.put_u8(0x60); // string
+        encode_string_into("alice", order, &mut payload);
+
+        let header = PvaHeader::application(
+            false,
+            order,
+            Command::ConnectionValidation.code(),
+            payload.len() as u32,
+        );
+        let frame = Frame { header, payload };
+
+        let creds = parse_client_credentials(&frame, order)
+            .expect("decode must succeed")
+            .expect("non-anonymous method yields Some");
+        assert_eq!(
+            creds.method, "CA",
+            "method preserved byte-for-byte, never folded to `ca`"
+        );
+        assert!(
+            !["anonymous", "ca"].iter().any(|m| *m == creds.method),
+            "uppercase `CA` must not match an advertised method: {:?}",
+            creds.method
+        );
+    }
+
+    /// A mixed-case `Ca` with no user field must NOT take the
+    /// ca-requires-user anonymous fallback: that fallback keys on the exact
+    /// string `ca` (`serverconn.cpp:221-231`), so `Ca` falls through with
+    /// its verbatim method and is rejected by the caller as unadvertised
+    /// (`serverconn.cpp:238-241`) rather than silently treated as a clean
+    /// anonymous handshake.
+    #[test]
+    fn parse_client_credentials_mixedcase_ca_missing_user_is_not_advertised() {
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(0x10000, order); // buffer_size
+        payload.put_u16(1, order); // intro_size
+        payload.put_u16(0, order); // qos
+        encode_string_into("Ca", order, &mut payload);
+        payload.put_u8(0xFF); // NULL auth value (no user field)
+
+        let header = PvaHeader::application(
+            false,
+            order,
+            Command::ConnectionValidation.code(),
+            payload.len() as u32,
+        );
+        let frame = Frame { header, payload };
+
+        let creds = parse_client_credentials(&frame, order)
+            .expect("decode must succeed")
+            .expect("mixed-case `Ca` is not the exact `ca` fallback → Some");
+        assert_eq!(
+            creds.method, "Ca",
+            "method preserved byte-for-byte, never folded to `ca`"
+        );
+        assert!(
+            !["anonymous", "ca"].iter().any(|m| *m == creds.method),
+            "mixed-case `Ca` must not match an advertised method: {:?}",
+            creds.method
+        );
+    }
+
+    /// A capitalized `Anonymous` is not the advertised `anonymous`
+    /// (`serverconn.cpp:108-114`). Only the byte-exact `anonymous` (or an
+    /// empty method) folds to the anonymous placeholder; `Anonymous` falls
+    /// through verbatim and is rejected as unadvertised
+    /// (`serverconn.cpp:238-241`), never case-folded into a clean anonymous
+    /// handshake.
+    #[test]
+    fn parse_client_credentials_capitalized_anonymous_is_not_folded() {
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(0x10000, order); // buffer_size
+        payload.put_u16(1, order); // intro_size
+        payload.put_u16(0, order); // qos
+        encode_string_into("Anonymous", order, &mut payload);
+        payload.put_u8(0xFF); // NULL auth value
+
+        let header = PvaHeader::application(
+            false,
+            order,
+            Command::ConnectionValidation.code(),
+            payload.len() as u32,
+        );
+        let frame = Frame { header, payload };
+
+        let creds = parse_client_credentials(&frame, order)
+            .expect("decode must succeed")
+            .expect("capitalized `Anonymous` is not the exact fold → Some");
+        assert_eq!(
+            creds.method, "Anonymous",
+            "method preserved byte-for-byte, never folded to `anonymous`"
+        );
+        assert!(
+            !["anonymous", "ca"].iter().any(|m| *m == creds.method),
+            "capitalized `Anonymous` must not match an advertised method: {:?}",
+            creds.method
         );
     }
 

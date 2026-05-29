@@ -669,6 +669,46 @@ impl ChannelSource for PvDatabaseSource {
         }
     }
 
+    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        let db = self.db.clone();
+        let name = name.to_string();
+        async move {
+            // The WRITE-class gate ran in `process_checked` (trait
+            // default) before reaching here, so a failure below is
+            // operational, not a denial. pvxs serves PVA PROCESS by
+            // running the IOC processing chain (`iocsource.cpp:397-417`
+            // dbProcess / `singlesource.cpp:346-382`); the backing
+            // database already exposes that through
+            // `process_record_with_links` — the foreign-caller
+            // full-processing entry that is alias-aware, takes the
+            // record's advisory write gate, and runs
+            // INP -> process -> alarms -> OUT -> FLNK with cycle/depth
+            // guards. The previous no-op default returned success while
+            // the record never processed (alarms, monitors, OUT links and
+            // the FLNK chain all skipped).
+            match db.find_entry(&name).await {
+                Some(PvEntry::Record(_)) => {
+                    // PROCESS targets the whole record, not a field —
+                    // drop any `.FIELD` suffix so the record/alias name
+                    // resolves in `process_record_with_links`.
+                    let (base, _field) = parse_pv_name(&name);
+                    let base = base.to_string();
+                    let mut visited = std::collections::HashSet::new();
+                    db.process_record_with_links(&base, &mut visited, 0)
+                        .await
+                        .map_err(|e| OpError::failed(e.to_string()))
+                }
+                // A simple/mailbox SharedPV has no record body to run;
+                // report PROCESS as unsupported rather than silently
+                // succeeding (no process hook exists for these).
+                Some(PvEntry::Simple(_)) => Err(OpError::failed(format!(
+                    "PROCESS not supported for simple PV '{name}'"
+                ))),
+                None => Err(OpError::failed(format!("no record serves '{name}'"))),
+            }
+        }
+    }
+
     // the legacy `get_value_ctx` / `subscribe_ctx` /
     // `put_value_ctx` overrides were deleted. The trait's
     // `*_checked` defaults already enforce the AccessChecked level
@@ -2106,5 +2146,74 @@ ASG(DEFAULT) {
             )
             .await
             .expect("ASL=0 record must match RULE(2, WRITE)");
+    }
+
+    /// PVA-61 regression: a record-backed PROCESS must run the record's
+    /// processing chain, not the no-op default success. A `CALC="5"`
+    /// record evaluates the expression into VAL on process, so VAL flips
+    /// from its unprocessed default (0) to 5 — proof the chain ran, which
+    /// the old no-op `Ok(())` could never produce.
+    #[tokio::test]
+    async fn process_runs_record_processing_not_noop() {
+        use epics_base_rs::server::records::calc::CalcRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("CALC:PROC", Box::new(CalcRecord::new("5")))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+
+        // Unprocessed default.
+        let before = source
+            .get_value_ctx("CALC:PROC", ctx.clone())
+            .await
+            .expect("initial get");
+        assert_eq!(
+            extract_put_value_leaf(&before),
+            Some(PvField::Scalar(ScalarValue::Double(0.0))),
+            "VAL starts at the unprocessed default"
+        );
+
+        // PROCESS via the WRITE-gated checked path (no ACF → allowed).
+        let checked = source
+            .access()
+            .check("CALC:PROC", &ctx.host, &ctx.account, &ctx.method, "")
+            .await;
+        source
+            .process_checked(checked, ctx.clone())
+            .await
+            .expect("PROCESS must succeed");
+
+        // The CALC expression was evaluated into VAL: the chain ran.
+        let after = source
+            .get_value_ctx("CALC:PROC", ctx.clone())
+            .await
+            .expect("post-process get");
+        assert_eq!(
+            extract_put_value_leaf(&after),
+            Some(PvField::Scalar(ScalarValue::Double(5.0))),
+            "record PROCESS must evaluate CALC into VAL, not no-op"
+        );
+    }
+
+    /// A simple/mailbox PV has no record body; PROCESS reports unsupported
+    /// rather than silently succeeding.
+    #[tokio::test]
+    async fn process_simple_pv_is_unsupported() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("MAILBOX:PV", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let checked = source
+            .access()
+            .check("MAILBOX:PV", &ctx.host, &ctx.account, &ctx.method, "")
+            .await;
+        assert!(
+            source.process_checked(checked, ctx).await.is_err(),
+            "PROCESS on a simple PV must be unsupported, not silent success"
+        );
     }
 }

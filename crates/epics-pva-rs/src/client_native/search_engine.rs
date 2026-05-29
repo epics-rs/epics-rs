@@ -297,11 +297,7 @@ impl SearchEngine {
         // pvxs 8db40be (2025-10): warn loudly when a Context is built
         // with no search destinations and AUTO_ADDR_LIST disabled.
         // The user otherwise sees nothing but timeouts.
-        let auto_addr = std::env::var("EPICS_PVA_AUTO_ADDR_LIST").unwrap_or_else(|_| "YES".into());
-        let auto_on = matches!(
-            auto_addr.trim().to_ascii_uppercase().as_str(),
-            "YES" | "Y" | "1" | "TRUE"
-        );
+        let auto_on = crate::config::env::auto_addr_list_enabled();
         let env_addrs = std::env::var("EPICS_PVA_ADDR_LIST").ok();
         // PVA-466: expand $(VAR) before checking emptiness so an
         // unset macro collapses to "" and the no-destinations

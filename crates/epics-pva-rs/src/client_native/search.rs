@@ -63,13 +63,10 @@ pub fn default_server_port() -> u16 {
 }
 
 fn auto_addr_list_enabled() -> bool {
-    match std::env::var("EPICS_PVA_AUTO_ADDR_LIST") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_uppercase();
-            v == "YES" || v == "Y" || v == "1" || v == "TRUE"
-        }
-        Err(_) => true,
-    }
+    // Delegate to the single owner so this legacy module cannot drift back
+    // to collapsing an invalid value to `false` (it must preserve the
+    // enabled default, matching pvxs).
+    crate::config::env::auto_addr_list_enabled()
 }
 
 /// Build a list of UDP destinations to broadcast SEARCH to.

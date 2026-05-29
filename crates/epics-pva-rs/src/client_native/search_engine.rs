@@ -297,11 +297,7 @@ impl SearchEngine {
         // pvxs 8db40be (2025-10): warn loudly when a Context is built
         // with no search destinations and AUTO_ADDR_LIST disabled.
         // The user otherwise sees nothing but timeouts.
-        let auto_addr = std::env::var("EPICS_PVA_AUTO_ADDR_LIST").unwrap_or_else(|_| "YES".into());
-        let auto_on = matches!(
-            auto_addr.trim().to_ascii_uppercase().as_str(),
-            "YES" | "Y" | "1" | "TRUE"
-        );
+        let auto_on = crate::config::env::auto_addr_list_enabled();
         let env_addrs = std::env::var("EPICS_PVA_ADDR_LIST").ok();
         // PVA-466: expand $(VAR) before checking emptiness so an
         // unset macro collapses to "" and the no-destinations
@@ -613,10 +609,7 @@ async fn recv_from_v6_opt(
 }
 
 fn bind_beacon_udp() -> Option<AsyncUdpV4> {
-    let port = std::env::var("EPICS_PVA_BROADCAST_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_BROADCAST_PORT);
+    let port = crate::config::env::broadcast_port();
     // Skip the loopback NIC: any local pva-rs *server* has its UDP
     // responder bound on 127.0.0.1:5076 with SO_REUSEPORT, and a
     // co-bound client beacon socket on the same (addr, port) would
@@ -650,10 +643,7 @@ fn bind_beacon_udp() -> Option<AsyncUdpV4> {
 fn bind_beacon_udp_v6() -> Option<Arc<UdpSocket>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
-    let port = std::env::var("EPICS_PVA_BROADCAST_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_BROADCAST_PORT);
+    let port = crate::config::env::broadcast_port();
 
     let sock = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
         Ok(s) => s,
@@ -1685,10 +1675,7 @@ async fn broadcast(
     client_interfaces: &[Ipv4Addr],
     send_errs: &mut HashSet<SocketAddr>,
 ) {
-    let bport = std::env::var("EPICS_PVA_BROADCAST_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_BROADCAST_PORT);
+    let bport = crate::config::env::broadcast_port();
     let targets = search_targets(
         bport,
         crate::config::env::auto_addr_list_enabled(),

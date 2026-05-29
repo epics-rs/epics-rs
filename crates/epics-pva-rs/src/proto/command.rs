@@ -107,14 +107,23 @@ impl QosFlags {
     pub const INIT: u8 = 0x08;
     /// `0x10` — DESTROY phase (release operation, no further requests).
     pub const DESTROY: u8 = 0x10;
-    /// `0x40` — operation is a GET (set on PUT_GET to request value back).
+    /// `0x40` — `QOS_GET`. On PUT_GET this is the EPICS `getGet`
+    /// subcommand: read the current get-side data with no put payload
+    /// (pvAccess `remote.h:78`).
     pub const GET: u8 = 0x40;
     // MONITOR_START and MONITOR_STOP hold wrong values — see doc/source-review-2026-05-26.md.
     /// `0x44` — START a paused monitor (control bit `0x04` | GET bit `0x40`; subscriber → server).
     pub const MONITOR_START: u8 = 0x44;
     /// `0x04` — STOP a running monitor (control bit only; subscriber → server).
     pub const MONITOR_STOP: u8 = 0x04;
+    /// `0x80` — `QOS_GET_PUT`. On PUT_GET this is the EPICS `getPut`
+    /// subcommand: read the current put-side data with no put payload
+    /// (pvAccess `remote.h:82`). The same byte means `PIPELINE_ACK` only
+    /// in MONITOR context, so callers must scope it to the command.
+    pub const GET_PUT: u8 = 0x80;
     /// `0x80` — pipelined ack (number of free slots in flow window).
+    /// MONITOR-scoped; see [`Self::GET_PUT`] for the PUT_GET meaning of
+    /// the same bit.
     pub const PIPELINE_ACK: u8 = 0x80;
 }
 

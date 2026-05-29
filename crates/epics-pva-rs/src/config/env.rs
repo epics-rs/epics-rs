@@ -228,19 +228,62 @@ pub fn parse_addr_list(env: &str) -> Vec<SocketAddr> {
     parse_addr_list_with_port(env, broadcast_port())
 }
 
-/// Truthy parsing for `YES/NO` strings — pvxs accepts `YES`, `Y`, `1`,
-/// `TRUE` (case-insensitive). Everything else is `NO`.
-fn parse_bool(s: &str) -> bool {
-    let v = s.trim().to_ascii_uppercase();
-    matches!(v.as_str(), "YES" | "Y" | "1" | "TRUE")
+/// Parse a PVA boolean env value, returning `None` for any value pvxs
+/// would reject so the caller **preserves its default** rather than
+/// collapsing an invalid string to `false`.
+///
+/// pvxs `parse_bool` (config.cpp:199-208) assigns the destination only
+/// for `YES`/`1` (true) or `NO`/`0` (false); on any other value it logs
+/// `"<name> invalid bool value (YES/NO)"` and leaves the destination at
+/// its prior/default state. Collapsing e.g. `EPICS_PVA_AUTO_ADDR_LIST=maybe`
+/// to `false` silently disabled discovery on a typo; returning `None`
+/// keeps the documented default enabled, matching pvxs.
+///
+/// Accepted true values extend pvxs with the historically documented
+/// `Y`/`TRUE`; the symmetric false set is `NO`/`N`/`0`/`FALSE`. Every
+/// other value is invalid (`None` + a warning), never silently `false`.
+fn parse_bool(name: &str, raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "YES" | "Y" | "1" | "TRUE" => Some(true),
+        "NO" | "N" | "0" | "FALSE" => Some(false),
+        _ => {
+            tracing::warn!(
+                var = name,
+                value = raw,
+                "invalid PVA boolean env value (expected YES/NO); keeping default"
+            );
+            None
+        }
+    }
 }
 
+/// Effective **client** UDP search/broadcast port from
 /// `EPICS_PVA_BROADCAST_PORT` (default 5076).
+///
+/// pvxs (config.cpp:556-566) parses this into the client `udp_port` and
+/// then explicitly rejects `udp_port == 0`: it logs "ignoring
+/// EPICS_PVA_BROADCAST_PORT=0" and restores 5076, because a client SEARCH
+/// targeting UDP port 0 can never reach a server. This helper is the
+/// single owner of that rule for every client search destination —
+/// limited broadcast, per-NIC broadcast, the `EPICS_PVA_ADDR_LIST`
+/// default port, and the beacon-listener bind all read it. The
+/// server-side `EPICS_PVAS_BROADCAST_PORT` path
+/// ([`server_broadcast_port`]) keeps port 0 (pvxs allows a server random
+/// bind/readback), so the zero rule lives here, not in the shared parse.
+/// An unparseable value also falls back to 5076 (pvxs leaves `udp_port` at
+/// its default on a parse error).
 pub fn broadcast_port() -> u16 {
-    std::env::var("EPICS_PVA_BROADCAST_PORT")
+    match std::env::var("EPICS_PVA_BROADCAST_PORT")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5076)
+        .and_then(|s| s.parse::<u16>().ok())
+    {
+        Some(0) => {
+            tracing::warn!("ignoring EPICS_PVA_BROADCAST_PORT=0; using default 5076");
+            5076
+        }
+        Some(p) => p,
+        None => 5076,
+    }
 }
 
 /// `EPICS_PVAS_BROADCAST_PORT` falling back to `EPICS_PVA_BROADCAST_PORT`,
@@ -309,7 +352,9 @@ pub fn pvas_server_port_opt() -> Option<u16> {
 /// engine adds per-NIC broadcast addresses to the SEARCH targets list.
 pub fn auto_addr_list_enabled() -> bool {
     match std::env::var("EPICS_PVA_AUTO_ADDR_LIST") {
-        Ok(v) => parse_bool(&v),
+        // Present-but-invalid preserves the default (`true`), matching
+        // pvxs which leaves `autoAddrList` untouched on a bad value.
+        Ok(v) => parse_bool("EPICS_PVA_AUTO_ADDR_LIST", &v).unwrap_or(true),
         Err(_) => true,
     }
 }
@@ -330,10 +375,19 @@ pub fn auto_beacon_addr_list_enabled() -> bool {
 /// `EPICS_PVAS_AUTO_BEACON_ADDR_LIST` nor `EPICS_PVA_AUTO_ADDR_LIST` is
 /// set, so `with_env` preserves a caller-supplied `auto_beacon`.
 pub fn auto_beacon_addr_list_enabled_opt() -> Option<bool> {
-    std::env::var("EPICS_PVAS_AUTO_BEACON_ADDR_LIST")
-        .ok()
-        .or_else(|| std::env::var("EPICS_PVA_AUTO_ADDR_LIST").ok())
-        .map(|s| parse_bool(&s))
+    // pvxs PickOne (config.cpp:430-432): first-present of the two vars
+    // wins; the var name is carried into `parse_bool` for the diagnostic.
+    // A present-but-invalid value yields `None` here so `with_env`
+    // preserves the caller-supplied `auto_beacon` (matching pvxs's
+    // leave-destination-unchanged-on-invalid contract), instead of the
+    // old `false` collapse.
+    let (name, raw) = std::env::var("EPICS_PVAS_AUTO_BEACON_ADDR_LIST")
+        .map(|v| ("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", v))
+        .or_else(|_| {
+            std::env::var("EPICS_PVA_AUTO_ADDR_LIST").map(|v| ("EPICS_PVA_AUTO_ADDR_LIST", v))
+        })
+        .ok()?;
+    parse_bool(name, &raw)
 }
 
 /// `EPICS_PVAS_BEACON_PERIOD` — default 15s. Controls the *short*
@@ -883,15 +937,67 @@ mod tests {
     }
 
     #[test]
-    fn parse_bool_yes_y_1_true() {
-        assert!(parse_bool("YES"));
-        assert!(parse_bool("yes"));
-        assert!(parse_bool("Y"));
-        assert!(parse_bool("1"));
-        assert!(parse_bool("True"));
-        assert!(!parse_bool("NO"));
-        assert!(!parse_bool("0"));
-        assert!(!parse_bool(""));
+    fn parse_bool_valid_true_false_invalid_none() {
+        const N: &str = "EPICS_PVA_AUTO_ADDR_LIST";
+        // True set (pvxs YES/1 + documented Y/TRUE extensions).
+        assert_eq!(parse_bool(N, "YES"), Some(true));
+        assert_eq!(parse_bool(N, "yes"), Some(true));
+        assert_eq!(parse_bool(N, "Y"), Some(true));
+        assert_eq!(parse_bool(N, "1"), Some(true));
+        assert_eq!(parse_bool(N, "True"), Some(true));
+        // False set (pvxs NO/0 + symmetric N/FALSE).
+        assert_eq!(parse_bool(N, "NO"), Some(false));
+        assert_eq!(parse_bool(N, "0"), Some(false));
+        assert_eq!(parse_bool(N, "false"), Some(false));
+        // Invalid → None so the caller preserves its default (pvxs leaves
+        // the destination unchanged on an unrecognized value).
+        assert_eq!(parse_bool(N, "maybe"), None);
+        assert_eq!(parse_bool(N, ""), None);
+    }
+
+    #[test]
+    fn auto_addr_list_invalid_value_preserves_default_enabled() {
+        // pvxs: a misspelled EPICS_PVA_AUTO_ADDR_LIST keeps auto-addr ON;
+        // the old truthy-collapse turned it OFF on any non-true string.
+        // SAFETY: nextest runs each test in its own process, so mutating
+        // the process environment here cannot race other tests.
+        unsafe { std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "maybe") };
+        assert!(
+            auto_addr_list_enabled(),
+            "invalid value must preserve default true"
+        );
+        unsafe { std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO") };
+        assert!(!auto_addr_list_enabled(), "explicit NO disables");
+        unsafe { std::env::remove_var("EPICS_PVA_AUTO_ADDR_LIST") };
+        assert!(auto_addr_list_enabled(), "unset defaults to enabled");
+    }
+
+    #[test]
+    fn broadcast_port_zero_falls_back_to_5076_client_only() {
+        // pvxs ignores EPICS_PVA_BROADCAST_PORT=0 and restores 5076 for the
+        // client (a SEARCH to UDP port 0 can never reach a server).
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("EPICS_PVA_BROADCAST_PORT", "0") };
+        assert_eq!(
+            broadcast_port(),
+            5076,
+            "client port 0 must fall back to 5076"
+        );
+        unsafe { std::env::set_var("EPICS_PVA_BROADCAST_PORT", "5099") };
+        assert_eq!(broadcast_port(), 5099, "explicit non-zero port honored");
+        unsafe { std::env::set_var("EPICS_PVA_BROADCAST_PORT", "garbage") };
+        assert_eq!(broadcast_port(), 5076, "unparseable falls back to 5076");
+        // Server path is distinct: pvxs allows EPICS_PVAS_BROADCAST_PORT=0
+        // for a server random bind/readback, so 0 is preserved there.
+        unsafe { std::env::remove_var("EPICS_PVA_BROADCAST_PORT") };
+        unsafe { std::env::set_var("EPICS_PVAS_BROADCAST_PORT", "0") };
+        assert_eq!(
+            server_broadcast_port(),
+            0,
+            "server port 0 is preserved (distinct from the client rule)"
+        );
+        unsafe { std::env::remove_var("EPICS_PVAS_BROADCAST_PORT") };
+        assert_eq!(broadcast_port(), 5076, "unset defaults to 5076");
     }
 
     #[test]

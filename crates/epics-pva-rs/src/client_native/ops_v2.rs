@@ -3035,6 +3035,42 @@ pub async fn op_put_get(
     value_str: &str,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
+    // Default putGet (data subcmd 0x00): write `value_str`, then read back.
+    op_put_get_data(channel, 0x00, Some(value_str), op_timeout).await
+}
+
+/// EPICS ChannelPutGet `getGet` (`QOS_GET`, 0x40): read the current
+/// get-side data with no put. INITs a PUT_GET op, sends a payload-less
+/// getGet data frame, and returns the readback (pvAccess
+/// `clientContextImpl.cpp:1100`, `:1138-1152`).
+pub async fn op_get_get(
+    channel: &Arc<Channel>,
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, PvField)> {
+    op_put_get_data(channel, QosFlags::GET, None, op_timeout).await
+}
+
+/// EPICS ChannelPutGet `getPut` (`QOS_GET_PUT`, 0x80): read the current
+/// put-side data with no put (pvAccess `clientContextImpl.cpp:1156-1170`).
+pub async fn op_get_put(
+    channel: &Arc<Channel>,
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, PvField)> {
+    op_put_get_data(channel, QosFlags::GET_PUT, None, op_timeout).await
+}
+
+/// Shared PUT_GET data-phase driver: INIT, then a single data frame whose
+/// subcommand selects putGet (`Some(value)` → put BitSet + value) or the
+/// read-only getGet/getPut (`None` → no payload, pvAccess
+/// `clientContextImpl.cpp:1100-1112`), then decode the readback. Factored
+/// so the three subcommands share one INIT/destroy lifecycle and cannot
+/// drift apart.
+async fn op_put_get_data(
+    channel: &Arc<Channel>,
+    data_subcmd: u8,
+    value_str: Option<&str>,
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, PvField)> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order;
     let big_endian = matches!(order, ByteOrder::Big);
@@ -3075,24 +3111,26 @@ pub async fn op_put_get(
     };
     ioid_guard.arm_destroy(sid);
 
-    // Build the value against the negotiated introspection.
-    let value = build_put_value(&intro, value_str)?;
-
-    // PUT-GET data — `sid + ioid + 0x00 + put bitset + put value`.
+    // Data — `sid + ioid + subcmd [+ put bitset + put value]`. putGet
+    // (`Some`) carries a payload built against the negotiated
+    // introspection; getGet/getPut (`None`) send none.
     let mut data = Vec::new();
     data.put_u32(sid, order);
     data.put_u32(ioid, order);
-    data.put_u8(0x00);
-    let mut changed = BitSet::new();
-    if let Some(bit) = intro.bit_for_path("value") {
-        changed.set(bit);
-    } else {
-        changed.set(0);
+    data.put_u8(data_subcmd);
+    if let Some(value_str) = value_str {
+        let value = build_put_value(&intro, value_str)?;
+        let mut changed = BitSet::new();
+        if let Some(bit) = intro.bit_for_path("value") {
+            changed.set(bit);
+        } else {
+            changed.set(0);
+        }
+        changed.write_into(order, &mut data);
+        // pvxs `from_wire_valid` decodes a BitSet delta — only the fields
+        // whose bit is set. Encode consistently.
+        encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut data);
     }
-    changed.write_into(order, &mut data);
-    // pvxs `from_wire_valid` decodes a BitSet delta — only the fields
-    // whose bit is set. Encode consistently.
-    encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut data);
     let data_h = PvaHeader::application(false, order, Command::PutGet.code(), data.len() as u32);
     let mut data_frame = Vec::with_capacity(8 + data.len());
     data_h.write_into(&mut data_frame);

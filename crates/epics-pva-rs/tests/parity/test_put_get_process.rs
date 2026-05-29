@@ -226,6 +226,77 @@ async fn put_get_then_get_consistent() {
     let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }
 
+/// getGet (`QOS_GET`, 0x40) and getPut (`QOS_GET_PUT`, 0x80) — the two
+/// read-only ChannelPutGet subcommands — must return the current value
+/// WITHOUT running a put leg. Before the fix the server unconditionally
+/// decoded a put BitSet/value for every PUT_GET data frame, so these
+/// payload-less frames failed to decode instead of returning data.
+#[tokio::test]
+async fn get_get_and_get_put_read_without_writing() {
+    let (port, udp) = alloc_port();
+    let cfg = PvaServerConfig {
+        tcp_port: port,
+        udp_port: udp,
+        ..Default::default()
+    };
+    let src = DoublingSource::new();
+    let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = client_to(port);
+
+    // getGet on the fresh source: returns the current value (1) and runs
+    // no put leg, so the stored value is unchanged.
+    let (_intro, gg) = tokio::time::timeout(Duration::from_secs(3), client.pvget_get("dut"))
+        .await
+        .expect("pvget_get timed out")
+        .expect("pvget_get failed");
+    assert_eq!(int_value(&gg), 1, "getGet returns the current value");
+    assert_eq!(
+        *src.value.lock(),
+        1,
+        "getGet must not write (value unchanged)"
+    );
+
+    // getPut likewise reads the put-side data and never writes.
+    let (_intro, gp) = tokio::time::timeout(Duration::from_secs(3), client.pvget_put("dut"))
+        .await
+        .expect("pvget_put timed out")
+        .expect("pvget_put failed");
+    assert_eq!(int_value(&gp), 1, "getPut returns the current value");
+    assert_eq!(
+        *src.value.lock(),
+        1,
+        "getPut must not write (value unchanged)"
+    );
+
+    // After a real putGet (PUT 21 → source stores doubled 42), getGet
+    // reflects the stored value and does NOT double again — proof its
+    // read-only leg never invoked the doubling put hook.
+    let (_i, pg) = tokio::time::timeout(Duration::from_secs(3), client.pvput_get("dut", "21"))
+        .await
+        .expect("pvput_get timed out")
+        .expect("pvput_get failed");
+    assert_eq!(int_value(&pg), 42);
+    let (_i, gg2) = tokio::time::timeout(Duration::from_secs(3), client.pvget_get("dut"))
+        .await
+        .expect("pvget_get timed out")
+        .expect("pvget_get failed");
+    assert_eq!(
+        int_value(&gg2),
+        42,
+        "getGet after putGet reflects the stored value, not a re-doubled one"
+    );
+    assert_eq!(
+        *src.value.lock(),
+        42,
+        "getGet must not mutate the stored value"
+    );
+
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
+}
+
 /// PROCESS triggers the server-side processing hook: the counter
 /// increments and the stored value gains 100.
 #[tokio::test]

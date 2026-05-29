@@ -468,14 +468,17 @@ impl PvaServer {
     ///
     /// The user-supplied `source` is wrapped in a
     /// [`super::CompositeSource`] together with the built-in
-    /// [`super::server_info::ServerInfoSource`]. The built-in
-    /// source is registered at `order = i32::MAX` — the lowest
-    /// priority slot — so a user source serving a PV literally named
-    /// `server` always wins, mirroring pvxs registering its
-    /// `ServerSource` at `(order = -1, "__server")` (the lowest pvxs
-    /// priority). The built-in source answers GET / RPC against the
-    /// `server` PV so `pvlist`-style clients can enumerate hosted
-    /// channels and read server info (GUID, version, peer counts).
+    /// [`super::server_info::ServerInfoSource`]. The built-in source is
+    /// registered at `order = -1` — BEFORE default-order (0) user
+    /// sources — mirroring pvxs registering its `ServerSource` at
+    /// `(order = -1, "__server")` (server.cpp:542-547), where the lowest
+    /// order is consulted first. It only claims the reserved `server`
+    /// name, so it shadows a user PV named `server` (the pvxs
+    /// diagnostic-source contract) while all other names fall through to
+    /// the user source; a user that wants to own `server` must register
+    /// at an explicit order `< -1`. The built-in source answers GET / RPC
+    /// against the `server` PV so `pvlist`-style clients can enumerate
+    /// hosted channels and read server info (GUID, version, peer counts).
     pub fn start<S>(source: Arc<S>, config: PvaServerConfig) -> PvaResult<Self>
     where
         S: ChannelSource + 'static,
@@ -510,9 +513,15 @@ impl PvaServer {
             },
         ));
 
-        // Composite registry: user source at order 0 (highest
-        // priority), built-in `__server` at i32::MAX (lowest). pvxs
-        // `server.cpp:667` registers `ServerSource` analogously.
+        // Composite registry: built-in `__server` at order -1, BEFORE
+        // default-order (0) user sources, matching pvxs registering its
+        // `ServerSource` at `(order = -1, "__server")` (server.cpp:542-547)
+        // where the lowest order is consulted first (server.h:108-118).
+        // The built-in source only claims the reserved `server` name, so
+        // running it first shadows a user PV named `server` (the pvxs
+        // diagnostic-source contract) while every other name still falls
+        // through to the user source. A user that genuinely wants to own
+        // `server` must register at an explicit order < -1.
         let composite = super::CompositeSource::new();
         composite
             .add_source("__user", user_source, 0)
@@ -523,7 +532,7 @@ impl PvaServer {
             .add_source(
                 super::server_info::SERVER_SOURCE_NAME,
                 server_info as DynSource,
-                i32::MAX,
+                -1,
             )
             .map_err(|e| {
                 PvaError::Protocol(format!(

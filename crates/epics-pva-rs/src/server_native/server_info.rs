@@ -1,8 +1,9 @@
-//! [`ServerInfoSource`] — the built-in low-priority `__server` source.
+//! [`ServerInfoSource`] — the built-in `__server` diagnostic source.
 //!
 //! Mirrors pvxs `ServerSource` (`serversource.cpp`). pvxs registers a
-//! single internal source at `(order = -1, "__server")` (the lowest
-//! priority slot, see `server.cpp:667`) that exposes one special PV
+//! single internal source at `(order = -1, "__server")` (server.cpp:542-547),
+//! consulted BEFORE default-order user sources since the lowest order is
+//! called first (server.h:108-118), that exposes one special PV
 //! named `server`. That PV answers:
 //!
 //! - **GET** — returns a structure describing the server: GUID,
@@ -27,9 +28,11 @@
 //! broadcast discovery.
 //!
 //! Registered automatically by [`crate::server_native::PvaServer::start`]
-//! at `order = i32::MAX` so every user source takes precedence on name
-//! collisions (a user is free to host their own PV literally named
-//! `server`).
+//! at `order = -1`, BEFORE default-order (0) user sources, so the
+//! reserved `server` name reaches diagnostics (pvxs parity). It claims
+//! only `server`, so all other names still fall through to user sources;
+//! a user that wants to own `server` must register at an explicit order
+//! `< -1`.
 
 use std::sync::Arc;
 

@@ -207,12 +207,18 @@ async fn rpc_unknown_op_is_rejected() {
     drop(server);
 }
 
-/// A user source serving a PV literally named `server` takes
-/// precedence over the built-in source — the built-in `__server`
-/// source is registered at the lowest priority (`order = i32::MAX`),
-/// mirroring pvxs registering `ServerSource` at `(order = -1)`.
+/// Regression: pvxs registers its built-in `ServerSource` at
+/// `(order = -1, "__server")` (server.cpp:542-547), BEFORE default-order
+/// (0) user sources, and the lowest order is consulted first
+/// (server.h:108-118). So a user source serving a PV literally named
+/// `server` at default order does NOT shadow the diagnostic source —
+/// `CREATE_CHANNEL`/GET/RPC for `server` reach the built-in source. The
+/// Rust server previously registered the built-in at `i32::MAX` (lowest
+/// priority), letting a user `server` PV win and hiding diagnostics from
+/// `pvlist`-style clients. A user that genuinely wants `server` must now
+/// register at an explicit order `< -1`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn user_server_pv_overrides_builtin() {
+async fn builtin_server_source_shadows_default_order_user_server_pv() {
     let user_server = SharedPV::new();
     let sentinel: f64 = 123.5;
     user_server.open(f64::descriptor(), f64::to_pv_field(&sentinel));
@@ -222,17 +228,23 @@ async fn user_server_pv_overrides_builtin() {
     let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
     let client = server.client_config();
 
-    // The user's NTScalar<f64> `server` PV must answer GET — not the
-    // built-in info structure.
-    let got: f64 =
-        tokio::time::timeout(Duration::from_secs(5), client.pvget_typed::<f64>("server"))
-            .await
-            .expect("GET user server timed out")
-            .expect("GET user server failed");
-    assert_eq!(
-        got, sentinel,
-        "user 'server' PV must win over the built-in source"
-    );
+    // GET `server` must return the built-in info structure (guid +
+    // version), not the user's NTScalar<f64> sentinel.
+    let resp = tokio::time::timeout(Duration::from_secs(5), client.pvget("server"))
+        .await
+        .expect("GET server timed out")
+        .expect("GET server failed");
+    match resp {
+        PvField::Structure(s) => {
+            assert!(
+                s.get_field("guid").is_some() && s.get_field("version").is_some(),
+                "built-in __server source must answer GET server, not the user PV: {s:?}"
+            );
+        }
+        other => panic!(
+            "expected the built-in info structure to shadow the user 'server' PV, got {other:?}"
+        ),
+    }
 
     drop(server);
 }

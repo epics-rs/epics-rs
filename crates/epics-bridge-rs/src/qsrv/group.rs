@@ -807,8 +807,17 @@ impl GroupChannel {
                         field: field_name.to_string(),
                     }
                 })?;
+                // Derive the NT shape from the configured field's resolved
+                // value (record → common → virtual), not from the owning
+                // record type: a `REC.SCAN` member is NTEnum and a
+                // `BI.DESC` member is NTScalar string regardless of the
+                // record's type. `snapshot.value` IS the resolved field
+                // value and `snapshot_for_field` already populated common
+                // enum choices (e.g. `.SCAN`). Matches the single-record
+                // path and pvxs's per-channel `getChannelValueType`
+                // (groupconfigprocessor.cpp:960-974).
                 let rtyp = instance.record.record_type();
-                let nt_type = NtType::from_record_type(rtyp);
+                let nt_type = pvif::nt_type_for_field(rtyp, field_name, Some(&snapshot.value));
                 Ok(PvField::Structure(pvif::snapshot_to_pv_structure(
                     &snapshot, nt_type,
                 )))
@@ -857,7 +866,18 @@ impl GroupChannel {
         }
     }
 
-    /// Introspect a member's actual DBF type and record type from the database.
+    /// Introspect a group scalar member's NT shape and DBF type from the
+    /// configured channel's final field — the same final-field metadata
+    /// the single-record path uses ([`super::channel::BridgeChannel::new`]),
+    /// not the owning record type. Resolving the field's actual value once
+    /// (record → common → virtual) is the single source of truth for both
+    /// the advertised NT shape and the descriptor's DBF, so the
+    /// descriptor cannot drift from the value the GET path serializes:
+    /// `REC.SCAN` advertises NTEnum, `REC.DESC` advertises NTScalar
+    /// string, and `BI.DESC` stays a string member on an enum record.
+    /// pvxs builds scalar group member descriptors from
+    /// `getTypeDefForChannel`/`getChannelValueType` on the field-specific
+    /// dbChannel (groupconfigprocessor.cpp:867-974), not the record type.
     async fn introspect_member(&self, member: &GroupMember) -> BridgeResult<(NtType, ScalarType)> {
         let (record_name, field_name) =
             epics_base_rs::server::database::parse_pv_name(&member.channel);
@@ -870,22 +890,32 @@ impl GroupChannel {
 
         let instance = rec.read().await;
         let rtyp = instance.record.record_type();
-        let nt_type = NtType::from_record_type(rtyp);
-
         let field_upper = field_name.to_ascii_uppercase();
-        let value_dbf = instance
-            .record
-            .field_list()
-            .iter()
-            .find(|f| f.name == field_upper)
-            .map(|f| f.dbf_type)
+        let resolved = instance.resolve_field(&field_upper);
+        let nt_type = pvif::nt_type_for_field(rtyp, &field_upper, resolved.as_ref());
+        let value_dbf = resolved
+            .as_ref()
+            .map(|v| v.db_field_type())
+            .or_else(|| {
+                instance
+                    .record
+                    .field_list()
+                    .iter()
+                    .find(|f| f.name == field_upper)
+                    .map(|f| f.dbf_type)
+            })
             .unwrap_or(DbFieldType::Double);
 
         Ok((nt_type, dbf_to_scalar_type(value_dbf)))
     }
 
-    /// Look up a member's actual DBF field type from the database.
-    /// Returns `Double` as a fallback if the record/field can't be found.
+    /// Look up a member's actual DBF field type for the PUT conversion
+    /// target. Resolves the configured field's value first (record →
+    /// common → virtual), so a common/virtual member field (e.g.
+    /// `REC.DESC` string, `REC.UTAG` uint64) converts against its real
+    /// type instead of falling back to `Double` — same final-field
+    /// resolution as the descriptor path above. Returns `Double` only
+    /// when the record/field cannot be resolved at all.
     async fn member_dbf_type(&self, member: &GroupMember) -> DbFieldType {
         let (record_name, field_name) =
             epics_base_rs::server::database::parse_pv_name(&member.channel);
@@ -897,11 +927,16 @@ impl GroupChannel {
         let instance = rec.read().await;
         let field_upper = field_name.to_ascii_uppercase();
         instance
-            .record
-            .field_list()
-            .iter()
-            .find(|f| f.name == field_upper)
-            .map(|f| f.dbf_type)
+            .resolve_field(&field_upper)
+            .map(|v| v.db_field_type())
+            .or_else(|| {
+                instance
+                    .record
+                    .field_list()
+                    .iter()
+                    .find(|f| f.name == field_upper)
+                    .map(|f| f.dbf_type)
+            })
             .unwrap_or(DbFieldType::Double)
     }
 
@@ -931,6 +966,84 @@ impl GroupChannel {
             // element types.
             _ => crate::convert::pv_field_to_epics(pv_field),
         }
+    }
+
+    /// Apply one ordinary (value) group-member write under the
+    /// requested [`ProcessMode`], the single owner of the tri-state →
+    /// write mapping for group member application. Mirrors pvxs
+    /// `putGroupField` → `IOCSource::put` + `doPostProcessing(
+    /// forceProcessing)` (groupsource.cpp:563-571, iocsource.cpp:
+    /// 397-420), which preserves the full `TriState forceProcessing`
+    /// per member rather than collapsing it to a boolean:
+    ///
+    /// - `Force` (process=true): raw-write the field, then run a full
+    ///   link-aware processing cycle (`dbProcess` equivalent), so a
+    ///   forced group PUT processes the backing record even when the
+    ///   target field is not process-passive or the record is not
+    ///   Passive-scanned.
+    /// - `Passive` (process unset): the CA-style put, which processes
+    ///   only a `pp(TRUE)` field on a `SCAN=Passive` record
+    ///   (`forceProcessing == Unset`).
+    /// - `Inhibit` (process=false): raw-write the field, no processing.
+    ///
+    /// `already_locked` selects the gate-holding variants for the
+    /// atomic PUT (which owns every member gate via `lock_records`; the
+    /// gate `Mutex` is not reentrant) vs the gate-acquiring variants for
+    /// the non-atomic per-member path.
+    async fn apply_member_value(
+        &self,
+        record_name: &str,
+        field_name: &str,
+        value: epics_base_rs::types::EpicsValue,
+        process: super::channel::ProcessMode,
+        already_locked: bool,
+    ) -> BridgeResult<()> {
+        use super::channel::ProcessMode;
+        let to_err = |e: epics_base_rs::error::CaError| BridgeError::PutRejected(e.to_string());
+        match process {
+            ProcessMode::Inhibit => {
+                let pv = format!("{record_name}.{field_name}");
+                if already_locked {
+                    self.db.put_pv_already_locked(&pv, value).await
+                } else {
+                    self.db.put_pv(&pv, value).await
+                }
+                .map_err(to_err)?;
+            }
+            ProcessMode::Passive => {
+                if already_locked {
+                    self.db
+                        .put_record_field_from_ca_already_locked(record_name, field_name, value)
+                        .await
+                } else {
+                    self.db
+                        .put_record_field_from_ca(record_name, field_name, value)
+                        .await
+                }
+                .map_err(to_err)?;
+            }
+            ProcessMode::Force => {
+                let pv = format!("{record_name}.{field_name}");
+                if already_locked {
+                    self.db.put_pv_already_locked(&pv, value).await
+                } else {
+                    self.db.put_pv(&pv, value).await
+                }
+                .map_err(to_err)?;
+                let mut visited = std::collections::HashSet::new();
+                if already_locked {
+                    self.db
+                        .process_record_with_links_already_locked(record_name, &mut visited, 0)
+                        .await
+                } else {
+                    self.db
+                        .process_record_with_links(record_name, &mut visited, 0)
+                        .await
+                }
+                .map_err(to_err)?;
+            }
+        }
+        Ok(())
     }
 
     /// group PUT with explicit per-operation options.
@@ -963,8 +1076,6 @@ impl GroupChannel {
                 self.def.name, self.access.user, self.access.host
             )));
         }
-
-        let use_process = opts.process != super::channel::ProcessMode::Inhibit;
 
         // pvRequest can override the group default atomicity
         // (`record._options.atomic = true|false`). Falls back to the
@@ -1164,32 +1275,27 @@ impl GroupChannel {
                     epics_base_rs::server::database::parse_pv_name(&member.channel);
 
                 if member.mapping == FieldMapping::Proc {
-                    // `_already_locked` — this atomic PUT owns
-                    // every member-record gate via `lock_records`.
+                    // A `+proc` member forces a full record-processing
+                    // cycle on every group PUT — pvxs's `doPostProcessing`
+                    // calls `dbProcess(precord)` for a proc field
+                    // (iocsource.cpp:397-417), the link-aware entry that
+                    // runs INP/OUT/FLNK side effects. Route through
+                    // `process_record_with_links`, not the value-only
+                    // `process_record` (process_local + notify) which
+                    // skips the link chain. `_already_locked` — this
+                    // atomic PUT owns every member-record gate via
+                    // `lock_records` (the gate `Mutex` is not reentrant).
+                    let mut visited = std::collections::HashSet::new();
                     self.db
-                        .process_record_already_locked(record_name)
+                        .process_record_with_links_already_locked(record_name, &mut visited, 0)
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     did_something = true;
                 } else if let Some(epics_val) = val {
-                    if use_process {
-                        self.db
-                            .put_record_field_from_ca_already_locked(
-                                record_name,
-                                field_name,
-                                epics_val,
-                            )
-                            .await
-                            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                    } else {
-                        self.db
-                            .put_pv_already_locked(
-                                &format!("{record_name}.{field_name}"),
-                                epics_val,
-                            )
-                            .await
-                            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                    }
+                    // `_already_locked` — this atomic PUT owns every
+                    // member-record gate via `lock_records`.
+                    self.apply_member_value(record_name, field_name, epics_val, opts.process, true)
+                        .await?;
                     did_something = true;
                 }
             }
@@ -1210,8 +1316,16 @@ impl GroupChannel {
                     epics_base_rs::server::database::parse_pv_name(&member.channel);
 
                 if member.mapping == FieldMapping::Proc {
+                    // Force a full record-processing cycle (INP/OUT/FLNK)
+                    // through the link-aware owner, matching pvxs
+                    // `doPostProcessing` → `dbProcess` for a proc field
+                    // (iocsource.cpp:397-417). The non-atomic path holds
+                    // no member gate, so this is a foreign gate-acquiring
+                    // entry. The bare `process_record` would run only the
+                    // local record body and skip the link chain.
+                    let mut visited = std::collections::HashSet::new();
                     self.db
-                        .process_record(record_name)
+                        .process_record_with_links(record_name, &mut visited, 0)
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     did_something = true;
@@ -1243,17 +1357,9 @@ impl GroupChannel {
                     }
                 };
 
-                if use_process {
-                    self.db
-                        .put_record_field_from_ca(record_name, field_name, epics_val)
-                        .await
-                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                } else {
-                    self.db
-                        .put_pv(&format!("{record_name}.{field_name}"), epics_val)
-                        .await
-                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                }
+                // non-atomic per-member write — gate-acquiring variants.
+                self.apply_member_value(record_name, field_name, epics_val, opts.process, false)
+                    .await?;
                 did_something = true;
             }
         }
@@ -1408,18 +1514,6 @@ struct MemberEvent {
     kind: MemberEventKind,
 }
 
-/// Per-field priming state for the subscription priming phase.
-///
-/// Corresponds to pvxs `GroupSourceSubscriptionCtx` priming logic
-/// (groupsource.cpp:206-237). The first monitor post is withheld until
-/// every field has received its initial value and (where applicable)
-/// property event.
-#[derive(Debug, Clone)]
-struct FieldPrimingState {
-    had_value_event: bool,
-    had_property_event: bool,
-}
-
 /// A PVA monitor for a group PV that subscribes to all member records.
 ///
 /// Corresponds to C++ QSRV's `PDBGroupMonitor` + `pdb_group_event()`.
@@ -1457,12 +1551,6 @@ pub struct GroupMonitor {
     _tasks: Vec<MemberTaskGuard>,
     /// Access control context propagated from the parent GroupChannel.
     access: super::provider::AccessContext,
-    /// Per-member priming state. Once all fields are primed, the first
-    /// snapshot is posted. Before that, events are accumulated but not
-    /// returned to the caller.
-    priming: Vec<FieldPrimingState>,
-    /// Whether the priming phase has completed.
-    events_primed: bool,
     /// negotiated monitor queue depth, resolved from
     /// the MONITOR INIT pvRequest's `record._options.queueSize`
     /// ([`negotiated_queue_size`]). Stamped into every monitor
@@ -1489,37 +1577,6 @@ enum EventMark {
 
 impl GroupMonitor {
     pub fn new(db: Arc<PvDatabase>, def: GroupPvDef) -> Self {
-        // Initialize priming state for each member.
-        // pvxs subscribes ALL members with channels (regardless of trigger)
-        // and waits for their initial events before posting.
-        let priming: Vec<FieldPrimingState> = def
-            .members
-            .iter()
-            .map(|member| {
-                match member.mapping {
-                    // Const, Structure, and Proc have no data to wait for —
-                    // immediately primed (pvxs groupsource.cpp:369-376).
-                    FieldMapping::Const | FieldMapping::Structure | FieldMapping::Proc => {
-                        FieldPrimingState {
-                            had_value_event: true,
-                            had_property_event: true,
-                        }
-                    }
-                    // Scalar and Meta need both value + property events.
-                    FieldMapping::Scalar | FieldMapping::Meta => FieldPrimingState {
-                        had_value_event: false,
-                        had_property_event: false,
-                    },
-                    // Plain, Any only need value events (auto-prime property,
-                    // pvxs groupsource.cpp:397).
-                    _ => FieldPrimingState {
-                        had_value_event: false,
-                        had_property_event: true,
-                    },
-                }
-            })
-            .collect();
-
         Self {
             db,
             def,
@@ -1528,8 +1585,6 @@ impl GroupMonitor {
             event_rx: None,
             _tasks: Vec::new(),
             access: super::provider::AccessContext::allow_all(),
-            priming,
-            events_primed: false,
             monitor_queue_size: GROUP_DEFAULT_QUEUE_SIZE,
         }
     }
@@ -1666,10 +1721,11 @@ impl super::provider::PvaMonitor for GroupMonitor {
         let (tx, rx) = tokio::sync::mpsc::channel::<MemberEvent>(cap);
 
         // Subscribe to ALL members with channels, regardless of trigger
-        // setting. pvxs subscribes every field with a dbChannel for the
-        // priming phase (groupsource.cpp:375-398). TriggerDef::None only
-        // means "don't update the group when this field changes" — the
-        // subscription still fires for priming.
+        // setting — pvxs subscribes every field with a dbChannel
+        // (groupsource.cpp:375-398). TriggerDef::None only means "don't
+        // update the group when this field changes"; its events are
+        // filtered to EventMark::Skip in poll() rather than gating the
+        // stream.
         for (idx, member) in self.def.members.iter().enumerate() {
             if member.channel.is_empty() {
                 continue; // Structure/Const/Proc-without-channel — no backing channel
@@ -1729,12 +1785,6 @@ impl super::provider::PvaMonitor for GroupMonitor {
                     }
                 });
                 self._tasks.push(MemberTaskGuard(handle.abort_handle()));
-            } else {
-                // Record not found or subscribe failed — auto-prime this
-                // member so the priming phase doesn't stall forever.
-                if let Some(state) = self.priming.get_mut(idx) {
-                    state.had_value_event = true;
-                }
             }
 
             // Property subscription (DBE_PROPERTY) — only for Scalar/Meta
@@ -1766,11 +1816,6 @@ impl super::provider::PvaMonitor for GroupMonitor {
                         }
                     });
                     self._tasks.push(MemberTaskGuard(handle.abort_handle()));
-                } else {
-                    // Property subscribe failed — auto-prime.
-                    if let Some(state) = self.priming.get_mut(idx) {
-                        state.had_property_event = true;
-                    }
                 }
             }
         }
@@ -1788,25 +1833,6 @@ impl super::provider::PvaMonitor for GroupMonitor {
             .with_monitor_queue_size(self.monitor_queue_size)
             .with_monitor_stamp();
 
-        // Check if all members are already primed (e.g., all Const/Structure).
-        let all_primed = self
-            .priming
-            .iter()
-            .all(|p| p.had_value_event && p.had_property_event);
-        if all_primed {
-            // No backing channels, so no member event will ever fire: the
-            // group is primed by construction. Mark it primed but do NOT
-            // manufacture a snapshot to forward — the native PVA server
-            // already emits the initial frame via get_value_checked() at
-            // MONITOR INIT (server_native/tcp.rs build_monitor_payload).
-            // Forwarding a snapshot here too would deliver the same static
-            // value twice, the channel-less mirror of the duplicate the
-            // single-record BridgeMonitor avoids the same way
-            // (qsrv/monitor.rs:189-195). pvxs posts one value for this case
-            // (groupsource.cpp:289-297).
-            self.events_primed = true;
-        }
-
         self.group_channel = Some(group_channel);
         self.event_rx = Some(rx);
         self.running = true;
@@ -1814,50 +1840,25 @@ impl super::provider::PvaMonitor for GroupMonitor {
     }
 
     async fn poll(&mut self) -> Option<super::provider::MonitorPoll> {
-        // Purely event-driven: the initial frame is the wire layer's
-        // get_value_checked() snapshot, so this stream only carries fresh
-        // member events. A channel-less (all-const) group has no member
-        // subscriptions, so this returns None immediately after start —
-        // exactly one DATA frame reaches the client.
+        // Purely event-driven: the wire layer already sent the initial
+        // frame via get_value_checked() at MONITOR INIT for every source
+        // (server_native/tcp.rs:build_monitor_payload), so this stream
+        // carries only fresh member deltas — never an initial snapshot.
+        //
+        // A channel-less (all-const) group has no member subscriptions, so
+        // this never wakes and the client sees exactly one DATA frame (the
+        // wire initial). A channel-backed group forwards each member event
+        // as it arrives, with NO gate on other members posting first: pvxs
+        // primes every field from sampled values at start via
+        // db_post_single_event (groupsource.cpp:289-297), so a quiet member
+        // never withholds an active one. The previous per-member priming
+        // gate both withheld every delta until all members changed and
+        // re-emitted a full snapshot the wire layer had already sent — one
+        // structural defect (the priming gate) producing two symptoms.
         let rx = self.event_rx.as_mut()?;
 
         loop {
             let event = rx.recv().await?;
-
-            // Update priming state for this member.
-            if !self.events_primed {
-                if let Some(state) = self.priming.get_mut(event.member_index) {
-                    match event.kind {
-                        MemberEventKind::Value => state.had_value_event = true,
-                        MemberEventKind::Property => state.had_property_event = true,
-                    }
-                }
-
-                // Check if all members are now primed.
-                let all_primed = self
-                    .priming
-                    .iter()
-                    .all(|p| p.had_value_event && p.had_property_event);
-
-                if all_primed {
-                    self.events_primed = true;
-                    // Post the first complete group snapshot now that all
-                    // fields have reported their initial state
-                    // (pvxs groupsource.cpp:220-230). The first event is
-                    // always full — pvxs marks every field on the priming
-                    // post — so it derives the changed-bitset (`marked:
-                    // None`), like the initial GET the PVA layer already
-                    // sent.
-                    let group_channel = self.group_channel.as_ref()?;
-                    return group_channel
-                        .read_group()
-                        .await
-                        .ok()
-                        .map(super::provider::MonitorPoll::derive);
-                }
-                // Not yet primed — accumulate events but don't return data.
-                continue;
-            }
 
             // resolve which group field paths this event
             // marks, instead of treating every trigger kind identically.
@@ -1897,26 +1898,6 @@ impl super::provider::PvaMonitor for GroupMonitor {
 
         self.running = false;
         self.group_channel = None;
-        self.events_primed = false;
-        // Reset priming state for potential restart
-        for (i, member) in self.def.members.iter().enumerate() {
-            if let Some(state) = self.priming.get_mut(i) {
-                match member.mapping {
-                    FieldMapping::Const | FieldMapping::Structure | FieldMapping::Proc => {
-                        state.had_value_event = true;
-                        state.had_property_event = true;
-                    }
-                    FieldMapping::Scalar | FieldMapping::Meta => {
-                        state.had_value_event = false;
-                        state.had_property_event = false;
-                    }
-                    _ => {
-                        state.had_value_event = false;
-                        state.had_property_event = true;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -2676,6 +2657,108 @@ mod tests {
                 init_flag(&db, "HOOK:rec").await,
                 1,
                 "proc member without +putorder must process its record (atomic={atomic})"
+            );
+        }
+    }
+
+    /// A QSRV group scalar member must derive its NT shape and DBF type
+    /// from the configured channel's final field, not the owning record
+    /// type: `REC.SCAN` is NTEnum, `REC.DESC` is NTScalar string, and a
+    /// common string field on an enum record (`BI.DESC`) stays NTScalar
+    /// string rather than being routed through the NTEnum encoder. Before
+    /// the fix `introspect_member`/`decode_member` used
+    /// `NtType::from_record_type` + a `field_list`-only DBF lookup that
+    /// fell back to `pvDouble` for common fields.
+    #[tokio::test]
+    async fn group_scalar_member_nt_type_follows_configured_field_not_record_type() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::bi::BiRecord;
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        // Pull the "value" FieldDesc out of a named group member.
+        fn member_value_desc<'a>(group: &'a FieldDesc, name: &str) -> &'a FieldDesc {
+            let FieldDesc::Structure { fields, .. } = group else {
+                panic!("group descriptor must be a structure");
+            };
+            let member = &fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("member '{name}' missing from group descriptor"))
+                .1;
+            let FieldDesc::Structure { fields, .. } = member else {
+                panic!("member '{name}' must be an NT structure");
+            };
+            &fields
+                .iter()
+                .find(|(n, _)| n == "value")
+                .expect("member must have a value field")
+                .1
+        }
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("BR62:ai", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("BR62:bi", Box::new(BiRecord::new(0)))
+            .await
+            .unwrap();
+
+        let cfg = r#"{
+            "BR62:GRP": {
+                "d":  {"+type": "scalar", "+channel": "BR62:ai.DESC"},
+                "s":  {"+type": "scalar", "+channel": "BR62:ai.SCAN"},
+                "bd": {"+type": "scalar", "+channel": "BR62:bi.DESC"}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        let channel = GroupChannel::new(db.clone(), def);
+
+        // ---- descriptor (introspect_member) ----
+        let desc = channel.get_field().await.expect("get_field");
+        assert_eq!(
+            member_value_desc(&desc, "d"),
+            &FieldDesc::Scalar(ScalarType::String),
+            "REC.DESC member must advertise an NTScalar string value"
+        );
+        assert!(
+            matches!(member_value_desc(&desc, "s"), FieldDesc::Structure { .. }),
+            "REC.SCAN member must advertise an NTEnum value (index/choices \
+             struct), got {:?}",
+            member_value_desc(&desc, "s")
+        );
+        assert_eq!(
+            member_value_desc(&desc, "bd"),
+            &FieldDesc::Scalar(ScalarType::String),
+            "BI.DESC must stay an NTScalar string even though the record \
+             type is enum"
+        );
+
+        // ---- runtime value (decode_member) ----
+        let val = channel
+            .get(&PvStructure::new("structure"))
+            .await
+            .expect("group GET");
+        let member = |name: &str| match val.get_field(name) {
+            Some(PvField::Structure(s)) => s.clone(),
+            other => panic!("member '{name}' value must be a structure, got {other:?}"),
+        };
+        // SCAN member's value is the enum_t sub-structure (index/choices).
+        let s_val = member("s");
+        assert!(
+            matches!(s_val.get_field("value"), Some(PvField::Structure(_))),
+            "REC.SCAN GET value must be an enum index/choices struct"
+        );
+        // DESC members' value is a plain string scalar.
+        for name in ["d", "bd"] {
+            let m = member(name);
+            assert!(
+                matches!(
+                    m.get_field("value"),
+                    Some(PvField::Scalar(ScalarValue::String(_)))
+                ),
+                "member '{name}' GET value must be a string scalar, got {:?}",
+                m.get_field("value")
             );
         }
     }

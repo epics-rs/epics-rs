@@ -61,6 +61,52 @@ impl NtType {
     }
 }
 
+/// Choose the NormativeType for a channel bound to `field`, the single
+/// owner of NT selection for both the single-record path
+/// ([`super::channel::BridgeChannel`]) and the QSRV group scalar-member
+/// path ([`super::group::GroupChannel`]).
+///
+/// `VAL` keeps the record-type mapping ([`NtType::from_record_type`]). A
+/// non-`VAL` field's NT is chosen from its *resolved value's* final
+/// DBR/DBF type and element count, mirroring pvxs, which builds every
+/// channel prototype from `dbChannelFinalFieldType(chan)`
+/// (singlesource.cpp:189-205; group members via `getTypeDefForChannel` /
+/// `IOCSource::getChannelValueType`, groupconfigprocessor.cpp:867-974):
+/// `DBF_ENUM`/`DBF_MENU`/`DBF_DEVICE` resolve to `DBR_ENUM`
+/// (db/dbAccess.c:88-90) and select `NTEnum`, an array field selects
+/// `NTScalarArray`, and everything else is `NTScalar`. Deriving NT from
+/// the configured field's resolved value — not from
+/// `Record::record_type()` — is what lets a `REC.SCAN` member become
+/// NTEnum and a `BI.DESC` member stay NTScalar string (the record type
+/// would otherwise mis-route both).
+pub(crate) fn nt_type_for_field(
+    record_type: &str,
+    field: &str,
+    value: Option<&EpicsValue>,
+) -> NtType {
+    if field.eq_ignore_ascii_case("VAL") {
+        return NtType::from_record_type(record_type);
+    }
+    match value {
+        // DBF_ENUM/MENU/DEVICE → DBR_ENUM → NTEnum (scalar index +
+        // choices). An enum *array* has no scalar-index NTEnum shape,
+        // so it falls through to NTScalarArray below.
+        Some(EpicsValue::Enum(_)) => NtType::Enum,
+        Some(
+            EpicsValue::ShortArray(_)
+            | EpicsValue::FloatArray(_)
+            | EpicsValue::EnumArray(_)
+            | EpicsValue::DoubleArray(_)
+            | EpicsValue::LongArray(_)
+            | EpicsValue::CharArray(_)
+            | EpicsValue::StringArray(_)
+            | EpicsValue::Int64Array(_)
+            | EpicsValue::UInt64Array(_),
+        ) => NtType::ScalarArray,
+        _ => NtType::Scalar,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scalar-type classification
 // ---------------------------------------------------------------------------

@@ -19,7 +19,7 @@
 
 use clap::Parser;
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarValue};
 
 #[derive(Parser)]
 #[command(
@@ -93,42 +93,16 @@ fn collect_args(tokens: &[String]) -> Result<Vec<(String, ScalarValue)>, String>
 }
 
 /// Build an NTURI-shaped pvRequest carrying the parsed args under
-/// `query.<key>`. pvxs's RPC server side accepts this shape — see
-/// `pvxs/src/pvxs/nt.h` `NTURI`.
+/// `query.<key>`, with `scheme="pva"` and `path=<pv_name>`.
+///
+/// Delegates to the shared [`epics_pva_rs::nt::NTURI::request`] builder
+/// so the request carries **all four** normative members — `scheme`,
+/// `authority`, `path`, `query` — that pvxs `NTURI::NTURI()` defines
+/// (`src/nt.cpp:253-262`). The previous hand-rolled descriptor omitted
+/// `authority`, so a strict NTURI receiver keying off
+/// `struct_id="epics:nt/NTURI:1.0"` saw a non-pvxs shape.
 fn build_nturi(pv_name: &str, args: &[(String, ScalarValue)]) -> (FieldDesc, PvField) {
-    let query_fields: Vec<(String, FieldDesc)> = args
-        .iter()
-        .map(|(k, v)| (k.clone(), FieldDesc::Scalar(v.scalar_type())))
-        .collect();
-    let desc = FieldDesc::Structure {
-        struct_id: "epics:nt/NTURI:1.0".into(),
-        fields: vec![
-            ("scheme".into(), FieldDesc::Scalar(ScalarType::String)),
-            ("path".into(), FieldDesc::Scalar(ScalarType::String)),
-            (
-                "query".into(),
-                FieldDesc::Structure {
-                    struct_id: String::new(),
-                    fields: query_fields.clone(),
-                },
-            ),
-        ],
-    };
-    let mut top = PvStructure::new("epics:nt/NTURI:1.0");
-    top.fields.push((
-        "scheme".into(),
-        PvField::Scalar(ScalarValue::String("pva".into())),
-    ));
-    top.fields.push((
-        "path".into(),
-        PvField::Scalar(ScalarValue::String(pv_name.into())),
-    ));
-    let mut query = PvStructure::new("");
-    for (k, v) in args {
-        query.fields.push((k.clone(), PvField::Scalar(v.clone())));
-    }
-    top.fields.push(("query".into(), PvField::Structure(query)));
-    (desc, PvField::Structure(top))
+    epics_pva_rs::nt::NTURI::request("pva", pv_name, args)
 }
 
 #[tokio::main]
@@ -191,6 +165,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_pva_rs::pvdata::ScalarType;
 
     /// pvxs `tools/call.cpp:104-118` sends every bare token as a PVA
     /// string; integer- and float-looking values must not be coerced.
@@ -207,6 +182,28 @@ mod tests {
             assert_eq!(k, key);
             assert_eq!(v, ScalarValue::String(want.to_string()), "for {raw:?}");
         }
+    }
+
+    /// The built NTURI advertises all four normative members, including
+    /// `authority` (pvxs `NTURI::NTURI()`, `src/nt.cpp:253-262`). The
+    /// pre-fix hand-rolled descriptor omitted `authority`.
+    #[test]
+    fn nturi_descriptor_includes_authority() {
+        let args = [("op".to_string(), ScalarValue::String("x".to_string()))];
+        let (desc, value) = build_nturi("svc", &args);
+        let FieldDesc::Structure { struct_id, fields } = &desc else {
+            panic!("expected NTURI structure descriptor");
+        };
+        assert_eq!(struct_id, "epics:nt/NTURI:1.0");
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["scheme", "authority", "path", "query"]);
+        let PvField::Structure(root) = &value else {
+            panic!("expected NTURI structure value");
+        };
+        assert!(
+            root.get_field("authority").is_some(),
+            "value must carry the authority member"
+        );
     }
 
     /// The NTURI query descriptor declares each member as a string,

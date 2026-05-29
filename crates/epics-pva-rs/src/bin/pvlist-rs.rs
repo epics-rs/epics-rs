@@ -26,7 +26,7 @@ use futures_util::future::join_all;
 
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::search_engine::{Discovered, SearchEngine};
-use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue};
 
 #[derive(Parser)]
 #[command(
@@ -145,36 +145,18 @@ fn parse_server_addr(s: &str, default_port: u16) -> Result<SocketAddr, String> {
 /// Build the NTURI RPC request that the pvxs/Java `server` PV expects:
 /// `scheme="pva"`, `path="server"`, `query.op=<op>`. Mirrors pvxs
 /// `ctxt.rpc("server").arg("op", ...)` (`tools/list.cpp`).
+///
+/// Delegates to the shared [`epics_pva_rs::nt::NTURI::request`] builder
+/// so the request carries **all four** normative members — `scheme`,
+/// `authority`, `path`, `query` — that pvxs `NTURI::NTURI()` defines
+/// (`src/nt.cpp:253-262`). The previous hand-rolled descriptor omitted
+/// `authority`.
 fn build_server_query(op: &str) -> (FieldDesc, PvField) {
-    let desc = FieldDesc::Structure {
-        struct_id: "epics:nt/NTURI:1.0".into(),
-        fields: vec![
-            ("scheme".into(), FieldDesc::Scalar(ScalarType::String)),
-            ("path".into(), FieldDesc::Scalar(ScalarType::String)),
-            (
-                "query".into(),
-                FieldDesc::Structure {
-                    struct_id: String::new(),
-                    fields: vec![("op".into(), FieldDesc::Scalar(ScalarType::String))],
-                },
-            ),
-        ],
-    };
-    let mut top = PvStructure::new("epics:nt/NTURI:1.0");
-    top.fields.push((
-        "scheme".into(),
-        PvField::Scalar(ScalarValue::String("pva".into())),
-    ));
-    top.fields.push((
-        "path".into(),
-        PvField::Scalar(ScalarValue::String("server".into())),
-    ));
-    let mut query = PvStructure::new("");
-    query
-        .fields
-        .push(("op".into(), PvField::Scalar(ScalarValue::String(op.into()))));
-    top.fields.push(("query".into(), PvField::Structure(query)));
-    (desc, PvField::Structure(top))
+    epics_pva_rs::nt::NTURI::request(
+        "pva",
+        "server",
+        &[("op".to_string(), ScalarValue::String(op.into()))],
+    )
 }
 
 /// Extract a string scalar field by name from a structure.
@@ -494,6 +476,28 @@ mod tests {
     #[test]
     fn active_and_passive_conflict() {
         assert!(Args::try_parse_from(["pvlist-rs", "-A", "-p"]).is_err());
+    }
+
+    /// The `server` RPC request advertises all four normative NTURI
+    /// members, including `authority` (pvxs `NTURI::NTURI()`,
+    /// `src/nt.cpp:253-262`). The pre-fix hand-rolled descriptor omitted
+    /// `authority`.
+    #[test]
+    fn server_query_nturi_includes_authority() {
+        let (desc, value) = build_server_query("channels");
+        let FieldDesc::Structure { struct_id, fields } = &desc else {
+            panic!("expected NTURI structure descriptor");
+        };
+        assert_eq!(struct_id, "epics:nt/NTURI:1.0");
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["scheme", "authority", "path", "query"]);
+        let PvField::Structure(root) = &value else {
+            panic!("expected NTURI structure value");
+        };
+        assert!(
+            root.get_field("authority").is_some(),
+            "value must carry the authority member"
+        );
     }
 
     fn addr(s: &str) -> SocketAddr {

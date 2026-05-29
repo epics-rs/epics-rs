@@ -556,13 +556,18 @@ fn try_build_forward_frame(frame: &[u8], reply_dest: SocketAddrV4) -> Option<Vec
 /// blocklist. Mirrors pvxs `udp_collector.cpp::handle_one` mcast-source
 /// drop and `serverconn.cpp` ignoreAddrs check.
 ///
+/// The multicast-source test is family-generic, matching pvxs
+/// `SockAddr::isMCast()` which reports multicast for both `AF_INET` and
+/// `AF_INET6` (`util.cpp:570-577`). `IpAddr::is_multicast()` dispatches to
+/// the V4 or V6 predicate, so IPv6 multicast sources (e.g. `ff02::/16`)
+/// are dropped by the same uniform rule rather than slipping past a
+/// V4-only branch.
+///
 /// Returns `true` if the packet should be processed.
 fn filter_inbound(peer: SocketAddr, ignore_addrs: &[(IpAddr, u16)]) -> bool {
-    if let std::net::IpAddr::V4(v4) = peer.ip() {
-        if v4.is_multicast() {
-            debug!("ignoring UDP with mcast source {peer}");
-            return false;
-        }
+    if peer.ip().is_multicast() {
+        debug!("ignoring UDP with mcast source {peer}");
+        return false;
     }
     let ignored = ignore_addrs
         .iter()
@@ -1668,9 +1673,17 @@ mod tests {
         // Plain unicast peer passes.
         let ok = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5076);
         assert!(filter_inbound(ok, &blocklist));
-        // Multicast source dropped.
+        // Multicast source dropped (IPv4).
         let mcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 128)), 5076);
         assert!(!filter_inbound(mcast, &blocklist));
+        // Multicast source dropped (IPv6) — pvxs `SockAddr::isMCast()` is
+        // family-generic (`util.cpp:570-577`); `ff02::1` is the v6
+        // all-nodes link-local multicast group.
+        let mcast_v6 = SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+            5076,
+        );
+        assert!(!filter_inbound(mcast_v6, &blocklist));
         // Blocklisted peer dropped on matching port.
         let blocked = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)), 5076);
         assert!(!filter_inbound(blocked, &blocklist));

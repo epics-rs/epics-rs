@@ -790,30 +790,37 @@ impl AbortOnDrop {
 /// Apply the data-phase op continuation after a GET/PUT/RPC EXEC task
 /// has been spawned.
 ///
-/// pvxs `serverget.cpp:112-116` either returns the op to `Idle` (more
-/// requests allowed) or `cleanup()`s it when the data-phase `subcmd`
-/// carried the last-request bit (`0x10`, recorded as `lastRequest` at
-/// `serverget.cpp:470-471`). The Rust EXEC handlers serialize their
-/// response from a spawned task that cannot reach `ch.ops`, so the
-/// read-loop owner applies the same rule once the task is running:
+/// pvxs records `op->lastRequest = subcmd & 0x10` *while the op stays
+/// `Executing` in `opByIOID`* (`serverget.cpp:470-471`) and only
+/// `cleanup()`s it — freeing the IOID — *after* the reply has been
+/// serialized (`serverget.cpp:111-114`, inside `doReply`). Freeing the IOID
+/// at spawn time (the pre-fix behaviour) opened a reuse race: a client could
+/// send a last-request EXEC, immediately re-INIT the same IOID before the
+/// slow source replied, and have the still-in-flight first reply and the new
+/// operation collide on one IOID on the wire.
 ///
-/// - last request (`subcmd & 0x10`): remove the op so its IOID is freed
-///   and a later re-INIT is accepted as fresh (matching pvxs
-///   `ServerOp::cleanup`). The spawned task already owns everything it
-///   needs to finish the response, so the op is dropped *without*
-///   installing an abort guard — installing one and then dropping the
-///   `OpState` would cancel the still-running response task.
-/// - otherwise: keep the op and store the task's abort guard so a later
-///   re-EXEC or connection teardown can cancel the in-flight response.
+/// The Rust EXEC handlers serialize their response from a spawned task that
+/// cannot reach `ch.ops`, so the read-loop owner defers cleanup to
+/// [`apply_exec_finish`], which fires when the task's [`ExecFinishGuard`]
+/// signals completion (right after the reply is handed to the writer). Both
+/// branches therefore keep the op reserved and install the abort guard; only
+/// the bookkeeping differs:
+///
+/// - last request (`subcmd & 0x10`): mark `last_request` so the completion
+///   owner removes the op (matching pvxs `ServerOp::cleanup`) once the reply
+///   is out, not before.
+/// - otherwise: leave it `Executing`; the completion owner returns it to
+///   `Idle` so a later explicit re-EXEC is accepted.
 fn finish_exec_data_task(
     ch: &mut ChannelState,
     ioid: u32,
     subcmd: u8,
     abort: tokio::task::AbortHandle,
 ) {
-    if subcmd & 0x10 != 0 {
-        ch.ops.remove(&ioid);
-    } else if let Some(op_mut) = ch.ops.get_mut(&ioid) {
+    if let Some(op_mut) = ch.ops.get_mut(&ioid) {
+        if subcmd & 0x10 != 0 {
+            op_mut.last_request = true;
+        }
         op_mut.data_task_abort = Some(Arc::new(AbortOnDrop(abort)));
     }
 }
@@ -955,16 +962,29 @@ impl Drop for ExecFinishGuard {
 }
 
 /// read-loop owner side of a data-phase task's terminal signal.
-/// Returns the op to `Idle` and clears its (now-inert) abort guard so a later
-/// explicit re-EXEC is accepted (pvxs `serverget.cpp:114-115`). Gated on the
-/// op-instance id so a stale signal cannot flip a re-INIT'd op that reused the
-/// ioid. For a `lastRequest` EXEC the op was already removed synchronously by
-/// [`finish_exec_data_task`], so the lookup misses and this is a no-op.
+/// Gated on the op-instance id so a stale signal cannot affect a re-INIT'd op
+/// that reused the ioid.
+///
+/// - `last_request` op: the reply has now been sent, so this is where pvxs
+///   `cleanup()`s the op after `doReply` (`serverget.cpp:111-114`). Remove it,
+///   freeing its IOID — kept reserved until exactly this point so a re-INIT
+///   racing a slow source could not reuse the IOID mid-reply.
+/// - otherwise: return the op to `Idle` and clear its (now-inert) abort guard
+///   so a later explicit re-EXEC is accepted (pvxs `serverget.cpp:114-115`).
 fn apply_exec_finish(channels: &mut HashMap<u32, ChannelState>, fin: ExecFinished) {
-    if let Some(ch) = channels.get_mut(&fin.sid)
-        && let Some(op) = ch.ops.get_mut(&fin.ioid)
-        && op.monitor_op_id == fin.op_id
-    {
+    let Some(ch) = channels.get_mut(&fin.sid) else {
+        return;
+    };
+    let (matches, last_request) = match ch.ops.get(&fin.ioid) {
+        Some(op) => (op.monitor_op_id == fin.op_id, op.last_request),
+        None => return,
+    };
+    if !matches {
+        return;
+    }
+    if last_request {
+        ch.ops.remove(&fin.ioid);
+    } else if let Some(op) = ch.ops.get_mut(&fin.ioid) {
         op.exec_state = ExecState::Idle;
         op.data_task_abort = None;
     }
@@ -1155,6 +1175,14 @@ struct OpState {
     /// in-flight task (pvxs `serverget.cpp:467-476`/`:511-514`). MONITOR ops
     /// leave this `Idle` (their lifecycle is `monitor_start_ctl`).
     exec_state: ExecState,
+    /// set when a data-phase EXEC carried the last-request bit
+    /// (`subcmd & 0x10`). pvxs records `op->lastRequest` while the op stays
+    /// `Executing` in `opByIOID` and only `cleanup()`s it *after* the reply
+    /// is serialized (`serverget.cpp:111-114`). The op therefore keeps its
+    /// IOID reserved until [`apply_exec_finish`] observes the spawned reply
+    /// task complete, so a re-INIT racing the slow source cannot reuse the
+    /// IOID while the first reply is still in flight.
+    last_request: bool,
 }
 
 /// atomically cross a pipeline-window watermark and mint
@@ -2787,6 +2815,7 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
         data_task_abort: None,
         monitor_start_ctl: None,
         exec_state: ExecState::Idle,
+        last_request: false,
     }
 }
 
@@ -4153,6 +4182,7 @@ async fn handle_op(
                 data_task_abort: None,
                 monitor_start_ctl: None,
                 exec_state: ExecState::Idle,
+                last_request: false,
             },
         );
 
@@ -7392,6 +7422,7 @@ mod tests {
                 data_task_abort: None,
                 monitor_start_ctl: None,
                 exec_state: ExecState::Idle,
+                last_request: false,
             },
         );
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
@@ -7645,6 +7676,7 @@ mod tests {
                 data_task_abort: None,
                 monitor_start_ctl: None,
                 exec_state: ExecState::Idle,
+                last_request: false,
             },
         );
         channels.insert(
@@ -8263,13 +8295,15 @@ mod tests {
     }
 
     /// a GET EXEC that sets the last-request bit (`subcmd & 0x10`)
-    /// must serialize its data response and then remove the op, matching
-    /// pvxs `serverget.cpp:112-116` (`cleanup()` after the reply, recorded
-    /// from `lastRequest = subcmd & 0x10` at `serverget.cpp:470-471`). The
-    /// removal must not abort the still-running response task. A plain GET
-    /// EXEC (no `0x10`) must keep the op registered.
+    /// keeps the op (and its IOID) reserved while the response task runs and
+    /// only removes it once the completion signal is applied — matching pvxs
+    /// `cleanup()` *after* `doReply` (`serverget.cpp:111-114`), recorded from
+    /// `lastRequest = subcmd & 0x10` (`serverget.cpp:470-471`). Freeing the
+    /// IOID at spawn time would let a re-INIT racing a slow source collide
+    /// with the still-in-flight reply on one IOID. A plain GET EXEC (no
+    /// `0x10`) returns the op to `Idle` on completion.
     #[tokio::test]
-    async fn get_exec_last_request_removes_op_after_response() {
+    async fn get_exec_last_request_defers_op_removal_until_response_sent() {
         use crate::pvdata::FieldDesc;
         use crate::pvdata::{PvField, PvStructure, ScalarType, ScalarValue};
         use crate::server_native::SharedSource;
@@ -8337,6 +8371,7 @@ mod tests {
         let mut channels = make_channels();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         handle_op(
             &source,
             &exec_frame(0x50),
@@ -8349,16 +8384,26 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
-            &discard_exec_fin(),
+            &exec_fin_tx,
         )
         .await
         .expect("GET EXEC (last request) ok");
-        // Op removed synchronously by the read-loop owner (pvxs cleanup()).
-        assert!(
-            !channels.get(&sid).unwrap().ops.contains_key(&ioid),
-            "last-request GET EXEC must remove the op from ch.ops"
-        );
-        // The response still arrives — the task was not aborted by removal.
+        // The IOID stays reserved while the spawned reply task runs —
+        // removal is deferred to the completion owner (pvxs cleanup() after
+        // doReply), so a re-INIT racing the reply cannot reuse the IOID.
+        {
+            let op = channels
+                .get(&sid)
+                .unwrap()
+                .ops
+                .get(&ioid)
+                .expect("last-request op stays reserved until its reply is sent");
+            assert!(
+                op.last_request,
+                "the op is marked last_request so the completion owner frees it"
+            );
+        }
+        // The response arrives — the task was not aborted by the deferral.
         let resp = rx.recv().await.expect("GET data response emitted");
         assert_eq!(
             resp[PvaHeader::SIZE + 4],
@@ -8369,11 +8414,24 @@ mod tests {
             resp.len() > PvaHeader::SIZE + 5,
             "data response carries a value, not a status-only frame"
         );
+        // The completion signal fires once the reply task's guard drops;
+        // applying it is where the last-request op's IOID is finally freed.
+        let fin = exec_fin_rx
+            .recv()
+            .await
+            .expect("data task signals completion");
+        apply_exec_finish(&mut channels, fin);
+        assert!(
+            !channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            "last-request GET op is removed once its response has been sent"
+        );
 
-        // Not the last request: subcmd = 0x00 keeps the op registered.
+        // Not the last request: subcmd = 0x00. The op is returned to Idle on
+        // completion, never removed.
         let mut channels = make_channels();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         handle_op(
             &source,
             &exec_frame(0x00),
@@ -8386,15 +8444,31 @@ mod tests {
             peer,
             &cred,
             &discard_mon_fin(),
-            &discard_exec_fin(),
+            &exec_fin_tx,
         )
         .await
         .expect("GET EXEC (not last request) ok");
+        let _ = rx.recv().await.expect("GET data response emitted");
+        let fin = exec_fin_rx
+            .recv()
+            .await
+            .expect("data task signals completion");
+        apply_exec_finish(&mut channels, fin);
         assert!(
             channels.get(&sid).unwrap().ops.contains_key(&ioid),
-            "non-last-request GET EXEC must keep the op registered"
+            "non-last-request GET EXEC keeps the op registered after completion"
         );
-        let _ = rx.recv().await.expect("GET data response emitted");
+        assert_eq!(
+            channels
+                .get(&sid)
+                .unwrap()
+                .ops
+                .get(&ioid)
+                .unwrap()
+                .exec_state,
+            ExecState::Idle,
+            "a completed non-last-request EXEC returns the op to Idle"
+        );
     }
 
     /// Build a flat 3-field NTScalar-like structure descriptor with
@@ -9774,6 +9848,7 @@ mod tests {
                 data_task_abort: None,
                 monitor_start_ctl: None,
                 exec_state: ExecState::Idle,
+                last_request: false,
             },
         );
         channels.insert(

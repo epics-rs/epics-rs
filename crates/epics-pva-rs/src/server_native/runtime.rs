@@ -346,6 +346,28 @@ where
     server.wait().await
 }
 
+/// Resolve the TCP listener bind addresses from the server interface
+/// list.
+///
+/// `EPICS_PVAS_INTF_ADDR_LIST` (`interfaces`) is the address set the
+/// server binds to; when empty it falls back to the single `bind_ip`
+/// wildcard default (pvxs `server.cpp:407-487` derives the TCP listener
+/// set from `effective.interfaces`). A wildcard entry (`0.0.0.0` /
+/// `[::]`) subsumes every specific address — binding a specific address
+/// on top of a wildcard already holding the port would fail — so it is
+/// bound alone. Otherwise one listener is bound per listed address so
+/// each interface is genuinely constrained at the kernel (a single
+/// `0.0.0.0` listener would accept on every NIC regardless of the list).
+fn tcp_bind_addresses(interfaces: &[IpAddr], bind_ip: IpAddr) -> Vec<IpAddr> {
+    if interfaces.is_empty() {
+        vec![bind_ip]
+    } else if let Some(wildcard) = interfaces.iter().find(|ip| ip.is_unspecified()) {
+        vec![*wildcard]
+    } else {
+        interfaces.to_vec()
+    }
+}
+
 /// Handle to a running PVA server returned by [`PvaServer::start`].
 ///
 /// Holds the JoinHandles for the UDP responder and TCP listener tasks
@@ -537,9 +559,11 @@ impl PvaServer {
             })?;
         let dyn_source: DynSource = composite as Arc<dyn ChannelSourceObj>;
 
-        let bind_addr = SocketAddr::new(config.bind_ip, config.tcp_port);
+        // TCP bind addresses derived from `EPICS_PVAS_INTF_ADDR_LIST`
+        // (empty → single `bind_ip` default); see [`tcp_bind_addresses`].
+        let tcp_bind_ips = tcp_bind_addresses(&config.interfaces, config.bind_ip);
 
-        // Robustness: bind the TCP listener synchronously here so the
+        // Robustness: bind the TCP listener(s) synchronously here so the
         // actually-bound port is observable to client_config() before
         // start() returns. The previous design spawned the accept task
         // and trusted `config.tcp_port` (which is 0 for ephemeral
@@ -559,17 +583,23 @@ impl PvaServer {
         // 5076 is already SO_REUSEPORT-shareable across local PVA
         // processes (epics-base-rs/net/async_udp_v4.rs:620), so the
         // remaining bottleneck was just the TCP single-bind.
-        let std_listener = match std::net::TcpListener::bind(bind_addr) {
+        //
+        // With a multi-interface list the FIRST listener picks the port
+        // (subject to the ephemeral fallback); the remaining interfaces
+        // then bind that same port on their own address (distinct
+        // (addr,port) tuples, so no SO_REUSEADDR is needed).
+        let first_bind_addr = SocketAddr::new(tcp_bind_ips[0], config.tcp_port);
+        let first_listener = match std::net::TcpListener::bind(first_bind_addr) {
             Ok(l) => l,
             Err(e)
                 if config.tcp_port != 0
                     && (e.kind() == std::io::ErrorKind::AddrInUse
                         || e.kind() == std::io::ErrorKind::PermissionDenied) =>
             {
-                let fallback_addr = SocketAddr::new(config.bind_ip, 0);
+                let fallback_addr = SocketAddr::new(tcp_bind_ips[0], 0);
                 let listener = std::net::TcpListener::bind(fallback_addr)?;
                 tracing::warn!(
-                    requested = ?bind_addr,
+                    requested = ?first_bind_addr,
                     bound = ?listener.local_addr().ok(),
                     error = %e,
                     "PVA TCP port unavailable; falling back to ephemeral",
@@ -578,8 +608,8 @@ impl PvaServer {
             }
             Err(e) => return Err(PvaError::Io(e)),
         };
-        std_listener.set_nonblocking(true)?;
-        let bound_tcp_port = std_listener.local_addr()?.port();
+        first_listener.set_nonblocking(true)?;
+        let bound_tcp_port = first_listener.local_addr()?.port();
         // Single bound-port source of truth: stamp the actually-bound
         // port back onto `config` so every consumer of `config.tcp_port`
         // — the TCP-circuit SEARCH_RESPONSE (handle_tcp_search), beacons,
@@ -593,7 +623,26 @@ impl PvaServer {
         // fallback above already consumed the original `tcp_port`, so
         // overwriting it here is safe.
         config.tcp_port = bound_tcp_port;
-        let tokio_listener = tokio::net::TcpListener::from_std(std_listener)?;
+        let mut tcp_listeners: Vec<tokio::net::TcpListener> =
+            vec![tokio::net::TcpListener::from_std(first_listener)?];
+        for ip in tcp_bind_ips.iter().skip(1) {
+            let addr = SocketAddr::new(*ip, bound_tcp_port);
+            let std_listener = std::net::TcpListener::bind(addr).map_err(PvaError::Io)?;
+            std_listener.set_nonblocking(true)?;
+            tcp_listeners.push(tokio::net::TcpListener::from_std(std_listener)?);
+        }
+
+        // v4 entries of the interface list constrain the UDP search
+        // responder bind; v6 entries (rare) are handled by the wildcard
+        // v6 responder below and are not part of the per-NIC v4 set.
+        let udp_interfaces: Vec<Ipv4Addr> = config
+            .interfaces
+            .iter()
+            .filter_map(|ip| match ip {
+                IpAddr::V4(v4) => Some(*v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
 
         let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
         let udp_handle = tokio::spawn(run_udp_responder_with_config(
@@ -609,6 +658,7 @@ impl PvaServer {
             config.auto_beacon,
             config.ignore_addrs.clone(),
             config.enable_ipv6_udp,
+            udp_interfaces,
         ));
         // PR #205 IPv6 Stage 2: optional companion responder bound
         // to `[::]:udp_port` that answers v6 SEARCH packets. Shares
@@ -627,12 +677,42 @@ impl PvaServer {
         } else {
             None
         };
-        let tcp_handle = tokio::spawn(crate::server_native::tcp::run_tcp_server_on_listener(
-            dyn_source,
-            tokio_listener,
-            config.clone(),
-            peers.clone(),
-        ));
+        // One accept loop per bound interface, supervised by a single
+        // task so the `PvaServer` keeps its single-handle shape (Drop /
+        // run / wait / report / stop are unchanged). The supervisor owns
+        // the per-listener `run_tcp_server_on_listener` futures in a
+        // JoinSet: the first listener to return Err ends the service and
+        // dropping the supervisor future (PvaServer::stop →
+        // `tcp_abort.abort()`) aborts every accept loop together. With
+        // the default empty interface list this is exactly one listener,
+        // identical to the previous single-bind behaviour.
+        let tcp_source = dyn_source;
+        let tcp_config = config.clone();
+        let tcp_peers = peers.clone();
+        let tcp_handle = tokio::spawn(async move {
+            let mut set: tokio::task::JoinSet<PvaResult<()>> = tokio::task::JoinSet::new();
+            for listener in tcp_listeners {
+                set.spawn(crate::server_native::tcp::run_tcp_server_on_listener(
+                    tcp_source.clone(),
+                    listener,
+                    tcp_config.clone(),
+                    tcp_peers.clone(),
+                ));
+            }
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) if e.is_cancelled() => return Ok(()),
+                    Err(e) => {
+                        return Err(crate::error::PvaError::Protocol(format!(
+                            "tcp listener task panic: {e}"
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        });
 
         let udp_abort = udp_handle.abort_handle();
         let udp_v6_abort = udp_v6_handle.as_ref().map(|h| h.abort_handle());
@@ -1166,6 +1246,75 @@ mod tcp_fallback_tests {
         // kicked in (sibling test grabbed it). Both are valid; only
         // a panic would be a regression.
         assert!(report.tcp_port != 0, "must bind a real port");
+        drop(server);
+    }
+
+    /// `EPICS_PVAS_INTF_ADDR_LIST` empty → fall back to the single
+    /// `bind_ip` default (historical behaviour).
+    #[test]
+    fn tcp_bind_addresses_empty_list_uses_bind_ip() {
+        let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert_eq!(tcp_bind_addresses(&[], bind_ip), vec![bind_ip]);
+    }
+
+    /// A loopback-only server interface list binds TCP only to loopback —
+    /// no wildcard / non-loopback address is produced.
+    #[test]
+    fn tcp_bind_addresses_loopback_only_binds_loopback_only() {
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let addrs = tcp_bind_addresses(&[lo], IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(addrs, vec![lo]);
+        assert!(
+            addrs.iter().all(|ip| ip.is_loopback()),
+            "loopback-only interface list produced a non-loopback bind addr: {addrs:?}"
+        );
+    }
+
+    /// Multiple specific interfaces → one listener per interface (each
+    /// kernel-constrained to its own address).
+    #[test]
+    fn tcp_bind_addresses_multi_interface_binds_each() {
+        let a = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
+        let addrs = tcp_bind_addresses(&[a, b], IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(addrs, vec![a, b]);
+    }
+
+    /// A wildcard entry subsumes every specific address (binding a
+    /// specific addr on top of a wildcard already holding the port would
+    /// fail), so the wildcard is bound alone.
+    #[test]
+    fn tcp_bind_addresses_wildcard_subsumes_specifics() {
+        let wild = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let specific = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
+        let addrs = tcp_bind_addresses(&[specific, wild], IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(addrs, vec![wild]);
+    }
+
+    /// End-to-end: a server constrained to loopback starts, binds, and is
+    /// reachable on loopback (the constrained bind path is wired through
+    /// `start()`, not just the helper).
+    #[tokio::test]
+    async fn server_with_loopback_interface_list_starts_and_is_reachable() {
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            interfaces: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+        let server = PvaServer::start(source, config).expect("loopback-constrained server starts");
+        let report = server.report();
+        assert!(report.tcp_port != 0, "must bind a real port");
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), report.tcp_port);
+        let connect =
+            tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr))
+                .await
+                .expect("connect timed out");
+        let _stream = connect.expect("loopback TCP connect must succeed");
         drop(server);
     }
 }

@@ -596,6 +596,53 @@ pub fn list_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
     out
 }
 
+/// Like [`list_broadcast_addresses`] but restricted to the interfaces in
+/// `interfaces` — the directed broadcast of each listed interface only.
+///
+/// This is the `EPICS_PVA*_INTF_ADDR_LIST` constraint on auto address
+/// expansion: pvxs runs `expandAddrList` over `Config::interfaces`
+/// (`config.cpp:624-648`), so a client constrained to a subset of
+/// interfaces broadcasts only on those subnets. Rules:
+///
+/// * Empty `interfaces` → delegate to [`list_broadcast_addresses`] (the
+///   all-interface default).
+/// * A wildcard entry (`0.0.0.0`) means "every interface", so it also
+///   delegates to the all-NIC enumeration.
+/// * Otherwise: each listed interface contributes its own subnet
+///   broadcast (looked up in the live interface table). The limited-
+///   broadcast `255.255.255.255` fallback is appended **only** when at
+///   least one listed interface is a real (non-loopback) NIC — so a
+///   loopback-only list (`127.0.0.1`) yields an empty set and no
+///   broadcast traffic leaves the host.
+pub fn list_broadcast_addresses_on(interfaces: &[Ipv4Addr], port: u16) -> Vec<SocketAddr> {
+    if interfaces.is_empty() || interfaces.iter().any(|ip| ip.is_unspecified()) {
+        return list_broadcast_addresses(port);
+    }
+    let mut out = Vec::new();
+    let mut any_non_loopback = false;
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for want in interfaces {
+            if want.is_loopback() {
+                continue;
+            }
+            for iface in &ifaces {
+                if let if_addrs::IfAddr::V4(v4) = &iface.addr {
+                    if &v4.ip == want {
+                        any_non_loopback = true;
+                        if let Some(bcast) = v4.broadcast {
+                            out.push(SocketAddr::new(IpAddr::V4(bcast), port));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if any_non_loopback {
+        out.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), port));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

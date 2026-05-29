@@ -268,7 +268,21 @@ impl SearchEngine {
         let beacons = BeaconTracker::new();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>(256);
 
-        let search_socket = bind_ephemeral_udp()?;
+        // `EPICS_PVA_INTF_ADDR_LIST` (v4 entries) constrains both the
+        // active-search socket bind and the auto-broadcast address
+        // expansion to the listed interfaces. Empty = all-NIC default
+        // (pvxs threads `client::Config::interfaces` into both, see
+        // `config.cpp:624-648`). v6 entries are not part of the v4
+        // search-socket bundle; the v6 search socket binds wildcard.
+        let client_interfaces: Vec<Ipv4Addr> = crate::config::env::list_intf_addresses()
+            .into_iter()
+            .filter_map(|ip| match ip {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+
+        let search_socket = bind_ephemeral_udp(&client_interfaces)?;
         // PR #205 IPv6 Stage 4: optional v6 send/recv socket. Used
         // alongside the v4 socket — graceful degradation when the
         // host has no usable IPv6 stack.
@@ -384,6 +398,7 @@ impl SearchEngine {
             ns_user,
             ns_host,
             ns_handshake_timeout,
+            client_interfaces,
         ));
 
         Ok(Self { cmd_tx, beacons })
@@ -520,12 +535,21 @@ impl SearchEngine {
 
 // ── UDP socket helpers ──────────────────────────────────────────────────
 
-fn bind_ephemeral_udp() -> PvaResult<AsyncUdpV4> {
+fn bind_ephemeral_udp(interfaces: &[Ipv4Addr]) -> PvaResult<AsyncUdpV4> {
     // SEARCH packets embed a `response_port` that IOCs reply unicast
     // to. With per-NIC sockets we want every NIC's reply port to be
     // identical so the IOC's response lands on the right
     // logical socket regardless of which NIC delivered it back.
-    AsyncUdpV4::bind_ephemeral_same_port(true).map_err(PvaError::Io)
+    //
+    // `EPICS_PVA_INTF_ADDR_LIST` (v4 entries) constrains the active-
+    // search socket to the listed interfaces (pvxs `config.cpp:624-648`
+    // threads `interfaces` into the search-socket bind); empty list =
+    // the historical all-NIC default.
+    if interfaces.is_empty() {
+        AsyncUdpV4::bind_ephemeral_same_port(true).map_err(PvaError::Io)
+    } else {
+        AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(interfaces, true).map_err(PvaError::Io)
+    }
 }
 
 /// PR #205 IPv6 Stage 4: bind a v6-only ephemeral UDP socket used to
@@ -876,6 +900,10 @@ async fn run_engine(
     ns_user: String,
     ns_host: String,
     ns_handshake_timeout: Duration,
+    // `EPICS_PVA_INTF_ADDR_LIST` (v4 entries): when non-empty, the auto
+    // broadcast-target expansion is restricted to these interfaces'
+    // subnets. Empty = all-NIC default.
+    client_interfaces: Vec<Ipv4Addr>,
 ) {
     static NEXT_SEARCH_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -1204,7 +1232,7 @@ async fn run_engine(
                     // unrelated found=false reply is not promoted to a fake
                     // beacon.
                     let pkt = codec.build_discover_search(DISCOVER_SEQ, response_port);
-                    broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
+                    broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &client_interfaces, &mut search_send_errs).await;
                 }
                 None => break,
             },
@@ -1363,6 +1391,7 @@ async fn run_engine(
                     &search_socket,
                     search_socket_v6.as_ref(),
                     &extra_targets,
+                    &client_interfaces,
                     &mut search_send_errs,
                     &ns_senders,
                 )
@@ -1486,6 +1515,7 @@ async fn run_engine(
                             search_socket_v6.as_ref(),
                             &frame,
                             &extra_targets,
+                            &client_interfaces,
                             &mut search_send_errs,
                         )
                         .await;
@@ -1590,12 +1620,14 @@ fn search_targets(
     bport: u16,
     auto_addr_list: bool,
     extra_targets: &[SocketAddr],
+    client_interfaces: &[Ipv4Addr],
 ) -> Vec<SocketAddr> {
     let mut targets: Vec<SocketAddr> = Vec::with_capacity(8);
 
     // Auto-expansion destinations — gated on AUTO_ADDR_LIST, matching
     // pvxs's `expandAddrList()` which only runs when autoAddrList is true.
-    if auto_addr_list {
+    if auto_addr_list && client_interfaces.is_empty() {
+        // All-NIC default (`EPICS_PVA_INTF_ADDR_LIST` unset).
         // Limited broadcast. pvxs uses per-interface directed broadcasts;
         // the 255.255.255.255 + per-NIC fanout below is the Rust
         // cross-NIC equivalent. On multi-NIC hosts (and macOS) the kernel
@@ -1614,6 +1646,23 @@ fn search_targets(
         // addr, which breaks on hosts whose only interface is loopback
         // (CI containers, isolated VMs). One extra datagram per burst.
         targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bport));
+    } else if auto_addr_list {
+        // `EPICS_PVA_INTF_ADDR_LIST` set: pvxs expands the auto address
+        // list over the configured interfaces only (`config.cpp:624-648`),
+        // so the directed-broadcast set is restricted to the listed
+        // interfaces' subnets. `list_broadcast_addresses_on` adds the
+        // limited-broadcast 255.255.255.255 fallback iff a non-loopback
+        // interface is listed — a loopback-only list contributes none, so
+        // no broadcast leaves the host.
+        for sa in crate::config::env::list_broadcast_addresses_on(client_interfaces, bport) {
+            targets.push(sa);
+        }
+        // Loopback unicast only when loopback is an explicitly-listed
+        // interface (the all-NIC path adds it unconditionally as a
+        // zero-config convenience; here the operator chose the set).
+        if client_interfaces.iter().any(|ip| ip.is_loopback()) {
+            targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bport));
+        }
     }
 
     // Explicitly configured / programmatic targets are always sent — they
@@ -1633,6 +1682,7 @@ async fn broadcast(
     socket_v6: Option<&Arc<UdpSocket>>,
     packet: &[u8],
     extra_targets: &[SocketAddr],
+    client_interfaces: &[Ipv4Addr],
     send_errs: &mut HashSet<SocketAddr>,
 ) {
     let bport = std::env::var("EPICS_PVA_BROADCAST_PORT")
@@ -1643,6 +1693,7 @@ async fn broadcast(
         bport,
         crate::config::env::auto_addr_list_enabled(),
         extra_targets,
+        client_interfaces,
     );
 
     for t in targets {
@@ -1709,6 +1760,7 @@ async fn flush_initial_searches(
     search_socket: &AsyncUdpV4,
     search_socket_v6: Option<&Arc<UdpSocket>>,
     extra_targets: &[SocketAddr],
+    client_interfaces: &[Ipv4Addr],
     send_errs: &mut HashSet<SocketAddr>,
     ns_senders: &[NsHandle],
 ) {
@@ -1733,6 +1785,7 @@ async fn flush_initial_searches(
             search_socket_v6,
             &frame,
             extra_targets,
+            client_interfaces,
             send_errs,
         )
         .await;
@@ -4094,10 +4147,37 @@ mod tests {
     /// a LAN the operator intentionally restricted.
     #[test]
     fn search_targets_empty_when_auto_off_and_no_extras() {
-        let targets = search_targets(5076, false, &[]);
+        let targets = search_targets(5076, false, &[], &[]);
         assert!(
             targets.is_empty(),
             "AUTO_ADDR_LIST=NO + empty list must emit no broadcast; got {targets:?}"
+        );
+    }
+
+    /// EPICS_PVA_INTF_ADDR_LIST=127.0.0.1 with AUTO_ADDR_LIST=YES must
+    /// produce no non-loopback broadcast target — the interface list
+    /// constrains auto address expansion (pvxs `config.cpp:624-648`).
+    #[test]
+    fn search_targets_loopback_only_interface_list_no_broadcast() {
+        let targets = search_targets(5076, true, &[], &[Ipv4Addr::LOCALHOST]);
+        assert!(
+            !targets.iter().any(|t| match t {
+                SocketAddr::V4(v4) => !v4.ip().is_loopback(),
+                SocketAddr::V6(_) => true,
+            }),
+            "loopback-only interface list produced a non-loopback target: {targets:?}"
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|t| matches!(t, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
+            "loopback-only interface list must not emit limited broadcast: {targets:?}"
+        );
+        // The loopback unicast convenience is still present (loopback is
+        // the explicitly-listed interface).
+        assert!(
+            targets.contains(&SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5076)),
+            "loopback unicast expected when loopback is the listed interface"
         );
     }
 
@@ -4106,7 +4186,7 @@ mod tests {
     #[test]
     fn search_targets_auto_off_sends_only_configured_extras() {
         let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
-        let targets = search_targets(5076, false, &[extra]);
+        let targets = search_targets(5076, false, &[extra], &[]);
         assert_eq!(targets, vec![extra]);
         assert!(
             !targets
@@ -4121,7 +4201,7 @@ mod tests {
     #[test]
     fn search_targets_auto_on_includes_limited_broadcast_and_extras() {
         let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
-        let targets = search_targets(5076, true, &[extra]);
+        let targets = search_targets(5076, true, &[extra], &[]);
         assert!(
             targets.contains(&SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 5076)),
             "AUTO_ADDR_LIST=YES must add the limited broadcast destination"

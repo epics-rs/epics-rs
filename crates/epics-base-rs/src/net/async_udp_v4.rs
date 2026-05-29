@@ -143,13 +143,35 @@ impl AsyncUdpV4 {
     /// socket and are silently dropped (the beacon receiver only
     /// processes BEACON, not SEARCH).
     pub fn bind_non_loopback(port: u16, broadcast: bool) -> io::Result<Self> {
-        Self::bind_with_map_filtered(&IfaceMap::new(), port, broadcast, true)
+        Self::bind_with_map_filtered(&IfaceMap::new(), port, broadcast, true, None)
+    }
+
+    /// Like [`Self::bind`] but binds **only** the interfaces whose
+    /// unicast IPv4 address appears in `interfaces`, in list order —
+    /// the all-NIC default is *replaced* by exactly the configured set.
+    ///
+    /// This is how `EPICS_PVA*_INTF_ADDR_LIST` constrains a responder /
+    /// search socket to specific interfaces (pvxs `server.cpp:407-439`,
+    /// `config.cpp:624-648`): the server binds only the addresses the
+    /// operator listed, not every discovered NIC. A listed address that
+    /// is not a currently-enumerated local NIC is bound directly as a
+    /// unicast-only interface (no broadcast-RX socket), so a
+    /// loopback-only list (`127.0.0.1`) binds exactly one loopback
+    /// socket and produces no non-loopback exposure. Pass an empty slice
+    /// only via the all-NIC entry points ([`Self::bind`]); here an empty
+    /// `interfaces` would bind nothing and error.
+    pub fn bind_on_interfaces(
+        interfaces: &[Ipv4Addr],
+        port: u16,
+        broadcast: bool,
+    ) -> io::Result<Self> {
+        Self::bind_with_map_filtered(&IfaceMap::new(), port, broadcast, false, Some(interfaces))
     }
 
     /// Like [`Self::bind`] but reuses an existing [`IfaceMap`] —
     /// useful when callers maintain a long-lived shared map.
     pub fn bind_with_map(map: &IfaceMap, port: u16, broadcast: bool) -> io::Result<Self> {
-        Self::bind_with_map_filtered(map, port, broadcast, false)
+        Self::bind_with_map_filtered(map, port, broadcast, false, None)
     }
 
     fn bind_with_map_filtered(
@@ -157,8 +179,9 @@ impl AsyncUdpV4 {
         port: u16,
         broadcast: bool,
         skip_loopback: bool,
+        only: Option<&[Ipv4Addr]>,
     ) -> io::Result<Self> {
-        let ifaces = map.all();
+        let ifaces = select_ifaces(map, only);
         let mut sockets = Vec::with_capacity(ifaces.len() * 2);
         for info in ifaces {
             if skip_loopback && info.ip.is_loopback() {
@@ -236,7 +259,31 @@ impl AsyncUdpV4 {
     /// Like [`Self::bind_ephemeral_same_port`] but reuses a caller-
     /// provided [`IfaceMap`].
     pub fn bind_ephemeral_same_port_with_map(map: &IfaceMap, broadcast: bool) -> io::Result<Self> {
-        let ifaces = map.all();
+        Self::bind_ephemeral_same_port_inner(map, broadcast, None)
+    }
+
+    /// Like [`Self::bind_ephemeral_same_port`] but binds **only** the
+    /// interfaces whose unicast IPv4 address appears in `interfaces` —
+    /// the same-port-per-NIC bundle is restricted to exactly the
+    /// configured set rather than every discovered NIC. This is the
+    /// client-side `EPICS_PVA_INTF_ADDR_LIST` constraint on the active-
+    /// search socket (pvxs `config.cpp:624-648` threads `interfaces`
+    /// into the search-socket bind), so a loopback-only list binds a
+    /// single loopback socket and a client never emits SEARCH out an
+    /// interface the operator excluded.
+    pub fn bind_ephemeral_same_port_on_interfaces(
+        interfaces: &[Ipv4Addr],
+        broadcast: bool,
+    ) -> io::Result<Self> {
+        Self::bind_ephemeral_same_port_inner(&IfaceMap::new(), broadcast, Some(interfaces))
+    }
+
+    fn bind_ephemeral_same_port_inner(
+        map: &IfaceMap,
+        broadcast: bool,
+        only: Option<&[Ipv4Addr]>,
+    ) -> io::Result<Self> {
+        let ifaces = select_ifaces(map, only);
         let mut up_first: Vec<IfaceInfo> = Vec::with_capacity(ifaces.len());
         // Order matters: pick the port from a non-loopback NIC if one
         // exists, so the kernel assigns from a more meaningful pool
@@ -965,6 +1012,41 @@ fn socket_ref(sock: &UdpSocket) -> socket2::SockRef<'_> {
     socket2::SockRef::from(sock)
 }
 
+/// Resolve which NICs a bind should cover.
+///
+/// `None` → every NIC `map.all()` enumerates (the all-interface
+/// default; `EPICS_PVA*_INTF_ADDR_LIST` unset). `Some(list)` → only the
+/// NICs whose unicast IPv4 address appears in `list`, returned in `list`
+/// order. A listed address that is not a currently-enumerated local NIC
+/// is synthesized as a unicast-only [`IfaceInfo`] (no subnet broadcast),
+/// so binding still happens for an address the OS enumerator omitted
+/// (e.g. an alias) and a loopback-only list yields exactly the loopback
+/// interface. This is the single point where the interface-list
+/// constraint is applied, shared by the fixed-port and ephemeral-same-
+/// port bind paths.
+fn select_ifaces(map: &IfaceMap, only: Option<&[Ipv4Addr]>) -> Vec<IfaceInfo> {
+    let all = map.all();
+    match only {
+        None => all,
+        Some(list) => list
+            .iter()
+            .map(|want| {
+                all.iter()
+                    .find(|i| i.ip == *want)
+                    .cloned()
+                    .unwrap_or_else(|| IfaceInfo {
+                        index: 0,
+                        name: String::new(),
+                        ip: *want,
+                        netmask: Ipv4Addr::UNSPECIFIED,
+                        broadcast: None,
+                        up_non_loopback: !want.is_loopback(),
+                    })
+            })
+            .collect(),
+    }
+}
+
 fn bind_one(info: &IfaceInfo, port: u16, broadcast: bool) -> io::Result<NicSocket> {
     bind_one_at(info, info.ip, port, broadcast, false)
 }
@@ -1141,6 +1223,42 @@ mod tests {
             assert_eq!(*p, first, "all NIC sockets must share one port");
         }
         assert!(first != 0, "ephemeral port must be non-zero");
+    }
+
+    #[tokio::test]
+    async fn bind_on_interfaces_loopback_only_binds_no_other_nic() {
+        // EPICS_PVA*_INTF_ADDR_LIST=127.0.0.1 must restrict the bundle
+        // to loopback — no non-loopback NIC may be bound.
+        let sock = AsyncUdpV4::bind_on_interfaces(&[Ipv4Addr::LOCALHOST], 0, true)
+            .expect("loopback-only bind");
+        assert!(
+            sock.ifaces().iter().all(|n| n.is_loopback),
+            "loopback-only interface list bound a non-loopback NIC: {:?}",
+            sock.ifaces().iter().map(|n| n.iface_ip).collect::<Vec<_>>()
+        );
+        assert!(
+            sock.local_addrs().iter().all(|a| a.ip().is_loopback()),
+            "loopback-only interface list produced a non-loopback bind addr"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_ephemeral_same_port_on_interfaces_loopback_only() {
+        // Client active-search socket constrained to loopback: one
+        // socket, loopback only, no non-loopback egress interface.
+        let sock = AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(&[Ipv4Addr::LOCALHOST], true)
+            .expect("loopback-only ephemeral bind");
+        assert!(
+            sock.ifaces().iter().all(|n| n.is_loopback),
+            "loopback-only search socket bound a non-loopback NIC: {:?}",
+            sock.ifaces().iter().map(|n| n.iface_ip).collect::<Vec<_>>()
+        );
+        let addrs = sock.local_addrs();
+        assert!(!addrs.is_empty(), "must bind at least the loopback socket");
+        assert!(
+            addrs.iter().all(|a| a.ip().is_loopback()),
+            "loopback-only search socket produced a non-loopback bind addr"
+        );
     }
 
     #[tokio::test]

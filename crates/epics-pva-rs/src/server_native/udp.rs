@@ -106,8 +106,19 @@ fn bind_beacon_send_v6() -> Option<Arc<tokio::net::UdpSocket>> {
     }
 }
 
-fn bind_udp(port: u16) -> PvaResult<AsyncUdpV4> {
-    let sock = AsyncUdpV4::bind(port, true).map_err(PvaError::Io)?;
+fn bind_udp(port: u16, interfaces: &[Ipv4Addr]) -> PvaResult<AsyncUdpV4> {
+    // `EPICS_PVAS_INTF_ADDR_LIST` constrains the responder to the listed
+    // interfaces (pvxs `server.cpp:407-439` binds UDP search listeners
+    // only on the effective interface set). Empty list = the historical
+    // all-NIC default. A constrained bind also gets each listed NIC's
+    // broadcast-RX socket from `bind_on_interfaces`, so subnet-directed
+    // SEARCH to a listed interface still reaches us.
+    let sock = if interfaces.is_empty() {
+        AsyncUdpV4::bind(port, true)
+    } else {
+        AsyncUdpV4::bind_on_interfaces(interfaces, port, true)
+    }
+    .map_err(PvaError::Io)?;
     // pvxs server.cpp joins multicast groups listed in
     // EPICS_PVAS_INTF_ADDR_LIST / EPICS_PVA_ADDR_LIST so SEARCH packets
     // sent to those groups reach the responder. We do the same here —
@@ -143,6 +154,7 @@ pub async fn run_udp_responder_proto(
         true,
         Vec::new(),
         false,
+        Vec::new(),
     )
     .await
 }
@@ -171,8 +183,12 @@ pub async fn run_udp_responder_with_config(
     // separately (see [`run_udp_responder_v6`]); the v6 flag here only
     // controls beacon emission to the v6 group.
     enable_ipv6_udp: bool,
+    // `EPICS_PVAS_INTF_ADDR_LIST` (v4 entries): when non-empty, the
+    // search responder binds only these interfaces instead of every
+    // discovered NIC. Empty = all-NIC default.
+    interfaces: Vec<Ipv4Addr>,
 ) -> PvaResult<()> {
-    let socket = bind_udp(udp_port)?;
+    let socket = bind_udp(udp_port, &interfaces)?;
     let socket = Arc::new(socket);
     debug!(?udp_port, "UDP search responder started");
 
@@ -2172,7 +2188,8 @@ mod tests {
             vec![v6_dest],
             false, // auto_beacon=false: only the explicit v6 dest
             Vec::new(),
-            true, // enable_ipv6_udp
+            true,       // enable_ipv6_udp
+            Vec::new(), // interfaces: all-NIC default
         ));
 
         let mut buf = vec![0u8; 4096];

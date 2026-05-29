@@ -289,6 +289,46 @@ impl PvaLinkResolver {
         record: Option<String>,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::parse(link_string, LinkDirection::Inp)?;
+        // Convenience-URI path: key the per-link options by the full
+        // scheme-stripped link string (including any `?query`), so two
+        // links to the same PV with different options each keep their
+        // own entry.
+        let options_key = strip_scheme(link_string).unwrap_or(link_string).to_string();
+        self.open_inp_cfg(cfg, options_key, record).await
+    }
+
+    /// Like [`Self::open_link_for_record`] but for a link parsed from
+    /// the structured pvxs-parity JSON longhand `{pva:{pv,…}}`
+    /// (`epics_base_rs` `PvaJsonLink`). The options arrive as JLink
+    /// members, not a `?key=value` query (BRIDGE-RS-2026-05-28-107), and
+    /// the per-link config is keyed by the BARE PV name — epics-base-rs
+    /// resolves a `PvaJson` INP link through `resolve_external_pv(&j.pv)`
+    /// (`server/database/links.rs`), so the steady-state lset hot path
+    /// looks the config up by bare PV. `record` is bound as a CP/CPP
+    /// scan-on-update target exactly as the convenience-URI path does.
+    pub async fn open_json_link_for_record(
+        &self,
+        pv: &str,
+        options: &[(String, String)],
+        record: &str,
+    ) -> PvaLinkResult<Arc<PvaLink>> {
+        let cfg = PvaLinkConfig::from_jlink_options(pv, options, LinkDirection::Inp)?;
+        self.open_inp_cfg(cfg, pv.to_string(), Some(record.to_string()))
+            .await
+    }
+
+    /// Register an INP link's options under `options_key`, bind an
+    /// optional scan-on-update `record`, open/cache the link, and spawn
+    /// its monitor-notification forwarder. The single owner shared by
+    /// the convenience-URI path ([`Self::open_link_inner`], keyed by the
+    /// full link string) and the pvxs-parity JSON path
+    /// ([`Self::open_json_link_for_record`], keyed by the bare PV name).
+    async fn open_inp_cfg(
+        &self,
+        cfg: PvaLinkConfig,
+        options_key: String,
+        record: Option<String>,
+    ) -> PvaLinkResult<Arc<PvaLink>> {
         // An INP link that is meaningful for the resolver must keep a
         // monitor open; force it on (pvxs treats `proc=CP/CPP` and the
         // resolver path as monitored).
@@ -335,14 +375,15 @@ impl PvaLinkResolver {
                 return Err(PvaLinkError::NotLocal(pv_name));
             }
         }
-        // key by the full link string (scheme-stripped, including
-        // any query) so two links to the same PV with different options
-        // (field, sevr, Q, …) each have their own entry. pvxs equivalent:
-        // each `pvaLink` carries its own `pvaLinkConfig`
+        // Register the per-link options under the caller-chosen key:
+        // the full scheme-stripped link string for the convenience-URI
+        // path (two links to the same PV with different options each keep
+        // their own entry), or the bare PV name for the pvxs-parity JSON
+        // path (the name epics-base-rs hands the lset at resolve time).
+        // pvxs equivalent: each `pvaLink` carries its own `pvaLinkConfig`
         // (`pvxs/ioc/pvalink.h:65`). The registry key shares the channel
         // by (pv_name, pipeline, queue_size) per `pvxs/ioc/pvalink.h:116`.
-        let full_key = strip_scheme(link_string).unwrap_or(link_string).to_string();
-        self.link_options.write().insert(full_key, cfg.clone());
+        self.link_options.write().insert(options_key, cfg.clone());
         // B3: register the scan-on-update target before opening so the
         // forwarder spawned below already sees it. Keyed by the monitor
         // variant identity, NOT bare PV name, so a `Q=1` record's scan
@@ -471,8 +512,39 @@ impl PvaLinkResolver {
     pub async fn open_out_link(&self, link_string: &str) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::parse(link_string, LinkDirection::Out)?;
         // key by full link string (same rationale as open_link_inner).
-        let full_key = strip_scheme(link_string).unwrap_or(link_string).to_string();
-        self.out_link_options.write().insert(full_key, cfg.clone());
+        let options_key = strip_scheme(link_string).unwrap_or(link_string).to_string();
+        self.open_out_cfg(cfg, options_key).await
+    }
+
+    /// OUT counterpart of [`Self::open_json_link_for_record`]: open an
+    /// OUT link from the structured pvxs-parity JSON longhand
+    /// (`epics_base_rs` `PvaJsonLink`), reading options as JLink members
+    /// rather than a `?key=value` query (BRIDGE-RS-2026-05-28-107). Keyed
+    /// by the bare PV name — epics-base-rs writes a `PvaJson` OUT link
+    /// through `external_pv_name()` → `j.pv` (`server/database/links.rs`),
+    /// so `put_value` looks the config up by bare PV.
+    pub async fn open_json_out_link(
+        &self,
+        pv: &str,
+        options: &[(String, String)],
+    ) -> PvaLinkResult<Arc<PvaLink>> {
+        let cfg = PvaLinkConfig::from_jlink_options(pv, options, LinkDirection::Out)?;
+        self.open_out_cfg(cfg, pv.to_string()).await
+    }
+
+    /// Register an OUT link's options under `options_key` and open/cache
+    /// the link. Shared by the convenience-URI path
+    /// ([`Self::open_out_link`], keyed by the full link string) and the
+    /// pvxs-parity JSON path ([`Self::open_json_out_link`], keyed by the
+    /// bare PV name).
+    async fn open_out_cfg(
+        &self,
+        cfg: PvaLinkConfig,
+        options_key: String,
+    ) -> PvaLinkResult<Arc<PvaLink>> {
+        self.out_link_options
+            .write()
+            .insert(options_key, cfg.clone());
         self.registry.get_or_open(cfg).await
     }
 
@@ -658,34 +730,52 @@ pub async fn install_pvalink_resolver(
     db.register_link_set("pva", Arc::new(resolver.clone()))
         .await;
 
-    // scan all loaded records and pre-register any pvalink
-    // options encoded in the ParsedLink::Pva query string. This
+    // scan all loaded records and pre-register any pvalink options —
+    // carried either as a `ParsedLink::Pva` convenience-URI/legacy-suffix
+    // string or as structured `ParsedLink::PvaJson` JLink members. This
     // ensures CP/CPP scan targets are wired before the first monitor
     // event and field/sevr/Q settings are effective from the first
     // read/write without iocsh pre-warming.
     use epics_base_rs::server::record::ParsedLink;
     for record_name in db.all_record_names().await {
         for (field_name, _raw, parsed) in db.record_link_fields(&record_name).await {
-            let ParsedLink::Pva(ref s) = parsed else {
-                continue;
-            };
-            // pre-register links that carry per-link options
-            // in EITHER representation — the `?key=value` query form OR
-            // the legacy whitespace suffix form (`TARGET MS`,
-            // `TARGET CPP`). `link_pv_name(s) == s` is true only for a
-            // truly bare PV (no query, no modifiers), which needs no
-            // pre-registration; anything else is parsed and wired so its
-            // `field`/`sevr`/`proc` and any `CP`/`CPP` scan target are
-            // effective before the first read. Pre-fix the gate was
-            // `!s.contains('?')`, which skipped every legacy-suffix link.
-            if link_pv_name(s) == s {
-                continue;
-            }
-            let link_str = format!("pva://{s}");
-            if field_name == "OUT" {
-                let _ = resolver.open_out_link(&link_str).await;
-            } else {
-                let _ = resolver.open_link_for_record(&link_str, &record_name).await;
+            match &parsed {
+                // Convenience-URI / legacy-suffix form: the verbatim
+                // channel-name string may carry options in the
+                // `?key=value` query form OR the legacy whitespace suffix
+                // form (`TARGET MS`, `TARGET CPP`). `link_pv_name(s) == s`
+                // is true only for a truly bare PV (no query, no
+                // modifiers), which needs no pre-registration; anything
+                // else is parsed and wired so its `field`/`sevr`/`proc`
+                // and any `CP`/`CPP` scan target are effective before the
+                // first read.
+                ParsedLink::Pva(s) => {
+                    if link_pv_name(s) == s {
+                        continue;
+                    }
+                    let link_str = format!("pva://{s}");
+                    if field_name == "OUT" {
+                        let _ = resolver.open_out_link(&link_str).await;
+                    } else {
+                        let _ = resolver.open_link_for_record(&link_str, &record_name).await;
+                    }
+                }
+                // pvxs-parity JSON longhand `{pva:{pv,…}}`: the options
+                // are structured JLink members, read directly without a
+                // `?key=value` query round-trip (BRIDGE-RS-2026-05-28-107).
+                // Always pre-registered — the longhand variant exists
+                // precisely to carry options (a pv-only longhand yields a
+                // plain `Pva`), so there is no bare-PV early-out here.
+                ParsedLink::PvaJson(j) => {
+                    if field_name == "OUT" {
+                        let _ = resolver.open_json_out_link(&j.pv, &j.options).await;
+                    } else {
+                        let _ = resolver
+                            .open_json_link_for_record(&j.pv, &j.options, &record_name)
+                            .await;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -947,22 +1037,52 @@ impl LinkSet for PvaLinkResolver {
         let array_path = is_array_value(&value);
         block_in_place_or_warn(|| {
             self.handle.block_on(async {
+                // Resolve the SHARED channel owner for this PV (the
+                // registry no longer keys on the per-link OUT options),
+                // then stage THIS link's write with its own
+                // `field`/`proc`/`defer`/`retry` so sibling fields
+                // coalesce into one upstream PUT.
                 let link = self
                     .registry
-                    .get_or_open(cfg)
+                    .get_or_open(cfg.clone())
                     .await
                     .map_err(|e| e.to_string())?;
                 if array_path {
                     let pv_field = crate::convert::epics_to_pv_field(&value);
-                    link.write_pv_field(&pv_field)
+                    link.put_out_field(&cfg, &pv_field)
                         .await
                         .map_err(|e| e.to_string())
                 } else {
                     let value_str = value.to_string();
-                    link.write(&value_str).await.map_err(|e| e.to_string())
+                    link.put_out_str(&cfg, &value_str)
+                        .await
+                        .map_err(|e| e.to_string())
                 }
             })
         })
+    }
+
+    fn flush_puts(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        // Production drain of any retry-queued OUT writes: re-attempt
+        // every shared channel owner that a prior disconnect left with
+        // a `retry` write staged, now that some OUT activity has reached
+        // the lset (the upstream may have reconnected). `flush_retry_pending`
+        // is a no-op on channels with nothing stuck, so a freshly-`defer`red
+        // write awaiting its sibling is never flushed early.
+        let links = self.registry.out_links();
+        if links.is_empty() {
+            return;
+        }
+        block_in_place_or_warn(|| {
+            self.handle.block_on(async {
+                for link in links {
+                    let _ = link.flush_retry_pending().await;
+                }
+            })
+        });
     }
 
     fn alarm_message(&self, name: &str) -> Option<String> {
@@ -2385,60 +2505,70 @@ mod tests {
 
     // ---- DB JSON pvalink options preserved ----
 
-    /// JSON-object pvalink options (field, proc, sevr, Q, …)
-    /// survive the parse→bridge pipeline.
+    /// JSON-object pvalink options (field, proc, sevr, Q, …) survive the
+    /// parse→bridge pipeline as STRUCTURED JLink members, not a synthetic
+    /// `?key=value` query (BRIDGE-RS-2026-05-28-107).
     ///
-    /// Two parts: (a) parse_link_v2 encodes JSON options as a
-    /// query string in ParsedLink::Pva, and (b) the integration layer
-    /// wires those options when open_link_for_record is called — the
-    /// same path install_pvalink_resolver's pre-scanner follows after
-    /// the parse fix.
+    /// Three parts: (a) parse_link_v2 yields a `ParsedLink::PvaJson` whose
+    /// `options` is the verbatim `(key, value)` pair list; (b)
+    /// `PvaLinkConfig::from_jlink_options` reconstructs the config from
+    /// those members with no query round-trip; (c) the integration layer
+    /// wires them via `open_json_link_for_record`, keyed by the bare PV
+    /// name — the same path install_pvalink_resolver's pre-scanner follows
+    /// for a loaded record.
     ///
-    /// Fails on main: parse_link_v2 returns ParsedLink::Pva("TARGET:AI")
-    /// with no options, so the first assert immediately fails.
-    ///
-    /// Upstream parity: pvxs pvalink_jlif.cpp:24-196 (all pvalink
-    /// JSON keys parsed and stored on the jlink struct for the link's
-    /// lifetime).
+    /// Upstream parity: pvxs pvalink_jlif.cpp:24-196 (all pvalink JSON
+    /// keys parsed as JLink map keys / typed values and stored on the
+    /// jlink struct for the link's lifetime); :286-300 (no `?key=value`
+    /// URI query parser exists in the JLink callback table).
     #[tokio::test]
     async fn br_r10_db_json_pvalink_options_preserved() {
-        use epics_base_rs::server::record::{ParsedLink, parse_link_v2};
+        use epics_base_rs::server::record::{ParsedLink, PvaJsonLink, parse_link_v2};
 
-        // Part 1: parse_link_v2 must encode all options as query string.
+        // Part 1: the JSON longhand parses to a structured PvaJson link —
+        // options as JLink members, in source order with original key
+        // case, never a query string.
         let json =
             r#"{pva: {pv: "TARGET:AI", field: "display.precision", proc: "CPP", sevr: "MS"}}"#;
-        let stored = match parse_link_v2(json) {
-            ParsedLink::Pva(s) => s,
-            other => panic!("expected Pva, got {other:?}"),
+        let j = match parse_link_v2(json) {
+            ParsedLink::PvaJson(j) => j,
+            other => panic!("expected PvaJson, got {other:?}"),
         };
-        assert!(
-            stored.contains("field=display.precision"),
-            "field option must survive parse: {stored}"
+        assert_eq!(
+            j,
+            PvaJsonLink {
+                pv: "TARGET:AI".to_string(),
+                options: vec![
+                    ("field".to_string(), "display.precision".to_string()),
+                    ("proc".to_string(), "CPP".to_string()),
+                    ("sevr".to_string(), "MS".to_string()),
+                ],
+            },
+            "pvalink options preserved as structured JLink members"
         );
-        assert!(stored.contains("proc=CPP"), "proc must survive: {stored}");
-        assert!(stored.contains("sevr=MS"), "sevr must survive: {stored}");
 
-        // Reconstruct config — all options must round-trip through
-        // PvaLinkConfig::parse (same code used by open_link_for_record
-        // in the pre-scanner).
-        let cfg = PvaLinkConfig::parse(&format!("pva://{stored}"), LinkDirection::Inp).unwrap();
+        // Part 2: reconstruct the config straight from the structured
+        // members — the single `apply_options` owner, no `?query` parse.
+        let cfg = PvaLinkConfig::from_jlink_options(&j.pv, &j.options, LinkDirection::Inp).unwrap();
         assert_eq!(cfg.pv_name, "TARGET:AI");
         assert_eq!(cfg.field, "display.precision");
         assert!(cfg.scan_on_update, "CPP → scan_on_update");
         assert!(cfg.scan_on_passive, "CPP → scan_on_passive");
         assert_eq!(cfg.sevr, SevrMode::Ms);
 
-        // Part 2: the integration layer wires options when
-        // open_link_for_record is called with the query-bearing string.
-        // This is exactly what install_pvalink_resolver's pre-scanner
-        // does for each loaded record after the parse fix.
+        // Part 3: the integration layer wires the structured options
+        // exactly as install_pvalink_resolver's pre-scanner does for a
+        // loaded record carrying this PvaJson link.
         let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
         let _ = resolver
-            .open_link_for_record(&format!("pva://{stored}"), "MY:RECORD")
+            .open_json_link_for_record(&j.pv, &j.options, "MY:RECORD")
             .await;
 
-        // options are registered under the full query-bearing string.
-        let cfg = resolver.inp_cfg_for(&stored);
+        // options are registered under the BARE PV name — the name
+        // epics-base-rs hands the lset for a PvaJson link
+        // (`resolve_external_pv(&j.pv)`), so the steady-state hot path
+        // resolves the config by bare PV.
+        let cfg = resolver.inp_cfg_for("TARGET:AI");
         assert_eq!(
             cfg.field, "display.precision",
             "field option must be registered (was 'value' before fix)"
@@ -3069,7 +3199,12 @@ mod tests {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
             fields: vec![("value".into(), PvField::ScalarArray(vec![]))],
         });
-        let pv = SharedPV::new();
+        // A writable mailbox PV: a plain `SharedPV::new()` rejects every
+        // PUT ("PUT not supported by this PV" — pvxs `sharedpv.cpp:209-227`
+        // makes a handler-less SharedPV non-writable). The typed PUT must
+        // land and store so the readback below can verify the typed
+        // encoder produced the right elements.
+        let pv = SharedPV::build_mailbox();
         pv.open(desc, initial).unwrap();
         let source = SharedSource::new();
         source.add(pv_name, pv.clone());

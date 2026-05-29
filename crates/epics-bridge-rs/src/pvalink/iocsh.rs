@@ -281,6 +281,31 @@ fn dump_record_link_fields(resolver: &PvaLinkResolver, ctx: &CommandContext, rec
                     ctx.println(&format!("        timeStamp={s}.{n:09}"));
                 }
             }
+            epics_base_rs::server::record::ParsedLink::PvaJson(j) => {
+                // pvxs-parity JSON longhand `{pva:{pv,…}}`: dump the same
+                // connection / value / alarm / time state as the string
+                // form, looked up by the bare channel name (the name
+                // epics-base-rs hands the lset), and surface the parsed
+                // JLink options so `dbpvar` shows the per-link config.
+                let name = &j.pv;
+                let connected = <PvaLinkResolver as LinkSet>::is_connected(resolver, name);
+                let value = <PvaLinkResolver as LinkSet>::get_value(resolver, name);
+                let alarm = <PvaLinkResolver as LinkSet>::alarm_message(resolver, name);
+                let ts = <PvaLinkResolver as LinkSet>::time_stamp(resolver, name);
+                ctx.println(&format!(
+                    "    {field}={raw:?}  pva://{name}  opts={:?}  connected={connected}",
+                    j.options
+                ));
+                if let Some(v) = value {
+                    ctx.println(&format!("        value={v}"));
+                }
+                if let Some(a) = alarm {
+                    ctx.println(&format!("        alarm={a:?}"));
+                }
+                if let Some((s, n, _)) = ts {
+                    ctx.println(&format!("        timeStamp={s}.{n:09}"));
+                }
+            }
             epics_base_rs::server::record::ParsedLink::Ca(ca) => {
                 let name = &ca.pv;
                 ctx.println(&format!(

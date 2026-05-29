@@ -178,9 +178,11 @@ pub struct PvaLinkConfig {
     /// true the monitor request carries `record[pipeline=true]`.
     /// INP+monitor only.
     pub pipeline: bool,
-    /// Defer the actual Put: when true a `write` only queues the value
-    /// locally and the caller must call `flush_deferred` to push it.
-    /// Mirrors pvxs `pvaLinkConfig::defer`. OUT only.
+    /// Defer the actual Put: when true a `write` only stages the value
+    /// on the shared OUT channel and a non-deferred sibling — or the
+    /// `LinkSet::flush_puts` production drain — flushes it, so several
+    /// fields combine into one PUT. Mirrors pvxs `pvaLinkConfig::defer`.
+    /// OUT only.
     pub defer: bool,
     /// Retry queued Puts across disconnects: when true a `write` issued
     /// while the upstream is unreachable is queued and replayed once
@@ -250,88 +252,13 @@ impl PvaLinkConfig {
             return Err(PvaLinkParseError::EmptyPv);
         }
 
-        let mut cfg = PvaLinkConfig {
-            pv_name: pv_name.to_string(),
-            direction,
-            ..PvaLinkConfig::defaults_for(pv_name, direction)
-        };
-
-        if let Some(v) = opts.get("field") {
-            cfg.field = v.clone();
-        }
-        // `monitor` is handled before `proc` so a `proc=CP`/`CPP` (which
-        // forces an open monitor below) takes precedence over an explicit
-        // `monitor=false` on the same link, matching the prior ordering.
-        apply_or_warn(pv_name, "monitor", &opts, &mut cfg.monitor, parse_bool);
-        if let Some(v) = opts.get("proc") {
-            // pvxs `proc` is a five-state enum
-            // (`pvalink_jlif.cpp:69-166`): boolean true→PP / false→NPP,
-            // plus the strings NPP/PP/CP/CPP. `CP`/`CPP` additionally
-            // imply an open monitor and INP scan-on-update. Store the
-            // enum and derive the scan flags from it. `PASSIVE` is NOT
-            // a pvxs `proc` enum value (it is only the later wire
-            // request string for `Default`); an unknown value is warned
-            // and the prior (default) mode is kept — pvxs does the same
-            // (`log_warn_printf` + `jlif_continue`, pvalink_jlif.cpp:156-170)
-            // rather than failing the whole link.
-            //
-            // The enum string forms are CASE-SENSITIVE uppercase, matching
-            // pvxs `pva_parse_string` (`pvalink_jlif.cpp:156-170`), which
-            // compares `sval` byte-for-byte against `CP`/`CPP`/`PP`/`NPP`
-            // and warns "unknown proc" on anything else. A lowercase typo
-            // like `proc=cp` must therefore be ignored (kept at default),
-            // not silently activated — otherwise the same link behaves
-            // differently under Rust vs pvxs/QSRV. The boolean shorthands
-            // (`true`/`false`/`1`/`0`) are a distinct path: pvxs accepts a
-            // JSON boolean `proc:true`→PP / `proc:false`→NPP via
-            // `pva_parse_bool` (`pvalink_jlif.cpp:96-98`), so they are kept.
-            match v.as_str() {
-                "TRUE" | "true" | "1" => cfg.proc = ProcMode::Pp,
-                "FALSE" | "false" | "0" => cfg.proc = ProcMode::Npp,
-                "PP" => cfg.proc = ProcMode::Pp,
-                "NPP" => cfg.proc = ProcMode::Npp,
-                "CP" => cfg.proc = ProcMode::Cp,
-                "CPP" => cfg.proc = ProcMode::Cpp,
-                _ => warn_ignored_option(pv_name, "proc", v),
-            }
-            let (sou, sop) = cfg.proc.inp_scan();
-            if sou {
-                cfg.monitor = true;
-                cfg.scan_on_update = true;
-                cfg.scan_on_passive = sop;
-            }
-        }
-        apply_or_warn(pv_name, "notify", &opts, &mut cfg.notify, parse_bool);
-        apply_or_warn(
-            pv_name,
-            "scan_on_update",
-            &opts,
-            &mut cfg.scan_on_update,
-            parse_bool,
-        );
-        apply_or_warn(pv_name, "sevr", &opts, &mut cfg.sevr, parse_sevr);
-        apply_or_warn(pv_name, "always", &opts, &mut cfg.always, parse_bool);
-        if let Some(v) = opts.get("Q").or_else(|| opts.get("queueSize")) {
-            match v.parse::<i64>() {
-                // pvxs clamps `Q < 1` to 1.
-                Ok(n) => cfg.queue_size = if n < 1 { 1 } else { n as usize },
-                Err(_) => warn_ignored_option(pv_name, "Q", v),
-            }
-        }
-        apply_or_warn(pv_name, "pipeline", &opts, &mut cfg.pipeline, parse_bool);
-        apply_or_warn(pv_name, "defer", &opts, &mut cfg.defer, parse_bool);
-        apply_or_warn(pv_name, "retry", &opts, &mut cfg.retry, parse_bool);
-        apply_or_warn(pv_name, "local", &opts, &mut cfg.local, parse_bool);
-        apply_or_warn(pv_name, "atomic", &opts, &mut cfg.atomic, parse_bool);
-        if let Some(v) = opts.get("monorder") {
-            match v.parse::<i64>() {
-                // pvxs clamps to [-1024, 1024].
-                Ok(n) => cfg.monorder = n.clamp(-1024, 1024) as i32,
-                Err(_) => warn_ignored_option(pv_name, "monorder", v),
-            }
-        }
-        // `time` adopts the linked PV's NT timestamp on read.
-        apply_or_warn(pv_name, "time", &opts, &mut cfg.time, parse_bool);
+        // `opts` is an already-structured option map (split from the
+        // `?key=value` query here, or handed in verbatim as JLink
+        // members via [`Self::from_jlink_options`]). The query string is
+        // never reconstructed — both entry points apply the same
+        // structured map through the single [`Self::apply_options`]
+        // owner.
+        let mut cfg = Self::apply_options(pv_name, &opts, direction);
 
         // Apply legacy bare modifiers
         for m in legacy_mods {
@@ -380,6 +307,131 @@ impl PvaLinkConfig {
         }
 
         Ok(cfg)
+    }
+
+    /// Build a config from the structured JLink members of a
+    /// `{pva:{pv:"name", field:"f", proc:"CP", …}}` longhand
+    /// (`epics_base_rs` `PvaJsonLink.options`), WITHOUT round-tripping
+    /// through a `?key=value` query string.
+    ///
+    /// pvxs parses pvalink options only as JLink map keys / typed values
+    /// (`pvalink_jlif.cpp:69-196`) — there is no `?key=value` URI query
+    /// parser in the JLink callback table (`:286-300`). The structured
+    /// `(key, value)` pairs carry the same option vocabulary the query
+    /// parser produces, so they feed the identical
+    /// [`Self::apply_options`] owner directly. This is the pvxs-parity
+    /// path (BRIDGE-RS-2026-05-28-107); [`Self::parse`] remains the Rust
+    /// convenience-URI path.
+    pub fn from_jlink_options(
+        pv_name: &str,
+        options: &[(String, String)],
+        direction: LinkDirection,
+    ) -> Result<Self, PvaLinkParseError> {
+        let pv_name = pv_name.trim();
+        if pv_name.is_empty() {
+            return Err(PvaLinkParseError::EmptyPv);
+        }
+        let opts: HashMap<String, String> = options.iter().cloned().collect();
+        Ok(Self::apply_options(pv_name, &opts, direction))
+    }
+
+    /// The single owner of "structured option map → [`PvaLinkConfig`]".
+    ///
+    /// Both [`Self::parse`] (after splitting the `?key=value` query) and
+    /// [`Self::from_jlink_options`] (with verbatim JLink members) apply
+    /// every option through here, so the query and structured-JSON paths
+    /// can never diverge in how an option maps to a config field. Legacy
+    /// bare modifiers (`PP`/`MS`/…) are NOT handled here — they exist
+    /// only on the convenience-URI path and are applied by `parse`.
+    fn apply_options(
+        pv_name: &str,
+        opts: &HashMap<String, String>,
+        direction: LinkDirection,
+    ) -> Self {
+        let mut cfg = PvaLinkConfig {
+            pv_name: pv_name.to_string(),
+            direction,
+            ..PvaLinkConfig::defaults_for(pv_name, direction)
+        };
+
+        if let Some(v) = opts.get("field") {
+            cfg.field = v.clone();
+        }
+        // `monitor` is handled before `proc` so a `proc=CP`/`CPP` (which
+        // forces an open monitor below) takes precedence over an explicit
+        // `monitor=false` on the same link, matching the prior ordering.
+        apply_or_warn(pv_name, "monitor", opts, &mut cfg.monitor, parse_bool);
+        if let Some(v) = opts.get("proc") {
+            // pvxs `proc` is a five-state enum
+            // (`pvalink_jlif.cpp:69-166`): boolean true→PP / false→NPP,
+            // plus the strings NPP/PP/CP/CPP. `CP`/`CPP` additionally
+            // imply an open monitor and INP scan-on-update. Store the
+            // enum and derive the scan flags from it. `PASSIVE` is NOT
+            // a pvxs `proc` enum value (it is only the later wire
+            // request string for `Default`); an unknown value is warned
+            // and the prior (default) mode is kept — pvxs does the same
+            // (`log_warn_printf` + `jlif_continue`, pvalink_jlif.cpp:156-170)
+            // rather than failing the whole link.
+            //
+            // The enum string forms are CASE-SENSITIVE uppercase, matching
+            // pvxs `pva_parse_string` (`pvalink_jlif.cpp:156-170`), which
+            // compares `sval` byte-for-byte against `CP`/`CPP`/`PP`/`NPP`
+            // and warns "unknown proc" on anything else. A lowercase typo
+            // like `proc=cp` must therefore be ignored (kept at default),
+            // not silently activated — otherwise the same link behaves
+            // differently under Rust vs pvxs/QSRV. The boolean shorthands
+            // (`true`/`false`/`1`/`0`) are a distinct path: pvxs accepts a
+            // JSON boolean `proc:true`→PP / `proc:false`→NPP via
+            // `pva_parse_bool` (`pvalink_jlif.cpp:96-98`), so they are kept.
+            match v.as_str() {
+                "TRUE" | "true" | "1" => cfg.proc = ProcMode::Pp,
+                "FALSE" | "false" | "0" => cfg.proc = ProcMode::Npp,
+                "PP" => cfg.proc = ProcMode::Pp,
+                "NPP" => cfg.proc = ProcMode::Npp,
+                "CP" => cfg.proc = ProcMode::Cp,
+                "CPP" => cfg.proc = ProcMode::Cpp,
+                _ => warn_ignored_option(pv_name, "proc", v),
+            }
+            let (sou, sop) = cfg.proc.inp_scan();
+            if sou {
+                cfg.monitor = true;
+                cfg.scan_on_update = true;
+                cfg.scan_on_passive = sop;
+            }
+        }
+        apply_or_warn(pv_name, "notify", opts, &mut cfg.notify, parse_bool);
+        apply_or_warn(
+            pv_name,
+            "scan_on_update",
+            opts,
+            &mut cfg.scan_on_update,
+            parse_bool,
+        );
+        apply_or_warn(pv_name, "sevr", opts, &mut cfg.sevr, parse_sevr);
+        apply_or_warn(pv_name, "always", opts, &mut cfg.always, parse_bool);
+        if let Some(v) = opts.get("Q").or_else(|| opts.get("queueSize")) {
+            match v.parse::<i64>() {
+                // pvxs clamps `Q < 1` to 1.
+                Ok(n) => cfg.queue_size = if n < 1 { 1 } else { n as usize },
+                Err(_) => warn_ignored_option(pv_name, "Q", v),
+            }
+        }
+        apply_or_warn(pv_name, "pipeline", opts, &mut cfg.pipeline, parse_bool);
+        apply_or_warn(pv_name, "defer", opts, &mut cfg.defer, parse_bool);
+        apply_or_warn(pv_name, "retry", opts, &mut cfg.retry, parse_bool);
+        apply_or_warn(pv_name, "local", opts, &mut cfg.local, parse_bool);
+        apply_or_warn(pv_name, "atomic", opts, &mut cfg.atomic, parse_bool);
+        if let Some(v) = opts.get("monorder") {
+            match v.parse::<i64>() {
+                // pvxs clamps to [-1024, 1024].
+                Ok(n) => cfg.monorder = n.clamp(-1024, 1024) as i32,
+                Err(_) => warn_ignored_option(pv_name, "monorder", v),
+            }
+        }
+        // `time` adopts the linked PV's NT timestamp on read.
+        apply_or_warn(pv_name, "time", opts, &mut cfg.time, parse_bool);
+
+        cfg
     }
 
     /// Construct a config with pvxs-default option values for the

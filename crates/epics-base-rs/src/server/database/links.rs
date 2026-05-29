@@ -646,7 +646,16 @@ impl PvDatabase {
             for s in schemes {
                 if let Some(lset) = registry.get(&s) {
                     match lset.put_value(name, value.clone()) {
-                        Ok(()) => return Ok(()),
+                        Ok(()) => {
+                            // Production drain of any retry-queued OUT
+                            // writes on this lset now that a write has
+                            // reached it (the channel may have just
+                            // reconnected). pvxs replays the queued
+                            // put from record processing, not test code
+                            // (`pvalink_channel.cpp:220-263`).
+                            lset.flush_puts();
+                            return Ok(());
+                        }
                         Err(e) => last_err = e,
                     }
                 }
@@ -660,7 +669,11 @@ impl PvDatabase {
             .await
             .get(scheme)
             .ok_or_else(|| format!("no '{scheme}' link set registered for '{name}'"))?;
-        lset.put_value(body, value)
+        let result = lset.put_value(body, value);
+        if result.is_ok() {
+            lset.flush_puts();
+        }
+        result
     }
 
     /// Write a value through a parsed OUT link, dispatching DB links

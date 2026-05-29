@@ -1,5 +1,6 @@
 //! `PvaLink` — a single live PVA link bound to a remote PV.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -8,6 +9,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use epics_pva_rs::client::PvaClient;
+use epics_pva_rs::client_native::CacheAction;
 use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
@@ -107,31 +109,41 @@ pub struct PvaLink {
     /// subscription ends, so the forwarder can scan CP/CPP targets on
     /// the disconnect even though no value accompanies it.
     notify_rx: Mutex<Option<mpsc::Receiver<ScanEvent>>>,
-    /// Single pending OUT Put (OUT links, B4 `defer` / `retry`).
+    /// Per-field staged OUT writes — this link's role as the shared
+    /// `pvaLinkChannel` PUT owner (pvxs `put_scratch` / `put_queue`,
+    /// `pvalink_channel.cpp:127-263`).
     ///
-    /// `defer=true` causes `write` to store the value here instead of
-    /// issuing the Put immediately; `flush_deferred` sends it.
-    /// `retry=true` causes a Put that fails because the upstream is
-    /// unreachable to be stored and replayed by `flush_deferred` on
-    /// reconnect.
+    /// Sibling OUT links to the same `(pv, pipeline, queue_size)` now
+    /// resolve to THIS one `PvaLink` (the registry no longer keys on
+    /// per-link OUT options), and each stages its value here keyed by
+    /// its own `field` selector (`""` = root). A non-deferred write
+    /// flushes the whole map into ONE combined upstream PUT, with the
+    /// process option resolved across every participating field
+    /// (PP/CP/CPP beats NPP, `pvalink_channel.cpp:251-263`). A
+    /// `defer=true` write stays staged until a non-deferred sibling —
+    /// or the production drain — flushes it, so several fields combine
+    /// into one PUT (`documentation/pvalink.rst:111-113`).
     ///
-    /// One slot, NOT a FIFO queue: pvxs keeps a single `put_scratch`
-    /// per link and a later write to the same link overwrites it before
-    /// the channel-level PUT starts, so retry replays only "the most
-    /// recent incomplete PUT" and defer caches one current value
-    /// (`pvxs/ioc/pvalink_lset.cpp:643-653`, `documentation/pvalink.rst:99-113`).
-    /// A FIFO log would replay stale intermediate values after a newer
-    /// value superseded them. (Combining sibling-field writes from
-    /// different links into one channel-level PUT is a separate concern
-    /// owned by the shared OUT channel, tracked under the OUT-coalescing
-    /// work.)
+    /// Keyed per field with most-recent-wins overwrite: pvxs keeps one
+    /// `put_scratch` per link and a later write to the same field
+    /// supersedes the earlier one before the channel PUT starts
+    /// (`pvalink_lset.cpp:643-653`), so `retry` replays only the most
+    /// recent incomplete value, never a stale FIFO log.
     ///
-    /// Stores [`QueuedPut`], not a bare `PvField`: a string-form
-    /// `write` must replay through the string `pvput` path (which
-    /// coerces the text against the channel's introspected type),
-    /// not as a `PvField::Scalar(String)` — replaying a String to a
-    /// numeric record was a type mismatch.
-    pending_put: Mutex<Option<QueuedPut>>,
+    /// Stores [`QueuedPut`] (via [`StagedPut`]), not a bare `PvField`:
+    /// a string-form write must replay through the string `pvput` path
+    /// (which coerces the text against the channel's introspected
+    /// type), not as a `PvField::Scalar(String)` that would mismatch a
+    /// numeric record.
+    out_scratch: Mutex<HashMap<String, StagedPut>>,
+    /// Set when a disconnected flush left `retry=true` writes staged for
+    /// replay. The `LinkSet::flush_puts` production drain re-attempts the
+    /// staged writes only while this is set, so a freshly-`defer`red
+    /// write awaiting its sibling is never flushed early — only a
+    /// genuinely stuck retry write is replayed on the next OUT activity
+    /// (pvxs replays the queued put on the client reconnect event,
+    /// `pvalink.rst:99-100`).
+    retry_pending: AtomicBool,
 }
 
 /// A queued OUT-link Put, preserving the caller's original value
@@ -146,6 +158,25 @@ enum QueuedPut {
     /// From [`PvaLink::write_pv_field`] — replayed verbatim via the
     /// typed `pvput_pv_field` path.
     Field(PvField),
+}
+
+/// One field's staged OUT write on the shared channel, carrying the
+/// originating link's PUT options. Several of these — one per
+/// participating sibling field — combine into one upstream PUT, so the
+/// per-link `proc`/`retry` must travel with the value rather than being
+/// read from the shared owner's representative `config`.
+#[derive(Debug, Clone)]
+struct StagedPut {
+    /// The value to write, in its original string/typed form.
+    value: QueuedPut,
+    /// The originating link's process mode — folded into the combined
+    /// PUT's process option (PP/CP/CPP beats NPP).
+    proc: ProcMode,
+    /// The originating link's `retry` flag — decides whether this field
+    /// is requeued for replay or dropped on a disconnect.
+    retry: bool,
+    /// The originating link's `block` flag (`record._options.block`).
+    block: bool,
 }
 
 struct MonitorAbort(tokio::task::AbortHandle);
@@ -273,7 +304,8 @@ impl PvaLink {
             latest,
             monitor_connected,
             notify_rx: Mutex::new(notify_rx),
-            pending_put: Mutex::new(None),
+            out_scratch: Mutex::new(HashMap::new()),
+            retry_pending: AtomicBool::new(false),
             _monitor_abort: monitor_abort,
         })
     }
@@ -377,14 +409,11 @@ impl PvaLink {
         scalar_as_f64(&pv).ok_or_else(|| PvaLinkError::NotScalar(self.config.field.clone()))
     }
 
-    /// Write a value to the linked PV (OUT direction only).
-    ///
-    /// B4: honors the link's `defer` / `retry` options. With
-    /// `defer=true` the value is queued and the Put is only issued by
-    /// [`Self::flush_deferred`]. With `retry=true` a Put that fails
-    /// because the upstream is unreachable is queued for replay
-    /// instead of surfacing an error. Mirrors pvxs `pvaPutValue`
-    /// (pvalink_lset.cpp:647 `if(!self->defer) lchan->put()`).
+    /// Write a string value to the linked PV (OUT direction only),
+    /// using THIS link's own `config` options. Convenience wrapper over
+    /// the shared-channel staging path for direct callers and tests;
+    /// the record OUT-link dispatch uses [`Self::put_out_str`] to pass
+    /// each sibling's per-call options onto the shared owner.
     ///
     /// delegates to [`Self::write_with_block`] with `block=false`.
     pub async fn write(&self, value_str: &str) -> PvaLinkResult<()> {
@@ -396,44 +425,21 @@ impl PvaLink {
     /// `pvaPutValueX(wait)` → `block = !after_put.empty()`
     /// (`pvalink_lset.cpp:647`, `pvalink_channel.cpp:223`).
     pub async fn write_with_block(&self, value_str: &str, block: bool) -> PvaLinkResult<()> {
-        if matches!(self.config.direction, LinkDirection::Inp) {
-            return Err(PvaLinkError::NotWritable);
-        }
-        // Keep the value in string form on the defer / retry queue so
-        // the replay goes through the string `pvput` path — which
-        // coerces the text against the channel's introspected scalar
-        // type. Storing `PvField::Scalar(String)` instead would
-        // replay a String field to a possibly-numeric record.
-        if self.config.defer {
-            self.set_pending(QueuedPut::Str(value_str.to_string()));
-            return Ok(());
-        }
-        let req = build_put_request(self.config.proc, block);
-        let result = if is_subfield(&self.config.field) {
-            self.client
-                .pvput_field_with_request(&self.config.pv_name, &self.config.field, &req, value_str)
-                .await
-        } else {
-            self.client
-                .pvput_with_request(&self.config.pv_name, &req, value_str)
-                .await
-        };
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) if self.config.retry && is_disconnect(&e) => {
-                self.set_pending(QueuedPut::Str(value_str.to_string()));
-                Ok(())
-            }
-            Err(e) => Err(PvaLinkError::Pva(e)),
-        }
+        self.stage_and_flush(
+            &self.config.field,
+            self.config.proc,
+            self.config.defer,
+            self.config.retry,
+            block,
+            QueuedPut::Str(value_str.to_string()),
+        )
+        .await
     }
 
-    /// Write a typed `PvField` directly (no string round-trip). For
-    /// large arrays this avoids the O(N) `Display` allocation +
-    /// O(N) pvput parse-back that `write(value_str)` triggers.
-    /// Used by the pvalink OUT path on EpicsValue array variants.
-    ///
-    /// B4: same `defer` / `retry` semantics as [`Self::write`].
+    /// Write a typed `PvField` directly (no string round-trip), using
+    /// THIS link's own `config` options. For large arrays this avoids
+    /// the O(N) `Display` allocation + O(N) pvput parse-back that a
+    /// string write triggers.
     ///
     /// delegates to [`Self::write_pv_field_with_block`] with
     /// `block=false`.
@@ -441,138 +447,254 @@ impl PvaLink {
         self.write_pv_field_with_block(value, false).await
     }
 
-    /// Like [`Self::write_pv_field`] but passes `block` through to the
-    /// PUT pvRequest. Mirrors pvxs `pvaPutValueX` for typed values
-    /// (`pvalink_channel.cpp:268`).
+    /// Like [`Self::write_pv_field`] but passes `block` through.
     pub async fn write_pv_field_with_block(
         &self,
         value: &PvField,
         block: bool,
     ) -> PvaLinkResult<()> {
+        self.stage_and_flush(
+            &self.config.field,
+            self.config.proc,
+            self.config.defer,
+            self.config.retry,
+            block,
+            QueuedPut::Field(value.clone()),
+        )
+        .await
+    }
+
+    /// Stage + flush a string OUT write onto this shared channel owner
+    /// using the PER-CALL link config's options.
+    ///
+    /// The record OUT-link dispatch resolves each sibling link's own
+    /// `field` / `proc` / `defer` / `retry` and routes it here, so
+    /// siblings that share this channel each apply their own options:
+    /// the shared `self.config` is only the first opener's
+    /// representative config and never drives a sibling's PUT behavior
+    /// (pvxs keeps the per-link options on the child `pvaLink`,
+    /// `pvalink.h:65`).
+    pub async fn put_out_str(
+        &self,
+        link_cfg: &PvaLinkConfig,
+        value_str: &str,
+    ) -> PvaLinkResult<()> {
+        self.stage_and_flush(
+            &link_cfg.field,
+            link_cfg.proc,
+            link_cfg.defer,
+            link_cfg.retry,
+            false,
+            QueuedPut::Str(value_str.to_string()),
+        )
+        .await
+    }
+
+    /// Typed-`PvField` twin of [`Self::put_out_str`] — keeps a large
+    /// array on the typed PUT path instead of a string round-trip.
+    pub async fn put_out_field(
+        &self,
+        link_cfg: &PvaLinkConfig,
+        value: &PvField,
+    ) -> PvaLinkResult<()> {
+        self.stage_and_flush(
+            &link_cfg.field,
+            link_cfg.proc,
+            link_cfg.defer,
+            link_cfg.retry,
+            false,
+            QueuedPut::Field(value.clone()),
+        )
+        .await
+    }
+
+    /// Core OUT-write path: stage `value` under `field` on the shared
+    /// channel scratch, then — unless `defer` — flush the whole scratch
+    /// into one combined upstream PUT. Mirrors pvxs `pvaPutValue`
+    /// (`pvalink_lset.cpp:643-653`): `put_scratch = value; if(!defer)
+    /// lchan->put()`.
+    async fn stage_and_flush(
+        &self,
+        field: &str,
+        proc: ProcMode,
+        defer: bool,
+        retry: bool,
+        block: bool,
+        value: QueuedPut,
+    ) -> PvaLinkResult<()> {
         if matches!(self.config.direction, LinkDirection::Inp) {
             return Err(PvaLinkError::NotWritable);
         }
-        if self.config.defer {
-            self.set_pending(QueuedPut::Field(value.clone()));
+        self.stage_put(
+            field,
+            StagedPut {
+                value,
+                proc,
+                retry,
+                block,
+            },
+        );
+        if defer {
+            // Cached for sibling coalescing; a non-deferred sibling — or
+            // the `flush_puts` production drain — flushes it later.
             return Ok(());
         }
-        let req = build_put_request(self.config.proc, block);
-        // a typed write to a query-bearing OUT link
-        // (`pva://PV?field=someArray`) must target the selected
-        // sub-field, not the root `value`. Mirrors pvxs `linkBuildPut`
-        // (`pvalink_channel.cpp:138`): `top[fieldName]` when
-        // `fieldName` is non-empty.
-        let result = if is_subfield(&self.config.field) {
-            self.client
-                .pvput_pv_field_field_with_request(
-                    &self.config.pv_name,
-                    &self.config.field,
-                    &req,
-                    value,
-                )
-                .await
+        self.flush_scratch().await.map(|_| ())
+    }
+
+    /// Stage one field's write into the shared scratch, overwriting any
+    /// earlier staged write for the same field (most-recent-wins, pvxs
+    /// single `put_scratch` per link, `pvalink_lset.cpp:643-653`).
+    fn stage_put(&self, field: &str, staged: StagedPut) {
+        self.out_scratch.lock().insert(field.to_string(), staged);
+    }
+
+    /// Number of distinct fields currently staged on this channel — the
+    /// shared `put_scratch` size (0 when nothing is queued).
+    pub fn staged_count(&self) -> usize {
+        self.out_scratch.lock().len()
+    }
+
+    /// Flush every staged field into ONE combined upstream PUT. Mirrors
+    /// pvxs `pvaLinkChannel::put` (`pvalink_channel.cpp:220-263`).
+    ///
+    /// A single staged field keeps the typed path (a typed array PUT
+    /// must NOT round-trip through `Display` + parse); multiple fields
+    /// are assigned into one prototype via `pvput_fields` so siblings
+    /// land in one PUT (pvxs `linkBuildPut`, `pvalink_channel.cpp:127-156`).
+    /// The process option is resolved across all participating links —
+    /// PP/CP/CPP forces processing over NPP (`pvalink_channel.cpp:251-263`).
+    ///
+    /// On a disconnect, `retry=true` fields are restored to the scratch
+    /// (most-recent-wins) and `retry_pending` is set so the production
+    /// drain replays them on reconnect; `retry=false` fields are
+    /// dropped and surfaced as an error so the owning record alarms.
+    /// Returns the number of upstream PUTs issued (0 or 1).
+    pub async fn flush_scratch(&self) -> PvaLinkResult<usize> {
+        if matches!(self.config.direction, LinkDirection::Inp) {
+            return Err(PvaLinkError::NotWritable);
+        }
+        // Snapshot + clear (pvxs moves used_scratch into put_queue).
+        let staged: Vec<(String, StagedPut)> = {
+            let mut scratch = self.out_scratch.lock();
+            if scratch.is_empty() {
+                return Ok(0);
+            }
+            scratch.drain().collect()
+        };
+        let combined_proc = combine_proc(staged.iter().map(|(_, s)| s.proc));
+        let block = staged.iter().any(|(_, s)| s.block);
+        let req = build_put_request(combined_proc, block);
+
+        let put_result = if staged.len() == 1 {
+            let (field, sp) = &staged[0];
+            self.put_single(field, &sp.value, &req).await
         } else {
+            // One combined PUT assigning every staged field into the
+            // same prototype (pvxs `linkBuildPut`).
+            let assignments: Vec<(String, String)> = staged
+                .iter()
+                .map(|(field, sp)| (put_field_path(field), queued_to_string(&sp.value)))
+                .collect();
             self.client
-                .pvput_pv_field_with_request(&self.config.pv_name, &req, value)
+                .pvput_fields(&self.config.pv_name, &assignments, Some(&req))
                 .await
         };
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) if self.config.retry && is_disconnect(&e) => {
-                self.set_pending(QueuedPut::Field(value.clone()));
-                Ok(())
+
+        match put_result {
+            Ok(()) => {
+                self.retry_pending.store(false, Ordering::Release);
+                Ok(1)
+            }
+            Err(e) if is_disconnect(&e) => {
+                // Requeue retry-eligible fields for replay; drop the
+                // rest. Most-recent-wins: only restore a field a newer
+                // write has not already re-staged.
+                let mut any_retry = false;
+                let mut any_dropped = false;
+                {
+                    let mut scratch = self.out_scratch.lock();
+                    for (field, sp) in staged {
+                        if sp.retry {
+                            scratch.entry(field).or_insert(sp);
+                            any_retry = true;
+                        } else {
+                            any_dropped = true;
+                        }
+                    }
+                }
+                if any_retry {
+                    self.retry_pending.store(true, Ordering::Release);
+                    // Discard the dead channel so the replay re-resolves a
+                    // fresh one. pvxs's channel auto-recovers on reconnect;
+                    // our cached channel does not re-create after a failed
+                    // `create_channel` (a pinned `EPICS_PVA_ADDR_LIST`
+                    // retry link would otherwise NEVER replay — the dead
+                    // channel stays cached forever). `Drop` removes it
+                    // unconditionally so the next `flush_retry_pending`
+                    // opens a new channel against the now-present PV.
+                    self.client
+                        .cache_clear_action(&self.config.pv_name, CacheAction::Drop)
+                        .await;
+                }
+                if any_dropped {
+                    // A non-retry link saw a real disconnect — its
+                    // record must alarm. Retry links stay queued.
+                    Err(PvaLinkError::Pva(e))
+                } else {
+                    Ok(0)
+                }
             }
             Err(e) => Err(PvaLinkError::Pva(e)),
         }
     }
 
-    /// Store `value` as the link's single pending Put (B4), overwriting
-    /// any earlier pending value. pvxs keeps one `put_scratch` per link
-    /// and a later write overwrites it before the channel PUT starts
-    /// (`pvxs/ioc/pvalink_lset.cpp:643-653`), so defer/retry coalesce to
-    /// the most recent value rather than queueing a stale FIFO log.
-    fn set_pending(&self, value: QueuedPut) {
-        *self.pending_put.lock() = Some(value);
-    }
-
-    /// Number of Puts currently pending (0 or 1) on the defer / retry
-    /// slot (B4).
-    pub fn pending_put_count(&self) -> usize {
-        usize::from(self.pending_put.lock().is_some())
-    }
-
-    /// Flush the link's single pending Put to the upstream PV (B4).
-    ///
-    /// Called for `defer` links to issue the cached value, and for
-    /// `retry` links once the upstream reconnects. Replays only the
-    /// most recent pending value — pvxs keeps one `put_scratch` per
-    /// link, so retry replays "the most recent incomplete PUT" rather
-    /// than a FIFO log of superseded intermediate values
-    /// (`documentation/pvalink.rst:99-113`,
-    /// `pvxs/ioc/pvalink_lset.cpp:643-653`). Returns the number of Puts
-    /// issued (0 or 1).
-    ///
-    /// On a disconnect error for a `retry` link the value is restored
-    /// to the pending slot so a later flush retries it — but only if a
-    /// newer write has not already taken the slot, so the most-recent
-    /// value still wins. A non-disconnect (or non-retry) error drops
-    /// the value: it would fail identically on every retry.
-    pub async fn flush_deferred(&self) -> PvaLinkResult<usize> {
-        if matches!(self.config.direction, LinkDirection::Inp) {
-            return Err(PvaLinkError::NotWritable);
-        }
-        let Some(value) = self.pending_put.lock().take() else {
+    /// Replay any retry-queued writes if a prior disconnect left them
+    /// staged — the per-channel half of the `LinkSet::flush_puts`
+    /// production drain. No-op unless `retry_pending` is set, so a
+    /// freshly-`defer`red write awaiting its sibling is never flushed
+    /// early; only a genuinely stuck retry write is replayed. Mirrors
+    /// pvxs replaying the queued put on the client reconnect event
+    /// (`pvalink.rst:99-100`).
+    pub async fn flush_retry_pending(&self) -> PvaLinkResult<usize> {
+        if !self.retry_pending.load(Ordering::Acquire) {
             return Ok(0);
-        };
-        // Replay through the same pvRequest path the immediate Put would
-        // have used (process/block options, field targeting). block=false:
-        // the caller did not request a blocking wait at queue time and
-        // there is no caller to signal completion to.
-        let req = build_put_request(self.config.proc, false);
-        let put_result = match &value {
+        }
+        self.flush_scratch().await
+    }
+
+    /// Issue one single-field PUT, choosing the string vs typed path
+    /// and root vs sub-field targeting (pvxs `linkBuildPut:138`:
+    /// `top[fieldName]` when `fieldName` is non-empty).
+    async fn put_single(
+        &self,
+        field: &str,
+        value: &QueuedPut,
+        req: &PvRequestExpr,
+    ) -> Result<(), epics_pva_rs::error::PvaError> {
+        match value {
             QueuedPut::Str(s) => {
-                if is_subfield(&self.config.field) {
+                if is_subfield(field) {
                     self.client
-                        .pvput_field_with_request(&self.config.pv_name, &self.config.field, &req, s)
+                        .pvput_field_with_request(&self.config.pv_name, field, req, s)
                         .await
                 } else {
                     self.client
-                        .pvput_with_request(&self.config.pv_name, &req, s)
+                        .pvput_with_request(&self.config.pv_name, req, s)
                         .await
                 }
             }
             QueuedPut::Field(f) => {
-                // replay typed field writes to the selected sub-field,
-                // same targeting as the immediate path.
-                if is_subfield(&self.config.field) {
+                if is_subfield(field) {
                     self.client
-                        .pvput_pv_field_field_with_request(
-                            &self.config.pv_name,
-                            &self.config.field,
-                            &req,
-                            f,
-                        )
+                        .pvput_pv_field_field_with_request(&self.config.pv_name, field, req, f)
                         .await
                 } else {
                     self.client
-                        .pvput_pv_field_with_request(&self.config.pv_name, &req, f)
+                        .pvput_pv_field_with_request(&self.config.pv_name, req, f)
                         .await
                 }
             }
-        };
-        match put_result {
-            Ok(()) => Ok(1),
-            Err(e) if self.config.retry && is_disconnect(&e) => {
-                // Still disconnected — restore the value so a later
-                // flush retries it, but only if a newer write has not
-                // already replaced it (most-recent-PUT wins).
-                let mut slot = self.pending_put.lock();
-                if slot.is_none() {
-                    *slot = Some(value);
-                }
-                Err(PvaLinkError::Pva(e))
-            }
-            Err(e) => Err(PvaLinkError::Pva(e)),
         }
     }
 
@@ -947,7 +1069,8 @@ impl PvaLink {
             latest: Arc::new(Mutex::new(cached)),
             monitor_connected: None,
             notify_rx: Mutex::new(None),
-            pending_put: Mutex::new(None),
+            out_scratch: Mutex::new(HashMap::new()),
+            retry_pending: AtomicBool::new(false),
         }
     }
 
@@ -965,7 +1088,8 @@ impl PvaLink {
             latest: Arc::new(Mutex::new(None)),
             monitor_connected: None,
             notify_rx: Mutex::new(None),
-            pending_put: Mutex::new(None),
+            out_scratch: Mutex::new(HashMap::new()),
+            retry_pending: AtomicBool::new(false),
         }
     }
 
@@ -988,7 +1112,8 @@ impl PvaLink {
             latest: Arc::new(Mutex::new(cached)),
             monitor_connected: Some(flag.clone()),
             notify_rx: Mutex::new(None),
-            pending_put: Mutex::new(None),
+            out_scratch: Mutex::new(HashMap::new()),
+            retry_pending: AtomicBool::new(false),
         };
         (link, flag)
     }
@@ -1017,12 +1142,20 @@ fn is_disconnect(e: &epics_pva_rs::error::PvaError) -> bool {
         | PvaError::Disconnected => true,
         // The client reports a failed name search as a Protocol
         // error ("no servers found for PV ..."); that is a
-        // not-connected condition, not a protocol violation.
+        // not-connected condition, not a protocol violation. A
+        // create_channel rejection ("create_channel(X) failed: unknown
+        // PV") is the same "unresolved channel" condition expressed by
+        // a pinned server that lacks the PV — the channel could not be
+        // established, so a `retry` link queues for replay once the PV
+        // appears (the UDP-search form, "no servers found", already
+        // maps here). Mirrors `ChannelNotFound` above.
         PvaError::Protocol(msg) => {
             let m = msg.to_ascii_lowercase();
             m.contains("no servers found")
                 || m.contains("not connected")
                 || m.contains("disconnect")
+                || m.contains("create_channel")
+                || m.contains("unknown pv")
         }
         PvaError::InvalidValue(_) | PvaError::Decode(_) => false,
         // an interrupted *wait* is not a disconnect. The
@@ -1077,6 +1210,52 @@ fn build_put_request(proc: ProcMode, block: bool) -> PvRequestExpr {
 /// `top[fieldName]` when `fieldName` is non-empty.
 fn is_subfield(field: &str) -> bool {
     !field.is_empty() && field != "value"
+}
+
+/// Resolve the combined `record._options.process` mode across all
+/// fields participating in one PUT. Mirrors pvxs
+/// `pvalink_channel.cpp:251-263`: PP/CP/CPP force processing
+/// (`"true"`) over NPP (`"false"`); a bare `Default` leaves the remote
+/// default (`"passive"`). PP wins when both PP and NPP are present.
+fn combine_proc(modes: impl Iterator<Item = ProcMode>) -> ProcMode {
+    let mut any_process = false;
+    let mut any_npp = false;
+    for m in modes {
+        match m {
+            ProcMode::Pp | ProcMode::Cp | ProcMode::Cpp => any_process = true,
+            ProcMode::Npp => any_npp = true,
+            ProcMode::Default => {}
+        }
+    }
+    if any_process {
+        ProcMode::Pp
+    } else if any_npp {
+        ProcMode::Npp
+    } else {
+        ProcMode::Default
+    }
+}
+
+/// Render a queued OUT value to its PUT string form for a combined
+/// multi-field PUT. A typed `PvField` is rendered via `Display`: the
+/// combined `pvput_fields` path is the documented scalar-field
+/// coalescing case (`pvalink.rst:111-113`), while a lone typed array
+/// stays on the single-field typed path (see [`PvaLink::flush_scratch`]).
+fn queued_to_string(value: &QueuedPut) -> String {
+    match value {
+        QueuedPut::Str(s) => s.clone(),
+        QueuedPut::Field(f) => f.to_string(),
+    }
+}
+
+/// The dotted field path for a staged write's `pvput_fields`
+/// assignment: a root write (`""`) targets `value`.
+fn put_field_path(field: &str) -> String {
+    if field.is_empty() {
+        "value".to_string()
+    } else {
+        field.to_string()
+    }
 }
 
 /// build the pvRequest for an INP+monitor link.
@@ -1718,41 +1897,50 @@ mod tests {
         }
     }
 
+    /// Read the single staged value (tests stage exactly one field).
+    fn sole_staged(link: &PvaLink) -> Option<QueuedPut> {
+        link.out_scratch
+            .lock()
+            .values()
+            .next()
+            .map(|s| s.value.clone())
+    }
+
     #[tokio::test]
     async fn b4_defer_coalesces_to_most_recent() {
         let link = PvaLink::for_test(out_cfg(true, false), None);
-        assert_eq!(link.pending_put_count(), 0);
-        // defer=true: write caches, returns Ok without a server.
+        assert_eq!(link.staged_count(), 0);
+        // defer=true: write stages, returns Ok without a server.
         link.write("42").await.expect("deferred write is Ok");
-        assert_eq!(link.pending_put_count(), 1);
-        // A second deferred write supersedes the first — the link keeps
-        // one pending value (most-recent-PUT wins), it does not grow a
+        assert_eq!(link.staged_count(), 1);
+        // A second deferred write to the SAME field supersedes the first
+        // — one staged value per field (most-recent-PUT wins), not a
         // FIFO log of stale intermediate writes.
         link.write_pv_field(&PvField::Scalar(ScalarValue::Double(1.0)))
             .await
             .expect("deferred typed write is Ok");
-        assert_eq!(link.pending_put_count(), 1);
+        assert_eq!(link.staged_count(), 1);
         // The retained value is the most recent (the typed Double),
         // not the superseded "42".
-        match link.pending_put.lock().as_ref() {
-            Some(QueuedPut::Field(PvField::Scalar(ScalarValue::Double(d)))) => assert_eq!(*d, 1.0),
+        match sole_staged(&link) {
+            Some(QueuedPut::Field(PvField::Scalar(ScalarValue::Double(d)))) => assert_eq!(d, 1.0),
             other => panic!("most-recent write must be retained, got {other:?}"),
         }
     }
 
-    /// MINOR (pvalink string-PUT): a deferred string `write` is cached
+    /// MINOR (pvalink string-PUT): a deferred string `write` is staged
     /// as a `QueuedPut::Str`, NOT a `PvField::Scalar(String)`. The
     /// replay then goes through the string `pvput` path, which coerces
     /// the text against the channel's native scalar type — replaying a
     /// String field to a numeric record was the bug. A typed
-    /// `write_pv_field` is cached as `QueuedPut::Field` verbatim.
+    /// `write_pv_field` is staged as `QueuedPut::Field` verbatim.
     #[tokio::test]
     async fn minor_deferred_string_put_keeps_string_form() {
         let str_link = PvaLink::for_test(out_cfg(true, false), None);
         str_link.write("42").await.unwrap();
-        match str_link.pending_put.lock().as_ref() {
+        match sole_staged(&str_link) {
             Some(QueuedPut::Str(s)) => assert_eq!(s, "42"),
-            other => panic!("string write must cache QueuedPut::Str, got {other:?}"),
+            other => panic!("string write must stage QueuedPut::Str, got {other:?}"),
         }
 
         let field_link = PvaLink::for_test(out_cfg(true, false), None);
@@ -1760,85 +1948,88 @@ mod tests {
             .write_pv_field(&PvField::Scalar(ScalarValue::Double(1.0)))
             .await
             .unwrap();
-        match field_link.pending_put.lock().as_ref() {
-            Some(QueuedPut::Field(PvField::Scalar(ScalarValue::Double(d)))) => assert_eq!(*d, 1.0),
-            other => panic!("typed write must cache QueuedPut::Field, got {other:?}"),
+        match sole_staged(&field_link) {
+            Some(QueuedPut::Field(PvField::Scalar(ScalarValue::Double(d)))) => assert_eq!(d, 1.0),
+            other => panic!("typed write must stage QueuedPut::Field, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn b4_retry_queues_on_disconnect() {
         // retry=true, no server reachable → write should queue rather
-        // than error.
+        // than error, and arm the retry-pending flag for the drain.
         let link = PvaLink::for_test(out_cfg(false, true), None);
         let r = link.write("7").await;
         assert!(r.is_ok(), "retry write should queue, got {r:?}");
-        assert_eq!(link.pending_put_count(), 1);
+        assert_eq!(link.staged_count(), 1);
+        assert!(
+            link.retry_pending.load(Ordering::Acquire),
+            "a queued retry write must arm the production drain"
+        );
     }
 
     #[tokio::test]
     async fn b4_no_retry_surfaces_disconnect_error() {
-        // retry=false, no server → write must surface the error.
+        // retry=false, no server → write must surface the error and
+        // stage nothing.
         let link = PvaLink::for_test(out_cfg(false, false), None);
         let r = link.write("7").await;
         assert!(r.is_err(), "non-retry write must error on disconnect");
-        assert_eq!(link.pending_put_count(), 0);
+        assert_eq!(link.staged_count(), 0);
+        assert!(!link.retry_pending.load(Ordering::Acquire));
     }
 
     #[tokio::test]
-    async fn b4_flush_deferred_drops_value_on_hard_error() {
-        // defer link, retry=false; flush against no server. The pending
-        // value's Put fails with a hard error → the value is dropped
-        // (it would fail identically on every replay), leaving the slot
-        // empty.
+    async fn b4_flush_drops_value_when_no_retry() {
+        // defer link, retry=false; flush against no server. The staged
+        // value's Put fails on disconnect → with retry=false it is
+        // dropped (it would fail identically on every replay), leaving
+        // the scratch empty and an error for the record to alarm on.
         let link = PvaLink::for_test(out_cfg(true, false), None);
         link.write("1").await.unwrap();
         link.write("2").await.unwrap();
-        // Coalesced to one pending value ("2").
-        assert_eq!(link.pending_put_count(), 1);
-        let r = link.flush_deferred().await;
-        assert!(r.is_err());
-        assert_eq!(link.pending_put_count(), 0);
+        // Coalesced to one staged value ("2").
+        assert_eq!(link.staged_count(), 1);
+        let r = link.flush_scratch().await;
+        assert!(r.is_err(), "no-retry disconnect surfaces an error");
+        assert_eq!(link.staged_count(), 0);
+        assert!(!link.retry_pending.load(Ordering::Acquire));
     }
 
     #[tokio::test]
-    async fn b4_flush_deferred_retry_restores_pending() {
-        // defer + retry: flush against no server → the pending value is
-        // restored to the slot for a later retry.
+    async fn b4_flush_retry_restores_staged() {
+        // defer + retry: flush against no server → the staged value is
+        // restored for a later retry and the drain is armed. A queued
+        // retry is NOT an error (0 PUTs issued, queued), matching the
+        // immediate-write path.
         let link = PvaLink::for_test(out_cfg(true, true), None);
         link.write("1").await.unwrap();
         link.write("2").await.unwrap();
-        assert_eq!(link.pending_put_count(), 1);
-        let r = link.flush_deferred().await;
-        assert!(r.is_err(), "still disconnected");
-        // retry restores the most-recent pending value ("2").
-        assert_eq!(link.pending_put_count(), 1);
-        match link.pending_put.lock().as_ref() {
+        assert_eq!(link.staged_count(), 1);
+        let r = link.flush_scratch().await;
+        assert!(matches!(r, Ok(0)), "retry disconnect queues, got {r:?}");
+        // retry restores the most-recent staged value ("2").
+        assert_eq!(link.staged_count(), 1);
+        assert!(link.retry_pending.load(Ordering::Acquire));
+        match sole_staged(&link) {
             Some(QueuedPut::Str(s)) => assert_eq!(s, "2"),
             other => panic!("most-recent value must be restored, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn b4_flush_deferred_retry_keeps_newer_write() {
-        // defer + retry: a fresh write that lands during a still-failing
-        // flush must NOT be clobbered by the restore — most-recent-PUT
-        // wins. Here the slot already holds "2"; simulate a newer write
-        // by pre-seeding then confirming the restore is a no-op when the
-        // slot is already occupied.
+    async fn b4_flush_retry_keeps_newer_write() {
+        // defer + retry: most-recent-PUT wins across a failing flush.
         let link = PvaLink::for_test(out_cfg(true, true), None);
         link.write("1").await.unwrap();
-        // flush takes "1"; while the put is failing a newer "2" arrives.
-        // Model it by writing "2" after the take would have happened —
-        // since flush is synchronous here, instead assert the guard:
-        // restore only when slot empty.
-        let r = link.flush_deferred().await;
-        assert!(r.is_err());
+        let r = link.flush_scratch().await;
+        assert!(matches!(r, Ok(0)));
+        // A newer write supersedes the restored "1".
         link.write("2").await.unwrap();
         // A second flush restores "2" (not the older "1").
-        let r2 = link.flush_deferred().await;
-        assert!(r2.is_err());
-        match link.pending_put.lock().as_ref() {
+        let r2 = link.flush_scratch().await;
+        assert!(matches!(r2, Ok(0)));
+        match sole_staged(&link) {
             Some(QueuedPut::Str(s)) => assert_eq!(s, "2"),
             other => panic!("newer write must survive, got {other:?}"),
         }
@@ -1848,7 +2039,7 @@ mod tests {
     async fn b4_flush_on_inp_link_rejected() {
         let link = PvaLink::for_test(inp_cfg(SevrMode::Nms), None);
         assert!(matches!(
-            link.flush_deferred().await,
+            link.flush_scratch().await,
             Err(PvaLinkError::NotWritable)
         ));
     }
@@ -2514,7 +2705,7 @@ mod tests {
                     .await
                     .expect("deferred write_with_block must enqueue");
             });
-        assert_eq!(link.pending_put_count(), 1, "one entry queued");
+        assert_eq!(link.staged_count(), 1, "one entry staged");
     }
 
     /// a typed (`PvField`) OUT write to a query-bearing link
@@ -2530,8 +2721,11 @@ mod tests {
         use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
 
         // Structure PV with a root `value` array and an `aux` array
-        // sub-field. The default SharedPV has no on_put handler, so
-        // an inbound PUT lands directly in `current()`.
+        // sub-field, built as a writable mailbox so the field-targeted
+        // PUT stores and posts. A plain `SharedPV::new()` rejects every
+        // PUT ("PUT not supported by this PV" — pvxs `sharedpv.cpp:209-227`
+        // makes a handler-less SharedPV non-writable), which would mask
+        // what this test checks: that a typed write lands in `aux`.
         let desc = FieldDesc::Structure {
             struct_id: "structure".into(),
             fields: vec![
@@ -2552,7 +2746,7 @@ mod tests {
                 ),
             ],
         });
-        let pv = SharedPV::new();
+        let pv = SharedPV::build_mailbox();
         pv.open(desc, initial).unwrap();
         let source = SharedSource::new();
         source.add("MR_R4:PV", pv.clone());
@@ -2614,5 +2808,243 @@ mod tests {
             vec![1, 2],
             "root `value` must be untouched by a field-targeted write"
         );
+    }
+
+    /// Combined-PUT process precedence (pvxs `pvalink_channel.cpp:251-263`):
+    /// any PP/CP/CPP forces processing over NPP; a bare `Default` leaves
+    /// the remote default. PP wins when PP and NPP both contribute.
+    #[test]
+    fn combine_proc_precedence() {
+        use ProcMode::*;
+        // PP/CP/CPP force processing, even alongside NPP/Default.
+        assert_eq!(combine_proc([Npp, Pp].into_iter()), Pp);
+        assert_eq!(combine_proc([Default, Cp].into_iter()), Pp);
+        assert_eq!(combine_proc([Npp, Cpp, Default].into_iter()), Pp);
+        // Only NPP present → explicit no-process.
+        assert_eq!(combine_proc([Npp, Npp].into_iter()), Npp);
+        assert_eq!(combine_proc([Default, Npp].into_iter()), Npp);
+        // Only Default → remote default (passive).
+        assert_eq!(combine_proc([Default, Default].into_iter()), Default);
+        assert_eq!(combine_proc(std::iter::empty()), Default);
+    }
+
+    fn double_struct_desc() -> epics_pva_rs::pvdata::FieldDesc {
+        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+        FieldDesc::Structure {
+            struct_id: "structure".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                ("setpoint".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        }
+    }
+
+    fn double_struct_initial() -> PvField {
+        PvField::Structure(PvStructure {
+            struct_id: "structure".into(),
+            fields: vec![
+                ("value".into(), PvField::Scalar(ScalarValue::Double(0.0))),
+                ("setpoint".into(), PvField::Scalar(ScalarValue::Double(0.0))),
+            ],
+        })
+    }
+
+    fn struct_double(v: &PvField, field: &str) -> f64 {
+        let PvField::Structure(s) = v else {
+            panic!("expected structure, got {v:?}");
+        };
+        match s.get_field(field).expect("field present") {
+            PvField::Scalar(ScalarValue::Double(d)) => *d,
+            other => panic!("expected Double at {field}, got {other:?}"),
+        }
+    }
+
+    /// BRIDGE-RS OUT coalescing: two OUT links to DIFFERENT fields of one
+    /// structured PV — one `defer`/NPP, one non-deferred/PP — that share
+    /// one channel owner emit a SINGLE combined upstream PUT. The
+    /// deferred field is NOT sent on its own; the non-deferred sibling
+    /// flushes both at once (pvxs `pvalink_channel.cpp:127-263`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn out_links_coalesce_into_one_combined_put() {
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        let pv = SharedPV::build_mailbox();
+        pv.open(double_struct_desc(), double_struct_initial())
+            .unwrap();
+        let source = SharedSource::new();
+        source.add("COAL:PV", pv.clone());
+        let server = PvaServer::isolated(Arc::new(source)).expect("test PVA server must start");
+        let addr = server.tcp_addr();
+
+        let client = PvaClient::builder()
+            .server_addr(addr)
+            .timeout(Duration::from_secs(3))
+            .build();
+        // One shared channel owner; two sibling links stage onto it.
+        let link = PvaLink::for_test_with_client(
+            PvaLinkConfig::defaults_for("COAL:PV", LinkDirection::Out),
+            client,
+        );
+
+        // Link A: field=value, defer=true, NPP — stages, does NOT send.
+        let cfg_value = PvaLinkConfig {
+            field: "value".to_string(),
+            proc: ProcMode::Npp,
+            defer: true,
+            ..PvaLinkConfig::defaults_for("COAL:PV", LinkDirection::Out)
+        };
+        link.put_out_str(&cfg_value, "10")
+            .await
+            .expect("deferred stage is Ok");
+        assert_eq!(link.staged_count(), 1, "deferred write staged, not sent");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            struct_double(&pv.current().unwrap(), "value"),
+            0.0,
+            "a deferred field must NOT reach the server before the trigger"
+        );
+
+        // Link B: field=setpoint, non-deferred, PP — flushes BOTH fields
+        // in one combined PUT.
+        let cfg_setpoint = PvaLinkConfig {
+            field: "setpoint".to_string(),
+            proc: ProcMode::Pp,
+            ..PvaLinkConfig::defaults_for("COAL:PV", LinkDirection::Out)
+        };
+        link.put_out_str(&cfg_setpoint, "20")
+            .await
+            .expect("trigger write flushes the channel");
+        assert_eq!(
+            link.staged_count(),
+            0,
+            "scratch drained by the combined PUT"
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let current = pv.current().expect("PV value");
+        assert_eq!(
+            struct_double(&current, "value"),
+            10.0,
+            "the deferred field landed via the combined PUT"
+        );
+        assert_eq!(
+            struct_double(&current, "setpoint"),
+            20.0,
+            "the triggering field landed in the same combined PUT"
+        );
+    }
+
+    /// BRIDGE-RS defer drain: two `defer=true` writes to different fields
+    /// are held until an explicit drain (the `LinkSet::flush_puts`
+    /// production path / `flush_scratch`), then sent as ONE combined PUT
+    /// (pvxs `documentation/pvalink.rst:111-113`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deferred_fields_drain_in_one_put() {
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        let pv = SharedPV::build_mailbox();
+        pv.open(double_struct_desc(), double_struct_initial())
+            .unwrap();
+        let source = SharedSource::new();
+        source.add("DEFER:PV", pv.clone());
+        let server = PvaServer::isolated(Arc::new(source)).expect("test PVA server must start");
+        let addr = server.tcp_addr();
+
+        let client = PvaClient::builder()
+            .server_addr(addr)
+            .timeout(Duration::from_secs(3))
+            .build();
+        let link = PvaLink::for_test_with_client(
+            PvaLinkConfig::defaults_for("DEFER:PV", LinkDirection::Out),
+            client,
+        );
+
+        let defer_value = PvaLinkConfig {
+            field: "value".to_string(),
+            defer: true,
+            ..PvaLinkConfig::defaults_for("DEFER:PV", LinkDirection::Out)
+        };
+        let defer_setpoint = PvaLinkConfig {
+            field: "setpoint".to_string(),
+            defer: true,
+            ..PvaLinkConfig::defaults_for("DEFER:PV", LinkDirection::Out)
+        };
+        link.put_out_str(&defer_value, "11").await.unwrap();
+        link.put_out_str(&defer_setpoint, "22").await.unwrap();
+        assert_eq!(
+            link.staged_count(),
+            2,
+            "both deferred writes staged, none sent"
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let pre = pv.current().unwrap();
+        assert_eq!(struct_double(&pre, "value"), 0.0, "nothing sent yet");
+        assert_eq!(struct_double(&pre, "setpoint"), 0.0, "nothing sent yet");
+
+        // Explicit drain → one combined PUT carrying both fields.
+        let n = link.flush_scratch().await.expect("drain succeeds");
+        assert_eq!(n, 1, "two deferred fields drain as ONE upstream PUT");
+        assert_eq!(link.staged_count(), 0);
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let current = pv.current().unwrap();
+        assert_eq!(struct_double(&current, "value"), 11.0);
+        assert_eq!(struct_double(&current, "setpoint"), 22.0);
+    }
+
+    /// BRIDGE-RS retry replay: a `retry=true` write issued while the
+    /// target channel does not exist is queued (not errored), and the
+    /// `flush_puts` production drain (`flush_retry_pending`) replays it
+    /// automatically once the PV appears (pvxs `pvalink.rst:99-100`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retry_replays_after_target_pv_appears() {
+        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        // Server is up the whole time; the channel is absent at first.
+        let source = Arc::new(SharedSource::new());
+        let server = PvaServer::isolated(source.clone()).expect("test PVA server must start");
+        let addr = server.tcp_addr();
+
+        let client = PvaClient::builder()
+            .server_addr(addr)
+            .timeout(Duration::from_secs(2))
+            .build();
+        let cfg = PvaLinkConfig {
+            retry: true,
+            ..PvaLinkConfig::defaults_for("RETRY:PV", LinkDirection::Out)
+        };
+        let link = PvaLink::for_test_with_client(cfg, client);
+
+        // Channel does not exist yet → disconnect → queued, not errored.
+        link.write("42")
+            .await
+            .expect("retry write queues, not errors");
+        assert_eq!(link.staged_count(), 1, "value queued for retry");
+        assert!(
+            link.retry_pending.load(Ordering::Acquire),
+            "queued retry arms the production drain"
+        );
+
+        // The target PV appears.
+        let pv = SharedPV::build_mailbox();
+        pv.open(
+            FieldDesc::Scalar(ScalarType::Double),
+            PvField::Scalar(ScalarValue::Double(0.0)),
+        )
+        .unwrap();
+        source.add("RETRY:PV", pv.clone());
+
+        // Production drain replays the queued write now that it resolves.
+        let n = link.flush_retry_pending().await.expect("replay");
+        assert_eq!(n, 1, "the queued retry write replays as one PUT");
+        assert_eq!(link.staged_count(), 0);
+        assert!(!link.retry_pending.load(Ordering::Acquire));
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        match pv.current().expect("PV value") {
+            PvField::Scalar(ScalarValue::Double(d)) => assert_eq!(d, 42.0),
+            other => panic!("expected Double 42, got {other:?}"),
+        }
     }
 }

@@ -420,22 +420,27 @@ pub fn parse_pvlist(content: &str) -> BridgeResult<PvList> {
             continue;
         }
 
-        // EVALUATION ORDER directive
-        if let Some(rest) = line.strip_prefix("EVALUATION ORDER") {
-            let rest = rest.trim();
-            if rest.eq_ignore_ascii_case("ALLOW, DENY") || rest.eq_ignore_ascii_case("ALLOW,DENY") {
-                list.order = EvaluationOrder::AllowDeny;
-            } else if rest.eq_ignore_ascii_case("DENY, ALLOW")
-                || rest.eq_ignore_ascii_case("DENY,ALLOW")
-            {
-                list.order = EvaluationOrder::DenyAllow;
-            } else {
-                return Err(BridgeError::GroupConfigError(format!(
-                    "line {}: invalid EVALUATION ORDER '{}'",
-                    lineno + 1,
-                    rest
-                )));
-            }
+        // ORDER directive. C ca-gateway does not special-case an
+        // "EVALUATION ORDER" prefix: it tokenizes every line uniformly into a
+        // pattern token + a command token, then matches the command with
+        // `strcasecmp(cmd,"ORDER")` (gateAs.cc:531-535,579). So the leading
+        // word ("EVALUATION") is just an ignored pattern token, the command
+        // and operands are matched case-insensitively, and the two operands
+        // are tokenized with `strtok(NULL,", \t\n")` (gateAs.cc:581-582) —
+        // comma and whitespace are interchangeable separators. Detecting the
+        // directive by "second token == ORDER" (rather than a literal
+        // uppercase prefix) reproduces that and keeps the requirement that a
+        // leading word precede ORDER, so `ORDER ALLOW DENY` is still a normal
+        // rule line (pattern "ORDER", keyword "ALLOW") exactly as in C.
+        let mut head = line.split_whitespace();
+        let _pattern_tok = head.next();
+        if head
+            .next()
+            .is_some_and(|cmd| cmd.eq_ignore_ascii_case("ORDER"))
+        {
+            // `head` now yields the operand tokens (after the pattern token and
+            // the ORDER command). Pass them on for comma/whitespace splitting.
+            list.order = parse_order_directive(head, lineno + 1)?;
             continue;
         }
 
@@ -538,6 +543,42 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
         other => Err(BridgeError::GroupConfigError(format!(
             "line {lineno}: unknown keyword '{other}', expected ALLOW/PATTERN/PV/DENY/ALIAS"
         ))),
+    }
+}
+
+/// Parse the operands of an `[EVALUATION] ORDER <a>, <b>` directive.
+///
+/// C ca-gateway (gateAs.cc:580-595) reads exactly two operands with
+/// `strtok(NULL,", \t\n")` — so comma and whitespace are interchangeable
+/// separators — and matches each with `strcasecmp` against `ALLOW`/`DENY`.
+/// `ALLOW, DENY`, `ALLOW,DENY`, `allow deny`, and `DENY ALLOW` are therefore
+/// all accepted; only the two recognised orderings are valid. C reads just the
+/// first two operands and ignores any trailing tokens, so we do too.
+fn parse_order_directive<'a>(
+    operands: impl Iterator<Item = &'a str>,
+    lineno: usize,
+) -> BridgeResult<EvaluationOrder> {
+    // strtok ", \t\n": split each whitespace token further on commas, drop
+    // the empties a stray comma (e.g. `ALLOW ,DENY`) would produce.
+    let mut ops = operands
+        .flat_map(|t| t.split(','))
+        .filter(|s| !s.is_empty());
+    let a = ops.next();
+    let b = ops.next();
+    let (Some(a), Some(b)) = (a, b) else {
+        return Err(BridgeError::GroupConfigError(format!(
+            "line {lineno}: ORDER requires two operands (ALLOW, DENY or DENY, ALLOW)"
+        )));
+    };
+    if a.eq_ignore_ascii_case("ALLOW") && b.eq_ignore_ascii_case("DENY") {
+        Ok(EvaluationOrder::AllowDeny)
+    } else if a.eq_ignore_ascii_case("DENY") && b.eq_ignore_ascii_case("ALLOW") {
+        Ok(EvaluationOrder::DenyAllow)
+    } else {
+        Err(BridgeError::GroupConfigError(format!(
+            "line {lineno}: invalid ORDER operands '{a} {b}' \
+             (expected ALLOW, DENY or DENY, ALLOW)"
+        )))
     }
 }
 
@@ -663,6 +704,54 @@ mod tests {
 
         let list = parse_pvlist("EVALUATION ORDER ALLOW, DENY").unwrap();
         assert_eq!(list.order, EvaluationOrder::AllowDeny);
+    }
+
+    /// C ca-gateway tokenizes the ORDER directive case-insensitively and
+    /// accepts comma OR whitespace between operands (gateAs.cc:580-595). A
+    /// pvlist that C loads must not fail Rust startup just because the
+    /// operator wrote it in lower case or dropped the comma.
+    #[test]
+    fn parse_evaluation_order_case_and_delimiter_tolerant() {
+        // Documented uppercase comma form still works.
+        assert_eq!(
+            parse_pvlist("EVALUATION ORDER ALLOW, DENY").unwrap().order,
+            EvaluationOrder::AllowDeny
+        );
+        // Lower case.
+        assert_eq!(
+            parse_pvlist("evaluation order deny, allow").unwrap().order,
+            EvaluationOrder::DenyAllow
+        );
+        // Whitespace-only operand separator (no comma).
+        assert_eq!(
+            parse_pvlist("EVALUATION ORDER DENY ALLOW").unwrap().order,
+            EvaluationOrder::DenyAllow
+        );
+        assert_eq!(
+            parse_pvlist("evaluation order allow deny").unwrap().order,
+            EvaluationOrder::AllowDeny
+        );
+        // No-comma, no-space (single token "ALLOW,DENY").
+        assert_eq!(
+            parse_pvlist("EVALUATION ORDER ALLOW,DENY").unwrap().order,
+            EvaluationOrder::AllowDeny
+        );
+        // The leading word is an ignored pattern token in C — any word works.
+        assert_eq!(
+            parse_pvlist("FOO ORDER ALLOW DENY").unwrap().order,
+            EvaluationOrder::AllowDeny
+        );
+
+        // Genuinely invalid operands are still rejected.
+        assert!(parse_pvlist("EVALUATION ORDER ALLOW ALLOW").is_err());
+        assert!(parse_pvlist("EVALUATION ORDER ALLOW").is_err());
+
+        // `ORDER` as the *first* token is NOT a directive — it is a pattern
+        // named "ORDER" with keyword ALLOW (matches C: pattern, then cmd).
+        let list = parse_pvlist("ORDER ALLOW").unwrap();
+        assert_eq!(list.entries.len(), 1);
+        assert!(matches!(list.entries[0], PvListEntry::Allow { .. }));
+        assert_eq!(list.order, EvaluationOrder::AllowDeny, "order unchanged");
     }
 
     #[test]

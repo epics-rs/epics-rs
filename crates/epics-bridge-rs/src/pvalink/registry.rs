@@ -9,7 +9,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
-use super::config::{LinkDirection, ProcMode, PvaLinkConfig};
+use super::config::{LinkDirection, ProcMode, PvaLinkConfig, SevrMode};
 use super::link::{PvaLink, PvaLinkResult};
 
 /// Registry cache key.
@@ -60,6 +60,32 @@ impl OutOpts {
             LinkDirection::Inp => None,
         }
     }
+}
+
+/// One row of pvalink channel diagnostics — the per-channel state the
+/// `dbpvar` IOC shell command prints. Mirrors the fields pvxs `dbpvxr`
+/// dumps per channel (`pvxs/ioc/pvalink.cpp:243-303`): the connection
+/// state plus the link's `proc`/`sevr` mode and its
+/// queue/pipeline/defer/time/retry/monorder configuration.
+///
+/// NOTE the pvxs `num_disconnect` / `num_type_change` counters and the
+/// active-`Put` marker are not represented: the Rust [`PvaLink`] does
+/// not instrument those transitions, so they are intentionally absent
+/// rather than reported as a fabricated zero.
+#[derive(Debug, Clone)]
+pub struct ChannelDiag {
+    pub pv_name: String,
+    pub direction: LinkDirection,
+    pub connected: bool,
+    pub pipeline: bool,
+    pub queue_size: usize,
+    pub proc: ProcMode,
+    pub sevr: SevrMode,
+    pub field: String,
+    pub defer: bool,
+    pub time: bool,
+    pub retry: bool,
+    pub monorder: i32,
 }
 
 /// Cached PvaLink. Returns the same `Arc<PvaLink>` for repeated
@@ -310,6 +336,51 @@ impl PvaLinkRegistry {
         ids.dedup();
         ids
     }
+
+    /// Per-channel diagnostics snapshot for every cached link, sorted by
+    /// `(pv_name, direction)` for stable output. Backs the `dbpvar` IOC
+    /// shell command, the Rust counterpart of pvxs `dbpvxr`
+    /// (`pvxs/ioc/pvalink.cpp:184-316`), which iterates
+    /// `linkGlobal->channels`. Each cached registry entry is one channel
+    /// (the registry already folds links that differ only in
+    /// `field`/`sevr` onto one entry, matching pvxs's one-subscription
+    /// fold).
+    pub fn channel_diagnostics(&self) -> Vec<ChannelDiag> {
+        fn dir_rank(d: LinkDirection) -> u8 {
+            match d {
+                LinkDirection::Inp => 0,
+                LinkDirection::Out => 1,
+            }
+        }
+        let mut rows: Vec<ChannelDiag> = self
+            .map
+            .read()
+            .iter()
+            .map(|((pv, pipeline, qsize, dir, _), link)| {
+                let c = link.config();
+                ChannelDiag {
+                    pv_name: pv.clone(),
+                    direction: *dir,
+                    connected: link.is_connected(),
+                    pipeline: *pipeline,
+                    queue_size: *qsize,
+                    proc: c.proc,
+                    sevr: c.sevr,
+                    field: c.field.clone(),
+                    defer: c.defer,
+                    time: c.time,
+                    retry: c.retry,
+                    monorder: c.monorder,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.pv_name
+                .cmp(&b.pv_name)
+                .then(dir_rank(a.direction).cmp(&dir_rank(b.direction)))
+        });
+        rows
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +453,46 @@ mod tests {
             "distinct Q variants of A:PV reported separately; field-only \
              variant folded; OUT (C:OUT) excluded"
         );
+    }
+
+    /// `channel_diagnostics` backs the `dbpvar` IOC shell command: it
+    /// snapshots every cached channel (INP and OUT) with its connection
+    /// state and per-link config, sorted by `(pv_name, direction)`.
+    #[tokio::test]
+    async fn channel_diagnostics_reports_all_channels_with_config() {
+        let reg = PvaLinkRegistry::new();
+
+        let inp = PvaLinkConfig {
+            queue_size: 8,
+            time: true,
+            sevr: SevrMode::Ms,
+            ..PvaLinkConfig::defaults_for("A:PV", LinkDirection::Inp)
+        };
+        let out = PvaLinkConfig {
+            field: "VAL".to_string(),
+            proc: ProcMode::Pp,
+            defer: true,
+            ..PvaLinkConfig::defaults_for("A:PV", LinkDirection::Out)
+        };
+        reg.insert_for_test(&inp, Arc::new(PvaLink::for_test(inp.clone(), None)));
+        reg.insert_for_test(&out, Arc::new(PvaLink::for_test(out.clone(), None)));
+
+        let diags = reg.channel_diagnostics();
+        assert_eq!(diags.len(), 2, "both INP and OUT channels reported");
+
+        // Sorted: same pv_name, INP before OUT.
+        assert_eq!(diags[0].direction, LinkDirection::Inp);
+        assert_eq!(diags[0].queue_size, 8);
+        assert_eq!(diags[0].sevr, SevrMode::Ms);
+        assert!(diags[0].time, "INP link config (time=true) surfaced");
+
+        assert_eq!(diags[1].direction, LinkDirection::Out);
+        assert_eq!(diags[1].proc, ProcMode::Pp);
+        assert!(diags[1].defer, "OUT link config (defer=true) surfaced");
+        assert_eq!(diags[1].field, "VAL");
+
+        // `for_test` links are not connected (no live monitor).
+        assert!(diags.iter().all(|d| !d.connected));
     }
 
     /// two OUT links to the same remote PV with different

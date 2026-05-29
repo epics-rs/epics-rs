@@ -486,6 +486,12 @@ impl PvaLinkResolver {
         self.registry.len()
     }
 
+    /// Per-channel pvalink diagnostics, backing the `dbpvar` IOC shell
+    /// command (pvxs `dbpvxr`, `pvxs/ioc/pvalink.cpp:184-316`).
+    pub fn channel_diagnostics(&self) -> Vec<super::registry::ChannelDiag> {
+        self.registry.channel_diagnostics()
+    }
+
     /// Maximize-severity result for the link named `pv_name` (B2).
     ///
     /// Returns the remote EPICS severity that should fold into the

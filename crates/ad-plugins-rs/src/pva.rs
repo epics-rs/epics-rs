@@ -17,7 +17,7 @@ use epics_pva_rs::nt::nd_array::{
     NdAlarm, NdArrayBuffer, NdAttribute, NdCodec, NdDimension, NdTimeStamp, NtNdArray,
     nt_nd_array_value,
 };
-use epics_pva_rs::pvdata::{PvField, ScalarValue};
+use epics_pva_rs::pvdata::{PvField, ScalarValue, VariantValue};
 
 /// Latest snapshot + subscriber list, shared with the qsrv adapter via a
 /// global registry.
@@ -132,7 +132,7 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
         .iter()
         .map(|a| NdAttribute {
             name: a.name.clone(),
-            value: attribute_value_to_scalar(&a.value),
+            value: attribute_value_to_variant(&a.value),
             tags: Vec::new(),
             descriptor: a.description.clone(),
             alarm: NdAlarm::default(),
@@ -215,9 +215,15 @@ fn ndattr_source_string(src: &ad_core_rs::attributes::NDAttrSource) -> String {
     }
 }
 
-fn attribute_value_to_scalar(val: &ad_core_rs::attributes::NDAttrValue) -> ScalarValue {
+/// Convert an areaDetector attribute value into the `any` variant that
+/// fills the advertised `Any("value")` NTAttribute slot (pvxs
+/// `nt.cpp:240-247`). A defined value carries its own scalar descriptor;
+/// `Undefined` becomes the null variant (slot present, no value) rather
+/// than masquerading as a zero `int`, which would silently narrow the
+/// advertised `any` to a typed scalar.
+fn attribute_value_to_variant(val: &ad_core_rs::attributes::NDAttrValue) -> VariantValue {
     use ad_core_rs::attributes::NDAttrValue;
-    match val {
+    let scalar = match val {
         NDAttrValue::Int8(v) => ScalarValue::Byte(*v),
         NDAttrValue::UInt8(v) => ScalarValue::UByte(*v),
         NDAttrValue::Int16(v) => ScalarValue::Short(*v),
@@ -229,8 +235,9 @@ fn attribute_value_to_scalar(val: &ad_core_rs::attributes::NDAttrValue) -> Scala
         NDAttrValue::Float32(v) => ScalarValue::Float(*v),
         NDAttrValue::Float64(v) => ScalarValue::Double(*v),
         NDAttrValue::String(v) => ScalarValue::String(v.clone()),
-        NDAttrValue::Undefined => ScalarValue::Int(0),
-    }
+        NDAttrValue::Undefined => return VariantValue::null(),
+    };
+    VariantValue::scalar(scalar)
 }
 
 #[cfg(test)]
@@ -270,5 +277,59 @@ mod tests {
 
         let latest = proc.latest_handle().lock().clone();
         assert!(latest.is_some());
+    }
+
+    #[test]
+    fn attribute_values_fill_any_slot() {
+        // The NTAttribute `value` is the advertised `Any("value")` slot
+        // (pvxs nt.cpp:240-247). A defined areaDetector attribute must
+        // reach the wire as a tagged scalar variant; an `Undefined`
+        // attribute must be the null variant (slot present, no value), not
+        // a zero `int` that silently narrows the `any` to a typed scalar.
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+
+        let mut arr = NDArray::new(vec![NDDimension::new(2)], NDDataType::UInt8);
+        arr.attributes.add(NDAttribute::new_static(
+            "gain",
+            "detector gain",
+            NDAttrSource::Constant,
+            NDAttrValue::Int32(7),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "missing",
+            "undefined attr",
+            NDAttrSource::Undefined,
+            NDAttrValue::Undefined,
+        ));
+
+        let payload = ndarray_to_pv_field(&arr);
+        let PvField::Structure(s) = &payload else {
+            panic!("expected structure, got {payload:?}");
+        };
+        let Some(PvField::StructureArray(attrs)) = s.get_field("attribute") else {
+            panic!("expected attribute structure-array");
+        };
+        assert_eq!(attrs.len(), 2);
+
+        let gain = attrs[0].as_ref().expect("gain attribute present");
+        match gain.get_field("value") {
+            Some(PvField::Variant(vv)) => {
+                assert_eq!(vv.value, PvField::Scalar(ScalarValue::Int(7)));
+                assert!(vv.desc.is_some(), "defined value must carry a descriptor");
+            }
+            other => panic!("expected variant gain value, got {other:?}"),
+        }
+
+        let missing = attrs[1].as_ref().expect("undefined attribute present");
+        match missing.get_field("value") {
+            Some(PvField::Variant(vv)) => {
+                assert_eq!(vv.value, PvField::Null);
+                assert!(
+                    vv.desc.is_none(),
+                    "undefined value must be the null variant"
+                );
+            }
+            other => panic!("expected null variant value, got {other:?}"),
+        }
     }
 }

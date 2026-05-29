@@ -1893,31 +1893,37 @@ fn parse_client_credentials(
     let peek = cur
         .get_u8()
         .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth desc peek: {e}")))?;
-    if peek == 0xFF {
-        // Null auth Value — empty creds, but the method is honoured.
-        return Ok(Some(creds.with_server_roles()));
-    }
-    // Rewind and decode the real descriptor.
-    cur.set_position(pos);
-    let desc = decode_type_desc(&mut cur, order)
-        .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth desc: {e}")))?;
-    let value = decode_pv_field(&desc, &mut cur, order)
-        .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth value: {e}")))?;
-    if let PvField::Structure(s) = value {
-        for (name, field) in &s.fields {
-            match (name.as_str(), field) {
-                ("user", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
-                    creds.account = v.clone();
+    // A leading `0xFF` is the pvxs "null type" tag: the auth Value carries
+    // no `user`/`host` fields. pvxs `serverconn.cpp:223-231` only sets
+    // method/account inside the `auth["user"]` callback, so a null body
+    // leaves the placeholder `anonymous/anonymous` exactly as a structure
+    // with no `user` field does. Rather than return early here — which left
+    // a null-auth "ca" handshake as `method="ca", account=""` and skipped
+    // the shared ca-requires-user rule below — fall through with an empty
+    // account so both the null and empty-structure paths take one rule.
+    if peek != 0xFF {
+        // Rewind and decode the real descriptor.
+        cur.set_position(pos);
+        let desc = decode_type_desc(&mut cur, order)
+            .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth desc: {e}")))?;
+        let value = decode_pv_field(&desc, &mut cur, order)
+            .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth value: {e}")))?;
+        if let PvField::Structure(s) = value {
+            for (name, field) in &s.fields {
+                match (name.as_str(), field) {
+                    ("user", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
+                        creds.account = v.clone();
+                    }
+                    ("host", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
+                        creds.host = v.clone();
+                    }
+                    // A `groups`/`roles` field MAY be advertised here, but the
+                    // server MUST NOT trust it (ACL bypass — see the `roles`
+                    // field doc). pvxs reads only `user`/`host` off the wire
+                    // and re-derives roles via `osdGetRoles`. We ignore it and
+                    // re-derive in `with_server_roles` before returning.
+                    _ => {}
                 }
-                ("host", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
-                    creds.host = v.clone();
-                }
-                // A `groups`/`roles` field MAY be advertised here, but the
-                // server MUST NOT trust it (ACL bypass — see the `roles`
-                // field doc). pvxs reads only `user`/`host` off the wire
-                // and re-derives roles via `osdGetRoles`. We ignore it and
-                // re-derive in `with_server_roles` before returning.
-                _ => {}
             }
         }
     }
@@ -1925,8 +1931,9 @@ fn parse_client_credentials(
     // only meaningful when a user field was present (the lambda sets
     // BOTH method and account). Without a user field the lambda never
     // fires, C->method stays empty, and the anonymous fallback triggers.
-    // Mirror that: ca with a missing or empty user field returns Ok(None)
-    // so the caller falls back to ClientCredentials::anonymous().
+    // Mirror that: ca with a missing or empty user field (including the
+    // null-auth body above) returns Ok(None) so the caller falls back to
+    // ClientCredentials::anonymous().
     if creds.method.eq_ignore_ascii_case("ca") && creds.account.is_empty() {
         return Ok(None);
     }
@@ -9211,6 +9218,38 @@ mod tests {
             creds.roles,
             crate::auth::osd_get_roles(fake_account),
             "roles must be re-derived server-side from the account"
+        );
+    }
+
+    /// A `ca` CONNECTION_VALIDATION with a NULL (`0xFF`) auth value carries
+    /// no `user` field, so pvxs leaves the credential at the anonymous
+    /// placeholder (`serverconn.cpp:223-231` only sets account inside the
+    /// `auth["user"]` callback). The pre-fix null-auth branch returned early
+    /// with `method="ca", account=""` — a CA identity pvxs never produces.
+    /// It must now take the same anonymous fallback as a no-user structure.
+    #[test]
+    fn parse_client_credentials_ca_null_auth_falls_back_to_anonymous() {
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(0x10000, order); // buffer_size
+        payload.put_u16(1, order); // intro_size
+        payload.put_u16(0, order); // qos
+        encode_string_into("ca", order, &mut payload);
+        payload.put_u8(0xFF); // NULL auth Value (no user/host fields)
+
+        let header = PvaHeader::application(
+            false,
+            order,
+            Command::ConnectionValidation.code(),
+            payload.len() as u32,
+        );
+        let frame = Frame { header, payload };
+
+        let parsed = parse_client_credentials(&frame, order).expect("decode must succeed");
+        assert!(
+            parsed.is_none(),
+            "ca + null auth must yield the anonymous fallback (None), \
+             not a blank-account CA credential: {parsed:?}"
         );
     }
 

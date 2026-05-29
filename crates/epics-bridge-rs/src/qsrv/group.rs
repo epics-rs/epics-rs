@@ -807,8 +807,17 @@ impl GroupChannel {
                         field: field_name.to_string(),
                     }
                 })?;
+                // Derive the NT shape from the configured field's resolved
+                // value (record → common → virtual), not from the owning
+                // record type: a `REC.SCAN` member is NTEnum and a
+                // `BI.DESC` member is NTScalar string regardless of the
+                // record's type. `snapshot.value` IS the resolved field
+                // value and `snapshot_for_field` already populated common
+                // enum choices (e.g. `.SCAN`). Matches the single-record
+                // path and pvxs's per-channel `getChannelValueType`
+                // (groupconfigprocessor.cpp:960-974).
                 let rtyp = instance.record.record_type();
-                let nt_type = NtType::from_record_type(rtyp);
+                let nt_type = pvif::nt_type_for_field(rtyp, field_name, Some(&snapshot.value));
                 Ok(PvField::Structure(pvif::snapshot_to_pv_structure(
                     &snapshot, nt_type,
                 )))
@@ -857,7 +866,18 @@ impl GroupChannel {
         }
     }
 
-    /// Introspect a member's actual DBF type and record type from the database.
+    /// Introspect a group scalar member's NT shape and DBF type from the
+    /// configured channel's final field — the same final-field metadata
+    /// the single-record path uses ([`super::channel::BridgeChannel::new`]),
+    /// not the owning record type. Resolving the field's actual value once
+    /// (record → common → virtual) is the single source of truth for both
+    /// the advertised NT shape and the descriptor's DBF, so the
+    /// descriptor cannot drift from the value the GET path serializes:
+    /// `REC.SCAN` advertises NTEnum, `REC.DESC` advertises NTScalar
+    /// string, and `BI.DESC` stays a string member on an enum record.
+    /// pvxs builds scalar group member descriptors from
+    /// `getTypeDefForChannel`/`getChannelValueType` on the field-specific
+    /// dbChannel (groupconfigprocessor.cpp:867-974), not the record type.
     async fn introspect_member(&self, member: &GroupMember) -> BridgeResult<(NtType, ScalarType)> {
         let (record_name, field_name) =
             epics_base_rs::server::database::parse_pv_name(&member.channel);
@@ -870,22 +890,32 @@ impl GroupChannel {
 
         let instance = rec.read().await;
         let rtyp = instance.record.record_type();
-        let nt_type = NtType::from_record_type(rtyp);
-
         let field_upper = field_name.to_ascii_uppercase();
-        let value_dbf = instance
-            .record
-            .field_list()
-            .iter()
-            .find(|f| f.name == field_upper)
-            .map(|f| f.dbf_type)
+        let resolved = instance.resolve_field(&field_upper);
+        let nt_type = pvif::nt_type_for_field(rtyp, &field_upper, resolved.as_ref());
+        let value_dbf = resolved
+            .as_ref()
+            .map(|v| v.db_field_type())
+            .or_else(|| {
+                instance
+                    .record
+                    .field_list()
+                    .iter()
+                    .find(|f| f.name == field_upper)
+                    .map(|f| f.dbf_type)
+            })
             .unwrap_or(DbFieldType::Double);
 
         Ok((nt_type, dbf_to_scalar_type(value_dbf)))
     }
 
-    /// Look up a member's actual DBF field type from the database.
-    /// Returns `Double` as a fallback if the record/field can't be found.
+    /// Look up a member's actual DBF field type for the PUT conversion
+    /// target. Resolves the configured field's value first (record →
+    /// common → virtual), so a common/virtual member field (e.g.
+    /// `REC.DESC` string, `REC.UTAG` uint64) converts against its real
+    /// type instead of falling back to `Double` — same final-field
+    /// resolution as the descriptor path above. Returns `Double` only
+    /// when the record/field cannot be resolved at all.
     async fn member_dbf_type(&self, member: &GroupMember) -> DbFieldType {
         let (record_name, field_name) =
             epics_base_rs::server::database::parse_pv_name(&member.channel);
@@ -897,11 +927,16 @@ impl GroupChannel {
         let instance = rec.read().await;
         let field_upper = field_name.to_ascii_uppercase();
         instance
-            .record
-            .field_list()
-            .iter()
-            .find(|f| f.name == field_upper)
-            .map(|f| f.dbf_type)
+            .resolve_field(&field_upper)
+            .map(|v| v.db_field_type())
+            .or_else(|| {
+                instance
+                    .record
+                    .field_list()
+                    .iter()
+                    .find(|f| f.name == field_upper)
+                    .map(|f| f.dbf_type)
+            })
             .unwrap_or(DbFieldType::Double)
     }
 
@@ -2747,6 +2782,108 @@ mod tests {
                 init_flag(&db, "HOOK:rec").await,
                 1,
                 "proc member without +putorder must process its record (atomic={atomic})"
+            );
+        }
+    }
+
+    /// A QSRV group scalar member must derive its NT shape and DBF type
+    /// from the configured channel's final field, not the owning record
+    /// type: `REC.SCAN` is NTEnum, `REC.DESC` is NTScalar string, and a
+    /// common string field on an enum record (`BI.DESC`) stays NTScalar
+    /// string rather than being routed through the NTEnum encoder. Before
+    /// the fix `introspect_member`/`decode_member` used
+    /// `NtType::from_record_type` + a `field_list`-only DBF lookup that
+    /// fell back to `pvDouble` for common fields.
+    #[tokio::test]
+    async fn group_scalar_member_nt_type_follows_configured_field_not_record_type() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::bi::BiRecord;
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        // Pull the "value" FieldDesc out of a named group member.
+        fn member_value_desc<'a>(group: &'a FieldDesc, name: &str) -> &'a FieldDesc {
+            let FieldDesc::Structure { fields, .. } = group else {
+                panic!("group descriptor must be a structure");
+            };
+            let member = &fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("member '{name}' missing from group descriptor"))
+                .1;
+            let FieldDesc::Structure { fields, .. } = member else {
+                panic!("member '{name}' must be an NT structure");
+            };
+            &fields
+                .iter()
+                .find(|(n, _)| n == "value")
+                .expect("member must have a value field")
+                .1
+        }
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("BR62:ai", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("BR62:bi", Box::new(BiRecord::new(0)))
+            .await
+            .unwrap();
+
+        let cfg = r#"{
+            "BR62:GRP": {
+                "d":  {"+type": "scalar", "+channel": "BR62:ai.DESC"},
+                "s":  {"+type": "scalar", "+channel": "BR62:ai.SCAN"},
+                "bd": {"+type": "scalar", "+channel": "BR62:bi.DESC"}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        let channel = GroupChannel::new(db.clone(), def);
+
+        // ---- descriptor (introspect_member) ----
+        let desc = channel.get_field().await.expect("get_field");
+        assert_eq!(
+            member_value_desc(&desc, "d"),
+            &FieldDesc::Scalar(ScalarType::String),
+            "REC.DESC member must advertise an NTScalar string value"
+        );
+        assert!(
+            matches!(member_value_desc(&desc, "s"), FieldDesc::Structure { .. }),
+            "REC.SCAN member must advertise an NTEnum value (index/choices \
+             struct), got {:?}",
+            member_value_desc(&desc, "s")
+        );
+        assert_eq!(
+            member_value_desc(&desc, "bd"),
+            &FieldDesc::Scalar(ScalarType::String),
+            "BI.DESC must stay an NTScalar string even though the record \
+             type is enum"
+        );
+
+        // ---- runtime value (decode_member) ----
+        let val = channel
+            .get(&PvStructure::new("structure"))
+            .await
+            .expect("group GET");
+        let member = |name: &str| match val.get_field(name) {
+            Some(PvField::Structure(s)) => s.clone(),
+            other => panic!("member '{name}' value must be a structure, got {other:?}"),
+        };
+        // SCAN member's value is the enum_t sub-structure (index/choices).
+        let s_val = member("s");
+        assert!(
+            matches!(s_val.get_field("value"), Some(PvField::Structure(_))),
+            "REC.SCAN GET value must be an enum index/choices struct"
+        );
+        // DESC members' value is a plain string scalar.
+        for name in ["d", "bd"] {
+            let m = member(name);
+            assert!(
+                matches!(
+                    m.get_field("value"),
+                    Some(PvField::Scalar(ScalarValue::String(_)))
+                ),
+                "member '{name}' GET value must be a string scalar, got {:?}",
+                m.get_field("value")
             );
         }
     }

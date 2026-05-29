@@ -350,43 +350,6 @@ pub struct BridgeChannel {
 }
 
 impl BridgeChannel {
-    /// Choose the NormativeType for a single-record channel bound to
-    /// `field`. `VAL` keeps the record-type mapping
-    /// ([`NtType::from_record_type`]). A non-`VAL` field's NT is chosen
-    /// from its resolved value's final DBR/DBF type and element count,
-    /// mirroring pvxs, which builds the single-record prototype from
-    /// `dbChannelFinalFieldType(chan)` (ioc/singlesource.cpp:189-205):
-    /// `DBF_ENUM`/`DBF_MENU`/`DBF_DEVICE` resolve to `DBR_ENUM`
-    /// (db/dbAccess.c:88-90) and select `NTEnum`, an array field selects
-    /// `NTScalarArray`, and everything else is `NTScalar`. Forcing every
-    /// non-`VAL` field to `NTScalar` (the prior rule) mis-served enum
-    /// fields such as `REC.SCAN` as a scalar index with no `choices`.
-    /// A scalar non-array field (e.g. `waveform.NORD`) still selects
-    /// `NTScalar`, preserving the "non-VAL scalar" behavior.
-    fn nt_type_for_field(record_type: &str, field: &str, value: Option<&EpicsValue>) -> NtType {
-        if field.eq_ignore_ascii_case("VAL") {
-            return NtType::from_record_type(record_type);
-        }
-        match value {
-            // DBF_ENUM/MENU/DEVICE → DBR_ENUM → NTEnum (scalar index +
-            // choices). An enum *array* has no scalar-index NTEnum shape,
-            // so it falls through to NTScalarArray below.
-            Some(EpicsValue::Enum(_)) => NtType::Enum,
-            Some(
-                EpicsValue::ShortArray(_)
-                | EpicsValue::FloatArray(_)
-                | EpicsValue::EnumArray(_)
-                | EpicsValue::DoubleArray(_)
-                | EpicsValue::LongArray(_)
-                | EpicsValue::CharArray(_)
-                | EpicsValue::StringArray(_)
-                | EpicsValue::Int64Array(_)
-                | EpicsValue::UInt64Array(_),
-            ) => NtType::ScalarArray,
-            _ => NtType::Scalar,
-        }
-    }
-
     /// Create from cached metadata (no DB introspection needed).
     pub fn from_cached(
         db: Arc<PvDatabase>,
@@ -476,7 +439,7 @@ impl BridgeChannel {
         {
             NtType::LongString
         } else {
-            Self::nt_type_for_field(rtyp, &field_upper, resolved.as_ref())
+            pvif::nt_type_for_field(rtyp, &field_upper, resolved.as_ref())
         };
 
         // DBF type for the bound field, taken from the field's actual

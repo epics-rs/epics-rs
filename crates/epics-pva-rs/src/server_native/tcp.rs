@@ -3992,10 +3992,22 @@ async fn handle_tcp_search(
     raw.extend_from_slice(&frame.payload);
 
     let Some(req) = super::udp::parse_search_request(&raw) else {
-        // Malformed body — drop silently, same as the UDP path.
-        // pvxs `serverchan.cpp:255` returns without emitting a
-        // response on bad input.
-        return Ok(());
+        // The command framing already classified this frame as a SEARCH,
+        // so `parse_search_request` returning `None` here means the body
+        // failed to decode (truncated, bad size prefix, missing channel
+        // name) — not "this isn't a SEARCH". On an established TCP circuit
+        // that is a protocol fault: pvxs decodes the body, checks
+        // `!M.good()` and throws "TCP Search decode error"
+        // (serverchan.cpp:209-210), which the connection dispatcher treats
+        // as a circuit fault and tears the connection down. We surface the
+        // same fault as a connection-level decode error so the read loop
+        // closes the circuit rather than silently skipping the frame and
+        // continuing to serve a peer that already corrupted the stream.
+        // (UDP keeps the datagram-drop ignore path: a bad datagram there
+        // is not a stream fault.)
+        return Err(PvaError::Decode(
+            "TCP SEARCH decode error (pvxs serverchan.cpp:209-210)".into(),
+        ));
     };
 
     // Default protocol on TCP is "tcp" (or "tls" when TLS is in use).

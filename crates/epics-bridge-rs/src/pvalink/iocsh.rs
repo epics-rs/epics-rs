@@ -1,11 +1,17 @@
-//! iocsh commands for pvalink — `pvxr`, `pvxrefdiff`, `dbpvar`,
+//! iocsh commands for pvalink — `pvxr`, `pvalinkrefdiff`, `dbpvar`,
 //! `dbpvxr`, `pvaLinkNWorkers`.
 //!
 //! Mirrors pvxs `ioc/pvalink.cpp` (`dbpvxr` registered under the IOC
-//! shell name `dbpvar`, `pvxrefdiff`, `testqsrvWaitForLinkConnected`,
-//! and the `pvaLinkNWorkers` variable). Pre-warms link entries so the
+//! shell name `dbpvar`, `testqsrvWaitForLinkConnected`, and the
+//! `pvaLinkNWorkers` variable). Pre-warms link entries so the
 //! synchronous record-link resolver can read cached monitor values
 //! without `block_on(GET)`.
+//!
+//! NOTE: `pvalinkrefdiff` is a Rust-specific pvalink read-activity
+//! counter, deliberately NOT named `pvxrefdiff` — the pvxs
+//! `pvxrefshow`/`pvxrefsave`/`pvxrefdiff` family is a PVA-library
+//! reference-leak diagnostic (`pvxs/ioc/iochooks.cpp:479-484`), not a
+//! pvalink command.
 
 use epics_base_rs::server::database::LinkSet;
 use epics_base_rs::server::iocsh::registry::{
@@ -51,22 +57,36 @@ pub fn db_pvxr_command(resolver: PvaLinkResolver) -> CommandDef {
     )
 }
 
-/// `pvxrefdiff` — print "links touched since last call" delta.
-/// Mirrors pvxs `pvxrefdiff` (iochooks.cpp:270). Uses interior counter
-/// state on the [`PvaLinkResolver`] — the first call shows the
-/// running total, subsequent calls show deltas vs. the previous call.
-pub fn pvxrefdiff_command(resolver: PvaLinkResolver) -> CommandDef {
+/// `pvalinkrefdiff` — print pvalink "reads since last call" delta.
+///
+/// This is a Rust-specific pvalink read-activity counter; it is NOT the
+/// pvxs `pvxrefdiff` reference-leak diagnostic and must NOT be
+/// registered under that name. pvxs `pvxrefshow` / `pvxrefsave` /
+/// `pvxrefdiff` are a matched library-wide diagnostic set over
+/// `instanceSnapshot()` per-class object counts, registered by
+/// `pvxsBaseRegistrar` (`pvxs/ioc/iochooks.cpp:247-310,479-484`) — a
+/// PVA-library reference-leak facility, not a pvalink concern. Squatting
+/// the `pvxrefdiff` name here gave operators running the known pvxs
+/// command unrelated pvalink read totals and silently broke log checks
+/// keyed to pvxs counter classes. The name is therefore freed for the
+/// PVA library to register correctly; the pvalink read-activity delta
+/// lives under its own honest name.
+///
+/// Uses interior counter state on the [`PvaLinkResolver`] — the first
+/// call shows the running total, subsequent calls show deltas vs. the
+/// previous call.
+pub fn pvalinkrefdiff_command(resolver: PvaLinkResolver) -> CommandDef {
     let last = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     CommandDef::new(
-        "pvxrefdiff",
+        "pvalinkrefdiff",
         vec![],
-        "pvxrefdiff",
+        "pvalinkrefdiff",
         move |_args: &[ArgValue], ctx: &CommandContext| {
             let now = resolver.read_count();
             let prev = last.swap(now, std::sync::atomic::Ordering::Relaxed);
             let delta = now.wrapping_sub(prev);
             ctx.println(&format!(
-                "pvxrefdiff: {delta} read(s) since last call (total {now}, {} cached link(s))",
+                "pvalinkrefdiff: {delta} read(s) since last call (total {now}, {} cached link(s))",
                 resolver.link_count()
             ));
             Ok(CommandOutcome::Continue)
@@ -357,7 +377,7 @@ pub fn pvalink_disable_command(resolver: PvaLinkResolver) -> CommandDef {
 pub fn register_pvalink_commands(resolver: PvaLinkResolver) -> Vec<CommandDef> {
     vec![
         db_pvxr_command(resolver.clone()),
-        pvxrefdiff_command(resolver.clone()),
+        pvalinkrefdiff_command(resolver.clone()),
         dbpvar_command(resolver.clone()),
         dbpvxr_command(resolver.clone()),
         pvalink_nworkers_command(),
@@ -383,13 +403,21 @@ mod tests {
         // `pvaLinkNWorkers` variable (`pvxs/ioc/pvalink.cpp:328-333`);
         // `dbpvxr` is kept as a Rust back-compat alias.
         assert!(names.contains(&"pvxr"));
-        assert!(names.contains(&"pvxrefdiff"));
+        assert!(names.contains(&"pvalinkrefdiff"));
         assert!(names.contains(&"dbpvar"));
         assert!(names.contains(&"dbpvxr"));
         assert!(names.contains(&"pvaLinkNWorkers"));
         assert!(names.contains(&"pvalink_enable"));
         assert!(names.contains(&"pvalink_disable"));
         assert_eq!(cmds.len(), 7);
+
+        // The pvxs `pvxrefshow`/`pvxrefsave`/`pvxrefdiff` reference-leak
+        // diagnostic family belongs to the PVA library, not pvalink:
+        // pvalink must NOT squat any of those names
+        // (BRIDGE-RS-2026-05-28-83).
+        assert!(!names.contains(&"pvxrefdiff"));
+        assert!(!names.contains(&"pvxrefsave"));
+        assert!(!names.contains(&"pvxrefshow"));
 
         // `dbpvar` and `dbpvxr` both take (record, level): two optional
         // args, matching pvxs `IOCShCommand<const char*, int>`.

@@ -62,7 +62,7 @@ pub struct PvaLinkResolver {
     registry: Arc<PvaLinkRegistry>,
     handle: tokio::runtime::Handle,
     /// Counter incremented on every successful link read. Used by
-    /// `pvxrefdiff` to report "links touched since last call". Wraps
+    /// `pvalinkrefdiff` to report "links touched since last call". Wraps
     /// at u64::MAX.
     reads: Arc<std::sync::atomic::AtomicU64>,
     /// Master enable flag. Set false via [`Self::set_enabled`] (or
@@ -634,8 +634,8 @@ impl PvaLinkResolver {
 }
 
 /// Install a [`PvaLinkResolver`] on `db`. Returns the resolver so the
-/// caller can pre-open links and query stats (`db_pvxr` / `pvxrefdiff`
-/// iocsh commands lean on this).
+/// caller can pre-open links and query stats (`db_pvxr` /
+/// `pvalinkrefdiff` iocsh commands lean on this).
 ///
 /// Registers the resolver under the `"pva"` lset scheme *and*
 /// installs the legacy [`ExternalPvResolver`] closure so callers

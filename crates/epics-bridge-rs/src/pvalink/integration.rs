@@ -24,7 +24,7 @@ use epics_base_rs::types::EpicsValue;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
 use super::config::{LinkDirection, PvaLinkConfig};
-use super::link::{PvaLink, PvaLinkError, PvaLinkResult};
+use super::link::{PvaLink, PvaLinkError, PvaLinkResult, ScanEvent};
 use super::registry::PvaLinkRegistry;
 
 /// Wrap `tokio::task::block_in_place(f)` with a runtime-flavour check.
@@ -62,7 +62,7 @@ pub struct PvaLinkResolver {
     registry: Arc<PvaLinkRegistry>,
     handle: tokio::runtime::Handle,
     /// Counter incremented on every successful link read. Used by
-    /// `pvxrefdiff` to report "links touched since last call". Wraps
+    /// `pvalinkrefdiff` to report "links touched since last call". Wraps
     /// at u64::MAX.
     reads: Arc<std::sync::atomic::AtomicU64>,
     /// Master enable flag. Set false via [`Self::set_enabled`] (or
@@ -96,14 +96,19 @@ pub struct PvaLinkResolver {
     /// wires it — without it, monitor events still update the cached
     /// value but cannot drive `CP`/`CPP` record processing.
     db: Arc<parking_lot::RwLock<Option<PvDatabase>>>,
-    /// B3: per-PV set of record names to process when a monitor event
-    /// arrives (the `scan_on_update` / CP fan-out targets). Populated
-    /// by [`Self::open_link_for_record`].
-    scan_targets: Arc<parking_lot::RwLock<std::collections::HashMap<String, ScanFanout>>>,
-    /// B3: PV names whose monitor-notification forwarder task is
-    /// already running, so [`Self::open_link`] spawns it at most once
-    /// per link.
-    forwarders: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// B3: per-monitor-variant set of record names to process when a
+    /// monitor event arrives (the `scan_on_update` / CP fan-out
+    /// targets). Populated by [`Self::open_link_for_record`]. Keyed by
+    /// [`MonitorKey`] — NOT bare PV name — so two records linking the
+    /// same PV with different `Q` / `pipeline` each fan out from their
+    /// own monitor (BRIDGE-RS-2026-05-28-128).
+    scan_targets: Arc<parking_lot::RwLock<std::collections::HashMap<MonitorKey, ScanFanout>>>,
+    /// B3: monitor variants whose notification forwarder task is already
+    /// running, so [`Self::open_link`] spawns it at most once per
+    /// variant. Keyed by [`MonitorKey`] so distinct `Q` / `pipeline`
+    /// variants of one PV each get their own forwarder draining their
+    /// own monitor receiver.
+    forwarders: Arc<parking_lot::Mutex<std::collections::HashSet<MonitorKey>>>,
     /// B4 `local`: optional handle to the QSRV provider's name
     /// registry. When the IOC also runs QSRV (the common dual-server
     /// deployment), a `local=true` link may target a QSRV group
@@ -117,41 +122,61 @@ pub struct PvaLinkResolver {
     qsrv: Arc<parking_lot::RwLock<Option<Arc<crate::qsrv::BridgeProvider>>>>,
 }
 
-/// Per-PV scan-on-update fan-out state (B3).
+/// Identity of an INP monitor variant: the subset of the registry key
+/// that distinguishes two monitors of the same upstream PV. Mirrors
+/// pvxs `channels_key_t = (channelName, pvRequest)` where the pvRequest
+/// encodes `pipeline` / `queueSize` (`pvxs/ioc/pvalink.h:115-120`).
+///
+/// Scan fan-out and forwarder dedup key on this rather than the bare PV
+/// name so a `Q=1` record's CP/CPP scans are driven by its own monitor,
+/// not whichever variant opened first (BRIDGE-RS-2026-05-28-128). Two
+/// links that differ only in `field` / `sevr` share one `MonitorKey`:
+/// the registry already folds them onto one subscription, so one
+/// forwarder correctly drives both (their per-`field` change tracking
+/// is independent inside `run_notify_forwarder`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MonitorKey {
+    pv_name: String,
+    pipeline: bool,
+    queue_size: usize,
+}
+
+impl MonitorKey {
+    fn from_config(cfg: &PvaLinkConfig) -> Self {
+        Self {
+            pv_name: cfg.pv_name.clone(),
+            pipeline: cfg.pipeline,
+            queue_size: cfg.queue_size,
+        }
+    }
+}
+
+/// Per-monitor-variant scan-on-update fan-out state (B3).
 #[derive(Default)]
 struct ScanFanout {
     /// Records to process on every monitor event. Each entry mirrors
-    /// one INP pvalink whose `proc` is `CP` (always) or `CPP`
-    /// (passive). At our integration granularity both reduce to
-    /// "process this record"; `always` widens it to fire even when
-    /// the value did not change.
+    /// one INP pvalink whose `proc` is `CP` (scans always) or `CPP`
+    /// (scans when the owner is Passive). At our integration
+    /// granularity both reduce to "process this record on each event".
     records: Vec<ScanTarget>,
 }
 
 /// One record bound to a CP/CPP pvalink (B3).
 struct ScanTarget {
     record: String,
-    /// pvxs `pvaLinkConfig::always` — process even on a no-op update.
-    always: bool,
     /// pvxs `pvaLinkConfig::monorder` — lower scans first within one
     /// monitor batch.
     monorder: i32,
     /// pvxs `pvaLinkConfig::atomic` — atomic links scan as one
     /// contiguous group ahead of the non-atomic targets in the same
-    /// monitor batch, and an atomic group scans whenever *any* of its
-    /// members changed (so siblings stay consistent within the batch).
+    /// monitor batch, under one multi-record lock so siblings stay
+    /// mutually consistent within the batch.
     atomic: bool,
     /// pvxs distinguishes `CP` (scanOnUpdateYes) from `CPP`
     /// (scanOnUpdatePassive). `CPP` is gated by the owning record's
     /// SCAN being Passive (pvalink_channel.cpp:313). True here means
     /// "skip processing when the owning record's SCAN != Passive".
     passive_only: bool,
-    /// per-link sub-field selector. Mirrors pvxs
-    /// `pvaLink::fieldName` resolved per-link from the shared channel
-    /// root (`pvalink_link.cpp:91`). Change detection in
-    /// `run_notify_forwarder` uses this field so targets with
-    /// different sub-fields track changes independently.
-    field: String,
 }
 
 impl PvaLinkResolver {
@@ -314,60 +339,61 @@ impl PvaLinkResolver {
         // any query) so two links to the same PV with different options
         // (field, sevr, Q, …) each have their own entry. pvxs equivalent:
         // each `pvaLink` carries its own `pvaLinkConfig`
-        // (`pvxs/ioc/pvalink.h:65`). The bare PV name is still used as
-        // the registry key (shared channel by (pv_name, pipeline,
-        // queue_size)) per `pvxs/ioc/pvalink.h:116`.
+        // (`pvxs/ioc/pvalink.h:65`). The registry key shares the channel
+        // by (pv_name, pipeline, queue_size) per `pvxs/ioc/pvalink.h:116`.
         let full_key = strip_scheme(link_string).unwrap_or(link_string).to_string();
         self.link_options.write().insert(full_key, cfg.clone());
         // B3: register the scan-on-update target before opening so the
-        // forwarder spawned below already sees it.
+        // forwarder spawned below already sees it. Keyed by the monitor
+        // variant identity, NOT bare PV name, so a `Q=1` record's scan
+        // targets are not merged with a `Q=64` sibling's
+        // (BRIDGE-RS-2026-05-28-128; pvxs keys links onto their channel
+        // by `(channelName, pvRequest)`, `pvxs/ioc/pvalink.h:115-120`).
+        let monitor_key = MonitorKey::from_config(&cfg);
         if let Some(rec) = record {
             if cfg.scan_on_update {
                 self.scan_targets
                     .write()
-                    .entry(pv_name.clone())
+                    .entry(monitor_key.clone())
                     .or_default()
                     .records
                     .push(ScanTarget {
                         record: rec,
-                        always: cfg.always,
                         monorder: cfg.monorder,
                         atomic: cfg.atomic,
                         passive_only: cfg.scan_on_passive,
-                        field: cfg.field.clone(),
                     });
             }
         }
         let link = self.registry.get_or_open(cfg).await?;
-        self.spawn_notify_forwarder(&pv_name, &link);
+        self.spawn_notify_forwarder(monitor_key, &link);
         Ok(link)
     }
 
-    /// B3: spawn the per-link monitor-notification forwarder, at most
-    /// once per PV. The task drains the link's notify receiver and,
-    /// for every event, processes the link's registered
-    /// scan-on-update records (`monorder`-sorted; `always` links also
-    /// process on no-op updates).
-    fn spawn_notify_forwarder(&self, pv_name: &str, link: &Arc<PvaLink>) {
+    /// B3: spawn the monitor-notification forwarder, at most once per
+    /// monitor variant. The task drains that variant's notify receiver
+    /// and, for every event, processes the records registered as
+    /// scan-on-update targets for the same variant (`monorder`-sorted;
+    /// `always` links also process on no-op updates).
+    fn spawn_notify_forwarder(&self, key: MonitorKey, link: &Arc<PvaLink>) {
         {
             let mut started = self.forwarders.lock();
-            if started.contains(pv_name) {
+            if started.contains(&key) {
                 return;
             }
-            started.insert(pv_name.to_string());
+            started.insert(key.clone());
         }
         let Some(rx) = link.take_notify_rx() else {
             // OUT / non-monitor links never created a channel.
-            self.forwarders.lock().remove(pv_name);
+            self.forwarders.lock().remove(&key);
             return;
         };
-        let pv_name = pv_name.to_string();
         let scan_targets = self.scan_targets.clone();
         let db = self.db.clone();
         // field is now per-ScanTarget (not shared across all
         // targets). `run_notify_forwarder` reads each target's own field.
         self.handle
-            .spawn(run_notify_forwarder(pv_name, rx, scan_targets, db));
+            .spawn(run_notify_forwarder(key, rx, scan_targets, db));
     }
 
     /// Whether `pv_name` is hosted by the attached `PvDatabase` as a
@@ -460,6 +486,12 @@ impl PvaLinkResolver {
         self.registry.len()
     }
 
+    /// Per-channel pvalink diagnostics, backing the `dbpvar` IOC shell
+    /// command (pvxs `dbpvxr`, `pvxs/ioc/pvalink.cpp:184-316`).
+    pub fn channel_diagnostics(&self) -> Vec<super::registry::ChannelDiag> {
+        self.registry.channel_diagnostics()
+    }
+
     /// Maximize-severity result for the link named `pv_name` (B2).
     ///
     /// Returns the remote EPICS severity that should fold into the
@@ -469,20 +501,24 @@ impl PvaLinkResolver {
     /// yet open, or links with no cached value. Mirrors pvxs
     /// `pvaGetAlarmMsg`'s severity output (pvalink_lset.cpp:544).
     pub fn link_alarm_severity(&self, pv_name: &str) -> Option<i32> {
-        // apply the caller's own parsed `sevr` mode. Pre-fix
-        // this called `link_alarm_severity()` on whichever cached INP
-        // link `try_get_any` returned first — that link's
-        // `config.sevr` belongs to an arbitrary other caller. pvxs
-        // `pvaLinkConfig::sevr` is per-link (`pvxs/ioc/pvalink.h:65`).
+        // apply the caller's own parsed `sevr` mode and resolve the
+        // caller's own monitor variant. Pre-fix this called
+        // `link_alarm_severity()` on whichever cached INP link
+        // `try_get_any` returned first for the bare PV — that link's
+        // `config.sevr` and monitor variant belong to an arbitrary other
+        // caller. pvxs `pvaLinkConfig` is per-link and the channel is
+        // keyed by `(channelName, pvRequest)`
+        // (`pvxs/ioc/pvalink.h:65,115-120`).
         let full = strip_scheme(pv_name)?;
         let bare = link_pv_name(full);
         if full != bare {
             lazy_register_inp_opts(&self.link_options, full);
         }
-        let sevr = self.inp_cfg_for(full).sevr;
+        let cfg = self.inp_cfg_for(full);
+        let sevr = cfg.sevr;
         self.registry
-            .try_get_any(bare, LinkDirection::Inp)?
-            .link_alarm_severity_with(sevr)
+            .try_get_inp(bare, cfg.pipeline, cfg.queue_size)?
+            .link_alarm_severity_with(&cfg.field, sevr)
     }
 
     /// Wait until the link for `pv_name` has received at least one
@@ -551,10 +587,14 @@ impl PvaLinkResolver {
 
             // Fast path: a previously-opened link with a cached
             // monitor value. No `block_on`, no async runtime touch.
-            // `try_get_any` finds any cached link for this PV;
-            // `try_read_cached_with_field` applies the per-link field
-            // selector so two links to the same PV return their own leaf.
-            if let Some(link) = resolver.registry.try_get_any(bare, LinkDirection::Inp)
+            // `try_get_inp` resolves THIS caller's monitor variant
+            // (`pipeline` / `Q`), so a `Q=1` record reads from its own
+            // monitor, not a `Q=64` sibling sharing the PV name
+            // (BRIDGE-RS-2026-05-28-128). `try_read_cached_with_field`
+            // then applies the per-link field selector.
+            if let Some(link) = resolver
+                .registry
+                .try_get_inp(bare, cfg.pipeline, cfg.queue_size)
                 && let Some(value) = link.try_read_cached_with_field(&cfg.field)
             {
                 resolver
@@ -594,8 +634,8 @@ impl PvaLinkResolver {
 }
 
 /// Install a [`PvaLinkResolver`] on `db`. Returns the resolver so the
-/// caller can pre-open links and query stats (`db_pvxr` / `pvxrefdiff`
-/// iocsh commands lean on this).
+/// caller can pre-open links and query stats (`db_pvxr` /
+/// `pvalinkrefdiff` iocsh commands lean on this).
 ///
 /// Registers the resolver under the `"pva"` lset scheme *and*
 /// installs the legacy [`ExternalPvResolver`] closure so callers
@@ -653,57 +693,56 @@ pub async fn install_pvalink_resolver(
     resolver
 }
 
-type ScanTargetMap = Arc<parking_lot::RwLock<std::collections::HashMap<String, ScanFanout>>>;
+type ScanTargetMap = Arc<parking_lot::RwLock<std::collections::HashMap<MonitorKey, ScanFanout>>>;
 
 /// B3 monitor-notification forwarder loop.
 ///
 /// Drains `rx` (fed by the link's monitor task) and, for every event,
-/// processes the records registered as scan-on-update targets for
-/// `pv_name`.
+/// processes the records registered as scan-on-update targets for this
+/// monitor variant.
 ///
-/// Ordering (B4): `atomic` targets scan first as one contiguous
-/// group, then the non-atomic targets; within each group `monorder`
-/// (low → high) decides the order. A `CPP` target (`always=false`) is
-/// skipped on a no-op update, *except* an atomic target scans
-/// whenever any atomic sibling in the same batch changed — so atomic
-/// links stay mutually consistent. Mirrors pvxs `pvaLinkConfig`
-/// `atomic` / `monorder` / `always`. The loop ends when every sender
-/// is dropped (i.e. the link is closed).
+/// pvxs scans every CP target and every eligible CPP target on EVERY
+/// monitor event — and on disconnect — with no value-difference
+/// comparison: the `always` option is parsed but ignored at scan time
+/// (`pvxs/documentation/pvalink.rst:102`;
+/// `pvxs/ioc/pvalink_channel.cpp:389-431` rebuilds and scans the
+/// atomic/non-atomic target lists unconditionally after both the
+/// value-update branch and the `catch(client::Disconnect&)` branch,
+/// `:335-373`). A `Value` and a `Disconnected` event therefore drive
+/// the identical scan loop — there is no no-op suppression and no
+/// per-field change tracking.
+///
+/// Ordering (B4): `atomic` targets scan first as one contiguous group
+/// under a single multi-record lock, then the non-atomic targets;
+/// within each group `monorder` (low → high) decides the order. A `CPP`
+/// (`passive_only`) target is skipped only when its owning record's
+/// SCAN is not Passive. The loop ends when every sender is dropped
+/// (i.e. the link is closed).
 async fn run_notify_forwarder(
-    pv_name: String,
-    mut rx: tokio::sync::mpsc::Receiver<PvField>,
+    monitor_key: MonitorKey,
+    mut rx: tokio::sync::mpsc::Receiver<ScanEvent>,
     scan_targets: ScanTargetMap,
     db: Arc<parking_lot::RwLock<Option<PvDatabase>>>,
 ) {
-    // per-(record, field) last delivered leaf, so each target
-    // tracks changes against its own sub-field independently. Mirrors
-    // pvxs per-`pvaLink` change tracking (`pvalink_link.cpp:91`).
-    let mut last: std::collections::HashMap<(String, String), PvField> =
-        std::collections::HashMap::new();
-    while let Some(value) = rx.recv().await {
+    // Every event — `Value` or `Disconnected` — drives the same scan
+    // loop. The event payload is intentionally unused: pvxs does not
+    // value-diff before scanning (see the doc comment above), and the
+    // cached value itself is updated by the monitor task, not here.
+    while rx.recv().await.is_some() {
         // Snapshot the fan-out, then order it: atomic group first,
         // then non-atomic; `monorder` within each group.
-        let mut targets: Vec<(String, bool, i32, bool, bool, String)> =
-            match scan_targets.read().get(&pv_name) {
+        let mut targets: Vec<(String, i32, bool, bool)> =
+            match scan_targets.read().get(&monitor_key) {
                 Some(fanout) => fanout
                     .records
                     .iter()
-                    .map(|t| {
-                        (
-                            t.record.clone(),
-                            t.always,
-                            t.monorder,
-                            t.atomic,
-                            t.passive_only,
-                            t.field.clone(),
-                        )
-                    })
+                    .map(|t| (t.record.clone(), t.monorder, t.atomic, t.passive_only))
                     .collect(),
                 None => Vec::new(),
             };
         // Sort key: (!atomic, monorder) → atomic (false sorts first),
         // then ascending monorder.
-        targets.sort_by_key(|(_, _, order, atomic, _, _)| (!*atomic, *order));
+        targets.sort_by_key(|(_, order, atomic, _)| (!*atomic, *order));
 
         let Some(db_handle) = db.read().clone() else {
             continue;
@@ -728,8 +767,8 @@ async fn run_notify_forwarder(
         // atomic link is locked exactly once.
         let atomic_records: Vec<String> = targets
             .iter()
-            .filter(|(_, _, _, atomic, _, _)| *atomic)
-            .map(|(record, _, _, _, _, _)| record.clone())
+            .filter(|(_, _, atomic, _)| *atomic)
+            .map(|(record, _, _, _)| record.clone())
             .collect();
 
         // The epoch guard is held only across the atomic group. pvxs
@@ -745,29 +784,13 @@ async fn run_notify_forwarder(
             Some(db_handle.lock_records(&atomic_records).await)
         };
 
-        for (record, always, _order, atomic, passive_only, field) in &targets {
+        for (record, _order, atomic, passive_only) in &targets {
             // `targets` is sorted atomic-first; the first non-atomic
             // target marks the end of the atomic group, so release
             // the epoch here — exactly where pvxs's `DBManyLocker`
             // goes out of scope before the non-atomic loop.
             if !*atomic {
                 atomic_epoch = None;
-            }
-            // per-target change detection using each target's
-            // own field selector. pvxs `pvaLinkConfig::always` — CP
-            // scans unconditionally; atomic scans whenever any atomic
-            // sibling changed; CPP (`always=false`, non-atomic) only
-            // scans when this target's field leaf changed.
-            let changed = {
-                let leaf = extract_leaf(&value, field);
-                let key = (record.clone(), field.clone());
-                let prev = last.get(&key);
-                let did_change = prev != Some(&leaf);
-                last.insert(key, leaf);
-                did_change
-            };
-            if !changed && !*always && !*atomic {
-                continue;
             }
             // `CPP` (passive_only) only fires when the owning
             // record's SCAN is Passive. pvxs `pvalink_channel.cpp:313`
@@ -823,22 +846,6 @@ async fn run_notify_forwarder(
     }
 }
 
-/// Walk a dotted field path and return the leaf [`PvField`]. Mirror
-/// of `link::extract_field` for the B3 forwarder's change detection.
-fn extract_leaf(root: &PvField, path: &str) -> PvField {
-    if path.is_empty() {
-        return root.clone();
-    }
-    let mut cursor = root.clone();
-    for segment in path.split('.') {
-        cursor = match cursor {
-            PvField::Structure(s) => s.get_field(segment).cloned().unwrap_or(PvField::Null),
-            other => return other,
-        };
-    }
-    cursor
-}
-
 impl LinkSet for PvaLinkResolver {
     fn is_connected(&self, name: &str) -> bool {
         // Sync-only check: trait can't await. If the link hasn't
@@ -850,7 +857,18 @@ impl LinkSet for PvaLinkResolver {
             return false;
         };
         let bare = link_pv_name(full);
-        match self.registry.try_get_any(bare, LinkDirection::Inp) {
+        // resolve THIS link's monitor variant. `link_names()` hands back
+        // one identity string per distinct `(pv, pipeline, Q)` variant,
+        // so the wait confirms each variant's own monitor connected, not
+        // just the first to share the PV name (BRIDGE-RS-2026-05-28-128).
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
+        match self
+            .registry
+            .try_get_inp(bare, cfg.pipeline, cfg.queue_size)
+        {
             Some(link) => link.is_connected(),
             None => false,
         }
@@ -870,8 +888,11 @@ impl LinkSet for PvaLinkResolver {
         let cfg = self.inp_cfg_for(full);
 
         // Fast path: cached monitor value, no async runtime touch.
-        // apply per-link field selector.
-        if let Some(link) = self.registry.try_get_any(bare, LinkDirection::Inp)
+        // resolve THIS caller's monitor variant, then apply the per-link
+        // field selector (BRIDGE-RS-2026-05-28-128).
+        if let Some(link) = self
+            .registry
+            .try_get_inp(bare, cfg.pipeline, cfg.queue_size)
             && let Some(value) = link.try_read_cached_with_field(&cfg.field)
         {
             self.reads
@@ -958,11 +979,12 @@ impl LinkSet for PvaLinkResolver {
         }
         let cfg = self.inp_cfg_for(full);
         let sevr = cfg.sevr;
+        let field = cfg.field.clone();
         let link = block_in_place_or_warn(|| {
             self.handle
                 .block_on(async { self.registry.get_or_open(cfg).await.ok() })
         })?;
-        link.alarm_message_with(sevr)
+        link.alarm_message_with(&field, sevr)
     }
 
     fn alarm_severity(&self, name: &str) -> Option<i32> {
@@ -980,11 +1002,12 @@ impl LinkSet for PvaLinkResolver {
         }
         let cfg = self.inp_cfg_for(full);
         let sevr = cfg.sevr;
+        let field = cfg.field.clone();
         let link = block_in_place_or_warn(|| {
             self.handle
                 .block_on(async { self.registry.get_or_open(cfg).await.ok() })
         })?;
-        link.link_alarm_severity_with(sevr)
+        link.link_alarm_severity_with(&field, sevr)
     }
 
     fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
@@ -1006,6 +1029,7 @@ impl LinkSet for PvaLinkResolver {
         // wrong link's option. pvxs `pvaLinkConfig::time` is per-link.
         let cfg = self.inp_cfg_for(full);
         let want_time = cfg.time;
+        let field = cfg.field.clone();
         let link = block_in_place_or_warn(|| {
             self.handle
                 .block_on(async { self.registry.get_or_open(cfg).await.ok() })
@@ -1019,7 +1043,7 @@ impl LinkSet for PvaLinkResolver {
         if !want_time {
             return None;
         }
-        link.time_stamp()
+        link.time_stamp(&field)
     }
 
     fn link_metadata(&self, name: &str) -> Option<epics_base_rs::server::database::LinkMetadata> {
@@ -1053,16 +1077,32 @@ impl LinkSet for PvaLinkResolver {
     }
 
     fn link_names(&self) -> Vec<String> {
-        // surface the opened INP upstream PV names so the
+        // surface one identity per opened INP monitor variant so the
         // base iocInit external-link wait
-        // (`PvDatabase::wait_for_external_links`) waits for pvalinks to
-        // connect, exactly as CA links already do. The returned names
-        // are the bare upstream PV names — the same key family
-        // `is_connected(name)` resolves through `try_get_any(.., Inp)` —
-        // so the wait's per-name `is_connected` query lands on the
-        // right link. OUT links are excluded: they install no monitor
-        // and have no connection signal this resolver can report.
-        self.registry.inp_link_names()
+        // (`PvDatabase::wait_for_external_links`) waits for every
+        // pvalink monitor to connect, exactly as CA links already do.
+        //
+        // Each name is a canonical link string that round-trips back to
+        // the same `(pv_name, pipeline, queue_size)` variant when base
+        // hands it to `is_connected(name)`: a bare PV name for the
+        // default variant, or `PV?pipeline=…&Q=…` for a non-default one.
+        // Two records on the same PV with different `Q` / `pipeline`
+        // therefore each get their own wait entry, and the per-name
+        // `is_connected` query lands on that record's own monitor
+        // (BRIDGE-RS-2026-05-28-128). OUT links are excluded: they
+        // install no monitor and have no connection signal to report.
+        let default_q = PvaLinkConfig::defaults_for("", LinkDirection::Inp).queue_size;
+        self.registry
+            .inp_identities()
+            .into_iter()
+            .map(|(pv, pipeline, qsize)| {
+                if !pipeline && qsize == default_q {
+                    pv
+                } else {
+                    format!("{pv}?pipeline={pipeline}&Q={qsize}")
+                }
+            })
+            .collect()
     }
 }
 
@@ -1315,15 +1355,20 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                         })
                         .collect(),
                 )),
-                // A remote `uint[]` is 32-bit; `EpicsValue` has no
-                // unsigned-32 array variant, so it keeps the existing
-                // `LongArray` (i32) mapping — width-preserving, only
-                // a sign reinterpretation.
-                ScalarValue::UInt(_) => Some(EpicsValue::LongArray(
+                // a remote `uint[]` is unsigned 32-bit and the
+                // link advertises DBF_ULONG metadata; the prior
+                // `LongArray` (i32) mapping sign-cast every element
+                // above i32::MAX, contradicting that metadata. Preserve
+                // the unsigned value losslessly as `Int64Array`, the
+                // same width-preserving contract `long[] => Int64Array`
+                // / `ulong[] => UInt64Array` use here (pvxs routes
+                // DBR_ULONG arrays through `ArrayType::UInt32`,
+                // `pvxs/ioc/pvalink_lset.cpp:287-325`).
+                ScalarValue::UInt(_) => Some(EpicsValue::Int64Array(
                     arr.iter()
                         .filter_map(|s| {
                             if let ScalarValue::UInt(v) = s {
-                                Some(*v as i32)
+                                Some(*v as i64)
                             } else {
                                 None
                             }
@@ -1413,9 +1458,12 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                 TypedScalarArray::UShort(a) => Some(EpicsValue::ShortArray(
                     a.iter().map(|v| *v as i16).collect(),
                 )),
-                TypedScalarArray::UInt(a) => {
-                    Some(EpicsValue::LongArray(a.iter().map(|v| *v as i32).collect()))
-                }
+                // unsigned 32-bit; widen losslessly to `Int64Array`
+                // to agree with the link's DBF_ULONG metadata (same
+                // reasoning as the generic `uint[]` arm above).
+                TypedScalarArray::UInt(a) => Some(EpicsValue::Int64Array(
+                    a.iter().map(|v| *v as i64).collect(),
+                )),
                 // a remote `ulong[]` is 64-bit per element;
                 // preserve the full width as `UInt64Array`.
                 TypedScalarArray::ULong(a) => Some(EpicsValue::UInt64Array(a.to_vec())),
@@ -1451,7 +1499,17 @@ fn scalar_to_epics(sv: &ScalarValue) -> EpicsValue {
         ScalarValue::Short(v) => EpicsValue::Short(*v),
         ScalarValue::Byte(v) => EpicsValue::Char(*v as u8),
         ScalarValue::ULong(v) => EpicsValue::UInt64(*v),
-        ScalarValue::UInt(v) => EpicsValue::Long(*v as i32),
+        // a remote PVA `uint` is unsigned 32-bit and the link
+        // advertises DBF_ULONG metadata (`link.rs` `ScalarValue::UInt
+        // => LinkDbfType::ULong`, mirroring pvxs `pvaGetDBFtype`
+        // `TypeCode::UInt32 => DBF_ULONG`, `pvxs/ioc/pvalink_lset.cpp:215-223`).
+        // Carrying it as `EpicsValue::Long` (i32) sign-casts any value
+        // above i32::MAX (e.g. 0x8000_0000 → -2147483648), so the
+        // record would consume a negative value the unsigned metadata
+        // never promised. Widen losslessly to `Int64`, matching the
+        // `Long => Int64` / `ULong => UInt64` width-preserving contract
+        // above; the owning record narrows to its field type.
+        ScalarValue::UInt(v) => EpicsValue::Int64(*v as i64),
         ScalarValue::UShort(v) => EpicsValue::Short(*v as i16),
         // DBF_CHAR is signed (pvByte). Widen UByte to Short so the
         // unsigned 128..255 range survives the cross-protocol hop.
@@ -1656,6 +1714,49 @@ mod tests {
         );
     }
 
+    /// A remote PVA `uint` / `uint[]` is unsigned 32-bit, and the link
+    /// advertises DBF_ULONG metadata. The INP conversion previously
+    /// carried it as `EpicsValue::Long` / `LongArray` (i32), sign-casting
+    /// any value above i32::MAX to a negative number — contradicting the
+    /// unsigned metadata. It must now widen losslessly to `Int64` /
+    /// `Int64Array` (pvxs maps `TypeCode::UInt32 => DBF_ULONG` and routes
+    /// the arrays through `ArrayType::UInt32`,
+    /// `pvxs/ioc/pvalink_lset.cpp:215-223`, `:287-325`).
+    #[test]
+    fn inp_uint_preserves_unsigned_value_above_i32_max() {
+        use epics_pva_rs::pvdata::TypedScalarArray;
+
+        // 0x8000_0000 = 2147483648: the smallest u32 that overflows i32.
+        let big: u32 = 0x8000_0000;
+        let big_i: i64 = 2_147_483_648;
+
+        // Scalar `uint` → `Int64` (positive, not the sign-cast -2147483648).
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::Scalar(ScalarValue::UInt(big))),
+            Some(EpicsValue::Int64(big_i)),
+            "remote uint scalar above i32::MAX must stay unsigned, not sign-cast negative"
+        );
+
+        // Untyped `uint[]` → `Int64Array`.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArray(vec![
+                ScalarValue::UInt(big),
+                ScalarValue::UInt(1),
+            ])),
+            Some(EpicsValue::Int64Array(vec![big_i, 1])),
+            "remote uint[] above i32::MAX must stay unsigned per element"
+        );
+
+        // Typed-fast-path `uint[]` → `Int64Array`.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::UInt(
+                vec![big, 2].into()
+            ))),
+            Some(EpicsValue::Int64Array(vec![big_i, 2])),
+            "typed remote uint[] above i32::MAX must stay unsigned per element"
+        );
+    }
+
     // ---- B3: monitor-notification forwarder wiring ----
 
     use crate::pvalink::config::SevrMode;
@@ -1666,6 +1767,13 @@ mod tests {
         s.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(v))));
         PvField::Structure(s)
+    }
+
+    /// The default-variant [`MonitorKey`] for `pv` — the identity a
+    /// bare / default-`Q` INP link registers under (matches the key
+    /// `open_link_for_record` derives via `MonitorKey::from_config`).
+    fn mk(pv: &str) -> MonitorKey {
+        MonitorKey::from_config(&default_inp_cfg(pv))
     }
 
     /// A minimal record whose `process()` bumps a shared counter, so
@@ -1715,43 +1823,42 @@ mod tests {
         .await
         .unwrap();
 
-        // CP-style target: always=true so every event scans.
+        // CP target: scans on every event.
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
             record: "DEST".to_string(),
-            always: true,
             monorder: 0,
             atomic: false,
             passive_only: false,
-            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
-                ("SRC".to_string(), fanout),
+                (mk("SRC"), fanout),
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
-        let forwarder = tokio::spawn(run_notify_forwarder(
-            "SRC".to_string(),
-            rx,
-            scan_targets,
-            db_slot,
-        ));
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
+        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
 
         // Two distinct values → two scans.
-        tx.send(nt_scalar(1.0)).await.unwrap();
-        tx.send(nt_scalar(2.0)).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(2.0))).await.unwrap();
         drop(tx); // close channel so the forwarder loop ends
         forwarder.await.unwrap();
 
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
-    /// B3: with `always=false` (a `CPP` link) a no-op update — same
-    /// leaf value — does NOT re-process the record.
+    /// BRIDGE-RS-2026-05-28-51: repeated *identical* monitor values still
+    /// process a CP target on EVERY event. pvxs has no value-difference
+    /// gate and ignores the `always` option at scan time
+    /// (`pvxs/documentation/pvalink.rst:102`,
+    /// `pvxs/ioc/pvalink_channel.cpp:389-431`), so event-driven side
+    /// effects (timestamps, counters, FLNK chains) fire on every post.
+    /// Pre-fix the forwarder suppressed no-op updates unless `always`,
+    /// diverging from upstream.
     #[tokio::test]
-    async fn b3_forwarder_skips_unchanged_value_when_not_always() {
+    async fn br51_repeated_identical_values_still_scan() {
         let db = PvDatabase::new();
         let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         db.add_record(
@@ -1766,35 +1873,109 @@ mod tests {
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
             record: "DEST".to_string(),
-            always: false,
             monorder: 0,
             atomic: false,
             passive_only: false,
-            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
-                ("SRC".to_string(), fanout),
+                (mk("SRC"), fanout),
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
-        let forwarder = tokio::spawn(run_notify_forwarder(
-            "SRC".to_string(),
-            rx,
-            scan_targets,
-            db_slot,
-        ));
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
+        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
 
-        // 1.0 (change), 1.0 (no-op → skipped), 3.0 (change).
-        tx.send(nt_scalar(1.0)).await.unwrap();
-        tx.send(nt_scalar(1.0)).await.unwrap();
-        tx.send(nt_scalar(3.0)).await.unwrap();
+        // Three identical values — pvxs processes all three.
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
 
-        // Only the two changed events scanned.
-        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "every identical monitor event must still scan (no no-op suppression)"
+        );
+    }
+
+    /// A `Disconnected` lifecycle event scans CP and passive-CPP
+    /// targets even though no value accompanies it, so the owning
+    /// record processes the upstream disconnect (and can expose
+    /// LINK_ALARM/INVALID). pvxs runs the same scan loop after the
+    /// `catch(client::Disconnect&)` branch as after a value update
+    /// (`pvxs/ioc/pvalink_channel.cpp:359-373` + `:420-432`).
+    ///
+    /// Pre-fix the forwarder channel carried only `PvField` values, so
+    /// a disconnect produced no event and the record was never
+    /// processed until some later unrelated trigger — here that would
+    /// leave each count at 1 (the single value) instead of 2.
+    #[tokio::test]
+    async fn forwarder_scans_cp_and_passive_cpp_on_disconnect() {
+        let db = PvDatabase::new();
+        let cp_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cpp_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        db.add_record(
+            "CP_REC",
+            Box::new(CountingRecord {
+                count: cp_count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        // CPP target's owner defaults to SCAN=Passive, so the
+        // `passive_only` gate admits it.
+        db.add_record(
+            "CPP_REC",
+            Box::new(CountingRecord {
+                count: cpp_count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut fanout = ScanFanout::default();
+        // CP: scans on every event, not passive-restricted.
+        fanout.records.push(ScanTarget {
+            record: "CP_REC".to_string(),
+            monorder: 0,
+            atomic: false,
+            passive_only: false,
+        });
+        // CPP: passive-restricted; owner is Passive so it is eligible.
+        fanout.records.push(ScanTarget {
+            record: "CPP_REC".to_string(),
+            monorder: 1,
+            atomic: false,
+            passive_only: true,
+        });
+        let scan_targets: ScanTargetMap =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
+                (mk("SRC"), fanout),
+            ])));
+        let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
+        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
+
+        // One value (each target scans once), then a disconnect with no
+        // trailing value (each target must scan again).
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
+        tx.send(ScanEvent::Disconnected).await.unwrap();
+        drop(tx);
+        forwarder.await.unwrap();
+
+        assert_eq!(
+            cp_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "CP target must process on the value AND the disconnect"
+        );
+        assert_eq!(
+            cpp_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "passive CPP target must process on the value AND the disconnect"
+        );
     }
 
     /// B3: a pvalink-driven update fans out through the owning
@@ -1835,27 +2016,20 @@ mod tests {
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
             record: "DEST".to_string(),
-            always: true,
             monorder: 0,
             atomic: false,
             passive_only: false,
-            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
-                ("SRC".to_string(), fanout),
+                (mk("SRC"), fanout),
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
-        let forwarder = tokio::spawn(run_notify_forwarder(
-            "SRC".to_string(),
-            rx,
-            scan_targets,
-            db_slot,
-        ));
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
+        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
 
-        tx.send(nt_scalar(5.0)).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(5.0))).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
 
@@ -1879,7 +2053,7 @@ mod tests {
             .await;
         // Scan target registered under the bare PV name.
         let targets = resolver.scan_targets.read();
-        let fanout = targets.get("SRC:PV").expect("scan target registered");
+        let fanout = targets.get(&mk("SRC:PV")).expect("scan target registered");
         assert_eq!(fanout.records.len(), 1);
         assert_eq!(fanout.records[0].record, "MY:REC");
         drop(targets);
@@ -1900,7 +2074,7 @@ mod tests {
         let _ = resolver
             .open_link_for_record("pva://OTHER:PV?proc=NPP", "REC2")
             .await;
-        assert!(resolver.scan_targets.read().get("OTHER:PV").is_none());
+        assert!(resolver.scan_targets.read().get(&mk("OTHER:PV")).is_none());
     }
 
     /// B2 through the resolver: `open_link` retains `sevr` so a later
@@ -1969,19 +2143,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extract_leaf_walks_dotted_path() {
-        let mut alarm = PvStructure::new("alarm_t");
-        alarm
-            .fields
-            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(2))));
-        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
-        root.fields
-            .push(("alarm".into(), PvField::Structure(alarm)));
-        let leaf = extract_leaf(&PvField::Structure(root), "alarm.severity");
-        assert!(matches!(leaf, PvField::Scalar(ScalarValue::Int(2))));
-    }
-
     // ---- B4: local / atomic / monorder forwarder effects ----
 
     /// A record that appends its name to a shared log on `process()`,
@@ -2035,51 +2196,38 @@ mod tests {
         // Non-atomic, monorder 1 / -1.
         fanout.records.push(ScanTarget {
             record: "C".into(),
-            always: true,
             monorder: 1,
             atomic: false,
             passive_only: false,
-            field: String::new(),
         });
         fanout.records.push(ScanTarget {
             record: "D".into(),
-            always: true,
             monorder: -1,
             atomic: false,
             passive_only: false,
-            field: String::new(),
         });
         // Atomic, monorder 5 / 0.
         fanout.records.push(ScanTarget {
             record: "A".into(),
-            always: true,
             monorder: 5,
             atomic: true,
             passive_only: false,
-            field: String::new(),
         });
         fanout.records.push(ScanTarget {
             record: "B".into(),
-            always: true,
             monorder: 0,
             atomic: true,
             passive_only: false,
-            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
-                ("SRC".to_string(), fanout),
+                (mk("SRC"), fanout),
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
-        let forwarder = tokio::spawn(run_notify_forwarder(
-            "SRC".to_string(),
-            rx,
-            scan_targets,
-            db_slot,
-        ));
-        tx.send(nt_scalar(1.0)).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(4);
+        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
 
@@ -2088,8 +2236,12 @@ mod tests {
         assert_eq!(*log.lock(), vec!["B", "A", "D", "C"]);
     }
 
-    /// B4 `atomic`: an atomic CPP-style target (`always=false`) still
-    /// scans on a no-op update — atomic siblings stay consistent.
+    /// B4 `atomic`: an atomic target scans on every monitor event,
+    /// including a repeated identical value. Post-BRIDGE-RS-2026-05-28-51
+    /// this is the same rule that governs every CP/CPP target (no no-op
+    /// suppression); the test is retained to guard the atomic path
+    /// specifically, since atomic targets run under the shared
+    /// multi-record lock.
     #[tokio::test]
     async fn b4_atomic_scans_even_on_no_op_update() {
         let db = PvDatabase::new();
@@ -2105,28 +2257,20 @@ mod tests {
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
             record: "DEST".into(),
-            always: false, // CPP
             monorder: 0,
             atomic: true, // but atomic → scans anyway
             passive_only: false,
-            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
-                ("SRC".to_string(), fanout),
+                (mk("SRC"), fanout),
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
-        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
-        let forwarder = tokio::spawn(run_notify_forwarder(
-            "SRC".to_string(),
-            rx,
-            scan_targets,
-            db_slot,
-        ));
-        // Two identical values: the 2nd is a no-op. A plain CPP link
-        // would scan once; atomic makes it scan both times.
-        tx.send(nt_scalar(1.0)).await.unwrap();
-        tx.send(nt_scalar(1.0)).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(4);
+        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
+        // Two identical values: both scan (pvxs does no value-diff).
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -2309,15 +2453,14 @@ mod tests {
         // Scan target must be registered under the bare PV name.
         let targets = resolver.scan_targets.read();
         let fanout = targets
-            .get("TARGET:AI")
+            .get(&mk("TARGET:AI"))
             .expect("CPP target must be registered");
         assert_eq!(fanout.records[0].record, "MY:RECORD");
         assert!(fanout.records[0].passive_only, "CPP must set passive_only");
-        // ScanTarget carries per-link field.
-        assert_eq!(
-            fanout.records[0].field, "display.precision",
-            "ScanTarget.field must reflect the per-link field selector"
-        );
+        // The per-link `field` selector lives in the link config
+        // (applied at read time), asserted via `cfg.field` above — pvxs
+        // resolves `fieldName` per-link at the lset getter, not in the
+        // scan fan-out.
     }
 
     /// a DB record can write a pvalink in the *legacy
@@ -2395,12 +2538,12 @@ mod tests {
         // form — the suffix string must never become a registry key.
         let targets = resolver.scan_targets.read();
         let fanout = targets
-            .get("TARGET:AI")
+            .get(&mk("TARGET:AI"))
             .expect("CPP target must be registered under the bare PV name");
         assert_eq!(fanout.records[0].record, "MY:RECORD");
         assert!(fanout.records[0].passive_only, "CPP must set passive_only");
         assert!(
-            targets.get("TARGET:AI CPP MS").is_none(),
+            targets.get(&mk("TARGET:AI CPP MS")).is_none(),
             "suffix string must never become a scan-target key"
         );
     }
@@ -2451,10 +2594,12 @@ mod tests {
         );
 
         // ScanTargets must also be independent per-link — each record
-        // gets its own entry with its own field.
+        // gets its own entry with its own proc mode (CPP vs CP). The
+        // per-link `field` is verified at the `cfg` level above (it is
+        // applied at read time, not in the scan fan-out).
         let targets = resolver.scan_targets.read();
         let fanout = targets
-            .get("TARGET:PV")
+            .get(&mk("TARGET:PV"))
             .expect("scan targets registered for TARGET:PV");
         let rec_a = fanout
             .records
@@ -2466,16 +2611,139 @@ mod tests {
             .iter()
             .find(|t| t.record == "RECORD:B")
             .expect("RECORD:B must be in scan targets");
-        assert_eq!(
-            rec_a.field, "alarm.severity",
-            "RECORD:A ScanTarget.field wrong"
-        );
-        assert_eq!(rec_b.field, "value", "RECORD:B ScanTarget.field wrong");
         assert!(rec_a.passive_only, "RECORD:A must be CPP (passive_only)");
         assert!(
             !rec_b.passive_only,
             "RECORD:B must be CP (not passive_only)"
         );
+    }
+
+    /// BRIDGE-RS-2026-05-28-128: two records linking the SAME upstream
+    /// PV with different `Q` are distinct monitor variants (distinct
+    /// pvxs subscriptions, `pvxs/ioc/pvalink.h:115-120`). Their CP scan
+    /// fan-out must land in SEPARATE [`MonitorKey`] buckets — pre-fix
+    /// both collapsed onto one bare-PV-name entry, so a `Q=1` record
+    /// could be driven by the `Q=64` monitor's events, and only one
+    /// forwarder spawned for both. The base iocInit wait
+    /// (`link_names`) must likewise list BOTH variants so each monitor's
+    /// connection is awaited independently.
+    #[tokio::test]
+    async fn br128_distinct_q_variants_do_not_collapse() {
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+
+        // Same PV, CP scan, but different queue depths → two variants.
+        let _ = resolver
+            .open_link_for_record("pva://VAR:PV?proc=CP&Q=1", "REC:Q1")
+            .await;
+        let _ = resolver
+            .open_link_for_record("pva://VAR:PV?proc=CP&Q=64", "REC:Q64")
+            .await;
+
+        let targets = resolver.scan_targets.read();
+        let key_q1 = MonitorKey {
+            pv_name: "VAR:PV".to_string(),
+            pipeline: false,
+            queue_size: 1,
+        };
+        let key_q64 = MonitorKey {
+            pv_name: "VAR:PV".to_string(),
+            pipeline: false,
+            queue_size: 64,
+        };
+        let fan_q1 = targets
+            .get(&key_q1)
+            .expect("Q=1 variant must have its own scan fan-out");
+        let fan_q64 = targets
+            .get(&key_q64)
+            .expect("Q=64 variant must have its own scan fan-out");
+        assert_eq!(
+            fan_q1.records.len(),
+            1,
+            "Q=1 fan-out must hold only its own record"
+        );
+        assert_eq!(fan_q1.records[0].record, "REC:Q1");
+        assert_eq!(
+            fan_q64.records.len(),
+            1,
+            "Q=64 fan-out must not inherit the Q=1 record"
+        );
+        assert_eq!(fan_q64.records[0].record, "REC:Q64");
+        drop(targets);
+
+        // Both monitor variants must appear in the iocInit wait set,
+        // each rendered as an identity that round-trips back to its own
+        // variant; the default-Q form is bare, non-default carries the
+        // query.
+        let mut names = resolver.link_names();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "VAR:PV?pipeline=false&Q=1".to_string(),
+                "VAR:PV?pipeline=false&Q=64".to_string(),
+            ],
+            "both Q variants must be waited on independently"
+        );
+    }
+
+    /// BRIDGE-RS-2026-05-28-37: the `pipeline` dimension of the monitor
+    /// identity must also separate variants — a default link and a
+    /// `Q=1&pipeline=true` link to the same PV are distinct monitor
+    /// channels (distinct pvRequest, `pvxs/ioc/pvalink_link.cpp:49-65`,
+    /// `pvxs/ioc/pvalink_lset.cpp:99-122`). Each must open its OWN
+    /// cached link (its own monitor receiver) and register its scan
+    /// fan-out under its own [`MonitorKey`], rather than the default
+    /// link satisfying both reads and CP scans for the pipelined one.
+    #[tokio::test]
+    async fn br37_pipeline_variant_opens_its_own_monitor() {
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+
+        // Default variant (no query options) and a pipelined Q=1 variant
+        // of the SAME PV, both CP so each registers a scan target.
+        let _ = resolver
+            .open_link_for_record("pva://PIPE:PV?proc=CP", "REC:DEF")
+            .await;
+        let _ = resolver
+            .open_link_for_record("pva://PIPE:PV?proc=CP&Q=1&pipeline=true", "REC:PIPE")
+            .await;
+
+        let default_q = PvaLinkConfig::defaults_for("", LinkDirection::Inp).queue_size;
+
+        // Each variant opened its OWN cached link (own monitor receiver).
+        let link_def = resolver
+            .registry
+            .try_get_inp("PIPE:PV", false, default_q)
+            .expect("default variant link must exist");
+        let link_pipe = resolver
+            .registry
+            .try_get_inp("PIPE:PV", true, 1)
+            .expect("pipelined Q=1 variant link must exist");
+        assert!(
+            !Arc::ptr_eq(&link_def, &link_pipe),
+            "pipeline/Q-distinct variants must not share one monitor"
+        );
+
+        // Scan fan-out is keyed per variant: each holds only its own
+        // record, never the sibling's.
+        let targets = resolver.scan_targets.read();
+        let fan_def = targets
+            .get(&MonitorKey {
+                pv_name: "PIPE:PV".to_string(),
+                pipeline: false,
+                queue_size: default_q,
+            })
+            .expect("default variant scan fan-out");
+        let fan_pipe = targets
+            .get(&MonitorKey {
+                pv_name: "PIPE:PV".to_string(),
+                pipeline: true,
+                queue_size: 1,
+            })
+            .expect("pipelined variant scan fan-out");
+        assert_eq!(fan_def.records.len(), 1);
+        assert_eq!(fan_def.records[0].record, "REC:DEF");
+        assert_eq!(fan_pipe.records.len(), 1);
+        assert_eq!(fan_pipe.records[0].record, "REC:PIPE");
     }
 
     /// #2: with no QSRV provider wired (pvalink-only deployment), the
@@ -2585,33 +2853,24 @@ mod tests {
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
             record: "AT:A".into(),
-            always: true,
             monorder: 0,
             atomic: true,
             passive_only: false,
-            field: "value".into(),
         });
         fanout.records.push(ScanTarget {
             record: "AT:B".into(),
-            always: true,
             monorder: 1,
             atomic: true,
             passive_only: false,
-            field: "value".into(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
-                ("SRC".to_string(), fanout),
+                (mk("SRC"), fanout),
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db.clone())));
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
-        let forwarder = tokio::spawn(run_notify_forwarder(
-            "SRC".to_string(),
-            rx,
-            scan_targets,
-            db_slot,
-        ));
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(4);
+        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
 
         // Competing party: contends for an epoch over an atomic
         // target record (AT:B). It waits until the forwarder is
@@ -2626,7 +2885,7 @@ mod tests {
             competitor_log.lock().push("EXTERNAL".to_string());
         });
 
-        tx.send(nt_scalar(1.0)).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
         competitor.await.unwrap();

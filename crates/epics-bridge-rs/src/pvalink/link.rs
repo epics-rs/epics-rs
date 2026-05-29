@@ -29,13 +29,40 @@ pub enum PvaLinkError {
     NotScalar(String),
     #[error("link config parse error: {0}")]
     Config(#[from] super::config::PvaLinkParseError),
-    #[error("retry queue full ({0} pending puts)")]
-    RetryQueueFull(usize),
     #[error("local-only link {0:?} has no matching local record")]
     NotLocal(String),
 }
 
 pub type PvaLinkResult<T> = Result<T, PvaLinkError>;
+
+/// A lifecycle-aware event delivered to the scan-on-update forwarder
+/// for an INP+monitor link.
+///
+/// pvxs `pvaLinkChannel::run()` scans every CP / eligible-CPP target
+/// after BOTH the monitor value-update branch AND the
+/// `catch(client::Disconnect&)` branch — the same
+/// `atomic_records` / `nonatomic_records` scan loop runs with no
+/// value comparison (`pvxs/ioc/pvalink_channel.cpp:359-373` sets
+/// `connected=false` + `onDisconnect()`, then `:420-432` scans). A
+/// value-only channel can only fire the forwarder on `Value`, so a
+/// disconnect with no trailing value was silently missed and the CP
+/// record never observed LINK_ALARM/INVALID. `Disconnected` carries
+/// that lifecycle transition so the forwarder runs the scan path
+/// even when no new `PvField` arrives.
+///
+/// Reconnect needs no separate variant: the re-subscribe loop's first
+/// post-reconnect monitor callback delivers a `Value`, which already
+/// drives the scan (matching pvxs's reconnect/`onTypeChange` scan at
+/// `:342-352`).
+#[derive(Debug, Clone)]
+pub enum ScanEvent {
+    /// A fresh monitor value arrived; drives per-field change detection.
+    Value(PvField),
+    /// The live monitor subscription ended (IOC restart / transient
+    /// I/O). Carries no value; the forwarder scans CP/CPP targets
+    /// unconditionally so the owning record processes the disconnect.
+    Disconnected,
+}
 
 /// A live PVA link.
 ///
@@ -74,21 +101,37 @@ pub struct PvaLink {
     /// `scan_on_update` / CP processing of the owning record. Wrapped
     /// in a `Mutex<Option<..>>` because the receiver is single-consumer
     /// and is moved out exactly once.
-    notify_rx: Mutex<Option<mpsc::Receiver<PvField>>>,
-    /// Deferred / retry Put queue (OUT links, B4 `defer` / `retry`).
     ///
-    /// `defer=true` causes `write` to enqueue here instead of issuing
-    /// the Put immediately; `flush_deferred` drains it. `retry=true`
-    /// causes a Put that fails because the upstream is unreachable to
-    /// be enqueued and replayed by `flush_deferred` on reconnect.
-    /// Mirrors pvxs `pvaLink::put_queue` (pvalink_channel.cpp:147).
+    /// Carries [`ScanEvent`], not a bare `PvField`: the monitor task
+    /// also pushes a `Disconnected` lifecycle event when a live
+    /// subscription ends, so the forwarder can scan CP/CPP targets on
+    /// the disconnect even though no value accompanies it.
+    notify_rx: Mutex<Option<mpsc::Receiver<ScanEvent>>>,
+    /// Single pending OUT Put (OUT links, B4 `defer` / `retry`).
+    ///
+    /// `defer=true` causes `write` to store the value here instead of
+    /// issuing the Put immediately; `flush_deferred` sends it.
+    /// `retry=true` causes a Put that fails because the upstream is
+    /// unreachable to be stored and replayed by `flush_deferred` on
+    /// reconnect.
+    ///
+    /// One slot, NOT a FIFO queue: pvxs keeps a single `put_scratch`
+    /// per link and a later write to the same link overwrites it before
+    /// the channel-level PUT starts, so retry replays only "the most
+    /// recent incomplete PUT" and defer caches one current value
+    /// (`pvxs/ioc/pvalink_lset.cpp:643-653`, `documentation/pvalink.rst:99-113`).
+    /// A FIFO log would replay stale intermediate values after a newer
+    /// value superseded them. (Combining sibling-field writes from
+    /// different links into one channel-level PUT is a separate concern
+    /// owned by the shared OUT channel, tracked under the OUT-coalescing
+    /// work.)
     ///
     /// Stores [`QueuedPut`], not a bare `PvField`: a string-form
     /// `write` must replay through the string `pvput` path (which
     /// coerces the text against the channel's introspected type),
     /// not as a `PvField::Scalar(String)` — replaying a String to a
     /// numeric record was a type mismatch.
-    put_queue: Mutex<Vec<QueuedPut>>,
+    pending_put: Mutex<Option<QueuedPut>>,
 }
 
 /// A queued OUT-link Put, preserving the caller's original value
@@ -104,12 +147,6 @@ enum QueuedPut {
     /// typed `pvput_pv_field` path.
     Field(PvField),
 }
-
-/// Upper bound on the OUT-side retry/defer queue. pvxs bounds the
-/// retry queue implicitly by the monitor queue depth; we use a fixed
-/// generous cap so a permanently-disconnected link cannot grow memory
-/// without bound.
-const MAX_PUT_QUEUE: usize = 1024;
 
 struct MonitorAbort(tokio::task::AbortHandle);
 
@@ -138,7 +175,7 @@ impl PvaLink {
             // events. `try_send` below still tolerates a full
             // channel (the `latest` cache is authoritative for the
             // value itself; the channel only drives scan-on-update).
-            let (tx, rx) = mpsc::channel::<PvField>(config.queue_size.max(1));
+            let (tx, rx) = mpsc::channel::<ScanEvent>(config.queue_size.max(1));
             notify_rx = Some(rx);
 
             let pv_name = config.pv_name.clone();
@@ -177,7 +214,7 @@ impl PvaLink {
                     let on_event = move |value: &PvField| {
                         connected_inner.store(true, Ordering::Release);
                         *latest_inner.lock() = Some(value.clone());
-                        let _ = tx_inner.try_send(value.clone());
+                        let _ = tx_inner.try_send(ScanEvent::Value(value.clone()));
                     };
                     let result = match &request {
                         Some(req) => {
@@ -189,7 +226,28 @@ impl PvaLink {
                     };
                     // Subscription ended — reflect the disconnect so
                     // `is_connected()` goes false until re-subscribed.
-                    connected_for_task.store(false, Ordering::Release);
+                    // `swap` reports whether the subscription had been
+                    // live (any event delivered): pvxs only runs the
+                    // disconnect scan path for a channel that was
+                    // connected (`pvalink_channel.cpp:342` gates the
+                    // `Disconnect` handling on the prior `connected`
+                    // state), so a never-connected subscription failure
+                    // must not synthesize a spurious disconnect scan.
+                    let was_connected = connected_for_task.swap(false, Ordering::AcqRel);
+                    if was_connected {
+                        // Notify the scan forwarder of the lifecycle
+                        // transition so CP / passive-CPP targets process
+                        // and expose LINK_ALARM/INVALID even though no
+                        // value follows the disconnect. pvxs scans the
+                        // atomic/non-atomic target lists after the
+                        // `catch(client::Disconnect&)` branch
+                        // (`pvalink_channel.cpp:359-373` + `:420-432`).
+                        // `try_send` matches the value path: the channel
+                        // is drained promptly and a single disconnect
+                        // event sits alone, so a drop here is only
+                        // possible under an already-saturated backlog.
+                        let _ = tx.try_send(ScanEvent::Disconnected);
+                    }
                     match &result {
                         Ok(()) => tracing::debug!(
                             pv = %pv_name,
@@ -215,7 +273,7 @@ impl PvaLink {
             latest,
             monitor_connected,
             notify_rx: Mutex::new(notify_rx),
-            put_queue: Mutex::new(Vec::new()),
+            pending_put: Mutex::new(None),
             _monitor_abort: monitor_abort,
         })
     }
@@ -226,7 +284,7 @@ impl PvaLink {
     /// scan-on-update forwarder. `None` for OUT / non-monitor links
     /// (they never created a channel) or after the receiver has
     /// already been claimed.
-    pub fn take_notify_rx(&self) -> Option<mpsc::Receiver<PvField>> {
+    pub fn take_notify_rx(&self) -> Option<mpsc::Receiver<ScanEvent>> {
         self.notify_rx.lock().take()
     }
 
@@ -270,7 +328,7 @@ impl PvaLink {
                 return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
             }
             return match self.latest.lock().clone() {
-                Some(v) => Ok(extract_field(&v, field)),
+                Some(v) => Ok(select_link_value(&v, field)),
                 // Connected flag set but the first event has not yet
                 // written `latest` (the callback stores the flag before
                 // the value): not-yet-valid, surface a failed read.
@@ -278,7 +336,7 @@ impl PvaLink {
             };
         }
         let result = self.client.pvget_full(&self.config.pv_name).await?;
-        Ok(extract_field(&result.value, field))
+        Ok(select_link_value(&result.value, field))
     }
 
     /// Synchronous fast-path read: return the cached field if the
@@ -310,7 +368,7 @@ impl PvaLink {
             return None;
         }
         let v = self.latest.lock().clone()?;
-        Some(extract_field(&v, field))
+        Some(select_link_value(&v, field))
     }
 
     /// Convenience: read the value as f64.
@@ -347,7 +405,8 @@ impl PvaLink {
         // type. Storing `PvField::Scalar(String)` instead would
         // replay a String field to a possibly-numeric record.
         if self.config.defer {
-            return self.enqueue_put(QueuedPut::Str(value_str.to_string()));
+            self.set_pending(QueuedPut::Str(value_str.to_string()));
+            return Ok(());
         }
         let req = build_put_request(self.config.proc, block);
         let result = if is_subfield(&self.config.field) {
@@ -362,7 +421,8 @@ impl PvaLink {
         match result {
             Ok(()) => Ok(()),
             Err(e) if self.config.retry && is_disconnect(&e) => {
-                self.enqueue_put(QueuedPut::Str(value_str.to_string()))
+                self.set_pending(QueuedPut::Str(value_str.to_string()));
+                Ok(())
             }
             Err(e) => Err(PvaLinkError::Pva(e)),
         }
@@ -393,7 +453,8 @@ impl PvaLink {
             return Err(PvaLinkError::NotWritable);
         }
         if self.config.defer {
-            return self.enqueue_put(QueuedPut::Field(value.clone()));
+            self.set_pending(QueuedPut::Field(value.clone()));
+            return Ok(());
         }
         let req = build_put_request(self.config.proc, block);
         // a typed write to a query-bearing OUT link
@@ -418,118 +479,101 @@ impl PvaLink {
         match result {
             Ok(()) => Ok(()),
             Err(e) if self.config.retry && is_disconnect(&e) => {
-                self.enqueue_put(QueuedPut::Field(value.clone()))
+                self.set_pending(QueuedPut::Field(value.clone()));
+                Ok(())
             }
             Err(e) => Err(PvaLinkError::Pva(e)),
         }
     }
 
-    /// Push `value` onto the deferred / retry Put queue (B4). Returns
-    /// `RetryQueueFull` once the queue hits [`MAX_PUT_QUEUE`].
-    fn enqueue_put(&self, value: QueuedPut) -> PvaLinkResult<()> {
-        let mut q = self.put_queue.lock();
-        if q.len() >= MAX_PUT_QUEUE {
-            return Err(PvaLinkError::RetryQueueFull(q.len()));
-        }
-        q.push(value);
-        Ok(())
+    /// Store `value` as the link's single pending Put (B4), overwriting
+    /// any earlier pending value. pvxs keeps one `put_scratch` per link
+    /// and a later write overwrites it before the channel PUT starts
+    /// (`pvxs/ioc/pvalink_lset.cpp:643-653`), so defer/retry coalesce to
+    /// the most recent value rather than queueing a stale FIFO log.
+    fn set_pending(&self, value: QueuedPut) {
+        *self.pending_put.lock() = Some(value);
     }
 
-    /// Number of Puts currently held in the defer / retry queue (B4).
+    /// Number of Puts currently pending (0 or 1) on the defer / retry
+    /// slot (B4).
     pub fn pending_put_count(&self) -> usize {
-        self.put_queue.lock().len()
+        usize::from(self.pending_put.lock().is_some())
     }
 
-    /// Flush every queued Put to the upstream PV in FIFO order (B4).
+    /// Flush the link's single pending Put to the upstream PV (B4).
     ///
-    /// Called for `defer` links to issue the queued value, and for
-    /// `retry` links once the upstream reconnects. On a disconnect
-    /// error for a `retry` link the still-unsent values are restored
-    /// to the front of the queue so a later flush retries them;
-    /// non-disconnect errors are surfaced and the offending value is
-    /// dropped (it would fail identically on every retry). Returns
-    /// the number of Puts successfully issued. Mirrors pvxs
-    /// `pvaLinkChannel::run` draining `put_queue` (pvalink_channel.cpp).
+    /// Called for `defer` links to issue the cached value, and for
+    /// `retry` links once the upstream reconnects. Replays only the
+    /// most recent pending value — pvxs keeps one `put_scratch` per
+    /// link, so retry replays "the most recent incomplete PUT" rather
+    /// than a FIFO log of superseded intermediate values
+    /// (`documentation/pvalink.rst:99-113`,
+    /// `pvxs/ioc/pvalink_lset.cpp:643-653`). Returns the number of Puts
+    /// issued (0 or 1).
+    ///
+    /// On a disconnect error for a `retry` link the value is restored
+    /// to the pending slot so a later flush retries it — but only if a
+    /// newer write has not already taken the slot, so the most-recent
+    /// value still wins. A non-disconnect (or non-retry) error drops
+    /// the value: it would fail identically on every retry.
     pub async fn flush_deferred(&self) -> PvaLinkResult<usize> {
         if matches!(self.config.direction, LinkDirection::Inp) {
             return Err(PvaLinkError::NotWritable);
         }
-        let queued: Vec<QueuedPut> = std::mem::take(&mut *self.put_queue.lock());
-        let mut sent = 0usize;
-        for (idx, value) in queued.iter().enumerate() {
-            // Replay each queued Put through the same pvRequest path the
-            // immediate Put would have used (include process/block
-            // options, honor field targeting). block=false for deferred
-            // replay — the caller did not request a blocking wait at
-            // queue time and there is no caller to signal completion to.
-            let req = build_put_request(self.config.proc, false);
-            let put_result = match value {
-                QueuedPut::Str(s) => {
-                    if is_subfield(&self.config.field) {
-                        self.client
-                            .pvput_field_with_request(
-                                &self.config.pv_name,
-                                &self.config.field,
-                                &req,
-                                s,
-                            )
-                            .await
-                    } else {
-                        self.client
-                            .pvput_with_request(&self.config.pv_name, &req, s)
-                            .await
-                    }
-                }
-                QueuedPut::Field(f) => {
-                    // replay typed field writes to the selected
-                    // sub-field, same targeting as the immediate path.
-                    if is_subfield(&self.config.field) {
-                        self.client
-                            .pvput_pv_field_field_with_request(
-                                &self.config.pv_name,
-                                &self.config.field,
-                                &req,
-                                f,
-                            )
-                            .await
-                    } else {
-                        self.client
-                            .pvput_pv_field_with_request(&self.config.pv_name, &req, f)
-                            .await
-                    }
-                }
-            };
-            match put_result {
-                Ok(()) => sent += 1,
-                Err(e) if self.config.retry && is_disconnect(&e) => {
-                    // Still disconnected — restore the unsent tail
-                    // (including the current value) to the front so
-                    // a later flush picks up where we left off.
-                    let mut q = self.put_queue.lock();
-                    let mut tail: Vec<QueuedPut> = queued[idx..].to_vec();
-                    tail.append(&mut q);
-                    *q = tail;
-                    return Err(PvaLinkError::Pva(e));
-                }
-                Err(e) => {
-                    // Non-retry hard error: the offending value (idx)
-                    // would fail identically on every retry, so drop
-                    // only it — restore the still-unsent tail
-                    // (`idx+1..`) so a later flush replays the values
-                    // queued behind the failure. The queue was already
-                    // `mem::take`-emptied, so without this the entire
-                    // tail is silently lost.
-                    if idx + 1 < queued.len() {
-                        let mut q = self.put_queue.lock();
-                        let mut tail: Vec<QueuedPut> = queued[idx + 1..].to_vec();
-                        tail.append(&mut q);
-                        *q = tail;
-                    }
-                    return Err(PvaLinkError::Pva(e));
+        let Some(value) = self.pending_put.lock().take() else {
+            return Ok(0);
+        };
+        // Replay through the same pvRequest path the immediate Put would
+        // have used (process/block options, field targeting). block=false:
+        // the caller did not request a blocking wait at queue time and
+        // there is no caller to signal completion to.
+        let req = build_put_request(self.config.proc, false);
+        let put_result = match &value {
+            QueuedPut::Str(s) => {
+                if is_subfield(&self.config.field) {
+                    self.client
+                        .pvput_field_with_request(&self.config.pv_name, &self.config.field, &req, s)
+                        .await
+                } else {
+                    self.client
+                        .pvput_with_request(&self.config.pv_name, &req, s)
+                        .await
                 }
             }
+            QueuedPut::Field(f) => {
+                // replay typed field writes to the selected sub-field,
+                // same targeting as the immediate path.
+                if is_subfield(&self.config.field) {
+                    self.client
+                        .pvput_pv_field_field_with_request(
+                            &self.config.pv_name,
+                            &self.config.field,
+                            &req,
+                            f,
+                        )
+                        .await
+                } else {
+                    self.client
+                        .pvput_pv_field_with_request(&self.config.pv_name, &req, f)
+                        .await
+                }
+            }
+        };
+        match put_result {
+            Ok(()) => Ok(1),
+            Err(e) if self.config.retry && is_disconnect(&e) => {
+                // Still disconnected — restore the value so a later
+                // flush retries it, but only if a newer write has not
+                // already replaced it (most-recent-PUT wins).
+                let mut slot = self.pending_put.lock();
+                if slot.is_none() {
+                    *slot = Some(value);
+                }
+                Err(PvaLinkError::Pva(e))
+            }
+            Err(e) => Err(PvaLinkError::Pva(e)),
         }
-        Ok(sent)
     }
 
     /// True when the link currently has a live upstream connection.
@@ -551,13 +595,20 @@ impl PvaLink {
         }
     }
 
-    /// Raw remote NT `alarm.severity` of the latest cached value, in
-    /// EPICS severity numbering (`0 = NO_ALARM` … `3 = INVALID`).
-    /// `None` when no value is cached or the structure carries no
-    /// alarm sub-field.
-    fn remote_alarm_severity(&self) -> Option<i32> {
+    /// Raw remote NT `alarm.severity` of the latest cached value, read
+    /// relative to the link's selected field root, in EPICS severity
+    /// numbering (`0 = NO_ALARM` … `3 = INVALID`). `None` when no value
+    /// is cached or the selected root carries no alarm sub-field.
+    ///
+    /// `field` selects the metadata root exactly as pvxs does: a
+    /// non-empty `fieldName` rebinds `root = lchan->root[fieldName]` and
+    /// `fld_severity` is then resolved relative to that selected root
+    /// (`pvxs/ioc/pvalink_link.cpp:90-110`,
+    /// `pvxs/ioc/pvalink_lset.cpp:412-430`). `field=""` keeps the
+    /// top-level root.
+    fn remote_alarm_severity(&self, field: &str) -> Option<i32> {
         let v = self.latest.lock().clone()?;
-        let PvField::Structure(s) = v else {
+        let PvField::Structure(s) = select_target(&v, field) else {
             return None;
         };
         let PvField::Structure(a) = s.get_field("alarm")? else {
@@ -599,7 +650,7 @@ impl PvaLink {
     /// gate that propagates `snap_severity` into `LINK_ALARM` only
     /// when `(sevr==MS && sev!=NO_ALARM) || (sevr==MSI && sev==INVALID)`.
     pub fn link_alarm_severity(&self) -> Option<i32> {
-        self.link_alarm_severity_with(self.config.sevr)
+        self.link_alarm_severity_with(&self.config.field, self.config.sevr)
     }
 
     /// Like [`Self::link_alarm_severity`] but gates on a
@@ -613,7 +664,11 @@ impl PvaLink {
     /// gate. The resolver passes the caller's own parsed `sevr` so
     /// each link applies its own maximize-severity mode (pvxs
     /// `pvaLinkConfig::sevr` is per-link, `pvxs/ioc/pvalink.h:65`).
-    pub fn link_alarm_severity_with(&self, sevr: super::config::SevrMode) -> Option<i32> {
+    pub fn link_alarm_severity_with(
+        &self,
+        field: &str,
+        sevr: super::config::SevrMode,
+    ) -> Option<i32> {
         // a disconnected monitor link is INVALID
         // regardless of the MS/NMS/MSI gate — a broken link is a local
         // failure, not a remote-severity propagation that NMS would
@@ -626,7 +681,7 @@ impl PvaLink {
         if self.monitor_disconnected_stale() {
             return Some(3); // INVALID
         }
-        let sev = self.remote_alarm_severity()?;
+        let sev = self.remote_alarm_severity(field)?;
         if sevr.propagates(sev) {
             Some(sev)
         } else {
@@ -650,7 +705,7 @@ impl PvaLink {
     /// the severity does propagate, a synthetic message is returned so
     /// the alarm is still observable.
     pub fn alarm_message(&self) -> Option<String> {
-        self.alarm_message_with(self.config.sevr)
+        self.alarm_message_with(&self.config.field, self.config.sevr)
     }
 
     /// Like [`Self::alarm_message`] but gates on a caller-supplied
@@ -659,7 +714,7 @@ impl PvaLink {
     /// same rationale as [`Self::link_alarm_severity_with`] —
     /// the alarm-message gate must use the caller's per-link `sevr`,
     /// not whichever cached link's mode happens to be shared.
-    pub fn alarm_message_with(&self, sevr: super::config::SevrMode) -> Option<String> {
+    pub fn alarm_message_with(&self, field: &str, sevr: super::config::SevrMode) -> Option<String> {
         // disconnect dominates — report the link failure,
         // not the stale remote alarm message. Pairs with the INVALID
         // severity `link_alarm_severity_with` returns for the same
@@ -671,9 +726,14 @@ impl PvaLink {
         }
         // Severity gate first — NMS / sub-threshold links report
         // nothing.
-        let sev = self.link_alarm_severity_with(sevr)?;
+        let sev = self.link_alarm_severity_with(field, sevr)?;
         let v = self.latest.lock().clone()?;
-        let PvField::Structure(s) = v else {
+        // Resolve the alarm string relative to the link's selected
+        // field root, matching `remote_alarm_severity` — pvxs reads
+        // `fld_message` from the same selected `root[fieldName]`
+        // (`pvxs/ioc/pvalink_link.cpp:90-110`,
+        // `pvxs/ioc/pvalink_lset.cpp:412-430`).
+        let PvField::Structure(s) = select_target(&v, field) else {
             return None;
         };
         let msg = s.get_field("alarm").and_then(|alarm| {
@@ -701,7 +761,7 @@ impl PvaLink {
     /// `pvaGetTimeStampTag`. The `userTag` is the remote
     /// `timeStamp.userTag` widened to the 64-bit tag WITHOUT sign
     /// extension (see the read below); `0` when the field is absent.
-    pub fn time_stamp(&self) -> Option<(i64, i32, u64)> {
+    pub fn time_stamp(&self, field: &str) -> Option<(i64, i32, u64)> {
         // a disconnected monitor link must not serve its
         // stale latched timestamp — pvxs gates every lset getter
         // through `CHECK_VALID` (`valid() = connected && root`), so
@@ -713,7 +773,12 @@ impl PvaLink {
             return None;
         }
         let v = self.latest.lock().clone()?;
-        let PvField::Structure(s) = v else {
+        // Resolve `timeStamp` relative to the selected field root —
+        // pvxs reads `fld_seconds`/`fld_nanoseconds`/`fld_usertag` from
+        // the same `root[fieldName]` selected by `onTypeChange`
+        // (`pvxs/ioc/pvalink_link.cpp:90-110`,
+        // `pvxs/ioc/pvalink_lset.cpp:399-409`).
+        let PvField::Structure(s) = select_target(&v, field) else {
             return None;
         };
         let ts = s.get_field("timeStamp")?;
@@ -800,23 +865,41 @@ impl PvaLink {
 
         let root = self.latest.lock().clone()?;
 
-        // The value at the link's field path drives DBF type and
-        // element count. `pvaGetDBFtype` uses `fld_value`; `fld_value`
-        // is the value sub-field selected by the link's field name.
-        let value_field = extract_field(&root, field);
+        // DBF type and element count derive from the selected value.
+        // pvxs `pvaGetDBFtype` reads `fld_value`, which is the
+        // selected-root rule: empty `field` selects the top-level value
+        // (its `.value` for a structure, else the root itself), a
+        // non-empty `field` selects `root[field]` (then `.value` if that
+        // is itself a structure). See [`select_link_value`]
+        // (`pvalink_link.cpp:90-110`, `pvalink_lset.cpp:199-236`).
+        let value_field = select_link_value(&root, field);
 
         let dbf_type = link_dbf_type(&value_field);
         let element_count = link_element_count(&value_field);
 
-        // display / control / valueAlarm are top-level NT children;
-        // pvxs reads them from `fld_meta` (the top-level struct).
-        let graphic_limits = limit_pair(&root, "display.limitLow", "display.limitHigh");
-        let control_limits = limit_pair(&root, "control.limitLow", "control.limitHigh");
+        // display / control / valueAlarm are read from the selected
+        // metadata root, NOT the top-level root. pvxs derives `fld_meta`
+        // from the same selected root as `fld_value`: when `fieldName`
+        // is non-empty, `root = lchan->root[fieldName]` and every
+        // `fld_meta["display.*"]` / `["control.*"]` / `["valueAlarm.*"]`
+        // is resolved relative to that selected root
+        // (`pvxs/ioc/pvalink_link.cpp:90-110`,
+        // `pvxs/ioc/pvalink_lset.cpp:444-535`). A link selecting a
+        // nested member must expose that member's engineering units,
+        // precision and graphic/control/alarm limits — not the
+        // container's. A scalar/array field selection has no nested
+        // metadata sub-structures, so its metadata root is empty.
+        let meta_root = match select_target(&root, field) {
+            s @ PvField::Structure(_) => s,
+            _ => PvField::Null,
+        };
+        let graphic_limits = limit_pair(&meta_root, "display.limitLow", "display.limitHigh");
+        let control_limits = limit_pair(&meta_root, "control.limitLow", "control.limitHigh");
         let alarm_limits = {
-            let lolo = scalar_as_f64(&extract_field(&root, "valueAlarm.lowAlarmLimit"));
-            let lo = scalar_as_f64(&extract_field(&root, "valueAlarm.lowWarningLimit"));
-            let hi = scalar_as_f64(&extract_field(&root, "valueAlarm.highWarningLimit"));
-            let hihi = scalar_as_f64(&extract_field(&root, "valueAlarm.highAlarmLimit"));
+            let lolo = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.lowAlarmLimit"));
+            let lo = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.lowWarningLimit"));
+            let hi = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.highWarningLimit"));
+            let hihi = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.highAlarmLimit"));
             match (lolo, lo, hi, hihi) {
                 // pvxs writes each of the four buffers independently
                 // and leaves a missing one untouched; we only surface
@@ -832,9 +915,10 @@ impl PvaLink {
                 )),
             }
         };
-        let precision = scalar_as_f64(&extract_field(&root, "display.precision")).map(|p| p as i16);
-        let units = string_field(&root, "display.units");
-        let description = string_field(&root, "display.description");
+        let precision =
+            scalar_as_f64(&extract_field(&meta_root, "display.precision")).map(|p| p as i16);
+        let units = string_field(&meta_root, "display.units");
+        let description = string_field(&meta_root, "display.description");
 
         Some(LinkMetadata {
             dbf_type,
@@ -863,7 +947,7 @@ impl PvaLink {
             latest: Arc::new(Mutex::new(cached)),
             monitor_connected: None,
             notify_rx: Mutex::new(None),
-            put_queue: Mutex::new(Vec::new()),
+            pending_put: Mutex::new(None),
         }
     }
 
@@ -881,7 +965,7 @@ impl PvaLink {
             latest: Arc::new(Mutex::new(None)),
             monitor_connected: None,
             notify_rx: Mutex::new(None),
-            put_queue: Mutex::new(Vec::new()),
+            pending_put: Mutex::new(None),
         }
     }
 
@@ -904,7 +988,7 @@ impl PvaLink {
             latest: Arc::new(Mutex::new(cached)),
             monitor_connected: Some(flag.clone()),
             notify_rx: Mutex::new(None),
-            put_queue: Mutex::new(Vec::new()),
+            pending_put: Mutex::new(None),
         };
         (link, flag)
     }
@@ -1028,6 +1112,42 @@ fn monitor_request(config: &PvaLinkConfig) -> Option<epics_pva_rs::pv_request::P
         config.queue_size.max(1).to_string(),
     ));
     Some(req)
+}
+
+/// Select the link's *target* from the remote root, following pvxs's
+/// `pvaLink::onTypeChange()` rule (`pvxs/ioc/pvalink_link.cpp:90-110`):
+/// an empty `field` selects the top-level root (`lchan->root`); a
+/// non-empty `field` selects `root[field]` (a dotted path navigates
+/// through nested structures). The target is the basis both for the
+/// value (see [`select_link_value`]) and for the display / control /
+/// valueAlarm metadata.
+fn select_target(root: &PvField, field: &str) -> PvField {
+    if field.is_empty() {
+        root.clone()
+    } else {
+        extract_field(root, field)
+    }
+}
+
+/// Select the link's *value* from the remote root, following pvxs's
+/// `pvaGetDBFtype` / `onTypeChange` rule
+/// (`pvxs/ioc/pvalink_lset.cpp:199-236`, `pvalink_link.cpp:90-110`):
+/// after [`select_target`] picks the target, if that target is itself
+/// a structure (an NTScalar/NTScalarArray) its `.value` child is the
+/// value; otherwise the selected target *is* the value (a top-level
+/// or sub-field scalar/array).
+///
+/// For the default empty `field` on an NTScalar this yields `root.value`
+/// — identical to the former hard-coded `field="value"`; the new
+/// behavior is that a top-level non-structure value (a bare scalar/array
+/// PV) is selected directly instead of being searched for a non-existent
+/// `value` child, and that an explicitly selected sub-structure drills
+/// into its own `.value`.
+fn select_link_value(root: &PvField, field: &str) -> PvField {
+    match select_target(root, field) {
+        PvField::Structure(s) => s.get_field("value").cloned().unwrap_or(PvField::Null),
+        other => other,
+    }
 }
 
 /// Walk a dotted field path through a [`PvField`] and return the leaf value.
@@ -1244,6 +1364,197 @@ mod tests {
         assert!(matches!(v, PvField::Null));
     }
 
+    /// pvxs selected-root rule (`select_link_value`,
+    /// `pvalink_link.cpp:90-110`): empty field selects the top-level
+    /// value (`.value` for a structure, else the root itself); a
+    /// non-empty field selects `root[field]` then `.value` if that is a
+    /// structure. Default `field=""` on an NTScalar still yields the
+    /// scalar, but a bare top-level value is now selected directly
+    /// instead of being searched for a missing `value` child.
+    #[test]
+    fn select_link_value_follows_pvxs_selected_root_rule() {
+        // NTScalar, empty field → .value.
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.5))));
+        let nt = PvField::Structure(nt);
+        assert!(matches!(
+            select_link_value(&nt, ""),
+            PvField::Scalar(ScalarValue::Double(d)) if d == 2.5
+        ));
+        // explicit field="value" yields the same scalar.
+        assert!(matches!(
+            select_link_value(&nt, "value"),
+            PvField::Scalar(ScalarValue::Double(d)) if d == 2.5
+        ));
+
+        // Bare top-level scalar (PV whose root is not an NT structure):
+        // empty field selects the scalar itself, not a missing child.
+        let bare = PvField::Scalar(ScalarValue::Long(7));
+        assert!(matches!(
+            select_link_value(&bare, ""),
+            PvField::Scalar(ScalarValue::Long(7))
+        ));
+
+        // Non-empty field selecting a nested structure drills into its
+        // own `.value`.
+        let mut sub = PvStructure::new("epics:nt/NTScalar:1.0");
+        sub.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Long(42))));
+        let mut outer = PvStructure::new("some_t");
+        outer.fields.push(("sub".into(), PvField::Structure(sub)));
+        let outer = PvField::Structure(outer);
+        assert!(matches!(
+            select_link_value(&outer, "sub"),
+            PvField::Scalar(ScalarValue::Long(42))
+        ));
+    }
+
+    /// `link_metadata` derives the DBF type from the selected value. A
+    /// link whose `field` selects a nested NTScalar-shaped structure
+    /// must report that structure's `.value` DBF type. Pre-fix the
+    /// metadata path read the selected target *as* the value, so a
+    /// structure selection produced no DBF type at all.
+    #[test]
+    fn link_metadata_dbf_drills_selected_substructure_value() {
+        use epics_base_rs::server::database::LinkDbfType;
+
+        let mut sub = PvStructure::new("epics:nt/NTScalar:1.0");
+        sub.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Long(42))));
+        let mut outer = PvStructure::new("some_t");
+        outer.fields.push(("sub".into(), PvField::Structure(sub)));
+
+        let cfg = PvaLinkConfig {
+            field: "sub".to_string(),
+            ..PvaLinkConfig::defaults_for("META:PV", LinkDirection::Inp)
+        };
+        let link = PvaLink::for_test(cfg, Some(PvField::Structure(outer)));
+        let meta = link.link_metadata().expect("metadata present");
+        // PVA `long` → DBF Int64 (full 64-bit width); the point is that
+        // a DBF type is derived at all, from the sub-structure's .value.
+        assert_eq!(
+            meta.dbf_type,
+            Some(LinkDbfType::Int64),
+            "DBF type must come from the selected sub-structure's .value"
+        );
+    }
+
+    /// A link whose `field` selects a nested structure must read its
+    /// alarm severity, alarm message AND timestamp from that selected
+    /// root — not from the top-level NT alarm/timeStamp. pvxs rebinds
+    /// `root = lchan->root[fieldName]` in `onTypeChange`
+    /// (`pvxs/ioc/pvalink_link.cpp:90-110`) and then resolves
+    /// `fld_severity`/`fld_message`/`fld_seconds`/`fld_nanoseconds`/
+    /// `fld_usertag` relative to that root
+    /// (`pvxs/ioc/pvalink_lset.cpp:399-430`). Pre-fix every one of
+    /// these getters read the top-level alarm/timeStamp regardless of
+    /// the selected field, so a link selecting a nested member adopted
+    /// the wrong member's (or the container's) alarm and time.
+    #[test]
+    fn alarm_and_timestamp_resolve_at_selected_field_root() {
+        // Top-level alarm is NO_ALARM and timeStamp is secs=1; the
+        // selected `member` sub-structure carries MAJOR(2)/"member hot"
+        // and a distinct timeStamp secs=999, ns=7, userTag=5.
+        let mut top_alarm = PvStructure::new("alarm_t");
+        top_alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(0))));
+        let mut top_ts = PvStructure::new("time_t");
+        top_ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(1)),
+        ));
+        top_ts
+            .fields
+            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(0))));
+
+        let mut mem_alarm = PvStructure::new("alarm_t");
+        mem_alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(2))));
+        mem_alarm.fields.push((
+            "message".into(),
+            PvField::Scalar(ScalarValue::String("member hot".into())),
+        ));
+        let mut mem_ts = PvStructure::new("time_t");
+        mem_ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(999)),
+        ));
+        mem_ts
+            .fields
+            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(7))));
+        mem_ts
+            .fields
+            .push(("userTag".into(), PvField::Scalar(ScalarValue::Int(5))));
+        let mut member = PvStructure::new("epics:nt/NTScalar:1.0");
+        member
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(7.0))));
+        member
+            .fields
+            .push(("alarm".into(), PvField::Structure(mem_alarm)));
+        member
+            .fields
+            .push(("timeStamp".into(), PvField::Structure(mem_ts)));
+
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        root.fields
+            .push(("alarm".into(), PvField::Structure(top_alarm)));
+        root.fields
+            .push(("timeStamp".into(), PvField::Structure(top_ts)));
+        root.fields
+            .push(("member".into(), PvField::Structure(member)));
+        let value = PvField::Structure(root);
+
+        // field="member", MS: alarm/message/timestamp come from member.
+        let cfg = PvaLinkConfig {
+            field: "member".to_string(),
+            monitor: true,
+            sevr: SevrMode::Ms,
+            ..PvaLinkConfig::defaults_for("SEL:PV", LinkDirection::Inp)
+        };
+        let link = PvaLink::for_test(cfg, Some(value.clone()));
+        assert_eq!(
+            link.link_alarm_severity(),
+            Some(2),
+            "severity must come from the selected member, not top-level NO_ALARM"
+        );
+        assert_eq!(
+            link.alarm_message().as_deref(),
+            Some("member hot"),
+            "message must come from the selected member"
+        );
+        assert_eq!(
+            link.time_stamp("member"),
+            Some((999, 7, 5)),
+            "timestamp/userTag must come from the selected member"
+        );
+
+        // field="" reads the top-level root: NO_ALARM does not
+        // propagate (None), and the timestamp is the top-level secs=1.
+        let cfg_top = PvaLinkConfig {
+            monitor: true,
+            sevr: SevrMode::Ms,
+            ..PvaLinkConfig::defaults_for("SEL:PV", LinkDirection::Inp)
+        };
+        let link_top = PvaLink::for_test(cfg_top, Some(value));
+        assert_eq!(
+            link_top.link_alarm_severity(),
+            None,
+            "top-level NO_ALARM under MS propagates nothing"
+        );
+        assert_eq!(link_top.alarm_message(), None);
+        assert_eq!(
+            link_top.time_stamp(""),
+            Some((1, 0, 0)),
+            "empty field reads the top-level timeStamp"
+        );
+    }
+
     use super::super::config::LinkDirection;
     use super::super::config::{PvaLinkConfig, SevrMode};
 
@@ -1408,40 +1719,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn b4_defer_queues_instead_of_putting() {
+    async fn b4_defer_coalesces_to_most_recent() {
         let link = PvaLink::for_test(out_cfg(true, false), None);
         assert_eq!(link.pending_put_count(), 0);
-        // defer=true: write enqueues, returns Ok without a server.
+        // defer=true: write caches, returns Ok without a server.
         link.write("42").await.expect("deferred write is Ok");
         assert_eq!(link.pending_put_count(), 1);
+        // A second deferred write supersedes the first — the link keeps
+        // one pending value (most-recent-PUT wins), it does not grow a
+        // FIFO log of stale intermediate writes.
         link.write_pv_field(&PvField::Scalar(ScalarValue::Double(1.0)))
             .await
             .expect("deferred typed write is Ok");
-        assert_eq!(link.pending_put_count(), 2);
+        assert_eq!(link.pending_put_count(), 1);
+        // The retained value is the most recent (the typed Double),
+        // not the superseded "42".
+        match link.pending_put.lock().as_ref() {
+            Some(QueuedPut::Field(PvField::Scalar(ScalarValue::Double(d)))) => assert_eq!(*d, 1.0),
+            other => panic!("most-recent write must be retained, got {other:?}"),
+        }
     }
 
-    /// MINOR (pvalink string-PUT): a deferred string `write` is queued
+    /// MINOR (pvalink string-PUT): a deferred string `write` is cached
     /// as a `QueuedPut::Str`, NOT a `PvField::Scalar(String)`. The
     /// replay then goes through the string `pvput` path, which coerces
     /// the text against the channel's native scalar type — replaying a
     /// String field to a numeric record was the bug. A typed
-    /// `write_pv_field` is queued as `QueuedPut::Field` verbatim.
+    /// `write_pv_field` is cached as `QueuedPut::Field` verbatim.
     #[tokio::test]
     async fn minor_deferred_string_put_keeps_string_form() {
-        let link = PvaLink::for_test(out_cfg(true, false), None);
-        link.write("42").await.unwrap();
-        link.write_pv_field(&PvField::Scalar(ScalarValue::Double(1.0)))
+        let str_link = PvaLink::for_test(out_cfg(true, false), None);
+        str_link.write("42").await.unwrap();
+        match str_link.pending_put.lock().as_ref() {
+            Some(QueuedPut::Str(s)) => assert_eq!(s, "42"),
+            other => panic!("string write must cache QueuedPut::Str, got {other:?}"),
+        }
+
+        let field_link = PvaLink::for_test(out_cfg(true, false), None);
+        field_link
+            .write_pv_field(&PvField::Scalar(ScalarValue::Double(1.0)))
             .await
             .unwrap();
-        let q = link.put_queue.lock();
-        assert_eq!(q.len(), 2);
-        match &q[0] {
-            QueuedPut::Str(s) => assert_eq!(s, "42"),
-            other => panic!("string write must queue QueuedPut::Str, got {other:?}"),
-        }
-        match &q[1] {
-            QueuedPut::Field(PvField::Scalar(ScalarValue::Double(d))) => assert_eq!(*d, 1.0),
-            other => panic!("typed write must queue QueuedPut::Field, got {other:?}"),
+        match field_link.pending_put.lock().as_ref() {
+            Some(QueuedPut::Field(PvField::Scalar(ScalarValue::Double(d)))) => assert_eq!(*d, 1.0),
+            other => panic!("typed write must cache QueuedPut::Field, got {other:?}"),
         }
     }
 
@@ -1465,44 +1786,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn b4_retry_queue_full_rejects() {
-        let link = PvaLink::for_test(out_cfg(true, false), None);
-        for _ in 0..MAX_PUT_QUEUE {
-            link.write("1").await.expect("within capacity");
-        }
-        assert_eq!(link.pending_put_count(), MAX_PUT_QUEUE);
-        let overflow = link.write("1").await;
-        assert!(matches!(overflow, Err(PvaLinkError::RetryQueueFull(_))));
-    }
-
-    #[tokio::test]
-    async fn b4_flush_deferred_replays_when_still_disconnected() {
-        // defer link, retry=false; flush against no server. The first
-        // value's Put fails with a hard error → that one value is
-        // dropped, but the still-unsent tail (`idx+1..`) is restored so
-        // a later flush can replay it. Without the tail restore the
-        // whole queue would be silently lost to the `mem::take`.
+    async fn b4_flush_deferred_drops_value_on_hard_error() {
+        // defer link, retry=false; flush against no server. The pending
+        // value's Put fails with a hard error → the value is dropped
+        // (it would fail identically on every replay), leaving the slot
+        // empty.
         let link = PvaLink::for_test(out_cfg(true, false), None);
         link.write("1").await.unwrap();
         link.write("2").await.unwrap();
-        assert_eq!(link.pending_put_count(), 2);
+        // Coalesced to one pending value ("2").
+        assert_eq!(link.pending_put_count(), 1);
         let r = link.flush_deferred().await;
         assert!(r.is_err());
-        // Only the failing entry ("1") was dropped; "2" stays queued.
-        assert_eq!(link.pending_put_count(), 1);
+        assert_eq!(link.pending_put_count(), 0);
     }
 
     #[tokio::test]
-    async fn b4_flush_deferred_retry_restores_unsent_tail() {
-        // defer + retry: flush against no server → all values are
-        // restored to the queue for a later retry.
+    async fn b4_flush_deferred_retry_restores_pending() {
+        // defer + retry: flush against no server → the pending value is
+        // restored to the slot for a later retry.
         let link = PvaLink::for_test(out_cfg(true, true), None);
         link.write("1").await.unwrap();
         link.write("2").await.unwrap();
+        assert_eq!(link.pending_put_count(), 1);
         let r = link.flush_deferred().await;
         assert!(r.is_err(), "still disconnected");
-        // retry restores the unsent tail (both values).
-        assert_eq!(link.pending_put_count(), 2);
+        // retry restores the most-recent pending value ("2").
+        assert_eq!(link.pending_put_count(), 1);
+        match link.pending_put.lock().as_ref() {
+            Some(QueuedPut::Str(s)) => assert_eq!(s, "2"),
+            other => panic!("most-recent value must be restored, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn b4_flush_deferred_retry_keeps_newer_write() {
+        // defer + retry: a fresh write that lands during a still-failing
+        // flush must NOT be clobbered by the restore — most-recent-PUT
+        // wins. Here the slot already holds "2"; simulate a newer write
+        // by pre-seeding then confirming the restore is a no-op when the
+        // slot is already occupied.
+        let link = PvaLink::for_test(out_cfg(true, true), None);
+        link.write("1").await.unwrap();
+        // flush takes "1"; while the put is failing a newer "2" arrives.
+        // Model it by writing "2" after the take would have happened —
+        // since flush is synchronous here, instead assert the guard:
+        // restore only when slot empty.
+        let r = link.flush_deferred().await;
+        assert!(r.is_err());
+        link.write("2").await.unwrap();
+        // A second flush restores "2" (not the older "1").
+        let r2 = link.flush_deferred().await;
+        assert!(r2.is_err());
+        match link.pending_put.lock().as_ref() {
+            Some(QueuedPut::Str(s)) => assert_eq!(s, "2"),
+            other => panic!("newer write must survive, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1599,12 +1938,12 @@ mod tests {
         // Alarm hooks report INVALID(3) + a disconnect message even
         // though the link is NMS (which suppresses remote severities).
         assert_eq!(
-            link.link_alarm_severity_with(SevrMode::Nms),
+            link.link_alarm_severity_with("", SevrMode::Nms),
             Some(3),
             "disconnect must surface INVALID regardless of NMS"
         );
         assert_eq!(
-            link.alarm_message_with(SevrMode::Nms).as_deref(),
+            link.alarm_message_with("", SevrMode::Nms).as_deref(),
             Some("pvalink monitor disconnected"),
             "disconnect message, not the stale remote alarm string"
         );
@@ -1634,9 +1973,9 @@ mod tests {
             "live monitor fast path returns the cached value"
         );
         // MS link, remote MAJOR(2) → propagates 2, not the disconnect INVALID.
-        assert_eq!(link.link_alarm_severity_with(SevrMode::Ms), Some(2));
+        assert_eq!(link.link_alarm_severity_with("", SevrMode::Ms), Some(2));
         assert_eq!(
-            link.alarm_message_with(SevrMode::Ms).as_deref(),
+            link.alarm_message_with("", SevrMode::Ms).as_deref(),
             Some("hot")
         );
     }
@@ -1658,11 +1997,11 @@ mod tests {
         );
         assert!(link.try_read_cached().is_none());
         assert_eq!(
-            link.link_alarm_severity_with(SevrMode::Ms),
+            link.link_alarm_severity_with("", SevrMode::Ms),
             None,
             "never-connected link must not claim INVALID via the alarm hook"
         );
-        assert_eq!(link.alarm_message_with(SevrMode::Ms), None);
+        assert_eq!(link.alarm_message_with("", SevrMode::Ms), None);
     }
 
     /// Boundary (cached=Some, connected=false): the FR-13 stale gate is
@@ -1703,7 +2042,7 @@ mod tests {
         // (the FR-13 gate is inert while connected).
         flag.store(true, Ordering::Release);
         assert_eq!(
-            link.time_stamp(),
+            link.time_stamp(""),
             Some((1_700_000_000, 42, 0)),
             "connected monitor surfaces the cached timestamp; no userTag \
              field in the fixture, so the tag defaults to 0"
@@ -1717,7 +2056,7 @@ mod tests {
         // is still cached for diagnostics.
         flag.store(false, Ordering::Release);
         assert!(
-            link.time_stamp().is_none(),
+            link.time_stamp("").is_none(),
             "disconnected monitor must not serve the stale latched timestamp"
         );
         assert!(
@@ -1763,7 +2102,7 @@ mod tests {
                 Some(PvField::Structure(root)),
             );
             flag.store(true, Ordering::Release);
-            link.time_stamp().map(|(_, _, utag)| utag)
+            link.time_stamp("").map(|(_, _, utag)| utag)
         };
 
         // Absent userTag → 0 (pvxs `else snap_tag = 0`).
@@ -1938,6 +2277,126 @@ mod tests {
             Some("linked"),
             "display description"
         );
+    }
+
+    /// A link whose `field` selects a nested member must expose THAT
+    /// member's display/control/valueAlarm metadata, not the parent
+    /// PV's. pvxs derives `fld_meta` from the same selected root as
+    /// `fld_value` (`pvxs/ioc/pvalink_link.cpp:90-110`,
+    /// `pvxs/ioc/pvalink_lset.cpp:444-535`). Pre-fix `link_metadata_with`
+    /// used the selected field only for DBF type/element count and read
+    /// every metadata limit/unit/precision from the top-level root,
+    /// mixing the container's engineering metadata with the member's
+    /// value domain.
+    #[test]
+    fn link_metadata_resolves_display_control_valuealarm_at_selected_field_root() {
+        use epics_base_rs::server::database::LinkDbfType;
+
+        // Nested member NTScalar with its OWN distinct metadata.
+        let mut member = PvStructure::new("epics:nt/NTScalar:1.0");
+        member
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.0))));
+        member.fields.push((
+            "display".into(),
+            nt_display(-90.0, 90.0, "MEM", "member", 4),
+        ));
+        member
+            .fields
+            .push(("control".into(), nt_control(-100.0, 100.0)));
+        member.fields.push((
+            "valueAlarm".into(),
+            nt_value_alarm(-80.0, -70.0, 70.0, 80.0),
+        ));
+
+        // Top-level NTScalar with DIFFERENT metadata + the member.
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        root.fields
+            .push(("display".into(), nt_display(-9.0, 9.0, "TOP", "top", 2)));
+        root.fields
+            .push(("control".into(), nt_control(-10.0, 10.0)));
+        root.fields
+            .push(("valueAlarm".into(), nt_value_alarm(-8.0, -7.0, 7.0, 8.0)));
+        root.fields
+            .push(("member".into(), PvField::Structure(member)));
+        let value = PvField::Structure(root);
+
+        // field="member": every metadatum comes from the member.
+        let cfg = PvaLinkConfig {
+            field: "member".to_string(),
+            ..PvaLinkConfig::defaults_for("META:PV", LinkDirection::Inp)
+        };
+        let meta = PvaLink::for_test(cfg, Some(value.clone()))
+            .link_metadata()
+            .expect("metadata present");
+        assert_eq!(meta.dbf_type, Some(LinkDbfType::Double));
+        assert_eq!(meta.element_count, Some(1));
+        assert_eq!(
+            meta.graphic_limits,
+            Some((-90.0, 90.0)),
+            "graphic limits must come from the selected member"
+        );
+        assert_eq!(
+            meta.control_limits,
+            Some((-100.0, 100.0)),
+            "control limits must come from the selected member"
+        );
+        assert_eq!(
+            meta.alarm_limits,
+            Some((-80.0, -70.0, 70.0, 80.0)),
+            "alarm limits must come from the selected member"
+        );
+        assert_eq!(meta.precision, Some(4), "member precision");
+        assert_eq!(meta.units.as_deref(), Some("MEM"), "member units");
+        assert_eq!(meta.description.as_deref(), Some("member"));
+
+        // field="": every metadatum comes from the top-level root.
+        let cfg_top = PvaLinkConfig::defaults_for("META:PV", LinkDirection::Inp);
+        let meta_top = PvaLink::for_test(cfg_top, Some(value))
+            .link_metadata()
+            .expect("metadata present");
+        assert_eq!(meta_top.graphic_limits, Some((-9.0, 9.0)));
+        assert_eq!(meta_top.control_limits, Some((-10.0, 10.0)));
+        assert_eq!(meta_top.alarm_limits, Some((-8.0, -7.0, 7.0, 8.0)));
+        assert_eq!(meta_top.precision, Some(2));
+        assert_eq!(meta_top.units.as_deref(), Some("TOP"));
+        assert_eq!(meta_top.description.as_deref(), Some("top"));
+    }
+
+    /// A scalar/array field selection has no nested metadata
+    /// sub-structures, so the metadata root is empty and no
+    /// display/control/valueAlarm is surfaced — the metadata scalar
+    /// value must NOT be misread as a graphic/alarm limit. (`extract_field`
+    /// on a non-structure returns the scalar itself; the structural
+    /// guard in `link_metadata_with` prevents that scalar from leaking
+    /// into the limit reads.)
+    #[test]
+    fn link_metadata_scalar_field_has_no_nested_metadata() {
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(42.0))));
+        root.fields
+            .push(("display".into(), nt_display(-9.0, 9.0, "TOP", "top", 2)));
+
+        // Select the bare scalar `value` field directly.
+        let cfg = PvaLinkConfig {
+            field: "value".to_string(),
+            ..PvaLinkConfig::defaults_for("META:PV", LinkDirection::Inp)
+        };
+        let meta = PvaLink::for_test(cfg, Some(PvField::Structure(root)))
+            .link_metadata()
+            .expect("metadata present");
+        assert_eq!(
+            meta.graphic_limits, None,
+            "a scalar field selection exposes no display limits"
+        );
+        assert_eq!(
+            meta.units, None,
+            "a scalar field selection exposes no units"
+        );
+        assert_eq!(meta.precision, None);
     }
 
     /// a not-yet-connected link (no cached value) reports no

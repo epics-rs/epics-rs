@@ -26,7 +26,7 @@ mod registry;
 pub use config::{LinkDirection, PvaLinkConfig, PvaLinkParseError, SevrMode};
 pub use integration::{PvaLinkResolver, install_pvalink_resolver};
 pub use iocsh::{
-    db_pvxr_command, pvalink_disable_command, pvalink_enable_command, pvxrefdiff_command,
+    db_pvxr_command, pvalink_disable_command, pvalink_enable_command, pvalinkrefdiff_command,
     register_pvalink_commands,
 };
 pub use link::{PvaLink, PvaLinkError};

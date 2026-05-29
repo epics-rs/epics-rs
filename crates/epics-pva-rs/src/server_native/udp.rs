@@ -642,10 +642,19 @@ async fn process_search_datagram(
             // for the forward-frame rewriter.
             if let Some(req) = parse_search_request(frame) {
                 if req.unicast {
-                    let reply_ip = req.reply_addr.unwrap_or_else(|| match udp_src.ip() {
-                        IpAddr::V4(v4) => v4,
-                        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
-                    });
+                    // The loopback ORIGIN_TAG forward channel is IPv4-only,
+                    // so a forwarded reply destination must resolve to a v4
+                    // address: prefer the SEARCH-payload addr when it is v4,
+                    // else the UDP source's v4 (a v6 reply addr or v6 source
+                    // has no place on this channel — fall back to
+                    // UNSPECIFIED so OS routing/the recipient sorts it out).
+                    let reply_ip = match req.reply_addr {
+                        Some(IpAddr::V4(v4)) => v4,
+                        _ => match udp_src.ip() {
+                            IpAddr::V4(v4) => v4,
+                            IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+                        },
+                    };
                     let reply_dest = SocketAddrV4::new(reply_ip, req.reply_port);
                     if let Some(forward) = try_build_forward_frame(frame, reply_dest) {
                         let prefix = PvaCodec::build_origin_tag_prefix(reply_iface_ip);
@@ -678,7 +687,7 @@ async fn process_search_datagram(
                 // sentinel arrives via ORIGIN_TAG (the forwarder is
                 // not the original requester).
                 let reply_dest = match req.reply_addr {
-                    Some(ip) => SocketAddr::V4(std::net::SocketAddrV4::new(ip, req.reply_port)),
+                    Some(ip) => SocketAddr::new(ip, req.reply_port),
                     None => {
                         // Any forwarded origin (tagged ORIGIN_TAG or
                         // untagged local forward) cannot reply to the
@@ -838,12 +847,45 @@ pub async fn run_udp_responder_v6(
     }
 }
 
+/// Resolve a SEARCH_RESPONSE destination from the announced reply
+/// address/port and the UDP source, for the IPv6 responder.
+///
+/// - Explicit (non-wildcard) reply address: trust the advertised
+///   address AND port (pvxs `udp_collector.cpp:377-380`). This is the
+///   capability the pre-fix v6 responder lacked — it always replied to
+///   the UDP source and ignored an explicit v6 reply endpoint.
+/// - Wildcard reply address: reply to the sender's actual socket tuple.
+///   pvxs additionally overrides the port with the advertised value
+///   (`:380 setPort`), which assumes the client advertises the port it
+///   listens on. The in-repo Rust v6 client advertises its v4
+///   search-socket port while listening on a distinct v6 socket
+///   (`client_native/search_engine.rs` `bind_ephemeral_udp_v6` binds an
+///   independent ephemeral port), so adopting the advertised port on the
+///   wildcard path would route the reply to a port nothing listens on.
+///   Replying to the real source tuple is the robust "reply to sender".
+///   Aligning the client's advertised v6 `response_port` (so the server
+///   can take pvxs's unconditional `setPort`) is a client-side change
+///   tracked as a cross-request.
+fn resolve_reply_dest(
+    reply_addr: Option<IpAddr>,
+    reply_port: u16,
+    udp_src: SocketAddr,
+) -> SocketAddr {
+    match reply_addr {
+        Some(ip) => SocketAddr::new(ip, reply_port),
+        None => udp_src,
+    }
+}
+
 /// Stripped-down `process_search_datagram` for the v6 responder.
 /// Skips the IPv4-only ORIGIN_TAG forwarding path entirely (v6 has
-/// its own group conventions that aren't wired yet) and always
-/// replies to the UDP source address rather than honouring the
-/// in-payload `reply_addr` field (which is IPv4-typed and stays
-/// `None` for v6 peers anyway).
+/// its own group conventions that aren't wired yet) but honours the
+/// in-payload reply address/port: pvxs decodes that field into a full
+/// `SockAddr` and uses an advertised non-wildcard destination
+/// (`udp_collector.cpp:367-380`), so a v6 SEARCH that points the reply
+/// at a different v6 address or port than the UDP source tuple is
+/// answered there. Wildcard falls back to the UDP source IP with the
+/// advertised port.
 async fn process_v6_search_datagram(
     source: &DynSource,
     socket: &tokio::net::UdpSocket,
@@ -859,15 +901,14 @@ async fn process_v6_search_datagram(
         let consumed = match parse_search_request(chunk) {
             Some(req) => {
                 let consumed = req.consumed;
-                // For IPv6 SEARCH we reply directly to the UDP source
-                // (ip + port). The wire `reply_port` field is parsed
-                // from an IPv4-typed payload and may not match what
-                // the v6 client actually listens on (a v6 client
-                // builds its packet via the same codec that encodes
-                // the v4 socket's port). Using `udp_src.port()` keeps
-                // the response on the same socket pair the SEARCH
-                // arrived on — natural for v6 unicast.
-                let reply_dest = udp_src;
+                // Honour the SEARCH's announced reply destination: an
+                // advertised non-wildcard v6 address/port wins (pvxs
+                // `udp_collector.cpp:377-380`); a wildcard falls back to
+                // the UDP source tuple. Pre-fix the v6 responder always
+                // replied to the UDP source and ignored an explicit v6
+                // reply endpoint. See `resolve_reply_dest` for the
+                // wildcard-port deviation and its cross-request.
+                let reply_dest = resolve_reply_dest(req.reply_addr, req.reply_port, udp_src);
                 // The v6 responder must apply the same protocol gate as
                 // v4/TCP — without it a TLS-only client gets `found=1`
                 // from a tcp-only server. Shared helper.
@@ -1044,7 +1085,12 @@ pub(crate) struct SearchRequest {
     /// was the unspecified sentinel (`0.0.0.0` / `::`), in which case
     /// pvxs falls back to the UDP source address. The port is always
     /// populated, even when `reply_addr` is `None`.
-    pub(crate) reply_addr: Option<Ipv4Addr>,
+    ///
+    /// Stored as a full [`IpAddr`] (not IPv4-only) so the IPv6 responder
+    /// can honour an advertised v6 reply address; pvxs decodes the field
+    /// into a full `SockAddr` regardless of family
+    /// (`udp_collector.cpp:367-370`).
+    pub(crate) reply_addr: Option<IpAddr>,
     pub(crate) reply_port: u16,
     /// True when the SEARCH header had the Unicast flag (`0x80`,
     /// `pva_search_flags::Unicast`) set. pvxs uses this as a marker
@@ -1130,9 +1176,13 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     addr16.copy_from_slice(&addr_bytes);
     // pvxs `udp_collector.cpp:351-360`: `server.isAny()` means "reply
     // to UDP source"; otherwise the SEARCH carries a specific reply
-    // destination. Filter to IPv4 since this stack is IPv4-only.
+    // destination. Keep any concrete address (v4 or v6); fold only the
+    // wildcard sentinel (`0.0.0.0` / `::`, in either raw or v4-mapped
+    // form) to `None`. pvxs decodes a full `SockAddr` here
+    // (`udp_collector.cpp:367-370`), so an IPv6 reply address must
+    // survive rather than being dropped by an IPv4-only filter.
     let reply_addr = match ip_from_bytes(&addr16) {
-        Some(IpAddr::V4(v4)) if !v4.is_unspecified() => Some(v4),
+        Some(ip) if !ip.is_unspecified() => Some(ip),
         _ => None,
     };
     let reply_port = p.get_u16(order).ok()?;
@@ -1307,7 +1357,7 @@ mod tests {
         );
         assert_eq!(
             req.reply_addr,
-            Some(Ipv4Addr::new(127, 0, 0, 1)),
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             "reply addr preserved from original SEARCH"
         );
         assert_eq!(req.reply_port, 9999);
@@ -1807,7 +1857,10 @@ mod tests {
         // must reflect the resolved dest.
         let req = parse_search_request(&out).expect("re-parse ok");
         assert!(!req.unicast, "unicast flag must be cleared");
-        assert_eq!(req.reply_addr, Some(Ipv4Addr::new(192, 168, 1, 5)));
+        assert_eq!(
+            req.reply_addr,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)))
+        );
         assert_eq!(req.reply_port, 54321);
 
         // Non-unicast SEARCH: forward returns None (no rewrite).
@@ -1825,7 +1878,10 @@ mod tests {
         // Specific reply addr 192.168.5.10:9999.
         let frame = codec.build_search(7, 42, "MY:PV", [192, 168, 5, 10], 9999, false);
         let req = parse_search_request(&frame).expect("parse ok");
-        assert_eq!(req.reply_addr, Some(Ipv4Addr::new(192, 168, 5, 10)));
+        assert_eq!(
+            req.reply_addr,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 5, 10)))
+        );
         assert_eq!(req.reply_port, 9999);
 
         // Unspecified addr → None (sentinel for "use UDP source").
@@ -1833,6 +1889,67 @@ mod tests {
         let req_any = parse_search_request(&frame_any).expect("parse ok");
         assert_eq!(req_any.reply_addr, None);
         assert_eq!(req_any.reply_port, 5076);
+    }
+
+    /// `parse_search_request` must keep a concrete IPv6 reply address
+    /// instead of folding it to `None`. pvxs decodes the 16-byte address
+    /// field into a full `SockAddr` (`udp_collector.cpp:367-370`); the
+    /// pre-fix IPv4-only filter dropped every v6 address.
+    #[test]
+    fn parse_search_request_keeps_ipv6_reply_addr() {
+        use std::net::Ipv6Addr;
+        let codec = PvaCodec { big_endian: false };
+        // Build a v4 frame, then overwrite the 16-byte response_addr
+        // field (payload offset 8) with a real IPv6 address.
+        let mut frame = codec.build_search(7, 42, "MY:PV", [0, 0, 0, 0], 9999, false);
+        let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let off = PvaHeader::SIZE + 8;
+        frame[off..off + 16].copy_from_slice(&ip_to_bytes(IpAddr::V6(v6)));
+        let req = parse_search_request(&frame).expect("parse ok");
+        assert_eq!(req.reply_addr, Some(IpAddr::V6(v6)));
+        assert_eq!(req.reply_port, 9999);
+
+        // Raw-zero `::` (v6 wildcard) still folds to None.
+        let mut frame_any = codec.build_search(7, 42, "MY:PV", [0, 0, 0, 0], 5076, false);
+        frame_any[off..off + 16].copy_from_slice(&[0u8; 16]);
+        let req_any = parse_search_request(&frame_any).expect("parse ok");
+        assert_eq!(req_any.reply_addr, None);
+        assert_eq!(req_any.reply_port, 5076);
+    }
+
+    /// `resolve_reply_dest` invariant boundaries: an explicit advertised
+    /// address is honoured with its advertised port (pvxs
+    /// `udp_collector.cpp:377-380`), including a port that differs from
+    /// the UDP source port; a wildcard (`None`) replies to the full UDP
+    /// source tuple (see the helper doc for the deliberate deviation
+    /// from pvxs's wildcard `setPort`).
+    #[test]
+    fn resolve_reply_dest_boundaries() {
+        use std::net::Ipv6Addr;
+        let src: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5000);
+
+        // Wildcard reply addr → full UDP source tuple (source port kept).
+        assert_eq!(
+            resolve_reply_dest(None, 9876, src),
+            src,
+            "wildcard replies to the sender's actual socket tuple"
+        );
+
+        // Explicit v6 reply addr → that addr, advertised port (differs
+        // from the UDP source port 5000).
+        let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        assert_eq!(
+            resolve_reply_dest(Some(IpAddr::V6(v6)), 9876, src),
+            SocketAddr::new(IpAddr::V6(v6), 9876),
+            "explicit v6 reply addr/port is honoured over the UDP source"
+        );
+
+        // Explicit v4 reply addr with a differing port.
+        let v4 = Ipv4Addr::new(192, 168, 9, 9);
+        assert_eq!(
+            resolve_reply_dest(Some(IpAddr::V4(v4)), 1234, src),
+            SocketAddr::new(IpAddr::V4(v4), 1234),
+        );
     }
 
     /// `filter_inbound`: mcast-source packets and blocklisted peers

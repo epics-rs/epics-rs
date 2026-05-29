@@ -747,6 +747,16 @@ const N_SEARCH_BUCKETS: usize = 30;
 /// amplified UDP search-broadcast storm.
 const POKE_HOLDOFF: Duration = Duration::from_secs(30);
 
+/// pvxs fixed SEARCH sequence id `search_seq` (client.cpp:71-73): the
+/// ASCII bytes `"find"` (0x66 0x69 0x6e 0x64). pvxs stamps this value
+/// into every discovery SEARCH and only treats a `found=false`,
+/// zero-channel UDP SEARCH_RESPONSE as a discovery pong when its decoded
+/// sequence equals `search_seq` (client.cpp:889). Using a fixed,
+/// recognizable value lets the pong path reject stray/unrelated
+/// `found=false` replies instead of promoting any of them to a fake
+/// beacon.
+const DISCOVER_SEQ: u32 = 0x6669_6e64;
+
 /// Decide which bucket to drop a fresh search into based on the
 /// caller's intent. Pure function so the production handlers and
 /// the unit tests share the formula and can't drift apart.
@@ -1165,8 +1175,13 @@ async fn run_engine(
                     // single-channel SEARCH with empty name, which
                     // most servers correctly ignored as malformed —
                     // `ping_all()` was effectively a silent op.
-                    let probe_id = NEXT_SEARCH_ID.fetch_add(1, Ordering::Relaxed);
-                    let pkt = codec.build_discover_search(probe_id, response_port);
+                    //
+                    // Stamp the fixed pvxs `search_seq` ("find") rather than
+                    // a fresh randomized id: the discovery-pong receive path
+                    // gates on this exact value (client.cpp:889) so an
+                    // unrelated found=false reply is not promoted to a fake
+                    // beacon.
+                    let pkt = codec.build_discover_search(DISCOVER_SEQ, response_port);
                     broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
                 }
                 None => break,
@@ -1734,10 +1749,17 @@ fn handle_search_response(
     // host the searched PV, or a stale/duplicate reply) would spuriously feed
     // the beacon tracker, announce the server, and poke every pending search's
     // backoff — fabricating discovery activity nobody requested.
+    //
+    // pvxs additionally gates on `seq==search_seq` (client.cpp:889): the
+    // discovery pong must echo the fixed `DISCOVER_SEQ` we stamped into the
+    // outgoing discovery SEARCH. A `found=false`/zero-cid reply carrying any
+    // other sequence is some other server's SEARCH_RESPONSE, not a reply to
+    // our DiscoverPing, and must NOT be promoted to a fake beacon.
     if !resp.found {
         if !subscribers.is_empty()
             && !is_tcp
             && resp.cids.is_empty()
+            && resp.seq == DISCOVER_SEQ
             && !ignore_guids.contains(&resp.guid)
         {
             let server = rewrite_loopback(resp.server_addr, peer);
@@ -2311,12 +2333,13 @@ mod tests {
 
     /// Build a server→client `SEARCH_RESPONSE` frame with `found=false`
     /// and zero channel IDs — the on-wire shape of a discovery pong
-    /// (the reply to a `DiscoverPing`) and also the shape any server
-    /// would use to say "I do not host this" if it bothered to reply.
+    /// (the reply to a `DiscoverPing`). The sequence echoes the fixed
+    /// `DISCOVER_SEQ` we stamp into the discovery SEARCH, which the pong
+    /// path requires (pvxs client.cpp:889).
     fn found_false_response() -> Vec<u8> {
         crate::server_native::udp::build_search_response_proto(
             [0x42u8; 12],
-            0,
+            DISCOVER_SEQ,
             5075,
             &[], // empty cids ⇒ found byte encodes false
             ByteOrder::Little,
@@ -2410,6 +2433,51 @@ mod tests {
         }
     }
 
+    /// pvxs gates the discovery-pong fake-beacon branch on
+    /// `seq==search_seq` (client.cpp:889). A `found=false`/zero-cid UDP
+    /// reply whose sequence is NOT our `DISCOVER_SEQ` is some other
+    /// server's not-found reply, not a reply to our DiscoverPing, and
+    /// must not be promoted to a fake beacon — even with an active
+    /// `discover()` subscriber.
+    #[test]
+    fn discovery_pong_rejected_on_wrong_sequence() {
+        // Same shape as found_false_response() but with a stray sequence.
+        let frame = crate::server_native::udp::build_search_response_proto(
+            [0x42u8; 12],
+            DISCOVER_SEQ ^ 0x1,
+            5075,
+            &[],
+            ByteOrder::Little,
+            "tcp",
+        );
+        let beacons = BeaconTracker::new();
+        let mut pending: HashMap<u32, Pending> = HashMap::new();
+        let mut by_name: HashMap<String, u32> = HashMap::new();
+        let ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+        let (tx, mut rx) = mpsc::channel::<Discovered>(8);
+        let mut subscribers: Vec<mpsc::Sender<Discovered>> = vec![tx]; // discover() active
+        let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
+            std::collections::HashSet::new();
+        let mut poke = false;
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
+
+        let consumed = handle_search_response(
+            &frame, &mut pending, &mut by_name, &beacons, &ignore_guids, &mut subscribers,
+            &mut announced, &mut poke, peer, false,
+        );
+
+        assert!(consumed > 0, "frame must still be consumed/advanced");
+        assert!(!poke, "wrong-sequence reply must not poke");
+        assert!(
+            announced.is_empty(),
+            "wrong-sequence found=false reply must NOT be promoted to a fake beacon"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no Discovered event for a non-matching sequence"
+        );
+    }
+
     /// `ignore_server_guids` is a SEARCH_RESPONSE-only filter, matching
     /// pvxs (consulted in procSearchReply client.cpp:880, never in
     /// onBeacon client.cpp:773-847). A found SEARCH_RESPONSE and a
@@ -2461,8 +2529,14 @@ mod tests {
         let mut announced2: std::collections::HashSet<(SocketAddr, [u8; 12])> =
             std::collections::HashSet::new();
         let mut poke2 = false;
-        let pong =
-            crate::server_native::udp::build_search_response_proto(IG, 0, 5075, &[], ByteOrder::Little, "tcp");
+        let pong = crate::server_native::udp::build_search_response_proto(
+            IG,
+            DISCOVER_SEQ,
+            5075,
+            &[],
+            ByteOrder::Little,
+            "tcp",
+        );
         handle_search_response(
             &pong, &mut pending, &mut by_name, &beacons, &ignore, &mut subs2,
             &mut announced2, &mut poke2, peer, false,

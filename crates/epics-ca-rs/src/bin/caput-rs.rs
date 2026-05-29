@@ -289,21 +289,29 @@ async fn main() {
             }
         }
         WriteValue::EnumString(s) => {
-            // Always write ENUM-by-name through the DBR_STRING put so
-            // the server resolves the menu string.
+            // ENUM-by-name → DBR_STRING; the server resolves the menu
+            // string. Route through the same explicit-wire-type path as
+            // the numeric/-S writes so the CLI `-w` timeout owns the
+            // callback wait (caput.c:558-567 uses one caTimeout for every
+            // dbrType), instead of put_string's EPICS_CA_PUT_TIMEOUT/30s
+            // default which dropped `-w`.
+            let v = epics_ca_rs::EpicsValue::String(s.clone());
+            let dbr = epics_ca_rs::DbFieldType::String as u16;
             if args.callback {
-                ch.put_string(s).await
+                ch.put_as_dbr_with_timeout(dbr, &v, timeout).await
             } else {
-                ch.put_string_nowait(s).await
+                ch.put_as_dbr_nowait(dbr, &v).await
             }
         }
         WriteValue::EnumStringArray(v) => {
             // ENUM waveform by name — DBR_STRING array, server resolves
-            // each element.
+            // each element. Same single timeout owner as above.
+            let arr = epics_ca_rs::EpicsValue::StringArray(v.clone());
+            let dbr = epics_ca_rs::DbFieldType::String as u16;
             if args.callback {
-                ch.put_string_array(v).await
+                ch.put_as_dbr_with_timeout(dbr, &arr, timeout).await
             } else {
-                ch.put_string_array_nowait(v).await
+                ch.put_as_dbr_nowait(dbr, &arr).await
             }
         }
     };

@@ -133,14 +133,20 @@ impl Args {
 /// method becomes a SharedPV whose `on_rpc` handler routes the
 /// incoming request through the generated dispatch.
 ///
-/// Returns the names that were registered for diagnostics.
+/// Returns the registered names on success. A name that collides with an
+/// already-registered PV is an error: registration is all-or-nothing —
+/// the methods added so far are rolled back and
+/// [`AddPvError`](crate::server_native::AddPvError) is returned, so a
+/// duplicate registration never silently swaps part of the served
+/// namespace (pvxs `StaticSource::add()` rejects duplicates rather than
+/// replacing, `sharedpv.cpp:568-581`).
 pub fn add_rpc_service<S: PvaService>(
     source: &crate::server_native::SharedSource,
     prefix: &str,
     service: S,
-) -> Vec<String> {
+) -> Result<Vec<String>, crate::server_native::AddPvError> {
     let arc = Arc::new(service);
-    let mut registered = Vec::new();
+    let mut registered: Vec<String> = Vec::new();
     for method in PvaService::methods(arc.clone()) {
         let pv_name = if prefix.is_empty() {
             method.name.clone()
@@ -175,10 +181,17 @@ pub fn add_rpc_service<S: PvaService>(
                 }
             }
         });
-        source.add(&pv_name, pv);
+        if let Err(e) = source.try_add(&pv_name, pv) {
+            // Roll back the methods registered so far so a duplicate
+            // leaves the namespace exactly as it was before this call.
+            for name in &registered {
+                source.remove(name);
+            }
+            return Err(e);
+        }
         registered.push(pv_name);
     }
-    registered
+    Ok(registered)
 }
 
 /// Tear down a previously-registered service. Pass the same

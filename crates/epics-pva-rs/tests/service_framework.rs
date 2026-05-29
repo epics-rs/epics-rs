@@ -82,7 +82,8 @@ fn nturi_request(args: &[(&str, ScalarValue)]) -> (FieldDesc, PvField) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_service_dispatch_round_trip() {
     let source = SharedSource::new();
-    let registered = epics_pva_rs::service::add_rpc_service(&source, "counter", Counter::default());
+    let registered = epics_pva_rs::service::add_rpc_service(&source, "counter", Counter::default())
+        .expect("first registration must succeed");
     assert_eq!(registered.len(), 3);
     assert!(registered.contains(&"counter:add".to_string()));
     assert!(registered.contains(&"counter:reset".to_string()));
@@ -176,7 +177,8 @@ fn direct_struct_request(args: &[(&str, ScalarValue)]) -> (FieldDesc, PvField) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_service_accepts_direct_struct_request() {
     let source = SharedSource::new();
-    let _ = epics_pva_rs::service::add_rpc_service(&source, "calc", Counter::default());
+    epics_pva_rs::service::add_rpc_service(&source, "calc", Counter::default())
+        .expect("registration must succeed");
     let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
     let client = server.client_config();
 
@@ -215,6 +217,33 @@ async fn pva_service_accepts_direct_struct_request() {
         other => panic!("unexpected wrapper: {other:?}"),
     };
     assert_eq!(v, 7);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_rpc_service_rejects_colliding_registration() {
+    let source = SharedSource::new();
+    let first = epics_pva_rs::service::add_rpc_service(&source, "counter", Counter::default())
+        .expect("first registration must succeed");
+    assert_eq!(first.len(), 3);
+
+    // A second service under the same prefix collides on the very
+    // first method (`counter:add`). pvxs `StaticSource::add()` rejects
+    // duplicates instead of replacing, so this must error and leave the
+    // already-served namespace untouched — never a silent half-swap.
+    let err = epics_pva_rs::service::add_rpc_service(&source, "counter", Counter::default())
+        .expect_err("colliding registration must be rejected");
+    assert!(err.0.contains("counter:add"), "unexpected error: {err}");
+
+    // All three original PVs are still present and exactly three exist:
+    // the rejected call rolled itself back, adding nothing.
+    for name in ["counter:add", "counter:reset", "counter:square"] {
+        assert!(source.has_pv(name).await, "{name} must remain registered");
+    }
+    assert_eq!(
+        source.list_pvs().await.len(),
+        3,
+        "no extra PVs from the rejected call"
+    );
 }
 
 /// Client end-to-end: a source that opens (descriptor

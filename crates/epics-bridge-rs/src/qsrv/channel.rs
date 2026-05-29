@@ -285,13 +285,18 @@ pub struct BridgeChannel {
     nt_type: NtType,
     /// The DBF type of the bound field (not always VAL).
     value_dbf: DbFieldType,
-    /// parsed pvxs-compatible channel-filter chain from the
-    /// trailing JSON suffix on the PV name (`PV.VAL{"dbnd":{"d":2.0}}`
-    /// etc.). Empty chain when the name carries no suffix. Attached to
-    /// the monitor subscription so the same subscription's events go
-    /// through the filter framework; GET/PUT see the un-filtered
-    /// record state, matching pvxs's subscription-only filter scope.
-    monitor_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
+    /// Parsed pvxs-compatible channel-filter chain from the trailing
+    /// JSON suffix on the PV name (`PV.VAL{"dbnd":{"d":2.0}}`,
+    /// `PV.VAL{"arr":{"s":1,"e":2}}`, …). Empty chain when the name
+    /// carries no suffix. pvxs attaches the chain to the `dbChannel`, so
+    /// it governs BOTH the monitor subscription AND one-shot GET reads:
+    /// GET wraps the read in a `LocalFieldLog` and runs the pre/post
+    /// chain (`ioc/singlesource.cpp:278-292`, `localfieldlog.cpp:15-24`).
+    /// The monitor path installs the chain on its subscription; the GET
+    /// path applies it in read context via
+    /// [`FilterChain::apply_to_read_value`]. PUT writes the raw value
+    /// (filters are read-side only).
+    channel_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
     /// Access control context — checked on every get/put.
     access: super::provider::AccessContext,
 }
@@ -325,7 +330,7 @@ impl BridgeChannel {
             field,
             nt_type,
             value_dbf,
-            monitor_filters: std::sync::Arc::new(
+            channel_filters: std::sync::Arc::new(
                 epics_base_rs::server::database::filters::FilterChain::new(),
             ),
             access: super::provider::AccessContext::allow_all(),
@@ -357,7 +362,7 @@ impl BridgeChannel {
         // EPICS `dbChannelCreate()` (`dbChannel.c:512-529`). Fail-open
         // to an unfiltered monitor would silently drop the requested
         // throttling/slicing semantics.
-        let monitor_filters = match parsed.json_suffix.as_deref() {
+        let channel_filters = match parsed.json_suffix.as_deref() {
             Some(json) => std::sync::Arc::new(
                 epics_base_rs::server::database::filters::try_parse_filter_chain(json)
                     .map_err(|e| BridgeError::ChannelFilterError(e.to_string()))?,
@@ -416,7 +421,7 @@ impl BridgeChannel {
             field: field_upper,
             nt_type,
             value_dbf,
-            monitor_filters,
+            channel_filters,
             access: super::provider::AccessContext::allow_all(),
         })
     }
@@ -581,13 +586,36 @@ impl Channel for BridgeChannel {
             .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
         let instance = rec.read().await;
-        let snapshot =
+        let mut snapshot =
             instance
                 .snapshot_for_field(&self.field)
                 .ok_or_else(|| BridgeError::FieldNotFound {
                     record: self.record_name.clone(),
                     field: self.field.clone(),
                 })?;
+
+        // Apply the channel-filter chain in READ context. pvxs wraps
+        // every QSRV GET in a `LocalFieldLog` and runs the field-log
+        // pre/post chain before serialization (ioc/singlesource.cpp:
+        // 278-292, ioc/localfieldlog.cpp:15-24); a GET on a filtered
+        // channel must return the same transformed value as the monitor,
+        // not the raw record snapshot. `arr` slicing and `ts` tagging
+        // transform the value; the stream-only filters (`dbnd`/`dec`/
+        // `sync`) short-circuit in read context. A chain that drops the
+        // read yields no value — surface the error rather than serving
+        // the unfiltered snapshot (matching the C `if(pLog)` no-frame
+        // contract that `apply_to_event_value` also honors).
+        if !self.channel_filters.is_empty() {
+            snapshot.value = self
+                .channel_filters
+                .apply_to_read_value(snapshot.value)
+                .ok_or_else(|| {
+                    BridgeError::ChannelFilterError(format!(
+                        "filter chain dropped the read value for {}",
+                        self.pv_name
+                    ))
+                })?;
+        }
 
         let full = snapshot_to_pv_structure(&snapshot, self.nt_type);
         Ok(pvif::filter_by_request(&full, request))
@@ -640,7 +668,7 @@ impl BridgeChannel {
         // thread the channel's parsed filter chain (from the
         // pvxs `PV.VAL{...}` JSON suffix) into the monitor so its
         // subscription installs the filters at the dbChannel level.
-        .with_filters(self.monitor_filters.clone());
+        .with_filters(self.channel_filters.clone());
         if let Some(mask) = value_mask {
             monitor = monitor.with_value_mask(mask);
         }
@@ -938,7 +966,7 @@ mod tests {
         let ch = BridgeChannel::new(db, r#"REC.{"arr":{s:2,i:2,e:8}}"#)
             .await
             .expect("documented JSON5 arr filter must create the channel");
-        assert_eq!(ch.monitor_filters.len(), 1);
+        assert_eq!(ch.channel_filters.len(), 1);
     }
 
     /// An unknown filter name aborts channel creation, matching
@@ -978,6 +1006,6 @@ mod tests {
         let ch = BridgeChannel::new(db, "REC")
             .await
             .expect("unfiltered channel must create");
-        assert!(ch.monitor_filters.is_empty());
+        assert!(ch.channel_filters.is_empty());
     }
 }

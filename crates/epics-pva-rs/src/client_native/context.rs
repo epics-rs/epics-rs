@@ -465,7 +465,18 @@ impl PvaClient {
             return Ok(engine);
         }
         if self.inner.search.get().is_none() {
-            let engine = SearchEngine::spawn(Vec::new(), self.inner.name_servers.clone()).await?;
+            // Per-client engine carries the CA credentials so TCP name-server
+            // handshakes authenticate as this client's user/host (pvxs has no
+            // name-server auth exception, clientconn.cpp:215-263). The shared
+            // engine above never has name servers, so it needs no credentials.
+            let engine = SearchEngine::spawn_with_auth(
+                Vec::new(),
+                self.inner.name_servers.clone(),
+                self.inner.user.clone(),
+                self.inner.host.clone(),
+                self.inner.tcp_timeout,
+            )
+            .await?;
             let _ = self.inner.search.set(engine);
         }
         Ok(self.inner.search.get().unwrap())

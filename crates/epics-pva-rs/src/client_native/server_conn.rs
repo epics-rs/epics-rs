@@ -255,11 +255,7 @@ impl ServerConn {
             read_handshake_init(&mut reader, &mut rx_buf, op_timeout, max_message_size).await?;
 
         // Choose auth method: prefer "ca" if offered.
-        let negotiated_auth = if auth_methods.iter().any(|m| m == "ca") {
-            "ca"
-        } else {
-            "anonymous"
-        };
+        let negotiated_auth = select_client_auth(&auth_methods);
 
         // Step 3: send our CONNECTION_VALIDATION reply on the (still-not-spawned) writer.
         let mut writer_owned = writer;
@@ -804,8 +800,22 @@ impl ServerConn {
 // ── Helpers ────────────────────────────────────────────────────────────
 
 // match pvxs clientconn.cpp:292-293 — serverReceiveBufferSize = 0x10000 ("not used").
-const DEFAULT_BUFFER_SIZE: u32 = 0x10000;
-const DEFAULT_REGISTRY_SIZE: u16 = 32_767;
+pub(super) const DEFAULT_BUFFER_SIZE: u32 = 0x10000;
+pub(super) const DEFAULT_REGISTRY_SIZE: u16 = 32_767;
+
+/// Select the client-side auth method from the server's advertised list,
+/// preferring `"ca"` when offered and falling back to `"anonymous"`. pvxs
+/// `Connection::handle_CONNECTION_VALIDATION` scans the advertised methods and
+/// selects `"ca"` when present (clientconn.cpp:215-263), with no name-server
+/// exception — so both the normal TCP path and the name-server path must use
+/// this same rule rather than a separate hard-coded policy.
+pub(super) fn select_client_auth(auth_methods: &[String]) -> &'static str {
+    if auth_methods.iter().any(|m| m == "ca") {
+        "ca"
+    } else {
+        "anonymous"
+    }
+}
 
 fn now_nanos() -> u64 {
     use std::time::SystemTime;
@@ -815,7 +825,7 @@ fn now_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-async fn read_handshake_init<R: tokio::io::AsyncRead + Unpin>(
+pub(super) async fn read_handshake_init<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
     op_timeout: Duration,
@@ -842,7 +852,7 @@ async fn read_handshake_init<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-async fn wait_for_validated<R: tokio::io::AsyncRead + Unpin>(
+pub(super) async fn wait_for_validated<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
     op_timeout: Duration,
@@ -1180,7 +1190,7 @@ fn maybe_destroy_stale_create_channel(
     let _ = writer_tx.send(frame_out);
 }
 
-fn build_client_connection_validation(
+pub(super) fn build_client_connection_validation(
     order: ByteOrder,
     buffer_size: u32,
     registry_size: u16,
@@ -1258,6 +1268,33 @@ fn _suppress(_: HeaderFlags, _: Status) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The auth-selection rule shared by the normal TCP connection path and the
+    // TCP name-server path (pvxs has no name-server auth exception): prefer "ca"
+    // when the server offers it, else fall back to "anonymous".
+    #[test]
+    fn select_client_auth_prefers_ca_when_offered() {
+        assert_eq!(
+            select_client_auth(&["anonymous".to_string(), "ca".to_string()]),
+            "ca",
+            "must select ca when the server advertises anonymous, ca"
+        );
+        assert_eq!(
+            select_client_auth(&["ca".to_string()]),
+            "ca",
+            "must select ca when it is the only method"
+        );
+        assert_eq!(
+            select_client_auth(&["anonymous".to_string()]),
+            "anonymous",
+            "must fall back to anonymous when ca is not offered"
+        );
+        assert_eq!(
+            select_client_auth(&[]),
+            "anonymous",
+            "must fall back to anonymous when no methods are advertised"
+        );
+    }
 
     fn build_message_payload(order: ByteOrder, ioid: u32, mtype: u8, msg: &str) -> Vec<u8> {
         let mut p = Vec::new();

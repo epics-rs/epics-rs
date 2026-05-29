@@ -35,12 +35,15 @@ use tracing::{debug, warn};
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
-    ByteOrder, Command, ControlCommand, PvaHeader, ReadExt, WriteExt, decode_size, decode_string,
-    encode_string_into, ip_from_bytes_allow_unspec,
+    Command, PvaHeader, ReadExt, decode_size, decode_string, ip_from_bytes_allow_unspec,
 };
 
 use super::beacon_throttle::BeaconTracker;
 use super::decode::{PeerRole, decode_search_response, try_parse_frame_role};
+use super::server_conn::{
+    DEFAULT_BUFFER_SIZE, DEFAULT_REGISTRY_SIZE, build_client_connection_validation,
+    read_handshake_init, select_client_auth, wait_for_validated,
+};
 
 /// Search retry intervals in seconds.
 ///
@@ -54,6 +57,13 @@ pub const BACKOFF_SECS: &[u64] = &[1, 1, 2, 5, 10, 15, 30, 60, 120, 210];
 
 /// Default UDP broadcast port for SEARCH/BEACON messages (5076).
 pub const DEFAULT_BROADCAST_PORT: u16 = 5076;
+
+/// Per-frame read deadline for a TCP name-server CONNECTION_VALIDATION
+/// handshake when no client timeout is threaded in (the credential-less
+/// [`SearchEngine::spawn`] path). Bounds a name server that accepts the TCP
+/// connection but never completes the PVA handshake; [`SearchEngine::spawn_with_auth`]
+/// supplies the client's own connection timeout instead.
+const NS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// PR #205 IPv6 Stage 4: default v6 multicast group for PVA SEARCH.
 /// pvxs `udp_collector.cpp` uses `ff0e::400` (organization-local,
@@ -192,9 +202,53 @@ pub struct SearchEngine {
 impl SearchEngine {
     /// Spawn the engine. Returns a handle that channels use to issue
     /// `find()` requests.
+    /// Spawn a search engine without TCP name-server credentials: name-server
+    /// handshakes still select `"ca"` if the server offers it but send empty
+    /// user/host. The public entry point for discovery-only callers that
+    /// configure no name servers (`name_servers` empty → no NS handshake runs).
     pub async fn spawn(
+        extra_targets: Vec<SocketAddr>,
+        name_servers: Vec<SocketAddr>,
+    ) -> PvaResult<Self> {
+        Self::spawn_inner(
+            extra_targets,
+            name_servers,
+            String::new(),
+            String::new(),
+            NS_HANDSHAKE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Spawn with the client's CA credentials for TCP name-server connections,
+    /// so a name-server handshake authenticates as the same user/host as a
+    /// normal server connection. pvxs builds name-server peers with the same
+    /// `Connection::build()` and auth negotiation as ordinary TCP servers and
+    /// only flips `nameserver = true` afterward (client.cpp:674-685); there is
+    /// no separate name-server auth policy.
+    pub async fn spawn_with_auth(
+        extra_targets: Vec<SocketAddr>,
+        name_servers: Vec<SocketAddr>,
+        ns_user: String,
+        ns_host: String,
+        ns_handshake_timeout: Duration,
+    ) -> PvaResult<Self> {
+        Self::spawn_inner(
+            extra_targets,
+            name_servers,
+            ns_user,
+            ns_host,
+            ns_handshake_timeout,
+        )
+        .await
+    }
+
+    async fn spawn_inner(
         mut extra_targets: Vec<SocketAddr>,
         name_servers: Vec<SocketAddr>,
+        ns_user: String,
+        ns_host: String,
+        ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         let beacons = BeaconTracker::new();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>(256);
@@ -312,6 +366,9 @@ impl SearchEngine {
             extra_targets,
             beacons_clone,
             name_servers,
+            ns_user,
+            ns_host,
+            ns_handshake_timeout,
         ));
 
         Ok(Self { cmd_tx, beacons })
@@ -757,6 +814,9 @@ async fn run_engine(
     extra_targets: Vec<SocketAddr>,
     beacons: Arc<BeaconTracker>,
     name_servers: Vec<SocketAddr>,
+    ns_user: String,
+    ns_host: String,
+    ns_handshake_timeout: Duration,
 ) {
     static NEXT_SEARCH_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -818,7 +878,15 @@ async fn run_engine(
             ready: Arc::clone(&ready),
         });
         let resp_tx = ns_response_tx.clone();
-        tokio::spawn(ns_task(ns_addr, search_rx, resp_tx, ready));
+        tokio::spawn(ns_task(
+            ns_addr,
+            search_rx,
+            resp_tx,
+            ready,
+            ns_user.clone(),
+            ns_host.clone(),
+            ns_handshake_timeout,
+        ));
     }
 
     let mut tick = interval(Duration::from_secs(1));
@@ -1879,11 +1947,23 @@ async fn ns_task(
     mut search_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     ready: Arc<AtomicBool>,
+    user: String,
+    host: String,
+    handshake_timeout: Duration,
 ) {
     // pvxs client.cpp:68: tcpNSCheckInterval = 10s.
     const RECONNECT_INTERVAL: Duration = Duration::from_secs(10);
     loop {
-        let res = ns_run_once(ns_addr, &mut search_rx, &response_tx, &ready).await;
+        let res = ns_run_once(
+            ns_addr,
+            &mut search_rx,
+            &response_tx,
+            &ready,
+            &user,
+            &host,
+            handshake_timeout,
+        )
+        .await;
         // Connection is gone: clear readiness immediately so the engine skips
         // this NS for every tick until the next CONNECTION_VALIDATED, rather
         // than enqueuing frames into a channel nobody is draining.
@@ -1905,6 +1985,9 @@ async fn ns_run_once(
     search_rx: &mut mpsc::Receiver<Vec<u8>>,
     response_tx: &mpsc::Sender<(Vec<u8>, SocketAddr)>,
     ready: &AtomicBool,
+    user: &str,
+    host: &str,
+    handshake_timeout: Duration,
 ) -> std::io::Result<()> {
     let stream = TcpStream::connect(ns_addr).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -1912,79 +1995,32 @@ async fn ns_run_once(
     let mut rx_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
 
-    // ── Handshake: wait for SET_BYTE_ORDER + CONNECTION_VALIDATION request ──
-    let mut byte_order = ByteOrder::Little;
-    loop {
-        let n = reader.read(&mut tmp).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "NS closed during handshake",
-            ));
-        }
-        rx_buf.extend_from_slice(&tmp[..n]);
-        let mut pos = 0;
-        let mut got_validation_req = false;
-        while rx_buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
-            let Ok(hdr) = PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[pos..])) else {
-                break;
-            };
-            let frame_end = pos + PvaHeader::SIZE + hdr.payload_length as usize;
-            if rx_buf.len() < frame_end {
-                break;
-            }
-            if hdr.flags.is_control() {
-                if hdr.command == ControlCommand::SetByteOrder.code() {
-                    byte_order = hdr.flags.byte_order();
-                }
-            } else if hdr.command == Command::ConnectionValidation.code() {
-                got_validation_req = true;
-            }
-            pos = frame_end;
-        }
-        rx_buf.drain(..pos);
-        if got_validation_req {
-            break;
-        }
-    }
-
-    // ── Send anonymous CONNECTION_VALIDATION reply ───────────────────────────
-    // pvxs clientconn.cpp:163-174: NS only needs SEARCH routing, not channel
-    // ops — anonymous auth is sufficient.
-    writer
-        .write_all(&build_ns_connection_validation(byte_order))
-        .await?;
-
-    // ── Wait for CONNECTION_VALIDATED ────────────────────────────────────────
-    loop {
-        let n = reader.read(&mut tmp).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "NS closed before validated",
-            ));
-        }
-        rx_buf.extend_from_slice(&tmp[..n]);
-        let mut pos = 0;
-        let mut validated = false;
-        while rx_buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
-            let Ok(hdr) = PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[pos..])) else {
-                break;
-            };
-            let frame_end = pos + PvaHeader::SIZE + hdr.payload_length as usize;
-            if rx_buf.len() < frame_end {
-                break;
-            }
-            if !hdr.flags.is_control() && hdr.command == Command::ConnectionValidated.code() {
-                validated = true;
-            }
-            pos = frame_end;
-        }
-        rx_buf.drain(..pos);
-        if validated {
-            break;
-        }
-    }
+    // CONNECTION_VALIDATION handshake. pvxs builds name-server peers with the
+    // same Connection::build()/auth negotiation as ordinary TCP servers and
+    // only flips `nameserver = true` afterward (client.cpp:674-685); there is
+    // no name-server auth exception (clientconn.cpp:215-263). Reuse the normal
+    // client handshake helpers so the NS sees the same "ca"-preferred user/host
+    // identity a regular server connection presents, instead of forced anonymous.
+    // `None` message cap = pvxs-parity unbounded; the read is deadlined by
+    // `handshake_timeout`.
+    let (byte_order, _server_buf, _server_reg, auth_methods) =
+        read_handshake_init(&mut reader, &mut rx_buf, handshake_timeout, None)
+            .await
+            .map_err(std::io::Error::other)?;
+    let negotiated_auth = select_client_auth(&auth_methods);
+    let reply = build_client_connection_validation(
+        byte_order,
+        DEFAULT_BUFFER_SIZE,
+        DEFAULT_REGISTRY_SIZE,
+        0,
+        negotiated_auth,
+        user,
+        host,
+    );
+    writer.write_all(&reply).await?;
+    wait_for_validated(&mut reader, &mut rx_buf, handshake_timeout, None)
+        .await
+        .map_err(std::io::Error::other)?;
 
     // Discard any SEARCH frames that the engine enqueued while this connection
     // was down or handshaking. pvxs keeps no disconnected-side queue to replay
@@ -2040,34 +2076,13 @@ async fn ns_run_once(
     }
 }
 
-/// Minimal CONNECTION_VALIDATION payload for anonymous NS connections.
-/// pvxs clientconn.cpp:163-174: buffer_size=1MiB, registry=0x7FFF, QOS=0,
-/// auth="anonymous", null variant (0xFF).
-fn build_ns_connection_validation(order: ByteOrder) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.put_u32(1024 * 1024, order);
-    payload.put_u16(0x7FFF, order);
-    payload.put_u16(0, order);
-    encode_string_into("anonymous", order, &mut payload);
-    payload.push(0xFF); // null variant
-    let h = PvaHeader::application(
-        false,
-        order,
-        Command::ConnectionValidation.code(),
-        payload.len() as u32,
-    );
-    let mut out = Vec::with_capacity(PvaHeader::SIZE + payload.len());
-    h.write_into(&mut out);
-    out.extend_from_slice(&payload);
-    out
-}
-
 #[allow(dead_code)]
 fn _suppress(_: PvaHeader) {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{ByteOrder, ControlCommand, WriteExt, encode_string_into};
     use serial_test::serial;
 
     // ---- maybe_poke rate-limit invariant (pvxs pokeHoldoff, A8-R2-1) ----
@@ -3423,6 +3438,129 @@ mod tests {
             resolved.ip(),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "resolved IP must be 127.0.0.1 (rewrite_loopback from unspecified)"
+        );
+    }
+
+    /// A TCP name server that advertises `anonymous, ca` must see the client
+    /// select `ca` and send the configured user/host — pvxs negotiates CA on
+    /// name-server connections exactly as on normal servers (clientconn.cpp:215-263),
+    /// rather than forcing anonymous. Captures the client's CONNECTION_VALIDATION
+    /// reply on the mock NS and asserts the negotiated method + credentials.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial(epics_env)]
+    async fn pva_rs_51_tcp_nameserver_selects_ca_with_credentials() {
+        use std::io::Cursor as IoCursor;
+        use tokio::net::TcpListener;
+
+        let ns_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock NS listener bind");
+        let ns_addr = ns_listener.local_addr().unwrap();
+
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+        ]);
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+
+        let ns_handle = tokio::spawn(async move {
+            let (mut stream, _peer) = ns_listener.accept().await.expect("mock NS: accept");
+            let order = ByteOrder::Little;
+
+            // SET_BYTE_ORDER
+            let mut sbo = Vec::with_capacity(PvaHeader::SIZE);
+            PvaHeader::control(true, order, ControlCommand::SetByteOrder.code(), 0)
+                .write_into(&mut sbo);
+            stream.write_all(&sbo).await.expect("mock NS: write SBO");
+
+            // CONNECTION_VALIDATION request advertising both methods.
+            {
+                let mut payload = Vec::new();
+                payload.put_u32(0x10000, order);
+                payload.put_u16(32_767, order);
+                payload.push(2u8); // auth_methods count (size-encoded, < 254)
+                encode_string_into("anonymous", order, &mut payload);
+                encode_string_into("ca", order, &mut payload);
+                let h = PvaHeader::application(
+                    true,
+                    order,
+                    Command::ConnectionValidation.code(),
+                    payload.len() as u32,
+                );
+                let mut frame = Vec::new();
+                h.write_into(&mut frame);
+                frame.extend_from_slice(&payload);
+                stream
+                    .write_all(&frame)
+                    .await
+                    .expect("mock NS: write val req");
+            }
+
+            // Capture the client's CONNECTION_VALIDATION reply payload.
+            let mut buf = Vec::<u8>::new();
+            let mut tmp = [0u8; 4096];
+            let reply_payload = 'capture: loop {
+                let n = stream
+                    .read(&mut tmp)
+                    .await
+                    .expect("mock NS: read val reply");
+                assert!(n > 0, "mock NS: client closed before validation");
+                buf.extend_from_slice(&tmp[..n]);
+                let mut pos = 0usize;
+                while buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
+                    let Ok(hdr) = PvaHeader::decode(&mut IoCursor::new(&buf[pos..])) else {
+                        break;
+                    };
+                    let frame_end = pos + PvaHeader::SIZE + hdr.payload_length as usize;
+                    if buf.len() < frame_end {
+                        break;
+                    }
+                    if !hdr.flags.is_control()
+                        && hdr.command == Command::ConnectionValidation.code()
+                    {
+                        break 'capture buf[pos + PvaHeader::SIZE..frame_end].to_vec();
+                    }
+                    pos = frame_end;
+                }
+            };
+            let _ = reply_tx.send(reply_payload);
+        });
+
+        let _engine = SearchEngine::spawn_with_auth(
+            Vec::new(),
+            vec![ns_addr],
+            "operator".to_string(),
+            "myhost".to_string(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("spawn engine");
+
+        let payload = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("client must send CONNECTION_VALIDATION reply within 5 s")
+            .expect("mock NS captured the reply");
+        ns_handle.abort();
+
+        // Reply layout: buffer_size(4) + registry_size(2) + qos(2) + auth(string).
+        let auth = decode_string(&mut Cursor::new(&payload[8..]), ByteOrder::Little)
+            .expect("decode negotiated auth method")
+            .expect("auth method string present");
+        assert_eq!(
+            auth, "ca",
+            "client must select ca when the NS advertises anonymous, ca"
+        );
+        // The CA variant carries the user/host as string values; assert the
+        // configured credentials appear (distinct from the b\"user\"/b\"host\"
+        // field-name descriptors).
+        assert!(
+            payload.windows(b"operator".len()).any(|w| w == b"operator"),
+            "CA reply must carry the configured user"
+        );
+        assert!(
+            payload.windows(b"myhost".len()).any(|w| w == b"myhost"),
+            "CA reply must carry the configured host"
         );
     }
 

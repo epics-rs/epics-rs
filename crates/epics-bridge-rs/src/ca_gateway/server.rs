@@ -207,12 +207,50 @@ impl GatewayServer {
             p.resolve_hosts().await;
             p
         } else if let Some(content) = &config.pvlist_content {
+            // Inline content. An explicitly-supplied string (even empty)
+            // is the operator's literal pvlist: `Some("")` deliberately
+            // serves nothing. This is the documented "deny-all" escape
+            // hatch — distinct from *no* pvlist config at all (the `else`
+            // arm below), which C ca-gateway treats as serve-everything.
             let mut p = super::pvlist::parse_pvlist(content)?;
             p.resolve_hosts().await;
             p
         } else {
-            // Empty pvlist allows nothing
-            PvList::new()
+            // No pvlist configured. C ca-gateway does NOT deny everything
+            // here: `gateResources.cc:318-321` auto-loads a `gateway.pvlist`
+            // from the working directory when present, and `gateAs.cc:430-445`
+            // otherwise installs an implicit `.* ALLOW` rule so every PV is
+            // served (documented at Gateway.html:742-745). Mirror that so a
+            // no-argument / default-file deployment is a pass-through gateway
+            // rather than a black hole that rejects every downstream search
+            // before any upstream lookup. An operator who genuinely wants
+            // deny-all sets `pvlist_content: Some(String::new())` (handled
+            // above), so the two intents stay distinct.
+            const DEFAULT_PVLIST_FILE: &str = "gateway.pvlist";
+            let default_path = std::path::Path::new(DEFAULT_PVLIST_FILE);
+            if default_path.is_file() {
+                tracing::info!(
+                    file = DEFAULT_PVLIST_FILE,
+                    "ca-gateway-rs: no pvlist configured; loading default \
+                     gateway.pvlist from the working directory \
+                     (parity with gateResources.cc:318-321)"
+                );
+                let mut p = super::pvlist::parse_pvlist_file(default_path)?;
+                p.resolve_hosts().await;
+                p
+            } else {
+                tracing::info!(
+                    "ca-gateway-rs: no pvlist configured and no default \
+                     gateway.pvlist found; installing implicit '.* ALLOW' rule \
+                     (parity with gateAs.cc:430-445)"
+                );
+                // Reuse the parser so the implicit rule is byte-for-byte the
+                // structure of a hand-written `.* ALLOW` line: an anchored
+                // `^.*$` regex, default ASG, and ASL 1 (via
+                // `PvListMatch::effective_asl`). No host tokens, so
+                // `resolve_hosts()` is a no-op and is skipped.
+                super::pvlist::parse_pvlist(".* ALLOW")?
+            }
         };
         let pvlist = Arc::new(ArcSwap::from_pointee(pvlist));
 
@@ -894,6 +932,40 @@ mod tests {
             server.is_ok(),
             "build with upstream TLS failed: {:?}",
             server.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn build_no_pvlist_installs_implicit_allow_all() {
+        // No pvlist path AND no inline content: C ca-gateway serves every
+        // PV through an implicit `.* ALLOW` rule (gateAs.cc:430-445), not a
+        // deny-all. Assumes no `gateway.pvlist` exists in the crate's
+        // working directory (it does not) — the default-file probe is the
+        // thin `is_file()` branch above, exercised by `parse_pvlist_file`.
+        let config = GatewayConfig::default();
+        let server = GatewayServer::build(config).await.unwrap();
+        let pvlist = server.pvlist().load_full();
+        assert!(
+            pvlist.match_name("Any:Random:PV").is_some(),
+            "no-pvlist gateway must serve all PVs via implicit .* ALLOW"
+        );
+        assert!(pvlist.match_name("another.unlikely.name").is_some());
+    }
+
+    #[tokio::test]
+    async fn build_empty_inline_content_stays_deny_all() {
+        // An explicitly-supplied empty pvlist is the operator's deny-all
+        // request: it must NOT be promoted to the implicit allow-all that
+        // the no-config path installs. This pins the two intents apart.
+        let config = GatewayConfig {
+            pvlist_content: Some(String::new()),
+            ..Default::default()
+        };
+        let server = GatewayServer::build(config).await.unwrap();
+        let pvlist = server.pvlist().load_full();
+        assert!(
+            pvlist.match_name("Any:Random:PV").is_none(),
+            "explicit empty pvlist must deny all (distinct from no-config)"
         );
     }
 

@@ -466,18 +466,36 @@ fn value_to_json(value: &PvField) -> String {
     }
 }
 
+/// Emit a single JSON string token, delegating all escaping to
+/// `serde_json`. This is the one owner of "string → JSON token" for the
+/// CLI JSON formatter: both structure member names and string scalars
+/// go through it, so quotes, backslashes, control characters (newline,
+/// tab, NUL, …), and non-ASCII are emitted as valid JSON instead of the
+/// prior hand-rolled escaper that quoted neither keys nor control chars.
+/// EPICS Base routes the same tokens through YAJL's `yg_string()`
+/// (`pvData/src/json/jprint.cpp:112-164`).
+fn json_string(s: &str) -> String {
+    // `Value::String(..).to_string()` is the compact, fully-escaped
+    // JSON token (e.g. `"a\nb"`); it never fails.
+    serde_json::Value::String(s.to_owned()).to_string()
+}
+
 fn structure_to_json(s: &PvStructure) -> String {
+    // Member order is preserved by iterating `fields` in declared order
+    // (EPICS Base prints `names[i]` in structure order); a
+    // `serde_json::Map` would re-sort keys and break that parity, so the
+    // generator owns only token escaping, not container assembly.
     let parts: Vec<String> = s
         .fields
         .iter()
-        .map(|(n, v)| format!("{n}:{}", value_to_json(v)))
+        .map(|(n, v)| format!("{}:{}", json_string(n), value_to_json(v)))
         .collect();
     format!("{{{}}}", parts.join(","))
 }
 
 fn scalar_to_json(v: &ScalarValue) -> String {
     match v {
-        ScalarValue::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        ScalarValue::String(s) => json_string(s),
         ScalarValue::Float(f) => {
             if f.fract() == 0.0 {
                 format!("{f:.1}")
@@ -811,6 +829,63 @@ mod tests {
         let v = PvField::ScalarArray(vec![ScalarValue::Int(1), ScalarValue::Int(2)]);
         let out = format_json("X", &v);
         assert_eq!(out, "X [1,2]\n");
+    }
+
+    /// Extract the JSON payload from a `format_json("X", ..)` line:
+    /// `"X <json>\n"` → `<json>`.
+    fn json_payload(out: &str) -> &str {
+        out.strip_prefix("X ")
+            .and_then(|s| s.strip_suffix('\n'))
+            .expect("format_json output shape")
+    }
+
+    /// A structure member name that is not a bare JSON5 identifier
+    /// (space, dash) must be emitted as a quoted, escaped key, and the
+    /// whole line must be strict-JSON parseable. Pre-fix the key was
+    /// spliced in unquoted (`{alarm message:...}`), which no JSON parser
+    /// accepts. Member order must survive (declared order, not sorted).
+    #[test]
+    fn json_quotes_and_escapes_structure_keys() {
+        let mut s = PvStructure::new("");
+        s.set("alarm message", PvField::Scalar(ScalarValue::Int(1)));
+        s.set("a-b", PvField::Scalar(ScalarValue::Int(2)));
+        let out = format_json("X", &PvField::Structure(s));
+        let payload = json_payload(&out);
+        let parsed: serde_json::Value = serde_json::from_str(payload).expect("must be strict JSON");
+        assert_eq!(parsed["alarm message"], serde_json::json!(1));
+        assert_eq!(parsed["a-b"], serde_json::json!(2));
+        // Declared order preserved (not lexicographically re-sorted).
+        assert_eq!(payload, r#"{"alarm message":1,"a-b":2}"#);
+    }
+
+    /// A string scalar carrying control characters (newline, tab, NUL,
+    /// carriage return) plus a quote and a backslash must be escaped by
+    /// the JSON generator, not emitted raw. The result must parse as
+    /// strict JSON and round-trip back to the exact original bytes.
+    #[test]
+    fn json_escapes_string_control_characters() {
+        let raw = "line1\nline2\tx\r\0\"q\\z";
+        let v = PvField::Scalar(ScalarValue::String(raw.to_string()));
+        let out = format_json("X", &v);
+        let payload = json_payload(&out);
+        let parsed: serde_json::Value = serde_json::from_str(payload).expect("must be strict JSON");
+        assert_eq!(parsed, serde_json::Value::String(raw.to_string()));
+        // No raw newline leaked into the token.
+        assert!(!payload.contains('\n'));
+    }
+
+    /// A string-array element with control characters is escaped per
+    /// element and the array stays strict JSON.
+    #[test]
+    fn json_escapes_string_array_elements() {
+        let v = PvField::ScalarArray(vec![
+            ScalarValue::String("a\nb".to_string()),
+            ScalarValue::String("c\"d".to_string()),
+        ]);
+        let out = format_json("X", &v);
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_payload(&out)).expect("must be strict JSON");
+        assert_eq!(parsed, serde_json::json!(["a\nb", "c\"d"]));
     }
 
     #[test]

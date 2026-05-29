@@ -242,25 +242,11 @@ async fn group_monitor_subscribes_archive_log_events() {
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
 
-    // Drive priming: the Plain mapping needs a value event per
-    // member to complete priming. Use VALUE-class posts (not LOG)
-    // so the priming path doesn't accidentally satisfy itself with
-    // the bit under test.
-    for rec_name in ["TEST:level", "TEST:count"] {
-        let rec = db.get_record(rec_name).await.expect("rec exists");
-        let inst = rec.read().await;
-        inst.notify_field("VAL", EventMask::VALUE);
-    }
-    // Pull the post-priming snapshot off the queue.
-    let primed = tokio::time::timeout(Duration::from_secs(2), mon.poll()).await;
-    primed
-        .expect("priming snapshot must arrive within 2s")
-        .expect("priming snapshot");
-
-    // Now the gate is open: post a LOG-ONLY event on `level.VAL`.
-    // No VALUE / ALARM bit set; if the bridge had subscribed only
-    // with VALUE|ALARM the event would silently drop and the
-    // following poll would time out.
+    // Post a LOG-ONLY event on `level.VAL`. No VALUE / ALARM bit set;
+    // if the bridge had subscribed only with VALUE|ALARM the event
+    // would silently drop and the following poll would time out. The
+    // group monitor is purely delta-driven (the wire layer owns the
+    // initial frame), so this delta must wake poll() directly.
     {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
         let inst = rec.read().await;
@@ -402,13 +388,15 @@ async fn br_r33_group_monitor_stamps_negotiated_queue_size() {
         |def: epics_bridge_rs::qsrv::GroupPvDef, db: Arc<PvDatabase>, negotiated: i32| async move {
             let mut mon = GroupMonitor::new(db.clone(), def).with_queue_size(negotiated);
             mon.start().await.expect("start");
+            // A member post wakes the delta-driven monitor; the emitted
+            // value carries the stamped record._options.queueSize.
             for rec_name in ["TEST:level", "TEST:count"] {
                 let rec = db.get_record(rec_name).await.expect("rec exists");
                 rec.read().await.notify_field("VAL", EventMask::VALUE);
             }
             let snap = tokio::time::timeout(Duration::from_secs(2), mon.poll())
                 .await
-                .expect("priming snapshot within 2s")
+                .expect("first monitor delta within 2s")
                 .expect("snapshot");
             mon.stop().await;
             let record = match snap
@@ -539,7 +527,7 @@ async fn group_monitor_stamps_atomic_true_while_get_reports_operation_atomicity(
     }
     let snap = tokio::time::timeout(Duration::from_secs(2), mon.poll())
         .await
-        .expect("priming snapshot within 2s")
+        .expect("first monitor delta within 2s")
         .expect("snapshot");
     mon.stop().await;
     assert!(
@@ -690,22 +678,9 @@ async fn br_fr12_named_trigger_marks_only_target() {
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
 
-    // Prime both Plain members with a value event each.
-    for rec_name in ["TEST:level", "TEST:count"] {
-        let rec = db.get_record(rec_name).await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
-    }
-    let primed = tokio::time::timeout(Duration::from_secs(2), mon.poll())
-        .await
-        .expect("priming snapshot within 2s")
-        .expect("priming snapshot");
-    // The priming/first event is always full — the server derives the
-    // changed-bitset, so it carries no explicit marked set.
-    assert!(
-        primed.marked.is_none(),
-        "priming snapshot must derive a full changed-bitset (marked: None), got {:?}",
-        primed.marked
-    );
+    // The monitor is purely delta-driven: the wire layer owns the full
+    // initial frame, so poll() carries only fresh member deltas with
+    // their resolved marked set (no priming snapshot precedes them).
 
     // A `level` post triggers only `count`.
     {
@@ -768,15 +743,10 @@ async fn br_fr12_pure_self_trigger_derives_bitset() {
 
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
-    for rec_name in ["TEST:level", "TEST:count"] {
-        let rec = db.get_record(rec_name).await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
-    }
-    tokio::time::timeout(Duration::from_secs(2), mon.poll())
-        .await
-        .expect("priming snapshot within 2s")
-        .expect("priming snapshot");
 
+    // Delta-driven monitor: a single `level` post yields one delta. A
+    // pure self-trigger group derives its changed-bitset (marked: None)
+    // rather than carrying an explicit marked set.
     {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
         rec.read().await.notify_field("VAL", EventMask::VALUE);
@@ -789,6 +759,54 @@ async fn br_fr12_pure_self_trigger_derives_bitset() {
         ev.marked.is_none(),
         "a pure self-trigger group must derive its bitset (marked: None), got {:?}",
         ev.marked
+    );
+
+    mon.stop().await;
+}
+
+/// a group monitor must forward an active member's
+/// update without waiting for a quiet member to change after start.
+/// `TEST:grp` has two Plain members (`level`, `count`); only `level`
+/// posts, `count` stays quiet. The old per-member priming gate withheld
+/// every delta until BOTH members posted their initial events, so
+/// `level`'s update was discarded indefinitely. pvxs primes each field
+/// from sampled values at start (db_post_single_event,
+/// `groupsource.cpp:289-297`), so a quiet member never blocks an active
+/// one. The 500ms timeout is the guard: before the fix poll() never
+/// returned because `count`'s priming flag stayed unset.
+#[tokio::test]
+async fn br113_quiet_member_does_not_block_active_member_update() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_bridge_rs::qsrv::group::GroupMonitor;
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::time::Duration;
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp")
+        .cloned()
+        .expect("grp registered");
+
+    let mut mon = GroupMonitor::new(db.clone(), def);
+    mon.start().await.expect("start");
+
+    // Only `level` changes after start; `count` never posts.
+    {
+        let rec = db.get_record("TEST:level").await.expect("rec exists");
+        rec.read().await.notify_field("VAL", EventMask::VALUE);
+    }
+    let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+        .await
+        .expect("active member's update must flow without waiting for the quiet member")
+        .expect("snapshot");
+    // The delta carries the full group structure read fresh; `count`'s
+    // current value is included even though it never posted.
+    assert!(
+        !ev.value.fields.is_empty(),
+        "active-member delta must carry the full group structure, got {ev:?}"
     );
 
     mon.stop().await;

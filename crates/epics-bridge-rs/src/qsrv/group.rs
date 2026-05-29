@@ -1514,18 +1514,6 @@ struct MemberEvent {
     kind: MemberEventKind,
 }
 
-/// Per-field priming state for the subscription priming phase.
-///
-/// Corresponds to pvxs `GroupSourceSubscriptionCtx` priming logic
-/// (groupsource.cpp:206-237). The first monitor post is withheld until
-/// every field has received its initial value and (where applicable)
-/// property event.
-#[derive(Debug, Clone)]
-struct FieldPrimingState {
-    had_value_event: bool,
-    had_property_event: bool,
-}
-
 /// A PVA monitor for a group PV that subscribes to all member records.
 ///
 /// Corresponds to C++ QSRV's `PDBGroupMonitor` + `pdb_group_event()`.
@@ -1563,12 +1551,6 @@ pub struct GroupMonitor {
     _tasks: Vec<MemberTaskGuard>,
     /// Access control context propagated from the parent GroupChannel.
     access: super::provider::AccessContext,
-    /// Per-member priming state. Once all fields are primed, the first
-    /// snapshot is posted. Before that, events are accumulated but not
-    /// returned to the caller.
-    priming: Vec<FieldPrimingState>,
-    /// Whether the priming phase has completed.
-    events_primed: bool,
     /// negotiated monitor queue depth, resolved from
     /// the MONITOR INIT pvRequest's `record._options.queueSize`
     /// ([`negotiated_queue_size`]). Stamped into every monitor
@@ -1595,37 +1577,6 @@ enum EventMark {
 
 impl GroupMonitor {
     pub fn new(db: Arc<PvDatabase>, def: GroupPvDef) -> Self {
-        // Initialize priming state for each member.
-        // pvxs subscribes ALL members with channels (regardless of trigger)
-        // and waits for their initial events before posting.
-        let priming: Vec<FieldPrimingState> = def
-            .members
-            .iter()
-            .map(|member| {
-                match member.mapping {
-                    // Const, Structure, and Proc have no data to wait for —
-                    // immediately primed (pvxs groupsource.cpp:369-376).
-                    FieldMapping::Const | FieldMapping::Structure | FieldMapping::Proc => {
-                        FieldPrimingState {
-                            had_value_event: true,
-                            had_property_event: true,
-                        }
-                    }
-                    // Scalar and Meta need both value + property events.
-                    FieldMapping::Scalar | FieldMapping::Meta => FieldPrimingState {
-                        had_value_event: false,
-                        had_property_event: false,
-                    },
-                    // Plain, Any only need value events (auto-prime property,
-                    // pvxs groupsource.cpp:397).
-                    _ => FieldPrimingState {
-                        had_value_event: false,
-                        had_property_event: true,
-                    },
-                }
-            })
-            .collect();
-
         Self {
             db,
             def,
@@ -1634,8 +1585,6 @@ impl GroupMonitor {
             event_rx: None,
             _tasks: Vec::new(),
             access: super::provider::AccessContext::allow_all(),
-            priming,
-            events_primed: false,
             monitor_queue_size: GROUP_DEFAULT_QUEUE_SIZE,
         }
     }
@@ -1772,10 +1721,11 @@ impl super::provider::PvaMonitor for GroupMonitor {
         let (tx, rx) = tokio::sync::mpsc::channel::<MemberEvent>(cap);
 
         // Subscribe to ALL members with channels, regardless of trigger
-        // setting. pvxs subscribes every field with a dbChannel for the
-        // priming phase (groupsource.cpp:375-398). TriggerDef::None only
-        // means "don't update the group when this field changes" — the
-        // subscription still fires for priming.
+        // setting — pvxs subscribes every field with a dbChannel
+        // (groupsource.cpp:375-398). TriggerDef::None only means "don't
+        // update the group when this field changes"; its events are
+        // filtered to EventMark::Skip in poll() rather than gating the
+        // stream.
         for (idx, member) in self.def.members.iter().enumerate() {
             if member.channel.is_empty() {
                 continue; // Structure/Const/Proc-without-channel — no backing channel
@@ -1835,12 +1785,6 @@ impl super::provider::PvaMonitor for GroupMonitor {
                     }
                 });
                 self._tasks.push(MemberTaskGuard(handle.abort_handle()));
-            } else {
-                // Record not found or subscribe failed — auto-prime this
-                // member so the priming phase doesn't stall forever.
-                if let Some(state) = self.priming.get_mut(idx) {
-                    state.had_value_event = true;
-                }
             }
 
             // Property subscription (DBE_PROPERTY) — only for Scalar/Meta
@@ -1872,11 +1816,6 @@ impl super::provider::PvaMonitor for GroupMonitor {
                         }
                     });
                     self._tasks.push(MemberTaskGuard(handle.abort_handle()));
-                } else {
-                    // Property subscribe failed — auto-prime.
-                    if let Some(state) = self.priming.get_mut(idx) {
-                        state.had_property_event = true;
-                    }
                 }
             }
         }
@@ -1894,25 +1833,6 @@ impl super::provider::PvaMonitor for GroupMonitor {
             .with_monitor_queue_size(self.monitor_queue_size)
             .with_monitor_stamp();
 
-        // Check if all members are already primed (e.g., all Const/Structure).
-        let all_primed = self
-            .priming
-            .iter()
-            .all(|p| p.had_value_event && p.had_property_event);
-        if all_primed {
-            // No backing channels, so no member event will ever fire: the
-            // group is primed by construction. Mark it primed but do NOT
-            // manufacture a snapshot to forward — the native PVA server
-            // already emits the initial frame via get_value_checked() at
-            // MONITOR INIT (server_native/tcp.rs build_monitor_payload).
-            // Forwarding a snapshot here too would deliver the same static
-            // value twice, the channel-less mirror of the duplicate the
-            // single-record BridgeMonitor avoids the same way
-            // (qsrv/monitor.rs:189-195). pvxs posts one value for this case
-            // (groupsource.cpp:289-297).
-            self.events_primed = true;
-        }
-
         self.group_channel = Some(group_channel);
         self.event_rx = Some(rx);
         self.running = true;
@@ -1920,50 +1840,25 @@ impl super::provider::PvaMonitor for GroupMonitor {
     }
 
     async fn poll(&mut self) -> Option<super::provider::MonitorPoll> {
-        // Purely event-driven: the initial frame is the wire layer's
-        // get_value_checked() snapshot, so this stream only carries fresh
-        // member events. A channel-less (all-const) group has no member
-        // subscriptions, so this returns None immediately after start —
-        // exactly one DATA frame reaches the client.
+        // Purely event-driven: the wire layer already sent the initial
+        // frame via get_value_checked() at MONITOR INIT for every source
+        // (server_native/tcp.rs:build_monitor_payload), so this stream
+        // carries only fresh member deltas — never an initial snapshot.
+        //
+        // A channel-less (all-const) group has no member subscriptions, so
+        // this never wakes and the client sees exactly one DATA frame (the
+        // wire initial). A channel-backed group forwards each member event
+        // as it arrives, with NO gate on other members posting first: pvxs
+        // primes every field from sampled values at start via
+        // db_post_single_event (groupsource.cpp:289-297), so a quiet member
+        // never withholds an active one. The previous per-member priming
+        // gate both withheld every delta until all members changed and
+        // re-emitted a full snapshot the wire layer had already sent — one
+        // structural defect (the priming gate) producing two symptoms.
         let rx = self.event_rx.as_mut()?;
 
         loop {
             let event = rx.recv().await?;
-
-            // Update priming state for this member.
-            if !self.events_primed {
-                if let Some(state) = self.priming.get_mut(event.member_index) {
-                    match event.kind {
-                        MemberEventKind::Value => state.had_value_event = true,
-                        MemberEventKind::Property => state.had_property_event = true,
-                    }
-                }
-
-                // Check if all members are now primed.
-                let all_primed = self
-                    .priming
-                    .iter()
-                    .all(|p| p.had_value_event && p.had_property_event);
-
-                if all_primed {
-                    self.events_primed = true;
-                    // Post the first complete group snapshot now that all
-                    // fields have reported their initial state
-                    // (pvxs groupsource.cpp:220-230). The first event is
-                    // always full — pvxs marks every field on the priming
-                    // post — so it derives the changed-bitset (`marked:
-                    // None`), like the initial GET the PVA layer already
-                    // sent.
-                    let group_channel = self.group_channel.as_ref()?;
-                    return group_channel
-                        .read_group()
-                        .await
-                        .ok()
-                        .map(super::provider::MonitorPoll::derive);
-                }
-                // Not yet primed — accumulate events but don't return data.
-                continue;
-            }
 
             // resolve which group field paths this event
             // marks, instead of treating every trigger kind identically.
@@ -2003,26 +1898,6 @@ impl super::provider::PvaMonitor for GroupMonitor {
 
         self.running = false;
         self.group_channel = None;
-        self.events_primed = false;
-        // Reset priming state for potential restart
-        for (i, member) in self.def.members.iter().enumerate() {
-            if let Some(state) = self.priming.get_mut(i) {
-                match member.mapping {
-                    FieldMapping::Const | FieldMapping::Structure | FieldMapping::Proc => {
-                        state.had_value_event = true;
-                        state.had_property_event = true;
-                    }
-                    FieldMapping::Scalar | FieldMapping::Meta => {
-                        state.had_value_event = false;
-                        state.had_property_event = false;
-                    }
-                    _ => {
-                        state.had_value_event = false;
-                        state.had_property_event = true;
-                    }
-                }
-            }
-        }
     }
 }
 

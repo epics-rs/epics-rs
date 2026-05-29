@@ -1628,15 +1628,18 @@ fn handle_search_response(
         }
         return consumed;
     }
-    // pvxs `client.cpp:849-880` ignores SEARCH_RESPONSE
-    // frames whose `proto != "tcp"`. The Rust UDP search engine
-    // only opens plain TCP connections to resolved servers; a
-    // server advertising a non-tcp transport (tls without an
-    // established trust path, or an experimental scheme) must be
-    // dropped — connecting on plain TCP would fail at handshake.
-    // Accept "tcp" only here. An empty protocol is tolerated for
-    // back-compat with older shims that omit the field.
-    if !resp.protocol.is_empty() && resp.protocol != "tcp" {
+    // pvxs `client.cpp:872-904` drops any found SEARCH_RESPONSE whose
+    // `proto != "tcp"`. The comparison is exact: pvxs's string decoder
+    // can map a null/omitted marker to an empty `std::string`, but that
+    // empty string still fails `proto != "tcp"` (pvaproto.h:392-405,
+    // client.cpp:902-904) — there is no empty-protocol exception for
+    // found=true channel resolution. The Rust UDP search engine only
+    // opens plain TCP connections, so a server that did not advertise
+    // exactly `"tcp"` (empty, a null marker, "tls", or an experimental
+    // scheme) must be dropped rather than dialed on a transport it never
+    // offered. The discovery-pong (found=false) path above is the only
+    // place an empty/other protocol is tolerated, matching pvxs.
+    if resp.protocol != "tcp" {
         return consumed;
     }
     // pvxs procSearchReply (client.cpp:857-863) drops responses whose
@@ -2249,6 +2252,107 @@ mod tests {
             Ok(Discovered::Online { guid, .. }) => assert_eq!(guid, [0x42u8; 12]),
             other => panic!("expected Discovered::Online for discovery pong, got {other:?}"),
         }
+    }
+
+    /// PVA-RS-2026-05-28-114: a found=true SEARCH_RESPONSE is resolved
+    /// only when its transport protocol is exactly `"tcp"`. pvxs drops
+    /// any other found reply — including an empty/null-marker protocol —
+    /// and keeps searching (client.cpp:872-904). An empty protocol used
+    /// to be tolerated as a back-compat exception, which let a malformed
+    /// or legacy responder satisfy a search and make the client dial a
+    /// plain TCP circuit to an endpoint that never advertised `"tcp"`.
+    #[test]
+    fn found_true_requires_exact_tcp_protocol() {
+        use tokio::sync::oneshot;
+
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
+
+        let make_pending = || -> (HashMap<u32, Pending>, HashMap<String, u32>, oneshot::Receiver<SocketAddr>) {
+            let (tx, rx) = oneshot::channel::<SocketAddr>();
+            let mut pending: HashMap<u32, Pending> = HashMap::new();
+            pending.insert(
+                1,
+                Pending {
+                    pv_name: "dut".into(),
+                    responder: Responder::Single(tx),
+                    last_attempt: Instant::now(),
+                    attempt: 1,
+                    bucket: 0,
+                },
+            );
+            let mut by_name: HashMap<String, u32> = HashMap::new();
+            by_name.insert("dut".into(), 1);
+            (pending, by_name, rx)
+        };
+
+        let found_true = |proto: &str| -> Vec<u8> {
+            crate::server_native::udp::build_search_response_proto(
+                [0x42u8; 12],
+                0,
+                5075,
+                &[1], // non-empty cids ⇒ found byte encodes true
+                ByteOrder::Little,
+                proto,
+            )
+        };
+
+        // `""` here also stands in for the null-string-marker case: the
+        // decoder maps a null marker to an empty protocol, which must
+        // fail the exact `== "tcp"` gate just like a literal empty field.
+        for proto in ["", "tls", "TCP", "udp"] {
+            let (mut pending, mut by_name, _rx) = make_pending();
+            let beacons = BeaconTracker::new();
+            let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+            let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+            let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
+                std::collections::HashSet::new();
+            let mut poke = false;
+            handle_search_response(
+                &found_true(proto),
+                &mut pending,
+                &mut by_name,
+                &beacons,
+                &ignore,
+                &mut subs,
+                &mut announced,
+                &mut poke,
+                peer,
+                false,
+            );
+            assert!(
+                pending.contains_key(&1),
+                "found=true with protocol {proto:?} must be ignored, not resolved"
+            );
+        }
+
+        // Exactly "tcp" resolves the pending channel.
+        let (mut pending, mut by_name, mut rx) = make_pending();
+        let beacons = BeaconTracker::new();
+        let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
+            std::collections::HashSet::new();
+        let mut poke = false;
+        handle_search_response(
+            &found_true("tcp"),
+            &mut pending,
+            &mut by_name,
+            &beacons,
+            &ignore,
+            &mut subs,
+            &mut announced,
+            &mut poke,
+            peer,
+            false,
+        );
+        assert!(
+            !pending.contains_key(&1),
+            "found=true with protocol \"tcp\" must resolve the pending channel"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "the resolver must receive the server address"
+        );
     }
 
     /// pvxs `Channel::disconnect` (client.cpp:213) parity: a

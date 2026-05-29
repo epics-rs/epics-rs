@@ -345,8 +345,31 @@ pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<Group
 pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Vec<GroupPvDef>) {
     for def in new_defs {
         if let Some(existing_def) = existing.get_mut(&def.name) {
-            // Merge members into existing group
-            existing_def.members.extend(def.members);
+            // Merge members, keyed by group field name. pvxs holds one
+            // field per group field name (`groupDefinition.fieldMap`,
+            // groupdefinition.h:36-37); when a later fragment maps a field
+            // name already defined, `defineFields` warns "ignoring
+            // duplicate mapping" and skips it (groupconfigprocessor.cpp:
+            // 221-225) — first definition wins. A blind `extend` instead
+            // kept BOTH members, so GET composed the field twice and an
+            // atomic PUT could drive two backing writes for one client
+            // field. Skip duplicates here so the runtime group has exactly
+            // one member per field name, matching pvxs.
+            let mut seen: std::collections::HashSet<String> = existing_def
+                .members
+                .iter()
+                .map(|m| m.field_name.clone())
+                .collect();
+            for member in def.members {
+                if !seen.insert(member.field_name.clone()) {
+                    eprintln!(
+                        "warning: group '{}': ignoring duplicate mapping for field '{}'",
+                        def.name, member.field_name
+                    );
+                    continue;
+                }
+                existing_def.members.push(member);
+            }
             // re-sort the combined member list — the merge appends
             // a second source's members, so the canonical (put_order,
             // field_name) order must be re-established over the union.
@@ -1263,6 +1286,37 @@ mod tests {
 
         let grp = existing.get("GRP:a").unwrap();
         assert_eq!(grp.members.len(), 2);
+    }
+
+    /// Two info(Q:group) fragments contributing the SAME group field
+    /// name collapse to one member — pvxs keeps one field per name
+    /// (`groupdefinition.h:36-37`) and `defineFields`
+    /// (groupconfigprocessor.cpp:221-225) skips the duplicate with
+    /// "ignoring duplicate mapping" (first definition wins). A blind
+    /// member append would compose the field twice on GET and double the
+    /// backing write on an atomic PUT.
+    #[test]
+    fn merge_collapses_duplicate_field_name_first_wins() {
+        let mut existing = HashMap::new();
+        let defs1 =
+            parse_group_config(r#"{ "GRP:d": { "x": { "+channel": "R1:x", "+putorder": 0 } } }"#)
+                .unwrap();
+        merge_group_defs(&mut existing, defs1);
+
+        // A second fragment maps the same field name `x` to a different
+        // channel — pvxs ignores it; the first definition stands.
+        let defs2 =
+            parse_group_config(r#"{ "GRP:d": { "x": { "+channel": "R2:x", "+putorder": 1 } } }"#)
+                .unwrap();
+        merge_group_defs(&mut existing, defs2);
+
+        let grp = existing.get("GRP:d").unwrap();
+        assert_eq!(grp.members.len(), 1, "duplicate field must collapse");
+        assert_eq!(grp.members[0].field_name, "x");
+        assert_eq!(
+            grp.members[0].channel, "R1:x",
+            "first definition must win (pvxs ignores the duplicate)"
+        );
     }
 
     #[test]

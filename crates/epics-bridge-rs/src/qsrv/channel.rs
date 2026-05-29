@@ -215,11 +215,47 @@ fn process_mode_from_scalar(sv: &ScalarValue) -> ProcessMode {
     }
 }
 
+/// Coerce a pvRequest scalar to a bool exactly as pvxs `Value::as<bool>`
+/// does. `copyOutScalar` (`src/data.cpp:399-409`) converts a bool, any
+/// signed/unsigned integer (nonzero ⇒ true), or a real to bool; the
+/// string store (`src/data.cpp:459-462`) accepts only the exact tokens
+/// `"true"` / `"false"` (no trim, case-sensitive) and otherwise raises
+/// `NoConvert`. `None` mirrors that `NoConvert` outcome — the caller
+/// keeps its default, matching pvxs `as<bool>(fallback)` returning the
+/// fallback for an absent or unconvertible field.
+///
+/// This is intentionally distinct from [`process_mode_from_scalar`],
+/// which is a tri-state (Force/Inhibit/Passive) routed through pvxs's
+/// separate `setForceProcessingFlag` chain (real ⇒ passive, `"passive"`
+/// recognized) — mirroring the two different pvxs code paths rather than
+/// forcing one parser to serve both.
+fn scalar_as_bool(sv: &ScalarValue) -> Option<bool> {
+    match sv {
+        ScalarValue::Boolean(b) => Some(*b),
+        ScalarValue::Byte(n) => Some(*n != 0),
+        ScalarValue::Short(n) => Some(*n != 0),
+        ScalarValue::Int(n) => Some(*n != 0),
+        ScalarValue::Long(n) => Some(*n != 0),
+        ScalarValue::UByte(n) => Some(*n != 0),
+        ScalarValue::UShort(n) => Some(*n != 0),
+        ScalarValue::UInt(n) => Some(*n != 0),
+        ScalarValue::ULong(n) => Some(*n != 0),
+        ScalarValue::Float(v) => Some(*v != 0.0),
+        ScalarValue::Double(v) => Some(*v != 0.0),
+        ScalarValue::String(s) => match s.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+    }
+}
+
 impl PutOptions {
     /// Extract process/block options from a PvStructure.
     ///
     /// Looks for `record._options.process` (bool / integer / "true" /
-    /// "false" / "passive") and `record._options.block` (boolean) fields.
+    /// "false" / "passive") and `record._options.block` (bool / integer /
+    /// unsigned / real / "true" / "false", via pvxs `as<bool>` coercion).
     pub fn from_pv_request(request: &PvStructure) -> Self {
         let mut opts = Self::default();
 
@@ -247,13 +283,25 @@ impl PutOptions {
                 opts.process = process_mode_from_scalar(sv);
             }
 
-            // block option
-            if let Some(PvField::Scalar(ScalarValue::Boolean(b))) = opt_struct.get_field("block") {
-                opts.block = *b;
-                // No point blocking if we're not processing
-                if opts.process == ProcessMode::Inhibit {
-                    opts.block = false;
+            // block option. pvxs reads `record._options.block` via
+            // `Value::as<bool>` (ioc/singlesource.cpp:346-352), which
+            // coerces bool / integer / unsigned / real / `"true"` /
+            // `"false"` through `copyOutScalar`. The earlier path matched
+            // only `Boolean`, silently dropping the integer and string
+            // forms a PVA client can legally send — so a `block=1` or
+            // `block="true"` lost the put-notify completion barrier.
+            if let Some(PvField::Scalar(sv)) = opt_struct.get_field("block") {
+                if let Some(b) = scalar_as_bool(sv) {
+                    opts.block = b;
                 }
+            }
+            // No point blocking if processing is inhibited
+            // (singlesource.cpp:350-352: `doWait` is cleared whenever the
+            // PUT does not process). Applied uniformly after parsing, so
+            // the invariant `process == Inhibit ⇒ !block` holds for every
+            // accepted `block` encoding, not only the boolean one.
+            if opts.process == ProcessMode::Inhibit {
+                opts.block = false;
             }
         }
 
@@ -778,6 +826,79 @@ mod tests {
             f(ScalarValue::String("passive".into())),
             ProcessMode::Passive
         );
+    }
+
+    fn req_with_block(value: PvField) -> PvStructure {
+        let mut options = PvStructure::new("");
+        // A non-Inhibit process so the block flag is not cleared by the
+        // `process == Inhibit ⇒ !block` rule — isolates the block parse.
+        options.fields.push((
+            "process".into(),
+            PvField::Scalar(ScalarValue::Boolean(true)),
+        ));
+        options.fields.push(("block".into(), value));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+        req
+    }
+
+    /// pvxs reads `record._options.block` via `as<bool>`
+    /// (singlesource.cpp:346-352), coercing bool, integer, unsigned,
+    /// real, and the exact strings `"true"`/`"false"` (data.cpp:399-409,
+    /// 459-462). The earlier parser accepted only a boolean scalar, so a
+    /// client sending `block=1` or `block="true"` lost the put-notify
+    /// completion barrier.
+    #[test]
+    fn put_options_block_accepts_integer_and_string_forms() {
+        let f = |v| PutOptions::from_pv_request(&req_with_block(PvField::Scalar(v))).block;
+
+        // boolean (already worked)
+        assert!(f(ScalarValue::Boolean(true)));
+        assert!(!f(ScalarValue::Boolean(false)));
+        // integer 1 / 0
+        assert!(f(ScalarValue::Int(1)));
+        assert!(!f(ScalarValue::Int(0)));
+        // unsigned + 64-bit integer
+        assert!(f(ScalarValue::UInt(1)));
+        assert!(f(ScalarValue::Long(5)));
+        // real
+        assert!(f(ScalarValue::Double(1.0)));
+        assert!(!f(ScalarValue::Double(0.0)));
+        // exact "true" / "false" strings
+        assert!(f(ScalarValue::String("true".into())));
+        assert!(!f(ScalarValue::String("false".into())));
+        // unconvertible string keeps the default (false)
+        assert!(!f(ScalarValue::String("yes".into())));
+    }
+
+    /// The `process == Inhibit ⇒ !block` rule (singlesource.cpp:350-352)
+    /// must hold for every accepted `block` encoding, not only boolean.
+    #[test]
+    fn put_options_inhibit_disables_integer_block() {
+        let mut options = PvStructure::new("");
+        options.fields.push((
+            "process".into(),
+            PvField::Scalar(ScalarValue::String("false".into())),
+        ));
+        options
+            .fields
+            .push(("block".into(), PvField::Scalar(ScalarValue::Int(1))));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+
+        let opts = PutOptions::from_pv_request(&req);
+        assert_eq!(opts.process, ProcessMode::Inhibit);
+        assert!(!opts.block, "block=1 must be cleared when process=false");
     }
 
     fn req_with_dbe(value: PvField) -> PvStructure {

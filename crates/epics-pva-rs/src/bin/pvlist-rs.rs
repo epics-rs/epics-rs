@@ -2,9 +2,10 @@
 //! mirroring pvxs `tools/list.cpp`.
 //!
 //! ```text
-//! pvlist-rs                  # discover servers (passive beacon listen)
+//! pvlist-rs                  # discover servers (active: broadcast ping + listen)
 //! pvlist-rs -w 5             # discover for 5 seconds, then exit
-//! pvlist-rs --ping           # actively ping (DiscoverBuilder::pingAll)
+//! pvlist-rs -p               # passive discovery (beacon listen only)
+//! pvlist-rs -A               # active discovery (explicit; the default)
 //! pvlist-rs --verbose        # include guid + proto + peer
 //! pvlist-rs <ip[:port]>      # query one server for its hosted channels
 //! pvlist-rs -i <ip[:port]>   # query one server for its serverInfo
@@ -36,9 +37,17 @@ struct Args {
     #[arg(short = 'w', default_value = "5.0")]
     timeout: f64,
 
-    /// Actively ping discoverable servers (DiscoverBuilder::pingAll).
-    #[arg(short = 'p', long = "ping")]
-    ping: bool,
+    /// Active discovery mode (default): send a broadcast ping, then
+    /// keep listening for beacons. pvxs `tools/list.cpp:50-52,83-85`
+    /// documents `-A` as active and initializes `active = true`.
+    #[arg(short = 'A', long = "active")]
+    active: bool,
+
+    /// Passive discovery mode: only listen for server beacons, no
+    /// broadcast ping. pvxs `tools/list.cpp:53,86-88` makes `-p` set
+    /// `active = false`.
+    #[arg(short = 'p', long = "passive", conflicts_with = "active")]
+    passive: bool,
 
     /// Verbose output — include GUID, proto, and beacon peer address.
     #[arg(short = 'v', long = "verbose")]
@@ -52,6 +61,16 @@ struct Args {
     /// Server address(es) to query, `ip[:port]`. When given, switches
     /// from discovery mode to per-server channel enumeration.
     servers: Vec<String>,
+}
+
+impl Args {
+    /// Resolve the active/passive discovery flag the way pvxs does:
+    /// active by default, `-A` keeps it active, `-p` clears it. pvxs
+    /// `tools/list.cpp:71` initializes `active = true` and passes it to
+    /// `.pingAll(active)` (`:151`); only `-p` flips it off (`:86-88`).
+    fn active_discovery(&self) -> bool {
+        !self.passive
+    }
 }
 
 fn fmt_guid(guid: &[u8; 12]) -> String {
@@ -214,7 +233,8 @@ async fn query_server(
     }
 }
 
-/// Discovery mode — passive beacon listen + optional active ping.
+/// Discovery mode — active by default (broadcast ping + beacon
+/// listen); `-p` makes it passive (beacon listen only).
 async fn discover_mode(args: &Args) {
     let engine = match SearchEngine::spawn(Vec::new(), Vec::new()).await {
         Ok(e) => e,
@@ -230,7 +250,10 @@ async fn discover_mode(args: &Args) {
             std::process::exit(1);
         }
     };
-    if args.ping {
+    // pvxs always calls `.pingAll(active)`; with active=false it skips
+    // the broadcast probe. We gate the equivalent `ping_all()` on the
+    // resolved flag, which is active by default (tools/list.cpp:151).
+    if args.active_discovery() {
         engine.ping_all().await;
     }
 
@@ -331,5 +354,41 @@ async fn main() {
     }
     if had_error {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// pvxs `tools/list.cpp:71` defaults `active = true`: no-argument
+    /// discovery actively pings.
+    #[test]
+    fn discovery_is_active_by_default() {
+        let args = Args::parse_from(["pvlist-rs"]);
+        assert!(args.active_discovery());
+    }
+
+    /// pvxs `-p` (`tools/list.cpp:86-88`) sets `active = false`.
+    #[test]
+    fn passive_flag_disables_active_discovery() {
+        let args = Args::parse_from(["pvlist-rs", "-p"]);
+        assert!(!args.active_discovery());
+        let long = Args::parse_from(["pvlist-rs", "--passive"]);
+        assert!(!long.active_discovery());
+    }
+
+    /// pvxs `-A` (`tools/list.cpp:83-85`) keeps active mode.
+    #[test]
+    fn active_flag_keeps_active_discovery() {
+        let args = Args::parse_from(["pvlist-rs", "-A"]);
+        assert!(args.active_discovery());
+    }
+
+    /// `-A` and `-p` are mutually exclusive, mirroring the single
+    /// `active` bool in pvxs that the two options write.
+    #[test]
+    fn active_and_passive_conflict() {
+        assert!(Args::try_parse_from(["pvlist-rs", "-A", "-p"]).is_err());
     }
 }

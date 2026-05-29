@@ -31,9 +31,14 @@
 //! let nested leaf mismatches reach the coercing fallback; that was
 //! the defect this closes. `Variant`/`VariantArray` are accepted as-is
 //! because the value carries its own descriptor (the encoder emits it
-//! inline rather than coercing to a fixed type); a `Null` field
-//! encodes as the descriptor's default and likewise carries no
-//! value-derived data to corrupt.
+//! inline rather than coercing to a fixed type). A `Null` value fits
+//! only a `Variant`/Any slot — at every level, top-level or nested —
+//! where the wire is the 0xFF null marker; under any concrete
+//! descriptor it is rejected. pvxs allocates typed storage per member
+//! and has no nested-null concept (`data.cpp:96-121`), so a producer
+//! that hands a concrete field a `Null` would have the encoder coerce
+//! it to that descriptor's zero/default and pass fabricated data off
+//! as real — exactly the coercion this check refuses.
 
 use super::{FieldDesc, PvField, PvStructure, ScalarValue};
 
@@ -180,24 +185,10 @@ fn structure_fields_match(
 ) -> Result<(), ValueDescMismatch> {
     for (name, child_desc) in fields {
         if let Some(child_val) = s.get_field(name) {
-            value_matches_descriptor_child(child_val, child_desc)?;
+            value_matches_descriptor(child_val, child_desc)?;
         }
     }
     Ok(())
-}
-
-/// Recurse into a nested field. A `Null` child encodes as the
-/// descriptor's default (no value-derived data), so it fits any
-/// descriptor in a nested position — unlike a top-level `Null`, which
-/// fits only a `Variant` slot.
-fn value_matches_descriptor_child(
-    value: &PvField,
-    desc: &FieldDesc,
-) -> Result<(), ValueDescMismatch> {
-    if matches!(value, PvField::Null) {
-        return Ok(());
-    }
-    value_matches_descriptor(value, desc)
 }
 
 /// Validate a union selector and, when it selects a variant, the held
@@ -218,7 +209,7 @@ fn check_union_selector(
         return Ok(()); // null union — the 0xFF marker, no value bytes
     }
     match variants.get(selector as usize) {
-        Some((_, vdesc)) => value_matches_descriptor_child(value, vdesc),
+        Some((_, vdesc)) => value_matches_descriptor(value, vdesc),
         None => Err(ValueDescMismatch::UnionSelectorOutOfRange {
             selector,
             variants: variants.len(),
@@ -353,12 +344,82 @@ mod tests {
     }
 
     #[test]
-    fn null_nested_field_fits_any_descriptor() {
-        // A present-but-Null field encodes as the descriptor default.
+    fn null_nested_field_under_concrete_descriptor_is_err() {
+        // A present-but-Null field under a concrete (non-Variant)
+        // descriptor would be coerced to that descriptor's default by the
+        // encoder, fabricating a value the producer never set — reject it.
         let desc = nt_scalar_desc(ScalarType::Double);
         let mut s = PvStructure::new(NT_SCALAR);
         s.set("value", PvField::Null);
+        assert!(matches!(
+            value_matches_descriptor(&PvField::Structure(s), &desc),
+            Err(ValueDescMismatch::VariantMismatch {
+                desc: "Scalar",
+                value: "Null",
+            })
+        ));
+    }
+
+    #[test]
+    fn null_nested_field_under_variant_descriptor_is_ok() {
+        // A Null under a Variant/Any slot is the legitimate 0xFF null
+        // marker — accepted at the nested level just as at the top level.
+        let desc = FieldDesc::Structure {
+            struct_id: NT_SCALAR.to_string(),
+            fields: vec![("value".to_string(), FieldDesc::Variant)],
+        };
+        let mut s = PvStructure::new(NT_SCALAR);
+        s.set("value", PvField::Null);
         assert!(value_matches_descriptor(&PvField::Structure(s), &desc).is_ok());
+    }
+
+    #[test]
+    fn null_nested_field_under_scalar_array_descriptor_is_err() {
+        // NTScalarArray<Int>.value = Null would coerce to an empty array.
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalarArray:1.0".to_string(),
+            fields: vec![("value".to_string(), FieldDesc::ScalarArray(ScalarType::Int))],
+        };
+        let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
+        s.set("value", PvField::Null);
+        assert!(matches!(
+            value_matches_descriptor(&PvField::Structure(s), &desc),
+            Err(ValueDescMismatch::VariantMismatch {
+                desc: "ScalarArray",
+                value: "Null",
+            })
+        ));
+    }
+
+    #[test]
+    fn null_deeply_nested_field_is_err() {
+        // alarm.severity = Null, two levels down, must still be rejected —
+        // the recursion reaches every concrete leaf, not just the top one.
+        let desc = FieldDesc::Structure {
+            struct_id: NT_SCALAR.to_string(),
+            fields: vec![
+                ("value".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".to_string(),
+                        fields: vec![("severity".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+            ],
+        };
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm.set("severity", PvField::Null);
+        let mut s = PvStructure::new(NT_SCALAR);
+        s.set("value", PvField::Scalar(ScalarValue::Double(1.0)));
+        s.set("alarm", PvField::Structure(alarm));
+        assert!(matches!(
+            value_matches_descriptor(&PvField::Structure(s), &desc),
+            Err(ValueDescMismatch::VariantMismatch {
+                desc: "Scalar",
+                value: "Null",
+            })
+        ));
     }
 
     // ── Scalar-array element-type boundary. ─────────────────────────

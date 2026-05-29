@@ -123,6 +123,35 @@ pub type SearchResolver = Arc<
         + Sync,
 >;
 
+/// Per-request admission gate for an **already-registered** simple PV.
+///
+/// A plain IOC's simple PVs are authoritative: once registered they
+/// exist unconditionally, so no gate is installed and the cached-PV
+/// short-circuit in [`PvDatabase::find_entry_from`] /
+/// [`PvDatabase::has_name_from`] is unchanged. A CA gateway is
+/// different — its shadow PVs are projections of an upstream that can be
+/// host-denied for a given requester or disconnected — so it installs a
+/// gate that the lookup path consults *before* returning a cached simple
+/// PV. Returning `false` makes the database answer "does not exist" for
+/// that requester, exactly as C ca-gateway's `pvExistTest` returns
+/// `pverDoesNotExistHere` for a host-denied or disconnected PV
+/// (`gateServer.cc:1516-1637`) — without removing the PV object, so its
+/// cached value stays available for diagnostics and re-admission.
+///
+/// The first argument is the filter-suffix-stripped record path (the
+/// same key the simple-PV map and the gateway cache use); the second is
+/// the requesting peer (`None` for host-less internal lookups). The gate
+/// governs **only** simple PVs — records and aliases are never
+/// gateway-managed and bypass it.
+pub type ExistenceGate = Arc<
+    dyn Fn(
+            String,
+            Option<std::net::SocketAddr>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Internal state of [`PvDatabase`].
 ///
 /// # Invariant — alias-aware lookup (epics-base PR #336)
@@ -222,6 +251,10 @@ struct PvDatabaseInner {
     external_resolver: RwLock<Option<ExternalPvResolver>>,
     /// Optional async resolver invoked on `has_name` misses (e.g. CA gateway).
     search_resolver: RwLock<Option<SearchResolver>>,
+    /// Optional per-request gate consulted before a *cached* simple PV is
+    /// advertised as existing (e.g. CA gateway host/state admission). See
+    /// [`ExistenceGate`]. `None` for a plain IOC (short-circuit unchanged).
+    existence_gate: RwLock<Option<ExistenceGate>>,
     /// Per-scheme link sets — pluggable backends for `pva://` /
     /// `ca://` link resolution. Consulted before the legacy
     /// [`ExternalPvResolver`] in [`Self::resolve_external_pv`].
@@ -369,6 +402,7 @@ impl PvDatabase {
                 simple_pvs: RwLock::new(HashMap::new()),
                 external_resolver: RwLock::new(None),
                 search_resolver: RwLock::new(None),
+                existence_gate: RwLock::new(None),
                 link_sets: RwLock::new(link_set::LinkSetRegistry::new()),
                 records: RwLock::new(HashMap::new()),
                 scan_index: RwLock::new(HashMap::new()),
@@ -445,6 +479,49 @@ impl PvDatabase {
     /// Remove the previously installed search resolver, if any.
     pub async fn clear_search_resolver(&self) {
         *self.inner.search_resolver.write().await = None;
+    }
+
+    /// Install the per-request existence gate (see [`ExistenceGate`]).
+    /// Replaces any previously installed gate. Used by the CA gateway so
+    /// a cached shadow PV re-runs host/state admission per request.
+    pub async fn set_existence_gate(&self, gate: ExistenceGate) {
+        *self.inner.existence_gate.write().await = Some(gate);
+    }
+
+    /// Remove the previously installed existence gate, if any.
+    pub async fn clear_existence_gate(&self) {
+        *self.inner.existence_gate.write().await = None;
+    }
+
+    /// True when a cached simple PV named `name` must be treated as
+    /// non-existent for `peer` because the installed [`ExistenceGate`]
+    /// denied it. Always `false` when no gate is installed (a plain IOC)
+    /// or when `name` does not resolve to a simple PV — records and
+    /// aliases are never gateway-managed and bypass the gate.
+    ///
+    /// The single consultation point for the gate, shared by
+    /// [`Self::find_entry_from`] and [`Self::has_name_from`] so the
+    /// "cached simple PV ⇒ exists" short-circuit is closed uniformly on
+    /// both the create and search paths.
+    async fn simple_pv_gate_denies(&self, name: &str, peer: Option<std::net::SocketAddr>) -> bool {
+        let gate = match self.inner.existence_gate.read().await.clone() {
+            Some(g) => g,
+            None => return false,
+        };
+        // Strip the channel-filter suffix exactly as the lookups do
+        // (CA-FR-8) so the gate sees the same record-path key the
+        // simple-PV map and the gateway cache are keyed on.
+        let record_path = filters::split_channel_name(name).record_path;
+        if !self
+            .inner
+            .simple_pvs
+            .read()
+            .await
+            .contains_key(record_path.as_str())
+        {
+            return false;
+        }
+        !gate(record_path, peer).await
     }
 
     /// Set an external PV resolver for CA/PVA link resolution.
@@ -963,6 +1040,16 @@ impl PvDatabase {
         peer: Option<std::net::SocketAddr>,
     ) -> Option<PvEntry> {
         if let Some(entry) = self.find_entry_no_resolve(name).await {
+            // A cached simple PV must still pass the per-request
+            // existence gate (CA gateway host/state admission). When the
+            // gate denies it, answer does-not-exist for this requester
+            // instead of returning the stale shadow entry — C ca-gateway
+            // re-runs `gateAs::findEntry`/cache-state on every
+            // `pvExistTest` (gateServer.cc:1516-1637). Records/aliases
+            // bypass the gate (see `simple_pv_gate_denies`).
+            if matches!(entry, PvEntry::Simple(_)) && self.simple_pv_gate_denies(name, peer).await {
+                return None;
+            }
             return Some(entry);
         }
         // Try the search resolver
@@ -991,6 +1078,12 @@ impl PvDatabase {
     /// apply host-scoped `.pvlist` admission.
     pub async fn has_name_from(&self, name: &str, peer: Option<std::net::SocketAddr>) -> bool {
         if self.has_name_no_resolve(name).await {
+            // Same per-request gate as `find_entry_from`: a cached simple
+            // PV the gateway's host/state admission denies must answer
+            // does-not-exist at search time. Records/aliases bypass.
+            if self.simple_pv_gate_denies(name, peer).await {
+                return false;
+            }
             return true;
         }
         let resolver = self.inner.search_resolver.read().await.clone();
@@ -1659,5 +1752,57 @@ mod tests {
             (r1.is_ok() && r2.is_err()) || (r1.is_err() && r2.is_ok()),
             "exactly one of the racing inserts must succeed: r1={r1:?} r2={r2:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn existence_gate_blocks_cached_simple_pv_per_request() {
+        // A cached simple PV must re-pass the installed existence gate on
+        // both the search (`has_name_from`) and create (`find_entry_from`)
+        // paths. Records bypass the gate. With no gate the short-circuit
+        // is unchanged (plain-IOC behaviour).
+        use std::net::SocketAddr;
+
+        let db = PvDatabase::new();
+        db.add_pv("SHADOW:x", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        db.add_record(
+            "REC",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await
+        .unwrap();
+
+        let denied: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let allowed: SocketAddr = "192.0.2.5:5064".parse().unwrap();
+
+        // No gate installed: the cached simple PV resolves unconditionally.
+        assert!(db.has_name_from("SHADOW:x", Some(denied)).await);
+        assert!(db.find_entry_from("SHADOW:x", Some(denied)).await.is_some());
+
+        // Gate denies the simple PV only for `denied` (the gateway's
+        // host-scoped `.pvlist` admission has exactly this shape).
+        let gate: ExistenceGate = Arc::new(move |name, peer| {
+            Box::pin(async move { !(name == "SHADOW:x" && peer == Some(denied)) })
+        });
+        db.set_existence_gate(gate).await;
+
+        // Denied peer: does-not-exist on both paths despite the PV being
+        // cached in `simple_pvs`.
+        assert!(!db.has_name_from("SHADOW:x", Some(denied)).await);
+        assert!(db.find_entry_from("SHADOW:x", Some(denied)).await.is_none());
+
+        // Allowed peer: still resolves.
+        assert!(db.has_name_from("SHADOW:x", Some(allowed)).await);
+        assert!(
+            db.find_entry_from("SHADOW:x", Some(allowed))
+                .await
+                .is_some()
+        );
+
+        // Records are never gateway-managed — the gate must not gate them
+        // even for the denied peer.
+        assert!(db.has_name_from("REC", Some(denied)).await);
+        assert!(db.find_entry_from("REC", Some(denied)).await.is_some());
     }
 }

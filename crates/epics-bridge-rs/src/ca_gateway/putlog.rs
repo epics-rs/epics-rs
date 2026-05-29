@@ -1,29 +1,58 @@
 //! Put-event logging.
 //!
-//! Records all client put operations to a log file. Corresponds to
+//! Records client put operations to a log file. Corresponds to
 //! C++ ca-gateway's `-putlog` option.
 //!
 //! Each put generates one line in the log. The `old=` field carries the
 //! gateway's last cached upstream value before the put (C ca-gateway logs
 //! `vc->eventData()` here; `old=?` when no monitor value has been cached
-//! yet):
+//! yet).
 //!
-//! ```text
-//! 2026-04-09T14:35:21.123Z user@host TEMP:setpoint 25.0 old=24.8 OK
-//! 2026-04-09T14:35:22.456Z guest@1.2.3.4 PRESSURE:cmd 100.0 old=? DENIED
-//! ```
+//! ## Logging scope ([`PutLogScope`])
 //!
-//! ## Deviation from C ca-gateway (intentional, broader audit)
+//! The *scope* — which writes produce a line — is selected by the write
+//! hook, not by this module; the two modes also use distinct line formats:
 //!
-//! C logs a put only for PVs whose access-security client has the
-//! `TRAPWRITE` / `trapMask` flag set (`gateVc.cc:236`), and only the
-//! write *attempt* — a put rejected by access security before
-//! `gateVcChan::write` is reached is never logged. pva-rs has no per-PV
-//! `trapMask` concept: it logs **every** client put and records the
-//! outcome (`OK` / `FAILED` / `DENIED`), including access-denied and
-//! upstream-failed writes. This is a deliberately broader, fail-loud
-//! audit trail — every write attempt against the gateway is recorded,
-//! not only those an operator pre-flagged with `TRAPWRITE`.
+//! - [`PutLogScope::TrapWrite`] (default, C contract): record only granted
+//!   writes whose matched WRITE rule carries `TRAPWRITE`. C ca-gateway
+//!   gates all put-log emission on `asclient->clientPvt()->trapMask`
+//!   (`gateVc.cc:236`) and only reaches `gateVcChan::write` for writes
+//!   access security already granted, so denied and non-trapped writes are
+//!   never logged. The line omits an outcome token, matching C's
+//!   `"%s %s@%s %s %s old=%s\n"` (`gateResources.cc:486`):
+//!
+//!   ```text
+//!   2026-04-09T14:35:21.123Z user@host TEMP:setpoint 25.0 old=24.8
+//!   ```
+//!
+//! - [`PutLogScope::AllWrites`] (opt-in, broader audit): record *every*
+//!   client write attempt with its outcome (`OK` / `FAILED` / `DENIED`),
+//!   including access-denied and upstream-failed writes — a fail-loud
+//!   superset that is not the C contract:
+//!
+//!   ```text
+//!   2026-04-09T14:35:22.456Z guest@1.2.3.4 PRESSURE:cmd 100.0 old=? DENIED
+//!   ```
+//!
+//! The line format is selected by the `outcome` argument to [`PutLog::log`]:
+//! `None` writes the C-compatible TrapWrite line, `Some(_)` writes the
+//! outcome-tagged AllWrites line.
+
+/// Which client writes the put log records. Selected by the write hook
+/// from gateway configuration; see the module docs for the per-mode line
+/// format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PutLogScope {
+    /// C ca-gateway contract (default): only granted writes to PVs whose
+    /// matched WRITE rule carries `TRAPWRITE` are logged, without an
+    /// outcome token (`gateVc.cc:236`, `gateResources.cc:486`).
+    #[default]
+    TrapWrite,
+    /// Broader fail-loud audit (opt-in): every client write attempt is
+    /// logged with its `OK`/`FAILED`/`DENIED` outcome, including
+    /// access-denied and non-trapped writes.
+    AllWrites,
+}
 
 use std::path::PathBuf;
 
@@ -107,6 +136,11 @@ impl PutLog {
     /// in the same position (gateResources.cc:486-492). Callers pass
     /// `"?"` when no monitor value has been cached, matching C's
     /// `old_value == NULL` → `acOldVal = "?"` (gateResources.cc:476-480).
+    ///
+    /// `outcome` selects the line format ([`PutLogScope`]): `None` writes
+    /// the C-compatible TrapWrite line `"{ts} {u}@{h} {pv} {val} old={old}"`
+    /// (`gateResources.cc:486`); `Some(o)` appends the AllWrites outcome
+    /// token (` OK`/` FAILED`/` DENIED`).
     pub async fn log(
         &self,
         user: &str,
@@ -114,19 +148,28 @@ impl PutLog {
         pv: &str,
         value: &str,
         old: &str,
-        outcome: PutOutcome,
+        outcome: Option<PutOutcome>,
     ) -> BridgeResult<()> {
         let timestamp = Utc::now().to_rfc3339();
-        let line = format!(
-            "{} {}@{} {} {} old={} {}\n",
-            timestamp,
-            user,
-            host,
-            pv,
-            value,
-            old,
-            outcome.as_str()
-        );
+        let line = match outcome {
+            // AllWrites: outcome-tagged audit line.
+            Some(o) => format!(
+                "{} {}@{} {} {} old={} {}\n",
+                timestamp,
+                user,
+                host,
+                pv,
+                value,
+                old,
+                o.as_str()
+            ),
+            // TrapWrite: C-compatible line, no outcome token
+            // (gateResources.cc:486 `"%s %s@%s %s %s old=%s\n"`).
+            None => format!(
+                "{} {}@{} {} {} old={}\n",
+                timestamp, user, host, pv, value, old
+            ),
+        };
 
         let mut guard = self.file.lock().await;
         if guard.is_none() {
@@ -199,23 +242,55 @@ mod tests {
         let _ = std::fs::remove_file(&temp);
 
         let log = PutLog::new(temp.clone());
-        log.log("alice", "host1", "TEMP", "25.0", "24.8", PutOutcome::Ok)
-            .await
-            .unwrap();
-        log.log("bob", "host2", "PRESS", "100", "?", PutOutcome::Denied)
-            .await
-            .unwrap();
-        log.log("eve", "host3", "VAC", "1e-6", "2e-6", PutOutcome::Failed)
+        // AllWrites lines carry the outcome token.
+        log.log(
+            "alice",
+            "host1",
+            "TEMP",
+            "25.0",
+            "24.8",
+            Some(PutOutcome::Ok),
+        )
+        .await
+        .unwrap();
+        log.log(
+            "bob",
+            "host2",
+            "PRESS",
+            "100",
+            "?",
+            Some(PutOutcome::Denied),
+        )
+        .await
+        .unwrap();
+        log.log(
+            "eve",
+            "host3",
+            "VAC",
+            "1e-6",
+            "2e-6",
+            Some(PutOutcome::Failed),
+        )
+        .await
+        .unwrap();
+        // TrapWrite line (None): C-compatible, no outcome token.
+        log.log("max", "host4", "FLOW", "3.3", "3.2", None)
             .await
             .unwrap();
 
         // Read back
         let content = std::fs::read_to_string(&temp).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 4);
         assert!(lines[0].contains("alice@host1 TEMP 25.0 old=24.8 OK"));
         assert!(lines[1].contains("bob@host2 PRESS 100 old=? DENIED"));
         assert!(lines[2].contains("eve@host3 VAC 1e-6 old=2e-6 FAILED"));
+        // The C-compatible line ends at `old=...` with no trailing token.
+        assert!(lines[3].ends_with("max@host4 FLOW 3.3 old=3.2"));
+        assert!(
+            !lines[3].contains("OK") && !lines[3].contains("DENIED"),
+            "TrapWrite line must not carry an outcome token"
+        );
 
         let _ = std::fs::remove_file(&temp);
     }

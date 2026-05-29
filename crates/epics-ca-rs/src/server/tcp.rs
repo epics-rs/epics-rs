@@ -4099,7 +4099,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .unwrap_or(scan_end);
             let pv_name = String::from_utf8_lossy(&payload[..end]).to_string();
 
-            if db.has_name(&pv_name).await {
+            // Thread the connection peer into the existence check just
+            // like TCP CREATE_CHANNEL (`find_entry_from(.., Some(peer))`)
+            // and UDP SEARCH (`has_name_from(.., Some(src))`). Without it
+            // the CA gateway resolver received `peer: None` and skipped
+            // host-scoped `.pvlist` `DENY FROM host` admission, so a denied
+            // host's TCP SEARCH could resolve (and lazily instantiate) a
+            // PV the pvlist forbids — parity with C `pvExistTest` passing
+            // the client host to `gateAs::findEntry`.
+            if db.has_name_from(&pv_name, Some(peer)).await {
                 // C parity: `search_reply_tcp`
                 // (`rsrv/camessage.c:2229-2287`) sends:
                 //   m_postsize  = 0  (no payload — TCP search reply

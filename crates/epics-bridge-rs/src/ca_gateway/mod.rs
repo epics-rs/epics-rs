@@ -52,7 +52,7 @@ pub use cache::{CacheTimeouts, GwPvEntry, PvCache, PvState};
 pub use command::{CommandHandler, GatewayCommand};
 pub use downstream::{ConnEventRecv, ConnEventReplay, DownstreamServer, ReplayingReceiver};
 pub use master::{RestartPolicy, SuperviseError, supervise};
-pub use putlog::{PutLog, PutOutcome};
+pub use putlog::{PutLog, PutLogScope, PutOutcome};
 pub use pvlist::{EvaluationOrder, PvList, PvListEntry, PvListMatch};
 pub use server::{GatewayConfig, GatewayServer};
 pub use stats::Stats;

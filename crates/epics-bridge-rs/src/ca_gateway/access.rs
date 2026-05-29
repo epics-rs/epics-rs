@@ -61,6 +61,20 @@ pub struct AccessConfig {
     mode: Mode,
 }
 
+/// Outcome of a write access-rights check: whether the write is permitted
+/// and whether the matched WRITE rule carried `TRAPWRITE` (the
+/// `trapMask` C ca-gateway gates put-log emission on, `gateVc.cc:236`).
+/// Returned as one value by [`AccessConfig::can_write_trap`] so the trap
+/// state survives the access decision instead of being discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WritePermit {
+    /// `true` iff the client is granted write access.
+    pub allowed: bool,
+    /// `true` iff the matched WRITE rule carried `TRAPWRITE`. Always
+    /// `false` when `allowed` is `false`.
+    pub trap: bool,
+}
+
 impl AccessConfig {
     /// Read-only default policy (no `.access` file): reads allowed, writes
     /// denied. Matches C ca-gateway's `ASG(DEFAULT) { RULE(1,READ) }`
@@ -114,20 +128,53 @@ impl AccessConfig {
         }
     }
 
-    /// Whether writing the given tuple is allowed.
-    pub fn can_write(&self, asg: &str, asl: i32, user: &str, host: &str) -> bool {
+    /// Write permission for the (asg, asl, user, host) tuple, paired with
+    /// the matched WRITE rule's `TRAPWRITE`/`trapMask` flag.
+    ///
+    /// C ca-gateway gates *all* put-log emission on
+    /// `asclient->clientPvt()->trapMask` (`gateVc.cc:236`), the mask of the
+    /// access rule the client matched. Collapsing the rule to a bare
+    /// allow/deny here — as the old `can_write` did — discards that mask,
+    /// so the put log cannot be TRAPWRITE-scoped. Returning both halves as
+    /// one value keeps the trap state available to the write hook instead
+    /// of reducing the rule to a boolean before the audit decision.
+    ///
+    /// `trap` is always `false` for `AllowAll`/`ReadOnly` (no ACF rule to
+    /// carry the flag) and for any denied write (base-rs
+    /// `check_access_method_trap` returns `trap = false` on a `NoAccess`
+    /// outcome, matching C `asComputePvt` which only copies `trapMask` on
+    /// the lines that raise `access`).
+    pub fn can_write_trap(&self, asg: &str, asl: i32, user: &str, host: &str) -> WritePermit {
         match &self.mode {
-            Mode::AllowAll => true,
+            Mode::AllowAll => WritePermit {
+                allowed: true,
+                trap: false,
+            },
             // the read-only default denies writes (C parity).
-            Mode::ReadOnly => false,
+            Mode::ReadOnly => WritePermit {
+                allowed: false,
+                trap: false,
+            },
             Mode::Rules(cfg) => {
                 let asl = asl.max(0).min(u8::MAX as i32) as u8;
-                matches!(
-                    cfg.check_access_asl(asg, host, user, asl),
-                    AccessLevel::ReadWrite
-                )
+                // Method-aware trap-carrying check (default scopes, like
+                // `check_access_asl`); the second tuple element is the
+                // matched rule's `trapMask` (base-rs access_security.rs).
+                let (level, trap) = cfg.check_access_method_trap(asg, host, user, asl, "", "");
+                WritePermit {
+                    allowed: matches!(level, AccessLevel::ReadWrite),
+                    trap,
+                }
             }
         }
+    }
+
+    /// Whether writing the given tuple is allowed. Thin accessor over
+    /// [`Self::can_write_trap`] for the access-rights *report* path
+    /// (`build_access_hook`), which gates reported write rights and never
+    /// emits a put-log line, so the trap mask is irrelevant there.
+    pub fn can_write(&self, asg: &str, asl: i32, user: &str, host: &str) -> bool {
+        self.can_write_trap(asg, asl, user, host).allowed
     }
 
     /// Whether the underlying ACF was successfully loaded.
@@ -170,6 +217,44 @@ mod tests {
         let acc = AccessConfig::read_only();
         assert!(acc.can_read("BeamGroup", 1, "anyone", "anywhere"));
         assert!(!acc.can_write("BeamGroup", 1, "anyone", "anywhere"));
+    }
+
+    #[test]
+    fn can_write_trap_reflects_matched_rule_trapmask() {
+        // The trap flag must follow the matched WRITE rule's TRAPWRITE
+        // option — the mask C ca-gateway gates put-log emission on
+        // (gateVc.cc:236). A granted write to a TRAPWRITE rule carries
+        // trap=true; an identical write to a NOTRAPWRITE rule carries
+        // trap=false; a denied write always carries trap=false.
+        let acf = r#"
+            ASG(TRAPPED)   { RULE(1, WRITE, TRAPWRITE) }
+            ASG(UNTRAPPED) { RULE(1, WRITE, NOTRAPWRITE) }
+            ASG(READONLY)  { RULE(1, READ) }
+        "#;
+        let acc = AccessConfig::from_string(acf).expect("ACF parses");
+
+        let trapped = acc.can_write_trap("TRAPPED", 1, "u", "h");
+        assert!(trapped.allowed, "TRAPWRITE rule grants write");
+        assert!(trapped.trap, "TRAPWRITE rule sets trap mask");
+
+        let untrapped = acc.can_write_trap("UNTRAPPED", 1, "u", "h");
+        assert!(untrapped.allowed, "NOTRAPWRITE rule still grants write");
+        assert!(!untrapped.trap, "NOTRAPWRITE rule clears trap mask");
+
+        let denied = acc.can_write_trap("READONLY", 1, "u", "h");
+        assert!(!denied.allowed, "READ-only ASG denies write");
+        assert!(!denied.trap, "a denied write never carries a trap mask");
+    }
+
+    #[test]
+    fn can_write_trap_modes_carry_no_trap() {
+        // AllowAll/ReadOnly have no ACF rule to carry TRAPWRITE, so the
+        // trap mask is always false (matches C: an allow-all gateway with
+        // no TRAPWRITE rule logs nothing in trap-scoped mode).
+        let allow = AccessConfig::allow_all().can_write_trap("X", 1, "u", "h");
+        assert!(allow.allowed && !allow.trap);
+        let ro = AccessConfig::read_only().can_write_trap("X", 1, "u", "h");
+        assert!(!ro.allowed && !ro.trap);
     }
 
     #[test]

@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use epics_bridge_rs::ca_gateway::{GatewayConfig, GatewayServer};
+use epics_bridge_rs::ca_gateway::{GatewayConfig, GatewayServer, PutLogScope};
 use epics_bridge_rs::pva_gateway::{PvaGateway, PvaGatewayConfig};
 use epics_pva_rs::server_native::PvaServerConfig;
 
@@ -58,9 +58,16 @@ struct Args {
     #[arg(long)]
     ca_access: Option<PathBuf>,
 
-    /// Path to put-event log file (CA gateway).
+    /// Path to put-event log file (CA gateway). TRAPWRITE-scoped by
+    /// default (C contract); see `--ca-putlog-all`.
     #[arg(long)]
     ca_putlog: Option<PathBuf>,
+
+    /// Broaden the CA gateway put log to a fail-loud audit: record every
+    /// client write attempt with its outcome, not only TRAPWRITE-matched
+    /// granted writes. Not the C ca-gateway contract.
+    #[arg(long)]
+    ca_putlog_all: bool,
 
     /// Path to a literal-PV preload list (CA gateway).
     #[arg(long)]
@@ -167,6 +174,7 @@ struct CaSection {
     pvlist: Option<PathBuf>,
     access: Option<PathBuf>,
     putlog: Option<PathBuf>,
+    putlog_all: Option<bool>,
     preload: Option<PathBuf>,
     command: Option<PathBuf>,
     port: Option<u16>,
@@ -205,6 +213,7 @@ fn default_config_toml() -> &'static str {
 # pvlist = "/etc/gw/gateway.pvlist"
 # access = "/etc/gw/access.acf"
 # putlog = "/var/log/gateway-puts.log"
+# putlog_all = false                    # true = broader fail-loud audit (non-C)
 # preload = "/etc/gw/preload.txt"
 # command = "/etc/gw/command.cmd"      # SIGUSR1-triggered (Unix)
 # port = 5064
@@ -245,6 +254,11 @@ async fn run_ca_gateway(args: &Args) -> Result<(), String> {
         pvlist_content: None,
         access_path: args.ca_access.clone(),
         putlog_path: args.ca_putlog.clone(),
+        putlog_scope: if args.ca_putlog_all {
+            PutLogScope::AllWrites
+        } else {
+            PutLogScope::TrapWrite
+        },
         command_path: args.ca_command.clone(),
         preload_path: args.ca_preload.clone(),
         server_port: args.ca_port,
@@ -340,6 +354,11 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile) {
     }
     if args.ca_putlog.is_none() {
         args.ca_putlog = cfg.ca.putlog.clone();
+    }
+    if !args.ca_putlog_all {
+        if let Some(true) = cfg.ca.putlog_all {
+            args.ca_putlog_all = true;
+        }
     }
     if args.ca_preload.is_none() {
         args.ca_preload = cfg.ca.preload.clone();

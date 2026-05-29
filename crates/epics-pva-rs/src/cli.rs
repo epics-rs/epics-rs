@@ -31,30 +31,37 @@ pub fn timeout_duration(secs: f64) -> std::time::Duration {
 /// `std::cout << pvxs::version_information; return 0;`
 /// (`tools/get.cpp:62-64`, `put.cpp:55`, `list.cpp:75-82`,
 /// `monitor.cpp:63`, `call.cpp:55`, …), which prints the PVXS library
-/// version, the EPICS Base version, and the libevent version — the
+/// version, the EPICS Base version string (`EPICS_VERSION_STRING`,
+/// `src/describe.cpp:138`), and the libevent version — the
 /// protocol/toolchain stack an operator pastes into a bug report.
 /// Clap's generated `--version` reports only `<binary> <crate-version>`,
 /// losing that dependency context.
 ///
-/// The Rust analogue reports the two facts the linked library knows at
-/// compile time without a build script:
+/// The Rust analogue reports the three facts the linked libraries know
+/// at compile time without a build script:
 ///   - the `epics-pva-rs` crate version (the PVA implementation, the
-///     PVXS analogue), and
+///     PVXS analogue),
+///   - the EPICS Base release the port targets
+///     ([`epics_base_rs::EPICS_BASE_VERSION`], from
+///     `configure/CONFIG_BASE_VERSION`) — the `EPICS_VERSION_STRING`
+///     analogue, and
 ///   - the PVA wire-protocol version it speaks
 ///     ([`crate::proto::PVA_VERSION`]) — the interop-critical fact a
 ///     "talks to pvxs/Java but not X" report needs, the analogue of
 ///     pvxs's libevent/runtime line.
 ///
-/// The `epics-base-rs` port is workspace-version-locked to this crate
-/// (`version.workspace = true` in both), so its version equals
-/// [`crate::VERSION`] and is not printed as a distinct, identical line.
+/// The EPICS Base version names the upstream C release being ported,
+/// which tracks EPICS Base's release cadence rather than the
+/// `epics-base-rs` crate version, so it is a genuinely separate line
+/// and not a duplicate of [`crate::VERSION`].
 pub fn version_information() -> &'static str {
     use std::sync::OnceLock;
     static V: OnceLock<String> = OnceLock::new();
     V.get_or_init(|| {
         format!(
-            "epics-pva-rs {}\nPVA protocol version {}\n",
+            "epics-pva-rs {}\nEPICS Base {}\nPVA protocol version {}\n",
             crate::VERSION,
+            epics_base_rs::EPICS_BASE_VERSION,
             crate::proto::PVA_VERSION
         )
     })
@@ -169,15 +176,19 @@ mod tests {
     }
 
     /// The shared `-V` text reports more than `<binary> <crate-version>`:
-    /// it names the `epics-pva-rs` library, its version, and the PVA
-    /// wire-protocol version (the pvxs `version_information` analogue).
-    /// This is the dependency/protocol context clap's crate-only
-    /// `--version` dropped.
+    /// it names the `epics-pva-rs` library version, the EPICS Base
+    /// release the port targets, and the PVA wire-protocol version (the
+    /// pvxs `version_information` analogue). This is the
+    /// dependency/protocol context clap's crate-only `--version` dropped.
     #[test]
     fn version_information_includes_protocol_stack() {
         let v = super::version_information();
         assert!(
             v.contains(&format!("epics-pva-rs {}", crate::VERSION)),
+            "got: {v:?}"
+        );
+        assert!(
+            v.contains(&format!("EPICS Base {}", epics_base_rs::EPICS_BASE_VERSION)),
             "got: {v:?}"
         );
         assert!(
@@ -187,9 +198,10 @@ mod tests {
             )),
             "got: {v:?}"
         );
-        // Strictly more than the bare crate version: at least two lines.
+        // Strictly more than the bare crate version: at least three lines
+        // (crate version, EPICS Base version, PVA protocol version).
         assert!(
-            v.lines().count() >= 2,
+            v.lines().count() >= 3,
             "version output must carry dependency context, got: {v:?}"
         );
     }

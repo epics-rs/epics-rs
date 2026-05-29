@@ -45,7 +45,7 @@ use arc_swap::ArcSwap;
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{DbFieldType, EpicsValue};
 use epics_ca_rs::client::{CaChannel, CaClient, EventWatcher};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -57,6 +57,52 @@ use super::cache::{PvCache, PvState};
 use super::putlog::{PutLog, PutOutcome};
 use super::pvlist::PvList;
 use super::stats::Stats;
+
+/// Build a zero-initialised [`EpicsValue`] of the upstream channel's
+/// native field type and element count.
+///
+/// Used as the shadow PV's initial value when the best-effort DBR
+/// negotiation GET fails or times out. The shadow PV must still
+/// advertise the upstream's *native* DBF type and element count at
+/// `CREATE_CHANNEL`: C ca-gateway reads `ca_field_type(chid)` /
+/// `ca_element_count(chid)` straight from the connected channel's CA
+/// connection metadata (gatePv.cc:1241-1314, gatePv.h:139-142),
+/// independent of any value GET succeeding. A connected upstream whose
+/// first read is slow or denied must not be exposed downstream as
+/// `DBF_DOUBLE/1`; the create-channel reply derives its type and count
+/// from `value.dbr_type()` / `value.count()`, so giving the placeholder
+/// the right variant and length makes both correct by construction. The
+/// first monitor event overwrites the value, but a client that sizes its
+/// buffer from the create reply in that window now sees the real type.
+fn native_placeholder(native_type: DbFieldType, element_count: u32) -> EpicsValue {
+    let n = element_count.max(1) as usize;
+    let scalar = element_count <= 1;
+    match native_type {
+        DbFieldType::String if scalar => EpicsValue::String(String::new()),
+        DbFieldType::String => EpicsValue::StringArray(vec![String::new(); n]),
+        DbFieldType::Short if scalar => EpicsValue::Short(0),
+        DbFieldType::Short => EpicsValue::ShortArray(vec![0; n]),
+        DbFieldType::Float if scalar => EpicsValue::Float(0.0),
+        DbFieldType::Float => EpicsValue::FloatArray(vec![0.0; n]),
+        DbFieldType::Enum if scalar => EpicsValue::Enum(0),
+        DbFieldType::Enum => EpicsValue::EnumArray(vec![0; n]),
+        DbFieldType::Char if scalar => EpicsValue::Char(0),
+        DbFieldType::Char => EpicsValue::CharArray(vec![0; n]),
+        DbFieldType::Long if scalar => EpicsValue::Long(0),
+        DbFieldType::Long => EpicsValue::LongArray(vec![0; n]),
+        DbFieldType::Double if scalar => EpicsValue::Double(0.0),
+        DbFieldType::Double => EpicsValue::DoubleArray(vec![0.0; n]),
+        // CA wire types 7/8 do not exist: a CA upstream channel never
+        // reports Int64/UInt64 natively (they are internal record types
+        // that travel over CA as DBR_DOUBLE). Mirror that DBR mapping —
+        // their `dbr_type()` is `Double`, so the advertised create-channel
+        // type stays DBF_DOUBLE even on this unreachable branch.
+        DbFieldType::Int64 if scalar => EpicsValue::Int64(0),
+        DbFieldType::Int64 => EpicsValue::Int64Array(vec![0; n]),
+        DbFieldType::UInt64 if scalar => EpicsValue::UInt64(0),
+        DbFieldType::UInt64 => EpicsValue::UInt64Array(vec![0; n]),
+    }
+}
 
 /// The `.pvlist` access-security identity (group + level) resolved for
 /// one shadow PV. Held behind an `Arc<ArcSwap<_>>` ([`PvAclCell`]) so it
@@ -395,37 +441,51 @@ impl UpstreamManager {
         }
 
         // DBR negotiation: best-effort initial GET so the shadow
-        // PV's first registered type matches upstream's native type.
-        // Falls back to a Double placeholder if the get fails or
-        // times out — the first monitor event will overwrite the
-        // value either way. The timeout/error is logged at INFO so
-        // an operator chasing type-mismatch confusion can correlate
-        // a confused downstream introspect with its upstream miss.
-        // channel.get() returns (DbFieldType, EpicsValue)
-        // only — no DBR_CTRL_* metadata (units/precision/limits).
-        // A DBR_CTRL GET + DBE_PROPERTY subscription is needed so
-        // downstream DBR_CTRL_* and DBR_GR_* reads return real
-        // metadata (gatePv.cc:930-934, gatePv.cc:858-862).
-        let initial_value = match tokio::time::timeout(Duration::from_millis(500), channel.get())
-            .await
-        {
-            Ok(Ok((_dbf, v))) => v,
-            Ok(Err(e)) => {
-                tracing::info!(
-                    pv = upstream_name,
-                    error = %e,
-                    "ca-gateway-rs: DBR negotiation get failed; using Double(0.0) placeholder"
-                );
-                EpicsValue::Double(0.0)
-            }
-            Err(_) => {
-                tracing::info!(
-                    pv = upstream_name,
-                    "ca-gateway-rs: DBR negotiation get timed out; using Double(0.0) placeholder"
-                );
-                EpicsValue::Double(0.0)
-            }
+        // PV's first registered value matches upstream's native type.
+        // channel.get() returns (DbFieldType, EpicsValue) only — no
+        // DBR_CTRL_* metadata (units/precision/limits). A DBR_CTRL GET +
+        // DBE_PROPERTY subscription is needed so downstream DBR_CTRL_*
+        // and DBR_GR_* reads return real metadata (gatePv.cc:930-934,
+        // gatePv.cc:858-862).
+        //
+        // When the GET fails or times out, fall back to a placeholder
+        // whose CA native type AND element count come from the *connected*
+        // channel's CA metadata (`ca_field_type`/`ca_element_count`), not
+        // a hardcoded `Double(0.0)`. The channel connected above
+        // (`wait_connected`), so this metadata is a cached snapshot read
+        // with no round-trip. Without it a slow or denied first read
+        // advertised the shadow PV as DBF_DOUBLE/1 to clients that connect
+        // in the window before the first monitor event (see
+        // `native_placeholder`). Built lazily so the success path never
+        // allocates a throwaway array for a large waveform.
+        let make_placeholder = || match (channel.native_field_type(), channel.element_count()) {
+            (Ok(dbf), Ok(n)) => native_placeholder(dbf, n),
+            // Pathological: metadata unreadable despite a connected
+            // channel. Keep the old scalar-double fallback rather than
+            // failing the subscription outright.
+            _ => EpicsValue::Double(0.0),
         };
+        let initial_value =
+            match tokio::time::timeout(Duration::from_millis(500), channel.get()).await {
+                Ok(Ok((_dbf, v))) => v,
+                Ok(Err(e)) => {
+                    tracing::info!(
+                        pv = upstream_name,
+                        error = %e,
+                        "ca-gateway-rs: DBR negotiation get failed; \
+                         using upstream native type/count placeholder"
+                    );
+                    make_placeholder()
+                }
+                Err(_) => {
+                    tracing::info!(
+                        pv = upstream_name,
+                        "ca-gateway-rs: DBR negotiation get timed out; \
+                     using upstream native type/count placeholder"
+                    );
+                    make_placeholder()
+                }
+            };
 
         // read initial upstream write-access and create a flag
         // the access hook AND write-hook closures share. `channel.info()`
@@ -1115,6 +1175,34 @@ mod tests {
     use super::*;
     use epics_ca_rs::server::CaServer;
     use serial_test::serial;
+
+    #[test]
+    fn native_placeholder_preserves_upstream_type_and_count() {
+        // The GET-timeout fallback must advertise the upstream native DBF
+        // type + element count, never DBF_DOUBLE/1. CREATE_CHANNEL derives
+        // the advertised type/count from value.dbr_type()/value.count(),
+        // so pin both for every native CA field type, scalar and array.
+        for dbf in [
+            DbFieldType::String,
+            DbFieldType::Short,
+            DbFieldType::Float,
+            DbFieldType::Enum,
+            DbFieldType::Char,
+            DbFieldType::Long,
+            DbFieldType::Double,
+        ] {
+            let scalar = native_placeholder(dbf, 1);
+            assert_eq!(scalar.dbr_type(), dbf, "scalar dbr_type for {dbf:?}");
+            assert_eq!(scalar.count(), 1, "scalar count for {dbf:?}");
+
+            let array = native_placeholder(dbf, 100);
+            assert_eq!(array.dbr_type(), dbf, "array dbr_type for {dbf:?}");
+            assert_eq!(array.count(), 100, "array count for {dbf:?}");
+        }
+        // A zero/absent native count collapses to a 1-element scalar — an
+        // empty array would be rejected downstream as a LINK_ALARM.
+        assert_eq!(native_placeholder(DbFieldType::Long, 0).count(), 1);
+    }
 
     fn dummy_env() -> WriteHookEnv {
         WriteHookEnv {

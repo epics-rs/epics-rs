@@ -59,9 +59,11 @@ fn nturi_op(op: &str) -> (FieldDesc, PvField) {
 /// client plus the live server handle.
 fn server_with_two_pvs() -> (PvaServer, epics_pva_rs::client_native::context::PvaClient) {
     let pv_a = SharedPV::new();
-    pv_a.open(f64::descriptor(), f64::to_pv_field(&1.0));
+    pv_a.open(f64::descriptor(), f64::to_pv_field(&1.0))
+        .unwrap();
     let pv_b = SharedPV::new();
-    pv_b.open(f64::descriptor(), f64::to_pv_field(&2.0));
+    pv_b.open(f64::descriptor(), f64::to_pv_field(&2.0))
+        .unwrap();
 
     let source = SharedSource::new();
     source.add("test:alpha", pv_a);
@@ -212,7 +214,9 @@ async fn rpc_unknown_op_is_rejected() {
 async fn builtin_server_source_shadows_default_order_user_server_pv() {
     let user_server = SharedPV::new();
     let sentinel: f64 = 123.5;
-    user_server.open(f64::descriptor(), f64::to_pv_field(&sentinel));
+    user_server
+        .open(f64::descriptor(), f64::to_pv_field(&sentinel))
+        .unwrap();
     let source = SharedSource::new();
     source.add("server", user_server);
 

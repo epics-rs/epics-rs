@@ -27,7 +27,8 @@ pub struct PvBuild {
 impl PvBuild {
     pub fn open(&self) -> SharedPV {
         let pv = SharedPV::new();
-        pv.open(self.desc.clone(), self.value.clone());
+        pv.open(self.desc.clone(), self.value.clone())
+            .expect("fresh PvBuild PV opens");
         pv
     }
 }

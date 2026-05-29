@@ -151,10 +151,13 @@ pub fn add_rpc_service<S: PvaService>(
         // Open with a generic Variant descriptor so any struct
         // can flow in/out of this RPC slot. Concrete responses
         // carry their own descriptor (encoded by the framework).
+        // Freshly constructed PV: this is the only open() and cannot
+        // collide with a prior one, so the close()-first guard never trips.
         pv.open(
             FieldDesc::Variant,
             PvField::Structure(PvStructure::new("epics:nt/NTRPC:1.0")),
-        );
+        )
+        .expect("freshly built service PV opens");
         let dispatch = method.dispatch.clone();
         // Use the async on_rpc variant so dispatch runs on the
         // calling task's runtime — no `block_in_place` (which

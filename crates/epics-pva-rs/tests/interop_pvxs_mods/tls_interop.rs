@@ -195,7 +195,8 @@ async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![("value".into(), PvField::Scalar(ScalarValue::Int(777)))],
         }),
-    );
+    )
+    .unwrap();
     let src = SharedSource::new();
     src.add("TLS:PV", pv);
 

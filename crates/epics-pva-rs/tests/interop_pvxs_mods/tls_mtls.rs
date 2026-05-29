@@ -161,7 +161,8 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![("value".into(), PvField::Scalar(ScalarValue::Int(2024)))],
         }),
-    );
+    )
+    .unwrap();
     let src = SharedSource::new();
     src.add("MTLS:PV", pv);
 

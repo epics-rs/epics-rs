@@ -35,7 +35,8 @@ async fn pvxs_connect_onconnect_fires_after_server_start() {
     pv.open(
         NTScalar::new(ScalarType::Int).build(),
         NTScalar::new(ScalarType::Int).create(),
-    );
+    )
+    .unwrap();
     let src = Arc::new(SharedSource::new());
     src.add("mailbox", pv);
 

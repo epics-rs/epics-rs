@@ -441,15 +441,29 @@ impl SharedPV {
         self.inner.lock().put_policy.is_writable()
     }
 
-    /// Declare the type and seed the initial value. Repeated calls
-    /// replace the type and value; subscribers are kept and will see
-    /// the new value on next post().
-    pub fn open(&self, desc: FieldDesc, initial: PvField) {
+    /// Declare the type and seed the initial value, transitioning the
+    /// PV from [`PvState::Closed`] to [`PvState::Open`].
+    ///
+    /// Returns `Err` if the PV is already open. pvxs `sharedpv.cpp:357-358`
+    /// throws `"close() first"` when `impl->current` is already set, so a
+    /// republish of the type/value requires an explicit [`Self::close`]
+    /// first. The rejection keys off the `PvState::Open` discriminant that
+    /// stores the descriptor and value — not a side `is_open` flag — so
+    /// "open ⟺ a descriptor+value exist" holds by construction: a second
+    /// `open()` cannot swap the descriptor out from under monitor
+    /// operations that captured the old introspection at subscribe time.
+    pub fn open(&self, desc: FieldDesc, initial: PvField) -> crate::error::PvaResult<()> {
         let mut g = self.inner.lock();
+        if matches!(g.state, PvState::Open { .. }) {
+            return Err(crate::error::PvaError::Protocol(
+                "SharedPV already open; close() first".to_string(),
+            ));
+        }
         g.state = PvState::Open {
             desc,
             value: initial,
         };
+        Ok(())
     }
 
     /// Returns true iff the PV has been opened.
@@ -1304,7 +1318,8 @@ mod tests {
     fn shared_pv_open_then_current() {
         let pv = SharedPV::new();
         assert!(!pv.is_open());
-        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(42));
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(42))
+            .unwrap();
         assert!(pv.is_open());
         assert!(pv.current().is_some());
     }
@@ -1312,7 +1327,8 @@ mod tests {
     #[tokio::test]
     async fn shared_pv_subscribe_sees_initial_then_updates() {
         let pv = SharedPV::new();
-        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
         let mut rx = pv.subscribe(8).expect("subscribe");
         // Initial value delivered immediately.
         let first = rx.recv().await.expect("first");
@@ -1331,7 +1347,8 @@ mod tests {
     #[test]
     fn shared_pv_close_drops_subscribers() {
         let pv = SharedPV::new();
-        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
         let _rx = pv.subscribe(8);
         pv.close();
         assert!(!pv.is_open());
@@ -1359,7 +1376,8 @@ mod tests {
                 f.fetch_add(1, Ordering::SeqCst);
                 // pvxs lazy-open pattern: open the PV when the first
                 // channel attaches (testget.cpp:204-234).
-                p.open(nt_scalar_int_desc(), nt_scalar_int_value(1));
+                p.open(nt_scalar_int_desc(), nt_scalar_int_value(1))
+                    .unwrap();
             });
         }
         {
@@ -1436,7 +1454,8 @@ mod tests {
             let o = opened.clone();
             pv.on_first_connect(move |p| {
                 o.fetch_add(1, Ordering::SeqCst);
-                p.open(nt_scalar_int_desc(), nt_scalar_int_value(5));
+                p.open(nt_scalar_int_desc(), nt_scalar_int_value(5))
+                    .unwrap();
             });
         }
         pv.on_last_disconnect(|p| p.close());
@@ -1484,7 +1503,8 @@ mod tests {
     #[test]
     fn shared_pv_close_withdraws_descriptor_value_and_fetch() {
         let pv = SharedPV::new();
-        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(42));
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(42))
+            .unwrap();
         assert!(pv.current().is_some());
         assert!(pv.introspection().is_some());
 
@@ -1511,10 +1531,46 @@ mod tests {
         );
 
         // Reopen restores the lifecycle.
-        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(7));
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(7))
+            .unwrap();
         assert!(pv.is_open());
         assert!(pv.current().is_some());
         assert!(pv.introspection().is_some());
+    }
+
+    /// Regression: pvxs `SharedPV::open()` throws `"close() first"` when
+    /// `impl->current` is already set (`sharedpv.cpp:357-358`), so a second
+    /// `open()` without an intervening `close()` is rejected rather than
+    /// silently swapping the descriptor/value out from under attached
+    /// monitors. The Rust `open()` returns `Err` off the `PvState::Open`
+    /// discriminant; only after `close()` does a fresh `open()` succeed.
+    #[test]
+    fn shared_pv_open_while_open_is_rejected() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(42))
+            .unwrap();
+
+        // Second open without close() is refused; the original type/value
+        // are left intact (no partial swap).
+        let err = pv
+            .open(nt_scalar_int_desc(), nt_scalar_int_value(99))
+            .expect_err("open() on an already-open SharedPV must be rejected");
+        assert!(
+            matches!(err, crate::error::PvaError::Protocol(_)),
+            "reopen rejection is a protocol/logic error, got {err:?}"
+        );
+        assert_eq!(
+            extract_int(&pv.current().expect("still open after rejected reopen")),
+            42,
+            "rejected reopen must not overwrite the published value"
+        );
+
+        // close() first, then open() succeeds — the pvxs close-before-open
+        // contract.
+        pv.close();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(99))
+            .unwrap();
+        assert_eq!(extract_int(&pv.current().expect("open after close")), 99,);
     }
 
     /// Regression: the GET / GET_FIELD wire paths read through
@@ -1528,7 +1584,8 @@ mod tests {
 
         let src = SharedSource::new();
         let pv = SharedPV::new();
-        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(42));
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(42))
+            .unwrap();
         src.add("X", pv.clone());
 
         assert!(src.get_value("X").await.is_some());
@@ -1573,7 +1630,8 @@ mod tests {
     #[tokio::test]
     async fn pva_r6_squash_to_tail() {
         let pv = SharedPV::new();
-        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
         let mut rx = pv.subscribe(2).expect("subscribe"); // queue limit = 2
 
         // Drain the initial value so the queue is empty.
@@ -1617,7 +1675,8 @@ mod tests {
     async fn shared_source_exposes_per_pv_watermark_levels() {
         use super::super::source::ChannelSource;
         let pv = SharedPV::new();
-        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
         pv.set_low_watermark(2);
         pv.set_high_watermark(5);
         let src = SharedSource::new();
@@ -1636,7 +1695,8 @@ mod tests {
         use crate::proto::BitSet;
 
         let pv = SharedPV::build_mailbox();
-        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
         let mut rx = pv.subscribe(8).expect("subscribe");
         // Drain the initial value.
         let _ = rx.recv().await.expect("initial value");
@@ -1682,7 +1742,9 @@ mod tests {
 
         // Plain: reject, value unchanged.
         let plain = SharedPV::new();
-        plain.open(nt_scalar_int_desc(), nt_scalar_int_value(7));
+        plain
+            .open(nt_scalar_int_desc(), nt_scalar_int_value(7))
+            .unwrap();
         assert!(!plain.is_writable(), "plain PV must not be writable");
         assert!(
             plain.put(nt_scalar_int_value(9)).is_err(),
@@ -1704,14 +1766,16 @@ mod tests {
 
         // Mailbox: accept and store.
         let mbox = SharedPV::build_mailbox();
-        mbox.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        mbox.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
         assert!(mbox.is_writable(), "mailbox PV must be writable");
         mbox.put(nt_scalar_int_value(42)).expect("mailbox put ok");
         assert_eq!(extract_int(&mbox.current().unwrap()), 42);
 
         // Read-only: explicit refusal with the pvxs message.
         let ro = SharedPV::build_readonly();
-        ro.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        ro.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
         assert!(
             !ro.is_writable(),
             "read-only PV reports not writable (still has a refusing handler)"
@@ -1726,7 +1790,8 @@ mod tests {
     #[tokio::test]
     async fn mr_r2_close_still_terminates_subscriber() {
         let pv = SharedPV::new();
-        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
         let mut rx = pv.subscribe(8).expect("subscribe");
         let _ = rx.recv().await.expect("initial value");
         pv.close();
@@ -1743,7 +1808,8 @@ mod tests {
     async fn shared_source_serves_named_pv() {
         use super::super::source::ChannelSource;
         let pv = SharedPV::new();
-        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(123));
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(123))
+            .unwrap();
         let src = SharedSource::new();
         src.add("test:pv", pv);
 

@@ -80,7 +80,8 @@ async fn pvget_typed_against_local_server() {
             timestamp: TimeStamp::default(),
         };
         initial.to_pv_field()
-    });
+    })
+    .unwrap();
     let source = SharedSource::new();
     source.add("MOTOR:VAL", pv);
     let _server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
@@ -170,7 +171,7 @@ fn typed_nt_enum_round_trip() {
 async fn pvget_typed_primitive_f64() {
     // Bare f64 against a plain NTScalar<double> source.
     let pv = SharedPV::new();
-    pv.open(f64::descriptor(), f64::to_pv_field(&7.5));
+    pv.open(f64::descriptor(), f64::to_pv_field(&7.5)).unwrap();
     let source = SharedSource::new();
     source.add("OVEN:TEMP", pv);
     let _server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");

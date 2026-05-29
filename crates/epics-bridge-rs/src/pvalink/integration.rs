@@ -3070,7 +3070,7 @@ mod tests {
             fields: vec![("value".into(), PvField::ScalarArray(vec![]))],
         });
         let pv = SharedPV::new();
-        pv.open(desc, initial);
+        pv.open(desc, initial).unwrap();
         let source = SharedSource::new();
         source.add(pv_name, pv.clone());
         let server =

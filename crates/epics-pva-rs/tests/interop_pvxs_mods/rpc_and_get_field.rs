@@ -47,7 +47,8 @@ async fn interop_rpc_pvxcall_against_rust_server() {
             struct_id: "rpc_in".into(),
             fields: vec![("x".into(), PvField::Scalar(ScalarValue::Int(0)))],
         }),
-    );
+    )
+    .unwrap();
     pv.on_rpc(|_pv, _desc_in, val_in| {
         // pvxcall sends arguments as
         //   epics:nt/NTURI:1.0 {
@@ -146,7 +147,8 @@ async fn interop_get_field_pvxinfo_against_rust_server() {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![("value".into(), PvField::Scalar(ScalarValue::Double(7.5)))],
         }),
-    );
+    )
+    .unwrap();
     let src = SharedSource::new();
     src.add("R:INFO:PV", pv);
     let server = PvaServer::isolated(Arc::new(src)).expect("server start");

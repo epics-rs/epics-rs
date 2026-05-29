@@ -140,7 +140,8 @@ async fn interop_r11_tcp_circuit_search_returns_matching_cid() {
                 PvField::Scalar(ScalarValue::Double(0.0)),
             )],
         }),
-    );
+    )
+    .unwrap();
     let source = SharedSource::new();
     source.add("R11:TEST", pv);
     let source_arc = std::sync::Arc::new(source);
@@ -255,7 +256,8 @@ async fn interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server() {
                 PvField::Scalar(ScalarValue::Double(42.5)),
             )],
         }),
-    );
+    )
+    .unwrap();
     let source = SharedSource::new();
     source.add("R11:NS:PV", pv);
     let server = PvaServer::isolated(Arc::new(source)).expect("server start");
@@ -364,7 +366,8 @@ async fn interop_r11_malformed_tcp_search_closes_circuit() {
                 PvField::Scalar(ScalarValue::Double(0.0)),
             )],
         }),
-    );
+    )
+    .unwrap();
     let source = SharedSource::new();
     source.add("R11:TEST", pv);
     let server = PvaServer::isolated(std::sync::Arc::new(source)).expect("server start");

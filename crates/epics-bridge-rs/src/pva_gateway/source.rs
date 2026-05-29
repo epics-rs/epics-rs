@@ -1192,11 +1192,25 @@ impl ChannelSource for GatewayChannelSource {
             method = %ctx.method,
             "pva-gateway: forwarding PUT with downstream credentials"
         );
-        // typed pass-through (see put_value for rationale).
-        client
-            .pvput_pv_field(name, &value)
-            .await
-            .map_err(|e| OpError::failed(e.to_string()))
+        // Forward the downstream PUT INIT pvRequest — preserved into
+        // `ctx.pv_request` (PUT INIT stash) — so upstream
+        // `record._options.process`/`block` are honored. pva2pva forwards
+        // `createChannelPut(..., pvRequest)` verbatim (channel.cpp:117-127);
+        // the prior `pvput_pv_field` reissued the gateway default request,
+        // dropping process/block. The data leg still targets the `value`
+        // bit (typed pass-through, see put_value). Atomic single-upstream
+        // PUT_GET / delta forwarding (one upstream op carrying the
+        // readback) is a separate, larger change. Falls back to the
+        // default request when the downstream sent none.
+        let result = match ctx.pv_request.as_ref() {
+            Some(req) => {
+                client
+                    .pvput_pv_field_with_request_value(name, req, &value)
+                    .await
+            }
+            None => client.pvput_pv_field(name, &value).await,
+        };
+        result.map_err(|e| OpError::failed(e.to_string()))
     }
 
     async fn is_writable(&self, name: &str) -> bool {

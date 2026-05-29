@@ -1208,6 +1208,33 @@ impl PvaClient {
         crate::client_native::ops_v2::op_put_value_raw(&ch, &bytes, value, self.inner.timeout).await
     }
 
+    /// Like [`Self::pvput_pv_field_with_request`] but takes the PUT INIT
+    /// pvRequest as a decoded [`PvField`] value (e.g. the request a PVA
+    /// gateway preserved into `ChannelContext.pv_request`) rather than a
+    /// [`crate::pv_request::PvRequestExpr`]. The pvRequest — carrying
+    /// `record._options.process`/`block` — is serialized in the
+    /// connection's negotiated byte order and sent at PUT INIT, while the
+    /// value targets the `value` bit as in
+    /// [`Self::pvput_pv_field_with_request`].
+    pub async fn pvput_pv_field_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &crate::pvdata::PvField,
+        value: &crate::pvdata::PvField,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        let order =
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order;
+        let mut bytes = Vec::new();
+        let desc = pv_request.descriptor();
+        crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
+        crate::pvdata::encode::encode_pv_field(pv_request, &desc, order, &mut bytes);
+        crate::client_native::ops_v2::op_put_value_raw(&ch, &bytes, value, self.inner.timeout).await
+    }
+
     /// PUT a pre-built [`PvField`] into a single dotted-path sub-field
     /// using a caller-provided pvRequest. Combines the typed-value
     /// path of [`Self::pvput_pv_field_with_request`] with the

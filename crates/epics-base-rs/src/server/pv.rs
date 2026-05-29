@@ -254,11 +254,34 @@ pub struct PvMetadata {
     pub enums: Option<EnumInfo>,
 }
 
+/// Metadata of the most recent full-snapshot write to a bare PV:
+/// alarm + acquisition timestamp + userTag. A bare `ProcessVariable`
+/// has no alarm engine, so without this it would forget everything a
+/// full-value write carried beyond the raw value. pvxs mailbox
+/// `SharedPV::post()` assigns the *whole* posted value to the current
+/// value (`sharedpv.cpp:417-432`); to match that, a PV that received a
+/// full posted Value must reflect its alarm/time on every later GET,
+/// not just to the monitor subscribers that saw the post live.
+#[derive(Clone)]
+struct PostedMeta {
+    alarm: crate::server::snapshot::AlarmInfo,
+    timestamp: std::time::SystemTime,
+    user_tag: i32,
+}
+
 /// A process variable hosted by the server.
 pub struct ProcessVariable {
     pub name: String,
     pub value: RwLock<EpicsValue>,
     pub subscribers: Mutex<Vec<Subscriber>>,
+    /// Sticky metadata of the last full-snapshot write. `None` until a
+    /// [`Self::set_snapshot`] lands; a value-only [`Self::set`] clears it
+    /// back to `None` (a plain value write carries no explicit
+    /// alarm/time, so it reverts to NO_ALARM + wall-clock-now). When
+    /// `Some`, [`Self::snapshot`] serves these instead of the defaults.
+    /// Single meaning: the served snapshot reflects the most recent
+    /// write — value always current, metadata from that write.
+    posted_meta: parking_lot::RwLock<Option<PostedMeta>>,
     /// Shadow DBR_GR_*/DBR_CTRL_*/enum metadata, installed by a proxy
     /// (CA / PVA gateway) via [`Self::set_metadata`]. Empty for a plain
     /// local PV. Stored under the same sync `parking_lot::RwLock` slot
@@ -291,6 +314,7 @@ impl ProcessVariable {
             value: RwLock::new(initial),
             subscribers: Mutex::new(Vec::new()),
             metadata: parking_lot::RwLock::new(PvMetadata::default()),
+            posted_meta: parking_lot::RwLock::new(None),
             write_hook: parking_lot::RwLock::new(None),
             access_hook: parking_lot::RwLock::new(None),
         }
@@ -383,7 +407,20 @@ impl ProcessVariable {
     /// adapter to surface upstream disconnect).
     pub async fn snapshot(&self) -> Snapshot {
         let value = self.value.read().await.clone();
-        let mut snap = Snapshot::new(value, 0, 0, crate::runtime::time::now_wall());
+        // Serve the sticky metadata of the last full-snapshot write if
+        // one landed (pvxs mailbox parity: a posted full Value stays the
+        // current value, alarm/time included); otherwise the bare-PV
+        // default of NO_ALARM + wall-clock-now.
+        let mut snap = match self.posted_meta.read().clone() {
+            Some(m) => {
+                let mut s = Snapshot::new(value, m.alarm.status, m.alarm.severity, m.timestamp);
+                s.alarm.ackt = m.alarm.ackt;
+                s.alarm.acks = m.alarm.acks;
+                s.user_tag = m.user_tag;
+                s
+            }
+            None => Snapshot::new(value, 0, 0, crate::runtime::time::now_wall()),
+        };
         self.apply_metadata(&mut snap);
         snap
     }
@@ -394,6 +431,10 @@ impl ProcessVariable {
             let mut val = self.value.write().await;
             *val = new_value.clone();
         }
+        // A plain value write carries no explicit alarm/time — revert to
+        // the bare-PV default so a stale full-snapshot's metadata does
+        // not linger on a value the client never stamped.
+        *self.posted_meta.write() = None;
         self.notify_subscribers(new_value).await;
     }
 
@@ -407,6 +448,13 @@ impl ProcessVariable {
             let mut val = self.value.write().await;
             *val = snapshot.value.clone();
         }
+        // Persist the posted alarm/time/userTag so a later GET reflects
+        // the full posted value, not just the live monitor fan-out.
+        *self.posted_meta.write() = Some(PostedMeta {
+            alarm: snapshot.alarm.clone(),
+            timestamp: snapshot.timestamp,
+            user_tag: snapshot.user_tag,
+        });
         self.notify_subscribers_from_snapshot(snapshot).await;
     }
 
@@ -721,6 +769,39 @@ mod mask_gate_tests {
 
     fn pv() -> ProcessVariable {
         ProcessVariable::new("test:pv".into(), EpicsValue::Double(0.0))
+    }
+
+    /// A full-snapshot write must persist alarm + timestamp + userTag so
+    /// a later `snapshot()` (the GET path) reflects them — not just the
+    /// live monitor fan-out. A subsequent value-only `set()` carries no
+    /// explicit metadata and must revert the snapshot to NO_ALARM.
+    #[tokio::test]
+    async fn set_snapshot_metadata_persists_then_value_set_clears() {
+        let pv = pv();
+
+        let posted_time = std::time::UNIX_EPOCH + std::time::Duration::new(1_600_000_000, 42);
+        let mut snap = Snapshot::new(EpicsValue::Double(7.0), 3, 2, posted_time);
+        snap.user_tag = 9;
+        pv.set_snapshot(snap).await;
+
+        let got = pv.snapshot().await;
+        assert_eq!(got.value, EpicsValue::Double(7.0), "value persisted");
+        assert_eq!(got.alarm.status, 3, "alarm.status persisted to GET");
+        assert_eq!(got.alarm.severity, 2, "alarm.severity persisted to GET");
+        assert_eq!(got.user_tag, 9, "userTag persisted to GET");
+        assert_eq!(got.timestamp, posted_time, "timestamp persisted to GET");
+
+        // A plain value write reverts to the bare-PV default.
+        pv.set(EpicsValue::Double(8.0)).await;
+        let after = pv.snapshot().await;
+        assert_eq!(after.value, EpicsValue::Double(8.0));
+        assert_eq!(after.alarm.status, 0, "value set clears posted alarm");
+        assert_eq!(after.alarm.severity, 0, "value set clears posted severity");
+        assert_eq!(after.user_tag, 0, "value set clears posted userTag");
+        assert_ne!(
+            after.timestamp, posted_time,
+            "value set must restamp the timestamp, not keep the posted one"
+        );
     }
 
     /// a `DBE_ALARM`-only subscriber must not receive a plain

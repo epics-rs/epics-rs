@@ -459,6 +459,17 @@ impl SharedPV {
                 "SharedPV already open; close() first".to_string(),
             ));
         }
+        // The seeded value must fit its descriptor — the SAME guard
+        // `try_post_checked`/`put_delta` enforce on every later write.
+        // Without it the first value had weaker invariants than all
+        // subsequent ones, so a startup-only descriptor/value mismatch
+        // could be encoded under the advertised descriptor on the very
+        // first GET / monitor snapshot.
+        if let Err(e) = crate::pvdata::value_matches_descriptor(&initial, &desc) {
+            return Err(crate::error::PvaError::InvalidValue(format!(
+                "SharedPV::open: initial value does not fit descriptor ({e})"
+            )));
+        }
         g.state = PvState::Open {
             desc,
             value: initial,
@@ -985,6 +996,16 @@ impl Default for SharedPV {
     }
 }
 
+/// Error from [`SharedSource::try_add`] / [`crate::service::add_rpc_service`]
+/// when a PV name is already registered. The existing PV is left in place
+/// — the served namespace is never swapped. Mirrors pvxs
+/// `StaticSource::add()` throwing `"add() will not create duplicate PV"`
+/// (`sharedpv.cpp:568-581`); for an intentional swap, [`SharedSource::remove`]
+/// first.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("SharedSource: PV '{0}' is already registered (remove() it first to replace)")]
+pub struct AddPvError(pub String);
+
 /// Trivial map-of-named-SharedPV adapter that implements
 /// [`super::source::ChannelSource`]. Construct via `SharedSource::new()`,
 /// `add(name, shared_pv)`, then pass to [`super::runtime::run_pva_server`].
@@ -1023,20 +1044,36 @@ impl SharedSource {
             .map_err(|_| "SharedSource access gate already installed")
     }
 
+    /// Register `pv` under `name`, rejecting a duplicate name without
+    /// mutating the map (pvxs `StaticSource::add()` parity,
+    /// `sharedpv.cpp:568-581`). The check-and-insert is atomic under the
+    /// single map lock, so two concurrent registrations of the same name
+    /// cannot both succeed. This is the single owner of insertion — every
+    /// add path routes through it, so "a name is registered at most once"
+    /// holds by construction and the served namespace can never silently
+    /// swap underneath in-flight operations holding the old `SharedPV`.
+    pub fn try_add(&self, name: impl Into<String>, pv: SharedPV) -> Result<(), AddPvError> {
+        use std::collections::hash_map::Entry;
+        match self.pvs.lock().entry(name.into()) {
+            Entry::Occupied(e) => Err(AddPvError(e.key().clone())),
+            Entry::Vacant(slot) => {
+                slot.insert(pv);
+                Ok(())
+            }
+        }
+    }
+
+    /// Lenient register: [`Self::try_add`] but a duplicate is logged and
+    /// the existing PV is kept (never replaced) instead of surfacing an
+    /// error — for the many infallible call sites. Callers that must
+    /// observe the duplicate (the service framework) use `try_add`.
     pub fn add(&self, name: impl Into<String>, pv: SharedPV) {
-        let key = name.into();
-        // Warn on silent overwrite: a second registration with the
-        // same name swaps in the new SharedPV, but in-flight clones
-        // held by ongoing RPCs still reference the previous SharedPV.
-        // Surfacing this nudges callers toward `remove` then `add`
-        // for intentional swaps.
-        if self.pvs.lock().insert(key.clone(), pv).is_some() {
+        if let Err(e) = self.try_add(name, pv) {
             tracing::warn!(
-                pv = %key,
-                "SharedSource::add overwriting an existing PV — \
-                 in-flight operations on the old SharedPV continue \
-                 with stale state. Call SharedSource::remove first \
-                 for intentional swaps."
+                pv = %e.0,
+                "SharedSource::add: PV already registered — keeping the \
+                 existing SharedPV, ignoring the duplicate. Call \
+                 SharedSource::remove first for an intentional swap."
             );
         }
     }
@@ -1322,6 +1359,115 @@ mod tests {
             .unwrap();
         assert!(pv.is_open());
         assert!(pv.current().is_some());
+    }
+
+    /// Regression: `open()` must enforce the same descriptor/value guard
+    /// every later post does — a scalar-type mismatch is rejected and the
+    /// PV stays Closed, so a startup-only mismatch cannot be encoded under
+    /// the advertised descriptor on the first GET. The same value also
+    /// fails identically through `try_post_checked`.
+    #[test]
+    fn shared_pv_open_rejects_descriptor_value_type_mismatch() {
+        // Descriptor says NTScalar<Double>, value is NTScalar<Int>.
+        let double_desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let double_value = || {
+            let mut s = crate::pvdata::PvStructure::new("epics:nt/NTScalar:1.0");
+            s.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+            PvField::Structure(s)
+        };
+        let pv = SharedPV::new();
+        let err = pv
+            .open(double_desc.clone(), nt_scalar_int_value(42))
+            .expect_err("type mismatch must be rejected");
+        assert!(matches!(err, crate::error::PvaError::InvalidValue(_)));
+        assert!(!pv.is_open(), "PV must stay Closed after a rejected open");
+
+        // The same mismatch fails identically on the post path once the
+        // PV is correctly opened with a matching Double value.
+        let pv2 = SharedPV::build_mailbox();
+        pv2.open(double_desc, double_value()).unwrap();
+        assert!(pv2.try_post_checked(nt_scalar_int_value(42)).is_err());
+    }
+
+    /// A `Variant` ("any") root is a deliberate Rust generalization for
+    /// generic RPC-method slots (the service framework registers each
+    /// method as a SharedPV opened with `FieldDesc::Variant`). Unlike
+    /// pvxs's Struct-only root, it is accepted — but the seeded value
+    /// must still fit the descriptor, so `Null` (an unset `any`) opens
+    /// while a concrete value that the variant cannot faithfully carry
+    /// does not.
+    #[test]
+    fn shared_pv_open_accepts_variant_root_with_null_value() {
+        let pv = SharedPV::new();
+        pv.open(FieldDesc::Variant, PvField::Null)
+            .expect("variant root with null value must open");
+        assert!(pv.is_open());
+    }
+
+    /// `try_add` is the single owner of insertion: a duplicate name is
+    /// rejected and the originally-registered `SharedPV` is kept — the
+    /// served namespace never silently swaps (pvxs `StaticSource::add()`
+    /// rejects duplicates, `sharedpv.cpp:568-581`). The lenient `add`
+    /// wrapper has the same keep-original effect. An intentional swap goes
+    /// through `remove` first.
+    #[test]
+    fn try_add_rejects_duplicate_and_keeps_original() {
+        let source = SharedSource::new();
+
+        let first = SharedPV::new();
+        first
+            .open(nt_scalar_int_desc(), nt_scalar_int_value(1))
+            .unwrap();
+        source.try_add("dup", first).expect("first add succeeds");
+
+        // A second PV under the same name is rejected; the map is untouched.
+        let second = SharedPV::new();
+        second
+            .open(nt_scalar_int_desc(), nt_scalar_int_value(2))
+            .unwrap();
+        let err = source
+            .try_add("dup", second)
+            .expect_err("duplicate name must be rejected");
+        assert_eq!(err.0, "dup");
+
+        // The original (value 1) is still the registered PV.
+        let kept = source.get("dup").expect("original PV remains");
+        match kept.current() {
+            Some(PvField::Structure(s)) => assert_eq!(
+                s.get_field("value"),
+                Some(&PvField::Scalar(ScalarValue::Int(1)))
+            ),
+            other => panic!("unexpected current value: {other:?}"),
+        }
+
+        // The lenient wrapper also keeps the original on a collision.
+        let third = SharedPV::new();
+        third
+            .open(nt_scalar_int_desc(), nt_scalar_int_value(3))
+            .unwrap();
+        source.add("dup", third);
+        let still = source.get("dup").expect("original PV still present");
+        match still.current() {
+            Some(PvField::Structure(s)) => assert_eq!(
+                s.get_field("value"),
+                Some(&PvField::Scalar(ScalarValue::Int(1)))
+            ),
+            other => panic!("unexpected current value: {other:?}"),
+        }
+
+        // After an explicit remove, the name is free to be re-registered.
+        assert!(source.remove("dup").is_some());
+        let fresh = SharedPV::new();
+        fresh
+            .open(nt_scalar_int_desc(), nt_scalar_int_value(9))
+            .unwrap();
+        source
+            .try_add("dup", fresh)
+            .expect("re-add after remove succeeds");
     }
 
     #[tokio::test]

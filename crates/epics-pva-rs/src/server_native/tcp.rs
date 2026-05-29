@@ -2266,6 +2266,17 @@ async fn handle_connection_io(
                         // mirror live channel names for the report.
                         peer_entry
                             .set_channel_names(channels.values().map(|c| c.name.clone()).collect());
+                        // Notify the bound source that a channel attached,
+                        // matching pvxs `SharedPV::attach` running
+                        // `onFirstConnect` on the empty→non-empty edge
+                        // (sharedpv.cpp:299-313). This is a CHANNEL edge,
+                        // independent of monitor subscription, so a
+                        // GET/PUT/RPC/GET_FIELD-only client drives lazy open
+                        // too. Paired with `close_channel`'s onClose.
+                        if let Some(ch) = channels.get(&cc.sid) {
+                            let ctx = channel_lifecycle_ctx(peer, &cred);
+                            ch.source.notify_channel_open(&ch.name, &ctx);
+                        }
                     } else {
                         // CREATE_CHANNEL failure sid must be the
                         // no-channel sentinel 0xFFFFFFFF (pvxs
@@ -3701,20 +3712,16 @@ async fn handle_create_channel(
     Ok(())
 }
 
-/// Tear a single channel down and deliver its `onClose` to the bound
-/// source, in pvxs `ServerChan::cleanup` order: drop the per-op state
-/// first — aborting any monitor subscriber tasks and releasing
-/// source-side subscriptions — then notify the source exactly once
-/// (`serverchan.cpp:43-60`, `:115-127`). `peer`/`cred` reconstruct the
-/// connection-scoped identity the channel was opened under; pvAccess
-/// carries no per-op `pvRequest` on close, so `pv_request` is `None`
-/// (matching the CREATE_CHANNEL resolve context).
-fn close_channel(ch: ChannelState, peer: SocketAddr, cred: &ClientCredentials) {
-    let ChannelState {
-        name, source, ops, ..
-    } = ch;
-    drop(ops);
-    let ctx = crate::server_native::source::ChannelContext {
+/// Build the connection-scoped [`ChannelContext`] for a channel
+/// *lifecycle* edge (open/close). pvAccess carries no per-op `pvRequest`
+/// on these edges, so `pv_request` is `None` — the same shape
+/// CREATE_CHANNEL uses to resolve the owner (serverchan.cpp:62, the
+/// channel is built from `conn->cred`).
+fn channel_lifecycle_ctx(
+    peer: SocketAddr,
+    cred: &ClientCredentials,
+) -> crate::server_native::source::ChannelContext {
+    crate::server_native::source::ChannelContext {
         peer,
         account: cred.account.clone(),
         method: cred.method.clone(),
@@ -3722,7 +3729,21 @@ fn close_channel(ch: ChannelState, peer: SocketAddr, cred: &ClientCredentials) {
         authority: cred.authority.clone(),
         roles: cred.roles.clone(),
         pv_request: None,
-    };
+    }
+}
+
+/// Tear a single channel down and deliver its `onClose` to the bound
+/// source, in pvxs `ServerChan::cleanup` order: drop the per-op state
+/// first — aborting any monitor subscriber tasks and releasing
+/// source-side subscriptions — then notify the source exactly once
+/// (`serverchan.cpp:43-60`, `:115-127`). `peer`/`cred` reconstruct the
+/// connection-scoped identity the channel was opened under.
+fn close_channel(ch: ChannelState, peer: SocketAddr, cred: &ClientCredentials) {
+    let ChannelState {
+        name, source, ops, ..
+    } = ch;
+    drop(ops);
+    let ctx = channel_lifecycle_ctx(peer, cred);
     source.notify_channel_close(&name, &ctx);
 }
 

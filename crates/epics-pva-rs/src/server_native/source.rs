@@ -802,6 +802,24 @@ pub trait ChannelSource: Send + Sync + 'static {
         let _ = (name, ctx, start);
     }
 
+    /// A peer channel to `name` has been admitted — CREATE_CHANNEL
+    /// resolved the PV and the channel was inserted into the connection's
+    /// channel table. Fired exactly once per opened channel by the
+    /// channel-lifecycle owner, matching pvxs `SharedPV::attach()` which
+    /// inserts each `ChannelControl` into `impl->channels` and runs
+    /// `onFirstConnect` on the empty→non-empty transition
+    /// (`sharedpv.cpp:299-313`). This is a *channel* edge, distinct from
+    /// the *monitor-operation* edge [`Self::notify_monitor_start`]: it
+    /// fires for a channel that only ever carries GET/PUT/RPC/GET_FIELD
+    /// traffic and never opens a monitor, which is exactly the
+    /// lazy-resource pattern pvxs tests (`testget.cpp:204-234`). A source
+    /// uses it to acquire per-channel leases or open lazily on first
+    /// attach. `ctx` is credential-scoped (no `pv_request`). Paired with
+    /// [`Self::notify_channel_close`]. Default impl ignores it.
+    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
+        let _ = (name, ctx);
+    }
+
     /// A peer channel to `name` has closed — the client sent
     /// `DESTROY_CHANNEL` or the TCP connection dropped. Fired exactly
     /// once per opened channel by the channel-lifecycle owner AFTER the
@@ -1106,6 +1124,7 @@ pub trait ChannelSourceObj: Send + Sync {
     fn monitor_emits_partial(&self, name: &str) -> bool;
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent);
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool);
+    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext);
     fn notify_channel_close(&self, name: &str, ctx: &ChannelContext);
     fn monitor_watermarks<'a>(
         &'a self,
@@ -1348,6 +1367,9 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
         <Self as ChannelSource>::notify_monitor_start(self, name, ctx, start);
+    }
+    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
+        <Self as ChannelSource>::notify_channel_open(self, name, ctx);
     }
     fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
         <Self as ChannelSource>::notify_channel_close(self, name, ctx);

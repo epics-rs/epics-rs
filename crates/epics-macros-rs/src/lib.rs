@@ -511,8 +511,15 @@ fn epics_pva_path() -> proc_macro2::TokenStream {
 ///   `#[nt(meta)]` get encoded as their type's
 ///   [`TypedNT`] impl (`Alarm`, `TimeStamp`, custom meta structs).
 ///
-/// Generated code emits `epics:nt/NTScalar:1.0` as the wrapper
-/// struct id; meta fields are inlined alongside `value`.
+/// The wrapper structure id is taken from the `value` type's own
+/// [`TypedNT`] descriptor (`epics:nt/NTScalar:1.0`,
+/// `epics:nt/NTScalarArray:1.0`, or `epics:nt/NTEnum:1.0`). The
+/// mandatory metadata members for that id — `alarm` and `timeStamp`
+/// (and `display` for NTEnum) — are always present in the generated
+/// descriptor and value: a `#[nt(meta)]` field with the matching name
+/// supplies its own type/value, otherwise a default is filled in.
+/// A derived type therefore cannot claim a normative structure id while
+/// omitting the members that id requires.
 ///
 /// ```ignore
 /// use epics_pva_rs::nt::{Alarm, TimeStamp};
@@ -676,6 +683,12 @@ pub fn derive_nt_scalar(input: TokenStream) -> TokenStream {
                         <#meta_field_tys as #krate::nt::TypedNT>::descriptor(),
                     ));
                 )*
+                // Guarantee the mandatory NT metadata members for the
+                // resolved structure ID are present (alarm/timeStamp, plus
+                // display for NTEnum) even when the user declared none —
+                // pvxs `NTScalar`/`NTEnum::build()` always emit them
+                // (nt.cpp:44-53, :121-131), so a type claiming the ID must.
+                let __fields = __rt::ensure_nt_meta_desc(&__sid, __fields);
                 __rt::FieldDesc::Structure {
                     struct_id: __sid,
                     fields: __fields,
@@ -711,6 +724,10 @@ pub fn derive_nt_scalar(input: TokenStream) -> TokenStream {
                         <#meta_field_tys as #krate::nt::TypedNT>::to_pv_field(&self.#meta_field_idents),
                     ));
                 )*
+                // Mirror descriptor(): fill any mandatory NT metadata member
+                // the user omitted with its default so the value matches the
+                // advertised normative structure ID.
+                __s.fields = __rt::ensure_nt_meta_value(&__sid, __s.fields);
                 __rt::PvField::Structure(__s)
             }
 
@@ -864,6 +881,9 @@ pub fn pva_service(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///         col2: Vec<T2>,
 ///         ...
 ///     },
+///     descriptor: String,     // normative NTTable metadata, always
+///     alarm: alarm_t,         // emitted (pvxs NTTable::build, nt.cpp)
+///     timeStamp: time_t,
 /// }
 /// ```
 ///
@@ -951,15 +971,21 @@ pub fn derive_nt_table(input: TokenStream) -> TokenStream {
                     };
                     __value_fields.push((#col_names.into(), __slot));
                 )*
+                let __fields: ::std::vec::Vec<(::std::string::String, __rt::FieldDesc)> = ::std::vec![
+                    ("labels".into(), __rt::FieldDesc::ScalarArray(__rt::ScalarType::String)),
+                    ("value".into(), __rt::FieldDesc::Structure {
+                        struct_id: "".into(),
+                        fields: __value_fields,
+                    }),
+                ];
+                // pvxs `NTTable::build()` (nt.cpp:170-176) always carries
+                // `descriptor`, `alarm`, and `timeStamp` after `labels` +
+                // `value`; inject them so the derived type matches the
+                // normative NTTable shape rather than a two-field stub.
+                let __fields = __rt::ensure_nt_meta_desc("epics:nt/NTTable:1.0", __fields);
                 __rt::FieldDesc::Structure {
                     struct_id: "epics:nt/NTTable:1.0".into(),
-                    fields: ::std::vec![
-                        ("labels".into(), __rt::FieldDesc::ScalarArray(__rt::ScalarType::String)),
-                        ("value".into(), __rt::FieldDesc::Structure {
-                            struct_id: "".into(),
-                            fields: __value_fields,
-                        }),
-                    ],
+                    fields: __fields,
                 }
             }
 
@@ -992,6 +1018,9 @@ pub fn derive_nt_table(input: TokenStream) -> TokenStream {
                     "value".into(),
                     __rt::PvField::Structure(__value_struct),
                 ));
+                // Mirror descriptor(): fill the normative NTTable metadata
+                // (descriptor/alarm/timeStamp) with defaults.
+                __root.fields = __rt::ensure_nt_meta_value("epics:nt/NTTable:1.0", __root.fields);
                 __rt::PvField::Structure(__root)
             }
 

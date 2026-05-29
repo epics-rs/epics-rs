@@ -246,6 +246,139 @@ pub mod __rt {
             got: got.into(),
         }
     }
+
+    /// The pvxs metadata baseline a `#[derive]`d Normative Type MUST carry
+    /// for its resolved structure ID, in canonical pvxs order. Mirrors the
+    /// fields pvxs `*::build()` always emits:
+    /// - NTScalar / NTScalarArray (`nt.cpp:44-53`): `alarm`, `timeStamp`
+    /// - NTEnum (`nt.cpp:121-131`): `alarm`, `timeStamp`, `display{description}`
+    /// - NTTable (`nt.cpp:170-176`): `descriptor`, `alarm`, `timeStamp`
+    ///   (`labels` + `value` are emitted by the derive ahead of these)
+    ///
+    /// Any other / empty structure ID has no NT baseline — the field list
+    /// passes through unchanged.
+    fn nt_meta_desc(struct_id: &str) -> ::std::vec::Vec<(&'static str, FieldDesc)> {
+        use crate::nt::meta;
+        match struct_id {
+            "epics:nt/NTScalar:1.0" | "epics:nt/NTScalarArray:1.0" => {
+                ::std::vec![
+                    ("alarm", meta::alarm_desc()),
+                    ("timeStamp", meta::time_desc())
+                ]
+            }
+            "epics:nt/NTEnum:1.0" => ::std::vec![
+                ("alarm", meta::alarm_desc()),
+                ("timeStamp", meta::time_desc()),
+                ("display", enum_display_desc()),
+            ],
+            "epics:nt/NTTable:1.0" => ::std::vec![
+                ("descriptor", FieldDesc::Scalar(ScalarType::String)),
+                ("alarm", meta::alarm_desc()),
+                ("timeStamp", meta::time_desc()),
+            ],
+            _ => ::std::vec::Vec::new(),
+        }
+    }
+
+    /// Default values matching [`nt_meta_desc`], used to fill any mandatory
+    /// member the derive user did not declare.
+    fn nt_meta_value(struct_id: &str) -> ::std::vec::Vec<(&'static str, PvField)> {
+        use crate::nt::meta;
+        match struct_id {
+            "epics:nt/NTScalar:1.0" | "epics:nt/NTScalarArray:1.0" => ::std::vec![
+                ("alarm", meta::alarm_default()),
+                ("timeStamp", meta::time_default())
+            ],
+            "epics:nt/NTEnum:1.0" => ::std::vec![
+                ("alarm", meta::alarm_default()),
+                ("timeStamp", meta::time_default()),
+                ("display", enum_display_default()),
+            ],
+            "epics:nt/NTTable:1.0" => ::std::vec![
+                (
+                    "descriptor",
+                    PvField::Scalar(ScalarValue::String(String::new()))
+                ),
+                ("alarm", meta::alarm_default()),
+                ("timeStamp", meta::time_default()),
+            ],
+            _ => ::std::vec::Vec::new(),
+        }
+    }
+
+    /// pvxs NTEnum `display` sub-struct: just `description` (`nt.cpp:129-131`).
+    fn enum_display_desc() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: ::std::vec![("description".into(), FieldDesc::Scalar(ScalarType::String))],
+        }
+    }
+
+    fn enum_display_default() -> PvField {
+        let mut s = PvStructure::new("");
+        s.fields.push((
+            "description".into(),
+            PvField::Scalar(ScalarValue::String(String::new())),
+        ));
+        PvField::Structure(s)
+    }
+
+    /// Merge the pvxs metadata baseline for `struct_id` into a derived
+    /// descriptor's field list. Every non-baseline user field is kept in
+    /// declaration order; then each mandatory member is emitted in canonical
+    /// pvxs order — the user's own field when they declared one with the
+    /// matching name, otherwise the default. The result therefore always
+    /// contains the mandatory members for the claimed structure ID *by
+    /// construction*, so a `#[derive]` cannot reintroduce a truncated
+    /// normative type no matter which `#[nt(meta)]` fields the user omits.
+    pub fn ensure_nt_meta_desc(
+        struct_id: &str,
+        user: ::std::vec::Vec<(String, FieldDesc)>,
+    ) -> ::std::vec::Vec<(String, FieldDesc)> {
+        let baseline = nt_meta_desc(struct_id);
+        if baseline.is_empty() {
+            return user;
+        }
+        let mut out: ::std::vec::Vec<(String, FieldDesc)> =
+            ::std::vec::Vec::with_capacity(user.len() + baseline.len());
+        for (n, d) in &user {
+            if !baseline.iter().any(|(bn, _)| *bn == n.as_str()) {
+                out.push((n.clone(), d.clone()));
+            }
+        }
+        for (bn, bd) in &baseline {
+            match user.iter().find(|(n, _)| n.as_str() == *bn) {
+                Some((_, ud)) => out.push(((*bn).to_string(), ud.clone())),
+                None => out.push(((*bn).to_string(), bd.clone())),
+            }
+        }
+        out
+    }
+
+    /// Value-side counterpart of [`ensure_nt_meta_desc`].
+    pub fn ensure_nt_meta_value(
+        struct_id: &str,
+        user: ::std::vec::Vec<(String, PvField)>,
+    ) -> ::std::vec::Vec<(String, PvField)> {
+        let baseline = nt_meta_value(struct_id);
+        if baseline.is_empty() {
+            return user;
+        }
+        let mut out: ::std::vec::Vec<(String, PvField)> =
+            ::std::vec::Vec::with_capacity(user.len() + baseline.len());
+        for (n, v) in &user {
+            if !baseline.iter().any(|(bn, _)| *bn == n.as_str()) {
+                out.push((n.clone(), v.clone()));
+            }
+        }
+        for (bn, bv) in &baseline {
+            match user.iter().find(|(n, _)| n.as_str() == *bn) {
+                Some((_, uv)) => out.push(((*bn).to_string(), uv.clone())),
+                None => out.push(((*bn).to_string(), bv.clone())),
+            }
+        }
+        out
+    }
 }
 
 fn get_i32(s: &PvStructure, name: &str) -> Option<i32> {

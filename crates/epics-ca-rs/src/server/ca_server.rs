@@ -404,6 +404,31 @@ impl ServerStats {
     }
 }
 
+/// A cloneable, detachable handle that triggers `CA_PROTO_ACCESS_RIGHTS`
+/// re-evaluation for every connected client, equivalent to
+/// [`CaServer::notify_access_change`] but usable after [`CaServer::run`]
+/// has taken ownership of the server value.
+///
+/// Obtain one via [`CaServer::access_rights_notifier`]. It wraps a clone of
+/// the server's ACF-reload broadcast sender; firing [`Self::notify`] prompts
+/// each client's TCP task to re-run its per-channel access computation
+/// (including any installed `PvDatabase` access hook) and re-push
+/// `CA_PROTO_ACCESS_RIGHTS` only for channels whose computed level changed
+/// (libca `oldaccess != access` filter, asLibRoutines.c:1047-1051).
+#[derive(Clone)]
+pub struct AccessRightsNotifier {
+    tx: tokio::sync::broadcast::Sender<()>,
+}
+
+impl AccessRightsNotifier {
+    /// Prompt every connected client to re-evaluate and re-push
+    /// `CA_PROTO_ACCESS_RIGHTS` for its open channels. A send error (no live
+    /// subscribers) is a normal transient state and is ignored.
+    pub fn notify(&self) {
+        let _ = self.tx.send(());
+    }
+}
+
 pub struct CaServer {
     db: Arc<PvDatabase>,
     /// UDP discovery port. Bound by the search responder.
@@ -651,7 +676,25 @@ impl CaServer {
     /// prefer [`Self::reload_acf_from`], which swaps the config and
     /// notifies in one step.
     pub fn notify_access_change(&self) {
-        let _ = self.acf_reload_tx.send(());
+        self.access_rights_notifier().notify();
+    }
+
+    /// Snapshot a cloneable, detachable [`AccessRightsNotifier`] that fires
+    /// the same access-rights re-evaluation as [`Self::notify_access_change`].
+    ///
+    /// Unlike `&self`-based `notify_access_change`, the returned handle keeps
+    /// working after [`Self::run`] has consumed the server: it holds a clone
+    /// of the `acf_reload_tx` sender, and the matching receivers live inside
+    /// each connected client's TCP task. A caller (e.g. the CA gateway, whose
+    /// upstream manager outlives the `CaServer` value once `run` is spawned)
+    /// snapshots this before `run` and fires it whenever a programmatic
+    /// access-state change — such as an upstream IOC write-access flip or an
+    /// `.acf`/`.pvlist` reload — should re-push `CA_PROTO_ACCESS_RIGHTS` to
+    /// already-connected clients (RSRV `sendAllUpdateAS`, caservertask.c:1224).
+    pub fn access_rights_notifier(&self) -> AccessRightsNotifier {
+        AccessRightsNotifier {
+            tx: self.acf_reload_tx.clone(),
+        }
     }
 
     /// Set callbacks to run after PINI processing completes.
@@ -1398,4 +1441,45 @@ fn drain_grace_from_env() -> u64 {
     epics_base_rs::runtime::env::get("EPICS_CAS_DRAIN_GRACE_SECS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(30)
+}
+
+#[cfg(test)]
+mod access_notifier_tests {
+    use super::*;
+
+    fn empty_server() -> CaServer {
+        let db = Arc::new(PvDatabase::new());
+        CaServer::from_parts(db, 0, None, None, None, None)
+    }
+
+    // The detachable handle must keep firing after the CaServer value is
+    // gone — that is the whole point: the gateway's upstream manager calls
+    // it long after `run()` has consumed the server.
+    #[tokio::test]
+    async fn access_rights_notifier_fires_after_server_dropped() {
+        let server = empty_server();
+        let mut rx = server.acf_reload_tx.subscribe();
+        let notifier = server.access_rights_notifier();
+        drop(server);
+        notifier.notify();
+        assert!(
+            rx.try_recv().is_ok(),
+            "detached notifier must deliver to a live receiver after server drop"
+        );
+    }
+
+    // notify_access_change and the detachable handle must drive the SAME
+    // broadcast, so both re-push CA_PROTO_ACCESS_RIGHTS identically.
+    #[tokio::test]
+    async fn notify_access_change_and_handle_share_one_channel() {
+        let server = empty_server();
+        let mut rx = server.acf_reload_tx.subscribe();
+        server.notify_access_change();
+        assert!(rx.try_recv().is_ok(), "notify_access_change must send");
+        server.access_rights_notifier().notify();
+        assert!(
+            rx.try_recv().is_ok(),
+            "handle must send on the same channel"
+        );
+    }
 }

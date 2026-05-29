@@ -41,12 +41,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use epics_ca_rs::client::{CaChannel, CaClient, EventWatcher};
+use epics_ca_rs::server::AccessRightsNotifier;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
@@ -253,6 +254,18 @@ pub struct UpstreamManager {
     /// (gateServer.cc:1294-1356, set once via setConnectTimeout,
     /// gateway.cc:1147) rather than a second hard-coded clock.
     connect_timeout: Duration,
+    /// Detachable handle that re-pushes `CA_PROTO_ACCESS_RIGHTS` to
+    /// already-connected downstream clients. Installed via
+    /// [`Self::install_access_notifier`] once the downstream `CaServer`
+    /// exists (the manager is built first), so it is wrapped in an
+    /// `ArcSwapOption` for lock-free interior mutability. Fired whenever a
+    /// gateway-side change flips a channel's computed downstream access —
+    /// an upstream IOC write-access event (`on_access_rights_change`) or an
+    /// `.acf`/`.pvlist` reload re-resolving per-PV ACLs
+    /// ([`Self::notify_downstream_access_change`]). Mirrors C ca-gateway
+    /// `postAccessRights` / `gateChan::resetAsClient` (gateVc.cc:170-199,
+    /// 1624-1638) and RSRV `asComputeAllAsg`.
+    access_notifier: Arc<ArcSwapOption<AccessRightsNotifier>>,
 }
 
 impl UpstreamManager {
@@ -307,7 +320,36 @@ impl UpstreamManager {
             subs: parking_lot::Mutex::new(HashMap::new()),
             pending: parking_lot::Mutex::new(HashMap::new()),
             connect_timeout: cfg.connect_timeout,
+            access_notifier: Arc::new(ArcSwapOption::empty()),
         })
+    }
+
+    /// Install the downstream access-rights notifier.
+    ///
+    /// The manager is constructed before the downstream `CaServer` exists,
+    /// so the gateway snapshots the server's [`AccessRightsNotifier`] during
+    /// build (after the server is created, before `run` consumes it) and
+    /// installs it here. Once installed, gateway-side access-state changes
+    /// re-push `CA_PROTO_ACCESS_RIGHTS` to already-connected clients instead
+    /// of silently updating only the hook flag.
+    pub fn install_access_notifier(&self, notifier: AccessRightsNotifier) {
+        self.access_notifier.store(Some(Arc::new(notifier)));
+    }
+
+    /// Fire the installed downstream access-rights notifier, if any.
+    ///
+    /// Prompts every connected downstream client to re-run its per-channel
+    /// access computation (the gateway's access hook, which ANDs the live
+    /// per-PV ACL with the upstream write bit) and re-push
+    /// `CA_PROTO_ACCESS_RIGHTS` only where the computed level changed. Called
+    /// by the `AS`/`PVL` reload owner after re-resolving every still-admitted
+    /// PV's ACL (C `gateServer::newAs` → `asComputeAllAsg`,
+    /// gateServer.cc:603-630). A no-op until [`Self::install_access_notifier`]
+    /// has run.
+    pub fn notify_downstream_access_change(&self) {
+        if let Some(notifier) = self.access_notifier.load_full() {
+            notifier.notify();
+        }
     }
 
     /// Number of active upstream subscriptions.
@@ -573,12 +615,27 @@ impl UpstreamManager {
 
         // keep upstream_write up-to-date when the IOC's write-
         // access changes (e.g. ASG protection lockout). The C gateway's
-        // accessCB (gatePv.cc:1851-1852) calls setWriteAccess + postAccessRights;
-        // runtime re-notification to connected downstream clients requires a
-        // CaServer::notify_access_change() API (deferred cross-crate).
+        // accessCB (gatePv.cc:1851-1852) calls setWriteAccess +
+        // postAccessRights, and postAccessRights loops the downstream
+        // channels posting CA_PROTO_ACCESS_RIGHTS (gateVc.cc:1624-1638).
+        // We mirror that second half: when the upstream write bit actually
+        // flips, fire the downstream access-rights notifier so connected
+        // clients re-run the access hook (which ANDs the per-PV ACL with
+        // this flag) and re-push CA_PROTO_ACCESS_RIGHTS where the computed
+        // level changed. Gated on an observed transition so a no-op
+        // callback does not wake every client; the downstream side applies
+        // the further `oldaccess != access` filter.
         let access_rights_watcher = channel.on_access_rights_change({
             let flag = upstream_write.clone();
-            move |rights| flag.store(rights.write, Ordering::Relaxed)
+            let notifier = self.access_notifier.clone();
+            move |rights| {
+                let prev = flag.swap(rights.write, Ordering::Relaxed);
+                if prev != rights.write {
+                    if let Some(n) = notifier.load_full() {
+                        n.notify();
+                    }
+                }
+            }
         });
 
         // Spawn forwarding task — does NOT borrow the channel, so the
@@ -844,12 +901,13 @@ impl UpstreamManager {
     /// `gateServer::newAs` reinstalling the new `gateAsEntry` on each
     /// still-allowed PV (gateServer.cc:603-630).
     ///
-    /// runtime re-notification of *already-connected* downstream clients
-    /// (C `gateChan::resetAsClient` posting an access-rights event,
-    /// gateVc.cc:170-199) requires a `CaServer::notify_access_change()`
-    /// API and is deferred cross-crate — see the `on_access_rights_change`
-    /// note in `ensure_subscribed`. New connections re-evaluate the access
-    /// hook and therefore already see the updated rights.
+    /// This swaps only the per-PV ACL cell; it does not itself notify
+    /// downstream clients. Runtime re-notification of *already-connected*
+    /// clients (C `gateChan::resetAsClient` posting an access-rights event,
+    /// gateVc.cc:170-199) is owned by the reload caller, which fires
+    /// [`Self::notify_downstream_access_change`] once after re-resolving
+    /// every still-admitted PV — one `asComputeAllAsg`-style recompute pass
+    /// per reload rather than one broadcast per mutated PV.
     pub fn update_acl(&self, served_name: &str, asg: Option<String>, asl: i32) -> bool {
         let subs = self.subs.lock();
         match subs.get(served_name) {

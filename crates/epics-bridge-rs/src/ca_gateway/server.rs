@@ -383,6 +383,17 @@ impl GatewayServer {
             beacon_anomaly.install_pulse(pulse);
         }
 
+        // Snapshot the downstream CaServer's access-rights notifier and
+        // install it on the upstream manager (built above, before the
+        // server existed). With it, an upstream IOC write-access flip or an
+        // AS/PVL reload re-pushes CA_PROTO_ACCESS_RIGHTS to already-connected
+        // clients instead of only updating the hook flag (gateVc.cc:1624-1638
+        // postAccessRights). Captured BEFORE `downstream.run()` consumes the
+        // inner CaServer; the handle stays valid afterwards.
+        if let Some(notifier) = downstream.access_rights_notifier().await {
+            upstream.install_access_notifier(notifier);
+        }
+
         // Publish C-compatible control flag PVs (commandFlag, report*Flag,
         // newAsFlag, quitFlag, quitServerFlag) under the stats prefix so
         // operators can trigger command-file execution, reports, reload,

@@ -252,6 +252,7 @@ impl CommandHandler {
         let mut pruned: usize = 0;
         if let Some(upstream) = &self.upstream {
             let cached_names: Vec<String> = self.cache.read().await.names();
+            let mut acl_changed = false;
             for name in cached_names {
                 match new_arc.match_name(&name) {
                     None => {
@@ -261,9 +262,22 @@ impl CommandHandler {
                     }
                     Some(m) => {
                         let asl = m.effective_asl();
-                        upstream.update_acl(&name, m.asg, asl);
+                        if upstream.update_acl(&name, m.asg, asl) {
+                            acl_changed = true;
+                        }
                     }
                 }
+            }
+            // One asComputeAllAsg-style recompute pass per reload: when any
+            // still-admitted PV's ACL actually changed, re-push
+            // CA_PROTO_ACCESS_RIGHTS to already-connected clients so they see
+            // the new group/level immediately instead of keeping the rights
+            // advertised at first subscription (C `gateServer::newAs` →
+            // `gateChan::resetAsClient`, gateVc.cc:170-199). The downstream
+            // side still filters out channels whose computed level is
+            // unchanged, so a no-op reload emits zero frames.
+            if acl_changed {
+                upstream.notify_downstream_access_change();
             }
         }
 

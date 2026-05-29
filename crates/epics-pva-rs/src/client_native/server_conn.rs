@@ -540,7 +540,7 @@ impl ServerConn {
                                     &mut dispatch_frame,
                                     &mut reader_type_cache,
                                 );
-                                route_frame(dispatch_frame, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, &ioid_to_cmd_reader, &writer_tx_reader, order_reader, &cancel_reader);
+                                route_frame(dispatch_frame, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, &ioid_to_cmd_reader, &writer_tx_reader, &cancel_reader);
                             }
                         }
                         Err(_) => break,
@@ -947,10 +947,18 @@ fn route_frame(
     ioid_to_sid: &Arc<DashMap<u32, u32>>,
     ioid_to_cmd: &Arc<DashMap<u32, u8>>,
     writer_tx: &mpsc::UnboundedSender<Vec<u8>>,
-    order: ByteOrder,
     cancel: &CancellationToken,
 ) {
     let cmd = frame.header.command;
+    // Route by THIS frame's header byte order, not the startup handshake
+    // order. pvxs sets `peerBE = header[2]&pva_flags::MSB` per received
+    // application frame before command dispatch (conn.cpp:195-198) and
+    // reads every routing key (CREATE_CHANNEL CID/SID, GET/PUT/RPC/MONITOR/
+    // GET_FIELD IOID) from `EvInBuf M(peerBE, ...)`. A server may legally
+    // send a response whose header selects a different order than the
+    // handshake; peeking the CID/IOID with the stale connection order would
+    // miss the slot, misroute, or trip the command-mismatch close path.
+    let order = frame.order();
 
     // CMD_MESSAGE — log server diagnostic, don't route by IOID.
     if cmd == Command::Message.code() {
@@ -1371,7 +1379,6 @@ mod tests {
             &ioid_to_sid,
             &ioid_to_cmd,
             &writer_tx,
-            order,
             &cancel,
         );
         assert!(flag.load(AtoOrd::Relaxed));
@@ -1407,7 +1414,6 @@ mod tests {
             &ioid_to_sid,
             &ioid_to_cmd,
             &writer_tx,
-            ByteOrder::Little,
             &cancel,
         );
         assert!(!by_sid_close.contains_key(&sid));
@@ -1458,7 +1464,6 @@ mod tests {
             &ioid_to_sid,
             &ioid_to_cmd,
             &writer_tx,
-            ByteOrder::Little,
             &cancel,
         );
 
@@ -1538,7 +1543,6 @@ mod tests {
             &ioid_to_sid,
             &ioid_to_cmd,
             &writer_tx,
-            ByteOrder::Little,
             &cancel,
         );
 
@@ -1558,6 +1562,89 @@ mod tests {
         assert!(by_ioid.contains_key(&2003));
         assert!(ioid_to_sid.contains_key(&2003));
         assert!(ioid_to_cmd.contains_key(&2003));
+    }
+
+    /// Regression: the router must peek routing keys with THIS frame's
+    /// header byte order, not a fixed startup-handshake order. pvxs sets
+    /// `peerBE` per received application frame (conn.cpp:195-198) and reads
+    /// every routing key (CID/IOID) from `EvInBuf M(peerBE, ...)`. The
+    /// IOIDs below are chosen so their big-endian and little-endian
+    /// encodings differ — peeking with the wrong order would miss the slot
+    /// (or trip the command-mismatch close path).
+    #[test]
+    fn route_frame_peeks_ioid_with_per_frame_byte_order() {
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, writer_tx, cancel) =
+            fresh_router();
+        let ioid = 0x01020304u32; // BE bytes != LE bytes
+        let (tx, mut rx) = oneshot::channel::<Frame>();
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(tx);
+        by_ioid.insert(ioid, IoidSlot::TwoShot(q));
+        ioid_to_cmd.insert(ioid, Command::Get.code());
+
+        // Big-endian GET response (header MSB set, ioid encoded big-endian).
+        let order = ByteOrder::Big;
+        let mut payload = Vec::new();
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00); // subcmd — not used by routing
+        let header = PvaHeader::application(true, order, Command::Get.code(), payload.len() as u32);
+        route_frame(
+            Frame { header, payload },
+            &by_ioid,
+            &by_cid,
+            &by_sid_close,
+            &ioid_to_sid,
+            &ioid_to_cmd,
+            &writer_tx,
+            &cancel,
+        );
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "a big-endian response must route to the IOID peeked with the frame's own order"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "correct per-frame routing must not trip the command-mismatch close path"
+        );
+    }
+
+    /// Same per-frame-order requirement for CREATE_CHANNEL CID routing —
+    /// a CID peeked with the wrong order would strand a successful channel.
+    #[test]
+    fn route_frame_peeks_create_channel_cid_with_per_frame_byte_order() {
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, writer_tx, cancel) =
+            fresh_router();
+        let cid = 0x0A0B0C0Du32;
+        let (tx, mut rx) = oneshot::channel::<Frame>();
+        by_cid.insert(cid, tx);
+
+        let order = ByteOrder::Big;
+        let mut payload = Vec::new();
+        payload.put_u32(cid, order);
+        payload.put_u32(7, order); // sid
+        Status::ok().write_into(order, &mut payload);
+        let header = PvaHeader::application(
+            true,
+            order,
+            Command::CreateChannel.code(),
+            payload.len() as u32,
+        );
+        route_frame(
+            Frame { header, payload },
+            &by_ioid,
+            &by_cid,
+            &by_sid_close,
+            &ioid_to_sid,
+            &ioid_to_cmd,
+            &writer_tx,
+            &cancel,
+        );
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "a big-endian CREATE_CHANNEL response must route to the CID peeked with the frame's own order"
+        );
     }
 
     /// Regression: `tcp_timeout` passed to `ServerConn::connect` must

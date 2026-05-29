@@ -352,7 +352,15 @@ impl PvaLinkConfig {
     pub fn defaults_for(pv_name: &str, direction: LinkDirection) -> Self {
         PvaLinkConfig {
             pv_name: pv_name.to_string(),
-            field: "value".to_string(),
+            // pvxs's default `field` is the empty string, which selects
+            // the top-level structure (`pvalink.rst:13-30`,
+            // `pvalink_link.cpp:90-110`): if that root is a structure
+            // its `.value` is used, otherwise the root itself is the
+            // value. Defaulting to `"value"` instead conflated the
+            // default with an explicit `field=value` and could not
+            // represent a top-level (non-NT) value. The selected-root
+            // rule lives in `link::select_link_value`.
+            field: String::new(),
             monitor: false,
             proc: ProcMode::Default,
             notify: false,
@@ -475,7 +483,9 @@ mod tests {
     fn bare_pv_name() {
         let c = PvaLinkConfig::parse("pva://OTHER:PV", LinkDirection::Inp).unwrap();
         assert_eq!(c.pv_name, "OTHER:PV");
-        assert_eq!(c.field, "value");
+        // pvxs default field is the empty string (top-level selection),
+        // not "value".
+        assert_eq!(c.field, "");
         assert!(!c.monitor);
         assert_eq!(c.proc, ProcMode::Default);
         // `time` defaults to false to match pvxs.

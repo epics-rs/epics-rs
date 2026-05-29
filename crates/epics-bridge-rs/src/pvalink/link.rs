@@ -325,7 +325,7 @@ impl PvaLink {
                 return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
             }
             return match self.latest.lock().clone() {
-                Some(v) => Ok(extract_field(&v, field)),
+                Some(v) => Ok(select_link_value(&v, field)),
                 // Connected flag set but the first event has not yet
                 // written `latest` (the callback stores the flag before
                 // the value): not-yet-valid, surface a failed read.
@@ -333,7 +333,7 @@ impl PvaLink {
             };
         }
         let result = self.client.pvget_full(&self.config.pv_name).await?;
-        Ok(extract_field(&result.value, field))
+        Ok(select_link_value(&result.value, field))
     }
 
     /// Synchronous fast-path read: return the cached field if the
@@ -365,7 +365,7 @@ impl PvaLink {
             return None;
         }
         let v = self.latest.lock().clone()?;
-        Some(extract_field(&v, field))
+        Some(select_link_value(&v, field))
     }
 
     /// Convenience: read the value as f64.
@@ -855,16 +855,21 @@ impl PvaLink {
 
         let root = self.latest.lock().clone()?;
 
-        // The value at the link's field path drives DBF type and
-        // element count. `pvaGetDBFtype` uses `fld_value`; `fld_value`
-        // is the value sub-field selected by the link's field name.
-        let value_field = extract_field(&root, field);
+        // DBF type and element count derive from the selected value.
+        // pvxs `pvaGetDBFtype` reads `fld_value`, which is the
+        // selected-root rule: empty `field` selects the top-level value
+        // (its `.value` for a structure, else the root itself), a
+        // non-empty `field` selects `root[field]` (then `.value` if that
+        // is itself a structure). See [`select_link_value`]
+        // (`pvalink_link.cpp:90-110`, `pvalink_lset.cpp:199-236`).
+        let value_field = select_link_value(&root, field);
 
         let dbf_type = link_dbf_type(&value_field);
         let element_count = link_element_count(&value_field);
 
-        // display / control / valueAlarm are top-level NT children;
-        // pvxs reads them from `fld_meta` (the top-level struct).
+        // display / control / valueAlarm are read from the top-level
+        // root here (the `field=`-aware `fld_meta` selection is a
+        // separate concern tracked on its own).
         let graphic_limits = limit_pair(&root, "display.limitLow", "display.limitHigh");
         let control_limits = limit_pair(&root, "control.limitLow", "control.limitHigh");
         let alarm_limits = {
@@ -1085,6 +1090,42 @@ fn monitor_request(config: &PvaLinkConfig) -> Option<epics_pva_rs::pv_request::P
     Some(req)
 }
 
+/// Select the link's *target* from the remote root, following pvxs's
+/// `pvaLink::onTypeChange()` rule (`pvxs/ioc/pvalink_link.cpp:90-110`):
+/// an empty `field` selects the top-level root (`lchan->root`); a
+/// non-empty `field` selects `root[field]` (a dotted path navigates
+/// through nested structures). The target is the basis both for the
+/// value (see [`select_link_value`]) and for the display / control /
+/// valueAlarm metadata.
+fn select_target(root: &PvField, field: &str) -> PvField {
+    if field.is_empty() {
+        root.clone()
+    } else {
+        extract_field(root, field)
+    }
+}
+
+/// Select the link's *value* from the remote root, following pvxs's
+/// `pvaGetDBFtype` / `onTypeChange` rule
+/// (`pvxs/ioc/pvalink_lset.cpp:199-236`, `pvalink_link.cpp:90-110`):
+/// after [`select_target`] picks the target, if that target is itself
+/// a structure (an NTScalar/NTScalarArray) its `.value` child is the
+/// value; otherwise the selected target *is* the value (a top-level
+/// or sub-field scalar/array).
+///
+/// For the default empty `field` on an NTScalar this yields `root.value`
+/// — identical to the former hard-coded `field="value"`; the new
+/// behavior is that a top-level non-structure value (a bare scalar/array
+/// PV) is selected directly instead of being searched for a non-existent
+/// `value` child, and that an explicitly selected sub-structure drills
+/// into its own `.value`.
+fn select_link_value(root: &PvField, field: &str) -> PvField {
+    match select_target(root, field) {
+        PvField::Structure(s) => s.get_field("value").cloned().unwrap_or(PvField::Null),
+        other => other,
+    }
+}
+
 /// Walk a dotted field path through a [`PvField`] and return the leaf value.
 fn extract_field(root: &PvField, path: &str) -> PvField {
     if path.is_empty() {
@@ -1297,6 +1338,82 @@ mod tests {
         let s = PvStructure::new("epics:nt/NTScalar:1.0");
         let v = extract_field(&PvField::Structure(s), "nope");
         assert!(matches!(v, PvField::Null));
+    }
+
+    /// pvxs selected-root rule (`select_link_value`,
+    /// `pvalink_link.cpp:90-110`): empty field selects the top-level
+    /// value (`.value` for a structure, else the root itself); a
+    /// non-empty field selects `root[field]` then `.value` if that is a
+    /// structure. Default `field=""` on an NTScalar still yields the
+    /// scalar, but a bare top-level value is now selected directly
+    /// instead of being searched for a missing `value` child.
+    #[test]
+    fn select_link_value_follows_pvxs_selected_root_rule() {
+        // NTScalar, empty field → .value.
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.5))));
+        let nt = PvField::Structure(nt);
+        assert!(matches!(
+            select_link_value(&nt, ""),
+            PvField::Scalar(ScalarValue::Double(d)) if d == 2.5
+        ));
+        // explicit field="value" yields the same scalar.
+        assert!(matches!(
+            select_link_value(&nt, "value"),
+            PvField::Scalar(ScalarValue::Double(d)) if d == 2.5
+        ));
+
+        // Bare top-level scalar (PV whose root is not an NT structure):
+        // empty field selects the scalar itself, not a missing child.
+        let bare = PvField::Scalar(ScalarValue::Long(7));
+        assert!(matches!(
+            select_link_value(&bare, ""),
+            PvField::Scalar(ScalarValue::Long(7))
+        ));
+
+        // Non-empty field selecting a nested structure drills into its
+        // own `.value`.
+        let mut sub = PvStructure::new("epics:nt/NTScalar:1.0");
+        sub.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Long(42))));
+        let mut outer = PvStructure::new("some_t");
+        outer.fields.push(("sub".into(), PvField::Structure(sub)));
+        let outer = PvField::Structure(outer);
+        assert!(matches!(
+            select_link_value(&outer, "sub"),
+            PvField::Scalar(ScalarValue::Long(42))
+        ));
+    }
+
+    /// `link_metadata` derives the DBF type from the selected value. A
+    /// link whose `field` selects a nested NTScalar-shaped structure
+    /// must report that structure's `.value` DBF type. Pre-fix the
+    /// metadata path read the selected target *as* the value, so a
+    /// structure selection produced no DBF type at all.
+    #[test]
+    fn link_metadata_dbf_drills_selected_substructure_value() {
+        use epics_base_rs::server::database::LinkDbfType;
+
+        let mut sub = PvStructure::new("epics:nt/NTScalar:1.0");
+        sub.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Long(42))));
+        let mut outer = PvStructure::new("some_t");
+        outer.fields.push(("sub".into(), PvField::Structure(sub)));
+
+        let cfg = PvaLinkConfig {
+            field: "sub".to_string(),
+            ..PvaLinkConfig::defaults_for("META:PV", LinkDirection::Inp)
+        };
+        let link = PvaLink::for_test(cfg, Some(PvField::Structure(outer)));
+        let meta = link.link_metadata().expect("metadata present");
+        // PVA `long` → DBF Int64 (full 64-bit width); the point is that
+        // a DBF type is derived at all, from the sub-structure's .value.
+        assert_eq!(
+            meta.dbf_type,
+            Some(LinkDbfType::Int64),
+            "DBF type must come from the selected sub-structure's .value"
+        );
     }
 
     use super::super::config::LinkDirection;

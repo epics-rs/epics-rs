@@ -2537,8 +2537,20 @@ async fn handle_connection_io(
                         // no-channel sentinel 0xFFFFFFFF (pvxs
                         // serverchan.cpp:349, sid=-1), not 0.
                         payload.put_u32(CREATE_CHANNEL_NO_SID, order);
-                        Status::error(format!("unknown PV: {}", cc.name))
-                            .write_into(order, &mut payload);
+                        // An unclaimed channel is a *refused* channel, which
+                        // pvxs reports as Fatal — not a recoverable Error —
+                        // with the fixed message "Refused to create Channel"
+                        // and the refusal trace "pvx:serv:refusechan:"
+                        // (serverchan.cpp:328-351). Matching the status kind
+                        // and trace lets conformance clients distinguish a
+                        // refused channel from a recoverable operation error,
+                        // and keeps the wire message PV-name-free like pvxs.
+                        Status::Detailed {
+                            kind: crate::proto::status::StatusKind::Fatal,
+                            message: "Refused to create Channel".to_string(),
+                            stack: "pvx:serv:refusechan:".to_string(),
+                        }
+                        .write_into(order, &mut payload);
                     }
                     let h = PvaHeader::application(
                         true, order,

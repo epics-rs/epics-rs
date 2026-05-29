@@ -1319,6 +1319,92 @@ async fn create_channel_multi_name_emits_one_reply_per_name() {
     h.abort();
 }
 
+/// PVA-126 / pvxs `serverchan.cpp:328-351` parity: a CREATE_CHANNEL for
+/// an unclaimed (missing) PV is a *refused* channel. pvxs replies with
+/// `sid = -1` (0xFFFFFFFF) and a Fatal status "Refused to create Channel"
+/// (trace "pvx:serv:refusechan:"), not a recoverable Error. A direct-TCP
+/// client that bypasses UDP SEARCH must see the Fatal refusal class.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_channel_missing_pv_refused_fatal() {
+    use std::io::Write;
+
+    use epics_pva_rs::codec::CMD_CREATE_CHANNEL;
+    use epics_pva_rs::proto::encode_string_into;
+    use epics_pva_rs::proto::{
+        ByteOrder, Command, PvaHeader, ReadExt, Status, StatusKind, WriteExt,
+    };
+
+    // Source hosts one PV; we will ask for a different, missing one.
+    let source = Arc::new(MemSource::new());
+    source.add_pv("PRESENT:PV", 1.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+
+    let mut sock = read_handshake_prelude(server_addr);
+    let order = ByteOrder::Little;
+    let mut payload: Vec<u8> = Vec::new();
+    payload.put_u32(0x10000, order);
+    payload.put_u16(32_767, order);
+    payload.put_u16(0, order);
+    encode_string_into("anonymous", order, &mut payload);
+    payload.put_u8(0xFF);
+    let h_req = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut req = Vec::new();
+    h_req.write_into(&mut req);
+    req.extend_from_slice(&payload);
+    sock.write_all(&req).unwrap();
+    let mut reader = FrameReader::new();
+    let _validated = reader.read(&mut sock);
+
+    // CREATE_CHANNEL for a PV the source does not host.
+    let mut body = Vec::new();
+    body.put_u16(1, order); // count
+    body.put_u32(303, order);
+    encode_string_into("ABSENT:PV", order, &mut body);
+    let h_req = PvaHeader::application(false, order, CMD_CREATE_CHANNEL, body.len() as u32);
+    let mut frame_bytes = Vec::new();
+    h_req.write_into(&mut frame_bytes);
+    frame_bytes.extend_from_slice(&body);
+    sock.write_all(&frame_bytes).unwrap();
+
+    let resp = reader.read(&mut sock);
+    assert_eq!(resp.header.command, CMD_CREATE_CHANNEL);
+    let mut cur = resp.cursor();
+    let cid = cur.get_u32(order).unwrap();
+    let sid = cur.get_u32(order).unwrap();
+    let status = Status::decode(&mut cur, order).unwrap();
+    assert_eq!(cid, 303);
+    assert_eq!(
+        sid,
+        u32::MAX,
+        "refused channel must use the no-channel SID sentinel"
+    );
+    match status {
+        Status::Detailed {
+            kind,
+            message,
+            stack,
+        } => {
+            assert_eq!(
+                kind,
+                StatusKind::Fatal,
+                "refused channel must be Fatal, not Error"
+            );
+            assert_eq!(message, "Refused to create Channel");
+            assert_eq!(stack, "pvx:serv:refusechan:");
+        }
+        other => panic!("expected a detailed Fatal refusal, got {other:?}"),
+    }
+
+    h.abort();
+}
+
 /// Connect to a freshly started PVA server and drain the server's
 /// SET_BYTE_ORDER + CONNECTION_VALIDATION prologue. Polls for up to
 /// one second so the per-thread spawn race doesn't surface as a

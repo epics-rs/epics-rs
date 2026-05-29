@@ -36,7 +36,47 @@ use crate::pvdata::{
 };
 
 use super::channel::Channel;
-use super::decode::{OpResponse, decode_op_response, decode_op_response_cached};
+use super::decode::{
+    Frame, GetFieldResponse, OpResponse, decode_get_field_response, decode_op_response,
+    decode_op_response_cached,
+};
+use super::server_conn::ServerConn;
+
+/// Decode a one-shot GET/PUT/RPC op-response frame, closing the virtual
+/// circuit on a wire-decode fault.
+///
+/// pvxs treats a malformed op-response body (bad cursor / truncated payload,
+/// `M.fault()`) — or a wrong op-state — as a connection-level protocol
+/// violation and forces `bev.reset()` (`clientget.cpp:456-493`), not a
+/// per-operation error. A non-success `Status` is decoded *successfully*
+/// (it is data, not a fault) and is surfaced per-op by the caller. Closing
+/// here matters because a circuit left alive after a bad frame would carry a
+/// corrupted peer / type-cache state into later ops on the same connection.
+fn decode_op_or_reset(
+    server: &ServerConn,
+    frame: &Frame,
+    introspection: Option<&FieldDesc>,
+) -> PvaResult<OpResponse> {
+    decode_op_response(frame, introspection).inspect_err(|_| server.close())
+}
+
+/// `TypeCache`-threaded variant of [`decode_op_or_reset`] for INIT frames
+/// (0xFD/0xFE marker resolution). Same connection-fatal contract.
+fn decode_op_cached_or_reset(
+    server: &ServerConn,
+    frame: &Frame,
+    introspection: Option<&FieldDesc>,
+    type_cache: &mut crate::pvdata::encode::TypeCache,
+) -> PvaResult<OpResponse> {
+    decode_op_response_cached(frame, introspection, type_cache).inspect_err(|_| server.close())
+}
+
+/// GET_FIELD analog: pvxs resets the circuit on a bad GET_FIELD descriptor
+/// buffer (`clientintrospect.cpp:115-133`). A non-success `Status` decodes
+/// to `Ok` (no introspection) and stays per-op at the caller.
+fn decode_get_field_or_reset(server: &ServerConn, frame: &Frame) -> PvaResult<GetFieldResponse> {
+    decode_get_field_response(frame).inspect_err(|_| server.close())
+}
 
 static NEXT_IOID: AtomicU32 = AtomicU32::new(1);
 fn alloc_ioid() -> u32 {
@@ -290,9 +330,12 @@ async fn op_get_inner(
 
     // Receive INIT response
     let init_frame = await_oneshot_frame(rx_init, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected GET INIT, got {other:?}"
@@ -312,7 +355,7 @@ async fn op_get_inner(
     // Receive DATA response (already sent, just waiting for the reply)
     let data_frame = await_oneshot_frame(rx_data, op_timeout).await?;
     let intro_arc = Arc::new(intro);
-    let result = match decode_op_response(&data_frame, Some(&intro_arc))? {
+    let result = match decode_op_or_reset(&server, &data_frame, Some(&intro_arc))? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
                 Ok(((*intro_arc).clone(), d.value))
@@ -325,9 +368,14 @@ async fn op_get_inner(
         // so it decodes to OpResponse::Status. Surface the server status
         // instead of mislabelling it "expected GET data, got Status".
         OpResponse::Status(s) => Err(PvaError::Protocol(format!("GET data: {:?}", s.status))),
-        other => Err(PvaError::Protocol(format!(
-            "expected GET data, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the GET data step == impossible op
+            // state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected GET data, got {other:?}"
+            )))
+        }
     };
 
     // Cache (sid, ioid, intro) so the next default GET on this
@@ -395,7 +443,7 @@ async fn try_warm_get(
         return Err(PvaError::Protocol("warm GET send failed".into()));
     }
     let data_frame = await_oneshot_frame(rx, op_timeout).await?;
-    match decode_op_response(&data_frame, Some(&warm.intro))? {
+    match decode_op_or_reset(server, &data_frame, Some(&warm.intro))? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
                 Ok(Some((warm.intro.clone(), d.value)))
@@ -441,7 +489,7 @@ pub async fn op_get_field(
     let frame = await_frame(&mut stream, op_timeout).await;
     server.unregister_ioid(ioid);
     let frame = frame?;
-    let resp = super::decode::decode_get_field_response(&frame)?;
+    let resp = decode_get_field_or_reset(&server, &frame)?;
     if !resp.status.is_success() {
         return Err(PvaError::Protocol(format!(
             "GET_FIELD failed: {:?}",
@@ -513,9 +561,12 @@ pub async fn op_put_field(
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
     server.send(init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
@@ -558,7 +609,7 @@ pub async fn op_put_field(
     server.send(frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -566,9 +617,14 @@ pub async fn op_put_field(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
@@ -646,9 +702,12 @@ pub async fn op_put_fields(
     let init_req = codec.build_put_init(sid, ioid, pv_req);
     server.send(init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
@@ -696,7 +755,7 @@ pub async fn op_put_fields(
     server.send(frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -704,9 +763,14 @@ pub async fn op_put_fields(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
@@ -745,9 +809,12 @@ pub async fn op_put_field_with_request(
     let init_req = codec.build_put_init(sid, ioid, pv_req);
     server.send(init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
@@ -787,7 +854,7 @@ pub async fn op_put_field_with_request(
     server.send(frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -795,9 +862,14 @@ pub async fn op_put_field_with_request(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
@@ -842,9 +914,12 @@ pub async fn op_put_value_field_with_request(
     let init_req = codec.build_put_init(sid, ioid, pv_req);
     server.send(init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
@@ -892,7 +967,7 @@ pub async fn op_put_value_field_with_request(
     server.send(frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -900,9 +975,14 @@ pub async fn op_put_value_field_with_request(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
@@ -1041,9 +1121,12 @@ pub async fn op_put_value(
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
     server.send(init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
             )));
@@ -1083,7 +1166,7 @@ pub async fn op_put_value(
     server.send(frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -1091,9 +1174,14 @@ pub async fn op_put_value(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
@@ -1126,9 +1214,12 @@ pub async fn op_put_value_raw(
     let init_req = codec.build_put_init(sid, ioid, pv_req);
     server.send(init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
             )));
@@ -1165,7 +1256,7 @@ pub async fn op_put_value_raw(
     server.send(frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -1173,9 +1264,14 @@ pub async fn op_put_value_raw(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
@@ -1208,9 +1304,12 @@ async fn op_put_inner(
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
     server.send(init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
@@ -1252,7 +1351,7 @@ async fn op_put_inner(
     server.send(frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -1260,9 +1359,14 @@ async fn op_put_inner(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
@@ -2529,9 +2633,12 @@ pub async fn op_rpc(
     server.send(init_frame).await?;
 
     let init_resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let init_resp = match decode_op_response(&init_resp_frame, None)? {
+    let init_resp = match decode_op_or_reset(&server, &init_resp_frame, None)? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected RPC INIT, got {other:?}"
@@ -2566,7 +2673,7 @@ pub async fn op_rpc(
     // RPC response carries its own type — `response_intro` from INIT is
     // unused (RPC INIT has no introspection per pvxs).
     let _ = response_intro;
-    let result = match decode_op_response(&resp_frame, None)? {
+    let result = match decode_op_or_reset(&server, &resp_frame, None)? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
                 let desc = d.response_desc.unwrap_or(FieldDesc::Variant);
@@ -2576,9 +2683,14 @@ pub async fn op_rpc(
             }
         }
         OpResponse::Status(s) => Err(PvaError::Protocol(format!("RPC: {:?}", s.status))),
-        other => Err(PvaError::Protocol(format!(
-            "expected RPC data, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the RPC data step == impossible op
+            // state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected RPC data, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
@@ -2633,7 +2745,20 @@ pub async fn op_put_get(
     server.send(init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
-    let intro = decode_put_get_init(&init_resp, &mut cache.lock())?;
+    let intro = match decode_put_get_init(&init_resp, &mut cache.lock()) {
+        Ok(Ok(intro)) => intro,
+        Ok(Err(status)) => {
+            server.unregister_ioid(ioid);
+            return Err(PvaError::Protocol(format!(
+                "PUT_GET INIT failed: {status:?}"
+            )));
+        }
+        Err(e) => {
+            // Command/subcommand mismatch or truncated INIT body is fatal.
+            server.close();
+            return Err(e);
+        }
+    };
     ioid_guard.arm_destroy(sid);
 
     // Build the value against the negotiated introspection.
@@ -2661,7 +2786,15 @@ pub async fn op_put_get(
     server.send(data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = decode_put_get_data(&resp_frame, &intro, &mut cache.lock());
+    let result = match decode_put_get_data(&resp_frame, &intro, &mut cache.lock()) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(status)) => Err(PvaError::Protocol(format!("PUT_GET: {status:?}"))),
+        Err(e) => {
+            // Command mismatch or truncated data body is fatal.
+            server.close();
+            Err(e)
+        }
+    };
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
@@ -2671,13 +2804,18 @@ pub async fn op_put_get(
 }
 
 /// Decode a `PUT_GET` INIT response: `ioid + subcmd + status + putIF +
-/// getIF`. Returns the get-leg introspection (used to encode the put
-/// value and decode the readback). On a non-success status this is an
-/// error.
+/// getIF`. On success returns the get-leg introspection (used to encode
+/// the put value and decode the readback).
+///
+/// The two-level result separates connection-fatal faults from per-op
+/// failures: an outer `Err` (command/subcommand mismatch, truncated body)
+/// is a protocol violation pvxs answers with `bev.reset()`
+/// (clientget.cpp:456-493); an inner `Ok(Err(status))` is a non-success
+/// INIT — a per-operation error the caller surfaces without resetting.
 fn decode_put_get_init(
     frame: &super::decode::Frame,
     type_cache: &mut crate::pvdata::encode::TypeCache,
-) -> PvaResult<FieldDesc> {
+) -> PvaResult<Result<FieldDesc, crate::proto::Status>> {
     if frame.header.command != Command::PutGet.code() {
         return Err(PvaError::Protocol(format!(
             "expected PUT_GET INIT, got command {}",
@@ -2698,9 +2836,7 @@ fn decode_put_get_init(
     let status = crate::proto::Status::decode(&mut cur, order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     if !status.is_success() {
-        return Err(PvaError::Protocol(format!(
-            "PUT_GET INIT failed: {status:?}"
-        )));
+        return Ok(Err(status));
     }
     // putIF then getIF. The put structure is decoded (advancing the
     // cursor + populating the type cache) but the get structure is
@@ -2709,16 +2845,20 @@ fn decode_put_get_init(
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let get_if = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    Ok(get_if)
+    Ok(Ok(get_if))
 }
 
 /// Decode a `PUT_GET` data response: `ioid + subcmd + status + get
 /// bitset + get value`.
+///
+/// Same two-level result as [`decode_put_get_init`]: an outer `Err`
+/// (command mismatch, truncated body) is connection-fatal; an inner
+/// `Ok(Err(status))` is a non-success per-op result.
 fn decode_put_get_data(
     frame: &super::decode::Frame,
     intro: &FieldDesc,
     type_cache: &mut crate::pvdata::encode::TypeCache,
-) -> PvaResult<PvField> {
+) -> PvaResult<Result<PvField, crate::proto::Status>> {
     if frame.header.command != Command::PutGet.code() {
         return Err(PvaError::Protocol(format!(
             "expected PUT_GET data, got command {}",
@@ -2734,14 +2874,14 @@ fn decode_put_get_data(
     let status = crate::proto::Status::decode(&mut cur, order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     if !status.is_success() {
-        return Err(PvaError::Protocol(format!("PUT_GET: {status:?}")));
+        return Ok(Err(status));
     }
     let changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
     let value = crate::pvdata::encode::decode_pv_field_with_bitset_cached(
         intro, &changed, 0, &mut cur, order, type_cache,
     )
     .map_err(|e| PvaError::Decode(e.to_string()))?;
-    Ok(value)
+    Ok(Ok(value))
 }
 
 // ── PROCESS (cmd 16) ────────────────────────────────────────────────────
@@ -2779,7 +2919,20 @@ pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResu
     server.send(init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
-    decode_process_status(&init_resp, QosFlags::INIT)?;
+    let init_status = match decode_process_status(&init_resp) {
+        Ok(s) => s,
+        Err(e) => {
+            // Decode fault / command mismatch on the INIT reply is fatal.
+            server.close();
+            return Err(e);
+        }
+    };
+    if !init_status.is_success() {
+        server.unregister_ioid(ioid);
+        return Err(PvaError::Protocol(format!(
+            "PROCESS INIT failed: {init_status:?}"
+        )));
+    }
     ioid_guard.arm_destroy(sid);
 
     // PROCESS data — `sid + ioid + 0x00`, no payload.
@@ -2794,7 +2947,15 @@ pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResu
     server.send(data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = decode_process_status(&resp_frame, 0x00);
+    let result = match decode_process_status(&resp_frame) {
+        Ok(s) if s.is_success() => Ok(()),
+        Ok(s) => Err(PvaError::Protocol(format!("PROCESS failed: {s:?}"))),
+        Err(e) => {
+            // Decode fault / command mismatch on the done reply is fatal.
+            server.close();
+            Err(e)
+        }
+    };
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
@@ -2803,10 +2964,15 @@ pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResu
     result
 }
 
-/// Decode a `PROCESS` response: `ioid + subcmd + status`.
-/// `expected_init` is `QosFlags::INIT` when an INIT reply is expected,
-/// `0x00` for the PROCESS-done reply — only used to label errors.
-fn decode_process_status(frame: &super::decode::Frame, expected_init: u8) -> PvaResult<()> {
+/// Decode a `PROCESS` response: `ioid + subcmd + status`. Returns the
+/// decoded `Status`.
+///
+/// An `Err` from this decoder is always connection-fatal — a command
+/// mismatch or a truncated body is a protocol violation that pvxs answers
+/// with `bev.reset()` (clientget.cpp:456-493). A non-success `Status`
+/// decodes to `Ok`: it is a per-operation result, NOT a fault, so the
+/// caller surfaces it without resetting the circuit.
+fn decode_process_status(frame: &super::decode::Frame) -> PvaResult<crate::proto::Status> {
     if frame.header.command != Command::Process.code() {
         return Err(PvaError::Protocol(format!(
             "expected PROCESS response, got command {}",
@@ -2821,15 +2987,7 @@ fn decode_process_status(frame: &super::decode::Frame, expected_init: u8) -> Pva
     let _subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
     let status = crate::proto::Status::decode(&mut cur, order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    if !status.is_success() {
-        let phase = if expected_init & QosFlags::INIT != 0 {
-            "PROCESS INIT"
-        } else {
-            "PROCESS"
-        };
-        return Err(PvaError::Protocol(format!("{phase} failed: {status:?}")));
-    }
-    Ok(())
+    Ok(status)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -3690,5 +3848,185 @@ mod tests {
         state.teardown();
         assert!(state.stop.load(std::sync::atomic::Ordering::Relaxed));
         assert!(state.active.lock().is_none());
+    }
+
+    // ── op-response decode-fault → circuit close regressions ─────────────
+    //
+    // pvxs resets the circuit (`bev.reset()`, clientget.cpp:456-493) on a
+    // malformed op-response body or a command/subcommand mismatch, but
+    // delivers a non-success Status to the operation without resetting.
+    // The PUT_GET/PROCESS decoders carry that distinction structurally: an
+    // outer `Err` is connection-fatal (the caller closes the `ServerConn`);
+    // a non-success Status is a per-op result, NOT an `Err`. These tests
+    // lock that split so a later edit cannot fold the two meanings back
+    // together (which is what left the circuit reusable after a bad frame).
+
+    fn scalar_int_struct() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+        }
+    }
+
+    /// PUT_GET INIT: `ioid + subcmd + status [+ putIF + getIF]`.
+    fn put_get_init_frame(
+        order: ByteOrder,
+        status: crate::proto::Status,
+        with_types: bool,
+    ) -> Frame {
+        let mut payload = Vec::new();
+        payload.put_u32(7, order);
+        payload.put_u8(QosFlags::INIT);
+        status.write_into(order, &mut payload);
+        if with_types {
+            let desc = scalar_int_struct();
+            encode_type_desc(&desc, order, &mut payload); // putIF
+            encode_type_desc(&desc, order, &mut payload); // getIF
+        }
+        let header =
+            PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    #[test]
+    fn put_get_init_non_success_status_is_per_op_not_fatal() {
+        let frame = put_get_init_frame(
+            ByteOrder::Little,
+            crate::proto::Status::error("denied"),
+            false,
+        );
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        match decode_put_get_init(&frame, &mut cache) {
+            Ok(Err(s)) => assert!(!s.is_success(), "expected the carried non-success status"),
+            other => panic!("non-success INIT must be per-op Ok(Err(status)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_get_init_success_decodes_get_introspection() {
+        let frame = put_get_init_frame(ByteOrder::Little, crate::proto::Status::ok(), true);
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        match decode_put_get_init(&frame, &mut cache) {
+            Ok(Ok(intro)) => assert!(matches!(intro, FieldDesc::Structure { .. })),
+            other => panic!("successful INIT must yield Ok(Ok(getIF)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_get_init_truncated_status_is_fatal_err() {
+        // ioid + subcmd only — the Status decode runs off the end.
+        let mut frame = put_get_init_frame(ByteOrder::Little, crate::proto::Status::ok(), false);
+        frame.payload.truncate(5); // u32 ioid + u8 subcmd, no status
+        frame.header.payload_length = frame.payload.len() as u32;
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        assert!(
+            decode_put_get_init(&frame, &mut cache).is_err(),
+            "a truncated INIT body must be a connection-fatal Err, not Ok"
+        );
+    }
+
+    #[test]
+    fn put_get_init_wrong_command_is_fatal_err() {
+        let mut frame = put_get_init_frame(ByteOrder::Little, crate::proto::Status::ok(), true);
+        frame.header.command = Command::Get.code(); // command mismatch
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        assert!(
+            decode_put_get_init(&frame, &mut cache).is_err(),
+            "a command mismatch must be a connection-fatal Err"
+        );
+    }
+
+    /// PUT_GET data: `ioid + subcmd + status [+ get bitset + get value]`.
+    fn put_get_data_frame(
+        order: ByteOrder,
+        status: crate::proto::Status,
+        with_value: bool,
+    ) -> Frame {
+        let mut payload = Vec::new();
+        payload.put_u32(7, order);
+        payload.put_u8(0x00);
+        status.write_into(order, &mut payload);
+        if with_value {
+            let desc = scalar_int_struct();
+            let mut changed = BitSet::new();
+            changed.set(desc.bit_for_path("value").unwrap());
+            changed.write_into(order, &mut payload);
+            let value = build_put_value(&desc, "11").unwrap();
+            encode_pv_field_with_bitset(&value, &desc, &changed, 0, order, &mut payload);
+        }
+        let header =
+            PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    #[test]
+    fn put_get_data_non_success_status_is_per_op_not_fatal() {
+        let frame = put_get_data_frame(
+            ByteOrder::Little,
+            crate::proto::Status::error("nope"),
+            false,
+        );
+        let desc = scalar_int_struct();
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        match decode_put_get_data(&frame, &desc, &mut cache) {
+            Ok(Err(s)) => assert!(!s.is_success()),
+            other => panic!("non-success data must be per-op Ok(Err(status)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_get_data_truncated_value_is_fatal_err() {
+        // ok status but the bitset/value never arrive.
+        let frame = put_get_data_frame(ByteOrder::Little, crate::proto::Status::ok(), false);
+        let desc = scalar_int_struct();
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        assert!(
+            decode_put_get_data(&frame, &desc, &mut cache).is_err(),
+            "a truncated successful data body must be a connection-fatal Err"
+        );
+    }
+
+    /// PROCESS response: `ioid + subcmd + status`.
+    fn process_frame(order: ByteOrder, status: crate::proto::Status, full: bool) -> Frame {
+        let mut payload = Vec::new();
+        payload.put_u32(7, order);
+        payload.put_u8(0x00);
+        if full {
+            status.write_into(order, &mut payload);
+        }
+        let header =
+            PvaHeader::application(true, order, Command::Process.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    #[test]
+    fn process_non_success_status_is_per_op_not_fatal() {
+        let frame = process_frame(ByteOrder::Little, crate::proto::Status::error("busy"), true);
+        match decode_process_status(&frame) {
+            Ok(s) => assert!(
+                !s.is_success(),
+                "non-success PROCESS status is data, not Err"
+            ),
+            Err(e) => panic!("non-success PROCESS must decode to Ok(status), got Err({e:?})"),
+        }
+    }
+
+    #[test]
+    fn process_truncated_is_fatal_err() {
+        let frame = process_frame(ByteOrder::Little, crate::proto::Status::ok(), false);
+        assert!(
+            decode_process_status(&frame).is_err(),
+            "a truncated PROCESS body must be a connection-fatal Err"
+        );
+    }
+
+    #[test]
+    fn process_wrong_command_is_fatal_err() {
+        let mut frame = process_frame(ByteOrder::Little, crate::proto::Status::ok(), true);
+        frame.header.command = Command::Get.code();
+        assert!(
+            decode_process_status(&frame).is_err(),
+            "a command mismatch must be a connection-fatal Err"
+        );
     }
 }

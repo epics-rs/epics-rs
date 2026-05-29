@@ -851,47 +851,73 @@ impl ChannelSource for GatewayChannelSource {
     }
 
     async fn has_pv(&self, name: &str) -> bool {
-        // Trigger an upstream lookup so the very first downstream
-        // SEARCH for a previously-unseen PV resolves correctly.
-        // Subsequent calls hit the fast path.
-        self.cache.lookup(name, self.connect_timeout).await.is_ok()
+        // Admit a channel on upstream CONNECTION, not on a first MONITOR
+        // event. pva2pva `p2pApp/server.cpp:36-56` answers `channelFind`
+        // from `ChannelCache::lookup`, which returns an entry only once
+        // `channel->isConnected()` (`chancache.cpp:166-199`) — it never
+        // creates a monitor. Gating admission on the monitor cache made a
+        // connectable PV that is slow to (or never does) produce a monitor
+        // event look "not found", and poisoned the negative cache on a slow
+        // first frame. `pvconnect` connects the channel without a monitor
+        // (pvxs `Context::connect`); the client's pool reuses the
+        // connection for the GET/PUT/RPC/PROCESS that follow.
+        matches!(
+            tokio::time::timeout(self.connect_timeout, self.cache.client().pvconnect(name)).await,
+            Ok(Ok(_))
+        )
     }
 
     async fn get_introspection(&self, name: &str) -> Option<FieldDesc> {
-        let entry = self.cache.lookup(name, self.connect_timeout).await.ok()?;
-        entry.introspection()
-    }
-
-    /// a credentialed downstream CREATE_CHANNEL resolves
-    /// existence against THAT peer's per-credential upstream cache, not
-    /// the shared gateway cache, so channel setup never opens or refreshes
-    /// upstream state under the shared identity. Anonymous peers fall back
-    /// to the shared cache (`upstream_cache_for` returns `self.cache`), so
-    /// their behaviour is unchanged. The credential-free `has_pv` is kept
-    /// for the connectionless UDP SEARCH path, which carries no identity.
-    async fn has_pv_checked(&self, name: &str, ctx: ChannelContext) -> bool {
-        self.upstream_cache_for(&ctx)
-            .lookup(name, self.connect_timeout)
+        // Forward a real upstream GET_FIELD rather than reading the monitor
+        // cache descriptor. pva2pva forwards introspection through the
+        // connected channel independently of monitor setup
+        // (`p2pApp/channel.cpp:99-148`); `pvinfo` issues a one-shot
+        // GET_FIELD that reuses the client's connection pool and no longer
+        // waits on a first monitor event (see `has_pv`).
+        tokio::time::timeout(self.connect_timeout, self.cache.client().pvinfo(name))
             .await
-            .is_ok()
+            .ok()?
+            .ok()
     }
 
-    /// descriptor discovery for a credentialed downstream
-    /// peer (CREATE_CHANNEL GET-INIT / GET_FIELD) reads the upstream type
-    /// through that peer's per-credential cache — the same cache
-    /// `get_value_checked`/`subscribe_checked` use — so the upstream audit
-    /// identity matches the operation that follows.
+    /// a credentialed downstream CREATE_CHANNEL resolves existence by
+    /// CONNECTING through THAT peer's per-credential upstream client, not
+    /// by waiting on a monitor event, so channel setup never opens upstream
+    /// monitor state under the shared identity and a connectable-but-not-
+    /// monitorable PV still resolves (see `has_pv` for the pva2pva
+    /// `server.cpp:36-56` / `chancache.cpp:166-199` rationale). Anonymous
+    /// peers fall back to the shared client (`upstream_client_for` returns
+    /// `self.cache.client()`). The credential-free `has_pv` is kept for the
+    /// connectionless UDP SEARCH path, which carries no identity.
+    async fn has_pv_checked(&self, name: &str, ctx: ChannelContext) -> bool {
+        matches!(
+            tokio::time::timeout(
+                self.connect_timeout,
+                self.upstream_client_for(&ctx).pvconnect(name)
+            )
+            .await,
+            Ok(Ok(_))
+        )
+    }
+
+    /// descriptor discovery for a credentialed downstream peer
+    /// (CREATE_CHANNEL GET-INIT / GET_FIELD) forwards a one-shot upstream
+    /// GET_FIELD through that peer's per-credential client — the same
+    /// identity routing `get_value_checked` uses — so the upstream audit
+    /// identity matches the operation that follows, and discovery no longer
+    /// waits on a monitor event (see `get_introspection`).
     async fn get_introspection_checked(
         &self,
         name: &str,
         ctx: ChannelContext,
     ) -> Option<FieldDesc> {
-        let entry = self
-            .upstream_cache_for(&ctx)
-            .lookup(name, self.connect_timeout)
-            .await
-            .ok()?;
-        entry.introspection()
+        tokio::time::timeout(
+            self.connect_timeout,
+            self.upstream_client_for(&ctx).pvinfo(name),
+        )
+        .await
+        .ok()?
+        .ok()
     }
 
     async fn get_value(&self, name: &str) -> Option<PvField> {
@@ -926,15 +952,13 @@ impl ChannelSource for GatewayChannelSource {
                 "PUT denied by gateway access security: PV '{name}' (anonymous)"
             )));
         }
-        // Look up the entry to keep the upstream channel alive (and
-        // confirm the PV exists) before issuing the PUT through the
-        // shared client. The client's connection pool reuses the
-        // already-open server connection.
-        let _entry = self
-            .cache
-            .lookup(name, self.connect_timeout)
-            .await
-            .map_err(|e| OpError::failed(e.to_string()))?;
+        // No monitor-gated preflight. The PUT forwards through the shared
+        // client, which connects on demand and surfaces the upstream error
+        // itself — exactly as `put_value_checked` does. pva2pva forwards
+        // PUT through the connected upstream channel independently of
+        // monitor setup (`p2pApp/channel.cpp:99-148`); a monitor-cache
+        // lookup here made a write wait on a first monitor event (see
+        // `has_pv`).
         // typed pass-through — forward the PvField as-is without
         // re-encoding through string form. pvxs serialises the PUT value
         // with to_wire_valid(R, temp) (pvxs/src/clientget.cpp:305) — no
@@ -1025,11 +1049,9 @@ impl ChannelSource for GatewayChannelSource {
         request_desc: FieldDesc,
         request_value: PvField,
     ) -> Result<(FieldDesc, PvField), OpError> {
-        let _entry = self
-            .cache
-            .lookup(name, self.connect_timeout)
-            .await
-            .map_err(|e| OpError::failed(e.to_string()))?;
+        // No monitor-gated preflight (see `put_value`): the RPC forwards
+        // through the shared client, which connects on demand and surfaces
+        // the upstream error itself.
         let result = tokio::time::timeout(
             self.rpc_timeout,
             self.cache
@@ -1101,15 +1123,12 @@ impl ChannelSource for GatewayChannelSource {
     /// `ChannelSource` default returns `Ok(())` — for a proxying
     /// gateway that silently swallows the PROCESS and falsely reports
     /// success, so a downstream `caput -c` / `pvcall .PROC` never
-    /// actually triggers the upstream record. This override resolves
-    /// the PV through the cache (confirming it exists) and forwards
-    /// `pvprocess` through the shared client.
+    /// actually triggers the upstream record. This override forwards
+    /// `pvprocess` through the shared client, which connects on demand.
     async fn process(&self, name: &str) -> Result<(), OpError> {
-        let _entry = self
-            .cache
-            .lookup(name, self.connect_timeout)
-            .await
-            .map_err(|e| OpError::failed(e.to_string()))?;
+        // No monitor-gated preflight (see `put_value`): PROCESS forwards
+        // through the shared client, which connects on demand and surfaces
+        // the upstream error itself.
         self.cache
             .client()
             .pvprocess(name)

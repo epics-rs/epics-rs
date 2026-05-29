@@ -5,13 +5,38 @@
 //! but callers can override via [`crate::client_native::PvaClientBuilder`]
 //! or the `EPICS_PVA_AUTH_USER` / `EPICS_PVA_AUTH_HOST` environment variables.
 
+/// pvxs `buildCAMethod` (client.cpp:519-532) sends these literals in the
+/// `ca` credential when the OS user / hostname lookup fails — `nobody`
+/// for an unresolved user, `invalidhost.` for an unresolved host. PVA ACF
+/// rules can match on user and host, so the degraded identity must match
+/// pvxs exactly rather than diverging to `anonymous` / `localhost`.
+const CA_FALLBACK_USER: &str = "nobody";
+const CA_FALLBACK_HOST: &str = "invalidhost.";
+
+/// Fold a resolved user identity to the pvxs CA fallback when absent.
+/// Split out so the fallback literal is unit-testable without depending
+/// on the host's environment.
+fn user_or_ca_fallback(resolved: Option<String>) -> String {
+    resolved.unwrap_or_else(|| CA_FALLBACK_USER.to_string())
+}
+
+/// Fold a resolved host identity to the pvxs CA fallback when absent.
+/// Split out because `gethostname()` cannot be forced to fail from a
+/// test, so the fallback literal is exercised through this pure helper.
+fn host_or_ca_fallback(resolved: Option<String>) -> String {
+    resolved.unwrap_or_else(|| CA_FALLBACK_HOST.to_string())
+}
+
 /// Resolve the AuthZ user. Honours `EPICS_PVA_AUTH_USER`, then `USER`,
-/// then `USERNAME`, then falls back to `"anonymous"`.
+/// then `USERNAME`, then falls back to the pvxs CA default identity
+/// (`nobody`), matching `buildCAMethod` when `osiGetUserName()` fails.
 pub fn authnz_default_user() -> String {
-    std::env::var("EPICS_PVA_AUTH_USER")
-        .or_else(|_| std::env::var("USER"))
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "anonymous".to_string())
+    user_or_ca_fallback(
+        std::env::var("EPICS_PVA_AUTH_USER")
+            .or_else(|_| std::env::var("USER"))
+            .or_else(|_| std::env::var("USERNAME"))
+            .ok(),
+    )
 }
 
 /// Run `getgrouplist(3)` for `name`/`basegid`, returning `basegid` plus
@@ -231,15 +256,13 @@ pub fn osd_get_roles(account: &str) -> Vec<String> {
 }
 
 /// Resolve the AuthZ host. Honours `EPICS_PVA_AUTH_HOST`, then the OS
-/// hostname, falling back to `"localhost"`.
+/// hostname, falling back to the pvxs CA default identity
+/// (`invalidhost.`), matching `buildCAMethod` when `gethostname()` fails.
 pub fn authnz_default_host() -> String {
     if let Ok(h) = std::env::var("EPICS_PVA_AUTH_HOST") {
         return h;
     }
-    hostname::get()
-        .ok()
-        .and_then(|s| s.into_string().ok())
-        .unwrap_or_else(|| "localhost".to_string())
+    host_or_ca_fallback(hostname::get().ok().and_then(|s| s.into_string().ok()))
 }
 
 #[cfg(test)]
@@ -257,6 +280,25 @@ mod tests {
     fn host_falls_back() {
         let h = authnz_default_host();
         assert!(!h.is_empty());
+    }
+
+    #[test]
+    fn user_fallback_is_pvxs_ca_literal() {
+        // pvxs buildCAMethod (client.cpp:519-526) sends "nobody" when the
+        // OS user lookup fails. A resolved name passes through unchanged;
+        // an absent one degrades to exactly that literal (not "anonymous").
+        assert_eq!(user_or_ca_fallback(Some("alice".to_string())), "alice");
+        assert_eq!(user_or_ca_fallback(None), "nobody");
+    }
+
+    #[test]
+    fn host_fallback_is_pvxs_ca_literal() {
+        // pvxs buildCAMethod (client.cpp:528-532) sends "invalidhost."
+        // when gethostname() fails. gethostname() cannot be forced to fail
+        // from a test, so the fallback literal is exercised through the
+        // pure helper; a resolved host passes through unchanged.
+        assert_eq!(host_or_ca_fallback(Some("myhost".to_string())), "myhost");
+        assert_eq!(host_or_ca_fallback(None), "invalidhost.");
     }
 
     #[test]

@@ -713,7 +713,16 @@ fn decode_type_desc_cached_at_depth(
             // define new cache slot, then full inline descriptor.
             let key = cur.get_u16(order)?;
             let desc = decode_type_desc_cached_at_depth(cur, order, cache, depth + 1)?;
-            cache.insert(key, desc.clone());
+            // pvxs uses `std::map::emplace` (dataencode.cpp:91-95), which is
+            // a no-op when the slot is already bound: a duplicate `0xFD`
+            // for an existing slot is consumed and validated (the inline
+            // descriptor was decoded above) but does NOT replace the slot,
+            // so later `0xFE` references resolve to the FIRST definition.
+            // `HashMap::insert` would instead overwrite, diverging from
+            // pvxs on the same byte stream. The current field still uses
+            // the just-decoded inline `desc` (pvxs binds `descs[index]` to
+            // the inline value regardless of the slot's prior contents).
+            cache.entry(key).or_insert_with(|| desc.clone());
             Ok(desc)
         }
         0xFE => {
@@ -3029,6 +3038,57 @@ mod tests {
             let mut cur = Cursor::new(buf.as_slice());
             let decoded = decode_pv_field(&desc, &mut cur, order).unwrap();
             assert_eq!(decoded, value);
+            assert_eq!(cur.remaining(), 0);
+        }
+    }
+
+    /// Duplicate `0xFD` definition of an already-bound slot must NOT
+    /// overwrite it: pvxs `std::map::emplace` keeps the first definition,
+    /// so a later `0xFE` reference resolves to the original descriptor.
+    /// The field carrying the second `0xFD` still decodes as its inline
+    /// descriptor.
+    #[test]
+    fn duplicate_typecache_slot_keeps_first_definition() {
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            // Inline wire bytes for the two descriptors.
+            let mut int_bytes = Vec::new();
+            encode_type_desc(&FieldDesc::Scalar(ScalarType::Int), order, &mut int_bytes);
+            let mut dbl_bytes = Vec::new();
+            encode_type_desc(
+                &FieldDesc::Scalar(ScalarType::Double),
+                order,
+                &mut dbl_bytes,
+            );
+
+            let mut buf = Vec::new();
+            // 0xFD define slot 1 = Int
+            buf.put_u8(0xFD);
+            buf.put_u16(1, order);
+            buf.extend_from_slice(&int_bytes);
+            // 0xFD define slot 1 again = Double (duplicate)
+            buf.put_u8(0xFD);
+            buf.put_u16(1, order);
+            buf.extend_from_slice(&dbl_bytes);
+            // 0xFE reference slot 1
+            buf.put_u8(0xFE);
+            buf.put_u16(1, order);
+
+            let mut cur = Cursor::new(buf.as_slice());
+            let mut cache = TypeCache::new();
+            // First define: current field is Int; slot 1 := Int.
+            let d1 = decode_type_desc_cached(&mut cur, order, &mut cache).unwrap();
+            assert_eq!(d1, FieldDesc::Scalar(ScalarType::Int));
+            // Second define: current field is the inline Double, but the
+            // slot is NOT overwritten (emplace no-op).
+            let d2 = decode_type_desc_cached(&mut cur, order, &mut cache).unwrap();
+            assert_eq!(d2, FieldDesc::Scalar(ScalarType::Double));
+            // Reference resolves to the FIRST definition (Int), not Double.
+            let d3 = decode_type_desc_cached(&mut cur, order, &mut cache).unwrap();
+            assert_eq!(
+                d3,
+                FieldDesc::Scalar(ScalarType::Int),
+                "0xFE must resolve to the first 0xFD definition (pvxs emplace)"
+            );
             assert_eq!(cur.remaining(), 0);
         }
     }

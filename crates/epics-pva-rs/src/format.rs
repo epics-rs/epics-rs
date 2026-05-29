@@ -394,13 +394,7 @@ fn format_nt_enum(pv_name: &str, s: &PvStructure) -> String {
                 .unwrap_or_else(|| "0".to_string());
             let choice = if let Some(PvField::ScalarArray(items)) = es.get_field("choices") {
                 let n: usize = i.parse().unwrap_or(0);
-                items
-                    .get(n)
-                    .map(|v| match v {
-                        ScalarValue::String(s) => s.clone(),
-                        other => format!("{other}"),
-                    })
-                    .unwrap_or_default()
+                items.get(n).map(enum_choice_text).unwrap_or_default()
             } else {
                 String::new()
             };
@@ -532,11 +526,11 @@ fn write_table_row<I: Iterator<Item = String>>(out: &mut String, widths: &[usize
 /// field is not a scalar array (the case printTable refuses).
 fn scalar_array_cells(field: &PvField) -> Option<Vec<String>> {
     match field {
-        PvField::ScalarArray(items) => Some(items.iter().map(scalar_to_inline).collect()),
+        PvField::ScalarArray(items) => Some(items.iter().map(scalar_cell_text).collect()),
         PvField::ScalarArrayTyped(arr) => Some(
             arr.to_scalar_values()
                 .iter()
-                .map(scalar_to_inline)
+                .map(scalar_cell_text)
                 .collect(),
         ),
         _ => None,
@@ -717,17 +711,22 @@ fn format_enum_summary(s: &PvStructure) -> String {
         .unwrap_or_else(|| "0".to_string());
     let choice = if let Some(PvField::ScalarArray(items)) = s.get_field("choices") {
         let n: usize = idx.parse().unwrap_or(0);
-        items
-            .get(n)
-            .map(|v| match v {
-                ScalarValue::String(s) => s.clone(),
-                other => format!("{other}"),
-            })
-            .unwrap_or_default()
+        items.get(n).map(enum_choice_text).unwrap_or_default()
     } else {
         String::new()
     };
     format!("({idx}) {choice}")
+}
+
+/// Render an NTEnum choice for display, mirroring EPICS Base `printEnumT`
+/// which streams the selected choice through `maybeQuote(ch[I])`
+/// (pvData printer.cpp:168-175). A non-string choice element (malformed
+/// enum) falls back to its plain scalar text.
+fn enum_choice_text(v: &ScalarValue) -> String {
+    match v {
+        ScalarValue::String(s) => maybe_quote(s),
+        other => scalar_cell_text(other),
+    }
 }
 
 /// Format an EPICS timestamp from a `time_t` structure. Returns
@@ -833,16 +832,58 @@ fn top_alarm_summary(s: &PvStructure) -> String {
 fn format_value_inline(v: &PvField) -> String {
     match v {
         PvField::Scalar(sv) => scalar_to_inline(sv),
-        PvField::ScalarArray(items) => {
-            let parts: Vec<String> = items.iter().map(scalar_to_inline).collect();
-            format!("[{}]", parts.join(", "))
-        }
+        PvField::ScalarArray(items) => format_scalar_array_inline(items),
+        // Typed wire-decoded arrays render through the same display path
+        // as untyped ones — not the generic `TypedScalarArray::Display`,
+        // which is a diagnostic representation that does not apply Base's
+        // `maybeQuote` string rule (EPICS Base routes both through the
+        // PVField stream operator, printer.cpp:382-386).
+        PvField::ScalarArrayTyped(arr) => format_scalar_array_inline(&arr.to_scalar_values()),
         PvField::Null => String::new(),
         other => format!("{other}"),
     }
 }
 
+/// Render a scalar array for raw / NT inline display: `[` elements `]`.
+/// Each element goes through [`scalar_to_inline`], so string elements are
+/// `maybeQuote`-escaped while numeric elements print bare with six
+/// significant digits. The element separator follows Base's per-type
+/// array dump: a string array uses `", "`
+/// (`PVValueArray<std::string>::dumpValue`, PVDataCreateFactory.cpp:
+/// 240-251) while every numeric/bool array uses a bare `","`
+/// (`PVValueArray<T>::dumpValue`, :216-229).
+fn format_scalar_array_inline(items: &[ScalarValue]) -> String {
+    let parts: Vec<String> = items.iter().map(scalar_to_inline).collect();
+    let sep = if matches!(items.first(), Some(ScalarValue::String(_))) {
+        ", "
+    } else {
+        ","
+    };
+    format!("[{}]", parts.join(sep))
+}
+
+/// Inline display rendering of a scalar for raw / NT output. Mirrors the
+/// EPICS Base PVField stream operator: a string is `maybeQuote`-escaped
+/// (`PVString::dumpValue`, PVDataCreateFactory.cpp:145-149); a float is
+/// printed with six significant digits, matching Base's C++ stream
+/// default precision for `PVScalarValue<T>::dumpValue` (`o << get()`,
+/// PVDataCreateFactory.cpp:64-68) and the NT formatter's explicit
+/// `precision(6)` (printer.cpp:428-440); other scalars print exact text.
 fn scalar_to_inline(v: &ScalarValue) -> String {
+    match v {
+        ScalarValue::String(s) => maybe_quote(s),
+        ScalarValue::Double(f) => format_g(*f, 6),
+        ScalarValue::Float(f) => format_g(*f as f64, 6),
+        other => scalar_cell_text(other),
+    }
+}
+
+/// Raw, unquoted scalar text used for table cells (which apply their own
+/// CSV escaping) — distinct from [`scalar_to_inline`], whose strings are
+/// `maybeQuote`-escaped for inline display. Keeping the two separate
+/// prevents a table cell from being `maybeQuote`-escaped and then
+/// `csv_escape`-escaped a second time.
+fn scalar_cell_text(v: &ScalarValue) -> String {
     match v {
         ScalarValue::Double(f) => {
             if f.fract() == 0.0 && f.abs() < 1e15 {
@@ -862,6 +903,58 @@ fn scalar_to_inline(v: &ScalarValue) -> String {
         ScalarValue::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
         other => format!("{other}"),
     }
+}
+
+/// Render a PVA display string the way EPICS Base `maybeQuote` does
+/// (pvData printer.cpp:521-548): if the string contains a space, a quote,
+/// a backslash, an apostrophe, a control character (`\a \b \f \n \r \t
+/// \v`), or any non-printable byte, wrap it in double quotes and escape
+/// it; otherwise emit it verbatim. The escaping uses Base's default
+/// (non-CSV) `escape` style, so a literal `"` becomes `\"` (printer.cpp:
+/// 485-516) — distinct from the CSV style [`csv_escape`] uses, where `"`
+/// is doubled.
+fn maybe_quote(s: &str) -> String {
+    let needs_quote = s.bytes().any(|b| {
+        matches!(
+            b,
+            0x07 | 0x08 | 0x0c | b'\n' | b'\r' | b'\t' | b' ' | 0x0b | b'\\' | b'\'' | b'"'
+        ) || !(0x20..=0x7e).contains(&b)
+    });
+    if needs_quote {
+        format!("\"{}\"", escape_display(s))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Byte-wise escape mirroring EPICS Base's default `escape` style
+/// (`style_t::C`, pvData printer.cpp:485-516): named backslash escapes
+/// for `\a \b \f \n \r \t \v`, `\\`, `\'`, and `\"`; any other
+/// non-printable byte as `\xHH`; printable ASCII verbatim. Byte-wise to
+/// match Base's `isprint((unsigned char)C)`, so a non-ASCII UTF-8 byte
+/// becomes `\xHH`. Base's `hexdigit` off-by-one (nibble 9 → `@`) is not
+/// reproduced; correct `{:02X}` hex is emitted.
+fn escape_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x0c => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x0b => out.push_str("\\v"),
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            b'"' => out.push_str("\\\""),
+            0x20..=0x7e => out.push(b as char),
+            other => {
+                let _ = write!(out, "\\x{other:02X}");
+            }
+        }
+    }
+    out
 }
 
 fn value_type_name(v: &PvField) -> &'static str {
@@ -1194,6 +1287,102 @@ mod tests {
         let mut top = PvStructure::new("epics:nt/NTTable:1.0");
         top.set("value", PvField::Structure(value));
         assert!(format_nt_table("PV", &top).is_none());
+    }
+
+    /// `maybe_quote` mirrors Base `maybeQuote`/default `escape`: quote and
+    /// escape on space / control / quote / backslash / apostrophe /
+    /// non-printable; emit verbatim otherwise. A literal `"` becomes `\"`
+    /// (default style), not the CSV `""`.
+    #[test]
+    fn maybe_quote_matches_base_rules() {
+        assert_eq!(maybe_quote("plain"), "plain");
+        assert_eq!(maybe_quote("a b"), "\"a b\"");
+        assert_eq!(maybe_quote("a\tb"), "\"a\\tb\"");
+        assert_eq!(maybe_quote("a\nb"), "\"a\\nb\"");
+        assert_eq!(maybe_quote("a\"b"), "\"a\\\"b\"");
+        assert_eq!(maybe_quote("a\\b"), "\"a\\\\b\"");
+        assert_eq!(maybe_quote("a'b"), "\"a\\'b\"");
+        assert_eq!(maybe_quote("\u{01}"), "\"\\x01\"");
+    }
+
+    /// Inline/raw display of a string scalar applies `maybeQuote`: a value
+    /// with a space is quoted; a simple value stays verbatim
+    /// (PVString::dumpValue, PVDataCreateFactory.cpp:145-149).
+    #[test]
+    fn raw_string_scalar_is_maybequoted() {
+        assert_eq!(
+            format_value_inline(&PvField::Scalar(ScalarValue::String("a b".into()))),
+            "\"a b\""
+        );
+        assert_eq!(
+            format_value_inline(&PvField::Scalar(ScalarValue::String("plain".into()))),
+            "plain"
+        );
+    }
+
+    /// A string array quotes each element via `maybeQuote` and joins with
+    /// ", " (PVValueArray<std::string>::dumpValue, PVDataCreateFactory.cpp:
+    /// 240-251).
+    #[test]
+    fn raw_string_array_quotes_each_element() {
+        let v = PvField::ScalarArray(vec![
+            ScalarValue::String("a b".into()),
+            ScalarValue::String("c".into()),
+        ]);
+        assert_eq!(format_value_inline(&v), "[\"a b\", c]");
+    }
+
+    /// NTEnum choice text is `maybeQuote`-escaped (printEnumT streams the
+    /// selected choice through maybeQuote, printer.cpp:168-175).
+    #[test]
+    fn nt_enum_choice_is_maybequoted() {
+        let mut e = PvStructure::new("enum_t");
+        e.set("index", PvField::Scalar(ScalarValue::Int(1)));
+        e.set(
+            "choices",
+            PvField::ScalarArray(vec![
+                ScalarValue::String("off".into()),
+                ScalarValue::String("on hold".into()),
+            ]),
+        );
+        assert_eq!(format_enum_summary(&e), "(1) \"on hold\"");
+    }
+
+    /// A raw double scalar prints with six significant digits, matching
+    /// Base's C++ stream default precision (PVDataCreateFactory.cpp:64-68),
+    /// not Rust's shortest-round-trip Display.
+    #[test]
+    fn raw_double_scalar_six_significant_digits() {
+        assert_eq!(
+            format_value_inline(&PvField::Scalar(ScalarValue::Double(1.23456789))),
+            "1.23457"
+        );
+    }
+
+    /// Numeric (and bool) scalar arrays join elements with a bare comma,
+    /// matching Base `PVValueArray<T>::dumpValue` (PVDataCreateFactory.cpp:
+    /// 216-229) — not `, `.
+    #[test]
+    fn numeric_array_uses_bare_comma_separator() {
+        let ints = PvField::ScalarArray(vec![
+            ScalarValue::Int(1),
+            ScalarValue::Int(2),
+            ScalarValue::Int(3),
+        ]);
+        assert_eq!(format_value_inline(&ints), "[1,2,3]");
+        let dbls = PvField::ScalarArray(vec![ScalarValue::Double(1.5), ScalarValue::Double(2.25)]);
+        assert_eq!(format_value_inline(&dbls), "[1.5,2.25]");
+    }
+
+    /// Decoupling guard: table cells use `scalar_cell_text` (Base
+    /// `getAs<std::string>`, full precision), NOT the six-significant-digit
+    /// raw/NT display path — so the same double renders differently in a
+    /// table cell vs an inline scalar.
+    #[test]
+    fn nt_table_double_cell_keeps_full_precision() {
+        let (desc, value) = nt_table(&["d"], &[("d", vec![ScalarValue::Double(1.23456789)])]);
+        let out = format_nt("PV", &desc, &value);
+        assert_eq!(out, "PV \n         d\n1.23456789\n");
     }
 
     #[test]

@@ -5395,10 +5395,15 @@ async fn handle_op(
                             }
                         }
                     }
-                    // Back-pressure / squashing loop: drain available
-                    // events between writes, keeping only the most recent
-                    // value if more than `queue_depth` events stack up.
-                    let mut squashing = false;
+                    // Server-side monitor queue (pvxs servermon.cpp:271-287,
+                    // drained one-per-reply at :171-183). A short burst below
+                    // the negotiated depth is delivered as distinct DATA
+                    // frames; coalescing happens only as the overflow action
+                    // once the queue is full. See `drain_monitor_queue`.
+                    let queue_limit = queue_depth.max(1);
+                    let mut pending: std::collections::VecDeque<
+                        crate::server_native::MonitorUpdate,
+                    > = std::collections::VecDeque::new();
                     // value squashed while paused, flushed on
                     // resume. `None` between batches.
                     let mut held: Option<crate::server_native::MonitorUpdate> = None;
@@ -5415,18 +5420,30 @@ async fn handle_op(
                         // events coalesced during a pause
                         // union their marked-leaf sets via
                         // `coalesce_monitor_update`.
-                        let mut value = match next_monitor_event(
-                            &mut rx,
-                            &mut held,
-                            &paused_flag,
-                            &resume_notify,
-                            |_| false,
-                            coalesce_monitor_update,
-                        )
-                        .await
+                        // Emit a queued entry first — one per reply (pvxs
+                        // servermon.cpp:171-183) — and only block for a fresh
+                        // event when the queue is empty. While paused we must
+                        // NOT drain the queue: fall through to the pause-aware
+                        // `next_monitor_event`, which holds the latest, and
+                        // the pause branch below folds the queue into `held`.
+                        let mut value = if !paused_flag.load(std::sync::atomic::Ordering::Relaxed)
+                            && let Some(front) = pending.pop_front()
                         {
-                            Some(v) => v,
-                            None => break,
+                            front
+                        } else {
+                            match next_monitor_event(
+                                &mut rx,
+                                &mut held,
+                                &paused_flag,
+                                &resume_notify,
+                                |_| false,
+                                coalesce_monitor_update,
+                            )
+                            .await
+                            {
+                                Some(v) => v,
+                                None => break,
+                            }
                         };
                         // ACL re-check on policy reload (same
                         // shape as the raw-fast-path branch above).
@@ -5454,26 +5471,17 @@ async fn handle_op(
                             mon_acl_version_at_subscribe_cell
                                 .store(live_v, std::sync::atomic::Ordering::Release);
                         }
-                        // Drain extras; keep the latest value but union
-                        // the coalesced events' marked-leaf sets
-                        //.
-                        let mut squashed = 0usize;
-                        loop {
-                            match rx.try_recv() {
-                                Ok(next) => {
-                                    value = coalesce_monitor_update(value, next);
-                                    squashed += 1;
-                                    if squashed > queue_depth {
-                                        squashing = true;
-                                    }
-                                }
-                                Err(mpsc::error::TryRecvError::Empty) => break,
-                                Err(mpsc::error::TryRecvError::Disconnected) => break,
-                            }
-                        }
-                        if squashing {
-                            debug!(pv = %pv_name, squashed, "monitor squashed events");
-                            squashing = false;
+                        // Drain immediately-available extras into the queue.
+                        // `value` is the entry being sent THIS iteration (the
+                        // popped head), so the not-yet-sent queue may still
+                        // hold up to `queue_limit` more distinct entries; only
+                        // a full queue squashes the newest into its tail.
+                        if drain_monitor_queue(&mut rx, &mut pending, queue_limit) {
+                            debug!(
+                                pv = %pv_name,
+                                queue_limit,
+                                "monitor queue full — squashed newest into tail"
+                            );
                         }
                         // outbound-queue depth is a SERVER
                         // diagnostic only — it is no longer used to fire
@@ -5482,16 +5490,16 @@ async fn handle_op(
                         // control window, which we now do at the credit
                         // gate below. Counter is max_capacity - capacity
                         // since mpsc doesn't expose len directly.
-                        let pending = tx_clone.max_capacity() - tx_clone.capacity();
-                        if pending >= high_watermark && !queue_over_high {
+                        let outbound_pending = tx_clone.max_capacity() - tx_clone.capacity();
+                        if outbound_pending >= high_watermark && !queue_over_high {
                             queue_over_high = true;
                             warn!(
                                 pv = %pv_name,
-                                pending,
+                                pending = outbound_pending,
                                 high_watermark,
                                 "monitor outbound queue crossed high watermark"
                             );
-                        } else if pending == 0 && queue_over_high {
+                        } else if outbound_pending == 0 && queue_over_high {
                             queue_over_high = false;
                             debug!(pv = %pv_name, "monitor outbound queue drained");
                         }
@@ -5514,6 +5522,15 @@ async fn handle_op(
                         // it once was, holding consumes no pipeline credit
                         // (no wire frame is produced).
                         if paused_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            // Paused: emit nothing. Squash the in-hand value
+                            // and any queued backlog (front→back, oldest→
+                            // newest) into the single held latest — resume
+                            // flushes it. The queue models the non-paused
+                            // burst; pause keeps the existing hold-latest
+                            // semantics and must not leave entries behind.
+                            while let Some(q) = pending.pop_front() {
+                                value = coalesce_monitor_update(value, q);
+                            }
                             held = Some(value);
                             continue;
                         }
@@ -6140,6 +6157,43 @@ fn coalesce_monitor_update(
         value: newer.value,
         marked,
     }
+}
+
+/// Drain every immediately-available monitor update from `rx` into the
+/// bounded server-side queue `pending`, returning true if any overflow
+/// squash occurred.
+///
+/// This is the server monitor queue, modelled after pvxs
+/// `servermon.cpp:271-287`: a post is appended as a DISTINCT queue entry
+/// while `pending.len() < limit`, and only once the queue is full is the
+/// newest update squashed into the queue tail (unioning marked-leaf sets
+/// via [`coalesce_monitor_update`]). The send loop pops exactly one entry
+/// per reply (`servermon.cpp:171-183`), so a burst below the negotiated
+/// depth is delivered as distinct DATA frames rather than collapsed into
+/// one. Coalescing is the OVERFLOW action, not the normal drain.
+///
+/// `limit` must be >= 1, so a full queue always has a tail to squash into.
+fn drain_monitor_queue(
+    rx: &mut mpsc::Receiver<crate::server_native::MonitorUpdate>,
+    pending: &mut std::collections::VecDeque<crate::server_native::MonitorUpdate>,
+    limit: usize,
+) -> bool {
+    let mut overflow = false;
+    // `try_recv` Empty (no more buffered) or Disconnected (source ended)
+    // both stop the drain; disconnect is observed by the outer loop's
+    // `next_monitor_event` returning None once the queue empties.
+    while let Ok(next) = rx.try_recv() {
+        if pending.len() < limit {
+            pending.push_back(next);
+        } else {
+            let tail = pending
+                .pop_back()
+                .expect("limit >= 1 so a full queue has a tail to squash into");
+            pending.push_back(coalesce_monitor_update(tail, next));
+            overflow = true;
+        }
+    }
+    overflow
 }
 
 /// outcome of turning one [`crate::server_native::RawMonitorEvent`]
@@ -6772,6 +6826,55 @@ mod tests {
         assert!(
             merged.marked.is_none(),
             "a None side must collapse the coalesced set to None (either order)"
+        );
+    }
+
+    /// Boundary test for the server-side monitor queue
+    /// ([`drain_monitor_queue`], pvxs servermon.cpp:271-287): below the
+    /// limit every post stays a DISTINCT entry; at the limit the newest is
+    /// squashed into the tail. Tested by the `len < limit` vs `len == limit`
+    /// boundary, not by a narrative burst.
+    #[tokio::test]
+    async fn pva_44_monitor_queue_keeps_distinct_below_limit_squashes_tail_at_limit() {
+        use std::collections::VecDeque;
+        let val = |tag: i32| PvField::Scalar(ScalarValue::Int(tag));
+        let upd = |tag: i32| crate::server_native::MonitorUpdate {
+            value: val(tag),
+            marked: None,
+        };
+
+        // Three posts into a queue of limit 4 (the finding's exact case):
+        // all stay distinct, no squash.
+        let (tx, mut rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(16);
+        for tag in 1..=3 {
+            tx.send(upd(tag)).await.unwrap();
+        }
+        let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
+        let overflow = drain_monitor_queue(&mut rx, &mut pending, 4);
+        assert!(!overflow, "3 posts below limit 4 must not squash");
+        assert_eq!(pending.len(), 3, "three distinct queue entries below limit");
+        let tags: Vec<_> = pending.iter().map(|u| u.value.clone()).collect();
+        assert_eq!(
+            tags,
+            vec![val(1), val(2), val(3)],
+            "distinct posts must be delivered in order, not coalesced"
+        );
+
+        // Filling past the limit squashes the NEWEST into the tail and
+        // leaves the head entries untouched.
+        let (tx, mut rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(16);
+        for tag in 1..=5 {
+            tx.send(upd(tag)).await.unwrap();
+        }
+        let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
+        let overflow = drain_monitor_queue(&mut rx, &mut pending, 2);
+        assert!(overflow, "5 posts into limit 2 must squash the tail");
+        assert_eq!(pending.len(), 2, "queue stays capped at the limit");
+        let tags: Vec<_> = pending.iter().map(|u| u.value.clone()).collect();
+        assert_eq!(
+            tags,
+            vec![val(1), val(5)],
+            "head (1) is preserved distinct; the tail squashes to the newest (5)"
         );
     }
 

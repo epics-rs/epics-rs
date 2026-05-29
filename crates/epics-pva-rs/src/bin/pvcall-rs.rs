@@ -58,6 +58,25 @@ fn parse_arg(arg: &str) -> Result<(String, ScalarValue), String> {
     Ok((k.to_string(), ScalarValue::String(v.to_string())))
 }
 
+/// Parse all `field=value` tokens, rejecting a duplicate field name the
+/// way pvxs does: `tools/call.cpp:93-101` stores arguments in a
+/// `std::map` and errors out on a repeated key before building the
+/// NTURI `query`, so a duplicate has no stable meaning and is refused
+/// locally rather than sent. Insertion order is preserved for the
+/// `query` members (matching pvxs's `keys` list).
+fn collect_args(tokens: &[String]) -> Result<Vec<(String, ScalarValue)>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        let (k, v) = parse_arg(tok)?;
+        if !seen.insert(k.clone()) {
+            return Err(format!("duplicate argument name {k:?}"));
+        }
+        out.push((k, v));
+    }
+    Ok(out)
+}
+
 /// Build an NTURI-shaped pvRequest carrying the parsed args under
 /// `query.<key>`. pvxs's RPC server side accepts this shape — see
 /// `pvxs/src/pvxs/nt.h` `NTURI`.
@@ -100,12 +119,7 @@ fn build_nturi(pv_name: &str, args: &[(String, ScalarValue)]) -> (FieldDesc, PvF
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let parsed_args: Vec<(String, ScalarValue)> = match args
-        .args
-        .iter()
-        .map(|s| parse_arg(s))
-        .collect::<Result<Vec<_>, _>>()
-    {
+    let parsed_args: Vec<(String, ScalarValue)> = match collect_args(&args.args) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("pvcall-rs: {e}");
@@ -196,5 +210,23 @@ mod tests {
     #[test]
     fn missing_equals_is_error() {
         assert!(parse_arg("novalue").is_err());
+    }
+
+    /// pvxs `tools/call.cpp:93-101` rejects a repeated field name; so
+    /// must we, before building an ambiguous duplicate `query` member.
+    #[test]
+    fn duplicate_field_name_is_rejected() {
+        let toks = vec!["a=1".to_string(), "a=2".to_string()];
+        let err = collect_args(&toks).unwrap_err();
+        assert!(err.contains("duplicate argument name"), "got: {err}");
+    }
+
+    /// Distinct field names are accepted in order.
+    #[test]
+    fn distinct_field_names_preserved_in_order() {
+        let toks = vec!["a=1".to_string(), "b=2".to_string()];
+        let got = collect_args(&toks).unwrap();
+        assert_eq!(got[0].0, "a");
+        assert_eq!(got[1].0, "b");
     }
 }

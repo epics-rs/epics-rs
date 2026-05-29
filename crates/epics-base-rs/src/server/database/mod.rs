@@ -7,7 +7,7 @@ mod processing;
 mod record_lock;
 mod scan_index;
 
-pub use link_set::{DynLinkSet, LinkDbfType, LinkMetadata, LinkSet, LinkSetRegistry};
+pub use link_set::{DynLinkSet, LinkDbfType, LinkMetadata, LinkSet, LinkSetRegistry, RemoteAlarm};
 pub use record_lock::{ManyRecordWriteGuard, RecordWriteGuard};
 
 use crate::error::{CaError, CaResult};

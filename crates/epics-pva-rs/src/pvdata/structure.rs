@@ -196,6 +196,39 @@ impl PvField {
         Self::ScalarArrayTyped(super::TypedScalarArray::UByte(data.into()))
     }
 
+    /// Dereference a *selected* union / non-empty variant ("any") to the
+    /// concrete value it carries, mirroring pvxs `Value::lookup("->")`.
+    ///
+    /// pvxs follows a union/`Any` to its active member before reading the
+    /// payload — e.g. `pvaGetValue` does
+    /// `if(value.type()==Any || value.type()==Union) value =
+    /// value.lookup("->")` before the array/scalar conversion
+    /// (`pvxs/ioc/pvalink_lset.cpp:278-279`). The standard EPICS
+    /// `NTNDArray` carries its image data as a discriminated `Union`
+    /// `value` member (`pvxs/src/nt.cpp:196-220`), so a consumer that
+    /// stops at the union sees no usable value.
+    ///
+    /// * [`PvField::Union`] with a selected variant (`selector >= 0`)
+    ///   resolves to the chosen variant's value.
+    /// * [`PvField::Variant`] carrying a descriptor resolves to its value.
+    /// * A null union (`selector == -1`) or empty variant (no descriptor)
+    ///   has no selected payload and resolves to itself — the caller then
+    ///   sees a union/variant and treats it as "no concrete value".
+    /// * Every other field resolves to itself.
+    ///
+    /// Idempotent on non-union/variant fields, and recursive: a union
+    /// whose selected variant is itself a union/variant is followed
+    /// through to the leaf concrete value.
+    pub fn deref_selected(&self) -> &PvField {
+        match self {
+            PvField::Union {
+                selector, value, ..
+            } if *selector >= 0 => value.deref_selected(),
+            PvField::Variant(v) if v.desc.is_some() => v.value.deref_selected(),
+            other => other,
+        }
+    }
+
     /// Recover a [`FieldDesc`] from a concrete value. Used by paths
     /// that cache values without a separate descriptor (e.g. QSRV
     /// PVA-plugin PV registry, gateway snapshot replay).

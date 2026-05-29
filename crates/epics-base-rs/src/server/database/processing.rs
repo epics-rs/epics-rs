@@ -1320,10 +1320,13 @@ impl PvDatabase {
                 }
             }
 
-            // pvalink `time=true` adopts the latched upstream
-            // NT timestamp into the owning record. `external_link_time`
-            // returned `None` unless the lset signalled the option, so
-            // a `Some` here is the operator-requested remote timestamp.
+            // pvalink `time=true` adopts the latched upstream timestamp
+            // into the owning record. `external_link_time` returned
+            // `None` unless the lset signalled the option, so a `Some`
+            // here is the operator-requested remote timestamp: the remote
+            // NT `timeStamp` while connected, or the disconnect-event time
+            // while the subscription is down (pvxs `snap_time = e.time`,
+            // adopted on the invalid read — `pvalink_lset.cpp:268-270`).
             // Apply BEFORE `apply_timestamp` so the upstream value
             // survives the soft-channel TSE=0 default (`apply_timestamp`
             // would otherwise stamp wall-clock-now on top).

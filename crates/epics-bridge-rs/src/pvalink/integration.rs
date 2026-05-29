@@ -1130,6 +1130,28 @@ impl LinkSet for PvaLinkResolver {
         link.link_alarm_severity_with(&field, sevr)
     }
 
+    fn remote_alarm(&self, name: &str) -> Option<epics_base_rs::server::database::RemoteAlarm> {
+        // Ungated remote alarm snapshot for DB-link inspection
+        // (`dbGetAlarm`/`dbGetAlarmMsg`). Unlike `alarm_severity`, this
+        // applies NO `sevr` gate — a default `NMS` link still reports
+        // its remote severity here. pvxs `pvaGetAlarmMsg`
+        // (`pvalink_lset.cpp:542-575`) reads the snapshot directly. The
+        // per-link `field` still selects the metadata root, matching the
+        // value/alarm getters.
+        let full = strip_scheme(name)?;
+        let bare = link_pv_name(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
+        let field = cfg.field.clone();
+        let link = block_in_place_or_warn(|| {
+            self.handle
+                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
+        })?;
+        link.remote_alarm_snapshot(&field)
+    }
+
     fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
         let full = strip_scheme(name)?;
         let bare = link_pv_name(full);
@@ -1364,7 +1386,13 @@ fn is_array_value(value: &EpicsValue) -> bool {
 /// closure, which surfaces as "no link value" upstream (record alarm
 /// LINK/INVALID).
 fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
-    match field {
+    // Follow a selected union / non-empty variant to its concrete member
+    // before conversion — pvxs `value.lookup("->")` for an Any/Union
+    // value (`pvalink_lset.cpp:278-279`). The standard NTNDArray carries
+    // its pixels in a discriminated union `value` member; without this an
+    // INP pvalink pointed at an NTNDArray reported no usable value.
+    // Idempotent on plain scalars/arrays/structures.
+    match field.deref_selected() {
         PvField::Scalar(sv) => Some(scalar_to_epics(sv)),
         PvField::Structure(s) => {
             // NTEnum (pvxs `pvalink_lset.cpp:331`, gated on
@@ -1699,6 +1727,36 @@ mod tests {
         s.fields
             .push(("labels".into(), PvField::Scalar(ScalarValue::Int(1))));
         assert_eq!(pvfield_to_epics_value(&PvField::Structure(s)), None);
+    }
+
+    /// An NTNDArray `value` is a discriminated union; conversion must
+    /// follow it to its active member (pvxs `value.lookup("->")`,
+    /// `pvalink_lset.cpp:278-279`). Pre-fix a `PvField::Union` hit the
+    /// catch-all and returned `None`, so an INP pvalink on an NTNDArray
+    /// reported no usable value.
+    #[test]
+    fn pvfield_ntndarray_union_value_converts_to_active_member() {
+        use epics_pva_rs::pvdata::PvStructure;
+        let union = PvField::Union {
+            selector: 9,
+            variant_name: "floatValue".into(),
+            value: Box::new(PvField::scalar_array_float(vec![1.5f32, 2.5, 3.5])),
+        };
+        // Directly on the selected union (the value-read path hands the
+        // already-selected field here).
+        assert_eq!(
+            pvfield_to_epics_value(&union),
+            Some(EpicsValue::FloatArray(vec![1.5, 2.5, 3.5])),
+            "selected union must convert to its floatValue member"
+        );
+        // And on the whole NTNDArray struct: the `value`-child recursion
+        // dereferences the union too.
+        let mut nd = PvStructure::new("epics:nt/NTNDArray:1.0");
+        nd.fields.push(("value".into(), union));
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::Structure(nd)),
+            Some(EpicsValue::FloatArray(vec![1.5, 2.5, 3.5])),
+        );
     }
 
     /// string / float / short / char / typed-array shapes the
@@ -3115,6 +3173,16 @@ mod tests {
             Some(2),
             "resolver-level link_alarm_severity must use the caller's MS mode"
         );
+
+        // Ungated snapshot (pvxs pvaGetAlarmMsg / dbGetAlarm): even the
+        // NMS caller — whose gated contribution is None above — must see
+        // the remote MAJOR severity, LINK_ALARM(14) status, and message.
+        // The `sevr` mode does not gate this path.
+        let snap = LinkSet::remote_alarm(&resolver, nms_name)
+            .expect("NMS caller still gets the ungated remote alarm snapshot");
+        assert_eq!(snap.severity, 2, "ungated snapshot reports remote MAJOR");
+        assert_eq!(snap.status, 14, "LINK_ALARM status derived from severity");
+        assert_eq!(snap.message, "HIGH", "ungated snapshot carries the message");
 
         // The shared cached link is time=false → a bare caller adopts
         // no timestamp. A caller asking `?time=true` must adopt it.

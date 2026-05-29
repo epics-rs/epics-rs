@@ -272,11 +272,16 @@ impl Value {
                 | FieldDesc::BoundedString(_) => {
                     let _ = self.write_field(&path, src_field.clone());
                 }
-                // A marked structure node represents its subtree (see
-                // PVA-RS-2026-05-28-90); copying its scalar leaves is
-                // handled when those leaves are themselves marked. The
-                // node itself carries no own payload to copy here.
-                FieldDesc::Structure { .. } => {}
+                // A marked structure node represents its whole subtree
+                // (pvxs imarked, testdata.cpp:180-209). Copy the subtree
+                // payload so a bare structure-level mark transfers; any
+                // individually-marked descendant leaf is also visited and
+                // re-copied (with scalar coercion) later in this loop.
+                FieldDesc::Structure { .. } => {
+                    if matches!(src_field, PvField::Structure(_)) {
+                        let _ = self.write_field(&path, src_field.clone());
+                    }
+                }
             }
             // Every path here came from the source mark set, so the
             // destination field is now part of the update.
@@ -285,8 +290,19 @@ impl Value {
         Ok(())
     }
 
-    /// Iterate every leaf field's path (depth-first §5.4 order).
+    /// Iterate every field path — structure nodes AND leaves — in
+    /// pvData bit order, excluding the root.
+    ///
+    /// Mirrors pvxs `Value::iall()` (testdata.cpp:159-178): an
+    /// `NTScalar` yields 9 descendants, including the `alarm` and
+    /// `timeStamp` structure nodes, not only scalar leaves. Use
+    /// [`Self::iter_all_leaves`] for leaf-only iteration.
     pub fn iter_all(&self) -> impl Iterator<Item = String> + '_ {
+        walk_all_paths(&self.desc, "").into_iter()
+    }
+
+    /// Iterate only leaf field paths (no structure nodes), depth-first.
+    pub fn iter_all_leaves(&self) -> impl Iterator<Item = String> + '_ {
         walk_leaf_paths(&self.desc, "").into_iter()
     }
 
@@ -298,9 +314,16 @@ impl Value {
         }
     }
 
-    /// Iterate every currently-marked leaf path.
+    /// Iterate every currently-marked field path, structure nodes
+    /// included, in bit order.
+    ///
+    /// pvxs `imarked()` reports a marked structure node alongside its
+    /// leaves (testdata.cpp:180-209): marking `alarm` makes `imarked()`
+    /// see the `alarm` node plus its three leaves. A bare structure-node
+    /// mark is therefore visible here and flows through
+    /// [`Self::assign`], where the previous leaf-only walk dropped it.
     pub fn iter_marked(&self) -> Vec<String> {
-        walk_leaf_paths(&self.desc, "")
+        walk_all_paths(&self.desc, "")
             .into_iter()
             .filter(|p| self.is_marked(p))
             .collect()
@@ -457,6 +480,31 @@ fn default_scalar(t: ScalarType) -> ScalarValue {
         ScalarType::Double => ScalarValue::Double(0.0),
         ScalarType::String => ScalarValue::String(String::new()),
     }
+}
+
+/// Walk every field path — structure nodes and leaves — in pvData bit
+/// order (§5.4), excluding the root. Each node's path is emitted before
+/// its descendants, matching the depth-first bit numbering in
+/// [`FieldDesc::bit_for_path`]: e.g. an `NTScalar` yields `value`,
+/// `alarm`, `alarm.severity`, …, `timeStamp`, `timeStamp.secondsPastEpoch`, …
+/// — pvxs `iall()`'s 9 descendants.
+fn walk_all_paths(desc: &FieldDesc, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let FieldDesc::Structure { fields, .. } = desc {
+        for (name, child) in fields {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            // The node itself occupies a bit before any of its children.
+            out.push(path.clone());
+            if matches!(child, FieldDesc::Structure { .. }) {
+                out.extend(walk_all_paths(child, &path));
+            }
+        }
+    }
+    out
 }
 
 /// Walk leaf paths for `desc` (depth-first §5.4).
@@ -743,13 +791,33 @@ mod tests {
     }
 
     #[test]
-    fn iter_all_walks_depth_first() {
+    fn iter_all_includes_structure_nodes_in_bit_order() {
+        // pvxs iall() = 9 descendants for NTScalar (the `alarm` and
+        // `timeStamp` structure nodes plus 7 scalar leaves), in bit order.
         let v = make_nt_int();
         let all: Vec<String> = v.iter_all().collect();
-        // pvxs expects 9 leaves for NTScalar(Int) without display/control.
-        assert_eq!(all.len(), 7);
-        assert_eq!(all[0], "value");
-        assert_eq!(all[1], "alarm.severity");
+        assert_eq!(
+            all,
+            vec![
+                "value",
+                "alarm",
+                "alarm.severity",
+                "alarm.status",
+                "alarm.message",
+                "timeStamp",
+                "timeStamp.secondsPastEpoch",
+                "timeStamp.nanoseconds",
+                "timeStamp.userTag",
+            ]
+        );
+    }
+
+    #[test]
+    fn iter_all_leaves_excludes_structure_nodes() {
+        let v = make_nt_int();
+        let leaves: Vec<String> = v.iter_all_leaves().collect();
+        assert_eq!(leaves.len(), 7);
+        assert!(!leaves.contains(&"alarm".to_string()));
     }
 
     #[test]
@@ -759,6 +827,33 @@ mod tests {
         v.mark("alarm.message").unwrap();
         let marked = v.iter_marked();
         assert_eq!(marked, vec!["value", "alarm.message"]);
+    }
+
+    #[test]
+    fn iter_marked_reports_marked_structure_node() {
+        // pvxs: marking `alarm` makes imarked() see the alarm node; the
+        // leaves stay unmarked unless marked individually.
+        let mut v = make_nt_int();
+        v.mark("alarm").unwrap();
+        assert_eq!(v.iter_marked(), vec!["alarm"]);
+        assert!(v.is_marked("alarm"));
+        assert!(!v.is_marked("alarm.severity"));
+    }
+
+    #[test]
+    fn assign_copies_marked_structure_subtree() {
+        // A bare structure-level mark transfers the whole subtree.
+        let mut src = make_nt_int();
+        src.set("alarm.severity", 3i32).unwrap();
+        src.set("alarm.status", 1i32).unwrap();
+        src.unmark("alarm.severity").unwrap();
+        src.unmark("alarm.status").unwrap();
+        src.mark("alarm").unwrap(); // only the structure node is marked
+        let mut dst = make_nt_int();
+        dst.assign(&src).unwrap();
+        assert_eq!(dst.get_as::<i32>("alarm.severity").unwrap(), 3);
+        assert_eq!(dst.get_as::<i32>("alarm.status").unwrap(), 1);
+        assert!(dst.is_marked("alarm"));
     }
 
     #[test]

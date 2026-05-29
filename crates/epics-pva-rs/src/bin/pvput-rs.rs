@@ -78,8 +78,11 @@ struct Args {
     ///   `pvput <PV> <size/ignored> <value> [<value> ...]`
     ///   `pvput <PV> <field>=<value> ...`
     ///   `pvput <PV> <json>`
-    /// Today the Rust client supports the first and third forms via
-    /// `pvput`/`pvput_with_field_request`.
+    /// The bare forms are classified against the server PUT prototype:
+    /// a scalar-array `.value` drops the leading `<size/ignored>` token
+    /// and writes the rest (a lone `[...]` token is the JSON-array
+    /// shortcut), and a scalar `.value` takes exactly one token —
+    /// matching pvAccessCPP `pvput.cpp:144-178`.
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     values: Vec<String>,
 }
@@ -166,10 +169,15 @@ async fn main() {
                 .pvput_fields(&pv_name, assignments, request.as_ref())
                 .await
         }
-        PutInput::Bare(value_str) => match &request {
-            None => client.pvput(&pv_name, value_str).await,
-            Some(req) => client.pvput_with_request(&pv_name, req, value_str).await,
-        },
+        // Bare positional tokens are classified against the server PUT
+        // prototype inside the client (legacy `<size> <v>...` array form
+        // + `[...]` shortcut), so the raw token list is forwarded rather
+        // than pre-joined into one string. pvAccessCPP pvput.cpp:144-178.
+        PutInput::Bare(tokens) => {
+            client
+                .pvput_tokens(&pv_name, tokens, request.as_ref())
+                .await
+        }
     };
     if let Err(e) = put_result {
         eprintln!("error: {e}");
@@ -246,9 +254,12 @@ fn check_provider(provider: &str) -> Result<(), String> {
 /// the two forms must not be mixed.
 #[derive(Debug)]
 enum PutInput {
-    /// Single bare value (possibly space-joined array tokens), written
-    /// to `.value`.
-    Bare(String),
+    /// One or more bare positional tokens written to `.value`. The
+    /// tokens are NOT joined here: the array-vs-scalar decision (and
+    /// the legacy "first token is a length to drop" rule) needs the
+    /// server PUT prototype, so the raw list is carried into the client
+    /// and classified there. pvAccessCPP `pvput.cpp:144-178`.
+    Bare(Vec<String>),
     /// One or more `field=value` assignments, written as a delta.
     Fields(Vec<(String, String)>),
 }
@@ -258,8 +269,10 @@ enum PutInput {
 /// then *every* token must be `<field>=<value>`, else it is an error.
 fn parse_put_args(values: &[String]) -> Result<PutInput, String> {
     if !values.iter().any(|v| v.contains('=')) {
-        // No assignment syntax — legacy bare/array value joined by space.
-        return Ok(PutInput::Bare(values.join(" ")));
+        // No assignment syntax — legacy bare/positional-array form. The
+        // tokens are carried verbatim; the client classifies them once
+        // the PUT prototype is known (pvAccessCPP pvput.cpp:144-178).
+        return Ok(PutInput::Bare(values.to_vec()));
     }
     let mut assignments = Vec::with_capacity(values.len());
     for tok in values {
@@ -304,15 +317,22 @@ mod tests {
     #[test]
     fn bare_single_value_maps_to_value() {
         match parse_put_args(&v(&["42"])).unwrap() {
-            PutInput::Bare(s) => assert_eq!(s, "42"),
+            PutInput::Bare(toks) => assert_eq!(toks, vec!["42".to_string()]),
             PutInput::Fields(_) => panic!("single bare token must be Bare"),
         }
     }
 
+    /// Bare positional tokens are carried verbatim (NOT joined): the
+    /// legacy `<size> <value>...` array form needs the prototype to
+    /// decide that the first token is a length to drop, so classification
+    /// is deferred to the client (pvAccessCPP pvput.cpp:171-178).
     #[test]
-    fn bare_array_tokens_join_with_space() {
-        match parse_put_args(&v(&["1", "2", "3"])).unwrap() {
-            PutInput::Bare(s) => assert_eq!(s, "1 2 3"),
+    fn bare_array_tokens_carried_verbatim() {
+        match parse_put_args(&v(&["3", "1.0", "2.0"])).unwrap() {
+            PutInput::Bare(toks) => assert_eq!(
+                toks,
+                vec!["3".to_string(), "1.0".to_string(), "2.0".to_string()]
+            ),
             PutInput::Fields(_) => panic!("no '=' tokens must be Bare"),
         }
     }

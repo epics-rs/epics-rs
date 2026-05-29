@@ -934,6 +934,49 @@ impl PvaClient {
         op_put(&ch, value_str, self.inner.timeout).await
     }
 
+    /// PUT the legacy pvAccessCPP positional bare-token form
+    /// (`pvput <PV> <size/ignored> <value> [<value>...]`), optionally
+    /// with a custom pvRequest. The token list is carried verbatim and
+    /// classified against the PUT prototype the server returns: a
+    /// scalar-array `.value` drops the leading compatibility length and
+    /// writes the rest, a lone `[...]` token is the JSON-array
+    /// shortcut, and a scalar `.value` takes exactly one token. pvxs /
+    /// pvAccessCPP `pvtoolsSrc/pvput.cpp:144-178` parity.
+    pub async fn pvput_tokens(
+        &self,
+        pv_name: &str,
+        tokens: &[String],
+        request: Option<&crate::pv_request::PvRequestExpr>,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        match request {
+            None => {
+                crate::client_native::ops_v2::op_put_tokens(&ch, tokens, None, self.inner.timeout)
+                    .await
+            }
+            Some(req) => {
+                let big_endian = matches!(
+                    crate::client_native::ops_v2::ensure_active_with_op_timeout(
+                        &ch,
+                        self.inner.timeout
+                    )
+                    .await?
+                    .0
+                    .byte_order,
+                    crate::proto::ByteOrder::Big
+                );
+                let bytes = req.encode(big_endian);
+                crate::client_native::ops_v2::op_put_tokens(
+                    &ch,
+                    tokens,
+                    Some(&bytes),
+                    self.inner.timeout,
+                )
+                .await
+            }
+        }
+    }
+
     /// Value-only read-modify-write — fetch the channel's `.value`
     /// subfield, hand it to `build` as a mutable [`PvField`], then PUT
     /// the modified value back. Mirrors pvxs

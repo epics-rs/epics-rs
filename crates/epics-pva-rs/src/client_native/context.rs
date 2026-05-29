@@ -1729,15 +1729,28 @@ impl PvaClient {
             }
             let frame_res = tokio::time::timeout(op_timeout, rx).await;
             let value = match frame_res {
-                Ok(Ok(frame)) => match super::decode::decode_op_response(&frame, Some(&intro)) {
-                    Ok(OpResponse::Data(d)) if d.status.is_success() => Ok(d.value),
-                    Ok(OpResponse::Data(d)) => {
-                        Err(PvaError::Protocol(format!("warm GET data: {:?}", d.status)))
-                    }
-                    Ok(other) => Err(PvaError::Protocol(format!(
-                        "expected GET data, got {other:?}"
-                    ))),
-                    Err(e) => Err(e),
+                // Decode through the same connection-scoped `TypeCache` the
+                // warm op's circuit owns, so a GET DATA value carrying an
+                // `any`/`variant` `0xFE <slot>` back-reference resolves
+                // against the slot a prior frame defined (pvxs reuses one
+                // `rxRegistry` for every value, `clientget.cpp:445-451`).
+                // If the circuit is already gone the warm op cannot complete.
+                Ok(Ok(frame)) => match warm.server.upgrade() {
+                    Some(srv) => match super::decode::decode_op_response_cached(
+                        &frame,
+                        Some(&intro),
+                        &mut srv.type_cache().lock(),
+                    ) {
+                        Ok(OpResponse::Data(d)) if d.status.is_success() => Ok(d.value),
+                        Ok(OpResponse::Data(d)) => {
+                            Err(PvaError::Protocol(format!("warm GET data: {:?}", d.status)))
+                        }
+                        Ok(other) => Err(PvaError::Protocol(format!(
+                            "expected GET data, got {other:?}"
+                        ))),
+                        Err(e) => Err(e),
+                    },
+                    None => Err(PvaError::Protocol("warm GET server gone".into())),
                 },
                 Ok(Err(_)) => Err(PvaError::Protocol("warm GET channel closed".into())),
                 Err(_) => Err(PvaError::Timeout),

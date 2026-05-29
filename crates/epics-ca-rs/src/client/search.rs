@@ -194,6 +194,25 @@ fn max_search_period_secs() -> f64 {
 /// With the C-faithful period (default 300 s, lower-limited at
 /// 60 s — see [`max_search_period_secs`]) the tick is always
 /// `>= 60/30 = 2 s`; the default 300 s yields a 10 s tick.
+///
+/// DESIGN NOTE — intentional cadence deviation from libca. Upstream CA
+/// seeds each channel's UDP search timer from `minRoundTripEstimate`
+/// (32 ms; `epics-base:modules/ca/src/client/udpiiu.h:85`) and doubles
+/// the period per miss — `(1 << index) * RTT`
+/// (`searchTimer.cpp:391-395`) — so a lost initial SEARCH is re-sent
+/// several times within the first second, with `maxSearchPeriod` acting
+/// only as the cap on that exponential ladder. This client deliberately
+/// does NOT replicate the RTT ladder: it uses the max-period-derived
+/// 30-bucket ring as the *normal* cadence, trading libca's aggressive
+/// sub-second early retries for bucketed load shaping (a bounded,
+/// even-rate retransmit volume across many channels). The operational
+/// cost is that a dropped *initial* UDP SEARCH waits one bucket tick
+/// (seconds-to-tens-of-seconds at the default period) before its first
+/// retry, which can lengthen short client-side discovery waits such as
+/// `caget -w`. Fast discovery is instead recovered out-of-band by the
+/// beacon-poke `FAST_TICK` path. If libca-style short-wait discovery
+/// becomes a goal, the fix is an RTT-derived early-retry path for
+/// `Initial` searches, not a change to this normal-cadence tick.
 fn normal_tick() -> Duration {
     let period_secs = max_search_period_secs();
     Duration::from_secs_f64(period_secs / N_SEARCH_BUCKETS as f64)

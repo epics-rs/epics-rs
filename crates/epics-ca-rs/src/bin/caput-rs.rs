@@ -229,15 +229,26 @@ async fn main() {
             (false, None) => ch.get_with_timeout(timeout).await.map(|(_t, v)| (v, None)),
         }
     };
-    let (old_value, old_snap) = match read_display(ch.clone()).await {
-        Ok(pair) => pair,
-        Err(CaError::Timeout) => {
-            eprintln!("Read operation timed out: PV data was not read.");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+    // C caput.c:532-535 gates the pre-put "Old :" read+print on
+    // `if (format != terse)`. Terse mode prints only the new value, so the
+    // pre-put GET must NOT be issued: C never issues it, and a PV that is slow
+    // to read, read-denied before a write-side access transition, or backed by
+    // an expensive/side-effecting read path must still proceed to the write.
+    // The post-put read below is kept in every mode (C still calls caget()
+    // after the put, caput.c:583; terse only suppresses the `New :` label).
+    let (old_value, old_snap) = if args.terse {
+        (None, None)
+    } else {
+        match read_display(ch.clone()).await {
+            Ok((v, s)) => (Some(v), s),
+            Err(CaError::Timeout) => {
+                eprintln!("Read operation timed out: PV data was not read.");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
     };
 
@@ -307,7 +318,12 @@ async fn main() {
         fmt.field_separator = c;
     }
     let sep = fmt.field_separator;
-    let old_rendered = format_value(&old_value, &fmt, None, false);
+    // In terse mode `old_value` is `None` (no pre-put read was issued) and the
+    // rendered old value is unused; non-terse modes always carry `Some`.
+    let old_rendered = old_value
+        .as_ref()
+        .map(|v| format_value(v, &fmt, None, false))
+        .unwrap_or_default();
     let new_rendered = format_value(&new_value, &fmt, None, false);
     let is_scalar = new_value.count() == 1;
     let pad = |name: &str| -> String {
@@ -475,8 +491,9 @@ fn raw_from_escaped_string(s: &str) -> String {
 /// so the array path takes precedence over `-S`. String- and char-array-
 /// destined values are escape-decoded via [`raw_from_escaped`]; numeric
 /// values are parsed from the raw token (C runs `epicsStrtod` on the
-/// original argv). Non-fatal `-a` count-token mismatches warn on stderr;
-/// fatal cases return `Err` with the full message for the caller to print.
+/// original argv). In `-a` mode the leading count token is skipped
+/// without parsing (C `caput.c:413-418`); a per-element parse failure
+/// returns `Err` with the full message for the caller to print.
 fn build_write_value(
     values: &[String],
     native_type: epics_ca_rs::DbFieldType,
@@ -487,32 +504,16 @@ fn build_write_value(
 ) -> Result<WriteValue, String> {
     if array_mode {
         // C `caput -a` (caput.c:413-418): after the PV name it skips the
-        // count token (`optind++`) and uses ALL remaining values — the
-        // count number is informational only. `values[0]` is the count
-        // token, `[1..]` the actual values.
+        // count token (`optind++`) WITHOUT parsing it, then derives the
+        // real count from `argc - optind`. The token is purely
+        // informational positional-compatibility syntax — C never
+        // validates it against the supplied values, never errors on a
+        // non-numeric token, and reaches the write path with `count == 0`
+        // when no values follow. Mirror that: skip `values[0]` silently
+        // and let `values[1..]` (possibly empty) flow to the write, so a
+        // zero-count put is decided by the server/libca, not by CLI
+        // argument parsing.
         let tokens = &values[1..];
-        if let Ok(want) = values[0].parse::<usize>() {
-            if want != tokens.len() {
-                eprintln!(
-                    "caput-rs: warning: -a count {} differs from {} values supplied; \
-                     using all {} (C-parity)",
-                    want,
-                    tokens.len(),
-                    tokens.len()
-                );
-            }
-        } else {
-            // C does not parse the count token at all — a non-numeric
-            // token is silently skipped. Mirror that, no hard error.
-            eprintln!(
-                "caput-rs: warning: -a count token '{}' is not a number; \
-                 ignored (C-parity)",
-                values[0]
-            );
-        }
-        if tokens.is_empty() {
-            return Err("caput-rs: -a requires at least one value after the count token".into());
-        }
         // ENUM waveform special-casing, parallel to the scalar path:
         // unless `-n` forces numeric, route to a DBR_STRING array for
         // server-side menu resolution when `-s` is set or any element is
@@ -796,6 +797,45 @@ mod tests {
         match r {
             Ok(WriteValue::Typed(EpicsValue::String(s))) => assert_eq!(s, "A\\q"),
             other => panic!("expected escape-decoded String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_count_token_is_skipped_without_parsing_or_error() {
+        // C `caput -a` (caput.c:413-418) skips the count token without
+        // parsing it: the value is taken from `argc - optind`. A count
+        // that disagrees with the supplied values, a non-numeric count,
+        // and a count of zero must all reach the write path silently —
+        // no warning, no CLI-side rejection.
+        // `-a PV 999 1 2`: count 999 vs 2 values → use both, no error.
+        match build_write_value(
+            &vals(&["999", "1", "2"]),
+            DbFieldType::Long,
+            false,
+            false,
+            false,
+            true,
+        ) {
+            Ok(WriteValue::Typed(EpicsValue::LongArray(a))) => assert_eq!(a, vec![1, 2]),
+            other => panic!("count mismatch must use all values, got {other:?}"),
+        }
+        // `-a PV not-a-count 1 2`: non-numeric count token skipped.
+        match build_write_value(
+            &vals(&["not-a-count", "1", "2"]),
+            DbFieldType::Long,
+            false,
+            false,
+            false,
+            true,
+        ) {
+            Ok(WriteValue::Typed(EpicsValue::LongArray(a))) => assert_eq!(a, vec![1, 2]),
+            other => panic!("non-numeric count token must be ignored, got {other:?}"),
+        }
+        // `-a PV 0`: zero trailing values reaches the write path as an
+        // empty array (count == 0), decided by the server — not a CLI error.
+        match build_write_value(&vals(&["0"]), DbFieldType::Long, false, false, false, true) {
+            Ok(WriteValue::Typed(EpicsValue::LongArray(a))) => assert!(a.is_empty()),
+            other => panic!("zero-count -a must reach the write path empty, got {other:?}"),
         }
     }
 

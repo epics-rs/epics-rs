@@ -16,12 +16,15 @@
 //! each scheduled `get`/`put` spawns its op immediately (it is
 //! "in flight" the moment it is scheduled, matching libca), and the
 //! group tracks the outstanding tasks. [`Self::block`] takes `&mut self`
-//! and waits only for the requests issued since the last successful
-//! `block`/`reset` (libca clears the outstanding set on a successful
-//! `ca_sg_block`); a timeout leaves them outstanding so the caller can
-//! [`Self::test`] / retry / [`Self::reset`]. [`Self::test`] reports
-//! completion without consuming the group, [`Self::reset`] aborts and
-//! discards the outstanding batch, and [`Self::stat`] exposes the
+//! and waits only for the requests issued since the last `block`/`reset`.
+//! libca `ca_sg_block` discards the batch on **every** return — success
+//! *and* timeout — because it unconditionally calls `sync_group_reset`
+//! after `CASG::block` returns (`syncgrp.cpp:128-150`); the next
+//! `ca_sg_block` then waits only for ops issued afterward (`cadef.h`).
+//! So a timed-out `block` here also empties the batch: retry means
+//! scheduling fresh ops, not re-blocking the old ones. [`Self::test`]
+//! reports completion without consuming the group, [`Self::reset`] aborts
+//! and discards the outstanding batch, and [`Self::stat`] exposes the
 //! outstanding/completed counts.
 
 use std::time::Duration;
@@ -131,18 +134,21 @@ impl SyncGroup {
     }
 
     /// Wait until every op in the current batch completes or `timeout`
-    /// elapses. Mirrors libca `ca_sg_block(gid, timeout)`: on success
-    /// the outstanding set is cleared and the results returned (the
-    /// group is then reusable for a fresh batch); on timeout the ops
-    /// remain outstanding (`Err(Timeout)`) for [`Self::test`] / retry /
-    /// [`Self::reset`].
+    /// elapses. Mirrors libca `ca_sg_block(gid, timeout)`, which discards
+    /// the batch on **every** return path: on success the results are
+    /// returned, and on timeout `Err(Timeout)` is returned — but in both
+    /// cases the outstanding set is cleared (C unconditionally calls
+    /// `sync_group_reset` → `CASG::reset`, which cancels pending IO and
+    /// destroys completed IO, `syncgrp.cpp:128-150` / `CASG.cpp:132-170`).
+    /// After a timeout, [`Self::test`] therefore reports
+    /// [`SyncGroupStatus::Done`], [`Self::stat`] shows zero outstanding,
+    /// and a later `block` waits only for freshly scheduled ops — retry
+    /// means scheduling a new batch, not re-blocking the timed-out one.
     pub async fn block(&mut self, timeout: Duration) -> CaResult<SyncGroupResults> {
         // The tasks already run concurrently (spawned at schedule time),
         // so awaiting them in order just *collects* results — wall time
         // is bounded by the slowest op, and the single outer timeout
-        // fires if that exceeds `timeout`. Each awaited handle is
-        // borrowed by `&mut`, so a timeout leaves every still-running
-        // task — and its handle — intact in `self.ops`.
+        // fires if that exceeds `timeout`.
         let collect = async {
             for op in self.ops.iter_mut() {
                 if op.done.is_none() {
@@ -175,9 +181,17 @@ impl SyncGroup {
                 }
                 Ok(SyncGroupResults { gets, puts })
             }
-            // Timeout: collected ops keep `done = Some`, the rest stay in
-            // flight; the batch remains for a later block/test/reset.
-            Err(_) => Err(CaError::Timeout),
+            // Timeout: C ca_sg_block resets the group on the timeout return
+            // path too (syncgrp.cpp:147-149), so discard the whole batch
+            // here — abort the still-running tasks and empty `self.ops`
+            // through the single batch-discard owner, `reset`. This is the
+            // invariant "block always ends the current batch": after a
+            // timeout the group is reusable and the next block waits only
+            // for ops scheduled afterward.
+            Err(_) => {
+                self.reset();
+                Err(CaError::Timeout)
+            }
         }
     }
 
@@ -286,28 +300,42 @@ mod tests {
         assert_eq!(r.gets.len(), 1);
     }
 
-    /// `reset` after a timeout discards the outstanding batch and the
-    /// group reports complete/empty again.
+    /// C parity (CA-RS-2026-05-28-16): `block` discards the batch on the
+    /// timeout return path, just like a successful return. After
+    /// `block(short)` returns `Timeout`, the group is already empty —
+    /// `test() == Done`, `stat().outstanding == 0`, no explicit `reset`
+    /// needed — matching libca `ca_sg_block`'s unconditional
+    /// `sync_group_reset` (syncgrp.cpp:147-149).
     #[tokio::test]
-    async fn reset_after_timeout_discards_outstanding() {
+    async fn block_timeout_discards_batch_like_c() {
         let mut g = SyncGroup::new();
         g.push_delayed_get(60_000, 1); // never completes in the test window
         let r = g.block(Duration::from_millis(20)).await;
         assert!(matches!(r, Err(CaError::Timeout)), "block times out");
-        assert_eq!(
-            g.stat().outstanding,
-            1,
-            "op still outstanding after timeout"
-        );
-        g.reset();
-        assert!(g.is_empty());
-        assert_eq!(g.test(), SyncGroupStatus::Done);
+
+        // The timed-out batch is discarded WITHOUT an explicit reset.
+        assert!(g.is_empty(), "timeout empties the batch");
+        assert_eq!(g.test(), SyncGroupStatus::Done, "test() reports IODONE");
         assert_eq!(
             g.stat(),
             SyncGroupStat {
                 outstanding: 0,
                 completed: 0
-            }
+            },
+            "no outstanding ops after a timed-out block"
+        );
+
+        // A later block waits only for freshly scheduled ops — it does NOT
+        // re-collect the timed-out task (which C had already discarded).
+        g.push_delayed_get(10, 7);
+        let r2 = g
+            .block(Duration::from_secs(2))
+            .await
+            .expect("fresh batch completes");
+        assert_eq!(r2.gets.len(), 1, "only the new op is awaited");
+        assert!(
+            matches!(r2.gets[0], Ok((_, EpicsValue::Long(7)))),
+            "the new op's result, not the discarded one"
         );
     }
 }

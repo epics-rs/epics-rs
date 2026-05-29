@@ -57,6 +57,49 @@ pub fn enum_string_readback_dbr(
     }
 }
 
+/// Readback DBR type for a `caget -s` / `camonitor -s` (`floatAsString`)
+/// request on a native FLOAT/DOUBLE field.
+///
+/// C `caget`/`camonitor` set `dbrType = DBR_TIME_STRING` when `floatAsString`
+/// is set and the native type is FLOAT or DOUBLE (`caget.c:183-187`,
+/// `camonitor.c:162-166`), so the SERVER performs the float→string
+/// conversion — honoring record/server precision — instead of the client
+/// formatting a numeric value locally. C always selects the TIME-class
+/// string here (it starts from `dbf_type_to_DBR_TIME`), so this returns
+/// `DBR_TIME_STRING` regardless of output mode; a plain readback simply
+/// ignores the carried timestamp/alarm.
+///
+/// Returns `None` for every non-FLOAT/DOUBLE field (ENUM is handled by
+/// [`enum_string_readback_dbr`], which takes precedence per C's `if/else if`).
+pub fn float_as_string_readback_dbr(native: DbFieldType) -> Option<u16> {
+    matches!(native, DbFieldType::Float | DbFieldType::Double).then_some(DBR_TIME_STRING)
+}
+
+/// TIME-class readback DBR type for a *subscription*, applying the C CLI
+/// substitution chain in source order (`camonitor.c:155-166`): an ENUM
+/// field honours `-n` via [`enum_string_readback_dbr`]
+/// (`enum_as_string` → `DBR_TIME_STRING`); otherwise a FLOAT/DOUBLE under
+/// `-s` becomes `DBR_TIME_STRING` via [`float_as_string_readback_dbr`];
+/// otherwise the field's native TIME-class type. C tests the ENUM case
+/// first and the float case in the `else if`, so the ENUM substitution
+/// takes precedence — preserved here by `enum_string_readback_dbr(..).or_else(..)`.
+///
+/// Single owner of the subscribe-time derivation so the initial
+/// `Subscribe` and the `NativeTypeChanged` restore stay in agreement.
+pub fn subscription_readback_dbr(
+    native: DbFieldType,
+    enum_as_string: bool,
+    float_as_string: bool,
+) -> u16 {
+    enum_string_readback_dbr(native, true, enum_as_string)
+        .or_else(|| {
+            float_as_string
+                .then(|| float_as_string_readback_dbr(native))
+                .flatten()
+        })
+        .unwrap_or_else(|| native.time_dbr_type())
+}
+
 use state::ChannelInner;
 
 use std::sync::Arc;
@@ -355,6 +398,12 @@ enum CoordRequest {
         /// coordinator at connect-time type derivation, so it works even
         /// though the subscribe is issued before the channel connects.
         enum_as_string: bool,
+        /// When set, a FLOAT/DOUBLE field is subscribed in its
+        /// `DBR_TIME_STRING` form so the server renders the value to a
+        /// string at record precision (`camonitor -s` / `floatAsString`;
+        /// C `camonitor.c:162-166`). Folded into the readback derivation
+        /// after the ENUM case, mirroring C's `else if`.
+        float_as_string: bool,
         /// the coordinator owns the `subid` table, so it
         /// allocates the id (probing live subscriptions) and returns
         /// it here rather than accepting one minted at the call site.
@@ -2387,6 +2436,23 @@ impl CaChannel {
         mask: u16,
         enum_as_string: bool,
     ) -> CaResult<MonitorHandle> {
+        self.subscribe_with_mask_readback(deadband, mask, enum_as_string, false)
+            .await
+    }
+
+    /// Like [`Self::subscribe_with_mask_enum_as_string`], but also honours
+    /// `float_as_string`: when set, a FLOAT/DOUBLE field is monitored in
+    /// its `DBR_TIME_STRING` form so the server renders the value to a
+    /// string at record precision (`camonitor -s` / `floatAsString`; C
+    /// `camonitor.c:162-166`). The ENUM substitution takes precedence over
+    /// the float one, matching C's `if (ENUM) … else if (floatAsString …)`.
+    pub async fn subscribe_with_mask_readback(
+        &self,
+        deadband: f64,
+        mask: u16,
+        enum_as_string: bool,
+        float_as_string: bool,
+    ) -> CaResult<MonitorHandle> {
         let env = epics_base_rs::runtime::env::get("EPICS_CA_MONITOR_QUEUE")
             .and_then(|s| s.parse::<usize>().ok());
         let queue_size = resolve_monitor_queue_size(env);
@@ -2401,6 +2467,7 @@ impl CaChannel {
             callback_tx,
             coalesce_slot: coalesce_slot.clone(),
             enum_as_string,
+            float_as_string,
             reply: reply_tx,
         });
 
@@ -2887,22 +2954,21 @@ async fn run_coordinator(
                                 .push(reply);
                         }
                     }
-                    CoordRequest::Subscribe { cid, mask, deadband, callback_tx, coalesce_slot, enum_as_string, reply } => {
+                    CoordRequest::Subscribe { cid, mask, deadband, callback_tx, coalesce_slot, enum_as_string, float_as_string, reply } => {
                         if let Some(ch) = channels.get(&cid) {
                             let server_addr = ch.server_addr.unwrap_or_else(|| {
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
                             });
                             let priority = ch.priority;
                             let connected = ch.state == ChannelState::Connected;
-                            // `time_dbr_type()` (not `as u16 + 14`) for
-                            // consistency with the rest of the codebase.
-                            // `enum_as_string` (camonitor default) substitutes
-                            // DBR_TIME_STRING for an ENUM field so values
-                            // arrive as state labels (C camonitor.c:156-160).
-                            let data_type = ch.native_type.map(|t| {
-                                enum_string_readback_dbr(t, true, enum_as_string)
-                                    .unwrap_or_else(|| t.time_dbr_type())
-                            });
+                            // Single owner of the subscribe-time readback
+                            // derivation: ENUM honours -n (camonitor default
+                            // DBR_TIME_STRING), else FLOAT/DOUBLE under -s
+                            // becomes DBR_TIME_STRING, else native TIME type
+                            // (C camonitor.c:155-166).
+                            let data_type = ch
+                                .native_type
+                                .map(|t| subscription_readback_dbr(t, enum_as_string, float_as_string));
                             let count = ch.native_type.map(|_| ch.element_count);
 
                             // allocate the subid here, where the
@@ -2920,11 +2986,13 @@ async fn run_coordinator(
                                 // The public subscribe API auto-derives the
                                 // DBR type from the channel's native type, so
                                 // it must re-derive on NativeTypeChanged. The
-                                // `enum_as_string` preference is carried on
-                                // the record so the restore re-derivation
-                                // applies the same ENUM→STRING substitution.
+                                // `enum_as_string` / `float_as_string`
+                                // preferences are carried on the record so the
+                                // restore re-derivation applies the same
+                                // substitution chain.
                                 type_user_supplied: false,
                                 enum_as_string,
+                                float_as_string,
                                 mask,
                                 server_addr,
                                 priority,
@@ -4222,6 +4290,68 @@ mod enum_readback_tests {
         assert_eq!(
             enum_string_readback_dbr(DbFieldType::Long, false, true),
             None
+        );
+    }
+
+    // `-s` (floatAsString) readback substitution. Boundary axes:
+    // FLOAT/DOUBLE vs other native types (C only substitutes the two
+    // float kinds, caget.c:183-187 / camonitor.c:162-166).
+    #[test]
+    fn float_as_string_only_for_float_and_double() {
+        assert_eq!(
+            float_as_string_readback_dbr(DbFieldType::Float),
+            Some(DBR_TIME_STRING)
+        );
+        assert_eq!(
+            float_as_string_readback_dbr(DbFieldType::Double),
+            Some(DBR_TIME_STRING)
+        );
+        // Every non-float native type keeps its native path.
+        for t in [
+            DbFieldType::String,
+            DbFieldType::Short,
+            DbFieldType::Enum,
+            DbFieldType::Char,
+            DbFieldType::Long,
+        ] {
+            assert_eq!(float_as_string_readback_dbr(t), None, "{t:?}");
+        }
+    }
+
+    // The unified subscribe-time chain, by invariant boundary:
+    // ENUM-case-precedence × float-substitution × native fallback,
+    // mirroring C `if (ENUM) … else if (float …) … else native`.
+    #[test]
+    fn subscription_readback_chain_precedence() {
+        // ENUM + enum_as_string wins even when float_as_string is also set.
+        assert_eq!(
+            subscription_readback_dbr(DbFieldType::Enum, true, true),
+            DBR_TIME_STRING
+        );
+        // ENUM with `-n` (enum_as_string=false) keeps native ENUM TIME type
+        // regardless of float_as_string (ENUM is not a float kind).
+        assert_eq!(
+            subscription_readback_dbr(DbFieldType::Enum, false, true),
+            DbFieldType::Enum.time_dbr_type()
+        );
+        // FLOAT/DOUBLE under `-s` → DBR_TIME_STRING.
+        assert_eq!(
+            subscription_readback_dbr(DbFieldType::Float, false, true),
+            DBR_TIME_STRING
+        );
+        assert_eq!(
+            subscription_readback_dbr(DbFieldType::Double, false, true),
+            DBR_TIME_STRING
+        );
+        // FLOAT without `-s` → native TIME type (no substitution).
+        assert_eq!(
+            subscription_readback_dbr(DbFieldType::Double, false, false),
+            DbFieldType::Double.time_dbr_type()
+        );
+        // Non-float, non-enum native type is untouched by either flag.
+        assert_eq!(
+            subscription_readback_dbr(DbFieldType::Long, true, true),
+            DbFieldType::Long.time_dbr_type()
         );
     }
 }

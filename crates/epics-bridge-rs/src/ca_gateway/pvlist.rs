@@ -163,9 +163,17 @@ impl PvList {
     /// time (`gateAs.cc:488–509`):
     ///
     /// - Tokens that are already IP-address literals are kept verbatim.
-    /// - Hostnames are resolved via `tokio::net::lookup_host`; a hostname
-    ///   that resolves to multiple addresses expands into one IP entry per
-    ///   address.
+    /// - Hostnames are resolved via `tokio::net::lookup_host` and reduced to a
+    ///   **single IPv4 address — the first one returned**. C ca-gateway resolves
+    ///   each DENY FROM token through `aToIPAddr` → `hostToIPAddr`, which sets
+    ///   an `AF_INET` hint and breaks after the first `getaddrinfo` result
+    ///   (`osdSock.c:250-267`), then stores exactly one dotted-decimal IPv4
+    ///   address (`gateAs.cc:493-503`). Expanding a multi-homed name into one
+    ///   entry per address — including secondary A records and IPv6 — would
+    ///   deny strictly more peers than C, so we keep only the first IPv4 to
+    ///   match C's single-address selection. A name with no IPv4 record
+    ///   resolves to nothing in C (the `AF_INET` lookup fails) and is dropped
+    ///   here for the same reason.
     /// - A hostname that fails to resolve is logged at `WARN` level and
     ///   dropped from this rule's host set, mirroring C's pass-1 omission
     ///   (`gateAs.cc:504-507` — the unresolved host is simply not appended).
@@ -191,22 +199,23 @@ impl PvList {
                         from_hosts.push(token);
                         continue;
                     }
-                    // Hostname — resolve to IP(s). Append `:0` as the
-                    // required port sentinel for lookup_host.
+                    // Hostname — resolve to a single IPv4 address. Append `:0`
+                    // as the required port sentinel for lookup_host. C's
+                    // hostToIPAddr is AF_INET and keeps only the first result
+                    // (osdSock.c:250-267 / gateAs.cc:493-503), so take the
+                    // first IPv4 address and ignore the rest (including any
+                    // IPv6 records, which C's AF_INET lookup never returns).
                     match tokio::net::lookup_host(format!("{token}:0")).await {
                         Ok(addrs) => {
-                            let mut resolved_any = false;
-                            for sa in addrs {
-                                from_hosts.push(sa.ip().to_string());
-                                resolved_any = true;
-                            }
-                            if !resolved_any {
-                                tracing::warn!(
+                            match addrs.map(|sa| sa.ip()).find(std::net::IpAddr::is_ipv4) {
+                                Some(ip) => from_hosts.push(ip.to_string()),
+                                None => tracing::warn!(
                                     hostname = %token,
-                                    "pvlist DENY FROM: hostname resolved to no addresses \
-                                     — host dropped; if it is the rule's only host the \
-                                     rule collapses to a global deny (matches C gateAs.cc:540-556)"
-                                );
+                                    "pvlist DENY FROM: hostname resolved to no IPv4 address \
+                                     — host dropped (C hostToIPAddr is AF_INET-only); if it is \
+                                     the rule's only host the rule collapses to a global deny \
+                                     (matches C gateAs.cc:540-556)"
+                                ),
                             }
                         }
                         Err(e) => {
@@ -281,15 +290,28 @@ impl PvList {
     /// only global rules, because a host-targeted deny must not remove a
     /// PV that is still admissible for other hosts.
     pub fn match_name(&self, name: &str) -> Option<PvListMatch> {
-        // Find first matching ALLOW (or ALIAS) and first matching global
-        // DENY. Host-targeted DENY FROM rules do not participate here.
+        // Select the LAST-in-file matching ALLOW (or ALIAS) and the
+        // LAST-in-file matching global DENY, each from its own list.
+        // C ca-gateway keeps separate allow/deny `tsSLList`s and inserts
+        // every parsed rule at the HEAD (`tsSLList::add` — "add to the
+        // beginning of the list", tsSLList.h:62), then `findEntryInList`
+        // iterates from the head and returns the first hit
+        // (gateAs.cc:386-410). Head-insertion + front-iteration means the
+        // rule nearest the BOTTOM of the file wins — the documented
+        // bottom-to-top precedence (Gateway.html:694-696,746-747) where a
+        // later, more-specific rule overrides an earlier general one.
+        // Forward `.find()` selected the TOP-most match and inverted that
+        // precedence; `.rev().find()` reproduces C's bottom-most selection
+        // per list. Host-targeted DENY FROM rules do not participate here.
         let allow_match = self
             .entries
             .iter()
+            .rev()
             .find(|e| e.is_allow() && e.pattern().is_match(name));
         let deny_match = self
             .entries
             .iter()
+            .rev()
             .find(|e| e.is_global_deny() && e.pattern().is_match(name));
 
         let allow_decision: Option<PvListMatch> = allow_match.map(|e| match e {
@@ -407,22 +429,27 @@ pub fn parse_pvlist(content: &str) -> BridgeResult<PvList> {
             continue;
         }
 
-        // EVALUATION ORDER directive
-        if let Some(rest) = line.strip_prefix("EVALUATION ORDER") {
-            let rest = rest.trim();
-            if rest.eq_ignore_ascii_case("ALLOW, DENY") || rest.eq_ignore_ascii_case("ALLOW,DENY") {
-                list.order = EvaluationOrder::AllowDeny;
-            } else if rest.eq_ignore_ascii_case("DENY, ALLOW")
-                || rest.eq_ignore_ascii_case("DENY,ALLOW")
-            {
-                list.order = EvaluationOrder::DenyAllow;
-            } else {
-                return Err(BridgeError::GroupConfigError(format!(
-                    "line {}: invalid EVALUATION ORDER '{}'",
-                    lineno + 1,
-                    rest
-                )));
-            }
+        // ORDER directive. C ca-gateway does not special-case an
+        // "EVALUATION ORDER" prefix: it tokenizes every line uniformly into a
+        // pattern token + a command token, then matches the command with
+        // `strcasecmp(cmd,"ORDER")` (gateAs.cc:531-535,579). So the leading
+        // word ("EVALUATION") is just an ignored pattern token, the command
+        // and operands are matched case-insensitively, and the two operands
+        // are tokenized with `strtok(NULL,", \t\n")` (gateAs.cc:581-582) —
+        // comma and whitespace are interchangeable separators. Detecting the
+        // directive by "second token == ORDER" (rather than a literal
+        // uppercase prefix) reproduces that and keeps the requirement that a
+        // leading word precede ORDER, so `ORDER ALLOW DENY` is still a normal
+        // rule line (pattern "ORDER", keyword "ALLOW") exactly as in C.
+        let mut head = line.split_whitespace();
+        let _pattern_tok = head.next();
+        if head
+            .next()
+            .is_some_and(|cmd| cmd.eq_ignore_ascii_case("ORDER"))
+        {
+            // `head` now yields the operand tokens (after the pattern token and
+            // the ORDER command). Pass them on for comma/whitespace splitting.
+            list.order = parse_order_directive(head, lineno + 1)?;
             continue;
         }
 
@@ -460,37 +487,49 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
     let pattern = build_pattern(pattern_str, lineno)?;
 
     match keyword.to_ascii_uppercase().as_str() {
-        "ALLOW" => {
-            let asg = tokens.next().map(String::from);
-            let asl = tokens
-                .next()
-                .map(|s| {
-                    s.parse::<i32>().map_err(|e| {
-                        BridgeError::GroupConfigError(format!(
-                            "line {lineno}: invalid asl '{s}': {e}"
-                        ))
-                    })
-                })
-                .transpose()?;
+        // C ca-gateway (gateAs.cc:617-621) treats ALLOW, ALIAS, PATTERN and
+        // PV identically: all four insert a `gateAsEntry` into the same
+        // `allow_list` with the same ASG/ASL parsing. PATTERN and PV are
+        // therefore plain synonyms for ALLOW (they predate the ALLOW keyword
+        // and remain accepted for legacy pvlist files). Rejecting them broke
+        // load/reload of C-compatible pvlist files that use the older syntax.
+        "ALLOW" | "PATTERN" | "PV" => {
+            let (asg, asl) = parse_asg_asl(&mut tokens, lineno);
             Ok(PvListEntry::Allow { pattern, asg, asl })
         }
         "DENY" => {
-            // Optional FROM host1 host2 ...
-            let mut from_hosts = Vec::new();
-            if let Some(t) = tokens.next() {
-                if t.eq_ignore_ascii_case("FROM") {
-                    for h in tokens {
-                        // Stored as-is here; PvList::resolve_hosts() converts
-                        // hostnames to IP strings at load time,
-                        // mirroring C aToIPAddr (gateAs.cc:488-506).
-                        from_hosts.push(h.to_string());
-                    }
-                } else {
-                    return Err(BridgeError::GroupConfigError(format!(
-                        "line {lineno}: expected FROM after DENY, got '{t}'"
-                    )));
-                }
+            // `pattern DENY [FROM] [host ...]`. C ca-gateway (gateAs.cc:539-552,
+            // USE_DENYFROM branch):
+            //
+            //   if((hname=strtok(NULL,", \t\n")) && strcasecmp(hname,"FROM")==0)
+            //       hname=strtok(NULL,", \t\n");
+            //   if(hname) { do { ... } while((hname=strtok(NULL,", \t\n"))); }
+            //   else { /* global deny */ }
+            //
+            // Two C behaviors this reproduces:
+            //
+            // - `FROM` is OPTIONAL. The first token after DENY is consumed as
+            //   the `FROM` keyword ONLY when it matches case-insensitively;
+            //   otherwise it is the first host. So `PV.* DENY h1 h2` is a
+            //   host-scoped deny exactly like `PV.* DENY FROM h1 h2`. The old
+            //   code rejected the whole pvlist when `FROM` was omitted.
+            // - Hosts are tokenized with `strtok(NULL,", \t\n")`, so comma is a
+            //   delimiter just like whitespace; `h1,h2` is two hosts.
+            //   `split_whitespace` only split on whitespace, so each remaining
+            //   token is further split on commas with empties dropped, giving
+            //   `h1,h2`, `h1, h2`, and `h1 ,h2` the same host set.
+            //
+            // A bare `DENY` (no hosts) stays a global deny. Hosts are stored
+            // verbatim here; PvList::resolve_hosts() converts hostnames to IP
+            // strings at load time, mirroring C aToIPAddr (gateAs.cc:488-506).
+            let mut hosts = tokens
+                .flat_map(|t| t.split(','))
+                .filter(|s| !s.is_empty())
+                .peekable();
+            if hosts.peek().is_some_and(|h| h.eq_ignore_ascii_case("FROM")) {
+                hosts.next();
             }
+            let from_hosts: Vec<String> = hosts.map(String::from).collect();
             Ok(PvListEntry::Deny {
                 pattern,
                 from_hosts,
@@ -502,17 +541,7 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
                     "line {lineno}: ALIAS requires a target name"
                 ))
             })?;
-            let asg = tokens.next().map(String::from);
-            let asl = tokens
-                .next()
-                .map(|s| {
-                    s.parse::<i32>().map_err(|e| {
-                        BridgeError::GroupConfigError(format!(
-                            "line {lineno}: invalid asl '{s}': {e}"
-                        ))
-                    })
-                })
-                .transpose()?;
+            let (asg, asl) = parse_asg_asl(&mut tokens, lineno);
             Ok(PvListEntry::Alias {
                 pattern,
                 target_template: target.to_string(),
@@ -521,9 +550,88 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
             })
         }
         other => Err(BridgeError::GroupConfigError(format!(
-            "line {lineno}: unknown keyword '{other}', expected ALLOW/DENY/ALIAS"
+            "line {lineno}: unknown keyword '{other}', expected ALLOW/PATTERN/PV/DENY/ALIAS"
         ))),
     }
+}
+
+/// Parse the operands of an `[EVALUATION] ORDER <a>, <b>` directive.
+///
+/// C ca-gateway (gateAs.cc:580-595) reads exactly two operands with
+/// `strtok(NULL,", \t\n")` — so comma and whitespace are interchangeable
+/// separators — and matches each with `strcasecmp` against `ALLOW`/`DENY`.
+/// `ALLOW, DENY`, `ALLOW,DENY`, `allow deny`, and `DENY ALLOW` are therefore
+/// all accepted; only the two recognised orderings are valid. C reads just the
+/// first two operands and ignores any trailing tokens, so we do too.
+fn parse_order_directive<'a>(
+    operands: impl Iterator<Item = &'a str>,
+    lineno: usize,
+) -> BridgeResult<EvaluationOrder> {
+    // strtok ", \t\n": split each whitespace token further on commas, drop
+    // the empties a stray comma (e.g. `ALLOW ,DENY`) would produce.
+    let mut ops = operands
+        .flat_map(|t| t.split(','))
+        .filter(|s| !s.is_empty());
+    let a = ops.next();
+    let b = ops.next();
+    let (Some(a), Some(b)) = (a, b) else {
+        return Err(BridgeError::GroupConfigError(format!(
+            "line {lineno}: ORDER requires two operands (ALLOW, DENY or DENY, ALLOW)"
+        )));
+    };
+    if a.eq_ignore_ascii_case("ALLOW") && b.eq_ignore_ascii_case("DENY") {
+        Ok(EvaluationOrder::AllowDeny)
+    } else if a.eq_ignore_ascii_case("DENY") && b.eq_ignore_ascii_case("ALLOW") {
+        Ok(EvaluationOrder::DenyAllow)
+    } else {
+        Err(BridgeError::GroupConfigError(format!(
+            "line {lineno}: invalid ORDER operands '{a} {b}' \
+             (expected ALLOW, DENY or DENY, ALLOW)"
+        )))
+    }
+}
+
+/// Parse the optional trailing `[asg [asl]]` of an ALLOW/PATTERN/PV/ALIAS
+/// rule, mirroring C ca-gateway (gateAs.cc:609-613):
+///
+/// ```c
+/// if((asg=strtok(NULL," \t\n"))) {
+///     if((asl=strtok(NULL," \t\n")) && (sscanf(asl,"%d",&lev)!=1)) lev=1;
+/// } else { asg=default_group; lev=1; }
+/// ```
+///
+/// Two C behaviors this reproduces:
+///
+/// - The ASL token is read **only** when an ASG token precedes it (C reads
+///   `asl` inside the `if(asg)` block); a bare `pattern ALLOW` carries no ASG
+///   and no ASL.
+/// - An ASL token that is present but not an integer falls back to **level 1**
+///   (`sscanf(...)!=1 → lev=1`) instead of aborting. A single typo such as
+///   `PV.* ALLOW BeamGroup typo` keeps serving `PV.*` at ASL 1 in C; the
+///   previous `s.parse::<i32>()?` rejected the whole pvlist (or reload). The
+///   omitted-ASL and invalid-ASL cases both resolve to 1 — `Some(1)` here for
+///   the invalid case records the explicit fallback, `None` for the omitted
+///   case defaults to 1 via [`PvListMatch::effective_asl`].
+///
+/// Genuine syntax errors C also rejects (a missing ALIAS target) remain hard
+/// errors at their call site, not here.
+fn parse_asg_asl<'a>(
+    tokens: &mut impl Iterator<Item = &'a str>,
+    lineno: usize,
+) -> (Option<String>, Option<i32>) {
+    let asg = tokens.next().map(String::from);
+    let asl = asg.is_some().then(|| tokens.next()).flatten().map(|s| {
+        s.parse::<i32>().unwrap_or_else(|_| {
+            tracing::warn!(
+                line = lineno,
+                token = %s,
+                "pvlist: invalid ASL token — falling back to level 1 \
+                 (C gateAs.cc:612 sscanf!=1 → lev=1)"
+            );
+            1
+        })
+    });
+    (asg, asl)
 }
 
 fn build_pattern(pat: &str, lineno: usize) -> BridgeResult<Regex> {
@@ -607,6 +715,54 @@ mod tests {
         assert_eq!(list.order, EvaluationOrder::AllowDeny);
     }
 
+    /// C ca-gateway tokenizes the ORDER directive case-insensitively and
+    /// accepts comma OR whitespace between operands (gateAs.cc:580-595). A
+    /// pvlist that C loads must not fail Rust startup just because the
+    /// operator wrote it in lower case or dropped the comma.
+    #[test]
+    fn parse_evaluation_order_case_and_delimiter_tolerant() {
+        // Documented uppercase comma form still works.
+        assert_eq!(
+            parse_pvlist("EVALUATION ORDER ALLOW, DENY").unwrap().order,
+            EvaluationOrder::AllowDeny
+        );
+        // Lower case.
+        assert_eq!(
+            parse_pvlist("evaluation order deny, allow").unwrap().order,
+            EvaluationOrder::DenyAllow
+        );
+        // Whitespace-only operand separator (no comma).
+        assert_eq!(
+            parse_pvlist("EVALUATION ORDER DENY ALLOW").unwrap().order,
+            EvaluationOrder::DenyAllow
+        );
+        assert_eq!(
+            parse_pvlist("evaluation order allow deny").unwrap().order,
+            EvaluationOrder::AllowDeny
+        );
+        // No-comma, no-space (single token "ALLOW,DENY").
+        assert_eq!(
+            parse_pvlist("EVALUATION ORDER ALLOW,DENY").unwrap().order,
+            EvaluationOrder::AllowDeny
+        );
+        // The leading word is an ignored pattern token in C — any word works.
+        assert_eq!(
+            parse_pvlist("FOO ORDER ALLOW DENY").unwrap().order,
+            EvaluationOrder::AllowDeny
+        );
+
+        // Genuinely invalid operands are still rejected.
+        assert!(parse_pvlist("EVALUATION ORDER ALLOW ALLOW").is_err());
+        assert!(parse_pvlist("EVALUATION ORDER ALLOW").is_err());
+
+        // `ORDER` as the *first* token is NOT a directive — it is a pattern
+        // named "ORDER" with keyword ALLOW (matches C: pattern, then cmd).
+        let list = parse_pvlist("ORDER ALLOW").unwrap();
+        assert_eq!(list.entries.len(), 1);
+        assert!(matches!(list.entries[0], PvListEntry::Allow { .. }));
+        assert_eq!(list.order, EvaluationOrder::AllowDeny, "order unchanged");
+    }
+
     #[test]
     fn parse_simple_allow() {
         let list = parse_pvlist("Beam:.* ALLOW").unwrap();
@@ -636,6 +792,91 @@ mod tests {
         let list = parse_pvlist("test.* DENY FROM bad.host evil.host").unwrap();
         if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
             assert_eq!(from_hosts, &["bad.host", "evil.host"]);
+        } else {
+            panic!("expected Deny");
+        }
+    }
+
+    /// C ca-gateway tokenizes DENY FROM host lists on comma AND
+    /// whitespace (`strtok(NULL, ", \t\n")`, gateAs.cc:469-472). A
+    /// comma-joined list must parse to one entry per host, not a single
+    /// unresolvable `bad1,bad2` token that collapses into a global deny.
+    #[test]
+    fn parse_deny_from_comma_separated_hosts() {
+        // No spaces around the comma.
+        let list = parse_pvlist("test.* DENY FROM bad1.example,bad2.example").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert_eq!(from_hosts, &["bad1.example", "bad2.example"]);
+        } else {
+            panic!("expected Deny");
+        }
+
+        // Space after the comma → split_whitespace already separates the
+        // second host; comma-stripping must not leave a trailing comma.
+        let list = parse_pvlist("test.* DENY FROM bad1.example, bad2.example").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert_eq!(from_hosts, &["bad1.example", "bad2.example"]);
+        } else {
+            panic!("expected Deny");
+        }
+
+        // Mixed: leading-comma token and a three-host comma list with a
+        // stray space — every host is recovered, no empty entries.
+        let list = parse_pvlist("test.* DENY FROM h1,h2 ,h3").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert_eq!(from_hosts, &["h1", "h2", "h3"]);
+        } else {
+            panic!("expected Deny");
+        }
+    }
+
+    /// C ca-gateway (gateAs.cc:539-552) makes the `FROM` keyword OPTIONAL on
+    /// host-scoped DENY rules: the first post-DENY token is the `FROM` keyword
+    /// only when it matches case-insensitively, otherwise it is the first host.
+    /// `PV.* DENY h1 h2` must therefore parse as a host-scoped deny, not reject
+    /// the whole pvlist.
+    #[test]
+    fn parse_deny_optional_from_keyword() {
+        // No FROM: first token is a host.
+        let list = parse_pvlist("PV.* DENY host1 host2").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert_eq!(from_hosts, &["host1", "host2"]);
+        } else {
+            panic!("expected Deny");
+        }
+
+        // FROM present (case-insensitive) is consumed, not stored as a host.
+        for kw in ["FROM", "from", "From"] {
+            let list = parse_pvlist(&format!("PV.* DENY {kw} host1 host2")).unwrap();
+            if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+                assert_eq!(from_hosts, &["host1", "host2"], "{kw} consumed");
+            } else {
+                panic!("{kw}: expected Deny");
+            }
+        }
+
+        // No-FROM combined with comma tokenization (BRIDGE-RS-2026-05-28-12
+        // host splitting still applies without the keyword).
+        let list = parse_pvlist("PV.* DENY h1,h2 ,h3").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert_eq!(from_hosts, &["h1", "h2", "h3"]);
+        } else {
+            panic!("expected Deny");
+        }
+
+        // Bare DENY stays a global deny (empty host set).
+        let list = parse_pvlist("PV.* DENY").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert!(from_hosts.is_empty(), "bare DENY is global");
+        } else {
+            panic!("expected Deny");
+        }
+
+        // `DENY FROM` with no following host is also a global deny (FROM
+        // consumed, nothing left) — matches C (hname==NULL → deny_list).
+        let list = parse_pvlist("PV.* DENY FROM").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert!(from_hosts.is_empty(), "DENY FROM with no host is global");
         } else {
             panic!("expected Deny");
         }
@@ -682,6 +923,40 @@ mod tests {
         assert!(parse_pvlist("foo BAD").is_err());
     }
 
+    /// C ca-gateway (gateAs.cc:617-621) accepts PATTERN and PV as synonyms
+    /// for ALLOW — all four insert into the same allow_list with identical
+    /// ASG/ASL parsing. A legacy pvlist using PATTERN/PV must load (and
+    /// match, alias, and carry ASG/ASL) exactly like the ALLOW form.
+    #[test]
+    fn parse_pattern_and_pv_are_allow_synonyms() {
+        for kw in ["PATTERN", "PV", "pattern", "pv"] {
+            let list = parse_pvlist(&format!("PV.* {kw} BeamGroup 2")).unwrap();
+            assert_eq!(list.entries.len(), 1, "{kw}: one entry");
+            match &list.entries[0] {
+                PvListEntry::Allow { asg, asl, .. } => {
+                    assert_eq!(asg.as_deref(), Some("BeamGroup"), "{kw}: ASG");
+                    assert_eq!(*asl, Some(2), "{kw}: ASL");
+                }
+                other => panic!("{kw}: expected Allow, got {other:?}"),
+            }
+            // Behaves as an allow rule end-to-end.
+            let m = list.match_name("PV:current").expect("{kw}: admitted");
+            assert!(!m.is_alias);
+            assert_eq!(m.resolved_name, "PV:current");
+            assert!(
+                list.match_name("Other:x").is_none(),
+                "{kw}: non-match denied"
+            );
+        }
+
+        // Default ASG/ASL (no tokens) — PATTERN with bare pattern is admitted
+        // at the C level-1 default, same as bare ALLOW.
+        let list = parse_pvlist("Beam:.* PATTERN").unwrap();
+        let m = list.match_name("Beam:x").expect("admitted");
+        assert_eq!(m.asl, None);
+        assert_eq!(m.effective_asl(), 1);
+    }
+
     #[test]
     fn parse_invalid_regex() {
         assert!(parse_pvlist("[invalid ALLOW").is_err());
@@ -689,6 +964,55 @@ mod tests {
 
     #[test]
     fn parse_alias_missing_target() {
+        assert!(parse_pvlist("foo ALIAS").is_err());
+    }
+
+    /// C ca-gateway (gateAs.cc:612) parses ASL with `sscanf("%d")`; when that
+    /// fails it sets `lev=1` and still installs the rule. A pvlist line with a
+    /// typo'd ASL field must therefore keep serving the pattern at level 1, not
+    /// abort the whole file/reload. Applies to ALLOW, PATTERN, PV and ALIAS,
+    /// which all route through the shared `parse_asg_asl` helper.
+    #[test]
+    fn parse_invalid_asl_falls_back_to_level_one() {
+        // ALLOW with a non-integer ASL: parses, ASG kept, level → 1.
+        let list = parse_pvlist("PV.* ALLOW BeamGroup typo").unwrap();
+        match &list.entries[0] {
+            PvListEntry::Allow { asg, asl, .. } => {
+                assert_eq!(asg.as_deref(), Some("BeamGroup"), "ASG preserved");
+                assert_eq!(*asl, Some(1), "unparseable ASL → level 1");
+            }
+            other => panic!("expected Allow, got {other:?}"),
+        }
+        assert_eq!(list.match_name("PV:x").expect("served").effective_asl(), 1);
+
+        // Same fallback for the legacy PATTERN/PV synonyms and for ALIAS.
+        for kw in ["PATTERN", "PV"] {
+            let list = parse_pvlist(&format!("PV.* {kw} grp xyz")).unwrap();
+            match &list.entries[0] {
+                PvListEntry::Allow { asl, .. } => assert_eq!(*asl, Some(1), "{kw}"),
+                other => panic!("{kw}: expected Allow, got {other:?}"),
+            }
+        }
+        let list = parse_pvlist(r"ps([0-9]) ALIAS PSCurrent\1.ai PSGroup oops").unwrap();
+        match &list.entries[0] {
+            PvListEntry::Alias { asg, asl, .. } => {
+                assert_eq!(asg.as_deref(), Some("PSGroup"));
+                assert_eq!(*asl, Some(1), "ALIAS unparseable ASL → level 1");
+            }
+            other => panic!("expected Alias, got {other:?}"),
+        }
+
+        // A valid ASL is still parsed exactly; only the unparseable case falls
+        // back. Level 0 (more permissive) must NOT be silently produced from a
+        // valid "0" token by the fallback path.
+        let list = parse_pvlist("PV.* ALLOW grp 0").unwrap();
+        match &list.entries[0] {
+            PvListEntry::Allow { asl, .. } => assert_eq!(*asl, Some(0), "valid 0 preserved"),
+            other => panic!("expected Allow, got {other:?}"),
+        }
+
+        // A missing ALIAS target is a genuine syntax error C also rejects —
+        // it must stay a hard parse error, not fall through to level 1.
         assert!(parse_pvlist("foo ALIAS").is_err());
     }
 
@@ -821,6 +1145,70 @@ mod tests {
         assert!(list.match_name_for_host("PV:x", "other.host").is_some());
     }
 
+    /// C ca-gateway precedence is bottom-to-top: a later (lower-in-file),
+    /// more-specific rule overrides an earlier general one. The review's
+    /// canonical case — `.* ALLOW DEFAULT 1` above `SEC:.* ALLOW Secure 0`
+    /// — must resolve `SEC:x` to the specific rule's ASG/ASL, not the
+    /// broad rule at the top.
+    #[test]
+    fn match_specific_rule_below_general_rule_wins() {
+        let list = parse_pvlist(
+            r#"
+                EVALUATION ORDER ALLOW, DENY
+                .*       ALLOW DEFAULT 1
+                SEC:.*   ALLOW Secure 0
+            "#,
+        )
+        .unwrap();
+
+        // The specific rule sits below the general one and must win.
+        let m = list.match_name("SEC:hv").expect("SEC:hv allowed");
+        assert_eq!(m.asg.as_deref(), Some("Secure"), "bottom-most rule's ASG");
+        assert_eq!(m.asl, Some(0), "bottom-most rule's ASL");
+
+        // A name only the general rule matches still resolves to it.
+        let g = list.match_name("OTHER:x").expect("OTHER:x allowed");
+        assert_eq!(g.asg.as_deref(), Some("DEFAULT"));
+        assert_eq!(g.asl, Some(1));
+    }
+
+    /// Alias precedence is also bottom-to-top: a specific ALIAS placed
+    /// below a general ALIAS must win, carrying its own target + ASG/ASL.
+    #[test]
+    fn match_specific_alias_below_general_alias_wins() {
+        let list = parse_pvlist(
+            r#"
+                EVALUATION ORDER ALLOW, DENY
+                (.*)        ALIAS general_\1 GenGrp 1
+                SEC:(.*)    ALIAS secure_\1 SecGrp 0
+            "#,
+        )
+        .unwrap();
+
+        let m = list.match_name("SEC:hv").expect("SEC:hv aliased");
+        assert!(m.is_alias);
+        assert_eq!(m.resolved_name, "secure_hv", "bottom-most alias target");
+        assert_eq!(m.asg.as_deref(), Some("SecGrp"));
+        assert_eq!(m.asl, Some(0));
+    }
+
+    /// A specific DENY below a general ALLOW must win under ALLOW,DENY
+    /// order (the deny list is searched bottom-up too), while a name only
+    /// the general ALLOW covers is still served.
+    #[test]
+    fn match_specific_deny_below_general_allow_wins() {
+        let list = parse_pvlist(
+            r#"
+                EVALUATION ORDER ALLOW, DENY
+                .*       ALLOW
+                SEC:.*   DENY
+            "#,
+        )
+        .unwrap();
+        assert!(list.match_name("SEC:hv").is_none(), "specific DENY wins");
+        assert!(list.match_name("OTHER:x").is_some(), "general ALLOW serves");
+    }
+
     #[test]
     fn match_alias_with_backreference() {
         let list = parse_pvlist(r"ps([0-9]) ALIAS PSCurrent\1.ai PSGroup 1").unwrap();
@@ -903,11 +1291,39 @@ mod tests {
                     "resolved entry must be an IP string, got {h:?}"
                 );
             }
-            // The resolved IPs (127.0.0.1 and/or ::1) must deny the peer.
+            // The resolved IP (127.0.0.1) must deny the peer.
             let denied = from_hosts.iter().any(|ip| list.is_host_denied("PV:x", ip));
             assert!(denied, "resolved IP must be denied");
         } else {
             panic!("expected Deny");
+        }
+    }
+
+    /// C ca-gateway resolves each DENY FROM hostname to a SINGLE IPv4 address
+    /// (`hostToIPAddr` is AF_INET and breaks after the first getaddrinfo
+    /// result, osdSock.c:250-267; gateAs.cc:493-503 stores one dotted IP).
+    /// `resolve_hosts` must therefore store at most one address per hostname,
+    /// and that address must be IPv4 — never the multi-address / IPv6 fan-out
+    /// that would deny strictly more peers than C.
+    #[tokio::test]
+    async fn resolve_hosts_hostname_keeps_single_ipv4() {
+        let mut list = parse_pvlist("PV.* DENY FROM localhost").unwrap();
+        list.resolve_hosts().await;
+        let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] else {
+            panic!("expected Deny");
+        };
+        // At most one address (C keeps only the first); on any normal host
+        // `localhost` has an IPv4 record so exactly one is expected.
+        assert!(
+            from_hosts.len() <= 1,
+            "DENY FROM hostname must store a single address, got {from_hosts:?}"
+        );
+        for h in from_hosts {
+            let ip: std::net::IpAddr = h.parse().expect("resolved entry is an IP");
+            assert!(
+                ip.is_ipv4(),
+                "resolved DENY FROM address must be IPv4, got {ip}"
+            );
         }
     }
 

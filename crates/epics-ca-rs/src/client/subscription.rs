@@ -269,6 +269,13 @@ pub(crate) struct SubscriptionRecord {
     /// re-derivation in `restore_for_channel` re-applies the same
     /// ENUM→STRING substitution against the (possibly new) native type.
     pub enum_as_string: bool,
+    /// `camonitor -s` float-as-string preference. When `true`, a
+    /// FLOAT/DOUBLE field's auto-derived monitor type is the
+    /// `DBR_TIME_STRING` form so the server renders the value to a string
+    /// at record precision (C `camonitor.c:162-166`). Carried here for the
+    /// same reconnect re-derivation reason as `enum_as_string`; the ENUM
+    /// substitution takes precedence (C `if (ENUM) … else if (float …)`).
+    pub float_as_string: bool,
     pub mask: u16,
     pub server_addr: SocketAddr,
     /// the CA priority of the channel this subscription rides.
@@ -534,16 +541,20 @@ impl SubscriptionRegistry {
                     rec.data_type = None;
                     rec.count = None;
                 }
-                // Re-derive the DBR type from the fresh native type. The
-                // `enum_as_string` (camonitor) preference re-applies the
-                // ENUM→STRING substitution (C camonitor.c:156-160) so an
-                // ENUM monitor keeps delivering state labels across
-                // reconnects. native_type is the server-reported CA wire
-                // type (0..6), so the non-ENUM fallback `+ 14` always
-                // lands in the DBR_TIME range; Int64 (7) cannot reach here.
+                // Re-derive the DBR type from the fresh native type via the
+                // shared subscribe-time owner, so the reconnect re-derivation
+                // applies the identical substitution chain as the initial
+                // subscribe: ENUM honours -n, else FLOAT/DOUBLE under -s
+                // becomes DBR_TIME_STRING, else native TIME type
+                // (C camonitor.c:155-166). native_type is the server-reported
+                // CA wire type (0..6), so the `+ 14` fallback (only reached if
+                // from_u16 fails) lands in the DBR_TIME range; Int64 (7)
+                // cannot reach here.
                 let derived = DbFieldType::from_u16(native_type)
                     .ok()
-                    .and_then(|t| super::enum_string_readback_dbr(t, true, rec.enum_as_string))
+                    .map(|t| {
+                        super::subscription_readback_dbr(t, rec.enum_as_string, rec.float_as_string)
+                    })
                     .unwrap_or(native_type + 14);
                 let data_type = *rec.data_type.get_or_insert(derived);
                 let count = *rec.count.get_or_insert(element_count);
@@ -666,6 +677,7 @@ mod tests {
             count: None,
             type_user_supplied,
             enum_as_string: false,
+            float_as_string: false,
             mask: 1,
             server_addr: addr(),
             priority: 0,
@@ -783,6 +795,7 @@ mod tests {
             count: Some(1),
             type_user_supplied: true,
             enum_as_string: false,
+            float_as_string: false,
             mask: 1,
             server_addr: addr(),
             priority: 0,

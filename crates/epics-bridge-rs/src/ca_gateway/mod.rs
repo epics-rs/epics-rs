@@ -37,6 +37,7 @@ pub mod access;
 pub mod beacon;
 pub mod cache;
 pub mod command;
+pub mod control;
 pub mod downstream;
 pub mod master;
 pub mod putlog;

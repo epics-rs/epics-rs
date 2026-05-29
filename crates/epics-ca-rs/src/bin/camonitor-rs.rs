@@ -141,10 +141,6 @@ async fn main() {
         return;
     }
 
-    if args.string_format {
-        eprintln!("camonitor-rs: -s (string format) is accepted for parity but not yet honoured");
-    }
-
     let client = CaClient::new().await.expect("failed to create CA client");
     // -p selects the priority virtual circuit.
     let priority = args.priority.unwrap_or(0);
@@ -165,6 +161,10 @@ async fn main() {
     // incremental timestamp renderings.
     let mask = parse_event_mask(args.event_mask.as_deref());
     let spec = parse_timestamp_spec(args.timestamp_key.as_deref());
+    // `-s` (`floatAsString`): request DBR_TIME_STRING for FLOAT/DOUBLE
+    // fields so the server renders the value at record precision
+    // (C `camonitor.c:162-166`).
+    let float_as_string = args.string_format;
     let start = SystemTime::now();
     // `tsFirst` (`tool_lib.c:40`): the first SERVER stamp seen across all
     // channels, captured once — the server-relative (`-t sr`) baseline.
@@ -189,6 +189,7 @@ async fn main() {
                 pv,
                 flag,
                 fmt,
+                float_as_string,
                 req_elems_present,
                 mask,
                 spec,
@@ -287,6 +288,7 @@ async fn monitor_pv(
     pv_name: String,
     connected_flag: Arc<AtomicBool>,
     fmt: Arc<ValueFormat>,
+    float_as_string: bool,
     req_elems_present: bool,
     mask: u16,
     spec: TimestampSpec,
@@ -334,10 +336,13 @@ async fn monitor_pv(
 
     // honour `-m <msk>` via the caller-resolved DBE_* mask.
     // C `camonitor.c:156-160` requests DBR_TIME_STRING for an ENUM field
-    // unless `-n`, so the monitor delivers state labels by default.
+    // unless `-n`, so the monitor delivers state labels by default;
+    // C `camonitor.c:162-166` requests DBR_TIME_STRING for a FLOAT/DOUBLE
+    // field under `-s` so the server renders it to a string. The ENUM
+    // case takes precedence over the float case (C `if/else if`).
     let enum_as_string = !fmt.enum_as_number;
     let Ok(mut monitor) = channel
-        .subscribe_with_mask_enum_as_string(0.0, mask, enum_as_string)
+        .subscribe_with_mask_readback(0.0, mask, enum_as_string, float_as_string)
         .await
     else {
         return;
@@ -532,11 +537,20 @@ fn render_timestamp(
     start: SystemTime,
     state: &mut TimestampState<'_>,
 ) -> Option<String> {
+    // C `epicsTimeDiffInSeconds(pLeft, pRight)` is the SIGNED difference
+    // `pLeft - pRight` (epicsTime.cpp:417-431) — a backward stamp step
+    // (server clock correction, NTP step, device-support timestamp change,
+    // reconnect to a different provider) yields a NEGATIVE delta. The old
+    // `duration_since(a,b).or_else(b,a)` collapsed that to a positive
+    // magnitude, so `-t sr/si/sI` reported a forward interval for exactly
+    // the non-monotonic condition operators use those modes to detect.
     fn secs_between(a: SystemTime, b: SystemTime) -> f64 {
-        a.duration_since(b)
-            .or_else(|_| b.duration_since(a))
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0)
+        match a.duration_since(b) {
+            Ok(d) => d.as_secs_f64(),
+            // `a < b`: SystemTimeError::duration() is the magnitude `b - a`;
+            // negate it to recover the signed `a - b`.
+            Err(e) => -e.duration().as_secs_f64(),
+        }
     }
     // C `tool_lib.c:419-422`: latch the first SERVER stamp once; it is
     // the server-relative baseline (`tsFirst`).
@@ -549,6 +563,9 @@ fn render_timestamp(
     let print_abs = spec.kind == TimestampKind::Absolute || !*state.first_printed;
     // Server-relative baseline = `tsFirst`; client-relative = `tsStart`.
     let server_ref = state.first_server.unwrap_or(server_ts);
+    // The inner value: an absolute stamp string, or — for a diff kind — the
+    // C `%+12.6f` signed delta (12-wide, 6 decimals, forced sign), matching
+    // `printf("%+12.6f", epicsTimeDiffInSeconds(...))` (tool_lib.c:455-457).
     let render_one = |ts: SystemTime, is_server: bool, prev: Option<SystemTime>| -> String {
         if print_abs {
             return format_server_timestamp(ts);
@@ -558,23 +575,29 @@ fn render_timestamp(
             TimestampKind::Absolute => format_server_timestamp(ts),
             TimestampKind::Relative => {
                 let r = if is_server { server_ref } else { start };
-                format!("{:.6}", secs_between(ts, r))
+                format!("{:+12.6}", secs_between(ts, r))
             }
             TimestampKind::IncrAll | TimestampKind::IncrChan => {
-                format!("{:.6}", secs_between(ts, prev.unwrap_or(ts)))
+                format!("{:+12.6}", secs_between(ts, prev.unwrap_or(ts)))
             }
         }
     };
-    // C `print_time_val_sts` prints the server stamp, then the client
-    // stamp wrapped in `()`, back to back. Either may be absent.
+    // C `print_time_val_sts` prints the server stamp, then the client stamp
+    // wrapped in `()`, back to back. Either may be absent. The diff (non-abs)
+    // branches are preceded by a 14-space column prefix that sits OUTSIDE the
+    // client parentheses (`printf("              (%+12.6f)", ...)`,
+    // tool_lib.c:455-457); absolute stamps carry no such prefix.
+    const DIFF_PREFIX: &str = "              "; // 14 spaces (C column shape)
+    let prefix = if print_abs { "" } else { DIFF_PREFIX };
     let mut out = String::new();
     if spec.server {
+        out.push_str(prefix);
         out.push_str(&render_one(server_ts, true, *state.prev_server));
     }
     if spec.client {
-        let c = render_one(client_ts, false, *state.prev_client);
+        out.push_str(prefix);
         out.push('(');
-        out.push_str(&c);
+        out.push_str(&render_one(client_ts, false, *state.prev_client));
         out.push(')');
     }
     // C `tool_lib.c:461-467`: advance the incremental baselines on EVERY
@@ -667,6 +690,18 @@ mod tests {
         }
     }
 
+    /// Reconstruct the C diff column shape exactly: a 14-space prefix then a
+    /// `%+12.6f` signed, 12-wide, 6-decimal field (tool_lib.c:455). Used to
+    /// pin sign + width + prefix without hand-counting spaces.
+    fn srv_diff(d: f64) -> String {
+        format!("              {d:+12.6}")
+    }
+    /// Client diff column: 14-space prefix then `(%+12.6f)` (tool_lib.c:457) —
+    /// the prefix sits OUTSIDE the parentheses.
+    fn cli_diff(d: f64) -> String {
+        format!("              ({d:+12.6})")
+    }
+
     #[test]
     fn timestamp_first_event_is_absolute_then_diffs() {
         // C `tool_lib.c:414`: the leading event of a channel prints an
@@ -703,7 +738,7 @@ mod tests {
         // Second event: diff against the FIRST SERVER stamp (t1), so
         // t2 - t1 = 3s — NOT t2 - start (= 13s).
         let second = render_timestamp(srv(TimestampKind::Relative), t2, t2, start, &mut st);
-        assert_eq!(second.as_deref(), Some("3.000000"));
+        assert_eq!(second.as_deref(), Some(srv_diff(3.0).as_str()));
     }
 
     #[test]
@@ -726,8 +761,39 @@ mod tests {
         );
         assert_eq!(
             render_timestamp(srv, t2, t2, start, &mut st).as_deref(),
-            Some("3.000000"),
+            Some(srv_diff(3.0).as_str()),
             "second incremental event diffs against the prior stamp"
+        );
+    }
+
+    /// CA-RS-2026-05-28-12: a BACKWARD server-stamp step must render a
+    /// NEGATIVE signed delta (C `epicsTimeDiffInSeconds` = pLeft - pRight,
+    /// epicsTime.cpp:417-431). The previous magnitude-only formatting hid
+    /// exactly the non-monotonic condition `-t si` is used to detect.
+    #[test]
+    fn timestamp_backward_step_renders_negative_delta() {
+        let start = SystemTime::UNIX_EPOCH;
+        let t1 = start + Duration::from_secs(10);
+        let t2 = start + Duration::from_secs(7); // moved BACKWARD by 3s
+        let srv = TimestampSpec {
+            server: true,
+            client: false,
+            kind: TimestampKind::IncrAll,
+        };
+        let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
+        let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
+        // First event is absolute.
+        render_timestamp(srv, t1, t1, start, &mut st);
+        // Second event: 7 - 10 = -3s, rendered with a leading '-'.
+        let second = render_timestamp(srv, t2, t2, start, &mut st);
+        assert_eq!(
+            second.as_deref(),
+            Some(srv_diff(-3.0).as_str()),
+            "backward step must render as a negative delta, not +3"
+        );
+        assert!(
+            second.as_deref().unwrap().contains("-3.000000"),
+            "delta carries a minus sign: {second:?}"
         );
     }
 
@@ -754,7 +820,7 @@ mod tests {
         );
         // Second: client diff vs program start → 10s (NOT vs c1).
         let second = render_timestamp(cr, start, c2, start, &mut st);
-        assert_eq!(second.as_deref(), Some("(10.000000)"));
+        assert_eq!(second.as_deref(), Some(cli_diff(10.0).as_str()));
     }
 
     #[test]
@@ -789,6 +855,9 @@ mod tests {
         // Second event: server (s2 - tsFirst=s1) = 3s, client
         // (c2 - tsStart=start) = 10s.
         let second = render_timestamp(both, s2, c2, start, &mut st);
-        assert_eq!(second.as_deref(), Some("3.000000(10.000000)"));
+        assert_eq!(
+            second.as_deref(),
+            Some(format!("{}{}", srv_diff(3.0), cli_diff(10.0)).as_str())
+        );
     }
 }

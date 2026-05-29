@@ -30,8 +30,7 @@ use crate::error::BridgeResult;
 use super::access::AccessConfig;
 use super::beacon::BeaconAnomaly;
 use super::cache::{CacheTimeouts, PvCache};
-// Used only inside the cfg(unix) signal handler below.
-#[cfg(unix)]
+// Used by the cfg(unix) signal handler AND the control-PV command owner.
 use super::command::CommandHandler;
 use super::downstream::DownstreamServer;
 use super::putlog::PutLog;
@@ -183,6 +182,16 @@ pub struct GatewayServer {
     stats: Arc<Stats>,
     putlog: Option<Arc<PutLog>>,
     beacon_anomaly: Arc<BeaconAnomaly>,
+    /// Fired by a `quitFlag`/`quitServerFlag` control-PV write so the run
+    /// loop tears down gracefully — the CA-triggered analogue of SIGINT.
+    shutdown: Arc<tokio::sync::Notify>,
+    /// Receiver for control-PV triggers, drained once by the command
+    /// owner spawned in [`Self::run`]. `None` when the stats prefix is
+    /// empty (control PVs disabled). Wrapped for interior take from the
+    /// owned-`self` run loop.
+    control_rx: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedReceiver<super::control::ControlEvent>>,
+    >,
 }
 
 impl GatewayServer {
@@ -255,6 +264,11 @@ impl GatewayServer {
             putlog: putlog.clone(),
             stats: stats.clone(),
             read_only: config.read_only,
+            // Single connect-timeout owner: the lazy-resolution
+            // `wait_connected` gate uses the same configured budget as the
+            // cache reaper instead of a local constant (parity with C
+            // gateResources::connectTimeout).
+            connect_timeout: config.timeouts.connect_timeout,
             beacon_anomaly: beacon_anomaly.clone(),
             // B10: forward the upstream-side TLS config so the
             // gateway's CaClient to the real IOC can also use TLS,
@@ -298,6 +312,15 @@ impl GatewayServer {
             beacon_anomaly.install_pulse(pulse);
         }
 
+        // Publish C-compatible control flag PVs (commandFlag, report*Flag,
+        // newAsFlag, quitFlag, quitServerFlag) under the stats prefix so
+        // operators can trigger command-file execution, reports, reload,
+        // and shutdown via `caput` — the cross-platform alternative to
+        // SIGUSR1 (gateServer.cc:1877-2102). The receiver is drained by a
+        // single command owner in `run()`; `None` when stats are disabled.
+        let control_rx =
+            super::control::publish_control_pvs(&shadow_db, &config.stats_prefix).await;
+
         let server = Self {
             config,
             pvlist,
@@ -309,6 +332,8 @@ impl GatewayServer {
             stats,
             putlog,
             beacon_anomaly,
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            control_rx: std::sync::Mutex::new(control_rx),
         };
 
         // Pre-register stats PVs in shadow database so downstream can read them
@@ -567,6 +592,33 @@ impl GatewayServer {
         // SIGUSR1 → command file processing (Unix only)
         let signal_handle = self.spawn_signal_handler();
 
+        // Control-PV command owner: drains commandFlag/report*Flag/
+        // newAsFlag/quitFlag writes and dispatches each through the SAME
+        // CommandHandler the SIGUSR1 path uses — one command owner for
+        // every trigger source (mirrors C routing all flags through the
+        // gateServer main loop). `quit*` fires `self.shutdown`.
+        let control_handle = {
+            let taken = self.control_rx.lock().unwrap().take();
+            taken.map(|rx| {
+                let handler = CommandHandler::new(
+                    self.cache.clone(),
+                    self.pvlist.clone(),
+                    self.access.clone(),
+                    self.config.pvlist_path.clone(),
+                    self.config.access_path.clone(),
+                )
+                .with_upstream(self.upstream.clone())
+                .with_beacon_anomaly(self.beacon_anomaly.clone());
+                super::control::spawn_control_owner(
+                    rx,
+                    handler,
+                    self.shadow_db.clone(),
+                    self.config.command_path.clone(),
+                    self.shutdown.clone(),
+                )
+            })
+        };
+
         // Connection event subscriber.
         //
         // - `Connected`/`Disconnected`: per-host stats tracking (matches
@@ -688,6 +740,7 @@ impl GatewayServer {
         // shutdown). On signal we tear down upstream subscriptions
         // first so the upstream IOC sees a clean disconnect, then
         // abort the auxiliary tasks.
+        let shutdown = self.shutdown.clone();
         let downstream_result = {
             let downstream_run = downstream.run();
             tokio::pin!(downstream_run);
@@ -697,6 +750,14 @@ impl GatewayServer {
                 r = &mut downstream_run => r,
                 _ = &mut ctrl_c => {
                     tracing::info!("ca-gateway-rs: SIGINT received — shutting down");
+                    self.upstream.shutdown().await;
+                    Ok(())
+                }
+                // quitFlag/quitServerFlag control-PV write (a stored
+                // Notify permit is honored even if it fired before we
+                // reached this select). Same teardown as SIGINT.
+                _ = shutdown.notified() => {
+                    tracing::info!("ca-gateway-rs: shutdown requested via control PV");
                     self.upstream.shutdown().await;
                     Ok(())
                 }
@@ -710,6 +771,9 @@ impl GatewayServer {
             h.abort();
         }
         if let Some(h) = signal_handle {
+            h.abort();
+        }
+        if let Some(h) = control_handle {
             h.abort();
         }
         if let Some(h) = conn_handle {
@@ -733,6 +797,7 @@ impl GatewayServer {
         let pvlist = self.pvlist.clone();
         let access = self.access.clone();
         let upstream = self.upstream.clone();
+        let beacon_anomaly = self.beacon_anomaly.clone();
 
         Some(tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
@@ -744,7 +809,8 @@ impl GatewayServer {
                 }
             };
             let handler = CommandHandler::new(cache, pvlist, access, pvlist_path, access_path)
-                .with_upstream(upstream);
+                .with_upstream(upstream)
+                .with_beacon_anomaly(beacon_anomaly);
             tracing::info!(
                 command_file = %cmd_path.display(),
                 "ca-gateway-rs: SIGUSR1 handler armed"

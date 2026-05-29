@@ -242,18 +242,28 @@ pub fn server_broadcast_port() -> u16 {
         .unwrap_or_else(broadcast_port)
 }
 
-/// `EPICS_PVA_SERVER_PORT` (default 5075).
+/// Effective **client** default TCP destination port — the port a bare
+/// (port-less) `EPICS_PVA_NAME_SERVERS` / address-list token resolves to.
 ///
-/// pvxs `config.cpp:568-578` lets the client TCP port come
-/// from `EPICS_PVAS_SERVER_PORT` when `EPICS_PVA_SERVER_PORT` is not
-/// set, so a site that only configured the server-specific var still
-/// has a coherent default for client name-server lookups.
+/// pvxs `config.cpp:568-578` lets the client TCP port come from
+/// `EPICS_PVAS_SERVER_PORT` when `EPICS_PVA_SERVER_PORT` is not set, so a
+/// site that only configured the server-specific var still has a coherent
+/// default. `Config::expand()` then normalizes an effective client TCP
+/// port of zero back to the protocol default 5075 (`config.cpp:624-632`):
+/// zero is a valid *server* ephemeral-bind request but never a usable
+/// client destination, so `EPICS_PVA_SERVER_PORT=0` must not rewrite every
+/// bare name-server token to `host:0`. The server bind port keeps zero —
+/// see [`pvas_server_port`]. An explicit `host:0` in a name-server list is
+/// preserved verbatim by [`parse_addr_list_with_port`]; only the *default*
+/// port is expanded here.
 pub fn server_port() -> u16 {
-    std::env::var("EPICS_PVA_SERVER_PORT")
+    let parsed = std::env::var("EPICS_PVA_SERVER_PORT")
         .ok()
         .or_else(|| std::env::var("EPICS_PVAS_SERVER_PORT").ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5075)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(5075);
+    // pvxs Config::expand(): a zero effective client TCP port → 5075.
+    if parsed == 0 { 5075 } else { parsed }
 }
 
 /// server-side TCP port helper that mirrors pvxs
@@ -925,6 +935,97 @@ mod tests {
             match prev_pva {
                 Some(v) => std::env::set_var("EPICS_PVA_TLS_KEYCHAIN", v),
                 None => std::env::remove_var("EPICS_PVA_TLS_KEYCHAIN"),
+            }
+        }
+    }
+
+    /// `EPICS_PVA_SERVER_PORT=0` is a valid server ephemeral-bind request
+    /// but never a usable client TCP destination, so the client default
+    /// port expands a zero back to 5075 (pvxs `Config::expand()`,
+    /// config.cpp:624-632). An explicit non-zero value and the unset
+    /// default are unchanged.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn server_port_zero_expands_to_protocol_default() {
+        let prev_pva = std::env::var("EPICS_PVA_SERVER_PORT").ok();
+        let prev_pvas = std::env::var("EPICS_PVAS_SERVER_PORT").ok();
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_SERVER_PORT");
+            std::env::set_var("EPICS_PVA_SERVER_PORT", "0");
+        }
+        assert_eq!(server_port(), 5075, "zero must expand to the 5075 default");
+        unsafe {
+            std::env::set_var("EPICS_PVA_SERVER_PORT", "1234");
+        }
+        assert_eq!(server_port(), 1234, "explicit non-zero port is preserved");
+        unsafe {
+            std::env::remove_var("EPICS_PVA_SERVER_PORT");
+        }
+        assert_eq!(server_port(), 5075, "unset → 5075 default");
+        unsafe {
+            match prev_pva {
+                Some(v) => std::env::set_var("EPICS_PVA_SERVER_PORT", v),
+                None => std::env::remove_var("EPICS_PVA_SERVER_PORT"),
+            }
+            match prev_pvas {
+                Some(v) => std::env::set_var("EPICS_PVAS_SERVER_PORT", v),
+                None => std::env::remove_var("EPICS_PVAS_SERVER_PORT"),
+            }
+        }
+    }
+
+    /// With `EPICS_PVA_SERVER_PORT=0`, a bare `EPICS_PVA_NAME_SERVERS`
+    /// token must resolve to the expanded default port 5075, not `:0`; an
+    /// explicit `host:port` token keeps its literal port; an empty list
+    /// yields no addresses.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn name_servers_bare_token_uses_expanded_port_under_server_port_zero() {
+        let prev_pva = std::env::var("EPICS_PVA_SERVER_PORT").ok();
+        let prev_pvas = std::env::var("EPICS_PVAS_SERVER_PORT").ok();
+        let prev_ns = std::env::var("EPICS_PVA_NAME_SERVERS").ok();
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_SERVER_PORT");
+            std::env::set_var("EPICS_PVA_SERVER_PORT", "0");
+            std::env::set_var("EPICS_PVA_NAME_SERVERS", "127.0.0.1");
+        }
+        let bare = name_servers();
+        assert_eq!(
+            bare.iter().map(SocketAddr::port).collect::<Vec<_>>(),
+            vec![5075],
+            "bare name-server token must use the expanded default port, not 0"
+        );
+
+        unsafe {
+            std::env::set_var("EPICS_PVA_NAME_SERVERS", "127.0.0.1:9876");
+        }
+        let explicit = name_servers();
+        assert_eq!(
+            explicit.iter().map(SocketAddr::port).collect::<Vec<_>>(),
+            vec![9876],
+            "an explicit name-server port is preserved verbatim"
+        );
+
+        unsafe {
+            std::env::remove_var("EPICS_PVA_NAME_SERVERS");
+        }
+        assert!(
+            name_servers().is_empty(),
+            "no name-server list → no addresses"
+        );
+
+        unsafe {
+            match prev_pva {
+                Some(v) => std::env::set_var("EPICS_PVA_SERVER_PORT", v),
+                None => std::env::remove_var("EPICS_PVA_SERVER_PORT"),
+            }
+            match prev_pvas {
+                Some(v) => std::env::set_var("EPICS_PVAS_SERVER_PORT", v),
+                None => std::env::remove_var("EPICS_PVAS_SERVER_PORT"),
+            }
+            match prev_ns {
+                Some(v) => std::env::set_var("EPICS_PVA_NAME_SERVERS", v),
+                None => std::env::remove_var("EPICS_PVA_NAME_SERVERS"),
             }
         }
     }

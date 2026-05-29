@@ -179,8 +179,13 @@ pub async fn search(pv_name: &str, total_timeout: Duration) -> PvaResult<SocketA
         match timeout(wait, socket.recv_from(&mut buf)).await {
             Ok(Ok((n, peer))) => {
                 // UDP SearchResponse/Beacon are server-originated — enforce
-                // the direction bit (pvxs `conn.cpp:160` parity).
-                if let Ok(Some((frame, _))) = try_parse_frame_role(&buf[..n], PeerRole::Client) {
+                // the direction bit (pvxs `conn.cpp:160` parity). A UDP
+                // datagram must not be segmented (segment bits are TCP-only);
+                // pvxs drops a segmented UDP SEARCH_RESPONSE (client.cpp:
+                // 973-982).
+                if let Ok(Some((frame, _))) = try_parse_frame_role(&buf[..n], PeerRole::Client)
+                    && frame.header.flags.unsegmented()
+                {
                     if let Ok(resp) = decode_search_response(&frame) {
                         if resp.found && resp.cids.contains(&search_id) {
                             return Ok(rewrite_loopback_target(&resp, peer));

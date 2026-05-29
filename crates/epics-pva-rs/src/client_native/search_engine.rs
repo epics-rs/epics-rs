@@ -1949,6 +1949,14 @@ fn handle_search_response(
     let Ok(Some((frame, consumed))) = try_parse_frame_role(bytes, PeerRole::Client) else {
         return 0;
     };
+    // A UDP SEARCH_RESPONSE must not be segmented — segment bits are a TCP
+    // reassembly feature only, so pvxs drops a segmented UDP datagram
+    // before processing (client.cpp:973-982). The same handler also serves
+    // the TCP name-server stream (`is_tcp`), where segmentation is legal,
+    // so the rejection is UDP-only.
+    if !is_tcp && !frame.header.flags.unsegmented() {
+        return consumed;
+    }
     let Ok(resp) = decode_search_response(&frame) else {
         return consumed;
     };
@@ -2071,6 +2079,12 @@ fn handle_beacon(
     let Ok(Some((frame, consumed))) = try_parse_frame_role(bytes, PeerRole::Client) else {
         return 0;
     };
+    // Beacons arrive only over UDP, which can carry neither control
+    // messages nor segmentation; a segmented datagram is malformed and
+    // dropped (pvxs udp_collector.cpp:329-340).
+    if !frame.header.flags.unsegmented() {
+        return consumed;
+    }
     if frame.header.command != Command::Beacon.code() {
         return consumed;
     }
@@ -2863,6 +2877,179 @@ mod tests {
         assert!(
             matches!(rxb.try_recv(), Ok(Discovered::Online { guid, .. }) if guid == IG),
             "ignored-GUID BEACON must still emit Discovered::Online"
+        );
+    }
+
+    /// Segment bits are a TCP reassembly feature; a UDP SEARCH_RESPONSE
+    /// must never carry them. pvxs drops a segmented UDP datagram before
+    /// processing (client.cpp:973-982). A segmented found=true reply must
+    /// NOT resolve the pending channel, while the same frame un-segmented
+    /// does — proving the rejection is the segment bits, not the payload.
+    #[test]
+    fn segmented_udp_search_response_does_not_resolve() {
+        use crate::proto::header::HeaderFlags;
+        use tokio::sync::oneshot;
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
+        let base = crate::server_native::udp::build_search_response_proto(
+            [0x42u8; 12],
+            0,
+            5075,
+            &[1],
+            ByteOrder::Little,
+            "tcp",
+        );
+
+        // Segmented (any segment bit) UDP reply: dropped, pending kept.
+        for seg in [
+            HeaderFlags::SEGMENT_FIRST,
+            HeaderFlags::SEGMENT_LAST,
+            HeaderFlags::SEGMENT_MASK,
+        ] {
+            let mut frame = base.clone();
+            frame[2] |= seg; // flags byte
+            let (tx, _rx) = oneshot::channel::<SocketAddr>();
+            let mut pending: HashMap<u32, Pending> = HashMap::new();
+            pending.insert(
+                1,
+                Pending {
+                    pv_name: "dut".into(),
+                    responder: Responder::Single(tx),
+                    last_attempt: Instant::now(),
+                    attempt: 1,
+                    bucket: 0,
+                },
+            );
+            let mut by_name: HashMap<String, u32> =
+                std::iter::once(("dut".to_string(), 1)).collect();
+            let beacons = BeaconTracker::new();
+            let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+            let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+            let mut poke = false;
+            let consumed = handle_search_response(
+                &frame,
+                &mut pending,
+                &mut by_name,
+                &beacons,
+                &ignore,
+                &mut subs,
+                &mut poke,
+                peer,
+                false, // UDP
+            );
+            assert!(consumed > 0, "segmented frame must still be advanced");
+            assert!(
+                pending.contains_key(&1),
+                "segmented UDP SEARCH_RESPONSE (bits {seg:#04x}) must not resolve the pending channel"
+            );
+        }
+
+        // Control: the same frame un-segmented DOES resolve.
+        let (tx, mut rx) = oneshot::channel::<SocketAddr>();
+        let mut pending: HashMap<u32, Pending> = HashMap::new();
+        pending.insert(
+            1,
+            Pending {
+                pv_name: "dut".into(),
+                responder: Responder::Single(tx),
+                last_attempt: Instant::now(),
+                attempt: 1,
+                bucket: 0,
+            },
+        );
+        let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
+        let beacons = BeaconTracker::new();
+        let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut poke = false;
+        handle_search_response(
+            &base,
+            &mut pending,
+            &mut by_name,
+            &beacons,
+            &ignore,
+            &mut subs,
+            &mut poke,
+            peer,
+            false,
+        );
+        assert!(
+            !pending.contains_key(&1),
+            "un-segmented found SEARCH_RESPONSE must resolve the pending channel"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "resolved channel must receive a server addr"
+        );
+    }
+
+    /// A segmented UDP BEACON datagram must be dropped — segment bits are
+    /// TCP-only (pvxs udp_collector.cpp:329-340) — producing no discovery
+    /// event and no tracker entry, while the un-segmented beacon does.
+    #[test]
+    fn segmented_udp_beacon_emits_no_event() {
+        use crate::proto::header::HeaderFlags;
+        const G: [u8; 12] = [0x77u8; 12];
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
+        let server = SocketAddr::new(peer.ip(), 5075);
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&G); // guid
+        payload.put_u8(0); // flags
+        payload.put_u8(0); // seq
+        payload.put_u16(0, order); // change
+        payload.extend_from_slice(&[0u8; 16]); // addr wildcard → peer
+        payload.put_u16(5075, order); // port
+        encode_string_into("tcp", order, &mut payload);
+        let header =
+            PvaHeader::application(true, order, Command::Beacon.code(), payload.len() as u32);
+        let mut base = Vec::new();
+        header.write_into(&mut base);
+        base.extend_from_slice(&payload);
+
+        // Segmented (any segment bit): dropped — no event, not tracked.
+        for seg in [
+            HeaderFlags::SEGMENT_FIRST,
+            HeaderFlags::SEGMENT_LAST,
+            HeaderFlags::SEGMENT_MASK,
+        ] {
+            let mut frame = base.clone();
+            frame[2] |= seg;
+            let beacons = BeaconTracker::new();
+            let mut pending: HashMap<u32, Pending> = HashMap::new();
+            let (tx, mut rx) = mpsc::channel::<Discovered>(8);
+            let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+            let mut poke = false;
+            let consumed =
+                handle_beacon(&frame, &beacons, &mut pending, &mut subs, &mut poke, peer);
+            assert!(
+                consumed > 0,
+                "segmented beacon frame must still be advanced"
+            );
+            assert!(
+                beacons.guid_for(server).is_none(),
+                "segmented UDP BEACON (bits {seg:#04x}) must not enter the tracker"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "segmented UDP BEACON (bits {seg:#04x}) must emit no Discovered event"
+            );
+        }
+
+        // Control: the un-segmented beacon tracks + emits Online.
+        let beacons = BeaconTracker::new();
+        let mut pending: HashMap<u32, Pending> = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<Discovered>(8);
+        let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+        let mut poke = false;
+        handle_beacon(&base, &beacons, &mut pending, &mut subs, &mut poke, peer);
+        assert_eq!(
+            beacons.guid_for(server),
+            Some(G),
+            "un-segmented BEACON must enter the tracker"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(Discovered::Online { guid, .. }) if guid == G),
+            "un-segmented BEACON must emit Discovered::Online"
         );
     }
 

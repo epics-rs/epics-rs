@@ -35,17 +35,23 @@ pub enum PvField {
         variant_name: String,
         value: Box<PvField>,
     },
-    /// Union array. `None` is a `0x00` null element (absent);
-    /// `Some(item)` is a present element, which may itself carry a
-    /// null-selector union (`selector == -1`) — a distinct state from an
-    /// absent element.
+    /// Union array. `None` is a `0x00` null element (absent); `Some(item)`
+    /// is a present element selecting a real variant (`selector >= 0`).
+    /// A `Some(item)` whose selector is `-1`/out-of-range selects no
+    /// variant and is *not* a distinct wire state: pvxs's UnionA decoder
+    /// collapses a present null selector to absent
+    /// (`dataencode.cpp:635-637`), so the encoder canonicalizes such an
+    /// element to the absent (`0x00`) form and a round trip yields `None`.
     UnionArray(Vec<Option<UnionItem>>),
     /// "Any" — variant carries its own [`FieldDesc`]. Empty descriptor +
     /// null value indicates "no value".
     Variant(Box<VariantValue>),
-    /// Variant ("any") array. `None` is a `0x00` null element
-    /// (absent); `Some(v)` is a present element, which may itself carry a
-    /// descriptor-less empty value — a distinct state from absent.
+    /// Variant ("any") array. `None` is a `0x00` null element (absent);
+    /// `Some(v)` is a present element carrying a descriptor + value.
+    /// A `Some(v)` with no descriptor is *not* a distinct wire state: pvxs's
+    /// AnyA decoder collapses a present null descriptor to absent
+    /// (`dataencode.cpp:669-675`), so the encoder canonicalizes such an
+    /// element to the absent (`0x00`) form and a round trip yields `None`.
     VariantArray(Vec<Option<VariantValue>>),
     /// Explicit empty value (used by null union / null variant).
     Null,

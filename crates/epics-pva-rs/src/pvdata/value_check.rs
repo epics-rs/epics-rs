@@ -52,6 +52,8 @@ pub enum ValueDescMismatch {
     },
     #[error("structure id mismatch: descriptor `{desc_id}`, value `{value_id}`")]
     StructureIdMismatch { desc_id: String, value_id: String },
+    #[error("union selector {selector} out of range ({variants} variant(s))")]
+    UnionSelectorOutOfRange { selector: i32, variants: usize },
 }
 
 /// True iff `value` can be encoded under `desc` without taking the
@@ -113,35 +115,42 @@ pub fn value_matches_descriptor(
             }
             structure_fields_match(s, fields)
         }
-        // Structure array: the encoder encodes each present element
-        // under the descriptor's field list (with the element's own
-        // `struct_id`), coercing leaf mismatches — walk each present
-        // element's fields. A `None` (absent) element emits a presence
-        // byte only and cannot corrupt.
-        (PvField::StructureArray(items), FieldDesc::StructureArray { fields, .. }) => {
+        // Structure array: every present element must carry the
+        // descriptor's element `struct_id`, then match its field list.
+        // pvxs encodes a present StructA element only after asserting the
+        // element value's descriptor IS the array element descriptor
+        // (dataencode.cpp:354-365), and decodes each element under that
+        // descriptor's id (dataencode.cpp:607-618) — the element body
+        // carries no id of its own. Checking only the field list let an
+        // `other_t` element ride out under a `row_t[]` descriptor: local
+        // diagnostics see `other_t`, every peer decodes `row_t`. A `None`
+        // (absent) element emits a presence byte only and cannot corrupt.
+        (PvField::StructureArray(items), FieldDesc::StructureArray { struct_id, fields }) => {
             for elem in items.iter().flatten() {
+                if &elem.struct_id != struct_id {
+                    return Err(ValueDescMismatch::StructureIdMismatch {
+                        desc_id: struct_id.clone(),
+                        value_id: elem.struct_id.clone(),
+                    });
+                }
                 structure_fields_match(elem, fields)?;
             }
             Ok(())
         }
-        // Union: the encoder encodes the selected variant's value under
-        // that variant's descriptor, coercing a leaf mismatch. An
-        // out-of-range / `-1` selector encodes as the null marker (no
-        // value bytes) and cannot corrupt, so it is accepted.
+        // Union: a null selector (`< 0`) encodes as the 0xFF null marker
+        // and cannot corrupt. An in-range selector picks a variant whose
+        // held value must match. An out-of-range selector is a producer
+        // bug the encoder masks as a null marker — reject it here so a
+        // checked server reply / SharedPV post cannot silently send null.
         (
             PvField::Union {
                 selector, value, ..
             },
             FieldDesc::Union { variants, .. },
-        ) => match selected_variant(*selector, variants) {
-            Some(vdesc) => value_matches_descriptor_child(value, vdesc),
-            None => Ok(()),
-        },
+        ) => check_union_selector(*selector, value, variants),
         (PvField::UnionArray(items), FieldDesc::UnionArray { variants, .. }) => {
             for it in items.iter().flatten() {
-                if let Some(vdesc) = selected_variant(it.selector, variants) {
-                    value_matches_descriptor_child(&it.value, vdesc)?;
-                }
+                check_union_selector(it.selector, &it.value, variants)?;
             }
             Ok(())
         }
@@ -193,14 +202,30 @@ fn value_matches_descriptor_child(
     value_matches_descriptor(value, desc)
 }
 
-/// The descriptor of the variant a union selector points at, or `None`
-/// for a null / out-of-range selector (encoded as the null marker, so
-/// not a coercible mismatch).
-fn selected_variant(selector: i32, variants: &[(String, FieldDesc)]) -> Option<&FieldDesc> {
-    usize::try_from(selector)
-        .ok()
-        .and_then(|idx| variants.get(idx))
-        .map(|(_, d)| d)
+/// Validate a union selector and, when it selects a variant, the held
+/// value against that variant's descriptor.
+///
+/// pvxs decode treats the null selector (`-1` Size sentinel) as null but
+/// FAULTS an out-of-range selector — `dataencode.cpp:520-538` for `Union`
+/// and `:624-650` for present `UnionA` elements. A locally-built union
+/// whose selector is past the variant list is a producer bug pvxs would
+/// never put on the wire; the Rust encoder masks it as the 0xFF null
+/// marker, so it must be rejected here before a checked path emits it.
+fn check_union_selector(
+    selector: i32,
+    value: &PvField,
+    variants: &[(String, FieldDesc)],
+) -> Result<(), ValueDescMismatch> {
+    if selector < 0 {
+        return Ok(()); // null union — the 0xFF marker, no value bytes
+    }
+    match variants.get(selector as usize) {
+        Some((_, vdesc)) => value_matches_descriptor_child(value, vdesc),
+        None => Err(ValueDescMismatch::UnionSelectorOutOfRange {
+            selector,
+            variants: variants.len(),
+        }),
+    }
 }
 
 fn scalar_type_of(v: &ScalarValue) -> super::ScalarType {
@@ -396,6 +421,41 @@ mod tests {
         assert!(value_matches_descriptor(&value, &desc).is_err());
     }
 
+    #[test]
+    fn structure_array_element_struct_id_mismatch_is_err() {
+        // Descriptor is `row_t[]`; the element has identical fields but a
+        // different `struct_id` (`other_t`). Field-only checking accepted
+        // it; the element id must be compared too.
+        let fields = vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Int))];
+        let desc = FieldDesc::StructureArray {
+            struct_id: "row_t".to_string(),
+            fields: fields.clone(),
+        };
+        let mut elem = PvStructure::new("other_t");
+        elem.set("value", PvField::Scalar(ScalarValue::Int(1)));
+        let value = PvField::StructureArray(vec![Some(elem)]);
+        assert!(matches!(
+            value_matches_descriptor(&value, &desc),
+            Err(ValueDescMismatch::StructureIdMismatch {
+                ref desc_id,
+                ref value_id,
+            }) if desc_id == "row_t" && value_id == "other_t"
+        ));
+    }
+
+    #[test]
+    fn structure_array_element_matching_struct_id_is_ok() {
+        let fields = vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Int))];
+        let desc = FieldDesc::StructureArray {
+            struct_id: "row_t".to_string(),
+            fields: fields.clone(),
+        };
+        let mut elem = PvStructure::new("row_t");
+        elem.set("value", PvField::Scalar(ScalarValue::Int(1)));
+        let value = PvField::StructureArray(vec![Some(elem)]);
+        assert!(value_matches_descriptor(&value, &desc).is_ok());
+    }
+
     fn double_or_int_union_desc() -> FieldDesc {
         FieldDesc::Union {
             struct_id: String::new(),
@@ -427,6 +487,42 @@ mod tests {
             value: Box::new(PvField::Null),
         };
         assert!(value_matches_descriptor(&value, &desc).is_ok());
+    }
+
+    #[test]
+    fn union_out_of_range_selector_is_err() {
+        // selector == variants.len() is past the last variant (only 0,1
+        // are valid for a 2-variant union).
+        let desc = double_or_int_union_desc();
+        let value = PvField::Union {
+            selector: 2,
+            variant_name: String::new(),
+            value: Box::new(PvField::Scalar(ScalarValue::Double(1.0))),
+        };
+        assert!(matches!(
+            value_matches_descriptor(&value, &desc),
+            Err(ValueDescMismatch::UnionSelectorOutOfRange {
+                selector: 2,
+                variants: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn union_array_out_of_range_selector_is_err() {
+        let desc = FieldDesc::UnionArray {
+            struct_id: String::new(),
+            variants: vec![("d".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let value = PvField::UnionArray(vec![Some(UnionItem {
+            selector: 5,
+            variant_name: String::new(),
+            value: PvField::Scalar(ScalarValue::Double(1.0)),
+        })]);
+        assert!(matches!(
+            value_matches_descriptor(&value, &desc),
+            Err(ValueDescMismatch::UnionSelectorOutOfRange { selector: 5, .. })
+        ));
     }
 
     #[test]

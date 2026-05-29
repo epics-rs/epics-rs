@@ -69,7 +69,19 @@ impl NTURI {
         }
         let mut query = PvStructure::new("");
         for a in &self.args {
-            query.fields.push((a.name.clone(), default_for(&a.desc)));
+            // Route every query member through the shared recursive
+            // descriptor→default-value helper so a non-scalar query arg
+            // (nested structure, structure array, union, bounded string)
+            // gets a descriptor-consistent default instead of a bare
+            // `Null`. pvxs `NTURI::create()` delegates to
+            // `build().create()` (`src/pvxs/nt.h:170-182`), which fills
+            // every member from its type — so a `query.nested` advertised
+            // as a structure must materialize as an (empty) structure, not
+            // a value that mismatches its own descriptor.
+            query.fields.push((
+                a.name.clone(),
+                crate::pvdata::encode::default_value_for(&a.desc),
+            ));
         }
         root.fields
             .push(("query".into(), PvField::Structure(query)));
@@ -80,35 +92,6 @@ impl NTURI {
 impl Default for NTURI {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-fn default_for(desc: &FieldDesc) -> PvField {
-    match desc {
-        FieldDesc::Scalar(t) => PvField::Scalar(default_scalar(*t)),
-        FieldDesc::ScalarArray(_) => PvField::ScalarArray(Vec::new()),
-        FieldDesc::Variant => PvField::Variant(Box::new(crate::pvdata::VariantValue {
-            desc: None,
-            value: PvField::Null,
-        })),
-        _ => PvField::Null,
-    }
-}
-
-fn default_scalar(t: ScalarType) -> ScalarValue {
-    match t {
-        ScalarType::Boolean => ScalarValue::Boolean(false),
-        ScalarType::Byte => ScalarValue::Byte(0),
-        ScalarType::Short => ScalarValue::Short(0),
-        ScalarType::Int => ScalarValue::Int(0),
-        ScalarType::Long => ScalarValue::Long(0),
-        ScalarType::UByte => ScalarValue::UByte(0),
-        ScalarType::UShort => ScalarValue::UShort(0),
-        ScalarType::UInt => ScalarValue::UInt(0),
-        ScalarType::ULong => ScalarValue::ULong(0),
-        ScalarType::Float => ScalarValue::Float(0.0),
-        ScalarType::Double => ScalarValue::Double(0.0),
-        ScalarType::String => ScalarValue::String(String::new()),
     }
 }
 
@@ -137,5 +120,50 @@ mod tests {
                 assert_eq!(names, vec!["arg1", "arg2"]);
             }
         }
+    }
+
+    #[test]
+    fn nt_uri_create_value_matches_descriptor_for_nonscalar_args() {
+        // Pre-fix `create()` filled non-scalar query args with `Null`,
+        // which mismatches the advertised descriptor. The shared
+        // descriptor→default helper now materializes a structure/array
+        // default, so the created value must satisfy `build()`.
+        use crate::pvdata::value_matches_descriptor;
+
+        let nested = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                ("a".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("b".into(), FieldDesc::Scalar(ScalarType::String)),
+            ],
+        };
+        let sarr = FieldDesc::StructureArray {
+            struct_id: String::new(),
+            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let uri = NTURI::new()
+            .arg("nested", nested)
+            .arg("rows", sarr)
+            .arg_scalar("flat", ScalarType::UInt);
+
+        let desc = uri.build();
+        let value = uri.create();
+
+        // The whole created value must be descriptor-consistent.
+        value_matches_descriptor(&value, &desc)
+            .expect("NTURI::create value must match its own descriptor");
+
+        // The nested structure arg must be an (empty-defaulted) structure,
+        // not a Null.
+        let PvField::Structure(root) = &value else {
+            panic!("NTURI value must be a structure");
+        };
+        let Some(PvField::Structure(query)) = root.get_field("query") else {
+            panic!("query must be a structure");
+        };
+        assert!(
+            matches!(query.get_field("nested"), Some(PvField::Structure(_))),
+            "nested query arg must default to a structure, not Null"
+        );
     }
 }

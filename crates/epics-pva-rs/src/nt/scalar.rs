@@ -17,6 +17,11 @@ pub struct NTScalar {
     pub display: bool,
     pub control: bool,
     pub value_alarm: bool,
+    /// pvxs `NTScalar::form` (`src/pvxs/nt.h:68-89`): when set, the numeric
+    /// `display` structure also carries `display.precision` and an
+    /// `display.form` `enum_t`. pvxs gates this inside `if(display &&
+    /// isnumeric)`, so `form` only takes effect together with `display`.
+    pub form: bool,
 }
 
 impl NTScalar {
@@ -28,6 +33,7 @@ impl NTScalar {
             display: false,
             control: false,
             value_alarm: false,
+            form: false,
         }
     }
 
@@ -39,10 +45,21 @@ impl NTScalar {
             display: false,
             control: false,
             value_alarm: false,
+            form: false,
         }
     }
 
     pub fn with_display(mut self) -> Self {
+        self.display = true;
+        self
+    }
+
+    /// Add `display.precision` + `display.form` (`enum_t`) to the numeric
+    /// display structure, mirroring pvxs `NTScalar{ ..., form=true }`
+    /// (`src/nt.cpp:67-77`). pvxs emits these only when `display` is also
+    /// set, so this implies [`with_display`](Self::with_display).
+    pub fn with_form(mut self) -> Self {
+        self.form = true;
         self.display = true;
         self
     }
@@ -92,16 +109,36 @@ impl NTScalar {
 
         if self.display {
             if is_numeric {
+                // pvxs `nt.cpp:58-66` numeric display base.
+                let mut display_fields = vec![
+                    ("limitLow".into(), FieldDesc::Scalar(self.value_type)),
+                    ("limitHigh".into(), FieldDesc::Scalar(self.value_type)),
+                    ("description".into(), FieldDesc::Scalar(ScalarType::String)),
+                    ("units".into(), FieldDesc::Scalar(ScalarType::String)),
+                ];
+                if self.form {
+                    // pvxs `nt.cpp:67-77` merges a second `Struct("display",
+                    // {precision, form enum_t})` into the same display
+                    // struct; the Rust builder appends those members
+                    // directly (final order: limits, description, units,
+                    // precision, form).
+                    display_fields.push(("precision".into(), FieldDesc::Scalar(ScalarType::Int)));
+                    display_fields.push((
+                        "form".into(),
+                        FieldDesc::Structure {
+                            struct_id: "enum_t".into(),
+                            fields: vec![
+                                ("index".into(), FieldDesc::Scalar(ScalarType::Int)),
+                                ("choices".into(), FieldDesc::ScalarArray(ScalarType::String)),
+                            ],
+                        },
+                    ));
+                }
                 fields.push((
                     "display".into(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: vec![
-                            ("limitLow".into(), FieldDesc::Scalar(self.value_type)),
-                            ("limitHigh".into(), FieldDesc::Scalar(self.value_type)),
-                            ("description".into(), FieldDesc::Scalar(ScalarType::String)),
-                            ("units".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        fields: display_fields,
                     },
                 ));
             } else {
@@ -214,6 +251,71 @@ mod tests {
         } else {
             panic!("expected struct");
         }
+    }
+
+    #[test]
+    fn nt_scalar_with_form_adds_precision_and_form_enum_to_display() {
+        // pvxs `nt.cpp:67-77`: a numeric NTScalar with `form` carries
+        // `display.precision` (Int32) and `display.form` (enum_t).
+        let desc = NTScalar::new(ScalarType::Double).with_form().build();
+        let FieldDesc::Structure { fields, .. } = desc else {
+            panic!("expected struct");
+        };
+        let display = fields
+            .iter()
+            .find_map(|(n, d)| (n == "display").then_some(d))
+            .expect("display field");
+        let FieldDesc::Structure {
+            fields: subfields, ..
+        } = display
+        else {
+            panic!("display must be a structure");
+        };
+        // Order matches pvxs merge: limits, description, units, precision, form.
+        let names: Vec<&str> = subfields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "limitLow",
+                "limitHigh",
+                "description",
+                "units",
+                "precision",
+                "form"
+            ]
+        );
+        // precision is Int32.
+        let precision = &subfields.iter().find(|(n, _)| n == "precision").unwrap().1;
+        assert!(matches!(precision, FieldDesc::Scalar(ScalarType::Int)));
+        // form is an enum_t { index: Int32, choices: String[] }.
+        let form = &subfields.iter().find(|(n, _)| n == "form").unwrap().1;
+        let FieldDesc::Structure {
+            struct_id: form_id,
+            fields: form_fields,
+        } = form
+        else {
+            panic!("form must be a structure");
+        };
+        assert_eq!(form_id, "enum_t");
+        assert!(matches!(
+            form_fields.iter().find(|(n, _)| n == "index").unwrap().1,
+            FieldDesc::Scalar(ScalarType::Int)
+        ));
+        assert!(matches!(
+            form_fields.iter().find(|(n, _)| n == "choices").unwrap().1,
+            FieldDesc::ScalarArray(ScalarType::String)
+        ));
+    }
+
+    #[test]
+    fn nt_scalar_form_without_display_still_emits_display() {
+        // `with_form()` implies `with_display()` (pvxs gates form inside
+        // `if(display)`), so the display structure is present.
+        let desc = NTScalar::new(ScalarType::Int).with_form().build();
+        let FieldDesc::Structure { fields, .. } = desc else {
+            panic!("expected struct");
+        };
+        assert!(fields.iter().any(|(n, _)| n == "display"));
     }
 
     #[test]

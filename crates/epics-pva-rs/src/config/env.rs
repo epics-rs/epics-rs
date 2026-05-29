@@ -58,16 +58,15 @@ pub fn expand_dollar_vars(input: &str) -> String {
 }
 
 /// Seed a name→value map of EPICS_PVA / EPICS_PVAS overrides into the
-/// process environment so subsequent `*_from_env`-style reads pick them
-/// up. An `st.cmd`-style helper for callers holding a dictionary of
-/// overrides (e.g. parsed from a config file).
+/// **process environment** so subsequent `*_from_env`-style reads pick
+/// them up. A startup-only, `st.cmd`-style global seeder for callers
+/// holding a dictionary of overrides (e.g. parsed from a config file).
 ///
-/// This is **not** pvxs `Config::applyDefs`: pvxs reads the map *into a
-/// `Config` struct's fields* (it never touches `getenv`/`setenv`, has no
-/// replace-vs-fill toggle, and returns the `Config`). This crate reads
-/// its configuration from the environment via the `*_from_env` readers,
-/// so the equivalent injection point is the process environment — hence
-/// this writes there instead.
+/// This is deliberately **not** the pvxs `Config::applyDefs` analogue —
+/// it mutates global state shared by every later reader, so it cannot
+/// scope definitions to one client/server config. For pvxs-style
+/// per-config definitions that leave the environment untouched, use
+/// [`PvaConfigDefs::apply_defs`].
 ///
 /// Semantics: for each `(name, value)` pair, sets `name=value` in the
 /// process environment when `name` isn't already set, OR replaces the
@@ -75,7 +74,7 @@ pub fn expand_dollar_vars(input: &str) -> String {
 /// variables that were actually written. Keys are written verbatim with
 /// no validation — caller is responsible for using real EPICS_PVA[S]_*
 /// names.
-pub fn apply_defs(map: &HashMap<String, String>, replace_existing: bool) -> usize {
+pub fn seed_env_overrides(map: &HashMap<String, String>, replace_existing: bool) -> usize {
     let mut applied = 0usize;
     for (name, value) in map {
         let exists = std::env::var(name).is_ok();
@@ -94,6 +93,55 @@ pub fn apply_defs(map: &HashMap<String, String>, replace_existing: bool) -> usiz
         applied += 1;
     }
     applied
+}
+
+/// Per-config EPICS_PVA / EPICS_PVAS definitions, scoped to one
+/// client/server configuration.
+///
+/// This is the Rust analogue of pvxs `Config::applyDefs(defs)`
+/// (`src/pvxs/server.h:197-203`, `src/pvxs/client.h:1053-1059`,
+/// implemented in `src/config.cpp:468-471` / `:607-610`): it captures the
+/// supplied definitions **into this object** and leaves the process
+/// environment unchanged. Two `PvaConfigDefs` built from two different
+/// maps are fully independent — building one does not affect the other or
+/// any [`seed_env_overrides`]-seeded global, so a single process can hold
+/// several named client/server configs (pva2pva-style) without
+/// cross-contamination.
+///
+/// Resolution precedence matches pvxs (explicit definitions win over the
+/// ambient environment): [`PvaConfigDefs::get`] returns the scoped
+/// definition when present, else falls back to the process environment.
+/// Compose `get` with the pure parsers in this module
+/// ([`parse_addr_list_with_port`], integer/`parse_bool` parsing) to derive
+/// typed config values without reading global state for a scoped key.
+#[derive(Debug, Clone, Default)]
+pub struct PvaConfigDefs {
+    defs: HashMap<String, String>,
+}
+
+impl PvaConfigDefs {
+    /// Capture `map` as this config's definitions. Does **not** touch the
+    /// process environment (pvxs `Config::applyDefs` contract). Keys are
+    /// stored verbatim; the caller supplies real `EPICS_PVA[S]_*` names.
+    pub fn apply_defs(map: &HashMap<String, String>) -> Self {
+        Self { defs: map.clone() }
+    }
+
+    /// Resolve a variable name. A scoped definition takes precedence; when
+    /// this config does not define `name`, fall back to the process
+    /// environment (pvxs: explicit defs override the ambient env).
+    pub fn get(&self, name: &str) -> Option<String> {
+        match self.defs.get(name) {
+            Some(v) => Some(v.clone()),
+            None => std::env::var(name).ok(),
+        }
+    }
+
+    /// True when `name` is defined by this config (independent of the
+    /// process environment).
+    pub fn contains(&self, name: &str) -> bool {
+        self.defs.contains_key(name)
+    }
 }
 
 /// Parse a `EPICS_PVA_ADDR_LIST`-style string (comma/whitespace
@@ -553,7 +601,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn apply_defs_writes_when_unset_and_skips_when_set_unless_replace() {
+    fn seed_env_overrides_writes_when_unset_and_skips_when_set_unless_replace() {
         unsafe {
             std::env::remove_var("EPICS_RS_AUDIT_DEFS_A");
             std::env::set_var("EPICS_RS_AUDIT_DEFS_B", "preset");
@@ -564,12 +612,12 @@ mod tests {
             "EPICS_RS_AUDIT_DEFS_B".to_string(),
             "would-replace".to_string(),
         );
-        let written = apply_defs(&map, false);
+        let written = seed_env_overrides(&map, false);
         assert_eq!(written, 1, "B should not be replaced when not asked");
         assert_eq!(std::env::var("EPICS_RS_AUDIT_DEFS_A").unwrap(), "from-defs");
         assert_eq!(std::env::var("EPICS_RS_AUDIT_DEFS_B").unwrap(), "preset");
         // replace_existing = true overwrites
-        let written2 = apply_defs(&map, true);
+        let written2 = seed_env_overrides(&map, true);
         assert_eq!(written2, 2);
         assert_eq!(
             std::env::var("EPICS_RS_AUDIT_DEFS_B").unwrap(),
@@ -579,6 +627,62 @@ mod tests {
             std::env::remove_var("EPICS_RS_AUDIT_DEFS_A");
             std::env::remove_var("EPICS_RS_AUDIT_DEFS_B");
         }
+    }
+
+    #[test]
+    fn pva_config_defs_are_independent_and_do_not_touch_env() {
+        // pvxs `Config::applyDefs` contract: definitions are scoped to the
+        // config object and the process environment is left unchanged, so
+        // two configs built from two maps cannot contaminate each other.
+        // Use a guaranteed-unset, uniquely-named key so the env-fallback
+        // assertion is not racy with parallel tests.
+        const KEY_ADDR: &str = "EPICS_PVA_ADDR_LIST";
+        const KEY_PORT: &str = "EPICS_PVAS_SERVER_PORT";
+        const UNSET: &str = "EPICS_RS_AUDIT_PVACFG_UNSET";
+        // A uniquely-named scoped key that is also placed in the map, so
+        // its absence from the env after apply_defs proves no global write.
+        const AUDIT_KEY: &str = "EPICS_RS_AUDIT_PVACFG_SCOPED";
+        unsafe {
+            std::env::remove_var(UNSET);
+            std::env::remove_var(AUDIT_KEY);
+        }
+
+        let mut a = HashMap::new();
+        a.insert(KEY_ADDR.to_string(), "10.0.0.1".to_string());
+        a.insert(KEY_PORT.to_string(), "5085".to_string());
+        a.insert(AUDIT_KEY.to_string(), "scoped-only".to_string());
+        let mut b = HashMap::new();
+        b.insert(KEY_ADDR.to_string(), "192.168.1.1".to_string());
+        b.insert(KEY_PORT.to_string(), "5095".to_string());
+
+        let cfg_a = PvaConfigDefs::apply_defs(&a);
+        let cfg_b = PvaConfigDefs::apply_defs(&b);
+
+        // Independent: each config keeps its own definitions.
+        assert_eq!(cfg_a.get(KEY_ADDR).as_deref(), Some("10.0.0.1"));
+        assert_eq!(cfg_b.get(KEY_ADDR).as_deref(), Some("192.168.1.1"));
+        assert_eq!(cfg_a.get(KEY_PORT).as_deref(), Some("5085"));
+        assert_eq!(cfg_b.get(KEY_PORT).as_deref(), Some("5095"));
+
+        // Scoped value parses through the existing pure parser without
+        // reading global state.
+        let addrs = parse_addr_list_with_port(&cfg_a.get(KEY_ADDR).unwrap(), 5076);
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].ip().to_string(), "10.0.0.1");
+
+        // apply_defs must NOT have written the process environment: a
+        // scoped-only key resolves through the config but stays absent
+        // from the env.
+        assert_eq!(cfg_a.get(AUDIT_KEY).as_deref(), Some("scoped-only"));
+        assert!(
+            std::env::var(AUDIT_KEY).is_err(),
+            "apply_defs must not seed the process environment"
+        );
+
+        // A key absent from the config falls back to the (here unset)
+        // process environment → None.
+        assert!(cfg_a.get(UNSET).is_none(), "unset key resolves to None");
+        assert!(!cfg_a.contains(UNSET));
     }
 
     #[test]

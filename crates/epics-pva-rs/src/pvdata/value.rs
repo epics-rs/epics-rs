@@ -25,7 +25,9 @@
 use std::sync::Arc;
 
 use crate::proto::BitSet;
-use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+use crate::pvdata::{
+    FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, UnionItem, VariantValue,
+};
 
 /// High-level value container.
 #[derive(Clone)]
@@ -98,12 +100,12 @@ impl Value {
 
     /// True iff `path` exists.
     pub fn has(&self, path: &str) -> bool {
-        self.desc.bit_for_path(path).is_some()
+        self.bit_for_value_path(path).is_some()
     }
 
     /// True iff the leaf at `path` is marked.
     pub fn is_marked(&self, path: &str) -> bool {
-        match self.desc.bit_for_path(path) {
+        match self.bit_for_value_path(path) {
             Some(bit) => self.marks.get(bit),
             None => false,
         }
@@ -111,7 +113,7 @@ impl Value {
 
     /// Mark the leaf at `path`. Returns `Err(NoField)` if missing.
     pub fn mark(&mut self, path: &str) -> Result<(), ValueError> {
-        match self.desc.bit_for_path(path) {
+        match self.bit_for_value_path(path) {
             Some(bit) => {
                 self.marks.set(bit);
                 Ok(())
@@ -122,7 +124,7 @@ impl Value {
 
     /// Unmark the leaf at `path` (single bit).
     pub fn unmark(&mut self, path: &str) -> Result<(), ValueError> {
-        match self.desc.bit_for_path(path) {
+        match self.bit_for_value_path(path) {
             Some(bit) => {
                 self.marks.clear(bit);
                 Ok(())
@@ -154,23 +156,30 @@ impl Value {
     }
 
     /// Set the leaf at `path` from a typed value with coercion. Marks
-    /// the leaf bit. The target type is taken from the descriptor.
+    /// the leaf's container bit. The target scalar type is taken from the
+    /// leaf's current (typed) value. The path may traverse union/any
+    /// members and compound-array elements (e.g. `value->floatValue`,
+    /// `array[0].field`); the addressed leaf must already be a scalar —
+    /// `set()` does not select a union variant or grow an array.
     pub fn set<T: IntoScalarValue>(&mut self, path: &str, v: T) -> Result<(), ValueError> {
-        let bit = self
-            .desc
-            .bit_for_path(path)
+        let bit = self.bit_for_value_path(path);
+        let leaf = self
+            .lookup_mut(path)
             .ok_or_else(|| ValueError::NoField(path.into()))?;
-        let target_type = self
-            .scalar_type_at(path)
-            .ok_or_else(|| ValueError::NoField(path.into()))?;
+        let target_type = match leaf {
+            PvField::Scalar(sv) => sv.scalar_type(),
+            _ => return Err(ValueError::NoField(path.into())),
+        };
         let new_scalar = v
             .into_scalar(target_type)
             .map_err(|()| ValueError::NoConvert {
                 path: path.into(),
                 target: format!("{target_type:?}"),
             })?;
-        self.write_scalar(path, new_scalar)?;
-        self.marks.set(bit);
+        *leaf = PvField::Scalar(new_scalar);
+        if let Some(bit) = bit {
+            self.marks.set(bit);
+        }
         Ok(())
     }
 
@@ -209,34 +218,100 @@ impl Value {
         self.get_as(path).ok()
     }
 
-    /// Assign from another `Value`. Copies all leaf fields whose path
-    /// exists in both, performing type coercion as needed. Marks every
-    /// leaf that the source had marked AND that exists here. Pvxs's
-    /// `assign()` semantics — fields missing on the source side are
-    /// left unchanged.
+    /// Assign from another `Value`, copying the **marked** source fields
+    /// into the destination.
+    ///
+    /// pvxs `Value::assign()` delegates to `copyIn(&o, StoreType::Compound)`
+    /// whose struct branch iterates `src.imarked()` only (data.cpp:731-769):
+    /// an unmarked source field is not part of the update and leaves the
+    /// destination unchanged, and a marked source field with no matching
+    /// destination field throws `NoField` (data.cpp:746-756) rather than
+    /// being silently dropped. Driving the copy from every descriptor leaf
+    /// instead copied stale unmarked values and hid schema mismatches.
     pub fn assign(&mut self, other: &Value) -> Result<(), ValueError> {
-        for path in walk_leaf_paths(other.desc(), "") {
-            if !self.has(&path) {
+        for path in other.iter_marked() {
+            // Marked source field absent in the destination: pvxs throws
+            // NoField; we do too instead of skipping it.
+            let Some(dst_desc) = self.desc_at(&path).cloned() else {
+                return Err(ValueError::NoField(path));
+            };
+            let Some(src_field) = other.lookup_field(&path) else {
                 continue;
+            };
+            // Dispatch the payload copy on the destination leaf's store
+            // type, mirroring pvxs `copyIn()` which switches on
+            // `StoreType` (data.cpp:609-769): scalars coerce, scalar
+            // arrays copy with element conversion, and Struct/Union/Any
+            // (and their array forms) copy through.
+            match &dst_desc {
+                FieldDesc::Scalar(t) => {
+                    if let PvField::Scalar(sv) = src_field {
+                        if let Some(coerced) = coerce_scalar(sv, *t) {
+                            let _ = self.write_scalar(&path, coerced);
+                        }
+                    }
+                }
+                FieldDesc::ScalarArray(t) => {
+                    let elems: Vec<ScalarValue> = match src_field {
+                        PvField::ScalarArray(v) => v.clone(),
+                        PvField::ScalarArrayTyped(a) => a.to_scalar_values(),
+                        _ => continue,
+                    };
+                    // pvxs converts element types and faults when a value
+                    // does not fit; we surface that as an error rather
+                    // than returning Ok after dropping the array.
+                    let converted = elems
+                        .iter()
+                        .map(|e| coerce_scalar(e, *t))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| ValueError::NoConvert {
+                            path: path.clone(),
+                            target: format!("{t:?}[]"),
+                        })?;
+                    let _ = self.write_field(&path, PvField::ScalarArray(converted));
+                }
+                // Compound / "any" leaves: same-shape copy of the source
+                // store. BoundedString is a string scalar on the value
+                // side, so a clone is the faithful copy here too.
+                FieldDesc::StructureArray { .. }
+                | FieldDesc::Union { .. }
+                | FieldDesc::UnionArray { .. }
+                | FieldDesc::Variant
+                | FieldDesc::VariantArray
+                | FieldDesc::BoundedString(_) => {
+                    let _ = self.write_field(&path, src_field.clone());
+                }
+                // A marked structure node represents its whole subtree
+                // (pvxs imarked, testdata.cpp:180-209). Copy the subtree
+                // payload so a bare structure-level mark transfers; any
+                // individually-marked descendant leaf is also visited and
+                // re-copied (with scalar coercion) later in this loop.
+                FieldDesc::Structure { .. } => {
+                    if matches!(src_field, PvField::Structure(_)) {
+                        let _ = self.write_field(&path, src_field.clone());
+                    }
+                }
             }
-            // copy value (best-effort coercion via ScalarValue passthrough)
-            if let Ok(sv) = other.lookup_scalar(&path) {
-                let target = self.scalar_type_at(&path).unwrap_or(ScalarType::String);
-                let coerced = match coerce_scalar(&sv, target) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let _ = self.write_scalar(&path, coerced);
-            }
-            if other.is_marked(&path) {
-                let _ = self.mark(&path);
-            }
+            // Every path here came from the source mark set, so the
+            // destination field is now part of the update.
+            let _ = self.mark(&path);
         }
         Ok(())
     }
 
-    /// Iterate every leaf field's path (depth-first §5.4 order).
+    /// Iterate every field path — structure nodes AND leaves — in
+    /// pvData bit order, excluding the root.
+    ///
+    /// Mirrors pvxs `Value::iall()` (testdata.cpp:159-178): an
+    /// `NTScalar` yields 9 descendants, including the `alarm` and
+    /// `timeStamp` structure nodes, not only scalar leaves. Use
+    /// [`Self::iter_all_leaves`] for leaf-only iteration.
     pub fn iter_all(&self) -> impl Iterator<Item = String> + '_ {
+        walk_all_paths(&self.desc, "").into_iter()
+    }
+
+    /// Iterate only leaf field paths (no structure nodes), depth-first.
+    pub fn iter_all_leaves(&self) -> impl Iterator<Item = String> + '_ {
         walk_leaf_paths(&self.desc, "").into_iter()
     }
 
@@ -248,9 +323,16 @@ impl Value {
         }
     }
 
-    /// Iterate every currently-marked leaf path.
+    /// Iterate every currently-marked field path, structure nodes
+    /// included, in bit order.
+    ///
+    /// pvxs `imarked()` reports a marked structure node alongside its
+    /// leaves (testdata.cpp:180-209): marking `alarm` makes `imarked()`
+    /// see the `alarm` node plus its three leaves. A bare structure-node
+    /// mark is therefore visible here and flows through
+    /// [`Self::assign`], where the previous leaf-only walk dropped it.
     pub fn iter_marked(&self) -> Vec<String> {
-        walk_leaf_paths(&self.desc, "")
+        walk_all_paths(&self.desc, "")
             .into_iter()
             .filter(|p| self.is_marked(p))
             .collect()
@@ -258,7 +340,10 @@ impl Value {
 
     // ── internal helpers ─────────────────────────────────────────────
 
-    fn scalar_type_at(&self, path: &str) -> Option<ScalarType> {
+    /// Resolve a dotted path to the leaf [`FieldDesc`], descending only
+    /// through structure nodes. Shared traversal for the scalar and
+    /// compound copy paths.
+    fn desc_at(&self, path: &str) -> Option<&FieldDesc> {
         let mut cur: &FieldDesc = &self.desc;
         for seg in path.split('.').filter(|s| !s.is_empty()) {
             match cur {
@@ -268,47 +353,107 @@ impl Value {
                 _ => return None,
             }
         }
-        match cur {
-            FieldDesc::Scalar(t) => Some(*t),
-            _ => None,
-        }
+        Some(cur)
     }
 
-    fn lookup_scalar(&self, path: &str) -> Result<ScalarValue, ValueError> {
+    /// Resolve a dotted path to the leaf [`PvField`], descending only
+    /// through structure nodes. Used by [`Self::assign`], whose paths
+    /// always come from the descriptor's structure walk.
+    fn lookup_field(&self, path: &str) -> Option<&PvField> {
         let mut field = &self.field;
         for seg in path.split('.').filter(|s| !s.is_empty()) {
             match field {
-                PvField::Structure(s) => {
-                    field = s
-                        .get_field(seg)
-                        .ok_or_else(|| ValueError::NoField(path.into()))?;
-                }
-                _ => return Err(ValueError::NoField(path.into())),
+                PvField::Structure(s) => field = s.get_field(seg)?,
+                _ => return None,
             }
         }
-        match field {
-            PvField::Scalar(s) => Ok(s.clone()),
-            other => Err(ValueError::TypeMismatch {
+        Some(field)
+    }
+
+    fn lookup_scalar(&self, path: &str) -> Result<ScalarValue, ValueError> {
+        match self.lookup(path) {
+            Some(PvField::Scalar(s)) => Ok(s.clone()),
+            Some(other) => Err(ValueError::TypeMismatch {
                 path: path.into(),
                 expected: "scalar".into(),
                 got: format!("{other:?}"),
             }),
+            None => Err(ValueError::NoField(path.into())),
         }
     }
 
-    fn write_scalar(&mut self, path: &str, value: ScalarValue) -> Result<(), ValueError> {
-        let segs: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
-        Self::write_scalar_in(&mut self.field, &segs, value, path)
+    /// Resolve a pvxs-style path to a borrowed leaf [`PvField`].
+    ///
+    /// Supports `.` (structure member), `->` / `->member` (union/`any`
+    /// dereference and selection), and `[index]` (compound-array
+    /// element) — mirroring pvxs `Value::traverse` (data.cpp:783-950).
+    /// Returns `None` when a segment is missing, a `->member` names a
+    /// variant other than the one currently selected, a union/any is
+    /// null, or an array index is out of range / a null element. The
+    /// parent operator `<` is not supported: a root `Value` exposes no
+    /// parent handle to walk up to.
+    pub fn lookup(&self, path: &str) -> Option<&PvField> {
+        let segs = parse_path(path).ok()?;
+        let mut cur = Cur::Field(&self.field);
+        for seg in &segs {
+            cur = step(cur, seg)?;
+        }
+        match cur {
+            Cur::Field(f) => Some(f),
+            _ => None,
+        }
     }
 
-    fn write_scalar_in(
+    /// Mutable counterpart of [`Self::lookup`].
+    pub fn lookup_mut(&mut self, path: &str) -> Option<&mut PvField> {
+        let segs = parse_path(path).ok()?;
+        let mut cur = CurMut::Field(&mut self.field);
+        for seg in &segs {
+            cur = step_mut(cur, seg)?;
+        }
+        match cur {
+            CurMut::Field(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// The mark bit a value path maps to. pvData §5.4 gives a union or
+    /// compound array a single bit; its contents are not separately
+    /// addressed. A path that descends through `->` or `[index]`
+    /// therefore marks its nearest containing structure field. For a
+    /// plain dotted path this is just the leaf's own bit.
+    fn bit_for_value_path(&self, path: &str) -> Option<usize> {
+        let cut = [path.find("->"), path.find('[')]
+            .into_iter()
+            .flatten()
+            .min();
+        let prefix = match cut {
+            Some(i) => path[..i].trim_end_matches('.'),
+            None => path,
+        };
+        self.desc.bit_for_path(prefix)
+    }
+
+    fn write_scalar(&mut self, path: &str, value: ScalarValue) -> Result<(), ValueError> {
+        self.write_field(path, PvField::Scalar(value))
+    }
+
+    /// Replace the whole [`PvField`] at a dotted path, descending only
+    /// through structure nodes. Used by both scalar writes and the
+    /// compound-payload copy in [`Self::assign`].
+    fn write_field(&mut self, path: &str, value: PvField) -> Result<(), ValueError> {
+        let segs: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+        Self::write_field_in(&mut self.field, &segs, value, path)
+    }
+
+    fn write_field_in(
         field: &mut PvField,
         segs: &[&str],
-        value: ScalarValue,
+        value: PvField,
         full_path: &str,
     ) -> Result<(), ValueError> {
         if segs.is_empty() {
-            *field = PvField::Scalar(value);
+            *field = value;
             return Ok(());
         }
         let head = segs[0];
@@ -317,7 +462,7 @@ impl Value {
             PvField::Structure(s) => {
                 for (n, f) in s.fields.iter_mut() {
                     if n == head {
-                        return Self::write_scalar_in(f, tail, value, full_path);
+                        return Self::write_field_in(f, tail, value, full_path);
                     }
                 }
                 Err(ValueError::NoField(full_path.into()))
@@ -389,6 +534,178 @@ fn default_scalar(t: ScalarType) -> ScalarValue {
         ScalarType::Float => ScalarValue::Float(0.0),
         ScalarType::Double => ScalarValue::Double(0.0),
         ScalarType::String => ScalarValue::String(String::new()),
+    }
+}
+
+/// Walk every field path — structure nodes and leaves — in pvData bit
+/// order (§5.4), excluding the root. Each node's path is emitted before
+/// its descendants, matching the depth-first bit numbering in
+/// [`FieldDesc::bit_for_path`]: e.g. an `NTScalar` yields `value`,
+/// `alarm`, `alarm.severity`, …, `timeStamp`, `timeStamp.secondsPastEpoch`, …
+/// — pvxs `iall()`'s 9 descendants.
+fn walk_all_paths(desc: &FieldDesc, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let FieldDesc::Structure { fields, .. } = desc {
+        for (name, child) in fields {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            // The node itself occupies a bit before any of its children.
+            out.push(path.clone());
+            if matches!(child, FieldDesc::Structure { .. }) {
+                out.extend(walk_all_paths(child, &path));
+            }
+        }
+    }
+    out
+}
+
+/// One parsed segment of a high-level value path.
+enum PathSeg {
+    /// `.name` or a leading bare `name` — a structure member.
+    Field(String),
+    /// `[index]` — a compound-array element.
+    Index(usize),
+    /// `->` (bare) or `->member` — dereference / select a union or `any`.
+    Deref(Option<String>),
+}
+
+/// Parse a pvxs-style value path into segments: `.`, `->`, `->member`,
+/// and `[index]`. `<` (parent) is intentionally unsupported — a root
+/// `Value` has no parent handle. A malformed path yields `NoField`.
+fn parse_path(path: &str) -> Result<Vec<PathSeg>, ValueError> {
+    let nofield = || ValueError::NoField(path.into());
+    let mut segs = Vec::new();
+    let mut rest = path;
+    while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix("->") {
+            let (name, r2) = take_ident(r);
+            segs.push(PathSeg::Deref((!name.is_empty()).then(|| name.to_string())));
+            rest = r2;
+        } else if let Some(r) = rest.strip_prefix('.') {
+            let (name, r2) = take_ident(r);
+            if name.is_empty() {
+                return Err(nofield());
+            }
+            segs.push(PathSeg::Field(name.to_string()));
+            rest = r2;
+        } else if let Some(r) = rest.strip_prefix('[') {
+            let end = r.find(']').ok_or_else(nofield)?;
+            let idx: usize = r[..end].parse().map_err(|_| nofield())?;
+            segs.push(PathSeg::Index(idx));
+            rest = &r[end + 1..];
+        } else {
+            let (name, r2) = take_ident(rest);
+            if name.is_empty() {
+                return Err(nofield());
+            }
+            segs.push(PathSeg::Field(name.to_string()));
+            rest = r2;
+        }
+    }
+    Ok(segs)
+}
+
+/// Read an identifier up to the next path delimiter (`.`, `[`, or the
+/// `-` that begins `->`).
+fn take_ident(s: &str) -> (&str, &str) {
+    let end = s.find(['.', '[', '-']).unwrap_or(s.len());
+    (&s[..end], &s[end..])
+}
+
+/// True iff a union with `selector`/`variant_name` can be dereferenced
+/// by `member`: the union must have a variant selected, and when a
+/// member name is given it must be the selected one.
+fn deref_union(selector: i32, variant_name: &str, member: &Option<String>) -> bool {
+    if selector < 0 {
+        return false;
+    }
+    match member {
+        None => true,
+        Some(m) => m == variant_name,
+    }
+}
+
+/// Read-side traversal cursor — the value tree's array elements are not
+/// themselves `PvField`, so the cursor tracks the concrete container.
+enum Cur<'a> {
+    Field(&'a PvField),
+    Struct(&'a PvStructure),
+    Union(&'a UnionItem),
+    Variant(&'a VariantValue),
+}
+
+fn step<'a>(cur: Cur<'a>, seg: &PathSeg) -> Option<Cur<'a>> {
+    match (seg, cur) {
+        (PathSeg::Field(n), Cur::Field(PvField::Structure(s))) => Some(Cur::Field(s.get_field(n)?)),
+        (PathSeg::Field(n), Cur::Struct(s)) => Some(Cur::Field(s.get_field(n)?)),
+        (PathSeg::Index(i), Cur::Field(PvField::StructureArray(items))) => {
+            Some(Cur::Struct(items.get(*i)?.as_ref()?))
+        }
+        (PathSeg::Index(i), Cur::Field(PvField::UnionArray(items))) => {
+            Some(Cur::Union(items.get(*i)?.as_ref()?))
+        }
+        (PathSeg::Index(i), Cur::Field(PvField::VariantArray(items))) => {
+            Some(Cur::Variant(items.get(*i)?.as_ref()?))
+        }
+        (
+            PathSeg::Deref(m),
+            Cur::Field(PvField::Union {
+                selector,
+                variant_name,
+                value,
+            }),
+        ) if deref_union(*selector, variant_name, m) => Some(Cur::Field(value)),
+        (PathSeg::Deref(_), Cur::Field(PvField::Variant(v))) => Some(Cur::Field(&v.value)),
+        (PathSeg::Deref(m), Cur::Union(it)) if deref_union(it.selector, &it.variant_name, m) => {
+            Some(Cur::Field(&it.value))
+        }
+        (PathSeg::Deref(_), Cur::Variant(v)) => Some(Cur::Field(&v.value)),
+        _ => None,
+    }
+}
+
+/// Mutable counterpart of [`Cur`].
+enum CurMut<'a> {
+    Field(&'a mut PvField),
+    Struct(&'a mut PvStructure),
+    Union(&'a mut UnionItem),
+    Variant(&'a mut VariantValue),
+}
+
+fn step_mut<'a>(cur: CurMut<'a>, seg: &PathSeg) -> Option<CurMut<'a>> {
+    match (seg, cur) {
+        (PathSeg::Field(n), CurMut::Field(PvField::Structure(s))) => {
+            Some(CurMut::Field(s.get_field_mut(n)?))
+        }
+        (PathSeg::Field(n), CurMut::Struct(s)) => Some(CurMut::Field(s.get_field_mut(n)?)),
+        (PathSeg::Index(i), CurMut::Field(PvField::StructureArray(items))) => {
+            Some(CurMut::Struct(items.get_mut(*i)?.as_mut()?))
+        }
+        (PathSeg::Index(i), CurMut::Field(PvField::UnionArray(items))) => {
+            Some(CurMut::Union(items.get_mut(*i)?.as_mut()?))
+        }
+        (PathSeg::Index(i), CurMut::Field(PvField::VariantArray(items))) => {
+            Some(CurMut::Variant(items.get_mut(*i)?.as_mut()?))
+        }
+        (
+            PathSeg::Deref(m),
+            CurMut::Field(PvField::Union {
+                selector,
+                variant_name,
+                value,
+            }),
+        ) if deref_union(*selector, variant_name, m) => Some(CurMut::Field(value)),
+        (PathSeg::Deref(_), CurMut::Field(PvField::Variant(v))) => {
+            Some(CurMut::Field(&mut v.value))
+        }
+        (PathSeg::Deref(m), CurMut::Union(it)) if deref_union(it.selector, &it.variant_name, m) => {
+            Some(CurMut::Field(&mut it.value))
+        }
+        (PathSeg::Deref(_), CurMut::Variant(v)) => Some(CurMut::Field(&mut v.value)),
+        _ => None,
     }
 }
 
@@ -676,13 +993,33 @@ mod tests {
     }
 
     #[test]
-    fn iter_all_walks_depth_first() {
+    fn iter_all_includes_structure_nodes_in_bit_order() {
+        // pvxs iall() = 9 descendants for NTScalar (the `alarm` and
+        // `timeStamp` structure nodes plus 7 scalar leaves), in bit order.
         let v = make_nt_int();
         let all: Vec<String> = v.iter_all().collect();
-        // pvxs expects 9 leaves for NTScalar(Int) without display/control.
-        assert_eq!(all.len(), 7);
-        assert_eq!(all[0], "value");
-        assert_eq!(all[1], "alarm.severity");
+        assert_eq!(
+            all,
+            vec![
+                "value",
+                "alarm",
+                "alarm.severity",
+                "alarm.status",
+                "alarm.message",
+                "timeStamp",
+                "timeStamp.secondsPastEpoch",
+                "timeStamp.nanoseconds",
+                "timeStamp.userTag",
+            ]
+        );
+    }
+
+    #[test]
+    fn iter_all_leaves_excludes_structure_nodes() {
+        let v = make_nt_int();
+        let leaves: Vec<String> = v.iter_all_leaves().collect();
+        assert_eq!(leaves.len(), 7);
+        assert!(!leaves.contains(&"alarm".to_string()));
     }
 
     #[test]
@@ -692,6 +1029,33 @@ mod tests {
         v.mark("alarm.message").unwrap();
         let marked = v.iter_marked();
         assert_eq!(marked, vec!["value", "alarm.message"]);
+    }
+
+    #[test]
+    fn iter_marked_reports_marked_structure_node() {
+        // pvxs: marking `alarm` makes imarked() see the alarm node; the
+        // leaves stay unmarked unless marked individually.
+        let mut v = make_nt_int();
+        v.mark("alarm").unwrap();
+        assert_eq!(v.iter_marked(), vec!["alarm"]);
+        assert!(v.is_marked("alarm"));
+        assert!(!v.is_marked("alarm.severity"));
+    }
+
+    #[test]
+    fn assign_copies_marked_structure_subtree() {
+        // A bare structure-level mark transfers the whole subtree.
+        let mut src = make_nt_int();
+        src.set("alarm.severity", 3i32).unwrap();
+        src.set("alarm.status", 1i32).unwrap();
+        src.unmark("alarm.severity").unwrap();
+        src.unmark("alarm.status").unwrap();
+        src.mark("alarm").unwrap(); // only the structure node is marked
+        let mut dst = make_nt_int();
+        dst.assign(&src).unwrap();
+        assert_eq!(dst.get_as::<i32>("alarm.severity").unwrap(), 3);
+        assert_eq!(dst.get_as::<i32>("alarm.status").unwrap(), 1);
+        assert!(dst.is_marked("alarm"));
     }
 
     #[test]
@@ -711,5 +1075,315 @@ mod tests {
         assert_eq!(a.get_as::<i32>("value").unwrap(), 17);
         assert!(a.is_marked("value"));
         assert!(a.is_marked("alarm.severity"));
+    }
+
+    // ── path traversal of union/any/array — PVA-RS-2026-05-28-104 ──
+
+    fn struct_of(name: &str, fdesc: FieldDesc, field: PvField) -> Value {
+        let desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![(name.into(), fdesc)],
+        };
+        let mut s = PvStructure::new("");
+        s.fields.push((name.into(), field));
+        Value::from_parts(desc, PvField::Structure(s), BitSet::new())
+    }
+
+    fn union_value_desc() -> FieldDesc {
+        FieldDesc::Union {
+            struct_id: String::new(),
+            variants: vec![
+                ("floatValue".into(), FieldDesc::Scalar(ScalarType::Float)),
+                ("intValue".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        }
+    }
+
+    #[test]
+    fn lookup_union_selected_member() {
+        let v = struct_of(
+            "value",
+            union_value_desc(),
+            PvField::Union {
+                selector: 0,
+                variant_name: "floatValue".into(),
+                value: Box::new(PvField::Scalar(ScalarValue::Float(1.5))),
+            },
+        );
+        assert_eq!(v.get_as::<f32>("value->floatValue").unwrap(), 1.5);
+        // A non-selected member is not reachable.
+        assert!(v.lookup("value->intValue").is_none());
+        // Bare `->` dereferences the current selection.
+        assert!(matches!(
+            v.lookup("value->"),
+            Some(PvField::Scalar(ScalarValue::Float(_)))
+        ));
+    }
+
+    #[test]
+    fn set_union_selected_member_and_marks_container() {
+        let mut v = struct_of(
+            "value",
+            union_value_desc(),
+            PvField::Union {
+                selector: 0,
+                variant_name: "floatValue".into(),
+                value: Box::new(PvField::Scalar(ScalarValue::Float(0.0))),
+            },
+        );
+        v.set("value->floatValue", 2.5f32).unwrap();
+        assert_eq!(v.get_as::<f32>("value->floatValue").unwrap(), 2.5);
+        // The union occupies one bit; marking its member marks `value`.
+        assert!(v.is_marked("value"));
+        assert!(v.is_marked("value->floatValue"));
+    }
+
+    #[test]
+    fn lookup_any_deref() {
+        let v = struct_of(
+            "any",
+            FieldDesc::Variant,
+            PvField::Variant(Box::new(crate::pvdata::VariantValue {
+                desc: Some(FieldDesc::Scalar(ScalarType::Int)),
+                value: PvField::Scalar(ScalarValue::Int(7)),
+            })),
+        );
+        assert_eq!(v.get_as::<i32>("any->").unwrap(), 7);
+    }
+
+    #[test]
+    fn lookup_structure_array_element_field() {
+        let mut elem = PvStructure::new("");
+        elem.fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Int(5))));
+        let v = struct_of(
+            "rows",
+            FieldDesc::StructureArray {
+                struct_id: String::new(),
+                fields: vec![("a".into(), FieldDesc::Scalar(ScalarType::Int))],
+            },
+            PvField::StructureArray(vec![Some(elem)]),
+        );
+        assert_eq!(v.get_as::<i32>("rows[0].a").unwrap(), 5);
+        // Out-of-range index is not reachable.
+        assert!(v.lookup("rows[5].a").is_none());
+    }
+
+    #[test]
+    fn lookup_union_array_element_member() {
+        let v = struct_of(
+            "cells",
+            FieldDesc::UnionArray {
+                struct_id: String::new(),
+                variants: vec![("d".into(), FieldDesc::Scalar(ScalarType::Double))],
+            },
+            PvField::UnionArray(vec![Some(UnionItem {
+                selector: 0,
+                variant_name: "d".into(),
+                value: PvField::Scalar(ScalarValue::Double(3.5)),
+            })]),
+        );
+        assert_eq!(v.get_as::<f64>("cells[0]->d").unwrap(), 3.5);
+    }
+
+    // ── assign() is driven by the source mark set — PVA-RS-2026-05-28-103 ──
+
+    #[test]
+    fn assign_does_not_copy_unmarked_source_scalar() {
+        // Source carries value=5 but it is NOT marked: pvxs leaves the
+        // destination unchanged for unmarked source fields.
+        let mut src = make_nt_int();
+        src.set("value", 5i32).unwrap();
+        src.unmark("value").unwrap();
+        let mut dst = make_nt_int();
+        dst.assign(&src).unwrap();
+        assert_eq!(dst.get_as::<i32>("value").unwrap(), 0);
+        assert!(!dst.is_marked("value"));
+    }
+
+    #[test]
+    fn assign_marked_field_absent_in_dest_errors() {
+        // Source marks `b`, which the destination descriptor lacks: pvxs
+        // throws NoField rather than silently skipping it.
+        let src_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                ("a".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("b".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        };
+        let dst_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("a".into(), FieldDesc::Scalar(ScalarType::Int))],
+        };
+        let mut src = Value::create_from(src_desc);
+        src.set("b", 1i32).unwrap();
+        let mut dst = Value::create_from(dst_desc);
+        let err = dst.assign(&src).unwrap_err();
+        assert!(matches!(err, ValueError::NoField(ref p) if p == "b"));
+    }
+
+    // ── assign() copies non-scalar payloads — PVA-RS-2026-05-28-102 ──
+    //
+    // pvxs copyIn() (data.cpp:609-769) copies array / union / any store
+    // types; the old scalar-only loop dropped them while still copying
+    // the mark, leaving the destination empty but advertising a change.
+
+    /// Build a single-field structure value carrying `field` at `name`,
+    /// with that field marked.
+    fn one_field_value(name: &str, fdesc: FieldDesc, field: PvField) -> Value {
+        let desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![(name.into(), fdesc)],
+        };
+        let mut s = PvStructure::new("");
+        s.fields.push((name.into(), field));
+        let mut marks = BitSet::new();
+        marks.set(1); // root=0, first child=1
+        Value::from_parts(desc, PvField::Structure(s), marks)
+    }
+
+    #[test]
+    fn assign_copies_scalar_array_payload() {
+        let src = one_field_value(
+            "value",
+            FieldDesc::ScalarArray(ScalarType::Double),
+            PvField::ScalarArray(vec![ScalarValue::Double(1.5), ScalarValue::Double(2.5)]),
+        );
+        let mut dst = Value::create_from((*src.desc).clone());
+        dst.assign(&src).unwrap();
+        match dst.lookup_field("value").unwrap() {
+            PvField::ScalarArray(v) => {
+                assert_eq!(v.len(), 2);
+                assert_eq!(v[1], ScalarValue::Double(2.5));
+            }
+            other => panic!("expected ScalarArray, got {other:?}"),
+        }
+        assert!(dst.is_marked("value"));
+    }
+
+    #[test]
+    fn assign_scalar_array_converts_element_type() {
+        // Source element type Int, destination element type Long: pvxs
+        // converts; we must not drop the payload.
+        let src = one_field_value(
+            "value",
+            FieldDesc::ScalarArray(ScalarType::Int),
+            PvField::ScalarArray(vec![ScalarValue::Int(7), ScalarValue::Int(8)]),
+        );
+        let dst_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Long))],
+        };
+        let mut dst = Value::create_from(dst_desc);
+        dst.assign(&src).unwrap();
+        match dst.lookup_field("value").unwrap() {
+            PvField::ScalarArray(v) => {
+                assert_eq!(v[0], ScalarValue::Long(7));
+                assert_eq!(v[1], ScalarValue::Long(8));
+            }
+            other => panic!("expected ScalarArray, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_copies_selected_union_payload() {
+        let union_desc = FieldDesc::Union {
+            struct_id: String::new(),
+            variants: vec![
+                ("i".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("s".into(), FieldDesc::Scalar(ScalarType::String)),
+            ],
+        };
+        let src = one_field_value(
+            "u",
+            union_desc.clone(),
+            PvField::Union {
+                selector: 0,
+                variant_name: "i".into(),
+                value: Box::new(PvField::Scalar(ScalarValue::Int(42))),
+            },
+        );
+        let mut dst = Value::create_from((*src.desc).clone());
+        dst.assign(&src).unwrap();
+        match dst.lookup_field("u").unwrap() {
+            PvField::Union {
+                selector, value, ..
+            } => {
+                assert_eq!(*selector, 0);
+                assert_eq!(**value, PvField::Scalar(ScalarValue::Int(42)));
+            }
+            other => panic!("expected Union, got {other:?}"),
+        }
+        assert!(dst.is_marked("u"));
+    }
+
+    #[test]
+    fn assign_copies_variant_payload() {
+        let src = one_field_value(
+            "any",
+            FieldDesc::Variant,
+            PvField::Variant(Box::new(crate::pvdata::VariantValue {
+                desc: Some(FieldDesc::Scalar(ScalarType::Int)),
+                value: PvField::Scalar(ScalarValue::Int(99)),
+            })),
+        );
+        let mut dst = Value::create_from((*src.desc).clone());
+        dst.assign(&src).unwrap();
+        match dst.lookup_field("any").unwrap() {
+            PvField::Variant(v) => {
+                assert_eq!(v.value, PvField::Scalar(ScalarValue::Int(99)));
+            }
+            other => panic!("expected Variant, got {other:?}"),
+        }
+        assert!(dst.is_marked("any"));
+    }
+
+    #[test]
+    fn assign_copies_structure_array_payload() {
+        let elem_fields = vec![("a".into(), FieldDesc::Scalar(ScalarType::Int))];
+        let mut elem = PvStructure::new("");
+        elem.fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Int(5))));
+        let src = one_field_value(
+            "rows",
+            FieldDesc::StructureArray {
+                struct_id: String::new(),
+                fields: elem_fields,
+            },
+            PvField::StructureArray(vec![Some(elem)]),
+        );
+        let mut dst = Value::create_from((*src.desc).clone());
+        dst.assign(&src).unwrap();
+        match dst.lookup_field("rows").unwrap() {
+            PvField::StructureArray(rows) => {
+                assert_eq!(rows.len(), 1);
+                let row = rows[0].as_ref().expect("present element");
+                assert_eq!(
+                    row.get_field("a"),
+                    Some(&PvField::Scalar(ScalarValue::Int(5)))
+                );
+            }
+            other => panic!("expected StructureArray, got {other:?}"),
+        }
+        assert!(dst.is_marked("rows"));
+    }
+
+    #[test]
+    fn assign_scalar_array_conversion_failure_errors() {
+        // A non-numeric string element cannot convert to Int: pvxs faults;
+        // we return NoConvert rather than Ok after dropping the array.
+        let src = one_field_value(
+            "value",
+            FieldDesc::ScalarArray(ScalarType::String),
+            PvField::ScalarArray(vec![ScalarValue::String("not a number".into())]),
+        );
+        let dst_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Int))],
+        };
+        let mut dst = Value::create_from(dst_desc);
+        let err = dst.assign(&src).unwrap_err();
+        assert!(matches!(err, ValueError::NoConvert { .. }));
     }
 }

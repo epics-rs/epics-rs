@@ -713,7 +713,16 @@ fn decode_type_desc_cached_at_depth(
             // define new cache slot, then full inline descriptor.
             let key = cur.get_u16(order)?;
             let desc = decode_type_desc_cached_at_depth(cur, order, cache, depth + 1)?;
-            cache.insert(key, desc.clone());
+            // pvxs uses `std::map::emplace` (dataencode.cpp:91-95), which is
+            // a no-op when the slot is already bound: a duplicate `0xFD`
+            // for an existing slot is consumed and validated (the inline
+            // descriptor was decoded above) but does NOT replace the slot,
+            // so later `0xFE` references resolve to the FIRST definition.
+            // `HashMap::insert` would instead overwrite, diverging from
+            // pvxs on the same byte stream. The current field still uses
+            // the just-decoded inline `desc` (pvxs binds `descs[index]` to
+            // the inline value regardless of the slot's prior contents).
+            cache.entry(key).or_insert_with(|| desc.clone());
             Ok(desc)
         }
         0xFE => {
@@ -900,20 +909,27 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
                 encode_pv_field(&child_val, child_desc, order, out);
             }
         }
-        (FieldDesc::StructureArray { fields, .. }, PvField::StructureArray(items)) => {
+        (FieldDesc::StructureArray { struct_id, fields }, PvField::StructureArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
             // each element is preceded by a presence byte —
             // 0x00 for a null (absent) element, 0x01 followed by the
             // body for a present one (pvxs dataencode.cpp:354-365).
+            // The element descriptor is the ARRAY's element descriptor:
+            // its `struct_id` comes from the descriptor, not the value.
+            // pvxs encodes each present element under the array element
+            // descriptor it asserted the value against, and the element
+            // body carries no id of its own — synthesizing the descriptor
+            // from the value's `struct_id` only masked a mismatch that
+            // `value_matches_descriptor` now rejects on checked paths.
+            let element_desc = FieldDesc::Structure {
+                struct_id: struct_id.clone(),
+                fields: fields.clone(),
+            };
             for s in items {
                 match s {
                     None => out.put_u8(0x00),
                     Some(s) => {
                         out.put_u8(0x01);
-                        let element_desc = FieldDesc::Structure {
-                            struct_id: s.struct_id.clone(),
-                            fields: fields.clone(),
-                        };
                         encode_pv_field(&PvField::Structure(s.clone()), &element_desc, order, out);
                     }
                 }
@@ -942,29 +958,29 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
         }
         (FieldDesc::UnionArray { variants, .. }, PvField::UnionArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
-            // pvxs `dataencode.cpp:368-378` encodes UnionA elements as a
-            // per-element presence byte (`0x00` null/absent, `0x01`
-            // followed by the union body for present). a
-            // `None` element is the absent (`0x00`) case; a present
-            // element's union body is `selector + value`, where an
-            // out-of-range/`-1` selector routes through the inner
-            // Size-null sentinel (`0xFF`) — distinct from element-absent.
+            // pvxs `dataencode.cpp:368-379` derives the per-element
+            // presence byte from `if(!elem)`: a UnionA element Value is
+            // truthy only once `Value::Helper::build` runs for a *valid*
+            // selector, so pvxs emits `0x01` only for an element that
+            // selects a real variant and `0x00` otherwise. A union element
+            // that selects no valid variant (absent, negative, or
+            // out-of-range selector) is therefore the absent (`0x00`)
+            // case — pvxs's own UnionA decoder collapses a present null
+            // selector to absent (`dataencode.cpp:635-637`), so emitting it
+            // as `0x01`-present would not survive a round trip. Collapse it
+            // here so the wire form has a single meaning per element.
             for it in items {
-                match it {
-                    None => out.put_u8(0x00),
-                    Some(it) => {
+                match it.as_ref().and_then(|it| {
+                    usize::try_from(it.selector)
+                        .ok()
+                        .and_then(|idx| variants.get(idx).map(|(_, vdesc)| (idx, &it.value, vdesc)))
+                }) {
+                    Some((idx, value, vdesc)) => {
                         out.put_u8(0x01);
-                        match usize::try_from(it.selector)
-                            .ok()
-                            .and_then(|idx| variants.get(idx).map(|v| (idx, v)))
-                        {
-                            Some((idx, (_, vdesc))) => {
-                                encode_size_into(idx as u32, order, out);
-                                encode_pv_field(&it.value, vdesc, order, out);
-                            }
-                            None => out.put_u8(0xFF),
-                        }
+                        encode_size_into(idx as u32, order, out);
+                        encode_pv_field(value, vdesc, order, out);
                     }
+                    None => out.put_u8(0x00),
                 }
             }
         }
@@ -977,25 +993,25 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
         },
         (FieldDesc::VariantArray, PvField::VariantArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
-            // pvxs `dataencode.cpp:382-393` encodes AnyA as a presence
-            // byte (`0x00` null/absent, `0x01 + descriptor + value` for
-            // present). a `None` element is the absent (`0x00`)
-            // case; a present element whose descriptor is `None` is the
-            // present-but-empty "any" shape, emitted as `0x01` + the
-            // Null type tag (`0xFF`) — distinct from element-absent.
+            // pvxs `dataencode.cpp:382-394` writes `0x01` only for a truthy
+            // AnyA element (one with a stored descriptor) and `0x00`
+            // otherwise. A present element with no descriptor is the absent
+            // (`0x00`) case — pvxs's AnyA decoder collapses a present null
+            // descriptor to absent (`dataencode.cpp:669-675`), so a
+            // present-but-empty "any" would not survive a round trip.
+            // Collapse it here so the wire form has a single meaning per
+            // element.
             for it in items {
-                match it {
-                    None => out.put_u8(0x00),
-                    Some(it) => {
+                match it
+                    .as_ref()
+                    .and_then(|it| it.desc.as_ref().map(|d| (d, &it.value)))
+                {
+                    Some((d, value)) => {
                         out.put_u8(0x01);
-                        match &it.desc {
-                            None => out.put_u8(0xFF),
-                            Some(d) => {
-                                encode_type_desc(d, order, out);
-                                encode_pv_field(&it.value, d, order, out);
-                            }
-                        }
+                        encode_type_desc(d, order, out);
+                        encode_pv_field(value, d, order, out);
                     }
+                    None => out.put_u8(0x00),
                 }
             }
         }
@@ -1862,15 +1878,14 @@ fn decode_pv_field_at_depth(
                 match presence {
                     // 0x00 = null (absent) element → `None`.
                     0x00 => items.push(None),
-                    // 0x01 = present; the union body may still carry a
-                    // null selector (`-1`) — a present null-selector
-                    // union, distinct from an absent element.
+                    // 0x01 = present. pvxs `dataencode.cpp:635-637` treats a
+                    // present byte followed by a null selector "the same as
+                    // 0 case" — the element stays the default empty Value,
+                    // i.e. absent. Collapse it to `None` rather than
+                    // retaining a distinct present null-selector union,
+                    // which pvxs never preserves across a round trip.
                     0x01 => match decode_size(cur, order)? {
-                        None => items.push(Some(UnionItem {
-                            selector: -1,
-                            variant_name: String::new(),
-                            value: PvField::Null,
-                        })),
+                        None => items.push(None),
                         Some(sel_u32) => {
                             let sel = sel_u32 as i32;
                             let (variant_name, vdesc) = variants
@@ -1939,15 +1954,17 @@ fn decode_pv_field_at_depth(
                     // 0x00 = null (absent) element → `None`.
                     0x00 => items.push(None),
                     0x01 => {
-                        // Present element. Inner descriptor may itself be
-                        // the null type tag `0xFF` (a present-but-empty
-                        // AnyA element) — distinct from element-absent.
+                        // Present element. pvxs `dataencode.cpp:669-675`
+                        // reads the inner descriptor after the present byte;
+                        // if it is the null type tag (`0xFF`, an empty
+                        // descriptor vector) the element stays the default
+                        // empty Value, i.e. absent. Collapse it to `None`
+                        // rather than retaining a distinct present-but-empty
+                        // "any", which pvxs never preserves across a round
+                        // trip.
                         let peek = cur.get_u8()?;
                         if peek == 0xFF {
-                            items.push(Some(VariantValue {
-                                desc: None,
-                                value: PvField::Null,
-                            }));
+                            items.push(None);
                             continue;
                         }
                         let pos = cur.position();
@@ -2098,6 +2115,78 @@ mod tests {
             out.starts_with(&desc_bytes),
             "explicit `any` must lead with the canonical descriptor"
         );
+    }
+
+    /// A present UnionArray/VariantArray element that selects no real
+    /// variant/descriptor is not a distinct wire state: pvxs collapses it to
+    /// absent on decode (`dataencode.cpp:635-637`, `:669-675`), so the
+    /// encoder must emit the same bytes as an absent (`None`) element and a
+    /// hand-crafted `0x01`+null wire form must round-trip to `None`.
+    #[test]
+    fn union_variant_array_present_null_collapses_to_absent() {
+        let union_desc = FieldDesc::UnionArray {
+            struct_id: String::new(),
+            variants: vec![("i".into(), FieldDesc::Scalar(ScalarType::Int))],
+        };
+        let any_desc = FieldDesc::VariantArray;
+
+        for order in [ByteOrder::Big, ByteOrder::Little] {
+            // (a) encode: a present null-selector union element produces the
+            //     same bytes as an absent (`None`) element.
+            let present_null_union = PvField::UnionArray(vec![Some(UnionItem {
+                selector: -1,
+                variant_name: String::new(),
+                value: PvField::Null,
+            })]);
+            let absent_union = PvField::UnionArray(vec![None]);
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            encode_pv_field(&present_null_union, &union_desc, order, &mut a);
+            encode_pv_field(&absent_union, &union_desc, order, &mut b);
+            assert_eq!(
+                a, b,
+                "present null-selector UnionA element must encode as absent ({order:?})"
+            );
+            // length 1 (Size) + one presence byte 0x00
+            assert_eq!(a.last(), Some(&0x00), "absent presence byte ({order:?})");
+
+            // (b) encode: a present descriptor-less "any" element produces
+            //     the same bytes as an absent element.
+            let present_null_any = PvField::VariantArray(vec![Some(VariantValue {
+                desc: None,
+                value: PvField::Null,
+            })]);
+            let absent_any = PvField::VariantArray(vec![None]);
+            let mut c = Vec::new();
+            let mut d = Vec::new();
+            encode_pv_field(&present_null_any, &any_desc, order, &mut c);
+            encode_pv_field(&absent_any, &any_desc, order, &mut d);
+            assert_eq!(
+                c, d,
+                "present null-descriptor AnyA element must encode as absent ({order:?})"
+            );
+            assert_eq!(c.last(), Some(&0x00), "absent presence byte ({order:?})");
+
+            // (c) decode: a hand-crafted `0x01`+null-selector UnionA element
+            //     and `0x01`+0xFF AnyA element both decode to `None`.
+            let union_wire = vec![0x01, 0x01, 0xFF];
+            let mut cur = Cursor::new(union_wire.as_slice());
+            match decode_pv_field(&union_desc, &mut cur, order).unwrap() {
+                PvField::UnionArray(items) => {
+                    assert_eq!(items, vec![None], "0x01+null selector → None ({order:?})");
+                }
+                other => panic!("expected UnionArray, got {other:?}"),
+            }
+
+            let any_wire = vec![0x01, 0x01, 0xFF];
+            let mut cur = Cursor::new(any_wire.as_slice());
+            match decode_pv_field(&any_desc, &mut cur, order).unwrap() {
+                PvField::VariantArray(items) => {
+                    assert_eq!(items, vec![None], "0x01+0xFF desc → None ({order:?})");
+                }
+                other => panic!("expected VariantArray, got {other:?}"),
+            }
+        }
     }
 
     fn nt_scalar_double_desc() -> FieldDesc {
@@ -3029,6 +3118,57 @@ mod tests {
             let mut cur = Cursor::new(buf.as_slice());
             let decoded = decode_pv_field(&desc, &mut cur, order).unwrap();
             assert_eq!(decoded, value);
+            assert_eq!(cur.remaining(), 0);
+        }
+    }
+
+    /// Duplicate `0xFD` definition of an already-bound slot must NOT
+    /// overwrite it: pvxs `std::map::emplace` keeps the first definition,
+    /// so a later `0xFE` reference resolves to the original descriptor.
+    /// The field carrying the second `0xFD` still decodes as its inline
+    /// descriptor.
+    #[test]
+    fn duplicate_typecache_slot_keeps_first_definition() {
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            // Inline wire bytes for the two descriptors.
+            let mut int_bytes = Vec::new();
+            encode_type_desc(&FieldDesc::Scalar(ScalarType::Int), order, &mut int_bytes);
+            let mut dbl_bytes = Vec::new();
+            encode_type_desc(
+                &FieldDesc::Scalar(ScalarType::Double),
+                order,
+                &mut dbl_bytes,
+            );
+
+            let mut buf = Vec::new();
+            // 0xFD define slot 1 = Int
+            buf.put_u8(0xFD);
+            buf.put_u16(1, order);
+            buf.extend_from_slice(&int_bytes);
+            // 0xFD define slot 1 again = Double (duplicate)
+            buf.put_u8(0xFD);
+            buf.put_u16(1, order);
+            buf.extend_from_slice(&dbl_bytes);
+            // 0xFE reference slot 1
+            buf.put_u8(0xFE);
+            buf.put_u16(1, order);
+
+            let mut cur = Cursor::new(buf.as_slice());
+            let mut cache = TypeCache::new();
+            // First define: current field is Int; slot 1 := Int.
+            let d1 = decode_type_desc_cached(&mut cur, order, &mut cache).unwrap();
+            assert_eq!(d1, FieldDesc::Scalar(ScalarType::Int));
+            // Second define: current field is the inline Double, but the
+            // slot is NOT overwritten (emplace no-op).
+            let d2 = decode_type_desc_cached(&mut cur, order, &mut cache).unwrap();
+            assert_eq!(d2, FieldDesc::Scalar(ScalarType::Double));
+            // Reference resolves to the FIRST definition (Int), not Double.
+            let d3 = decode_type_desc_cached(&mut cur, order, &mut cache).unwrap();
+            assert_eq!(
+                d3,
+                FieldDesc::Scalar(ScalarType::Int),
+                "0xFE must resolve to the first 0xFD definition (pvxs emplace)"
+            );
             assert_eq!(cur.remaining(), 0);
         }
     }

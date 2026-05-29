@@ -191,6 +191,11 @@ fn write_raw_field(out: &mut String, name: &str, desc: &FieldDesc, value: &PvFie
             } else if struct_id == "enum_t" {
                 let summary = format_enum_summary(s);
                 let _ = writeln!(out, "{indent}{id} {name} {summary}");
+            } else if struct_id == "alarm_t" {
+                // EPICS Base raw formatter appends the one-line alarm
+                // summary on the `alarm_t` structure line (printer.cpp:368-372).
+                let summary = format_alarm_summary(s);
+                let _ = writeln!(out, "{indent}{id} {name} {summary}");
             } else {
                 let _ = writeln!(out, "{indent}{id} {name}");
             }
@@ -287,7 +292,11 @@ fn nt_payload(s: &PvStructure) -> String {
             _ => None,
         })
         .unwrap_or_else(|| "<undefined>".to_string());
-    format!("{ts}  {val} \n")
+    // EPICS Base NTScalar order is `<timeStamp> <value> <alarm>`
+    // (pvData printer.cpp:428-434: printTimeT, value, printAlarmT). The
+    // alarm summary is empty unless severity is nonzero.
+    let alarm = top_alarm_summary(s);
+    format!("{ts}  {val} {alarm}\n")
 }
 
 /// Render an NTScalar `value` field for `-M nt` output.
@@ -394,7 +403,10 @@ fn format_nt_enum(pv_name: &str, s: &PvStructure) -> String {
         }
         _ => ("0".to_string(), String::new()),
     };
-    format!("{pv_name} {ts} ({idx}) {choice}\n")
+    // EPICS Base NTEnum order is `<timeStamp> <alarm> (index) choice`
+    // (pvData printer.cpp:162-176: printTimeT, printAlarmT, then the enum).
+    let alarm = top_alarm_summary(s);
+    format!("{pv_name} {ts} {alarm}({idx}) {choice}\n")
 }
 
 // ─── JSON formatting ────────────────────────────────────────────────────────
@@ -523,13 +535,87 @@ fn format_timestamp(s: &PvStructure) -> String {
         Some(PvField::Scalar(ScalarValue::UInt(v))) => *v,
         _ => 0,
     };
+    // EPICS Base `printTimeTx` (pvData printer.cpp:135-139) appends the
+    // `userTag` after the timestamp text when the field is present and
+    // nonzero (e.g. a QSRV pulse-id / event tag). The CLI dropped it.
+    let user_tag = match s.get_field("userTag") {
+        Some(PvField::Scalar(ScalarValue::Int(v))) => *v as i64,
+        Some(PvField::Scalar(ScalarValue::Long(v))) => *v,
+        Some(PvField::Scalar(ScalarValue::UInt(v))) => *v as i64,
+        _ => 0,
+    };
     let dt = chrono::DateTime::from_timestamp(sec, nsec);
     match dt {
         Some(dt) => {
             let local = dt.with_timezone(&chrono::Local);
-            format!("{}", local.format("%Y-%m-%d %H:%M:%S.%3f"))
+            let ts = local.format("%Y-%m-%d %H:%M:%S.%3f");
+            if user_tag != 0 {
+                format!("{ts} {user_tag}")
+            } else {
+                format!("{ts}")
+            }
         }
         None => "<undefined>".to_string(),
+    }
+}
+
+/// One-line alarm summary, mirroring EPICS Base `printAlarmTx`
+/// (pvData printer.cpp:77-106). Empty when `severity == 0`; otherwise the
+/// severity label, then the status label (omitted when status 0), then a
+/// non-empty message — each token followed by a single trailing space, as
+/// Base streams them.
+fn format_alarm_summary(alarm: &PvStructure) -> String {
+    let as_i64 = |name: &str| -> i64 {
+        match alarm.get_field(name) {
+            Some(PvField::Scalar(ScalarValue::Int(v))) => *v as i64,
+            Some(PvField::Scalar(ScalarValue::Long(v))) => *v,
+            Some(PvField::Scalar(ScalarValue::UInt(v))) => *v as i64,
+            Some(PvField::Scalar(ScalarValue::Short(v))) => *v as i64,
+            _ => 0,
+        }
+    };
+    let severity = as_i64("severity");
+    if severity == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    match severity {
+        1 => out.push_str("MINOR "),
+        2 => out.push_str("MAJOR "),
+        3 => out.push_str("INVALID "),
+        4 => out.push_str("UNDEFINED "),
+        n => {
+            let _ = write!(out, "{n} ");
+        }
+    }
+    match as_i64("status") {
+        0 => {}
+        1 => out.push_str("DEVICE "),
+        2 => out.push_str("DRIVER "),
+        3 => out.push_str("RECORD "),
+        4 => out.push_str("DB "),
+        5 => out.push_str("CONF "),
+        6 => out.push_str("UNDEFINED "),
+        7 => out.push_str("CLIENT "),
+        n => {
+            let _ = write!(out, "{n} ");
+        }
+    }
+    if let Some(PvField::Scalar(ScalarValue::String(m))) = alarm.get_field("message") {
+        if !m.is_empty() {
+            let _ = write!(out, "{m} ");
+        }
+    }
+    out
+}
+
+/// Top-level alarm summary: find the `alarm` sub-structure of an NT value
+/// and render it (Base `printAlarmT`, printer.cpp:109-114). Empty when no
+/// alarm or `severity == 0`.
+fn top_alarm_summary(s: &PvStructure) -> String {
+    match s.get_field("alarm") {
+        Some(PvField::Structure(a)) => format_alarm_summary(a),
+        _ => String::new(),
     }
 }
 
@@ -623,6 +709,102 @@ mod tests {
         let out = format_nt("MY:PV", &desc, &val);
         assert!(out.contains("MY:PV"));
         assert!(out.contains("42.5"));
+    }
+
+    #[test]
+    fn nt_scalar_timestamp_renders_nonzero_user_tag() {
+        // EPICS Base `printTimeTx` (pvData printer.cpp:135-139) appends the
+        // userTag after the timestamp when it is nonzero; pvxs/QSRV forces
+        // e.g. UTAG 142 (testqsingle.cpp:280-283).
+        let (desc, val) = nt_scalar_double(1.0, 1_700_000_000, 0);
+        let PvField::Structure(mut s) = val else {
+            panic!("nt scalar must be a structure");
+        };
+        if let Some(PvField::Structure(ts)) = s.get_field_mut("timeStamp") {
+            ts.set("userTag", PvField::Scalar(ScalarValue::Int(142)));
+        }
+        let out = format_nt("MY:PV", &desc, &PvField::Structure(s));
+        assert!(
+            out.contains(" 142 "),
+            "nonzero userTag must appear after the timestamp, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn nt_scalar_timestamp_omits_zero_user_tag() {
+        // userTag == 0 must not be rendered (Base prints it only when nonzero).
+        let (desc, val) = nt_scalar_double(1.0, 1_700_000_000, 0);
+        let out = format_nt("MY:PV", &desc, &val);
+        // The only standalone integer token would be a userTag; assert the
+        // zero tag is absent (value 1 renders as "1", tag would be " 0 ").
+        assert!(
+            !out.contains(" 0 "),
+            "zero userTag must not be rendered, got: {out:?}"
+        );
+    }
+
+    fn alarm_struct(severity: i32, status: i32, message: &str) -> PvField {
+        let mut a = PvStructure::new("alarm_t");
+        a.set("severity", PvField::Scalar(ScalarValue::Int(severity)));
+        a.set("status", PvField::Scalar(ScalarValue::Int(status)));
+        a.set(
+            "message",
+            PvField::Scalar(ScalarValue::String(message.into())),
+        );
+        PvField::Structure(a)
+    }
+
+    #[test]
+    fn nt_scalar_renders_nonzero_alarm_after_value() {
+        // EPICS Base NTScalar order is `<ts> <value> <alarm>`
+        // (printer.cpp:428-434).
+        let (desc, val) = nt_scalar_double(1.5, 1_700_000_000, 0);
+        let PvField::Structure(mut s) = val else {
+            panic!("nt scalar must be a structure");
+        };
+        s.set("alarm", alarm_struct(2, 3, "HIGH"));
+        let out = format_nt("MY:PV", &desc, &PvField::Structure(s));
+        assert!(
+            out.contains("MAJOR RECORD HIGH"),
+            "alarm summary must render, got: {out:?}"
+        );
+        let vi = out.find("1.5").expect("value present");
+        let ai = out.find("MAJOR").expect("alarm present");
+        assert!(vi < ai, "value must precede alarm for NTScalar: {out:?}");
+    }
+
+    #[test]
+    fn nt_scalar_omits_zero_severity_alarm() {
+        let (desc, val) = nt_scalar_double(1.5, 1_700_000_000, 0);
+        let PvField::Structure(mut s) = val else {
+            panic!("nt scalar must be a structure");
+        };
+        s.set("alarm", alarm_struct(0, 0, "ignored"));
+        let out = format_nt("MY:PV", &desc, &PvField::Structure(s));
+        assert!(
+            !out.contains("MINOR")
+                && !out.contains("MAJOR")
+                && !out.contains("INVALID")
+                && !out.contains("ignored"),
+            "severity 0 must render no alarm summary, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn alarm_summary_maps_severity_status_and_message() {
+        // printer.cpp:77-106 label mapping; trailing space per token.
+        let mut a = PvStructure::new("alarm_t");
+        a.set("severity", PvField::Scalar(ScalarValue::Int(1)));
+        a.set("status", PvField::Scalar(ScalarValue::Int(7)));
+        a.set("message", PvField::Scalar(ScalarValue::String("x".into())));
+        assert_eq!(format_alarm_summary(&a), "MINOR CLIENT x ");
+        // severity 0 → empty regardless of status/message.
+        a.set("severity", PvField::Scalar(ScalarValue::Int(0)));
+        assert_eq!(format_alarm_summary(&a), "");
+        // status 0 → status label omitted, message still appended.
+        a.set("severity", PvField::Scalar(ScalarValue::Int(2)));
+        a.set("status", PvField::Scalar(ScalarValue::Int(0)));
+        assert_eq!(format_alarm_summary(&a), "MAJOR x ");
     }
 
     #[test]

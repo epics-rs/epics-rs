@@ -185,12 +185,41 @@ pub struct Member {
     pub desc: FieldDesc,
 }
 
+/// Validate a local member name against pvxs's field-name grammar
+/// `[a-zA-Z_][a-zA-Z0-9_]*`.
+///
+/// An empty name is permitted: pvxs `Member::_validate()` skips
+/// `name_validate()` for empty names (the unnamed root / anonymous node
+/// case). Any non-empty name that violates the grammar is rejected.
+///
+/// Mirrors pvxs `src/type.cpp:193-224` (`name_validate()` /
+/// `Member::_validate()`), which throws `std::runtime_error` at `Member`
+/// construction — before a local `TypeDef` can be built. We panic for the
+/// same contract so an invalid schema is caught at type-definition time
+/// rather than emitted onto the wire, where a pvxs peer decoding the
+/// descriptor would fault. ASCII-only by design: pvxs's check uses the
+/// `'a'..='z'` / `'A'..='Z'` / `'0'..='9'` ranges, so non-ASCII letters
+/// must be rejected too.
+fn validate_field_name(name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    let mut chars = name.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    assert!(
+        first_ok && rest_ok,
+        "invalid pvData field name {name:?}: must match [a-zA-Z_][a-zA-Z0-9_]*"
+    );
+}
+
 impl Member {
     pub fn new(name: impl Into<String>, desc: FieldDesc) -> Self {
-        Self {
-            name: name.into(),
-            desc,
-        }
+        let name = name.into();
+        validate_field_name(&name);
+        Self { name, desc }
     }
 
     /// Convenience: scalar member `name: T`. Mirrors pvxs
@@ -562,5 +591,65 @@ mod tests {
     fn typedef_member_scalar_array_helper() {
         let m = Member::scalar_array("xs", ScalarType::String);
         assert!(matches!(m.desc, FieldDesc::ScalarArray(ScalarType::String)));
+    }
+
+    // ── Member name validation — pvxs type.cpp::name_validate parity ──
+
+    #[test]
+    fn member_name_valid_names_accepted() {
+        // [a-zA-Z_][a-zA-Z0-9_]* — leading underscore, digits after first.
+        for name in ["value", "_private", "field1", "a", "A_1b2"] {
+            let m = Member::scalar(name, ScalarType::Int);
+            assert_eq!(m.name, name);
+        }
+    }
+
+    #[test]
+    fn member_name_empty_allowed_for_unnamed_node() {
+        // pvxs Member::_validate() skips name_validate() for empty names.
+        let m = Member::new("", FieldDesc::Scalar(ScalarType::Int));
+        assert!(m.name.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid pvData field name")]
+    fn member_name_leading_digit_rejected() {
+        let _ = Member::scalar("1value", ScalarType::Int);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid pvData field name")]
+    fn member_name_dotted_rejected() {
+        // Dotted names collide with pvRequest / BitSet path conventions.
+        let _ = Member::scalar("alarm.severity", ScalarType::Int);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid pvData field name")]
+    fn member_name_hyphen_rejected() {
+        let _ = Member::scalar("value-status", ScalarType::Int);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid pvData field name")]
+    fn member_name_space_rejected() {
+        let _ = Member::new("has space", FieldDesc::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid pvData field name")]
+    fn member_name_non_ascii_rejected() {
+        // pvxs's ranges are ASCII-only; a unicode letter must be rejected.
+        let _ = Member::scalar("café", ScalarType::Int);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid pvData field name")]
+    fn typedef_builder_rejects_invalid_member_name() {
+        // The fluent builder funnels through Member::new, so an invalid
+        // name is rejected before build().
+        let _ = TypeDef::structure("epics:nt/NTScalar:1.0")
+            .scalar("bad name", ScalarType::Double)
+            .build();
     }
 }

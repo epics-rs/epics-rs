@@ -50,12 +50,23 @@ pub enum GatewayCommand {
 
 impl GatewayCommand {
     /// Parse a single command line. Returns `Noop` for blank/comment lines.
+    /// Retained as the programmatic single-command API; the command-file
+    /// path uses the per-token parser ([`Self::parse_token`]) so it can
+    /// honor C's multi-command-per-line shape.
     pub fn parse(line: &str) -> Option<Self> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             return Some(Self::Noop);
         }
-        match line.to_ascii_uppercase().as_str() {
+        Self::parse_token(line)
+    }
+
+    /// Parse one whitespace-delimited token into a command, or `None` if
+    /// the token is not a recognized command keyword. Case-insensitive,
+    /// mirroring C ca-gateway's per-token string comparisons after
+    /// `strtok` (gateServer.cc:461-470).
+    fn parse_token(tok: &str) -> Option<Self> {
+        match tok.to_ascii_uppercase().as_str() {
             "R1" | "REPORT" | "REPORT_FULL" => Some(Self::ReportFull),
             "R2" | "REPORT_SUMMARY" | "SUMMARY" => Some(Self::ReportSummary),
             "R3" | "REPORT_ACCESS" => Some(Self::ReportAccess),
@@ -269,13 +280,30 @@ impl CommandHandler {
         Ok(Some((count, pruned)))
     }
 
-    /// Process all commands from a command file (one command per line).
+    /// Process all commands from a command file.
+    ///
+    /// C ca-gateway strips an inline `#` comment from each line, then
+    /// `strtok`s it on whitespace and dispatches EVERY recognized command
+    /// token (gateServer.cc:458-470, :475-493) — so a single line may
+    /// carry several commands (`R1 AS`) and may end in a trailing comment
+    /// (`R1 # reload`). Parsing each whole line as one exact command (the
+    /// old behavior) silently dropped those C-compatible shapes, making a
+    /// `kill -USR1` appear to succeed while the intended command never
+    /// ran. Tokenize like C: split on whitespace and dispatch each
+    /// recognized token; unrecognized tokens are ignored, as in C.
     pub async fn process_file(&self, path: &PathBuf) -> BridgeResult<String> {
         let content = std::fs::read_to_string(path)?;
         let mut combined = String::new();
-        for line in content.lines() {
-            if let Some(cmd) = GatewayCommand::parse(line) {
-                combined.push_str(&self.dispatch(cmd).await?);
+        for raw in content.lines() {
+            // Strip an inline comment, then dispatch each token.
+            let line = match raw.find('#') {
+                Some(i) => &raw[..i],
+                None => raw,
+            };
+            for tok in line.split_whitespace() {
+                if let Some(cmd) = GatewayCommand::parse_token(tok) {
+                    combined.push_str(&self.dispatch(cmd).await?);
+                }
             }
         }
         Ok(combined)
@@ -438,6 +466,37 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&pvl_path);
+    }
+
+    /// C-compatible command files put several commands on one line and
+    /// allow trailing `#` comments (gateServer.cc:458-470). process_file
+    /// must tokenize and dispatch every recognized token, not parse each
+    /// whole line as one exact command. Pre-fix `V R1 # note` was a no-op.
+    #[tokio::test]
+    async fn process_file_tokenizes_multi_command_and_comment_lines() {
+        let pid = std::process::id();
+        let cmd_path = std::env::temp_dir().join(format!("ca_gw_a10_cmd_{pid}.command"));
+        // Line 1: two commands on one line + trailing inline comment.
+        // Line 2: a bare comment line (ignored).
+        // Line 3: a command with a leading-token comment stripped.
+        std::fs::write(&cmd_path, "V R2 # reload now\n# just a comment\nR2 #x\n").unwrap();
+
+        let cache = Arc::new(RwLock::new(PvCache::new()));
+        let pvlist = Arc::new(ArcSwap::from_pointee(PvList::new()));
+        let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
+        let handler = CommandHandler::new(cache, pvlist, access, None, None);
+
+        let out = handler.process_file(&cmd_path).await.unwrap();
+
+        // `V` produced a version line; both `R2` tokens produced a summary.
+        assert!(out.contains("ca-gateway-rs"), "V token dispatched: {out:?}");
+        let summaries = out.matches("Summary:").count();
+        assert_eq!(
+            summaries, 2,
+            "both R2 tokens (line 1 and line 3) must dispatch: {out:?}"
+        );
+
+        let _ = std::fs::remove_file(&cmd_path);
     }
 
     /// a reload with no beacon attached (stat-only/test handler) must not

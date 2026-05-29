@@ -805,6 +805,39 @@ impl BridgeProvider {
         self.channel_find(name).await
     }
 
+    /// True iff a backing record, alias, or simple PV named `name`
+    /// exists locally — the resolver-free existence test used to
+    /// detect group/record name collisions. Mirrors pvxs
+    /// `dbChannelTest(name)` (ioc/groupconfigprocessor.cpp:177):
+    /// records + aliases via [`PvDatabase::get_record`], simple PVs
+    /// via [`PvDatabase::find_pv`]. Deliberately does NOT invoke the
+    /// search resolver (no upstream gateway subscription) — a name
+    /// only conflicts when it is *locally* a record, exactly as
+    /// `dbChannelTest` tests the local database.
+    async fn record_exists(&self, name: &str) -> bool {
+        self.db.get_record(name).await.is_some() || self.db.find_pv(name).await.is_some()
+    }
+
+    /// Resolve `name` to a group definition only when no backing
+    /// record shadows it. pvxs ignores a configured group whose name
+    /// collides with a real record name — the record wins and the
+    /// group is dropped at `defineGroups`
+    /// (ioc/groupconfigprocessor.cpp:170-181), so the surviving
+    /// group map (ioc/groupsource.cpp:75-89) never contains a
+    /// shadowed name. The Rust daemon (`bin/qsrv_rs.rs`) never runs
+    /// the `processGroups` finalize, so the same invariant — a name
+    /// is a record OR a group, never both — is enforced here at the
+    /// single serving owner. Every group lookup on the serve path
+    /// (`channel_find`, `create_channel*`, `channel_list`) goes
+    /// through this gate, so the dual meaning cannot reach a client.
+    async fn servable_group(&self, name: &str) -> Option<GroupPvDef> {
+        let def = self.groups.read().get(name).cloned()?;
+        if self.record_exists(name).await {
+            return None;
+        }
+        Some(def)
+    }
+
     /// Drop every registered group definition. Mirrors pvxs
     /// `resetGroups` (groupsourcehooks.cpp:222) — used between
     /// `iocInit` cycles in tests so the second run starts clean. The
@@ -897,7 +930,10 @@ impl ChannelProvider for BridgeProvider {
     }
 
     async fn channel_find(&self, name: &str) -> bool {
-        if self.groups.read().contains_key(name) {
+        // A servable group answers as a group; a group name shadowed
+        // by a record falls through to the database, so the record is
+        // what answers (and resolves on create). See `servable_group`.
+        if self.servable_group(name).await.is_some() {
             return true;
         }
         self.db.has_name(name).await
@@ -910,7 +946,18 @@ impl ChannelProvider for BridgeProvider {
         // it can connect by alias. `channel_find` / `create_channel`
         // already resolve aliases via has_name/get_record.
         names.extend(self.db.all_alias_names().await);
-        names.extend(self.groups.read().keys().cloned());
+        // A group name that collides with a record/alias/simple PV is
+        // ignored (the record wins), so list it once — as the record.
+        // Mirrors pvxs: a shadowed name never enters groupMap at
+        // `defineGroups` (ioc/groupconfigprocessor.cpp:177), so
+        // groupsource.cpp:75-89 lists only the surviving groups.
+        let existing: std::collections::HashSet<String> = names.iter().cloned().collect();
+        let group_keys: Vec<String> = self.groups.read().keys().cloned().collect();
+        for k in group_keys {
+            if !existing.contains(&k) && self.db.find_pv(&k).await.is_none() {
+                names.push(k);
+            }
+        }
         names.sort();
         names
     }
@@ -961,11 +1008,18 @@ impl BridgeProvider {
         self.note_channel_created();
         let access_ctx = AccessContext::with_creds(self.live_access(), creds);
 
-        // Check group PVs first
-        if let Some(def) = self.groups.read().get(name).cloned() {
+        // Check group PVs first — but a group name that collides with
+        // a real record is ignored (the record wins), matching pvxs
+        // `defineGroups` dbChannelTest (ioc/groupconfigprocessor.cpp:177).
+        if let Some(def) = self.servable_group(name).await {
             return Ok(AnyChannel::Group(
                 GroupChannel::new(self.db.clone(), def).with_access(access_ctx),
             ));
+        } else if self.groups.read().contains_key(name) {
+            tracing::warn!(
+                group = %name,
+                "QSRV group name conflicts with record name; serving the record and ignoring the group"
+            );
         }
 
         // Single record (or `record.FIELD`) channel.
@@ -1029,6 +1083,57 @@ impl BridgeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A QSRV group whose name collides with a real record must be
+    /// ignored — the record wins, mirroring pvxs `defineGroups`
+    /// dbChannelTest (ioc/groupconfigprocessor.cpp:177). A non-colliding
+    /// group stays servable.
+    #[tokio::test]
+    async fn group_name_conflicting_with_record_is_ignored() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("REC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let provider = BridgeProvider::new(db);
+        // "REC" shadows the record; "GRP:ONLY" has no backing record.
+        provider
+            .load_group_config(
+                r#"{
+                    "REC":      { "value": { "+channel": "REC.VAL",   "+type": "plain" } },
+                    "GRP:ONLY": { "value": { "+channel": "OTHER.VAL", "+type": "plain" } }
+                }"#,
+            )
+            .unwrap();
+
+        // create_channel resolves the record, not the group.
+        match provider.create_channel("REC").await.unwrap() {
+            AnyChannel::Single(_) => {}
+            AnyChannel::Group(_) => panic!("REC must resolve to the record, not the group"),
+        }
+        // The non-colliding group is still served as a group.
+        match provider.create_channel("GRP:ONLY").await.unwrap() {
+            AnyChannel::Group(_) => {}
+            AnyChannel::Single(_) => panic!("GRP:ONLY has no backing record; must be a group"),
+        }
+
+        assert!(provider.channel_find("REC").await);
+
+        // channel_list emits exactly one "REC" (the record), not a
+        // duplicate from the shadowed group; the live group survives.
+        let list = provider.channel_list().await;
+        assert_eq!(
+            list.iter().filter(|n| n.as_str() == "REC").count(),
+            1,
+            "REC must appear once (record), not duplicated by the group"
+        );
+        assert!(
+            list.iter().any(|n| n == "GRP:ONLY"),
+            "the non-colliding group must still be listed"
+        );
+    }
 
     /// Access control that denies all writes, allows all reads.
     struct ReadOnly;

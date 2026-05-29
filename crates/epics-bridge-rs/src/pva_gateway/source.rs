@@ -50,6 +50,62 @@ pub struct RawEvent {
     pub type_changed: bool,
 }
 
+/// OR a bridge-local overrun signal into a raw MONITOR DATA body.
+///
+/// `body` is the wire `changed | value | overrun` triplet. When the
+/// gateway fanout drops events under one downstream subscriber's own
+/// backpressure (a tokio `broadcast::Lagged`), pva2pva does not silently
+/// swallow the loss: the downstream `MonitorUser` enters overflow, ORs the
+/// upstream and downstream overrun information into a coalesced element and
+/// accumulates the changed set (`moncache.cpp:156-174`), and on the next
+/// `MonitorUser::release()` delivers that element with the accumulated
+/// overrun bitset (`moncache.cpp:354-365`). The downstream client reads the
+/// overrun bitset to learn that intermediate values were lost.
+///
+/// The broadcast ring has already overwritten the dropped events, so we do
+/// not have their changed bitsets to reproduce pva2pva's exact accumulation.
+/// We instead OR the *delivered* (coalesced latest) event's own changed
+/// leaves into its overrun bitset: every field changing in the value the
+/// subscriber is about to see is flagged as having had at least one
+/// unobserved intermediate value across the dropped range. This is a
+/// conservative over-approximation in the safe direction (it can only
+/// over-report "you may have missed a value", never hide a real loss).
+/// Upstream overrun bits already present in the body are preserved — the new
+/// bitset is the union, never a replacement.
+///
+/// Returns the rewritten body, or `None` when the body cannot be decoded
+/// against `desc` (the caller then forwards the original bytes unchanged).
+fn mark_raw_body_local_overrun(
+    body: &bytes::Bytes,
+    desc: &FieldDesc,
+    order: epics_pva_rs::proto::ByteOrder,
+) -> Option<bytes::Bytes> {
+    use epics_pva_rs::proto::BitSet;
+    let mut cur = std::io::Cursor::new(body.as_ref());
+    let changed = BitSet::decode(&mut cur, order).ok()?;
+    // Advance the cursor past the value region so it lands on the trailing
+    // overrun bitset; the decoded value itself is discarded — we only need
+    // the `changed | value` / `overrun` split offset.
+    epics_pva_rs::pvdata::encode::decode_pv_field_with_bitset(desc, &changed, 0, &mut cur, order)
+        .ok()?;
+    let value_end = cur.position() as usize;
+    let mut overrun = BitSet::decode(&mut cur, order).ok()?;
+    // Union the delivered event's changed leaves into the (preserved)
+    // upstream overrun bitset.
+    for b in changed.iter() {
+        overrun.set(b);
+    }
+    if overrun.is_empty() {
+        // Nothing changed and nothing was overrun — leave the body byte-
+        // identical so the dedup/ptr fast paths upstream stay valid.
+        return None;
+    }
+    let mut out = Vec::with_capacity(value_end + 8);
+    out.extend_from_slice(&body[..value_end]);
+    overrun.write_into(order, &mut out);
+    Some(bytes::Bytes::from(out))
+}
+
 /// one downstream→upstream pause/resume command queued to
 /// the gateway's single watermark applier (spawned in
 /// [`GatewayChannelSource::new`]).
@@ -775,6 +831,13 @@ impl GatewayChannelSource {
         // bytes::Bytes::clone() is a refcount clone; same allocation ⟹ same
         // as_ptr(). Take the Option once so only a single event is skipped.
         let dedup_body: Option<bytes::Bytes> = initial_raw.as_ref().map(|e| e.body.clone());
+        // Descriptor snapshot for bridge-local overrun marking on lag. A
+        // type-change event terminates this forwarder (see the `type_changed`
+        // return below), so the descriptor is stable for the forwarder's whole
+        // life — capturing it once here is correct. `lookup()` waited for the
+        // first upstream event, so introspection is populated; `None` only on
+        // the degenerate not-yet-decoded case, where we forward unmarked.
+        let desc = entry.introspection();
         let (mpsc_tx, mpsc_rx) =
             mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
@@ -797,6 +860,12 @@ impl GatewayChannelSource {
                 }
             }
             let mut dedup = dedup_body;
+            // Set when this subscriber's broadcast receiver lagged (events
+            // dropped under its own backpressure). pva2pva marks the
+            // coalesced overflow element's overrun bitset on the next
+            // delivery (moncache.cpp:354-365); we mirror that by flagging the
+            // next forwarded body via `mark_raw_body_local_overrun`.
+            let mut pending_overrun = false;
             loop {
                 match bcast.recv().await {
                     Ok(ev) => {
@@ -806,8 +875,23 @@ impl GatewayChannelSource {
                             }
                         }
                         let type_changed = ev.type_changed;
+                        let mut body = ev.body;
+                        // After a drop, this (latest) event is the coalesced
+                        // element pva2pva would deliver marked overrun. A
+                        // type-change marker carries an empty body and is
+                        // never a value event, so it is left untouched.
+                        if pending_overrun && !type_changed {
+                            if let Some(d) = desc.as_ref() {
+                                if let Some(marked) =
+                                    mark_raw_body_local_overrun(&body, d, ev.byte_order)
+                                {
+                                    body = marked;
+                                }
+                            }
+                            pending_overrun = false;
+                        }
                         let out = epics_pva_rs::server_native::RawMonitorEvent {
-                            body_bytes: ev.body,
+                            body_bytes: body,
                             byte_order: ev.byte_order,
                             type_changed,
                         };
@@ -819,13 +903,18 @@ impl GatewayChannelSource {
                             return;
                         }
                     }
-                    // dropped events under this receiver's own
-                    // backpressure are skipped with NO overrun signal to the
-                    // client. pva2pva coalesces into an overflowElement and
-                    // sets the overrun bitset (moncache.cpp:157-174). Faithful
-                    // signaling needs the epics-pva-rs monitor encoder — see
-                    // legend (cross-crate, deferred).
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // Events dropped under this receiver's own backpressure.
+                    // pva2pva enters overflow and ORs the overrun bitset
+                    // (moncache.cpp:156-174) rather than silently swallowing
+                    // the loss; we accumulate a pending overrun to be flagged
+                    // on the next delivered body (see `pending_overrun`
+                    // above), so a slow downstream client sees the same
+                    // overrun signal it would behind pva2pva instead of a
+                    // deceptively clean stream.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        pending_overrun = true;
+                        continue;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -883,9 +972,16 @@ impl GatewayChannelSource {
                             return;
                         }
                     }
-                    // same as the raw path — drops under this
-                    // receiver's backpressure carry no overrun signal
-                    // (pva2pva moncache.cpp:157-174). Cross-crate, deferred.
+                    // Drops under this receiver's backpressure. The raw path
+                    // (default-on, EPICS_PVA_GW_RAW_FRAMES) now marks the
+                    // coalesced body's overrun bitset on lag; the typed
+                    // PvField fan-out cannot — the downstream native server
+                    // encodes a typed monitor with an empty overrun bitset
+                    // (epics-pva-rs server_native/tcp.rs `BitSet::new(); //
+                    // no overruns`) and the `mpsc<PvField>` item carries no
+                    // bitset to thread one through. Faithful overrun on the
+                    // typed path needs an epics-pva-rs API that accepts an
+                    // overrun bitset alongside the typed value (cross-crate).
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
@@ -2368,6 +2464,133 @@ ASG(DEFAULT) {
             src.max_upstream_identities(),
             1,
             "accessor must report the floored cap of 1"
+        );
+    }
+
+    // ---- bridge-local overrun marking on fanout lag --------------------
+
+    use epics_pva_rs::proto::{BitSet, ByteOrder};
+    use epics_pva_rs::pvdata::encode::{decode_pv_field_with_bitset, encode_pv_field_with_bitset};
+    use epics_pva_rs::pvdata::{ScalarType, ScalarValue};
+
+    /// Encode a full wire MONITOR DATA body `changed | value | overrun`.
+    fn full_body(
+        desc: &FieldDesc,
+        value: &PvField,
+        changed_bits: &[usize],
+        overrun_bits: &[usize],
+    ) -> bytes::Bytes {
+        let mut changed = BitSet::new();
+        for &b in changed_bits {
+            changed.set(b);
+        }
+        let mut overrun = BitSet::new();
+        for &b in overrun_bits {
+            overrun.set(b);
+        }
+        let mut body = Vec::new();
+        changed.write_into(ByteOrder::Little, &mut body);
+        encode_pv_field_with_bitset(value, desc, &changed, 0, ByteOrder::Little, &mut body);
+        overrun.write_into(ByteOrder::Little, &mut body);
+        bytes::Bytes::from(body)
+    }
+
+    /// Decode the trailing overrun bitset back out of a marked body so a
+    /// test can assert the exact bits a downstream client would observe.
+    fn decode_overrun(body: &bytes::Bytes, desc: &FieldDesc) -> BitSet {
+        let mut cur = std::io::Cursor::new(body.as_ref());
+        let changed = BitSet::decode(&mut cur, ByteOrder::Little).expect("changed");
+        decode_pv_field_with_bitset(desc, &changed, 0, &mut cur, ByteOrder::Little).expect("value");
+        BitSet::decode(&mut cur, ByteOrder::Little).expect("overrun")
+    }
+
+    /// A scalar body whose changed bit is set but whose overrun bitset is
+    /// empty (the common case) must come back with the changed leaf ORed
+    /// into the overrun bitset, while the `changed | value` prefix bytes are
+    /// preserved byte-for-byte.
+    #[test]
+    fn lag_marks_scalar_changed_leaf_as_overrun() {
+        let desc = FieldDesc::Scalar(ScalarType::Double);
+        let value = PvField::Scalar(ScalarValue::Double(42.0));
+        let body = full_body(&desc, &value, &[0], &[]);
+
+        let marked =
+            mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).expect("marked body");
+
+        let overrun = decode_overrun(&marked, &desc);
+        assert!(overrun.get(0), "changed leaf must be flagged overrun");
+        assert_eq!(overrun.count(), 1, "only the changed leaf is overrun");
+
+        // The decoded value is unchanged: the prefix bytes were preserved.
+        let mut cur = std::io::Cursor::new(marked.as_ref());
+        let changed = BitSet::decode(&mut cur, ByteOrder::Little).unwrap();
+        let v =
+            decode_pv_field_with_bitset(&desc, &changed, 0, &mut cur, ByteOrder::Little).unwrap();
+        assert_eq!(v, value, "value bytes preserved across overrun marking");
+    }
+
+    /// Upstream overrun bits already present in the body must be preserved —
+    /// the marking is a UNION with the changed leaves, never a replacement.
+    #[test]
+    fn lag_preserves_upstream_overrun_and_unions_changed() {
+        // Structure { a: Int, b: Int }: bit 0 = struct, bit 1 = a, bit 2 = b.
+        let desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        };
+        let value = {
+            let mut s = epics_pva_rs::pvdata::PvStructure::new("");
+            s.fields
+                .push(("a".to_string(), PvField::Scalar(ScalarValue::Int(7))));
+            s.fields
+                .push(("b".to_string(), PvField::Scalar(ScalarValue::Int(9))));
+            PvField::Structure(s)
+        };
+        // This event changes `a` (bit 1); the upstream already flagged `b`
+        // (bit 2) as overrun from its own squashing.
+        let body = full_body(&desc, &value, &[1], &[2]);
+
+        let marked =
+            mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).expect("marked body");
+
+        let overrun = decode_overrun(&marked, &desc);
+        assert!(overrun.get(1), "bridge-local changed leaf `a` flagged");
+        assert!(overrun.get(2), "upstream overrun bit `b` preserved");
+        assert_eq!(overrun.count(), 2, "exactly the union of both");
+    }
+
+    /// A body with nothing changed and no upstream overrun has no loss to
+    /// signal — the helper returns `None` so the caller forwards the bytes
+    /// untouched (keeps the dedup pointer fast path valid).
+    #[test]
+    fn lag_noop_when_nothing_changed_or_overrun() {
+        let desc = FieldDesc::Scalar(ScalarType::Double);
+        let value = PvField::Scalar(ScalarValue::Double(1.0));
+        let body = full_body(&desc, &value, &[], &[]);
+        assert!(
+            mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).is_none(),
+            "empty changed + empty overrun is a no-op"
+        );
+    }
+
+    /// A truncated / undecodable body must not panic and must fall back to
+    /// forwarding the original bytes (helper returns `None`).
+    #[test]
+    fn lag_undecodable_body_returns_none() {
+        let desc = FieldDesc::Scalar(ScalarType::Double);
+        // Only a changed bitset, no value/overrun — decode of the value
+        // region fails.
+        let mut body = Vec::new();
+        let mut changed = BitSet::new();
+        changed.set(0);
+        changed.write_into(ByteOrder::Little, &mut body);
+        let body = bytes::Bytes::from(body);
+        assert!(
+            mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).is_none(),
+            "undecodable body falls back to None"
         );
     }
 }

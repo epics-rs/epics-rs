@@ -30,7 +30,7 @@
 pub mod env;
 
 pub use env::{
-    PvaConfigDefs, auto_addr_list_enabled, auto_beacon_addr_list_enabled, beacon_period_secs,
+    PvaConfigDefs, auto_addr_list_enabled, auto_beacon_addr_list_enabled, beacon_period,
     broadcast_port, client_tls_keychain_password, conn_timeout_secs, expand_dollar_vars,
     list_broadcast_addresses, list_intf_addresses, name_servers, parse_addr_list,
     parse_addr_list_with_port, seed_env_overrides, server_addr_list, server_beacon_addr_list,

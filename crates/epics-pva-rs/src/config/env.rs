@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 /// Expand `$(VAR)` and `${VAR}` references in `input` against the
 /// process environment. Mirrors pvxs `Config::expand()` (server.h:219).
@@ -144,6 +145,25 @@ impl PvaConfigDefs {
     }
 }
 
+/// From a synchronous-resolver iterator, pick the first IPv4 answer, else
+/// the first IPv6. pvxs `SockAddr::setAddress` (util.cpp:530-540) applies
+/// the same "we always prefer IPv4" rule; this stack additionally needs it
+/// because `AsyncUdpV4` is IPv4-only and would reject a V6 send target.
+/// Shared by every env address-list parser so the family cannot drift back
+/// to dropping DNS hostnames at one site while resolving them at another.
+fn pick_v4_preferred(iter: impl Iterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    let mut v4: Option<SocketAddr> = None;
+    let mut v6: Option<SocketAddr> = None;
+    for sa in iter {
+        match sa {
+            SocketAddr::V4(_) if v4.is_none() => v4 = Some(sa),
+            SocketAddr::V6(_) if v6.is_none() => v6 = Some(sa),
+            _ => {}
+        }
+    }
+    v4.or(v6)
+}
+
 /// Parse a `EPICS_PVA_ADDR_LIST`-style string (comma/whitespace
 /// separated) into a list of `SocketAddr`. Accepts plain IPs (gets
 /// `default_port` appended), `ip:port`, DNS hostnames (resolves via
@@ -190,21 +210,10 @@ pub fn parse_addr_list_with_port(env: &str, default_port: u16) -> Vec<SocketAddr
                 format!("{s}:{default_port}")
             };
             match with_port.to_socket_addrs() {
-                Ok(iter) => {
-                    let mut v4: Option<SocketAddr> = None;
-                    let mut v6: Option<SocketAddr> = None;
-                    for sa in iter {
-                        match sa {
-                            SocketAddr::V4(_) if v4.is_none() => v4 = Some(sa),
-                            SocketAddr::V6(_) if v6.is_none() => v6 = Some(sa),
-                            _ => {}
-                        }
-                    }
-                    v4.or(v6).or_else(|| {
-                        tracing::debug!(token = %s, "EPICS_PVA addr-list: empty resolution");
-                        None
-                    })
-                }
+                Ok(iter) => pick_v4_preferred(iter).or_else(|| {
+                    tracing::debug!(token = %s, "EPICS_PVA addr-list: empty resolution");
+                    None
+                }),
                 Err(e) => {
                     tracing::debug!(token = %s, error = %e, "EPICS_PVA addr-list: resolve failed");
                     None
@@ -234,12 +243,21 @@ pub fn broadcast_port() -> u16 {
         .unwrap_or(5076)
 }
 
-/// `EPICS_PVAS_BROADCAST_PORT` falling back to `EPICS_PVA_BROADCAST_PORT`.
-pub fn server_broadcast_port() -> u16 {
+/// `EPICS_PVAS_BROADCAST_PORT` falling back to `EPICS_PVA_BROADCAST_PORT`,
+/// returning `None` when neither variable is set. The presence-aware form
+/// lets [`crate::server_native::PvaServerConfig::with_env`] preserve a
+/// caller-supplied port when the env is silent (pvxs `PickOne`,
+/// `config.cpp:397-437`).
+pub fn server_broadcast_port_opt() -> Option<u16> {
     std::env::var("EPICS_PVAS_BROADCAST_PORT")
         .ok()
+        .or_else(|| std::env::var("EPICS_PVA_BROADCAST_PORT").ok())
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(broadcast_port)
+}
+
+/// `EPICS_PVAS_BROADCAST_PORT` falling back to `EPICS_PVA_BROADCAST_PORT`.
+pub fn server_broadcast_port() -> u16 {
+    server_broadcast_port_opt().unwrap_or(5076)
 }
 
 /// Effective **client** default TCP destination port — the port a bare
@@ -274,11 +292,17 @@ pub fn server_port() -> u16 {
 /// `EPICS_PVAS_SERVER_PORT` was silently ignored and the Rust server
 /// bound to 5075.
 pub fn pvas_server_port() -> u16 {
+    pvas_server_port_opt().unwrap_or(5075)
+}
+
+/// Presence-aware [`pvas_server_port`] — `None` when neither
+/// `EPICS_PVAS_SERVER_PORT` nor `EPICS_PVA_SERVER_PORT` is set, so
+/// `with_env` preserves a caller-supplied `tcp_port`.
+pub fn pvas_server_port_opt() -> Option<u16> {
     std::env::var("EPICS_PVAS_SERVER_PORT")
         .ok()
         .or_else(|| std::env::var("EPICS_PVA_SERVER_PORT").ok())
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5075)
 }
 
 /// `EPICS_PVA_AUTO_ADDR_LIST` — default YES. When truthy, the search
@@ -299,59 +323,88 @@ pub fn auto_addr_list_enabled() -> bool {
 /// so shared deployment config still drives the server's beacon
 /// auto-discovery.
 pub fn auto_beacon_addr_list_enabled() -> bool {
-    let v = std::env::var("EPICS_PVAS_AUTO_BEACON_ADDR_LIST")
+    auto_beacon_addr_list_enabled_opt().unwrap_or(true)
+}
+
+/// Presence-aware [`auto_beacon_addr_list_enabled`] — `None` when neither
+/// `EPICS_PVAS_AUTO_BEACON_ADDR_LIST` nor `EPICS_PVA_AUTO_ADDR_LIST` is
+/// set, so `with_env` preserves a caller-supplied `auto_beacon`.
+pub fn auto_beacon_addr_list_enabled_opt() -> Option<bool> {
+    std::env::var("EPICS_PVAS_AUTO_BEACON_ADDR_LIST")
         .ok()
-        .or_else(|| std::env::var("EPICS_PVA_AUTO_ADDR_LIST").ok());
-    match v {
-        Some(s) => parse_bool(&s),
-        None => true,
-    }
+        .or_else(|| std::env::var("EPICS_PVA_AUTO_ADDR_LIST").ok())
+        .map(|s| parse_bool(&s))
 }
 
 /// `EPICS_PVAS_BEACON_PERIOD` — default 15s. Controls the *short*
 /// burst-interval; see [`crate::server_native::runtime::PvaServerConfig`]
-/// for the burst-then-slowdown semantics.
-pub fn beacon_period_secs() -> u64 {
+/// for the burst-then-slowdown semantics. Rust extension — pvxs has no
+/// configurable beacon interval (fixed 15s/180s, `server.cpp:45-46`).
+///
+/// Returns a [`Duration`] built with [`Duration::from_secs_f64`] so a
+/// sub-second positive request (`0.5`) is honored as 500ms rather than
+/// truncated to zero. The 100ms floor is applied *after* the float
+/// conversion, so every `0 < value` survives as a real delay instead of
+/// collapsing into a `Duration::ZERO` emit-loop.
+pub fn beacon_period() -> Duration {
+    beacon_period_opt().unwrap_or(Duration::from_secs(15))
+}
+
+/// Presence-aware [`beacon_period`] — `None` when `EPICS_PVAS_BEACON_PERIOD`
+/// is unset (or rejected as non-positive/non-finite), so `with_env`
+/// preserves a caller-supplied `beacon_period`.
+pub fn beacon_period_opt() -> Option<Duration> {
     std::env::var("EPICS_PVAS_BEACON_PERIOD")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        // Reject negatives, NaN, infinity, and zero — `f as u64` would
-        // saturate to 0 silently, producing `Duration::ZERO` and a
-        // beacon emit-loop that spins at memory bandwidth.
+        // Reject negatives, NaN, infinity, and zero.
         .filter(|f| f.is_finite() && *f > 0.0)
-        .map(|f| f.max(0.1) as u64)
-        .unwrap_or(15)
+        .map(Duration::from_secs_f64)
+        .map(|d| d.max(Duration::from_millis(100)))
 }
 
 /// `EPICS_PVAS_BEACON_PERIOD_LONG` — explicit long-interval override.
 /// `None` falls back to 12× the short interval (pvxs 15→180 ratio).
-pub fn beacon_period_long_secs() -> Option<u64> {
+/// Sub-second precision preserved via [`Duration::from_secs_f64`] with a
+/// post-conversion 100ms floor, same as [`beacon_period`].
+pub fn beacon_period_long() -> Option<Duration> {
     std::env::var("EPICS_PVAS_BEACON_PERIOD_LONG")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|f| f.is_finite() && *f > 0.0)
-        .map(|f| f.max(0.1) as u64)
+        .map(Duration::from_secs_f64)
+        .map(|d| d.max(Duration::from_millis(100)))
 }
 
 /// `EPICS_PVAS_MAX_CONNECTIONS` — server hard cap on simultaneous
 /// client connections. Excess accept()s are immediately closed. Default
 /// 1024.
 pub fn max_connections() -> usize {
+    max_connections_opt().unwrap_or(1024)
+}
+
+/// Presence-aware [`max_connections`] — `None` when
+/// `EPICS_PVAS_MAX_CONNECTIONS` is unset or non-positive.
+pub fn max_connections_opt() -> Option<usize> {
     std::env::var("EPICS_PVAS_MAX_CONNECTIONS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(1024)
 }
 
 /// `EPICS_PVAS_MAX_CHANNELS_PER_CONN` — server cap on channels created
 /// by a single client connection. Default 256.
 pub fn max_channels_per_connection() -> usize {
+    max_channels_per_connection_opt().unwrap_or(256)
+}
+
+/// Presence-aware [`max_channels_per_connection`] — `None` when
+/// `EPICS_PVAS_MAX_CHANNELS_PER_CONN` is unset or non-positive.
+pub fn max_channels_per_connection_opt() -> Option<usize> {
     std::env::var("EPICS_PVAS_MAX_CHANNELS_PER_CONN")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(256)
 }
 
 /// `EPICS_PVAS_MAX_OPS_PER_CHANNEL` — server cap on concurrent
@@ -360,11 +413,16 @@ pub fn max_channels_per_connection() -> usize {
 /// [`crate::server_native::runtime::PvaServerConfig::max_ops_per_channel`]
 /// for rationale.
 pub fn max_ops_per_channel() -> usize {
+    max_ops_per_channel_opt().unwrap_or(64)
+}
+
+/// Presence-aware [`max_ops_per_channel`] — `None` when
+/// `EPICS_PVAS_MAX_OPS_PER_CHANNEL` is unset or non-positive.
+pub fn max_ops_per_channel_opt() -> Option<usize> {
     std::env::var("EPICS_PVAS_MAX_OPS_PER_CHANNEL")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(64)
 }
 
 /// `EPICS_PVA_CONN_TMO` — connection idle timeout (default 30s, pvxs
@@ -372,12 +430,18 @@ pub fn max_ops_per_channel() -> usize {
 /// for this long, the client sends an ECHO; without a response within
 /// the same window it declares the link dead.
 pub fn conn_timeout_secs() -> u64 {
+    conn_timeout_secs_opt().unwrap_or(30)
+}
+
+/// Presence-aware [`conn_timeout_secs`] — `None` when `EPICS_PVA_CONN_TMO`
+/// is unset (or non-positive/non-finite), so `with_env` preserves a
+/// caller-supplied `idle_timeout`.
+pub fn conn_timeout_secs_opt() -> Option<u64> {
     std::env::var("EPICS_PVA_CONN_TMO")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|f| f.is_finite() && *f > 0.0)
         .map(|f| f.max(1.0) as u64)
-        .unwrap_or(30)
 }
 
 /// `EPICS_PVAS_SEND_TMO` — server-side per-write timeout (default 5s).
@@ -385,12 +449,17 @@ pub fn conn_timeout_secs() -> u64 {
 /// instantly fail. See `PvaServerConfig::send_timeout` for full
 /// rationale (stuck-client detection on non-blocking tokio sockets).
 pub fn send_timeout_secs() -> f64 {
+    send_timeout_secs_opt().unwrap_or(5.0)
+}
+
+/// Presence-aware [`send_timeout_secs`] — `None` when `EPICS_PVAS_SEND_TMO`
+/// is unset (or non-positive/non-finite).
+pub fn send_timeout_secs_opt() -> Option<f64> {
     std::env::var("EPICS_PVAS_SEND_TMO")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0)
         .map(|v| v.max(0.1))
-        .unwrap_or(5.0)
 }
 
 /// `EPICS_PVAS_TLS_HANDSHAKE_TMO` — server-side TLS handshake timeout
@@ -400,12 +469,17 @@ pub fn send_timeout_secs() -> f64 {
 /// (~30s on default keepalive); coordinated peers can exhaust the
 /// connection limit. Floored at 1.0s.
 pub fn tls_handshake_timeout_secs() -> f64 {
+    tls_handshake_timeout_secs_opt().unwrap_or(10.0)
+}
+
+/// Presence-aware [`tls_handshake_timeout_secs`] — `None` when
+/// `EPICS_PVAS_TLS_HANDSHAKE_TMO` is unset (or non-positive/non-finite).
+pub fn tls_handshake_timeout_secs_opt() -> Option<f64> {
     std::env::var("EPICS_PVAS_TLS_HANDSHAKE_TMO")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0)
         .map(|v| v.max(1.0))
-        .unwrap_or(10.0)
 }
 
 /// Keychain password for a server-side TLS keychain.
@@ -508,6 +582,15 @@ pub fn list_intf_addresses() -> Vec<IpAddr> {
 /// Parse `EPICS_PVAS_INTF_ADDR_LIST` — server-side interface bind list.
 /// Falls back to `EPICS_PVA_INTF_ADDR_LIST` when unset; if both are
 /// empty, returns an empty list (caller should bind 0.0.0.0).
+/// Presence-aware [`server_intf_addr_list`] — `None` when neither
+/// `EPICS_PVAS_INTF_ADDR_LIST` nor `EPICS_PVA_INTF_ADDR_LIST` is set, so
+/// `with_env` preserves a caller-supplied `interfaces`.
+pub fn server_intf_addr_list_opt() -> Option<Vec<IpAddr>> {
+    let present = std::env::var("EPICS_PVAS_INTF_ADDR_LIST").is_ok()
+        || std::env::var("EPICS_PVA_INTF_ADDR_LIST").is_ok();
+    present.then(server_intf_addr_list)
+}
+
 pub fn server_intf_addr_list() -> Vec<IpAddr> {
     if let Ok(s) = std::env::var("EPICS_PVAS_INTF_ADDR_LIST") {
         // PVA-466: expand $(VAR) refs before tokenising.
@@ -543,6 +626,15 @@ pub fn server_intf_addr_list() -> Vec<IpAddr> {
 /// `Config::ignoreAddrs`. Default port for plain-IP entries is
 /// `EPICS_PVAS_BROADCAST_PORT`, but the dropped-port match is
 /// usually wildcard-by-zero anyway.
+/// Presence-aware [`server_ignore_addr_list`] — `None` when
+/// `EPICS_PVAS_IGNORE_ADDR_LIST` is unset, so `with_env` preserves a
+/// caller-supplied `ignore_addrs`.
+pub fn server_ignore_addr_list_opt() -> Option<Vec<(IpAddr, u16)>> {
+    std::env::var("EPICS_PVAS_IGNORE_ADDR_LIST")
+        .is_ok()
+        .then(server_ignore_addr_list)
+}
+
 pub fn server_ignore_addr_list() -> Vec<(IpAddr, u16)> {
     let Ok(raw) = std::env::var("EPICS_PVAS_IGNORE_ADDR_LIST") else {
         return Vec::new();
@@ -555,15 +647,57 @@ pub fn server_ignore_addr_list() -> Vec<(IpAddr, u16)> {
             if s.is_empty() {
                 return None;
             }
-            if let Ok(sa) = s.parse::<SocketAddr>() {
-                return Some((sa.ip(), sa.port()));
-            }
-            if let Ok(ip) = s.parse::<IpAddr>() {
-                return Some((ip, 0));
-            }
-            None
+            resolve_ignore_entry(s)
         })
         .collect()
+}
+
+/// Resolve one `EPICS_PVAS_IGNORE_ADDR_LIST` token to `(IpAddr, port)`,
+/// where `port == 0` is the wildcard "match any port from this IP". pvxs
+/// parses this list through `split_addr_into(..., defaultPort=0)`
+/// (`config.cpp:422`), which builds a `SockEndpoint` whose `setAddress`
+/// resolves DNS hostnames (`util.cpp:444-540`). The previous Rust parser
+/// only accepted numeric `SocketAddr`/`IpAddr`, so `ioc-host` or
+/// `ioc-host:5076` was silently dropped and the peer never blocked.
+fn resolve_ignore_entry(token: &str) -> Option<(IpAddr, u16)> {
+    use std::net::ToSocketAddrs;
+    // Numeric `ip:port` / `[ipv6]:port` — explicit port kept.
+    if let Ok(sa) = token.parse::<SocketAddr>() {
+        return Some((sa.ip(), sa.port()));
+    }
+    // Numeric bare IP (v4 or v6) — wildcard (0) port.
+    if let Ok(ip) = token.parse::<IpAddr>() {
+        return Some((ip, 0));
+    }
+    // `host:port` or bare hostname — synchronous DNS resolve, IPv4
+    // preferred (pvxs `setAddress`). A bare host resolves against the
+    // wildcard port `:0`, so its `port()` stays 0; `host:port` carries
+    // its explicit port through resolution.
+    let with_port = if token.contains(':') {
+        token.to_string()
+    } else {
+        format!("{token}:0")
+    };
+    match with_port.to_socket_addrs() {
+        Ok(iter) => match pick_v4_preferred(iter) {
+            Some(sa) => Some((sa.ip(), sa.port())),
+            None => {
+                tracing::warn!(
+                    token = %token,
+                    "EPICS_PVAS_IGNORE_ADDR_LIST: host resolved to no addresses; entry ignored"
+                );
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                token = %token,
+                error = %e,
+                "EPICS_PVAS_IGNORE_ADDR_LIST: unresolvable entry ignored"
+            );
+            None
+        }
+    }
 }
 
 /// Parse `EPICS_PVAS_BEACON_ADDR_LIST` — explicit beacon destinations
@@ -576,11 +710,17 @@ pub fn server_ignore_addr_list() -> Vec<(IpAddr, u16)> {
 /// `EPICS_PVAS_*` var, so a site that listed beacon targets in
 /// `EPICS_PVA_ADDR_LIST` had no beacons emitted.
 pub fn server_beacon_addr_list() -> Vec<SocketAddr> {
-    let src = std::env::var("EPICS_PVAS_BEACON_ADDR_LIST")
+    server_beacon_addr_list_opt().unwrap_or_default()
+}
+
+/// Presence-aware [`server_beacon_addr_list`] — `None` when neither
+/// `EPICS_PVAS_BEACON_ADDR_LIST` nor `EPICS_PVA_ADDR_LIST` is set, so
+/// `with_env` preserves caller-supplied `beacon_destinations`.
+pub fn server_beacon_addr_list_opt() -> Option<Vec<SocketAddr>> {
+    std::env::var("EPICS_PVAS_BEACON_ADDR_LIST")
         .ok()
-        .or_else(|| std::env::var("EPICS_PVA_ADDR_LIST").ok());
-    src.map(|s| parse_addr_list_with_port(&s, server_broadcast_port()))
-        .unwrap_or_default()
+        .or_else(|| std::env::var("EPICS_PVA_ADDR_LIST").ok())
+        .map(|s| parse_addr_list_with_port(&s, server_broadcast_port()))
 }
 
 /// Discover per-NIC IPv4 broadcast addresses. Used to fan SEARCH
@@ -847,6 +987,86 @@ mod tests {
             std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
             std::env::remove_var("EPICS_PVAS_IGNORE_ADDR_LIST");
         }
+    }
+
+    /// PVA-40: numeric ignore-list tokens keep pvxs port semantics — a
+    /// bare IP is a wildcard (port 0 matches any port from that IP); an
+    /// `ip:port` token keeps its explicit port.
+    #[test]
+    fn resolve_ignore_entry_numeric_port_semantics() {
+        assert_eq!(
+            resolve_ignore_entry("192.168.1.1"),
+            Some((IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 0)),
+            "bare IP must be wildcard port 0"
+        );
+        assert_eq!(
+            resolve_ignore_entry("10.0.0.1:5075"),
+            Some((IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5075)),
+            "ip:port must keep the explicit port"
+        );
+    }
+
+    /// PVA-40 regression: a hostname token must be DNS-resolved instead of
+    /// silently dropped. `localhost` is in every hosts file, so this needs
+    /// no network. A bare hostname is a wildcard (port 0); `host:port`
+    /// carries its explicit port through resolution.
+    #[test]
+    fn resolve_ignore_entry_resolves_hostnames() {
+        let bare = resolve_ignore_entry("localhost").expect("localhost must resolve");
+        assert!(
+            bare.0.is_loopback(),
+            "localhost must resolve to a loopback IP"
+        );
+        assert_eq!(bare.1, 0, "bare hostname must be wildcard port 0");
+
+        let with_port =
+            resolve_ignore_entry("localhost:5076").expect("localhost:5076 must resolve");
+        assert!(
+            with_port.0.is_loopback(),
+            "localhost must resolve to a loopback IP"
+        );
+        assert_eq!(with_port.1, 5076, "host:port must keep the explicit port");
+    }
+
+    /// PVA-40: an unresolvable token is dropped (with a warning, not the
+    /// old silent debug-less drop). `.invalid` is reserved by RFC 6761 to
+    /// never resolve.
+    #[test]
+    fn resolve_ignore_entry_drops_unresolvable() {
+        assert_eq!(resolve_ignore_entry("no-such-host.invalid"), None);
+    }
+
+    /// PVA-40 end-to-end: a server configured with a hostname in
+    /// `EPICS_PVAS_IGNORE_ADDR_LIST` actually installs an ignore entry for
+    /// that host (was an empty drop). Mixed numeric + hostname + invalid
+    /// tokens: the invalid one is dropped, the rest resolve.
+    #[test]
+    fn server_ignore_addr_list_resolves_hostname_tokens() {
+        // SAFETY: nextest runs each test in its own process; the env
+        // mutation here cannot leak into a sibling test.
+        unsafe {
+            std::env::set_var(
+                "EPICS_PVAS_IGNORE_ADDR_LIST",
+                "localhost 10.0.0.1:5075 no-such-host.invalid",
+            );
+        }
+        let list = server_ignore_addr_list();
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_IGNORE_ADDR_LIST");
+        }
+        assert_eq!(
+            list.len(),
+            2,
+            "invalid token dropped, two resolve: {list:?}"
+        );
+        assert!(
+            list.iter().any(|(ip, port)| ip.is_loopback() && *port == 0),
+            "hostname `localhost` must install a wildcard-port loopback entry: {list:?}"
+        );
+        assert!(
+            list.contains(&(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5075)),
+            "numeric ip:port must survive alongside the resolved hostname: {list:?}"
+        );
     }
 
     /// Env-driven server caps fall back to safe defaults when

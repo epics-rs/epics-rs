@@ -266,6 +266,16 @@ impl PvaCodec {
         self.frame(false, CMD_MONITOR, p)
     }
 
+    /// Tear down a monitor via the MONITOR command's destroy bit
+    /// (`subcmd=0x10`) rather than the separate `DESTROY_REQUEST` command.
+    /// pvxs accepts destroy in any non-INIT MONITOR message
+    /// (`servermon.cpp:640-642`, :691-708) and pvAccessCPP clients use this
+    /// form; the body is `sid + ioid + subcmd` only, no trailer.
+    pub fn build_monitor_destroy(&self, server_channel_id: u32, ioid: u32) -> Vec<u8> {
+        let p = Self::op_payload(server_channel_id, ioid, 0x10, &[], self.order());
+        self.frame(false, CMD_MONITOR, p)
+    }
+
     /// Subsequent pipeline-ack message: subcmd `0x80` + ack count.
     pub fn build_monitor_ack(&self, server_channel_id: u32, ioid: u32, ack_count: u32) -> Vec<u8> {
         let order = self.order();

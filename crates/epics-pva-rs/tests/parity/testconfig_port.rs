@@ -9,6 +9,7 @@
 #![cfg(test)]
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use epics_pva_rs::client_native::search::parse_addr_list;
 use epics_pva_rs::config::env;
@@ -105,9 +106,53 @@ fn pvxs_beacon_period_default_is_15_seconds() {
     // When EPICS_PVAS_BEACON_PERIOD is unset, default is 15s.
     let prev = std::env::var("EPICS_PVAS_BEACON_PERIOD").ok();
     unsafe { std::env::remove_var("EPICS_PVAS_BEACON_PERIOD") };
-    assert_eq!(env::beacon_period_secs(), 15);
+    assert_eq!(env::beacon_period(), Duration::from_secs(15));
     if let Some(v) = prev {
         unsafe { std::env::set_var("EPICS_PVAS_BEACON_PERIOD", v) };
+    }
+}
+
+/// A fractional beacon period must survive as sub-second precision, not
+/// truncate to a zero-second emit-loop. `0.5` → 500ms, `0.05` floors to
+/// the 100ms minimum, `1.0` → 1s, an invalid string → the 15s default.
+#[test]
+fn beacon_period_preserves_subsecond_values() {
+    let prev = std::env::var("EPICS_PVAS_BEACON_PERIOD").ok();
+    let cases = [
+        ("0", Duration::from_secs(15)),       // zero rejected → default
+        ("0.05", Duration::from_millis(100)), // below floor → 100ms
+        ("0.5", Duration::from_millis(500)),  // honored as 500ms
+        ("1.0", Duration::from_secs(1)),
+        ("not-a-number", Duration::from_secs(15)), // invalid → default
+    ];
+    for (val, expect) in cases {
+        unsafe { std::env::set_var("EPICS_PVAS_BEACON_PERIOD", val) };
+        assert_eq!(
+            env::beacon_period(),
+            expect,
+            "EPICS_PVAS_BEACON_PERIOD={val}"
+        );
+    }
+    match prev {
+        Some(v) => unsafe { std::env::set_var("EPICS_PVAS_BEACON_PERIOD", v) },
+        None => unsafe { std::env::remove_var("EPICS_PVAS_BEACON_PERIOD") },
+    }
+}
+
+/// `EPICS_PVAS_BEACON_PERIOD_LONG` likewise keeps sub-second precision and
+/// floors at 100ms; absent → `None` (caller derives 12× short).
+#[test]
+fn beacon_period_long_preserves_subsecond_values() {
+    let prev = std::env::var("EPICS_PVAS_BEACON_PERIOD_LONG").ok();
+    unsafe { std::env::remove_var("EPICS_PVAS_BEACON_PERIOD_LONG") };
+    assert_eq!(env::beacon_period_long(), None);
+    unsafe { std::env::set_var("EPICS_PVAS_BEACON_PERIOD_LONG", "0.5") };
+    assert_eq!(env::beacon_period_long(), Some(Duration::from_millis(500)));
+    unsafe { std::env::set_var("EPICS_PVAS_BEACON_PERIOD_LONG", "0") };
+    assert_eq!(env::beacon_period_long(), None); // zero rejected
+    match prev {
+        Some(v) => unsafe { std::env::set_var("EPICS_PVAS_BEACON_PERIOD_LONG", v) },
+        None => unsafe { std::env::remove_var("EPICS_PVAS_BEACON_PERIOD_LONG") },
     }
 }
 

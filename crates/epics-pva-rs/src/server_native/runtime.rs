@@ -289,33 +289,72 @@ impl PvaServerConfig {
     }
 
     /// Apply standard EPICS_PVAS_* / EPICS_PVA_* env vars on top of an
-    /// existing config. Only fields backed by the recognised vars are
-    /// touched — others stay at their existing values.
+    /// existing config. Only fields backed by a **present** env var are
+    /// touched — every other field keeps its existing value.
+    ///
+    /// Each `env::*_opt()` helper returns `None` when none of the variables
+    /// that back its field is set, so an absent variable never overwrites a
+    /// caller-supplied value with a compiled default. This mirrors pvxs
+    /// `Config::applyEnv` → `PickOne` (`config.cpp:397-437`/:439-443), where
+    /// every field is assigned only inside `if(pickone(...))`. It keeps
+    /// `PvaServerConfig::isolated().with_env()` isolated in an empty
+    /// environment (ports stay ephemeral, `auto_beacon` stays off) instead
+    /// of silently reverting to the LAN-facing defaults.
     pub fn with_env(mut self) -> Self {
         use crate::config::env;
         // server respects EPICS_PVAS_SERVER_PORT first, then
         // falls back to EPICS_PVA_SERVER_PORT (pvxs config.cpp:
         // 402-408 PickOne precedence).
-        self.tcp_port = env::pvas_server_port();
-        self.udp_port = env::server_broadcast_port();
-        self.max_connections = env::max_connections();
-        self.max_channels_per_connection = env::max_channels_per_connection();
-        self.max_ops_per_channel = env::max_ops_per_channel();
-        self.beacon_period = Duration::from_secs(env::beacon_period_secs());
-        // Keep the pvxs short:long = 15:180 = 1:12 ratio when the
-        // operator tunes only the short period; an explicit
-        // `EPICS_PVAS_BEACON_PERIOD_LONG` override wins. Floor at
-        // `beacon_period + 1s` so the long path never goes faster
-        // than the burst path (beacon_loop assumes long > short).
-        let long = env::beacon_period_long_secs()
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| self.beacon_period.saturating_mul(12));
-        self.beacon_period_long = long.max(self.beacon_period + Duration::from_secs(1));
-        self.beacon_destinations = env::server_beacon_addr_list();
-        self.auto_beacon = env::auto_beacon_addr_list_enabled();
-        self.interfaces = env::server_intf_addr_list();
-        self.send_timeout = Duration::from_secs_f64(env::send_timeout_secs());
-        self.tls_handshake_timeout = Duration::from_secs_f64(env::tls_handshake_timeout_secs());
+        if let Some(v) = env::pvas_server_port_opt() {
+            self.tcp_port = v;
+        }
+        if let Some(v) = env::server_broadcast_port_opt() {
+            self.udp_port = v;
+        }
+        if let Some(v) = env::max_connections_opt() {
+            self.max_connections = v;
+        }
+        if let Some(v) = env::max_channels_per_connection_opt() {
+            self.max_channels_per_connection = v;
+        }
+        if let Some(v) = env::max_ops_per_channel_opt() {
+            self.max_ops_per_channel = v;
+        }
+        // Beacon periods: keep the pvxs short:long = 15:180 = 1:12 ratio
+        // when only the short period is tuned; an explicit
+        // `EPICS_PVAS_BEACON_PERIOD_LONG` wins. Floor the long path at
+        // `beacon_period + 1s` (beacon_loop assumes long > short). A short
+        // override re-derives the long unless the long is also set; if
+        // neither var is present both fields keep their caller values.
+        let short_set = if let Some(v) = env::beacon_period_opt() {
+            self.beacon_period = v;
+            true
+        } else {
+            false
+        };
+        if let Some(long) = env::beacon_period_long() {
+            self.beacon_period_long = long.max(self.beacon_period + Duration::from_secs(1));
+        } else if short_set {
+            self.beacon_period_long = self
+                .beacon_period
+                .saturating_mul(12)
+                .max(self.beacon_period + Duration::from_secs(1));
+        }
+        if let Some(v) = env::server_beacon_addr_list_opt() {
+            self.beacon_destinations = v;
+        }
+        if let Some(v) = env::auto_beacon_addr_list_enabled_opt() {
+            self.auto_beacon = v;
+        }
+        if let Some(v) = env::server_intf_addr_list_opt() {
+            self.interfaces = v;
+        }
+        if let Some(v) = env::send_timeout_secs_opt() {
+            self.send_timeout = Duration::from_secs_f64(v);
+        }
+        if let Some(v) = env::tls_handshake_timeout_secs_opt() {
+            self.tls_handshake_timeout = Duration::from_secs_f64(v);
+        }
         // Effective inactivity timeout = configured CONN_TMO × 4/3.
         // pvxs config.cpp:187 applies the same scaling so a client
         // sending ECHO every CONN_TMO/2 (the protocol convention)
@@ -323,10 +362,13 @@ impl PvaServerConfig {
         // server with idle_timeout = exactly CONN_TMO would race
         // with a healthy client's second ECHO and disconnect it.
         // Floor at 2s mirrors pvxs `enforceTimeout`.
-        let configured = env::conn_timeout_secs() as f64;
-        let scaled = (configured * 4.0 / 3.0).max(2.0);
-        self.idle_timeout = Duration::from_secs_f64(scaled);
-        self.ignore_addrs = env::server_ignore_addr_list();
+        if let Some(c) = env::conn_timeout_secs_opt() {
+            let scaled = (c as f64 * 4.0 / 3.0).max(2.0);
+            self.idle_timeout = Duration::from_secs_f64(scaled);
+        }
+        if let Some(v) = env::server_ignore_addr_list_opt() {
+            self.ignore_addrs = v;
+        }
         self
     }
 }
@@ -1337,5 +1379,112 @@ mod sr9_message_size_tests {
         assert_eq!(PvaServerConfig::isolated().max_message_size, None);
         // `with_env()` does not introduce a cap either.
         assert_eq!(PvaServerConfig::default().with_env().max_message_size, None);
+    }
+}
+
+#[cfg(test)]
+mod with_env_preserve_tests {
+    //! pvxs `Config::applyEnv` parity (`config.cpp:397-437`): `with_env`
+    //! overrides a field only when a backing env var is *present*; an
+    //! absent var must leave the caller-supplied value intact. Pre-fix
+    //! Rust assigned every field unconditionally from a default-returning
+    //! helper, so an empty environment reset ports / auto-beacon back to
+    //! the LAN-facing defaults — and broke the `isolated()` contract.
+    use super::*;
+
+    /// Clear the env vars a test depends on, run `f`, then restore them.
+    /// nextest isolates each test in its own process, but we still save +
+    /// restore so a `cargo test` (thread-shared) run stays coherent.
+    fn with_cleared_env<R>(vars: &[&str], f: impl FnOnce() -> R) -> R {
+        let saved: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|v| ((*v).to_string(), std::env::var(v).ok()))
+            .collect();
+        for v in vars {
+            unsafe { std::env::remove_var(v) };
+        }
+        let out = f();
+        for (k, val) in saved {
+            match val {
+                Some(s) => unsafe { std::env::set_var(&k, s) },
+                None => unsafe { std::env::remove_var(&k) },
+            }
+        }
+        out
+    }
+
+    const PORT_VARS: &[&str] = &[
+        "EPICS_PVAS_SERVER_PORT",
+        "EPICS_PVA_SERVER_PORT",
+        "EPICS_PVAS_BROADCAST_PORT",
+        "EPICS_PVA_BROADCAST_PORT",
+    ];
+
+    #[test]
+    fn with_env_preserves_caller_fields_when_vars_absent() {
+        with_cleared_env(PORT_VARS, || {
+            let cfg = PvaServerConfig {
+                tcp_port: 12345,
+                udp_port: 11111,
+                ..Default::default()
+            }
+            .with_env();
+            assert_eq!(
+                cfg.tcp_port, 12345,
+                "absent server-port var must not reset tcp_port"
+            );
+            assert_eq!(
+                cfg.udp_port, 11111,
+                "absent broadcast-port var must not reset udp_port"
+            );
+        });
+    }
+
+    #[test]
+    fn with_env_overrides_only_the_present_var() {
+        with_cleared_env(PORT_VARS, || {
+            unsafe { std::env::set_var("EPICS_PVAS_SERVER_PORT", "6789") };
+            let cfg = PvaServerConfig {
+                tcp_port: 12345,
+                udp_port: 11111,
+                ..Default::default()
+            }
+            .with_env();
+            assert_eq!(
+                cfg.tcp_port, 6789,
+                "present EPICS_PVAS_SERVER_PORT must override tcp_port"
+            );
+            assert_eq!(
+                cfg.udp_port, 11111,
+                "absent broadcast-port var must leave udp_port"
+            );
+        });
+    }
+
+    #[test]
+    fn isolated_with_env_stays_isolated_in_empty_env() {
+        let vars = [
+            "EPICS_PVAS_SERVER_PORT",
+            "EPICS_PVA_SERVER_PORT",
+            "EPICS_PVAS_BROADCAST_PORT",
+            "EPICS_PVA_BROADCAST_PORT",
+            "EPICS_PVAS_AUTO_BEACON_ADDR_LIST",
+            "EPICS_PVA_AUTO_ADDR_LIST",
+        ];
+        with_cleared_env(&vars, || {
+            let cfg = PvaServerConfig::isolated().with_env();
+            assert_eq!(
+                cfg.tcp_port, 0,
+                "isolated().with_env() must keep the ephemeral tcp_port"
+            );
+            assert_eq!(
+                cfg.udp_port, 0,
+                "isolated().with_env() must keep the ephemeral udp_port"
+            );
+            assert!(
+                !cfg.auto_beacon,
+                "isolated().with_env() must keep auto_beacon off"
+            );
+        });
     }
 }

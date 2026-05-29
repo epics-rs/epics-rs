@@ -22,6 +22,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::Parser;
+use futures_util::future::join_all;
+
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::search_engine::{Discovered, SearchEngine};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -343,16 +345,20 @@ async fn main() {
         .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
         .build();
 
-    let mut had_error = false;
-    for (raw, addr) in &addrs {
-        if query_server(&client, raw, *addr, args.info, args.verbose)
-            .await
-            .is_err()
-        {
-            had_error = true;
-        }
-    }
-    if had_error {
+    // pvxs `tools/list.cpp:156-197` `exec()`s every server RPC before
+    // waiting, then waits once on a shared event bounded by a single
+    // command-level timeout (`:200-203`). Launch all queries
+    // concurrently and await them as one batch so a slow or
+    // unreachable earlier server cannot delay or block later servers;
+    // the shared `client` timeout bounds the whole batch to one wait
+    // window instead of `N * -w`.
+    let results = join_all(
+        addrs
+            .iter()
+            .map(|(raw, addr)| query_server(&client, raw, *addr, args.info, args.verbose)),
+    )
+    .await;
+    if results.iter().any(|r| r.is_err()) {
         std::process::exit(1);
     }
 }

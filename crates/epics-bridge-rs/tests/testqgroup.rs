@@ -460,6 +460,89 @@ async fn br_r33_group_monitor_stamps_negotiated_queue_size() {
     );
 }
 
+/// a group MONITOR stamps `record._options.atomic = true`
+/// unconditionally, regardless of the group's `+atomic:false`
+/// default, while a GET on the same group reports the actual
+/// operation atomicity (`false`). pvxs `groupsource.cpp:401-405`
+/// (GroupMonitor::onStart) always sets the monitor value's atomic
+/// flag true — a monitor delivers one consistent snapshot, so it
+/// reports itself atomic — whereas `groupsource.cpp:480-485`
+/// (GroupSource::onOp, the GET path) stamps the per-operation
+/// atomicity. Before the fix both paths reported the group default,
+/// so a `+atomic:false` group's monitor wrongly advertised `false`.
+#[tokio::test]
+async fn group_monitor_stamps_atomic_true_while_get_reports_operation_atomicity() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_bridge_rs::qsrv::group::GroupMonitor;
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::time::Duration;
+
+    // Extract `record._options.atomic` from a posted/returned value.
+    fn atomic_of(s: &PvStructure) -> bool {
+        let record = match s.fields.iter().find(|(n, _)| n == "record").map(|(_, v)| v) {
+            Some(PvField::Structure(r)) => r,
+            other => panic!("record sub-structure missing: {other:?}"),
+        };
+        let options = match record
+            .fields
+            .iter()
+            .find(|(n, _)| n == "_options")
+            .map(|(_, v)| v)
+        {
+            Some(PvField::Structure(o)) => o,
+            other => panic!("record._options missing: {other:?}"),
+        };
+        match options
+            .fields
+            .iter()
+            .find(|(n, _)| n == "atomic")
+            .map(|(_, v)| v)
+        {
+            Some(PvField::Scalar(ScalarValue::Boolean(b))) => *b,
+            other => panic!("record._options.atomic missing: {other:?}"),
+        }
+    }
+
+    // GET path: a `+atomic:false` group reports the operation
+    // atomicity, which defaults to the group default (false).
+    let db = make_db_na().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(GROUP_JSON_NONATOMIC)
+        .expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp_na")
+        .cloned()
+        .expect("grp_na registered");
+    assert!(!def.atomic, "fixture must be a non-atomic group");
+
+    let ch = GroupChannel::new(db.clone(), def.clone());
+    let get_result = ch.get(&empty_request()).await.expect("get");
+    assert!(
+        !atomic_of(&get_result),
+        "GET on a +atomic:false group must report operation atomicity (false)"
+    );
+
+    // MONITOR path: the same group's monitor snapshot reports
+    // atomic = true unconditionally.
+    let mut mon = GroupMonitor::new(db.clone(), def);
+    mon.start().await.expect("start");
+    for rec_name in ["TEST:level_na", "TEST:count_na"] {
+        let rec = db.get_record(rec_name).await.expect("rec exists");
+        rec.read().await.notify_field("VAL", EventMask::VALUE);
+    }
+    let snap = tokio::time::timeout(Duration::from_secs(2), mon.poll())
+        .await
+        .expect("priming snapshot within 2s")
+        .expect("snapshot");
+    mon.stop().await;
+    assert!(
+        atomic_of(&snap.value),
+        "group MONITOR must stamp record._options.atomic = true even for a +atomic:false group"
+    );
+}
+
 /// a per-member ACF denial fails the group PUT even when the
 /// group PV itself is writable. Mirrors pvxs's per-field
 /// SecurityClient gating (groupsource.cpp:161 + 515) — "any

@@ -512,6 +512,14 @@ pub struct GroupChannel {
     /// `Some(n)` when a `GroupMonitor` built this channel from the
     /// MONITOR INIT pvRequest's negotiated `queueSize`.
     monitor_queue_size: Option<i32>,
+    /// When `true`, the composed value stamps `record._options.atomic =
+    /// true` regardless of the group/operation atomicity. pvxs's group
+    /// MONITOR path sets `currentValue["record._options.atomic"] = true`
+    /// unconditionally (ioc/groupsource.cpp:401-405), whereas group GET
+    /// stamps the *selected* operation atomicity (groupsource.cpp:480-485).
+    /// Only a `GroupMonitor`-built channel sets this; the GET path leaves
+    /// it `false` so it keeps reflecting the request/default atomicity.
+    monitor_atomic_stamp: bool,
 }
 
 impl GroupChannel {
@@ -521,6 +529,7 @@ impl GroupChannel {
             def,
             access: super::provider::AccessContext::allow_all(),
             monitor_queue_size: None,
+            monitor_atomic_stamp: false,
         }
     }
 
@@ -536,6 +545,15 @@ impl GroupChannel {
     /// INIT pvRequest.
     pub fn with_monitor_queue_size(mut self, queue_size: i32) -> Self {
         self.monitor_queue_size = Some(queue_size);
+        self
+    }
+
+    /// Mark this channel as a MONITOR source so composed values stamp
+    /// `record._options.atomic = true` unconditionally, matching pvxs
+    /// group MONITOR (ioc/groupsource.cpp:401-405). The GET path never
+    /// calls this, so GET keeps stamping the request/default atomicity.
+    pub fn with_monitor_atomic_stamp(mut self) -> Self {
+        self.monitor_atomic_stamp = true;
         self
     }
 
@@ -631,7 +649,23 @@ impl GroupChannel {
         // `GROUP_DEFAULT_QUEUE_SIZE` — a GET has no subscription
         // queue, matching pvxs's monitor-only `limitQueue`.
         let queue_size = self.monitor_queue_size.unwrap_or(GROUP_DEFAULT_QUEUE_SIZE);
-        push_record_options(&mut pv, atomic, queue_size);
+        // pvxs `groupsource.cpp:401-405` (GroupMonitor::onStart) stamps
+        // `record._options.atomic = true` unconditionally on every group
+        // *monitor* value, regardless of the group's configured `atomic`
+        // default or a `+atomic:false` annotation: a monitor always
+        // delivers a single consistent snapshot, so it reports itself as
+        // atomic. The GET path (`groupsource.cpp:480-485`,
+        // GroupSource::onOp) instead stamps the *operation* atomicity
+        // (`record._options.atomic` from the pvRequest, defaulting to the
+        // group default). `monitor_atomic_stamp` distinguishes the two
+        // callers: the cached monitor `group_channel` sets it, GET does
+        // not. Locking still uses the real `atomic` mode above.
+        let stamp_atomic = if self.monitor_atomic_stamp {
+            true
+        } else {
+            atomic
+        };
+        push_record_options(&mut pv, stamp_atomic, queue_size);
 
         Ok(pv)
     }
@@ -1688,7 +1722,8 @@ impl super::provider::PvaMonitor for GroupMonitor {
         // (pvxs `groupsource.cpp:359` `stats.limitQueue`).
         let group_channel = GroupChannel::new(self.db.clone(), self.def.clone())
             .with_access(self.access.clone())
-            .with_monitor_queue_size(self.monitor_queue_size);
+            .with_monitor_queue_size(self.monitor_queue_size)
+            .with_monitor_atomic_stamp();
 
         // Check if all members are already primed (e.g., all Const/Structure).
         let all_primed = self

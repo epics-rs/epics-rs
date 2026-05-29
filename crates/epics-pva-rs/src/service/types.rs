@@ -1,5 +1,6 @@
 //! Argument / response / error types for [`super::PvaService`].
 
+use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 
 /// Errors a service method can surface. The framework converts
@@ -112,16 +113,18 @@ macro_rules! impl_resp_scalar {
     ($t:ty, $st:ident, $sv:ident) => {
         impl IntoServiceResponse for $t {
             fn into_service_response(self) -> ServiceResponse {
-                let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
-                s.fields
-                    .push(("value".into(), PvField::Scalar(ScalarValue::$sv(self))));
-                ServiceResponse {
-                    descriptor: FieldDesc::Structure {
-                        struct_id: "epics:nt/NTScalar:1.0".into(),
-                        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::$st))],
-                    },
-                    value: PvField::Structure(s),
+                // Route through the shared NTScalar builder so the RPC
+                // response carries value + alarm + timeStamp by
+                // construction (pvxs nt.cpp:37-53), not a value-only
+                // truncated NTScalar that claims the normative id while
+                // omitting the mandatory metadata.
+                let builder = NTScalar::new(ScalarType::$st);
+                let descriptor = builder.build();
+                let mut value = builder.create();
+                if let PvField::Structure(s) = &mut value {
+                    s.set("value", PvField::Scalar(ScalarValue::$sv(self)));
                 }
+                ServiceResponse { descriptor, value }
             }
         }
     };
@@ -141,16 +144,15 @@ impl_resp_scalar!(bool, Boolean, Boolean);
 
 impl IntoServiceResponse for String {
     fn into_service_response(self) -> ServiceResponse {
-        let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
-        s.fields
-            .push(("value".into(), PvField::Scalar(ScalarValue::String(self))));
-        ServiceResponse {
-            descriptor: FieldDesc::Structure {
-                struct_id: "epics:nt/NTScalar:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
-            },
-            value: PvField::Structure(s),
+        // Same NTScalar baseline as the numeric scalars: value + alarm +
+        // timeStamp present by construction (pvxs nt.cpp:37-53).
+        let builder = NTScalar::new(ScalarType::String);
+        let descriptor = builder.build();
+        let mut value = builder.create();
+        if let PvField::Structure(s) = &mut value {
+            s.set("value", PvField::Scalar(ScalarValue::String(self)));
         }
+        ServiceResponse { descriptor, value }
     }
 }
 
@@ -207,5 +209,64 @@ impl<T: IntoServiceResponse, E: std::fmt::Display> IntoServiceResponse for Resul
             Ok(v) => v.into_service_response(),
             Err(e) => Status::error(e.to_string()).into_service_response(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pvdata::value_matches_descriptor;
+
+    fn member_names(d: &FieldDesc) -> Vec<&str> {
+        match d {
+            FieldDesc::Structure { fields, .. } => fields.iter().map(|(n, _)| n.as_str()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// A scalar `#[pva_service]` return must produce the full NTScalar
+    /// baseline (value + alarm + timeStamp), identical to the dedicated
+    /// builder — not a value-only truncated NTScalar.
+    #[test]
+    fn scalar_response_is_full_ntscalar() {
+        let r = 1.5_f64.into_service_response();
+        assert_eq!(r.descriptor, NTScalar::new(ScalarType::Double).build());
+        assert_eq!(
+            member_names(&r.descriptor),
+            vec!["value", "alarm", "timeStamp"]
+        );
+        // the value body is internally consistent with its descriptor.
+        assert!(value_matches_descriptor(&r.value, &r.descriptor).is_ok());
+
+        let r = 7_i32.into_service_response();
+        assert_eq!(r.descriptor, NTScalar::new(ScalarType::Int).build());
+        assert!(value_matches_descriptor(&r.value, &r.descriptor).is_ok());
+
+        let r = true.into_service_response();
+        assert_eq!(r.descriptor, NTScalar::new(ScalarType::Boolean).build());
+        assert!(value_matches_descriptor(&r.value, &r.descriptor).is_ok());
+    }
+
+    /// The `String` return shares the same full NTScalar baseline and
+    /// carries the real value plus alarm/timeStamp.
+    #[test]
+    fn string_response_is_full_ntscalar() {
+        let r = "hi".to_string().into_service_response();
+        assert_eq!(r.descriptor, NTScalar::new(ScalarType::String).build());
+        assert_eq!(
+            member_names(&r.descriptor),
+            vec!["value", "alarm", "timeStamp"]
+        );
+        if let PvField::Structure(s) = &r.value {
+            assert!(matches!(
+                s.get_field("value"),
+                Some(PvField::Scalar(ScalarValue::String(v))) if v == "hi"
+            ));
+            assert!(s.get_field("alarm").is_some(), "alarm present");
+            assert!(s.get_field("timeStamp").is_some(), "timeStamp present");
+        } else {
+            panic!("response value must be a structure");
+        }
+        assert!(value_matches_descriptor(&r.value, &r.descriptor).is_ok());
     }
 }

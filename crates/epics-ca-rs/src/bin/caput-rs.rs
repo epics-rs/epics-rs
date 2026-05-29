@@ -278,22 +278,40 @@ async fn main() {
                 ch.put_nowait(v).await
             }
         }
-        WriteValue::EnumString(s) => {
-            // Always write ENUM-by-name through the DBR_STRING put so
-            // the server resolves the menu string.
+        WriteValue::Wire { dbr_type, value } => {
+            // C-tool wire model: send the explicit DBR type (DBR_STRING /
+            // DBR_CHAR) and let the server convert. The CLI `-w` timeout
+            // owns the callback wait, matching caput.c:556-567.
             if args.callback {
-                ch.put_string(s).await
+                ch.put_as_dbr_with_timeout(*dbr_type, value, timeout).await
             } else {
-                ch.put_string_nowait(s).await
+                ch.put_as_dbr_nowait(*dbr_type, value).await
+            }
+        }
+        WriteValue::EnumString(s) => {
+            // ENUM-by-name → DBR_STRING; the server resolves the menu
+            // string. Route through the same explicit-wire-type path as
+            // the numeric/-S writes so the CLI `-w` timeout owns the
+            // callback wait (caput.c:558-567 uses one caTimeout for every
+            // dbrType), instead of put_string's EPICS_CA_PUT_TIMEOUT/30s
+            // default which dropped `-w`.
+            let v = epics_ca_rs::EpicsValue::String(s.clone());
+            let dbr = epics_ca_rs::DbFieldType::String as u16;
+            if args.callback {
+                ch.put_as_dbr_with_timeout(dbr, &v, timeout).await
+            } else {
+                ch.put_as_dbr_nowait(dbr, &v).await
             }
         }
         WriteValue::EnumStringArray(v) => {
             // ENUM waveform by name — DBR_STRING array, server resolves
-            // each element.
+            // each element. Same single timeout owner as above.
+            let arr = epics_ca_rs::EpicsValue::StringArray(v.clone());
+            let dbr = epics_ca_rs::DbFieldType::String as u16;
             if args.callback {
-                ch.put_string_array(v).await
+                ch.put_as_dbr_with_timeout(dbr, &arr, timeout).await
             } else {
-                ch.put_string_array_nowait(v).await
+                ch.put_as_dbr_nowait(dbr, &arr).await
             }
         }
     };
@@ -370,7 +388,21 @@ async fn main() {
 /// for server-side resolution (the ENUM-by-name path).
 #[derive(Debug)]
 enum WriteValue {
+    /// A native-typed write sent as the channel's native DBR type via
+    /// `CaChannel::put*`. Used only for ENUM numeric-index values, which
+    /// C `caput` writes as the numeric type (`caput.c:474-481`,
+    /// `enumAsNr`); every other CLI value is converted by the server from
+    /// an explicit-wire-type [`WriteValue::Wire`].
     Typed(epics_ca_rs::EpicsValue),
+    /// An explicit-wire-type write: the tool picks the DBR wire type and
+    /// the server converts to the native field type. C `caput` sends a
+    /// non-ENUM value as `DBR_STRING` (`caput.c:540-552`) and an `-S`
+    /// long string as `DBR_CHAR` (`caput.c:531-538`), never the native
+    /// binary type. Routed through `CaChannel::put_as_dbr_*`.
+    Wire {
+        dbr_type: u16,
+        value: epics_ca_rs::EpicsValue,
+    },
     /// A scalar ENUM value written by name. The server resolves it
     /// against the record's menu — see `CaChannel::put_string`.
     EnumString(String),
@@ -385,6 +417,7 @@ impl WriteValue {
     fn echo_fallback(&self) -> epics_ca_rs::EpicsValue {
         match self {
             WriteValue::Typed(v) => v.clone(),
+            WriteValue::Wire { value, .. } => value.clone(),
             WriteValue::EnumString(s) => epics_ca_rs::EpicsValue::String(s.clone()),
             WriteValue::EnumStringArray(v) => epics_ca_rs::EpicsValue::StringArray(v.clone()),
         }
@@ -475,13 +508,40 @@ fn raw_from_escaped(s: &str) -> Vec<u8> {
     out
 }
 
+/// Max raw payload of a CA `DBR_STRING` element: `MAX_STRING_SIZE` (40)
+/// minus the trailing NUL. C `caput` decodes each string/ENUM-name value
+/// into a fixed `EpicsStr[MAX_STRING_SIZE]` buffer, so at most 39 raw
+/// bytes survive (`epicsStrnRawFromEscaped` writes while `--rem > 0` from
+/// `rem = 40`, then NUL-terminates — epicsString.c:55-118).
+const DBR_STRING_PAYLOAD_MAX: usize = 39;
+
 /// `raw_from_escaped` decoded into a `String` for the DBR_STRING / ENUM-
 /// by-name put paths. The common escapes (`\n`, `\t`, `\\`, …) decode to
 /// ASCII; a high-byte `\xNN` that is not valid UTF-8 falls back to lossy
 /// decoding (the Rust `EpicsValue::String` is UTF-8, whereas C carries a
 /// raw byte buffer).
+///
+/// The decoded value is truncated to [`DBR_STRING_PAYLOAD_MAX`] bytes, the
+/// way C `caput` decodes into its fixed `EpicsStr` buffer and forces a
+/// trailing NUL (caput.c:484-489 for ENUM names, caput.c:523-528 for
+/// native DBR_STRING): an overlong CLI value is written as its 39-byte
+/// prefix, not rejected. The Rust client's `validate_put_strings` /
+/// libca's `nciu::stringVerify` reject `>= 40`, so the cap must happen in
+/// the CLI builder to keep C-tool parity. `-S` long strings take the
+/// DBR_CHAR path (`raw_from_escaped`, not this helper) and stay uncapped.
+/// The truncation lands on a UTF-8 char boundary — C's buffer is
+/// byte-oriented, but for the printable/ASCII values this targets the two
+/// coincide.
 fn raw_from_escaped_string(s: &str) -> String {
-    String::from_utf8_lossy(&raw_from_escaped(s)).into_owned()
+    let mut decoded = String::from_utf8_lossy(&raw_from_escaped(s)).into_owned();
+    if decoded.len() > DBR_STRING_PAYLOAD_MAX {
+        let mut end = DBR_STRING_PAYLOAD_MAX;
+        while !decoded.is_char_boundary(end) {
+            end -= 1;
+        }
+        decoded.truncate(end);
+    }
+    decoded
 }
 
 /// Build the value to write, in C `caput`'s precedence order
@@ -526,17 +586,22 @@ fn build_write_value(
             let escaped = tokens.iter().map(|t| raw_from_escaped_string(t)).collect();
             return Ok(WriteValue::EnumStringArray(escaped));
         }
-        // String-array elements are escape-decoded (C caput.c:520);
-        // numeric arrays parse the raw token.
-        if native_type == epics_ca_rs::DbFieldType::String {
-            let escaped: Vec<String> = tokens.iter().map(|t| raw_from_escaped_string(t)).collect();
-            return parse_array(native_type, &escaped)
+        // ENUM numeric-index waveform stays native — the server takes the
+        // index directly. This is the documented ENUM divergence, not the
+        // non-ENUM string-conversion path below.
+        if native_type == epics_ca_rs::DbFieldType::Enum {
+            return parse_array(native_type, tokens)
                 .map(WriteValue::Typed)
                 .map_err(|e| format!("error: {e}"));
         }
-        return parse_array(native_type, tokens)
-            .map(WriteValue::Typed)
-            .map_err(|e| format!("error: {e}"));
+        // Non-ENUM array: C sends every element as a DBR_STRING after
+        // epicsStrnRawFromEscaped (caput.c:540-552), regardless of the
+        // native numeric or string field type — the server converts each.
+        let escaped: Vec<String> = tokens.iter().map(|t| raw_from_escaped_string(t)).collect();
+        return Ok(WriteValue::Wire {
+            dbr_type: epics_ca_rs::DbFieldType::String as u16,
+            value: epics_ca_rs::EpicsValue::StringArray(escaped),
+        });
     }
 
     // Scalar: C `caput` joins extra positionals with single spaces.
@@ -561,25 +626,30 @@ fn build_write_value(
     }
 
     // (2) `-S` (charArrAsStr) on a NON-ENUM PV → NUL-terminated DBR_CHAR
-    // array built from the escape-decoded bytes (caput.c:512). No
-    // native-type parse on this path.
+    // array built from the escape-decoded bytes, sent with the explicit
+    // DBR_CHAR wire type and count = nbytes + NUL (caput.c:531-538:
+    // `dbrType = DBR_CHAR; count = epicsStrnRawFromEscaped(...) + 1`).
+    // The wire type must be DBR_CHAR regardless of the channel native
+    // type — sending these char bytes under the native header
+    // (DBR_STRING/DBR_DOUBLE/…) is a malformed/rejected write.
     if long_string {
         let mut bytes = raw_from_escaped(&joined);
         bytes.push(0);
-        return Ok(WriteValue::Typed(epics_ca_rs::EpicsValue::CharArray(bytes)));
+        return Ok(WriteValue::Wire {
+            dbr_type: epics_ca_rs::DbFieldType::Char as u16,
+            value: epics_ca_rs::EpicsValue::CharArray(bytes),
+        });
     }
 
-    // (3) Native DBR_STRING is escape-decoded (caput.c:520).
-    if native_type == epics_ca_rs::DbFieldType::String {
-        return Ok(WriteValue::Typed(epics_ca_rs::EpicsValue::String(
-            raw_from_escaped_string(&joined),
-        )));
-    }
-
-    // (4) Numeric native types parse the raw token (no escaping).
-    epics_ca_rs::EpicsValue::parse(native_type, &joined)
-        .map(WriteValue::Typed)
-        .map_err(|e| format!("error: {e}"))
+    // (3) Non-ENUM, non-`-S`: C sends the value as DBR_STRING after
+    // epicsStrnRawFromEscaped (caput.c:540-552), regardless of the native
+    // numeric or string field type — the server/IOC performs the
+    // string->native conversion. This matches C `caput`'s wire model; the
+    // programmatic native-typed write stays on `CaChannel::put`.
+    Ok(WriteValue::Wire {
+        dbr_type: epics_ca_rs::DbFieldType::String as u16,
+        value: epics_ca_rs::EpicsValue::String(raw_from_escaped_string(&joined)),
+    })
 }
 
 /// Parse a plain integer index — decimal, optionally signed, no radix
@@ -708,10 +778,14 @@ mod tests {
             false,
         );
         match r {
-            Ok(WriteValue::Typed(EpicsValue::CharArray(bytes))) => {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::CharArray(bytes),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::Char as u16, "DBR_CHAR wire type");
                 assert_eq!(bytes, b"hello\0", "NUL-terminated long string bytes");
             }
-            _ => panic!("expected Ok(CharArray) for -S on a CHAR PV"),
+            _ => panic!("expected Ok(DBR_CHAR Wire CharArray) for -S on a CHAR PV"),
         }
     }
 
@@ -728,8 +802,14 @@ mod tests {
         ] {
             let r = build_write_value(&vals(&["not a number"]), nt, false, false, true, false);
             assert!(
-                matches!(r, Ok(WriteValue::Typed(EpicsValue::CharArray(_)))),
-                "-S must yield CharArray for non-ENUM native type {nt:?}"
+                matches!(
+                    r,
+                    Ok(WriteValue::Wire {
+                        dbr_type,
+                        value: EpicsValue::CharArray(_),
+                    }) if dbr_type == DbFieldType::Char as u16
+                ),
+                "-S must yield a DBR_CHAR Wire CharArray for non-ENUM native type {nt:?}"
             );
         }
     }
@@ -775,17 +855,23 @@ mod tests {
             false,
         );
         match r {
-            Ok(WriteValue::Typed(EpicsValue::CharArray(bytes))) => {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::CharArray(bytes),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::Char as u16, "DBR_CHAR wire type");
                 assert_eq!(bytes, vec![b'a', 0x09, b'b', 0x0A, 0x00]);
             }
-            other => panic!("expected escape-decoded CharArray, got {other:?}"),
+            other => panic!("expected escape-decoded DBR_CHAR Wire CharArray, got {other:?}"),
         }
     }
 
     #[test]
     fn native_string_scalar_decodes_c_escapes() {
-        // A native DBR_STRING scalar is escape-decoded too (`caput.c:520`):
-        // `\x41` → 'A', `\\` → one backslash, `\q` (unknown) → 'q'.
+        // A non-ENUM scalar is escape-decoded and sent as DBR_STRING
+        // (`caput.c:540-552`): `\x41` → 'A', `\\` → one backslash, `\q`
+        // (unknown) → 'q'. The wire type is DBR_STRING regardless of the
+        // native field type — the server converts.
         let r = build_write_value(
             &vals(&["\\x41\\\\\\q"]),
             DbFieldType::String,
@@ -795,8 +881,59 @@ mod tests {
             false,
         );
         match r {
-            Ok(WriteValue::Typed(EpicsValue::String(s))) => assert_eq!(s, "A\\q"),
-            other => panic!("expected escape-decoded String, got {other:?}"),
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::String(s),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::String as u16, "DBR_STRING wire type");
+                assert_eq!(s, "A\\q");
+            }
+            other => panic!("expected escape-decoded DBR_STRING Wire, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_enum_numeric_scalar_and_array_send_dbr_string() {
+        // CA-RS parity: C `caput` sends every non-ENUM, non-`-S` value as
+        // DBR_STRING (`caput.c:540-552`), NOT the native numeric type; the
+        // server/IOC performs the string->native conversion. A numeric
+        // scalar against a DBF_DOUBLE PV must therefore yield a DBR_STRING
+        // Wire carrying the original token, not a parsed EpicsValue::Double.
+        match build_write_value(
+            &vals(&["1.5"]),
+            DbFieldType::Double,
+            false,
+            false,
+            false,
+            false,
+        ) {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::String(s),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::String as u16);
+                assert_eq!(s, "1.5");
+            }
+            other => panic!("numeric scalar must be a DBR_STRING Wire, got {other:?}"),
+        }
+        // A numeric array (`-a`) sends DBR_STRING[] with count == nvalues,
+        // each element the raw token; no native LongArray parse.
+        match build_write_value(
+            &vals(&["3", "10", "20", "30"]),
+            DbFieldType::Long,
+            false,
+            false,
+            false,
+            true,
+        ) {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::StringArray(a),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::String as u16);
+                assert_eq!(a, vec!["10", "20", "30"]);
+            }
+            other => panic!("numeric array must be a DBR_STRING[] Wire, got {other:?}"),
         }
     }
 
@@ -807,6 +944,8 @@ mod tests {
         // that disagrees with the supplied values, a non-numeric count,
         // and a count of zero must all reach the write path silently —
         // no warning, no CLI-side rejection.
+        // The non-ENUM array path now sends DBR_STRING[] (caput.c:540-552);
+        // these assertions check the count-token skip via the element list.
         // `-a PV 999 1 2`: count 999 vs 2 values → use both, no error.
         match build_write_value(
             &vals(&["999", "1", "2"]),
@@ -816,7 +955,10 @@ mod tests {
             false,
             true,
         ) {
-            Ok(WriteValue::Typed(EpicsValue::LongArray(a))) => assert_eq!(a, vec![1, 2]),
+            Ok(WriteValue::Wire {
+                value: EpicsValue::StringArray(a),
+                ..
+            }) => assert_eq!(a, vec!["1", "2"]),
             other => panic!("count mismatch must use all values, got {other:?}"),
         }
         // `-a PV not-a-count 1 2`: non-numeric count token skipped.
@@ -828,42 +970,120 @@ mod tests {
             false,
             true,
         ) {
-            Ok(WriteValue::Typed(EpicsValue::LongArray(a))) => assert_eq!(a, vec![1, 2]),
+            Ok(WriteValue::Wire {
+                value: EpicsValue::StringArray(a),
+                ..
+            }) => assert_eq!(a, vec!["1", "2"]),
             other => panic!("non-numeric count token must be ignored, got {other:?}"),
         }
         // `-a PV 0`: zero trailing values reaches the write path as an
         // empty array (count == 0), decided by the server — not a CLI error.
         match build_write_value(&vals(&["0"]), DbFieldType::Long, false, false, false, true) {
-            Ok(WriteValue::Typed(EpicsValue::LongArray(a))) => assert!(a.is_empty()),
+            Ok(WriteValue::Wire {
+                value: EpicsValue::StringArray(a),
+                ..
+            }) => assert!(a.is_empty()),
             other => panic!("zero-count -a must reach the write path empty, got {other:?}"),
         }
     }
 
     #[test]
-    fn scalar_char_without_long_string_still_parses_numeric() {
-        // Without `-S`, a native CHAR scalar parses the token as a number;
-        // a non-numeric token is an error, exactly as before the fix.
-        assert!(
-            build_write_value(
-                &vals(&["65"]),
-                DbFieldType::Char,
-                false,
-                false,
-                false,
-                false
-            )
-            .is_ok()
-        );
-        assert!(
-            build_write_value(
-                &vals(&["hello"]),
-                DbFieldType::Char,
-                false,
-                false,
-                false,
-                false
-            )
-            .is_err()
-        );
+    fn scalar_char_without_long_string_sends_dbr_string() {
+        // Without `-S`, a non-ENUM CHAR scalar is sent as DBR_STRING
+        // (caput.c:540-552), NOT parsed locally as a number — so a
+        // non-numeric token is no longer a CLI-side error (the server
+        // performs the conversion and any rejection). This is distinct
+        // from `-S`, which sends a DBR_CHAR byte array.
+        for tok in ["65", "hello"] {
+            match build_write_value(&vals(&[tok]), DbFieldType::Char, false, false, false, false) {
+                Ok(WriteValue::Wire {
+                    dbr_type,
+                    value: EpicsValue::String(s),
+                }) => {
+                    assert_eq!(dbr_type, DbFieldType::String as u16);
+                    assert_eq!(s, tok);
+                }
+                other => panic!("CHAR scalar without -S must be a DBR_STRING Wire, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn overlong_dbr_string_values_truncate_to_39_bytes() {
+        // C `caput` decodes each DBR_STRING / ENUM-name value into a fixed
+        // EpicsStr[40] buffer and keeps 39 raw bytes (caput.c:484-489,
+        // 523-528); an overlong value is TRUNCATED before libca, not
+        // rejected. The Rust client rejects >= 40, so caput-rs must cap.
+        let long = "a".repeat(50); // 50 ASCII bytes
+        // Non-ENUM string scalar -> DBR_STRING capped to 39.
+        match build_write_value(
+            &vals(&[long.as_str()]),
+            DbFieldType::String,
+            false,
+            false,
+            false,
+            false,
+        ) {
+            Ok(WriteValue::Wire {
+                value: EpicsValue::String(s),
+                ..
+            }) => {
+                assert_eq!(s.len(), 39, "scalar string truncated to 39 bytes");
+                assert_eq!(s, "a".repeat(39));
+            }
+            other => panic!("expected truncated DBR_STRING Wire, got {other:?}"),
+        }
+        // Non-ENUM string array element -> each capped to 39 (the leading
+        // token is the skipped -a count).
+        match build_write_value(
+            &vals(&["2", long.as_str(), "short"]),
+            DbFieldType::String,
+            false,
+            false,
+            false,
+            true,
+        ) {
+            Ok(WriteValue::Wire {
+                value: EpicsValue::StringArray(a),
+                ..
+            }) => {
+                assert_eq!(a[0].len(), 39, "array element truncated to 39 bytes");
+                assert_eq!(a[1], "short");
+            }
+            other => panic!("expected truncated DBR_STRING[] Wire, got {other:?}"),
+        }
+        // ENUM-by-name scalar (`-s`) -> EnumString capped to 39.
+        match build_write_value(
+            &vals(&[long.as_str()]),
+            DbFieldType::Enum,
+            false,
+            true,
+            false,
+            false,
+        ) {
+            Ok(WriteValue::EnumString(s)) => {
+                assert_eq!(s.len(), 39, "enum-by-name value truncated to 39 bytes")
+            }
+            other => panic!("expected truncated EnumString, got {other:?}"),
+        }
+        // `-S` long strings take the DBR_CHAR path and stay UNCAPPED — all
+        // 50 bytes + NUL survive (finding: -S is not 39-byte limited).
+        match build_write_value(
+            &vals(&[long.as_str()]),
+            DbFieldType::Char,
+            false,
+            false,
+            true,
+            false,
+        ) {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::CharArray(b),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::Char as u16);
+                assert_eq!(b.len(), 51, "-S keeps all 50 bytes + NUL, uncapped");
+            }
+            other => panic!("expected uncapped DBR_CHAR Wire, got {other:?}"),
+        }
     }
 }

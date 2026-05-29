@@ -256,6 +256,17 @@ pub(crate) struct SubscriptionRecord {
     pub cid: u32,
     pub data_type: Option<u16>,
     pub count: Option<u32>,
+    /// The caller's requested element-count cap (`camonitor -#`), or
+    /// `None` for the full native count. Unlike the resolved [`Self::count`]
+    /// (which caches the clamped wire count for the current connection),
+    /// this is a persistent *preference* — carried across reconnects and
+    /// re-clamped against the fresh native element count on each connect,
+    /// mirroring C `camonitor.c:169`
+    /// (`reqElems = reqElems > nElems ? nElems : reqElems`, run inside the
+    /// connect handler). Orthogonal to [`Self::type_user_supplied`]: the
+    /// cap survives a `NativeTypeChanged` reset because it is the user's
+    /// intent, not an auto-derived value.
+    pub req_count: Option<u32>,
     /// `true` when `data_type`/`count` were chosen explicitly by the
     /// caller, `false` when they were auto-derived from the channel's
     /// native type at subscribe time. Auto-derived values must be
@@ -313,6 +324,22 @@ pub(crate) struct SubscriptionRegistry {
     /// stale `EVENT_ADD`/`EVENT_CANCEL` for the old subscription would
     /// otherwise be routed to the wrong record.
     next_subid: AtomicU32,
+}
+
+/// Resolve a subscription's wire element count from the caller's requested
+/// cap and the channel's native element count. Single owner of the
+/// `reqElems → wire count` rule for monitors, mirroring C
+/// `camonitor.c:169` (`ppv->reqElems = reqElems > nElems ? nElems :
+/// reqElems`): a cap larger than the array is clamped to the array, and
+/// "no cap" (`None`, or an explicit `0` as C treats `reqElems == 0`)
+/// requests the full native count. Re-run on every connect against the
+/// fresh native count, exactly as C runs the clamp inside its connect
+/// handler.
+pub(crate) fn resolve_subscription_count(req_count: Option<u32>, element_count: u32) -> u32 {
+    match req_count {
+        Some(n) if n > 0 => n.min(element_count),
+        _ => element_count,
+    }
 }
 
 impl SubscriptionRegistry {
@@ -535,8 +562,13 @@ impl SubscriptionRegistry {
                 rec.server_addr = server_addr;
                 // The IOC redefined the record: a previously auto-derived
                 // type/count is now stale and would decode monitor frames
-                // against the wrong DBR type. Drop it so it re-derives from
-                // the fresh native type below. User-supplied types are kept.
+                // against the wrong DBR type. Drop both so they re-derive
+                // from the fresh native type/count below — the count
+                // re-derivation re-clamps the `-#` cap to the new native
+                // element count. User-supplied type/count are kept. Without
+                // a native-type change, auto-derived type AND count stay
+                // locked to their first-connect values (established
+                // reconnect behaviour).
                 if native_changed && !rec.type_user_supplied {
                     rec.data_type = None;
                     rec.count = None;
@@ -557,7 +589,16 @@ impl SubscriptionRegistry {
                     })
                     .unwrap_or(native_type + 14);
                 let data_type = *rec.data_type.get_or_insert(derived);
-                let count = *rec.count.get_or_insert(element_count);
+                // Single owner of the auto-derived count seed: clamp the
+                // requested `-#` cap to the native element count
+                // (`resolve_subscription_count`, C `camonitor.c:169`). Cached
+                // like `data_type` via `get_or_insert`, so it is computed at
+                // first connect and re-derived only when a native-type change
+                // cleared it above — keeping count and type re-derivation
+                // uniform. User-supplied counts (already `Some`) are kept.
+                let count = *rec
+                    .count
+                    .get_or_insert(resolve_subscription_count(rec.req_count, element_count));
                 let _ = transport_tx.send(TransportCommand::Subscribe {
                     sid: new_sid,
                     data_type,
@@ -675,6 +716,7 @@ mod tests {
             cid,
             data_type: None,
             count: None,
+            req_count: None,
             type_user_supplied,
             enum_as_string: false,
             float_as_string: false,
@@ -776,6 +818,69 @@ mod tests {
         assert_eq!(drained_type(&mut rx), (19, 2));
     }
 
+    /// `camonitor -#` requested cap is clamped to the native element count
+    /// at the first connect — mirrors C `camonitor.c:169`
+    /// `reqElems = reqElems > nElems ? nElems : reqElems`. Boundary: a cap
+    /// below the native count requests the cap; a cap above requests the
+    /// native count.
+    #[test]
+    fn auto_derived_count_clamps_req_count_to_native() {
+        // cap (2) < native (5) ⇒ request the cap.
+        let mut reg = SubscriptionRegistry::new();
+        let (mut rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
+        rec.req_count = Some(2);
+        reg.add(rec);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (restored, _) = reg.restore_for_channel(100, 7, 6, 5, false, addr(), &tx);
+        assert_eq!(restored, 1);
+        assert_eq!(drained_type(&mut rx).1, 2, "cap below native ⇒ cap");
+
+        // Separate record: cap (4) > native (1) ⇒ clamp DOWN to native.
+        let mut reg2 = SubscriptionRegistry::new();
+        let (mut rec2, _cb_rx2) = record(2, 200, /* type_user_supplied */ false);
+        rec2.req_count = Some(4);
+        reg2.add(rec2);
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let (restored, _) = reg2.restore_for_channel(200, 9, 6, 1, false, addr(), &tx2);
+        assert_eq!(restored, 1);
+        assert_eq!(drained_type(&mut rx2).1, 1, "cap above native ⇒ native");
+    }
+
+    /// The `-#` cap re-clamps to the FRESH native element count when a
+    /// native-type change forces re-derivation (C `camonitor.c:169` re-runs
+    /// the clamp on each connect; here the type-change reset is what triggers
+    /// the recompute, consistent with the auto-derived `data_type` rule).
+    #[test]
+    fn auto_derived_count_reclamps_on_native_change() {
+        let mut reg = SubscriptionRegistry::new();
+        let (mut rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
+        rec.req_count = Some(4);
+        reg.add(rec);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // First connect: native count 5, cap 4 ⇒ request 4.
+        let (restored, _) = reg.restore_for_channel(100, 7, 1, 5, false, addr(), &tx);
+        assert_eq!(restored, 1);
+        assert_eq!(drained_type(&mut rx).1, 4, "cap below native ⇒ cap");
+        // Native-type change, array now 2 elements: cap 4 > native 2 ⇒ 2.
+        reg.subscriptions.get_mut(&1).unwrap().needs_restore = true;
+        let (restored, _) = reg.restore_for_channel(100, 8, 6, 2, true, addr(), &tx);
+        assert_eq!(restored, 1);
+        assert_eq!(drained_type(&mut rx).1, 2, "native change re-clamps cap");
+    }
+
+    /// No `-#` cap (`req_count == None`) requests the full native count.
+    #[test]
+    fn auto_derived_count_without_cap_requests_full_native() {
+        let mut reg = SubscriptionRegistry::new();
+        let (rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
+        assert_eq!(rec.req_count, None);
+        reg.add(rec);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (restored, _) = reg.restore_for_channel(100, 7, 6, 4, false, addr(), &tx);
+        assert_eq!(restored, 1);
+        assert_eq!(drained_type(&mut rx).1, 4, "no cap ⇒ full native count");
+    }
+
     /// Regression: pre-fix `on_monitor_data` did `try_send → drop` on a
     /// full callback channel, losing terminal transitions like DMOV
     /// 1→0 under burst load (ophyd MoveStatus stuck forever). The fix
@@ -793,6 +898,7 @@ mod tests {
             cid: 100,
             data_type: Some(DBR_TIME_LONG),
             count: Some(1),
+            req_count: None,
             type_user_supplied: true,
             enum_as_string: false,
             float_as_string: false,

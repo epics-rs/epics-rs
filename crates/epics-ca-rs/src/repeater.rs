@@ -87,16 +87,6 @@ pub async fn run_repeater() -> io::Result<()> {
 pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    // libcom commits 19146a5 + 5064931 + 65ef6e9: SO_REUSEADDR is POSIX-only
-    // (Windows lets any process hijack the port). On Linux datagram fanout
-    // (e.g. another repeater, or a CA server sharing 5065 in dev setups)
-    // needs BOTH SO_REUSEADDR and SO_REUSEPORT; BSD/macOS need SO_REUSEPORT.
-    #[cfg(not(windows))]
-    {
-        let _ = sock.set_reuse_address(true);
-        #[cfg(unix)]
-        let _ = sock.set_reuse_port(true);
-    }
     // libcom commit 51191e6: Linux defaults IP_MULTICAST_ALL=1, which would
     // give the repeater multicast traffic for groups it never joined.
     // No-op on non-Linux.
@@ -111,7 +101,25 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
     // with a parallel C caRepeater on the default 5065) reach our
     // daemon. The default remains 5065 when the env var is unset.
     let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, repeater_port());
+    // Singleton-per-host bind. libca `repeater.cpp` makeSocket() binds
+    // with NO reuse option set, so a second repeater process gets
+    // EADDRINUSE and exits (`repeater.cpp:513-521`); ca-repeater-rs
+    // treats that error as "another repeater is already running". The
+    // bind must therefore be exclusive — do not enable SO_REUSEPORT
+    // here: `epicsSocketEnableAddressUseForDatagramFanout` (the
+    // SO_REUSEPORT fanout helper) is never called for the repeater, and
+    // enabling it would let two repeaters join the kernel UDP fanout
+    // group and split client registration / beacon delivery between
+    // them. CA server UDP sockets keep fanout (server/udp.rs) so
+    // multiple IOCs share the CA port; the repeater daemon port does not.
     sock.bind(&bind_addr.into())?;
+    // Only after a successful exclusive bind does C enable SO_REUSEADDR
+    // (`epicsSocketEnableAddressReuseDuringTimeWaitState`) so THIS daemon
+    // can rebind across a restart. POSIX-only — WINSOCK SO_REUSEADDR has
+    // different (port-hijack) semantics, so the C helper is a no-op on
+    // Windows.
+    #[cfg(not(windows))]
+    let _ = sock.set_reuse_address(true);
 
     // ca commit 97bf917: join every multicast (224.0.0.0/4) beacon address
     // from EPICS_CAS_BEACON_ADDR_LIST (or EPICS_CA_ADDR_LIST as fallback) so

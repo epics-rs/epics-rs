@@ -165,6 +165,12 @@ async fn main() {
     // fields so the server renders the value at record precision
     // (C `camonitor.c:162-166`).
     let float_as_string = args.string_format;
+    // C `camonitor.c:169` applies the user's `-#` count to the
+    // `ca_create_subscription` request count (clamped to the native element
+    // count at connect); `None` (no `-#`) requests the full count. Carried
+    // into the subscription so each monitor event transfers only the
+    // requested slice instead of the whole waveform.
+    let req_count = args.max_elements.map(|n| n as u32);
     let start = SystemTime::now();
     // `tsFirst` (`tool_lib.c:40`): the first SERVER stamp seen across all
     // channels, captured once — the server-relative (`-t sr`) baseline.
@@ -191,6 +197,7 @@ async fn main() {
                 fmt,
                 float_as_string,
                 req_elems_present,
+                req_count,
                 mask,
                 spec,
                 start,
@@ -290,6 +297,7 @@ async fn monitor_pv(
     fmt: Arc<ValueFormat>,
     float_as_string: bool,
     req_elems_present: bool,
+    req_count: Option<u32>,
     mask: u16,
     spec: TimestampSpec,
     start: SystemTime,
@@ -342,7 +350,7 @@ async fn monitor_pv(
     // case takes precedence over the float case (C `if/else if`).
     let enum_as_string = !fmt.enum_as_number;
     let Ok(mut monitor) = channel
-        .subscribe_with_mask_readback(0.0, mask, enum_as_string, float_as_string)
+        .subscribe_with_mask_readback_count(0.0, mask, enum_as_string, float_as_string, req_count)
         .await
     else {
         return;

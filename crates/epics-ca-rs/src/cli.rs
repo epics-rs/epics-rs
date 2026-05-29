@@ -140,11 +140,11 @@ pub fn format_value(
 ) -> String {
     let sep = fmt.field_separator;
     match v {
-        EpicsValue::String(s) => s.clone(),
+        EpicsValue::String(s) => escape_from_raw(s.as_bytes()),
         EpicsValue::Short(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::Long(n) => format_int_i64(*n as i64, fmt.int_style),
-        EpicsValue::Int64(n) => format_int_i64(*n, fmt.int_style),
-        EpicsValue::UInt64(n) => format_int_u64(*n, fmt.int_style),
+        EpicsValue::Int64(n) => format_int_wide(n.to_string(), *n as u64, fmt.int_style),
+        EpicsValue::UInt64(n) => format_int_wide(n.to_string(), *n, fmt.int_style),
         EpicsValue::Char(n) => format_int_i64((*n as i8) as i64, fmt.int_style),
         EpicsValue::Enum(idx) => format_enum(*idx as i64, fmt, enum_strings),
         EpicsValue::Float(x) => format_float(*x as f64, fmt),
@@ -163,11 +163,17 @@ pub fn format_value(
             sep,
             req_elems_present,
         ),
-        EpicsValue::Int64Array(arr) => {
-            render_array_int(arr.iter().copied(), arr.len(), fmt, sep, req_elems_present)
-        }
+        EpicsValue::Int64Array(arr) => render_array_iter(
+            arr.iter()
+                .map(|&n| format_int_wide(n.to_string(), n as u64, fmt.int_style)),
+            arr.len(),
+            fmt,
+            sep,
+            req_elems_present,
+        ),
         EpicsValue::UInt64Array(arr) => render_array_iter(
-            arr.iter().map(|&n| format_int_u64(n, fmt.int_style)),
+            arr.iter()
+                .map(|&n| format_int_wide(n.to_string(), n, fmt.int_style)),
             arr.len(),
             fmt,
             sep,
@@ -203,9 +209,10 @@ pub fn format_value(
             // `charArrAsStr && (reqElems || nElems > 1)` — a 1-element
             // CHAR array with `-S` but no `-#` falls through to numeric.
             if fmt.char_array_as_string && (req_elems_present || arr.len() > 1) {
-                // Long-string convention: bytes up to first NUL.
+                // Long-string convention: bytes up to first NUL, then
+                // EPICS-escaped (caget.c:322-327 escapes the prefix).
                 let end = arr.iter().position(|&b| b == 0).unwrap_or(arr.len());
-                String::from_utf8_lossy(&arr[..end]).into_owned()
+                escape_from_raw(&arr[..end])
             } else {
                 render_array_int(
                     arr.iter().map(|&b| (b as i8) as i64),
@@ -222,7 +229,7 @@ pub fn format_value(
                 parts.push(arr.len().to_string());
             }
             let take = fmt.max_elements.unwrap_or(arr.len()).min(arr.len());
-            parts.extend(arr[..take].iter().cloned());
+            parts.extend(arr[..take].iter().map(|s| escape_from_raw(s.as_bytes())));
             parts.join(&sep.to_string())
         }
     }
@@ -273,27 +280,77 @@ fn format_enum(idx: i64, fmt: &ValueFormat, enum_strings: Option<&[String]>) -> 
     format_int_i64(idx, fmt.int_style)
 }
 
+/// Port of EPICS `epicsStrnEscapedFromRaw` (`epicsString.c:120-159`):
+/// render raw bytes as printable text for CA CLI readback. The C control
+/// escapes (`\a \b \f \n \r \t \v \\ \' \" \0`) map to their two-char
+/// form, ASCII-printable bytes (0x20-0x7E) pass through, and every other
+/// byte becomes `\xHH` (lowercase hex). C `val2str` runs every DBR_STRING
+/// element through this (tool_lib.c:135), and `caget -S` escapes the
+/// long-string byte prefix (caget.c:322-327). Operates per byte so
+/// multi-byte UTF-8 is escaped exactly as C escapes the raw char buffer,
+/// rather than emitting real control/non-printable bytes into the stream.
+fn escape_from_raw(src: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(src.len());
+    for &c in src {
+        match c {
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x0c => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x0b => out.push_str("\\v"),
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            b'"' => out.push_str("\\\""),
+            0 => out.push_str("\\0"),
+            0x20..=0x7e => out.push(c as char),
+            _ => {
+                out.push('\\');
+                out.push('x');
+                out.push(HEX[(c >> 4) as usize] as char);
+                out.push(HEX[(c & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Format a CA classic integer (`DBR_INT`/`DBR_LONG`/`DBR_CHAR`, an ENUM
+/// index, or a float rounded to long) with EPICS `sprint_long` semantics
+/// (`tool_lib.c:64-91`). C widens every such value to a 32-bit
+/// `dbr_long_t` and prints:
+///   dec: `%d`   oct: `0o%o`   hex: `0x%X` (UPPERCASE)
+///   bin: bare bit digits, leading zeros skipped, no `0b`; zero -> "0".
+/// The non-decimal bases reinterpret the low 32 bits as unsigned, so `-1`
+/// prints as `0xFFFFFFFF` / `0o37777777777` / 32 ones — NOT the 64-bit
+/// `0xffffffffffffffff` the pre-fix `as u64` cast produced. `format!("{:b}",
+/// 0u32)` already yields the bare `0` C special-cases.
 fn format_int_i64(n: i64, style: IntStyle) -> String {
+    let v32 = n as i32; // C: (dbr_long_t)(int) val
+    let bits = v32 as u32; // unsigned reinterpretation for the bases
     match style {
-        IntStyle::Dec => n.to_string(),
-        // C `%lx` / `%lo` / `%lb` print the bit pattern of a signed
-        // integer reinterpreted as unsigned of the same width. We
-        // emulate that with the `as u64` cast.
-        IntStyle::Hex => format!("0x{:x}", n as u64),
-        IntStyle::Oct => format!("0o{:o}", n as u64),
-        IntStyle::Bin => format!("0b{:b}", n as u64),
+        IntStyle::Dec => v32.to_string(),
+        IntStyle::Hex => format!("0x{bits:X}"),
+        IntStyle::Oct => format!("0o{bits:o}"),
+        IntStyle::Bin => format!("{bits:b}"),
     }
 }
 
-/// Format a `DBF_UINT64` value. Unlike `format_int_i64`, the decimal
-/// rendering keeps the full unsigned range — a value above `i64::MAX`
-/// must print as a positive integer, not a negative one.
-fn format_int_u64(n: u64, style: IntStyle) -> String {
+/// Format a Rust-only 64-bit field (`DBF_INT64` / `DBF_UINT64`). These
+/// have no CA classic wire type (served as `Double` over CA), so they are
+/// NOT subject to the 32-bit `sprint_long` truncation in
+/// [`format_int_i64`] — the full 64-bit value is printed. The base shape
+/// still matches `sprint_long` (`0x` UPPERCASE hex, `0o` octal, bare
+/// binary) applied to the 64-bit pattern; `decimal` carries the
+/// type-correct signed (`Int64`) or unsigned (`UInt64`) rendering.
+fn format_int_wide(decimal: String, bits: u64, style: IntStyle) -> String {
     match style {
-        IntStyle::Dec => n.to_string(),
-        IntStyle::Hex => format!("0x{n:x}"),
-        IntStyle::Oct => format!("0o{n:o}"),
-        IntStyle::Bin => format!("0b{n:b}"),
+        IntStyle::Dec => decimal,
+        IntStyle::Hex => format!("0x{bits:X}"),
+        IntStyle::Oct => format!("0o{bits:o}"),
+        IntStyle::Bin => format!("{bits:b}"),
     }
 }
 
@@ -488,9 +545,44 @@ mod tests {
     }
 
     #[test]
-    fn negative_int_hex_matches_c() {
-        // C `printf("%lx", (long)-1)` → "ffffffffffffffff"
-        assert_eq!(format_int_i64(-1, IntStyle::Hex), "0xffffffffffffffff");
+    fn classic_int_base_format_matches_sprint_long() {
+        // EPICS sprint_long (tool_lib.c:64-91) formats a 32-bit dbr_long_t.
+        // -1: hex/oct/bin reinterpret the low 32 bits as unsigned; hex is
+        // uppercase with `0x`, octal `0o`, binary BARE (no `0b`).
+        assert_eq!(format_int_i64(-1, IntStyle::Hex), "0xFFFFFFFF");
+        assert_eq!(format_int_i64(-1, IntStyle::Oct), "0o37777777777");
+        assert_eq!(format_int_i64(-1, IntStyle::Bin), "1".repeat(32));
+        assert_eq!(format_int_i64(-1, IntStyle::Dec), "-1");
+        // C special-cases val == 0 in binary as a bare "0".
+        assert_eq!(format_int_i64(0, IntStyle::Bin), "0");
+        // Positive value: uppercase hex, `0o` octal, bare binary.
+        assert_eq!(format_int_i64(1235, IntStyle::Hex), "0x4D3");
+        assert_eq!(format_int_i64(1235, IntStyle::Oct), "0o2323");
+        assert_eq!(format_int_i64(1235, IntStyle::Bin), "10011010011");
+    }
+
+    #[test]
+    fn wide_int64_uint64_keep_64_bits_explicit() {
+        // The Rust-only 64-bit extension is NOT truncated to 32 bits.
+        let mut hex = fmt_default();
+        hex.int_style = IntStyle::Hex;
+        assert_eq!(
+            format_value(&EpicsValue::Int64(-1), &hex, None, false),
+            "0xFFFFFFFFFFFFFFFF",
+            "Int64 -1 keeps the full 64-bit pattern, uppercase"
+        );
+        // UInt64 above i64::MAX prints its full unsigned decimal.
+        assert_eq!(
+            format_value(&EpicsValue::UInt64(u64::MAX), &fmt_default(), None, false),
+            u64::MAX.to_string()
+        );
+        // UInt64 binary is bare (no `0b`).
+        let mut bin = fmt_default();
+        bin.int_style = IntStyle::Bin;
+        assert_eq!(
+            format_value(&EpicsValue::UInt64(5), &bin, None, false),
+            "101"
+        );
     }
 
     #[test]
@@ -543,13 +635,44 @@ mod tests {
     }
 
     #[test]
+    fn cli_readback_escapes_raw_string_bytes() {
+        // C val2str runs every DBR_STRING element through
+        // epicsStrnEscapedFromRaw (tool_lib.c:135); caget -S escapes the
+        // long-string byte prefix (caget.c:322-327). Control chars,
+        // backslash, quotes and non-printable bytes escape; ASCII passes.
+        assert_eq!(escape_from_raw(b"a\tb\nc"), "a\\tb\\nc");
+        assert_eq!(escape_from_raw(b"a\\b\"c'd"), "a\\\\b\\\"c\\'d");
+        assert_eq!(escape_from_raw(&[0x00, 0x01, b'A', 0x7f]), "\\0\\x01A\\x7f");
+        // 'é' = UTF-8 0xC3 0xA9: each raw byte escapes as \xHH, like C.
+        assert_eq!(escape_from_raw(&[0xc3, 0xa9]), "\\xc3\\xa9");
+        // String scalar through format_value is escaped.
+        assert_eq!(
+            format_value(
+                &EpicsValue::String("x\ty".to_string()),
+                &fmt_default(),
+                None,
+                false
+            ),
+            "x\\ty"
+        );
+        // StringArray elements escaped; count prefix preserved.
+        let a = EpicsValue::StringArray(vec!["a\nb".to_string(), "c".to_string()]);
+        assert_eq!(format_value(&a, &fmt_default(), None, false), "2 a\\nb c");
+        // `-S` long-string: escape the printable prefix up to NUL.
+        let mut sfmt = fmt_default();
+        sfmt.char_array_as_string = true;
+        let cv = EpicsValue::CharArray(b"hi\tthere\0junk".to_vec());
+        assert_eq!(format_value(&cv, &sfmt, None, true), "hi\\tthere");
+    }
+
+    #[test]
     fn float_as_int_rounds_then_renders() {
         let v = EpicsValue::Double(1234.6);
         let mut fmt = fmt_default();
         fmt.float_as_int = true;
         fmt.int_style = IntStyle::Hex;
-        // 1235 = 0x4d3
-        assert_eq!(format_value(&v, &fmt, None, false), "0x4d3");
+        // 1235 = 0x4D3 (sprint_long uses uppercase %X)
+        assert_eq!(format_value(&v, &fmt, None, false), "0x4D3");
     }
 
     #[test]

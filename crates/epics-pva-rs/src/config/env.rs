@@ -145,6 +145,25 @@ impl PvaConfigDefs {
     }
 }
 
+/// From a synchronous-resolver iterator, pick the first IPv4 answer, else
+/// the first IPv6. pvxs `SockAddr::setAddress` (util.cpp:530-540) applies
+/// the same "we always prefer IPv4" rule; this stack additionally needs it
+/// because `AsyncUdpV4` is IPv4-only and would reject a V6 send target.
+/// Shared by every env address-list parser so the family cannot drift back
+/// to dropping DNS hostnames at one site while resolving them at another.
+fn pick_v4_preferred(iter: impl Iterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    let mut v4: Option<SocketAddr> = None;
+    let mut v6: Option<SocketAddr> = None;
+    for sa in iter {
+        match sa {
+            SocketAddr::V4(_) if v4.is_none() => v4 = Some(sa),
+            SocketAddr::V6(_) if v6.is_none() => v6 = Some(sa),
+            _ => {}
+        }
+    }
+    v4.or(v6)
+}
+
 /// Parse a `EPICS_PVA_ADDR_LIST`-style string (comma/whitespace
 /// separated) into a list of `SocketAddr`. Accepts plain IPs (gets
 /// `default_port` appended), `ip:port`, DNS hostnames (resolves via
@@ -191,21 +210,10 @@ pub fn parse_addr_list_with_port(env: &str, default_port: u16) -> Vec<SocketAddr
                 format!("{s}:{default_port}")
             };
             match with_port.to_socket_addrs() {
-                Ok(iter) => {
-                    let mut v4: Option<SocketAddr> = None;
-                    let mut v6: Option<SocketAddr> = None;
-                    for sa in iter {
-                        match sa {
-                            SocketAddr::V4(_) if v4.is_none() => v4 = Some(sa),
-                            SocketAddr::V6(_) if v6.is_none() => v6 = Some(sa),
-                            _ => {}
-                        }
-                    }
-                    v4.or(v6).or_else(|| {
-                        tracing::debug!(token = %s, "EPICS_PVA addr-list: empty resolution");
-                        None
-                    })
-                }
+                Ok(iter) => pick_v4_preferred(iter).or_else(|| {
+                    tracing::debug!(token = %s, "EPICS_PVA addr-list: empty resolution");
+                    None
+                }),
                 Err(e) => {
                     tracing::debug!(token = %s, error = %e, "EPICS_PVA addr-list: resolve failed");
                     None
@@ -639,15 +647,57 @@ pub fn server_ignore_addr_list() -> Vec<(IpAddr, u16)> {
             if s.is_empty() {
                 return None;
             }
-            if let Ok(sa) = s.parse::<SocketAddr>() {
-                return Some((sa.ip(), sa.port()));
-            }
-            if let Ok(ip) = s.parse::<IpAddr>() {
-                return Some((ip, 0));
-            }
-            None
+            resolve_ignore_entry(s)
         })
         .collect()
+}
+
+/// Resolve one `EPICS_PVAS_IGNORE_ADDR_LIST` token to `(IpAddr, port)`,
+/// where `port == 0` is the wildcard "match any port from this IP". pvxs
+/// parses this list through `split_addr_into(..., defaultPort=0)`
+/// (`config.cpp:422`), which builds a `SockEndpoint` whose `setAddress`
+/// resolves DNS hostnames (`util.cpp:444-540`). The previous Rust parser
+/// only accepted numeric `SocketAddr`/`IpAddr`, so `ioc-host` or
+/// `ioc-host:5076` was silently dropped and the peer never blocked.
+fn resolve_ignore_entry(token: &str) -> Option<(IpAddr, u16)> {
+    use std::net::ToSocketAddrs;
+    // Numeric `ip:port` / `[ipv6]:port` — explicit port kept.
+    if let Ok(sa) = token.parse::<SocketAddr>() {
+        return Some((sa.ip(), sa.port()));
+    }
+    // Numeric bare IP (v4 or v6) — wildcard (0) port.
+    if let Ok(ip) = token.parse::<IpAddr>() {
+        return Some((ip, 0));
+    }
+    // `host:port` or bare hostname — synchronous DNS resolve, IPv4
+    // preferred (pvxs `setAddress`). A bare host resolves against the
+    // wildcard port `:0`, so its `port()` stays 0; `host:port` carries
+    // its explicit port through resolution.
+    let with_port = if token.contains(':') {
+        token.to_string()
+    } else {
+        format!("{token}:0")
+    };
+    match with_port.to_socket_addrs() {
+        Ok(iter) => match pick_v4_preferred(iter) {
+            Some(sa) => Some((sa.ip(), sa.port())),
+            None => {
+                tracing::warn!(
+                    token = %token,
+                    "EPICS_PVAS_IGNORE_ADDR_LIST: host resolved to no addresses; entry ignored"
+                );
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                token = %token,
+                error = %e,
+                "EPICS_PVAS_IGNORE_ADDR_LIST: unresolvable entry ignored"
+            );
+            None
+        }
+    }
 }
 
 /// Parse `EPICS_PVAS_BEACON_ADDR_LIST` — explicit beacon destinations
@@ -937,6 +987,86 @@ mod tests {
             std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
             std::env::remove_var("EPICS_PVAS_IGNORE_ADDR_LIST");
         }
+    }
+
+    /// PVA-40: numeric ignore-list tokens keep pvxs port semantics — a
+    /// bare IP is a wildcard (port 0 matches any port from that IP); an
+    /// `ip:port` token keeps its explicit port.
+    #[test]
+    fn resolve_ignore_entry_numeric_port_semantics() {
+        assert_eq!(
+            resolve_ignore_entry("192.168.1.1"),
+            Some((IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 0)),
+            "bare IP must be wildcard port 0"
+        );
+        assert_eq!(
+            resolve_ignore_entry("10.0.0.1:5075"),
+            Some((IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5075)),
+            "ip:port must keep the explicit port"
+        );
+    }
+
+    /// PVA-40 regression: a hostname token must be DNS-resolved instead of
+    /// silently dropped. `localhost` is in every hosts file, so this needs
+    /// no network. A bare hostname is a wildcard (port 0); `host:port`
+    /// carries its explicit port through resolution.
+    #[test]
+    fn resolve_ignore_entry_resolves_hostnames() {
+        let bare = resolve_ignore_entry("localhost").expect("localhost must resolve");
+        assert!(
+            bare.0.is_loopback(),
+            "localhost must resolve to a loopback IP"
+        );
+        assert_eq!(bare.1, 0, "bare hostname must be wildcard port 0");
+
+        let with_port =
+            resolve_ignore_entry("localhost:5076").expect("localhost:5076 must resolve");
+        assert!(
+            with_port.0.is_loopback(),
+            "localhost must resolve to a loopback IP"
+        );
+        assert_eq!(with_port.1, 5076, "host:port must keep the explicit port");
+    }
+
+    /// PVA-40: an unresolvable token is dropped (with a warning, not the
+    /// old silent debug-less drop). `.invalid` is reserved by RFC 6761 to
+    /// never resolve.
+    #[test]
+    fn resolve_ignore_entry_drops_unresolvable() {
+        assert_eq!(resolve_ignore_entry("no-such-host.invalid"), None);
+    }
+
+    /// PVA-40 end-to-end: a server configured with a hostname in
+    /// `EPICS_PVAS_IGNORE_ADDR_LIST` actually installs an ignore entry for
+    /// that host (was an empty drop). Mixed numeric + hostname + invalid
+    /// tokens: the invalid one is dropped, the rest resolve.
+    #[test]
+    fn server_ignore_addr_list_resolves_hostname_tokens() {
+        // SAFETY: nextest runs each test in its own process; the env
+        // mutation here cannot leak into a sibling test.
+        unsafe {
+            std::env::set_var(
+                "EPICS_PVAS_IGNORE_ADDR_LIST",
+                "localhost 10.0.0.1:5075 no-such-host.invalid",
+            );
+        }
+        let list = server_ignore_addr_list();
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_IGNORE_ADDR_LIST");
+        }
+        assert_eq!(
+            list.len(),
+            2,
+            "invalid token dropped, two resolve: {list:?}"
+        );
+        assert!(
+            list.iter().any(|(ip, port)| ip.is_loopback() && *port == 0),
+            "hostname `localhost` must install a wildcard-port loopback entry: {list:?}"
+        );
+        assert!(
+            list.contains(&(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5075)),
+            "numeric ip:port must survive alongside the resolved hostname: {list:?}"
+        );
     }
 
     /// Env-driven server caps fall back to safe defaults when

@@ -2773,6 +2773,66 @@ mod tests {
         );
     }
 
+    /// BRIDGE-RS-2026-05-28-37: the `pipeline` dimension of the monitor
+    /// identity must also separate variants — a default link and a
+    /// `Q=1&pipeline=true` link to the same PV are distinct monitor
+    /// channels (distinct pvRequest, `pvxs/ioc/pvalink_link.cpp:49-65`,
+    /// `pvxs/ioc/pvalink_lset.cpp:99-122`). Each must open its OWN
+    /// cached link (its own monitor receiver) and register its scan
+    /// fan-out under its own [`MonitorKey`], rather than the default
+    /// link satisfying both reads and CP scans for the pipelined one.
+    #[tokio::test]
+    async fn br37_pipeline_variant_opens_its_own_monitor() {
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+
+        // Default variant (no query options) and a pipelined Q=1 variant
+        // of the SAME PV, both CP so each registers a scan target.
+        let _ = resolver
+            .open_link_for_record("pva://PIPE:PV?proc=CP", "REC:DEF")
+            .await;
+        let _ = resolver
+            .open_link_for_record("pva://PIPE:PV?proc=CP&Q=1&pipeline=true", "REC:PIPE")
+            .await;
+
+        let default_q = PvaLinkConfig::defaults_for("", LinkDirection::Inp).queue_size;
+
+        // Each variant opened its OWN cached link (own monitor receiver).
+        let link_def = resolver
+            .registry
+            .try_get_inp("PIPE:PV", false, default_q)
+            .expect("default variant link must exist");
+        let link_pipe = resolver
+            .registry
+            .try_get_inp("PIPE:PV", true, 1)
+            .expect("pipelined Q=1 variant link must exist");
+        assert!(
+            !Arc::ptr_eq(&link_def, &link_pipe),
+            "pipeline/Q-distinct variants must not share one monitor"
+        );
+
+        // Scan fan-out is keyed per variant: each holds only its own
+        // record, never the sibling's.
+        let targets = resolver.scan_targets.read();
+        let fan_def = targets
+            .get(&MonitorKey {
+                pv_name: "PIPE:PV".to_string(),
+                pipeline: false,
+                queue_size: default_q,
+            })
+            .expect("default variant scan fan-out");
+        let fan_pipe = targets
+            .get(&MonitorKey {
+                pv_name: "PIPE:PV".to_string(),
+                pipeline: true,
+                queue_size: 1,
+            })
+            .expect("pipelined variant scan fan-out");
+        assert_eq!(fan_def.records.len(), 1);
+        assert_eq!(fan_def.records[0].record, "REC:DEF");
+        assert_eq!(fan_pipe.records.len(), 1);
+        assert_eq!(fan_pipe.records[0].record, "REC:PIPE");
+    }
+
     /// #2: with no QSRV provider wired (pvalink-only deployment), the
     /// `local` gate keeps its record / simple-PV behaviour — group-PV
     /// locality is simply unavailable, and a link to a non-local PV

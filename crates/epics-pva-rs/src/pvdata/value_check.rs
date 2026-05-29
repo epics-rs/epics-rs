@@ -113,13 +113,24 @@ pub fn value_matches_descriptor(
             }
             structure_fields_match(s, fields)
         }
-        // Structure array: the encoder encodes each present element
-        // under the descriptor's field list (with the element's own
-        // `struct_id`), coercing leaf mismatches — walk each present
-        // element's fields. A `None` (absent) element emits a presence
-        // byte only and cannot corrupt.
-        (PvField::StructureArray(items), FieldDesc::StructureArray { fields, .. }) => {
+        // Structure array: every present element must carry the
+        // descriptor's element `struct_id`, then match its field list.
+        // pvxs encodes a present StructA element only after asserting the
+        // element value's descriptor IS the array element descriptor
+        // (dataencode.cpp:354-365), and decodes each element under that
+        // descriptor's id (dataencode.cpp:607-618) — the element body
+        // carries no id of its own. Checking only the field list let an
+        // `other_t` element ride out under a `row_t[]` descriptor: local
+        // diagnostics see `other_t`, every peer decodes `row_t`. A `None`
+        // (absent) element emits a presence byte only and cannot corrupt.
+        (PvField::StructureArray(items), FieldDesc::StructureArray { struct_id, fields }) => {
             for elem in items.iter().flatten() {
+                if &elem.struct_id != struct_id {
+                    return Err(ValueDescMismatch::StructureIdMismatch {
+                        desc_id: struct_id.clone(),
+                        value_id: elem.struct_id.clone(),
+                    });
+                }
                 structure_fields_match(elem, fields)?;
             }
             Ok(())
@@ -394,6 +405,41 @@ mod tests {
         elem.set("value", PvField::Scalar(ScalarValue::Int(1)));
         let value = PvField::StructureArray(vec![Some(elem)]);
         assert!(value_matches_descriptor(&value, &desc).is_err());
+    }
+
+    #[test]
+    fn structure_array_element_struct_id_mismatch_is_err() {
+        // Descriptor is `row_t[]`; the element has identical fields but a
+        // different `struct_id` (`other_t`). Field-only checking accepted
+        // it; the element id must be compared too.
+        let fields = vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Int))];
+        let desc = FieldDesc::StructureArray {
+            struct_id: "row_t".to_string(),
+            fields: fields.clone(),
+        };
+        let mut elem = PvStructure::new("other_t");
+        elem.set("value", PvField::Scalar(ScalarValue::Int(1)));
+        let value = PvField::StructureArray(vec![Some(elem)]);
+        assert!(matches!(
+            value_matches_descriptor(&value, &desc),
+            Err(ValueDescMismatch::StructureIdMismatch {
+                ref desc_id,
+                ref value_id,
+            }) if desc_id == "row_t" && value_id == "other_t"
+        ));
+    }
+
+    #[test]
+    fn structure_array_element_matching_struct_id_is_ok() {
+        let fields = vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Int))];
+        let desc = FieldDesc::StructureArray {
+            struct_id: "row_t".to_string(),
+            fields: fields.clone(),
+        };
+        let mut elem = PvStructure::new("row_t");
+        elem.set("value", PvField::Scalar(ScalarValue::Int(1)));
+        let value = PvField::StructureArray(vec![Some(elem)]);
+        assert!(value_matches_descriptor(&value, &desc).is_ok());
     }
 
     fn double_or_int_union_desc() -> FieldDesc {

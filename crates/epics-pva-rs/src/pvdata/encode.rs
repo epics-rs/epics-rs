@@ -909,20 +909,27 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
                 encode_pv_field(&child_val, child_desc, order, out);
             }
         }
-        (FieldDesc::StructureArray { fields, .. }, PvField::StructureArray(items)) => {
+        (FieldDesc::StructureArray { struct_id, fields }, PvField::StructureArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
             // each element is preceded by a presence byte —
             // 0x00 for a null (absent) element, 0x01 followed by the
             // body for a present one (pvxs dataencode.cpp:354-365).
+            // The element descriptor is the ARRAY's element descriptor:
+            // its `struct_id` comes from the descriptor, not the value.
+            // pvxs encodes each present element under the array element
+            // descriptor it asserted the value against, and the element
+            // body carries no id of its own — synthesizing the descriptor
+            // from the value's `struct_id` only masked a mismatch that
+            // `value_matches_descriptor` now rejects on checked paths.
+            let element_desc = FieldDesc::Structure {
+                struct_id: struct_id.clone(),
+                fields: fields.clone(),
+            };
             for s in items {
                 match s {
                     None => out.put_u8(0x00),
                     Some(s) => {
                         out.put_u8(0x01);
-                        let element_desc = FieldDesc::Structure {
-                            struct_id: s.struct_id.clone(),
-                            fields: fields.clone(),
-                        };
                         encode_pv_field(&PvField::Structure(s.clone()), &element_desc, order, out);
                     }
                 }

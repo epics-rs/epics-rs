@@ -2799,7 +2799,7 @@ async fn handle_connection_io(
                 // had no arm here and the frame fell through to
                 // the silent default — the redirector hung waiting
                 // for SEARCH_RESPONSE.
-                handle_tcp_search(&source, &frame, &tx, &config).await?;
+                handle_tcp_search(&source, &frame, &tx, &config, peer).await?;
             }
             Some(Command::DestroyRequest) => {
                 handle_destroy_request(&frame, &mut channels)?;
@@ -4196,6 +4196,7 @@ async fn handle_tcp_search(
     frame: &Frame,
     tx: &SrvTx,
     config: &PvaServerConfig,
+    peer: SocketAddr,
 ) -> PvaResult<()> {
     // Rebuild the raw frame bytes so the UDP parser sees the same
     // shape (header + payload). `parse_search_request` reads from
@@ -4227,7 +4228,10 @@ async fn handle_tcp_search(
     // Protocol-gated match set, shared with the v4/v6 UDP responders.
     // See `udp::search_matched_cids`.
     let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
-    let matched = super::udp::search_matched_cids(source, &req, protocol).await;
+    // pvxs fills `Search::source` from the TCP peer for circuit search
+    // (serverchan.cpp:197-222), so a source can scope advertisement by
+    // the established peer endpoint.
+    let matched = super::udp::search_matched_cids(source, &req, protocol, peer).await;
     // pvxs `serverchan.cpp:240-249`: emit the response only when
     // there's a match OR MustReply was set. Skip otherwise to
     // avoid leaking server presence on every probe.

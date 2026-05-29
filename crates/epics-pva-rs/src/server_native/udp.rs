@@ -733,7 +733,10 @@ async fn process_search_datagram(
 
                 // Protocol-gated match set, shared with the v6 UDP and
                 // TCP-circuit responders. See `search_matched_cids`.
-                let matched_cids = search_matched_cids(source, &req, protocol).await;
+                // The requester endpoint is the resolved reply
+                // destination (pvxs fills Search::source from
+                // msg.replyDest, server.cpp:674-704).
+                let matched_cids = search_matched_cids(source, &req, protocol, reply_dest).await;
                 // pvxs `server.cpp:730-732`: when `nreply==0` AND the
                 // SEARCH header did not set `MustReply`, drop the
                 // SEARCH silently. Honouring `MustReply` even with
@@ -932,8 +935,9 @@ async fn process_v6_search_datagram(
                 let reply_dest = resolve_reply_dest(req.reply_addr, req.reply_port, udp_src);
                 // The v6 responder must apply the same protocol gate as
                 // v4/TCP — without it a TLS-only client gets `found=1`
-                // from a tcp-only server. Shared helper.
-                let matched_cids = search_matched_cids(source, &req, protocol).await;
+                // from a tcp-only server. Shared helper. Requester
+                // endpoint is the resolved reply destination.
+                let matched_cids = search_matched_cids(source, &req, protocol, reply_dest).await;
                 // pvxs `server.cpp:730-732` (also reached for v6
                 // SEARCH via the same handler): honour `MustReply`
                 // with an empty (`found=0`, `nreply=0`) response so
@@ -981,10 +985,16 @@ async fn process_v6_search_datagram(
 ///
 /// Returns an empty vec on protocol mismatch, so each responder's
 /// `found`/`MustReply` decision is identical regardless of family.
+///
+/// `requester` is the SEARCH's resolved reply destination (UDP) or the
+/// established peer (TCP circuit); it is forwarded to
+/// [`ChannelSource::searchable_from`] so a source can scope
+/// advertisement by client endpoint (pvxs `Search::source()`).
 pub(crate) async fn search_matched_cids(
     source: &DynSource,
     req: &SearchRequest,
     protocol: &str,
+    requester: SocketAddr,
 ) -> Vec<u32> {
     // Byte-exact protocol gate (pvxs udp_collector.cpp:408-421 compares
     // the raw wire string to "tcp"). An empty list is a legacy SEARCH
@@ -1002,7 +1012,11 @@ pub(crate) async fn search_matched_cids(
     }
     let mut matched = Vec::with_capacity(req.queries.len());
     for (cid, name) in &req.queries {
-        if source.searchable(name).await {
+        // Endpoint-scoped advertisement: a source may claim a name only
+        // for some requesters (pvxs `Search::source()`). The `requester`
+        // is the SEARCH's resolved reply destination for UDP and the
+        // established peer for TCP-circuit search.
+        if source.searchable_from(name, requester).await {
             matched.push(*cid);
         }
     }
@@ -1762,6 +1776,97 @@ mod tests {
         );
     }
 
+    /// The shared SEARCH match rule forwards the requester endpoint to
+    /// `ChannelSource::searchable_from`, so a source can claim a PV only
+    /// for some requesters (pvxs `Search::source()`). Because the v4
+    /// UDP, v6 UDP, and TCP-circuit responders all call this one rule,
+    /// the endpoint scope governs every search path.
+    #[tokio::test]
+    async fn search_matched_cids_honors_requester_endpoint() {
+        use crate::pvdata::{FieldDesc, PvField};
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        // Claims "MY:PV" only for a requester at 10.0.0.5.
+        struct ScopedSource;
+        #[allow(clippy::manual_async_fn)]
+        impl ChannelSource for ScopedSource {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { vec!["MY:PV".into()] }
+            }
+            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == "MY:PV";
+                async move { m }
+            }
+            fn searchable_from(
+                &self,
+                name: &str,
+                requester: SocketAddr,
+            ) -> impl std::future::Future<Output = bool> + Send {
+                let ok =
+                    name == "MY:PV" && requester.ip() == IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+                async move { ok }
+            }
+            fn get_introspection(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { None }
+            }
+            fn get_value(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _name: &str,
+                _value: PvField,
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+                async { Err("read-only".into()) }
+            }
+            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let source: DynSource = Arc::new(ScopedSource);
+        let req = SearchRequest {
+            seq: 1,
+            byte_order: ByteOrder::Little,
+            queries: vec![(7, "MY:PV".into())],
+            reply_addr: None,
+            reply_port: 0,
+            unicast: false,
+            must_reply: false,
+            protocols: vec![],
+            consumed: 0,
+        };
+        let allowed: SocketAddr = "10.0.0.5:5076".parse().unwrap();
+        let denied: SocketAddr = "192.168.1.1:5076".parse().unwrap();
+
+        assert_eq!(
+            search_matched_cids(&source, &req, "tcp", allowed).await,
+            vec![7],
+            "the scoped source must claim the PV for the allowed requester"
+        );
+        assert!(
+            search_matched_cids(&source, &req, "tcp", denied)
+                .await
+                .is_empty(),
+            "the scoped source must NOT claim the PV for a different requester"
+        );
+    }
+
     /// The shared SEARCH match rule gates on the advertised protocol:
     /// a matching protocol (or an empty/legacy list) yields the searchable
     /// CIDs, a mismatched one yields nothing. This is the single rule the
@@ -1817,6 +1922,7 @@ mod tests {
         }
 
         let source: DynSource = Arc::new(PresentSource);
+        let requester: SocketAddr = "127.0.0.1:5076".parse().unwrap();
         let req = |protocols: Vec<Vec<u8>>| SearchRequest {
             seq: 1,
             byte_order: ByteOrder::Little,
@@ -1831,18 +1937,18 @@ mod tests {
 
         // Server speaks "tcp". Matching protocol → searchable CID returned.
         assert_eq!(
-            search_matched_cids(&source, &req(vec![b"tcp".to_vec()]), "tcp").await,
+            search_matched_cids(&source, &req(vec![b"tcp".to_vec()]), "tcp", requester).await,
             vec![7]
         );
         // Client asks for "tls" only → no match off a tcp server.
         assert!(
-            search_matched_cids(&source, &req(vec![b"tls".to_vec()]), "tcp")
+            search_matched_cids(&source, &req(vec![b"tls".to_vec()]), "tcp", requester)
                 .await
                 .is_empty()
         );
         // Empty/legacy protocol list → wildcard, still matched.
         assert_eq!(
-            search_matched_cids(&source, &req(vec![]), "tcp").await,
+            search_matched_cids(&source, &req(vec![]), "tcp", requester).await,
             vec![7]
         );
         // A protocol entry that is not valid UTF-8 must compare as raw
@@ -1852,7 +1958,7 @@ mod tests {
         // where a non-UTF-8 protocol downgraded to an empty list and
         // matched every tcp server.
         assert!(
-            search_matched_cids(&source, &req(vec![vec![0xff, 0xfe]]), "tcp")
+            search_matched_cids(&source, &req(vec![vec![0xff, 0xfe]]), "tcp", requester)
                 .await
                 .is_empty(),
             "non-UTF-8 protocol must not be treated as a wildcard match"

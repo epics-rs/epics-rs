@@ -311,6 +311,29 @@ impl ChannelSource for CompositeSource {
         }
     }
 
+    /// Endpoint-scoped counterpart of [`Self::searchable`]: route to the
+    /// owning source and let IT decide using both the name and the
+    /// requester endpoint. Same "first source that hosts the name wins"
+    /// rule — a name hosted by a non-searchable source must stay
+    /// unanswered even though `has_pv` is true, so we cannot OR
+    /// `searchable_from` across sources.
+    fn searchable_from(
+        &self,
+        name: &str,
+        requester: std::net::SocketAddr,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        let sources = self.snapshot();
+        let name = name.to_string();
+        async move {
+            for src in sources {
+                if src.has_pv(&name).await {
+                    return src.searchable_from(&name, requester).await;
+                }
+            }
+            false
+        }
+    }
+
     fn get_introspection(
         &self,
         name: &str,

@@ -311,6 +311,28 @@ pub trait ChannelSource: Send + Sync + 'static {
         self.has_pv(name)
     }
 
+    /// True iff `name` should be answered to a SEARCH from `requester`.
+    ///
+    /// pvxs exposes the requester endpoint to a source's `onSearch` as
+    /// [`Search::source()`] — filled from `msg.replyDest` for UDP
+    /// (server.cpp:674-704) and from the established TCP peer for
+    /// circuit search (serverchan.cpp:197-222) — so a source can scope
+    /// advertisement by requester (claim a PV only for a local subnet,
+    /// hide private aliases from some peers, pick a redirect policy that
+    /// depends on the client endpoint).
+    ///
+    /// Default ignores the endpoint and defers to [`Self::searchable`],
+    /// so simple sources keep answering every requester the same way.
+    /// A source that wants endpoint-scoped advertisement overrides this.
+    fn searchable_from(
+        &self,
+        name: &str,
+        requester: SocketAddr,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        let _ = requester;
+        self.searchable(name)
+    }
+
     /// Fetch the type descriptor for a PV (used by GET-INIT and GET_FIELD).
     fn get_introspection(
         &self,
@@ -988,6 +1010,12 @@ pub trait ChannelSourceObj: Send + Sync {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    /// Dyn forwarder for [`ChannelSource::searchable_from`].
+    fn searchable_from<'a>(
+        &'a self,
+        name: &'a str,
+        requester: SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     fn get_introspection<'a>(
         &'a self,
         name: &'a str,
@@ -1169,6 +1197,15 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::searchable(self, name))
+    }
+    fn searchable_from<'a>(
+        &'a self,
+        name: &'a str,
+        requester: SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::searchable_from(
+            self, name, requester,
+        ))
     }
     fn get_introspection<'a>(
         &'a self,

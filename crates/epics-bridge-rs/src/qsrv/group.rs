@@ -220,6 +220,27 @@ pub fn push_record_options(pv: &mut PvStructure, atomic: bool, queue_size: i32) 
     }
 }
 
+/// Descriptor twin of [`push_record_options`]: the introspection shape
+/// of the built-in `record._options` subtree (`queueSize` int,
+/// `atomic` boolean). pvxs builds this branch into `group.valueTemplate`
+/// (ioc/groupconfigprocessor.cpp:499-523), so CREATE_CHANNEL / GET_FIELD
+/// negotiation advertises it and every GET/MONITOR value conforms.
+/// Keep the field names and scalar types here in lockstep with
+/// `push_record_options` so the descriptor never diverges from the value.
+fn record_options_field_desc() -> FieldDesc {
+    let options = FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![
+            ("queueSize".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ("atomic".into(), FieldDesc::Scalar(ScalarType::Boolean)),
+        ],
+    };
+    FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![("_options".into(), options)],
+    }
+}
+
 /// place a member's resolved value into the group structure.
 ///
 /// pvxs allows a `+type:"meta"` member with an empty key (`""`) to
@@ -1234,6 +1255,17 @@ impl super::provider::Channel for GroupChannel {
             // The read side uses set_member_field — introspection must
             // emit the same shape so clients see consistent type info.
             set_member_field_desc(&mut fields, member, desc);
+        }
+
+        // Advertise the built-in `record._options` branch the value
+        // side stamps via push_record_options, placed last to match the
+        // value's field order (the value adds `record` after members).
+        // pvxs carries it in group.valueTemplate so descriptor and
+        // payload agree (groupconfigprocessor.cpp:499-523).
+        if let Some(pos) = fields.iter().position(|(n, _)| n == "record") {
+            fields[pos].1 = record_options_field_desc();
+        } else {
+            fields.push(("record".into(), record_options_field_desc()));
         }
 
         Ok(FieldDesc::Structure {

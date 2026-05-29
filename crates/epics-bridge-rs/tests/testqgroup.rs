@@ -825,3 +825,63 @@ async fn structure_member_appears_in_nonatomic_group_value() {
     }
     assert_eq!(extract_double(&result, "value"), Some(1.5));
 }
+
+/// GET_FIELD / CREATE_CHANNEL must advertise the built-in
+/// `record._options` branch (queueSize int, atomic boolean) that GET
+/// and MONITOR values carry, matching pvxs `group.valueTemplate`
+/// (groupconfigprocessor.cpp:499-523).
+#[tokio::test]
+async fn group_descriptor_advertises_record_options() {
+    use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp")
+        .cloned()
+        .expect("registered");
+    let ch = GroupChannel::new(db, def);
+
+    let desc = ch.get_field().await.expect("get_field");
+    let root = match &desc {
+        FieldDesc::Structure { fields, .. } => fields,
+        other => panic!("group descriptor must be a structure, got {other:?}"),
+    };
+    let opts = match root.iter().find(|(n, _)| n == "record").map(|(_, d)| d) {
+        Some(FieldDesc::Structure { fields, .. }) => {
+            fields.iter().find(|(n, _)| n == "_options").map(|(_, d)| d)
+        }
+        other => panic!("descriptor must contain a `record` structure, got {other:?}"),
+    };
+    match opts {
+        Some(FieldDesc::Structure { fields, .. }) => {
+            assert!(
+                matches!(
+                    fields
+                        .iter()
+                        .find(|(n, _)| n == "queueSize")
+                        .map(|(_, d)| d),
+                    Some(FieldDesc::Scalar(ScalarType::Int))
+                ),
+                "record._options.queueSize must be advertised as int"
+            );
+            assert!(
+                matches!(
+                    fields.iter().find(|(n, _)| n == "atomic").map(|(_, d)| d),
+                    Some(FieldDesc::Scalar(ScalarType::Boolean))
+                ),
+                "record._options.atomic must be advertised as boolean"
+            );
+        }
+        other => panic!("descriptor must contain `record._options`, got {other:?}"),
+    }
+
+    // The GET value conforms: it carries the same record._options branch.
+    let val = ch.get(&empty_request()).await.expect("get");
+    assert!(
+        matches!(find_field(&val, "record"), Some(PvField::Structure(_))),
+        "GET value must carry the record._options branch the descriptor advertises"
+    );
+}

@@ -47,6 +47,14 @@ struct Args {
     #[arg(short = 'q')]
     quiet: bool,
 
+    /// Read the value before and after the PUT and print `Old :` /
+    /// `New :` echo lines. Rust-specific and off by default: pvxs
+    /// `pvxput` issues only the PUT and never reads back
+    /// (`tools/put.cpp:115-158`), so the default command does not GET a
+    /// write-only or read-restricted PV.
+    #[arg(long = "read-back")]
+    read_back: bool,
+
     /// Enable debug log output (currently a no-op; kept for parity).
     #[arg(short = 'd')]
     debug: bool,
@@ -117,10 +125,19 @@ async fn main() {
         }
     };
 
-    // 1. Read old NTScalar (with timestamp) for the `Old :` echo line.
-    //    Errors are tolerated — legacy pvput emits an "Error:" line in
-    //    the gap and continues to the put.
-    let old_get = client.pvget_full(&pv_name).await;
+    // pvxs `pvxput` issues a single PUT and prints nothing on success
+    // (tools/put.cpp:115-158): no pre- or post-PUT GET. The Old:/New:
+    // readback below is a Rust-only convenience gated behind
+    // `--read-back`, so the default command matches pvxs and never
+    // GETs a write-only PV.
+    //
+    // 1. Optional pre-PUT read for the `Old :` echo line. Errors are
+    //    tolerated — the echo prints an "Old : ***" line and continues.
+    let old_get = if args.read_back {
+        Some(client.pvget_full(&pv_name).await)
+    } else {
+        None
+    };
 
     // 2. Do the put. Field assignments build one prototype-based delta;
     //    a bare value targets `.value` via the existing helpers.
@@ -140,7 +157,13 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // 3. Read new NTScalar (with timestamp) for the `New :` echo line.
+    // pvxs-faithful default: the PUT is the whole command. Without
+    // `--read-back` there is no post-PUT GET and success is silent.
+    if !args.read_back {
+        return;
+    }
+
+    // 3. Post-PUT read for the `New :` echo line.
     let new_get = client.pvget_full(&pv_name).await;
 
     if args.quiet {
@@ -155,12 +178,14 @@ async fn main() {
         Some(format_old_new_line(label, s))
     };
 
-    match &old_get {
-        Ok(r) => match echo_line("Old : ", &r.value) {
-            Some(line) => print!("{line}"),
-            None => println!("Old : (non-NT value)"),
-        },
-        Err(e) => println!("Old : *** {e}"),
+    if let Some(old_get) = &old_get {
+        match old_get {
+            Ok(r) => match echo_line("Old : ", &r.value) {
+                Some(line) => print!("{line}"),
+                None => println!("Old : (non-NT value)"),
+            },
+            Err(e) => println!("Old : *** {e}"),
+        }
     }
     match &new_get {
         Ok(r) => match echo_line("New : ", &r.value) {
@@ -288,5 +313,20 @@ mod tests {
         // pvxs has no provider switch; pvAccessCPP `-p ca` is unsupported.
         assert!(check_provider("ca").is_err());
         assert!(check_provider("").is_err());
+    }
+
+    /// pvxs `pvxput` issues only the PUT — no readback. The default
+    /// command must not read back, so a write-only PV is never GET'd.
+    #[test]
+    fn readback_is_off_by_default() {
+        let args = Args::parse_from(["pvput-rs", "PV", "42"]);
+        assert!(!args.read_back);
+    }
+
+    /// `--read-back` opts in to the Rust-only Old:/New: echo.
+    #[test]
+    fn read_back_flag_enables_readback() {
+        let args = Args::parse_from(["pvput-rs", "--read-back", "PV", "42"]);
+        assert!(args.read_back);
     }
 }

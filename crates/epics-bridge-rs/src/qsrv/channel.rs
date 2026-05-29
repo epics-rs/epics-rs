@@ -430,6 +430,12 @@ impl BridgeChannel {
 
         let instance = rec.read().await;
         let rtyp = instance.record.record_type();
+        // Resolve the bound field's actual value once (record field →
+        // common field → virtual field). This is the single source of
+        // truth for both the served DBF type and (below) the NT shape,
+        // so the advertised descriptor cannot drift from the value the
+        // GET path will serialize.
+        let resolved = instance.resolve_field(&field_upper);
         // A long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL) is a
         // `DBF_CHAR` array that semantically holds a NUL-terminated
         // string. Serve it as a scalar-string NTScalar (pvxs's
@@ -448,18 +454,34 @@ impl BridgeChannel {
             Self::nt_type_for_field(rtyp, &field_upper)
         };
 
-        // DBF type for the bound field. Falls back to Double if the
-        // record's `field_list` does not enumerate it explicitly —
-        // common-fields like `.SCAN` / `.PROC` may not be in
-        // record-specific tables but are still resolvable through
-        // `resolve_field` and serialize through the generic Snapshot
-        // path.
-        let value_dbf = instance
-            .record
-            .field_list()
-            .iter()
-            .find(|f| f.name == field_upper)
-            .map(|f| f.dbf_type)
+        // DBF type for the bound field, taken from the field's actual
+        // resolved value. pvxs serves the type from
+        // `dbChannelFinalFieldType(chan)` (singlesource.cpp:189-205,
+        // dbChannel.h:452) — the channel's final field type after lookup,
+        // which covers `dbCommon` fields, not only record-specific ones.
+        // Deriving the DBF from the resolved `EpicsValue` makes the
+        // advertised descriptor agree with the value the GET path returns
+        // *by construction*: common/virtual fields such as `.SCAN`
+        // (enum), `.DESC` (string), `.PROC` (char), and `.UTAG` (unsigned
+        // 64) no longer fall back to `double`. The earlier `field_list`
+        // lookup + `Double` fallback advertised `double value` for every
+        // field a record's table did not enumerate, contradicting the
+        // value the snapshot then serialized — a descriptor/value
+        // wire-schema mismatch, not mere display drift. The
+        // record-specific `field_list` is the fallback only for a field
+        // that resolves to no concrete value, and `Double` the final
+        // backstop.
+        let value_dbf = resolved
+            .as_ref()
+            .map(|v| v.db_field_type())
+            .or_else(|| {
+                instance
+                    .record
+                    .field_list()
+                    .iter()
+                    .find(|f| f.name == field_upper)
+                    .map(|f| f.dbf_type)
+            })
             .unwrap_or(DbFieldType::Double);
 
         Ok(Self {

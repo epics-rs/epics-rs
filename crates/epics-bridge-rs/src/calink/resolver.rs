@@ -18,7 +18,18 @@ use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::DbFieldType;
 use epics_ca_rs::client::{CaChannel, CaClient};
+use epics_ca_rs::protocol::{DBE_ALARM, DBE_VALUE};
 use parking_lot::RwLock;
+
+/// CA record-link monitor event mask — `DBE_VALUE | DBE_ALARM`, matching
+/// C `dbCa`'s `ca_add_array_event` (`dbCa.c:1258-1269`), whose libca macro
+/// expands to `ca_add_masked_array_event(..., DBE_VALUE | DBE_ALARM)`
+/// (`cadef.h:2004-2012`). Deliberately excludes `DBE_LOG` / `DBE_ARCHIVE`
+/// (a separate event-trigger class, `cadef.h:1148-1158`) that `dbCa` never
+/// requests, so archive/log-only posts on the upstream PV never refresh a
+/// CP/CPP record link's cache or wake a scan. The default
+/// `CaChannel::subscribe()` would add `DBE_LOG`.
+const CALINK_EVENT_MASK: u16 = DBE_VALUE | DBE_ALARM;
 
 /// Errors from the CA-link resolver setup path.
 #[derive(Debug, thiserror::Error)]
@@ -234,8 +245,17 @@ impl CaLinkResolver {
         // await would emit `Connected` before the watcher existed, leaving
         // `meta` permanently empty until the next reconnect.
         let conn_rx = channel.connection_events();
+        // C `dbCa` opens the record-link monitor with `ca_add_array_event`
+        // (`dbCa.c:1258-1269`), whose libca macro expands to
+        // `ca_add_masked_array_event(..., DBE_VALUE | DBE_ALARM)`
+        // (`cadef.h:2004-2012`). DBE_LOG / DBE_ARCHIVE is a separate
+        // event-trigger class (`cadef.h:1148-1158`) that `dbCa` never
+        // requests, so a CP/CPP record link must not refresh its cache (or
+        // wake a scan) on archive/log-only posts. The default
+        // `CaChannel::subscribe()` requests `DBE_VALUE | DBE_LOG |
+        // DBE_ALARM`, so request the dbCa mask explicitly here.
         let monitor = channel
-            .subscribe()
+            .subscribe_with_mask(0.0, CALINK_EVENT_MASK)
             .await
             .map_err(|e| CaLinkError::Subscribe {
                 pv: pv_name.to_string(),
@@ -660,6 +680,27 @@ mod tests {
     fn strip_ca_scheme_handles_both_forms() {
         assert_eq!(strip_ca_scheme("ca://OTHER:PV"), "OTHER:PV");
         assert_eq!(strip_ca_scheme("OTHER:PV"), "OTHER:PV");
+    }
+
+    /// The CA record-link monitor mask matches C `dbCa`'s
+    /// `ca_add_array_event` = `DBE_VALUE | DBE_ALARM` and EXCLUDES
+    /// `DBE_LOG` (`cadef.h:2004-2012` / `:1148-1158`). `open()` subscribes
+    /// with this exact constant, so an archive/log-only upstream post does
+    /// not refresh a CP/CPP link's cache. Guards against a regression back
+    /// to the default `subscribe()` mask, which adds `DBE_LOG`.
+    #[test]
+    fn calink_monitor_mask_is_dbca_value_alarm_without_log() {
+        use epics_ca_rs::protocol::{DBE_ALARM, DBE_LOG, DBE_VALUE};
+        assert_eq!(
+            CALINK_EVENT_MASK,
+            DBE_VALUE | DBE_ALARM,
+            "calink monitor mask must equal dbCa's DBE_VALUE | DBE_ALARM"
+        );
+        assert_eq!(
+            CALINK_EVENT_MASK & DBE_LOG,
+            0,
+            "calink must not request DBE_LOG — dbCa.c never does"
+        );
     }
 
     /// BUG 1 regression: the connection-event → `connected` flag

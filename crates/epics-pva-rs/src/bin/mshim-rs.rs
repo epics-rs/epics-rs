@@ -32,17 +32,28 @@ use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
 
 #[derive(Parser)]
-#[command(name = "mshim-rs", version, about = "PVA beacon/search multicast shim")]
+#[command(
+    name = "mshim-rs",
+    about = "PVA beacon/search multicast shim",
+    disable_version_flag = true
+)]
 struct Args {
+    /// Print version information (pvxs `version_information`, tools
+    /// `case 'V'`) and exit. Routed through `cli::version_information`
+    /// so every PVA CLI reports the same library + protocol stack
+    /// instead of clap's crate-only `<binary> <version>`.
+    #[arg(short = 'V', long = "version")]
+    version: bool,
+
     /// Listen endpoint `<ip>[:port][,ttl#][@iface]`. Repeat for
     /// multiple. Multicast groups are joined automatically; `@iface`
     /// scopes the join to one interface.
-    #[arg(short = 'L', long = "listen", required = true)]
+    #[arg(short = 'L', long = "listen", required_unless_present = "version")]
     listen: Vec<String>,
 
     /// Forward destination `<ip>[:port][,ttl#][@iface]`. Repeat for
     /// multiple. `,ttl#` / `@iface` apply to multicast destinations.
-    #[arg(short = 'F', long = "forward", required = true)]
+    #[arg(short = 'F', long = "forward", required_unless_present = "version")]
     forward: Vec<String>,
 
     /// Default UDP port if a `-L` / `-F` entry omits one.
@@ -243,6 +254,14 @@ fn multicast_opts_for(tgt: &ForwardTarget) -> Option<(u32, Ipv4Addr)> {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // pvxs `-V` prints version_information and exits before binding any
+    // socket (mshim `case 'V'`).
+    if args.version {
+        print!("{}", epics_pva_rs::cli::version_information());
+        return;
+    }
+
     let default_port = args
         .port
         .or_else(|| {

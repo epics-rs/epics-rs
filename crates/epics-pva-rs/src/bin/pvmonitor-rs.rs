@@ -6,12 +6,19 @@ use epics_pva_rs::{cli, format};
 #[derive(Parser)]
 #[command(
     name = "pvmonitor-rs",
-    version,
-    about = "Monitor EPICS PVs via pvAccess"
+    about = "Monitor EPICS PVs via pvAccess",
+    disable_version_flag = true
 )]
 struct Args {
+    /// Print version information (pvxs `version_information`, tools
+    /// `case 'V'`) and exit. Routed through `cli::version_information`
+    /// so every PVA CLI reports the same library + protocol stack
+    /// instead of clap's crate-only `<binary> <version>`.
+    #[arg(short = 'V', long = "version")]
+    version: bool,
+
     /// PV names to monitor
-    #[arg(required = true)]
+    #[arg(required_unless_present = "version")]
     pv_names: Vec<String>,
 
     /// Output mode: raw, nt, json. The full structure is shown with
@@ -53,6 +60,13 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // pvxs `-V` prints version_information and exits before any client
+    // setup (tools/monitor.cpp:63).
+    if args.version {
+        print!("{}", cli::version_information());
+        return;
+    }
 
     // Parse the custom pvRequest once, up front, so an invalid string
     // exits before any subscription task is spawned. `None` means use

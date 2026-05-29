@@ -1,5 +1,7 @@
-//! Helpers shared across the `pvget` / `pvput` / `pvmonitor` /
-//! `pvinfo` / `pvcall` / `pvlist` command-line binaries.
+//! Helpers shared across the PVA command-line binaries (`pvget`,
+//! `pvput`, `pvmonitor`, `pvinfo`, `pvcall`, `pvlist`, `pvxvct`,
+//! `mshim`): timeout parsing, the `-v` effective-config diagnostic,
+//! and the `-V` version-information text.
 
 /// Default PVA CLI timeout in seconds when a user-supplied `-w`
 /// is missing or non-finite. Matches `pvget-rs` default of 5.0 s
@@ -20,6 +22,42 @@ pub fn timeout_duration(secs: f64) -> std::time::Duration {
         DEFAULT_CLI_TIMEOUT_SECS
     };
     std::time::Duration::from_secs_f64(s)
+}
+
+/// The shared `-V` / `--version` text for the PVA CLI tools, the
+/// analogue of pvxs `version_information` (`src/describe.cpp:135-140`).
+///
+/// pvxs routes every tool's `-V` through
+/// `std::cout << pvxs::version_information; return 0;`
+/// (`tools/get.cpp:62-64`, `put.cpp:55`, `list.cpp:75-82`,
+/// `monitor.cpp:63`, `call.cpp:55`, …), which prints the PVXS library
+/// version, the EPICS Base version, and the libevent version — the
+/// protocol/toolchain stack an operator pastes into a bug report.
+/// Clap's generated `--version` reports only `<binary> <crate-version>`,
+/// losing that dependency context.
+///
+/// The Rust analogue reports the two facts the linked library knows at
+/// compile time without a build script:
+///   - the `epics-pva-rs` crate version (the PVA implementation, the
+///     PVXS analogue), and
+///   - the PVA wire-protocol version it speaks
+///     ([`crate::proto::PVA_VERSION`]) — the interop-critical fact a
+///     "talks to pvxs/Java but not X" report needs, the analogue of
+///     pvxs's libevent/runtime line.
+///
+/// The `epics-base-rs` port is workspace-version-locked to this crate
+/// (`version.workspace = true` in both), so its version equals
+/// [`crate::VERSION`] and is not printed as a distinct, identical line.
+pub fn version_information() -> &'static str {
+    use std::sync::OnceLock;
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(|| {
+        format!(
+            "epics-pva-rs {}\nPVA protocol version {}\n",
+            crate::VERSION,
+            crate::proto::PVA_VERSION
+        )
+    })
 }
 
 /// Print the effective PVA client configuration, the shared `-v`
@@ -128,5 +166,31 @@ mod tests {
         ] {
             assert!(s.contains(key), "missing {key:?} in:\n{s}");
         }
+    }
+
+    /// The shared `-V` text reports more than `<binary> <crate-version>`:
+    /// it names the `epics-pva-rs` library, its version, and the PVA
+    /// wire-protocol version (the pvxs `version_information` analogue).
+    /// This is the dependency/protocol context clap's crate-only
+    /// `--version` dropped.
+    #[test]
+    fn version_information_includes_protocol_stack() {
+        let v = super::version_information();
+        assert!(
+            v.contains(&format!("epics-pva-rs {}", crate::VERSION)),
+            "got: {v:?}"
+        );
+        assert!(
+            v.contains(&format!(
+                "PVA protocol version {}",
+                crate::proto::PVA_VERSION
+            )),
+            "got: {v:?}"
+        );
+        // Strictly more than the bare crate version: at least two lines.
+        assert!(
+            v.lines().count() >= 2,
+            "version output must carry dependency context, got: {v:?}"
+        );
     }
 }

@@ -4,8 +4,6 @@ use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure};
 use epics_pva_rs::{cli, format};
 
-const VERSION_INFO: &str = concat!("pvput-rs ", env!("CARGO_PKG_VERSION"));
-
 /// Mirror of legacy `pvput` flag set (pvAccessCPP `pvput.cpp`).
 #[derive(Parser)]
 #[command(
@@ -14,7 +12,11 @@ const VERSION_INFO: &str = concat!("pvput-rs ", env!("CARGO_PKG_VERSION"));
     disable_version_flag = true
 )]
 struct Args {
-    #[arg(short = 'V', long, hide = true)]
+    /// Print version information (pvxs `version_information`, tools
+    /// `case 'V'`) and exit. Routed through `cli::version_information`
+    /// so every PVA CLI reports the same library + protocol stack
+    /// instead of clap's crate-only `<binary> <version>`.
+    #[arg(short = 'V', long = "version")]
     version: bool,
 
     /// pvRequest string (`field(...)` / `record[k=v]` syntax). When
@@ -86,8 +88,10 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
+    // pvxs `-V` prints version_information and exits before any client
+    // setup (tools/put.cpp:55).
     if args.version {
-        println!("{VERSION_INFO}");
+        print!("{}", cli::version_information());
         return;
     }
 

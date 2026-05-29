@@ -5,12 +5,19 @@ use epics_pva_rs::{cli, format};
 #[derive(Parser)]
 #[command(
     name = "pvget-rs",
-    version,
-    about = "Read EPICS PV values via pvAccess"
+    about = "Read EPICS PV values via pvAccess",
+    disable_version_flag = true
 )]
 struct Args {
+    /// Print version information (pvxs `version_information`, tools
+    /// `case 'V'`) and exit. Routed through `cli::version_information`
+    /// so every PVA CLI reports the same library + protocol stack
+    /// instead of clap's crate-only `<binary> <version>`.
+    #[arg(short = 'V', long = "version")]
+    version: bool,
+
     /// PV names to read
-    #[arg(required = true)]
+    #[arg(required_unless_present = "version")]
     pv_names: Vec<String>,
 
     /// Request, specifies what fields to return and options
@@ -65,6 +72,13 @@ fn parse_pv_request(request: &str) -> Vec<&str> {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // pvxs `-V` prints version_information and exits before any client
+    // setup (tools/get.cpp:62-64).
+    if args.version {
+        print!("{}", cli::version_information());
+        return;
+    }
 
     // pvxs `-v` prints the effective client config once, before any
     // operation (tools/get.cpp:99-100). It is a diagnostic, not an

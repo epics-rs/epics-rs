@@ -30,8 +30,20 @@ use epics_pva_rs::client_native::decode::try_parse_frame;
 use epics_pva_rs::proto::{Command, ReadExt, decode_size, decode_string, ip_from_bytes};
 
 #[derive(Parser)]
-#[command(name = "pvxvct-rs", version, about = "PVA Virtual Cable Tester")]
+#[command(
+    name = "pvxvct-rs",
+    about = "PVA Virtual Cable Tester",
+    disable_version_flag = true
+)]
 struct Args {
+    /// Print version information (pvxs `version_information`, tools
+    /// `case 'V'`) and exit. Routed through `cli::version_information`
+    /// so every PVA CLI reports the same library + protocol stack
+    /// instead of clap's crate-only `<binary> <version>`. Distinct
+    /// from `-v` (raise the sniffer logger to Debug).
+    #[arg(short = 'V', long = "version")]
+    version: bool,
+
     /// Show only client SEARCH packets.
     #[arg(short = 'C', conflicts_with = "server_only")]
     client_only: bool,
@@ -386,6 +398,14 @@ async fn run_listener(socket: UdpSocket, filters: Arc<Filters>) {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // pvxs `-V` prints version_information and exits before binding any
+    // sniffer socket (pvxvct `case 'V'`).
+    if args.version {
+        print!("{}", epics_pva_rs::cli::version_information());
+        return;
+    }
+
     let default_port = args.port.unwrap_or_else(|| {
         std::env::var("EPICS_PVA_BROADCAST_PORT")
             .ok()

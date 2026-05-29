@@ -31,10 +31,18 @@ use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarVa
 #[derive(Parser)]
 #[command(
     name = "pvlist-rs",
-    version,
-    about = "Discover PVA servers / list hosted channels"
+    about = "Discover PVA servers / list hosted channels",
+    disable_version_flag = true
 )]
 struct Args {
+    /// Print version information (pvxs `version_information`, tools
+    /// `case 'V'`) and exit. Routed through `cli::version_information`
+    /// so every PVA CLI reports the same library + protocol stack
+    /// instead of clap's crate-only `<binary> <version>`. Distinct
+    /// from `-v`/`--verbose` (discovery detail).
+    #[arg(short = 'V', long = "version")]
+    version: bool,
+
     /// Wait time in seconds before exiting (0 = forever)
     #[arg(short = 'w', default_value = "5.0")]
     timeout: f64,
@@ -398,6 +406,13 @@ async fn discover_mode(args: &Args) {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // pvxs `-V` prints version_information and exits before discovery
+    // (tools/list.cpp:75-82).
+    if args.version {
+        print!("{}", epics_pva_rs::cli::version_information());
+        return;
+    }
 
     if args.servers.is_empty() {
         if args.info {

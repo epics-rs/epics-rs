@@ -24,13 +24,20 @@ use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarVa
 #[derive(Parser)]
 #[command(
     name = "pvcall-rs",
-    version,
-    about = "Call an EPICS pvAccess RPC method"
+    about = "Call an EPICS pvAccess RPC method",
+    disable_version_flag = true
 )]
 struct Args {
+    /// Print version information (pvxs `version_information`, tools
+    /// `case 'V'`) and exit. Routed through `cli::version_information`
+    /// so every PVA CLI reports the same library + protocol stack
+    /// instead of clap's crate-only `<binary> <version>`.
+    #[arg(short = 'V', long = "version")]
+    version: bool,
+
     /// PV name of the RPC endpoint
-    #[arg(required = true)]
-    pv_name: String,
+    #[arg(required_unless_present = "version")]
+    pv_name: Option<String>,
 
     /// `field=value` arguments. Repeat for multiple args.
     /// Values are sent verbatim as PVA strings (pvxs CLI semantics).
@@ -127,6 +134,18 @@ fn build_nturi(pv_name: &str, args: &[(String, ScalarValue)]) -> (FieldDesc, PvF
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // pvxs `-V` prints version_information and exits before any client
+    // setup (tools/call.cpp:55).
+    if args.version {
+        print!("{}", epics_pva_rs::cli::version_information());
+        return;
+    }
+
+    let pv_name = args
+        .pv_name
+        .expect("clap enforces required unless --version");
+
     let parsed_args: Vec<(String, ScalarValue)> = match collect_args(&args.args) {
         Ok(v) => v,
         Err(e) => {
@@ -141,24 +160,24 @@ async fn main() {
         epics_pva_rs::cli::print_effective_config();
     }
 
-    let (desc, value) = build_nturi(&args.pv_name, &parsed_args);
+    let (desc, value) = build_nturi(&pv_name, &parsed_args);
 
     let client = PvaClient::builder()
         .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
         .build();
 
-    match client.pvrpc(&args.pv_name, &desc, &value).await {
+    match client.pvrpc(&pv_name, &desc, &value).await {
         Ok((resp_desc, resp_value)) => match args.mode.as_str() {
             "json" => {
-                let s = epics_pva_rs::format::format_json(&args.pv_name, &resp_value);
+                let s = epics_pva_rs::format::format_json(&pv_name, &resp_value);
                 println!("{s}");
             }
             "raw" => {
-                let s = epics_pva_rs::format::format_raw(&args.pv_name, &resp_desc, &resp_value);
+                let s = epics_pva_rs::format::format_raw(&pv_name, &resp_desc, &resp_value);
                 println!("{s}");
             }
             _ => {
-                let s = epics_pva_rs::format::format_nt(&args.pv_name, &resp_desc, &resp_value);
+                let s = epics_pva_rs::format::format_nt(&pv_name, &resp_desc, &resp_value);
                 println!("{s}");
             }
         },

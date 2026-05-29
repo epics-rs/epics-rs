@@ -5,12 +5,19 @@ use epics_pva_rs::{cli, config, format};
 #[derive(Parser)]
 #[command(
     name = "pvinfo-rs",
-    version,
-    about = "Show EPICS PV type info via pvAccess"
+    about = "Show EPICS PV type info via pvAccess",
+    disable_version_flag = true
 )]
 struct Args {
+    /// Print version information (pvxs `version_information`, tools
+    /// `case 'V'`) and exit. Routed through `cli::version_information`
+    /// so every PVA CLI reports the same library + protocol stack
+    /// instead of clap's crate-only `<binary> <version>`.
+    #[arg(short = 'V', long = "version")]
+    version: bool,
+
     /// PV names to query
-    #[arg(required_unless_present = "describe")]
+    #[arg(required_unless_present_any = ["describe", "version"])]
     pv_names: Vec<String>,
 
     /// Wait time in seconds
@@ -63,6 +70,13 @@ fn target_information() {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // pvxs `-V` prints version_information and exits before any client
+    // setup (tools/info.cpp `case 'V'`).
+    if args.version {
+        print!("{}", cli::version_information());
+        return;
+    }
 
     // pvxs `-D` prints host troubleshooting info and exits before any
     // server contact (`tools/info.cpp:62-64`: `target_information();

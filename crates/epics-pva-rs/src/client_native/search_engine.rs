@@ -1631,11 +1631,15 @@ fn search_targets(
             // collapses the duplicate.
             targets.push(sa);
         }
-        // Zero-config local-IOC convenience: also unicast to 127.0.0.1.
-        // pvxs/EPICS rely on the local IOC also binding the NIC broadcast
-        // addr, which breaks on hosts whose only interface is loopback
-        // (CI containers, isolated VMs). One extra datagram per burst.
-        targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bport));
+        // No implicit loopback unicast here. pvxs's auto-address expansion
+        // (config.cpp:624-648 → expandAddrList → evhelper.cpp:625-660)
+        // returns only discovered broadcast addresses, never a hard-coded
+        // 127.0.0.1 target. Loopback-only discovery requires an explicit
+        // operator entry: EPICS_PVA_ADDR_LIST=127.0.0.1 (flows into
+        // `extra_targets` below) or loopback in EPICS_PVA_INTF_ADDR_LIST
+        // (the gated push in the branch below). Injecting loopback by
+        // default let a Rust client reach loopback-only IOCs that pvxs
+        // would not, breaking isolation on shared hosts.
     } else if auto_addr_list {
         // `EPICS_PVA_INTF_ADDR_LIST` set: pvxs expands the auto address
         // list over the configured interfaces only (`config.cpp:624-648`),
@@ -4383,6 +4387,29 @@ mod tests {
         assert!(
             targets.contains(&extra),
             "configured extras are always included"
+        );
+    }
+
+    /// PVA parity: the default auto-address path (AUTO_ADDR_LIST=YES, no
+    /// EPICS_PVA_INTF_ADDR_LIST) must NOT inject an implicit 127.0.0.1
+    /// unicast target. pvxs's expandAddrList returns only discovered
+    /// broadcast addresses (`config.cpp:624-648` → `evhelper.cpp:625-660`);
+    /// loopback-only discovery requires an explicit address-list entry,
+    /// which arrives via `extra_targets`, not the auto path.
+    #[test]
+    fn search_targets_default_auto_path_has_no_implicit_loopback() {
+        let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5076);
+        let targets = search_targets(5076, true, &[], &[]);
+        assert!(
+            !targets.contains(&lo),
+            "default auto-address path must not inject an implicit loopback target: {targets:?}"
+        );
+        // An explicit EPICS_PVA_ADDR_LIST=127.0.0.1 entry (carried in
+        // extra_targets) still reaches loopback — the parity-correct path.
+        let with_explicit = search_targets(5076, true, &[lo], &[]);
+        assert!(
+            with_explicit.contains(&lo),
+            "explicit addr-list loopback entry must still target loopback: {with_explicit:?}"
         );
     }
 

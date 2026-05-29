@@ -32,15 +32,19 @@
 //! | `<prefix>:drop` | `pv` (string) | Drop one cache entry by exact name; returns `dropped` bool |
 //! | `<prefix>:reload` | optional `path` (string) | Re-parse the ACF file and hot-swap the gateway-side policy |
 //!
-//! The RPC reply is an `epics:nt/NTScalar:1.0` structure carrying the
-//! operation result plus a human-readable `message`. RPC is used (not
-//! PUT) because the wire layer routes RPC through `rpc_checked`, which
+//! The RPC reply is a gateway-private (non-normative) structure with an
+//! empty structure ID carrying the operation result (`value`) plus a
+//! human-readable `message`. The top-level `message` is a gateway
+//! extension absent from `epics:nt/NTScalar:1.0`, so the reply does not
+//! claim that normative ID. RPC is used (not PUT) because the wire layer
+//! routes RPC through `rpc_checked`, which
 //! threads the downstream peer's `(account, method, host)` credentials
 //! — PUT's type-state token carries only the resolved access level,
 //! not the raw identity needed for the operator allow-list.
 
 use std::sync::Arc;
 
+use epics_pva_rs::nt::NTScalar;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource, OpError};
 use tokio::sync::mpsc;
@@ -141,38 +145,35 @@ impl ControlSource {
         ]
     }
 
-    /// Build the NTScalar-shaped value for a Long counter so PVA
-    /// clients see the same structure regardless of which counter PV
-    /// they ask for. We deliberately keep the field set minimal
-    /// (`value` only — no alarm/timeStamp shells) so the descriptor
-    /// is small and the encode path stays cheap when these PVs are
-    /// polled at high cadence.
+    /// Build the NTScalar value for a Long counter via the shared
+    /// [`NTScalar`] builder so the advertised `epics:nt/NTScalar:1.0`
+    /// structure carries the mandatory `alarm` and `timeStamp` members
+    /// alongside `value`, matching pvxs `NTScalar::build()`
+    /// (`nt.cpp:44-53`). A strict NT client that selects the normative
+    /// layout by structure ID then finds every member it expects; the
+    /// ID and the shape no longer disagree.
     fn nt_scalar_long(v: i64) -> PvField {
-        let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
-        s.fields
-            .push(("value".into(), PvField::Scalar(ScalarValue::Long(v))));
-        PvField::Structure(s)
+        let mut value = NTScalar::new(ScalarType::Long).create();
+        if let PvField::Structure(s) = &mut value {
+            s.set("value", PvField::Scalar(ScalarValue::Long(v)));
+        }
+        value
     }
 
     fn nt_scalar_long_desc() -> FieldDesc {
-        FieldDesc::Structure {
-            struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Long))],
-        }
+        NTScalar::new(ScalarType::Long).build()
     }
 
     fn nt_scalar_string(v: String) -> PvField {
-        let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
-        s.fields
-            .push(("value".into(), PvField::Scalar(ScalarValue::String(v))));
-        PvField::Structure(s)
+        let mut value = NTScalar::new(ScalarType::String).create();
+        if let PvField::Structure(s) = &mut value {
+            s.set("value", PvField::Scalar(ScalarValue::String(v)));
+        }
+        value
     }
 
     fn nt_scalar_string_desc() -> FieldDesc {
-        FieldDesc::Structure {
-            struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
-        }
+        NTScalar::new(ScalarType::String).build()
     }
 
     /// Per-cache cap on entry rows the `<prefix>:report` PV lists, so a
@@ -218,11 +219,17 @@ impl ControlSource {
         out
     }
 
-    /// B6: RPC reply descriptor — an NTScalar Long `value` plus a
-    /// human-readable `message` string.
+    /// B6: RPC reply descriptor — a gateway-private structure carrying a
+    /// numeric `value` and a human-readable `message`. The top-level
+    /// `message` member is a gateway extension with no equivalent in the
+    /// normative `epics:nt/NTScalar:1.0` layout, so the reply uses an
+    /// empty (anonymous) structure ID rather than claiming the NT ID:
+    /// pvxs reserves the NTScalar ID for structures whose members match
+    /// `NTScalar::build()` (`nt.cpp:44-53`), and a strict NT client must
+    /// not be told this is one of them.
     fn control_reply_desc() -> FieldDesc {
         FieldDesc::Structure {
-            struct_id: "epics:nt/NTScalar:1.0".into(),
+            struct_id: String::new(),
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Long)),
                 ("message".into(), FieldDesc::Scalar(ScalarType::String)),
@@ -232,7 +239,7 @@ impl ControlSource {
 
     /// B6: RPC reply value carrying a numeric result and a message.
     fn control_reply(value: i64, message: impl Into<String>) -> PvField {
-        let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+        let mut s = PvStructure::new("");
         s.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Long(value))));
         s.fields.push((
@@ -1094,5 +1101,104 @@ mod tests {
         assert!(names.contains(&"gw:flush".to_string()));
         assert!(names.contains(&"gw:drop".to_string()));
         assert!(names.contains(&"gw:reload".to_string()));
+    }
+
+    /// Member names of a structure descriptor, in declaration order.
+    fn desc_member_names(desc: &FieldDesc) -> Vec<String> {
+        match desc {
+            FieldDesc::Structure { fields, .. } => fields.iter().map(|(n, _)| n.clone()).collect(),
+            other => panic!("expected structure descriptor, got {other:?}"),
+        }
+    }
+
+    fn desc_struct_id(desc: &FieldDesc) -> String {
+        match desc {
+            FieldDesc::Structure { struct_id, .. } => struct_id.clone(),
+            other => panic!("expected structure descriptor, got {other:?}"),
+        }
+    }
+
+    /// A descriptor that advertises the normative `epics:nt/NTScalar:1.0`
+    /// structure ID MUST carry the mandatory `alarm` and `timeStamp`
+    /// members alongside `value`, matching pvxs `NTScalar::build()`
+    /// (`nt.cpp:44-53`). A truncated value-only structure under that ID
+    /// is a wire-schema contract violation for strict NT clients.
+    #[tokio::test]
+    async fn diagnostic_descriptors_are_full_ntscalar() {
+        let gw = make_source();
+        let ctrl = ControlSource::new("gw", gw);
+
+        // Long counter diagnostics (cacheSize, upstreamCount, liveSubscribers).
+        let long_desc = ctrl
+            .get_introspection("gw:cacheSize")
+            .await
+            .expect("cacheSize introspection");
+        assert_eq!(desc_struct_id(&long_desc), "epics:nt/NTScalar:1.0");
+        let names = desc_member_names(&long_desc);
+        assert!(names.contains(&"value".to_string()));
+        assert!(
+            names.contains(&"alarm".to_string()),
+            "NTScalar diagnostic must carry alarm: {names:?}"
+        );
+        assert!(
+            names.contains(&"timeStamp".to_string()),
+            "NTScalar diagnostic must carry timeStamp: {names:?}"
+        );
+
+        // String diagnostic (report).
+        let string_desc = ctrl
+            .get_introspection("gw:report")
+            .await
+            .expect("report introspection");
+        assert_eq!(desc_struct_id(&string_desc), "epics:nt/NTScalar:1.0");
+        let names = desc_member_names(&string_desc);
+        assert!(names.contains(&"alarm".to_string()));
+        assert!(names.contains(&"timeStamp".to_string()));
+
+        // The served value must match the descriptor: alarm + timeStamp
+        // sub-structures present, not just `value`.
+        let PvField::Structure(s) = ctrl
+            .get_value("gw:cacheSize")
+            .await
+            .expect("cacheSize value")
+        else {
+            panic!("diagnostic value must be a structure");
+        };
+        assert_eq!(s.struct_id, "epics:nt/NTScalar:1.0");
+        assert!(s.get_field("alarm").is_some(), "value must carry alarm");
+        assert!(
+            s.get_field("timeStamp").is_some(),
+            "value must carry timeStamp"
+        );
+    }
+
+    /// The control RPC reply carries a top-level `message` extension with
+    /// no equivalent in the normative NTScalar layout, so it must NOT
+    /// claim `epics:nt/NTScalar:1.0`: it is advertised as a gateway-private
+    /// structure with an empty (anonymous) structure ID and exactly
+    /// `[value, message]`.
+    #[tokio::test]
+    async fn control_reply_is_gateway_private_not_ntscalar() {
+        let gw = make_source();
+        let ctrl = ControlSource::new("gw", gw);
+        let desc = ctrl
+            .get_introspection("gw:flush")
+            .await
+            .expect("control PV introspection");
+        assert_eq!(
+            desc_struct_id(&desc),
+            "",
+            "control reply must not claim the normative NTScalar ID"
+        );
+        assert_eq!(
+            desc_member_names(&desc),
+            vec!["value".to_string(), "message".to_string()],
+        );
+        // The served GET value carries the same empty-ID shape.
+        let PvField::Structure(s) = ctrl.get_value("gw:flush").await.expect("control GET value")
+        else {
+            panic!("control value must be a structure");
+        };
+        assert_eq!(s.struct_id, "");
     }
 }

@@ -42,6 +42,7 @@
 
 use std::sync::Arc;
 
+use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 
 use super::source::{ChannelSource, OpError};
@@ -121,45 +122,53 @@ impl ServerInfoSource {
         PvField::Structure(s)
     }
 
-    /// FieldDesc + value for a `help` reply — an `NTScalar` string, the
-    /// same NT type pvxs `ServerSource` replies with for a request that
-    /// carries a `help` field (serversource.cpp:46-51).
+    /// FieldDesc + value for a `help` reply — a full `NTScalar` string,
+    /// the same NT type pvxs `ServerSource` replies with for a request
+    /// that carries a `help` field (`nt::NTScalar{TypeCode::String}`,
+    /// serversource.cpp:46-51). Routed through the shared [`NTScalar`]
+    /// builder so the advertised `epics:nt/NTScalar:1.0` ID carries the
+    /// mandatory `alarm` and `timeStamp` members (pvxs `NTScalar::build()`,
+    /// nt.cpp:44-53) — a strict NT client selecting the layout by ID then
+    /// finds every member it expects.
     fn help_response() -> (FieldDesc, PvField) {
-        let desc = FieldDesc::Structure {
-            struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
-        };
-        let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
-        s.fields.push((
-            "value".into(),
-            PvField::Scalar(ScalarValue::String(
-                "server PV: RPC op=channels lists hosted PVs, op=info reports \
-                 implLang/version"
-                    .into(),
-            )),
-        ));
-        (desc, PvField::Structure(s))
+        let desc = NTScalar::new(ScalarType::String).build();
+        let mut value = NTScalar::new(ScalarType::String).create();
+        if let PvField::Structure(s) = &mut value {
+            s.set(
+                "value",
+                PvField::Scalar(ScalarValue::String(
+                    "server PV: RPC op=channels lists hosted PVs, op=info reports \
+                     implLang/version"
+                        .into(),
+                )),
+            );
+        }
+        (desc, value)
     }
 
-    /// FieldDesc for the `op=channels` response — an `NTScalarArray`
+    /// FieldDesc for the `op=channels` response — a full `NTScalarArray`
     /// of strings, the same NT type pvxs's `ServerSource` replies with
-    /// (`nt::NTScalar{TypeCode::StringA}`).
+    /// (`nt::NTScalar{TypeCode::StringA}.create()`, serversource.cpp:55-80).
+    /// Routed through the shared [`NTScalar`] array builder so the
+    /// advertised `epics:nt/NTScalarArray:1.0` ID carries the mandatory
+    /// `alarm` and `timeStamp` members alongside `value`.
     pub fn channels_descriptor() -> FieldDesc {
-        FieldDesc::Structure {
-            struct_id: "epics:nt/NTScalarArray:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::String))],
-        }
+        NTScalar::array(ScalarType::String).build()
     }
 
     /// Build the `op=channels` response value from a sorted, de-duped
-    /// list of channel names.
+    /// list of channel names. The full NT shape (value + alarm +
+    /// timeStamp) comes from the shared builder; only `value` is
+    /// overwritten with the channel-name array.
     fn channels_value(names: Vec<String>) -> PvField {
-        let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
-        s.fields.push((
-            "value".into(),
-            PvField::ScalarArrayTyped(TypedScalarArray::String(Arc::from(names))),
-        ));
-        PvField::Structure(s)
+        let mut value = NTScalar::array(ScalarType::String).create();
+        if let PvField::Structure(s) = &mut value {
+            s.set(
+                "value",
+                PvField::ScalarArrayTyped(TypedScalarArray::String(Arc::from(names))),
+            );
+        }
+        value
     }
 
     /// Whether the request carries a `help` field (after NTURI `query`
@@ -380,18 +389,40 @@ mod tests {
         ]);
         let (desc, value) = nturi_op("channels");
         let (resp_desc, resp_value) = src.rpc("server", desc, value).await.expect("rpc ok");
-        // Descriptor is NTScalarArray<string>.
-        match resp_desc {
-            FieldDesc::Structure { struct_id, .. } => {
+        // Descriptor is a full NTScalarArray<string>: pvxs replies with
+        // `nt::NTScalar{TypeCode::StringA}.create()` (serversource.cpp:55-80),
+        // whose `epics:nt/NTScalarArray:1.0` ID promises value + alarm +
+        // timeStamp (nt.cpp:44-53). A strict NT client must find all three.
+        match &resp_desc {
+            FieldDesc::Structure { struct_id, fields } => {
                 assert_eq!(struct_id, "epics:nt/NTScalarArray:1.0");
+                let members: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                assert!(members.contains(&"value"), "channels desc: {members:?}");
+                assert!(
+                    members.contains(&"alarm"),
+                    "channels desc must carry alarm: {members:?}"
+                );
+                assert!(
+                    members.contains(&"timeStamp"),
+                    "channels desc must carry timeStamp: {members:?}"
+                );
             }
             other => panic!("unexpected channels descriptor: {other:?}"),
         }
-        let names = match resp_value {
-            PvField::Structure(s) => match s.get_field("value") {
-                Some(PvField::ScalarArrayTyped(TypedScalarArray::String(a))) => a.to_vec(),
-                other => panic!("unexpected channels value shape: {other:?}"),
-            },
+        let names = match &resp_value {
+            PvField::Structure(s) => {
+                // The served value matches the descriptor: alarm + timeStamp
+                // sub-structures present, not just `value`.
+                assert!(s.get_field("alarm").is_some(), "value must carry alarm");
+                assert!(
+                    s.get_field("timeStamp").is_some(),
+                    "value must carry timeStamp"
+                );
+                match s.get_field("value") {
+                    Some(PvField::ScalarArrayTyped(TypedScalarArray::String(a))) => a.to_vec(),
+                    other => panic!("unexpected channels value shape: {other:?}"),
+                }
+            }
             other => panic!("unexpected channels wrapper: {other:?}"),
         };
         assert_eq!(
@@ -454,17 +485,38 @@ mod tests {
             .rpc("server", FieldDesc::Variant, PvField::Structure(root))
             .await
             .expect("help rpc ok");
-        match desc {
-            FieldDesc::Structure { struct_id, .. } => {
+        match &desc {
+            FieldDesc::Structure { struct_id, fields } => {
                 assert_eq!(struct_id, "epics:nt/NTScalar:1.0");
+                // Full NTScalar: value + alarm + timeStamp (nt.cpp:44-53).
+                let members: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                assert!(members.contains(&"value"), "help desc: {members:?}");
+                assert!(
+                    members.contains(&"alarm"),
+                    "help desc must carry alarm: {members:?}"
+                );
+                assert!(
+                    members.contains(&"timeStamp"),
+                    "help desc must carry timeStamp: {members:?}"
+                );
             }
             other => panic!("unexpected help descriptor: {other:?}"),
         }
         match resp {
-            PvField::Structure(s) => match s.get_field("value") {
-                Some(PvField::Scalar(ScalarValue::String(_))) => {}
-                other => panic!("unexpected help value: {other:?}"),
-            },
+            PvField::Structure(s) => {
+                assert!(
+                    s.get_field("alarm").is_some(),
+                    "help value must carry alarm"
+                );
+                assert!(
+                    s.get_field("timeStamp").is_some(),
+                    "help value must carry timeStamp"
+                );
+                match s.get_field("value") {
+                    Some(PvField::Scalar(ScalarValue::String(_))) => {}
+                    other => panic!("unexpected help value: {other:?}"),
+                }
+            }
             other => panic!("unexpected help wrapper: {other:?}"),
         }
     }

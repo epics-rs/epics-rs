@@ -32,7 +32,16 @@ use crate::error::{BridgeError, BridgeResult};
 pub struct GroupPvDef {
     pub name: String,
     pub struct_id: Option<String>,
+    /// Resolved runtime atomicity. pvxs builds the group with
+    /// `atomicPutGet = (tristate != False)` (groupconfigprocessor.cpp:436),
+    /// so an unspecified `+atomic` resolves to atomic (`true`) — the
+    /// default is applied here at materialization, not during parse/merge.
     pub atomic: bool,
+    /// pvxs `atomicIsSet` presence bit (groupconfig.h:25). `true` iff some
+    /// fragment explicitly carried `+atomic`. Used only by
+    /// [`merge_group_defs`] so a later `+atomic`-less fragment cannot
+    /// overwrite an earlier explicit setting; not consumed at runtime.
+    pub atomic_is_set: bool,
     pub members: Vec<GroupMember>,
     /// Serializes concurrent PUTs to the same `atomic` group so an
     /// atomic-flagged group cannot be observed half-applied by another
@@ -386,15 +395,25 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
             if def.struct_id.is_some() {
                 existing_def.struct_id = def.struct_id;
             }
-            // atomic: last-wins with warning on conflict
-            // (pvxs groupconfigprocessor.cpp:274-288)
-            if existing_def.atomic != def.atomic {
-                eprintln!(
-                    "warning: group '{}' atomic setting inconsistent, using latest ({})",
-                    def.name, def.atomic
-                );
+            // atomic: pvxs runs `defineAtomicity` ONLY when the incoming
+            // fragment explicitly set `+atomic` (groupconfigprocessor.cpp:
+            // 194 gates on `atomicIsSet`); a fragment that omits `+atomic`
+            // leaves the merged TriState untouched. The conflict warning
+            // fires only when the group's atomicity was ALREADY explicitly
+            // set and the new explicit value differs (`atomic != Unset &&
+            // atomic != atomicity`, :279). A plain last-wins assignment let
+            // an `+atomic`-less later fragment revert an earlier explicit
+            // `+atomic:false`.
+            if def.atomic_is_set {
+                if existing_def.atomic_is_set && existing_def.atomic != def.atomic {
+                    eprintln!(
+                        "warning: group '{}' atomic setting inconsistent, using latest ({})",
+                        def.name, def.atomic
+                    );
+                }
+                existing_def.atomic = def.atomic;
+                existing_def.atomic_is_set = true;
             }
-            existing_def.atomic = def.atomic;
         } else {
             existing.insert(def.name.clone(), def);
         }
@@ -409,14 +428,18 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
 struct RawGroupDef {
     #[serde(rename = "+id")]
     id: Option<String>,
-    #[serde(rename = "+atomic", default = "default_atomic")]
-    atomic: bool,
+    // pvxs tracks `+atomic` as a value plus a presence bit
+    // (`groupconfig.h:24-31`: `atomic` defaults true, `atomicIsSet`
+    // defaults false; groupprocessorcontext.cpp:27-30 sets the bit only
+    // when the JSON actually carries `+atomic`). `Option<bool>` is the
+    // faithful model: `None` == not specified by THIS fragment, so a
+    // later fragment that omits `+atomic` must not clobber an earlier
+    // explicit setting during merge. A plain `bool` with a `true`
+    // default erased that distinction.
+    #[serde(rename = "+atomic", default)]
+    atomic: Option<bool>,
     #[serde(flatten)]
     fields: HashMap<String, serde_json::Value>,
-}
-
-fn default_atomic() -> bool {
-    true
 }
 
 /// canonical group-member ordering — `put_order` primary,
@@ -515,7 +538,11 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
     let mut def = GroupPvDef {
         name,
         struct_id: raw.id,
-        atomic: raw.atomic,
+        // Resolve the TriState to pvxs's runtime rule `atomic != False`
+        // (groupconfigprocessor.cpp:436): unset (`None`) and explicit
+        // `true` both resolve atomic, only explicit `false` is non-atomic.
+        atomic: raw.atomic != Some(false),
+        atomic_is_set: raw.atomic.is_some(),
         members,
         atomic_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -1127,6 +1154,68 @@ mod tests {
         assert!(
             matches!(a.triggers, TriggerDef::None),
             "merge that introduces an explicit-trigger member must demote the earlier no-trigger member to silent"
+        );
+    }
+
+    /// An unspecified `+atomic` resolves to atomic (`true`) but leaves
+    /// the presence bit clear — pvxs `atomicPutGet = (TriState != False)`
+    /// with `atomicIsSet=false` (groupconfig.h:25, groupconfigprocessor
+    /// .cpp:436).
+    #[test]
+    fn group_without_atomic_resolves_true_but_unset() {
+        let g = &parse_group_config(r#"{ "G:d": { "a": { "+channel": "R.A" } } }"#).unwrap()[0];
+        assert!(
+            g.atomic,
+            "omitted +atomic resolves atomic (TriState != False)"
+        );
+        assert!(
+            !g.atomic_is_set,
+            "presence bit must stay clear when +atomic omitted"
+        );
+    }
+
+    /// A later `info(Q:group)` fragment that omits `+atomic` must not
+    /// revert an earlier explicit `+atomic:false`. pvxs only runs
+    /// `defineAtomicity` when the incoming fragment set `atomicIsSet`
+    /// (groupconfigprocessor.cpp:194); an omitting fragment leaves the
+    /// merged TriState untouched. Verified in both merge orders.
+    #[test]
+    fn br_63_omitted_atomic_preserves_explicit_false() {
+        use std::collections::HashMap;
+        let explicit_false = parse_group_config(
+            r#"{ "G:split": { "+atomic": false, "a": { "+channel": "R.A" } } }"#,
+        )
+        .unwrap();
+        let omits_atomic =
+            parse_group_config(r#"{ "G:split": { "b": { "+channel": "R.B" } } }"#).unwrap();
+
+        // Order 1: explicit-false first, omitting fragment merged on top.
+        let mut map: HashMap<String, GroupPvDef> = explicit_false
+            .iter()
+            .cloned()
+            .map(|d| (d.name.clone(), d))
+            .collect();
+        merge_group_defs(&mut map, omits_atomic.clone());
+        assert!(
+            !map["G:split"].atomic,
+            "omitted +atomic must not revert explicit +atomic:false (explicit-first)"
+        );
+
+        // Order 2: omitting fragment first (resolves to default atomic),
+        // explicit-false merged on top — the explicit setting wins.
+        let mut map2: HashMap<String, GroupPvDef> = omits_atomic
+            .iter()
+            .cloned()
+            .map(|d| (d.name.clone(), d))
+            .collect();
+        merge_group_defs(&mut map2, explicit_false.clone());
+        assert!(
+            !map2["G:split"].atomic,
+            "explicit +atomic:false must win over an earlier default (omit-first)"
+        );
+        assert!(
+            map2["G:split"].atomic_is_set,
+            "presence bit set after an explicit +atomic merges in"
         );
     }
 

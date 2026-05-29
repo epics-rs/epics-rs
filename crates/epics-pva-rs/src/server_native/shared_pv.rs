@@ -267,12 +267,31 @@ impl MonitorInbox {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Open/closed lifecycle of a SharedPV's published type + value.
+///
+/// pvxs keys the entire open-state on a single member, `impl->current`
+/// (`sharedpv.cpp:391` `isOpen() = !!impl->current`): `open()` sets it,
+/// `close()` clears it (`:404-405`), and `fetch()` throws `"open() first"`
+/// whenever it is empty (`:443-469`). Modelling the descriptor and value
+/// only inside the `Open` variant reproduces that single source of truth:
+/// "closed ⟹ nothing readable" holds by construction, because there is no
+/// desc/value field to read while `Closed`. This is what stops a closed PV
+/// from surfacing a stale descriptor/value through `current()` /
+/// `introspection()` (and hence GET / GET_FIELD), the way three independent
+/// `desc`/`value`/`is_open` fields allowed when `close()` only flipped the
+/// flag.
+enum PvState {
+    /// Not opened (or closed): no descriptor or value exists.
+    Closed,
+    /// Opened: both the declared type and the most recent value are present.
+    Open { desc: FieldDesc, value: PvField },
+}
+
 /// Per-PV state stored inside [`SharedPV`].
 struct Inner {
-    /// Type descriptor declared at open() — None when not opened.
-    desc: Option<FieldDesc>,
-    /// Most recent value (defaulted from desc on open).
-    value: Option<PvField>,
+    /// Published type + value, or `Closed`. Single source of truth for
+    /// open-state (pvxs `impl->current`).
+    state: PvState,
     /// Open subscribers. Each slot holds a MonitorOutbox for squash-to-tail delivery.
     subscribers: Vec<MonitorOutbox>,
     /// Optional flow-control watermark: monitor stream sends MORE
@@ -282,8 +301,6 @@ struct Inner {
     /// Pause sending updates when the monitor outbox depth is at or
     /// above `high_watermark`. Currently advisory.
     pub high_watermark: usize,
-    /// `is_open` is required to reject GETs after close().
-    is_open: bool,
     /// Optional user put handler; when None the default "store and
     /// post" behavior runs. pvxs `onPut` parity.
     on_put: Option<OnPutFn>,
@@ -316,12 +333,10 @@ struct Inner {
 impl Default for Inner {
     fn default() -> Self {
         Self {
-            desc: None,
-            value: None,
+            state: PvState::Closed,
             subscribers: Vec::new(),
             low_watermark: 4,
             high_watermark: 64,
-            is_open: false,
             on_put: None,
             on_rpc: None,
             on_process: None,
@@ -356,32 +371,44 @@ impl SharedPV {
     /// the new value on next post().
     pub fn open(&self, desc: FieldDesc, initial: PvField) {
         let mut g = self.inner.lock();
-        g.desc = Some(desc);
-        g.value = Some(initial);
-        g.is_open = true;
+        g.state = PvState::Open {
+            desc,
+            value: initial,
+        };
     }
 
     /// Returns true iff the PV has been opened.
     pub fn is_open(&self) -> bool {
-        self.inner.lock().is_open
+        matches!(self.inner.lock().state, PvState::Open { .. })
     }
 
-    /// Drop all subscribers; subsequent GETs return `None` until
-    /// open() is called again.
+    /// Close the PV: clear its descriptor and value and drop all
+    /// subscribers. After close, `current()` / `introspection()` (and
+    /// thus GET / GET_FIELD) return `None` until `open()` is called
+    /// again — pvxs `sharedpv.cpp:404-405` clears `impl->current`, which
+    /// is exactly what makes `fetch()` throw `"open() first"` afterwards
+    /// (`:443-469`). Channel-lifecycle teardown of attached clients
+    /// (pvxs `:411-414`) is a separate lifecycle concern.
     pub fn close(&self) {
         let mut g = self.inner.lock();
-        g.is_open = false;
+        g.state = PvState::Closed;
         g.subscribers.clear();
     }
 
-    /// Type descriptor (None until opened).
+    /// Type descriptor (None while closed).
     pub fn introspection(&self) -> Option<FieldDesc> {
-        self.inner.lock().desc.clone()
+        match &self.inner.lock().state {
+            PvState::Open { desc, .. } => Some(desc.clone()),
+            PvState::Closed => None,
+        }
     }
 
-    /// Current value (None until opened).
+    /// Current value (None while closed).
     pub fn current(&self) -> Option<PvField> {
-        self.inner.lock().value.clone()
+        match &self.inner.lock().state {
+            PvState::Open { value, .. } => Some(value.clone()),
+            PvState::Closed => None,
+        }
     }
 
     /// Push a new value to all subscribers; lossy semantics — drops
@@ -419,22 +446,21 @@ impl SharedPV {
     /// value only on `Ok`.
     pub fn try_post_checked(&self, value: PvField) -> crate::error::PvaResult<usize> {
         let mut g = self.inner.lock();
-        if !g.is_open {
+        let inner = &mut *g;
+        let PvState::Open { desc, value: cur } = &mut inner.state else {
             return Err(crate::error::PvaError::Protocol(
                 "SharedPV not open".to_string(),
             ));
+        };
+        if let Err(e) = crate::pvdata::value_matches_descriptor(&value, desc) {
+            return Err(crate::error::PvaError::InvalidValue(format!(
+                "SharedPV::try_post: value does not fit opened descriptor ({e})"
+            )));
         }
-        if let Some(desc) = g.desc.as_ref() {
-            if let Err(e) = crate::pvdata::value_matches_descriptor(&value, desc) {
-                return Err(crate::error::PvaError::InvalidValue(format!(
-                    "SharedPV::try_post: value does not fit opened descriptor ({e})"
-                )));
-            }
-        }
-        g.value = Some(value.clone());
+        *cur = value.clone();
         // pvxs servermon.cpp:283-286: normal post squashes tail when queue full.
-        g.subscribers.retain(|tx| tx.post(value.clone(), false));
-        Ok(g.subscribers.len())
+        inner.subscribers.retain(|tx| tx.post(value.clone(), false));
+        Ok(inner.subscribers.len())
     }
 
     /// Add a subscriber. Returns a [`MonitorInbox`] that yields posted values
@@ -450,14 +476,13 @@ impl SharedPV {
         // can't recurse on parking_lot Mutex.
         let cb = {
             let mut g = self.inner.lock();
-            if !g.is_open {
+            let PvState::Open { value, .. } = &g.state else {
                 return None;
-            }
+            };
+            // Initial value: queue is empty so limit not yet reached.
+            let initial = value.clone();
             let (outbox, inbox) = make_monitor_queue(limit);
-            if let Some(v) = &g.value {
-                // Initial value: queue is empty so limit not yet reached.
-                outbox.post(v.clone(), false);
-            }
+            outbox.post(initial, false);
             let was_empty = g.subscribers.is_empty();
             g.subscribers.push(outbox);
             let cb = if was_empty {
@@ -538,44 +563,40 @@ impl SharedPV {
         }
         let applied = {
             let mut g = self.inner.lock();
-            if !g.is_open {
+            let inner = &mut *g;
+            let PvState::Open {
+                desc: opened,
+                value: prior,
+            } = &mut inner.state
+            else {
                 return Err("SharedPV not open".into());
-            }
-            let merged = match &g.value {
-                Some(prior) => {
-                    crate::pvdata::encode::fill_unmarked_from_prior(desc, changed, 0, delta, prior)
-                }
-                // No prior value yet: the delta is all we have.
-                None => delta,
             };
-            match g.on_put.clone() {
+            let merged =
+                crate::pvdata::encode::fill_unmarked_from_prior(desc, changed, 0, delta, prior);
+            match inner.on_put.clone() {
                 Some(handler) => Applied::Handler {
                     handler,
                     value: merged,
                 },
                 None => {
-                    // descriptor enforcement for the
-                    // no-handler store path. Without a check the
-                    // merged value could carry a shape unrelated
-                    // to the opened descriptor (pvxs `sharedpv.cpp:
-                    // 417-431` rejects this). Compare against
-                    // `g.desc` (the opened descriptor, not the
-                    // per-put `desc` parameter — the wire request
-                    // may carry a stale descriptor cached by the
-                    // peer).
-                    if let Some(opened) = g.desc.as_ref() {
-                        if let Err(e) = crate::pvdata::value_matches_descriptor(&merged, opened) {
-                            return Err(format!(
-                                "SharedPV::put_delta: merged value does not fit opened descriptor ({e})"
-                            ));
-                        }
+                    // descriptor enforcement for the no-handler store
+                    // path. Without a check the merged value could carry
+                    // a shape unrelated to the opened descriptor (pvxs
+                    // `sharedpv.cpp:417-431` rejects this). Compare
+                    // against the opened descriptor (`opened`), not the
+                    // per-put `desc` parameter — the wire request may
+                    // carry a stale descriptor cached by the peer.
+                    if let Err(e) = crate::pvdata::value_matches_descriptor(&merged, opened) {
+                        return Err(format!(
+                            "SharedPV::put_delta: merged value does not fit opened descriptor ({e})"
+                        ));
                     }
                     // Store atomically with the read above so a
                     // concurrent put_delta sees this as its prior.
-                    g.value = Some(merged.clone());
+                    *prior = merged.clone();
                     Applied::Posted {
                         value: merged,
-                        subscribers: g.subscribers.clone(),
+                        subscribers: inner.subscribers.clone(),
                     }
                 }
             }
@@ -722,12 +743,12 @@ impl SharedPV {
     /// `SharedPV::fetch`.
     pub fn fetch(&self, out: &mut Option<PvField>) -> bool {
         let g = self.inner.lock();
-        match (&g.value, g.is_open) {
-            (Some(v), true) => {
-                *out = Some(v.clone());
+        match &g.state {
+            PvState::Open { value, .. } => {
+                *out = Some(value.clone());
                 true
             }
-            _ => false,
+            PvState::Closed => false,
         }
     }
 
@@ -1151,6 +1172,80 @@ mod tests {
         pv.close();
         assert!(!pv.is_open());
         assert_eq!(pv.try_post(nt_scalar_int_value(1)), 0);
+    }
+
+    /// Regression: pvxs `close()` clears `impl->current`
+    /// (`sharedpv.cpp:404-405`), so afterwards the descriptor and value
+    /// are gone and `fetch()` throws `"open() first"` (`:443-469`). The
+    /// Rust `close()` previously only flipped `is_open` and left
+    /// `desc`/`value` populated, so `current()` / `introspection()` (and
+    /// the GET / GET_FIELD wire paths that read them) surfaced the stale
+    /// pre-close state. After the close all of `current()`,
+    /// `introspection()`, `fetch()`, and a new `subscribe()` must report
+    /// withdrawn; a fresh `open()` must restore them.
+    #[test]
+    fn shared_pv_close_withdraws_descriptor_value_and_fetch() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(42));
+        assert!(pv.current().is_some());
+        assert!(pv.introspection().is_some());
+
+        pv.close();
+
+        assert!(!pv.is_open());
+        assert!(
+            pv.current().is_none(),
+            "closed SharedPV must not surface a stale value"
+        );
+        assert!(
+            pv.introspection().is_none(),
+            "closed SharedPV must not surface a stale descriptor"
+        );
+        let mut snap = None;
+        assert!(
+            !pv.fetch(&mut snap),
+            "fetch() on a closed SharedPV must report no value"
+        );
+        assert!(snap.is_none());
+        assert!(
+            pv.subscribe(8).is_none(),
+            "subscribe() on a closed SharedPV must be rejected"
+        );
+
+        // Reopen restores the lifecycle.
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(7));
+        assert!(pv.is_open());
+        assert!(pv.current().is_some());
+        assert!(pv.introspection().is_some());
+    }
+
+    /// Regression: the GET / GET_FIELD wire paths read through
+    /// `SharedSource::get_value` / `get_introspection`, which forward to
+    /// `SharedPV::current()` / `introspection()`. A closed PV must report
+    /// `None` on both, matching pvxs withdrawing `impl->current` so a
+    /// post-close fetch throws `"open() first"` (`sharedpv.cpp:443-469`).
+    #[tokio::test]
+    async fn shared_source_get_paths_withdraw_after_close() {
+        use crate::server_native::source::ChannelSource;
+
+        let src = SharedSource::new();
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(42));
+        src.add("X", pv.clone());
+
+        assert!(src.get_value("X").await.is_some());
+        assert!(src.get_introspection("X").await.is_some());
+
+        pv.close();
+
+        assert!(
+            src.get_value("X").await.is_none(),
+            "GET on a closed SharedPV must not return a stale value"
+        );
+        assert!(
+            src.get_introspection("X").await.is_none(),
+            "GET_FIELD on a closed SharedPV must not return a stale descriptor"
+        );
     }
 
     fn extract_int(v: &PvField) -> i32 {

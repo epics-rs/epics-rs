@@ -895,10 +895,16 @@ impl ChannelSource for GatewayChannelSource {
     }
 
     async fn get_value(&self, name: &str) -> Option<PvField> {
-        let entry = self.cache.lookup(name, self.connect_timeout).await.ok()?;
-        // Prefer the cached monitor snapshot — same value the upstream
-        // server would return to a fresh GET, no extra round-trip.
-        entry.snapshot()
+        // Forward a real upstream ChannelGet rather than serving the cached
+        // monitor snapshot. pva2pva `p2pApp/channel.cpp:109-115` implements
+        // GET as `entry->channel->createChannelGet(channelGetRequester,
+        // pvRequest)`; the monitor cache (`moncache.cpp`) feeds downstream
+        // MONITOR fanout only and never answers a ChannelGet. Replaying the
+        // snapshot returned a value that could be stale at GET time, skipped
+        // any upstream GET-side processing, and forced non-monitorable PVs
+        // through the monitor path. `pvget` issues a one-shot GET that reuses
+        // the client's connection pool, so no extra upstream search is paid.
+        self.cache.client().pvget(name).await.ok()
     }
 
     /// Ctx-less PUT (no downstream credentials). BUG 3: this path
@@ -1160,10 +1166,11 @@ impl ChannelSource for GatewayChannelSource {
         self.subscribe_inner(self.cache.clone(), name).await
     }
 
-    /// route GET through per-credential upstream cache so the
-    /// upstream IOC sees the real downstream identity. Pre-fix the
-    /// default trait impl called `self.get_value(name)` which used the
-    /// shared cache regardless of downstream credentials.
+    /// route GET through the per-credential upstream client so the
+    /// upstream IOC sees the real downstream identity. Pre-fix this
+    /// served `entry.snapshot()` from the monitor cache, which returned
+    /// stale cached state instead of forwarding a real upstream ChannelGet
+    /// (see `get_value` for the pva2pva `channel.cpp:109-115` rationale).
     async fn get_value_checked(
         &self,
         checked: AccessChecked,
@@ -1172,12 +1179,17 @@ impl ChannelSource for GatewayChannelSource {
         if !checked.allows_read() {
             return None;
         }
-        let cache = self.upstream_cache_for(&ctx);
-        let entry = cache
-            .lookup(checked.pv_name(), self.connect_timeout)
+        // Forward a real upstream ChannelGet through the per-credential
+        // client so the upstream IOC sees the real downstream identity and
+        // owns GET freshness — the same identity-preserving routing
+        // `put_value_checked` / `rpc_checked` / `process_checked` already use.
+        // pva2pva `channel.cpp:109-115` forwards createChannelGet rather than
+        // replaying the monitor cache; the snapshot path returned stale cache
+        // state and never ran the upstream GET-side handler.
+        self.upstream_client_for(&ctx)
+            .pvget(checked.pv_name())
             .await
-            .ok()?;
-        entry.snapshot()
+            .ok()
     }
 
     /// route MONITOR through per-credential upstream cache.

@@ -24,7 +24,7 @@ use epics_base_rs::types::EpicsValue;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
 use super::config::{LinkDirection, PvaLinkConfig};
-use super::link::{PvaLink, PvaLinkError, PvaLinkResult};
+use super::link::{PvaLink, PvaLinkError, PvaLinkResult, ScanEvent};
 use super::registry::PvaLinkRegistry;
 
 /// Wrap `tokio::task::block_in_place(f)` with a runtime-flavour check.
@@ -671,7 +671,7 @@ type ScanTargetMap = Arc<parking_lot::RwLock<std::collections::HashMap<String, S
 /// is dropped (i.e. the link is closed).
 async fn run_notify_forwarder(
     pv_name: String,
-    mut rx: tokio::sync::mpsc::Receiver<PvField>,
+    mut rx: tokio::sync::mpsc::Receiver<ScanEvent>,
     scan_targets: ScanTargetMap,
     db: Arc<parking_lot::RwLock<Option<PvDatabase>>>,
 ) {
@@ -680,7 +680,20 @@ async fn run_notify_forwarder(
     // pvxs per-`pvaLink` change tracking (`pvalink_link.cpp:91`).
     let mut last: std::collections::HashMap<(String, String), PvField> =
         std::collections::HashMap::new();
-    while let Some(value) = rx.recv().await {
+    while let Some(event) = rx.recv().await {
+        // A `Value` event carries a fresh monitor value and drives
+        // per-field change detection; a `Disconnected` lifecycle event
+        // carries no value and scans every CP / eligible-CPP target
+        // unconditionally. pvxs runs the SAME scan loop
+        // (`pvxs/ioc/pvalink_channel.cpp:420-432`) after both the
+        // value-update branch and the `catch(client::Disconnect&)`
+        // branch (`:359-373`), so a CP/CPP record observes the
+        // upstream disconnect (LINK_ALARM/INVALID) even when no new
+        // value arrives.
+        let value_opt: Option<PvField> = match event {
+            ScanEvent::Value(v) => Some(v),
+            ScanEvent::Disconnected => None,
+        };
         // Snapshot the fan-out, then order it: atomic group first,
         // then non-atomic; `monorder` within each group.
         let mut targets: Vec<(String, bool, i32, bool, bool, String)> =
@@ -758,13 +771,26 @@ async fn run_notify_forwarder(
             // scans unconditionally; atomic scans whenever any atomic
             // sibling changed; CPP (`always=false`, non-atomic) only
             // scans when this target's field leaf changed.
-            let changed = {
-                let leaf = extract_leaf(&value, field);
-                let key = (record.clone(), field.clone());
-                let prev = last.get(&key);
-                let did_change = prev != Some(&leaf);
-                last.insert(key, leaf);
-                did_change
+            let changed = match &value_opt {
+                Some(value) => {
+                    let leaf = extract_leaf(value, field);
+                    let key = (record.clone(), field.clone());
+                    let prev = last.get(&key);
+                    let did_change = prev != Some(&leaf);
+                    last.insert(key, leaf);
+                    did_change
+                }
+                // Lifecycle (disconnect) event: there is no value to
+                // compare, so the per-field change gate does not apply
+                // — every CP and atomic target scans, and the
+                // `passive_only` gate below still restricts CPP to
+                // passive owners. pvxs scans the full atomic/non-atomic
+                // target lists on the disconnect path with no
+                // value-difference test (`pvalink_channel.cpp:420-432`).
+                // `last` is intentionally left untouched so the first
+                // post-reconnect value still change-detects against the
+                // pre-disconnect leaf.
+                None => true,
             };
             if !changed && !*always && !*atomic {
                 continue;
@@ -1731,7 +1757,7 @@ mod tests {
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
         let forwarder = tokio::spawn(run_notify_forwarder(
             "SRC".to_string(),
             rx,
@@ -1740,8 +1766,8 @@ mod tests {
         ));
 
         // Two distinct values → two scans.
-        tx.send(nt_scalar(1.0)).await.unwrap();
-        tx.send(nt_scalar(2.0)).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(2.0))).await.unwrap();
         drop(tx); // close channel so the forwarder loop ends
         forwarder.await.unwrap();
 
@@ -1778,7 +1804,7 @@ mod tests {
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
         let forwarder = tokio::spawn(run_notify_forwarder(
             "SRC".to_string(),
             rx,
@@ -1787,14 +1813,102 @@ mod tests {
         ));
 
         // 1.0 (change), 1.0 (no-op → skipped), 3.0 (change).
-        tx.send(nt_scalar(1.0)).await.unwrap();
-        tx.send(nt_scalar(1.0)).await.unwrap();
-        tx.send(nt_scalar(3.0)).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(3.0))).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
 
         // Only the two changed events scanned.
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A `Disconnected` lifecycle event scans CP and passive-CPP
+    /// targets even though no value accompanies it, so the owning
+    /// record processes the upstream disconnect (and can expose
+    /// LINK_ALARM/INVALID). pvxs runs the same scan loop after the
+    /// `catch(client::Disconnect&)` branch as after a value update
+    /// (`pvxs/ioc/pvalink_channel.cpp:359-373` + `:420-432`).
+    ///
+    /// Pre-fix the forwarder channel carried only `PvField` values, so
+    /// a disconnect produced no event and the record was never
+    /// processed until some later unrelated trigger — here that would
+    /// leave each count at 1 (the single value) instead of 2.
+    #[tokio::test]
+    async fn forwarder_scans_cp_and_passive_cpp_on_disconnect() {
+        let db = PvDatabase::new();
+        let cp_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cpp_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        db.add_record(
+            "CP_REC",
+            Box::new(CountingRecord {
+                count: cp_count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        // CPP target's owner defaults to SCAN=Passive, so the
+        // `passive_only` gate admits it.
+        db.add_record(
+            "CPP_REC",
+            Box::new(CountingRecord {
+                count: cpp_count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut fanout = ScanFanout::default();
+        // CP: always=false (subject to the value change-gate), not
+        // passive-restricted.
+        fanout.records.push(ScanTarget {
+            record: "CP_REC".to_string(),
+            always: false,
+            monorder: 0,
+            atomic: false,
+            passive_only: false,
+            field: String::new(),
+        });
+        // CPP: passive-restricted; owner is Passive so it is eligible.
+        fanout.records.push(ScanTarget {
+            record: "CPP_REC".to_string(),
+            always: false,
+            monorder: 1,
+            atomic: false,
+            passive_only: true,
+            field: String::new(),
+        });
+        let scan_targets: ScanTargetMap =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
+                ("SRC".to_string(), fanout),
+            ])));
+        let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            "SRC".to_string(),
+            rx,
+            scan_targets,
+            db_slot,
+        ));
+
+        // One value (each target scans once), then a disconnect with no
+        // trailing value (each target must scan again).
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
+        tx.send(ScanEvent::Disconnected).await.unwrap();
+        drop(tx);
+        forwarder.await.unwrap();
+
+        assert_eq!(
+            cp_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "CP target must process on the value AND the disconnect"
+        );
+        assert_eq!(
+            cpp_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "passive CPP target must process on the value AND the disconnect"
+        );
     }
 
     /// B3: a pvalink-driven update fans out through the owning
@@ -1847,7 +1961,7 @@ mod tests {
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
         let forwarder = tokio::spawn(run_notify_forwarder(
             "SRC".to_string(),
             rx,
@@ -1855,7 +1969,7 @@ mod tests {
             db_slot,
         ));
 
-        tx.send(nt_scalar(5.0)).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(5.0))).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
 
@@ -2072,14 +2186,14 @@ mod tests {
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(4);
         let forwarder = tokio::spawn(run_notify_forwarder(
             "SRC".to_string(),
             rx,
             scan_targets,
             db_slot,
         ));
-        tx.send(nt_scalar(1.0)).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
 
@@ -2116,7 +2230,7 @@ mod tests {
                 ("SRC".to_string(), fanout),
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
-        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(4);
         let forwarder = tokio::spawn(run_notify_forwarder(
             "SRC".to_string(),
             rx,
@@ -2125,8 +2239,8 @@ mod tests {
         ));
         // Two identical values: the 2nd is a no-op. A plain CPP link
         // would scan once; atomic makes it scan both times.
-        tx.send(nt_scalar(1.0)).await.unwrap();
-        tx.send(nt_scalar(1.0)).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -2605,7 +2719,7 @@ mod tests {
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db.clone())));
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(4);
         let forwarder = tokio::spawn(run_notify_forwarder(
             "SRC".to_string(),
             rx,
@@ -2626,7 +2740,7 @@ mod tests {
             competitor_log.lock().push("EXTERNAL".to_string());
         });
 
-        tx.send(nt_scalar(1.0)).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
         competitor.await.unwrap();

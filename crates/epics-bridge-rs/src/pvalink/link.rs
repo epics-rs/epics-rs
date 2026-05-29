@@ -37,6 +37,35 @@ pub enum PvaLinkError {
 
 pub type PvaLinkResult<T> = Result<T, PvaLinkError>;
 
+/// A lifecycle-aware event delivered to the scan-on-update forwarder
+/// for an INP+monitor link.
+///
+/// pvxs `pvaLinkChannel::run()` scans every CP / eligible-CPP target
+/// after BOTH the monitor value-update branch AND the
+/// `catch(client::Disconnect&)` branch — the same
+/// `atomic_records` / `nonatomic_records` scan loop runs with no
+/// value comparison (`pvxs/ioc/pvalink_channel.cpp:359-373` sets
+/// `connected=false` + `onDisconnect()`, then `:420-432` scans). A
+/// value-only channel can only fire the forwarder on `Value`, so a
+/// disconnect with no trailing value was silently missed and the CP
+/// record never observed LINK_ALARM/INVALID. `Disconnected` carries
+/// that lifecycle transition so the forwarder runs the scan path
+/// even when no new `PvField` arrives.
+///
+/// Reconnect needs no separate variant: the re-subscribe loop's first
+/// post-reconnect monitor callback delivers a `Value`, which already
+/// drives the scan (matching pvxs's reconnect/`onTypeChange` scan at
+/// `:342-352`).
+#[derive(Debug, Clone)]
+pub enum ScanEvent {
+    /// A fresh monitor value arrived; drives per-field change detection.
+    Value(PvField),
+    /// The live monitor subscription ended (IOC restart / transient
+    /// I/O). Carries no value; the forwarder scans CP/CPP targets
+    /// unconditionally so the owning record processes the disconnect.
+    Disconnected,
+}
+
 /// A live PVA link.
 ///
 /// Constructed once per record-link instance. For INP links the optional
@@ -74,7 +103,12 @@ pub struct PvaLink {
     /// `scan_on_update` / CP processing of the owning record. Wrapped
     /// in a `Mutex<Option<..>>` because the receiver is single-consumer
     /// and is moved out exactly once.
-    notify_rx: Mutex<Option<mpsc::Receiver<PvField>>>,
+    ///
+    /// Carries [`ScanEvent`], not a bare `PvField`: the monitor task
+    /// also pushes a `Disconnected` lifecycle event when a live
+    /// subscription ends, so the forwarder can scan CP/CPP targets on
+    /// the disconnect even though no value accompanies it.
+    notify_rx: Mutex<Option<mpsc::Receiver<ScanEvent>>>,
     /// Deferred / retry Put queue (OUT links, B4 `defer` / `retry`).
     ///
     /// `defer=true` causes `write` to enqueue here instead of issuing
@@ -138,7 +172,7 @@ impl PvaLink {
             // events. `try_send` below still tolerates a full
             // channel (the `latest` cache is authoritative for the
             // value itself; the channel only drives scan-on-update).
-            let (tx, rx) = mpsc::channel::<PvField>(config.queue_size.max(1));
+            let (tx, rx) = mpsc::channel::<ScanEvent>(config.queue_size.max(1));
             notify_rx = Some(rx);
 
             let pv_name = config.pv_name.clone();
@@ -177,7 +211,7 @@ impl PvaLink {
                     let on_event = move |value: &PvField| {
                         connected_inner.store(true, Ordering::Release);
                         *latest_inner.lock() = Some(value.clone());
-                        let _ = tx_inner.try_send(value.clone());
+                        let _ = tx_inner.try_send(ScanEvent::Value(value.clone()));
                     };
                     let result = match &request {
                         Some(req) => {
@@ -189,7 +223,28 @@ impl PvaLink {
                     };
                     // Subscription ended — reflect the disconnect so
                     // `is_connected()` goes false until re-subscribed.
-                    connected_for_task.store(false, Ordering::Release);
+                    // `swap` reports whether the subscription had been
+                    // live (any event delivered): pvxs only runs the
+                    // disconnect scan path for a channel that was
+                    // connected (`pvalink_channel.cpp:342` gates the
+                    // `Disconnect` handling on the prior `connected`
+                    // state), so a never-connected subscription failure
+                    // must not synthesize a spurious disconnect scan.
+                    let was_connected = connected_for_task.swap(false, Ordering::AcqRel);
+                    if was_connected {
+                        // Notify the scan forwarder of the lifecycle
+                        // transition so CP / passive-CPP targets process
+                        // and expose LINK_ALARM/INVALID even though no
+                        // value follows the disconnect. pvxs scans the
+                        // atomic/non-atomic target lists after the
+                        // `catch(client::Disconnect&)` branch
+                        // (`pvalink_channel.cpp:359-373` + `:420-432`).
+                        // `try_send` matches the value path: the channel
+                        // is drained promptly and a single disconnect
+                        // event sits alone, so a drop here is only
+                        // possible under an already-saturated backlog.
+                        let _ = tx.try_send(ScanEvent::Disconnected);
+                    }
                     match &result {
                         Ok(()) => tracing::debug!(
                             pv = %pv_name,
@@ -226,7 +281,7 @@ impl PvaLink {
     /// scan-on-update forwarder. `None` for OUT / non-monitor links
     /// (they never created a channel) or after the receiver has
     /// already been claimed.
-    pub fn take_notify_rx(&self) -> Option<mpsc::Receiver<PvField>> {
+    pub fn take_notify_rx(&self) -> Option<mpsc::Receiver<ScanEvent>> {
         self.notify_rx.lock().take()
     }
 

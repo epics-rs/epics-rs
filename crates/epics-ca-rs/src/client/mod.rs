@@ -2293,6 +2293,62 @@ impl CaChannel {
         self.send_write_nowait_fast(&snap, snap.native_type as u16, count, payload)
     }
 
+    /// Write `value`'s payload under an explicit DBR wire type
+    /// (`dbr_type`) rather than the channel's native type, waiting for the
+    /// completion callback with `timeout`.
+    ///
+    /// This is the C `caput` write model: the tool — not the channel —
+    /// selects `dbrType` (`DBR_STRING` for CLI string/number conversion,
+    /// `DBR_CHAR` for `-S` long strings) and hands the matching buffer to
+    /// `ca_array_put_callback(dbrType, count, chid, pbuf)`
+    /// (`caput.c:556-563`); the server then converts to the native field
+    /// type. `count` and the payload come from `value`, so an
+    /// `EpicsValue::String` writes one 40-byte `DBR_STRING` and an
+    /// `EpicsValue::CharArray` writes `bytes.len()` `DBR_CHAR`.
+    ///
+    /// Distinct from [`Self::put_with_timeout`], which forces the channel
+    /// native type and is the programmatic native-typed write API. Use
+    /// this only for C-tool-parity paths that must control the wire type.
+    pub async fn put_as_dbr_with_timeout(
+        &self,
+        dbr_type: u16,
+        value: &EpicsValue,
+        timeout: Duration,
+    ) -> CaResult<()> {
+        let snap = self.snapshot()?;
+        let count = value.count() as u32;
+        validate_put_count(&snap, count)?;
+        validate_put_strings(value)?;
+
+        let ioid = self.in_flight.alloc_ioid();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
+
+        let payload = value.to_bytes();
+        if let Err(e) = self.send_write_notify_fast(&snap, dbr_type, count, ioid, payload) {
+            self.in_flight.writes.remove(&ioid);
+            return Err(e);
+        }
+
+        let result = tokio::time::timeout(timeout, reply_rx).await;
+        self.in_flight.writes.remove(&ioid);
+        result
+            .map_err(|_| CaError::Timeout)?
+            .map_err(|_| CaError::Shutdown)?
+    }
+
+    /// Fire-and-forget variant of [`Self::put_as_dbr_with_timeout`] —
+    /// sends the payload under `dbr_type` via `CA_PROTO_WRITE` without
+    /// waiting for server acknowledgement.
+    pub async fn put_as_dbr_nowait(&self, dbr_type: u16, value: &EpicsValue) -> CaResult<()> {
+        let snap = self.snapshot()?;
+        let count = value.count() as u32;
+        validate_put_count(&snap, count)?;
+        validate_put_strings(value)?;
+        let payload = value.to_bytes();
+        self.send_write_nowait_fast(&snap, dbr_type, count, payload)
+    }
+
     /// Write a string value to the channel as `DBR_STRING` (DBR type 0)
     /// regardless of the channel's native type, and wait for the
     /// completion callback.

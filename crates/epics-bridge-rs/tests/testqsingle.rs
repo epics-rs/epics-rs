@@ -476,3 +476,121 @@ async fn lsi_long_string_get_put_round_trips_as_string() {
         other => panic!("expected updated string, got {other:?}"),
     }
 }
+
+/// BR-59 parity: a common-field channel (`.DESC`, `.PROC`, `.UTAG`, …)
+/// must advertise its real DBF type in the `getField` descriptor, not
+/// the `double` fallback. pvxs derives the served type from
+/// `dbChannelFinalFieldType(chan)` (singlesource.cpp:189-205), which
+/// covers `dbCommon` fields. Because the descriptor type and the GET
+/// value both come from the field's resolved value, they must agree —
+/// the prior `field_list` + `Double` fallback produced `double value`
+/// descriptors over string/char/enum/ulong payloads.
+#[tokio::test]
+async fn common_field_descriptor_matches_value_type() {
+    use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:ai", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+
+    // (field, expected descriptor scalar type)
+    let cases = [
+        ("TEST:ai.DESC", ScalarType::String), // DBF_STRING
+        ("TEST:ai.PROC", ScalarType::Byte),   // DBF_CHAR
+        ("TEST:ai.UTAG", ScalarType::ULong),  // DBF_UINT64
+    ];
+
+    for (name, expected) in cases {
+        let ch = BridgeChannel::new(db.clone(), name).await.expect("new");
+
+        let desc = ch.get_field().await.expect("get_field");
+        let desc_ty = match &desc {
+            FieldDesc::Structure { fields, .. } => fields
+                .iter()
+                .find(|(n, _)| n == "value")
+                .and_then(|(_, d)| match d {
+                    FieldDesc::Scalar(st) => Some(*st),
+                    _ => None,
+                }),
+            _ => None,
+        }
+        .unwrap_or_else(|| panic!("{name}: no scalar value descriptor"));
+
+        assert_eq!(
+            desc_ty, expected,
+            "{name}: descriptor value type must be the field's real DBF, not double"
+        );
+        assert_ne!(
+            desc_ty,
+            ScalarType::Double,
+            "{name}: must not advertise the double fallback"
+        );
+
+        // The GET value's scalar type must agree with the descriptor —
+        // the wire-schema contract the descriptor promises.
+        let result = ch.get(&empty_request()).await.expect("get");
+        let val_ty = match extract_value(&result).expect("value") {
+            PvField::Scalar(sv) => sv.scalar_type(),
+            other => panic!("{name}: expected scalar value, got {other:?}"),
+        };
+        assert_eq!(
+            val_ty, desc_ty,
+            "{name}: GET value type must match the advertised descriptor"
+        );
+    }
+}
+
+/// BR-60 parity: a non-VAL enum/menu field (`REC.SCAN`) must be served
+/// as NTEnum (value.index + value.choices), not forced into NTScalar.
+/// pvxs builds the single-record prototype from
+/// `dbChannelFinalFieldType(chan)`, so DBF_ENUM/MENU/DEVICE fields select
+/// nt::NTEnum regardless of the field name (singlesource.cpp:189-205,
+/// dbAccess.c:88-90). A non-VAL scalar field stays NTScalar (no
+/// over-promotion).
+#[tokio::test]
+async fn non_val_enum_field_is_ntenum() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:ai", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+
+    // `.SCAN` is a DBF_MENU/ENUM common field → NTEnum.
+    let scan = BridgeChannel::new(db.clone(), "TEST:ai.SCAN")
+        .await
+        .expect("new");
+    assert_eq!(scan.nt_type(), NtType::Enum, ".SCAN must be NTEnum");
+
+    // GET yields an `enum_t` value with an int32 index and the SCAN menu
+    // choices — the path that the prior NTScalar classification dropped.
+    let result = scan.get(&empty_request()).await.expect("get");
+    match extract_value(&result).expect("NTEnum value") {
+        PvField::Structure(s) => {
+            let has_index = s
+                .fields
+                .iter()
+                .any(|(n, f)| n == "index" && matches!(f, PvField::Scalar(ScalarValue::Int(_))));
+            let choices_len = s
+                .fields
+                .iter()
+                .find(|(n, _)| n == "choices")
+                .and_then(|(_, f)| match f {
+                    PvField::ScalarArray(a) => Some(a.len()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            assert!(has_index, ".SCAN value.index must be an int32");
+            assert!(
+                choices_len > 0,
+                ".SCAN value.choices must enumerate the SCAN menu"
+            );
+        }
+        other => panic!("expected enum_t value structure, got {other:?}"),
+    }
+
+    // A non-VAL scalar common field is NOT promoted — it stays NTScalar.
+    let desc = BridgeChannel::new(db.clone(), "TEST:ai.DESC")
+        .await
+        .expect("new");
+    assert_eq!(desc.nt_type(), NtType::Scalar, ".DESC must stay NTScalar");
+}

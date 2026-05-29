@@ -215,11 +215,47 @@ fn process_mode_from_scalar(sv: &ScalarValue) -> ProcessMode {
     }
 }
 
+/// Coerce a pvRequest scalar to a bool exactly as pvxs `Value::as<bool>`
+/// does. `copyOutScalar` (`src/data.cpp:399-409`) converts a bool, any
+/// signed/unsigned integer (nonzero ⇒ true), or a real to bool; the
+/// string store (`src/data.cpp:459-462`) accepts only the exact tokens
+/// `"true"` / `"false"` (no trim, case-sensitive) and otherwise raises
+/// `NoConvert`. `None` mirrors that `NoConvert` outcome — the caller
+/// keeps its default, matching pvxs `as<bool>(fallback)` returning the
+/// fallback for an absent or unconvertible field.
+///
+/// This is intentionally distinct from [`process_mode_from_scalar`],
+/// which is a tri-state (Force/Inhibit/Passive) routed through pvxs's
+/// separate `setForceProcessingFlag` chain (real ⇒ passive, `"passive"`
+/// recognized) — mirroring the two different pvxs code paths rather than
+/// forcing one parser to serve both.
+fn scalar_as_bool(sv: &ScalarValue) -> Option<bool> {
+    match sv {
+        ScalarValue::Boolean(b) => Some(*b),
+        ScalarValue::Byte(n) => Some(*n != 0),
+        ScalarValue::Short(n) => Some(*n != 0),
+        ScalarValue::Int(n) => Some(*n != 0),
+        ScalarValue::Long(n) => Some(*n != 0),
+        ScalarValue::UByte(n) => Some(*n != 0),
+        ScalarValue::UShort(n) => Some(*n != 0),
+        ScalarValue::UInt(n) => Some(*n != 0),
+        ScalarValue::ULong(n) => Some(*n != 0),
+        ScalarValue::Float(v) => Some(*v != 0.0),
+        ScalarValue::Double(v) => Some(*v != 0.0),
+        ScalarValue::String(s) => match s.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+    }
+}
+
 impl PutOptions {
     /// Extract process/block options from a PvStructure.
     ///
     /// Looks for `record._options.process` (bool / integer / "true" /
-    /// "false" / "passive") and `record._options.block` (boolean) fields.
+    /// "false" / "passive") and `record._options.block` (bool / integer /
+    /// unsigned / real / "true" / "false", via pvxs `as<bool>` coercion).
     pub fn from_pv_request(request: &PvStructure) -> Self {
         let mut opts = Self::default();
 
@@ -247,13 +283,25 @@ impl PutOptions {
                 opts.process = process_mode_from_scalar(sv);
             }
 
-            // block option
-            if let Some(PvField::Scalar(ScalarValue::Boolean(b))) = opt_struct.get_field("block") {
-                opts.block = *b;
-                // No point blocking if we're not processing
-                if opts.process == ProcessMode::Inhibit {
-                    opts.block = false;
+            // block option. pvxs reads `record._options.block` via
+            // `Value::as<bool>` (ioc/singlesource.cpp:346-352), which
+            // coerces bool / integer / unsigned / real / `"true"` /
+            // `"false"` through `copyOutScalar`. The earlier path matched
+            // only `Boolean`, silently dropping the integer and string
+            // forms a PVA client can legally send — so a `block=1` or
+            // `block="true"` lost the put-notify completion barrier.
+            if let Some(PvField::Scalar(sv)) = opt_struct.get_field("block") {
+                if let Some(b) = scalar_as_bool(sv) {
+                    opts.block = b;
                 }
+            }
+            // No point blocking if processing is inhibited
+            // (singlesource.cpp:350-352: `doWait` is cleared whenever the
+            // PUT does not process). Applied uniformly after parsing, so
+            // the invariant `process == Inhibit ⇒ !block` holds for every
+            // accepted `block` encoding, not only the boolean one.
+            if opts.process == ProcessMode::Inhibit {
+                opts.block = false;
             }
         }
 
@@ -303,14 +351,39 @@ pub struct BridgeChannel {
 
 impl BridgeChannel {
     /// Choose the NormativeType for a single-record channel bound to
-    /// `field`. Non-VAL field PVs are scalar in pvxs QSRV regardless of
-    /// the record's record-type-derived NT mapping (a `waveform.NORD`
-    /// is an `NTScalar` even though `waveform.VAL` is `NTScalarArray`).
-    fn nt_type_for_field(record_type: &str, field: &str) -> NtType {
+    /// `field`. `VAL` keeps the record-type mapping
+    /// ([`NtType::from_record_type`]). A non-`VAL` field's NT is chosen
+    /// from its resolved value's final DBR/DBF type and element count,
+    /// mirroring pvxs, which builds the single-record prototype from
+    /// `dbChannelFinalFieldType(chan)` (ioc/singlesource.cpp:189-205):
+    /// `DBF_ENUM`/`DBF_MENU`/`DBF_DEVICE` resolve to `DBR_ENUM`
+    /// (db/dbAccess.c:88-90) and select `NTEnum`, an array field selects
+    /// `NTScalarArray`, and everything else is `NTScalar`. Forcing every
+    /// non-`VAL` field to `NTScalar` (the prior rule) mis-served enum
+    /// fields such as `REC.SCAN` as a scalar index with no `choices`.
+    /// A scalar non-array field (e.g. `waveform.NORD`) still selects
+    /// `NTScalar`, preserving the "non-VAL scalar" behavior.
+    fn nt_type_for_field(record_type: &str, field: &str, value: Option<&EpicsValue>) -> NtType {
         if field.eq_ignore_ascii_case("VAL") {
-            NtType::from_record_type(record_type)
-        } else {
-            NtType::Scalar
+            return NtType::from_record_type(record_type);
+        }
+        match value {
+            // DBF_ENUM/MENU/DEVICE → DBR_ENUM → NTEnum (scalar index +
+            // choices). An enum *array* has no scalar-index NTEnum shape,
+            // so it falls through to NTScalarArray below.
+            Some(EpicsValue::Enum(_)) => NtType::Enum,
+            Some(
+                EpicsValue::ShortArray(_)
+                | EpicsValue::FloatArray(_)
+                | EpicsValue::EnumArray(_)
+                | EpicsValue::DoubleArray(_)
+                | EpicsValue::LongArray(_)
+                | EpicsValue::CharArray(_)
+                | EpicsValue::StringArray(_)
+                | EpicsValue::Int64Array(_)
+                | EpicsValue::UInt64Array(_),
+            ) => NtType::ScalarArray,
+            _ => NtType::Scalar,
         }
     }
 
@@ -382,6 +455,12 @@ impl BridgeChannel {
 
         let instance = rec.read().await;
         let rtyp = instance.record.record_type();
+        // Resolve the bound field's actual value once (record field →
+        // common field → virtual field). This is the single source of
+        // truth for both the served DBF type and (below) the NT shape,
+        // so the advertised descriptor cannot drift from the value the
+        // GET path will serialize.
+        let resolved = instance.resolve_field(&field_upper);
         // A long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL) is a
         // `DBF_CHAR` array that semantically holds a NUL-terminated
         // string. Serve it as a scalar-string NTScalar (pvxs's
@@ -397,21 +476,37 @@ impl BridgeChannel {
         {
             NtType::LongString
         } else {
-            Self::nt_type_for_field(rtyp, &field_upper)
+            Self::nt_type_for_field(rtyp, &field_upper, resolved.as_ref())
         };
 
-        // DBF type for the bound field. Falls back to Double if the
-        // record's `field_list` does not enumerate it explicitly —
-        // common-fields like `.SCAN` / `.PROC` may not be in
-        // record-specific tables but are still resolvable through
-        // `resolve_field` and serialize through the generic Snapshot
-        // path.
-        let value_dbf = instance
-            .record
-            .field_list()
-            .iter()
-            .find(|f| f.name == field_upper)
-            .map(|f| f.dbf_type)
+        // DBF type for the bound field, taken from the field's actual
+        // resolved value. pvxs serves the type from
+        // `dbChannelFinalFieldType(chan)` (singlesource.cpp:189-205,
+        // dbChannel.h:452) — the channel's final field type after lookup,
+        // which covers `dbCommon` fields, not only record-specific ones.
+        // Deriving the DBF from the resolved `EpicsValue` makes the
+        // advertised descriptor agree with the value the GET path returns
+        // *by construction*: common/virtual fields such as `.SCAN`
+        // (enum), `.DESC` (string), `.PROC` (char), and `.UTAG` (unsigned
+        // 64) no longer fall back to `double`. The earlier `field_list`
+        // lookup + `Double` fallback advertised `double value` for every
+        // field a record's table did not enumerate, contradicting the
+        // value the snapshot then serialized — a descriptor/value
+        // wire-schema mismatch, not mere display drift. The
+        // record-specific `field_list` is the fallback only for a field
+        // that resolves to no concrete value, and `Double` the final
+        // backstop.
+        let value_dbf = resolved
+            .as_ref()
+            .map(|v| v.db_field_type())
+            .or_else(|| {
+                instance
+                    .record
+                    .field_list()
+                    .iter()
+                    .find(|f| f.name == field_upper)
+                    .map(|f| f.dbf_type)
+            })
             .unwrap_or(DbFieldType::Double);
 
         Ok(Self {
@@ -778,6 +873,79 @@ mod tests {
             f(ScalarValue::String("passive".into())),
             ProcessMode::Passive
         );
+    }
+
+    fn req_with_block(value: PvField) -> PvStructure {
+        let mut options = PvStructure::new("");
+        // A non-Inhibit process so the block flag is not cleared by the
+        // `process == Inhibit ⇒ !block` rule — isolates the block parse.
+        options.fields.push((
+            "process".into(),
+            PvField::Scalar(ScalarValue::Boolean(true)),
+        ));
+        options.fields.push(("block".into(), value));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+        req
+    }
+
+    /// pvxs reads `record._options.block` via `as<bool>`
+    /// (singlesource.cpp:346-352), coercing bool, integer, unsigned,
+    /// real, and the exact strings `"true"`/`"false"` (data.cpp:399-409,
+    /// 459-462). The earlier parser accepted only a boolean scalar, so a
+    /// client sending `block=1` or `block="true"` lost the put-notify
+    /// completion barrier.
+    #[test]
+    fn put_options_block_accepts_integer_and_string_forms() {
+        let f = |v| PutOptions::from_pv_request(&req_with_block(PvField::Scalar(v))).block;
+
+        // boolean (already worked)
+        assert!(f(ScalarValue::Boolean(true)));
+        assert!(!f(ScalarValue::Boolean(false)));
+        // integer 1 / 0
+        assert!(f(ScalarValue::Int(1)));
+        assert!(!f(ScalarValue::Int(0)));
+        // unsigned + 64-bit integer
+        assert!(f(ScalarValue::UInt(1)));
+        assert!(f(ScalarValue::Long(5)));
+        // real
+        assert!(f(ScalarValue::Double(1.0)));
+        assert!(!f(ScalarValue::Double(0.0)));
+        // exact "true" / "false" strings
+        assert!(f(ScalarValue::String("true".into())));
+        assert!(!f(ScalarValue::String("false".into())));
+        // unconvertible string keeps the default (false)
+        assert!(!f(ScalarValue::String("yes".into())));
+    }
+
+    /// The `process == Inhibit ⇒ !block` rule (singlesource.cpp:350-352)
+    /// must hold for every accepted `block` encoding, not only boolean.
+    #[test]
+    fn put_options_inhibit_disables_integer_block() {
+        let mut options = PvStructure::new("");
+        options.fields.push((
+            "process".into(),
+            PvField::Scalar(ScalarValue::String("false".into())),
+        ));
+        options
+            .fields
+            .push(("block".into(), PvField::Scalar(ScalarValue::Int(1))));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+
+        let opts = PutOptions::from_pv_request(&req);
+        assert_eq!(opts.process, ProcessMode::Inhibit);
+        assert!(!opts.block, "block=1 must be cleared when process=false");
     }
 
     fn req_with_dbe(value: PvField) -> PvStructure {

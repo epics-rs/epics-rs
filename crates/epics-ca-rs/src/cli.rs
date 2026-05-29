@@ -579,7 +579,10 @@ mod tests {
         // UInt64 binary is bare (no `0b`).
         let mut bin = fmt_default();
         bin.int_style = IntStyle::Bin;
-        assert_eq!(format_value(&EpicsValue::UInt64(5), &bin, None, false), "101");
+        assert_eq!(
+            format_value(&EpicsValue::UInt64(5), &bin, None, false),
+            "101"
+        );
     }
 
     #[test]
@@ -644,7 +647,12 @@ mod tests {
         assert_eq!(escape_from_raw(&[0xc3, 0xa9]), "\\xc3\\xa9");
         // String scalar through format_value is escaped.
         assert_eq!(
-            format_value(&EpicsValue::String("x\ty".to_string()), &fmt_default(), None, false),
+            format_value(
+                &EpicsValue::String("x\ty".to_string()),
+                &fmt_default(),
+                None,
+                false
+            ),
             "x\\ty"
         );
         // StringArray elements escaped; count prefix preserved.

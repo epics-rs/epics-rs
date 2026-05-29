@@ -899,7 +899,14 @@ mod tests {
         // server/IOC performs the string->native conversion. A numeric
         // scalar against a DBF_DOUBLE PV must therefore yield a DBR_STRING
         // Wire carrying the original token, not a parsed EpicsValue::Double.
-        match build_write_value(&vals(&["1.5"]), DbFieldType::Double, false, false, false, false) {
+        match build_write_value(
+            &vals(&["1.5"]),
+            DbFieldType::Double,
+            false,
+            false,
+            false,
+            false,
+        ) {
             Ok(WriteValue::Wire {
                 dbr_type,
                 value: EpicsValue::String(s),
@@ -1009,8 +1016,14 @@ mod tests {
         // rejected. The Rust client rejects >= 40, so caput-rs must cap.
         let long = "a".repeat(50); // 50 ASCII bytes
         // Non-ENUM string scalar -> DBR_STRING capped to 39.
-        match build_write_value(&vals(&[long.as_str()]), DbFieldType::String, false, false, false, false)
-        {
+        match build_write_value(
+            &vals(&[long.as_str()]),
+            DbFieldType::String,
+            false,
+            false,
+            false,
+            false,
+        ) {
             Ok(WriteValue::Wire {
                 value: EpicsValue::String(s),
                 ..
@@ -1040,7 +1053,14 @@ mod tests {
             other => panic!("expected truncated DBR_STRING[] Wire, got {other:?}"),
         }
         // ENUM-by-name scalar (`-s`) -> EnumString capped to 39.
-        match build_write_value(&vals(&[long.as_str()]), DbFieldType::Enum, false, true, false, false) {
+        match build_write_value(
+            &vals(&[long.as_str()]),
+            DbFieldType::Enum,
+            false,
+            true,
+            false,
+            false,
+        ) {
             Ok(WriteValue::EnumString(s)) => {
                 assert_eq!(s.len(), 39, "enum-by-name value truncated to 39 bytes")
             }
@@ -1048,7 +1068,14 @@ mod tests {
         }
         // `-S` long strings take the DBR_CHAR path and stay UNCAPPED — all
         // 50 bytes + NUL survive (finding: -S is not 39-byte limited).
-        match build_write_value(&vals(&[long.as_str()]), DbFieldType::Char, false, false, true, false) {
+        match build_write_value(
+            &vals(&[long.as_str()]),
+            DbFieldType::Char,
+            false,
+            false,
+            true,
+            false,
+        ) {
             Ok(WriteValue::Wire {
                 dbr_type,
                 value: EpicsValue::CharArray(b),

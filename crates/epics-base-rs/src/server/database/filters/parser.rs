@@ -62,27 +62,144 @@ pub struct ParsedChannelName {
 /// - `RECORD.FIELD{...}` → suffix directly after field (pvxs).
 /// - `RECORD.FIELD.{...}` → suffix after explicit separator.
 ///
-/// Returns the empty suffix when no `{` appears.
+/// A trailing legacy array-range modifier (`RECORD.VAL[start:incr:end]`)
+/// is normalised into a canonical `arr` channel filter, matching EPICS
+/// `dbChannel.c` `parseArrayRange` (dbChannel.c:351-446, 507-510): base
+/// translates `[N]`, `[s:e]`, `[s:i:e]` into an `arr` filter inserted
+/// *before* any JSON filters, so the slice applies first. Because every
+/// CA/PVA consumer already builds its [`FilterChain`] from `json_suffix`,
+/// emitting the range as `arr` here gives the legacy syntax full support
+/// with no consumer changes — `split_channel_name` is the single owner of
+/// "channel name → record_path + filters".
+///
+/// Returns the empty suffix when no `{` and no `[range]` appear.
 pub fn split_channel_name(raw: &str) -> ParsedChannelName {
-    let Some(brace_pos) = raw.find('{') else {
+    // 1. Peel the JSON filter suffix at the first `{`. EPICS PV names
+    //    never contain `{`, so the first `{` is unambiguous.
+    let (name_part, json_suffix) = match raw.find('{') {
+        Some(brace_pos) => {
+            // Strip an optional `.` separator immediately before the
+            // brace so `RECORD.{...}` and `RECORD.FIELD.{...}` produce a
+            // clean record path without the dangling dot.
+            let path_end = if brace_pos > 0 && raw.as_bytes()[brace_pos - 1] == b'.' {
+                brace_pos - 1
+            } else {
+                brace_pos
+            };
+            (&raw[..path_end], Some(raw[brace_pos..].to_string()))
+        }
+        None => (raw, None),
+    };
+
+    // 2. Peel a trailing `[range]` array-range modifier off the name and
+    //    fold it into the filter chain as a leading `arr` entry. Array
+    //    range is channel syntax (base parses it after field modifiers,
+    //    before JSON filters), not part of the field name.
+    if let Some((record_path, arr_inner)) = peel_array_range(name_part) {
+        let json_suffix = Some(match json_suffix {
+            Some(existing) => merge_arr_into_json(&arr_inner, &existing),
+            None => format!("{{{arr_inner}}}"),
+        });
         return ParsedChannelName {
-            record_path: raw.to_string(),
-            json_suffix: None,
+            record_path,
+            json_suffix,
         };
-    };
-    // Strip an optional `.` separator immediately before the brace
-    // so `RECORD.{...}` and `RECORD.FIELD.{...}` produce a clean
-    // `record_path` without the dangling dot.
-    let path_end = if brace_pos > 0 && raw.as_bytes()[brace_pos - 1] == b'.' {
-        brace_pos - 1
-    } else {
-        brace_pos
-    };
-    let record_path = raw[..path_end].to_string();
-    let json = raw[brace_pos..].to_string();
+    }
+
     ParsedChannelName {
-        record_path,
-        json_suffix: Some(json),
+        record_path: name_part.to_string(),
+        json_suffix,
+    }
+}
+
+/// Peel a trailing legacy array-range modifier (`[...]`) off a channel
+/// name part, returning the stripped record path and the synthesised
+/// inner `"arr":{...}` filter fragment. Returns `None` when there is no
+/// trailing `[...]` or it does not parse as a valid range — the name is
+/// then left untouched so the unresolved field still fails downstream
+/// exactly as before, matching base rejecting `dbChannelCreate`.
+fn peel_array_range(name_part: &str) -> Option<(String, String)> {
+    let without_close = name_part.strip_suffix(']')?;
+    let open = without_close.rfind('[')?;
+    let inner = &without_close[open + 1..];
+    let (start, incr, end) = parse_array_range(inner)?;
+    Some((
+        name_part[..open].to_string(),
+        build_arr_inner(start, incr, end),
+    ))
+}
+
+/// Parse the interior of a `[...]` array-range modifier into
+/// `(start, incr, end)`, mirroring EPICS `dbChannel.c` `parseArrayRange`
+/// (dbChannel.c:351-399). Accepts `[N]`, `[start:end]`, and
+/// `[start:incr:end]`; any numeric position may be omitted
+/// (`[:end]`, `[start:]`, `[start::end]`, `[:]`) and falls back to the
+/// base defaults start `0`, incr `1`, end `-1` (full array). Returns
+/// `None` for forms base also rejects: empty `[]`, a non-numeric
+/// position, or more than three colon-separated parts.
+fn parse_array_range(inner: &str) -> Option<(i64, i64, i64)> {
+    // Outer `None` ⇒ non-numeric (reject); inner `None` ⇒ empty (use
+    // the position default).
+    let part = |s: &str| -> Option<Option<i64>> {
+        let t = s.trim();
+        if t.is_empty() {
+            Some(None)
+        } else {
+            t.parse::<i64>().ok().map(Some)
+        }
+    };
+    match inner.split(':').collect::<Vec<_>>().as_slice() {
+        // `[N]`: single element start==end==N. Base requires a number
+        // here — `[]` is rejected.
+        [one] => {
+            let n = part(one)??;
+            Some((n, 1, n))
+        }
+        [s, e] => Some((part(s)?.unwrap_or(0), 1, part(e)?.unwrap_or(-1))),
+        [s, i, e] => Some((
+            part(s)?.unwrap_or(0),
+            part(i)?.unwrap_or(1),
+            part(e)?.unwrap_or(-1),
+        )),
+        _ => None,
+    }
+}
+
+/// Build the inner `"arr":{...}` filter fragment, emitting only the
+/// non-default positions (`s`≠0, `i`≠1, `e`≠-1) exactly as base's
+/// `parseArrayRange` does (dbChannel.c:422-433). A full-array range
+/// (`[:]`) yields `"arr":{}`, the identity slice.
+fn build_arr_inner(start: i64, incr: i64, end: i64) -> String {
+    let mut keys: Vec<String> = Vec::new();
+    if start != 0 {
+        keys.push(format!("\"s\":{start}"));
+    }
+    if incr != 1 {
+        keys.push(format!("\"i\":{incr}"));
+    }
+    if end != -1 {
+        keys.push(format!("\"e\":{end}"));
+    }
+    format!("\"arr\":{{{}}}", keys.join(","))
+}
+
+/// Prepend a synthesised `arr` filter into an existing JSON filter
+/// suffix so the slice applies first (base inserts the array-range
+/// filter before JSON filters; `serde_json`'s `preserve_order` keeps the
+/// leading `arr` first in iteration). The existing suffix is spliced as
+/// raw text rather than re-parsed, so JSON5 forms survive untouched for
+/// the downstream chain parser.
+fn merge_arr_into_json(arr_inner: &str, existing: &str) -> String {
+    let body = existing
+        .trim()
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .map(str::trim)
+        .unwrap_or("");
+    if body.is_empty() {
+        format!("{{{arr_inner}}}")
+    } else {
+        format!("{{{arr_inner},{body}}}")
     }
 }
 
@@ -473,6 +590,88 @@ mod tests {
             p.json_suffix.as_deref(),
             Some(r#"{"arr":{"s":0,"i":1,"e":4}}"#)
         );
+    }
+
+    /// Legacy `[N]` single-element range → `arr` with start==end==N
+    /// (base `parseArrayRange` sets `end=start` for the one-number form).
+    #[test]
+    fn split_array_range_single_element() {
+        let p = split_channel_name("WF.VAL[3]");
+        assert_eq!(p.record_path, "WF.VAL");
+        assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"s":3,"e":3}}"#));
+    }
+
+    /// `[start:end]` → `arr` with the bounds, default stride.
+    #[test]
+    fn split_array_range_start_end() {
+        let p = split_channel_name("WF.VAL[2:5]");
+        assert_eq!(p.record_path, "WF.VAL");
+        assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"s":2,"e":5}}"#));
+    }
+
+    /// `[start:incr:end]` → `arr` carrying the stride.
+    #[test]
+    fn split_array_range_start_incr_end() {
+        let p = split_channel_name("WF.VAL[0:2:10]");
+        assert_eq!(p.record_path, "WF.VAL");
+        assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"i":2,"e":10}}"#));
+    }
+
+    /// Range with no field component defaults the field to `VAL`
+    /// downstream; only the record path is stripped here.
+    #[test]
+    fn split_array_range_no_field() {
+        let p = split_channel_name("WF[1:4]");
+        assert_eq!(p.record_path, "WF");
+        assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"s":1,"e":4}}"#));
+    }
+
+    /// Default positions are omitted; a full-array `[:]` is the identity
+    /// `arr` filter.
+    #[test]
+    fn split_array_range_open_forms() {
+        assert_eq!(
+            split_channel_name("WF.VAL[:5]").json_suffix.as_deref(),
+            Some(r#"{"arr":{"e":5}}"#)
+        );
+        assert_eq!(
+            split_channel_name("WF.VAL[2:]").json_suffix.as_deref(),
+            Some(r#"{"arr":{"s":2}}"#)
+        );
+        assert_eq!(
+            split_channel_name("WF.VAL[:]").json_suffix.as_deref(),
+            Some(r#"{"arr":{}}"#)
+        );
+    }
+
+    /// A range combined with a JSON filter folds the `arr` in first so
+    /// the slice applies before the stream filter (base inserts the
+    /// array-range filter ahead of JSON filters; `preserve_order` keeps
+    /// `arr` leading).
+    #[test]
+    fn split_array_range_with_json_filter() {
+        let p = split_channel_name(r#"WF.VAL[2:5]{"dbnd":{"d":0.5}}"#);
+        assert_eq!(p.record_path, "WF.VAL");
+        assert_eq!(
+            p.json_suffix.as_deref(),
+            Some(r#"{"arr":{"s":2,"e":5},"dbnd":{"d":0.5}}"#)
+        );
+        // The merged suffix is a valid chain with arr first.
+        let chain = parse_filter_chain(p.json_suffix.as_deref().unwrap());
+        let names: Vec<&'static str> = chain.iter().map(|f| f.name()).collect();
+        assert_eq!(names, vec!["arr", "dbnd"]);
+    }
+
+    /// Malformed or empty ranges are left in the name untouched (base
+    /// rejects them at channel creation; here they fall through to a
+    /// field-not-found downstream).
+    #[test]
+    fn split_array_range_invalid_left_intact() {
+        for raw in ["WF.VAL[]", "WF.VAL[a:b]", "WF.VAL[1:2:3:4]"] {
+            let p = split_channel_name(raw);
+            assert_eq!(p.record_path, raw, "invalid range must stay in the name");
+            assert!(p.json_suffix.is_none());
+        }
     }
 
     #[test]

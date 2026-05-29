@@ -994,6 +994,26 @@ impl ChannelCache {
         self.max_entries
     }
 
+    /// Test-only: insert a placeholder entry so control / diagnostic
+    /// aggregation across caches and tenants can be exercised without a
+    /// live upstream. The entry holds an empty snapshot and an inert
+    /// monitor task.
+    #[cfg(test)]
+    pub(crate) async fn insert_placeholder_entry(&self, pv_name: &str) {
+        let entry = Arc::new(UpstreamEntry {
+            pv_name: pv_name.into(),
+            state: Arc::new(RwLock::new(EntryState::default())),
+            tx: broadcast::channel(4).0,
+            tx_raw: broadcast::channel(4).0,
+            latest_raw: Arc::new(RwLock::new(None)),
+            first_event: Arc::new(Notify::new()),
+            _monitor_task: AbortOnDrop(tokio::spawn(async {})),
+            drop_poke: parking_lot::Mutex::new(true),
+            pause: PauseControl::new(),
+        });
+        self.entries.lock().await.insert(pv_name.into(), entry);
+    }
+
     /// B6: operator-driven cache flush. Drops every cached
     /// `UpstreamEntry` and clears the negative-result LRU, then
     /// returns the number of entries that were removed.

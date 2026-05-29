@@ -63,7 +63,18 @@ pub type CredentialCheck = Arc<dyn Fn(&ChannelContext) -> bool + Send + Sync>;
 #[derive(Clone)]
 pub struct ControlSource {
     prefix: String,
-    gateway_source: GatewayChannelSource,
+    /// Every upstream `GatewayChannelSource` this control surface
+    /// administers. A single-tenant gateway has exactly one; a
+    /// multi-tenant downstream registers one per upstream label
+    /// ([`Self::with_source`]). Diagnostics (`cacheSize` /
+    /// `liveSubscribers` / `report`) aggregate across ALL of them and
+    /// `flush` / `drop` reach ALL of them — pre-fix the control source
+    /// held only the first upstream, so `<prefix>:cacheSize` could
+    /// report zero and `flush` / `drop` could silently miss every
+    /// non-first tenant (BRIDGE-RS-2026-05-28-73). pva2pva's operator
+    /// cache/status paths are client-aware, iterating every configured
+    /// client (`p2pApp/server.cpp:102-138`, `:158-310`).
+    gateway_sources: Vec<GatewayChannelSource>,
     /// B6: credential predicate gating the writable RPCs. Defaults to
     /// deny-all.
     credential_check: CredentialCheck,
@@ -78,12 +89,22 @@ impl ControlSource {
     pub fn new(prefix: impl Into<String>, gateway_source: GatewayChannelSource) -> Self {
         Self {
             prefix: prefix.into(),
-            gateway_source,
+            gateway_sources: vec![gateway_source],
             // Deny-all default: the writable surface does nothing
             // until an operator installs a real predicate.
             credential_check: Arc::new(|_ctx| false),
             acf_path: None,
         }
+    }
+
+    /// Register an additional upstream `GatewayChannelSource` under this
+    /// control surface. A multi-tenant downstream calls this once per
+    /// upstream label beyond the first so diagnostics and cache
+    /// administration span every tenant, not just the first
+    /// (BRIDGE-RS-2026-05-28-73).
+    pub fn with_source(mut self, gateway_source: GatewayChannelSource) -> Self {
+        self.gateway_sources.push(gateway_source);
+        self
     }
 
     /// B6: install the operator credential predicate that gates the
@@ -232,9 +253,12 @@ impl ControlSource {
         let names = self.control_pv_names();
         if name == names[0] {
             // <prefix>:flush — drop every cached upstream entry across
-            // the shared cache AND all per-credential caches
-            //.
-            let removed = self.gateway_source.flush_all_caches().await as i64;
+            // the shared cache AND all per-credential caches, for EVERY
+            // upstream tenant of this downstream (not just the first).
+            let mut removed = 0i64;
+            for src in &self.gateway_sources {
+                removed += src.flush_all_caches().await as i64;
+            }
             tracing::info!(
                 gateway_control = %name,
                 removed,
@@ -252,9 +276,13 @@ impl ControlSource {
             if target.is_empty() {
                 return Err("drop RPC 'pv' argument must not be empty".to_string());
             }
-            // Drop from the shared cache AND every per-credential cache
-            //.
-            let dropped = self.gateway_source.drop_entry_all_caches(&target).await;
+            // Drop from the shared cache AND every per-credential cache,
+            // for EVERY upstream tenant — a PV proxied through a
+            // non-first upstream must still be reachable by `drop`.
+            let mut dropped = false;
+            for src in &self.gateway_sources {
+                dropped |= src.drop_entry_all_caches(&target).await;
+            }
             tracing::info!(
                 gateway_control = %name,
                 pv = %target,
@@ -288,7 +316,11 @@ impl ControlSource {
                 .map_err(|e| format!("reload: cannot read ACF file '{path}': {e}"))?;
             let cfg = epics_base_rs::server::access_security::parse_acf(&content)
                 .map_err(|e| format!("reload: cannot parse ACF file '{path}': {e}"))?;
-            self.gateway_source.set_acf(Some(cfg)).await;
+            // Hot-swap the policy on EVERY upstream tenant of this
+            // downstream, not just the first (BRIDGE-RS-2026-05-28-73).
+            for src in &self.gateway_sources {
+                src.set_acf(Some(cfg.clone())).await;
+            }
             tracing::info!(
                 gateway_control = %name,
                 acf_path = %path,
@@ -346,11 +378,17 @@ impl ChannelSource for ControlSource {
         // Live snapshot: pulled at every GET. Cheap — no upstream
         // round-trip, just a HashMap len() under a tokio::Mutex plus
         // an atomic load for the bridge-task count.
-        // aggregate across the shared cache AND every per-credential
-        // cache so the operator does not see zero while credentialed
-        // upstream monitors remain alive.
-        let cache_size = self.gateway_source.total_cached_entry_count().await as i64;
-        let live_subs = self.gateway_source.live_subscribers() as i64;
+        // Aggregate across EVERY upstream tenant, and within each across
+        // the shared cache AND every per-credential cache, so the
+        // operator does not see zero while a non-first tenant's
+        // credentialed upstream monitors remain alive
+        // (BRIDGE-RS-2026-05-28-73).
+        let mut cache_size = 0i64;
+        let mut live_subs = 0i64;
+        for src in &self.gateway_sources {
+            cache_size += src.total_cached_entry_count().await as i64;
+            live_subs += src.live_subscribers() as i64;
+        }
 
         if name.ends_with(":cacheSize") || name.ends_with(":upstreamCount") {
             Some(Self::nt_scalar_long(cache_size))
@@ -592,6 +630,70 @@ mod tests {
     /// same way `put_value` refuses a PUT. `process_checked`'s default
     /// delegates to `process` after its WRITE gate, so the single
     /// `process` override covers both entry points.
+    /// BRIDGE-RS-2026-05-28-73: control diagnostics and cache admin
+    /// must span EVERY upstream tenant of a multi-tenant downstream,
+    /// not just the first. Only the SECOND tenant's cache is populated
+    /// here; `cacheSize`, `drop`, and `flush` must all reach it.
+    #[tokio::test]
+    async fn multi_tenant_control_spans_non_first_tenant() {
+        let s0 = make_source();
+        let s1 = make_source();
+        // Populate ONLY the second tenant's shared cache.
+        s1.cache().insert_placeholder_entry("B:PV").await;
+        s1.cache().insert_placeholder_entry("B:PV2").await;
+        let ctrl = ControlSource::new("gw", s0)
+            .with_source(s1)
+            .with_credential_check(Arc::new(|_| true));
+
+        let empty_req = || FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![],
+        };
+
+        // cacheSize must aggregate the non-first tenant's two entries.
+        let v = ctrl.get_value("gw:cacheSize").await.expect("cacheSize");
+        assert_eq!(
+            reply_value(&v),
+            2,
+            "cacheSize must aggregate non-first tenant"
+        );
+
+        // drop must reach the second tenant.
+        let (_d, reply) = ctrl
+            .rpc_checked(
+                checked("gw:drop").await,
+                empty_req(),
+                nturi_with_arg("pv", "B:PV"),
+                ctx("ops", "ca"),
+            )
+            .await
+            .expect("drop reply");
+        assert_eq!(
+            reply_value(&reply),
+            1,
+            "drop must reach the non-first tenant"
+        );
+
+        // flush must reach the second tenant (one entry remains).
+        let (_d, reply) = ctrl
+            .rpc_checked(
+                checked("gw:flush").await,
+                empty_req(),
+                PvField::Structure(PvStructure::new("")),
+                ctx("ops", "ca"),
+            )
+            .await
+            .expect("flush reply");
+        assert_eq!(
+            reply_value(&reply),
+            1,
+            "flush must reach the non-first tenant"
+        );
+
+        let v = ctrl.get_value("gw:cacheSize").await.expect("cacheSize");
+        assert_eq!(reply_value(&v), 0, "drop + flush must empty all tenants");
+    }
+
     #[tokio::test]
     async fn control_process_is_rejected() {
         let gw = make_source();

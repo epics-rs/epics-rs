@@ -2914,10 +2914,48 @@ where
 
 // ── RPC ────────────────────────────────────────────────────────────────
 
+/// RPC DATA-phase argument.
+///
+/// pvxs distinguishes a *top-level null* argument
+/// (`Context::rpc(name, Value())`) from a present value whose type is
+/// `any`. The null argument serializes as the single `0xff` "null
+/// type" descriptor tag with no value body
+/// (`dataencode.cpp:30-35` + `clientget.cpp:302-311` — the value body
+/// is written only when the arg is valid); a present argument
+/// serializes as `type(arg) + full_value(arg)`. This is distinct from
+/// `FieldDesc::Variant` plus an empty `PvField::Variant`, which is the
+/// "present `any` whose selected value is null" shape.
+pub enum RpcArg<'a> {
+    /// pvxs top-level null argument — the single `0xff` type tag, no
+    /// value body.
+    Null,
+    /// A present argument carrying its own descriptor and value.
+    Typed {
+        desc: &'a FieldDesc,
+        value: &'a PvField,
+    },
+}
+
+/// Serialize the RPC DATA-phase argument — the single owner of the
+/// RPC-argument wire shape, so the null/typed distinction lives in
+/// exactly one place. pvxs `clientget.cpp:302-311`.
+fn encode_rpc_exec_arg(arg: &RpcArg<'_>, order: ByteOrder, out: &mut Vec<u8>) {
+    match arg {
+        // pvxs `dataencode.cpp:30-35` — a null `FieldDesc*` is the
+        // single `0xff` byte; no value body follows.
+        RpcArg::Null => out.put_u8(0xff),
+        RpcArg::Typed { desc, value } => {
+            encode_type_desc(desc, order, out);
+            encode_pv_field(value, desc, order, out);
+        }
+    }
+}
+
 pub async fn op_rpc(
     channel: &Arc<Channel>,
     request_desc: &FieldDesc,
     request_value: &PvField,
+    arg: RpcArg<'_>,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
@@ -2969,14 +3007,15 @@ pub async fn op_rpc(
     ioid_guard.arm_destroy(sid);
     let response_intro = init_resp.introspection;
 
-    // DATA — RPC argument: `type(arg) + full_value(arg)`.
-    // pvxs clientget.cpp:307-311 — `to_wire(R, type); to_wire_full(R, arg)`.
+    // DATA — RPC argument. pvxs clientget.cpp:302-311 writes the
+    // argument descriptor then the value body *only when the arg is
+    // valid*; a top-level null arg is the single 0xff null-type tag
+    // with no body. `encode_rpc_exec_arg` owns that distinction.
     let mut data = Vec::new();
     data.put_u32(sid, order);
     data.put_u32(ioid, order);
     data.put_u8(0x00);
-    crate::pvdata::encode::encode_type_desc(request_desc, order, &mut data);
-    encode_pv_field(request_value, request_desc, order, &mut data);
+    encode_rpc_exec_arg(&arg, order, &mut data);
     let data_h = PvaHeader::application(false, order, Command::Rpc.code(), data.len() as u32);
     let mut data_frame = Vec::with_capacity(8 + data.len());
     data_h.write_into(&mut data_frame);
@@ -4667,6 +4706,81 @@ mod tests {
         assert!(
             decode_process_status(&frame).is_err(),
             "a command mismatch must be a connection-fatal Err"
+        );
+    }
+
+    #[test]
+    fn rpc_arg_null_encodes_single_null_type_tag() {
+        // pvxs dataencode.cpp:30-35 — a null FieldDesc* is the single
+        // 0xff byte; clientget.cpp:302-311 omits the value body. The
+        // server's decode_rpc_exec_arg reads exactly this as a
+        // top-level null argument.
+        let mut out = Vec::new();
+        encode_rpc_exec_arg(&RpcArg::Null, ByteOrder::Little, &mut out);
+        assert_eq!(
+            out,
+            vec![0xff],
+            "null RPC arg must be exactly the 0xff null-type tag with no value body"
+        );
+    }
+
+    #[test]
+    fn rpc_arg_typed_encodes_type_then_full_value() {
+        let desc = FieldDesc::Scalar(ScalarType::Int);
+        let value = PvField::Scalar(ScalarValue::Int(7));
+        let mut got = Vec::new();
+        encode_rpc_exec_arg(
+            &RpcArg::Typed {
+                desc: &desc,
+                value: &value,
+            },
+            ByteOrder::Little,
+            &mut got,
+        );
+        let mut want = Vec::new();
+        encode_type_desc(&desc, ByteOrder::Little, &mut want);
+        encode_pv_field(&value, &desc, ByteOrder::Little, &mut want);
+        assert_eq!(
+            got, want,
+            "typed RPC arg must serialize as type(arg) + full_value(arg)"
+        );
+        assert_ne!(
+            got,
+            vec![0xff],
+            "a typed arg must not collapse to the null tag"
+        );
+    }
+
+    #[test]
+    fn rpc_top_level_null_is_distinct_from_present_any_null() {
+        // The finding's invariant: a top-level null argument (0xff) is
+        // a different wire shape than a present `any` whose selected
+        // value is null (variant tag 0x82, then the inner any-null
+        // marker). Providers can tell the two apart.
+        let mut null_arg = Vec::new();
+        encode_rpc_exec_arg(&RpcArg::Null, ByteOrder::Little, &mut null_arg);
+
+        let variant_desc = FieldDesc::Variant;
+        let variant_null = build_put_value(&FieldDesc::Variant, "").unwrap();
+        let mut any_arg = Vec::new();
+        encode_rpc_exec_arg(
+            &RpcArg::Typed {
+                desc: &variant_desc,
+                value: &variant_null,
+            },
+            ByteOrder::Little,
+            &mut any_arg,
+        );
+
+        assert_eq!(null_arg, vec![0xff]);
+        assert_ne!(
+            any_arg, null_arg,
+            "present any-null must not collapse to the top-level 0xff null tag"
+        );
+        assert_eq!(
+            any_arg.first(),
+            Some(&0x82),
+            "a present any starts with the variant type tag, not 0xff"
         );
     }
 }

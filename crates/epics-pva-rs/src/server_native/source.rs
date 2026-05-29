@@ -786,9 +786,9 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// matching pvxs's marked-leaf semantics. Default `false` keeps
     /// the static-mask behaviour for single-record sources whose
     /// every event already carries a full value.
-    fn monitor_emits_partial(&self, name: &str) -> bool {
+    fn monitor_emits_partial(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
         let _ = name;
-        false
+        async { false }
     }
 
     /// Notify the source that the per-connection monitor outbox for
@@ -1169,7 +1169,10 @@ pub trait ChannelSourceObj: Send + Sync {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
-    fn monitor_emits_partial(&self, name: &str) -> bool;
+    fn monitor_emits_partial<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent);
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool);
     fn notify_channel_open(&self, name: &str, ctx: &ChannelContext);
@@ -1419,8 +1422,11 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::process_checked(self, checked, ctx))
     }
-    fn monitor_emits_partial(&self, name: &str) -> bool {
-        <Self as ChannelSource>::monitor_emits_partial(self, name)
+    fn monitor_emits_partial<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::monitor_emits_partial(self, name))
     }
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         <Self as ChannelSource>::notify_watermark(self, name, ctx, ev);

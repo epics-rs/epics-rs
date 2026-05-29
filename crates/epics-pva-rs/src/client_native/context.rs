@@ -28,12 +28,27 @@ use crate::pvdata::{FieldDesc, PvField};
 
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
-    DEFAULT_PIPELINE_SIZE, MonitorEvent, MonitorEventMask, SubscriptionHandle, op_get, op_get_get,
-    op_get_put, op_monitor, op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle,
-    op_monitor_raw_frames_handle_with_request, op_process, op_process_with_request, op_put,
-    op_put_get, op_rpc,
+    DEFAULT_PIPELINE_SIZE, MonitorEvent, MonitorEventMask, RpcArg, SubscriptionHandle, op_get,
+    op_get_get, op_get_put, op_monitor, op_monitor_events, op_monitor_handle,
+    op_monitor_raw_frames_handle, op_monitor_raw_frames_handle_with_request, op_process,
+    op_process_with_request, op_put, op_put_get, op_rpc,
 };
 use super::search_engine::SearchEngine;
+
+/// The empty pvRequest pvxs sends by default for a parameterless RPC
+/// (`pvRequest()` — an empty top-level structure). Used as the RPC
+/// INIT payload when the caller expresses a top-level null DATA
+/// argument; an empty pvRequest selects all fields server-side and is
+/// inert for RPC, which projects no fields.
+fn empty_pv_request() -> (FieldDesc, PvField) {
+    (
+        FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: Vec::new(),
+        },
+        PvField::Structure(crate::pvdata::PvStructure::new("")),
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct PvGetResult {
@@ -1508,7 +1523,31 @@ impl PvaClient {
         request_value: &PvField,
     ) -> PvaResult<(FieldDesc, PvField)> {
         let ch = self.channel(pv_name).await?;
-        op_rpc(&ch, request_desc, request_value, self.inner.timeout).await
+        op_rpc(
+            &ch,
+            request_desc,
+            request_value,
+            RpcArg::Typed {
+                desc: request_desc,
+                value: request_value,
+            },
+            self.inner.timeout,
+        )
+        .await
+    }
+
+    /// RPC with pvxs's **top-level null** argument
+    /// (`Context::rpc(name, Value())`): the DATA phase carries the
+    /// single `0xff` null-type tag with no value body, not an `any`
+    /// carrying null. Providers that use a null query object to mean
+    /// "no argument" require this exact wire shape; a present `any`
+    /// (the only shape [`Self::pvrpc`] can express) is distinguishable
+    /// from it. The INIT pvRequest is the empty pvRequest pvxs sends by
+    /// default for a parameterless RPC.
+    pub async fn pvrpc_null(&self, pv_name: &str) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        let (req_desc, req_value) = empty_pv_request();
+        op_rpc(&ch, &req_desc, &req_value, RpcArg::Null, self.inner.timeout).await
     }
 
     /// Same as [`Self::pvrpc`] but pins the operation to a specific
@@ -1524,7 +1563,29 @@ impl PvaClient {
         request_value: &PvField,
     ) -> PvaResult<(FieldDesc, PvField)> {
         let ch = self.channel_with_forced(pv_name, Some(server)).await?;
-        op_rpc(&ch, request_desc, request_value, self.inner.timeout).await
+        op_rpc(
+            &ch,
+            request_desc,
+            request_value,
+            RpcArg::Typed {
+                desc: request_desc,
+                value: request_value,
+            },
+            self.inner.timeout,
+        )
+        .await
+    }
+
+    /// Like [`Self::pvrpc_null`] but pins the operation to a specific
+    /// server, bypassing UDP search (mirrors [`Self::pvrpc_from`]).
+    pub async fn pvrpc_from_null(
+        &self,
+        pv_name: &str,
+        server: SocketAddr,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel_with_forced(pv_name, Some(server)).await?;
+        let (req_desc, req_value) = empty_pv_request();
+        op_rpc(&ch, &req_desc, &req_value, RpcArg::Null, self.inner.timeout).await
     }
 
     /// PVA `PUT_GET` (cmd 12) — atomic put-then-get. PUTs `value_str`

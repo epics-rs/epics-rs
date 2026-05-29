@@ -1010,6 +1010,85 @@ mod tests {
         }
     }
 
+    /// PVA-RS-2026-05-28-110 input contract: a MONITOR DATA frame
+    /// truncated before its trailing overrun bitset must decode as an
+    /// `Err`, so the typed monitor loop's `Err` arm fires and returns
+    /// `MonitorEnd::Fatal` (matching pvxs `clientmon.cpp:601-605`, which
+    /// resets the connection on an invalid MONITOR). If the decoder ever
+    /// became lenient here (e.g. defaulting the missing overrun to empty)
+    /// the loop would silently skip the corrupt frame under the same
+    /// IOID — the exact defect this finding closed.
+    #[test]
+    fn monitor_truncated_data_missing_overrun_is_decode_error() {
+        use crate::proto::WriteExt;
+        use crate::pvdata::ScalarType;
+
+        let order = ByteOrder::Little;
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let mut payload = Vec::new();
+        payload.put_u32(7, order); // ioid
+        payload.put_u8(0x00); // subcmd = DATA
+        let changed = BitSet::new(); // nothing marked → no value bytes
+        payload.extend_from_slice(&changed.encode(order));
+        // NB: trailing overrun bitset omitted → truncated frame.
+        let header =
+            PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
+        let frame = Frame { header, payload };
+        assert!(
+            decode_op_response(&frame, Some(&intro)).is_err(),
+            "MONITOR DATA missing the trailing overrun bitset must be a decode error"
+        );
+    }
+
+    /// PVA-RS-2026-05-28-110 input contract: a MONITOR FINISH frame
+    /// (`subcmd & 0x10`) whose Status cannot be decoded must be an `Err`,
+    /// so the typed loop tears down fatally instead of skipping.
+    #[test]
+    fn monitor_finish_with_truncated_status_is_decode_error() {
+        use crate::proto::WriteExt;
+
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(7, order); // ioid
+        payload.put_u8(0x10); // subcmd = FINISH, but no Status follows
+        let header =
+            PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
+        let frame = Frame { header, payload };
+        assert!(
+            decode_op_response(&frame, None).is_err(),
+            "MONITOR FINISH with a truncated Status must be a decode error"
+        );
+    }
+
+    /// PVA-RS-2026-05-28-110 input contract: a MONITOR frame with the
+    /// INIT bit (`subcmd & 0x08`) decodes as `OpResponse::Init`. The
+    /// typed loop is only entered AFTER the initial INIT, so any Init
+    /// here is a second INIT on a running subscription — a state-machine
+    /// violation pvxs rejects (clientmon.cpp:568-605). The loop's `Init`
+    /// arm now returns `MonitorEnd::Fatal` rather than ignoring it.
+    #[test]
+    fn monitor_init_frame_decodes_as_init_response() {
+        use crate::proto::WriteExt;
+
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(7, order); // ioid
+        payload.put_u8(0x08); // subcmd = INIT
+        // Non-success status returns early (no type descriptor needed),
+        // still classified as an INIT response.
+        Status::error("re-init").write_into(order, &mut payload);
+        let header =
+            PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
+        let frame = Frame { header, payload };
+        assert!(
+            matches!(decode_op_response(&frame, None), Ok(OpResponse::Init(_))),
+            "a MONITOR INIT-bit frame must classify as OpResponse::Init"
+        );
+    }
+
     /// a GET data response carrying the last-request bit
     /// (`subcmd & 0x10`) must still decode its value body. pvxs echoes the
     /// request subcmd on an otherwise normal data reply

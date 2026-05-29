@@ -2456,10 +2456,39 @@ where
                 }
             }
             Ok(OpResponse::Init(_)) => {
-                // Spurious INIT — ignore.
+                // A second INIT while the monitor is already Running is a
+                // state-machine violation. pvxs accepts only Creating+INIT,
+                // Idle+non-INIT, or Running+non-INIT and resets the
+                // connection otherwise (clientmon.cpp:568-605). Surface it
+                // as fatal — matching the raw path, which classifies
+                // unexpected control frames as `RawMonitorFrameKind::Fatal`
+                // — instead of treating the violation as harmless.
+                server.unregister_ioid(ioid);
+                if let Some(s) = &state {
+                    s.active.lock().take();
+                }
+                return Err(MonitorEnd::Fatal(PvaError::Protocol(
+                    "MONITOR: unexpected second INIT on a running subscription".into(),
+                )));
             }
             Err(e) => {
-                debug!("MONITOR decode error: {e}");
+                // A decode fault on a post-INIT MONITOR frame (truncated
+                // DATA body, missing trailing overrun bitset, malformed
+                // FINISH Status) is a connection-level protocol fault in
+                // pvxs: it logs an invalid MONITOR and resets the
+                // connection (clientmon.cpp:601-605). Surface it as fatal
+                // instead of logging and skipping under the same IOID —
+                // a silent skip also desyncs pipeline ACK accounting (the
+                // skipped frame's credit is never returned), which can
+                // stall a window-limited server. This mirrors the raw
+                // path's `MonitorEnd::Fatal` on a bad classification.
+                server.unregister_ioid(ioid);
+                if let Some(s) = &state {
+                    s.active.lock().take();
+                }
+                return Err(MonitorEnd::Fatal(PvaError::Protocol(format!(
+                    "MONITOR decode error: {e}"
+                ))));
             }
         }
     }

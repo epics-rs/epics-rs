@@ -1,8 +1,8 @@
 use clap::Parser;
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::format;
 use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure};
+use epics_pva_rs::{cli, format};
 
 const VERSION_INFO: &str = concat!("pvput-rs ", env!("CARGO_PKG_VERSION"));
 
@@ -36,12 +36,18 @@ struct Args {
 
     /// Output mode: `nt` (default), `raw`, or `json`. Selects how the
     /// `--read-back` Old:/New: echo renders values, mirroring
-    /// `pvget-rs` (pvAccessCPP pvput.cpp:299-310, 403-428).
+    /// `pvget-rs`. The full structure is shown with `-M raw` (pvxs
+    /// reserves `-v` for effective-config diagnostics, not formatting).
     #[arg(short = 'M', long = "mode", default_value = "nt")]
     mode: String,
 
-    /// Show entire structure in raw mode (legacy `-v` shorthand);
-    /// implies `-M raw` for the `--read-back` echo (pvput.cpp:281-283).
+    /// Verbose ("make more noise"): print the effective PVA client
+    /// configuration before the PUT. pvxs `tools/put.cpp:56-58,109-110`
+    /// sets `verbose=true` and prints `Effective config` + the client
+    /// context config; it does NOT change the value formatter (that is
+    /// `-M`). pvxs additionally prints a `Writing fields:` delta of the
+    /// PUT prototype (put.cpp:129) — not reproduced here because the
+    /// prototype is built inside the client, not surfaced to the CLI.
     #[arg(short = 'v', action = clap::ArgAction::Count)]
     verbose: u8,
 
@@ -91,6 +97,13 @@ async fn main() {
     if let Err(e) = check_provider(&args.provider) {
         eprintln!("pvput-rs: {e}");
         std::process::exit(1);
+    }
+
+    // pvxs `-v` prints the effective client config once, before the PUT
+    // (tools/put.cpp:109-110). It is a diagnostic, not an output-format
+    // switch — the readback echo formatter stays under `-M`.
+    if args.verbose > 0 {
+        cli::print_effective_config();
     }
 
     let pv_name = args.pv_name.expect("clap enforces required");
@@ -168,12 +181,12 @@ async fn main() {
     // 3. Post-PUT read for the `New :` echo line.
     let new_get = client.pvget_full(&pv_name).await;
 
-    // pvAccessCPP formats both the old and new readback values through
-    // the same `stream().format(outmode)` path (pvput.cpp:403-428), and
-    // `-v` selects raw mode (pvput.cpp:281-283). Mirror `pvget-rs`'s
-    // mode dispatch so `-M raw`/`-M json`/`-v` actually change the echo
-    // shape instead of always emitting the legacy NT form.
-    let mode = resolve_output_mode(&args.mode, args.verbose);
+    // The old and new readback values render through the same
+    // formatter, selected by `-M` (mirrors `pvget-rs`). `-v` is the
+    // effective-config diagnostic (pvxs put.cpp:109-110), not an
+    // output-format switch, so the full structure is requested with
+    // `-M raw`, not `-v`.
+    let mode = args.mode.as_str();
     let render = |label: &str, value: &PvField, desc: &FieldDesc| -> String {
         match mode {
             "json" => format::format_json(label, value),
@@ -258,13 +271,6 @@ fn parse_put_args(values: &[String]) -> Result<PutInput, String> {
         }
     }
     Ok(PutInput::Fields(assignments))
-}
-
-/// Resolve the effective output mode for the `--read-back` echo. `-v`
-/// implies raw mode (pvAccessCPP pvput.cpp:281-283); otherwise the
-/// `-M` value is used, matching `pvget-rs`.
-fn resolve_output_mode(mode: &str, verbose: u8) -> &str {
-    if verbose > 0 { "raw" } else { mode }
 }
 
 /// Label for the post-PUT `New :` echo line. pvAccessCPP `pvput -q`
@@ -364,15 +370,18 @@ mod tests {
         assert_eq!(new_echo_label(true), "");
     }
 
-    /// `-M` selects the readback echo formatter; `-v` overrides it to
-    /// raw (pvput.cpp:281-283), matching pvget-rs.
+    /// `-v` is the effective-config diagnostic, decoupled from output
+    /// formatting: it must NOT force the readback echo into raw mode.
+    /// The full structure is requested with `-M raw` instead (pvxs
+    /// reserves `-v` for `Effective config`, put.cpp:109-110).
     #[test]
-    fn output_mode_honors_mode_and_verbose() {
-        assert_eq!(resolve_output_mode("nt", 0), "nt");
-        assert_eq!(resolve_output_mode("json", 0), "json");
-        assert_eq!(resolve_output_mode("raw", 0), "raw");
-        // -v forces raw regardless of -M.
-        assert_eq!(resolve_output_mode("nt", 1), "raw");
-        assert_eq!(resolve_output_mode("json", 2), "raw");
+    fn verbose_does_not_change_output_mode() {
+        let v = Args::parse_from(["pvput-rs", "-v", "PV", "42"]);
+        assert!(v.verbose > 0, "-v sets the verbose flag");
+        assert_eq!(v.mode, "nt", "-v must not change -M from its default");
+
+        let raw = Args::parse_from(["pvput-rs", "-M", "raw", "PV", "42"]);
+        assert_eq!(raw.mode, "raw", "-M raw selects the raw echo formatter");
+        assert_eq!(raw.verbose, 0, "-M raw does not imply verbose");
     }
 }

@@ -1,6 +1,6 @@
 use clap::Parser;
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::{config, format};
+use epics_pva_rs::{cli, config, format};
 
 #[derive(Parser)]
 #[command(
@@ -39,39 +39,6 @@ struct Args {
     show_credentials: bool,
 }
 
-/// Print the effective PVA client configuration, mirroring pvxs
-/// `pvxinfo -v` (`tools/info.cpp:76-79`, which prints `Effective config`
-/// followed by the client context config). The values are read through
-/// the resolved `config` getters so the output reflects environment +
-/// defaults exactly as the client will use them.
-fn print_effective_config() {
-    let addr_list = std::env::var("EPICS_PVA_ADDR_LIST").unwrap_or_default();
-    let name_servers = config::name_servers()
-        .iter()
-        .map(|a| a.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let interfaces = config::list_intf_addresses()
-        .iter()
-        .map(|a| a.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    println!("Effective config");
-    println!("  EPICS_PVA_ADDR_LIST={addr_list}");
-    println!(
-        "  EPICS_PVA_AUTO_ADDR_LIST={}",
-        if config::auto_addr_list_enabled() {
-            "YES"
-        } else {
-            "NO"
-        }
-    );
-    println!("  EPICS_PVA_SERVER_PORT={}", config::server_port());
-    println!("  EPICS_PVA_BROADCAST_PORT={}", config::broadcast_port());
-    println!("  EPICS_PVA_NAME_SERVERS={name_servers}");
-    println!("  interfaces={interfaces}");
-}
-
 /// Print host network troubleshooting info and return, mirroring pvxs
 /// `target_information` (`src/describe.cpp:27`) as invoked by `-D`
 /// (`tools/info.cpp:62-64`). pvxs additionally dumps C++ toolchain/ABI
@@ -90,7 +57,7 @@ fn target_information() {
     for addr in config::list_broadcast_addresses(config::broadcast_port()) {
         println!("    {addr}");
     }
-    print_effective_config();
+    cli::print_effective_config();
 }
 
 #[tokio::main]
@@ -109,7 +76,7 @@ async fn main() {
     // pvxs `pvxinfo -v` prints the effective client config once, before
     // the per-PV type output (`tools/info.cpp:76-79`), not per channel.
     if args.verbose {
-        print_effective_config();
+        cli::print_effective_config();
     }
 
     let client = PvaClient::new().expect("failed to create PVA client");

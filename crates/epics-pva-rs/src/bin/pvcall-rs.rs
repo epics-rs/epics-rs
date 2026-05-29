@@ -43,6 +43,14 @@ struct Args {
     /// Output mode: nt (NTURI-aware), raw, json
     #[arg(short = 'M', default_value = "nt")]
     mode: String,
+
+    /// Verbose ("make more noise"): print the effective PVA client
+    /// configuration before issuing the RPC. pvxs
+    /// `tools/call.cpp:56-58,122-123` sets `verbose=true` and prints
+    /// `Effective config` + the client context config. pvxs accepts
+    /// `-v`; the prior Rust CLI rejected it outright.
+    #[arg(short = 'v', action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 /// Parse a `key=value` pair into a string-valued [`ScalarValue`]. pvxs
@@ -126,6 +134,12 @@ async fn main() {
             std::process::exit(2);
         }
     };
+
+    // pvxs `-v` prints the effective client config once, before the
+    // RPC is issued (tools/call.cpp:122-123).
+    if args.verbose > 0 {
+        epics_pva_rs::cli::print_effective_config();
+    }
 
     let (desc, value) = build_nturi(&args.pv_name, &parsed_args);
 

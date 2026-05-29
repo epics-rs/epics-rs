@@ -1,6 +1,6 @@
 use clap::Parser;
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::format;
+use epics_pva_rs::{cli, format};
 
 #[derive(Parser)]
 #[command(
@@ -17,11 +17,17 @@ struct Args {
     #[arg(short = 'r', default_value = "")]
     request: String,
 
-    /// Output mode: raw, nt, json
+    /// Output mode: raw, nt, json. The full structure is shown with
+    /// `-M raw` (pvxs reserves `-v` for effective-config diagnostics,
+    /// not output formatting).
     #[arg(short = 'M', default_value = "nt")]
     mode: String,
 
-    /// Show entire structure (implies raw mode)
+    /// Verbose ("make more noise"): print the effective PVA client
+    /// configuration before the GET. pvxs `tools/get.cpp:65-67,99-100`
+    /// sets `verbose=true` and prints `Effective config` + the client
+    /// context config; it does NOT change the value formatter (that is
+    /// `-M`/`-F`).
     #[arg(short = 'v', action = clap::ArgAction::Count)]
     verbose: u8,
 
@@ -59,12 +65,16 @@ fn parse_pv_request(request: &str) -> Vec<&str> {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // pvxs `-v` prints the effective client config once, before any
+    // operation (tools/get.cpp:99-100). It is a diagnostic, not an
+    // output-format switch — the value formatter stays under `-M`.
+    if args.verbose > 0 {
+        cli::print_effective_config();
+    }
+
     let client = PvaClient::new().expect("failed to create PVA client");
-    let mode = if args.verbose > 0 {
-        "raw"
-    } else {
-        args.mode.as_str()
-    };
+    let mode = args.mode.as_str();
     let fields = parse_pv_request(&args.request);
 
     let mut failed = false;

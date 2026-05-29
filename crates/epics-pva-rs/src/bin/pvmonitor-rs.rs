@@ -1,7 +1,7 @@
 use clap::Parser;
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::format;
 use epics_pva_rs::pv_request::PvRequestExpr;
+use epics_pva_rs::{cli, format};
 
 #[derive(Parser)]
 #[command(
@@ -14,11 +14,17 @@ struct Args {
     #[arg(required = true)]
     pv_names: Vec<String>,
 
-    /// Output mode: raw, nt, json
+    /// Output mode: raw, nt, json. The full structure is shown with
+    /// `-M raw` (pvxs reserves `-v` for effective-config diagnostics,
+    /// not output formatting).
     #[arg(short = 'M', default_value = "nt")]
     mode: String,
 
-    /// Show entire structure (implies raw mode)
+    /// Verbose ("make more noise"): print the effective PVA client
+    /// configuration before the subscription. pvxs
+    /// `tools/monitor.cpp:65-67,97-98` sets `verbose=true` and prints
+    /// `Effective config` + the client context config; it does NOT
+    /// change the value formatter (that is `-M`/`-F`).
     #[arg(short = 'v', action = clap::ArgAction::Count)]
     verbose: u8,
 
@@ -66,14 +72,18 @@ async fn main() {
         }
     };
 
+    // pvxs `-v` prints the effective client config once, before any
+    // subscription is started (tools/monitor.cpp:97-98). It is a
+    // diagnostic, not an output-format switch — the value formatter
+    // stays under `-M`.
+    if args.verbose > 0 {
+        cli::print_effective_config();
+    }
+
     let mut handles = Vec::new();
 
     for pv_name in args.pv_names {
-        let mode = if args.verbose > 0 {
-            "raw".to_string()
-        } else {
-            args.mode.clone()
-        };
+        let mode = args.mode.clone();
         let request = request.clone();
         let timeout = args.timeout;
         let handle = tokio::spawn(async move {

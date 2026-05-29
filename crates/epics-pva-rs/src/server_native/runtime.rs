@@ -165,10 +165,14 @@ pub struct PvaServerConfig {
     /// (e.g. a hardened deployment that wants to reject any header
     /// claiming more than `n` bytes and drop the connection).
     pub max_message_size: Option<usize>,
-    /// Inbound peer ACL. Each entry is `(IpAddr, port_or_zero)` —
-    /// matching connections (TCP) and search packets (UDP) are silently
-    /// dropped. `port == 0` matches any port from that IP. Mirrors
-    /// pvxs `Config::ignoreAddrs`. Empty = allow all (default).
+    /// UDP-SEARCH ignore list. Each entry is `(IpAddr, port_or_zero)` —
+    /// matching UDP SEARCH datagrams are silently dropped before
+    /// admission. `port == 0` matches any port from that IP. Mirrors
+    /// pvxs `Config::ignoreAddrs`, which is consulted ONLY from the UDP
+    /// search path (`Server::Pvt::onSearch`, server.cpp:654-670) and NOT
+    /// from the TCP accept callback (serverconn.cpp:461-467): a noisy
+    /// host's discovery traffic can be suppressed while its direct TCP
+    /// clients still connect. Empty = allow all (default).
     pub ignore_addrs: Vec<(std::net::IpAddr, u16)>,
     /// Spawn a parallel IPv6 UDP listener bound to `[::]:udp_port`
     /// alongside the existing IPv4 per-NIC responder. Required for
@@ -214,6 +218,12 @@ impl PvaServerConfig {
     /// True when `peer` matches an entry in `ignore_addrs`. Port 0 in
     /// the entry is a wildcard. O(n) over the list; n is expected to
     /// be small (single-digit) in practice.
+    ///
+    /// This predicate is the UDP-SEARCH ignore policy and is NOT applied
+    /// to TCP accepts (pvxs parity — see [`Self::ignore_addrs`]). It is
+    /// exposed so a deployment that wants a separate Rust-only TCP ACL
+    /// can opt into one explicitly rather than having the discovery
+    /// filter silently double as a transport gate.
     pub fn is_ignored_peer(&self, peer: std::net::SocketAddr) -> bool {
         for (ip, port) in &self.ignore_addrs {
             if peer.ip() == *ip && (*port == 0 || peer.port() == *port) {

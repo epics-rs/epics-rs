@@ -1576,11 +1576,14 @@ pub async fn run_tcp_server_on_listener(
         };
         match accept_result {
             Ok((stream, peer)) => {
-                if config.is_ignored_peer(peer) {
-                    debug!(?peer, "rejecting connection: peer on ignore_addrs");
-                    drop(stream);
-                    continue;
-                }
+                // pvxs scopes `ignoreAddrs` to the UDP SEARCH admission
+                // path (`Server::Pvt::onSearch`, server.cpp:654-670); the
+                // TCP accept callback registers a `ServerConn` with no
+                // ignore-list check (serverconn.cpp:461-467). Applying it
+                // to TCP accepts here turned a discovery filter into a
+                // transport ACL, blocking direct clients that reach the
+                // endpoint via a name server / cached beacon / static
+                // address. The UDP path keeps the filter (`filter_inbound`).
                 let cur = active.fetch_add(1, Ordering::SeqCst);
                 if cur >= config.max_connections {
                     active.fetch_sub(1, Ordering::SeqCst);

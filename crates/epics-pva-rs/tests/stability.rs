@@ -1793,3 +1793,48 @@ async fn ex_r4_pvget_many_warm_path_returns_responses() {
 
     h.abort();
 }
+
+/// Parity: pvxs consults `ignoreAddrs` only on the UDP SEARCH admission
+/// path (`Server::Pvt::onSearch`, server.cpp:654-670); the TCP accept
+/// callback registers a `ServerConn` without any ignore-list check
+/// (serverconn.cpp:461-467). The Rust server previously rejected TCP
+/// accepts from an ignore-list peer, turning a discovery filter into a
+/// transport ACL. Here a server that ignores `127.0.0.1` must still
+/// accept a direct loopback TCP connection and emit the handshake
+/// prelude (SET_BYTE_ORDER + CONNECTION_VALIDATION).
+///
+/// Multi-thread runtime: `read_handshake_prelude` does a blocking
+/// `std::net` read that would starve the server tasks on a
+/// current-thread runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ignore_addr_list_does_not_block_direct_tcp_connect() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("IGN:PV", 1.0).await;
+
+    let (tcp, udp) = alloc_port_pair();
+    let cfg = PvaServerConfig {
+        tcp_port: tcp,
+        udp_port: udp,
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 16,
+        max_channels_per_connection: 64,
+        monitor_queue_depth: 8,
+        // Loopback is on the UDP-search ignore list…
+        ignore_addrs: vec![(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)],
+        ..Default::default()
+    };
+    let h = tokio::spawn(async move {
+        let _ = run_pva_server(source, cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    // …yet a direct TCP connect from loopback must still complete the
+    // handshake. `read_handshake_prelude` panics if no prelude arrives,
+    // which is exactly the regression: pre-fix the accept loop dropped
+    // the stream and the prelude never came.
+    let _sock = read_handshake_prelude(server_addr);
+
+    h.abort();
+}

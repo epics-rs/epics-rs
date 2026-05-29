@@ -169,11 +169,48 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
     }
 }
 
+/// Map a `record._options.process` scalar to a [`ProcessMode`],
+/// mirroring pvxs `setForceProcessingFlag` (ioc/iocsource.cpp:426-448):
+/// `Value::as<bool>` accepts a bool, any integer (nonzero ⇒ true), or a
+/// bool-parsable string; the literal `"passive"` (and any other
+/// unrecognized value) leaves the mode at the passive default.
+fn process_mode_from_scalar(sv: &ScalarValue) -> ProcessMode {
+    let force = |b: bool| {
+        if b {
+            ProcessMode::Force
+        } else {
+            ProcessMode::Inhibit
+        }
+    };
+    match sv {
+        ScalarValue::Boolean(b) => force(*b),
+        ScalarValue::Byte(n) => force(*n != 0),
+        ScalarValue::Short(n) => force(*n != 0),
+        ScalarValue::Int(n) => force(*n != 0),
+        ScalarValue::Long(n) => force(*n != 0),
+        ScalarValue::UByte(n) => force(*n != 0),
+        ScalarValue::UShort(n) => force(*n != 0),
+        ScalarValue::UInt(n) => force(*n != 0),
+        ScalarValue::ULong(n) => force(*n != 0),
+        ScalarValue::String(s) => match s.trim() {
+            "true" => ProcessMode::Force,
+            "false" => ProcessMode::Inhibit,
+            // "passive" and any other string fall back to passive,
+            // matching pvxs's `as<bool>` failure → "passive" check →
+            // ignore-and-default chain.
+            _ => ProcessMode::Passive,
+        },
+        // Float/Double are not a documented `process` encoding; pvxs's
+        // as<bool> is not relied upon here. Leave passive.
+        ScalarValue::Float(_) | ScalarValue::Double(_) => ProcessMode::Passive,
+    }
+}
+
 impl PutOptions {
     /// Extract process/block options from a PvStructure.
     ///
-    /// Looks for `record._options.process` ("true"|"false"|"passive")
-    /// and `record._options.block` (boolean) fields.
+    /// Looks for `record._options.process` (bool / integer / "true" /
+    /// "false" / "passive") and `record._options.block` (boolean) fields.
     pub fn from_pv_request(request: &PvStructure) -> Self {
         let mut opts = Self::default();
 
@@ -190,13 +227,15 @@ impl PutOptions {
             });
 
         if let Some(opt_struct) = options {
-            // process option
-            if let Some(PvField::Scalar(ScalarValue::String(s))) = opt_struct.get_field("process") {
-                opts.process = match s.as_str() {
-                    "true" => ProcessMode::Force,
-                    "false" => ProcessMode::Inhibit,
-                    _ => ProcessMode::Passive,
-                };
+            // process option. pvxs reads `record._options.process` via
+            // `Value::as<bool>` first — accepting an actual bool, an
+            // integer, or a bool-parsable string — then falls back to the
+            // literal string "passive"; anything else is ignored and the
+            // mode stays passive/default (ioc/iocsource.cpp:426-448). The
+            // earlier Rust path matched only `String`, silently dropping
+            // the boolean and numeric forms a PVA client can legally send.
+            if let Some(PvField::Scalar(sv)) = opt_struct.get_field("process") {
+                opts.process = process_mode_from_scalar(sv);
             }
 
             // block option
@@ -626,6 +665,41 @@ mod tests {
         let opts = PutOptions::from_pv_request(&req);
         assert_eq!(opts.process, ProcessMode::Inhibit);
         assert!(!opts.block); // block disabled when process=false
+    }
+
+    fn req_with_process(value: PvField) -> PvStructure {
+        let mut options = PvStructure::new("");
+        options.fields.push(("process".into(), value));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+        req
+    }
+
+    /// pvxs reads `record._options.process` via `as<bool>` (bool,
+    /// integer, or bool-parsable string) before the "passive" string
+    /// (iocsource.cpp:426-448). Boolean and integer scalar forms must
+    /// map to Force/Inhibit, not silently fall back to passive.
+    #[test]
+    fn put_options_process_accepts_boolean_and_integer_scalars() {
+        let f = |v| PutOptions::from_pv_request(&req_with_process(PvField::Scalar(v))).process;
+
+        assert_eq!(f(ScalarValue::Boolean(true)), ProcessMode::Force);
+        assert_eq!(f(ScalarValue::Boolean(false)), ProcessMode::Inhibit);
+        assert_eq!(f(ScalarValue::Int(1)), ProcessMode::Force);
+        assert_eq!(f(ScalarValue::Int(0)), ProcessMode::Inhibit);
+        assert_eq!(f(ScalarValue::Long(5)), ProcessMode::Force);
+        // String forms still resolve; "passive" stays passive.
+        assert_eq!(f(ScalarValue::String("true".into())), ProcessMode::Force);
+        assert_eq!(f(ScalarValue::String("false".into())), ProcessMode::Inhibit);
+        assert_eq!(
+            f(ScalarValue::String("passive".into())),
+            ProcessMode::Passive
+        );
     }
 
     fn req_with_dbe(value: PvField) -> PvStructure {

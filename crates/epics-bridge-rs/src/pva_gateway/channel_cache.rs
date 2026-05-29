@@ -994,29 +994,8 @@ impl ChannelCache {
         self.max_entries
     }
 
-    /// Test-only: insert a placeholder entry so control / diagnostic
-    /// aggregation across caches and tenants can be exercised without a
-    /// live upstream. The entry holds an empty snapshot and an inert
-    /// monitor task.
-    #[cfg(test)]
-    pub(crate) async fn insert_placeholder_entry(&self, pv_name: &str) {
-        let entry = Arc::new(UpstreamEntry {
-            pv_name: pv_name.into(),
-            state: Arc::new(RwLock::new(EntryState::default())),
-            tx: broadcast::channel(4).0,
-            tx_raw: broadcast::channel(4).0,
-            latest_raw: Arc::new(RwLock::new(None)),
-            first_event: Arc::new(Notify::new()),
-            _monitor_task: AbortOnDrop(tokio::spawn(async {})),
-            drop_poke: parking_lot::Mutex::new(true),
-            pause: PauseControl::new(),
-        });
-        self.entries.lock().await.insert(pv_name.into(), entry);
-    }
-
     /// B6: operator-driven cache flush. Drops every cached
-    /// `UpstreamEntry` and clears the negative-result LRU, then
-    /// returns the number of entries that were removed.
+    /// `UpstreamEntry`, then returns the number of entries removed.
     ///
     /// Each removed entry's `AbortOnDrop` aborts its upstream monitor
     /// task once the last `Arc<UpstreamEntry>` is released; any live
@@ -1028,18 +1007,14 @@ impl ChannelCache {
         let mut map = self.entries.lock().await;
         let removed = map.len();
         map.clear();
-        self.negative_cache.lock().clear();
         removed
     }
 
     /// B6: drop a single cache entry by exact PV name. Returns `true`
     /// if an entry was present and removed, `false` if the name was
-    /// not cached. Also evicts the name from the negative-result LRU
-    /// so a subsequent search re-resolves immediately.
+    /// not cached.
     pub async fn drop_entry(&self, pv_name: &str) -> bool {
-        let removed = self.entries.lock().await.remove(pv_name).is_some();
-        self.negative_cache.lock().retain(|(n, _)| n != pv_name);
-        removed
+        self.entries.lock().await.remove(pv_name).is_some()
     }
 
     /// Test-only: insert a synthetic, parked entry under `pv_name` so

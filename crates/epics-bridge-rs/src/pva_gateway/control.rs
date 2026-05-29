@@ -639,8 +639,8 @@ mod tests {
         let s0 = make_source();
         let s1 = make_source();
         // Populate ONLY the second tenant's shared cache.
-        s1.cache().insert_placeholder_entry("B:PV").await;
-        s1.cache().insert_placeholder_entry("B:PV2").await;
+        s1.cache().insert_test_entry("B:PV").await;
+        s1.cache().insert_test_entry("B:PV2").await;
         let ctrl = ControlSource::new("gw", s0)
             .with_source(s1)
             .with_credential_check(Arc::new(|_| true));

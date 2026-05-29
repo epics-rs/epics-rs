@@ -241,11 +241,10 @@ impl CommandHandler {
         //   immediately, instead of keeping the identity captured at first
         //   subscription. Mirrors `newAs` reinstalling the freshly-resolved
         //   `gateAsEntry` on each still-allowed PV (gateServer.cc:603-630).
-        //   Runtime re-notification of already-connected downstream
-        //   clients (C `gateChan::resetAsClient` posting an access-rights
-        //   event, gateVc.cc:170-199) needs a cross-crate
-        //   `CaServer::notify_access_change()` and is deferred; new
-        //   connections already re-evaluate the access hook.
+        //   Already-connected downstream clients are then re-notified once
+        //   after the walk (see the `notify_downstream_access_change` call
+        //   below) — C `gateChan::resetAsClient` posting an access-rights
+        //   event, gateVc.cc:170-199.
         //
         // Match via the same host-less `match_name` the resolver-prune
         // uses so alias rewrites are honored and only global rules apply.

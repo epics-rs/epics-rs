@@ -73,15 +73,19 @@ fn dbe_value_class_mask(raw: u16) -> u16 {
     }
 }
 
-/// parse `record._options.DBE` from a MONITOR INIT
-/// pvRequest. Returns the DBE bitmask as an EPICS event mask
-/// (`EventMask::VALUE | ALARM | LOG | PROPERTY`), or `None` if
-/// the option is absent / unparseable.
+/// parse `record._options.DBE` from a MONITOR INIT pvRequest into the
+/// value-subscription mask. Returns `None` only when the option is
+/// absent; a present option always resolves to a non-empty value-class
+/// mask (pvxs's `VALUE|ALARM` fallback applies when nothing in the
+/// value class is selected).
 ///
-/// pvxs accepts a flag string with any of these tokens separated by
-/// `|`, `,`, or whitespace: `VALUE`, `ALARM`, `LOG`/`ARCHIVE`,
-/// `PROPERTY`. Numeric form is also accepted (e.g. `"5"` =
-/// `VALUE|ALARM`).
+/// String form mirrors pvxs's "sloppy" substring parse
+/// (singlesource.cpp:122-127): only `VALUE`, `ARCHIVE`, and `ALARM` are
+/// recognized for the value mask. `LOG` is not a recognized spelling,
+/// and `PROPERTY` is deliberately excluded — the property subscription
+/// is separate and unconditional (singlesource.cpp:161-167). Numeric
+/// form (`"5"` or an integer scalar) is masked to the value class the
+/// same way.
 pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
     use epics_base_rs::server::recgbl::EventMask;
 
@@ -118,26 +122,31 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
         return Some(dbe_value_class_mask((n & 0xFFFF) as u16));
     }
 
-    let mut mask = EventMask::NONE;
-    for tok in raw.split(|c: char| c == '|' || c == ',' || c.is_whitespace()) {
-        let t = tok.trim().to_ascii_uppercase();
-        let t = t.strip_prefix("DBE_").unwrap_or(&t);
-        match t {
-            "" => continue,
-            "VALUE" => mask |= EventMask::VALUE,
-            "ALARM" => mask |= EventMask::ALARM,
-            // pvxs accepts both LOG and ARCHIVE for the legacy DBE_LOG bit.
-            "LOG" | "ARCHIVE" => mask |= EventMask::LOG,
-            "PROPERTY" => mask |= EventMask::PROPERTY,
-            _ => return None,
-        }
+    // String DBE: pvxs does "sloppy" substring matching for only VALUE,
+    // ARCHIVE, and ALARM (singlesource.cpp:122-127). `LOG` is NOT a
+    // recognized spelling — the DBE_LOG/DBE_ARCHIVE bit (they are the
+    // same EPICS bit) is selected only by the substring `ARCHIVE`. And
+    // PROPERTY is deliberately excluded from the value mask
+    // (`CASE(PROPERTY)` is commented out): the property subscription is
+    // opened separately and unconditionally (singlesource.cpp:161-167),
+    // so a `PROPERTY` token must never reach the value subscription.
+    // Unknown text is ignored (pure substring search). The value-class
+    // mask + VALUE|ALARM fallback (singlesource.cpp:142-144) then
+    // applies, so a present `DBE` that selects an empty value mask
+    // (PROPERTY-only, or unrecognized text like `LOG`) falls back to
+    // VALUE|ALARM rather than leaving the value subscription empty.
+    let upper = raw.to_ascii_uppercase();
+    let mut raw_mask = 0u16;
+    if upper.contains("VALUE") {
+        raw_mask |= EventMask::VALUE.bits();
     }
-
-    if mask.is_empty() {
-        None
-    } else {
-        Some(mask.bits())
+    if upper.contains("ARCHIVE") {
+        raw_mask |= EventMask::LOG.bits();
     }
+    if upper.contains("ALARM") {
+        raw_mask |= EventMask::ALARM.bits();
+    }
+    Some(dbe_value_class_mask(raw_mask))
 }
 
 /// parse `record._options.atomic` from a group operation
@@ -725,9 +734,13 @@ mod tests {
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
-    /// `DBE_` prefix and `ARCHIVE` alias for LOG are accepted.
+    /// String DBE substring-matches VALUE and ARCHIVE (the DBE_LOG bit),
+    /// but a `PROPERTY` token must NOT enter the value mask — pvxs
+    /// comments out `CASE(PROPERTY)` because the property subscription is
+    /// separate (singlesource.cpp:126,161-167). `DBE_`-prefixed spellings
+    /// still match by substring.
     #[test]
-    fn dbe_mask_accepts_dbe_prefix_and_archive_alias() {
+    fn dbe_string_archive_selected_property_excluded() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String(
             "DBE_VALUE,DBE_ARCHIVE,PROPERTY".into(),
@@ -735,8 +748,34 @@ mod tests {
         let mask = dbe_mask_from_pv_request(&req).expect("must parse");
         assert_eq!(
             mask,
-            (EventMask::VALUE | EventMask::LOG | EventMask::PROPERTY).bits()
+            (EventMask::VALUE | EventMask::LOG).bits(),
+            "ARCHIVE selects the LOG bit; PROPERTY is excluded from the value mask"
         );
+    }
+
+    /// A `PROPERTY`-only string carries no value-class bit, so pvxs warns
+    /// and falls back to VALUE|ALARM for the value subscription
+    /// (singlesource.cpp:128-131,142-144). Before the fix the Rust value
+    /// subscription became PROPERTY-only, so VALUE/ALARM posts stopped
+    /// waking the monitor.
+    #[test]
+    fn dbe_string_property_only_falls_back_to_value_alarm() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::String("PROPERTY".into())));
+        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
+    }
+
+    /// The `LOG` spelling is NOT recognized by pvxs's string parser (only
+    /// `ARCHIVE` selects the DBE_LOG bit); a lone `LOG` selects an empty
+    /// value class and falls back to VALUE|ALARM, unlike the prior Rust
+    /// behavior that treated `LOG` as the archive bit.
+    #[test]
+    fn dbe_string_log_spelling_not_recognized() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::String("LOG".into())));
+        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
     /// numeric integer DBE within the value class passes through

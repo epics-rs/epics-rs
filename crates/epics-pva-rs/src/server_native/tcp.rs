@@ -5548,14 +5548,24 @@ async fn handle_op(
                     // `subscribe_ctx` below — which is also ACF-gated
                     // and will likewise return None.
                     if raw_path_eligible
-                        && let Some(mut rx_raw) = src
-                            .subscribe_raw_checked_opts(
+                        && let Some(seed_raw) = src
+                            .subscribe_raw_seeded(
                                 mon_checked.clone(),
                                 mon_ctx.clone(),
                                 monitor_options.clone(),
                             )
                             .await
                     {
+                        // Single MONITOR seed owner (raw path): the seed
+                        // is the source's cached snapshot, captured with
+                        // the subscription; the server no longer issues
+                        // its own `get_value` seed (which, for the
+                        // gateway, was a fresh upstream GET that diverged
+                        // from the pvxs cached-`lastelem` seed).
+                        let crate::server_native::source::SubscriptionSeed {
+                            initial: seed_raw_initial,
+                            updates: mut rx_raw,
+                        } = seed_raw;
                         // Revalidate ACL BEFORE sending the
                         // initial snapshot. Between the spawn's
                         // initial `check()` and reaching this point
@@ -5589,16 +5599,13 @@ async fn handle_op(
                             mon_acl_version_at_subscribe_cell
                                 .store(live_v0, std::sync::atomic::Ordering::Release);
                         }
-                        // Emit initial snapshot via the regular
-                        // encode path (no raw bytes for the
-                        // first-event seed; the cache may not have
-                        // them yet). ACF-aware: a peer with NoAccess
-                        // on this PV's ASG sees no initial frame
-                        // through the raw fast path either.
-                        if let Some(initial) = src
-                            .get_value_checked(mon_checked.clone(), mon_ctx.clone())
-                            .await
-                        {
+                        // Emit the single connect-time seed via the
+                        // regular encode path (no raw bytes for the
+                        // first-event seed; the cache may not have them
+                        // yet). `seed_raw_initial` is the source's cached
+                        // snapshot; `None` means no value yet or NoAccess
+                        // on this PV's ASG — no initial frame either way.
+                        if let Some(initial) = seed_raw_initial {
                             let payload = build_monitor_payload(
                                 ioid,
                                 &intro_clone,
@@ -5725,8 +5732,14 @@ async fn handle_op(
                         return;
                     }
 
-                    let Some(mut rx) = src
-                        .subscribe_checked_opts_marked(
+                    // Single MONITOR seed owner: the source returns the
+                    // connect-time seed AND the post-seed update stream
+                    // as one `SubscriptionSeed`, so the server emits the
+                    // seed below from `seed_initial` and never issues its
+                    // own `get_value` seed — closing the double-seed
+                    // (server get_value + a self-seeding source stream).
+                    let Some(seed) = src
+                        .subscribe_seeded(
                             mon_checked.clone(),
                             mon_ctx.clone(),
                             monitor_options.clone(),
@@ -5735,6 +5748,10 @@ async fn handle_op(
                     else {
                         return;
                     };
+                    let crate::server_native::source::SubscriptionSeed {
+                        initial: seed_initial,
+                        updates: mut rx,
+                    } = seed;
                     // Diagnostic-only outbound-queue-depth crossing flag.
                     let mut queue_over_high = false;
                     // per-PV pipeline-window watermark levels
@@ -5820,14 +5837,13 @@ async fn handle_op(
                     // holds the last emitted snapshot for that diff.
                     let emits_partial = src.monitor_emits_partial(&pv_name).await;
                     let mut prev_value: Option<PvField> = None;
-                    // Emit initial snapshot via the ACF-aware path —
-                    // a peer with NoAccess on the record's ASG sees
-                    // nothing; legacy sources fall through to
-                    // `get_value` via the trait default.
-                    if let Some(initial) = src
-                        .get_value_checked(mon_checked.clone(), mon_ctx.clone())
-                        .await
-                    {
+                    // Emit the single connect-time seed carried back by
+                    // `subscribe_seeded`. `None` means the source has no
+                    // current value yet (unopened SharedPV / gateway entry
+                    // awaiting its first upstream event) or a peer with
+                    // NoAccess on the record's ASG — emit nothing and let
+                    // the update loop deliver the first real event.
+                    if let Some(initial) = seed_initial {
                         // Finding #2: run the server `_filter` chain on the
                         // FIRST frame too, through the same owner the update
                         // loop uses — epics-base `dbChannelRunPreChain`

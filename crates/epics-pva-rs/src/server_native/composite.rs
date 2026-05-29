@@ -653,6 +653,54 @@ impl ChannelSource for CompositeSource {
         }
     }
 
+    /// Single-seed MONITOR (the server's monitor START dispatch path):
+    /// resolve the owning inner source and forward to ITS
+    /// `subscribe_seeded`, so a self-seeding inner (the PVA gateway's
+    /// cached snapshot, a `SharedPV`'s atomic seed) supplies the
+    /// connect-time seed rather than the composite's generic
+    /// get_value-seeding default — which would bypass the inner's atomic
+    /// seed and re-open the double-seed / gap-duplicate.
+    fn subscribe_seeded(
+        &self,
+        checked: AccessChecked,
+        ctx: crate::server_native::source::ChannelContext,
+        opts: crate::server_native::source::MonitorOptions,
+    ) -> impl std::future::Future<
+        Output = Option<
+            crate::server_native::source::SubscriptionSeed<
+                crate::server_native::source::MonitorUpdate,
+            >,
+        >,
+    > + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
+            src.subscribe_seeded(inner_checked, ctx, opts).await
+        }
+    }
+
+    /// Raw-path counterpart of [`Self::subscribe_seeded`].
+    fn subscribe_raw_seeded(
+        &self,
+        checked: AccessChecked,
+        ctx: crate::server_native::source::ChannelContext,
+        opts: crate::server_native::source::MonitorOptions,
+    ) -> impl std::future::Future<
+        Output = Option<
+            crate::server_native::source::SubscriptionSeed<
+                crate::server_native::source::RawMonitorEvent,
+            >,
+        >,
+    > + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
+            src.subscribe_raw_seeded(inner_checked, ctx, opts).await
+        }
+    }
+
     fn rpc_checked(
         &self,
         checked: AccessChecked,

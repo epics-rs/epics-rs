@@ -26,7 +26,9 @@ use tokio::sync::{Mutex, mpsc};
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
+use epics_pva_rs::server_native::{
+    ChannelSource, OpError, PvaServer, PvaServerConfig, SharedPV, SharedSource, run_pva_server,
+};
 
 // ── A tiny in-memory ChannelSource we can pump events into ───────────
 
@@ -2123,4 +2125,73 @@ async fn ignore_addr_list_does_not_block_direct_tcp_connect() {
     let _sock = read_handshake_prelude(server_addr);
 
     h.abort();
+}
+
+/// Wire-level single-seed: a `SharedPV` MONITOR START must deliver the
+/// connect-time value EXACTLY ONCE.
+///
+/// `SharedPV` self-seeds: its subscription inbox used to queue the
+/// current value before the first update. The server ALSO emitted its
+/// own connect-time snapshot via `get_value_checked`. A native monitor
+/// over a `SharedPV` therefore delivered the current value twice at
+/// START — two identical DATA frames before any `post()`. Clients that
+/// treat monitor events as edges (alarms, scans, archive samples,
+/// command handling) double-counted the first value.
+///
+/// The single MONITOR seed owner (`subscribe_seeded`) returns the
+/// connect-time value as the seed plus an updates-only stream, so the
+/// server emits exactly one initial frame. Mirrors pvxs `SharedPV`,
+/// which posts the current value once at attach (`sharedpv.cpp:69-92`)
+/// and has no second server-side GET seed.
+///
+/// Pre-fix: two `1.0` frames at START. Post-fix: exactly one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pva_rs_155_shared_pv_monitor_seeds_current_value_once() {
+    let pv = SharedPV::new();
+    pv.open(nt_scalar_desc(), make_nt_scalar(1.0))
+        .expect("open SharedPV");
+    let source = SharedSource::new();
+    source.add("STAB:SEED155", pv.clone());
+    let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
+    let client = server.client_config();
+
+    let received = Arc::new(parking_lot::Mutex::new(Vec::<f64>::new()));
+    let cb = received.clone();
+    let handle = client
+        .pvmonitor_handle("STAB:SEED155", move |_desc, value| {
+            if let PvField::Structure(s) = value
+                && let Some(ScalarValue::Double(v)) = s.get_value()
+            {
+                cb.lock().push(*v);
+            }
+        })
+        .await
+        .expect("subscribe");
+
+    // Generous settle with NO post: a correct seed delivers one frame;
+    // the regressed double-seed delivers a second identical frame, which
+    // this window would also capture.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    {
+        let got = received.lock().clone();
+        assert_eq!(
+            got,
+            vec![1.0],
+            "MONITOR START must deliver the connect-time value exactly once \
+             (double-seed regression delivers it twice)"
+        );
+    }
+
+    // A real post delivers exactly one more frame — the connect-time
+    // value is not re-sent.
+    pv.try_post(make_nt_scalar(2.0));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let got = received.lock().clone();
+    assert_eq!(
+        got,
+        vec![1.0, 2.0],
+        "after one post the wire carries seed(1.0) then update(2.0) — no duplicate seed"
+    );
+
+    handle.stop();
 }

@@ -202,6 +202,30 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
             .subscribe_raw_checked_opts(checked, ctx, opts)
             .await
     }
+    // Forward the single-seed MONITOR to the inner source so a
+    // self-seeding inner (a gateway's atomic cached snapshot) supplies
+    // the connect-time seed; the default would seed via inner.get_value
+    // and bypass that atomic seed.
+    async fn subscribe_seeded(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<
+        epics_pva_rs::server_native::source::SubscriptionSeed<
+            epics_pva_rs::server_native::source::MonitorUpdate,
+        >,
+    > {
+        self.inner.subscribe_seeded(checked, ctx, opts).await
+    }
+    async fn subscribe_raw_seeded(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<epics_pva_rs::server_native::source::SubscriptionSeed<RawMonitorEvent>> {
+        self.inner.subscribe_raw_seeded(checked, ctx, opts).await
+    }
     // RPC is commonly state-mutating and pva2pva blocks
     // `createChannelRPC` under `p2pReadOnly` exactly the way it blocks
     // Put/Process/PutGet (`channel.cpp:140-150`, the `if(!p2pReadOnly)`
@@ -613,6 +637,35 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         self.inner
             .subscribe_raw_checked_opts(checked, ctx, opts)
             .await
+    }
+    // Gate the single-seed MONITOR by the same allowlist, then forward
+    // to the inner so a self-seeding inner (gateway atomic snapshot)
+    // supplies the seed.
+    async fn subscribe_seeded(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<
+        epics_pva_rs::server_native::source::SubscriptionSeed<
+            epics_pva_rs::server_native::source::MonitorUpdate,
+        >,
+    > {
+        if !self.config.allowed(checked.pv_name()) {
+            return None;
+        }
+        self.inner.subscribe_seeded(checked, ctx, opts).await
+    }
+    async fn subscribe_raw_seeded(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<epics_pva_rs::server_native::source::SubscriptionSeed<RawMonitorEvent>> {
+        if !self.config.allowed(checked.pv_name()) {
+            return None;
+        }
+        self.inner.subscribe_raw_seeded(checked, ctx, opts).await
     }
     async fn rpc(
         &self,
@@ -1236,6 +1289,59 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
             .inner
             .subscribe_raw_checked_opts(checked, ctx, opts)
             .await;
+        if self.audit_subscribe {
+            let outcome: Result<(), OpError> = if result.is_some() {
+                Ok(())
+            } else {
+                Err(OpError::failed(format!("PV '{pv}' not subscribable (raw)")))
+            };
+            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
+            ev.event = AuditEventKind::Subscribe;
+            self.sink.record(ev);
+        }
+        result
+    }
+    // Single-seed MONITOR — the server's dispatch entry point. Record
+    // the same Subscribe audit row and forward to the inner so a
+    // self-seeding inner (gateway atomic snapshot) supplies the seed.
+    // Without this override the server's seeded dispatch would bypass
+    // the audit layer entirely.
+    async fn subscribe_seeded(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<
+        epics_pva_rs::server_native::source::SubscriptionSeed<
+            epics_pva_rs::server_native::source::MonitorUpdate,
+        >,
+    > {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self.inner.subscribe_seeded(checked, ctx, opts).await;
+        if self.audit_subscribe {
+            let outcome: Result<(), OpError> = if result.is_some() {
+                Ok(())
+            } else {
+                Err(OpError::failed(format!("PV '{pv}' not subscribable")))
+            };
+            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
+            ev.event = AuditEventKind::Subscribe;
+            self.sink.record(ev);
+        }
+        result
+    }
+    async fn subscribe_raw_seeded(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<epics_pva_rs::server_native::source::SubscriptionSeed<RawMonitorEvent>> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self.inner.subscribe_raw_seeded(checked, ctx, opts).await;
         if self.audit_subscribe {
             let outcome: Result<(), OpError> = if result.is_some() {
                 Ok(())

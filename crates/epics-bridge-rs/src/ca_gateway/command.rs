@@ -82,6 +82,13 @@ pub struct CommandHandler {
     upstream: Option<Arc<UpstreamManager>>,
     pvlist_path: Option<PathBuf>,
     access_path: Option<PathBuf>,
+    /// Beacon-anomaly throttle. After a successful `AS`/`PVL` pvlist
+    /// reload — which may newly admit PVs — `request()` is fired so CA
+    /// clients re-search and discover the now-available names immediately.
+    /// Mirrors C `gateServer::newAs` calling `generateBeaconAnomaly()`
+    /// after `reInitialize` "because new PVs may have become available"
+    /// (gateServer.cc:684-686). `None` in stat-only/test handlers.
+    beacon_anomaly: Option<Arc<super::beacon::BeaconAnomaly>>,
 }
 
 impl CommandHandler {
@@ -99,6 +106,7 @@ impl CommandHandler {
             upstream: None,
             pvlist_path,
             access_path,
+            beacon_anomaly: None,
         }
     }
 
@@ -107,6 +115,13 @@ impl CommandHandler {
     /// the handler is used; cache-stat commands work without it.
     pub fn with_upstream(mut self, upstream: Arc<UpstreamManager>) -> Self {
         self.upstream = Some(upstream);
+        self
+    }
+
+    /// Attach the gateway's beacon-anomaly throttle so an `AS`/`PVL`
+    /// reload announces newly-available PVs to downstream CA clients.
+    pub fn with_beacon_anomaly(mut self, beacon: Arc<super::beacon::BeaconAnomaly>) -> Self {
+        self.beacon_anomaly = Some(beacon);
         self
     }
 
@@ -239,6 +254,17 @@ impl CommandHandler {
                     }
                 }
             }
+        }
+
+        // Announce the reload: a pvlist edit can newly admit PVs, so emit
+        // a beacon anomaly to make downstream CA clients re-search and
+        // discover the now-available names immediately, rather than
+        // waiting for the next periodic beacon. The BeaconAnomaly throttle
+        // collapses repeated reloads within its inhibit window. Mirrors C
+        // gateServer::newAs calling generateBeaconAnomaly() after the
+        // reInitialize (gateServer.cc:684-686).
+        if let Some(beacon) = &self.beacon_anomaly {
+            beacon.request();
         }
         Ok(Some((count, pruned)))
     }
@@ -376,6 +402,62 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&acf_path);
+        let _ = std::fs::remove_file(&pvl_path);
+    }
+
+    /// a successful `PVL`/`AS` pvlist reload must fire a beacon anomaly so
+    /// downstream CA clients re-search and discover newly-admitted PVs
+    /// (C gateServer::newAs → generateBeaconAnomaly, gateServer.cc:684-686).
+    /// Pre-fix the reload path never touched the beacon throttle.
+    #[tokio::test]
+    async fn reload_fires_beacon_anomaly() {
+        let pid = std::process::id();
+        let pvl_path = std::env::temp_dir().join(format!("ca_gw_a11_pvl_{pid}.pvlist"));
+        std::fs::write(&pvl_path, "Beam.*  ALLOW\n").unwrap();
+
+        let cache = Arc::new(RwLock::new(PvCache::new()));
+        let pvlist = Arc::new(ArcSwap::from_pointee(PvList::new()));
+        let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
+        let beacon = Arc::new(super::super::beacon::BeaconAnomaly::new());
+        let handler = CommandHandler::new(cache, pvlist, access, Some(pvl_path.clone()), None)
+            .with_beacon_anomaly(beacon.clone());
+
+        // No request honored yet.
+        assert!(beacon.elapsed().is_none(), "beacon untouched before reload");
+
+        handler
+            .dispatch(GatewayCommand::ReloadPvList)
+            .await
+            .unwrap();
+
+        // The reload must have honored a beacon request (fresh throttle,
+        // so the first request is always honored).
+        assert!(
+            beacon.elapsed().is_some(),
+            "PVL reload must fire a beacon anomaly"
+        );
+
+        let _ = std::fs::remove_file(&pvl_path);
+    }
+
+    /// a reload with no beacon attached (stat-only/test handler) must not
+    /// panic — the beacon call is guarded by the `Option`.
+    #[tokio::test]
+    async fn reload_without_beacon_is_noop() {
+        let pid = std::process::id();
+        let pvl_path = std::env::temp_dir().join(format!("ca_gw_a11_nob_{pid}.pvlist"));
+        std::fs::write(&pvl_path, "Beam.*  ALLOW\n").unwrap();
+
+        let cache = Arc::new(RwLock::new(PvCache::new()));
+        let pvlist = Arc::new(ArcSwap::from_pointee(PvList::new()));
+        let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
+        let handler = CommandHandler::new(cache, pvlist, access, Some(pvl_path.clone()), None);
+
+        handler
+            .dispatch(GatewayCommand::ReloadPvList)
+            .await
+            .expect("reload without a beacon handle must succeed");
+
         let _ = std::fs::remove_file(&pvl_path);
     }
 }

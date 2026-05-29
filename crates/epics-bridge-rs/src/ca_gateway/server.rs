@@ -738,6 +738,7 @@ impl GatewayServer {
         let pvlist = self.pvlist.clone();
         let access = self.access.clone();
         let upstream = self.upstream.clone();
+        let beacon_anomaly = self.beacon_anomaly.clone();
 
         Some(tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
@@ -749,7 +750,8 @@ impl GatewayServer {
                 }
             };
             let handler = CommandHandler::new(cache, pvlist, access, pvlist_path, access_path)
-                .with_upstream(upstream);
+                .with_upstream(upstream)
+                .with_beacon_anomaly(beacon_anomaly);
             tracing::info!(
                 command_file = %cmd_path.display(),
                 "ca-gateway-rs: SIGUSR1 handler armed"

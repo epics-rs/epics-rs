@@ -387,7 +387,7 @@ async fn pvxs_pvxget_to_rust_server_ntndarray() {
         NdAlarm, NdArrayBuffer, NdAttribute, NdCodec, NdDimension, NdTimeStamp, NtNdArray,
         nt_nd_array_desc, nt_nd_array_value,
     };
-    use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarValue};
+    use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarValue, VariantValue};
     use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
 
     /// Source serving a single 4x4 ubyte NTNDArray with a known pattern.
@@ -447,7 +447,7 @@ async fn pvxs_pvxget_to_rust_server_ntndarray() {
                     time_stamp: NdTimeStamp::default(),
                     attribute: vec![NdAttribute {
                         name: "ColorMode".into(),
-                        value: ScalarValue::Int(0),
+                        value: VariantValue::scalar(ScalarValue::Int(0)),
                         descriptor: "Mono".into(),
                         source_type: 0,
                         source: "driver".into(),
@@ -534,7 +534,7 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
         NdAlarm, NdArrayBuffer, NdAttribute, NdCodec, NdDimension, NdTimeStamp, NtNdArray,
         nt_nd_array_desc, nt_nd_array_value,
     };
-    use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarValue};
+    use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarValue, VariantValue};
     use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
 
     #[derive(Clone)]
@@ -573,7 +573,7 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
                     time_stamp: NdTimeStamp::default(),
                     attribute: vec![NdAttribute {
                         name: "Test".into(),
-                        value: ScalarValue::Double(3.14),
+                        value: VariantValue::scalar(ScalarValue::Double(3.14)),
                         descriptor: "test attr".into(),
                         source_type: 1,
                         source: "fake".into(),

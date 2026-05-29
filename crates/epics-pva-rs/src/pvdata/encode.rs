@@ -400,10 +400,14 @@ pub fn encode_type_desc(desc: &FieldDesc, order: ByteOrder, out: &mut Vec<u8>) {
         }
         FieldDesc::Variant => out.put_u8(TAG_VARIANT),
         FieldDesc::VariantArray => out.put_u8(TAG_VARIANT_ARRAY),
-        FieldDesc::BoundedString(bound) => {
-            out.put_u8(TAG_BOUNDED_STRING);
-            encode_size_into(*bound, order, out);
-        }
+        // pvxs has no bounded-string TypeCode: `TypeCode::valid()`
+        // (type.cpp:44-70) accepts only the plain `String` scalar, and
+        // `dataencode.cpp:120-123,186-206` faults any fixed/bounded
+        // descriptor on decode. A `BoundedString` is a plain string
+        // everywhere in our value space (the bound is never enforced),
+        // so it must reach the wire as the ordinary string scalar —
+        // never the Rust-only 0x83 tag a pvxs peer would reject.
+        FieldDesc::BoundedString(_) => out.put_u8(ScalarType::String.type_code()),
     }
 }
 
@@ -549,10 +553,9 @@ fn encode_type_desc_inline_cached(
         }
         FieldDesc::Variant => out.put_u8(TAG_VARIANT),
         FieldDesc::VariantArray => out.put_u8(TAG_VARIANT_ARRAY),
-        FieldDesc::BoundedString(bound) => {
-            out.put_u8(TAG_BOUNDED_STRING);
-            encode_size_into(*bound, order, out);
-        }
+        // See `encode_type_desc`: a `BoundedString` is normalized to the
+        // plain string scalar on the wire (pvxs has no 0x83 TypeCode).
+        FieldDesc::BoundedString(_) => out.put_u8(ScalarType::String.type_code()),
     }
 }
 
@@ -755,11 +758,14 @@ fn decode_type_desc_cached_at_depth(
         }
         TAG_VARIANT => Ok(FieldDesc::Variant),
         TAG_VARIANT_ARRAY => Ok(FieldDesc::VariantArray),
-        TAG_BOUNDED_STRING => {
-            let bound = decode_size(cur, order)?
-                .ok_or_else(|| decode_err!("bounded string size cannot be null"))?;
-            Ok(FieldDesc::BoundedString(bound))
-        }
+        // pvxs faults on a bounded/fixed descriptor (`dataencode.cpp:120-123`
+        // for the fixed-size bit, `:186-206` leaves bounded unhandled in the
+        // default switch). The 0x83 tag is never emitted by a pvxs peer — nor,
+        // since this fix, by us (see `encode_type_desc`) — so reject it rather
+        // than reconstruct a `FieldDesc::BoundedString` no parity peer produces.
+        TAG_BOUNDED_STRING => Err(decode_err!(
+            "bounded string descriptor (0x{TAG_BOUNDED_STRING:02X}) is not a pvAccess type code"
+        )),
         b if b & 0x08 != 0 => {
             let scalar = ScalarType::from_array_type_code(b)
                 .ok_or_else(|| decode_err!("unknown scalar array tag 0x{b:02X}"))?;

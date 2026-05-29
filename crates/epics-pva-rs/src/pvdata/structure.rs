@@ -73,6 +73,29 @@ pub struct VariantValue {
     pub value: PvField,
 }
 
+impl VariantValue {
+    /// An `any` variant carrying a scalar value, tagged with the scalar's
+    /// own descriptor. Mirrors pvxs assigning a scalar `Value` into an
+    /// `Any` member — the common case for filling an advertised `any`
+    /// slot (e.g. an NTAttribute `value`) without hand-building the
+    /// descriptor/value pair.
+    pub fn scalar(v: ScalarValue) -> Self {
+        Self {
+            desc: Some(FieldDesc::Scalar(v.scalar_type())),
+            value: PvField::Scalar(v),
+        }
+    }
+
+    /// An empty (`null`) variant — the `any` slot is present but carries
+    /// no value, the field-discriminator `null` case on the wire.
+    pub fn null() -> Self {
+        Self {
+            desc: None,
+            value: PvField::Null,
+        }
+    }
+}
+
 impl fmt::Display for PvField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

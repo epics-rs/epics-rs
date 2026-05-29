@@ -176,10 +176,17 @@ pub struct NdDimension {
     pub reverse: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct NdAttribute {
     pub name: String,
-    pub value: ScalarValue,
+    /// pvxs advertises this member as `Any("value")` (`nt.cpp:240-247`):
+    /// the attribute value is a variant that may carry a scalar, scalar
+    /// array, structure, union, or be null. It is stored as a
+    /// [`VariantValue`] — the same `any` modeling [`NdCodec::parameters`]
+    /// uses — so the public builder can express the full advertised
+    /// schema rather than scalars only. Use [`NdAttribute::scalar`] for
+    /// the common scalar case.
+    pub value: VariantValue,
     /// Per pvxs `nt.cpp:240` NTAttribute element layout includes
     /// a `tags` StringArray between `value` and `descriptor`. Empty
     /// by default; expose to users that need to populate it.
@@ -191,9 +198,36 @@ pub struct NdAttribute {
     pub source: String,
 }
 
-impl Default for ScalarValue {
+impl Default for NdAttribute {
     fn default() -> Self {
-        ScalarValue::Int(0)
+        Self {
+            name: String::new(),
+            // An unset `any` value is the null variant (present member,
+            // no value) — not a zero scalar, which would silently narrow
+            // the advertised `any` slot to a typed scalar.
+            value: VariantValue::null(),
+            tags: Vec::new(),
+            descriptor: String::new(),
+            alarm: NdAlarm::default(),
+            time_stamp: NdTimeStamp::default(),
+            source_type: 0,
+            source: String::new(),
+        }
+    }
+}
+
+impl NdAttribute {
+    /// Convenience constructor for the common scalar-valued attribute.
+    /// The `any` value carries the scalar's own descriptor, matching what
+    /// pvxs emits for a scalar `NTAttribute.value`. For array/structure/
+    /// union/null attribute values, set [`NdAttribute::value`] to the
+    /// desired [`VariantValue`] directly.
+    pub fn scalar(name: impl Into<String>, value: ScalarValue) -> Self {
+        Self {
+            name: name.into(),
+            value: VariantValue::scalar(value),
+            ..Default::default()
+        }
     }
 }
 
@@ -453,13 +487,12 @@ fn attribute_value(attrs: &[NdAttribute]) -> PvField {
                     "name".into(),
                     PvField::Scalar(ScalarValue::String(a.name.clone())),
                 ));
-                s.fields.push((
-                    "value".into(),
-                    PvField::Variant(Box::new(VariantValue {
-                        desc: Some(FieldDesc::Scalar(scalar_kind(&a.value))),
-                        value: PvField::Scalar(a.value.clone()),
-                    })),
-                ));
+                // The attribute `value` is the advertised `any` slot: emit
+                // the caller's variant verbatim so a scalar-array,
+                // structure, union, or null value reaches the wire intact
+                // (pvxs `Any("value")`, nt.cpp:240-247).
+                s.fields
+                    .push(("value".into(), PvField::Variant(Box::new(a.value.clone()))));
                 s.fields.push((
                     "tags".into(),
                     PvField::ScalarArray(
@@ -488,23 +521,6 @@ fn attribute_value(attrs: &[NdAttribute]) -> PvField {
             })
             .collect(),
     )
-}
-
-fn scalar_kind(v: &ScalarValue) -> ScalarType {
-    match v {
-        ScalarValue::Boolean(_) => ScalarType::Boolean,
-        ScalarValue::Byte(_) => ScalarType::Byte,
-        ScalarValue::UByte(_) => ScalarType::UByte,
-        ScalarValue::Short(_) => ScalarType::Short,
-        ScalarValue::UShort(_) => ScalarType::UShort,
-        ScalarValue::Int(_) => ScalarType::Int,
-        ScalarValue::UInt(_) => ScalarType::UInt,
-        ScalarValue::Long(_) => ScalarType::Long,
-        ScalarValue::ULong(_) => ScalarType::ULong,
-        ScalarValue::Float(_) => ScalarType::Float,
-        ScalarValue::Double(_) => ScalarType::Double,
-        ScalarValue::String(_) => ScalarType::String,
-    }
 }
 
 fn codec_value(c: &NdCodec) -> PvField {
@@ -622,5 +638,82 @@ mod tests {
         encode_pv_field(&value, &desc, ByteOrder::Little, &mut buf);
         let mut cur = Cursor::new(buf.as_slice());
         let _decoded = decode_pv_field(&desc, &mut cur, ByteOrder::Little).unwrap();
+    }
+
+    #[test]
+    fn attribute_value_carries_non_scalar_variants() {
+        // pvxs advertises NTAttribute.value as `Any` (nt.cpp:240-247).
+        // The builder must be able to populate scalar-array, structure,
+        // and null attribute values — not just scalars — and they must
+        // survive an encode/decode/re-encode round trip against the
+        // Variant descriptor.
+        use crate::proto::ByteOrder;
+        use crate::pvdata::encode::{decode_pv_field, encode_pv_field};
+        use std::io::Cursor;
+
+        let scalar_array = VariantValue {
+            desc: Some(FieldDesc::ScalarArray(ScalarType::Double)),
+            value: PvField::ScalarArray(vec![ScalarValue::Double(1.0), ScalarValue::Double(2.0)]),
+        };
+        let structure = VariantValue {
+            desc: Some(FieldDesc::Structure {
+                struct_id: String::new(),
+                fields: vec![("n".into(), FieldDesc::Scalar(ScalarType::Int))],
+            }),
+            value: PvField::Structure({
+                let mut s = PvStructure::new("");
+                s.fields
+                    .push(("n".into(), PvField::Scalar(ScalarValue::Int(7))));
+                s
+            }),
+        };
+
+        let nt = NtNdArray {
+            value: NdArrayBuffer::UByte(vec![0]),
+            codec: NdCodec::default(),
+            compressed_size: 1,
+            uncompressed_size: 1,
+            unique_id: 1,
+            data_time_stamp: NdTimeStamp::default(),
+            alarm: NdAlarm::default(),
+            time_stamp: NdTimeStamp::default(),
+            dimension: Vec::new(),
+            attribute: vec![
+                NdAttribute {
+                    name: "arr".into(),
+                    value: scalar_array,
+                    ..NdAttribute::default()
+                },
+                NdAttribute {
+                    name: "struct".into(),
+                    value: structure,
+                    ..NdAttribute::default()
+                },
+                // Null attribute value — the `any` slot is present but
+                // empty (NdAttribute::default uses the null variant).
+                NdAttribute {
+                    name: "null".into(),
+                    ..NdAttribute::default()
+                },
+                // Scalar convenience constructor still works.
+                NdAttribute::scalar("scalar", ScalarValue::Int(3)),
+            ],
+        };
+
+        let desc = nt_nd_array_desc();
+        let value = nt_nd_array_value(&nt);
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut once = Vec::new();
+            encode_pv_field(&value, &desc, order, &mut once);
+            let mut cur = Cursor::new(once.as_slice());
+            let decoded = decode_pv_field(&desc, &mut cur, order)
+                .unwrap_or_else(|e| panic!("decode failed ({order:?}): {e:?}"));
+            let mut twice = Vec::new();
+            encode_pv_field(&decoded, &desc, order, &mut twice);
+            assert_eq!(
+                once, twice,
+                "attribute variant round-trip diverged ({order:?})"
+            );
+        }
     }
 }

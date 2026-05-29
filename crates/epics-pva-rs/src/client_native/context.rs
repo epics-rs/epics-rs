@@ -1523,10 +1523,19 @@ impl PvaClient {
         request_value: &PvField,
     ) -> PvaResult<(FieldDesc, PvField)> {
         let ch = self.channel(pv_name).await?;
+        // The RPC INIT pvRequest and the RPC DATA argument are distinct
+        // wire values: pvxs `clientget.cpp:348-352` serializes the
+        // operation pvRequest at INIT and `:302-310` the argument at
+        // EXEC. Send the default empty pvRequest at INIT and carry
+        // `(request_desc, request_value)` as the DATA argument; do NOT
+        // also send the argument as the INIT pvRequest, which would make
+        // an upstream `createChannelRPC(..., pvRequest)` provider see the
+        // argument where it expected the operation request.
+        let (req_desc, req_value) = empty_pv_request();
         op_rpc(
             &ch,
-            request_desc,
-            request_value,
+            &req_desc,
+            &req_value,
             RpcArg::Typed {
                 desc: request_desc,
                 value: request_value,
@@ -1563,10 +1572,13 @@ impl PvaClient {
         request_value: &PvField,
     ) -> PvaResult<(FieldDesc, PvField)> {
         let ch = self.channel_with_forced(pv_name, Some(server)).await?;
+        // See [`Self::pvrpc`]: default empty pvRequest at INIT, the
+        // caller's value as the DATA argument (no INIT/DATA conflation).
+        let (req_desc, req_value) = empty_pv_request();
         op_rpc(
             &ch,
-            request_desc,
-            request_value,
+            &req_desc,
+            &req_value,
             RpcArg::Typed {
                 desc: request_desc,
                 value: request_value,

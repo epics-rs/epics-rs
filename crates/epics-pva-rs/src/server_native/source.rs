@@ -47,12 +47,17 @@ pub struct ChannelContext {
     /// the wire layer captured one. PVA PUT INIT carries
     /// `record._options.process`/`block`; the data-phase payload is
     /// just the delta, so sources that interpret per-operation
-    /// options must consult this rather than the value.
+    /// options must consult this rather than the value. For RPC this is
+    /// the create-time pvRequest, kept distinct from the EXEC argument
+    /// (`request_desc`/`request_value` of [`ChannelSource::rpc_checked`])
+    /// so a source — or a gateway forwarding
+    /// `createChannelRPC(..., pvRequest)` — can inspect it. For PROCESS it
+    /// is the PROCESS INIT pvRequest (`record._options`).
     ///
-    /// `None` for op kinds where no pvRequest was captured (RPC INIT
-    /// today, GET/MONITOR where the request was consumed for masking)
-    /// or when the wire decoder could not parse it. Sources that
-    /// don't need per-op options can ignore the field.
+    /// `None` for op kinds / paths where no pvRequest was captured (GET,
+    /// where the request was consumed for masking) or when the wire
+    /// decoder could not parse it. Sources that don't need per-op options
+    /// can ignore the field.
     pub pv_request: Option<PvField>,
 }
 

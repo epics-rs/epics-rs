@@ -4648,11 +4648,14 @@ async fn handle_op(
         // PUT needs `record._options.process|block`; MONITOR needs
         // `record._options.DBE` (and other per-op stream tuning that
         // wasn't already consumed for mask/pipeline/filter parsing).
-        // GET / RPC don't read per-op options from this value beyond
-        // what was already extracted, so we don't pay the clone for
-        // those kinds.
+        // RPC needs the create-time pvRequest preserved separately from
+        // the EXEC argument (pvxs serverget.cpp:388-391 stores the INIT
+        // pvRequest and hands it to the operation controller) so a source
+        // — and a gateway forwarding `createChannelRPC(..., pvRequest)` —
+        // can inspect it. GET doesn't read per-op options from this value
+        // beyond what was already extracted, so we don't pay the clone.
         let stashed_pv_request = match kind {
-            OpKind::Put | OpKind::Monitor => req_value.clone(),
+            OpKind::Put | OpKind::Monitor | OpKind::Rpc => req_value.clone(),
             _ => None,
         };
 
@@ -6184,7 +6187,11 @@ async fn handle_op(
                 host: cred.host.clone(),
                 authority: cred.authority.clone(),
                 roles: cred.roles.clone(),
-                pv_request: None,
+                // RPC INIT pvRequest, preserved from the op state — distinct
+                // from the `(req_desc, req_value)` EXEC argument decoded
+                // above. A source (or gateway) can now inspect the
+                // create-time request (pvxs serverget.cpp:388-391).
+                pv_request: init_pv_request.clone(),
             };
             // ignore a second RPC EXEC while the first call is in
             // flight rather than aborting it (pvxs `serverget.cpp:511-514`).

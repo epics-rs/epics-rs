@@ -1721,10 +1721,21 @@ fn handle_beacon(
     let Ok(port) = cur.get_u16(order) else {
         return consumed;
     };
-    let proto = decode_string(&mut cur, order)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "tcp".into());
+    // pvxs decodes the BEACON protocol with `from_wire(M, beaconMsg.proto)`
+    // and only invokes the beacon callbacks when the decode buffer is
+    // still good afterward (udp_collector.cpp:464-488). A truncated or
+    // invalid-UTF8 protocol string leaves the buffer bad — that is a
+    // malformed BEACON and must be dropped, NOT coerced to a fabricated
+    // `"tcp"` that enters the tracker and fires a false
+    // `Discovered::Online`. Map the decode outcome to pvxs's `M.good()`:
+    // a decode error drops the beacon; a successfully decoded string
+    // (including the empty/null-marker case, where the buffer stays
+    // good) proceeds with the decoded value verbatim.
+    let proto = match decode_string(&mut cur, order) {
+        Ok(Some(p)) => p,
+        Ok(None) => String::new(),
+        Err(_) => return consumed,
+    };
     let _status_size = decode_size(&mut cur, order).ok();
 
     let mut guid_arr = [0u8; 12];
@@ -2361,6 +2372,82 @@ mod tests {
             rx.try_recv().is_ok(),
             "the resolver must receive the server address"
         );
+    }
+
+    /// PVA-RS-2026-05-28-128: a BEACON whose protocol string fails to
+    /// decode (truncated, or invalid UTF-8) is malformed and must be
+    /// dropped — it must NOT enter the beacon tracker, announce the
+    /// server, or emit `Discovered::Online`. pvxs only invokes beacon
+    /// callbacks when the buffer is still good after the protocol decode
+    /// (udp_collector.cpp:464-488). The pre-fix code coerced any decode
+    /// failure to a fabricated `"tcp"` protocol and proceeded.
+    #[test]
+    fn malformed_beacon_protocol_is_dropped() {
+        use crate::proto::{WriteExt, encode_size_into, encode_string_into};
+
+        let order = ByteOrder::Little;
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
+
+        // proto_writer appends the protocol-string region of the payload.
+        let build_beacon = |proto_writer: &dyn Fn(&mut Vec<u8>)| -> Vec<u8> {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&[0x42u8; 12]); // guid
+            payload.put_u8(0); // flags
+            payload.put_u8(0); // seq
+            payload.put_u16(0, order); // change
+            payload.extend_from_slice(&[0u8; 16]); // addr (wildcard → peer)
+            payload.put_u16(5075, order); // port
+            proto_writer(&mut payload);
+            let header =
+                PvaHeader::application(true, order, Command::Beacon.code(), payload.len() as u32);
+            let mut frame = Vec::new();
+            header.write_into(&mut frame);
+            frame.extend_from_slice(&payload);
+            frame
+        };
+
+        let run = |frame: &[u8]| -> (bool, usize) {
+            let beacons = BeaconTracker::new();
+            let mut pending: HashMap<u32, Pending> = HashMap::new();
+            let (tx, mut rx) = mpsc::channel::<Discovered>(8);
+            let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+            let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
+                std::collections::HashSet::new();
+            let mut poke = false;
+            let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+            handle_beacon(
+                frame,
+                &beacons,
+                &mut pending,
+                &mut subs,
+                &mut announced,
+                &mut poke,
+                &ignore,
+                peer,
+            );
+            (rx.try_recv().is_ok(), announced.len())
+        };
+
+        // Valid "tcp" beacon → announced + Discovered::Online fires.
+        let valid = build_beacon(&|p| encode_string_into("tcp", order, p));
+        let (online, announced) = run(&valid);
+        assert!(online, "valid BEACON must emit Discovered::Online");
+        assert_eq!(announced, 1, "valid BEACON must announce the server once");
+
+        // Truncated protocol: size claims 5 bytes, none follow.
+        let truncated = build_beacon(&|p| encode_size_into(5, order, p));
+        let (online, announced) = run(&truncated);
+        assert!(!online, "truncated-protocol BEACON must not announce");
+        assert_eq!(announced, 0, "truncated-protocol BEACON must be dropped");
+
+        // Invalid UTF-8 protocol payload (0xC3 0x28 is not valid UTF-8).
+        let bad_utf8 = build_beacon(&|p| {
+            encode_size_into(2, order, p);
+            p.extend_from_slice(&[0xC3, 0x28]);
+        });
+        let (online, announced) = run(&bad_utf8);
+        assert!(!online, "invalid-UTF8-protocol BEACON must not announce");
+        assert_eq!(announced, 0, "invalid-UTF8-protocol BEACON must be dropped");
     }
 
     /// pvxs `Channel::disconnect` (client.cpp:213) parity: a

@@ -487,8 +487,12 @@ impl SearchEngine {
     /// [`BeaconTracker`] regards as new or restarted. Mirrors pvxs's
     /// `client::Context::discover()` callback API.
     ///
-    /// The receiver is bounded; if the consumer falls behind, events are
-    /// dropped silently. Drop the receiver to unsubscribe.
+    /// The receiver is bounded; if the consumer falls behind, individual
+    /// events are dropped silently, but the **subscription survives** — a
+    /// momentarily-full queue does not unsubscribe a live consumer (pvxs
+    /// keeps each discovery operation until the caller cancels it,
+    /// clientdiscover.cpp:103-112). The subscription ends only when the
+    /// receiver is dropped.
     pub async fn discover(&self) -> PvaResult<mpsc::Receiver<Discovered>> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -1104,7 +1108,7 @@ async fn run_engine(
                             peer: server,
                             proto: "tcp".into(),
                         };
-                        subscribers.retain(|tx| tx.try_send(evt.clone()).is_ok());
+                        publish_discovery(&mut subscribers, evt);
                     }
                 }
                 Some(SearchCommand::Subscribe { responder }) => {
@@ -1277,7 +1281,7 @@ async fn run_engine(
                 for (server, guid) in beacons.prune_stale(BEACON_TIMEOUT) {
                     announced.remove(&(server, guid));
                     let evt = Discovered::Timeout { server, guid };
-                    subscribers.retain(|tx| tx.try_send(evt.clone()).is_ok());
+                    publish_discovery(&mut subscribers, evt);
                 }
             }
 
@@ -1667,6 +1671,29 @@ fn flush_expired_pending(
     }
 }
 
+/// Deliver a discovery event to every live subscriber.
+///
+/// Single owner of the subscriber-eviction policy. pvxs runs each
+/// discovery callback inline on the client loop and removes a discovery
+/// operation only when the caller cancels it
+/// (clientdiscover.cpp:83-112) — it never reinterprets a slow consumer
+/// as cancellation. So we drop the event for a subscriber whose bounded
+/// queue is momentarily full (lossy delivery, as `discover()` documents)
+/// but KEEP the subscriber; a subscriber is removed only when its
+/// receiver has been dropped (`Closed`). Treating `Full` as removal —
+/// what a plain `try_send(..).is_ok()` retain does — silently unsubscribes
+/// a live-but-slow consumer after a beacon storm, which pvxs never does.
+fn publish_discovery(subscribers: &mut Vec<mpsc::Sender<Discovered>>, evt: Discovered) {
+    subscribers.retain(|tx| match tx.try_send(evt.clone()) {
+        Ok(()) => true,
+        // Live consumer that fell behind: keep it; the event is lost, not
+        // the subscription.
+        Err(mpsc::error::TrySendError::Full(_)) => true,
+        // Receiver dropped: the discovery operation is gone.
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    });
+}
+
 /// Returns bytes consumed from `bytes` so the caller can advance to
 /// the next chained message in the same datagram.
 /// `is_tcp`: true when the response arrived on a TCP name-server connection;
@@ -1730,7 +1757,7 @@ fn handle_search_response(
                     peer,
                     proto: resp.protocol,
                 };
-                subscribers.retain(|tx| tx.try_send(evt.clone()).is_ok());
+                publish_discovery(subscribers, evt);
             }
         }
         return consumed;
@@ -1895,7 +1922,7 @@ fn handle_beacon(
             peer,
             proto,
         };
-        subscribers.retain(|tx| tx.try_send(evt.clone()).is_ok());
+        publish_discovery(subscribers, evt);
     }
     consumed
 }
@@ -2478,6 +2505,50 @@ mod tests {
         assert!(
             matches!(rxb.try_recv(), Ok(Discovered::Online { guid, .. }) if guid == IG),
             "ignored-GUID BEACON must still emit Discovered::Online"
+        );
+    }
+
+    /// A live discovery subscriber whose bounded queue is full must NOT be
+    /// evicted: pvxs keeps the operation until the caller cancels it
+    /// (clientdiscover.cpp:103-112) and never treats a slow consumer as
+    /// cancellation. The subscriber is removed only when its receiver is
+    /// dropped (`Closed`). Regression for treating `Full` as removal.
+    #[test]
+    fn full_queue_keeps_live_subscriber_closed_removes_it() {
+        let sa = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5075);
+        let mk = |n: u8| Discovered::Online {
+            server: sa,
+            guid: [n; 12],
+            peer: sa,
+            proto: "tcp".into(),
+        };
+        let (tx, mut rx) = mpsc::channel::<Discovered>(2);
+        let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+
+        // Fill the 2-slot queue.
+        publish_discovery(&mut subs, mk(1));
+        publish_discovery(&mut subs, mk(2));
+        assert_eq!(subs.len(), 1, "subscriber present after filling the queue");
+
+        // Queue full → event is dropped but the subscriber is RETAINED.
+        publish_discovery(&mut subs, mk(3));
+        assert_eq!(
+            subs.len(),
+            1,
+            "a full queue must not unsubscribe a live consumer"
+        );
+
+        // Drain one slot, then a later event is delivered to the same sub.
+        assert!(rx.try_recv().is_ok());
+        publish_discovery(&mut subs, mk(4));
+        assert_eq!(subs.len(), 1, "subscriber still live after draining");
+
+        // Dropping the receiver closes the channel → subscriber removed.
+        drop(rx);
+        publish_discovery(&mut subs, mk(5));
+        assert!(
+            subs.is_empty(),
+            "a closed receiver must unsubscribe the discovery operation"
         );
     }
 

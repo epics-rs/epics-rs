@@ -577,6 +577,21 @@ impl GroupChannel {
         self.read_group_atomic(self.def.atomic).await
     }
 
+    /// Root structure ID advertised for this group's value and descriptor.
+    ///
+    /// pvxs leaves `GroupDefinition::structureId` an empty `std::string`
+    /// unless a top-level `+id` is configured (groupdefinition.h:30-40,
+    /// groupconfigprocessor.cpp:183-189) and builds the group type as
+    /// `TypeDef(TypeCode::Struct, structureId, {})` — the empty string when
+    /// no `+id` (groupconfigprocessor.cpp:517-523). A non-empty Rust-only
+    /// fallback (`"structure"`) would change the group's public type
+    /// identity, so clients keying type adapters/caches on the structure ID
+    /// would see a different type than the same pvxs group. Single source of
+    /// truth so the value and descriptor paths never diverge on the ID.
+    fn root_struct_id(&self) -> &str {
+        self.def.struct_id.as_deref().unwrap_or("")
+    }
+
     /// read with a caller-specified atomic mode, overriding
     /// the group default. Used by `Channel::get` when the operation
     /// pvRequest carries `record._options.atomic`.
@@ -588,7 +603,7 @@ impl GroupChannel {
             )));
         }
 
-        let struct_id = self.def.struct_id.as_deref().unwrap_or("structure");
+        let struct_id = self.root_struct_id();
         let mut pv = PvStructure::new(struct_id);
 
         // For atomic groups, hold all record locks simultaneously to
@@ -687,7 +702,7 @@ impl GroupChannel {
             )));
         }
 
-        let struct_id = self.def.struct_id.as_deref().unwrap_or("structure");
+        let struct_id = self.root_struct_id();
         let mut pv = PvStructure::new(struct_id);
 
         for member in &self.def.members {
@@ -1262,7 +1277,7 @@ impl super::provider::Channel for GroupChannel {
     }
 
     async fn get_field(&self) -> BridgeResult<FieldDesc> {
-        let struct_id = self.def.struct_id.as_deref().unwrap_or("structure");
+        let struct_id = self.root_struct_id();
         let mut fields: Vec<(String, FieldDesc)> = Vec::new();
 
         for member in &self.def.members {
@@ -2828,6 +2843,59 @@ mod tests {
                 assert_eq!(*v, 9.25)
             }
             other => panic!("member b: expected Double(9.25), got {other:?}"),
+        }
+    }
+
+    /// BR-123: a group with no top-level `+id` advertises an EMPTY root
+    /// structure ID on BOTH the value and the descriptor — pvxs leaves
+    /// `GroupDefinition::structureId` empty and builds
+    /// `TypeDef(TypeCode::Struct, "", {})` (groupconfigprocessor.cpp:
+    /// 517-523). The prior Rust-only `"structure"` literal changed the
+    /// group's public type identity. An explicit `+id` still wins.
+    #[tokio::test]
+    async fn br_123_group_root_struct_id_empty_without_plus_id() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("R:rec", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+
+        // No top-level +id → empty root struct ID on value and descriptor.
+        let cfg = r#"{ "G:noid": { "a": {"+type":"plain","+channel":"R:rec.VAL"} } }"#;
+        let def = super::super::group_config::parse_group_config(cfg)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let channel = GroupChannel::new(db.clone(), def);
+        let pv = channel.read_group().await.unwrap();
+        assert_eq!(
+            pv.struct_id, "",
+            "value root struct ID must be empty without +id"
+        );
+        match channel.get_field().await.unwrap() {
+            FieldDesc::Structure { struct_id, .. } => {
+                assert_eq!(
+                    struct_id, "",
+                    "descriptor root struct ID must be empty without +id"
+                );
+            }
+            other => panic!("expected root Structure descriptor, got {other:?}"),
+        }
+
+        // Explicit +id wins on both value and descriptor.
+        let cfg2 = r#"{ "G:id": { "+id": "epics:nt/NTScalar:1.0", "a": {"+type":"plain","+channel":"R:rec.VAL"} } }"#;
+        let def2 = super::super::group_config::parse_group_config(cfg2)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let channel2 = GroupChannel::new(db.clone(), def2);
+        let pv2 = channel2.read_group().await.unwrap();
+        assert_eq!(pv2.struct_id, "epics:nt/NTScalar:1.0");
+        match channel2.get_field().await.unwrap() {
+            FieldDesc::Structure { struct_id, .. } => {
+                assert_eq!(struct_id, "epics:nt/NTScalar:1.0");
+            }
+            other => panic!("expected root Structure descriptor, got {other:?}"),
         }
     }
 

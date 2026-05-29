@@ -104,6 +104,30 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     ca_stats_interval: u64,
 
+    /// CA gateway: upstream connect timeout in seconds
+    /// (C `-connect_timeout`).
+    #[arg(long, default_value_t = 1)]
+    ca_connect_timeout: u64,
+
+    /// CA gateway: inactive-PV retention in seconds
+    /// (C `-inactive_timeout`).
+    #[arg(long, default_value_t = 60 * 60 * 2)]
+    ca_inactive_timeout: u64,
+
+    /// CA gateway: dead-PV retention in seconds (C `-dead_timeout`).
+    #[arg(long, default_value_t = 60 * 2)]
+    ca_dead_timeout: u64,
+
+    /// CA gateway: disconnected-PV retention in seconds
+    /// (C `-disconnect_timeout`).
+    #[arg(long, default_value_t = 60 * 60 * 2)]
+    ca_disconnect_timeout: u64,
+
+    /// CA gateway: reconnect beacon-anomaly inhibit window in seconds
+    /// (C `-reconnect_inhibit`).
+    #[arg(long, default_value_t = 60 * 5)]
+    ca_reconnect_inhibit: u64,
+
     // ── PVA-side flags ───────────────────────────────────────────────
     /// Disable the PVA gateway entirely (CA-only mode). Alias:
     /// `--ca-only`.
@@ -186,6 +210,11 @@ struct CaSection {
     heartbeat_interval: Option<u64>,
     cleanup_interval: Option<u64>,
     stats_interval: Option<u64>,
+    connect_timeout: Option<u64>,
+    inactive_timeout: Option<u64>,
+    dead_timeout: Option<u64>,
+    disconnect_timeout: Option<u64>,
+    reconnect_inhibit: Option<u64>,
 }
 
 #[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -225,6 +254,11 @@ fn default_config_toml() -> &'static str {
 # heartbeat_interval = 1
 # cleanup_interval = 10
 # stats_interval = 10
+# connect_timeout = 1                    # upstream connect timeout (s)
+# inactive_timeout = 7200                # idle PV -> inactive (s)
+# dead_timeout = 120                     # disconnected PV -> dead (s)
+# disconnect_timeout = 7200              # active PV disconnect grace (s)
+# reconnect_inhibit = 300                # post-beacon reconnect inhibit (s)
 
 [pva]
 # enabled = true                        # set false to disable the PVA gateway
@@ -265,7 +299,13 @@ async fn run_ca_gateway(args: &Args) -> Result<(), String> {
         command_path: args.ca_command.clone(),
         preload_path: args.ca_preload.clone(),
         server_port: args.ca_port,
-        timeouts: Default::default(),
+        timeouts: epics_bridge_rs::ca_gateway::CacheTimeouts {
+            connect_timeout: Duration::from_secs(args.ca_connect_timeout),
+            inactive_timeout: Duration::from_secs(args.ca_inactive_timeout),
+            dead_timeout: Duration::from_secs(args.ca_dead_timeout),
+            disconnect_timeout: Duration::from_secs(args.ca_disconnect_timeout),
+        },
+        reconnect_inhibit: Duration::from_secs(args.ca_reconnect_inhibit),
         stats_prefix: args
             .ca_stats_prefix
             .clone()
@@ -398,6 +438,31 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile) {
     if args.ca_stats_interval == 10 {
         if let Some(v) = cfg.ca.stats_interval {
             args.ca_stats_interval = v;
+        }
+    }
+    if args.ca_connect_timeout == 1 {
+        if let Some(v) = cfg.ca.connect_timeout {
+            args.ca_connect_timeout = v;
+        }
+    }
+    if args.ca_inactive_timeout == 60 * 60 * 2 {
+        if let Some(v) = cfg.ca.inactive_timeout {
+            args.ca_inactive_timeout = v;
+        }
+    }
+    if args.ca_dead_timeout == 60 * 2 {
+        if let Some(v) = cfg.ca.dead_timeout {
+            args.ca_dead_timeout = v;
+        }
+    }
+    if args.ca_disconnect_timeout == 60 * 60 * 2 {
+        if let Some(v) = cfg.ca.disconnect_timeout {
+            args.ca_disconnect_timeout = v;
+        }
+    }
+    if args.ca_reconnect_inhibit == 60 * 5 {
+        if let Some(v) = cfg.ca.reconnect_inhibit {
+            args.ca_reconnect_inhibit = v;
         }
     }
 

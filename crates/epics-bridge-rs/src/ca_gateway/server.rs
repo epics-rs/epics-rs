@@ -84,6 +84,11 @@ pub struct GatewayConfig {
     pub stats_interval: Duration,
     /// Heartbeat increment interval. `None` disables the heartbeat PV.
     pub heartbeat_interval: Option<Duration>,
+    /// Reconnect beacon-anomaly inhibit window (C `-reconnect_inhibit`,
+    /// gateServer.cc:414-432). Minimum spacing between upstream-reconnect
+    /// beacon anomalies. Defaults to 5 minutes
+    /// (C++ `GATE_RECONNECT_INHIBIT`).
+    pub reconnect_inhibit: Duration,
     /// Read-only mode: rejects all puts.
     pub read_only: bool,
     /// Optional TLS server config for downstream connections.
@@ -126,6 +131,8 @@ impl Default for GatewayConfig {
             cleanup_interval: Duration::from_secs(10),
             stats_interval: Duration::from_secs(10),
             heartbeat_interval: Some(Duration::from_secs(1)),
+            // C++ GATE_RECONNECT_INHIBIT default (BeaconAnomaly::new).
+            reconnect_inhibit: Duration::from_secs(60 * 5),
             read_only: false,
             #[cfg(feature = "ca-gateway-tls")]
             tls: None,
@@ -158,6 +165,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("cleanup_interval", &self.cleanup_interval)
             .field("stats_interval", &self.stats_interval)
             .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("reconnect_inhibit", &self.reconnect_inhibit)
             .field("read_only", &self.read_only);
         #[cfg(feature = "ca-gateway-tls")]
         {
@@ -309,7 +317,11 @@ impl GatewayServer {
         // honored `request()` calls actually emit a beacon — without
         // this the throttle just tracked timestamps and
         // `generateBeaconAnomaly` was silent on the wire.
-        let beacon_anomaly = Arc::new(BeaconAnomaly::new());
+        // Honour the configured reconnect-inhibit window (C
+        // `-reconnect_inhibit`, gateServer.cc:414-432) instead of the
+        // compiled-in 5-minute default, so the CLI/API knob governs how
+        // often an upstream-reconnect beacon anomaly may fire.
+        let beacon_anomaly = Arc::new(BeaconAnomaly::with_inhibit(config.reconnect_inhibit));
 
         // Upstream manager — receives the full WriteHook environment so
         // every PV's hook can enforce read_only / ACL / host-deny / putlog

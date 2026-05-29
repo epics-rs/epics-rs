@@ -85,6 +85,33 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     stats_interval: u64,
 
+    /// Upstream connect timeout in seconds (C `-connect_timeout`): how
+    /// long a first search waits for the upstream IOC before the shadow
+    /// PV is demoted from Connecting to Dead.
+    #[arg(long, default_value_t = 1)]
+    connect_timeout: u64,
+
+    /// Inactive-PV retention in seconds (C `-inactive_timeout`): how long
+    /// a cached PV with no downstream clients is kept before eviction.
+    #[arg(long, default_value_t = 60 * 60 * 2)]
+    inactive_timeout: u64,
+
+    /// Dead-PV retention in seconds (C `-dead_timeout`): how long a PV
+    /// whose upstream search never resolved is kept before eviction.
+    #[arg(long, default_value_t = 60 * 2)]
+    dead_timeout: u64,
+
+    /// Disconnected-PV retention in seconds (C `-disconnect_timeout`):
+    /// how long a PV is kept after its upstream disconnects.
+    #[arg(long, default_value_t = 60 * 60 * 2)]
+    disconnect_timeout: u64,
+
+    /// Reconnect beacon-anomaly inhibit window in seconds
+    /// (C `-reconnect_inhibit`): minimum spacing between
+    /// upstream-reconnect beacon anomalies.
+    #[arg(long, default_value_t = 60 * 5)]
+    reconnect_inhibit: u64,
+
     /// Run under auto-restart supervisor (NRESTARTS pattern).
     #[arg(long)]
     supervised: bool,
@@ -255,7 +282,13 @@ async fn main() -> ExitCode {
         command_path: args.command.clone(),
         preload_path: args.preload.clone(),
         server_port: args.port,
-        timeouts: Default::default(),
+        timeouts: epics_bridge_rs::ca_gateway::CacheTimeouts {
+            connect_timeout: std::time::Duration::from_secs(args.connect_timeout),
+            inactive_timeout: std::time::Duration::from_secs(args.inactive_timeout),
+            dead_timeout: std::time::Duration::from_secs(args.dead_timeout),
+            disconnect_timeout: std::time::Duration::from_secs(args.disconnect_timeout),
+        },
+        reconnect_inhibit: std::time::Duration::from_secs(args.reconnect_inhibit),
         stats_prefix: if args.no_stats {
             String::new()
         } else {

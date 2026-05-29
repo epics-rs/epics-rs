@@ -877,16 +877,29 @@ impl PvaLink {
         let dbf_type = link_dbf_type(&value_field);
         let element_count = link_element_count(&value_field);
 
-        // display / control / valueAlarm are read from the top-level
-        // root here (the `field=`-aware `fld_meta` selection is a
-        // separate concern tracked on its own).
-        let graphic_limits = limit_pair(&root, "display.limitLow", "display.limitHigh");
-        let control_limits = limit_pair(&root, "control.limitLow", "control.limitHigh");
+        // display / control / valueAlarm are read from the selected
+        // metadata root, NOT the top-level root. pvxs derives `fld_meta`
+        // from the same selected root as `fld_value`: when `fieldName`
+        // is non-empty, `root = lchan->root[fieldName]` and every
+        // `fld_meta["display.*"]` / `["control.*"]` / `["valueAlarm.*"]`
+        // is resolved relative to that selected root
+        // (`pvxs/ioc/pvalink_link.cpp:90-110`,
+        // `pvxs/ioc/pvalink_lset.cpp:444-535`). A link selecting a
+        // nested member must expose that member's engineering units,
+        // precision and graphic/control/alarm limits — not the
+        // container's. A scalar/array field selection has no nested
+        // metadata sub-structures, so its metadata root is empty.
+        let meta_root = match select_target(&root, field) {
+            s @ PvField::Structure(_) => s,
+            _ => PvField::Null,
+        };
+        let graphic_limits = limit_pair(&meta_root, "display.limitLow", "display.limitHigh");
+        let control_limits = limit_pair(&meta_root, "control.limitLow", "control.limitHigh");
         let alarm_limits = {
-            let lolo = scalar_as_f64(&extract_field(&root, "valueAlarm.lowAlarmLimit"));
-            let lo = scalar_as_f64(&extract_field(&root, "valueAlarm.lowWarningLimit"));
-            let hi = scalar_as_f64(&extract_field(&root, "valueAlarm.highWarningLimit"));
-            let hihi = scalar_as_f64(&extract_field(&root, "valueAlarm.highAlarmLimit"));
+            let lolo = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.lowAlarmLimit"));
+            let lo = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.lowWarningLimit"));
+            let hi = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.highWarningLimit"));
+            let hihi = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.highAlarmLimit"));
             match (lolo, lo, hi, hihi) {
                 // pvxs writes each of the four buffers independently
                 // and leaves a missing one untouched; we only surface
@@ -902,9 +915,10 @@ impl PvaLink {
                 )),
             }
         };
-        let precision = scalar_as_f64(&extract_field(&root, "display.precision")).map(|p| p as i16);
-        let units = string_field(&root, "display.units");
-        let description = string_field(&root, "display.description");
+        let precision =
+            scalar_as_f64(&extract_field(&meta_root, "display.precision")).map(|p| p as i16);
+        let units = string_field(&meta_root, "display.units");
+        let description = string_field(&meta_root, "display.description");
 
         Some(LinkMetadata {
             dbf_type,
@@ -2263,6 +2277,126 @@ mod tests {
             Some("linked"),
             "display description"
         );
+    }
+
+    /// A link whose `field` selects a nested member must expose THAT
+    /// member's display/control/valueAlarm metadata, not the parent
+    /// PV's. pvxs derives `fld_meta` from the same selected root as
+    /// `fld_value` (`pvxs/ioc/pvalink_link.cpp:90-110`,
+    /// `pvxs/ioc/pvalink_lset.cpp:444-535`). Pre-fix `link_metadata_with`
+    /// used the selected field only for DBF type/element count and read
+    /// every metadata limit/unit/precision from the top-level root,
+    /// mixing the container's engineering metadata with the member's
+    /// value domain.
+    #[test]
+    fn link_metadata_resolves_display_control_valuealarm_at_selected_field_root() {
+        use epics_base_rs::server::database::LinkDbfType;
+
+        // Nested member NTScalar with its OWN distinct metadata.
+        let mut member = PvStructure::new("epics:nt/NTScalar:1.0");
+        member
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.0))));
+        member.fields.push((
+            "display".into(),
+            nt_display(-90.0, 90.0, "MEM", "member", 4),
+        ));
+        member
+            .fields
+            .push(("control".into(), nt_control(-100.0, 100.0)));
+        member.fields.push((
+            "valueAlarm".into(),
+            nt_value_alarm(-80.0, -70.0, 70.0, 80.0),
+        ));
+
+        // Top-level NTScalar with DIFFERENT metadata + the member.
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        root.fields
+            .push(("display".into(), nt_display(-9.0, 9.0, "TOP", "top", 2)));
+        root.fields
+            .push(("control".into(), nt_control(-10.0, 10.0)));
+        root.fields
+            .push(("valueAlarm".into(), nt_value_alarm(-8.0, -7.0, 7.0, 8.0)));
+        root.fields
+            .push(("member".into(), PvField::Structure(member)));
+        let value = PvField::Structure(root);
+
+        // field="member": every metadatum comes from the member.
+        let cfg = PvaLinkConfig {
+            field: "member".to_string(),
+            ..PvaLinkConfig::defaults_for("META:PV", LinkDirection::Inp)
+        };
+        let meta = PvaLink::for_test(cfg, Some(value.clone()))
+            .link_metadata()
+            .expect("metadata present");
+        assert_eq!(meta.dbf_type, Some(LinkDbfType::Double));
+        assert_eq!(meta.element_count, Some(1));
+        assert_eq!(
+            meta.graphic_limits,
+            Some((-90.0, 90.0)),
+            "graphic limits must come from the selected member"
+        );
+        assert_eq!(
+            meta.control_limits,
+            Some((-100.0, 100.0)),
+            "control limits must come from the selected member"
+        );
+        assert_eq!(
+            meta.alarm_limits,
+            Some((-80.0, -70.0, 70.0, 80.0)),
+            "alarm limits must come from the selected member"
+        );
+        assert_eq!(meta.precision, Some(4), "member precision");
+        assert_eq!(meta.units.as_deref(), Some("MEM"), "member units");
+        assert_eq!(meta.description.as_deref(), Some("member"));
+
+        // field="": every metadatum comes from the top-level root.
+        let cfg_top = PvaLinkConfig::defaults_for("META:PV", LinkDirection::Inp);
+        let meta_top = PvaLink::for_test(cfg_top, Some(value))
+            .link_metadata()
+            .expect("metadata present");
+        assert_eq!(meta_top.graphic_limits, Some((-9.0, 9.0)));
+        assert_eq!(meta_top.control_limits, Some((-10.0, 10.0)));
+        assert_eq!(meta_top.alarm_limits, Some((-8.0, -7.0, 7.0, 8.0)));
+        assert_eq!(meta_top.precision, Some(2));
+        assert_eq!(meta_top.units.as_deref(), Some("TOP"));
+        assert_eq!(meta_top.description.as_deref(), Some("top"));
+    }
+
+    /// A scalar/array field selection has no nested metadata
+    /// sub-structures, so the metadata root is empty and no
+    /// display/control/valueAlarm is surfaced — the metadata scalar
+    /// value must NOT be misread as a graphic/alarm limit. (`extract_field`
+    /// on a non-structure returns the scalar itself; the structural
+    /// guard in `link_metadata_with` prevents that scalar from leaking
+    /// into the limit reads.)
+    #[test]
+    fn link_metadata_scalar_field_has_no_nested_metadata() {
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(42.0))));
+        root.fields
+            .push(("display".into(), nt_display(-9.0, 9.0, "TOP", "top", 2)));
+
+        // Select the bare scalar `value` field directly.
+        let cfg = PvaLinkConfig {
+            field: "value".to_string(),
+            ..PvaLinkConfig::defaults_for("META:PV", LinkDirection::Inp)
+        };
+        let meta = PvaLink::for_test(cfg, Some(PvField::Structure(root)))
+            .link_metadata()
+            .expect("metadata present");
+        assert_eq!(
+            meta.graphic_limits, None,
+            "a scalar field selection exposes no display limits"
+        );
+        assert_eq!(
+            meta.units, None,
+            "a scalar field selection exposes no units"
+        );
+        assert_eq!(meta.precision, None);
     }
 
     /// a not-yet-connected link (no cached value) reports no

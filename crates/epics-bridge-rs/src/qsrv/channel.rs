@@ -53,6 +53,26 @@ impl Default for PutOptions {
     }
 }
 
+/// Reduce a parsed numeric DBE mask to pvxs's value-subscription
+/// class. pvxs masks `record._options.DBE` down to the value-class
+/// bits `DBE_VALUE | DBE_ARCHIVE | DBE_ALARM` and falls back to
+/// `DBE_VALUE | DBE_ALARM` when nothing in that class survives
+/// (ioc/singlesource.cpp:142-144). PROPERTY and any out-of-class bits
+/// must never reach the value subscription — the property
+/// subscription is opened separately and unconditionally
+/// (singlesource.cpp:161-167). EPICS `DBE_*` bit values coincide with
+/// [`EventMask`] bits (VALUE=1, ARCHIVE/LOG=2, ALARM=4), so the raw
+/// client mask maps straight through.
+fn dbe_value_class_mask(raw: u16) -> u16 {
+    use epics_base_rs::server::recgbl::EventMask;
+    let m = raw & (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
+    if m == 0 {
+        (EventMask::VALUE | EventMask::ALARM).bits()
+    } else {
+        m
+    }
+}
+
 /// parse `record._options.DBE` from a MONITOR INIT
 /// pvRequest. Returns the DBE bitmask as an EPICS event mask
 /// (`EventMask::VALUE | ALARM | LOG | PROPERTY`), or `None` if
@@ -77,16 +97,25 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
         })?;
 
     let dbe = options.get_field("DBE")?;
+    // Numeric DBE: pvxs reads it as `dbe = fld.as<uint8_t>()` then
+    // applies the value-class mask + fallback (singlesource.cpp:134-144).
+    // PROPERTY / out-of-class bits are stripped here so they cannot
+    // leak into the value subscription.
     let raw = match dbe {
         PvField::Scalar(ScalarValue::String(s)) => s.clone(),
-        PvField::Scalar(ScalarValue::Int(n)) => return Some((*n as u32 & 0xFFFF) as u16),
-        PvField::Scalar(ScalarValue::Long(n)) => return Some((*n as u32 & 0xFFFF) as u16),
+        PvField::Scalar(ScalarValue::Int(n)) => {
+            return Some(dbe_value_class_mask((*n as u32 & 0xFFFF) as u16));
+        }
+        PvField::Scalar(ScalarValue::Long(n)) => {
+            return Some(dbe_value_class_mask((*n as u32 & 0xFFFF) as u16));
+        }
         _ => return None,
     };
 
-    // Numeric-as-string: `"5"` resolves to a raw mask.
+    // Numeric-as-string: `"5"` resolves through the same value-class
+    // mask as the integer form.
     if let Ok(n) = raw.trim().parse::<u32>() {
-        return Some((n & 0xFFFF) as u16);
+        return Some(dbe_value_class_mask((n & 0xFFFF) as u16));
     }
 
     let mut mask = EventMask::NONE;
@@ -636,12 +665,58 @@ mod tests {
         );
     }
 
-    /// numeric integer DBE option is accepted as the raw mask.
+    /// numeric integer DBE within the value class passes through
+    /// unchanged (`5` = VALUE|ALARM).
     #[test]
     fn dbe_mask_accepts_integer_form() {
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(5)));
         let mask = dbe_mask_from_pv_request(&req).expect("must parse");
         assert_eq!(mask, 5);
+    }
+
+    /// A numeric DBE selecting only PROPERTY (8) carries no
+    /// value-class bit, so pvxs falls back to VALUE|ALARM for the value
+    /// subscription (singlesource.cpp:142-144); PROPERTY is delivered
+    /// by the separate property subscription.
+    #[test]
+    fn dbe_numeric_property_only_falls_back_to_value_alarm() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(
+            EventMask::PROPERTY.bits() as i32,
+        )));
+        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
+    }
+
+    /// numeric DBE=0 still yields the pvxs value-class fallback, not
+    /// an empty value subscription.
+    #[test]
+    fn dbe_numeric_zero_falls_back_to_value_alarm() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(0)));
+        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
+    }
+
+    /// numeric DBE with an out-of-class PROPERTY bit alongside VALUE
+    /// (9 = VALUE|PROPERTY) keeps only the value-class VALUE bit.
+    #[test]
+    fn dbe_numeric_strips_property_bit_from_value_mask() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let raw = (EventMask::VALUE | EventMask::PROPERTY).bits();
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(raw as i32)));
+        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        assert_eq!(mask, EventMask::VALUE.bits());
+    }
+
+    /// numeric-string DBE goes through the same value-class mask as
+    /// the integer form (`"8"` = PROPERTY → VALUE|ALARM fallback).
+    #[test]
+    fn dbe_numeric_string_uses_value_class_mask() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::String("8".into())));
+        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
     /// missing DBE option resolves to None so the monitor

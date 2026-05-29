@@ -986,6 +986,14 @@ impl ChannelCache {
         self.entries.lock().await.len()
     }
 
+    /// Configured hard cap on cached entries for this cache. Exposed so
+    /// the gateway can verify that per-credential caches inherit the
+    /// configured policy rather than a hardcoded default
+    /// (BRIDGE-RS-2026-05-28-26) and for control-status reporting.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
     /// B6: operator-driven cache flush. Drops every cached
     /// `UpstreamEntry` and clears the negative-result LRU, then
     /// returns the number of entries that were removed.

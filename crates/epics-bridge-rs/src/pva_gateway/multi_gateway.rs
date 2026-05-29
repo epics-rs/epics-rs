@@ -318,6 +318,10 @@ impl MultiTenantPvaGatewayBuilder {
                 let mut src = GatewayChannelSource::new(cache.clone());
                 src.connect_timeout = self.connect_timeout;
                 src.max_subscribers = self.max_subscribers;
+                // Per-credential caches built lazily by this source must
+                // honor the configured policy too (BRIDGE-RS-2026-05-28-26).
+                src.cleanup_interval = self.cleanup_interval;
+                src.per_credential_max_entries = self.max_cache_entries;
                 if first_gw_source.is_none() {
                     // The control source operates on the *unlayered*
                     // proxy (its diagnostic PVs are not access-gated).

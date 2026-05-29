@@ -30,7 +30,7 @@ use epics_pva_rs::server_native::source::{
     AccessChecked, ChannelContext, ChannelSource, OpError, WatermarkEvent, WatermarkKind,
 };
 
-use super::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL};
+use super::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL, DEFAULT_MAX_ENTRIES};
 
 /// Raw upstream MONITOR DATA body bytes flowing through the
 /// per-entry broadcast channel. `body` is the wire-format
@@ -198,6 +198,21 @@ pub struct GatewayChannelSource {
     /// event when a downstream client searches for a previously
     /// unseen PV. Pass through to `ChannelCache::lookup`.
     pub connect_timeout: Duration,
+    /// Cache policy applied to every *per-credential* upstream cache
+    /// built lazily in [`Self::upstream_cache_for`]. The shared
+    /// `cache` is constructed by the caller (`gateway.rs` /
+    /// `multi_gateway.rs`) with the configured policy; these fields
+    /// carry the SAME policy to credentialed caches so a site that
+    /// tunes `cleanup_interval` / `max_cache_entries` for resource
+    /// control gets one uniform policy across anonymous and
+    /// authenticated peers (BRIDGE-RS-2026-05-28-26). pva2pva gives
+    /// each named client provider its own `ChannelCache` with the
+    /// configured bound (`p2pApp/server.h:9-16`), so `max_cache_entries`
+    /// is a per-cache cap here too — matching that one-cache-per-client
+    /// model rather than a single global ceiling.
+    pub cleanup_interval: Duration,
+    /// Per-credential-cache entry ceiling — see [`Self::cleanup_interval`].
+    pub per_credential_max_entries: usize,
     /// Bridge subscriber-side mpsc capacity. Each downstream subscriber
     /// has its own bridge task that copies broadcast events into this
     /// mpsc; an overrun causes the next event to be dropped. Pick a
@@ -301,6 +316,8 @@ impl GatewayChannelSource {
         Self {
             cache,
             connect_timeout: Duration::from_secs(5),
+            cleanup_interval: DEFAULT_CLEANUP_INTERVAL,
+            per_credential_max_entries: DEFAULT_MAX_ENTRIES,
             subscriber_queue: 64,
             rpc_timeout: Duration::from_secs(30),
             max_subscribers: 100_000,
@@ -483,14 +500,17 @@ impl GatewayChannelSource {
         }
         // Build outside any lock — PvaClient::builder() is pure-Rust.
         let client = self.upstream_client_for(ctx);
+        // Apply the SAME configured cache policy as the shared cache —
+        // not a hardcoded interval/ceiling. A site that lowers
+        // `max_cache_entries` or changes `cleanup_interval` for resource
+        // control now gets one uniform policy for anonymous AND
+        // credentialed peers (BRIDGE-RS-2026-05-28-26). pva2pva bounds
+        // each named client's `ChannelCache` by the configured cap
+        // (`p2pApp/server.h:9-16`).
         let new_cache = ChannelCache::with_max_entries(
             client,
-            DEFAULT_CLEANUP_INTERVAL,
-            // Per-credential ceiling: a single downstream identity is
-            // unlikely to monitor more than this many PVs concurrently.
-            // Bounded to prevent a single misbehaving peer from filling
-            // the per-credential map indefinitely.
-            1_024,
+            self.cleanup_interval,
+            self.per_credential_max_entries,
         );
         // Double-checked insert under lock: a racing caller may have won.
         let mut pool = self.upstream_caches.lock();

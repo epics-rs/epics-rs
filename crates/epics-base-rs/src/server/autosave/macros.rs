@@ -43,86 +43,35 @@ impl MacroContext {
         Self { macros: merged }
     }
 
-    /// Expand all `$(KEY)`, `${KEY}`, and `$(KEY=default)` patterns in `input`.
-    /// `$$` is treated as a literal `$`.
-    /// Returns error on undefined macro with no default.
+    /// Expand `$(...)` / `${...}` macro references in `input` using the
+    /// crate's single macLib engine
+    /// ([`crate::server::db_loader::expand_macros`]), so autosave `.req`
+    /// expansion gets the full language — nested defaults
+    /// (`$(BAR=$(FOO))`), scoped definitions (`$(X,X=$(Y))`),
+    /// name-of-name (`$($(WHICH))`), chained expansion, single-quote
+    /// suppression — not just the flat `$(KEY)` / `$(KEY=default)` subset.
+    ///
+    /// Autosave-specific options: `env_fallback` (C `macEnvExpand`) and
+    /// `dollar_escape` (`$$` → literal `$`, a `.req` convenience). An
+    /// undefined macro with no default is a hard error (the engine
+    /// records it; the placeholder text is discarded).
     pub fn expand(&self, input: &str, source: &str, line: usize) -> AutosaveResult<String> {
-        let mut result = String::with_capacity(input.len());
-        let bytes = input.as_bytes();
-        let len = bytes.len();
-        let mut i = 0;
-
-        while i < len {
-            if bytes[i] == b'$' && i + 1 < len {
-                if bytes[i + 1] == b'$' {
-                    // $$ → literal $
-                    result.push('$');
-                    i += 2;
-                    continue;
-                }
-                let (open, close) = if bytes[i + 1] == b'(' {
-                    (b'(', b')')
-                } else if bytes[i + 1] == b'{' {
-                    (b'{', b'}')
-                } else {
-                    result.push('$');
-                    i += 1;
-                    continue;
-                };
-
-                // Find closing delimiter
-                let start = i + 2;
-                let mut depth = 1u32;
-                let mut j = start;
-                while j < len && depth > 0 {
-                    if bytes[j] == open {
-                        depth += 1;
-                    } else if bytes[j] == close {
-                        depth -= 1;
-                    }
-                    if depth > 0 {
-                        j += 1;
-                    }
-                }
-
-                if depth != 0 {
-                    // Unmatched — pass through literally
-                    result.push('$');
-                    i += 1;
-                    continue;
-                }
-
-                let inner = &input[start..j];
-                // Check for default: $(KEY=default)
-                let (key, default) = if let Some(eq_pos) = inner.find('=') {
-                    (&inner[..eq_pos], Some(&inner[eq_pos + 1..]))
-                } else {
-                    (inner, None)
-                };
-
-                if let Some(val) = self.macros.get(key) {
-                    result.push_str(val);
-                } else if let Some(val) = crate::runtime::env::get(key) {
-                    // Fall back to environment variable (matches C macEnvExpand)
-                    result.push_str(&val);
-                } else if let Some(def) = default {
-                    result.push_str(def);
-                } else {
-                    return Err(AutosaveError::UndefinedMacro {
-                        key: key.to_string(),
-                        source: source.to_string(),
-                        line,
-                    });
-                }
-
-                i = j + 1; // skip closing delimiter
-            } else {
-                result.push(input[i..].chars().next().unwrap());
-                i += input[i..].chars().next().unwrap().len_utf8();
-            }
+        let result = crate::server::db_loader::expand_macros(
+            input,
+            &self.macros,
+            crate::server::db_loader::MacroExpandOptions {
+                env_fallback: true,
+                dollar_escape: true,
+            },
+        );
+        if let Some(key) = result.undefined.first() {
+            return Err(AutosaveError::UndefinedMacro {
+                key: key.clone(),
+                source: source.to_string(),
+                line,
+            });
         }
-
-        Ok(result)
+        Ok(result.text)
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -186,5 +135,56 @@ mod tests {
             ctx.expand("${FILE}/$(P)temp", "test", 1).unwrap(),
             "settings/IOC:temp"
         );
+    }
+
+    // The full macLib language now reaches autosave .req expansion via
+    // the shared engine — previously `expand` only did the flat
+    // `$(KEY)` / `$(KEY=default)` subset.
+
+    #[test]
+    fn nested_default_is_expanded() {
+        // `${BAR=${FOO}}`: BAR unset, default is itself a macro ref.
+        let ctx = MacroContext::from_map([("FOO".into(), "fromfoo".into())].into());
+        assert_eq!(ctx.expand("${BAR=${FOO}}", "test", 1).unwrap(), "fromfoo");
+    }
+
+    #[test]
+    fn scoped_definition_is_honored() {
+        // `$(INNER,A=$(FOO))`: A is defined only for this reference and
+        // its value is itself expanded.
+        let ctx = MacroContext::from_map(
+            [
+                ("INNER".into(), "$(A)".into()),
+                ("FOO".into(), "scoped".into()),
+            ]
+            .into(),
+        );
+        assert_eq!(
+            ctx.expand("$(INNER,A=$(FOO))", "test", 1).unwrap(),
+            "scoped"
+        );
+    }
+
+    #[test]
+    fn resolved_value_is_chained() {
+        // P=$(Q), Q=IOC: → $(P) expands through to IOC:.
+        let ctx = MacroContext::from_map(
+            [("P".into(), "$(Q)".into()), ("Q".into(), "IOC:".into())].into(),
+        );
+        assert_eq!(ctx.expand("$(P)TEMP", "test", 1).unwrap(), "IOC:TEMP");
+    }
+
+    #[test]
+    fn undefined_without_default_still_errors() {
+        let ctx = MacroContext::new();
+        let err = ctx.expand("$(NOPE)", "f.req", 7).unwrap_err();
+        match err {
+            AutosaveError::UndefinedMacro { key, source, line } => {
+                assert_eq!(key, "NOPE");
+                assert_eq!(source, "f.req");
+                assert_eq!(line, 7);
+            }
+            other => panic!("expected UndefinedMacro, got {other:?}"),
+        }
     }
 }

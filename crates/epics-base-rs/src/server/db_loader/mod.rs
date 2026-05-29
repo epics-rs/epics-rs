@@ -303,9 +303,47 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
     Ok(records)
 }
 
-/// Expand `$(...)` / `${...}` macro references, mirroring the C
-/// `macLib` engine (`modules/libcom/src/macLib/macCore.c` `trans` /
-/// `refer`). Implemented behaviors:
+/// Resolution options for the macLib expansion engine ([`expand_macros`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MacroExpandOptions {
+    /// Fall back to the process environment when a name is unset,
+    /// matching C `macCreateHandle(&h, environ)`. The `.db` parser
+    /// leaves this off (its substitutions come only from the
+    /// `dbLoadRecords` / `.substitutions` macro map); `dbLoadGroup`
+    /// and autosave turn it on.
+    pub env_fallback: bool,
+    /// Treat `$$` as a literal `$`. An autosave `.req` convenience, NOT
+    /// a macLib behavior — C macLib leaves `$$` verbatim (`$` is only
+    /// special before `(`/`{`), so the `.db` parser leaves it off.
+    pub dollar_escape: bool,
+}
+
+/// Outcome of [`expand_macros`]: the expanded text plus the names of
+/// every macro referenced with neither a definition (nor an env value,
+/// when `env_fallback`) nor a default. The text still carries the C
+/// `$(name,undefined)` placeholder for each; callers that must hard-fail
+/// on an undefined macro (autosave) inspect `undefined` instead.
+#[derive(Clone, Debug, Default)]
+pub struct MacroExpansion {
+    pub text: String,
+    pub undefined: Vec<String>,
+}
+
+/// Engine state threaded through [`trans`] / [`refer`] / [`parse_scoped`]:
+/// the base macro map, the resolution options, and the running list of
+/// undefined-macro names.
+struct ExpandCtx<'a> {
+    macros: &'a HashMap<String, String>,
+    opts: MacroExpandOptions,
+    undefined: Vec<String>,
+}
+
+/// Expand `$(...)` / `${...}` macro references, mirroring the C `macLib`
+/// engine (`modules/libcom/src/macLib/macCore.c` `trans` / `refer`).
+/// This is the single macLib implementation for the crate; the `.db`
+/// parser, `dbLoadGroup`, and autosave all route through it (with
+/// per-caller [`MacroExpandOptions`]) rather than re-implementing it.
+/// Implemented behaviors:
 ///
 ///   - `\<char>` blocks macro detection and copies both bytes verbatim
 ///     (`trans:740-749`; `macLib.plt:52`).
@@ -316,35 +354,61 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
 ///     (`macEnd = "=,)"`); `,name=val` introduces scoped macro
 ///     definitions visible only inside that reference's expansion.
 ///   - a resolved macro value is re-scanned for further `$(...)`
-///     (chained expansion).
+///     (chained expansion); a self-/mutually-referential macro stops
+///     at the `visiting` guard (C per-entry `visited`).
 ///   - an undefined macro with no default emits the placeholder
-///     `$(name,undefined)` (`refer:errval = ",undefined)"`).
-pub(crate) fn substitute_macros(input: &str, macros: &HashMap<String, String>) -> String {
+///     `$(name,undefined)` (`refer:errval = ",undefined)"`) and is
+///     recorded in [`MacroExpansion::undefined`].
+///   - with [`MacroExpandOptions::env_fallback`], an otherwise-unset
+///     name resolves from the process environment before the default
+///     (C `macCreateHandle(&h, environ)`).
+pub fn expand_macros(
+    input: &str,
+    macros: &HashMap<String, String>,
+    opts: MacroExpandOptions,
+) -> MacroExpansion {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
+    let mut ctx = ExpandCtx {
+        macros,
+        opts,
+        undefined: Vec::new(),
+    };
     trans(
         &chars,
         0,
-        macros,
+        &mut ctx,
         &mut Vec::new(),
         &mut Vec::new(),
         &mut out,
     );
-    out
+    MacroExpansion {
+        text: out,
+        undefined: ctx.undefined,
+    }
+}
+
+/// Expand `$(...)` / `${...}` macro references with the default
+/// macLib options (no env fallback, no `$$` escape, undefined →
+/// placeholder). Thin wrapper over [`expand_macros`]; `pub` so
+/// `dbLoadGroup` and other consumers reuse the one engine instead of
+/// re-implementing macLib.
+pub fn substitute_macros(input: &str, macros: &HashMap<String, String>) -> String {
+    expand_macros(input, macros, MacroExpandOptions::default()).text
 }
 
 /// Translate `chars` into `out`, expanding macro references.
 ///
 /// `scopes` is the stack of scoped-macro frames pushed by enclosing
 /// `$(name,key=val)` references; lookup walks it innermost-first then
-/// falls back to the base `macros` map. `visiting` is the stack of
-/// macro names currently being expanded — it guards against a
-/// self-referential macro (`A=$(A)`) recursing forever, mirroring C
-/// `macCore.c`'s per-entry `visited` flag.
+/// falls back to `ctx.macros` (and, when enabled, the environment).
+/// `visiting` is the stack of macro names currently being expanded — it
+/// guards against a self-referential macro (`A=$(A)`) recursing forever,
+/// mirroring C `macCore.c`'s per-entry `visited` flag.
 fn trans(
     chars: &[char],
     level: usize,
-    macros: &HashMap<String, String>,
+    ctx: &mut ExpandCtx,
     scopes: &mut Vec<HashMap<String, String>>,
     visiting: &mut Vec<String>,
     out: &mut String,
@@ -363,6 +427,13 @@ fn trans(
             quote = Some(c);
         }
 
+        // `$$` → literal `$` (opt-in; autosave `.req` convenience).
+        if ctx.opts.dollar_escape && c == '$' && i + 1 < chars.len() && chars[i + 1] == '$' {
+            out.push('$');
+            i += 2;
+            continue;
+        }
+
         // `\<char>`: emit both verbatim, skip macro detection.
         if c == '\\' && i + 1 < chars.len() {
             out.push('\\');
@@ -376,7 +447,7 @@ fn trans(
         let mac_ref =
             c == '$' && i + 1 < chars.len() && (chars[i + 1] == '(' || chars[i + 1] == '{');
         if mac_ref && quote != Some('\'') {
-            if let Some(next) = refer(chars, i, level, macros, scopes, visiting, out) {
+            if let Some(next) = refer(chars, i, level, ctx, scopes, visiting, out) {
                 i = next;
                 continue;
             }
@@ -394,7 +465,7 @@ fn refer(
     chars: &[char],
     start: usize,
     level: usize,
-    macros: &HashMap<String, String>,
+    ctx: &mut ExpandCtx,
     scopes: &mut Vec<HashMap<String, String>>,
     visiting: &mut Vec<String>,
     out: &mut String,
@@ -435,7 +506,7 @@ fn refer(
 
     // the name itself may contain macro references — expand it.
     let mut name = String::new();
-    trans(name_chars, level + 1, macros, scopes, visiting, &mut name);
+    trans(name_chars, level + 1, ctx, scopes, visiting, &mut name);
 
     // Default value (`=...`) and scoped definitions (`,k=v`).
     let mut default: Option<&[char]> = None;
@@ -448,12 +519,12 @@ fn refer(
             match dsplit {
                 Some(k) => {
                     default = Some(&dflt[..k]);
-                    parse_scoped(&dflt[k..], level, macros, scopes, visiting, &mut scoped);
+                    parse_scoped(&dflt[k..], level, ctx, scopes, visiting, &mut scoped);
                 }
                 None => default = Some(dflt),
             }
         } else if *first == ',' {
-            parse_scoped(rest, level, macros, scopes, visiting, &mut scoped);
+            parse_scoped(rest, level, ctx, scopes, visiting, &mut scoped);
         }
     }
 
@@ -464,12 +535,22 @@ fn refer(
     }
     scopes.push(frame);
 
-    // Look up: innermost scope first, then base macros.
+    // Look up: innermost scope first, then base macros, then (when
+    // enabled) the process environment — C `macCreateHandle(&h, environ)`
+    // installs env entries as macros, so env resolution sits at the same
+    // level as a defined macro, before any default.
     let resolved = scopes
         .iter()
         .rev()
         .find_map(|s| s.get(&name).cloned())
-        .or_else(|| macros.get(&name).cloned());
+        .or_else(|| ctx.macros.get(&name).cloned())
+        .or_else(|| {
+            if ctx.opts.env_fallback {
+                crate::runtime::env::get(&name)
+            } else {
+                None
+            }
+        });
 
     match resolved {
         Some(val) => {
@@ -482,7 +563,7 @@ fn refer(
                 // re-scan the resolved value for further refs.
                 visiting.push(name.clone());
                 let val_chars: Vec<char> = val.chars().collect();
-                trans(&val_chars, level + 1, macros, scopes, visiting, out);
+                trans(&val_chars, level + 1, ctx, scopes, visiting, out);
                 visiting.pop();
             }
         }
@@ -491,11 +572,14 @@ fn refer(
                 // Strip a single layer of surrounding quotes from the
                 // default (`$(NAME="value")` → value).
                 let def = strip_outer_quotes(def_chars);
-                trans(def, level + 1, macros, scopes, visiting, out);
+                trans(def, level + 1, ctx, scopes, visiting, out);
             }
             None => {
                 // L-4: undefined macro placeholder. C emits
-                // `$(name,undefined)` when warnings are enabled.
+                // `$(name,undefined)` when warnings are enabled. Record
+                // the name so a hard-fail caller (autosave) can surface
+                // it instead of accepting the placeholder.
+                ctx.undefined.push(name.clone());
                 out.push_str("$(");
                 out.push_str(&name);
                 out.push_str(",undefined)");
@@ -512,7 +596,7 @@ fn refer(
 fn parse_scoped(
     rest: &[char],
     level: usize,
-    macros: &HashMap<String, String>,
+    ctx: &mut ExpandCtx,
     scopes: &mut Vec<HashMap<String, String>>,
     visiting: &mut Vec<String>,
     out: &mut Vec<(String, String)>,
@@ -531,7 +615,7 @@ fn parse_scoped(
             None => (seg, &seg[seg.len()..]),
         };
         let mut sname = String::new();
-        trans(name_part, level + 1, macros, scopes, visiting, &mut sname);
+        trans(name_part, level + 1, ctx, scopes, visiting, &mut sname);
         k += name_part.len();
         if let Some('=') = tail.first() {
             let valseg = &tail[1..];
@@ -541,7 +625,7 @@ fn parse_scoped(
                 None => (valseg, &valseg[valseg.len()..]),
             };
             let mut sval = String::new();
-            trans(val_part, level + 1, macros, scopes, visiting, &mut sval);
+            trans(val_part, level + 1, ctx, scopes, visiting, &mut sval);
             out.push((sname, sval));
             k += 1 + val_part.len();
         }
@@ -1973,6 +2057,54 @@ record(ai, "REC") {
         let mut macros = HashMap::new();
         macros.insert("INNER".to_string(), "$(A)-$(B)".to_string());
         assert_eq!(substitute_macros("$(INNER,A=1,B=2)", &macros), "1-2");
+    }
+
+    // `expand_macros` reports every undefined macro so a hard-fail
+    // caller (autosave) can surface it; the text still carries the
+    // C `$(name,undefined)` placeholder for the no-fail callers.
+    #[test]
+    fn expand_macros_reports_undefined_names() {
+        let macros = HashMap::new();
+        let r = expand_macros("$(A)$(B=def)$(C)", &macros, MacroExpandOptions::default());
+        assert_eq!(r.text, "$(A,undefined)def$(C,undefined)");
+        // B had a default → not undefined; A and C are, in scan order.
+        assert_eq!(r.undefined, vec!["A".to_string(), "C".to_string()]);
+    }
+
+    // The default options match `.db` parse semantics: no env fallback,
+    // and `$$` is NOT an escape (macLib leaves it verbatim).
+    #[test]
+    fn expand_macros_default_opts_leave_dollar_dollar_verbatim() {
+        let macros = HashMap::new();
+        assert_eq!(substitute_macros("$$100", &macros), "$$100");
+        let r = expand_macros("$$100", &macros, MacroExpandOptions::default());
+        assert_eq!(r.text, "$$100");
+        assert!(r.undefined.is_empty());
+    }
+
+    // `env_fallback` resolves an otherwise-unset name from the process
+    // environment (C `macCreateHandle(&h, environ)`), at the same level
+    // as a defined macro — before any default.
+    #[test]
+    fn expand_macros_env_fallback_opt_in() {
+        let var = "_EPICS_BASE_RS_MACRO_ENV_TEST";
+        // Off by default: unset macro stays undefined even with the env set.
+        unsafe { std::env::set_var(var, "FROM_ENV") };
+        let macros = HashMap::new();
+        let off = expand_macros(&format!("$({var})"), &macros, MacroExpandOptions::default());
+        assert_eq!(off.text, format!("$({var},undefined)"));
+        // On: resolves from the environment.
+        let on = expand_macros(
+            &format!("$({var})"),
+            &macros,
+            MacroExpandOptions {
+                env_fallback: true,
+                dollar_escape: false,
+            },
+        );
+        assert_eq!(on.text, "FROM_ENV");
+        assert!(on.undefined.is_empty());
+        unsafe { std::env::remove_var(var) };
     }
 
     #[test]

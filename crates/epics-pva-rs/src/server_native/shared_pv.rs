@@ -42,6 +42,34 @@ use crate::server_native::source::OpError;
 /// inside the closure and return Ok.
 pub type OnPutFn = Arc<dyn Fn(&SharedPV, PvField) -> Result<(), String> + Send + Sync>;
 
+/// Per-PV PUT policy. Replaces the previous `Option<OnPutFn>` so the
+/// three pvxs behaviours each have one unambiguous meaning instead of
+/// being inferred from "handler present?" plus a side flag:
+///
+/// - [`PutPolicy::Reject`] — a plain `SharedPV` with no handler. A
+///   client PUT fails (pvxs `sharedpv.cpp:209-227` — no `onPut`).
+/// - [`PutPolicy::Mailbox`] — built-in writable store-and-post. The
+///   delta merge AND the store happen under one lock, preserving the
+///   atomic read-merge-write invariant for concurrent disjoint PUTs.
+/// - [`PutPolicy::Readonly`] — explicit refusal with the pvxs
+///   `"Read-only PV"` message (`sharedpv.cpp:135-144`).
+/// - [`PutPolicy::Custom`] — a user `onPut`. The merged value is handed
+///   to the handler outside the lock (handlers may re-enter the PV).
+#[derive(Clone)]
+enum PutPolicy {
+    Reject,
+    Mailbox,
+    Readonly,
+    Custom(OnPutFn),
+}
+
+impl PutPolicy {
+    /// Whether this policy *accepts* client writes.
+    fn is_writable(&self) -> bool {
+        matches!(self, PutPolicy::Mailbox | PutPolicy::Custom(_))
+    }
+}
+
 /// User-provided process handler. Fired by the PVA `PROCESS` wire
 /// command (cmd 16) — processing is triggered with no value payload,
 /// the wire equivalent of an EPICS `dbProcess` / `caput .PROC`.
@@ -301,9 +329,10 @@ struct Inner {
     /// Pause sending updates when the monitor outbox depth is at or
     /// above `high_watermark`. Currently advisory.
     pub high_watermark: usize,
-    /// Optional user put handler; when None the default "store and
-    /// post" behavior runs. pvxs `onPut` parity.
-    on_put: Option<OnPutFn>,
+    /// PUT policy: reject / mailbox / read-only / custom handler. The
+    /// single source of truth for both write dispatch and `is_writable`
+    /// (pvxs `onPut` parity — see [`PutPolicy`]).
+    put_policy: PutPolicy,
     /// Optional user RPC handler; when None RPC returns "not
     /// supported". pvxs `onRPC` parity.
     on_rpc: Option<OnRpcFn>,
@@ -345,7 +374,7 @@ impl Default for Inner {
             subscribers: Vec::new(),
             low_watermark: 4,
             high_watermark: 64,
-            on_put: None,
+            put_policy: PutPolicy::Reject,
             on_rpc: None,
             on_process: None,
             on_rpc_async: None,
@@ -369,10 +398,47 @@ pub struct SharedPV {
 
 impl SharedPV {
     /// New, unopened SharedPV. open() must be called before serving GETs.
+    ///
+    /// A plain `SharedPV` has NO PUT handler, so it is NOT writable —
+    /// a client PUT is rejected (pvxs `sharedpv.cpp:209-227`). Build a
+    /// writable PV with [`Self::build_mailbox`], a read-only one that
+    /// explicitly refuses writes with [`Self::build_readonly`], or
+    /// install a custom [`Self::on_put`] handler.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::default())),
         }
+    }
+
+    /// A writable "mailbox" PV: a client PUT stores the value and posts
+    /// it to all subscribers. Mirrors pvxs `SharedPV::buildMailbox`
+    /// (`sharedpv.cpp:106-132`) — it installs an `onPut` handler that
+    /// `post`s the value. (pvxs additionally stamps `timeStamp` with the
+    /// current time when the client left it unset; this builder leaves
+    /// the value untouched, so callers that want server-side timestamps
+    /// install a custom [`Self::on_put`].)
+    pub fn build_mailbox() -> Self {
+        let pv = Self::new();
+        pv.inner.lock().put_policy = PutPolicy::Mailbox;
+        pv
+    }
+
+    /// A read-only PV that explicitly refuses writes. Mirrors pvxs
+    /// `SharedPV::buildReadonly` (`sharedpv.cpp:135-144`), whose `onPut`
+    /// handler replies `"Read-only PV"`. Reports `is_writable() == false`.
+    pub fn build_readonly() -> Self {
+        let pv = Self::new();
+        pv.inner.lock().put_policy = PutPolicy::Readonly;
+        pv
+    }
+
+    /// Whether this PV *accepts* client writes. `true` only for a
+    /// mailbox ([`Self::build_mailbox`]) or a custom handler
+    /// ([`Self::on_put`]); `false` for a plain [`Self::new`] (PUT
+    /// rejected) and for [`Self::build_readonly`] (writes refused).
+    /// pvxs has no implicit-writable `SharedPV`.
+    pub fn is_writable(&self) -> bool {
+        self.inner.lock().put_policy.is_writable()
     }
 
     /// Declare the type and seed the initial value. Repeated calls
@@ -497,21 +563,29 @@ impl SharedPV {
         Some(inbox)
     }
 
-    /// Apply a PUT. By default, the new value is posted to all
-    /// subscribers and stored as `current()`. When [`Self::on_put`]
-    /// has been set, the user handler runs instead and is responsible
-    /// for any side-effects / re-posting. Mirrors pvxs `onPut`
-    /// dispatch.
+    /// Apply a PUT. When [`Self::on_put`] has been set, the user
+    /// handler runs and is responsible for any side-effects /
+    /// re-posting. When NO handler is installed the PUT is REJECTED —
+    /// pvxs `sharedpv.cpp:209-227` replies `op->error(...)` for a
+    /// plain `SharedPV` with no `onPut` rather than silently storing
+    /// the value. A writable PV is built with [`Self::build_mailbox`]
+    /// (posting handler) or [`Self::build_readonly`] (rejecting
+    /// handler), or by installing a custom [`Self::on_put`].
     pub fn put(&self, value: PvField) -> Result<(), String> {
         if !self.is_open() {
             return Err("SharedPV not open".into());
         }
-        let on_put = self.inner.lock().on_put.clone();
-        if let Some(f) = on_put {
-            return f(self, value);
+        let policy = self.inner.lock().put_policy.clone();
+        match policy {
+            PutPolicy::Reject => Err("PUT not supported by this PV".into()),
+            PutPolicy::Readonly => Err("Read-only PV".into()),
+            // Mailbox: store + post (descriptor-enforced).
+            PutPolicy::Mailbox => self
+                .try_post_checked(value)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            PutPolicy::Custom(f) => f(self, value),
         }
-        let _ = self.try_post(value);
-        Ok(())
     }
 
     /// Apply a **BitSet-delta PUT** atomically.
@@ -537,24 +611,35 @@ impl SharedPV {
     /// For PVs with an [`Self::on_put`] handler, the merge against
     /// `current()` is still atomic, but the handler then owns any
     /// further side-effects exactly as it does for [`Self::put`].
+    ///
+    /// A PV with NO handler REJECTS the PUT (pvxs `sharedpv.cpp:209-227`
+    /// — a plain `SharedPV` is not implicitly writable); the merged
+    /// value is neither stored nor posted. Use [`Self::build_mailbox`]
+    /// for a writable PV.
     pub fn put_delta(
         &self,
         desc: &FieldDesc,
         changed: &crate::proto::BitSet,
         delta: PvField,
     ) -> Result<(), String> {
-        // Phase 1: under the lock, read prior, merge, and (for the
-        // default no-handler path) store + snapshot subscribers.
-        // `crate::pvdata::encode::fill_unmarked_from_prior` is a pure
-        // function — safe to call while holding the parking_lot mutex.
+        // Phase 1: under the lock, dispatch on PUT policy. The merge
+        // (`fill_unmarked_from_prior`, a pure function) is safe to call
+        // while holding the parking_lot mutex.
+        //
+        // Reject/Readonly bail BEFORE merging so a non-writable PV's
+        // stored value is never touched (pvxs `sharedpv.cpp:209-227`).
+        //
+        // The MAILBOX store happens under THIS lock, atomically with the
+        // merge, so two concurrent disjoint delta PUTs cannot both read
+        // the same prior and clobber each other (the read-merge-write
+        // invariant). A CUSTOM handler runs OUTSIDE the lock (it may
+        // re-enter the PV), so its merge-then-handle is not atomic — the
+        // handler owns that semantics, exactly as it does for `put`.
         enum Applied {
-            // No on_put handler: value already stored under the lock;
-            // post the merged value to these subscribers.
             Posted {
                 value: PvField,
                 subscribers: Vec<MonitorOutbox>,
             },
-            // on_put handler installed: run it with the merged value.
             Handler {
                 handler: OnPutFn,
                 value: PvField,
@@ -563,45 +648,52 @@ impl SharedPV {
         let applied = {
             let mut g = self.inner.lock();
             let inner = &mut *g;
-            let PvState::Open {
-                desc: opened,
-                value: prior,
-            } = &mut inner.state
-            else {
-                return Err("SharedPV not open".into());
-            };
-            let merged =
-                crate::pvdata::encode::fill_unmarked_from_prior(desc, changed, 0, delta, prior);
-            match inner.on_put.clone() {
-                Some(handler) => Applied::Handler {
-                    handler,
-                    value: merged,
-                },
-                None => {
-                    // descriptor enforcement for the no-handler store
-                    // path. Without a check the merged value could carry
-                    // a shape unrelated to the opened descriptor (pvxs
-                    // `sharedpv.cpp:417-431` rejects this). Compare
-                    // against the opened descriptor (`opened`), not the
-                    // per-put `desc` parameter — the wire request may
-                    // carry a stale descriptor cached by the peer.
+            let policy = inner.put_policy.clone();
+            match policy {
+                PutPolicy::Reject => return Err("PUT not supported by this PV".into()),
+                PutPolicy::Readonly => return Err("Read-only PV".into()),
+                PutPolicy::Mailbox => {
+                    let PvState::Open {
+                        desc: opened,
+                        value: prior,
+                    } = &mut inner.state
+                    else {
+                        return Err("SharedPV not open".into());
+                    };
+                    let merged = crate::pvdata::encode::fill_unmarked_from_prior(
+                        desc, changed, 0, delta, prior,
+                    );
+                    // descriptor enforcement for the store path: the
+                    // merged value must fit the opened descriptor, not a
+                    // stale peer-cached `desc` (pvxs `sharedpv.cpp:417-431`).
                     if let Err(e) = crate::pvdata::value_matches_descriptor(&merged, opened) {
                         return Err(format!(
                             "SharedPV::put_delta: merged value does not fit opened descriptor ({e})"
                         ));
                     }
-                    // Store atomically with the read above so a
-                    // concurrent put_delta sees this as its prior.
+                    // store atomically with the read above.
                     *prior = merged.clone();
                     Applied::Posted {
                         value: merged,
                         subscribers: inner.subscribers.clone(),
                     }
                 }
+                PutPolicy::Custom(handler) => {
+                    let PvState::Open { value: prior, .. } = &mut inner.state else {
+                        return Err("SharedPV not open".into());
+                    };
+                    let merged = crate::pvdata::encode::fill_unmarked_from_prior(
+                        desc, changed, 0, delta, prior,
+                    );
+                    Applied::Handler {
+                        handler,
+                        value: merged,
+                    }
+                }
             }
         };
-        // Phase 2: outside the lock — post to subscribers or run the
-        // user handler (handlers may call back into SharedPV).
+        // Phase 2: outside the lock — post to subscribers (mailbox) or
+        // run the user handler (custom).
         match applied {
             Applied::Posted {
                 value,
@@ -609,10 +701,9 @@ impl SharedPV {
             } => {
                 // pvxs servermon.cpp:283-286: squash-to-tail for normal post.
                 subscribers.retain(|tx| tx.post(value.clone(), false));
-                // Reconcile the canonical subscriber set: drop receivers that
-                // closed between the phase-1 snapshot and now.
-                let mut g = self.inner.lock();
-                g.subscribers.retain(|tx| !tx.is_closed());
+                // Reconcile the canonical subscriber set: drop receivers
+                // that closed between the phase-1 snapshot and now.
+                self.inner.lock().subscribers.retain(|tx| !tx.is_closed());
                 Ok(())
             }
             Applied::Handler { handler, value } => handler(self, value),
@@ -672,13 +763,16 @@ impl SharedPV {
         }
     }
 
-    /// Install a put handler. Pass `None` to clear. Mirrors pvxs
-    /// `SharedPV::onPut`.
+    /// Install a put handler, making the PV writable. Mirrors pvxs
+    /// `SharedPV::onPut`. Installing a handler marks the PV writable
+    /// (`is_writable() == true`); for an explicitly read-only PV use
+    /// [`Self::build_readonly`] instead, which installs a refusing
+    /// handler while keeping `is_writable() == false`.
     pub fn on_put<F>(&self, handler: F)
     where
         F: Fn(&SharedPV, PvField) -> Result<(), String> + Send + Sync + 'static,
     {
-        self.inner.lock().on_put = Some(Arc::new(handler));
+        self.inner.lock().put_policy = PutPolicy::Custom(Arc::new(handler));
     }
 
     /// Install an RPC handler. Mirrors pvxs `SharedPV::onRPC`.
@@ -1038,8 +1132,13 @@ impl super::source::ChannelSource for SharedSource {
     }
 
     fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-        let exists = self.pvs.lock().contains_key(name);
-        async move { exists }
+        // Per-PV write policy, not mere existence: a PV is writable only
+        // when it has an `on_put` handler (built via
+        // [`SharedPV::build_mailbox`] or a custom `on_put`). A plain or
+        // read-only PV reports `false`, matching pvxs which has no
+        // implicit-writable `SharedPV`.
+        let writable = self.pvs.lock().get(name).map(|p| p.is_writable());
+        async move { writable.unwrap_or(false) }
     }
 
     fn subscribe(
@@ -1527,19 +1626,16 @@ mod tests {
         assert_eq!(src.monitor_watermarks("nope").await, None);
     }
 
-    /// Regression: a no-handler `put_delta` to a `SharedPV` with
-    /// a live subscriber clones `g.subscribers` for a lock-free post.
-    /// Before the fix, the cloned `MonitorOutbox` vector dropped at
-    /// function exit and each clone's `Drop` set `producer_done = true`,
-    /// terminating the subscriber inbox even though the receiver was
-    /// never dropped. After the fix, only the *last* producer endpoint
-    /// drop closes the queue, so the subscriber survives `put_delta`
-    /// and keeps receiving posts.
+    /// Regression: consecutive `put_delta` writes to a writable
+    /// (mailbox) `SharedPV` keep delivering to a live subscriber. The
+    /// mailbox handler posts through `try_post_checked`, which retains
+    /// the canonical subscriber set under the lock, so a subscriber
+    /// survives back-to-back delta PUTs and receives every value.
     #[tokio::test]
     async fn mr_r2_put_delta_clone_drop_keeps_subscriber_alive() {
         use crate::proto::BitSet;
 
-        let pv = SharedPV::new();
+        let pv = SharedPV::build_mailbox();
         pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
         let mut rx = pv.subscribe(8).expect("subscribe");
         // Drain the initial value.
@@ -1574,6 +1670,54 @@ mod tests {
             "subscriber inbox must keep receiving after repeated put_delta"
         );
         assert_eq!(extract_int(&v2.unwrap()), 22);
+    }
+
+    /// A plain (no-handler) `SharedPV` is NOT writable: both `put` and
+    /// `put_delta` are rejected, and the stored value is unchanged
+    /// (pvxs `sharedpv.cpp:209-227`). `build_mailbox` makes it writable;
+    /// `build_readonly` rejects with the pvxs `"Read-only PV"` message.
+    #[tokio::test]
+    async fn plain_shared_pv_rejects_put_mailbox_accepts_readonly_refuses() {
+        use crate::proto::BitSet;
+
+        // Plain: reject, value unchanged.
+        let plain = SharedPV::new();
+        plain.open(nt_scalar_int_desc(), nt_scalar_int_value(7));
+        assert!(!plain.is_writable(), "plain PV must not be writable");
+        assert!(
+            plain.put(nt_scalar_int_value(9)).is_err(),
+            "plain put rejected"
+        );
+        let mut changed = BitSet::new();
+        changed.set(1);
+        assert!(
+            plain
+                .put_delta(&nt_scalar_int_desc(), &changed, nt_scalar_int_value(9))
+                .is_err(),
+            "plain put_delta rejected"
+        );
+        assert_eq!(
+            extract_int(&plain.current().unwrap()),
+            7,
+            "rejected PUT must not mutate the stored value"
+        );
+
+        // Mailbox: accept and store.
+        let mbox = SharedPV::build_mailbox();
+        mbox.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        assert!(mbox.is_writable(), "mailbox PV must be writable");
+        mbox.put(nt_scalar_int_value(42)).expect("mailbox put ok");
+        assert_eq!(extract_int(&mbox.current().unwrap()), 42);
+
+        // Read-only: explicit refusal with the pvxs message.
+        let ro = SharedPV::build_readonly();
+        ro.open(nt_scalar_int_desc(), nt_scalar_int_value(0));
+        assert!(
+            !ro.is_writable(),
+            "read-only PV reports not writable (still has a refusing handler)"
+        );
+        let err = ro.put(nt_scalar_int_value(1)).unwrap_err();
+        assert_eq!(err, "Read-only PV");
     }
 
     /// explicit `close()` must still terminate the subscriber

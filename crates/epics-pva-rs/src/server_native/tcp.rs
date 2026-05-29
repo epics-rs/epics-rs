@@ -8782,7 +8782,7 @@ mod tests {
         let ioid: u32 = 100;
 
         // Build a SharedSource with one PV "dut" of type NTScalar<f64>.
-        let pv = SharedPV::new();
+        let pv = SharedPV::build_mailbox();
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
@@ -8911,7 +8911,7 @@ mod tests {
         let sid: u32 = 1;
         let ioid: u32 = 200;
 
-        let pv = SharedPV::new();
+        let pv = SharedPV::build_mailbox();
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
@@ -9380,7 +9380,7 @@ mod tests {
         let ioid: u32 = 300;
 
         let intro = three_field_intro();
-        let pv = SharedPV::new();
+        let pv = SharedPV::build_mailbox();
         pv.open(intro.clone(), three_field_value(10, 20, 30));
 
         let shared = SharedSource::new();
@@ -9504,7 +9504,7 @@ mod tests {
         let ioid: u32 = 400;
 
         let intro = three_field_intro();
-        let pv = SharedPV::new();
+        let pv = SharedPV::build_mailbox();
         pv.open(intro.clone(), three_field_value(10, 20, 30));
 
         let shared = SharedSource::new();
@@ -9660,7 +9660,9 @@ mod tests {
         // Run many trials to give the scheduler a chance to surface
         // any residual interleaving race.
         for trial in 0..200 {
-            let pv = SharedPV::new();
+            // Writable PV: a plain SharedPV is not writable (pvxs
+            // parity), so the atomic-merge PUT path needs a mailbox.
+            let pv = SharedPV::build_mailbox();
             pv.open(intro.clone(), three_field_value(0, 0, 0));
             let shared = SharedSource::new();
             shared.add("dut", pv);

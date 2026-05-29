@@ -1231,20 +1231,33 @@ fn value_fits_desc(value: &PvField, desc: &FieldDesc) -> bool {
 
 /// Canonicalize a *selection* bitset (e.g. the output of
 /// [`crate::pv_request::request_to_mask`]) into a valid wire
-/// *changed*-bitset.
+/// *changed*-bitset, mirroring pvxs `to_wire_valid`
+/// (`src/dataencode.cpp:414-438`): a set structure bit conveys its
+/// *entire subtree*, and `to_wire_valid` skips past the descendants of
+/// a valid structure bit rather than emitting them individually.
 ///
-/// A selection mask freely sets a structure bit alongside a *partial*
-/// set of its descendants — that is correct for request/intersection
-/// logic but wrong as a wire changed-bitset, where (pvData §5.4 / pvxs
-/// `BitSet`) a set structure bit means "the whole subtree changed".
-/// Feeding such a mask straight to [`encode_pv_field_with_bitset`]
-/// would emit the entire structure and defeat the field filter.
+/// A structure node is emitted as a whole subtree when either:
 ///
-/// This walks `desc` and, for every structure node, sets the node's
-/// bit **iff every descendant bit is set** in `selection`; otherwise it
-/// clears the structure bit and keeps the descendant bits. Leaf bits
-/// are copied verbatim. The result encodes and decodes symmetrically
-/// under the §5.4 semantics enforced by `*_with_bitset`.
+/// * **Every descendant bit is selected** — a fully-selected subtree,
+///   e.g. an empty `field {}` or `field(alarm)` request.
+/// * **Its own bit is selected and it is not the root** — the pvRequest
+///   named this structure, possibly via a nested path such as
+///   `field(alarm.status)`. pvxs `request2mask`
+///   (`src/pvrequest.cpp:33-40`) sets the matched structure's bit, and
+///   for a source value whose structure is valid pvxs sends the whole
+///   structure. Narrowing such a request down to the named leaf would
+///   drop sibling fields the peer expects.
+///
+/// The root bit (0) is excluded from the own-bit rule: `request_to_mask`
+/// always sets it as pvxs's wildcard bit, so honouring it as "whole
+/// tree" would defeat every field filter. The root expands to the whole
+/// tree only when every descendant is also selected (the empty-request
+/// case, first bullet).
+///
+/// Otherwise the structure bit stays clear and the walk recurses,
+/// keeping any selected leaves. Leaf bits are copied verbatim. The
+/// result encodes and decodes symmetrically under the §5.4 semantics
+/// enforced by `*_with_bitset`.
 pub fn canonical_changed_bitset(
     desc: &FieldDesc,
     selection: &crate::proto::BitSet,
@@ -1262,11 +1275,20 @@ pub fn canonical_changed_bitset(
     ) {
         match desc {
             FieldDesc::Structure { fields, .. } => {
-                if all_descendants_set(selection, bit_offset, desc) {
-                    // Whole subtree selected → a single structure bit
-                    // legitimately conveys it; descendant bits are
-                    // redundant but harmless, so set them too for an
-                    // unambiguous "all present" mask.
+                // A set structure bit conveys its whole subtree (pvxs
+                // `to_wire_valid`). That holds when the subtree is fully
+                // selected, or when a non-root structure's own bit is set
+                // because the pvRequest named it (`request2mask` sets the
+                // matched structure bit even for a nested leaf request like
+                // `alarm.status`). The always-set root wildcard bit is
+                // excluded so it does not widen a field filter to the
+                // whole tree.
+                let whole = all_descendants_set(selection, bit_offset, desc)
+                    || (bit_offset != 0 && selection.get(bit_offset));
+                if whole {
+                    // Descendant bits are redundant under a set structure
+                    // bit but harmless; set them for an unambiguous
+                    // "all present" mask.
                     let total = desc.total_bits();
                     for i in 0..total {
                         out.set(bit_offset + i);
@@ -3109,6 +3131,187 @@ mod tests {
         let decoded = decode_pv_field_with_bitset(&desc, &bs, 0, &mut cur, order).unwrap();
         assert_eq!(decoded, value);
         assert_eq!(cur.remaining(), 0);
+    }
+
+    /// pvxs `request2mask` sets the matched structure bit for a nested
+    /// leaf request like `field(alarm.status)` (pvrequest.cpp:33-40),
+    /// and `to_wire_valid` then sends the WHOLE `alarm` structure
+    /// (dataencode.cpp:414-438). The server canonicalization must
+    /// preserve that named structure bit rather than narrowing the reply
+    /// to the requested leaf — otherwise sibling fields the peer expects
+    /// (`alarm.severity`) are dropped from a GET/PUT-readback value.
+    #[test]
+    fn named_nested_struct_request_sends_whole_subtree() {
+        use crate::pv_request::request_to_mask;
+
+        let desc = nested_alarm_desc(); // root=0,value=1,alarm=2,severity=3,status=4
+        // pvRequest `field(alarm.status)`.
+        let req = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![(
+                "field".into(),
+                FieldDesc::Structure {
+                    struct_id: String::new(),
+                    fields: vec![(
+                        "alarm".into(),
+                        FieldDesc::Structure {
+                            struct_id: String::new(),
+                            fields: vec![(
+                                "status".into(),
+                                FieldDesc::Structure {
+                                    struct_id: String::new(),
+                                    fields: Vec::new(),
+                                },
+                            )],
+                        },
+                    )],
+                },
+            )],
+        };
+
+        // request_to_mask names alarm (bit 2) + alarm.status (bit 4); the
+        // root wildcard (bit 0) is set; severity (bit 3) and value
+        // (bit 1) are NOT selected.
+        let mask = request_to_mask(&desc, &req).unwrap();
+        assert_eq!(mask.iter().collect::<Vec<_>>(), vec![0, 2, 4]);
+
+        // Canonicalization preserves the named `alarm` structure bit as
+        // its whole subtree — {2,3,4} — NOT a narrowed {4}.
+        let changed = canonical_changed_bitset(&desc, &mask);
+        assert!(changed.get(2), "named alarm structure bit preserved");
+        assert!(changed.get(3), "alarm.severity included (whole subtree)");
+        assert!(changed.get(4), "alarm.status included");
+        assert!(!changed.get(1), "value not requested → omitted");
+        assert!(
+            !changed.get(0),
+            "root wildcard must not widen to whole tree"
+        );
+
+        // GET-response round-trip: the source value's alarm is fully
+        // populated; the wire reply must carry the WHOLE alarm.
+        let value = nested_alarm_value(42.0, 7, 5); // value, severity=7, status=5
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut buf = Vec::new();
+            encode_pv_field_with_bitset(&value, &desc, &changed, 0, order, &mut buf);
+            // whole alarm (2 Int = 8 bytes); value (bit 1) omitted.
+            assert_eq!(buf.len(), 8, "whole alarm, value omitted, order={order:?}");
+
+            let mut cur = Cursor::new(buf.as_slice());
+            let decoded = decode_pv_field_with_bitset(&desc, &changed, 0, &mut cur, order).unwrap();
+            if let PvField::Structure(s) = decoded {
+                // value not requested → default 0.0.
+                assert!(matches!(
+                    s.get_field("value"),
+                    Some(PvField::Scalar(ScalarValue::Double(v))) if v.abs() < 1e-9
+                ));
+                if let Some(PvField::Structure(a)) = s.get_field("alarm") {
+                    // BOTH sibling leaves present — severity is not
+                    // dropped just because only status was named.
+                    assert!(matches!(
+                        a.get_field("severity"),
+                        Some(PvField::Scalar(ScalarValue::Int(7)))
+                    ));
+                    assert!(matches!(
+                        a.get_field("status"),
+                        Some(PvField::Scalar(ScalarValue::Int(5)))
+                    ));
+                } else {
+                    panic!("alarm must be a Structure");
+                }
+            } else {
+                panic!("decoded must be Structure");
+            }
+            assert_eq!(cur.remaining(), 0);
+        }
+    }
+
+    /// Mirror of pvxs `testpvreq.cpp:58-71`: `field(timeStamp,alarm.status)`
+    /// against an NTScalar descriptor yields request mask
+    /// {0,2,4,6,7,8,9}. The wire changed-bitset must keep the matched
+    /// `alarm` structure bit (2) — pvxs `to_wire_valid` sends the whole
+    /// `alarm` subtree — so the canonical form is {2,3,4,5,6,7,8,9}
+    /// (whole alarm + whole timeStamp), not a leaf-narrowed {4,6,7,8,9}.
+    #[test]
+    fn ntscalar_alarm_status_request_keeps_whole_alarm_structure() {
+        use crate::pv_request::request_to_mask;
+
+        let value_desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::String)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![
+                            ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("message".into(), FieldDesc::Scalar(ScalarType::String)),
+                        ],
+                    },
+                ),
+                (
+                    "timeStamp".into(),
+                    FieldDesc::Structure {
+                        struct_id: "time_t".into(),
+                        fields: vec![
+                            (
+                                "secondsPastEpoch".into(),
+                                FieldDesc::Scalar(ScalarType::Long),
+                            ),
+                            ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        };
+        // pvRequest `field(timeStamp, alarm.status)`.
+        let req = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![(
+                "field".into(),
+                FieldDesc::Structure {
+                    struct_id: String::new(),
+                    fields: vec![
+                        (
+                            "timeStamp".into(),
+                            FieldDesc::Structure {
+                                struct_id: String::new(),
+                                fields: Vec::new(),
+                            },
+                        ),
+                        (
+                            "alarm".into(),
+                            FieldDesc::Structure {
+                                struct_id: String::new(),
+                                fields: vec![(
+                                    "status".into(),
+                                    FieldDesc::Structure {
+                                        struct_id: String::new(),
+                                        fields: Vec::new(),
+                                    },
+                                )],
+                            },
+                        ),
+                    ],
+                },
+            )],
+        };
+
+        let mask = request_to_mask(&value_desc, &req).unwrap();
+        assert_eq!(
+            mask.iter().collect::<Vec<_>>(),
+            vec![0, 2, 4, 6, 7, 8, 9],
+            "pvxs testpvreq.cpp:70 request mask"
+        );
+
+        let changed = canonical_changed_bitset(&value_desc, &mask);
+        assert_eq!(
+            changed.iter().collect::<Vec<_>>(),
+            vec![2, 3, 4, 5, 6, 7, 8, 9],
+            "whole alarm (2,3,4,5) + whole timeStamp (6,7,8,9); value omitted"
+        );
     }
 
     // ── BUG 2: unbounded allocation from wire-supplied array length ──────

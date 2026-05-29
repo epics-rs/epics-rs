@@ -473,7 +473,13 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
     let pattern = build_pattern(pattern_str, lineno)?;
 
     match keyword.to_ascii_uppercase().as_str() {
-        "ALLOW" => {
+        // C ca-gateway (gateAs.cc:617-621) treats ALLOW, ALIAS, PATTERN and
+        // PV identically: all four insert a `gateAsEntry` into the same
+        // `allow_list` with the same ASG/ASL parsing. PATTERN and PV are
+        // therefore plain synonyms for ALLOW (they predate the ALLOW keyword
+        // and remain accepted for legacy pvlist files). Rejecting them broke
+        // load/reload of C-compatible pvlist files that use the older syntax.
+        "ALLOW" | "PATTERN" | "PV" => {
             let asg = tokens.next().map(String::from);
             let asl = tokens
                 .next()
@@ -547,7 +553,7 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
             })
         }
         other => Err(BridgeError::GroupConfigError(format!(
-            "line {lineno}: unknown keyword '{other}', expected ALLOW/DENY/ALIAS"
+            "line {lineno}: unknown keyword '{other}', expected ALLOW/PATTERN/PV/DENY/ALIAS"
         ))),
     }
 }
@@ -739,6 +745,40 @@ mod tests {
     #[test]
     fn parse_invalid_keyword() {
         assert!(parse_pvlist("foo BAD").is_err());
+    }
+
+    /// C ca-gateway (gateAs.cc:617-621) accepts PATTERN and PV as synonyms
+    /// for ALLOW — all four insert into the same allow_list with identical
+    /// ASG/ASL parsing. A legacy pvlist using PATTERN/PV must load (and
+    /// match, alias, and carry ASG/ASL) exactly like the ALLOW form.
+    #[test]
+    fn parse_pattern_and_pv_are_allow_synonyms() {
+        for kw in ["PATTERN", "PV", "pattern", "pv"] {
+            let list = parse_pvlist(&format!("PV.* {kw} BeamGroup 2")).unwrap();
+            assert_eq!(list.entries.len(), 1, "{kw}: one entry");
+            match &list.entries[0] {
+                PvListEntry::Allow { asg, asl, .. } => {
+                    assert_eq!(asg.as_deref(), Some("BeamGroup"), "{kw}: ASG");
+                    assert_eq!(*asl, Some(2), "{kw}: ASL");
+                }
+                other => panic!("{kw}: expected Allow, got {other:?}"),
+            }
+            // Behaves as an allow rule end-to-end.
+            let m = list.match_name("PV:current").expect("{kw}: admitted");
+            assert!(!m.is_alias);
+            assert_eq!(m.resolved_name, "PV:current");
+            assert!(
+                list.match_name("Other:x").is_none(),
+                "{kw}: non-match denied"
+            );
+        }
+
+        // Default ASG/ASL (no tokens) — PATTERN with bare pattern is admitted
+        // at the C level-1 default, same as bare ALLOW.
+        let list = parse_pvlist("Beam:.* PATTERN").unwrap();
+        let m = list.match_name("Beam:x").expect("admitted");
+        assert_eq!(m.asl, None);
+        assert_eq!(m.effective_asl(), 1);
     }
 
     #[test]

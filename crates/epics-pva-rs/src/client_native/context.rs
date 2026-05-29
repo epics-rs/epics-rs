@@ -1545,6 +1545,35 @@ impl PvaClient {
         .await
     }
 
+    /// Like [`Self::pvrpc`] but sends a caller-provided RPC INIT
+    /// pvRequest, kept distinct from the RPC DATA argument. A PVA-to-PVA
+    /// gateway uses this to forward the downstream
+    /// `createChannelRPC(..., pvRequest)` create-time request upstream
+    /// (pva2pva `channel.cpp:140-148`) while carrying the downstream
+    /// argument as the DATA value. pvxs `clientget.cpp:348-352` serializes
+    /// the pvRequest at INIT and `:302-310` the argument at EXEC.
+    pub async fn pvrpc_with_request(
+        &self,
+        pv_name: &str,
+        pv_request_desc: &FieldDesc,
+        pv_request_value: &PvField,
+        arg_desc: &FieldDesc,
+        arg_value: &PvField,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        op_rpc(
+            &ch,
+            pv_request_desc,
+            pv_request_value,
+            RpcArg::Typed {
+                desc: arg_desc,
+                value: arg_value,
+            },
+            self.inner.timeout,
+        )
+        .await
+    }
+
     /// RPC with pvxs's **top-level null** argument
     /// (`Context::rpc(name, Value())`): the DATA phase carries the
     /// single `0xff` null-type tag with no value body, not an `any`

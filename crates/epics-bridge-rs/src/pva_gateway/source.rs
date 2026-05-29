@@ -1281,11 +1281,27 @@ impl ChannelSource for GatewayChannelSource {
         // The RPC runs through the per-credential client, which resolves
         // existence and returns the upstream error itself.
         let client = self.upstream_client_for(&ctx);
-        let result = tokio::time::timeout(
-            self.rpc_timeout,
-            client.pvrpc(name, &request_desc, &request_value),
-        )
-        .await;
+        // Forward the downstream RPC INIT pvRequest — captured into
+        // `ctx.pv_request` at RPC INIT — as the upstream
+        // create-time pvRequest, distinct from the EXEC argument
+        // (`request_desc`/`request_value`). pva2pva forwards the original
+        // create-time pvRequest into `createChannelRPC(..., pvRequest)`
+        // (channel.cpp:140-148); the prior code reissued the argument as
+        // the upstream INIT pvRequest, so a provider that interprets
+        // create-time fields saw the wrong request shape. Fall back to the
+        // default empty pvRequest when the downstream sent none.
+        let call = async {
+            match ctx.pv_request.as_ref() {
+                Some(req) => {
+                    let req_desc = req.descriptor();
+                    client
+                        .pvrpc_with_request(name, &req_desc, req, &request_desc, &request_value)
+                        .await
+                }
+                None => client.pvrpc(name, &request_desc, &request_value).await,
+            }
+        };
+        let result = tokio::time::timeout(self.rpc_timeout, call).await;
         match result {
             Ok(Ok(pair)) => Ok(pair),
             Ok(Err(e)) => Err(OpError::failed(e.to_string())),

@@ -118,12 +118,17 @@ async fn pva_server_stop_ends_listener() {
     );
 }
 
-/// `close()` clears the channel cache and the connection pool — a
-/// subsequent `pvget` must re-resolve and re-connect. We verify by
-/// checking that the second pvget still succeeds even after the
-/// in-memory client state was nuked. Mirrors pvxs `Context::close`.
+/// `close()` is terminal: it moves the context to a Stopped state, so
+/// every subsequent operation must FAIL rather than transparently
+/// re-resolve, and no new TCP connection may be opened. Mirrors pvxs
+/// `Channel::build()` refusing to construct a channel once the context
+/// has left `Running` ("Context close()d", client.cpp:349-352).
+///
+/// (Replaces the former `pva_client_close_then_reuse_succeeds`, which
+/// encoded the pre-fix contract that post-close reuse succeeds — the
+/// opposite of pvxs.)
 #[tokio::test]
-async fn pva_client_close_then_reuse_succeeds() {
+async fn pva_client_close_is_terminal_no_reuse() {
     let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
         tcp_port: port,
@@ -135,15 +140,43 @@ async fn pva_client_close_then_reuse_succeeds() {
 
     let client = client_to(port);
     client.pvget("dut").await.expect("pre-close pvget");
-    client.close(); // Drops cached channel + pool entry.
+    client.close();
 
-    // The exact same PvaClient handle still functions: it transparently
-    // re-creates the channel + connection on the next op.
-    let v = tokio::time::timeout(Duration::from_secs(3), client.pvget("dut"))
+    // Every operation kind must now fail, and fail FAST — the closed-
+    // context gate short-circuits before any dial, so each call returns
+    // well inside the 3 s op timeout. A slow failure would mean an op
+    // tried to re-resolve / re-connect, which is exactly the defect.
+    let fast = Duration::from_millis(500);
+
+    let get = tokio::time::timeout(fast, client.pvget("dut"))
         .await
-        .expect("post-close pvget timeout")
-        .expect("post-close pvget failed");
-    assert!(matches!(v, PvField::Structure(_)));
+        .expect("post-close pvget must fail fast, not attempt a connect");
+    assert!(get.is_err(), "post-close pvget must fail, got {get:?}");
+
+    let put = tokio::time::timeout(fast, client.pvput("dut", "1"))
+        .await
+        .expect("post-close pvput must fail fast");
+    assert!(put.is_err(), "post-close pvput must fail, got {put:?}");
+
+    let mon = tokio::time::timeout(fast, client.pvmonitor_handle("dut", |_: &_, _: &_| {}))
+        .await
+        .expect("post-close pvmonitor must fail fast");
+    assert!(mon.is_err(), "post-close pvmonitor must fail");
+
+    let conn = tokio::time::timeout(fast, client.pvconnect("dut"))
+        .await
+        .expect("post-close pvconnect must fail fast");
+    assert!(
+        conn.is_err(),
+        "post-close pvconnect must fail, got {conn:?}"
+    );
+
+    // No new TCP connection was opened by any of the refused ops: the
+    // pool was cleared by close() and the gate prevents fresh dials.
+    assert!(
+        client.report().connections.is_empty(),
+        "close() must leave no live connections; refused ops must not dial"
+    );
 
     server.stop();
     let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;

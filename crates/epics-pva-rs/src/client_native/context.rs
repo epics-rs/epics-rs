@@ -430,6 +430,17 @@ impl PvaClient {
         if pv_name.is_empty() {
             return Err(PvaError::InvalidValue("empty channel name".into()));
         }
+        // Closed-context gate. pvxs `Channel::build()` refuses to
+        // construct a channel once the context has left `Running`,
+        // throwing "Context close()d" (client.cpp:349-352). `close()`
+        // sets the single owner of that state — the per-client
+        // `ConnectionPool` shutdown flag (via `pool.clear()`); every
+        // channel factory routes through here, so this one gate makes
+        // post-close GET/PUT/MONITOR/CONNECT all fail rather than
+        // silently re-resolving and opening fresh sockets.
+        if self.inner.pool.is_shutdown() {
+            return Err(PvaError::Protocol("context closed".into()));
+        }
         // Forced-server channels skip the cache entirely — pinning is a
         // per-call request, not a global property of the PV name.
         if forced.is_none() {
@@ -758,13 +769,27 @@ impl PvaClient {
         self.search_engine().await?.discover().await
     }
 
-    /// Graceful shutdown: drop the channel cache, close pooled
-    /// connections, and stop accepting new operations. Any subsequent
-    /// `pvget` / `pvput` / etc. on this `PvaClient` will fail or
-    /// re-establish from scratch (depending on the operation's
-    /// reconnect policy). The background search-engine task continues
-    /// to run idle in the spawn until the last `PvaClient` clone is
-    /// dropped — there's no in-flight work left for it to do.
+    /// Terminal shutdown: move the context to a Stopped state. Drops the
+    /// channel cache and closes pooled connections, and — unlike the
+    /// previous behavior — **refuses** all subsequent operations rather
+    /// than transparently re-resolving. After `close()`, every
+    /// `pvget` / `pvput` / `monitor` / `connect` fails with
+    /// `Protocol("context closed")` and no new socket is opened, matching
+    /// pvxs `Channel::build()`'s refusal once the context has left
+    /// `Running` (client.cpp:349-352). `close()` is the single owner of
+    /// that Stopped state: it sets the `ConnectionPool` shutdown flag
+    /// (via `clear()`), which is enforced at both the channel-factory
+    /// boundary (`channel_with_forced`) and the dial boundary
+    /// (`ConnectionPool::get_or_connect`).
+    ///
+    /// The background search-engine task continues to run idle until the
+    /// last `PvaClient` clone is dropped — the Stopped gate prevents any
+    /// new search from being started, so it has no in-flight work, but
+    /// it is not torn down here because the per-client engine lives in a
+    /// shared `OnceLock` that a `&self` method cannot drain. pvxs removes
+    /// its search/beacon timers in `ContextImpl::close` (client.cpp:693-725);
+    /// the Rust idle-until-drop timer is a deliberate divergence.
+    ///
     /// Mirrors pvxs `Context::close` (client.cpp:422). Idempotent.
     pub fn close(&self) {
         // Drop channels first so their Arc<ServerConn> drops; this

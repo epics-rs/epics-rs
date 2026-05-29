@@ -271,6 +271,15 @@ impl ConnectionPool {
         op_timeout: std::time::Duration,
         tcp_timeout: std::time::Duration,
     ) -> PvaResult<Arc<ServerConn>> {
+        // Closed-context gate (pvxs 4d12da87205e): once `close()` /
+        // `clear()` has run, refuse to dial. This is the dial-boundary
+        // half of the single shutdown owner — without it an in-flight
+        // operation tearing down (or a name-server reconnect path) could
+        // still open a fresh socket after the context was closed, and
+        // the channel-factory gate alone would be a false invariant.
+        if self.is_shutdown() {
+            return Err(PvaError::Protocol("context closed".into()));
+        }
         // Fast path: existing alive conn.
         {
             let map = self.inner.lock();

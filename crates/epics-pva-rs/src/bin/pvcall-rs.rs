@@ -136,8 +136,13 @@ async fn main() {
 
     let (desc, value) = build_nturi(&pv_name, &parsed_args);
 
+    // pvxs `pvxcall -w 0` is an immediate completion poll (epicsEvent
+    // `tryWait`, `epicsEvent.h:101-107`), not a 5 s wait. Route `-w`
+    // through `rpc_timeout_duration` so a non-positive value maps to an
+    // immediate (zero) operation timeout rather than the generic
+    // `timeout_duration` 5 s clamp (tools/call.cpp:44-65,125-154).
     let client = PvaClient::builder()
-        .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
+        .timeout(epics_pva_rs::cli::rpc_timeout_duration(args.timeout))
         .build();
 
     match client.pvrpc(&pv_name, &desc, &value).await {
@@ -258,5 +263,28 @@ mod tests {
         let got = collect_args(&toks).unwrap();
         assert_eq!(got[0].0, "a");
         assert_eq!(got[1].0, "b");
+    }
+
+    /// `pvcall-rs -w 0` is an immediate completion poll (pvxs `pvxcall`
+    /// inherits epicsEvent `tryWait`, `tools/call.cpp:125-154`,
+    /// `epicsEvent.h:101-107`): the parsed `-w 0` maps to a zero
+    /// operation timeout, NOT the prior 5 s clamp.
+    #[test]
+    fn w_zero_is_immediate_timeout() {
+        let args = Args::parse_from(["pvcall-rs", "-w", "0", "svc"]);
+        assert_eq!(
+            epics_pva_rs::cli::rpc_timeout_duration(args.timeout),
+            std::time::Duration::ZERO
+        );
+    }
+
+    /// A positive `-w` is preserved as a bounded RPC timeout.
+    #[test]
+    fn w_positive_is_finite_timeout() {
+        let args = Args::parse_from(["pvcall-rs", "-w", "2.5", "svc"]);
+        assert_eq!(
+            epics_pva_rs::cli::rpc_timeout_duration(args.timeout),
+            std::time::Duration::from_secs_f64(2.5)
+        );
     }
 }

@@ -732,6 +732,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                             let update = epics_pva_rs::server_native::MonitorUpdate {
                                 value: PvField::Structure(poll.value),
                                 marked: poll.marked,
+                                type_changed: false,
                             };
                             if tx.send(update).await.is_err() {
                                 break;

@@ -588,6 +588,26 @@ impl SharedPV {
         Some(inbox)
     }
 
+    /// Add an **updates-only** subscriber and atomically capture the
+    /// current value as the connect-time monitor seed — both under one
+    /// `inner` lock, so no `post`/`put` can slip between the snapshot and
+    /// registration. This is the single-seed counterpart of
+    /// [`Self::subscribe`]: the returned `inbox` carries only
+    /// post-registration events, and the caller emits `initial` itself
+    /// (the server does this via [`crate::server_native::source::SubscriptionSeed`]).
+    /// Returns `None` only when the PV is not open. `initial` is the
+    /// current value (always `Some` here, since the PV is open).
+    pub fn subscribe_seeded(&self, limit: usize) -> Option<(Option<PvField>, MonitorInbox)> {
+        let mut g = self.inner.lock();
+        let PvState::Open { value, .. } = &g.state else {
+            return None;
+        };
+        let initial = value.clone();
+        let (outbox, inbox) = make_monitor_queue(limit);
+        g.subscribers.push(outbox);
+        Some((Some(initial), inbox))
+    }
+
     /// Apply a PUT. When [`Self::on_put`] has been set, the user
     /// handler runs and is responsible for any side-effects /
     /// re-posting. When NO handler is installed the PUT is REJECTED —
@@ -1212,6 +1232,46 @@ impl super::source::ChannelSource for SharedSource {
                 }
             });
             Some(rx)
+        }
+    }
+
+    /// Single-seed MONITOR: atomically capture the current value as the
+    /// connect-time seed and register an **updates-only** subscriber via
+    /// [`SharedPV::subscribe_seeded`], returning both as one
+    /// [`SubscriptionSeed`]. The default impl would subscribe (the
+    /// prepend path) and ALSO seed via `get_value` — the double-seed
+    /// PVA-RS closes; overriding here keeps the seed atomic with
+    /// registration (no gap-duplicate) and updates-only.
+    fn subscribe_seeded(
+        &self,
+        checked: super::source::AccessChecked,
+        ctx: super::source::ChannelContext,
+        opts: super::source::MonitorOptions,
+    ) -> impl std::future::Future<
+        Output = Option<super::source::SubscriptionSeed<super::source::MonitorUpdate>>,
+    > + Send {
+        let _ = (ctx, opts);
+        let pv = if checked.allows_read() {
+            self.pvs.lock().get(checked.pv_name()).cloned()
+        } else {
+            None
+        };
+        async move {
+            // pvxs servermon.cpp:66: default queue limit = 4.
+            let (initial, inbox) = pv.and_then(|p| p.subscribe_seeded(4))?;
+            let (tx, rx) = mpsc::channel::<PvField>(1);
+            tokio::spawn(async move {
+                let mut inbox = inbox;
+                while let Some(v) = inbox.recv().await {
+                    if tx.send(v).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Some(super::source::SubscriptionSeed {
+                initial,
+                updates: super::source::plain_monitor_updates(rx),
+            })
         }
     }
 

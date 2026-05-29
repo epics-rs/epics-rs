@@ -246,6 +246,108 @@ async fn gateway_monitor_fans_out_to_two_clients() {
     h2.abort();
 }
 
+/// Wire-level single-seed through the gateway: a downstream MONITOR
+/// START must deliver the connect-time value EXACTLY ONCE.
+///
+/// The gateway self-seeds: `subscribe_raw_inner` / `subscribe_inner`
+/// used to push `entry.snapshot()` into the downstream stream before
+/// forwarding upstream events, while the native server ALSO emitted its
+/// own connect-time snapshot. A downstream monitor therefore saw the
+/// current value twice at START.
+///
+/// The single MONITOR seed owner (`subscribe_seeded` /
+/// `subscribe_raw_seeded`) returns the cached snapshot as the seed plus
+/// an updates-only stream, captured atomically with the subscriber so
+/// the broadcast's own copy of the snapshot is deduped out. The server
+/// emits exactly one initial frame. Mirrors pva2pva, which copies one
+/// `lastelem` per `start()` (`moncache.cpp:270-320`).
+///
+/// Pre-fix: two identical seed frames at START. Post-fix: exactly one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_155_monitor_seeds_current_value_once() {
+    let (_us_server, us_addr, us_pv) = spawn_upstream("GW:SEED155:PV", 7.0);
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+
+    let pick = || {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let pick_udp = || {
+        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let server_config = PvaServerConfig {
+        tcp_port: pick(),
+        udp_port: pick_udp(),
+        ..PvaServerConfig::isolated()
+    };
+    let cfg = PvaGatewayConfig {
+        upstream_client: Some(upstream_client),
+        server_config,
+        cleanup_interval: Duration::from_secs(60),
+        connect_timeout: Duration::from_secs(2),
+        max_cache_entries: 1024,
+        max_subscribers: 1024,
+        control_prefix: None,
+        read_only: false,
+        acl: None,
+        audit: None,
+    };
+    let gw = PvaGateway::start(cfg).expect("gateway start");
+    let client = gw.client_config();
+
+    let received = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+    let cb = received.clone();
+    let h = tokio::spawn(async move {
+        let _ = client
+            .pvmonitor("GW:SEED155:PV", move |value| {
+                if let Some(d) = scalar_double(value) {
+                    cb.lock().unwrap().push(d);
+                }
+            })
+            .await;
+    });
+
+    // Wait until the seed has arrived (up to 3 s on loopback), then a
+    // short extra settle so a regressed SECOND seed frame — emitted
+    // back-to-back with the first — would also land before we count.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while received.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec![7.0],
+        "downstream MONITOR START must deliver the connect-time value exactly once \
+         (double-seed regression delivers it twice)"
+    );
+
+    // One real upstream post delivers exactly one more frame.
+    us_pv.try_post(nt_double_value(8.0));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while received.lock().unwrap().len() < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec![7.0, 8.0],
+        "after one upstream post the wire carries seed(7.0) then update(8.0) — no duplicate seed"
+    );
+
+    h.abort();
+}
+
 fn scalar_double(field: &PvField) -> Option<f64> {
     match field {
         PvField::Scalar(ScalarValue::Double(d)) => Some(*d),
@@ -890,10 +992,10 @@ async fn br_r6_gateway_typed_put_passthrough() {
 /// to an mpsc channel. Pre-fix the typed broadcast sender `tx_inner` was
 /// dropped before the `pvmonitor_raw_frames_handle` callback ran
 /// (`let _ = tx_inner; // typed broadcast retired in raw path`), so
-/// `bcast_rx.recv()` blocked forever after the initial snapshot. Downstream
-/// monitors using a pvRequest that forces the decoded fallback (masked
-/// fields, pipelined, filtered, or EPICS_PVA_GW_RAW_FRAMES=NO) received
-/// only the first value — never further updates.
+/// `bcast_rx.recv()` blocked forever — no decoded update ever reached the
+/// subscriber. Downstream monitors using a pvRequest that forces the
+/// decoded fallback (masked fields, pipelined, filtered, or
+/// EPICS_PVA_GW_RAW_FRAMES=NO) received nothing.
 ///
 /// Fails on main: `tx_inner` dropped → second value never sent → timeout.
 /// Passes after fix: `tx_inner` moves into callback, `tx_inner.send(val)`
@@ -949,22 +1051,17 @@ async fn br_r41_typed_subscribe_delivers_updates() {
     let mut src = GatewayChannelSource::new(cache);
     src.connect_timeout = Duration::from_secs(2);
 
-    // subscribe() uses subscribe_inner → typed broadcast fallback path.
+    // subscribe() routes through subscribe_inner → typed broadcast
+    // fallback path. Under the single-seed contract this ctx-less stream
+    // is UPDATES-ONLY: the connect-time snapshot is delivered via
+    // subscribe_seeded's seed (emitted by the native server), never
+    // replayed into the stream. This test exercises the legacy stream
+    // directly, so 1.0 is NOT delivered here — the regression guarded is
+    // that live UPDATES flow through the typed broadcast.
     let mut rx = src
         .subscribe("BR:R41:PV")
         .await
         .expect("subscribe must return Some for a known PV");
-
-    // First receive: initial snapshot from entry.snapshot().
-    let snap = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("initial snapshot must arrive within 2s")
-        .expect("channel must be open");
-    assert_eq!(
-        scalar_double(&snap),
-        Some(1.0),
-        "initial snapshot must be 1.0"
-    );
 
     // Post an update upstream; the monitor callback fires, apply_monitor_event
     // decodes it, and (after fix) tx_inner sends it to the typed broadcast.
@@ -975,11 +1072,10 @@ async fn br_r41_typed_subscribe_delivers_updates() {
     });
     pv.try_post(update_val);
 
-    // Drain until 42.0 arrives or 2 s elapses. The server's decoded
-    // path seeds new subscribers with the current value AND sends an
-    // explicit initial snapshot, so one extra 1.0 may arrive before
-    // the 42.0 update. Pre-fix: tx_inner was dropped → broadcast
-    // permanently empty → this loop times out.
+    // Drain until 42.0 arrives or 2 s elapses. The updates-only stream
+    // carries no connect-time 1.0, so 42.0 is the first (and only) item.
+    // Pre-fix: tx_inner was dropped → broadcast permanently empty → this
+    // loop times out.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let update = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -996,4 +1092,124 @@ async fn br_r41_typed_subscribe_delivers_updates() {
         Some(42.0),
         "typed subscribe must deliver the post-initial update",
     );
+}
+
+/// Regression: a downstream monitor forced onto the DECODED path
+/// (pipelined / field-masked / filtered) must receive the same
+/// subscription-boundary (MONITOR FINISH) on an upstream descriptor change
+/// as a raw-path-eligible monitor — it must NOT keep serving values under
+/// its stale INIT descriptor.
+///
+/// Pre-fix the gateway carried the type-change / disconnect boundary only on
+/// the RAW fanout (`RawEvent.type_changed`, and `signal_disconnect_boundary`
+/// emitting solely to `tx_raw`). A downstream monitor that negotiated a
+/// pipeline window (or a field projection / server-side filter) is served by
+/// the gateway's DECODED path (`subscribe_seeded` → `MonitorUpdate` stream),
+/// which carried bare values with no boundary marker — so the boundary was
+/// invisible to it. Post-fix `broadcast_boundary` emits on BOTH streams and
+/// the decoded server loop turns the `MonitorUpdate::type_change()` into
+/// MONITOR FINISH before encoding any value under the stale descriptor.
+///
+/// Upstream parity: pva2pva stops a monitor on a new upstream type
+/// (`moncache.cpp:56-83`) and surfaces a lost upstream as downstream
+/// *unlisten* (`moncache.cpp:212-235`); pvxs treats reconnect / type-change
+/// as a subscription boundary (`pvalink_channel.cpp:342-351 onTypeChange()`).
+///
+/// Topology: two downstream clients on the SAME gateway PV. The raw-vs-
+/// decoded split is driven entirely by the pvRequest's pipeline option,
+/// because every high-level client monitor builds `MonitorFlow` from it:
+///   * `field(value)` — no pipeline option ⟹ `MonitorFlow.pipeline == false`
+///     ⟹ the server negotiates no credit window ⟹ `window.is_none()` and
+///     (full mask, no filter) ⟹ `raw_path_eligible` ⟹ gateway serves it via
+///     the RAW fanout (`subscribe_raw_seeded`).
+///   * `record[pipeline=true,queueSize=4]` — `pipeline == true` ⟹
+///     `window.is_some()` defeats the raw-path gate ⟹ DECODED path
+///     (`subscribe_seeded`, the `MonitorUpdate` stream this finding fixes).
+/// After the upstream SharedPV is closed (descriptor change: old descriptor
+/// revoked), BOTH `pvmonitor_events` tasks must observe
+/// `MonitorEvent::Finished` and complete. Pre-fix the pipelined one never
+/// gets a boundary on the decoded stream and hangs until this test's timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
+    use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
+    use epics_pva_rs::pv_request::PvRequestExpr;
+
+    let (_us_server, us_addr, us_pv) = spawn_upstream("GW:BR99:PV", 1.0);
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+
+    let c_raw = gw.client_config();
+    let c_pipe = gw.client_config();
+
+    // Each monitor signals once it observes a subscription boundary
+    // (`Finished`, or `Disconnected` as a fallback boundary shape).
+    let (fin_raw_tx, mut fin_raw_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (fin_pipe_tx, mut fin_pipe_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // pvxs default mask: maskConnected=true, maskDisconnected=false — so
+    // both Finished and Disconnected reach the callback.
+    let mask = MonitorEventMask::default();
+
+    // Monitor #1: RAW-path eligible — `field(value)` is the full mask for
+    // this single-field PV and carries no pipeline option, so the server
+    // negotiates no credit window and routes it onto the raw fanout.
+    let raw_req = PvRequestExpr::parse("field(value)").expect("parse pvRequest");
+    let h_raw = tokio::spawn(async move {
+        let _ = c_raw
+            .pvmonitor_events("GW:BR99:PV", Some(&raw_req), mask, move |ev| {
+                if matches!(ev, MonitorEvent::Finished | MonitorEvent::Disconnected) {
+                    let _ = fin_raw_tx.try_send(());
+                }
+            })
+            .await;
+    });
+
+    // Monitor #2: pipelined → DECODED path. `window.is_some()` makes
+    // `raw_path_eligible` false in the native server, so this monitor is
+    // served from the gateway's decoded `MonitorUpdate` stream.
+    let pipe_req =
+        PvRequestExpr::parse("record[pipeline=true,queueSize=4]").expect("parse pvRequest");
+    let h_pipe = tokio::spawn(async move {
+        let _ = c_pipe
+            .pvmonitor_events("GW:BR99:PV", Some(&pipe_req), mask, move |ev| {
+                if matches!(ev, MonitorEvent::Finished | MonitorEvent::Disconnected) {
+                    let _ = fin_pipe_tx.try_send(());
+                }
+            })
+            .await;
+    });
+
+    // Let both subscriptions establish; the gateway's shared upstream
+    // monitor delivers the seed (1.0) and caches `latest_raw`, which arms
+    // `signal_disconnect_boundary` (it no-ops without a cached snapshot).
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    us_pv.try_post(nt_double_value(2.0));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Upstream descriptor change: close() revokes the descriptor and drops
+    // all subscribers. The upstream server sends MONITOR FINISH to the
+    // gateway's upstream client; the gateway's upstream monitor task ends and
+    // `signal_disconnect_boundary` fires the boundary on BOTH fanout streams.
+    us_pv.close();
+
+    // BOTH monitors must observe the boundary within the timeout. Pre-fix
+    // the pipelined (decoded) monitor never does → its recv times out.
+    tokio::time::timeout(Duration::from_secs(5), fin_raw_rx.recv())
+        .await
+        .expect(
+            "raw-path monitor must observe a boundary on upstream descriptor change (timed out)",
+        )
+        .expect("raw-path monitor boundary channel must not close empty");
+    tokio::time::timeout(Duration::from_secs(5), fin_pipe_rx.recv())
+        .await
+        .expect("decoded/pipelined monitor must observe a boundary on upstream descriptor change (pre-fix this hangs)")
+        .expect("decoded/pipelined monitor boundary channel must not close empty");
+
+    h_raw.abort();
+    h_pipe.abort();
 }

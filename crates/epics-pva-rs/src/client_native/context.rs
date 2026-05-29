@@ -31,7 +31,7 @@ use super::ops_v2::{
     DEFAULT_PIPELINE_SIZE, MonitorEvent, MonitorEventMask, RpcArg, SubscriptionHandle, op_get,
     op_get_get, op_get_put, op_monitor, op_monitor_events, op_monitor_handle,
     op_monitor_raw_frames_handle, op_monitor_raw_frames_handle_with_request, op_process,
-    op_process_with_request, op_put, op_put_get, op_rpc,
+    op_process_with_request, op_process_with_request_value, op_put, op_put_get, op_rpc,
 };
 use super::search_engine::SearchEngine;
 
@@ -1208,6 +1208,33 @@ impl PvaClient {
         crate::client_native::ops_v2::op_put_value_raw(&ch, &bytes, value, self.inner.timeout).await
     }
 
+    /// Like [`Self::pvput_pv_field_with_request`] but takes the PUT INIT
+    /// pvRequest as a decoded [`PvField`] value (e.g. the request a PVA
+    /// gateway preserved into `ChannelContext.pv_request`) rather than a
+    /// [`crate::pv_request::PvRequestExpr`]. The pvRequest — carrying
+    /// `record._options.process`/`block` — is serialized in the
+    /// connection's negotiated byte order and sent at PUT INIT, while the
+    /// value targets the `value` bit as in
+    /// [`Self::pvput_pv_field_with_request`].
+    pub async fn pvput_pv_field_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &crate::pvdata::PvField,
+        value: &crate::pvdata::PvField,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        let order =
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order;
+        let mut bytes = Vec::new();
+        let desc = pv_request.descriptor();
+        crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
+        crate::pvdata::encode::encode_pv_field(pv_request, &desc, order, &mut bytes);
+        crate::client_native::ops_v2::op_put_value_raw(&ch, &bytes, value, self.inner.timeout).await
+    }
+
     /// PUT a pre-built [`PvField`] into a single dotted-path sub-field
     /// using a caller-provided pvRequest. Combines the typed-value
     /// path of [`Self::pvput_pv_field_with_request`] with the
@@ -1523,13 +1550,51 @@ impl PvaClient {
         request_value: &PvField,
     ) -> PvaResult<(FieldDesc, PvField)> {
         let ch = self.channel(pv_name).await?;
+        // The RPC INIT pvRequest and the RPC DATA argument are distinct
+        // wire values: pvxs `clientget.cpp:348-352` serializes the
+        // operation pvRequest at INIT and `:302-310` the argument at
+        // EXEC. Send the default empty pvRequest at INIT and carry
+        // `(request_desc, request_value)` as the DATA argument; do NOT
+        // also send the argument as the INIT pvRequest, which would make
+        // an upstream `createChannelRPC(..., pvRequest)` provider see the
+        // argument where it expected the operation request.
+        let (req_desc, req_value) = empty_pv_request();
         op_rpc(
             &ch,
-            request_desc,
-            request_value,
+            &req_desc,
+            &req_value,
             RpcArg::Typed {
                 desc: request_desc,
                 value: request_value,
+            },
+            self.inner.timeout,
+        )
+        .await
+    }
+
+    /// Like [`Self::pvrpc`] but sends a caller-provided RPC INIT
+    /// pvRequest, kept distinct from the RPC DATA argument. A PVA-to-PVA
+    /// gateway uses this to forward the downstream
+    /// `createChannelRPC(..., pvRequest)` create-time request upstream
+    /// (pva2pva `channel.cpp:140-148`) while carrying the downstream
+    /// argument as the DATA value. pvxs `clientget.cpp:348-352` serializes
+    /// the pvRequest at INIT and `:302-310` the argument at EXEC.
+    pub async fn pvrpc_with_request(
+        &self,
+        pv_name: &str,
+        pv_request_desc: &FieldDesc,
+        pv_request_value: &PvField,
+        arg_desc: &FieldDesc,
+        arg_value: &PvField,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        op_rpc(
+            &ch,
+            pv_request_desc,
+            pv_request_value,
+            RpcArg::Typed {
+                desc: arg_desc,
+                value: arg_value,
             },
             self.inner.timeout,
         )
@@ -1563,10 +1628,13 @@ impl PvaClient {
         request_value: &PvField,
     ) -> PvaResult<(FieldDesc, PvField)> {
         let ch = self.channel_with_forced(pv_name, Some(server)).await?;
+        // See [`Self::pvrpc`]: default empty pvRequest at INIT, the
+        // caller's value as the DATA argument (no INIT/DATA conflation).
+        let (req_desc, req_value) = empty_pv_request();
         op_rpc(
             &ch,
-            request_desc,
-            request_value,
+            &req_desc,
+            &req_value,
             RpcArg::Typed {
                 desc: request_desc,
                 value: request_value,
@@ -1648,6 +1716,22 @@ impl PvaClient {
     pub async fn pvprocess_with_request(&self, pv_name: &str, pv_request: &[u8]) -> PvaResult<()> {
         let ch = self.channel(pv_name).await?;
         op_process_with_request(&ch, pv_request, self.inner.timeout).await
+    }
+
+    /// Like [`Self::pvprocess_with_request`] but takes the PROCESS INIT
+    /// pvRequest as a decoded [`PvField`] value rather than pre-encoded
+    /// bytes; it is serialized in the connection's negotiated byte order.
+    /// A PVA-to-PVA gateway uses this to forward the downstream PROCESS
+    /// create-time pvRequest — preserved into `ChannelContext.pv_request`
+    /// — upstream, matching pva2pva `createChannelProcess(..., pvRequest)`
+    /// (channel.cpp:98-106).
+    pub async fn pvprocess_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &PvField,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        op_process_with_request_value(&ch, pv_request, self.inner.timeout).await
     }
 
     /// Snapshot of the client's current state — channel cache size,

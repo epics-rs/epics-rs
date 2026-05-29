@@ -3610,7 +3610,11 @@ async fn handle_process(
         // route the PROCESS INIT pvRequest through the SAME
         // structured boundary as the generic GET/PUT/MONITOR INIT path
         // (`decode_init_pv_request_value`). PROCESS transfers no value,
-        // so the decoded pvRequest is discarded — but a present-but-
+        // but the create-time pvRequest carries `record._options` a
+        // provider can interpret (and a gateway must forward through
+        // `createChannelProcess(..., pvRequest)`, pva2pva
+        // channel.cpp:98-106), so it is preserved into the op state and
+        // surfaced as `ChannelContext.pv_request` at EXEC. A present-but-
         // malformed pvRequest is a peer wire-decode fault. The previous
         // `decode_type_desc(..).ok().and_then(|d| decode_pv_field(..)
         // .ok())` collapsed "absent body", "malformed descriptor", and
@@ -3629,16 +3633,19 @@ async fn handle_process(
                 )));
             }
         };
-        if let Err(e) =
-            decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache)
-        {
-            return Err(PvaError::Decode(format!(
-                "PROCESS INIT pvRequest value: {e}"
-            )));
-        }
+        let req_value =
+            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(PvaError::Decode(format!(
+                        "PROCESS INIT pvRequest value: {e}"
+                    )));
+                }
+            };
         let mask = BitSet::all_set(intro.total_bits());
-        ch.ops
-            .insert(ioid, non_monitor_op_state(intro, OpKind::Process, mask));
+        let mut process_op = non_monitor_op_state(intro, OpKind::Process, mask);
+        process_op.pv_request = req_value;
+        ch.ops.insert(ioid, process_op);
 
         // INIT response: ioid + subcmd + status. No type descriptor —
         // PROCESS negotiates no value.
@@ -3655,7 +3662,7 @@ async fn handle_process(
     }
 
     // PROCESS data phase — no payload to decode.
-    match ch.ops.get(&ioid) {
+    let init_pv_request = match ch.ops.get(&ioid) {
         None => {
             // silently drop — pvxs serverget.cpp:423-428 and servermon.cpp:611-619
             // return without reply here to handle the DESTROY_REQUEST race.
@@ -3676,8 +3683,9 @@ async fn handle_process(
                     o.kind
                 )));
             }
+            o.pv_request.clone()
         }
-    }
+    };
     let pv_name = ch.name.clone();
     let ctx = crate::server_native::source::ChannelContext {
         peer,
@@ -3686,7 +3694,10 @@ async fn handle_process(
         host: cred.host.clone(),
         authority: cred.authority.clone(),
         roles: cred.roles.clone(),
-        pv_request: None,
+        // PROCESS INIT pvRequest, preserved from the op state so a source
+        // — and a gateway forwarding createChannelProcess(..., pvRequest)
+        // — can inspect `record._options`.
+        pv_request: init_pv_request,
     };
     let src = source.clone();
     let tx_clone = chan_tx.clone();
@@ -4648,11 +4659,14 @@ async fn handle_op(
         // PUT needs `record._options.process|block`; MONITOR needs
         // `record._options.DBE` (and other per-op stream tuning that
         // wasn't already consumed for mask/pipeline/filter parsing).
-        // GET / RPC don't read per-op options from this value beyond
-        // what was already extracted, so we don't pay the clone for
-        // those kinds.
+        // RPC needs the create-time pvRequest preserved separately from
+        // the EXEC argument (pvxs serverget.cpp:388-391 stores the INIT
+        // pvRequest and hands it to the operation controller) so a source
+        // — and a gateway forwarding `createChannelRPC(..., pvRequest)` —
+        // can inspect it. GET doesn't read per-op options from this value
+        // beyond what was already extracted, so we don't pay the clone.
         let stashed_pv_request = match kind {
-            OpKind::Put | OpKind::Monitor => req_value.clone(),
+            OpKind::Put | OpKind::Monitor | OpKind::Rpc => req_value.clone(),
             _ => None,
         };
 
@@ -5534,14 +5548,24 @@ async fn handle_op(
                     // `subscribe_ctx` below — which is also ACF-gated
                     // and will likewise return None.
                     if raw_path_eligible
-                        && let Some(mut rx_raw) = src
-                            .subscribe_raw_checked_opts(
+                        && let Some(seed_raw) = src
+                            .subscribe_raw_seeded(
                                 mon_checked.clone(),
                                 mon_ctx.clone(),
                                 monitor_options.clone(),
                             )
                             .await
                     {
+                        // Single MONITOR seed owner (raw path): the seed
+                        // is the source's cached snapshot, captured with
+                        // the subscription; the server no longer issues
+                        // its own `get_value` seed (which, for the
+                        // gateway, was a fresh upstream GET that diverged
+                        // from the pvxs cached-`lastelem` seed).
+                        let crate::server_native::source::SubscriptionSeed {
+                            initial: seed_raw_initial,
+                            updates: mut rx_raw,
+                        } = seed_raw;
                         // Revalidate ACL BEFORE sending the
                         // initial snapshot. Between the spawn's
                         // initial `check()` and reaching this point
@@ -5575,16 +5599,13 @@ async fn handle_op(
                             mon_acl_version_at_subscribe_cell
                                 .store(live_v0, std::sync::atomic::Ordering::Release);
                         }
-                        // Emit initial snapshot via the regular
-                        // encode path (no raw bytes for the
-                        // first-event seed; the cache may not have
-                        // them yet). ACF-aware: a peer with NoAccess
-                        // on this PV's ASG sees no initial frame
-                        // through the raw fast path either.
-                        if let Some(initial) = src
-                            .get_value_checked(mon_checked.clone(), mon_ctx.clone())
-                            .await
-                        {
+                        // Emit the single connect-time seed via the
+                        // regular encode path (no raw bytes for the
+                        // first-event seed; the cache may not have them
+                        // yet). `seed_raw_initial` is the source's cached
+                        // snapshot; `None` means no value yet or NoAccess
+                        // on this PV's ASG — no initial frame either way.
+                        if let Some(initial) = seed_raw_initial {
                             let payload = build_monitor_payload(
                                 ioid,
                                 &intro_clone,
@@ -5711,8 +5732,14 @@ async fn handle_op(
                         return;
                     }
 
-                    let Some(mut rx) = src
-                        .subscribe_checked_opts_marked(
+                    // Single MONITOR seed owner: the source returns the
+                    // connect-time seed AND the post-seed update stream
+                    // as one `SubscriptionSeed`, so the server emits the
+                    // seed below from `seed_initial` and never issues its
+                    // own `get_value` seed — closing the double-seed
+                    // (server get_value + a self-seeding source stream).
+                    let Some(seed) = src
+                        .subscribe_seeded(
                             mon_checked.clone(),
                             mon_ctx.clone(),
                             monitor_options.clone(),
@@ -5721,6 +5748,10 @@ async fn handle_op(
                     else {
                         return;
                     };
+                    let crate::server_native::source::SubscriptionSeed {
+                        initial: seed_initial,
+                        updates: mut rx,
+                    } = seed;
                     // Diagnostic-only outbound-queue-depth crossing flag.
                     let mut queue_over_high = false;
                     // per-PV pipeline-window watermark levels
@@ -5806,14 +5837,13 @@ async fn handle_op(
                     // holds the last emitted snapshot for that diff.
                     let emits_partial = src.monitor_emits_partial(&pv_name).await;
                     let mut prev_value: Option<PvField> = None;
-                    // Emit initial snapshot via the ACF-aware path —
-                    // a peer with NoAccess on the record's ASG sees
-                    // nothing; legacy sources fall through to
-                    // `get_value` via the trait default.
-                    if let Some(initial) = src
-                        .get_value_checked(mon_checked.clone(), mon_ctx.clone())
-                        .await
-                    {
+                    // Emit the single connect-time seed carried back by
+                    // `subscribe_seeded`. `None` means the source has no
+                    // current value yet (unopened SharedPV / gateway entry
+                    // awaiting its first upstream event) or a peer with
+                    // NoAccess on the record's ASG — emit nothing and let
+                    // the update loop deliver the first real event.
+                    if let Some(initial) = seed_initial {
                         // Finding #2: run the server `_filter` chain on the
                         // FIRST frame too, through the same owner the update
                         // loop uses — epics-base `dbChannelRunPreChain`
@@ -5893,10 +5923,11 @@ async fn handle_op(
                         // paused we keep receiving and squash to the
                         // latest without emitting, waking on resume to
                         // flush it (pvxs queues posts while Idle and
-                        // drains on START). The decoded path has no
-                        // subscription-boundary event, so nothing is
-                        // yielded early while paused (`|_| false`).
-                        // events coalesced during a pause
+                        // drains on START). A `type_changed` boundary is
+                        // the one exception: `|u| u.type_changed` yields
+                        // it immediately even while paused, so an upstream
+                        // descriptor change is never squashed behind a
+                        // later value. Events coalesced during a pause
                         // union their marked-leaf sets via
                         // `coalesce_monitor_update`.
                         // Emit a queued entry first — one per reply (pvxs
@@ -5915,7 +5946,13 @@ async fn handle_op(
                                 &mut held,
                                 &paused_flag,
                                 &resume_notify,
-                                |_| false,
+                                // An upstream descriptor change arrives as a
+                                // `type_changed` boundary on the decoded stream
+                                // too (the PVA gateway fanout). Yield it
+                                // immediately — even while paused — so it is
+                                // never squashed behind a later,
+                                // descriptor-incompatible value.
+                                |u| u.type_changed,
                                 coalesce_monitor_update,
                             )
                             .await
@@ -5924,6 +5961,24 @@ async fn handle_op(
                                 None => break,
                             }
                         };
+                        // Subscription boundary: the upstream descriptor
+                        // changed. The decoded values that follow are shaped
+                        // for the NEW descriptor and would be mis-encoded
+                        // against the `intro_clone` negotiated at this
+                        // monitor's INIT. Emit MONITOR FINISH BEFORE reading
+                        // `value` (it is a placeholder on a boundary) so the
+                        // client reopens with a fresh INIT — the decoded-path
+                        // counterpart of the raw fast path's `type_changed`
+                        // branch. This covers both acquisition paths: a
+                        // boundary popped from `pending` (drained ahead) and
+                        // one yielded live by `next_monitor_event`, including
+                        // one surfaced through a pause-hold/queue-overflow
+                        // coalesce (which preserves the boundary).
+                        if value.type_changed {
+                            let finish = build_monitor_finish(ioid, order);
+                            let _ = tx_clone.send(finish).await;
+                            return;
+                        }
                         // ACL re-check on policy reload (same
                         // shape as the raw-fast-path branch above).
                         // The gate's `acl_version` bumps on every
@@ -6184,7 +6239,11 @@ async fn handle_op(
                 host: cred.host.clone(),
                 authority: cred.authority.clone(),
                 roles: cred.roles.clone(),
-                pv_request: None,
+                // RPC INIT pvRequest, preserved from the op state — distinct
+                // from the `(req_desc, req_value)` EXEC argument decoded
+                // above. A source (or gateway) can now inspect the
+                // create-time request (pvxs serverget.cpp:388-391).
+                pv_request: init_pv_request.clone(),
             };
             // ignore a second RPC EXEC while the first call is in
             // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
@@ -6711,10 +6770,21 @@ fn build_monitor_payload_marked(
 /// field that changed across the coalesced burst. A `None` on either
 /// side means "no explicit set — derive by diff", which over-marks
 /// safely, so the union of `None` with anything stays `None`.
+///
+/// A `type_changed` boundary must SURVIVE the squash: once the upstream
+/// descriptor changed, no value (squashed-old or post-boundary-new) may
+/// be delivered under the negotiated descriptor, so if either side is a
+/// boundary the result is the boundary — the dispatch loop then emits
+/// MONITOR FINISH instead of encoding a stale-descriptor value. This is
+/// what keeps the decoded type-change marker from being lost when the
+/// pause-hold or the `drain_monitor_queue` overflow coalesces a burst.
 fn coalesce_monitor_update(
     older: crate::server_native::MonitorUpdate,
     newer: crate::server_native::MonitorUpdate,
 ) -> crate::server_native::MonitorUpdate {
+    if older.type_changed || newer.type_changed {
+        return crate::server_native::MonitorUpdate::type_change();
+    }
     let marked = match (older.marked, newer.marked) {
         (Some(mut a), Some(b)) => {
             for p in b {
@@ -6729,6 +6799,7 @@ fn coalesce_monitor_update(
     crate::server_native::MonitorUpdate {
         value: newer.value,
         marked,
+        type_changed: false,
     }
 }
 
@@ -7373,6 +7444,7 @@ mod tests {
         let upd = |tag: i32, marked: Option<Vec<&str>>| crate::server_native::MonitorUpdate {
             value: val(tag),
             marked: marked.map(|v| v.into_iter().map(str::to_string).collect()),
+            type_changed: false,
         };
 
         // Some + Some → union of paths, deduped; newer value wins.
@@ -7414,6 +7486,7 @@ mod tests {
         let upd = |tag: i32| crate::server_native::MonitorUpdate {
             value: val(tag),
             marked: None,
+            type_changed: false,
         };
 
         // Three posts into a queue of limit 4 (the finding's exact case):

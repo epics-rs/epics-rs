@@ -3384,6 +3384,80 @@ pub async fn op_process_with_request(
     result
 }
 
+/// [`op_process_with_request`] variant taking the PROCESS pvRequest as a
+/// decoded [`PvField`] value. It is serialized (`type + full value`, as
+/// pvxs `serverget.cpp` decodes INIT pvRequests) in the connection's
+/// negotiated byte order, so the caller need not pre-encode it in the
+/// right endianness. A PVA-to-PVA gateway uses this to forward a
+/// downstream PROCESS create-time pvRequest upstream
+/// (`ChannelContext.pv_request` → pva2pva createChannelProcess).
+pub async fn op_process_with_request_value(
+    channel: &Arc<Channel>,
+    pv_request: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let order = server.byte_order;
+    let big_endian = matches!(order, ByteOrder::Big);
+    let codec = PvaCodec { big_endian };
+    let ioid = alloc_ioid();
+
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Process.code());
+    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
+
+    // INIT — `sid + ioid + 0x08 + pvRequest`, the pvRequest encoded
+    // (`type + full value`) in the connection's byte order.
+    let desc = pv_request.descriptor();
+    let mut pv_req = Vec::new();
+    encode_type_desc(&desc, order, &mut pv_req);
+    encode_pv_field(pv_request, &desc, order, &mut pv_req);
+    let init_frame = build_process_init(sid, ioid, &pv_req, order);
+    server.send_for_channel(sid, init_frame).await?;
+
+    let init_resp = await_frame(&mut stream, op_timeout).await?;
+    let init_status = match decode_process_status(&init_resp) {
+        Ok(s) => s,
+        Err(e) => {
+            server.close();
+            return Err(e);
+        }
+    };
+    if !init_status.is_success() {
+        server.unregister_ioid(ioid);
+        return Err(PvaError::Protocol(format!(
+            "PROCESS INIT failed: {init_status:?}"
+        )));
+    }
+    ioid_guard.arm_destroy(sid);
+
+    // PROCESS data — `sid + ioid + 0x00`, no payload.
+    let mut data = Vec::with_capacity(9);
+    data.put_u32(sid, order);
+    data.put_u32(ioid, order);
+    data.put_u8(0x00);
+    let data_h = PvaHeader::application(false, order, Command::Process.code(), data.len() as u32);
+    let mut data_frame = Vec::with_capacity(8 + data.len());
+    data_h.write_into(&mut data_frame);
+    data_frame.extend_from_slice(&data);
+    server.send_for_channel(sid, data_frame).await?;
+
+    let resp_frame = await_frame(&mut stream, op_timeout).await?;
+    let result = match decode_process_status(&resp_frame) {
+        Ok(s) if s.is_success() => Ok(()),
+        Ok(s) => Err(PvaError::Protocol(format!("PROCESS failed: {s:?}"))),
+        Err(e) => {
+            server.close();
+            Err(e)
+        }
+    };
+
+    ioid_guard.disarm();
+    let destroy = codec.build_destroy_request(sid, ioid);
+    let _ = server.send_for_channel(sid, destroy).await;
+    server.unregister_ioid(ioid);
+    result
+}
+
 /// Decode a `PROCESS` response: `ioid + subcmd + status`. Returns the
 /// decoded `Status`.
 ///

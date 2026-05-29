@@ -47,12 +47,17 @@ pub struct ChannelContext {
     /// the wire layer captured one. PVA PUT INIT carries
     /// `record._options.process`/`block`; the data-phase payload is
     /// just the delta, so sources that interpret per-operation
-    /// options must consult this rather than the value.
+    /// options must consult this rather than the value. For RPC this is
+    /// the create-time pvRequest, kept distinct from the EXEC argument
+    /// (`request_desc`/`request_value` of [`ChannelSource::rpc_checked`])
+    /// so a source — or a gateway forwarding
+    /// `createChannelRPC(..., pvRequest)` — can inspect it. For PROCESS it
+    /// is the PROCESS INIT pvRequest (`record._options`).
     ///
-    /// `None` for op kinds where no pvRequest was captured (RPC INIT
-    /// today, GET/MONITOR where the request was consumed for masking)
-    /// or when the wire decoder could not parse it. Sources that
-    /// don't need per-op options can ignore the field.
+    /// `None` for op kinds / paths where no pvRequest was captured (GET,
+    /// where the request was consumed for masking) or when the wire
+    /// decoder could not parse it. Sources that don't need per-op options
+    /// can ignore the field.
     pub pv_request: Option<PvField>,
 }
 
@@ -687,6 +692,61 @@ pub trait ChannelSource: Send + Sync + 'static {
         self.subscribe_raw_checked(checked, ctx)
     }
 
+    /// **Single MONITOR seed owner.** The server's monitor START
+    /// dispatch calls this (not [`Self::subscribe_checked_opts_marked`]
+    /// directly) so the connect-time seed and the post-seed update
+    /// stream come back together as one [`SubscriptionSeed`]; the server
+    /// emits `initial` then drains `updates` and never issues its own
+    /// `get_value` seed. This removes the prior double-seed where the
+    /// server's initial `get_value_checked` and a self-seeding source's
+    /// stream both delivered the connect-time value (pvxs posts the
+    /// current value exactly once at attach, `sharedpv.cpp:69-92`;
+    /// pva2pva copies one `lastelem` per `start()`, `moncache.cpp:270-320`).
+    ///
+    /// The default seeds from the ACF-aware [`Self::get_value_checked`]
+    /// (server-equivalent) and treats the source's
+    /// [`Self::subscribe_checked_opts_marked`] stream as updates-only —
+    /// correct for every source whose subscription does not itself
+    /// replay the current value. A source that must capture the seed
+    /// atomically with subscriber registration (the PVA gateway's shared
+    /// upstream-monitor `snapshot`) overrides this to return both from
+    /// one critical section.
+    fn subscribe_seeded(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> impl std::future::Future<Output = Option<SubscriptionSeed<MonitorUpdate>>> + Send {
+        async move {
+            let updates = self
+                .subscribe_checked_opts_marked(checked.clone(), ctx.clone(), opts)
+                .await?;
+            let initial = self.get_value_checked(checked, ctx).await;
+            Some(SubscriptionSeed { initial, updates })
+        }
+    }
+
+    /// Raw fast-path counterpart of [`Self::subscribe_seeded`]. Returns
+    /// a decoded [`PvField`] seed (the server encodes the START frame
+    /// through the regular path even on the raw path) plus the raw
+    /// update stream. Default seeds via [`Self::get_value_checked`] and
+    /// delegates the stream to [`Self::subscribe_raw_checked_opts`];
+    /// returns `None` when the source exposes no raw path.
+    fn subscribe_raw_seeded(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> impl std::future::Future<Output = Option<SubscriptionSeed<RawMonitorEvent>>> + Send {
+        async move {
+            let updates = self
+                .subscribe_raw_checked_opts(checked.clone(), ctx.clone(), opts)
+                .await?;
+            let initial = self.get_value_checked(checked, ctx).await;
+            Some(SubscriptionSeed { initial, updates })
+        }
+    }
+
     /// Dispatch an RPC. The default impl returns "RPC not supported";
     /// implementors can override to provide actual RPC behaviour.
     ///
@@ -939,6 +999,33 @@ pub struct MonitorUpdate {
     /// Explicit changed field paths, or `None` to let the server
     /// derive the changed-bitset.
     pub marked: Option<Vec<String>>,
+    /// When `true`, this event signals an upstream **descriptor
+    /// change** — a subscription boundary, not a value. `value`/`marked`
+    /// are meaningless and MUST NOT be encoded under the monitor's
+    /// negotiated INIT descriptor: the next decoded value is shaped for
+    /// the new upstream descriptor and would be mis-encoded against the
+    /// stale one. The decoded monitor dispatch loop checks this flag
+    /// FIRST and emits `MONITOR FINISH` before reading `value`, so the
+    /// client reopens with a fresh INIT — the decoded-path counterpart of
+    /// [`RawMonitorEvent::type_changed`]. pvxs treats reconnect /
+    /// type-change as a subscription boundary
+    /// (pvalink_channel.cpp:342-351 `onTypeChange()`). Only the PVA
+    /// gateway's fanout sets this; sources that own their descriptor
+    /// leave it `false`.
+    pub type_changed: bool,
+}
+
+impl MonitorUpdate {
+    /// A descriptor-change boundary marker. Carries a placeholder value
+    /// that consumers MUST NOT encode — the decoded monitor loop emits
+    /// `MONITOR FINISH` on `type_changed` before any value read.
+    pub fn type_change() -> Self {
+        Self {
+            value: PvField::Null,
+            marked: None,
+            type_changed: true,
+        }
+    }
 }
 
 impl From<PvField> for MonitorUpdate {
@@ -948,6 +1035,7 @@ impl From<PvField> for MonitorUpdate {
         Self {
             value,
             marked: None,
+            type_changed: false,
         }
     }
 }
@@ -988,6 +1076,39 @@ pub struct RawMonitorEvent {
     /// type-change as a subscription boundary (pvalink_channel.cpp:
     /// 342-351 `onTypeChange()`); the gateway mirrors that here.
     pub type_changed: bool,
+}
+
+/// The single MONITOR seeding contract for [`ChannelSource`]. A
+/// `subscribe_seeded` / `subscribe_raw_seeded` call returns exactly one
+/// connect-time seed (`initial`) alongside the post-seed `updates`
+/// stream. The server emits `initial` (if `Some`) as the MONITOR START
+/// frame and then drains `updates`; it performs **no** independent
+/// `get_value` seed, so a source cannot double-seed (the defect
+/// [`ChannelSource::subscribe_seeded`] closes).
+///
+/// `updates` MUST carry only events that occur *after* the `initial`
+/// snapshot. For sources whose initial value must be captured
+/// atomically with subscriber registration (the PVA gateway shares one
+/// upstream monitor and reads its cached `snapshot`), the seed is taken
+/// inside the same critical section as the subscribe, which is why the
+/// seed travels back with the stream rather than via a separate
+/// `get_value` call the server would issue out of band.
+///
+/// `initial` is a decoded [`PvField`] even on the raw fast path: the
+/// server always encodes the first frame through the regular encode
+/// path (raw bodies may not be cached yet at START — see the raw seed
+/// note in the server monitor task), so the seed value type is uniform
+/// across cooked and raw subscriptions.
+pub struct SubscriptionSeed<T> {
+    /// The connect-time value to emit as the MONITOR START frame, or
+    /// `None` when the source has no current value yet (e.g. an
+    /// unopened `SharedPV` or a gateway entry awaiting its first
+    /// upstream event) — the server then emits nothing until the first
+    /// `updates` item.
+    pub initial: Option<PvField>,
+    /// Post-seed update stream. By contract this MUST NOT repeat
+    /// `initial`.
+    pub updates: mpsc::Receiver<T>,
 }
 
 /// Type-erased handle so the server runtime can hold heterogeneous sources
@@ -1140,6 +1261,27 @@ pub trait ChannelSourceObj: Send + Sync {
         opts: MonitorOptions,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+    >;
+    /// dyn forwarder for the single-seed cooked MONITOR. The server's
+    /// monitor START dispatch uses this.
+    fn subscribe_seeded<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<SubscriptionSeed<MonitorUpdate>>> + Send + 'a>,
+    >;
+    /// dyn forwarder for the single-seed raw MONITOR fast path.
+    fn subscribe_raw_seeded<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<SubscriptionSeed<RawMonitorEvent>>> + Send + 'a,
+        >,
     >;
     fn rpc<'a>(
         &'a self,
@@ -1374,6 +1516,32 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe_raw_checked_opts(
+            self, checked, ctx, opts,
+        ))
+    }
+    fn subscribe_seeded<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<SubscriptionSeed<MonitorUpdate>>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::subscribe_seeded(
+            self, checked, ctx, opts,
+        ))
+    }
+    fn subscribe_raw_seeded<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+        opts: MonitorOptions,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<SubscriptionSeed<RawMonitorEvent>>> + Send + 'a,
+        >,
+    > {
+        Box::pin(<Self as ChannelSource>::subscribe_raw_seeded(
             self, checked, ctx, opts,
         ))
     }

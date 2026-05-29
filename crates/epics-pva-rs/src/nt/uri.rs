@@ -87,6 +87,59 @@ impl NTURI {
             .push(("query".into(), PvField::Structure(query)));
         PvField::Structure(root)
     }
+
+    /// Build a complete NTURI RPC request — descriptor **and** value —
+    /// for the given `scheme` / `path` and string-keyed scalar `query`
+    /// members.
+    ///
+    /// This is the request-side counterpart to [`NTURI::build`] /
+    /// [`NTURI::create`] (which produce a type template with empty/
+    /// default values): it stamps the concrete `scheme` and `path` and
+    /// the supplied query values, while still emitting **all four**
+    /// normative members — `scheme`, `authority`, `path`, `query` — that
+    /// pvxs `NTURI::NTURI()` defines unconditionally
+    /// (`src/nt.cpp:253-262`). `authority` is the empty string, matching
+    /// pvxs `pvxcall`, which builds `nt::NTURI({}).build()` and sets only
+    /// scheme/path/query (`tools/call.cpp:104-118`).
+    ///
+    /// Routing the CLI request builders through this single owner makes
+    /// the presence of `authority` an invariant by construction: a caller
+    /// cannot emit an NTURI that omits it. The value's members are
+    /// pushed in descriptor order (`scheme`, `authority`, `path`,
+    /// `query`) so the value satisfies its own descriptor.
+    pub fn request(
+        scheme: &str,
+        path: &str,
+        query: &[(String, ScalarValue)],
+    ) -> (FieldDesc, PvField) {
+        // Descriptor: reuse the instance builder so the advertised shape
+        // stays single-sourced with `build()`.
+        let mut b = NTURI::new();
+        for (name, val) in query {
+            b = b.arg_scalar(name.clone(), val.scalar_type());
+        }
+        let desc = b.build();
+
+        let mut root = PvStructure::new("epics:nt/NTURI:1.0");
+        root.fields.push((
+            "scheme".into(),
+            PvField::Scalar(ScalarValue::String(scheme.into())),
+        ));
+        root.fields.push((
+            "authority".into(),
+            PvField::Scalar(ScalarValue::String(String::new())),
+        ));
+        root.fields.push((
+            "path".into(),
+            PvField::Scalar(ScalarValue::String(path.into())),
+        ));
+        let mut q = PvStructure::new("");
+        for (name, val) in query {
+            q.fields.push((name.clone(), PvField::Scalar(val.clone())));
+        }
+        root.fields.push(("query".into(), PvField::Structure(q)));
+        (desc, PvField::Structure(root))
+    }
 }
 
 impl Default for NTURI {
@@ -165,5 +218,53 @@ mod tests {
             matches!(query.get_field("nested"), Some(PvField::Structure(_))),
             "nested query arg must default to a structure, not Null"
         );
+    }
+
+    #[test]
+    fn request_emits_all_four_normative_members_with_authority() {
+        use crate::pvdata::value_matches_descriptor;
+
+        let (desc, value) = NTURI::request(
+            "pva",
+            "some:rpc:service",
+            &[
+                ("op".into(), ScalarValue::String("channels".into())),
+                ("gain".into(), ScalarValue::String("2".into())),
+            ],
+        );
+
+        // Descriptor must declare scheme, authority, path, query — the
+        // `authority` member is the whole point of this fix.
+        let FieldDesc::Structure { struct_id, fields } = &desc else {
+            panic!("NTURI request descriptor must be a structure");
+        };
+        assert_eq!(struct_id, "epics:nt/NTURI:1.0");
+        let top_names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(top_names, vec!["scheme", "authority", "path", "query"]);
+
+        // Value must carry the same four members and satisfy its own
+        // descriptor (member order matches).
+        value_matches_descriptor(&value, &desc)
+            .expect("NTURI request value must match its own descriptor");
+        let PvField::Structure(root) = &value else {
+            panic!("NTURI request value must be a structure");
+        };
+        let val_names: Vec<&str> = root.fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(val_names, vec!["scheme", "authority", "path", "query"]);
+
+        // scheme/path carry the supplied values; authority is present and
+        // empty (pvxs pvxcall leaves it empty).
+        assert!(matches!(
+            root.get_field("scheme"),
+            Some(PvField::Scalar(ScalarValue::String(s))) if s == "pva"
+        ));
+        assert!(matches!(
+            root.get_field("path"),
+            Some(PvField::Scalar(ScalarValue::String(s))) if s == "some:rpc:service"
+        ));
+        assert!(matches!(
+            root.get_field("authority"),
+            Some(PvField::Scalar(ScalarValue::String(s))) if s.is_empty()
+        ));
     }
 }

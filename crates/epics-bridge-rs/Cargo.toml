@@ -51,8 +51,15 @@ pvalink = ["dep:epics-pva-rs"]
 calink = ["dep:epics-ca-rs"]
 # PVA-to-PVA proxy — mirrors C++ pva2pva/p2pApp.
 pva-gateway = ["dep:epics-pva-rs", "dep:regex"]
-# PVA gateway daemon binary (pva-gateway-rs).
-pva-gateway-bin = ["pva-gateway", "dep:clap", "dep:tracing-subscriber"]
+# PVA gateway daemon binary (pva-gateway-rs). serde/serde_json parse the
+# pva2pva-compatible JSON config file (gwmain.cpp schema) the binary loads.
+pva-gateway-bin = [
+    "pva-gateway",
+    "dep:clap",
+    "dep:tracing-subscriber",
+    "dep:serde",
+    "dep:serde_json",
+]
 # Convenience: enable all bridges + binaries
 all-bridges = ["qsrv", "qsrv-bin", "ca-gateway", "ca-gateway-bin", "pvalink", "calink", "pva-gateway", "pva-gateway-bin", "dual-gateway", "dual-gateway-bin"]
 # Dual-protocol IOC: serves the same PV database over both CA and PVA

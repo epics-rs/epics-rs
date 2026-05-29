@@ -341,12 +341,30 @@ async fn gateway_control_prefix_cache_size() {
     };
     assert_eq!(v, 0, "fresh gateway cache is empty before any proxy GET");
 
-    // Trigger a proxy GET to populate the cache, then re-read cacheSize.
-    let _ = ds.pvget_full("GW:CTRL:PV").await.expect("proxy get");
+    // Establish a downstream MONITOR to populate the cache, then re-read
+    // cacheSize. A monitor (not a GET) warms the gateway monitor cache:
+    // since the GET path forwards an upstream ChannelGet and no longer
+    // touches the subscription-keyed monitor cache, only a monitor
+    // inserts a cache entry. Keep the subscription alive across the read.
+    let mon = gw.client_config();
+    let (tx, _rx) = tokio::sync::mpsc::channel::<f64>(8);
+    let mon_task = tokio::spawn(async move {
+        let _ = mon
+            .pvmonitor("GW:CTRL:PV", move |value| {
+                if let Some(d) = scalar_double(value) {
+                    let _ = tx.try_send(d);
+                }
+            })
+            .await;
+    });
+
+    // Let the subscription establish so the gateway inserts a cache entry.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
     let snap = ds
         .pvget_full("gw:cacheSize")
         .await
-        .expect("cacheSize get post-proxy");
+        .expect("cacheSize get post-monitor");
     let v = match snap.value {
         PvField::Structure(s) => match s.get_field("value") {
             Some(PvField::Scalar(ScalarValue::Long(v))) => *v,
@@ -354,7 +372,9 @@ async fn gateway_control_prefix_cache_size() {
         },
         other => panic!("unexpected cacheSize wrapper: {other:?}"),
     };
-    assert!(v >= 1, "cacheSize should reflect the proxied PV; got {v}");
+    assert!(v >= 1, "cacheSize should reflect the monitored PV; got {v}");
+
+    mon_task.abort();
 }
 
 /// a multi-tenant gateway with two upstreams (each holding a

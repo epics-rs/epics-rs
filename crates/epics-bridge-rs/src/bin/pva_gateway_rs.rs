@@ -1,11 +1,16 @@
 //! PVA-to-PVA gateway daemon binary.
 //!
-//! Usage:
+//! Two run modes:
 //!
 //! ```text
+//! # 1. Flag mode — one upstream client, one downstream server:
 //! pva-gateway-rs [--bind 0.0.0.0|::|::1] [--tcp-port 5075] [--udp-port 5076]
 //!                [--connect-timeout-secs 5] [--cleanup-interval-secs 30]
 //!                [--prefetch PV1 PV2 ...]
+//!
+//! # 2. Config mode — pva2pva-compatible JSON describing named clients
+//! #    and servers (mirrors `pva2pva` `[-vhiIC] <config file>`):
+//! pva-gateway-rs [-C] <config.json>
 //! ```
 //!
 //! `--bind` accepts both IPv4 (`0.0.0.0`, `127.0.0.1`, ...) and IPv6
@@ -13,18 +18,52 @@
 //! `[::]` bind dual-stacks automatically; BSD/macOS need a parallel
 //! v4 instance for dual-stack.
 //!
-//! Mirrors `pva2pva/p2pApp/gwmain.cpp` at the runtime level: a single
-//! process that holds an upstream `PvaClient` and a downstream
-//! `PvaServer`, routing every search/get/put/monitor through a shared
-//! cache.
+//! ## pva2pva JSON config (config mode)
+//!
+//! Mirrors the schema `pva2pva/p2pApp/gwmain.cpp:39-59` defines and the
+//! `loopback.conf` example: a top-level `version` / `readOnly`, a
+//! `clients` array (each carrying `provider` / `addrlist` /
+//! `autoaddrlist` / `serverport` / `bcastport`), and a `servers` array
+//! (each selecting named `clients`, with `interface` / `addrlist` /
+//! `autoaddrlist` / `serverport` / `bcastport` / `control_prefix`).
+//!
+//! Validation mirrors `gwmain.cpp:99-130` (version must be 1; at least
+//! one client and one server) plus `:291-322` (duplicate names rejected,
+//! each server must resolve every referenced client). `-C` /
+//! `--check-config` parses and validates without binding any socket,
+//! mirroring `gwmain.cpp`'s `-C` preflight. Named clients/servers are
+//! wired through [`MultiTenantPvaGatewayBuilder`], so one downstream can
+//! be backed by a selected subset of named upstream providers
+//! (`gwmain.cpp:133-188`), instead of collapsing to one client/server
+//! pair.
+//!
+//! Two faithful-but-bounded mappings, because epics-pva-rs's PVA stack
+//! is the only provider available here:
+//! - a client's `provider` must be `"pva"`; a `"ca"` upstream would need
+//!   a CA client (a different binary), so it is rejected with a clear
+//!   error rather than silently ignored.
+//! - a client's `addrlist` × `serverport` maps to the gateway client's
+//!   TCP name-server list ([`PvaClientBuilder::name_servers`]) — the
+//!   gateway-appropriate "pin these upstream endpoints" mechanism. The
+//!   client-side UDP broadcast knobs (`bcastport` / `autoaddrlist`) have
+//!   no per-client builder surface and are not applied to clients (they
+//!   ARE applied to servers, whose beacon emission maps to
+//!   `udp_port` / `auto_beacon`).
 
-use std::net::IpAddr;
+use std::fs;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use serde::Deserialize;
 
-use epics_bridge_rs::pva_gateway::{PvaGateway, PvaGatewayConfig};
+use epics_bridge_rs::pva_gateway::{
+    MultiTenantPvaGateway, MultiTenantPvaGatewayBuilder, PvaGateway, PvaGatewayConfig,
+};
+use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::server_native::PvaServerConfig;
 
 #[derive(Parser, Debug)]
@@ -34,15 +73,27 @@ use epics_pva_rs::server_native::PvaServerConfig;
     version
 )]
 struct Args {
-    /// Bind IP for the downstream TCP listener.
+    /// pva2pva-compatible JSON config file. When given, the gateway runs
+    /// in multi-client / multi-server mode from the file and the
+    /// single-gateway flags below are ignored. Without it, the flags
+    /// configure one upstream client and one downstream server.
+    #[arg(value_name = "CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Validate the config file and exit without binding any socket
+    /// (mirrors pva2pva `-C`). Requires <CONFIG>.
+    #[arg(short = 'C', long = "check-config")]
+    check_config: bool,
+
+    /// Bind IP for the downstream TCP listener (flag mode only).
     #[arg(long, default_value = "0.0.0.0")]
     bind: IpAddr,
 
-    /// Downstream TCP port (default 5075).
+    /// Downstream TCP port (default 5075, flag mode only).
     #[arg(long, default_value_t = 5075)]
     tcp_port: u16,
 
-    /// Downstream UDP search port (default 5076).
+    /// Downstream UDP search port (default 5076, flag mode only).
     #[arg(long, default_value_t = 5076)]
     udp_port: u16,
 
@@ -55,9 +106,9 @@ struct Args {
     #[arg(long, default_value_t = 30)]
     cleanup_interval_secs: u64,
 
-    /// Pre-warm the cache with these PV names. Useful when you know
-    /// the workload ahead of time and want the first downstream
-    /// search to hit the fast path.
+    /// Pre-warm the cache with these PV names (flag mode only). Useful
+    /// when you know the workload ahead of time and want the first
+    /// downstream search to hit the fast path.
     #[arg(long = "prefetch", num_args = 1.., value_delimiter = ',')]
     prefetch: Vec<String>,
 
@@ -65,6 +116,278 @@ struct Args {
     /// debug, `-vvv` trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+}
+
+// ── pva2pva JSON config schema (gwmain.cpp:39-59) ──────────────────────
+
+/// Top-level config object. `version` defaults to 0 so a missing key is
+/// distinguishable from an explicit `1` (gwmain.cpp:118-122 warns on a
+/// missing version and assumes 1).
+#[derive(Debug, Deserialize)]
+struct GatewayConfigFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(rename = "readOnly", default)]
+    read_only: bool,
+    #[serde(default)]
+    clients: Vec<ClientSpec>,
+    #[serde(default)]
+    servers: Vec<ServerSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientSpec {
+    name: String,
+    #[serde(default = "default_provider")]
+    provider: String,
+    #[serde(default)]
+    addrlist: String,
+    #[serde(default)]
+    autoaddrlist: bool,
+    #[serde(default = "default_server_port")]
+    serverport: u16,
+    #[serde(default = "default_bcast_port")]
+    bcastport: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerSpec {
+    name: String,
+    #[serde(default)]
+    clients: Vec<String>,
+    #[serde(default = "default_interface")]
+    interface: String,
+    #[serde(default)]
+    addrlist: String,
+    #[serde(default)]
+    autoaddrlist: bool,
+    #[serde(default = "default_server_port")]
+    serverport: u16,
+    #[serde(default = "default_bcast_port")]
+    bcastport: u16,
+    #[serde(default)]
+    control_prefix: Option<String>,
+}
+
+fn default_provider() -> String {
+    "pva".to_string()
+}
+fn default_server_port() -> u16 {
+    5075
+}
+fn default_bcast_port() -> u16 {
+    5076
+}
+fn default_interface() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn parse_config(text: &str) -> Result<GatewayConfigFile, String> {
+    serde_json::from_str(text).map_err(|e| format!("config file is not valid JSON: {e}"))
+}
+
+/// Validate a parsed config without touching the network. Mirrors the
+/// gwmain.cpp checks: version (`:118-127`), non-empty clients/servers
+/// (`:128-135`), unique names + server→client resolution (`:291-322`),
+/// plus the PVA-only-provider constraint specific to this binary.
+fn validate(cfg: &GatewayConfigFile) -> Result<(), String> {
+    if cfg.version != 0 && cfg.version != 1 {
+        return Err(format!(
+            "config file version mis-match: expect 1, found {}",
+            cfg.version
+        ));
+    }
+    if cfg.clients.is_empty() {
+        return Err("No clients configured".to_string());
+    }
+    if cfg.servers.is_empty() {
+        return Err("No servers configured".to_string());
+    }
+    // Unique client names — duplicates would silently shadow under
+    // server→client resolution.
+    for (i, a) in cfg.clients.iter().enumerate() {
+        if a.provider != "pva" {
+            return Err(format!(
+                "client '{}': provider '{}' is not supported by pva-gateway-rs \
+                 (PVA-to-PVA only); use a CA gateway for CA upstreams",
+                a.name, a.provider
+            ));
+        }
+        for b in &cfg.clients[i + 1..] {
+            if a.name == b.name {
+                return Err(format!("duplicate client name '{}'", a.name));
+            }
+        }
+    }
+    for (i, a) in cfg.servers.iter().enumerate() {
+        for b in &cfg.servers[i + 1..] {
+            if a.name == b.name {
+                return Err(format!("duplicate server name '{}'", a.name));
+            }
+        }
+        if a.clients.is_empty() {
+            return Err(format!(
+                "server '{}' must reference at least one client",
+                a.name
+            ));
+        }
+        for needed in &a.clients {
+            if !cfg.clients.iter().any(|c| &c.name == needed) {
+                return Err(format!(
+                    "server '{}' references non-existent client '{needed}'",
+                    a.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse an EPICS-style whitespace-separated address list into socket
+/// addresses, combining bare IPs with `default_port`. Empty / blank
+/// input yields an empty list (the caller then keeps environment
+/// defaults rather than pinning an empty set).
+fn parse_addr_list(list: &str, default_port: u16) -> Result<Vec<SocketAddr>, String> {
+    let mut out = Vec::new();
+    for tok in list.split_whitespace() {
+        if let Ok(sa) = tok.parse::<SocketAddr>() {
+            out.push(sa);
+        } else if let Ok(ip) = tok.parse::<IpAddr>() {
+            out.push(SocketAddr::new(ip, default_port));
+        } else {
+            return Err(format!("invalid address-list entry '{tok}'"));
+        }
+    }
+    Ok(out)
+}
+
+/// Build (but do not run) the multi-tenant gateway described by `cfg`.
+/// Assumes `cfg` already passed [`validate`].
+fn build_gateway(
+    cfg: &GatewayConfigFile,
+    cleanup: Duration,
+    connect: Duration,
+) -> Result<MultiTenantPvaGateway, String> {
+    let mut builder = MultiTenantPvaGatewayBuilder::new()
+        .cleanup_interval(cleanup)
+        .connect_timeout(connect);
+
+    for c in &cfg.clients {
+        // addrlist × serverport → TCP name servers (the gateway pins its
+        // upstream endpoints; gwmain.cpp:133-150 configure_client).
+        let name_servers = parse_addr_list(&c.addrlist, c.serverport)
+            .map_err(|e| format!("client '{}' addrlist: {e}", c.name))?;
+        let mut cb = PvaClient::builder();
+        if !name_servers.is_empty() {
+            cb = cb.name_servers(name_servers);
+        }
+        // The client-side UDP broadcast-search knobs (`autoaddrlist` /
+        // `bcastport`) have no per-client builder surface — this gateway
+        // pins upstreams via TCP name servers instead. Surface that
+        // explicitly so an operator who set them is not silently ignored.
+        if c.autoaddrlist {
+            eprintln!(
+                "pva-gateway-rs: client '{}': autoaddrlist=true and bcastport={} are not applied \
+                 (no per-client UDP broadcast-search surface); pin upstreams via addrlist × serverport",
+                c.name, c.bcastport
+            );
+        }
+        builder = builder.add_upstream(c.name.clone(), Arc::new(cb.build()));
+    }
+
+    for s in &cfg.servers {
+        let bind_ip: IpAddr = s
+            .interface
+            .trim()
+            .parse()
+            .map_err(|_| format!("server '{}': invalid interface '{}'", s.name, s.interface))?;
+        // server addrlist × bcastport → beacon destinations
+        // (EPICS_PVAS_BEACON_ADDR_LIST; gwmain.cpp:160-166 configure_server).
+        let beacon = parse_addr_list(&s.addrlist, s.bcastport)
+            .map_err(|e| format!("server '{}' addrlist: {e}", s.name))?;
+        let server_config = PvaServerConfig {
+            tcp_port: s.serverport,
+            udp_port: s.bcastport,
+            bind_ip,
+            interfaces: if bind_ip.is_unspecified() {
+                Vec::new()
+            } else {
+                vec![bind_ip]
+            },
+            beacon_destinations: beacon,
+            auto_beacon: s.autoaddrlist,
+            ..PvaServerConfig::default()
+        };
+        let upstream_refs: Vec<&str> = s.clients.iter().map(String::as_str).collect();
+        let control_prefix = s.control_prefix.as_ref().filter(|p| !p.is_empty()).cloned();
+        builder = builder
+            .add_downstream(
+                s.name.clone(),
+                server_config,
+                &upstream_refs,
+                control_prefix,
+            )
+            // Top-level readOnly applies to every downstream (gwmain.cpp
+            // sets the global `p2pReadOnly` at :117). No ACL / audit from
+            // the pva2pva schema.
+            .downstream_access(None, cfg.read_only, None);
+    }
+
+    builder.start().map_err(|e| e.to_string())
+}
+
+async fn run_from_config(
+    path: &Path,
+    check_only: bool,
+    cleanup: Duration,
+    connect: Duration,
+) -> ExitCode {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "pva-gateway-rs: cannot read config '{}': {e}",
+                path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let cfg = match parse_config(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("pva-gateway-rs: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if cfg.version == 0 {
+        eprintln!("Warning: config file missing \"version\" key. Assuming 1");
+    }
+    if let Err(e) = validate(&cfg) {
+        eprintln!("pva-gateway-rs: {e}");
+        return ExitCode::FAILURE;
+    }
+    if check_only {
+        eprintln!("Config file OK");
+        return ExitCode::SUCCESS;
+    }
+
+    let gw = match build_gateway(&cfg, cleanup, connect) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("pva-gateway-rs: failed to start: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "pva-gateway-rs: {} upstream client(s), {} downstream server(s) (Ctrl-C to stop)",
+        gw.upstream_count(),
+        gw.downstream_count()
+    );
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        eprintln!("pva-gateway-rs: signal wait failed: {e}");
+    }
+    gw.stop_all();
+    ExitCode::SUCCESS
 }
 
 fn init_tracing(verbose: u8) {
@@ -85,6 +408,20 @@ async fn main() -> ExitCode {
     let args = Args::parse();
     init_tracing(args.verbose);
 
+    let cleanup = Duration::from_secs(args.cleanup_interval_secs);
+    let connect = Duration::from_secs(args.connect_timeout_secs);
+
+    // Config mode (pva2pva-compatible JSON) takes precedence over the
+    // single-gateway flags when a <CONFIG> path is supplied.
+    if let Some(path) = args.config.as_ref() {
+        return run_from_config(path, args.check_config, cleanup, connect).await;
+    }
+    if args.check_config {
+        eprintln!("pva-gateway-rs: --check-config requires a <CONFIG> file");
+        return ExitCode::FAILURE;
+    }
+
+    // Flag mode: one upstream client, one downstream server.
     // epics-base PR #205 IPv6 Stage 1: `PvaServerConfig::bind_ip` is
     // `IpAddr` so v4 and v6 bind addresses pass through unchanged.
     let server_config = PvaServerConfig {
@@ -97,8 +434,8 @@ async fn main() -> ExitCode {
     let cfg = PvaGatewayConfig {
         upstream_client: None,
         server_config,
-        cleanup_interval: Duration::from_secs(args.cleanup_interval_secs),
-        connect_timeout: Duration::from_secs(args.connect_timeout_secs),
+        cleanup_interval: cleanup,
+        connect_timeout: connect,
         // Inherit from the type's defaults — operators tune these via
         // EPICS_PVA_GW_MAX_CACHE_ENTRIES / EPICS_PVA_GW_MAX_SUBSCRIBERS
         // in PvaGatewayConfig::with_env, or via PvaGatewayConfig::default().
@@ -131,5 +468,138 @@ async fn main() -> ExitCode {
             eprintln!("pva-gateway-rs: stopped with error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The loopback.conf shipped with pva2pva — the canonical example.
+    const LOOPBACK: &str = r#"{
+        "version":1,
+        "readOnly":false,
+        "clients":[
+            {"name":"theclient","provider":"pva","addrlist":"127.0.0.1",
+             "autoaddrlist":false,"serverport":5085,"bcastport":5086}
+        ],
+        "servers":[
+            {"name":"theserver","clients":["theclient"],"interface":"127.0.0.1",
+             "addrlist":"127.255.255.255","autoaddrlist":false,
+             "serverport":5075,"bcastport":5076}
+        ]
+    }"#;
+
+    #[test]
+    fn loopback_config_parses_and_validates() {
+        let cfg = parse_config(LOOPBACK).expect("parse");
+        assert_eq!(cfg.version, 1);
+        assert!(!cfg.read_only);
+        assert_eq!(cfg.clients.len(), 1);
+        assert_eq!(cfg.servers.len(), 1);
+        assert_eq!(cfg.clients[0].serverport, 5085);
+        assert_eq!(cfg.servers[0].clients, vec!["theclient".to_string()]);
+        validate(&cfg).expect("loopback.conf must validate");
+    }
+
+    #[test]
+    fn missing_clients_is_rejected() {
+        let cfg = parse_config(r#"{"version":1,"servers":[]}"#).expect("parse");
+        assert_eq!(validate(&cfg).unwrap_err(), "No clients configured");
+    }
+
+    #[test]
+    fn missing_servers_is_rejected() {
+        let cfg =
+            parse_config(r#"{"version":1,"clients":[{"name":"c","provider":"pva"}],"servers":[]}"#)
+                .expect("parse");
+        assert_eq!(validate(&cfg).unwrap_err(), "No servers configured");
+    }
+
+    #[test]
+    fn server_referencing_unknown_client_is_rejected() {
+        let cfg = parse_config(
+            r#"{"version":1,
+                "clients":[{"name":"c1","provider":"pva"}],
+                "servers":[{"name":"s1","clients":["nope"]}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            validate(&cfg).unwrap_err(),
+            "server 's1' references non-existent client 'nope'"
+        );
+    }
+
+    #[test]
+    fn version_mismatch_is_rejected() {
+        let cfg = parse_config(
+            r#"{"version":2,"clients":[{"name":"c","provider":"pva"}],
+                "servers":[{"name":"s","clients":["c"]}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            validate(&cfg).unwrap_err(),
+            "config file version mis-match: expect 1, found 2"
+        );
+    }
+
+    #[test]
+    fn non_pva_provider_is_rejected() {
+        let cfg = parse_config(
+            r#"{"version":1,"clients":[{"name":"c","provider":"ca"}],
+                "servers":[{"name":"s","clients":["c"]}]}"#,
+        )
+        .expect("parse");
+        assert!(
+            validate(&cfg)
+                .unwrap_err()
+                .contains("provider 'ca' is not supported")
+        );
+    }
+
+    #[test]
+    fn duplicate_client_names_rejected() {
+        let cfg = parse_config(
+            r#"{"version":1,
+                "clients":[{"name":"c","provider":"pva"},{"name":"c","provider":"pva"}],
+                "servers":[{"name":"s","clients":["c"]}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(validate(&cfg).unwrap_err(), "duplicate client name 'c'");
+    }
+
+    #[test]
+    fn server_with_no_clients_rejected() {
+        let cfg = parse_config(
+            r#"{"version":1,"clients":[{"name":"c","provider":"pva"}],
+                "servers":[{"name":"s","clients":[]}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            validate(&cfg).unwrap_err(),
+            "server 's' must reference at least one client"
+        );
+    }
+
+    #[test]
+    fn missing_version_warns_but_validates() {
+        // version key absent → defaults to 0 → caller warns + assumes 1.
+        let cfg = parse_config(
+            r#"{"clients":[{"name":"c","provider":"pva"}],
+                "servers":[{"name":"s","clients":["c"]}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(cfg.version, 0);
+        validate(&cfg).expect("version 0 (missing) is accepted as 1");
+    }
+
+    #[test]
+    fn addr_list_parsing_combines_bare_ip_with_default_port() {
+        let got = parse_addr_list("127.0.0.1 10.0.0.2:9999", 5085).expect("parse");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], "127.0.0.1:5085".parse().unwrap());
+        assert_eq!(got[1], "10.0.0.2:9999".parse().unwrap());
+        assert!(parse_addr_list("", 5085).unwrap().is_empty());
+        assert!(parse_addr_list("not-an-ip", 5085).is_err());
     }
 }

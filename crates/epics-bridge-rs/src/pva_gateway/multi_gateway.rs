@@ -313,16 +313,21 @@ impl MultiTenantPvaGatewayBuilder {
             let acl_cfg = ds.acl.clone().unwrap_or_default();
             let audit_sink: Arc<dyn AuditSink> =
                 ds.audit.clone().unwrap_or_else(|| Arc::new(NoopAudit));
-            let mut first_gw_source: Option<GatewayChannelSource> = None;
+            // Collect EVERY per-tenant proxy source (unlayered) so the
+            // optional control source can administer all of them, not
+            // just the first (BRIDGE-RS-2026-05-28-73). The control
+            // source operates on the unlayered proxies — its diagnostic
+            // PVs are not access-gated.
+            let mut gw_sources: Vec<GatewayChannelSource> = Vec::new();
             for (i, (label, cache)) in sources.iter().enumerate() {
                 let mut src = GatewayChannelSource::new(cache.clone());
                 src.connect_timeout = self.connect_timeout;
                 src.max_subscribers = self.max_subscribers;
-                if first_gw_source.is_none() {
-                    // The control source operates on the *unlayered*
-                    // proxy (its diagnostic PVs are not access-gated).
-                    first_gw_source = Some(src.clone());
-                }
+                // Per-credential caches built lazily by this source must
+                // honor the configured policy too (BRIDGE-RS-2026-05-28-26).
+                src.cleanup_interval = self.cleanup_interval;
+                src.per_credential_max_entries = self.max_cache_entries;
+                gw_sources.push(src.clone());
                 let order = i as i32; // earlier labels win
                 let name = format!("gateway:{label}");
                 let layered =
@@ -334,17 +339,22 @@ impl MultiTenantPvaGatewayBuilder {
                     ))
                 })?;
             }
-            if let (Some(prefix), Some(gw_src)) = (ds.control_prefix.as_ref(), first_gw_source) {
+            if let Some(prefix) = ds.control_prefix.as_ref() {
                 if !prefix.is_empty() {
-                    let control = ControlSource::new(prefix, gw_src);
-                    composite
-                        .add_source("__gw_control", Arc::new(control), -100)
-                        .map_err(|e| {
-                            GwError::Other(format!(
-                                "downstream '{}' control source registration: {e}",
-                                ds.label
-                            ))
-                        })?;
+                    if let Some((first, rest)) = gw_sources.split_first() {
+                        let mut control = ControlSource::new(prefix, first.clone());
+                        for src in rest {
+                            control = control.with_source(src.clone());
+                        }
+                        composite
+                            .add_source("__gw_control", Arc::new(control), -100)
+                            .map_err(|e| {
+                                GwError::Other(format!(
+                                    "downstream '{}' control source registration: {e}",
+                                    ds.label
+                                ))
+                            })?;
+                    }
                 }
             }
             let server = PvaServer::start(composite, ds.config)?;

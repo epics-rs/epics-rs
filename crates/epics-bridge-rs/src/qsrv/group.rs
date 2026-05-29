@@ -11,7 +11,7 @@ use std::sync::Arc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::types::DbFieldType;
-use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, VariantValue};
 
 use super::group_config::{GroupMember, GroupPvDef, TriggerDef};
 use super::monitor::BridgeMonitor;
@@ -859,7 +859,16 @@ impl GroupChannel {
                         field: field_name.to_string(),
                     }
                 })?;
-                Ok(epics_to_pv_field(&value))
+                // pvxs serves `+type:"any"` as a PVA `any` slot whose
+                // payload carries the concrete DB field type: `IOCSource::
+                // get` allocates `anyType.cloneEmpty()` and writes the
+                // scalar/array value into it (iocsource.cpp:335-349). Wrap
+                // the converted value in a Variant tagged with its own
+                // wire-faithful descriptor so the slot decodes as `any`,
+                // not a fixed scalar.
+                let pv = epics_to_pv_field(&value);
+                let desc = pv.wire_descriptor();
+                Ok(PvField::Variant(Box::new(VariantValue { desc, value: pv })))
             }
             // Proc, Structure, Const handled by early return above
             FieldMapping::Proc | FieldMapping::Structure | FieldMapping::Const => unreachable!(),
@@ -951,6 +960,16 @@ impl GroupChannel {
         pv_field: &epics_pva_rs::pvdata::PvField,
     ) -> Option<epics_base_rs::types::EpicsValue> {
         use epics_pva_rs::pvdata::PvField;
+        // A `+type:"any"` member is advertised as a PVA `any` slot, so a
+        // pvxs-compatible client PUTs a Variant wrapper. Dereference it
+        // (pvxs `IOCSource::put` does `node["->"]`, iocsource.cpp:575-586)
+        // and convert the inner concrete value; an unconvertible inner
+        // shape (Structure/Union/…) still returns None below and rejects
+        // the PUT, matching pvxs.
+        let pv_field = match pv_field {
+            PvField::Variant(v) => &v.value,
+            other => other,
+        };
         match pv_field {
             PvField::Scalar(sv) => {
                 let target = self.member_dbf_type(member).await;
@@ -1446,7 +1465,12 @@ impl super::provider::Channel for GroupChannel {
                         FieldMapping::Scalar => pvif::build_field_desc_for_nt(nt_type, scalar_type),
                         FieldMapping::Plain => FieldDesc::Scalar(scalar_type),
                         FieldMapping::Meta => meta_desc(),
-                        FieldMapping::Any => FieldDesc::Scalar(scalar_type),
+                        // pvxs advertises `+type:"any"` as `Member(TypeCode
+                        // ::Any, …)` (groupconfigprocessor.cpp:904-910), an
+                        // `any` slot whose concrete payload type is carried
+                        // by the value — not a fixed scalar fixed at
+                        // introspection time.
+                        FieldMapping::Any => FieldDesc::Variant,
                         _ => continue,
                     }
                 }

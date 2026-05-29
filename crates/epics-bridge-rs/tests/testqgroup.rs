@@ -991,3 +991,122 @@ async fn group_descriptor_advertises_record_options() {
         "GET value must carry the record._options branch the descriptor advertises"
     );
 }
+
+/// a `+type:"any"` group member is advertised as a PVA `any`
+/// slot (FieldDesc::Variant), its GET value is a Variant wrapping the
+/// concrete scalar/array payload (tagged with that payload's descriptor),
+/// and a PUT of a Variant payload is dereferenced and written. pvxs builds
+/// the descriptor with `Member(TypeCode::Any,…)`
+/// (groupconfigprocessor.cpp:904-910), fills the slot via
+/// `anyType.cloneEmpty()` + `node.from(value)` (iocsource.cpp:335-349),
+/// and dereferences `node["->"]` on PUT (iocsource.cpp:575-586). Before
+/// the fix the member was advertised/served as a fixed scalar and a
+/// Variant PUT was rejected by `pv_field_to_epics`.
+#[tokio::test]
+async fn br76_any_member_is_variant_descriptor_value_and_put() {
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::{DbFieldType, EpicsValue};
+    use epics_pva_rs::pvdata::{FieldDesc, ScalarType, VariantValue};
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("B76:sc", Box::new(AiRecord::new(2.5)))
+        .await
+        .unwrap();
+    db.add_record(
+        "B76:wf",
+        Box::new(WaveformRecord::new(8, DbFieldType::Double)),
+    )
+    .await
+    .unwrap();
+    db.put_pv("B76:wf", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+        .await
+        .unwrap();
+
+    let json = r#"{
+        "B76:grp": {
+            "+atomic": true,
+            "sc": { "+channel": "B76:sc.VAL", "+type": "any", "+putorder": 0 },
+            "wf": { "+channel": "B76:wf.VAL", "+type": "any", "+putorder": 1 }
+        }
+    }"#;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(json).expect("load");
+    let def = provider
+        .groups()
+        .get("B76:grp")
+        .cloned()
+        .expect("registered");
+    let ch = GroupChannel::new(db.clone(), def);
+
+    // Descriptor: both `any` members advertise FieldDesc::Variant.
+    let desc = ch.get_field().await.expect("get_field");
+    let root = match &desc {
+        FieldDesc::Structure { fields, .. } => fields,
+        other => panic!("group descriptor must be a structure, got {other:?}"),
+    };
+    for name in ["sc", "wf"] {
+        let d = root.iter().find(|(n, _)| n == name).map(|(_, d)| d);
+        assert!(
+            matches!(d, Some(FieldDesc::Variant)),
+            "`+type:any` member `{name}` must advertise FieldDesc::Variant, got {d:?}"
+        );
+    }
+
+    // GET value: each member is a Variant carrying the concrete payload
+    // descriptor (scalar double / double array), not a bare scalar.
+    let val = ch.get(&empty_request()).await.expect("get");
+    match find_field(&val, "sc") {
+        Some(PvField::Variant(v)) => {
+            assert_eq!(
+                v.desc,
+                Some(FieldDesc::Scalar(ScalarType::Double)),
+                "scalar any payload must tag the concrete scalar descriptor"
+            );
+            assert!(
+                matches!(&v.value, PvField::Scalar(ScalarValue::Double(d)) if (*d - 2.5).abs() < 1e-9),
+                "scalar any value must carry the record value, got {:?}",
+                v.value
+            );
+        }
+        other => panic!("scalar any member must be a Variant, got {other:?}"),
+    }
+    match find_field(&val, "wf") {
+        Some(PvField::Variant(v)) => {
+            assert_eq!(
+                v.desc,
+                Some(FieldDesc::ScalarArray(ScalarType::Double)),
+                "array any payload must tag the concrete array descriptor"
+            );
+            assert!(
+                matches!(
+                    &v.value,
+                    PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_)
+                ),
+                "array any value must carry the array payload, got {:?}",
+                v.value
+            );
+        }
+        other => panic!("array any member must be a Variant, got {other:?}"),
+    }
+
+    // PUT: a Variant payload for the scalar member is dereferenced and written.
+    let mut put = PvStructure::new("epics:nt/NTGroup:1.0");
+    put.fields.push((
+        "sc".into(),
+        PvField::Variant(Box::new(VariantValue {
+            desc: Some(FieldDesc::Scalar(ScalarType::Double)),
+            value: PvField::Scalar(ScalarValue::Double(7.25)),
+        })),
+    ));
+    ch.put(&put).await.expect("variant put accepted");
+
+    let after = ch.get(&empty_request()).await.expect("get-after-put");
+    match find_field(&after, "sc") {
+        Some(PvField::Variant(v)) => assert!(
+            matches!(&v.value, PvField::Scalar(ScalarValue::Double(d)) if (*d - 7.25).abs() < 1e-9),
+            "variant PUT must update the backing record, got {:?}",
+            v.value
+        ),
+        other => panic!("scalar any member must be a Variant after put, got {other:?}"),
+    }
+}

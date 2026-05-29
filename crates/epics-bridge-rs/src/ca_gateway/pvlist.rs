@@ -484,35 +484,38 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
             Ok(PvListEntry::Allow { pattern, asg, asl })
         }
         "DENY" => {
-            // Optional FROM host1 host2 ...
-            let mut from_hosts = Vec::new();
-            if let Some(t) = tokens.next() {
-                if t.eq_ignore_ascii_case("FROM") {
-                    for h in tokens {
-                        // C ca-gateway tokenizes the DENY FROM host list
-                        // with `strtok(NULL, ", \t\n")` (gateAs.cc:469-472,
-                        // :540-552) — comma is a host delimiter just like
-                        // whitespace, so `FROM bad1,bad2` is two hosts.
-                        // `split_whitespace` above only split on
-                        // whitespace, leaving `bad1,bad2` as one token that
-                        // resolves to nothing and (when it is the rule's
-                        // only host) collapses the rule into a global deny
-                        // (see `resolve_hosts`). Split each token on commas
-                        // and drop empties so `h1,h2`, `h1, h2`, and
-                        // `h1 ,h2` all yield the same host set.
-                        // Stored as-is here; PvList::resolve_hosts() converts
-                        // hostnames to IP strings at load time,
-                        // mirroring C aToIPAddr (gateAs.cc:488-506).
-                        for host in h.split(',').filter(|s| !s.is_empty()) {
-                            from_hosts.push(host.to_string());
-                        }
-                    }
-                } else {
-                    return Err(BridgeError::GroupConfigError(format!(
-                        "line {lineno}: expected FROM after DENY, got '{t}'"
-                    )));
-                }
+            // `pattern DENY [FROM] [host ...]`. C ca-gateway (gateAs.cc:539-552,
+            // USE_DENYFROM branch):
+            //
+            //   if((hname=strtok(NULL,", \t\n")) && strcasecmp(hname,"FROM")==0)
+            //       hname=strtok(NULL,", \t\n");
+            //   if(hname) { do { ... } while((hname=strtok(NULL,", \t\n"))); }
+            //   else { /* global deny */ }
+            //
+            // Two C behaviors this reproduces:
+            //
+            // - `FROM` is OPTIONAL. The first token after DENY is consumed as
+            //   the `FROM` keyword ONLY when it matches case-insensitively;
+            //   otherwise it is the first host. So `PV.* DENY h1 h2` is a
+            //   host-scoped deny exactly like `PV.* DENY FROM h1 h2`. The old
+            //   code rejected the whole pvlist when `FROM` was omitted.
+            // - Hosts are tokenized with `strtok(NULL,", \t\n")`, so comma is a
+            //   delimiter just like whitespace; `h1,h2` is two hosts.
+            //   `split_whitespace` only split on whitespace, so each remaining
+            //   token is further split on commas with empties dropped, giving
+            //   `h1,h2`, `h1, h2`, and `h1 ,h2` the same host set.
+            //
+            // A bare `DENY` (no hosts) stays a global deny. Hosts are stored
+            // verbatim here; PvList::resolve_hosts() converts hostnames to IP
+            // strings at load time, mirroring C aToIPAddr (gateAs.cc:488-506).
+            let mut hosts = tokens
+                .flat_map(|t| t.split(','))
+                .filter(|s| !s.is_empty())
+                .peekable();
+            if hosts.peek().is_some_and(|h| h.eq_ignore_ascii_case("FROM")) {
+                hosts.next();
             }
+            let from_hosts: Vec<String> = hosts.map(String::from).collect();
             Ok(PvListEntry::Deny {
                 pattern,
                 from_hosts,
@@ -724,6 +727,58 @@ mod tests {
         let list = parse_pvlist("test.* DENY FROM h1,h2 ,h3").unwrap();
         if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
             assert_eq!(from_hosts, &["h1", "h2", "h3"]);
+        } else {
+            panic!("expected Deny");
+        }
+    }
+
+    /// C ca-gateway (gateAs.cc:539-552) makes the `FROM` keyword OPTIONAL on
+    /// host-scoped DENY rules: the first post-DENY token is the `FROM` keyword
+    /// only when it matches case-insensitively, otherwise it is the first host.
+    /// `PV.* DENY h1 h2` must therefore parse as a host-scoped deny, not reject
+    /// the whole pvlist.
+    #[test]
+    fn parse_deny_optional_from_keyword() {
+        // No FROM: first token is a host.
+        let list = parse_pvlist("PV.* DENY host1 host2").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert_eq!(from_hosts, &["host1", "host2"]);
+        } else {
+            panic!("expected Deny");
+        }
+
+        // FROM present (case-insensitive) is consumed, not stored as a host.
+        for kw in ["FROM", "from", "From"] {
+            let list = parse_pvlist(&format!("PV.* DENY {kw} host1 host2")).unwrap();
+            if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+                assert_eq!(from_hosts, &["host1", "host2"], "{kw} consumed");
+            } else {
+                panic!("{kw}: expected Deny");
+            }
+        }
+
+        // No-FROM combined with comma tokenization (BRIDGE-RS-2026-05-28-12
+        // host splitting still applies without the keyword).
+        let list = parse_pvlist("PV.* DENY h1,h2 ,h3").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert_eq!(from_hosts, &["h1", "h2", "h3"]);
+        } else {
+            panic!("expected Deny");
+        }
+
+        // Bare DENY stays a global deny (empty host set).
+        let list = parse_pvlist("PV.* DENY").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert!(from_hosts.is_empty(), "bare DENY is global");
+        } else {
+            panic!("expected Deny");
+        }
+
+        // `DENY FROM` with no following host is also a global deny (FROM
+        // consumed, nothing left) — matches C (hname==NULL → deny_list).
+        let list = parse_pvlist("PV.* DENY FROM").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert!(from_hosts.is_empty(), "DENY FROM with no host is global");
         } else {
             panic!("expected Deny");
         }

@@ -2,7 +2,7 @@ use clap::Parser;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::format;
 use epics_pva_rs::pv_request::PvRequestExpr;
-use epics_pva_rs::pvdata::{PvField, PvStructure};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure};
 
 const VERSION_INFO: &str = concat!("pvput-rs ", env!("CARGO_PKG_VERSION"));
 
@@ -34,12 +34,14 @@ struct Args {
     #[arg(short = 'p', long = "provider", default_value = "pva")]
     provider: String,
 
-    /// Output mode: `nt` (default), `raw`, or `json`. Currently the
-    /// post-put echo always uses the legacy NT shape.
+    /// Output mode: `nt` (default), `raw`, or `json`. Selects how the
+    /// `--read-back` Old:/New: echo renders values, mirroring
+    /// `pvget-rs` (pvAccessCPP pvput.cpp:299-310, 403-428).
     #[arg(short = 'M', long = "mode", default_value = "nt")]
     mode: String,
 
-    /// Show entire structure in raw mode (legacy `-v` shorthand).
+    /// Show entire structure in raw mode (legacy `-v` shorthand);
+    /// implies `-M raw` for the `--read-back` echo (pvput.cpp:281-283).
     #[arg(short = 'v', action = clap::ArgAction::Count)]
     verbose: u8,
 
@@ -166,12 +168,22 @@ async fn main() {
     // 3. Post-PUT read for the `New :` echo line.
     let new_get = client.pvget_full(&pv_name).await;
 
-    let echo_line = |label: &str, value: &PvField| -> Option<String> {
-        let s = match value {
-            PvField::Structure(s) => s,
-            _ => return None,
-        };
-        Some(format_old_new_line(label, s))
+    // pvAccessCPP formats both the old and new readback values through
+    // the same `stream().format(outmode)` path (pvput.cpp:403-428), and
+    // `-v` selects raw mode (pvput.cpp:281-283). Mirror `pvget-rs`'s
+    // mode dispatch so `-M raw`/`-M json`/`-v` actually change the echo
+    // shape instead of always emitting the legacy NT form.
+    let mode = resolve_output_mode(&args.mode, args.verbose);
+    let render = |label: &str, value: &PvField, desc: &FieldDesc| -> String {
+        match mode {
+            "json" => format::format_json(label, value),
+            "raw" => format::format_raw(label, desc, value),
+            // Default `-M nt`: legacy compact `<label><ts>  <val>` shape.
+            _ => match value {
+                PvField::Structure(s) => format_old_new_line(label, s),
+                _ => format!("{label}(non-NT value)\n"),
+            },
+        }
     };
 
     // pvAccessCPP `pvput -q` (pvput.cpp:403-428) suppresses the `Old :`
@@ -182,28 +194,21 @@ async fn main() {
         && let Some(old_get) = &old_get
     {
         match old_get {
-            Ok(r) => match echo_line("Old : ", &r.value) {
-                Some(line) => print!("{line}"),
-                None => println!("Old : (non-NT value)"),
-            },
+            Ok(r) => print!("{}", render("Old : ", &r.value, &r.introspection)),
             Err(e) => println!("Old : *** {e}"),
         }
     }
     let new_label = new_echo_label(args.quiet);
     match &new_get {
-        Ok(r) => match echo_line(new_label, &r.value) {
-            Some(line) => print!("{line}"),
-            None if args.quiet => println!("(non-NT value)"),
-            None => println!("New : (non-NT value)"),
-        },
+        Ok(r) => print!("{}", render(new_label, &r.value, &r.introspection)),
         // A readback GET failure is not the PUT result (already checked);
         // report it to stderr so quiet's stdout stays value-only.
         Err(e) if args.quiet => eprintln!("pvput-rs: readback failed: {e}"),
         Err(e) => println!("New : *** {e}"),
     }
 
-    // Suppress unused-warning for parity-only flags.
-    let _ = (args.mode, args.verbose, args.debug);
+    // Suppress unused-warning for the remaining parity-only flag.
+    let _ = args.debug;
 }
 
 /// Validate the requested provider. Only the native PVA provider is
@@ -253,6 +258,13 @@ fn parse_put_args(values: &[String]) -> Result<PutInput, String> {
         }
     }
     Ok(PutInput::Fields(assignments))
+}
+
+/// Resolve the effective output mode for the `--read-back` echo. `-v`
+/// implies raw mode (pvAccessCPP pvput.cpp:281-283); otherwise the
+/// `-M` value is used, matching `pvget-rs`.
+fn resolve_output_mode(mode: &str, verbose: u8) -> &str {
+    if verbose > 0 { "raw" } else { mode }
 }
 
 /// Label for the post-PUT `New :` echo line. pvAccessCPP `pvput -q`
@@ -350,5 +362,17 @@ mod tests {
     fn quiet_suppresses_new_label_only() {
         assert_eq!(new_echo_label(false), "New : ");
         assert_eq!(new_echo_label(true), "");
+    }
+
+    /// `-M` selects the readback echo formatter; `-v` overrides it to
+    /// raw (pvput.cpp:281-283), matching pvget-rs.
+    #[test]
+    fn output_mode_honors_mode_and_verbose() {
+        assert_eq!(resolve_output_mode("nt", 0), "nt");
+        assert_eq!(resolve_output_mode("json", 0), "json");
+        assert_eq!(resolve_output_mode("raw", 0), "raw");
+        // -v forces raw regardless of -M.
+        assert_eq!(resolve_output_mode("nt", 1), "raw");
+        assert_eq!(resolve_output_mode("json", 2), "raw");
     }
 }

@@ -1420,9 +1420,17 @@ impl PvaClient {
     /// `Finished`). Mirrors pvxs's MonitorBuilder + Subscription
     /// exception-based stream API. `mask` defaults are
     /// pvxs-compatible: `maskConnected=true`, `maskDisconnected=false`.
+    ///
+    /// `request` is an optional custom pvRequest (`None` = the default
+    /// all-fields request) applied at MONITOR INIT, so the descriptor in
+    /// each [`MonitorEvent::Data`] reflects exactly the requested
+    /// projection / filter shape — the same request reused across
+    /// reconnects, and its `record._options.{pipeline,queueSize}` driving
+    /// the flow window (pvxs `MonitorBuilder::pvRequest`).
     pub async fn pvmonitor_events<F>(
         &self,
         pv_name: &str,
+        request: Option<&crate::pv_request::PvRequestExpr>,
         mask: MonitorEventMask,
         callback: F,
     ) -> PvaResult<()>
@@ -1430,7 +1438,24 @@ impl PvaClient {
         F: FnMut(MonitorEvent) + Send,
     {
         let ch = self.channel(pv_name).await?;
-        op_monitor_events(&ch, &[], self.inner.pipeline_size, mask, callback).await
+        let (raw_pv_req, flow) = match request {
+            Some(req) => {
+                let big_endian = matches!(
+                    ch.ensure_active().await?.0.byte_order,
+                    crate::proto::ByteOrder::Big
+                );
+                let flow = crate::client_native::ops_v2::MonitorFlow::from_record_options(
+                    &req.record_options,
+                    self.inner.pipeline_size,
+                );
+                (Some(req.encode(big_endian)), flow)
+            }
+            None => (
+                None,
+                crate::client_native::ops_v2::MonitorFlow::window(self.inner.pipeline_size),
+            ),
+        };
+        op_monitor_events(&ch, raw_pv_req, flow, mask, callback).await
     }
 
     /// Fetch the channel's introspection (FieldDesc) using PVA's

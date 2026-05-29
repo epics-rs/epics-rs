@@ -1,5 +1,6 @@
 use clap::Parser;
 use epics_pva_rs::client::PvaClient;
+use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
 use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::{cli, format};
 
@@ -112,28 +113,36 @@ async fn main() {
         let request = request.clone();
         let client = client.clone();
         let handle = tokio::spawn(async move {
-            // Get introspection once for typed formatting
-            let desc = client.pvinfo(&pv_name).await.ok();
-
-            let render = |value: &epics_pva_rs::pvdata::PvField| {
-                // `-q` is a deprecated no-op (see Args::quiet); monitor
-                // updates are always printed, matching pvAccessCPP.
-                let output = if let Some(ref d) = desc {
-                    match mode.as_str() {
-                        "json" => format::format_json(&pv_name, value),
-                        "raw" => format::format_raw(&pv_name, d, value),
-                        _ => format::format_nt(&pv_name, d, value),
-                    }
-                } else {
-                    format!("{pv_name} {value}\n")
-                };
-                print!("{output}");
+            // Format every update with the descriptor carried by the
+            // monitor's own INIT response (`MonitorEvent::Data.intro`),
+            // not a separate GET_FIELD. A projected request
+            // (`-r 'field(alarm)'`) then formats against the projected
+            // monitor shape — and no extra wire op is issued that a server
+            // or gateway might fail or authorize differently from MONITOR.
+            // pvxs formats the Value popped from the subscription itself
+            // (tools/monitor.cpp:133-146).
+            let on_event = |event: MonitorEvent| {
+                if let MonitorEvent::Data { intro, value } = event {
+                    // `-q` is a deprecated no-op (see Args::quiet); monitor
+                    // updates are always printed, matching pvAccessCPP.
+                    let output = match mode.as_str() {
+                        "json" => format::format_json(&pv_name, &value),
+                        "raw" => format::format_raw(&pv_name, &intro, &value),
+                        _ => format::format_nt(&pv_name, &intro, &value),
+                    };
+                    print!("{output}");
+                }
             };
 
-            let result = match request {
-                Some(req) => client.pvmonitor_with_request(&pv_name, &req, render).await,
-                None => client.pvmonitor(&pv_name, render).await,
+            // Value-only output: lifecycle events stay suppressed at this
+            // step so the descriptor-source change is isolated.
+            let mask = MonitorEventMask {
+                mask_connected: true,
+                mask_disconnected: true,
             };
+            let result = client
+                .pvmonitor_events(&pv_name, request.as_ref(), mask, on_event)
+                .await;
 
             if let Err(e) = result {
                 eprintln!("{pv_name}: {e}");

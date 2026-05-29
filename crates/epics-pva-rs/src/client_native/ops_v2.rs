@@ -2569,18 +2569,24 @@ where
 /// loop to pvxs's typed event stream. The mask flags control whether
 /// `Connected`/`Disconnected`/`Finished` events surface or stay
 /// suppressed (pvxs `maskConnected` / `maskDisconnected`).
+///
+/// `raw_pv_req` is the caller's serialized pvRequest (`None` = the
+/// default all-fields request); `flow` carries the negotiated
+/// `record._options.{pipeline,queueSize}` window. The descriptor handed
+/// to every [`MonitorEvent::Data`] is the monitor's own INIT
+/// introspection, so a projected request (`field(alarm)`) yields the
+/// projected shape — no separate GET_FIELD is needed.
 pub async fn op_monitor_events<F>(
     channel: &Arc<Channel>,
-    fields: &[&str],
-    pipeline_size: u32,
+    raw_pv_req: Option<Vec<u8>>,
+    flow: MonitorFlow,
     mask: MonitorEventMask,
     mut callback: F,
 ) -> PvaResult<()>
 where
     F: FnMut(MonitorEvent) + Send,
 {
-    let fields_owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-    let flow = MonitorFlow::window(pipeline_size);
+    let no_fields: &[String] = &[];
     loop {
         let (server, sid) = match channel.ensure_active().await {
             Ok(p) => p,
@@ -2608,8 +2614,8 @@ where
         let result = run_monitor_loop(
             server.clone(),
             sid,
-            &fields_owned,
-            None,
+            no_fields,
+            raw_pv_req.as_deref(),
             flow,
             &mut data_callback,
             None,

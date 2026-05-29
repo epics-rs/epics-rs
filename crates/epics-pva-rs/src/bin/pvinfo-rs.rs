@@ -44,6 +44,12 @@ struct Args {
     /// flag; `-v` there is effective-config output, not credentials.
     #[arg(long = "show-credentials")]
     show_credentials: bool,
+
+    /// Raise the `epics_pva_rs` library log level to DEBUG. Mirrors pvxs
+    /// `pvxinfo -d` mapping to `logger_level_set("pvxs.*",
+    /// Level::Debug)` (`tools/info.cpp:47-66`).
+    #[arg(short = 'd')]
+    debug: bool,
 }
 
 /// Print host network troubleshooting info and return, mirroring pvxs
@@ -77,6 +83,12 @@ async fn main() {
         print!("{}", cli::version_information());
         return;
     }
+
+    // Install the shared tracing subscriber (honours EPICS_PVA_LOG /
+    // RUST_LOG) and apply `-d` as a DEBUG bump of the library namespace.
+    // pvxs runs `logger_config_env()` + maps `-d` before any option
+    // action, including `-D` (tools/info.cpp:47-66).
+    epics_pva_rs::log::install_cli_logging(args.debug);
 
     // pvxs `-D` prints host troubleshooting info and exits before any
     // server contact (`tools/info.cpp:62-64`: `target_information();
@@ -198,5 +210,13 @@ mod tests {
             Args::try_parse_from(["pvinfo-rs"]).is_err(),
             "no PV and no -D must be a usage error"
         );
+    }
+
+    /// `-d` parses into a real flag wired to `install_cli_logging`
+    /// (pvxs `pvxinfo -d`, info.cpp:47-66). Default off.
+    #[test]
+    fn debug_flag_parses() {
+        assert!(Args::parse_from(["pvinfo-rs", "-d", "PV"]).debug);
+        assert!(!Args::parse_from(["pvinfo-rs", "PV"]).debug);
     }
 }

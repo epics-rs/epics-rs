@@ -58,6 +58,12 @@ struct Args {
     /// `-v`; the prior Rust CLI rejected it outright.
     #[arg(short = 'v', action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Raise the `epics_pva_rs` library log level to DEBUG. Mirrors pvxs
+    /// `pvxcall -d` mapping to `logger_level_set("pvxs.*",
+    /// Level::Debug)` (`tools/call.cpp:47-64`).
+    #[arg(short = 'd')]
+    debug: bool,
 }
 
 /// Parse a `key=value` pair into a string-valued [`ScalarValue`]. pvxs
@@ -115,6 +121,11 @@ async fn main() {
         print!("{}", epics_pva_rs::cli::version_information());
         return;
     }
+
+    // Install the shared tracing subscriber (honours EPICS_PVA_LOG /
+    // RUST_LOG) and apply `-d` as a DEBUG bump of the library namespace,
+    // mirroring pvxs `logger_config_env()` + `-d` (tools/call.cpp:47-64).
+    epics_pva_rs::log::install_cli_logging(args.debug);
 
     let pv_name = args
         .pv_name
@@ -286,5 +297,13 @@ mod tests {
             epics_pva_rs::cli::rpc_timeout_duration(args.timeout),
             std::time::Duration::from_secs_f64(2.5)
         );
+    }
+
+    /// `-d` parses into a real flag wired to `install_cli_logging`
+    /// (pvxs `pvxcall -d`, call.cpp:47-64). Default off.
+    #[test]
+    fn debug_flag_parses() {
+        assert!(Args::parse_from(["pvcall-rs", "-d", "svc"]).debug);
+        assert!(!Args::parse_from(["pvcall-rs", "svc"]).debug);
     }
 }

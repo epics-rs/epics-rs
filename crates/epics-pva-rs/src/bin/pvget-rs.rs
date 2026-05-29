@@ -49,6 +49,13 @@ struct Args {
     /// option. Accepted for legacy CLI compatibility, but has no effect.
     #[arg(short = 'q')]
     quiet: bool,
+
+    /// Raise the `epics_pva_rs` library log level to DEBUG. Mirrors pvxs
+    /// `pvxget -d` mapping to `logger_level_set("pvxs.*", Level::Debug)`
+    /// (`tools/get.cpp:47-70`). Combine with `EPICS_PVA_LOG`/`RUST_LOG`
+    /// for finer control; this just raises the library namespace.
+    #[arg(short = 'd')]
+    debug: bool,
 }
 
 #[tokio::main]
@@ -61,6 +68,12 @@ async fn main() {
         print!("{}", cli::version_information());
         return;
     }
+
+    // Install the shared tracing subscriber (honours EPICS_PVA_LOG /
+    // RUST_LOG) and apply `-d` as a DEBUG bump of the library namespace.
+    // pvxs runs `logger_config_env()` + maps `-d` to a debug level set
+    // here, before any operation (tools/get.cpp:47-70).
+    epics_pva_rs::log::install_cli_logging(args.debug);
 
     // pvxs `-v` prints the effective client config once, before any
     // operation (tools/get.cpp:99-100). It is a diagnostic, not an
@@ -170,5 +183,14 @@ mod tests {
     fn empty_request_is_default_get() {
         let args = Args::parse_from(["pvget-rs", "PV"]);
         assert!(args.request.trim().is_empty());
+    }
+
+    /// `-d` parses into a real flag wired to `install_cli_logging`
+    /// (pvxs `pvxget -d` raises the library log level, get.cpp:47-70).
+    /// It must default off so ordinary runs stay quiet.
+    #[test]
+    fn debug_flag_parses() {
+        assert!(Args::parse_from(["pvget-rs", "-d", "PV"]).debug);
+        assert!(!Args::parse_from(["pvget-rs", "PV"]).debug);
     }
 }

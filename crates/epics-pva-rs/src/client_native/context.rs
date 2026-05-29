@@ -307,6 +307,62 @@ struct ClientInner {
 static SHARED_SEARCH_ENGINE: tokio::sync::OnceCell<SearchEngine> =
     tokio::sync::OnceCell::const_new();
 
+/// Apply a [`CacheAction`] to the channel map, returning the channels that were
+/// removed so the caller can close `Disconnect`ed ones after releasing the map
+/// lock. An empty `pv_name` is the pvxs wildcard over every cached name
+/// (client.cpp:1341-1348). `Clean` keeps channels that still have a live
+/// external reference (`Arc::strong_count > 1`, the analog of pvxs
+/// `use_count > 1`); `Drop`/`Disconnect` remove unconditionally
+/// (client.cpp:1350-1366).
+fn apply_cache_action(
+    chans: &mut HashMap<String, Arc<Channel>>,
+    pv_name: &str,
+    action: CacheAction,
+) -> Vec<Arc<Channel>> {
+    let names: Vec<String> = if pv_name.is_empty() {
+        chans.keys().cloned().collect()
+    } else {
+        vec![pv_name.to_string()]
+    };
+    let mut removed = Vec::new();
+    for name in names {
+        if action == CacheAction::Clean {
+            if let Some(c) = chans.get(&name) {
+                // The map's own `Arc` is the single expected reference; any
+                // extra clone means an in-use channel that `Clean` preserves.
+                if Arc::strong_count(c) > 1 {
+                    continue;
+                }
+            }
+        }
+        if let Some(ch) = chans.remove(&name) {
+            removed.push(ch);
+        }
+    }
+    removed
+}
+
+/// Cache-maintenance action for [`PvaClient::cache_clear_action`]. Mirrors
+/// pvxs `Context::cacheAction` (client.h:576-591), which distinguishes three
+/// behaviors that a single string-only `cache_clear` could not express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheAction {
+    /// Remove only channels that are no longer in use (no live external
+    /// `Arc<Channel>` beyond the cache's own, i.e. `use_count <= 1`), leaving
+    /// in-use channels connected and reusable. pvxs default (client.cpp:1350-1357).
+    #[default]
+    Clean,
+    /// Remove channels unconditionally so they will not be reused, but leave
+    /// any in-progress operations running on the detached channel
+    /// (client.cpp:1358-1366).
+    Drop,
+    /// Like [`CacheAction::Drop`], and additionally close each removed channel
+    /// so its operation waiters, connect watchers, and monitor loops observe a
+    /// disconnect transition — the analog of pvxs `trash->disconnect(trash)`
+    /// (client.cpp:1367-1369).
+    Disconnect,
+}
+
 #[derive(Clone)]
 pub struct PvaClient {
     inner: Arc<ClientInner>,
@@ -721,13 +777,43 @@ impl PvaClient {
         }
     }
 
-    /// Drop cached state for `pv_name`: cancels any in-flight search,
-    /// removes the channel from the local map, and forces the next
-    /// operation to start a fresh search round. Mirrors pvxs
-    /// `Context::cacheClear` (client.cpp:440). Use when an IOC moved
-    /// servers and the cached connection target is stale.
+    /// Drop cached state for `pv_name` using the default pvxs `Clean` action:
+    /// only channels with no live external reference are removed, in-use
+    /// channels are preserved, and the matching pending search (if any) is
+    /// cancelled. Mirrors pvxs `Context::cacheClear` (client.cpp:441-451),
+    /// whose default `cacheAction` is `Clean`.
+    ///
+    /// Pass an empty `pv_name` to sweep every cached name (the pvxs wildcard).
+    /// For `Drop`/`Disconnect` semantics use [`PvaClient::cache_clear_action`].
     pub async fn cache_clear(&self, pv_name: &str) {
-        self.inner.channels.write().remove(pv_name);
+        self.cache_clear_action(pv_name, CacheAction::Clean).await;
+    }
+
+    /// Cache maintenance with explicit pvxs [`CacheAction`] semantics.
+    ///
+    /// `pv_name` empty is a wildcard over the whole channel map and pending
+    /// search map (pvxs `cacheClean` skips the name filter when `name.empty()`,
+    /// client.cpp:1341-1348). The channel-map effect is governed by `action`:
+    /// `Clean` keeps in-use channels, `Drop` removes unconditionally, and
+    /// `Disconnect` additionally closes each removed channel so in-progress
+    /// operations observe the disconnect (client.cpp:1350-1369). The pending
+    /// search for the name(s) is always cancelled regardless of `action`.
+    pub async fn cache_clear_action(&self, pv_name: &str, action: CacheAction) {
+        // Collect the channels to remove under the map lock, then release it
+        // before closing any of them: `Channel::close()` takes the channel's
+        // own state lock, and we must not hold the map write-lock across that.
+        let closed: Vec<Arc<Channel>> = {
+            let mut chans = self.inner.channels.write();
+            apply_cache_action(&mut chans, pv_name, action)
+        };
+        if action == CacheAction::Disconnect {
+            // Route the disconnect through the channel owner so operation
+            // waiters, connect watchers, and monitor loops observe the same
+            // Closed transition as a server-side detach.
+            for ch in &closed {
+                ch.close();
+            }
+        }
         if let Ok(engine) = self.search_engine().await {
             engine.cache_clear(pv_name).await;
         }
@@ -1942,6 +2028,87 @@ impl Drop for ConnectHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── cache_clear CacheAction policy (pvxs Clean/Drop/Disconnect) ─────────
+
+    fn cache_test_channel(name: &str) -> Arc<Channel> {
+        let addr: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        Arc::new(Channel::new_direct(
+            name.to_string(),
+            "user".into(),
+            "host".into(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            ConnectionPool::new(),
+            addr,
+        ))
+    }
+
+    #[test]
+    fn cache_action_clean_keeps_in_use_removes_unused() {
+        let mut chans: HashMap<String, Arc<Channel>> = HashMap::new();
+        chans.insert("unused".into(), cache_test_channel("unused"));
+        let in_use = cache_test_channel("in_use");
+        chans.insert("in_use".into(), Arc::clone(&in_use)); // extra live ref
+
+        // Wildcard Clean over the whole map.
+        let removed = apply_cache_action(&mut chans, "", CacheAction::Clean);
+        assert!(
+            !chans.contains_key("unused"),
+            "Clean removes a channel with no live external reference"
+        );
+        assert!(
+            chans.contains_key("in_use"),
+            "Clean preserves an in-use channel (use_count > 1)"
+        );
+        assert_eq!(removed.len(), 1, "only the unused channel is removed");
+    }
+
+    #[test]
+    fn cache_action_drop_removes_in_use_unconditionally() {
+        let mut chans: HashMap<String, Arc<Channel>> = HashMap::new();
+        let in_use = cache_test_channel("pv");
+        chans.insert("pv".into(), Arc::clone(&in_use));
+
+        let removed = apply_cache_action(&mut chans, "pv", CacheAction::Drop);
+        assert!(
+            !chans.contains_key("pv"),
+            "Drop removes an in-use channel unconditionally"
+        );
+        assert_eq!(removed.len(), 1);
+    }
+
+    #[test]
+    fn cache_action_disconnect_removes_and_closes() {
+        use crate::client_native::channel::ChannelState;
+        let mut chans: HashMap<String, Arc<Channel>> = HashMap::new();
+        let in_use = cache_test_channel("pv");
+        chans.insert("pv".into(), Arc::clone(&in_use));
+
+        let removed = apply_cache_action(&mut chans, "pv", CacheAction::Disconnect);
+        assert!(!chans.contains_key("pv"), "Disconnect removes the channel");
+        assert_eq!(removed.len(), 1);
+        // The owner closes Disconnected channels after releasing the map lock;
+        // closing drives the channel into the Closed disconnect transition.
+        for ch in &removed {
+            ch.close();
+        }
+        assert!(
+            matches!(in_use.current_state(), ChannelState::Closed),
+            "Disconnect close() drives the channel to the Closed transition"
+        );
+    }
+
+    #[test]
+    fn cache_action_empty_name_is_wildcard() {
+        let mut chans: HashMap<String, Arc<Channel>> = HashMap::new();
+        chans.insert("a".into(), cache_test_channel("a"));
+        chans.insert("b".into(), cache_test_channel("b"));
+
+        let removed = apply_cache_action(&mut chans, "", CacheAction::Drop);
+        assert!(chans.is_empty(), "empty name sweeps every cached channel");
+        assert_eq!(removed.len(), 2);
+    }
 
     // Regression: a client built with both `share_udp(true)` and a
     // non-empty `name_servers` list must NOT be routed through the

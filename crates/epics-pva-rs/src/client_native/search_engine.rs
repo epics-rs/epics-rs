@@ -1038,8 +1038,17 @@ async fn run_engine(
                 }
                 Some(SearchCommand::CacheClear { pv_name }) => {
                     // Same drop-the-name path as Cancel, but the name
-                    // is the public identifier.
-                    if let Some(sid) = by_name.remove(&pv_name) {
+                    // is the public identifier. An empty name is a
+                    // wildcard over every pending search, matching pvxs
+                    // cacheClean's `name.empty()` skip-the-filter rule
+                    // (client.cpp:1341-1348).
+                    if pv_name.is_empty() {
+                        by_name.clear();
+                        pending.clear();
+                        for bucket in &mut search_buckets {
+                            bucket.clear();
+                        }
+                    } else if let Some(sid) = by_name.remove(&pv_name) {
                         if let Some(p) = pending.remove(&sid) {
                             search_buckets[p.bucket].retain(|x| *x != sid);
                         }

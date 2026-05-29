@@ -14,9 +14,9 @@
 //! re-set `drop_poke = true` so a repeatedly-asked PV stays alive even
 //! between bursts.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::RwLock;
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -44,14 +44,18 @@ pub const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 /// well below typical heap/socket budgets.
 pub const DEFAULT_MAX_ENTRIES: usize = 50_000;
 
-/// Negative-result LRU bound + TTL. After a `lookup` fails (timeout
-/// or upstream error), we record the name with a timestamp so the
-/// next ~30 s of `has_pv` / `is_writable` probes for the same name
-/// short-circuit to "not found" instead of re-spawning an upstream
-/// monitor task. Mirrors p2pApp `chancache.h:118` `dropPoke`
-/// semantics but bounded so a probe-storm cannot grow it forever.
-const NEG_CACHE_MAX: usize = 1024;
-const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
+// No negative-result cache: pva2pva's `ChannelCache::lookup`
+// (`p2pApp/chancache.cpp:166-206`) keeps a failed/not-yet-connected
+// name as a LIVE cache entry whose upstream channel observes a later
+// connection — it has no negative-admission table that suppresses
+// re-probing for a fixed TTL. A 30 s negative LRU here made a PV that
+// appears shortly after a failed search stay "not found" until the TTL
+// lapsed or an operator dropped the name (BRIDGE-RS-2026-05-28-87). The
+// probe-storm DoS the LRU originally guarded was structurally closed
+// separately: existence probes (`has_pv` / `get_introspection`) no
+// longer spawn upstream monitor tasks (they issue one-shot
+// `pvconnect` / `pvinfo`), and a failed `lookup` removes its fresh
+// entry immediately via the `CleanupGuard` rather than pinning a task.
 
 /// Per-PV upstream entry. One entry → one upstream channel → one
 /// upstream monitor task → N downstream subscribers via broadcast.
@@ -516,12 +520,6 @@ pub struct ChannelCache {
     /// monitor tasks. New inserts past this limit return
     /// `GwError::CacheFull` so the downstream sees a clean error.
     max_entries: usize,
-    /// Bounded LRU of recently-failed lookups (name + when failure
-    /// was recorded). VecDeque + linear scan is fine at NEG_CACHE_MAX
-    /// = 1024 entries; we trade a constant-factor cost for not
-    /// pulling in an LRU crate. Entries past NEG_CACHE_TTL are
-    /// pruned lazily on the next negative-cache hit.
-    negative_cache: parking_lot::Mutex<VecDeque<(String, Instant)>>,
 }
 
 impl ChannelCache {
@@ -546,7 +544,6 @@ impl ChannelCache {
             entries: Arc::new(Mutex::new(HashMap::new())),
             cleanup_task: parking_lot::Mutex::new(None),
             max_entries,
-            negative_cache: parking_lot::Mutex::new(VecDeque::with_capacity(NEG_CACHE_MAX)),
         });
         let weak = Arc::downgrade(&cache);
         let task = tokio::spawn(async move {
@@ -560,35 +557,6 @@ impl ChannelCache {
         });
         *cache.cleanup_task.lock() = Some(task);
         cache
-    }
-
-    /// True if `name` is in the negative-result LRU and its entry is
-    /// still within `NEG_CACHE_TTL`. Lazily prunes expired entries.
-    fn is_recently_failed(&self, name: &str) -> bool {
-        let now = Instant::now();
-        let mut neg = self.negative_cache.lock();
-        // Lazy prune (cheap at 1024 entries).
-        while let Some((_, t)) = neg.front() {
-            if now.duration_since(*t) >= NEG_CACHE_TTL {
-                neg.pop_front();
-            } else {
-                break;
-            }
-        }
-        neg.iter().any(|(n, _)| n == name)
-    }
-
-    /// Record `name` as recently-failed. FIFO eviction past
-    /// [`NEG_CACHE_MAX`].
-    fn record_failure(&self, name: &str) {
-        let mut neg = self.negative_cache.lock();
-        if neg.iter().any(|(n, _)| n == name) {
-            return; // already there
-        }
-        if neg.len() >= NEG_CACHE_MAX {
-            neg.pop_front();
-        }
-        neg.push_back((name.to_string(), Instant::now()));
     }
 
     /// Public accessor for the underlying client. Used by the source
@@ -626,12 +594,15 @@ impl ChannelCache {
     /// happens AFTER the lock is released so the lock is never held
     /// across the network round-trip.
     ///
-    /// **Negative-result handling**: if the upstream never delivers a
+    /// **Not-connected handling**: if the upstream never delivers a
     /// first event within `connect_timeout`, the freshly-inserted
     /// entry is removed before returning the error. This prevents a
     /// search storm vector where a typo'd PV name would otherwise
-    /// pin an upstream-monitor task on every `has_pv` call until the
-    /// next 30 s cleanup tick (review §3f).
+    /// pin an upstream-monitor task on every call until the next 30 s
+    /// cleanup tick (review §3f). A subsequent lookup for the same name
+    /// re-probes upstream — there is no negative-admission TTL that
+    /// would keep a now-available PV "not found" (pva2pva parity, see
+    /// the module-level note; BRIDGE-RS-2026-05-28-87).
     ///
     /// **Cancel safety**: cleanup of the freshly-inserted entry uses
     /// a drop guard so an awaiting future being cancelled
@@ -642,12 +613,6 @@ impl ChannelCache {
         pv_name: &str,
         connect_timeout: Duration,
     ) -> GwResult<Arc<UpstreamEntry>> {
-        // Negative-result short-circuit: if this name failed recently
-        // we don't pay for another upstream search. Saves a per-name
-        // upstream-monitor task in probe-storm scenarios.
-        if self.is_recently_failed(pv_name) {
-            return Err(GwError::UpstreamTimeout(pv_name.to_string()));
-        }
         let (entry, was_fresh) = {
             let mut map = self.entries.lock().await;
             if let Some(existing) = map.get(pv_name) {
@@ -698,12 +663,11 @@ impl ChannelCache {
                 if !self.armed {
                     return;
                 }
-                // also record a negative-cache hit so a
+                // Remove the fresh-but-unconnected entry so a
                 // cancellation race (caller's outer timeout / abort
-                // dropping the future before await_first_event
-                // returns Err) doesn't leave the next lookup
-                // re-spawning the same upstream search immediately.
-                self.cache.record_failure(self.pv_name);
+                // dropping the future before await_first_event returns)
+                // does not pin an upstream-monitor task. A later lookup
+                // re-probes from scratch.
                 if let Ok(mut map) = self.cache.entries.try_lock() {
                     map.remove(self.pv_name);
                     return;
@@ -732,11 +696,9 @@ impl ChannelCache {
                 Ok(e)
             }
             Err(e) => {
-                // Negative-result LRU: record so a probe-storm of N
-                // bad names doesn't keep paying the connect_timeout
-                // cost. Guard still fires on drop to remove the
-                // pinned entry.
-                self.record_failure(pv_name);
+                // Guard fires on drop to remove the unconnected entry.
+                // No negative-result record: the next lookup re-probes
+                // upstream (pva2pva parity, BRIDGE-RS-2026-05-28-87).
                 Err(e)
             }
         }

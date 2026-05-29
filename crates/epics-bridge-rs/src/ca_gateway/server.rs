@@ -495,10 +495,14 @@ impl GatewayServer {
     /// "first creator wins": a host an allowed peer already cached the PV
     /// for could then create a channel to it. This gate closes that
     /// short-circuit — the database consults it before returning a cached
-    /// shadow PV — so host-scoped admission is re-evaluated on every
+    /// shadow PV — so per-request admission is re-evaluated on every
     /// request, parity with C ca-gateway re-running
-    /// `gateAs::findEntry(pvname, host)` on each `pvExistTest`
-    /// (gateServer.cc:1516-1545).
+    /// `gateAs::findEntry(pvname, host)` and inspecting cache state on each
+    /// `pvExistTest` (gateServer.cc:1516-1637). The gate enforces two
+    /// things a cached shadow PV must satisfy to be advertised: (1)
+    /// host-scoped `.pvlist` admission for the requester, and (2) an
+    /// existent upstream connection state (`Inactive`/`Active`) — a
+    /// disconnected shadow PV answers does-not-exist without being removed.
     ///
     /// Called once during build().
     async fn install_existence_gate(&self) {
@@ -515,21 +519,38 @@ impl GatewayServer {
                     // Stats / heartbeat PVs are not gateway-managed (they
                     // are published straight into the shadow DB and never
                     // enter the upstream cache); they always exist and are
-                    // not subject to `.pvlist` admission.
-                    if cache.read().await.get(&name).is_none() {
-                        return true;
-                    }
+                    // subject to neither `.pvlist` admission nor upstream
+                    // connection state.
+                    let entry = match cache.read().await.get(&name) {
+                        Some(e) => e,
+                        None => return true,
+                    };
                     // Gateway-managed shadow PV: re-run host-scoped
                     // `.pvlist` admission for this requester. A host-less
                     // internal lookup (`peer: None`) falls back to the
                     // global rule decision, matching the search resolver.
-                    let pvlist = pvlist.load_full();
-                    match peer {
-                        Some(addr) => pvlist
-                            .match_name_for_host(&name, &addr.ip().to_string())
-                            .is_some(),
-                        None => pvlist.match_name(&name).is_some(),
+                    let admitted = {
+                        let pvlist = pvlist.load_full();
+                        match peer {
+                            Some(addr) => pvlist
+                                .match_name_for_host(&name, &addr.ip().to_string())
+                                .is_some(),
+                            None => pvlist.match_name(&name).is_some(),
+                        }
+                    };
+                    if !admitted {
+                        return false;
                     }
+                    // Upstream connection state: a disconnected shadow PV
+                    // must answer does-not-exist. C `pvExistTest` replies
+                    // `pverExistsHere` only for `gatePvInactive` /
+                    // `gatePvActive`; `gatePvDisconnect` (and Connecting /
+                    // Dead) reply `pverDoesNotExistHere`
+                    // (gateServer.cc:1618-1637). The shadow PV stays in the
+                    // database (its cached value remains for diagnostics),
+                    // but the gate hides it until the upstream monitor
+                    // reconnects and flips the state back to existent.
+                    entry.read().await.state.is_existent()
                 })
             },
         );
@@ -1079,6 +1100,71 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn existence_gate_hides_disconnected_shadow_pv() {
+        // A shadow PV whose upstream has disconnected must answer
+        // does-not-exist to a new search/create even though the PV remains
+        // in `simple_pvs` and the requesting host is allowed — parity with
+        // C pvExistTest returning pverDoesNotExistHere for gatePvDisconnect.
+        use std::net::SocketAddr;
+
+        let config = GatewayConfig {
+            pvlist_content: Some("PV.* ALLOW\n".to_string()),
+            ..Default::default()
+        };
+        let server = GatewayServer::build(config).await.unwrap();
+        server
+            .shadow_db
+            .add_pv("PV:y", epics_base_rs::types::EpicsValue::Double(0.0))
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "192.0.2.5:5064".parse().unwrap();
+
+        // Connected (Active): the allowed host is served.
+        {
+            let mut cache = server.cache.write().await;
+            cache
+                .get_or_create("PV:y")
+                .write()
+                .await
+                .set_state(crate::ca_gateway::PvState::Active);
+        }
+        assert!(server.shadow_db.has_name_from("PV:y", Some(peer)).await);
+
+        // Upstream disconnects: still in simple_pvs, host still allowed,
+        // but the cache state is now Disconnect → does-not-exist.
+        {
+            let cache = server.cache.read().await;
+            cache
+                .get("PV:y")
+                .unwrap()
+                .write()
+                .await
+                .set_state(crate::ca_gateway::PvState::Disconnect);
+        }
+        assert!(!server.shadow_db.has_name_from("PV:y", Some(peer)).await);
+        assert!(
+            server
+                .shadow_db
+                .find_entry_from("PV:y", Some(peer))
+                .await
+                .is_none()
+        );
+
+        // Reconnect (Inactive): advertised again without re-registration.
+        {
+            let cache = server.cache.read().await;
+            cache
+                .get("PV:y")
+                .unwrap()
+                .write()
+                .await
+                .set_state(crate::ca_gateway::PvState::Inactive);
+        }
+        assert!(server.shadow_db.has_name_from("PV:y", Some(peer)).await);
     }
 
     #[tokio::test]

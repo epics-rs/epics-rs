@@ -57,6 +57,32 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     port: u16,
 
+    /// Downstream listen-interface list (C `-sip`): sets
+    /// `EPICS_CAS_INTF_ADDR_LIST` so the gateway's CA server binds only the
+    /// given interfaces. Space-separated, EPICS env-list syntax.
+    #[arg(long)]
+    sip: Option<String>,
+
+    /// Downstream ignore-address list (C `-signore`): sets
+    /// `EPICS_CAS_IGNORE_ADDR_LIST` so searches from these addresses are
+    /// dropped. Space-separated.
+    #[arg(long)]
+    signore: Option<String>,
+
+    /// Upstream search-address list (C `-cip`): sets `EPICS_CA_ADDR_LIST`
+    /// for the gateway's upstream CA client AND forces
+    /// `EPICS_CA_AUTO_ADDR_LIST=NO`, so the gateway searches only the named
+    /// IOC domain and never broadcasts back onto its own downstream
+    /// segment. Space-separated.
+    #[arg(long)]
+    cip: Option<String>,
+
+    /// Upstream CA search port (C `-cport`): sets `EPICS_CA_SERVER_PORT`
+    /// for the gateway's upstream client, letting it search an IOC domain
+    /// on a non-default port.
+    #[arg(long)]
+    cport: Option<u16>,
+
     /// Read-only mode: reject all puts.
     #[arg(long)]
     read_only: bool,
@@ -254,8 +280,44 @@ async fn run_once(config: GatewayConfig) -> Result<(), String> {
         .map_err(|e| format!("runtime error: {e}"))
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let args = Args::parse();
+
+    // Apply C ca-gateway's split network routing (-sip/-signore/-cip/-cport)
+    // by exporting the EPICS env vars `startEverything` sets
+    // (gateway.cc:359-402) BEFORE the tokio runtime spawns worker threads,
+    // so the downstream CaServer (EPICS_CAS_*) and upstream CaClient
+    // (EPICS_CA_*) read them at construction. Distinct namespaces => the
+    // two sides cannot collide. Done here, while the process is still
+    // single-threaded, to satisfy `set_var`'s safety contract.
+    let routing = epics_bridge_rs::ca_gateway::routing_env_pairs(
+        args.sip.as_deref(),
+        args.signore.as_deref(),
+        args.cip.as_deref(),
+        args.cport,
+    );
+    // SAFETY: no runtime threads exist yet — the multi-thread tokio runtime
+    // is built below, after this loop returns.
+    unsafe {
+        for (key, value) in &routing {
+            std::env::set_var(key, value);
+        }
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("ca-gateway-rs: failed to build tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> ExitCode {
     // Initialize structured logging — RUST_LOG controls verbosity. The
     // gateway's hot paths (cache eviction, command processing, signal
     // handler, conn-event dispatch) all emit via `tracing` so a
@@ -266,8 +328,6 @@ async fn main() -> ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .try_init();
-
-    let args = Args::parse();
 
     let config = GatewayConfig {
         pvlist_path: args.pvlist.clone(),

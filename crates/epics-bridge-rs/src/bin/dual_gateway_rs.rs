@@ -81,6 +81,27 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     ca_port: u16,
 
+    /// CA gateway: downstream listen-interface list (C `-sip`), sets
+    /// `EPICS_CAS_INTF_ADDR_LIST`. Space-separated.
+    #[arg(long)]
+    ca_sip: Option<String>,
+
+    /// CA gateway: downstream ignore-address list (C `-signore`), sets
+    /// `EPICS_CAS_IGNORE_ADDR_LIST`. Space-separated.
+    #[arg(long)]
+    ca_signore: Option<String>,
+
+    /// CA gateway: upstream search-address list (C `-cip`), sets
+    /// `EPICS_CA_ADDR_LIST` AND forces `EPICS_CA_AUTO_ADDR_LIST=NO` for the
+    /// upstream client. Space-separated.
+    #[arg(long)]
+    ca_cip: Option<String>,
+
+    /// CA gateway: upstream CA search port (C `-cport`), sets
+    /// `EPICS_CA_SERVER_PORT` for the upstream client.
+    #[arg(long)]
+    ca_cport: Option<u16>,
+
     /// CA gateway: read-only mode (rejects all puts).
     #[arg(long)]
     ca_read_only: bool,
@@ -205,6 +226,10 @@ struct CaSection {
     preload: Option<PathBuf>,
     command: Option<PathBuf>,
     port: Option<u16>,
+    sip: Option<String>,
+    signore: Option<String>,
+    cip: Option<String>,
+    cport: Option<u16>,
     read_only: Option<bool>,
     stats_prefix: Option<String>,
     heartbeat_interval: Option<u64>,
@@ -249,6 +274,10 @@ fn default_config_toml() -> &'static str {
 # preload = "/etc/gw/preload.txt"
 # command = "/etc/gw/command.cmd"      # SIGUSR1-triggered (Unix)
 # port = 5064
+# sip = "192.168.1.10"                   # -sip: EPICS_CAS_INTF_ADDR_LIST
+# signore = "192.168.9.0"                # -signore: EPICS_CAS_IGNORE_ADDR_LIST
+# cip = "10.0.0.1 10.0.0.2"              # -cip: EPICS_CA_ADDR_LIST (+AUTO=NO)
+# cport = 5066                           # -cport: EPICS_CA_SERVER_PORT
 # read_only = false
 # stats_prefix = "gateway"               # bare namespace; ':' added at publish
 # heartbeat_interval = 1
@@ -417,6 +446,18 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile) {
             args.ca_port = p;
         }
     }
+    if args.ca_sip.is_none() {
+        args.ca_sip = cfg.ca.sip.clone();
+    }
+    if args.ca_signore.is_none() {
+        args.ca_signore = cfg.ca.signore.clone();
+    }
+    if args.ca_cip.is_none() {
+        args.ca_cip = cfg.ca.cip.clone();
+    }
+    if args.ca_cport.is_none() {
+        args.ca_cport = cfg.ca.cport;
+    }
     if !args.ca_read_only {
         if let Some(true) = cfg.ca.read_only {
             args.ca_read_only = true;
@@ -511,8 +552,7 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile) {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let mut args = Args::parse();
     init_tracing(args.verbose);
 
@@ -536,6 +576,42 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Apply the CA gateway's split network routing (-sip/-signore/-cip/-cport)
+    // by exporting the EPICS env vars C's `startEverything` sets
+    // (gateway.cc:359-402) BEFORE the tokio runtime spawns worker threads, so
+    // the downstream CaServer (EPICS_CAS_*) and upstream CaClient (EPICS_CA_*)
+    // read them at construction. Only when the CA side is enabled; the PVA
+    // side uses the EPICS_PVA_* namespace and is unaffected.
+    if !args.no_ca {
+        let routing = epics_bridge_rs::ca_gateway::routing_env_pairs(
+            args.ca_sip.as_deref(),
+            args.ca_signore.as_deref(),
+            args.ca_cip.as_deref(),
+            args.ca_cport,
+        );
+        // SAFETY: still single-threaded — the multi-thread runtime is built
+        // on the next statement, after this loop returns.
+        unsafe {
+            for (key, value) in &routing {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("dual-gateway-rs: failed to build tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> ExitCode {
     tracing::info!(
         ca_enabled = !args.no_ca,
         pva_enabled = !args.no_pva,

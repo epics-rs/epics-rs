@@ -1781,23 +1781,29 @@ fn handle_beacon(
 }
 
 fn rewrite_loopback(addr: SocketAddr, peer: SocketAddr) -> SocketAddr {
-    if addr.ip().is_unspecified() || addr.ip().is_loopback() {
-        if !peer.ip().is_loopback() {
-            SocketAddr::new(peer.ip(), addr.port())
-        } else {
-            // PR #205 IPv6 Stage 4: when both ends are loopback, mirror
-            // the peer's family rather than hard-coding `127.0.0.1`.
-            // For a v6 SEARCH that arrived from `[::1]` the resolved
-            // address must stay on `[::1]` so the subsequent TCP
-            // connect targets the v6 listener.
-            let lo = match peer.ip() {
-                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-            };
-            SocketAddr::new(lo, addr.port())
-        }
+    // pvxs `procSearchReply` (client.cpp:851-870) substitutes the
+    // datagram source address ONLY when the advertised server address is
+    // wildcard/unspecified (`serv.isAny()`). An explicit address is taken
+    // verbatim — there is no `is_loopback()` rewrite upstream. Rewriting
+    // an explicit `127.0.0.1` / `::1` would turn a deliberately
+    // loopback-only advertisement into a remote connection attempt that
+    // pvxs never makes, and would diverge the chosen endpoint on hosts
+    // where the peer also listens on the rewritten address.
+    if !addr.ip().is_unspecified() {
+        return addr;
+    }
+    if !peer.ip().is_loopback() {
+        SocketAddr::new(peer.ip(), addr.port())
     } else {
-        addr
+        // PR #205 IPv6 Stage 4: a wildcard advertisement from a loopback
+        // peer resolves to loopback of the peer's family rather than a
+        // hard-coded `127.0.0.1`, so a v6 SEARCH from `[::1]` targets the
+        // v6 listener.
+        let lo = match peer.ip() {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        };
+        SocketAddr::new(lo, addr.port())
     }
 }
 
@@ -2129,19 +2135,21 @@ mod tests {
         assert_eq!(r, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5075));
     }
 
-    // Extends pvxs `procSearchReply`, which only rewrites `isAny()`. A
-    // pvAccessCPP server bound via `EPICS_PVAS_INTF_ADDR_LIST=127.0.0.1`
-    // emits a literal 127.0.0.1 in its search reply; treat the wire
-    // address as unreliable when the UDP packet came from a non-loopback
-    // peer.
+    // PVA-RS-2026-05-28-123: pvxs `procSearchReply` rewrites ONLY
+    // `isAny()` (wildcard/unspecified) — never an explicit address. An
+    // explicit `127.0.0.1` advertised in a SEARCH_RESPONSE that arrives
+    // from a non-loopback peer must be PRESERVED, not rewritten to the
+    // packet source; rewriting it would dial a remote endpoint pvxs
+    // would not. (This previously asserted the opposite, divergent
+    // behavior.)
     #[test]
-    fn rewrite_loopback_explicit_loopback_overridden_by_remote_peer() {
+    fn rewrite_loopback_explicit_loopback_preserved_from_remote_peer() {
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5075);
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5076);
         let r = rewrite_loopback(a, peer);
         assert_eq!(
-            r,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5075)
+            r, a,
+            "an explicit loopback advertisement must be used verbatim (pvxs parity)"
         );
     }
 

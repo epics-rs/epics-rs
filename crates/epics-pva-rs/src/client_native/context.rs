@@ -841,9 +841,12 @@ impl PvaClient {
     }
 
     /// Replace the server-GUID blocklist used by the search engine.
-    /// Beacons and search responses from any listed GUID are silently
-    /// dropped. Mirrors pvxs `Context::ignoreServerGUIDs`
-    /// (client.cpp:453). Pass an empty `Vec` to clear the list.
+    /// SEARCH_RESPONSE frames (including discovery pongs) from a listed
+    /// GUID are silently dropped; BEACONs from that server are still
+    /// reported through `discover()` and still drive reconnect pokes.
+    /// Mirrors pvxs `Context::ignoreServerGUIDs` — "Ignore any search
+    /// replies with these GUIDs" (client.h:593-595, client.cpp:880).
+    /// Pass an empty `Vec` to clear the list.
     pub async fn ignore_server_guids(&self, guids: Vec<[u8; 12]>) {
         if let Ok(engine) = self.search_engine().await {
             engine.ignore_server_guids(guids).await;

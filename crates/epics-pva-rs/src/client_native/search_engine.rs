@@ -140,10 +140,11 @@ pub enum SearchCommand {
     /// outstanding search if one exists. The next `find()` call
     /// starts a fresh search round. Mirrors pvxs `Context::cacheClear`.
     CacheClear { pv_name: String },
-    /// Replace the GUID blocklist. Beacons / search responses whose
-    /// server GUID matches an entry are silently ignored. Mirrors
-    /// pvxs `Context::ignoreServerGUIDs` (client.cpp:453, consulted
-    /// at procSearchReply client.cpp:857).
+    /// Replace the GUID blocklist. Search responses (including discovery
+    /// pongs) whose server GUID matches an entry are silently dropped;
+    /// BEACONs are NOT filtered. Mirrors pvxs `Context::ignoreServerGUIDs`,
+    /// which is consulted only in procSearchReply (client.cpp:880), never
+    /// in onBeacon (client.cpp:773-847).
     IgnoreServerGuids { guids: Vec<[u8; 12]> },
     /// Send a "discover" SEARCH (no PV names; flags bit
     /// SEARCH_DISCOVER set) to broadcast targets so any reachable
@@ -459,9 +460,12 @@ impl SearchEngine {
             .await;
     }
 
-    /// Set the server-GUID blocklist. Beacons and search responses
-    /// from any server whose GUID is on this list are silently
-    /// ignored. Mirrors pvxs `Context::ignoreServerGUIDs`.
+    /// Set the server-GUID blocklist. SEARCH_RESPONSE frames (including
+    /// discovery pongs) from a server whose GUID is on this list are
+    /// silently dropped; BEACONs from that server still flow into the
+    /// tracker and `discover()` stream. Mirrors pvxs
+    /// `Context::ignoreServerGUIDs` — "Ignore any search replies with
+    /// these GUIDs" (client.h:593-595), consulted only in procSearchReply.
     pub async fn ignore_server_guids(&self, guids: Vec<[u8; 12]>) {
         let _ = self
             .cmd_tx
@@ -866,8 +870,9 @@ async fn run_engine(
     // tick regardless of how many channels are pending.
     let mut search_buckets: Vec<Vec<u32>> = vec![Vec::new(); N_SEARCH_BUCKETS];
     let mut current_bucket: usize = 0;
-    // Server-GUID blocklist (pvxs `ignoreServerGUIDs`). Beacons and
-    // search responses with a matching GUID are silently dropped.
+    // Server-GUID blocklist (pvxs `ignoreServerGUIDs`). Only SEARCH_RESPONSE
+    // frames (incl. discovery pongs) with a matching GUID are dropped;
+    // BEACONs are not filtered (pvxs onBeacon has no ignore check).
     // HashSet lookup keeps the steady-state cost negligible.
     let mut ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
     // After a `poke()` (fresh server identity discovered) we run one
@@ -1049,9 +1054,13 @@ async fn run_engine(
                     }
                 }
                 Some(SearchCommand::BeaconObserved { server, guid }) => {
-                    if ignore_guids.contains(&guid) {
-                        continue;
-                    }
+                    // pvxs `ignoreServerGUIDs` is a SEARCH_RESPONSE-only
+                    // filter (client.cpp:880, in procSearchReply): a beacon
+                    // from an ignored GUID still runs through `onBeacon()`,
+                    // enters the tracker, fires `Discovered::Online`, and
+                    // pokes pending searches (client.cpp:773-847 has no
+                    // ignore check). So this in-process beacon injection
+                    // does NOT consult the blocklist.
                     let allow_reconnect = beacons.observe(server, guid);
                     // discover() de-dup: announce each (server, guid) pair
                     // exactly once until forgotten.
@@ -1135,13 +1144,12 @@ async fn run_engine(
                 }
                 Some(SearchCommand::IgnoreServerGuids { guids }) => {
                     // Replace (not merge) so callers can also CLEAR
-                    // the list with an empty Vec. Drop tracker entries
-                    // we now want to ignore so a stale GUID doesn't
-                    // keep firing throttle decisions.
+                    // the list with an empty Vec. pvxs `ignoreServerGUIDs`
+                    // (client.cpp:454-460) only stores the vector; it has
+                    // no side effect on beacon tracking or the discovery
+                    // de-dup set, because beacons from ignored GUIDs are
+                    // still announced. So we do NOT prune `announced` here.
                     ignore_guids = guids.into_iter().collect();
-                    if !ignore_guids.is_empty() {
-                        announced.retain(|(_, g)| !ignore_guids.contains(g));
-                    }
                 }
                 Some(SearchCommand::DiscoverPing) => {
                     // pvxs DiscoverBuilder::pingAll wire format
@@ -1223,7 +1231,7 @@ async fn run_engine(
                         let consumed = handle_beacon(
                             &beacon_buf[pos..n], &beacons, &mut pending,
                             &mut subscribers, &mut announced, &mut poke,
-                            &ignore_guids, from,
+                            from,
                         );
                         if consumed == 0 {
                             break;
@@ -1250,7 +1258,7 @@ async fn run_engine(
                         let consumed = handle_beacon(
                             &beacon_buf_v6[pos..n], &beacons, &mut pending,
                             &mut subscribers, &mut announced, &mut poke,
-                            &ignore_guids, from,
+                            from,
                         );
                         if consumed == 0 {
                             break;
@@ -1786,7 +1794,6 @@ fn handle_beacon(
     subscribers: &mut Vec<mpsc::Sender<Discovered>>,
     announced: &mut std::collections::HashSet<(SocketAddr, [u8; 12])>,
     poke_request: &mut bool,
-    ignore_guids: &std::collections::HashSet<[u8; 12]>,
     peer: SocketAddr,
 ) -> usize {
     // Beacons are server-originated — enforce direction bit
@@ -1855,9 +1862,12 @@ fn handle_beacon(
     let resolved_ip = if ip.is_unspecified() { peer.ip() } else { ip };
     let server = SocketAddr::new(resolved_ip, port);
 
-    if ignore_guids.contains(&guid_arr) {
-        return consumed;
-    }
+    // NOTE: pvxs `ignoreServerGUIDs` does NOT filter beacons. `onBeacon()`
+    // (client.cpp:773-847) keys the tracker, fires Discovered::Online, and
+    // pokes regardless of the ignore list; the list is only consulted in
+    // procSearchReply (client.cpp:880). So a beacon from an ignored GUID
+    // still flows through here — it just won't resolve a searched channel
+    // when its SEARCH_RESPONSE is later dropped by the ignore check.
     let allow_reconnect = beacons.observe(server, guid_arr);
     let first_announce = announced.insert((server, guid_arr));
     // pvxs poke() — only kick on FRESH server identity (mirror of the
@@ -2373,6 +2383,104 @@ mod tests {
         }
     }
 
+    /// `ignore_server_guids` is a SEARCH_RESPONSE-only filter, matching
+    /// pvxs (consulted in procSearchReply client.cpp:880, never in
+    /// onBeacon client.cpp:773-847). A found SEARCH_RESPONSE and a
+    /// discovery pong from an ignored GUID are dropped, but a BEACON from
+    /// the same GUID still announces the server and fires
+    /// `Discovered::Online`.
+    #[test]
+    fn ignore_guids_drops_search_replies_not_beacons() {
+        use tokio::sync::oneshot;
+        const IG: [u8; 12] = [0x42u8; 12];
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
+        let ignore: std::collections::HashSet<[u8; 12]> = std::iter::once(IG).collect();
+
+        // (1) found=true SEARCH_RESPONSE with an ignored GUID must NOT
+        // resolve the pending channel.
+        let (tx, _rx) = oneshot::channel::<SocketAddr>();
+        let mut pending: HashMap<u32, Pending> = HashMap::new();
+        pending.insert(
+            1,
+            Pending {
+                pv_name: "dut".into(),
+                responder: Responder::Single(tx),
+                last_attempt: Instant::now(),
+                attempt: 1,
+                bucket: 0,
+            },
+        );
+        let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
+        let beacons = BeaconTracker::new();
+        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
+            std::collections::HashSet::new();
+        let mut poke = false;
+        let found_true =
+            crate::server_native::udp::build_search_response_proto(IG, 0, 5075, &[1], ByteOrder::Little, "tcp");
+        handle_search_response(
+            &found_true, &mut pending, &mut by_name, &beacons, &ignore, &mut subs,
+            &mut announced, &mut poke, peer, false,
+        );
+        assert!(
+            pending.contains_key(&1),
+            "ignored-GUID found SEARCH_RESPONSE must be dropped, not resolved"
+        );
+
+        // (2) found=false discovery pong with an ignored GUID, even with an
+        // active discover() subscriber, must NOT announce.
+        let (txd, _rxd) = mpsc::channel::<Discovered>(8);
+        let mut subs2: Vec<mpsc::Sender<Discovered>> = vec![txd];
+        let mut announced2: std::collections::HashSet<(SocketAddr, [u8; 12])> =
+            std::collections::HashSet::new();
+        let mut poke2 = false;
+        let pong =
+            crate::server_native::udp::build_search_response_proto(IG, 0, 5075, &[], ByteOrder::Little, "tcp");
+        handle_search_response(
+            &pong, &mut pending, &mut by_name, &beacons, &ignore, &mut subs2,
+            &mut announced2, &mut poke2, peer, false,
+        );
+        assert!(
+            announced2.is_empty(),
+            "ignored-GUID discovery pong must be dropped, not announced"
+        );
+
+        // (3) BEACON with the ignored GUID still announces + emits Online.
+        // handle_beacon takes no ignore set — the filter cannot reach it.
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&IG); // guid
+        payload.put_u8(0); // flags
+        payload.put_u8(0); // seq
+        payload.put_u16(0, order); // change
+        payload.extend_from_slice(&[0u8; 16]); // addr wildcard → peer
+        payload.put_u16(5075, order); // port
+        encode_string_into("tcp", order, &mut payload);
+        let header =
+            PvaHeader::application(true, order, Command::Beacon.code(), payload.len() as u32);
+        let mut frame = Vec::new();
+        header.write_into(&mut frame);
+        frame.extend_from_slice(&payload);
+
+        let (txb, mut rxb) = mpsc::channel::<Discovered>(8);
+        let mut subs3: Vec<mpsc::Sender<Discovered>> = vec![txb];
+        let mut announced3: std::collections::HashSet<(SocketAddr, [u8; 12])> =
+            std::collections::HashSet::new();
+        let mut poke3 = false;
+        handle_beacon(
+            &frame, &beacons, &mut pending, &mut subs3, &mut announced3, &mut poke3, peer,
+        );
+        assert_eq!(
+            announced3.len(),
+            1,
+            "ignored-GUID BEACON must still announce the server (pvxs onBeacon has no ignore check)"
+        );
+        assert!(
+            matches!(rxb.try_recv(), Ok(Discovered::Online { guid, .. }) if guid == IG),
+            "ignored-GUID BEACON must still emit Discovered::Online"
+        );
+    }
+
     /// PVA-RS-2026-05-28-114: a found=true SEARCH_RESPONSE is resolved
     /// only when its transport protocol is exactly `"tcp"`. pvxs drops
     /// any other found reply — including an empty/null-marker protocol —
@@ -2514,7 +2622,6 @@ mod tests {
             let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
                 std::collections::HashSet::new();
             let mut poke = false;
-            let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
             handle_beacon(
                 frame,
                 &beacons,
@@ -2522,7 +2629,6 @@ mod tests {
                 &mut subs,
                 &mut announced,
                 &mut poke,
-                &ignore,
                 peer,
             );
             (rx.try_recv().is_ok(), announced.len())

@@ -1729,9 +1729,19 @@ impl<'a> ConnectBuilder<'a> {
         self
     }
 
-    /// Spawn the watcher task. The returned handle owns the task; drop
-    /// it to stop watching. The channel itself stays in the client's
-    /// channel map so other ops can keep using it.
+    /// Spawn the connect operation. The returned handle owns the task;
+    /// drop it to stop watching. The channel itself stays in the
+    /// client's channel map so other ops can keep using it.
+    ///
+    /// Unlike a passive watcher, this actively drives resolution:
+    /// pvxs `Channel::build()` starts initial discovery immediately
+    /// (client.cpp:347-390) — a searchable channel is pushed into the
+    /// initial search bucket, a forced-server channel opens the
+    /// connection and sends `createChannels()`. A background driver
+    /// task calls `ensure_active()` to start (and, across reconnects,
+    /// keep) the connection without issuing any GET/PUT/MONITOR, so
+    /// `connect()` is a self-contained connection primitive instead of
+    /// depending on some other operation to resolve the same channel.
     pub async fn exec(self) -> PvaResult<ConnectHandle> {
         let ch = match self.server {
             Some(addr) => {
@@ -1746,17 +1756,72 @@ impl<'a> ConnectBuilder<'a> {
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_task = cancel.clone();
 
-        let task = tokio::spawn(async move {
-            let mut was_active = false;
+        // Resolution driver: start the search/connect immediately and
+        // re-drive after each disconnect, mirroring pvxs where a built
+        // channel lives in the search ring and reconnects automatically
+        // until the connector is removed. `ensure_active()` for a
+        // missing PV stays pending (no server reply) — that future is
+        // held under the cancel select, so dropping the handle stops it.
+        let ch_drive = ch.clone();
+        let cancel_drive = cancel.clone();
+        let driver = tokio::spawn(async move {
             loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel_drive.cancelled() => break,
+                    r = ch_drive.ensure_active() => {
+                        // Closed / fatal channel: stop driving. A pending
+                        // search (missing PV) never lands here.
+                        if r.is_err() {
+                            break;
+                        }
+                    }
+                }
+                // Connected: wait for the next inactive transition
+                // before re-driving so we don't spin while Active.
+                tokio::select! {
+                    biased;
+                    _ = cancel_drive.cancelled() => break,
+                    _ = ch_drive.wait_until_inactive() => {}
+                }
+            }
+        });
+
+        let task = tokio::spawn(async move {
+            // pvxs invokes the initial callback right after building the
+            // channel: `onConnect` if already active, otherwise
+            // `onDisconnect` once (client.cpp:274-282). A fresh channel
+            // is Idle, so a searchable connect fires `on_disconnect`
+            // first — the previous passive watcher fired nothing for the
+            // initial not-connected state.
+            let mut was_active = ch.is_active();
+            if was_active {
+                if let Some(cb) = &on_connect {
+                    cb();
+                }
+            } else if let Some(cb) = &on_disconnect {
+                cb();
+            }
+
+            loop {
+                // Register the wakeup futures BEFORE re-sampling state:
+                // `state_changed` uses `notify_waiters()` (no stored
+                // permit), so a transition racing between the sample and
+                // the await would be lost otherwise. `enable()` registers
+                // the waiter eagerly — same idiom as
+                // `Channel::wait_until_inactive`.
+                let state_n = ch.state_changed.notified();
+                let destroyed_n = ch.server_destroyed_notify().notified();
+                tokio::pin!(state_n);
+                tokio::pin!(destroyed_n);
+                state_n.as_mut().enable();
+                destroyed_n.as_mut().enable();
+
                 // Use `is_active()` (not the raw `ChannelState::Active`
-                // pattern) so a server-initiated CMD_DESTROY_CHANNEL
-                // — which sets `server_destroyed` without firing
-                // `state_changed` — flips us to `active_now = false`
-                // and lets `on_disconnect` run. Without this the
-                // watcher kept reporting Active until the next
-                // ensure_active(), so user-installed disconnect
-                // callbacks missed the destroy event entirely.
+                // pattern) so a server-initiated CMD_DESTROY_CHANNEL —
+                // which sets `server_destroyed` without firing
+                // `state_changed` — flips us to `active_now = false` and
+                // lets `on_disconnect` run.
                 let active_now = ch.is_active();
                 if active_now && !was_active {
                     if let Some(cb) = &on_connect {
@@ -1770,15 +1835,18 @@ impl<'a> ConnectBuilder<'a> {
                 was_active = active_now;
 
                 tokio::select! {
-                    _ = ch.state_changed.notified() => {}
+                    _ = state_n => {}
                     // server_destroyed_notify is the explicit DESTROY
-                    // signal; without this arm the watcher stays
-                    // blocked on state_changed even after the flag
-                    // flips.
-                    _ = ch.server_destroyed_notify().notified() => {}
+                    // signal; without this arm the watcher stays blocked
+                    // on state_changed even after the flag flips.
+                    _ = destroyed_n => {}
                     _ = cancel_task.cancelled() => break,
                 }
             }
+            // Tear the resolution driver down with the watcher (it also
+            // observes the shared cancel token, so this is belt-and-
+            // suspenders).
+            driver.abort();
         });
 
         Ok(ConnectHandle {
@@ -1941,5 +2009,55 @@ mod tests {
             get_elapsed >= op_timeout,
             "pvget_with_request must wait the op timeout, got {get_elapsed:?}"
         );
+    }
+
+    /// Regression for PVA-RS-2026-05-28-48: `ConnectBuilder::exec()`
+    /// must fire the pvxs initial callback for the not-yet-connected
+    /// channel WITHOUT depending on a separate GET/PUT/MONITOR
+    /// operation. pvxs fires `onDisconnect` right after `Channel::build`
+    /// when the channel is not yet active (client.cpp:274-282); the old
+    /// passive watcher fired nothing for the initial idle state and only
+    /// produced events if some other op happened to resolve the channel.
+    ///
+    /// A forced-server connect to an address with no server keeps the
+    /// channel Idle, so no `on_connect` can race in — the only callback
+    /// expected is the initial `on_disconnect`, and it must arrive with
+    /// no other operation issued on the client.
+    #[tokio::test]
+    async fn pva_rs_48_connect_fires_initial_on_disconnect_without_other_op() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let client = PvaClient::builder()
+            .timeout(Duration::from_millis(300))
+            .build();
+
+        let fired = std::sync::Arc::new(AtomicUsize::new(0));
+        let f = fired.clone();
+        let handle = client
+            .connect("PVA48:NOOP")
+            .server(dead)
+            .on_disconnect(move || {
+                f.fetch_add(1, Ordering::SeqCst);
+            })
+            .exec()
+            .await
+            .expect("connect builder");
+
+        // No pvget/pvput/monitor is issued. The initial on_disconnect
+        // must still fire promptly. Pre-fix `fired` stayed 0 forever.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if fired.load(Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial on_disconnect must fire without a separate operation");
+
+        drop(handle);
     }
 }

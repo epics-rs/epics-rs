@@ -54,7 +54,7 @@ use crate::error::{BridgeError, BridgeResult};
 
 use super::access::AccessConfig;
 use super::cache::{PvCache, PvState};
-use super::putlog::{PutLog, PutOutcome};
+use super::putlog::{PutLog, PutLogScope, PutOutcome};
 use super::pvlist::PvList;
 use super::stats::Stats;
 
@@ -168,6 +168,10 @@ struct WriteHookEnv {
     pvlist: Arc<ArcSwap<PvList>>,
     /// Optional put-event log.
     putlog: Option<Arc<PutLog>>,
+    /// Which writes the put log records. `TrapWrite` (default) reproduces
+    /// the C contract — only granted writes whose matched rule carries
+    /// `TRAPWRITE` (`gateVc.cc:236`); `AllWrites` logs every attempt.
+    putlog_scope: PutLogScope,
     /// Gateway PV cache, keyed by `served_name`. The write hook reads
     /// `GwPvEntry.cached` (the last upstream monitor value) for the
     /// put-audit `old=` field — the analog of C ca-gateway's
@@ -195,6 +199,9 @@ pub struct UpstreamManagerConfig {
     pub access: Arc<ArcSwap<AccessConfig>>,
     pub pvlist: Arc<ArcSwap<PvList>>,
     pub putlog: Option<Arc<PutLog>>,
+    /// Put-log scope: `TrapWrite` (C contract) or `AllWrites` (broader
+    /// audit). Threaded from `GatewayConfig::putlog_scope`.
+    pub putlog_scope: PutLogScope,
     pub stats: Arc<Stats>,
     pub read_only: bool,
     /// Upstream connect-timeout budget for lazy search resolution.
@@ -292,6 +299,7 @@ impl UpstreamManager {
                 access: cfg.access,
                 pvlist: cfg.pvlist,
                 putlog: cfg.putlog,
+                putlog_scope: cfg.putlog_scope,
                 cache: cfg.cache,
                 stats: cfg.stats,
                 beacon_anomaly: cfg.beacon_anomaly,
@@ -939,11 +947,16 @@ fn build_access_hook(
 /// field; `pv_name` is the upstream PV name written to the putlog.
 ///
 /// Pipeline (matches C ca-gateway `gatePvData::putCB` ordering):
-/// 1. Read-only mode → reject + record stat + putlog
-/// 2. Host-based DENY (pvlist `FROM host`) → reject + putlog
-/// 3. ACF `can_write(asg, asl, user, host)` → reject + putlog
+/// 1. Read-only mode → reject (+ denial putlog only in `AllWrites` scope)
+/// 2. Host-based DENY (pvlist `FROM host`) → reject (+ `AllWrites` putlog)
+/// 3. ACF `can_write_trap(asg, asl, user, host)` → reject (+ `AllWrites`
+///    putlog) on deny; on grant, carry the matched rule's `TRAPWRITE` mask
+///    forward
 /// 4. Forward `caput` to upstream via the shared channel
-/// 5. Putlog the outcome (Ok/Failed) and bump put-count stat
+/// 5. Putlog per scope: `AllWrites` logs the outcome (Ok/Failed) for every
+///    attempt; `TrapWrite` (C contract, `gateVc.cc:236`) logs only this
+///    granted write's attempt and only when its rule carried `TRAPWRITE`.
+///    Always bump the put-count stat on success.
 fn build_write_hook(
     served_name: String,
     pv_name: String,
@@ -1021,7 +1034,12 @@ fn build_write_hook(
             let pv_acl = acl.load();
             let asg_ref = pv_acl.asg.as_deref().unwrap_or("DEFAULT");
             let asl = pv_acl.asl;
-            if !access.can_write(asg_ref, asl, &ctx.user, &ctx.host) {
+            // Keep the matched rule's TRAPWRITE mask alongside the
+            // allow/deny so step 5 can reproduce C's trap-scoped put log
+            // instead of re-deriving (and discarding) it. `permit.trap`
+            // is false for any denied write (base-rs `NoAccess` ⇒ no mask).
+            let permit = access.can_write_trap(asg_ref, asl, &ctx.user, &ctx.host);
+            if !permit.allowed {
                 env.stats.record_readonly_reject();
                 log_denial(&env, &ctx, &pv_name, &value_str, &old_str).await;
                 return Err(CaError::ReadOnlyField(format!(
@@ -1035,28 +1053,24 @@ fn build_write_hook(
             // caller (e.g. ECA_TIMEOUT, ECA_DISCONN).
             let result = channel.put(&new_value).await;
 
-            // 5. Putlog + stats. PutLog write errors are surfaced via
-            // tracing (not just `let _ =`) so a disk-full audit
-            // trail is visible to operators.
-            if let Some(pl) = &env.putlog {
-                let outcome = if result.is_ok() {
-                    PutOutcome::Ok
-                } else {
-                    PutOutcome::Failed
-                };
-                if let Err(e) = pl
-                    .log(
-                        &ctx.user, &ctx.host, &pv_name, &value_str, &old_str, outcome,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "ca_gateway::putlog",
-                        error = %e,
-                        "ca-gateway-rs: putlog write failed"
-                    );
-                }
-            }
+            // 5. Putlog + stats. The single audit owner
+            // ([`emit_putlog`]/[`putlog_outcome`]) decides whether and how
+            // this forwarded write is logged, per scope. C logs the trapped
+            // *attempt* before the actual write (gateVc.cc:236-263), so the
+            // upstream result is recorded only as the `AllWrites` outcome
+            // token, never as a gate on whether to log.
+            emit_putlog(
+                &env,
+                &ctx,
+                &pv_name,
+                &value_str,
+                &old_str,
+                WriteAudit::Forwarded {
+                    trap: permit.trap,
+                    ok: result.is_ok(),
+                },
+            )
+            .await;
             if result.is_ok() {
                 env.stats.record_put();
             }
@@ -1083,18 +1097,68 @@ async fn cached_old_for_audit(env: &WriteHookEnv, key: &str) -> String {
     "?".to_string()
 }
 
-/// Helper: emit a single `Denied` putlog line. Called from each
-/// rejection branch in the WriteHook so the structure is uniform
-/// (timestamp, user@host, pv, value, old, DENIED). `old` is the prior
-/// cached value the caller read up-front (see [`cached_old_for_audit`]).
-/// Errors from the log write itself are surfaced via `tracing` (debounced
-/// via target) so a disk-full putlog doesn't silently disappear the audit
-/// trail.
-async fn log_denial(env: &WriteHookEnv, ctx: &WriteContext, pv: &str, value: &str, old: &str) {
+/// What happened to a client write, for the put-audit decision. The
+/// rejection branches report [`Self::Denied`]; the forward path reports
+/// [`Self::Forwarded`] with the matched rule's TRAPWRITE mask and the
+/// upstream outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteAudit {
+    /// The gateway rejected the put before forwarding (read-only mode,
+    /// host deny, missing identity, or ACF deny).
+    Denied,
+    /// The gateway forwarded the put upstream. `trap` is the matched WRITE
+    /// rule's `TRAPWRITE` mask; `ok` is whether the upstream write
+    /// succeeded.
+    Forwarded { trap: bool, ok: bool },
+}
+
+/// The single owner of the "what does the put log record" contract.
+/// Returns `None` to suppress the line, `Some(token)` to emit it — where
+/// `token = None` is the C-compatible token-less [`PutLogScope::TrapWrite`]
+/// line (`gateResources.cc:486`) and `Some(o)` is the
+/// [`PutLogScope::AllWrites`] outcome-tagged line.
+///
+/// C ca-gateway gates *all* put-log emission on the matched rule's
+/// `trapMask` and only reaches the write path for access-granted puts
+/// (`gateVc.cc:236`): so in `TrapWrite` scope a denied or non-trapped
+/// write logs nothing, and a trapped grant logs regardless of the upstream
+/// result (C logs the attempt before writing). `AllWrites` is the broader
+/// fail-loud superset: every event logs, tagged with its outcome.
+fn putlog_outcome(scope: PutLogScope, audit: WriteAudit) -> Option<Option<PutOutcome>> {
+    match (scope, audit) {
+        // Broader audit: log every event with its outcome token.
+        (PutLogScope::AllWrites, WriteAudit::Denied) => Some(Some(PutOutcome::Denied)),
+        (PutLogScope::AllWrites, WriteAudit::Forwarded { ok, .. }) => Some(Some(if ok {
+            PutOutcome::Ok
+        } else {
+            PutOutcome::Failed
+        })),
+        // C contract: denials and non-trapped writes are never logged; a
+        // trapped grant logs as a token-less C line.
+        (PutLogScope::TrapWrite, WriteAudit::Denied) => None,
+        (PutLogScope::TrapWrite, WriteAudit::Forwarded { trap: true, .. }) => Some(None),
+        (PutLogScope::TrapWrite, WriteAudit::Forwarded { trap: false, .. }) => None,
+    }
+}
+
+/// Emit (or suppress) the put-audit line for one write event via the
+/// single [`putlog_outcome`] owner. `old` is the prior cached value the
+/// caller read up-front (see [`cached_old_for_audit`]). Errors from the
+/// log write itself are surfaced via `tracing` so a disk-full putlog
+/// doesn't silently disappear the audit trail.
+async fn emit_putlog(
+    env: &WriteHookEnv,
+    ctx: &WriteContext,
+    pv: &str,
+    value: &str,
+    old: &str,
+    audit: WriteAudit,
+) {
+    let Some(outcome) = putlog_outcome(env.putlog_scope, audit) else {
+        return;
+    };
     if let Some(pl) = &env.putlog
-        && let Err(e) = pl
-            .log(&ctx.user, &ctx.host, pv, value, old, PutOutcome::Denied)
-            .await
+        && let Err(e) = pl.log(&ctx.user, &ctx.host, pv, value, old, outcome).await
     {
         tracing::warn!(
             target: "ca_gateway::putlog",
@@ -1102,6 +1166,14 @@ async fn log_denial(env: &WriteHookEnv, ctx: &WriteContext, pv: &str, value: &st
             "ca-gateway-rs: putlog write failed"
         );
     }
+}
+
+/// Emit a put-audit line for a rejected write. Thin wrapper over
+/// [`emit_putlog`] with [`WriteAudit::Denied`] so the four rejection
+/// branches stay uniform; the scope gate (denials log only in
+/// `AllWrites`) lives in [`putlog_outcome`].
+async fn log_denial(env: &WriteHookEnv, ctx: &WriteContext, pv: &str, value: &str, old: &str) {
+    emit_putlog(env, ctx, pv, value, old, WriteAudit::Denied).await;
 }
 
 /// Render an `EpicsValue` for the put-audit log, truncating to at
@@ -1204,12 +1276,100 @@ mod tests {
         assert_eq!(native_placeholder(DbFieldType::Long, 0).count(), 1);
     }
 
+    #[test]
+    fn putlog_outcome_trapwrite_scope_matches_c_contract() {
+        // C contract (gateVc.cc:236): in TrapWrite scope the put log is
+        // gated on the matched rule's trapMask and only the access-granted
+        // write path is reached. Enumerate every boundary.
+        use PutLogScope::TrapWrite;
+
+        // A granted write whose rule carried TRAPWRITE → one token-less
+        // C-compatible line, regardless of the upstream outcome (C logs the
+        // attempt before writing).
+        assert_eq!(
+            putlog_outcome(
+                TrapWrite,
+                WriteAudit::Forwarded {
+                    trap: true,
+                    ok: true
+                }
+            ),
+            Some(None),
+            "TRAPWRITE grant must log a C-style (token-less) line"
+        );
+        assert_eq!(
+            putlog_outcome(
+                TrapWrite,
+                WriteAudit::Forwarded {
+                    trap: true,
+                    ok: false
+                }
+            ),
+            Some(None),
+            "TRAPWRITE grant logs the attempt even if the upstream write failed"
+        );
+
+        // A granted write to a non-TRAPWRITE rule → no line.
+        assert_eq!(
+            putlog_outcome(
+                TrapWrite,
+                WriteAudit::Forwarded {
+                    trap: false,
+                    ok: true
+                }
+            ),
+            None,
+            "non-TRAPWRITE grant must not produce C-style output"
+        );
+
+        // A denied write → no line (C never reaches gateVcChan::write).
+        assert_eq!(
+            putlog_outcome(TrapWrite, WriteAudit::Denied),
+            None,
+            "denied write must not produce a C-style record"
+        );
+    }
+
+    #[test]
+    fn putlog_outcome_allwrites_scope_logs_every_event_with_token() {
+        // AllWrites is the broader fail-loud audit: every event logs with
+        // its outcome token, independent of the trap mask.
+        use PutLogScope::AllWrites;
+        assert_eq!(
+            putlog_outcome(AllWrites, WriteAudit::Denied),
+            Some(Some(PutOutcome::Denied))
+        );
+        assert_eq!(
+            putlog_outcome(
+                AllWrites,
+                WriteAudit::Forwarded {
+                    trap: false,
+                    ok: true
+                }
+            ),
+            Some(Some(PutOutcome::Ok)),
+            "AllWrites logs a non-trapped success as OK"
+        );
+        assert_eq!(
+            putlog_outcome(
+                AllWrites,
+                WriteAudit::Forwarded {
+                    trap: true,
+                    ok: false
+                }
+            ),
+            Some(Some(PutOutcome::Failed)),
+            "AllWrites logs an upstream failure as FAILED"
+        );
+    }
+
     fn dummy_env() -> WriteHookEnv {
         WriteHookEnv {
             read_only: false,
             access: Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all())),
             pvlist: Arc::new(ArcSwap::from_pointee(PvList::new())),
             putlog: None,
+            putlog_scope: PutLogScope::default(),
             cache: Arc::new(RwLock::new(PvCache::new())),
             stats: Arc::new(Stats::new("gw:".into())),
             beacon_anomaly: Arc::new(crate::ca_gateway::beacon::BeaconAnomaly::new()),
@@ -1280,6 +1440,7 @@ mod tests {
             access: env.access.clone(),
             pvlist: env.pvlist.clone(),
             putlog: None,
+            putlog_scope: PutLogScope::default(),
             stats: env.stats.clone(),
             read_only: false,
             connect_timeout: Duration::from_secs(1),
@@ -1304,6 +1465,7 @@ mod tests {
             access: env.access.clone(),
             pvlist: env.pvlist.clone(),
             putlog: None,
+            putlog_scope: PutLogScope::default(),
             stats: env.stats.clone(),
             read_only: false,
             connect_timeout: Duration::from_secs(1),
@@ -1344,6 +1506,7 @@ mod tests {
             access: env.access.clone(),
             pvlist: env.pvlist.clone(),
             putlog: None,
+            putlog_scope: PutLogScope::default(),
             stats: env.stats.clone(),
             read_only: false,
             connect_timeout: Duration::from_secs(1),
@@ -1690,6 +1853,7 @@ ASG(NewGroup) {
             access: env.access.clone(),
             pvlist: env.pvlist.clone(),
             putlog: None,
+            putlog_scope: PutLogScope::default(),
             stats: env.stats.clone(),
             read_only: false,
             connect_timeout: Duration::from_millis(150),

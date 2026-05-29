@@ -33,7 +33,7 @@ use super::cache::{CacheTimeouts, PvCache};
 // Used by the cfg(unix) signal handler AND the control-PV command owner.
 use super::command::CommandHandler;
 use super::downstream::DownstreamServer;
-use super::putlog::PutLog;
+use super::putlog::{PutLog, PutLogScope};
 use super::pvlist::PvList;
 use super::stats::Stats;
 use super::upstream::{UpstreamManager, UpstreamManagerConfig};
@@ -54,6 +54,12 @@ pub struct GatewayConfig {
     pub access_path: Option<PathBuf>,
     /// Optional path to put-event log file.
     pub putlog_path: Option<PathBuf>,
+    /// Put-log scope. [`PutLogScope::TrapWrite`] (default) reproduces the
+    /// C ca-gateway contract — only granted writes whose matched ACF rule
+    /// carries `TRAPWRITE` are logged (`gateVc.cc:236`).
+    /// [`PutLogScope::AllWrites`] opts into the broader fail-loud audit
+    /// (every attempt, with outcome). Ignored when `putlog_path` is `None`.
+    pub putlog_scope: PutLogScope,
     /// Optional path to a command file processed on SIGUSR1 (Unix only).
     /// Each non-comment line is a [`super::command::GatewayCommand`].
     pub command_path: Option<PathBuf>,
@@ -106,6 +112,7 @@ impl Default for GatewayConfig {
             pvlist_content: None,
             access_path: None,
             putlog_path: None,
+            putlog_scope: PutLogScope::default(),
             command_path: None,
             preload_path: None,
             server_port: 0,
@@ -137,6 +144,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("pvlist_content", &self.pvlist_content)
             .field("access_path", &self.access_path)
             .field("putlog_path", &self.putlog_path)
+            .field("putlog_scope", &self.putlog_scope)
             .field("command_path", &self.command_path)
             .field("preload_path", &self.preload_path)
             .field("server_port", &self.server_port)
@@ -300,6 +308,7 @@ impl GatewayServer {
             access: access.clone(),
             pvlist: pvlist.clone(),
             putlog: putlog.clone(),
+            putlog_scope: config.putlog_scope,
             stats: stats.clone(),
             read_only: config.read_only,
             // Single connect-timeout owner: the lazy-resolution

@@ -13,7 +13,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use epics_bridge_rs::ca_gateway::{GatewayConfig, GatewayServer, RestartPolicy, supervise};
+use epics_bridge_rs::ca_gateway::{
+    GatewayConfig, GatewayServer, PutLogScope, RestartPolicy, supervise,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -35,9 +37,17 @@ struct Args {
     #[arg(long)]
     preload: Option<PathBuf>,
 
-    /// Path to put-event log file (records all client puts).
+    /// Path to put-event log file. By default the log is TRAPWRITE-scoped
+    /// (C ca-gateway contract): only granted writes whose matched ACF rule
+    /// carries `TRAPWRITE` are recorded, without an outcome token.
     #[arg(long)]
     putlog: Option<PathBuf>,
+
+    /// Broaden `--putlog` to a fail-loud audit: record every client write
+    /// attempt — including access-denied and upstream-failed writes — with
+    /// its `OK`/`DENIED`/`FAILED` outcome. Not the C ca-gateway contract.
+    #[arg(long)]
+    putlog_all: bool,
 
     /// Path to a command file processed when the gateway receives SIGUSR1 (Unix).
     #[arg(long)]
@@ -233,6 +243,11 @@ async fn main() -> ExitCode {
         pvlist_content: None,
         access_path: args.access.clone(),
         putlog_path: args.putlog.clone(),
+        putlog_scope: if args.putlog_all {
+            PutLogScope::AllWrites
+        } else {
+            PutLogScope::TrapWrite
+        },
         command_path: args.command.clone(),
         preload_path: args.preload.clone(),
         server_port: args.port,

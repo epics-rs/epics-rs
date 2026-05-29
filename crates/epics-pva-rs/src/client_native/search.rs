@@ -49,10 +49,9 @@ pub fn parse_addr_list(env: &str) -> Vec<SocketAddr> {
 }
 
 pub fn default_broadcast_port() -> u16 {
-    std::env::var("EPICS_PVA_BROADCAST_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(5076)
+    // Single owner applies the client zero->5076 rule (pvxs config.cpp:563),
+    // so this legacy search path cannot send SEARCH to UDP port 0.
+    crate::config::env::broadcast_port()
 }
 
 pub fn default_server_port() -> u16 {

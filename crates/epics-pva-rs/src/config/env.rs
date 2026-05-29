@@ -257,12 +257,33 @@ fn parse_bool(name: &str, raw: &str) -> Option<bool> {
     }
 }
 
+/// Effective **client** UDP search/broadcast port from
 /// `EPICS_PVA_BROADCAST_PORT` (default 5076).
+///
+/// pvxs (config.cpp:556-566) parses this into the client `udp_port` and
+/// then explicitly rejects `udp_port == 0`: it logs "ignoring
+/// EPICS_PVA_BROADCAST_PORT=0" and restores 5076, because a client SEARCH
+/// targeting UDP port 0 can never reach a server. This helper is the
+/// single owner of that rule for every client search destination —
+/// limited broadcast, per-NIC broadcast, the `EPICS_PVA_ADDR_LIST`
+/// default port, and the beacon-listener bind all read it. The
+/// server-side `EPICS_PVAS_BROADCAST_PORT` path
+/// ([`server_broadcast_port`]) keeps port 0 (pvxs allows a server random
+/// bind/readback), so the zero rule lives here, not in the shared parse.
+/// An unparseable value also falls back to 5076 (pvxs leaves `udp_port` at
+/// its default on a parse error).
 pub fn broadcast_port() -> u16 {
-    std::env::var("EPICS_PVA_BROADCAST_PORT")
+    match std::env::var("EPICS_PVA_BROADCAST_PORT")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5076)
+        .and_then(|s| s.parse::<u16>().ok())
+    {
+        Some(0) => {
+            tracing::warn!("ignoring EPICS_PVA_BROADCAST_PORT=0; using default 5076");
+            5076
+        }
+        Some(p) => p,
+        None => 5076,
+    }
 }
 
 /// `EPICS_PVAS_BROADCAST_PORT` falling back to `EPICS_PVA_BROADCAST_PORT`,
@@ -949,6 +970,34 @@ mod tests {
         assert!(!auto_addr_list_enabled(), "explicit NO disables");
         unsafe { std::env::remove_var("EPICS_PVA_AUTO_ADDR_LIST") };
         assert!(auto_addr_list_enabled(), "unset defaults to enabled");
+    }
+
+    #[test]
+    fn broadcast_port_zero_falls_back_to_5076_client_only() {
+        // pvxs ignores EPICS_PVA_BROADCAST_PORT=0 and restores 5076 for the
+        // client (a SEARCH to UDP port 0 can never reach a server).
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("EPICS_PVA_BROADCAST_PORT", "0") };
+        assert_eq!(
+            broadcast_port(),
+            5076,
+            "client port 0 must fall back to 5076"
+        );
+        unsafe { std::env::set_var("EPICS_PVA_BROADCAST_PORT", "5099") };
+        assert_eq!(broadcast_port(), 5099, "explicit non-zero port honored");
+        unsafe { std::env::set_var("EPICS_PVA_BROADCAST_PORT", "garbage") };
+        assert_eq!(broadcast_port(), 5076, "unparseable falls back to 5076");
+        // Server path is distinct: pvxs allows EPICS_PVAS_BROADCAST_PORT=0
+        // for a server random bind/readback, so 0 is preserved there.
+        unsafe { std::env::remove_var("EPICS_PVA_BROADCAST_PORT") };
+        unsafe { std::env::set_var("EPICS_PVAS_BROADCAST_PORT", "0") };
+        assert_eq!(
+            server_broadcast_port(),
+            0,
+            "server port 0 is preserved (distinct from the client rule)"
+        );
+        unsafe { std::env::remove_var("EPICS_PVAS_BROADCAST_PORT") };
+        assert_eq!(broadcast_port(), 5076, "unset defaults to 5076");
     }
 
     #[test]

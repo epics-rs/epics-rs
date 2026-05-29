@@ -120,6 +120,22 @@ pub trait LinkSet: Send + Sync {
         Err("link set is read-only".into())
     }
 
+    /// Flush any OUT-link writes the lset has queued but not yet sent —
+    /// the production drain trigger for an async OUT channel owner.
+    ///
+    /// Two queued states this drains: a write deferred for sibling
+    /// coalescing, and a write that failed mid-disconnect and is held
+    /// for replay once the upstream reconnects (`retry`). The database
+    /// calls this after every external OUT-link write so the
+    /// "retry on connect" path has a production caller from record
+    /// processing — not only test code. Default no-op: a synchronous
+    /// lset (DB links, a read-only lset) queues nothing.
+    ///
+    /// Mirrors the role of pvxs's shared `pvaLinkChannel::put()` being
+    /// driven from record processing rather than left to manual calls
+    /// (`pvxs/ioc/pvalink_lset.cpp:647`, `pvalink_channel.cpp:220-263`).
+    fn flush_puts(&self) {}
+
     /// Most recent alarm message string from the upstream PV, when
     /// available. None means no alarm or no cache.
     fn alarm_message(&self, _name: &str) -> Option<String> {

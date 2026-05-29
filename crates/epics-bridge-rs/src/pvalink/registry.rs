@@ -14,53 +14,31 @@ use super::link::{PvaLink, PvaLinkResult};
 
 /// Registry cache key.
 ///
-/// The first four members — `(pv_name, pipeline, queue_size,
-/// direction)` — mirror pvxs's `channels_key_t = (channelName,
-/// pvRequest)` where pvRequest encodes `pipeline` and `queueSize`
-/// (`pvxs/ioc/pvalink_lset.cpp:49-65`, `pvxs/ioc/pvalink.h:116`).
+/// All four members — `(pv_name, pipeline, queue_size, direction)` —
+/// mirror pvxs's `channels_key_t = (channelName, pvRequest)` where
+/// pvRequest encodes `pipeline` and `queueSize`
+/// (`pvxs/ioc/pvalink_lset.cpp:49-65`, `pvxs/ioc/pvalink.h:116`). The
+/// key deliberately does NOT include the per-link OUT options
+/// (`field`, `process`, `defer`, `retry`): pvxs caches one shared
+/// `pvaLinkChannel` per `(channelName, pvRequest)` and keeps the
+/// per-link `field`/`proc`/`defer`/`retry` on the child `pvaLink`
+/// objects, not in the channel key (`pvxs/ioc/pvalink_lset.cpp:99-122`,
+/// `pvxs/ioc/pvalink.h:65,116`).
 ///
-/// `out_opts` carries the per-link OUT behavior options
-/// (`field`, `process`, `defer`, `retry`). The earlier key excluded
-/// these, so two OUT links to the same remote PV with different
-/// query options collapsed onto one cached [`PvaLink`] and the later
-/// link silently inherited the first link's `field` / `proc` /
-/// `defer` / `retry`. pvxs keeps a per-link `pvaLinkConfig`
-/// (`pvxs/ioc/pvalink.h:65`); including the OUT options in the key
-/// restores that per-link isolation — two OUT links with different
-/// behavior options now resolve to distinct cache entries.
+/// Folding sibling OUT links to one upstream PV onto one shared
+/// [`PvaLink`] is what lets several field writes coalesce into a
+/// single upstream PUT: the shared owner gathers each link's staged
+/// value (keyed by its `field`) and emits one combined PUT with the
+/// process option resolved across all participating links
+/// (`pvxs/ioc/pvalink_channel.cpp:220-263`). The per-link options
+/// travel with each write via [`PvaLink::put_out_str`] /
+/// [`PvaLink::put_out_field`] rather than being baked into the channel
+/// identity (see `link.rs`'s `out_scratch`).
 ///
-/// For INP links `out_opts` is always `None`, so INP keying is
-/// unchanged (INP per-link `field` / `sevr` / `time` divergence is
-/// handled at the getter level, see `integration.rs`).
-type RegistryKey = (String, bool, usize, LinkDirection, Option<OutOpts>);
-
-/// Behavior-changing OUT-link options that must not be shared across
-/// links — see [`RegistryKey`]. `field` selects the remote sub-field,
-/// `process` requests a remote `process()`, `defer` queues the Put,
-/// `retry` replays a Put across a disconnect.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct OutOpts {
-    field: String,
-    proc: ProcMode,
-    defer: bool,
-    retry: bool,
-}
-
-impl OutOpts {
-    /// Extract the OUT behavior options from a config, or `None` for
-    /// an INP link (INP links never key on these).
-    fn from_config(config: &PvaLinkConfig) -> Option<Self> {
-        match config.direction {
-            LinkDirection::Out => Some(Self {
-                field: config.field.clone(),
-                proc: config.proc,
-                defer: config.defer,
-                retry: config.retry,
-            }),
-            LinkDirection::Inp => None,
-        }
-    }
-}
+/// INP per-link `field` / `sevr` / `time` divergence is likewise
+/// handled at the getter level (see `integration.rs`), so INP links
+/// that differ only in those collapse onto one monitor subscription.
+type RegistryKey = (String, bool, usize, LinkDirection);
 
 /// One row of pvalink channel diagnostics — the per-channel state the
 /// `dbpvar` IOC shell command prints. Mirrors the fields pvxs `dbpvxr`
@@ -118,7 +96,6 @@ impl PvaLinkRegistry {
             config.pipeline,
             config.queue_size,
             config.direction,
-            OutOpts::from_config(config),
         );
         self.map.read().get(&key).cloned()
     }
@@ -127,8 +104,7 @@ impl PvaLinkRegistry {
     /// pipeline, queue_size)`. Returns the cached INP link for that
     /// exact variant, or `None`.
     ///
-    /// INP links never carry `out_opts` (always `None` in the key), so
-    /// the monitor variant is fully described by these three fields —
+    /// The monitor variant is fully described by these three fields —
     /// matching pvxs's `channels_key_t = (channelName, pvRequest)` where
     /// the pvRequest encodes `pipeline` / `queueSize`
     /// (`pvxs/ioc/pvalink.h:115-120`). Resolver hot paths use this
@@ -146,7 +122,6 @@ impl PvaLinkRegistry {
             pipeline,
             queue_size,
             LinkDirection::Inp,
-            None,
         );
         self.map.read().get(&key).cloned()
     }
@@ -161,7 +136,6 @@ impl PvaLinkRegistry {
             config.pipeline,
             config.queue_size,
             config.direction,
-            OutOpts::from_config(&config),
         );
 
         // Fast path: already cached.
@@ -293,7 +267,6 @@ impl PvaLinkRegistry {
             config.pipeline,
             config.queue_size,
             config.direction,
-            OutOpts::from_config(config),
         );
         self.map.write().insert(key, link);
     }
@@ -329,12 +302,25 @@ impl PvaLinkRegistry {
             .map
             .read()
             .keys()
-            .filter(|(_, _, _, dir, _)| *dir == LinkDirection::Inp)
-            .map(|(name, pipeline, qsize, _, _)| (name.clone(), *pipeline, *qsize))
+            .filter(|(_, _, _, dir)| *dir == LinkDirection::Inp)
+            .map(|(name, pipeline, qsize, _)| (name.clone(), *pipeline, *qsize))
             .collect();
         ids.sort();
         ids.dedup();
         ids
+    }
+
+    /// Every cached OUT-direction [`PvaLink`] — the shared channel
+    /// owners that may hold staged or retry-queued writes. Backs the
+    /// `LinkSet::flush_puts` production drain: the resolver re-attempts
+    /// any channel holding a retry-queued write after a reconnect.
+    pub fn out_links(&self) -> Vec<Arc<PvaLink>> {
+        self.map
+            .read()
+            .iter()
+            .filter(|((_, _, _, dir), _)| *dir == LinkDirection::Out)
+            .map(|(_, link)| link.clone())
+            .collect()
     }
 
     /// Per-channel diagnostics snapshot for every cached link, sorted by
@@ -356,7 +342,7 @@ impl PvaLinkRegistry {
             .map
             .read()
             .iter()
-            .map(|((pv, pipeline, qsize, dir, _), link)| {
+            .map(|((pv, pipeline, qsize, dir), link)| {
                 let c = link.config();
                 ChannelDiag {
                     pv_name: pv.clone(),
@@ -495,21 +481,25 @@ mod tests {
         assert!(diags.iter().all(|d| !d.connected));
     }
 
-    /// two OUT links to the same remote PV with different
-    /// behavior-changing query options (`field`, `proc`, `defer`,
-    /// `retry`) must resolve to *distinct* cached [`PvaLink`]s, each
-    /// owning its own config. Pre-fix the registry key was
-    /// `(pv_name, pipeline, queue_size, direction)` — it excluded the
-    /// OUT options, so the second `get_or_open` returned the first
-    /// link and silently inherited its `field` / `proc` / `defer` /
-    /// `retry`.
+    /// Two OUT links to the same remote PV that differ only in their
+    /// behavior options (`field`, `proc`, `defer`, `retry`) must
+    /// resolve to ONE shared [`PvaLink`] channel owner — the
+    /// precondition for coalescing sibling field writes into a single
+    /// upstream PUT. pvxs caches one `pvaLinkChannel` per
+    /// `(channelName, pvRequest)` and keeps the per-link options on the
+    /// child `pvaLink` objects, so two links to the same channel share
+    /// the owner and each contributes its staged value with its own
+    /// `field`/`proc` at PUT-build time
+    /// (`pvxs/ioc/pvalink_lset.cpp:99-122`, `pvalink_channel.cpp:127-156`).
     ///
-    /// OUT-link `PvaLink::open` does no network I/O (it only builds a
-    /// `PvaClient`), so this exercises the real registry path without
-    /// a PVA server. pvxs `pvaLinkConfig` is per-link
-    /// (`pvxs/ioc/pvalink.h:65`).
+    /// The per-link `field`/`proc`/`defer`/`retry` no longer live in
+    /// the registry key (they travel with each write via
+    /// `PvaLink::put_out_str` / `put_out_field`), so they cannot cause
+    /// distinct cache entries. OUT-link `PvaLink::open` does no network
+    /// I/O, so this exercises the real registry path without a PVA
+    /// server.
     #[tokio::test]
-    async fn mr_r14_out_links_keep_own_options() {
+    async fn mr_r14_out_links_share_one_channel_owner() {
         let reg = PvaLinkRegistry::new();
 
         let cfg_a = PvaLinkConfig {
@@ -531,45 +521,27 @@ mod tests {
         let link_b = reg.get_or_open(cfg_b).await.expect("open OUT link B");
 
         assert!(
-            !Arc::ptr_eq(&link_a, &link_b),
-            "OUT links with different options must not share one PvaLink"
+            Arc::ptr_eq(&link_a, &link_b),
+            "sibling OUT links to one PV must share a single channel owner \
+             so their writes can coalesce into one upstream PUT"
         );
         assert_eq!(
-            link_a.config().field,
-            "fieldA",
-            "link A keeps its own field"
+            reg.len(),
+            1,
+            "differing OUT options must NOT spawn distinct cache entries"
         );
-        assert_eq!(
-            link_b.config().field,
-            "fieldB",
-            "link B must not inherit link A's field"
-        );
-        assert!(
-            link_a.config().proc == ProcMode::Default
-                && !link_a.config().defer
-                && !link_a.config().retry,
-            "link A keeps its own proc/defer/retry"
-        );
-        assert!(
-            link_b.config().proc == ProcMode::Pp && link_b.config().defer && link_b.config().retry,
-            "link B must not inherit link A's proc/defer/retry"
-        );
-
-        // A second open of link A's exact config returns the same
-        // cached Arc — connection sharing for identical options is
-        // preserved.
-        let cfg_a2 = PvaLinkConfig {
-            field: "fieldA".to_string(),
-            proc: ProcMode::Default,
-            defer: false,
-            retry: false,
+        // A differing `pipeline` / `queue_size` IS a distinct channel
+        // (distinct upstream pvRequest, pvxs `channels_key_t`), so
+        // those still key separately.
+        let cfg_pipe = PvaLinkConfig {
+            pipeline: true,
             ..PvaLinkConfig::defaults_for("MR_R14:PV", LinkDirection::Out)
         };
-        let link_a2 = reg.get_or_open(cfg_a2).await.expect("re-open OUT link A");
+        let link_pipe = reg.get_or_open(cfg_pipe).await.expect("open piped owner");
         assert!(
-            Arc::ptr_eq(&link_a, &link_a2),
-            "identical OUT options must share one cached PvaLink"
+            !Arc::ptr_eq(&link_a, &link_pipe),
+            "a different pvRequest (pipeline) is a different channel owner"
         );
-        assert_eq!(reg.len(), 2, "two distinct OUT links cached");
+        assert_eq!(reg.len(), 2, "two distinct channel owners cached");
     }
 }

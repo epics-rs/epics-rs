@@ -1037,22 +1037,52 @@ impl LinkSet for PvaLinkResolver {
         let array_path = is_array_value(&value);
         block_in_place_or_warn(|| {
             self.handle.block_on(async {
+                // Resolve the SHARED channel owner for this PV (the
+                // registry no longer keys on the per-link OUT options),
+                // then stage THIS link's write with its own
+                // `field`/`proc`/`defer`/`retry` so sibling fields
+                // coalesce into one upstream PUT.
                 let link = self
                     .registry
-                    .get_or_open(cfg)
+                    .get_or_open(cfg.clone())
                     .await
                     .map_err(|e| e.to_string())?;
                 if array_path {
                     let pv_field = crate::convert::epics_to_pv_field(&value);
-                    link.write_pv_field(&pv_field)
+                    link.put_out_field(&cfg, &pv_field)
                         .await
                         .map_err(|e| e.to_string())
                 } else {
                     let value_str = value.to_string();
-                    link.write(&value_str).await.map_err(|e| e.to_string())
+                    link.put_out_str(&cfg, &value_str)
+                        .await
+                        .map_err(|e| e.to_string())
                 }
             })
         })
+    }
+
+    fn flush_puts(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        // Production drain of any retry-queued OUT writes: re-attempt
+        // every shared channel owner that a prior disconnect left with
+        // a `retry` write staged, now that some OUT activity has reached
+        // the lset (the upstream may have reconnected). `flush_retry_pending`
+        // is a no-op on channels with nothing stuck, so a freshly-`defer`red
+        // write awaiting its sibling is never flushed early.
+        let links = self.registry.out_links();
+        if links.is_empty() {
+            return;
+        }
+        block_in_place_or_warn(|| {
+            self.handle.block_on(async {
+                for link in links {
+                    let _ = link.flush_retry_pending().await;
+                }
+            })
+        });
     }
 
     fn alarm_message(&self, name: &str) -> Option<String> {

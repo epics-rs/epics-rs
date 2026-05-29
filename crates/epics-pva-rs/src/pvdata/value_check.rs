@@ -59,6 +59,10 @@ pub enum ValueDescMismatch {
     StructureIdMismatch { desc_id: String, value_id: String },
     #[error("union selector {selector} out of range ({variants} variant(s))")]
     UnionSelectorOutOfRange { selector: i32, variants: usize },
+    #[error("value is missing descriptor field `{name}`")]
+    MissingField { name: String },
+    #[error("value carries field `{name}` not present in the descriptor")]
+    UnexpectedField { name: String },
 }
 
 /// True iff `value` can be encoded under `desc` without taking the
@@ -173,19 +177,39 @@ pub fn value_matches_descriptor(
     }
 }
 
-/// Check every value field the encoder will emit for `s` against its
-/// matching descriptor field. `encode_pv_field`'s Structure arm emits
-/// each descriptor-named field from `s` when present, else a type
-/// default; only a *present* field can carry a coerced mismatch, so
-/// absent fields are not walked (a partial post / monitor delta is not
-/// a mismatch).
+/// A full value must carry the descriptor's exact member set: every
+/// descriptor field present (and fitting), and no field the descriptor
+/// does not name.
+///
+/// pvxs allocates typed storage for every descriptor member when a
+/// `Value` is built (`data.cpp:96-121`) and resolves field access only
+/// through the descriptor's `mlookup` table (`data.cpp:827-852`), so a
+/// posted value's member set is structurally the descriptor's — never a
+/// subset or superset. `SharedPV::post` accepts only the exact opened
+/// descriptor (`sharedpv.cpp:417-431`). An absent field would otherwise
+/// be silently encoded as `default_value_for(child_desc)`
+/// (`encode.rs` Structure arm) and shipped as if real; an extra field
+/// is never visited by the encoder, so a peer can never receive it
+/// while local diagnostics see data no PVA client gets.
+///
+/// This is the FULL-value contract. Partial PUT deltas are not checked
+/// here: they ride a separate changed-BitSet representation and are
+/// merged against the prior complete value (`fill_unmarked_from_prior`)
+/// into a complete value *before* reaching this check — so a checked
+/// path only ever validates a structurally-complete value.
 fn structure_fields_match(
     s: &PvStructure,
     fields: &[(String, FieldDesc)],
 ) -> Result<(), ValueDescMismatch> {
     for (name, child_desc) in fields {
-        if let Some(child_val) = s.get_field(name) {
-            value_matches_descriptor(child_val, child_desc)?;
+        match s.get_field(name) {
+            Some(child_val) => value_matches_descriptor(child_val, child_desc)?,
+            None => return Err(ValueDescMismatch::MissingField { name: name.clone() }),
+        }
+    }
+    for (name, _) in &s.fields {
+        if !fields.iter().any(|(n, _)| n == name) {
+            return Err(ValueDescMismatch::UnexpectedField { name: name.clone() });
         }
     }
     Ok(())
@@ -321,12 +345,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn partial_structure_missing_field_is_ok() {
-        // Descriptor has `value` + `alarm`; value posts only `value`.
-        // The absent field encodes as a default — a partial post / delta
-        // is not a mismatch.
-        let desc = FieldDesc::Structure {
+    fn value_and_alarm_desc() -> FieldDesc {
+        FieldDesc::Structure {
             struct_id: NT_SCALAR.to_string(),
             fields: vec![
                 ("value".to_string(), FieldDesc::Scalar(ScalarType::Double)),
@@ -334,13 +354,75 @@ mod tests {
                     "alarm".to_string(),
                     FieldDesc::Structure {
                         struct_id: "alarm_t".to_string(),
-                        fields: vec![("severity".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+                        fields: vec![
+                            ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
                     },
                 ),
             ],
-        };
+        }
+    }
+
+    fn full_alarm() -> PvField {
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm.set("severity", PvField::Scalar(ScalarValue::Int(0)));
+        alarm.set("status", PvField::Scalar(ScalarValue::Int(0)));
+        PvField::Structure(alarm)
+    }
+
+    #[test]
+    fn structure_missing_top_level_field_is_err() {
+        // Descriptor has `value` + `alarm`; value posts only `value`. A
+        // full value must carry the descriptor's whole member set — the
+        // absent `alarm` would otherwise ship as a default subtree.
+        let desc = value_and_alarm_desc();
         let value = nt_scalar_value(ScalarValue::Double(2.0));
-        assert!(value_matches_descriptor(&value, &desc).is_ok());
+        assert!(matches!(
+            value_matches_descriptor(&value, &desc),
+            Err(ValueDescMismatch::MissingField { ref name }) if name == "alarm"
+        ));
+    }
+
+    #[test]
+    fn structure_missing_nested_field_is_err() {
+        // `alarm` is present but its `status` member is absent — the
+        // strictness reaches every nesting level, not just the root.
+        let desc = value_and_alarm_desc();
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm.set("severity", PvField::Scalar(ScalarValue::Int(0)));
+        let mut s = PvStructure::new(NT_SCALAR);
+        s.set("value", PvField::Scalar(ScalarValue::Double(2.0)));
+        s.set("alarm", PvField::Structure(alarm));
+        assert!(matches!(
+            value_matches_descriptor(&PvField::Structure(s), &desc),
+            Err(ValueDescMismatch::MissingField { ref name }) if name == "status"
+        ));
+    }
+
+    #[test]
+    fn structure_extra_field_is_err() {
+        // An extra `debug` field the descriptor does not name: the
+        // encoder never visits it, so no PVA peer can receive it.
+        let desc = value_and_alarm_desc();
+        let mut s = PvStructure::new(NT_SCALAR);
+        s.set("value", PvField::Scalar(ScalarValue::Double(2.0)));
+        s.set("alarm", full_alarm());
+        s.set("debug", PvField::Scalar(ScalarValue::Int(1)));
+        assert!(matches!(
+            value_matches_descriptor(&PvField::Structure(s), &desc),
+            Err(ValueDescMismatch::UnexpectedField { ref name }) if name == "debug"
+        ));
+    }
+
+    #[test]
+    fn structure_exact_member_set_is_ok() {
+        // Every descriptor field present, no extras → accepted.
+        let desc = value_and_alarm_desc();
+        let mut s = PvStructure::new(NT_SCALAR);
+        s.set("value", PvField::Scalar(ScalarValue::Double(2.0)));
+        s.set("alarm", full_alarm());
+        assert!(value_matches_descriptor(&PvField::Structure(s), &desc).is_ok());
     }
 
     #[test]

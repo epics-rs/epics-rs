@@ -163,12 +163,114 @@ pub enum TriggerDef {
     None,
 }
 
+/// Normalize the relaxed JSON dialect that upstream QSRV accepts into
+/// the strict JSON `serde_json` requires.
+///
+/// pva2pva enables YAJL `allow_comments` for both external group files
+/// and record `info(Q:group, ...)` bodies (pva2pva
+/// `pdbApp/configparse.cpp:224-254`), and EPICS-base db-file
+/// `info(Q:group, ...)` bodies additionally use unquoted `+`-prefixed
+/// option keys — e.g. `{+channel:"VAL", +putorder:0}` (pva2pva
+/// `testApp/testpdb-groups.db:4-5`) and `+id`/`+type`/`+trigger`
+/// (`iocBoot/iocimagedemo/image.db:38-44`). The shipped `image.json`
+/// example also opens with a C-style block comment
+/// (`iocBoot/iocimagedemo/image.json:1`). All of these are valid for the
+/// reference parser but rejected by strict `serde_json`, so the same
+/// configuration text that loads under pva2pva fails to load here before
+/// any group semantics are reached.
+///
+/// Two string-literal-aware transformations (quoted payloads such as a
+/// channel value `"a/*b*/c"` or `"+notakey"` are never rewritten):
+///   1. strip `/* block */` and `// line` comments;
+///   2. wrap bare `+ident` object keys in double quotes.
+///
+/// Group names and member field names are always quoted in the upstream
+/// dialect, so only `+`-prefixed option keys are ever unquoted; this
+/// keeps the transform minimal rather than guessing at arbitrary bare
+/// keys. The existing typed validation runs unchanged on the parsed
+/// result, so parser leniency never hides an invalid group field.
+fn normalize_relaxed_group_json(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        match c {
+            // String literal: copy verbatim, honoring backslash escapes,
+            // so comment markers or `+` inside a quoted value are untouched.
+            '"' => {
+                out.push(c);
+                i += 1;
+                while i < n {
+                    let d = chars[i];
+                    out.push(d);
+                    i += 1;
+                    if d == '\\' {
+                        if i < n {
+                            out.push(chars[i]);
+                            i += 1;
+                        }
+                    } else if d == '"' {
+                        break;
+                    }
+                }
+            }
+            // Block comment `/* ... */`.
+            '/' if i + 1 < n && chars[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < n && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    i += 1;
+                }
+                i += 2; // consume the closing `*/` (or run off the end)
+            }
+            // Line comment `// ...`.
+            '/' if i + 1 < n && chars[i + 1] == '/' => {
+                i += 2;
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            // Bare `+ident` option key → `"+ident"`. Only quoted when an
+            // identifier follows and the next non-space token is `:` (an
+            // object-key position); otherwise emitted verbatim — the
+            // dialect uses a leading `+` exclusively for option keys, so
+            // the else branch is defensive.
+            '+' => {
+                let mut j = i + 1;
+                while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let mut k = j;
+                while k < n && chars[k].is_whitespace() {
+                    k += 1;
+                }
+                if j > i + 1 && k < n && chars[k] == ':' {
+                    out.push('"');
+                    out.extend(chars[i..j].iter());
+                    out.push('"');
+                    i = j;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Parse group definitions from a JSON string.
 ///
 /// The JSON is a top-level object where each key is a group name.
 pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
-    let root: HashMap<String, RawGroupDef> =
-        serde_json::from_str(json).map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
+    let normalized = normalize_relaxed_group_json(json);
+    let root: HashMap<String, RawGroupDef> = serde_json::from_str(&normalized)
+        .map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
 
     let mut groups = Vec::new();
     for (name, raw) in root {
@@ -203,8 +305,9 @@ pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
 /// The `record_name` is used as channel prefix: if `+channel` is a bare field
 /// name (no `:` separator), it becomes `"record_name.FIELD"`.
 pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<GroupPvDef>> {
-    let root: HashMap<String, RawGroupDef> =
-        serde_json::from_str(json).map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
+    let normalized = normalize_relaxed_group_json(json);
+    let root: HashMap<String, RawGroupDef> = serde_json::from_str(&normalized)
+        .map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
 
     let mut groups = Vec::new();
     for (name, raw) in root {
@@ -681,10 +784,93 @@ mod tests {
     }
 
     /// A syntactically malformed JSON body still rejects the whole file
-    /// (the strict-parse boundary is preserved).
+    /// (the strict-parse boundary is preserved). The relaxed-JSON
+    /// normalizer must not turn invalid input into something that parses.
     #[test]
     fn parse_group_config_rejects_malformed_json() {
         assert!(parse_group_config("{ not json").is_err());
+    }
+
+    /// pva2pva accepts EPICS db-file `info(Q:group, ...)` bodies that
+    /// carry unquoted `+`-prefixed option keys — pva2pva
+    /// `testApp/testpdb-groups.db:4-5`
+    /// (`{+channel:"VAL", +putorder:0}`) and `image.db:38-44`
+    /// (`+id`/`+type`/`+trigger`). The relaxed-JSON normalizer must quote
+    /// them so the same text loads here.
+    #[test]
+    fn parse_group_config_accepts_unquoted_plus_keys() {
+        let json = r#"{
+            "grp1": {
+                +id: "epics:nt/NTGroup:1.0",
+                +atomic: true,
+                "fld1": {+channel:"VAL", +putorder:0},
+                "fld2": {+channel:"RVAL", +trigger:"fld1,fld2"}
+            }
+        }"#;
+        let defs = parse_group_config(json).expect("unquoted +keys must parse");
+        assert_eq!(defs.len(), 1);
+        let g = &defs[0];
+        assert_eq!(g.name, "grp1");
+        assert_eq!(g.struct_id.as_deref(), Some("epics:nt/NTGroup:1.0"));
+        assert!(g.atomic);
+        let f1 = g.members.iter().find(|m| m.field_name == "fld1").unwrap();
+        assert_eq!(f1.channel, "VAL");
+        assert_eq!(f1.put_order, Some(0));
+        let f2 = g.members.iter().find(|m| m.field_name == "fld2").unwrap();
+        assert_eq!(f2.channel, "RVAL");
+        match &f2.triggers {
+            TriggerDef::Fields(t) => assert_eq!(t, &vec!["fld1".to_string(), "fld2".to_string()]),
+            other => panic!("expected named trigger fields, got {other:?}"),
+        }
+    }
+
+    /// pva2pva enables YAJL `allow_comments` (pva2pva
+    /// `configparse.cpp:231/249`); the shipped `image.json` example opens
+    /// with a C-style block comment (`image.json:1`). Both `/* */` and
+    /// `//` comments must be stripped before strict parsing.
+    #[test]
+    fn parse_group_config_strips_comments() {
+        let json = r#"/* leading block comment, as in image.json:1 */
+        {
+            // line comment
+            "grp": {
+                "v": { "+channel": "X.VAL" /* trailing */ }
+            }
+        }"#;
+        let defs = parse_group_config(json).expect("comments must be stripped");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].members[0].channel, "X.VAL");
+    }
+
+    /// The normalizer is string-literal aware: comment markers and a
+    /// leading `+` inside a quoted value must survive verbatim, never
+    /// mistaken for a comment or a bare key.
+    #[test]
+    fn parse_group_config_preserves_comment_markers_inside_strings() {
+        let json = r#"{
+            "grp": {
+                "v": { "+channel": "A/*not a comment*/B//x", "+id": "+literal" }
+            }
+        }"#;
+        let defs = parse_group_config(json).expect("strings with markers must parse");
+        assert_eq!(defs[0].members[0].channel, "A/*not a comment*/B//x");
+    }
+
+    /// The relaxed normalizer applies to the record `info(Q:group, ...)`
+    /// path too, not only standalone files — pvxs routes record info tags
+    /// through the same relaxed parser, and the Rust bridge feeds them via
+    /// `parse_info_group` (provider.rs).
+    #[test]
+    fn parse_info_group_accepts_unquoted_plus_keys() {
+        let json = r#"{
+            "grp1": {
+                "fld1": {+channel:"VAL", +putorder:0}
+            }
+        }"#;
+        let groups = parse_info_group("rec3", json).expect("unquoted +keys must parse");
+        assert_eq!(groups.len(), 1);
+        // bare field-name channel gets the record-name prefix applied.
+        assert_eq!(groups[0].members[0].channel, "rec3.VAL");
     }
 
     #[test]

@@ -131,7 +131,15 @@ async fn main() {
         }
     };
 
-    let client = PvaClient::new().expect("failed to create PVA client");
+    // Build the client with the parsed `-w` as the operation timeout,
+    // applied once at construction so the optional readback GET, the PUT
+    // wait, and the post-PUT GET all use the same owner. Before this, `-w`
+    // was parsed but dropped and every op ran against the 5 s default.
+    // pvAccessCPP pvput applies the parsed `-w` to all three operations
+    // (pvput.cpp:311-320,403-428).
+    let client = PvaClient::builder()
+        .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
+        .build();
 
     // Parse the optional pvRequest once (shared by both put forms).
     let trimmed = args.request.trim();

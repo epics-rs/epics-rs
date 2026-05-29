@@ -93,7 +93,14 @@ async fn main() {
         cli::print_effective_config();
     }
 
-    let client = PvaClient::new().expect("failed to create PVA client");
+    // Build the client with the parsed `-w` as the operation timeout,
+    // applied once at construction so every describe op uses the same
+    // owner. Before this, `-w` was parsed but dropped and every info ran
+    // against the 5 s default. pvAccessCPP pvinfo waits using the parsed
+    // `-w` (pvinfo.cpp:130-138,194-198).
+    let client = PvaClient::builder()
+        .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
+        .build();
 
     // Start a describe op for every PV before awaiting any, then await the
     // whole set under one command-level timeout (pvxs `tools/info.cpp:81-112`

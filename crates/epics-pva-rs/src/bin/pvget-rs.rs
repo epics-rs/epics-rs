@@ -90,7 +90,14 @@ async fn main() {
         }
     };
 
-    let client = PvaClient::new().expect("failed to create PVA client");
+    // Build the client with the parsed `-w` as the operation timeout,
+    // applied once at construction so every op path uses the same owner.
+    // Before this, `-w` was parsed but dropped and every GET ran against
+    // the 5 s default. pvAccessCPP pvget waits for completion using the
+    // parsed `-w` (pvget.cpp:317-326,422-431).
+    let client = PvaClient::builder()
+        .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
+        .build();
     let mode = args.mode.as_str();
 
     // Start a GET for every PV before awaiting any, then await the whole

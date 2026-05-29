@@ -269,11 +269,24 @@ impl PvaLinkConfig {
             // and the prior (default) mode is kept — pvxs does the same
             // (`log_warn_printf` + `jlif_continue`, pvalink_jlif.cpp:156-170)
             // rather than failing the whole link.
+            //
+            // The enum string forms are CASE-SENSITIVE uppercase, matching
+            // pvxs `pva_parse_string` (`pvalink_jlif.cpp:156-170`), which
+            // compares `sval` byte-for-byte against `CP`/`CPP`/`PP`/`NPP`
+            // and warns "unknown proc" on anything else. A lowercase typo
+            // like `proc=cp` must therefore be ignored (kept at default),
+            // not silently activated — otherwise the same link behaves
+            // differently under Rust vs pvxs/QSRV. The boolean shorthands
+            // (`true`/`false`/`1`/`0`) are a distinct path: pvxs accepts a
+            // JSON boolean `proc:true`→PP / `proc:false`→NPP via
+            // `pva_parse_bool` (`pvalink_jlif.cpp:96-98`), so they are kept.
             match v.as_str() {
-                "TRUE" | "true" | "1" | "PP" | "pp" => cfg.proc = ProcMode::Pp,
-                "FALSE" | "false" | "0" | "NPP" | "npp" => cfg.proc = ProcMode::Npp,
-                "CP" | "cp" => cfg.proc = ProcMode::Cp,
-                "CPP" | "cpp" => cfg.proc = ProcMode::Cpp,
+                "TRUE" | "true" | "1" => cfg.proc = ProcMode::Pp,
+                "FALSE" | "false" | "0" => cfg.proc = ProcMode::Npp,
+                "PP" => cfg.proc = ProcMode::Pp,
+                "NPP" => cfg.proc = ProcMode::Npp,
+                "CP" => cfg.proc = ProcMode::Cp,
+                "CPP" => cfg.proc = ProcMode::Cpp,
                 _ => warn_ignored_option(pv_name, "proc", v),
             }
             let (sou, sop) = cfg.proc.inp_scan();
@@ -317,14 +330,22 @@ impl PvaLinkConfig {
 
         // Apply legacy bare modifiers
         for m in legacy_mods {
+            // legacy bare modifiers map to the same five-state
+            // `ProcMode`; CP/CPP additionally drive the INP scan flags
+            // via `inp_scan`. These are CASE-SENSITIVE uppercase,
+            // matching EPICS base's link-modifier parser, which
+            // `strstr`s the raw modifier string against the literal
+            // uppercase tokens `NPP`/`CPP`/`PP`/`CA`/`CP` and
+            // `NMS`/`MSI`/`MSS`/`MS` (`epics-base/modules/database/src/
+            // ioc/dbStatic/dbStaticLib.c:2369-2378`). A lowercase
+            // modifier like `pp`/`ms` is not recognized by base, so
+            // accepting it here would diverge from how the same link
+            // parses under a C IOC.
             match m.as_str() {
-                // legacy bare modifiers map to the same
-                // five-state `ProcMode`; CP/CPP additionally drive the
-                // INP scan flags via `inp_scan`.
-                "PP" | "pp" => cfg.proc = ProcMode::Pp,
-                "NPP" | "npp" => cfg.proc = ProcMode::Npp,
-                "CP" | "cp" | "CPP" | "cpp" => {
-                    cfg.proc = if m.eq_ignore_ascii_case("CPP") {
+                "PP" => cfg.proc = ProcMode::Pp,
+                "NPP" => cfg.proc = ProcMode::Npp,
+                "CP" | "CPP" => {
+                    cfg.proc = if m == "CPP" {
                         ProcMode::Cpp
                     } else {
                         ProcMode::Cp
@@ -334,10 +355,10 @@ impl PvaLinkConfig {
                     cfg.scan_on_update = true;
                     cfg.scan_on_passive = sop;
                 }
-                "MS" | "ms" => cfg.sevr = SevrMode::Ms,
-                "MSI" | "msi" => cfg.sevr = SevrMode::Msi,
-                "MSS" | "mss" => cfg.sevr = SevrMode::Ms, // MSS == MS at our granularity
-                "NMS" | "nms" => cfg.sevr = SevrMode::Nms,
+                "MS" => cfg.sevr = SevrMode::Ms,
+                "MSI" => cfg.sevr = SevrMode::Msi,
+                "MSS" => cfg.sevr = SevrMode::Ms, // MSS == MS at our granularity
+                "NMS" => cfg.sevr = SevrMode::Nms,
                 _ => {}
             }
         }
@@ -453,16 +474,26 @@ fn warn_ignored_option(pv: &str, key: &str, value: &str) {
     );
 }
 
-/// Parse a `sevr` option value. Accepts the pvxs string forms
-/// (`NMS`/`MS`/`MSI`/`MSS`) plus boolean shorthands — pvxs maps
-/// `sevr:true` → `MS` and `sevr:false` → `NMS`.
+/// Parse a `sevr` option value.
+///
+/// The enum string forms are CASE-SENSITIVE uppercase
+/// (`NMS`/`MS`/`MSI`/`MSS`), matching pvxs `pva_parse_string`
+/// (`pvalink_jlif.cpp:172-187`), which compares `sval` byte-for-byte and
+/// warns "unknown sevr" on anything else (so a lowercase typo like
+/// `sevr=msi` is ignored, keeping the default NMS — not silently turned
+/// into INVALID-only propagation). `MSS` is accepted as an alias for
+/// `MS` exactly as pvxs does (`pvalink_jlif.cpp:179-183`).
+///
+/// The boolean shorthands (`true`/`false`/`1`/`0`) are a distinct path:
+/// pvxs maps a JSON boolean `sevr:true` → `MS` and `sevr:false` → `NMS`
+/// via `pva_parse_bool` (`pvalink_jlif.cpp:99`), so they are kept.
 fn parse_sevr(v: &str) -> Result<SevrMode, PvaLinkParseError> {
     match v {
-        "NMS" | "nms" | "false" | "FALSE" | "0" | "no" | "NO" => Ok(SevrMode::Nms),
+        "NMS" | "false" | "FALSE" | "0" | "no" | "NO" => Ok(SevrMode::Nms),
         // pvxs treats MSS as a maximize-severity variant; at our
         // granularity (no separate status propagation) it equals MS.
-        "MS" | "ms" | "MSS" | "mss" | "true" | "TRUE" | "1" | "yes" | "YES" => Ok(SevrMode::Ms),
-        "MSI" | "msi" => Ok(SevrMode::Msi),
+        "MS" | "MSS" | "true" | "TRUE" | "1" | "yes" | "YES" => Ok(SevrMode::Ms),
+        "MSI" => Ok(SevrMode::Msi),
         other => Err(PvaLinkParseError::BadOption(format!("sevr={other}"))),
     }
 }
@@ -713,6 +744,52 @@ mod tests {
                 .sevr,
             SevrMode::Nms
         );
+    }
+
+    /// pvxs enum string forms are case-sensitive uppercase. A lowercase
+    /// typo such as `proc=cp` or `sevr=msi` is "unknown" to pvxs
+    /// `pva_parse_string` (`pvalink_jlif.cpp:156-187`) and to EPICS
+    /// base's modifier parser (`dbStaticLib.c:2369-2378`): it is warned
+    /// and the prior/default mode is kept, never silently activated.
+    /// The same link must therefore behave identically under Rust and
+    /// pvxs/QSRV.
+    #[test]
+    fn proc_sevr_enum_strings_are_case_sensitive_uppercase() {
+        // Lowercase `proc=` enum strings are ignored → default (not CP).
+        for typo in ["cp", "cpp", "pp", "npp"] {
+            let c =
+                PvaLinkConfig::parse(&format!("pva://X?proc={typo}"), LinkDirection::Inp).unwrap();
+            assert_eq!(
+                c.proc,
+                ProcMode::Default,
+                "proc={typo} (lowercase) must be ignored, keeping default"
+            );
+            assert!(
+                !c.scan_on_update,
+                "lowercase proc={typo} must not turn on CP-style scan-on-update"
+            );
+        }
+
+        // Lowercase `sevr=` enum strings are ignored → default NMS.
+        for typo in ["ms", "msi", "mss", "nms"] {
+            let c =
+                PvaLinkConfig::parse(&format!("pva://X?sevr={typo}"), LinkDirection::Inp).unwrap();
+            assert_eq!(
+                c.sevr,
+                SevrMode::Nms,
+                "sevr={typo} (lowercase) must be ignored, keeping default NMS"
+            );
+        }
+
+        // Lowercase legacy bare modifiers are likewise ignored.
+        let c = PvaLinkConfig::parse("pva://X cp ms", LinkDirection::Inp).unwrap();
+        assert_eq!(c.proc, ProcMode::Default, "legacy `cp` ignored");
+        assert_eq!(c.sevr, SevrMode::Nms, "legacy `ms` ignored");
+
+        // Uppercase forms still work (regression guard).
+        let up = PvaLinkConfig::parse("pva://X?proc=CP&sevr=MSI", LinkDirection::Inp).unwrap();
+        assert_eq!(up.proc, ProcMode::Cp);
+        assert_eq!(up.sevr, SevrMode::Msi);
     }
 
     #[test]

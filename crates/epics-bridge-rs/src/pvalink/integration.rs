@@ -1341,15 +1341,20 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                         })
                         .collect(),
                 )),
-                // A remote `uint[]` is 32-bit; `EpicsValue` has no
-                // unsigned-32 array variant, so it keeps the existing
-                // `LongArray` (i32) mapping — width-preserving, only
-                // a sign reinterpretation.
-                ScalarValue::UInt(_) => Some(EpicsValue::LongArray(
+                // a remote `uint[]` is unsigned 32-bit and the
+                // link advertises DBF_ULONG metadata; the prior
+                // `LongArray` (i32) mapping sign-cast every element
+                // above i32::MAX, contradicting that metadata. Preserve
+                // the unsigned value losslessly as `Int64Array`, the
+                // same width-preserving contract `long[] => Int64Array`
+                // / `ulong[] => UInt64Array` use here (pvxs routes
+                // DBR_ULONG arrays through `ArrayType::UInt32`,
+                // `pvxs/ioc/pvalink_lset.cpp:287-325`).
+                ScalarValue::UInt(_) => Some(EpicsValue::Int64Array(
                     arr.iter()
                         .filter_map(|s| {
                             if let ScalarValue::UInt(v) = s {
-                                Some(*v as i32)
+                                Some(*v as i64)
                             } else {
                                 None
                             }
@@ -1439,9 +1444,12 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                 TypedScalarArray::UShort(a) => Some(EpicsValue::ShortArray(
                     a.iter().map(|v| *v as i16).collect(),
                 )),
-                TypedScalarArray::UInt(a) => {
-                    Some(EpicsValue::LongArray(a.iter().map(|v| *v as i32).collect()))
-                }
+                // unsigned 32-bit; widen losslessly to `Int64Array`
+                // to agree with the link's DBF_ULONG metadata (same
+                // reasoning as the generic `uint[]` arm above).
+                TypedScalarArray::UInt(a) => Some(EpicsValue::Int64Array(
+                    a.iter().map(|v| *v as i64).collect(),
+                )),
                 // a remote `ulong[]` is 64-bit per element;
                 // preserve the full width as `UInt64Array`.
                 TypedScalarArray::ULong(a) => Some(EpicsValue::UInt64Array(a.to_vec())),
@@ -1477,7 +1485,17 @@ fn scalar_to_epics(sv: &ScalarValue) -> EpicsValue {
         ScalarValue::Short(v) => EpicsValue::Short(*v),
         ScalarValue::Byte(v) => EpicsValue::Char(*v as u8),
         ScalarValue::ULong(v) => EpicsValue::UInt64(*v),
-        ScalarValue::UInt(v) => EpicsValue::Long(*v as i32),
+        // a remote PVA `uint` is unsigned 32-bit and the link
+        // advertises DBF_ULONG metadata (`link.rs` `ScalarValue::UInt
+        // => LinkDbfType::ULong`, mirroring pvxs `pvaGetDBFtype`
+        // `TypeCode::UInt32 => DBF_ULONG`, `pvxs/ioc/pvalink_lset.cpp:215-223`).
+        // Carrying it as `EpicsValue::Long` (i32) sign-casts any value
+        // above i32::MAX (e.g. 0x8000_0000 → -2147483648), so the
+        // record would consume a negative value the unsigned metadata
+        // never promised. Widen losslessly to `Int64`, matching the
+        // `Long => Int64` / `ULong => UInt64` width-preserving contract
+        // above; the owning record narrows to its field type.
+        ScalarValue::UInt(v) => EpicsValue::Int64(*v as i64),
         ScalarValue::UShort(v) => EpicsValue::Short(*v as i16),
         // DBF_CHAR is signed (pvByte). Widen UByte to Short so the
         // unsigned 128..255 range survives the cross-protocol hop.
@@ -1679,6 +1697,49 @@ mod tests {
             ))),
             Some(EpicsValue::Int64Array(vec![big_i, -2])),
             "typed remote long[] must keep all 64 bits per element"
+        );
+    }
+
+    /// A remote PVA `uint` / `uint[]` is unsigned 32-bit, and the link
+    /// advertises DBF_ULONG metadata. The INP conversion previously
+    /// carried it as `EpicsValue::Long` / `LongArray` (i32), sign-casting
+    /// any value above i32::MAX to a negative number — contradicting the
+    /// unsigned metadata. It must now widen losslessly to `Int64` /
+    /// `Int64Array` (pvxs maps `TypeCode::UInt32 => DBF_ULONG` and routes
+    /// the arrays through `ArrayType::UInt32`,
+    /// `pvxs/ioc/pvalink_lset.cpp:215-223`, `:287-325`).
+    #[test]
+    fn inp_uint_preserves_unsigned_value_above_i32_max() {
+        use epics_pva_rs::pvdata::TypedScalarArray;
+
+        // 0x8000_0000 = 2147483648: the smallest u32 that overflows i32.
+        let big: u32 = 0x8000_0000;
+        let big_i: i64 = 2_147_483_648;
+
+        // Scalar `uint` → `Int64` (positive, not the sign-cast -2147483648).
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::Scalar(ScalarValue::UInt(big))),
+            Some(EpicsValue::Int64(big_i)),
+            "remote uint scalar above i32::MAX must stay unsigned, not sign-cast negative"
+        );
+
+        // Untyped `uint[]` → `Int64Array`.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArray(vec![
+                ScalarValue::UInt(big),
+                ScalarValue::UInt(1),
+            ])),
+            Some(EpicsValue::Int64Array(vec![big_i, 1])),
+            "remote uint[] above i32::MAX must stay unsigned per element"
+        );
+
+        // Typed-fast-path `uint[]` → `Int64Array`.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::UInt(
+                vec![big, 2].into()
+            ))),
+            Some(EpicsValue::Int64Array(vec![big_i, 2])),
+            "typed remote uint[] above i32::MAX must stay unsigned per element"
         );
     }
 

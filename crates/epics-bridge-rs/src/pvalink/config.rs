@@ -115,13 +115,18 @@ impl ProcMode {
     }
 
     /// INP scan-on-update derivation: `(scan_on_update, scan_on_passive)`.
-    /// Only `Cp` / `Cpp` scan; `Cpp` gates on the owning record being
-    /// Passive. Mirrors pvxs `pvalink_link.cpp:122`.
+    /// `Pp` / `Cp` / `Cpp` all scan on monitor updates; `Pp` and `Cpp`
+    /// gate on the owning record being Passive, `Cp` always fires.
+    /// Mirrors the pvxs scan-list builder
+    /// (`pva2pva/pdbApp/pvalink_channel.cpp:393-397`): it skips only
+    /// `NPP`/`Default` (`pp != PP && pp != CPP && pp != CP → continue`)
+    /// and sets `scan_check_passive = pp != CP`, i.e. passive-only for
+    /// every scanning mode except `CP`.
     pub fn inp_scan(self) -> (bool, bool) {
         match self {
             ProcMode::Cp => (true, false),
-            ProcMode::Cpp => (true, true),
-            ProcMode::Default | ProcMode::Pp | ProcMode::Npp => (false, false),
+            ProcMode::Pp | ProcMode::Cpp => (true, true),
+            ProcMode::Default | ProcMode::Npp => (false, false),
         }
     }
 }
@@ -342,18 +347,29 @@ impl PvaLinkConfig {
             // accepting it here would diverge from how the same link
             // parses under a C IOC.
             match m.as_str() {
-                "PP" => cfg.proc = ProcMode::Pp,
-                "NPP" => cfg.proc = ProcMode::Npp,
-                "CP" | "CPP" => {
-                    cfg.proc = if m == "CPP" {
-                        ProcMode::Cpp
-                    } else {
-                        ProcMode::Cp
+                "PP" | "NPP" | "CP" | "CPP" => {
+                    // Set the five-state mode, then derive the INP scan
+                    // flags from it via the single `inp_scan` owner — the
+                    // same uniform derivation used for the query `proc=`
+                    // path above. `PP` is NOT special-cased to skip scan:
+                    // pvxs's scan-list builder
+                    // (`pva2pva/pdbApp/pvalink_channel.cpp:393-397`)
+                    // includes `PP`/`CP`/`CPP` INP links and gates `PP`
+                    // (like `CPP`) on the owning record being Passive, so
+                    // a legacy `PP` suffix on an INP link must register a
+                    // passive-only scan target, not stay PUT-only.
+                    cfg.proc = match m.as_str() {
+                        "PP" => ProcMode::Pp,
+                        "NPP" => ProcMode::Npp,
+                        "CP" => ProcMode::Cp,
+                        _ => ProcMode::Cpp,
                     };
-                    let (_sou, sop) = cfg.proc.inp_scan();
-                    cfg.monitor = true;
-                    cfg.scan_on_update = true;
-                    cfg.scan_on_passive = sop;
+                    let (sou, sop) = cfg.proc.inp_scan();
+                    if sou {
+                        cfg.monitor = true;
+                        cfg.scan_on_update = true;
+                        cfg.scan_on_passive = sop;
+                    }
                 }
                 "MS" => cfg.sevr = SevrMode::Ms,
                 "MSI" => cfg.sevr = SevrMode::Msi,
@@ -644,6 +660,34 @@ mod tests {
         assert_eq!(cpp.proc.inp_scan(), (true, true));
         assert!(cpp.scan_on_update && cpp.scan_on_passive && cpp.monitor);
         assert_eq!(cpp.proc.put_process_request(), "true");
+    }
+
+    /// `PP` (`proc=PP`, `proc=true`, and the legacy bare `PP` suffix)
+    /// must register a passive-only INP scan target — pvxs scans
+    /// `PP`/`CP`/`CPP` INP links and gates `PP`/`CPP` on Passive
+    /// (`pva2pva/pdbApp/pvalink_channel.cpp:393-397`). Pre-fix `PP`
+    /// returned `(false, false)` from `inp_scan` and stayed PUT-only.
+    #[test]
+    fn pp_inp_registers_passive_only_scan() {
+        // canonical NT scan flags
+        assert_eq!(ProcMode::Pp.inp_scan(), (true, true));
+        // still requests remote processing on PUT
+        assert_eq!(ProcMode::Pp.put_process_request(), "true");
+
+        for s in ["pva://X?proc=PP", "pva://X?proc=true", "pva://X PP"] {
+            let c = PvaLinkConfig::parse(s, LinkDirection::Inp).unwrap();
+            assert_eq!(c.proc, ProcMode::Pp, "{s}");
+            assert!(
+                c.scan_on_update && c.scan_on_passive && c.monitor,
+                "{s}: PP must be a passive-only scan target"
+            );
+        }
+
+        // NPP / Default never scan.
+        let npp = PvaLinkConfig::parse("pva://X?proc=NPP", LinkDirection::Inp).unwrap();
+        assert!(!npp.scan_on_update);
+        let def = PvaLinkConfig::parse("pva://X", LinkDirection::Inp).unwrap();
+        assert!(!def.scan_on_update);
     }
 
     /// `PASSIVE` is the wire request string for `Default`, not a pvxs

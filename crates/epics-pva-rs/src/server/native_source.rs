@@ -785,6 +785,20 @@ fn scalar_array_to_epics(items: &[ScalarValue]) -> Option<EpicsValue> {
                 })
                 .collect(),
         )),
+        // PVA `uint[]` has no array arm here, so a `DBF_ULONG`
+        // waveform PUT fell through to `None` and was rejected as
+        // "PUT value not representable as EpicsValue". Mirror the
+        // scalar `UInt -> Int64` rule: `Int64Array` carries the full
+        // `epicsUInt32` range of every element losslessly.
+        ScalarValue::UInt(_) => Some(EpicsValue::Int64Array(
+            items
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::UInt(x) => Some(*x as i64),
+                    _ => None,
+                })
+                .collect(),
+        )),
         ScalarValue::Float(_) => Some(EpicsValue::FloatArray(
             items
                 .iter()
@@ -822,7 +836,15 @@ fn scalar_to_epics(v: &ScalarValue) -> EpicsValue {
         ScalarValue::Long(x) => EpicsValue::Int64(*x),
         ScalarValue::UByte(x) => EpicsValue::Char(*x),
         ScalarValue::UShort(x) => EpicsValue::Enum(*x),
-        ScalarValue::UInt(x) => EpicsValue::Long(*x as i32),
+        // PVA `uint` is unsigned 32-bit. Casting it through `i32`
+        // sign-flips `0x8000_0000..=0xffff_ffff` to negative before
+        // `PvDatabase::put_pv` can coerce to the target field. The
+        // Rust value model has no unsigned-32 scalar; `Int64` carries
+        // the full `epicsUInt32` range losslessly, matching the
+        // `DBF_ULONG` convention used by the `ts` filter
+        // (`server/database/filters/ts.rs`) and pvxs's
+        // `uint32_t -> uint64_t` storage (`pvxs/src/pvxs/data.h:64-67`).
+        ScalarValue::UInt(x) => EpicsValue::Int64(*x as i64),
         // PVA `ulong` is unsigned 64-bit. Narrowing it to
         // `EpicsValue::Long` (i32) here drops the upper 32 bits before
         // `PvDatabase::put_pv` can coerce to the target `DBF_UINT64`
@@ -1615,6 +1637,110 @@ ASG(LOCKED) {
             snap.value,
             EpicsValue::UInt64Array(values),
             "wire-decoded ulong[] PUT must round-trip the full u64 elements, got {:?}",
+            snap.value,
+        );
+    }
+
+    /// Regression: a native PVA scalar `uint` PUT above `i32::MAX`
+    /// must not sign-flip. Pre-fix `scalar_to_epics` mapped
+    /// `ScalarValue::UInt(x)` to `EpicsValue::Long(x as i32)`, so
+    /// `0x8000_0000..=0xffff_ffff` was stored as a negative value.
+    /// `Int64` is the lossless `epicsUInt32` carrier.
+    #[tokio::test]
+    async fn pva_03_scalar_uint_put_preserves_full_u32() {
+        let db = Arc::new(PvDatabase::new());
+        // A simple PV stores the value verbatim, isolating the
+        // source-layer conversion under test (no field coercion).
+        db.add_pv("UI:SCALAR", EpicsValue::Int64(0)).await.unwrap();
+
+        let source = PvDatabaseSource::new(db.clone());
+
+        // Above signed-32 range: 0x8000_0001 = 2_147_483_649.
+        let big: u32 = 0x8000_0001;
+        source
+            .put_value_ctx(
+                "UI:SCALAR",
+                PvField::Scalar(ScalarValue::UInt(big)),
+                make_ctx("h", "anyone", "anonymous"),
+            )
+            .await
+            .expect("uint PUT must succeed");
+
+        let snap = snapshot_for(&db, "UI:SCALAR").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::Int64(i64::from(big)),
+            "scalar uint PUT must carry the full epicsUInt32 range, got {:?}",
+            snap.value,
+        );
+    }
+
+    /// Regression: a native PVA `uint[]` PUT was rejected outright —
+    /// `scalar_array_to_epics` had no `ScalarValue::UInt` arm, so the
+    /// PUT fell through to `None` ("PUT value not representable as
+    /// EpicsValue"). `Int64Array` carries every `epicsUInt32` element.
+    #[tokio::test]
+    async fn pva_03_uint_array_put_preserves_full_u32() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "UI:WF",
+            Box::new(WaveformRecord::new(4, DbFieldType::Int64)),
+        )
+        .await
+        .unwrap();
+
+        let source = PvDatabaseSource::new(db.clone());
+
+        // Two elements exceed i32::MAX; any cast through i32 corrupts them.
+        let values: Vec<u32> = vec![1, 0x8000_0001, u32::MAX, 0];
+        let put = PvField::ScalarArray(values.iter().map(|v| ScalarValue::UInt(*v)).collect());
+        source
+            .put_value_ctx("UI:WF", put, make_ctx("h", "anyone", "anonymous"))
+            .await
+            .expect("uint[] PUT must succeed");
+
+        let snap = snapshot_for(&db, "UI:WF").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::Int64Array(values.iter().map(|v| i64::from(*v)).collect()),
+            "uint[] PUT must round-trip the full epicsUInt32 elements, got {:?}",
+            snap.value,
+        );
+    }
+
+    /// a real PVA wire `uint[]` PUT decodes to
+    /// `PvField::ScalarArrayTyped`; it must reach the same `Int64Array`
+    /// conversion as the untyped form rather than being rejected.
+    #[tokio::test]
+    async fn pva_03_wire_typed_uint_array_put_preserves_full_u32() {
+        use crate::pvdata::TypedScalarArray;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "UI:WFT",
+            Box::new(WaveformRecord::new(4, DbFieldType::Int64)),
+        )
+        .await
+        .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+
+        let values: Vec<u32> = vec![1, 0x8000_0001, u32::MAX, 0];
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::UInt(Arc::from(values.as_slice())));
+        source
+            .put_value_ctx("UI:WFT", put, make_ctx("h", "anyone", "anonymous"))
+            .await
+            .expect("wire-decoded uint[] PUT must succeed");
+
+        let snap = snapshot_for(&db, "UI:WFT").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::Int64Array(values.iter().map(|v| i64::from(*v)).collect()),
+            "wire-decoded uint[] PUT must round-trip the full epicsUInt32 elements, got {:?}",
             snap.value,
         );
     }

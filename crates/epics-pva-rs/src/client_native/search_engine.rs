@@ -804,6 +804,33 @@ fn cascade_smoothed_next(
     }
 }
 
+/// Single owner of a search's post-send retry decision: returns the
+/// `(next_bucket, next_attempt)` to requeue it with.
+///
+/// pvxs `tickSearch(..., poked)` (client.cpp:1141-1160): on a poked tick (during
+/// the fast poke revolution) `ninc = 0`, so the channel keeps its accumulated
+/// `nSearch` backoff and is requeued into the SAME bucket — because
+/// `current_bucket` has already advanced, it waits for the fast revolution to
+/// wrap rather than becoming a fresh 1-bucket retry. On a normal tick `nSearch`
+/// is incremented first and the channel escalates forward by that count with
+/// cascade smoothing (client.cpp:1193-1206).
+fn rearm_after_send(
+    poked: bool,
+    current_bucket: usize,
+    attempt: u32,
+    bucket_sizes: impl Fn(usize) -> usize,
+) -> (usize, u32) {
+    if poked {
+        (current_bucket, attempt)
+    } else {
+        let next_attempt = attempt.saturating_add(1);
+        (
+            cascade_smoothed_next(current_bucket, next_attempt, bucket_sizes),
+            next_attempt,
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_engine(
     mut cmd_rx: mpsc::Receiver<SearchCommand>,
@@ -1041,27 +1068,19 @@ async fn run_engine(
                     // `maybe_poke` grants (not already poking, past the 30 s
                     // holdoff). When granted it switches the tick ring to the
                     // 200 ms fast cadence for one full revolution.
-                    if allow_reconnect
-                        && first_announce
-                        && maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await
-                    {
-                        let now = Instant::now();
-                        for p in pending.values_mut() {
-                            p.last_attempt = now - Duration::from_secs(60);
-                            // Reset `attempt` so the kicked retry re-enters at
-                            // the 1-bucket forward push instead of inheriting
-                            // the prior escalation. NOTE: this is MORE
-                            // aggressive than pvxs `tickSearch` line 1194
-                            // (`if !poked`), which skips the nSearch increment
-                            // for one tick (search re-pushed to SAME bucket).
-                            // Our reset-to-0 means post-poke retries cascade at
-                            // the normal 1, 2, 3, … bucket-forward pattern from
-                            // scratch, giving rapid retransmits during the
-                            // fast-tick window. Acceptable trade for single-
-                            // channel recovery; under mass-disconnect cascades
-                            // it spends more UDP bandwidth than pvxs would.
-                            p.attempt = 0;
-                        }
+                    if allow_reconnect && first_announce {
+                        // pvxs `poke()` (client.cpp:736-759): a fresh server
+                        // identity starts the 200 ms fast search revolution and
+                        // records the poke time — it does NOT touch per-channel
+                        // `nSearch`. The fast cadence sweeps the ring so every
+                        // parked search retransmits within one revolution while
+                        // keeping its accumulated backoff; the tick handler's
+                        // poked branch (client.cpp:1141-1160) skips the `nSearch`
+                        // increment and requeues into the same bucket. The
+                        // previous `attempt = 0` reset turned every pending PV
+                        // into a fresh 1-bucket retry, retransmitting far more
+                        // aggressively than pvxs during mass-disconnect cascades.
+                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
                     }
                     if first_announce {
                         // BeaconObserved is the in-process injection
@@ -1085,24 +1104,16 @@ async fn run_engine(
                     let _ = responder.send(rx);
                 }
                 Some(SearchCommand::HurryUp) => {
-                    // Same effect as a fresh-server beacon, routed through the
-                    // rate-limited `maybe_poke`. pvxs `hurryUp()` calls the
-                    // same `poke()`, so it is equally subject to the 30 s
-                    // holdoff and the skip-while-active guard (poke() even
-                    // logs "Ignoring hurryUp()" when it declines). On grant,
-                    // reset every pending search's retry counter so they all
-                    // retry within ~6 s. SEE NOTE in the BeaconObserved arm
-                    // above — our `attempt = 0` reset is more aggressive than
-                    // pvxs's `poked` semantic (which preserves nSearch and
-                    // just skips the increment for one tick). Tradeoff is
-                    // documented there.
-                    if maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await {
-                        let now = Instant::now();
-                        for p in pending.values_mut() {
-                            p.last_attempt = now - Duration::from_secs(60);
-                            p.attempt = 0;
-                        }
-                    }
+                    // pvxs `hurryUp()` routes through the same rate-limited
+                    // `poke()` (client.cpp:736-759): it is equally subject to the
+                    // 30 s holdoff and the skip-while-active guard. Start the fast
+                    // revolution WITHOUT resetting per-PV backoff: the fast cadence
+                    // retransmits every pending search within ~6 s while preserving
+                    // its `nSearch` state (the tick handler's poked branch skips
+                    // the increment and requeues into the same bucket). The prior
+                    // `attempt = 0` reset was more aggressive than pvxs's poked
+                    // semantic.
+                    maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
                 }
                 Some(SearchCommand::CacheClear { pv_name }) => {
                     // Same drop-the-name path as Cancel, but the name
@@ -1334,6 +1345,14 @@ async fn run_engine(
                 //    to `next+1` (mirrors pvxs `client.cpp:1199-1206`).
                 //    Lets a mass-disconnect spread across two ticks
                 //    instead of one.
+                // pvxs `tickSearch(..., poked)` (client.cpp:1141-1160): a tick
+                // during the fast poke revolution skips the `nSearch++` backoff
+                // increment and requeues each channel into the SAME bucket. Since
+                // `current_bucket` has already advanced, the channel waits for the
+                // fast revolution to wrap rather than becoming a fresh 1-bucket
+                // retry. Preserving `attempt` keeps each search's accumulated
+                // backoff across the poke.
+                let poked = fast_ticks_remaining > 0;
                 let bucket_ids = std::mem::take(&mut search_buckets[current_bucket]);
                 for sid in bucket_ids {
                     let responder_dead = match pending.get(&sid) {
@@ -1377,7 +1396,6 @@ async fn run_engine(
                             }
                         }
                         p.last_attempt = now;
-                        p.attempt = p.attempt.saturating_add(1);
                         codec.build_search(
                             0, sid, &p.pv_name, [0, 0, 0, 0], response_port, false,
                         )
@@ -1385,23 +1403,22 @@ async fn run_engine(
                     if let Some(pkt) = pkt_opt {
                         broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs)
                             .await;
-                        // Re-arm into the escalation bucket. Read
-                        // attempt under a fresh borrow so the closure
-                        // above doesn't have to outlive the
+                        // Re-arm via the single owner of the post-send retry
+                        // decision. Read attempt under a fresh borrow so the
+                        // closure above doesn't have to outlive the
                         // search_buckets borrow we need below.
                         if let Some(p) = pending.get(&sid) {
                             let attempt = p.attempt;
                             ns_search_to_ready(&ns_senders, &codec, sid, &p.pv_name);
-                            let bucket_sizes = |idx: usize| search_buckets[idx].len();
-                            let next = cascade_smoothed_next(
-                                current_bucket,
-                                attempt,
-                                bucket_sizes,
-                            );
-                            // Update the pending's bucket BEFORE the
-                            // mutable push so the in-place state and
-                            // the buckets agree if we re-enter.
+                            let (next, next_attempt) = {
+                                let bucket_sizes = |idx: usize| search_buckets[idx].len();
+                                rearm_after_send(poked, current_bucket, attempt, bucket_sizes)
+                            };
+                            // Update the pending's bucket/attempt BEFORE the
+                            // mutable push so the in-place state and the
+                            // buckets agree if we re-enter.
                             if let Some(p) = pending.get_mut(&sid) {
+                                p.attempt = next_attempt;
                                 p.bucket = next;
                             }
                             search_buckets[next].push(sid);
@@ -2655,6 +2672,42 @@ mod tests {
         assert_eq!(
             cascade_smoothed_next(current, attempt, sizes_reverse_overload),
             6,
+        );
+    }
+
+    /// pvxs poke preserves per-channel `nSearch` (client.cpp:1141-1160): a poked
+    /// tick must NOT escalate the backoff. An aged search at `attempt = 7`,
+    /// after a HurryUp/beacon poke, must requeue into the SAME bucket with its
+    /// attempt unchanged — not restart as a fresh 1-bucket retry at attempt 1.
+    #[test]
+    fn rearm_poked_preserves_backoff_and_requeues_same_bucket() {
+        let no_imbalance = |_| 0usize;
+        let current = 5;
+
+        // Poked tick: attempt preserved, requeued into the same bucket
+        // regardless of how large the accumulated backoff is.
+        assert_eq!(
+            rearm_after_send(true, current, 7, no_imbalance),
+            (current, 7),
+            "a poked tick keeps nSearch and requeues into the same bucket"
+        );
+        assert_eq!(
+            rearm_after_send(true, current, 1, no_imbalance),
+            (current, 1),
+            "poked requeue is independent of attempt value"
+        );
+
+        // Normal tick: nSearch increments first, then escalates forward by the
+        // incremented count.
+        assert_eq!(
+            rearm_after_send(false, current, 7, no_imbalance),
+            ((current + 8) % N_SEARCH_BUCKETS, 8),
+            "a normal tick increments nSearch and escalates the bucket"
+        );
+        assert_eq!(
+            rearm_after_send(false, current, 0, no_imbalance),
+            ((current + 1) % N_SEARCH_BUCKETS, 1),
+            "first normal retry escalates one bucket forward"
         );
     }
 

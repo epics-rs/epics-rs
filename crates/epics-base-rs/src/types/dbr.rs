@@ -161,6 +161,128 @@ impl DbFieldType {
     }
 }
 
+/// dbStatic link-field classes — the three `dbfType` values that mark a
+/// record field as a *link* rather than a value
+/// (`dbFldTypes.h`: `DBF_INLINK`=14, `DBF_OUTLINK`=15, `DBF_FWDLINK`=16).
+///
+/// pvxs rejects a QSRV group PUT to any field whose
+/// `dbChannelFinalFieldType` falls in `DBF_INLINK..=DBF_FWDLINK`
+/// (`ioc/groupsource.cpp:596-606`). The Rust port has no dbStatic field
+/// table, so [`dbf_link_class`] reconstructs the same classification from
+/// the EPICS Base / synApps `*.dbd(.pod)` link-field families and returns
+/// the matching class. Consumers gate "is this field a link" on
+/// `dbf_link_class(..).is_some()` (or [`is_link_dbf_type`] when they
+/// already hold a dbStatic code), rather than maintaining their own
+/// partial spelling lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DbfLinkClass {
+    /// `DBF_INLINK` (14) — an input link (`INP`, `DOL`, `SIML`, …).
+    InLink = DBF_INLINK,
+    /// `DBF_OUTLINK` (15) — an output link (`OUT`, `LNKn`, …).
+    OutLink = DBF_OUTLINK,
+    /// `DBF_FWDLINK` (16) — a forward link (`FLNK`).
+    FwdLink = DBF_FWDLINK,
+}
+
+/// `dbFldTypes.h` `DBF_INLINK`.
+pub const DBF_INLINK: u8 = 14;
+/// `dbFldTypes.h` `DBF_OUTLINK`.
+pub const DBF_OUTLINK: u8 = 15;
+/// `dbFldTypes.h` `DBF_FWDLINK`.
+pub const DBF_FWDLINK: u8 = 16;
+
+impl DbfLinkClass {
+    /// The dbStatic `dbfType` numeric code (`dbFldTypes.h`).
+    pub fn dbf_type(self) -> u8 {
+        self as u8
+    }
+}
+
+/// True iff `dbf_type` is a link class — the exact
+/// `DBF_INLINK <= t <= DBF_FWDLINK` range check pvxs applies in
+/// `ioc/groupsource.cpp:596-606`. Use when a caller already holds a
+/// dbStatic field-type code; [`dbf_link_class`] is the name-keyed entry
+/// point for the Rust port, which carries no dbStatic table.
+pub fn is_link_dbf_type(dbf_type: u8) -> bool {
+    (DBF_INLINK..=DBF_FWDLINK).contains(&dbf_type)
+}
+
+/// Classify a record field by its dbStatic link class, or `None` when it
+/// is not a link field. This is the single canonical owner of the
+/// "is this field a link" rule for the Rust port — the structural
+/// replacement for the partial, per-consumer name lists that the
+/// `groupsource.cpp:596-606` review flagged (a record-type-blind
+/// spelling list re-opens the bypass for every record that names a link
+/// field outside the list).
+///
+/// `record_type` is the record's `recordType` (`ai`, `bo`, `seq`, …); it
+/// is consulted only to resolve the one direction-ambiguous field,
+/// `SIOL`, which is `DBF_OUTLINK` on output records and `DBF_INLINK` on
+/// input records (compare `boRecord.dbd.pod:318` `SIOL,DBF_OUTLINK` vs
+/// `aiRecord`/`biRecord` `SIOL,DBF_INLINK`). Every other family has a
+/// fixed class across all record types.
+///
+/// Names and classes are taken verbatim from EPICS Base / synApps
+/// `*.dbd(.pod)`:
+///   - dbCommon: `FLNK`→Fwd, `SDIS`/`TSEL`→In.
+///   - `INP`/`DOL`/`SIML`/`NVL`/`SVL`/`SUBL`/`SELL`→In, `OUT`→Out.
+///   - `SIOL`→Out on output records, else In.
+///   - `INPA..INPU`/`INP0..INP9`→In; `OUTA..OUTU`→Out.
+///   - `DOL0..DOL9`/`DOLA..DOLF`→In; `LNK0..LNK9`/`LNKA..LNKF`→Out.
+pub fn dbf_link_class(record_type: &str, field: &str) -> Option<DbfLinkClass> {
+    use DbfLinkClass::*;
+    let f = field.trim().to_ascii_uppercase();
+
+    // Exact dbCommon + record-specific named link fields.
+    match f.as_str() {
+        "FLNK" => return Some(FwdLink),
+        "SDIS" | "TSEL" | "INP" | "DOL" | "SIML" | "NVL" | "SVL" | "SUBL" | "SELL" => {
+            return Some(InLink);
+        }
+        "OUT" => return Some(OutLink),
+        "SIOL" => {
+            return Some(if is_output_record_type(record_type) {
+                OutLink
+            } else {
+                InLink
+            });
+        }
+        _ => {}
+    }
+
+    // Indexed / lettered link families: a known prefix plus exactly one
+    // alphanumeric suffix character. The DBDs use `A..U` / `0..9` / `A..F`,
+    // but any single-alnum suffix on these prefixes is a link in every
+    // base record that defines the family, so a one-char-suffix rule is
+    // both complete and on the safe (reject) side for custom records.
+    let one_alnum = |rest: &str| rest.len() == 1 && rest.as_bytes()[0].is_ascii_alphanumeric();
+    for (prefix, class) in [
+        ("INP", InLink),
+        ("DOL", InLink),
+        ("OUT", OutLink),
+        ("LNK", OutLink),
+    ] {
+        if let Some(rest) = f.strip_prefix(prefix) {
+            if one_alnum(rest) {
+                return Some(class);
+            }
+        }
+    }
+    None
+}
+
+/// Record types whose `SIOL` simulation-output link is `DBF_OUTLINK`
+/// (the output records). Input records declare `SIOL` as `DBF_INLINK`.
+/// Same output-record set as the device-write records — compare
+/// `crate::server::record::Record::can_device_write`.
+fn is_output_record_type(record_type: &str) -> bool {
+    matches!(
+        record_type,
+        "ao" | "bo" | "longout" | "int64out" | "mbbo" | "mbboDirect" | "stringout" | "lso" | "aao"
+    )
+}
+
 /// Calculate buffer size for a DBR type including metadata, matching C
 /// `dbr_size_n(TYPE, COUNT) = dbr_size[TYPE] + (COUNT-1)*dbr_value_size[TYPE]`.
 ///
@@ -357,6 +479,87 @@ mod buffer_size_tests {
             28 + 2
         );
         assert_eq!(dbr_buffer_size(DBR_CTRL_CHAR, DbFieldType::Char, 1), 21 + 1);
+    }
+}
+
+#[cfg(test)]
+mod dbf_link_class_tests {
+    use super::*;
+
+    #[test]
+    fn dbcommon_links_classified_uniformly() {
+        // Present on every record (dbCommon.dbd).
+        assert_eq!(dbf_link_class("ai", "FLNK"), Some(DbfLinkClass::FwdLink));
+        assert_eq!(dbf_link_class("ao", "SDIS"), Some(DbfLinkClass::InLink));
+        assert_eq!(dbf_link_class("calc", "TSEL"), Some(DbfLinkClass::InLink));
+    }
+
+    #[test]
+    fn record_specific_link_families_the_old_name_list_missed() {
+        // The families the reviewed partial spelling list omitted, each a
+        // DBF_INLINK/OUTLINK in EPICS Base `*.dbd.pod`:
+        //   seqRecord DOL0 (INLINK) / LNK0 (OUTLINK) / DOLA / DOLF / LNKF
+        assert_eq!(dbf_link_class("seq", "DOL0"), Some(DbfLinkClass::InLink));
+        assert_eq!(dbf_link_class("seq", "LNK0"), Some(DbfLinkClass::OutLink));
+        assert_eq!(dbf_link_class("seq", "DOLA"), Some(DbfLinkClass::InLink));
+        assert_eq!(dbf_link_class("seq", "DOLF"), Some(DbfLinkClass::InLink));
+        assert_eq!(dbf_link_class("seq", "LNKF"), Some(DbfLinkClass::OutLink));
+        //   selRecord NVL (INLINK); histogramRecord SVL (INLINK)
+        assert_eq!(dbf_link_class("sel", "NVL"), Some(DbfLinkClass::InLink));
+        assert_eq!(
+            dbf_link_class("histogram", "SVL"),
+            Some(DbfLinkClass::InLink)
+        );
+        //   calc/aSub INPA..INPU (INLINK); fanout/aSub OUTA (OUTLINK)
+        assert_eq!(dbf_link_class("calc", "INPA"), Some(DbfLinkClass::InLink));
+        assert_eq!(dbf_link_class("aSub", "INPU"), Some(DbfLinkClass::InLink));
+        assert_eq!(
+            dbf_link_class("fanout", "OUTA"),
+            Some(DbfLinkClass::OutLink)
+        );
+        //   printf INP0..INP9 (INLINK)
+        assert_eq!(dbf_link_class("printf", "INP0"), Some(DbfLinkClass::InLink));
+    }
+
+    #[test]
+    fn siol_class_depends_on_record_direction() {
+        // boRecord.dbd.pod:318 SIOL=DBF_OUTLINK; ai/bi SIOL=DBF_INLINK.
+        assert_eq!(dbf_link_class("bo", "SIOL"), Some(DbfLinkClass::OutLink));
+        assert_eq!(dbf_link_class("ao", "SIOL"), Some(DbfLinkClass::OutLink));
+        assert_eq!(dbf_link_class("ai", "SIOL"), Some(DbfLinkClass::InLink));
+        assert_eq!(dbf_link_class("bi", "SIOL"), Some(DbfLinkClass::InLink));
+        // SIML is always DBF_INLINK regardless of direction.
+        assert_eq!(dbf_link_class("bo", "SIML"), Some(DbfLinkClass::InLink));
+        assert_eq!(dbf_link_class("ai", "SIML"), Some(DbfLinkClass::InLink));
+    }
+
+    #[test]
+    fn plain_value_fields_are_not_links() {
+        for f in [
+            "VAL", "EGU", "PREC", "HOPR", "RVAL", "DESC", "A", "B", "OVAL",
+        ] {
+            assert_eq!(dbf_link_class("ai", f), None, "{f} must not be a link");
+        }
+    }
+
+    #[test]
+    fn case_insensitive_and_trims() {
+        assert_eq!(dbf_link_class("ai", "inp"), Some(DbfLinkClass::InLink));
+        assert_eq!(dbf_link_class("ao", " OUT "), Some(DbfLinkClass::OutLink));
+    }
+
+    #[test]
+    fn dbf_codes_and_range_match_pvxs() {
+        assert_eq!(DbfLinkClass::InLink.dbf_type(), 14);
+        assert_eq!(DbfLinkClass::OutLink.dbf_type(), 15);
+        assert_eq!(DbfLinkClass::FwdLink.dbf_type(), 16);
+        // pvxs groupsource.cpp:596-606 range check.
+        assert!(is_link_dbf_type(DBF_INLINK));
+        assert!(is_link_dbf_type(DBF_OUTLINK));
+        assert!(is_link_dbf_type(DBF_FWDLINK));
+        assert!(!is_link_dbf_type(13)); // DBF_DEVICE
+        assert!(!is_link_dbf_type(17)); // DBF_NOACCESS
+        assert!(!is_link_dbf_type(0)); // DBF_STRING
     }
 }
 

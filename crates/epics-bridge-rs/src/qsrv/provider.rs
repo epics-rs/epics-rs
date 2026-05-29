@@ -717,9 +717,18 @@ impl BridgeProvider {
     pub fn load_group_config(&self, json: &str) -> BridgeResult<()> {
         let defs = super::group_config::parse_group_config(json)?;
         let mut g = self.groups.write();
-        for def in defs {
-            g.insert(def.name.clone(), def);
-        }
+        // Accumulate field-by-field, not replace. pvxs loads every DB
+        // `info(Q:group)` entry and every queued `dbLoadGroup` file into
+        // one `GroupConfigProcessor` (groupsourcehooks.cpp:192-207) whose
+        // `fieldConfigMap` (groupprocessorcontext.cpp:25-42) collects
+        // distinct fields for the same group name across all sources. A
+        // bare `insert` here dropped a same-named group loaded earlier
+        // (whether from another file or a record `info(Q:group)` tag),
+        // turning a valid modular config into an order-dependent partial
+        // group. `merge_group_defs` is the same field-keyed path
+        // `load_info_group` already uses, so cross-source duplicate field
+        // names collapse first-wins (groupconfigprocessor.cpp:221-225).
+        super::group_config::merge_group_defs(&mut g, defs);
         Ok(())
     }
 
@@ -748,13 +757,16 @@ impl BridgeProvider {
         // Drop a prior load of the same source identity (pvxs erases
         // the matching entry before appending the new one).
         self.remove_group_file(filename, macros);
-        let mut names = Vec::with_capacity(defs.len());
+        let names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
         {
             let mut g = self.groups.write();
-            for def in defs {
-                names.push(def.name.clone());
-                g.insert(def.name.clone(), def);
-            }
+            // Accumulate across files rather than replace — a second file
+            // contributing distinct fields to the same group name must add
+            // them, not drop the first file's group (finding 40 /
+            // groupsourcehooks.cpp:192-207, fieldConfigMap accumulation).
+            // Same field-keyed merge as `load_group_config` /
+            // `load_info_group`.
+            super::group_config::merge_group_defs(&mut g, defs);
         }
         self.group_files.write().push(GroupFileEntry {
             filename: filename.to_string(),
@@ -1270,6 +1282,41 @@ mod tests {
         // `-*` clears every file-loaded group.
         assert_eq!(provider.clear_group_files(), 1);
         assert_eq!(provider.group_count(), 0);
+    }
+
+    /// Two `dbLoadGroup` files each contribute a distinct field to the
+    /// SAME group name; pvxs accumulates both into one runtime group
+    /// (all files loaded into one GroupConfigProcessor,
+    /// groupsourcehooks.cpp:192-207). Before the fix the second file's
+    /// load did a bare `insert` that replaced the first, dropping file
+    /// A's field and making the group order-dependent and partial.
+    #[tokio::test]
+    async fn group_files_accumulate_distinct_fields_for_same_group() {
+        use epics_base_rs::server::database::PvDatabase;
+
+        let provider = BridgeProvider::new(Arc::new(PvDatabase::new()));
+        let file_a = r#"{ "GRP": { "a": { "+channel": "RA.VAL", "+type": "plain" } } }"#;
+        let file_b = r#"{ "GRP": { "b": { "+channel": "RB.VAL", "+type": "plain" } } }"#;
+
+        provider
+            .load_group_file_tracked("a.json", "", file_a)
+            .unwrap();
+        provider
+            .load_group_file_tracked("b.json", "", file_b)
+            .unwrap();
+
+        let def = provider.groups().get("GRP").cloned().expect("GRP exists");
+        let names: Vec<&str> = def.members.iter().map(|m| m.field_name.as_str()).collect();
+        assert_eq!(
+            def.members.len(),
+            2,
+            "both fields must be present: {names:?}"
+        );
+        assert!(names.contains(&"a"), "file A field must survive: {names:?}");
+        assert!(
+            names.contains(&"b"),
+            "file B field must be added: {names:?}"
+        );
     }
 
     /// Access control that denies all writes, allows all reads.

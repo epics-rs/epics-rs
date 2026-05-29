@@ -58,6 +58,30 @@ use super::putlog::{PutLog, PutOutcome};
 use super::pvlist::PvList;
 use super::stats::Stats;
 
+/// The `.pvlist` access-security identity (group + level) resolved for
+/// one shadow PV. Held behind an `Arc<ArcSwap<_>>` ([`PvAclCell`]) so it
+/// is *mutable per-shadow-PV gateway metadata* rather than a value
+/// captured permanently in the read/write hook closures: a SIGUSR1
+/// `AS`/`PVL` reload that moves a still-admitted PV from one ASG/ASL to
+/// another swaps in the new identity live, and both hooks `load()` it on
+/// every access. Mirrors C ca-gateway `gateServer::newAs` reinstalling
+/// the freshly-resolved `gateAsEntry` on each still-allowed PV
+/// (gateServer.cc:603-630) instead of leaving the old entry bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PvAcl {
+    /// Resolved access security group from the matching `.pvlist` rule
+    /// (`None` ⇒ the `DEFAULT` group, applied at the hook read site).
+    asg: Option<String>,
+    /// Resolved access security level (paired with `asg`).
+    asl: i32,
+}
+
+/// Shared, hot-swappable per-PV ACL. The subscription record owns one
+/// `Arc`; the read/write hook closures each capture a clone and `load()`
+/// the current value, so a reload that calls [`UpstreamManager::update_acl`]
+/// is observed by both hooks without rebuilding them.
+type PvAclCell = Arc<ArcSwap<PvAcl>>;
+
 /// One upstream subscription: the long-lived [`CaChannel`] is shared
 /// between the monitor-forwarding task and any direct
 /// [`UpstreamManager::put`] / [`UpstreamManager::get`] calls so we
@@ -67,12 +91,12 @@ use super::stats::Stats;
 struct UpstreamSubscription {
     channel: Arc<CaChannel>,
     task: JoinHandle<()>,
-    /// Resolved access security group from the matching `.pvlist` rule.
-    /// Cached here so the write hook can call `AccessConfig::can_write`
-    /// without re-resolving on every put.
-    asg: Option<String>,
-    /// Resolved access security level (paired with `asg`).
-    asl: i32,
+    /// Live `.pvlist` ASG/ASL for this shadow PV, shared by-`Arc` with
+    /// the read and write hook closures so a `AS`/`PVL` reload can swap
+    /// the group/level in place. Replaces the previous by-value
+    /// `asg`/`asl` capture that left hooks enforcing the identity
+    /// resolved at first subscription forever.
+    acl: PvAclCell,
     /// watcher that keeps `upstream_write` in the access hook
     /// closure up-to-date. Aborted on drop (when the subscription is
     /// removed via `unsubscribe`).
@@ -408,22 +432,25 @@ impl UpstreamManager {
         // into the small window where the PV is findable but the
         // hook isn't yet bound (which would silently drop the put
         // into the local `pv.set()` fallback).
+        // One live ACL cell shared by both hooks AND the subscription
+        // record, so an `AS`/`PVL` reload that re-resolves this PV to a
+        // new ASG/ASL is observed by every later read/write without
+        // rebuilding the closures.
+        let acl: PvAclCell = Arc::new(ArcSwap::from_pointee(PvAcl { asg, asl }));
         let hook = build_write_hook(
             served_name.to_string(),
             upstream_name.to_string(),
             channel.clone(),
-            asg.clone(),
-            asl,
+            acl.clone(),
             self.write_env.clone(),
         );
         // install the read/write access hook alongside the
         // write hook, capturing the same ACF authority + this PV's
-        // `.pvlist` ASG/ASL, so the CA server gates downstream reads
+        // live `.pvlist` ASG/ASL, so the CA server gates downstream reads
         // through `can_read` instead of granting every shadow PV a
         // permissive read.
         let access_hook = build_access_hook(
-            asg.clone(),
-            asl,
+            acl.clone(),
             self.write_env.access.clone(),
             upstream_write.clone(),
         );
@@ -635,8 +662,7 @@ impl UpstreamManager {
             UpstreamSubscription {
                 channel,
                 task,
-                asg,
-                asl,
+                acl,
                 _access_rights_watcher: access_rights_watcher,
             },
         );
@@ -710,13 +736,50 @@ impl UpstreamManager {
         Ok(value)
     }
 
-    /// ASG/ASL recorded for `upstream_name` at subscription time, if
-    /// any. Used by tests + diagnostics.
-    pub fn asg_for(&self, upstream_name: &str) -> Option<(Option<String>, i32)> {
-        self.subs
-            .lock()
-            .get(upstream_name)
-            .map(|s| (s.asg.clone(), s.asl))
+    /// Live `.pvlist` ASG/ASL currently enforced for the shadow PV keyed
+    /// by `served_name` (the subscription key). Reflects the latest
+    /// [`update_acl`](Self::update_acl) from an `AS`/`PVL` reload, not
+    /// just the value resolved at first subscription. Used by tests +
+    /// diagnostics.
+    pub fn asg_for(&self, served_name: &str) -> Option<(Option<String>, i32)> {
+        self.subs.lock().get(served_name).map(|s| {
+            let acl = s.acl.load();
+            (acl.asg.clone(), acl.asl)
+        })
+    }
+
+    /// Replace the live ASG/ASL for the still-admitted shadow PV keyed by
+    /// `served_name`. Returns `true` if the subscription exists and its
+    /// identity actually changed (caller can use this to decide whether a
+    /// downstream access-rights re-notification is warranted).
+    ///
+    /// This is the owner of the per-PV ACL transition during an
+    /// `AS`/`PVL` reload: it stores a new `PvAcl` into the shared cell so
+    /// the read and write hooks — which `load()` it on every access —
+    /// immediately enforce the new group/level. Mirrors C ca-gateway
+    /// `gateServer::newAs` reinstalling the new `gateAsEntry` on each
+    /// still-allowed PV (gateServer.cc:603-630).
+    ///
+    /// runtime re-notification of *already-connected* downstream clients
+    /// (C `gateChan::resetAsClient` posting an access-rights event,
+    /// gateVc.cc:170-199) requires a `CaServer::notify_access_change()`
+    /// API and is deferred cross-crate — see the `on_access_rights_change`
+    /// note in `ensure_subscribed`. New connections re-evaluate the access
+    /// hook and therefore already see the updated rights.
+    pub fn update_acl(&self, served_name: &str, asg: Option<String>, asl: i32) -> bool {
+        let subs = self.subs.lock();
+        match subs.get(served_name) {
+            Some(sub) => {
+                let next = PvAcl { asg, asl };
+                let prev = sub.acl.load();
+                if **prev == next {
+                    return false;
+                }
+                sub.acl.store(Arc::new(next));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Sweep cache and remove upstream subscriptions for entries that
@@ -768,14 +831,17 @@ impl UpstreamManager {
 /// decision is now `local_acf_write && upstream_write`, matching C
 /// `gateVcChan::writeAccess` (gateVc.cc:341): `asclient->writeAccess() && vc->writeAccess()`.
 fn build_access_hook(
-    asg: Option<String>,
-    asl: i32,
+    acl: PvAclCell,
     access: Arc<ArcSwap<AccessConfig>>,
     upstream_write: Arc<AtomicBool>,
 ) -> epics_base_rs::server::pv::AccessHook {
     Arc::new(move |user: &str, host: &str| {
         let cfg = access.load();
-        let asg_ref = asg.as_deref().unwrap_or("DEFAULT");
+        // Load the live `.pvlist` identity each call so a reloaded
+        // ASG/ASL is enforced immediately.
+        let pv_acl = acl.load();
+        let asg_ref = pv_acl.asg.as_deref().unwrap_or("DEFAULT");
+        let asl = pv_acl.asl;
         let read = cfg.can_read(asg_ref, asl, user, host);
         let local_write = if user.is_empty() && cfg.has_rules() {
             false
@@ -806,15 +872,14 @@ fn build_write_hook(
     served_name: String,
     pv_name: String,
     channel: Arc<CaChannel>,
-    asg: Option<String>,
-    asl: i32,
+    acl: PvAclCell,
     env: WriteHookEnv,
 ) -> WriteHook {
     Arc::new(move |new_value: EpicsValue, ctx: WriteContext| {
         let served_name = served_name.clone();
         let pv_name = pv_name.clone();
         let channel = channel.clone();
-        let asg = asg.clone();
+        let acl = acl.clone();
         let env = env.clone();
         Box::pin(async move {
             // Bound the audit-log value so a client putting a 1M
@@ -875,7 +940,11 @@ fn build_write_hook(
                     "{pv_name} (no client identity)"
                 )));
             }
-            let asg_ref = asg.as_deref().unwrap_or("DEFAULT");
+            // Load the live `.pvlist` identity per put so a reloaded
+            // ASG/ASL gates the write immediately.
+            let pv_acl = acl.load();
+            let asg_ref = pv_acl.asg.as_deref().unwrap_or("DEFAULT");
+            let asl = pv_acl.asl;
             if !access.can_write(asg_ref, asl, &ctx.user, &ctx.host) {
                 env.stats.record_readonly_reject();
                 log_denial(&env, &ctx, &pv_name, &value_str, &old_str).await;
@@ -1206,7 +1275,11 @@ ASG(DEFAULT) {
             AccessConfig::from_string(acf).expect("ACF parses"),
         ));
         let upstream_write = Arc::new(AtomicBool::new(true));
-        let hook = build_access_hook(Some("DEFAULT".to_string()), 0, access, upstream_write);
+        let acl = Arc::new(ArcSwap::from_pointee(PvAcl {
+            asg: Some("DEFAULT".to_string()),
+            asl: 0,
+        }));
+        let hook = build_access_hook(acl, access, upstream_write);
 
         // Privileged user: read granted, write denied (no WRITE rule).
         let alice = hook("alice", "host1");
@@ -1233,7 +1306,8 @@ ASG(DEFAULT) {
     fn br_fr1_access_hook_allow_all_grants_both() {
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
         let upstream_write = Arc::new(AtomicBool::new(true));
-        let hook = build_access_hook(None, 0, access, upstream_write);
+        let acl = Arc::new(ArcSwap::from_pointee(PvAcl { asg: None, asl: 0 }));
+        let hook = build_access_hook(acl, access, upstream_write);
         let d = hook("anyone", "anywhere");
         assert!(d.read && d.write, "allow-all must grant read and write");
     }
@@ -1246,7 +1320,8 @@ ASG(DEFAULT) {
     fn br_r51_upstream_write_denied_overrides_local_acf_allow() {
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
         let upstream_write = Arc::new(AtomicBool::new(false));
-        let hook = build_access_hook(None, 0, access, upstream_write.clone());
+        let acl = Arc::new(ArcSwap::from_pointee(PvAcl { asg: None, asl: 0 }));
+        let hook = build_access_hook(acl, access, upstream_write.clone());
 
         let d = hook("alice", "host1");
         assert!(d.read, "read must still be granted by allow-all");
@@ -1259,6 +1334,107 @@ ASG(DEFAULT) {
         upstream_write.store(true, Ordering::Relaxed);
         let d2 = hook("alice", "host1");
         assert!(d2.write, "write must be granted once upstream restores it");
+    }
+
+    /// the access hook must enforce the LIVE per-PV ASG/ASL, not the one
+    /// captured when the hook was built. An `AS`/`PVL` reload that moves a
+    /// still-admitted PV from `OldGroup` to `NewGroup` swaps the shared
+    /// ACL cell; the same hook (never rebuilt) must then compute against
+    /// the new group. Pre-fix the hook captured ASG/ASL by value and kept
+    /// enforcing the stale identity.
+    #[test]
+    fn br_2026_111_access_hook_follows_live_acl_swap() {
+        let acf = r#"
+UAG(ops)    { alice }
+UAG(others) { bob }
+ASG(OldGroup) {
+    RULE(1, READ) { UAG(ops) }
+}
+ASG(NewGroup) {
+    RULE(1, READ) { UAG(others) }
+}
+"#;
+        let access = Arc::new(ArcSwap::from_pointee(
+            AccessConfig::from_string(acf).expect("ACF parses"),
+        ));
+        let upstream_write = Arc::new(AtomicBool::new(true));
+        let acl = Arc::new(ArcSwap::from_pointee(PvAcl {
+            asg: Some("OldGroup".to_string()),
+            asl: 1,
+        }));
+        let hook = build_access_hook(acl.clone(), access, upstream_write);
+
+        // Under OldGroup, alice has READ; bob does not.
+        assert!(hook("alice", "h").read, "OldGroup grants alice READ");
+        assert!(!hook("bob", "h").read, "OldGroup denies bob READ");
+
+        // Simulate the reload: swap the live ACL cell the hook holds.
+        acl.store(Arc::new(PvAcl {
+            asg: Some("NewGroup".to_string()),
+            asl: 1,
+        }));
+
+        // The same hook now computes against NewGroup: rights flip.
+        assert!(
+            !hook("alice", "h").read,
+            "after live ACL swap to NewGroup, alice's READ is revoked"
+        );
+        assert!(
+            hook("bob", "h").read,
+            "after live ACL swap to NewGroup, bob gains READ"
+        );
+    }
+
+    /// the manager's reload owner path: `update_acl` swaps the live ASG/ASL
+    /// of a still-admitted shadow PV and `asg_for` reflects it immediately.
+    /// Re-applying the same identity reports no change (idempotent), so a
+    /// caller can gate a downstream access-rights re-notification on a real
+    /// transition.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn br_2026_111_reload_updates_live_acl_on_admitted_pv() {
+        let name = "AS:reload:pv";
+        let port = free_port();
+        let server = CaServer::builder()
+            .port(port)
+            .pv(name, EpicsValue::Double(1.0))
+            .build()
+            .await
+            .expect("CA server");
+        let _server = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let mgr = pinned_manager(db.clone()).await;
+
+        mgr.ensure_subscribed(name, name, Some("OldGroup".to_string()), 1)
+            .await
+            .expect("ensure_subscribed connects to the hosted upstream");
+        assert_eq!(
+            mgr.asg_for(name),
+            Some((Some("OldGroup".to_string()), 1)),
+            "initial ASG/ASL is the value resolved at subscribe"
+        );
+
+        // Reload moves the still-admitted PV to a new ASG/ASL.
+        assert!(
+            mgr.update_acl(name, Some("NewGroup".to_string()), 0),
+            "a real ASG/ASL change reports true"
+        );
+        assert_eq!(
+            mgr.asg_for(name),
+            Some((Some("NewGroup".to_string()), 0)),
+            "asg_for follows the reload immediately"
+        );
+
+        // Idempotent: re-applying the identical identity is a no-op.
+        assert!(
+            !mgr.update_acl(name, Some("NewGroup".to_string()), 0),
+            "an unchanged ASG/ASL reports false"
+        );
+
+        mgr.shutdown().await;
     }
 
     /// when a downstream client searches for a `.pvlist`

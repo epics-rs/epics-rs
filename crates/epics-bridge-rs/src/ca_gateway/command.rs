@@ -204,20 +204,39 @@ impl CommandHandler {
         let new_arc = Arc::new(new);
         self.pvlist.store(new_arc.clone());
 
-        // Prune subscriptions for PVs that the new pvlist no longer
-        // admits. Without this, removed entries leak shadow PVs and
-        // upstream channels until process restart. Match against the new
-        // pvlist via the same `match_name` the resolver uses so alias
-        // rewrites are honored. Mirrors C `newAs`'s pv_list walk that
-        // calls `pv->death()` + `list->remove()` for each denied PV.
+        // Walk every cached PV against the new pvlist, matching C
+        // `gateServer::newAs`'s two-part pv_list walk (gateServer.cc):
+        //
+        // - No longer admitted → prune. Without this, removed entries
+        //   leak shadow PVs and upstream channels until process restart;
+        //   mirrors `pv->death()` + `list->remove()` for each denied PV.
+        // - Still admitted → re-resolve its ASG/ASL and swap the live
+        //   per-PV ACL so the read/write hooks enforce the new group/level
+        //   immediately, instead of keeping the identity captured at first
+        //   subscription. Mirrors `newAs` reinstalling the freshly-resolved
+        //   `gateAsEntry` on each still-allowed PV (gateServer.cc:603-630).
+        //   Runtime re-notification of already-connected downstream
+        //   clients (C `gateChan::resetAsClient` posting an access-rights
+        //   event, gateVc.cc:170-199) needs a cross-crate
+        //   `CaServer::notify_access_change()` and is deferred; new
+        //   connections already re-evaluate the access hook.
+        //
+        // Match via the same host-less `match_name` the resolver-prune
+        // uses so alias rewrites are honored and only global rules apply.
         let mut pruned: usize = 0;
         if let Some(upstream) = &self.upstream {
             let cached_names: Vec<String> = self.cache.read().await.names();
             for name in cached_names {
-                if new_arc.match_name(&name).is_none() {
-                    upstream.unsubscribe(&name).await;
-                    self.cache.write().await.remove(&name);
-                    pruned += 1;
+                match new_arc.match_name(&name) {
+                    None => {
+                        upstream.unsubscribe(&name).await;
+                        self.cache.write().await.remove(&name);
+                        pruned += 1;
+                    }
+                    Some(m) => {
+                        let asl = m.effective_asl();
+                        upstream.update_acl(&name, m.asg, asl);
+                    }
                 }
             }
         }

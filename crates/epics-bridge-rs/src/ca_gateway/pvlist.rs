@@ -480,17 +480,7 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
         // and remain accepted for legacy pvlist files). Rejecting them broke
         // load/reload of C-compatible pvlist files that use the older syntax.
         "ALLOW" | "PATTERN" | "PV" => {
-            let asg = tokens.next().map(String::from);
-            let asl = tokens
-                .next()
-                .map(|s| {
-                    s.parse::<i32>().map_err(|e| {
-                        BridgeError::GroupConfigError(format!(
-                            "line {lineno}: invalid asl '{s}': {e}"
-                        ))
-                    })
-                })
-                .transpose()?;
+            let (asg, asl) = parse_asg_asl(&mut tokens, lineno);
             Ok(PvListEntry::Allow { pattern, asg, asl })
         }
         "DENY" => {
@@ -534,17 +524,7 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
                     "line {lineno}: ALIAS requires a target name"
                 ))
             })?;
-            let asg = tokens.next().map(String::from);
-            let asl = tokens
-                .next()
-                .map(|s| {
-                    s.parse::<i32>().map_err(|e| {
-                        BridgeError::GroupConfigError(format!(
-                            "line {lineno}: invalid asl '{s}': {e}"
-                        ))
-                    })
-                })
-                .transpose()?;
+            let (asg, asl) = parse_asg_asl(&mut tokens, lineno);
             Ok(PvListEntry::Alias {
                 pattern,
                 target_template: target.to_string(),
@@ -556,6 +536,49 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
             "line {lineno}: unknown keyword '{other}', expected ALLOW/PATTERN/PV/DENY/ALIAS"
         ))),
     }
+}
+
+/// Parse the optional trailing `[asg [asl]]` of an ALLOW/PATTERN/PV/ALIAS
+/// rule, mirroring C ca-gateway (gateAs.cc:609-613):
+///
+/// ```c
+/// if((asg=strtok(NULL," \t\n"))) {
+///     if((asl=strtok(NULL," \t\n")) && (sscanf(asl,"%d",&lev)!=1)) lev=1;
+/// } else { asg=default_group; lev=1; }
+/// ```
+///
+/// Two C behaviors this reproduces:
+///
+/// - The ASL token is read **only** when an ASG token precedes it (C reads
+///   `asl` inside the `if(asg)` block); a bare `pattern ALLOW` carries no ASG
+///   and no ASL.
+/// - An ASL token that is present but not an integer falls back to **level 1**
+///   (`sscanf(...)!=1 → lev=1`) instead of aborting. A single typo such as
+///   `PV.* ALLOW BeamGroup typo` keeps serving `PV.*` at ASL 1 in C; the
+///   previous `s.parse::<i32>()?` rejected the whole pvlist (or reload). The
+///   omitted-ASL and invalid-ASL cases both resolve to 1 — `Some(1)` here for
+///   the invalid case records the explicit fallback, `None` for the omitted
+///   case defaults to 1 via [`PvListMatch::effective_asl`].
+///
+/// Genuine syntax errors C also rejects (a missing ALIAS target) remain hard
+/// errors at their call site, not here.
+fn parse_asg_asl<'a>(
+    tokens: &mut impl Iterator<Item = &'a str>,
+    lineno: usize,
+) -> (Option<String>, Option<i32>) {
+    let asg = tokens.next().map(String::from);
+    let asl = asg.is_some().then(|| tokens.next()).flatten().map(|s| {
+        s.parse::<i32>().unwrap_or_else(|_| {
+            tracing::warn!(
+                line = lineno,
+                token = %s,
+                "pvlist: invalid ASL token — falling back to level 1 \
+                 (C gateAs.cc:612 sscanf!=1 → lev=1)"
+            );
+            1
+        })
+    });
+    (asg, asl)
 }
 
 fn build_pattern(pat: &str, lineno: usize) -> BridgeResult<Regex> {
@@ -788,6 +811,55 @@ mod tests {
 
     #[test]
     fn parse_alias_missing_target() {
+        assert!(parse_pvlist("foo ALIAS").is_err());
+    }
+
+    /// C ca-gateway (gateAs.cc:612) parses ASL with `sscanf("%d")`; when that
+    /// fails it sets `lev=1` and still installs the rule. A pvlist line with a
+    /// typo'd ASL field must therefore keep serving the pattern at level 1, not
+    /// abort the whole file/reload. Applies to ALLOW, PATTERN, PV and ALIAS,
+    /// which all route through the shared `parse_asg_asl` helper.
+    #[test]
+    fn parse_invalid_asl_falls_back_to_level_one() {
+        // ALLOW with a non-integer ASL: parses, ASG kept, level → 1.
+        let list = parse_pvlist("PV.* ALLOW BeamGroup typo").unwrap();
+        match &list.entries[0] {
+            PvListEntry::Allow { asg, asl, .. } => {
+                assert_eq!(asg.as_deref(), Some("BeamGroup"), "ASG preserved");
+                assert_eq!(*asl, Some(1), "unparseable ASL → level 1");
+            }
+            other => panic!("expected Allow, got {other:?}"),
+        }
+        assert_eq!(list.match_name("PV:x").expect("served").effective_asl(), 1);
+
+        // Same fallback for the legacy PATTERN/PV synonyms and for ALIAS.
+        for kw in ["PATTERN", "PV"] {
+            let list = parse_pvlist(&format!("PV.* {kw} grp xyz")).unwrap();
+            match &list.entries[0] {
+                PvListEntry::Allow { asl, .. } => assert_eq!(*asl, Some(1), "{kw}"),
+                other => panic!("{kw}: expected Allow, got {other:?}"),
+            }
+        }
+        let list = parse_pvlist(r"ps([0-9]) ALIAS PSCurrent\1.ai PSGroup oops").unwrap();
+        match &list.entries[0] {
+            PvListEntry::Alias { asg, asl, .. } => {
+                assert_eq!(asg.as_deref(), Some("PSGroup"));
+                assert_eq!(*asl, Some(1), "ALIAS unparseable ASL → level 1");
+            }
+            other => panic!("expected Alias, got {other:?}"),
+        }
+
+        // A valid ASL is still parsed exactly; only the unparseable case falls
+        // back. Level 0 (more permissive) must NOT be silently produced from a
+        // valid "0" token by the fallback path.
+        let list = parse_pvlist("PV.* ALLOW grp 0").unwrap();
+        match &list.entries[0] {
+            PvListEntry::Allow { asl, .. } => assert_eq!(*asl, Some(0), "valid 0 preserved"),
+            other => panic!("expected Allow, got {other:?}"),
+        }
+
+        // A missing ALIAS target is a genuine syntax error C also rejects —
+        // it must stay a hard parse error, not fall through to level 1.
         assert!(parse_pvlist("foo ALIAS").is_err());
     }
 

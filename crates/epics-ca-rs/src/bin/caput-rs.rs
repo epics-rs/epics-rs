@@ -591,12 +591,19 @@ fn build_write_value(
     }
 
     // (2) `-S` (charArrAsStr) on a NON-ENUM PV → NUL-terminated DBR_CHAR
-    // array built from the escape-decoded bytes (caput.c:512). No
-    // native-type parse on this path.
+    // array built from the escape-decoded bytes, sent with the explicit
+    // DBR_CHAR wire type and count = nbytes + NUL (caput.c:531-538:
+    // `dbrType = DBR_CHAR; count = epicsStrnRawFromEscaped(...) + 1`).
+    // The wire type must be DBR_CHAR regardless of the channel native
+    // type — sending these char bytes under the native header
+    // (DBR_STRING/DBR_DOUBLE/…) is a malformed/rejected write.
     if long_string {
         let mut bytes = raw_from_escaped(&joined);
         bytes.push(0);
-        return Ok(WriteValue::Typed(epics_ca_rs::EpicsValue::CharArray(bytes)));
+        return Ok(WriteValue::Wire {
+            dbr_type: epics_ca_rs::DbFieldType::Char as u16,
+            value: epics_ca_rs::EpicsValue::CharArray(bytes),
+        });
     }
 
     // (3) Non-ENUM, non-`-S`: C sends the value as DBR_STRING after
@@ -736,10 +743,14 @@ mod tests {
             false,
         );
         match r {
-            Ok(WriteValue::Typed(EpicsValue::CharArray(bytes))) => {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::CharArray(bytes),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::Char as u16, "DBR_CHAR wire type");
                 assert_eq!(bytes, b"hello\0", "NUL-terminated long string bytes");
             }
-            _ => panic!("expected Ok(CharArray) for -S on a CHAR PV"),
+            _ => panic!("expected Ok(DBR_CHAR Wire CharArray) for -S on a CHAR PV"),
         }
     }
 
@@ -756,8 +767,14 @@ mod tests {
         ] {
             let r = build_write_value(&vals(&["not a number"]), nt, false, false, true, false);
             assert!(
-                matches!(r, Ok(WriteValue::Typed(EpicsValue::CharArray(_)))),
-                "-S must yield CharArray for non-ENUM native type {nt:?}"
+                matches!(
+                    r,
+                    Ok(WriteValue::Wire {
+                        dbr_type,
+                        value: EpicsValue::CharArray(_),
+                    }) if dbr_type == DbFieldType::Char as u16
+                ),
+                "-S must yield a DBR_CHAR Wire CharArray for non-ENUM native type {nt:?}"
             );
         }
     }
@@ -803,10 +820,14 @@ mod tests {
             false,
         );
         match r {
-            Ok(WriteValue::Typed(EpicsValue::CharArray(bytes))) => {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::CharArray(bytes),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::Char as u16, "DBR_CHAR wire type");
                 assert_eq!(bytes, vec![b'a', 0x09, b'b', 0x0A, 0x00]);
             }
-            other => panic!("expected escape-decoded CharArray, got {other:?}"),
+            other => panic!("expected escape-decoded DBR_CHAR Wire CharArray, got {other:?}"),
         }
     }
 

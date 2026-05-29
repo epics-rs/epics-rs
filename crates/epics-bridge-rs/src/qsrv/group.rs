@@ -1446,8 +1446,6 @@ pub struct GroupMonitor {
     /// The internal GroupChannel inherits the same `access` context so
     /// any read enforcement applied at create_monitor time stays in effect.
     group_channel: Option<GroupChannel>,
-    /// Initial complete group snapshot (sent on first poll)
-    initial_snapshot: Option<PvStructure>,
     /// Fan-in receiver for member events
     event_rx: Option<tokio::sync::mpsc::Receiver<MemberEvent>>,
     /// Handles for spawned per-member tasks. Wrapped in AbortOnDrop
@@ -1527,7 +1525,6 @@ impl GroupMonitor {
             def,
             running: false,
             group_channel: None,
-            initial_snapshot: None,
             event_rx: None,
             _tasks: Vec::new(),
             access: super::provider::AccessContext::allow_all(),
@@ -1797,10 +1794,16 @@ impl super::provider::PvaMonitor for GroupMonitor {
             .iter()
             .all(|p| p.had_value_event && p.had_property_event);
         if all_primed {
-            // No subscriptions needed — post initial snapshot immediately.
-            if let Ok(snapshot) = group_channel.read_group().await {
-                self.initial_snapshot = Some(snapshot);
-            }
+            // No backing channels, so no member event will ever fire: the
+            // group is primed by construction. Mark it primed but do NOT
+            // manufacture a snapshot to forward — the native PVA server
+            // already emits the initial frame via get_value_checked() at
+            // MONITOR INIT (server_native/tcp.rs build_monitor_payload).
+            // Forwarding a snapshot here too would deliver the same static
+            // value twice, the channel-less mirror of the duplicate the
+            // single-record BridgeMonitor avoids the same way
+            // (qsrv/monitor.rs:189-195). pvxs posts one value for this case
+            // (groupsource.cpp:289-297).
             self.events_primed = true;
         }
 
@@ -1811,11 +1814,11 @@ impl super::provider::PvaMonitor for GroupMonitor {
     }
 
     async fn poll(&mut self) -> Option<super::provider::MonitorPoll> {
-        // Return initial snapshot first (C++ BaseMonitor::connect behavior)
-        if let Some(initial) = self.initial_snapshot.take() {
-            return Some(super::provider::MonitorPoll::derive(initial));
-        }
-
+        // Purely event-driven: the initial frame is the wire layer's
+        // get_value_checked() snapshot, so this stream only carries fresh
+        // member events. A channel-less (all-const) group has no member
+        // subscriptions, so this returns None immediately after start —
+        // exactly one DATA frame reaches the client.
         let rx = self.event_rx.as_mut()?;
 
         loop {
@@ -1894,7 +1897,6 @@ impl super::provider::PvaMonitor for GroupMonitor {
 
         self.running = false;
         self.group_channel = None;
-        self.initial_snapshot = None;
         self.events_primed = false;
         // Reset priming state for potential restart
         for (i, member) in self.def.members.iter().enumerate() {
@@ -2762,6 +2764,41 @@ mod tests {
                 .iter()
                 .any(|m| EventMask::from_bits(*m).intersects(EventMask::VALUE | EventMask::LOG)),
             "meta member must not wake on plain value/log posts, got {masks:?}"
+        );
+    }
+
+    /// BRIDGE-114 regression: a group whose only members are `+const`
+    /// has no backing channels, so it is primed by construction. It must
+    /// NOT forward a manufactured initial snapshot through the monitor
+    /// stream — the native PVA server already sends the initial frame via
+    /// get_value_checked() at MONITOR INIT, so a forwarded snapshot would
+    /// be a duplicate DATA frame for a value that never changes. After
+    /// start(), poll() must yield nothing (it returns None as soon as the
+    /// empty event channel closes), so the client sees exactly one DATA
+    /// frame and no source-side update follows.
+    #[tokio::test]
+    async fn bridge114_all_const_group_monitor_emits_no_stream_snapshot() {
+        use crate::qsrv::provider::PvaMonitor;
+
+        let db = Arc::new(PvDatabase::new());
+        let cfg = r#"{
+            "CONST:GRP": {
+                "a": {"+type": "const", "+const": 7},
+                "b": {"+type": "const", "+const": "static"}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        let mut mon = GroupMonitor::new(db.clone(), def);
+        mon.start().await.expect("all-const group monitor starts");
+
+        // poll() must NOT manufacture an initial snapshot. With no member
+        // subscriptions the event channel is already closed, so poll()
+        // resolves to None promptly (no manufactured DATA frame, no hang).
+        let polled = tokio::time::timeout(Duration::from_millis(200), mon.poll()).await;
+        assert!(
+            matches!(polled, Ok(None)),
+            "all-const group monitor must forward no stream snapshot, got {polled:?}"
         );
     }
 

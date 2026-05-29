@@ -927,6 +927,84 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
 // CA + PVA dual-protocol runner for IocApplication
 // ---------------------------------------------------------------------------
 
+/// The pvxs `enable2()` decision: whether QSRV2 serving is enabled, plus
+/// the startup diagnostics pvxs prints synchronously (iochooks.cpp:401-448).
+struct Qsrv2Decision {
+    enabled: bool,
+    /// Invalid `PVXS_QSRV_ENABLE` value — pvxs prints this to stderr
+    /// immediately (iochooks.cpp:421-426).
+    error: Option<String>,
+    /// The `INFO: PVXS QSRV2 ...` status line pvxs prints to stdout
+    /// (iochooks.cpp:441-443). `None` when the operator explicitly
+    /// disabled QSRV2 (`quiet` — the "shut up, I know what I'm doing" path).
+    info: Option<String>,
+}
+
+/// Pure core of pvxs `enable2()` (iochooks.cpp:401-448), parameterized on
+/// the two environment strings so it is testable without mutating the
+/// process environment.
+///
+/// pvxs gates on `permit && request`. `permit` is false only when QSRV1
+/// (`qsrv.dbd`) is co-linked; the Rust IOC has no QSRV1 coexistence, so
+/// `permit` is always true and only `request` varies. `EPICS_IOC_IGNORE_
+/// SERVERS=qsrv2` and `PVXS_QSRV_ENABLE=NO` disable quietly; `=YES`
+/// enables; any other value keeps the default (enabled) and emits the
+/// error diagnostic. The ignore-servers check takes precedence over
+/// `PVXS_QSRV_ENABLE` (pvxs evaluates it first).
+fn resolve_qsrv2_enable(ignore_servers: Option<&str>, qsrv_enable: Option<&str>) -> Qsrv2Decision {
+    let mut request = true;
+    let mut quiet = false;
+    let mut error = None;
+
+    if ignore_servers.is_some_and(|s| s.contains("qsrv2")) {
+        request = false;
+        quiet = true;
+    } else if qsrv_enable.is_some_and(|s| s.eq_ignore_ascii_case("YES")) {
+        request = true;
+    } else if qsrv_enable.is_some_and(|s| s.eq_ignore_ascii_case("NO")) {
+        request = false;
+        quiet = true;
+    } else if let Some(v) = qsrv_enable {
+        // Unknown value: keep the default (`request` unchanged) and report.
+        error = Some(format!(
+            "ERROR: PVXS_QSRV_ENABLE={v} not YES/NO.  Defaulting to {}.",
+            if request { "YES" } else { "NO" }
+        ));
+    }
+
+    // permit == true, so enable == request.
+    let enabled = request;
+    let info = if quiet {
+        None
+    } else {
+        Some(format!(
+            "INFO: PVXS QSRV2 is loaded, permitted, and {}.",
+            if enabled { "ENABLED" } else { "disabled" }
+        ))
+    };
+    Qsrv2Decision {
+        enabled,
+        error,
+        info,
+    }
+}
+
+/// Read `EPICS_IOC_IGNORE_SERVERS` / `PVXS_QSRV_ENABLE`, apply the pvxs
+/// `enable2()` rule, print the same synchronous startup diagnostics, and
+/// return whether QSRV2 database/group serving is enabled.
+fn qsrv2_enabled() -> bool {
+    let ignore = std::env::var("EPICS_IOC_IGNORE_SERVERS").ok();
+    let enable = std::env::var("PVXS_QSRV_ENABLE").ok();
+    let decision = resolve_qsrv2_enable(ignore.as_deref(), enable.as_deref());
+    if let Some(e) = &decision.error {
+        eprintln!("{e}");
+    }
+    if let Some(i) = &decision.info {
+        println!("{i}");
+    }
+    decision.enabled
+}
+
 /// Runs a combined CA + PVA IOC with QSRV bridge.
 ///
 /// Designed as a protocol runner for [`IocApplication::run`]. Starts a CA
@@ -953,8 +1031,16 @@ pub async fn run_ca_pva_qsrv_ioc(
         .and_then(|s| s.parse().ok())
         .unwrap_or(5075);
 
+    // ── QSRV2 enable gate (pvxs enable2(), iochooks.cpp:401-496) ──
+    // Honor PVXS_QSRV_ENABLE / EPICS_IOC_IGNORE_SERVERS=qsrv2 before
+    // standing up the database/group sources and pvalink. When disabled,
+    // the PVA server still runs and serves native PVA PVs (NDPluginPva),
+    // but the BridgeProvider answers "absent" for every DB/group channel
+    // — matching a pvxs IOC where enable2() returned false.
+    let qsrv2_on = qsrv2_enabled();
+
     // ── QSRV bridge ──
-    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), qsrv2_on));
 
     // install the IOC-wide ACF on the QSRV bridge so PVA
     // single-record / group operations enforce the same policy as
@@ -1011,7 +1097,11 @@ pub async fn run_ca_pva_qsrv_ioc(
         }
     }
     #[cfg(feature = "pvalink")]
-    {
+    if qsrv2_on {
+        // pvxs calls `pvalink_enable()` only when `enable2()` is true
+        // (iochooks.cpp:461-496); a QSRV2-disabled IOC leaves pvalink
+        // inactive and registers no pvalink iocsh commands.
+        //
         // `install_pvalink_resolver` is infallible — the PVA client is
         // created lazily per link — so there is no init failure to
         // abort the IOC on. A database with no PVA links is still
@@ -1060,6 +1150,102 @@ pub async fn run_ca_pva_qsrv_ioc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── pvxs enable2() decision (resolve_qsrv2_enable) ──
+
+    #[test]
+    fn qsrv2_enable_default_is_on() {
+        let d = resolve_qsrv2_enable(None, None);
+        assert!(d.enabled, "QSRV2 defaults to enabled when no env set");
+        assert!(d.error.is_none());
+        assert!(d.info.as_deref().unwrap().contains("ENABLED"));
+    }
+
+    #[test]
+    fn qsrv2_enable_yes_case_insensitive() {
+        assert!(resolve_qsrv2_enable(None, Some("YES")).enabled);
+        assert!(resolve_qsrv2_enable(None, Some("yes")).enabled);
+    }
+
+    #[test]
+    fn qsrv2_enable_no_disables_quietly() {
+        let d = resolve_qsrv2_enable(None, Some("NO"));
+        assert!(!d.enabled, "PVXS_QSRV_ENABLE=NO disables QSRV2");
+        assert!(d.error.is_none());
+        assert!(d.info.is_none(), "explicit NO is the quiet path");
+    }
+
+    #[test]
+    fn qsrv2_enable_ignore_servers_qsrv2_overrides_yes() {
+        // EPICS_IOC_IGNORE_SERVERS=qsrv2 takes precedence over an explicit
+        // PVXS_QSRV_ENABLE=YES (pvxs checks ignore-servers first).
+        let d = resolve_qsrv2_enable(Some("qsrv1 qsrv2"), Some("YES"));
+        assert!(!d.enabled, "qsrv2 in EPICS_IOC_IGNORE_SERVERS disables");
+        assert!(d.info.is_none(), "ignore-servers disable is quiet");
+    }
+
+    #[test]
+    fn qsrv2_enable_invalid_value_defaults_on_with_error() {
+        let d = resolve_qsrv2_enable(None, Some("maybe"));
+        assert!(d.enabled, "invalid PVXS_QSRV_ENABLE keeps the default (on)");
+        let err = d.error.expect("invalid value must report an error");
+        assert!(err.contains("not YES/NO"));
+        assert!(err.contains("Defaulting to YES"));
+        // pvxs still prints the INFO status line after the inline error.
+        assert!(d.info.as_deref().unwrap().contains("ENABLED"));
+    }
+
+    /// A QSRV2-disabled provider serves no DB-backed channel: channel_find
+    /// is false, create_channel errors, and channel_list is empty even
+    /// though the database holds a record. Mirrors a pvxs IOC where
+    /// enable2() returned false (no single/group source registered).
+    #[tokio::test]
+    async fn disabled_provider_serves_no_db_channel() {
+        use crate::qsrv::provider::ChannelProvider;
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_pva_rs::server_native::ChannelSource;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("TEST:Y", epics_base_rs::types::EpicsValue::Double(2.0))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new_with_serving(db, false));
+
+        assert!(
+            !provider.channel_find("TEST:Y").await,
+            "disabled provider must not find a DB record"
+        );
+        assert!(
+            provider.create_channel("TEST:Y").await.is_err(),
+            "disabled provider must refuse to create a DB channel"
+        );
+        assert!(
+            ChannelProvider::channel_list(provider.as_ref())
+                .await
+                .is_empty(),
+            "disabled provider lists no DB names"
+        );
+
+        // The store over a disabled provider hides the DB record but still
+        // serves a natively registered PVA PV (NDPluginPva equivalent).
+        let store = QsrvPvStore::new(provider);
+        assert!(
+            !store.has_pv("TEST:Y").await,
+            "DB record hidden when disabled"
+        );
+
+        let latest = Arc::new(parking_lot::Mutex::new(Some(PvField::Scalar(
+            epics_pva_rs::pvdata::ScalarValue::Int(7),
+        ))));
+        let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        store
+            .register_pva_pv("NATIVE:PV", latest, subscribers, None)
+            .await;
+        assert!(
+            store.has_pv("NATIVE:PV").await,
+            "native PVA PV stays served even when QSRV2 DB serving is off"
+        );
+    }
 
     #[tokio::test]
     async fn has_pv_falls_through_to_provider() {

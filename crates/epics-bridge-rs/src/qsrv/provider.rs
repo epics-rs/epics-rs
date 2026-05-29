@@ -551,6 +551,16 @@ pub struct BridgeProvider {
     /// source identity is retained here to make the same add / replace /
     /// remove contract expressible without a deferred-parse rearchitecture.
     group_files: parking_lot::RwLock<Vec<GroupFileEntry>>,
+    /// QSRV2 serving gate. pvxs adds the single-record and group sources
+    /// to the PVA server only when `enable2()` returns true
+    /// (`ioc/iochooks.cpp:461-496`, gated by `PVXS_QSRV_ENABLE` /
+    /// `EPICS_IOC_IGNORE_SERVERS=qsrv2`). When `false`, every database /
+    /// group resolution entry point answers "absent" so no DB-backed PVA
+    /// channel is served — matching a pvxs IOC that loaded QSRV2 but had
+    /// it disabled. Native PVA PVs (NDPluginPva) are owned by
+    /// `QsrvPvStore`, not here, so they remain served (pvxs serves those
+    /// through a separate `SharedPV`, ungated by `enable2()`).
+    enabled: bool,
 }
 
 /// One `dbLoadGroup(filename, macros)` registration: its source
@@ -588,6 +598,14 @@ impl AccessControl for LiveAccessProxy {
 
 impl BridgeProvider {
     pub fn new(db: Arc<PvDatabase>) -> Self {
+        Self::new_with_serving(db, true)
+    }
+
+    /// Construct a provider whose QSRV2 database/group serving is gated by
+    /// `enabled`. The runner passes the result of the pvxs-compatible
+    /// `enable2()` decision; `new` defaults to `true` (serving on) for the
+    /// common in-process and test paths.
+    pub fn new_with_serving(db: Arc<PvDatabase>, enabled: bool) -> Self {
         Self {
             db,
             groups: parking_lot::RwLock::new(HashMap::new()),
@@ -598,6 +616,7 @@ impl BridgeProvider {
             ops_put: std::sync::atomic::AtomicU64::new(0),
             ops_subscribe: std::sync::atomic::AtomicU64::new(0),
             group_files: parking_lot::RwLock::new(Vec::new()),
+            enabled,
         }
     }
 
@@ -1043,6 +1062,10 @@ impl ChannelProvider for BridgeProvider {
     }
 
     async fn channel_find(&self, name: &str) -> bool {
+        // QSRV2 disabled: no DB-backed or group channel is served.
+        if !self.enabled {
+            return false;
+        }
         // A servable group answers as a group; a group name shadowed
         // by a record falls through to the database, so the record is
         // what answers (and resolves on create). See `servable_group`.
@@ -1053,6 +1076,10 @@ impl ChannelProvider for BridgeProvider {
     }
 
     async fn channel_list(&self) -> Vec<String> {
+        // QSRV2 disabled: advertise no DB record / alias / group names.
+        if !self.enabled {
+            return Vec::new();
+        }
         let mut names = self.db.all_record_names().await;
         // PR #336 aliases are independently addressable channel
         // names — a PVA client running channelList expects them so
@@ -1118,6 +1145,13 @@ impl BridgeProvider {
         name: &str,
         creds: ClientCreds,
     ) -> BridgeResult<AnyChannel> {
+        // QSRV2 disabled: refuse to construct any DB-backed / group
+        // channel. Mirrors pvxs not registering the single/group sources
+        // (iochooks.cpp:461-496); the not-counted early return keeps the
+        // `qsrvStats` channel tally honest about what was actually served.
+        if !self.enabled {
+            return Err(BridgeError::ChannelNotFound(name.to_string()));
+        }
         self.note_channel_created();
         let access_ctx = AccessContext::with_creds(self.live_access(), creds);
 

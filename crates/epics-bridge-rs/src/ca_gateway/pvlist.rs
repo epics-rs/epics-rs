@@ -281,15 +281,28 @@ impl PvList {
     /// only global rules, because a host-targeted deny must not remove a
     /// PV that is still admissible for other hosts.
     pub fn match_name(&self, name: &str) -> Option<PvListMatch> {
-        // Find first matching ALLOW (or ALIAS) and first matching global
-        // DENY. Host-targeted DENY FROM rules do not participate here.
+        // Select the LAST-in-file matching ALLOW (or ALIAS) and the
+        // LAST-in-file matching global DENY, each from its own list.
+        // C ca-gateway keeps separate allow/deny `tsSLList`s and inserts
+        // every parsed rule at the HEAD (`tsSLList::add` — "add to the
+        // beginning of the list", tsSLList.h:62), then `findEntryInList`
+        // iterates from the head and returns the first hit
+        // (gateAs.cc:386-410). Head-insertion + front-iteration means the
+        // rule nearest the BOTTOM of the file wins — the documented
+        // bottom-to-top precedence (Gateway.html:694-696,746-747) where a
+        // later, more-specific rule overrides an earlier general one.
+        // Forward `.find()` selected the TOP-most match and inverted that
+        // precedence; `.rev().find()` reproduces C's bottom-most selection
+        // per list. Host-targeted DENY FROM rules do not participate here.
         let allow_match = self
             .entries
             .iter()
+            .rev()
             .find(|e| e.is_allow() && e.pattern().is_match(name));
         let deny_match = self
             .entries
             .iter()
+            .rev()
             .find(|e| e.is_global_deny() && e.pattern().is_match(name));
 
         let allow_decision: Option<PvListMatch> = allow_match.map(|e| match e {
@@ -819,6 +832,70 @@ mod tests {
         assert!(list.match_name_for_host("PV:x", "BAD.HOST").is_none());
         assert!(list.match_name_for_host("PV:x", "bad.host").is_none());
         assert!(list.match_name_for_host("PV:x", "other.host").is_some());
+    }
+
+    /// C ca-gateway precedence is bottom-to-top: a later (lower-in-file),
+    /// more-specific rule overrides an earlier general one. The review's
+    /// canonical case — `.* ALLOW DEFAULT 1` above `SEC:.* ALLOW Secure 0`
+    /// — must resolve `SEC:x` to the specific rule's ASG/ASL, not the
+    /// broad rule at the top.
+    #[test]
+    fn match_specific_rule_below_general_rule_wins() {
+        let list = parse_pvlist(
+            r#"
+                EVALUATION ORDER ALLOW, DENY
+                .*       ALLOW DEFAULT 1
+                SEC:.*   ALLOW Secure 0
+            "#,
+        )
+        .unwrap();
+
+        // The specific rule sits below the general one and must win.
+        let m = list.match_name("SEC:hv").expect("SEC:hv allowed");
+        assert_eq!(m.asg.as_deref(), Some("Secure"), "bottom-most rule's ASG");
+        assert_eq!(m.asl, Some(0), "bottom-most rule's ASL");
+
+        // A name only the general rule matches still resolves to it.
+        let g = list.match_name("OTHER:x").expect("OTHER:x allowed");
+        assert_eq!(g.asg.as_deref(), Some("DEFAULT"));
+        assert_eq!(g.asl, Some(1));
+    }
+
+    /// Alias precedence is also bottom-to-top: a specific ALIAS placed
+    /// below a general ALIAS must win, carrying its own target + ASG/ASL.
+    #[test]
+    fn match_specific_alias_below_general_alias_wins() {
+        let list = parse_pvlist(
+            r#"
+                EVALUATION ORDER ALLOW, DENY
+                (.*)        ALIAS general_\1 GenGrp 1
+                SEC:(.*)    ALIAS secure_\1 SecGrp 0
+            "#,
+        )
+        .unwrap();
+
+        let m = list.match_name("SEC:hv").expect("SEC:hv aliased");
+        assert!(m.is_alias);
+        assert_eq!(m.resolved_name, "secure_hv", "bottom-most alias target");
+        assert_eq!(m.asg.as_deref(), Some("SecGrp"));
+        assert_eq!(m.asl, Some(0));
+    }
+
+    /// A specific DENY below a general ALLOW must win under ALLOW,DENY
+    /// order (the deny list is searched bottom-up too), while a name only
+    /// the general ALLOW covers is still served.
+    #[test]
+    fn match_specific_deny_below_general_allow_wins() {
+        let list = parse_pvlist(
+            r#"
+                EVALUATION ORDER ALLOW, DENY
+                .*       ALLOW
+                SEC:.*   DENY
+            "#,
+        )
+        .unwrap();
+        assert!(list.match_name("SEC:hv").is_none(), "specific DENY wins");
+        assert!(list.match_name("OTHER:x").is_some(), "general ALLOW serves");
     }
 
     #[test]

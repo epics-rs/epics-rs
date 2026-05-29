@@ -72,11 +72,14 @@ pub struct GroupMember {
     /// pvxs defaults the missing-field sentinel to
     /// `i64::MIN` (`fieldconfig.h:37`) and treats that value as
     /// not-putable (`groupsource.cpp:503`). Wire parity therefore
-    /// requires `Option<i32>` here, not a defaulted i32 — a
+    /// requires `Option<i64>` here, not a defaulted value — a
     /// member without an explicit `+putorder` must be silently
     /// dropped from the PUT ordering, NOT written under an
-    /// implicit `0`.
-    pub put_order: Option<i32>,
+    /// implicit `0`. The width is the full pvxs `int64_t`
+    /// (`fieldconfig.h:37`): a config may use `+putorder` values
+    /// outside the `i32` range, and narrowing them would silently
+    /// re-order record processing.
+    pub put_order: Option<i64>,
     /// Optional structure ID for this member (from `+id`).
     pub struct_id: Option<String>,
     /// Constant value for `Const` mapping. Sourced from `+const`
@@ -417,7 +420,7 @@ fn default_atomic() -> bool {
 }
 
 /// canonical group-member ordering — `put_order` primary,
-/// `field_name` secondary. `put_order` is `Option<i32>`; `None`
+/// `field_name` secondary. `put_order` is `Option<i64>`; `None`
 /// (no `+putorder`, "not putable") sorts before any `Some`, matching
 /// pvxs's `i64::MIN` sentinel ordering (`fieldconfig.h:37`). The
 /// field-name tiebreak makes the order a pure function of the config,
@@ -620,10 +623,15 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
         }
     };
 
+    // pvxs reads `+putorder` as the full `int64_t`
+    // (groupprocessorcontext.cpp:74-78); when the explicit value equals
+    // the absent-sentinel `i64::MIN` it increments to `i64::MIN + 1` so
+    // an explicit minimum order is never confused with "no +putorder".
+    // We keep the value at full width and apply the same sentinel bump.
     let put_order = obj
         .get("+putorder")
         .and_then(|v| v.as_i64())
-        .map(|n| n as i32);
+        .map(|n| if n == i64::MIN { i64::MIN + 1 } else { n });
 
     let struct_id = obj
         .get("+id")
@@ -915,6 +923,49 @@ mod tests {
         // missing `+putorder` → `None` (not putable),
         // mirroring pvxs `fieldconfig.h:37` sentinel.
         assert_eq!(m.put_order, None);
+    }
+
+    /// `+putorder` is stored at full pvxs `int64_t` width
+    /// (fieldconfig.h:37): a value outside the `i32` range must not wrap,
+    /// and members order by the full `i64` value. Pre-fix the parser cast
+    /// `n as i32`, silently re-ordering record processing.
+    #[test]
+    fn putorder_preserves_int64_width_and_orders_by_full_value() {
+        let big = i32::MAX as i64 + 1; // 2147483648, wraps to negative as i32
+        let json = format!(
+            r#"{{ "G": {{
+                "hi":  {{ "+channel": "R:hi.VAL",  "+putorder": {big} }},
+                "lo":  {{ "+channel": "R:lo.VAL",  "+putorder": -5 }},
+                "mid": {{ "+channel": "R:mid.VAL", "+putorder": 0 }}
+            }} }}"#
+        );
+        let defs = parse_group_config(&json).unwrap();
+        let g = &defs[0];
+        let po = |name: &str| {
+            g.members
+                .iter()
+                .find(|m| m.field_name == name)
+                .unwrap()
+                .put_order
+        };
+        assert_eq!(po("hi"), Some(big), "i32::MAX+1 must not wrap to negative");
+        assert_eq!(po("lo"), Some(-5));
+        // Canonical order is by full i64 put_order: lo(-5), mid(0), hi(big).
+        let names: Vec<&str> = g.members.iter().map(|m| m.field_name.as_str()).collect();
+        assert_eq!(names, vec!["lo", "mid", "hi"]);
+    }
+
+    /// An explicit `+putorder` equal to the absent-sentinel `i64::MIN` is
+    /// bumped to `i64::MIN + 1` so it stays distinct from "no +putorder"
+    /// (`None`), matching pvxs `groupprocessorcontext.cpp:74-78`.
+    #[test]
+    fn putorder_explicit_min_is_bumped_off_the_sentinel() {
+        let json = format!(
+            r#"{{ "G": {{ "x": {{ "+channel": "R:x.VAL", "+putorder": {} }} }} }}"#,
+            i64::MIN
+        );
+        let defs = parse_group_config(&json).unwrap();
+        assert_eq!(defs[0].members[0].put_order, Some(i64::MIN + 1));
     }
 
     /// A group whose members all use the default

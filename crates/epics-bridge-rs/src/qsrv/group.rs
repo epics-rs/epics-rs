@@ -970,13 +970,13 @@ impl GroupChannel {
         // position (first), matching the absent-putOrder ordering. Before
         // this fix the `filter_map` dropped them, so a proc-only save/apply
         // hook without `+putorder` silently never ran.
-        let mut ordered: Vec<(&GroupMember, i32)> = self
+        let mut ordered: Vec<(&GroupMember, i64)> = self
             .def
             .members
             .iter()
             .filter_map(|m| match m.put_order {
                 Some(po) => Some((m, po)),
-                None if m.mapping == FieldMapping::Proc => Some((m, i32::MIN)),
+                None if m.mapping == FieldMapping::Proc => Some((m, i64::MIN)),
                 None => None,
             })
             .collect();

@@ -43,6 +43,13 @@ pub struct PvGetResult {
     pub server_addr: SocketAddr,
 }
 
+/// A single `pvinfo` describe result: the channel's introspection, the
+/// server that replied, and the server's verified X.509 identity (the
+/// credentials pvxs `pvxinfo -v` prints; `None` for a plain `pva://`
+/// connection). Names the shape returned per-PV by the concurrent
+/// [`PvaClient::pvinfo_many_full_with_credentials`] batch.
+pub type PvInfoResult = (FieldDesc, SocketAddr, Option<crate::auth::X509Credentials>);
+
 /// Records that this `PvaClient`'s upstream credentials are a
 /// gateway-asserted identity derived from a *downstream* connection
 /// that authenticated with a method this client cannot forward
@@ -760,6 +767,23 @@ impl PvaClient {
         pv_name: &str,
         request: &crate::pv_request::PvRequestExpr,
     ) -> PvaResult<PvField> {
+        Ok(self.pvget_with_request_full(pv_name, request).await?.value)
+    }
+
+    /// Like [`Self::pvget_with_request`] but returns the full
+    /// [`PvGetResult`] (value **plus** the response introspection and
+    /// the answering server) so callers can format the result with the
+    /// descriptor the GET actually negotiated — the parity-correct path
+    /// for `pvget -r '<pvRequest>'`, where `record[...]` options and
+    /// server-side `_filter` chains must reach the server verbatim
+    /// rather than being reduced to a field-name list. pvxs
+    /// `pvget.cpp:375-380` passes the whole `-r` string to
+    /// `createRequest`.
+    pub async fn pvget_with_request_full(
+        &self,
+        pv_name: &str,
+        request: &crate::pv_request::PvRequestExpr,
+    ) -> PvaResult<PvGetResult> {
         let ch = self.channel(pv_name).await?;
         let big_endian = matches!(
             crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
@@ -769,9 +793,18 @@ impl PvaClient {
             crate::proto::ByteOrder::Big
         );
         let bytes = request.encode(big_endian);
-        let (_, v) =
+        let (introspection, value) =
             crate::client_native::ops_v2::op_get_raw(&ch, &bytes, self.inner.timeout).await?;
-        Ok(v)
+        let server_addr = match ch.current_state() {
+            super::channel::ChannelState::Active { server, .. } => server.addr,
+            _ => SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+        };
+        Ok(PvGetResult {
+            pv_name: pv_name.to_string(),
+            value,
+            introspection,
+            server_addr,
+        })
     }
 
     /// Force the search engine into fast-tick mode for one revolution
@@ -932,6 +965,49 @@ impl PvaClient {
     pub async fn pvput(&self, pv_name: &str, value_str: &str) -> PvaResult<()> {
         let ch = self.channel(pv_name).await?;
         op_put(&ch, value_str, self.inner.timeout).await
+    }
+
+    /// PUT the legacy pvAccessCPP positional bare-token form
+    /// (`pvput <PV> <size/ignored> <value> [<value>...]`), optionally
+    /// with a custom pvRequest. The token list is carried verbatim and
+    /// classified against the PUT prototype the server returns: a
+    /// scalar-array `.value` drops the leading compatibility length and
+    /// writes the rest, a lone `[...]` token is the JSON-array
+    /// shortcut, and a scalar `.value` takes exactly one token. pvxs /
+    /// pvAccessCPP `pvtoolsSrc/pvput.cpp:144-178` parity.
+    pub async fn pvput_tokens(
+        &self,
+        pv_name: &str,
+        tokens: &[String],
+        request: Option<&crate::pv_request::PvRequestExpr>,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        match request {
+            None => {
+                crate::client_native::ops_v2::op_put_tokens(&ch, tokens, None, self.inner.timeout)
+                    .await
+            }
+            Some(req) => {
+                let big_endian = matches!(
+                    crate::client_native::ops_v2::ensure_active_with_op_timeout(
+                        &ch,
+                        self.inner.timeout
+                    )
+                    .await?
+                    .0
+                    .byte_order,
+                    crate::proto::ByteOrder::Big
+                );
+                let bytes = req.encode(big_endian);
+                crate::client_native::ops_v2::op_put_tokens(
+                    &ch,
+                    tokens,
+                    Some(&bytes),
+                    self.inner.timeout,
+                )
+                .await
+            }
+        }
     }
 
     /// Value-only read-modify-write — fetch the channel's `.value`
@@ -1344,9 +1420,17 @@ impl PvaClient {
     /// `Finished`). Mirrors pvxs's MonitorBuilder + Subscription
     /// exception-based stream API. `mask` defaults are
     /// pvxs-compatible: `maskConnected=true`, `maskDisconnected=false`.
+    ///
+    /// `request` is an optional custom pvRequest (`None` = the default
+    /// all-fields request) applied at MONITOR INIT, so the descriptor in
+    /// each [`MonitorEvent::Data`] reflects exactly the requested
+    /// projection / filter shape — the same request reused across
+    /// reconnects, and its `record._options.{pipeline,queueSize}` driving
+    /// the flow window (pvxs `MonitorBuilder::pvRequest`).
     pub async fn pvmonitor_events<F>(
         &self,
         pv_name: &str,
+        request: Option<&crate::pv_request::PvRequestExpr>,
         mask: MonitorEventMask,
         callback: F,
     ) -> PvaResult<()>
@@ -1354,7 +1438,24 @@ impl PvaClient {
         F: FnMut(MonitorEvent) + Send,
     {
         let ch = self.channel(pv_name).await?;
-        op_monitor_events(&ch, &[], self.inner.pipeline_size, mask, callback).await
+        let (raw_pv_req, flow) = match request {
+            Some(req) => {
+                let big_endian = matches!(
+                    ch.ensure_active().await?.0.byte_order,
+                    crate::proto::ByteOrder::Big
+                );
+                let flow = crate::client_native::ops_v2::MonitorFlow::from_record_options(
+                    &req.record_options,
+                    self.inner.pipeline_size,
+                );
+                (Some(req.encode(big_endian)), flow)
+            }
+            None => (
+                None,
+                crate::client_native::ops_v2::MonitorFlow::window(self.inner.pipeline_size),
+            ),
+        };
+        op_monitor_events(&ch, raw_pv_req, flow, mask, callback).await
     }
 
     /// Fetch the channel's introspection (FieldDesc) using PVA's
@@ -1821,20 +1922,75 @@ impl PvaClient {
     }
 
     /// Same as [`Self::pvget_many`] but returns full introspection +
-    /// server address for each PV.
-    pub async fn pvget_many_full(&self, pv_names: &[&str]) -> Vec<PvaResult<PvGetResult>> {
+    /// server address for each PV, and applies an optional custom
+    /// pvRequest (`None` = the default all-fields GET) to every PV.
+    ///
+    /// Every GET is *started* before any is awaited: one tokio task per
+    /// PV issues the operation concurrently, then the client's UDP
+    /// search is hurried so siblings discover in parallel, and the whole
+    /// set is awaited under the per-op timeout. A slow or missing PV no
+    /// longer blocks its siblings from starting, and the batch is bounded
+    /// by one timeout instead of N. Mirrors pvxs `tools/get.cpp:102-133`,
+    /// which `exec()`s every operation, calls `ctxt.hurryUp()`, and waits
+    /// once on the shared completion event. Results are in input order;
+    /// a failed PV maps to `Err`.
+    pub async fn pvget_many_full(
+        &self,
+        pv_names: &[&str],
+        request: Option<&crate::pv_request::PvRequestExpr>,
+    ) -> Vec<PvaResult<PvGetResult>> {
         let n = pv_names.len();
         let mut set = tokio::task::JoinSet::new();
         for (idx, name) in pv_names.iter().enumerate() {
             let client = self.clone();
             let name = name.to_string();
-            set.spawn(async move { (idx, client.pvget_full(&name).await) });
+            let request = request.cloned();
+            set.spawn(async move {
+                let r = match &request {
+                    Some(req) => client.pvget_with_request_full(&name, req).await,
+                    None => client.pvget_full(&name).await,
+                };
+                (idx, r)
+            });
         }
+        // All ops started — hurry discovery so the spawned channels
+        // search immediately instead of waiting for the periodic tick
+        // (pvxs `ctxt.hurryUp()` after the exec loop).
+        self.hurry_up().await;
         let mut results: Vec<PvaResult<PvGetResult>> =
             (0..n).map(|_| Err(PvaError::Timeout)).collect();
         while let Some(join_result) = set.join_next().await {
             if let Ok((idx, pva_result)) = join_result {
                 results[idx] = pva_result;
+            }
+        }
+        results
+    }
+
+    /// Concurrent multi-PV `pvinfo`. Starts a GET_FIELD describe op for
+    /// every PV at once, hurries discovery, then awaits the whole set
+    /// under the per-op timeout — the same start-all-then-wait structure
+    /// as [`Self::pvget_many_full`], mirroring pvxs `tools/info.cpp:81-112`
+    /// (`exec()` every op, `hurryUp()`, one shared wait). A slow or
+    /// missing PV does not block its siblings, and the batch is bounded by
+    /// one timeout. Results are in input order; a failed PV maps to `Err`.
+    pub async fn pvinfo_many_full_with_credentials(
+        &self,
+        pv_names: &[&str],
+    ) -> Vec<PvaResult<PvInfoResult>> {
+        let n = pv_names.len();
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, name) in pv_names.iter().enumerate() {
+            let client = self.clone();
+            let name = name.to_string();
+            set.spawn(async move { (idx, client.pvinfo_full_with_credentials(&name).await) });
+        }
+        self.hurry_up().await;
+        let mut results: Vec<PvaResult<PvInfoResult>> =
+            (0..n).map(|_| Err(PvaError::Timeout)).collect();
+        while let Some(join_result) = set.join_next().await {
+            if let Ok((idx, r)) = join_result {
+                results[idx] = r;
             }
         }
         results

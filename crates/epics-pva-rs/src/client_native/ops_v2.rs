@@ -669,6 +669,27 @@ pub async fn op_put_raw(
     op_put_inner(channel, value_str, Some(pv_req), op_timeout).await
 }
 
+/// PUT the legacy pvAccessCPP positional bare-token form, classified
+/// against the PUT prototype once the server returns it. Mirrors
+/// `pvtoolsSrc/pvput.cpp:144-178`: a scalar-array `.value` drops the
+/// first token (the compatibility length, ignored) and writes the
+/// rest; a lone `[...]` token is the JSON-array `value=[...]` shortcut;
+/// a scalar `.value` takes exactly one token (more than one is an
+/// error, matching upstream's "Can't assign multiple values to
+/// scalar"). Token classification is deferred to [`op_put_inner_build`]
+/// because the array-vs-scalar decision needs the prototype.
+pub async fn op_put_tokens(
+    channel: &Arc<Channel>,
+    tokens: &[String],
+    raw_pv_req: Option<&[u8]>,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    op_put_inner_build(channel, raw_pv_req, op_timeout, |intro| {
+        build_put_value_from_tokens(intro, tokens)
+    })
+    .await
+}
+
 /// PUT a single dotted-path field of the channel's structure (e.g.
 /// `"alarm.severity"`, `"value"`, `"display.units"`). pvxs
 /// `PutBuilder::set("path", val)` parity. Server receives a value
@@ -1429,6 +1450,29 @@ async fn op_put_inner(
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,
 ) -> PvaResult<()> {
+    op_put_inner_build(channel, raw_pv_req, op_timeout, |intro| {
+        build_put_value(intro, value_str)
+    })
+    .await
+}
+
+/// Single owner of the PUT INIT → DATA → done wire dance. The value to
+/// send is produced by `build_value` *after* the server returns the
+/// prototype introspection, so callers whose value parsing depends on
+/// the prototype (e.g. the legacy positional array form, where
+/// "scalar array" vs "scalar" decides whether the first token is a
+/// length to drop) get the prototype before they commit. `build_value`
+/// runs synchronously between the INIT reply and the DATA send — no
+/// await crosses it.
+async fn op_put_inner_build<FB>(
+    channel: &Arc<Channel>,
+    raw_pv_req: Option<&[u8]>,
+    op_timeout: Duration,
+    build_value: FB,
+) -> PvaResult<()>
+where
+    FB: FnOnce(&FieldDesc) -> PvaResult<PvField>,
+{
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order;
     let big_endian = matches!(order, ByteOrder::Big);
@@ -1469,8 +1513,9 @@ async fn op_put_inner(
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
 
-    // Build value matching introspection.
-    let value = build_put_value(&intro, value_str)?;
+    // Build value matching introspection. The builder may classify
+    // its input against the prototype (see `op_put_inner_build`).
+    let value = build_value(&intro)?;
 
     // DATA
     let mut payload = Vec::new();
@@ -1527,8 +1572,10 @@ async fn op_put_inner(
 #[derive(Debug, Clone)]
 pub enum MonitorEvent {
     /// Channel just transitioned to Active and the server has
-    /// confirmed our INIT/START. Fires once per connect cycle.
-    Connected,
+    /// confirmed our INIT/START. Fires once per connect cycle. Carries
+    /// the server endpoint so callers can report `Connected to <peer>`
+    /// like pvxs (`tools/monitor.cpp:152`).
+    Connected { peer: std::net::SocketAddr },
     /// Server pushed a value update.
     Data { intro: FieldDesc, value: PvField },
     /// Channel left Active (TCP closed, op error, channel closed).
@@ -2524,18 +2571,24 @@ where
 /// loop to pvxs's typed event stream. The mask flags control whether
 /// `Connected`/`Disconnected`/`Finished` events surface or stay
 /// suppressed (pvxs `maskConnected` / `maskDisconnected`).
+///
+/// `raw_pv_req` is the caller's serialized pvRequest (`None` = the
+/// default all-fields request); `flow` carries the negotiated
+/// `record._options.{pipeline,queueSize}` window. The descriptor handed
+/// to every [`MonitorEvent::Data`] is the monitor's own INIT
+/// introspection, so a projected request (`field(alarm)`) yields the
+/// projected shape — no separate GET_FIELD is needed.
 pub async fn op_monitor_events<F>(
     channel: &Arc<Channel>,
-    fields: &[&str],
-    pipeline_size: u32,
+    raw_pv_req: Option<Vec<u8>>,
+    flow: MonitorFlow,
     mask: MonitorEventMask,
     mut callback: F,
 ) -> PvaResult<()>
 where
     F: FnMut(MonitorEvent) + Send,
 {
-    let fields_owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-    let flow = MonitorFlow::window(pipeline_size);
+    let no_fields: &[String] = &[];
     loop {
         let (server, sid) = match channel.ensure_active().await {
             Ok(p) => p,
@@ -2552,7 +2605,7 @@ where
             }
         };
         if !mask.mask_connected {
-            callback(MonitorEvent::Connected);
+            callback(MonitorEvent::Connected { peer: server.addr });
         }
         let mut data_callback = |intro: &FieldDesc, value: &PvField| {
             callback(MonitorEvent::Data {
@@ -2563,8 +2616,8 @@ where
         let result = run_monitor_loop(
             server.clone(),
             sid,
-            &fields_owned,
-            None,
+            no_fields,
+            raw_pv_req.as_deref(),
             flow,
             &mut data_callback,
             None,
@@ -3374,6 +3427,71 @@ fn build_put_value_for_path(
     }
 }
 
+/// The descriptor a bare `.value` write targets: the `value` member of
+/// a structure prototype, or the prototype itself when it is already a
+/// bare leaf. Used to classify legacy positional PUT tokens against the
+/// shape the server actually exposes.
+fn value_target_desc(intro: &FieldDesc) -> &FieldDesc {
+    if let FieldDesc::Structure { fields, .. } = intro {
+        if let Some((_, child)) = fields.iter().find(|(n, _)| n == "value") {
+            return child;
+        }
+    }
+    intro
+}
+
+/// Classify the legacy pvAccessCPP positional bare-token PUT form
+/// against the prototype and lower it to a full [`PvField`] via
+/// [`build_put_value`]. pvAccessCPP `pvtoolsSrc/pvput.cpp:144-178`:
+///
+/// - scalar-array `.value`: a lone `[...]` token is the JSON-array
+///   shortcut (`value=[...]`); otherwise the first token is the
+///   compatibility length and is dropped (`bare.slice(1)`), the rest
+///   are the elements.
+/// - scalar `.value`: exactly one token (more than one is rejected,
+///   matching upstream's "Can't assign multiple values to scalar").
+/// - any other shape: tokens are space-joined and lowered as-is, so
+///   structure / union / variant prototypes behave as before.
+///
+/// The decision needs the prototype, so this runs from inside the PUT
+/// op after INIT (see [`op_put_inner_build`]).
+fn build_put_value_from_tokens(intro: &FieldDesc, tokens: &[String]) -> PvaResult<PvField> {
+    match value_target_desc(intro) {
+        FieldDesc::ScalarArray(_) => {
+            // `build_put_value`'s scalar-array arm splits on commas, so
+            // lower the chosen element set to a comma-separated string.
+            let csv = if tokens.len() == 1 && tokens[0].trim_start().starts_with('[') {
+                // JSON-array shortcut: `value=[...]`. Strip the outer
+                // brackets; the inner is already comma-separated scalars.
+                let t = tokens[0].trim();
+                let inner = t
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or(t);
+                inner.to_string()
+            } else {
+                // Legacy positional: first token is the length, ignored.
+                tokens
+                    .iter()
+                    .skip(1)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            build_put_value(intro, &csv)
+        }
+        FieldDesc::Scalar(_) => {
+            if tokens.len() != 1 {
+                return Err(PvaError::InvalidValue(
+                    "Can't assign multiple values to scalar".to_string(),
+                ));
+            }
+            build_put_value(intro, &tokens[0])
+        }
+        _ => build_put_value(intro, &tokens.join(" ")),
+    }
+}
+
 fn build_put_value(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
     match desc {
         FieldDesc::Scalar(st) => ScalarValue::parse(*st, value_str)
@@ -3640,6 +3758,90 @@ mod tests {
         let value_only = build_pv_request_value_only(false);
         let value_only_frame = build_process_init(sid, ioid, &value_only, order);
         assert_ne!(frame, value_only_frame);
+    }
+
+    /// Legacy pvAccessCPP positional bare-token PUT classification
+    /// (`pvput.cpp:144-178`): the array-vs-scalar decision is made
+    /// against the prototype, so these exercise `build_put_value_from_tokens`
+    /// directly with both an NTScalarArray-shaped and a scalar prototype.
+    mod put_tokens {
+        use super::*;
+        use crate::pvdata::ScalarType;
+
+        fn nt_scalar_array() -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalarArray:1.0".to_string(),
+                fields: vec![(
+                    "value".to_string(),
+                    FieldDesc::ScalarArray(ScalarType::Double),
+                )],
+            }
+        }
+        fn nt_scalar() -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".to_string(),
+                fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+            }
+        }
+        fn value_array(v: &PvField) -> Vec<f64> {
+            match v {
+                PvField::Structure(s) => {
+                    match &s.fields.iter().find(|(n, _)| n == "value").unwrap().1 {
+                        PvField::ScalarArray(items) => items
+                            .iter()
+                            .map(|sv| match sv {
+                                ScalarValue::Double(d) => *d,
+                                other => panic!("expected Double element, got {other:?}"),
+                            })
+                            .collect(),
+                        other => panic!("expected ScalarArray .value, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Structure, got {other:?}"),
+            }
+        }
+        fn t(args: &[&str]) -> Vec<String> {
+            args.iter().map(|s| s.to_string()).collect()
+        }
+
+        /// `pvput arr:pv 3 1.0 2.0` — the leading `3` is the legacy
+        /// length and is dropped; `[1.0, 2.0]` is written.
+        #[test]
+        fn scalar_array_drops_leading_length_token() {
+            let v =
+                build_put_value_from_tokens(&nt_scalar_array(), &t(&["3", "1.0", "2.0"])).unwrap();
+            assert_eq!(value_array(&v), vec![1.0, 2.0]);
+        }
+
+        /// A lone `[...]` token is the JSON-array shortcut `value=[...]`
+        /// — the brackets are NOT treated as a length-then-element list.
+        #[test]
+        fn scalar_array_json_bracket_shortcut() {
+            let v =
+                build_put_value_from_tokens(&nt_scalar_array(), &t(&["[1.0,2.0,3.0]"])).unwrap();
+            assert_eq!(value_array(&v), vec![1.0, 2.0, 3.0]);
+        }
+
+        /// Degenerate single non-bracket token: the only token is the
+        /// length, so the element list is empty (matches upstream
+        /// `bare.slice(1)` on a one-element vector).
+        #[test]
+        fn scalar_array_single_length_token_is_empty() {
+            let v = build_put_value_from_tokens(&nt_scalar_array(), &t(&["5"])).unwrap();
+            assert!(value_array(&v).is_empty());
+        }
+
+        /// A scalar `.value` takes exactly one token; more than one is
+        /// rejected ("Can't assign multiple values to scalar").
+        #[test]
+        fn scalar_rejects_multiple_tokens() {
+            assert!(build_put_value_from_tokens(&nt_scalar(), &t(&["1.0"])).is_ok());
+            let err = build_put_value_from_tokens(&nt_scalar(), &t(&["1.0", "2.0"])).unwrap_err();
+            assert!(
+                matches!(err, PvaError::InvalidValue(ref m) if m.contains("multiple values to scalar")),
+                "got: {err:?}"
+            );
+        }
     }
 
     /// Round-trip a built PUT value through encode/decode against its

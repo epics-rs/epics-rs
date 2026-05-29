@@ -95,12 +95,20 @@ async fn main() {
 
     let client = PvaClient::new().expect("failed to create PVA client");
 
+    // Start a describe op for every PV before awaiting any, then await the
+    // whole set under one command-level timeout (pvxs `tools/info.cpp:81-112`
+    // exec()s all ops, hurryUp()s, and waits once). The serial await-per-PV
+    // loop this replaces spent one timeout per PV and let a slow first PV
+    // block later ones from even starting.
+    let names: Vec<&str> = args.pv_names.iter().map(String::as_str).collect();
+    let results = client.pvinfo_many_full_with_credentials(&names).await;
+
     let mut failed = false;
-    for (i, pv_name) in args.pv_names.iter().enumerate() {
+    for (i, (pv_name, result)) in args.pv_names.iter().zip(results).enumerate() {
         if i > 0 {
             println!();
         }
-        match client.pvinfo_full_with_credentials(pv_name).await {
+        match result {
             Ok((desc, server_addr, cred)) => {
                 // Under `--show-credentials`, print the server's peer
                 // identity line first. pvxs

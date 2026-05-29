@@ -1,5 +1,6 @@
 use clap::Parser;
 use epics_pva_rs::client::PvaClient;
+use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
 use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::{cli, format};
 
@@ -94,42 +95,66 @@ async fn main() {
         cli::print_effective_config();
     }
 
+    // One client for the whole command, shared by every monitor task —
+    // not one PvaClient per PV. pvxs builds a single client::Context and
+    // starts every subscription from it (tools/monitor.cpp:95-122), so PVs
+    // on the same IOC share one channel cache, connection pool, and search
+    // engine, and one coherent hurryUp() can follow the install loop. `-w`
+    // bounds the connect/operation timeout (pvxs monitor has none; threaded
+    // per finding 23) rather than being silently dropped.
+    let client = PvaClient::builder()
+        .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
+        .build();
+
     let mut handles = Vec::new();
 
     for pv_name in args.pv_names {
         let mode = args.mode.clone();
         let request = request.clone();
-        let timeout = args.timeout;
+        let client = client.clone();
+        let verbose = args.verbose > 0;
         let handle = tokio::spawn(async move {
-            // `-w` bounds the connect/operation timeout (pvxs monitor
-            // has none; thread it into the client per finding 23's
-            // connect-timeout option) rather than being silently dropped.
-            let client = PvaClient::builder()
-                .timeout(epics_pva_rs::cli::timeout_duration(timeout))
-                .build();
-
-            // Get introspection once for typed formatting
-            let desc = client.pvinfo(&pv_name).await.ok();
-
-            let render = |value: &epics_pva_rs::pvdata::PvField| {
-                // `-q` is a deprecated no-op (see Args::quiet); monitor
-                // updates are always printed, matching pvAccessCPP.
-                let output = if let Some(ref d) = desc {
-                    match mode.as_str() {
-                        "json" => format::format_json(&pv_name, value),
-                        "raw" => format::format_raw(&pv_name, d, value),
-                        _ => format::format_nt(&pv_name, d, value),
+            // Format every Data update with the descriptor carried by the
+            // monitor's own INIT response (`MonitorEvent::Data.intro`), not
+            // a separate GET_FIELD, and surface the connect/disconnect/
+            // finished lifecycle the way pvxs does. Data goes to stdout;
+            // lifecycle goes to stderr (pvxs `tools/monitor.cpp:140-163`:
+            // `std::cout` for the value, `std::cerr` for Connected /
+            // Disconnected / Finished, the last only when verbose).
+            let on_event = |event: MonitorEvent| match event {
+                MonitorEvent::Data { intro, value } => {
+                    // `-q` is a deprecated no-op (see Args::quiet); monitor
+                    // updates are always printed, matching pvAccessCPP.
+                    let output = match mode.as_str() {
+                        "json" => format::format_json(&pv_name, &value),
+                        "raw" => format::format_raw(&pv_name, &intro, &value),
+                        _ => format::format_nt(&pv_name, &intro, &value),
+                    };
+                    print!("{output}");
+                }
+                MonitorEvent::Connected { peer } => {
+                    eprintln!("{pv_name} Connected to {peer}");
+                }
+                MonitorEvent::Disconnected => {
+                    eprintln!("{pv_name} Disconnected");
+                }
+                MonitorEvent::Finished => {
+                    if verbose {
+                        eprintln!("{pv_name} Finished");
                     }
-                } else {
-                    format!("{pv_name} {value}\n")
-                };
-                print!("{output}");
+                }
             };
 
-            let result = match request {
-                Some(req) => client.pvmonitor_with_request(&pv_name, &req, render).await,
-                None => client.pvmonitor(&pv_name, render).await,
+            // pvxs monitors with maskConnected=false, maskDisconnected=false
+            // so the CLI reports the subscription lifecycle
+            // (tools/monitor.cpp:111-112).
+            let mask = MonitorEventMask {
+                mask_connected: false,
+                mask_disconnected: false,
             };
+            let result = client
+                .pvmonitor_events(&pv_name, request.as_ref(), mask, on_event)
+                .await;
 
             if let Err(e) = result {
                 eprintln!("{pv_name}: {e}");
@@ -137,6 +162,11 @@ async fn main() {
         });
         handles.push(handle);
     }
+
+    // All subscriptions registered — hurry discovery once from the shared
+    // client, matching pvxs `ctxt.hurryUp()` after the install loop
+    // (tools/monitor.cpp:120-122).
+    client.hurry_up().await;
 
     for handle in handles {
         let _ = handle.await;

@@ -695,6 +695,105 @@ async fn pva_fr_2_client_report_has_connection_byte_counters() {
     h.abort();
 }
 
+/// Two PVs monitored through ONE shared client share a single server
+/// connection — the property the `pvmonitor-rs` command relies on after
+/// it was changed to build one client for the whole command instead of
+/// one `PvaClient` per PV. pvxs starts every subscription from a single
+/// `client::Context` whose `connByAddr` reuses one connection per server
+/// (clientconn.cpp:44-56). Before the CLI fix, two PVs on the same IOC
+/// opened two clients and could open two connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pva_fr_166_shared_client_one_connection_for_two_monitors() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:MON166A", 1.0).await;
+    source.add_pv("STAB:MON166B", 2.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    // Both monitors come from the SAME client (as the CLI now clones one
+    // shared client into every task).
+    let a = client
+        .pvmonitor_handle("STAB:MON166A", |_d, _v| {})
+        .await
+        .expect("subscribe A");
+    let b = client
+        .pvmonitor_handle("STAB:MON166B", |_d, _v| {})
+        .await
+        .expect("subscribe B");
+
+    // Let both subscriptions reach Active on the shared connection.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let r = client.report();
+    assert_eq!(
+        r.connections.len(),
+        1,
+        "two PVs on one server via one client must share one connection, got {}",
+        r.connections.len()
+    );
+    assert_eq!(
+        r.connections[0].channels.len(),
+        2,
+        "both monitored channels ride the single shared connection"
+    );
+
+    a.stop();
+    b.stop();
+    h.abort();
+}
+
+/// A `pvmonitor_events` subscription opened with both masks cleared
+/// surfaces the connect lifecycle the `pvmonitor-rs` CLI now prints: a
+/// `Connected` event carrying the server peer, followed by the initial
+/// `Data` snapshot. pvxs monitors with maskConnected=false,
+/// maskDisconnected=false and reports `Connected to <peer>`
+/// (tools/monitor.cpp:111-152). Before the CLI fix the value-only
+/// callback could not observe any lifecycle event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pva_fr_25_monitor_events_surface_connected_with_peer_then_data() {
+    use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:EVT25", 7.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+    let expected_peer =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let ev = events.clone();
+    let client_task = client.clone();
+    let mon = tokio::spawn(async move {
+        let mask = MonitorEventMask {
+            mask_connected: false,
+            mask_disconnected: false,
+        };
+        let _ = client_task
+            .pvmonitor_events("STAB:EVT25", None, mask, move |event| match event {
+                MonitorEvent::Connected { peer } => ev.lock().push(format!("connected:{peer}")),
+                MonitorEvent::Data { .. } => ev.lock().push("data".to_string()),
+                MonitorEvent::Disconnected => ev.lock().push("disconnected".to_string()),
+                MonitorEvent::Finished => ev.lock().push("finished".to_string()),
+            })
+            .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let got = events.lock().clone();
+    assert_eq!(
+        got.first().map(String::as_str),
+        Some(format!("connected:{expected_peer}").as_str()),
+        "first event must be Connected carrying the server peer, got {got:?}"
+    );
+    assert!(
+        got.iter().any(|s| s == "data"),
+        "an initial Data event must follow Connected, got {got:?}"
+    );
+
+    mon.abort();
+    h.abort();
+}
+
 /// Regression: commit c3f286c added a server-side pipeline
 /// credit window unconditionally for every Monitor op, but pvxs only
 /// applies flow control when the client's pvRequest explicitly

@@ -1235,13 +1235,21 @@ impl PvaClient {
             ch.ensure_active().await?.0.byte_order,
             crate::proto::ByteOrder::Big
         );
-        let bytes = request.encode(big_endian);
-        crate::client_native::ops_v2::op_monitor_raw(
-            &ch,
-            bytes,
+        // Flow control comes from the SAME request the wire bytes are
+        // built from: `record._options.{pipeline,queueSize,ackAny}`
+        // drive the INIT pipeline bit / `nack` trailer and the ACK
+        // cadence, not the client's fixed builder window. pvxs
+        // `MonitorBuilder::exec()` (clientmon.cpp:761-808). The builder
+        // `pipeline_size` is only the queueSize fallback when the
+        // request enables pipelining without naming a window.
+        let flow = crate::client_native::ops_v2::MonitorFlow::from_record_options(
+            &request.record_options,
             self.inner.pipeline_size,
-            move |_desc, value| callback(value),
-        )
+        );
+        let bytes = request.encode(big_endian);
+        crate::client_native::ops_v2::op_monitor_raw(&ch, bytes, flow, move |_desc, value| {
+            callback(value)
+        })
         .await
     }
 

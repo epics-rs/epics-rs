@@ -178,7 +178,9 @@ impl<T: Send + 'static> PvaOperation<T> {
         // clear AND the task still running (channel still open) reports
         // active. `has_changed()` returns `Err` once the task's sender has
         // dropped — i.e. the operation already terminated.
-        let already_cancelled = self.cancelled.swap(true, std::sync::atomic::Ordering::AcqRel);
+        let already_cancelled = self
+            .cancelled
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
         let was_active = !already_cancelled && self.terminated_rx.has_changed().is_ok();
         self.join.abort();
         // Synchronization point: wait until the task's `watch::Sender` has
@@ -303,7 +305,10 @@ mod tests {
         // Cancelling an in-flight op reports it was active and, as a
         // synchronization point, returns only after the task has stopped.
         let was_active = op.cancel().await;
-        assert!(was_active, "cancel of a running op must report it was active");
+        assert!(
+            was_active,
+            "cancel of a running op must report it was active"
+        );
         assert!(
             op.is_done(),
             "cancel() must not return until the spawned task has terminated"

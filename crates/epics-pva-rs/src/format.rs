@@ -262,14 +262,48 @@ pub fn format_nt(pv_name: &str, desc: &FieldDesc, value: &PvField) -> String {
         // printTable (printer.cpp:414-421). printTable cowardly refuses
         // a malformed table (`return false`); we mirror that by falling
         // back to the raw formatter when the table is not well-formed.
-        format_nt_table(pv_name, s).unwrap_or_else(|| format_raw(pv_name, desc, value))
-    } else if id.starts_with("epics:nt/NTScalar:") {
-        format_nt_scalar(pv_name, s)
-    } else if id.starts_with("epics:nt/NTEnum:") {
-        format_nt_enum(pv_name, s)
-    } else {
-        format_raw(pv_name, desc, value)
+        return format_nt_table(pv_name, s).unwrap_or_else(|| format_raw(pv_name, desc, value));
     }
+    // Every other NT shape — NTScalar, NTScalarArray, NTEnum, "or anything
+    // with '.value'" — is dispatched by the TYPE of the `value` subfield,
+    // not the struct ID (EPICS Base printer.cpp:422-453). Keying on the
+    // value type (rather than the ID prefix, which only matched NTScalar
+    // and NTEnum) is what gives NTScalarArray — and any other
+    // `.value`-bearing structure — the standard one-line NT output instead
+    // of the multi-line raw fallback.
+    match s.get_field("value") {
+        // scalar `.value`: `<timeStamp> <value> <alarm>`
+        // (printer.cpp:428-434).
+        Some(PvField::Scalar(_)) => format_nt_scalar(pv_name, s),
+        // scalar-array `.value`: `<timeStamp> <alarm> <value>`
+        // (printer.cpp:436-441) — the alarm precedes the value here,
+        // unlike the scalar branch above.
+        Some(PvField::ScalarArray(_)) | Some(PvField::ScalarArrayTyped(_)) => {
+            format_nt_scalar_array(pv_name, s)
+        }
+        // structure `.value` that is an `enum_t` (index + choices): printed
+        // as `(index) choice` via printEnumT (printer.cpp:443-447).
+        // printEnumT returns false — and Base then falls through to raw —
+        // when either field is missing, which `is_enum_t` mirrors.
+        Some(PvField::Structure(es)) if is_enum_t(es) => format_nt_enum(pv_name, s),
+        // No `.value`, or an unsupported value type: raw fallback
+        // (printer.cpp:449-462).
+        _ => format_raw(pv_name, desc, value),
+    }
+}
+
+/// Whether a `.value` substructure is an `enum_t` — an `index` scalar plus
+/// a `choices` array — the shape EPICS Base `printEnumT` requires before it
+/// will print `(index) choice` (printer.cpp:158-160 returns false when
+/// either field is absent). Both array encodings are accepted so a
+/// wire-decoded NTEnum reaches [`format_nt_enum`] exactly as the prior
+/// ID-prefix dispatch did.
+fn is_enum_t(value: &PvStructure) -> bool {
+    matches!(value.get_field("index"), Some(PvField::Scalar(_)))
+        && matches!(
+            value.get_field("choices"),
+            Some(PvField::ScalarArray(_)) | Some(PvField::ScalarArrayTyped(_))
+        )
 }
 
 fn format_nt_scalar(pv_name: &str, s: &PvStructure) -> String {
@@ -302,6 +336,35 @@ fn nt_payload(s: &PvStructure) -> String {
     // alarm summary is empty unless severity is nonzero.
     let alarm = top_alarm_summary(s);
     format!("{ts}  {val} {alarm}\n")
+}
+
+/// Default NT output for a scalar-array `value` (NTScalarArray, or any
+/// structure whose `.value` is a scalar array). Mirrors EPICS Base's
+/// `scalarArray` NT branch (pvData printer.cpp:436-441):
+///
+///   indent; printTimeT; printAlarmT; `setprecision(6)` value; `'\n'`
+///
+/// so the order is `<pv_name> <timeStamp>  <alarm><value>\n`. Two points
+/// of asymmetry with the NTScalar one-liner ([`nt_payload`]) are faithful
+/// to Base: the alarm is printed BEFORE the array value (not after), and
+/// the array value is the last token before the newline. The array is
+/// rendered through [`format_value_inline`], which already applies the
+/// six-significant-digit float precision (`std::setprecision(6)`,
+/// printer.cpp:440) and the per-type element separator.
+fn format_nt_scalar_array(pv_name: &str, s: &PvStructure) -> String {
+    let ts = s
+        .get_field("timeStamp")
+        .and_then(|f| match f {
+            PvField::Structure(ts) => Some(format_timestamp(ts)),
+            _ => None,
+        })
+        .unwrap_or_else(|| "<undefined>".to_string());
+    let alarm = top_alarm_summary(s);
+    let val = s
+        .get_field("value")
+        .map(format_value_inline)
+        .unwrap_or_default();
+    format!("{pv_name} {ts}  {alarm}{val}\n")
 }
 
 /// Render an NTScalar `value` field for `-M nt` output.
@@ -1383,6 +1446,107 @@ mod tests {
         let (desc, value) = nt_table(&["d"], &[("d", vec![ScalarValue::Double(1.23456789)])]);
         let out = format_nt("PV", &desc, &value);
         assert_eq!(out, "PV \n         d\n1.23456789\n");
+    }
+
+    /// Build an NTScalarArray top structure carrying the given scalar-array
+    /// `value`, an epoch-0 (`<undefined>`) timestamp, and optionally an
+    /// alarm. epoch-0 keeps the timestamp text deterministic across
+    /// machine timezones.
+    fn nt_scalar_array(value: PvField, alarm: Option<PvField>) -> (FieldDesc, PvField) {
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalarArray:1.0".into(),
+            fields: vec![],
+        };
+        let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
+        s.set("value", value);
+        let mut ts = PvStructure::new("time_t");
+        ts.set("secondsPastEpoch", PvField::Scalar(ScalarValue::Long(0)));
+        ts.set("nanoseconds", PvField::Scalar(ScalarValue::Int(0)));
+        ts.set("userTag", PvField::Scalar(ScalarValue::Int(0)));
+        s.set("timeStamp", PvField::Structure(ts));
+        if let Some(a) = alarm {
+            s.set("alarm", a);
+        }
+        (desc, PvField::Structure(s))
+    }
+
+    /// PVA-150: an NTScalarArray value renders on ONE line through the
+    /// Base-style `.value` NT branch (printer.cpp:436-441), not the
+    /// multi-line raw fallback. Numeric elements print with six
+    /// significant digits and a bare-comma separator.
+    #[test]
+    fn nt_scalar_array_double_renders_one_line() {
+        let (desc, val) = nt_scalar_array(
+            PvField::ScalarArray(vec![ScalarValue::Double(1.5), ScalarValue::Double(2.5)]),
+            None,
+        );
+        let out = format_nt("PV", &desc, &val);
+        assert_eq!(out, "PV <undefined>  [1.5,2.5]\n");
+        // Single line: the only newline is the terminator.
+        assert_eq!(out.matches('\n').count(), 1);
+    }
+
+    /// A string-valued NTScalarArray quotes each element via `maybeQuote`
+    /// and joins with `", "` (PVValueArray<std::string>::dumpValue), still
+    /// on one NT line.
+    #[test]
+    fn nt_scalar_array_string_quotes_each_element() {
+        let (desc, val) = nt_scalar_array(
+            PvField::ScalarArray(vec![
+                ScalarValue::String("a b".into()),
+                ScalarValue::String("c".into()),
+            ]),
+            None,
+        );
+        let out = format_nt("PV", &desc, &val);
+        assert_eq!(out, "PV <undefined>  [\"a b\", c]\n");
+    }
+
+    /// For a scalar ARRAY, Base prints the alarm BEFORE the value
+    /// (printer.cpp:436-441: printTimeT, printAlarmT, then the array) —
+    /// the opposite of the NTScalar order. Verify the alarm summary
+    /// precedes the array text, and severity 0 prints no alarm.
+    #[test]
+    fn nt_scalar_array_alarm_precedes_value() {
+        let (desc, val) = nt_scalar_array(
+            PvField::ScalarArray(vec![ScalarValue::Int(7), ScalarValue::Int(8)]),
+            Some(alarm_struct(2, 3, "HIGH")),
+        );
+        let out = format_nt("PV", &desc, &val);
+        assert_eq!(out, "PV <undefined>  MAJOR RECORD HIGH [7,8]\n");
+        let ai = out.find("MAJOR").expect("alarm present");
+        let vi = out.find("[7,8]").expect("value present");
+        assert!(ai < vi, "alarm must precede the array value: {out:?}");
+    }
+
+    /// severity 0 → no alarm tokens on the NTScalarArray line.
+    #[test]
+    fn nt_scalar_array_omits_zero_severity_alarm() {
+        let (desc, val) = nt_scalar_array(
+            PvField::ScalarArray(vec![ScalarValue::Int(1)]),
+            Some(alarm_struct(0, 0, "ignored")),
+        );
+        let out = format_nt("PV", &desc, &val);
+        assert_eq!(out, "PV <undefined>  [1]\n");
+    }
+
+    /// Structural check: the `.value` dispatch is keyed on the value TYPE,
+    /// not the NT struct ID — so a structure with an empty struct ID but a
+    /// scalar-array `.value` ("anything with '.value'", printer.cpp:423)
+    /// also gets the one-line NT output instead of the raw fallback.
+    #[test]
+    fn nt_generic_value_scalar_array_uses_nt_branch() {
+        let desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![],
+        };
+        let mut s = PvStructure::new("");
+        s.set(
+            "value",
+            PvField::ScalarArray(vec![ScalarValue::Int(1), ScalarValue::Int(2)]),
+        );
+        let out = format_nt("PV", &desc, &PvField::Structure(s));
+        assert_eq!(out, "PV <undefined>  [1,2]\n");
     }
 
     #[test]

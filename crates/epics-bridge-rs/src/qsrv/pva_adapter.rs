@@ -522,6 +522,113 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
+    /// BitSet-delta PUT (PVA PUT / PUT_GET data phase).
+    ///
+    /// The generic default (`source.rs` `put_delta_checked`) reads the
+    /// PV's current full value and overlays the marked leaves
+    /// (`fill_unmarked_from_prior`) before writing. That is correct for
+    /// a single record, but for a QSRV *group* the merged full structure
+    /// makes every putorder member look client-supplied, so
+    /// `GroupChannel::put_with_options` would access-check and
+    /// write/process every member — not just the ones the client marked.
+    ///
+    /// pvxs decodes a PUT into a value carrying mark bits
+    /// (`from_wire_valid`, serverget.cpp:443-452) and the group apply
+    /// writes only marked members (`marked = leafNode.isMarked(true,true)
+    /// && field.value`, groupsource.cpp:547-567). Match that: for a
+    /// group, prune the delta to its marked leaves so field presence ==
+    /// marked, then hand that to the group apply (which now selects,
+    /// access-checks, and writes only present/marked members). Single
+    /// records keep the read-merge-write default so unmarked metadata
+    /// leaves carry over from the prior value.
+    fn put_delta_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        desc: FieldDesc,
+        changed: epics_pva_rs::proto::BitSet,
+        delta: PvField,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        let provider = self.provider.clone();
+        async move {
+            if !checked.allows_write() {
+                return Err(OpError::denied(format!(
+                    "PUT denied by access security: '{}' from {}@{}",
+                    checked.pv_name(),
+                    ctx.account,
+                    ctx.host
+                )));
+            }
+            let name = checked.pv_name().to_string();
+            let init_req = match ctx.pv_request {
+                Some(PvField::Structure(ref req)) => Some(req),
+                _ => None,
+            };
+            let channel = provider
+                .create_channel_with_creds(&name, ctx_to_creds(&ctx))
+                .await
+                .map_err(|e| OpError::failed(e.to_string()))?;
+            match channel {
+                crate::qsrv::AnyChannel::Group(group) => {
+                    // Prune to the client's marked members (presence ==
+                    // marked). Nothing marked → empty apply, which the
+                    // group's own "No fields changed" logic treats as a
+                    // silent no-op (pvxs `value.isMarked` false).
+                    let pv = match epics_pva_rs::pvdata::encode::prune_to_marked(
+                        &desc, &changed, 0, delta,
+                    ) {
+                        Some(PvField::Structure(s)) => s,
+                        Some(other) => {
+                            return Err(OpError::failed(format!(
+                                "qsrv group PUT expects a structure value, got {other}"
+                            )));
+                        }
+                        None => PvStructure::new(""),
+                    };
+                    let opts = match init_req {
+                        Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
+                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                    };
+                    let atomic_override = match init_req {
+                        Some(req) => crate::qsrv::channel::atomic_from_pv_request(req),
+                        None => crate::qsrv::channel::atomic_from_pv_request(&pv),
+                    };
+                    group
+                        .put_with_options(&pv, opts, atomic_override)
+                        .await
+                        .map_err(|e| OpError::failed(e.to_string()))
+                }
+                crate::qsrv::AnyChannel::Single(single) => {
+                    // Single-record: generic read-merge-write under the
+                    // same identity (the record put consumes only the
+                    // value leaf, so the whole-structure write is fine).
+                    let merged = match self.get_value_checked(checked.clone(), ctx.clone()).await {
+                        Some(prior) => epics_pva_rs::pvdata::encode::fill_unmarked_from_prior(
+                            &desc, &changed, 0, delta, &prior,
+                        ),
+                        None => delta,
+                    };
+                    let pv = match merged {
+                        PvField::Structure(s) => s,
+                        other => {
+                            return Err(OpError::failed(format!(
+                                "qsrv PUT expects a structure value, got {other}"
+                            )));
+                        }
+                    };
+                    let opts = match init_req {
+                        Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
+                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                    };
+                    single
+                        .put_with_options(&pv, opts)
+                        .await
+                        .map_err(|e| OpError::failed(e.to_string()))
+                }
+            }
+        }
+    }
+
     /// PVA `PROCESS` against a QSRV record runs the record's
     /// `dbProcess`-equivalent path. The default `ChannelSource::process`
     /// returns `Ok(())` unconditionally — a client calling
@@ -1916,6 +2023,207 @@ mod tests {
             "member b TIME must NOT advance: process=false in the INIT \
              pvRequest must suppress member processing (got {b_before:?} \
              -> {b_after:?})"
+        );
+    }
+
+    /// Partial group PUT must write/process only the marked member.
+    /// The generic `put_delta_checked` default reads the full group and
+    /// overlays marked leaves, so every putorder member ends up present
+    /// in the merged structure and gets written/processed. The override
+    /// prunes the delta to the marked members (pvxs
+    /// groupsource.cpp:547-567 writes only marked members). Discriminator:
+    /// a member record's `common.time` advances only when processed.
+    #[tokio::test]
+    async fn bridge_rs_120_partial_group_put_writes_only_marked_member() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::longin::LonginRecord;
+        use epics_pva_rs::proto::BitSet;
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+
+        const GROUP_JSON: &str = r#"{
+            "BR120:grp": {
+                "+atomic": false,
+                "a": { "+channel": "BR120:a.VAL", "+type": "plain", "+putorder": 0 },
+                "b": { "+channel": "BR120:b.VAL", "+type": "plain", "+putorder": 1 }
+            }
+        }"#;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("BR120:a", Box::new(LonginRecord::new(0)))
+            .await
+            .unwrap();
+        db.add_record("BR120:b", Box::new(LonginRecord::new(0)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(GROUP_JSON).expect("load group");
+        let store = QsrvPvStore::new(provider);
+
+        let member_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
+            let rec = db.get_record(rec).await.unwrap();
+            let inst = rec.read().await;
+            inst.common.time
+        };
+        let a_before = member_time(db.clone(), "BR120:a").await;
+        let b_before = member_time(db.clone(), "BR120:b").await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Group value descriptor: depth-first bits root=0, a=1, b=2.
+        let desc = FieldDesc::Structure {
+            struct_id: "structure".into(),
+            fields: vec![
+                ("a".into(), FieldDesc::Scalar(ScalarType::Long)),
+                ("b".into(), FieldDesc::Scalar(ScalarType::Long)),
+            ],
+        };
+        // Mark ONLY member a; b carries its unmarked type default.
+        let mut changed = BitSet::new();
+        changed.set(1);
+        let mut delta = PvStructure::new("structure");
+        delta
+            .fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Long(11))));
+        delta
+            .fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Long(0))));
+
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "anonymous".into(),
+            method: "anonymous".into(),
+            host: "127.0.0.1".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: None,
+        };
+        let checked = AccessGate::open()
+            .check("BR120:grp", "127.0.0.1", "anonymous", "anonymous", "")
+            .await;
+
+        store
+            .put_delta_checked(checked, desc, changed, PvField::Structure(delta), ctx)
+            .await
+            .expect("partial group PUT must succeed");
+
+        let a_val = {
+            let rec = db.get_record("BR120:a").await.unwrap();
+            let inst = rec.read().await;
+            inst.snapshot_for_field("VAL").map(|s| s.value)
+        };
+        assert!(
+            matches!(a_val, Some(epics_base_rs::types::EpicsValue::Long(11))),
+            "marked member a must be written to 11, got {a_val:?}"
+        );
+        let a_after = member_time(db.clone(), "BR120:a").await;
+        assert_ne!(
+            a_after, a_before,
+            "marked member a must be processed (time advances)"
+        );
+
+        // Pre-fix the merge made b present, so every member was written
+        // and processed; post-fix b is unmarked and must be untouched.
+        let b_val = {
+            let rec = db.get_record("BR120:b").await.unwrap();
+            let inst = rec.read().await;
+            inst.snapshot_for_field("VAL").map(|s| s.value)
+        };
+        assert!(
+            matches!(b_val, Some(epics_base_rs::types::EpicsValue::Long(0))),
+            "unmarked member b must stay 0, got {b_val:?}"
+        );
+        let b_after = member_time(db.clone(), "BR120:b").await;
+        assert_eq!(
+            b_after, b_before,
+            "unmarked member b must NOT be processed (time unchanged)"
+        );
+    }
+
+    /// An empty changed BitSet (nothing marked) must write/process no
+    /// member — "No fields changed" follows the BitSet. Pre-fix the
+    /// read-merge-write default made every member present in the merged
+    /// value and processed them all.
+    #[tokio::test]
+    async fn bridge_rs_120_empty_bitset_group_put_writes_nothing() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::longin::LonginRecord;
+        use epics_pva_rs::proto::BitSet;
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+
+        const GROUP_JSON: &str = r#"{
+            "BR120E:grp": {
+                "+atomic": false,
+                "a": { "+channel": "BR120E:a.VAL", "+type": "plain", "+putorder": 0 },
+                "b": { "+channel": "BR120E:b.VAL", "+type": "plain", "+putorder": 1 }
+            }
+        }"#;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("BR120E:a", Box::new(LonginRecord::new(0)))
+            .await
+            .unwrap();
+        db.add_record("BR120E:b", Box::new(LonginRecord::new(0)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(GROUP_JSON).expect("load group");
+        let store = QsrvPvStore::new(provider);
+
+        let member_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
+            let rec = db.get_record(rec).await.unwrap();
+            let inst = rec.read().await;
+            inst.common.time
+        };
+        let a_before = member_time(db.clone(), "BR120E:a").await;
+        let b_before = member_time(db.clone(), "BR120E:b").await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let desc = FieldDesc::Structure {
+            struct_id: "structure".into(),
+            fields: vec![
+                ("a".into(), FieldDesc::Scalar(ScalarType::Long)),
+                ("b".into(), FieldDesc::Scalar(ScalarType::Long)),
+            ],
+        };
+        let changed = BitSet::new(); // nothing marked
+        let mut delta = PvStructure::new("structure");
+        delta
+            .fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Long(0))));
+        delta
+            .fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Long(0))));
+
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "anonymous".into(),
+            method: "anonymous".into(),
+            host: "127.0.0.1".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: None,
+        };
+        let checked = AccessGate::open()
+            .check("BR120E:grp", "127.0.0.1", "anonymous", "anonymous", "")
+            .await;
+
+        store
+            .put_delta_checked(checked, desc, changed, PvField::Structure(delta), ctx)
+            .await
+            .expect("empty-marked group PUT is a silent no-op");
+
+        assert_eq!(
+            member_time(db.clone(), "BR120E:a").await,
+            a_before,
+            "member a must not be processed when nothing is marked"
+        );
+        assert_eq!(
+            member_time(db.clone(), "BR120E:b").await,
+            b_before,
+            "member b must not be processed when nothing is marked"
         );
     }
 }

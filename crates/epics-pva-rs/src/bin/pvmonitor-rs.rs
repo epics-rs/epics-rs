@@ -22,7 +22,10 @@ struct Args {
     #[arg(short = 'v', action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Wait time in seconds
+    /// Connect/operation timeout in seconds (bounds the initial
+    /// connect, not the monitor duration). pvxs `tools/monitor.cpp:56`
+    /// has no `-w`; a monitor runs until interrupted. Kept as a
+    /// Rust-only connect-timeout control threaded into the client.
     #[arg(short = 'w', default_value = "5.0")]
     timeout: f64,
 
@@ -72,8 +75,14 @@ async fn main() {
             args.mode.clone()
         };
         let request = request.clone();
+        let timeout = args.timeout;
         let handle = tokio::spawn(async move {
-            let client = PvaClient::new().expect("failed to create PVA client");
+            // `-w` bounds the connect/operation timeout (pvxs monitor
+            // has none; thread it into the client per finding 23's
+            // connect-timeout option) rather than being silently dropped.
+            let client = PvaClient::builder()
+                .timeout(epics_pva_rs::cli::timeout_duration(timeout))
+                .build();
 
             // Get introspection once for typed formatting
             let desc = client.pvinfo(&pv_name).await.ok();
@@ -122,5 +131,16 @@ mod tests {
     fn quiet_flag_is_accepted_as_deprecated_noop() {
         let args = Args::parse_from(["pvmonitor-rs", "-q", "PV"]);
         assert!(args.quiet);
+    }
+
+    /// `-w` parses to a real value that is threaded into the client
+    /// connect timeout (finding 23 — it must not be silently dropped).
+    #[test]
+    fn wait_flag_parses_as_timeout() {
+        let args = Args::parse_from(["pvmonitor-rs", "-w", "2.5", "PV"]);
+        assert_eq!(args.timeout, 2.5);
+        // Default mirrors the other PVA CLIs (5s).
+        let dflt = Args::parse_from(["pvmonitor-rs", "PV"]);
+        assert_eq!(dflt.timeout, 5.0);
     }
 }

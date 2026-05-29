@@ -353,6 +353,103 @@ async fn arr_channel_filter_applies_to_get_matching_monitor() {
     );
 }
 
+/// Legacy EPICS array-range modifiers (`WF.VAL[start:incr:end]`) are
+/// channel syntax, not field-name text. pvxs builds single-record
+/// channels through `dbChannelCreate`, which parses the range and
+/// inserts an `arr` filter (dbChannel.c:351-446, 507-510). Rust now
+/// normalises the range into the same `arr` filter at the
+/// `split_channel_name` resolution boundary, so `WF.VAL[1:3]` resolves
+/// to record `WF`, field `VAL`, and serves the slice — identical to the
+/// JSON `{"arr":{"s":1,"e":3}}` form. Before the fix the modifier was
+/// preserved as a bogus field name `VAL[1:3]`, resolving the base record
+/// at search but failing the first GET with `FieldNotFound`.
+#[tokio::test]
+async fn legacy_array_range_modifier_resolves_and_slices() {
+    use epics_bridge_rs::qsrv::provider::BridgeProvider;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:rng_wf",
+        Box::new(WaveformRecord::new(8, DbFieldType::Double)),
+    )
+    .await
+    .unwrap();
+    db.put_pv(
+        "TEST:rng_wf",
+        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0, 50.0]),
+    )
+    .await
+    .expect("seed");
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+
+    let doubles = |s: &PvStructure| -> Vec<f64> {
+        match extract_value(s).expect("value") {
+            PvField::ScalarArray(a) => a
+                .iter()
+                .map(|v| match v {
+                    ScalarValue::Double(d) => *d,
+                    other => panic!("expected double element, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected scalar array, got {other:?}"),
+        }
+    };
+
+    let single = |c: epics_bridge_rs::qsrv::AnyChannel| match c {
+        epics_bridge_rs::qsrv::AnyChannel::Single(c) => c,
+        _ => panic!("expected single-record channel"),
+    };
+
+    // `[start:end]` → arr slice [1..=3] over the 5-element seed.
+    let ch = single(
+        provider
+            .create_channel_for("TEST:rng_wf.VAL[1:3]", "u", "h")
+            .await
+            .expect("`[1:3]` range must resolve through split_channel_name"),
+    );
+    // Resolution uses the un-suffixed record/field; the full client
+    // identity is preserved for ACF / error messages.
+    assert_eq!(ch.channel_name(), "TEST:rng_wf.VAL[1:3]");
+    assert_eq!(ch.record_name(), "TEST:rng_wf");
+    assert_eq!(ch.field(), "VAL");
+    let g = ch
+        .get(&empty_request())
+        .await
+        .expect("get must not FieldNotFound");
+    assert_eq!(
+        doubles(&g),
+        vec![20.0, 30.0, 40.0],
+        "`[1:3]` must serve the slice, not the full array"
+    );
+
+    // `[N]` single element selects index N only.
+    let ch1 = single(
+        provider
+            .create_channel_for("TEST:rng_wf.VAL[2]", "u", "h")
+            .await
+            .expect("`[2]` range resolves"),
+    );
+    assert_eq!(
+        doubles(&ch1.get(&empty_request()).await.expect("get")),
+        vec![30.0],
+        "`[2]` must serve only element 2"
+    );
+
+    // `[start:incr:end]` strides the slice.
+    let ch2 = single(
+        provider
+            .create_channel_for("TEST:rng_wf.VAL[0:2:4]", "u", "h")
+            .await
+            .expect("`[0:2:4]` range resolves"),
+    );
+    assert_eq!(
+        doubles(&ch2.get(&empty_request()).await.expect("get")),
+        vec![10.0, 30.0, 50.0],
+        "`[0:2:4]` must serve every second element"
+    );
+}
+
 /// a `record.FIELD` PV name binds to that field, not to VAL.
 /// GET on `test:ai.EGU` returns the EGU string, not the AI VAL double.
 /// PUT through the channel writes EGU, not VAL.

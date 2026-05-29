@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::runtime::sync::{Mutex, RwLock, mpsc};
 
@@ -625,6 +625,88 @@ impl ProcessVariable {
         let subs = self.subscribers.lock().await;
         let sub = subs.iter().find(|s| s.sid == sid)?;
         sub.coalesced.lock().ok()?.take()
+    }
+}
+
+/// Subscriber-id source for in-process [`PvSubscription`] monitors on a
+/// [`ProcessVariable`]. A `ProcessVariable`'s subscriber `Vec` is disjoint
+/// from any `RecordInstance`'s, so this is independent of the record-side
+/// allocator; it only has to stay unique among the simple-PV subscribers
+/// competing for one PV. Seeded at 1_000_000 for the same reason the
+/// record allocator is — keep in-process sids clear of the low,
+/// client-assigned wire subscription ids the CA server also registers on
+/// the same PV.
+static NEXT_PV_SUB_SID: AtomicU32 = AtomicU32::new(1_000_000);
+
+fn next_pv_sub_sid() -> u32 {
+    NEXT_PV_SUB_SID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// In-process value-change monitor on a simple [`ProcessVariable`], the
+/// counterpart of the record-side `DbSubscription`.
+///
+/// The PUT path (`ProcessVariable::set` / `set_snapshot`) calls
+/// `notify_subscribers`, which fans the new value out to every registered
+/// subscriber, so a consumer holding a `PvSubscription` observes every
+/// later PUT — not just the connect-time snapshot. This mirrors pvxs
+/// `SharedPV::post()` delivering a cloned update to each stored subscriber
+/// (`sharedpv.cpp:417-440`).
+///
+/// The handle owns its `Subscriber` slot: `Drop` removes it, so a dropped
+/// consumer cannot leave a dead `(sid, tx, coalesced)` row in
+/// `ProcessVariable.subscribers` — the same leak `DbSubscription`'s `Drop`
+/// closes for records.
+pub struct PvSubscription {
+    rx: mpsc::Receiver<MonitorEvent>,
+    pv: Arc<ProcessVariable>,
+    sid: u32,
+}
+
+impl PvSubscription {
+    /// Register a value-change monitor on `pv`. Returns `None` when the
+    /// per-PV subscriber cap is reached. The caller emits the initial
+    /// snapshot itself (pvxs `SharedPV::attach` posts the current value
+    /// before storing the subscriber); registering the subscriber *before*
+    /// reading that snapshot is the miss-free ordering — a PUT racing the
+    /// two is then delivered through the stream rather than lost.
+    pub async fn subscribe(pv: Arc<ProcessVariable>) -> Option<Self> {
+        use crate::server::recgbl::EventMask;
+        // VALUE|LOG matches the record-side `DbSubscription` default so
+        // simple-PV and record-backed monitors gate identically; a
+        // pure-alarm `post_alarm` (ALARM|LOG) still intersects via LOG.
+        let mask = (EventMask::VALUE | EventMask::LOG).bits();
+        let sid = next_pv_sub_sid();
+        // `data_type` is nominal for snapshot consumers: `deliver` ships
+        // the full `Snapshot` and gates only on mask/filters, never on the
+        // stored type — `DbSubscription` likewise registers as `Double`.
+        let rx = pv.add_subscriber(sid, DbFieldType::Double, mask).await?;
+        Some(Self { rx, pv, sid })
+    }
+
+    /// Await the next value change as a full `Snapshot`. Drains any
+    /// coalesced overflow the producer stashed when the bounded mpsc filled
+    /// mid-burst, so a briefly-slow consumer converges on the freshest
+    /// value rather than the stale queue tail — the same `pop_coalesced`
+    /// discipline `DbSubscription::next_event` applies.
+    pub async fn recv_snapshot(&mut self) -> Option<Snapshot> {
+        let queued = self.rx.recv().await?;
+        let event = self.pv.pop_coalesced(self.sid).await.unwrap_or(queued);
+        Some(event.snapshot)
+    }
+}
+
+impl Drop for PvSubscription {
+    fn drop(&mut self) {
+        let pv = self.pv.clone();
+        let sid = self.sid;
+        // Mirror `DbSubscription::drop`: `remove_subscriber` needs an async
+        // lock, so remove the slot off-thread. No current runtime means no
+        // live subscription to clean up.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
+                pv.remove_subscriber(sid).await;
+            });
+        }
     }
 }
 

@@ -680,12 +680,39 @@ impl ChannelSource for PvDatabaseSource {
             let entry = db.find_entry(&name).await?;
             match entry {
                 PvEntry::Simple(pv) => {
-                    // Simple PVs don't expose change-streams; emit one
-                    // initial snapshot. Subsequent puts won't be observed by
-                    // the monitor — accept this limitation for v1.
-                    let snap = pv.snapshot().await;
-                    let pv = snapshot_to_pv_field(&snap);
-                    let _ = tx.send(pv).await;
+                    // Register the live subscriber BEFORE reading the
+                    // initial snapshot so a PUT racing between the two is
+                    // delivered through the stream, not missed. pvxs
+                    // `SharedPV::post()` fans every later value out to its
+                    // stored subscribers (`sharedpv.cpp:417-440`); the
+                    // simple-PV `PvSubscription` is the same mechanism —
+                    // `ProcessVariable::set` -> `notify_subscribers`.
+                    use epics_base_rs::server::pv::PvSubscription;
+                    match PvSubscription::subscribe(pv.clone()).await {
+                        Some(mut sub) => {
+                            let initial = snapshot_to_pv_field(&pv.snapshot().await);
+                            tokio::spawn(async move {
+                                if tx.send(initial).await.is_err() {
+                                    return;
+                                }
+                                while let Some(snap) = sub.recv_snapshot().await {
+                                    let field = snapshot_to_pv_field(&snap);
+                                    if tx.send(field).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                // `sub` drops here → its `Drop` removes the
+                                // subscriber slot from the ProcessVariable.
+                            });
+                        }
+                        None => {
+                            // Per-PV subscriber cap reached: still honour the
+                            // connect-time read so the client at least sees
+                            // the current value.
+                            let initial = snapshot_to_pv_field(&pv.snapshot().await);
+                            let _ = tx.send(initial).await;
+                        }
+                    }
                 }
                 PvEntry::Record(_rec) => {
                     // Subscribe via the public DbSubscription API.
@@ -1136,6 +1163,59 @@ mod tests {
                 Some(PvField::Scalar(ScalarValue::Int(1)))
             ),
             "NTEnum PUT must land on value.index"
+        );
+    }
+
+    /// Regression: a monitor on a *simple* native PV must observe later
+    /// PUTs, not just the connect-time snapshot. Pre-fix the `Simple` arm
+    /// sent one snapshot and dropped the channel, so a PVA PUT through the
+    /// same server never reached the monitor. pvxs `SharedPV::post()` fans
+    /// every update out to its stored subscribers (`sharedpv.cpp:417-440`).
+    #[tokio::test]
+    async fn simple_pv_monitor_observes_later_puts() {
+        fn monitor_double(field: &PvField) -> Option<f64> {
+            match field {
+                PvField::Scalar(ScalarValue::Double(v)) => Some(*v),
+                PvField::Structure(s) => match s.get_field("value") {
+                    Some(PvField::Scalar(ScalarValue::Double(v))) => Some(*v),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("SIMPLE:MON", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        let src = PvDatabaseSource::new(db.clone());
+
+        let mut rx = src
+            .subscribe_ctx("SIMPLE:MON", make_ctx("127.0.0.1", "anon", "ca"))
+            .await
+            .expect("subscribe to simple PV");
+
+        // Connect-time snapshot.
+        let first = rx.recv().await.expect("initial monitor snapshot");
+        assert_eq!(monitor_double(&first), Some(1.0));
+
+        // A PVA PUT through the same source must reach the monitor.
+        src.put_value_ctx(
+            "SIMPLE:MON",
+            pv_double(2.0),
+            make_ctx("127.0.0.1", "anon", "ca"),
+        )
+        .await
+        .expect("PUT must succeed");
+
+        let updated = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("monitor must receive the PUT update within 2s")
+            .expect("monitor stream still open");
+        assert_eq!(
+            monitor_double(&updated),
+            Some(2.0),
+            "simple-PV monitor must observe the PUT, not only the initial snapshot"
         );
     }
 

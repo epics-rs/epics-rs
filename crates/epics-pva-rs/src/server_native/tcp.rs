@@ -2983,26 +2983,23 @@ async fn handle_put_get(
         };
         // pvRequest: `type + value` (pvxs clientget.cpp). Translate to
         // a field mask the GET leg consults.
+        // A peer wire-decode fault of the INIT pvRequest type/value is
+        // connection-fatal (pvxs `serverget.cpp:371-375` bev.reset()), not
+        // a per-op Status — the empty-mask case below stays op-level.
         let req_desc = match decode_type_desc(&mut cur, order) {
             Ok(d) => d,
             Err(e) => {
-                send_op_error(
-                    tx,
-                    OpKind::PutGet,
-                    ioid,
-                    subcmd,
-                    &format!("invalid pvRequest descriptor: {e}"),
-                    order,
-                )
-                .await?;
-                return Ok(());
+                return Err(PvaError::Decode(format!(
+                    "PUT_GET INIT pvRequest descriptor: {e}"
+                )));
             }
         };
         let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, order) {
             Ok(v) => v,
             Err(e) => {
-                send_op_error(tx, OpKind::PutGet, ioid, subcmd, &e, order).await?;
-                return Ok(());
+                return Err(PvaError::Decode(format!(
+                    "PUT_GET INIT pvRequest value: {e}"
+                )));
             }
         };
         // empty mask is an INIT error.
@@ -3328,37 +3325,28 @@ async fn handle_process(
         // structured boundary as the generic GET/PUT/MONITOR INIT path
         // (`decode_init_pv_request_value`). PROCESS transfers no value,
         // so the decoded pvRequest is discarded — but a present-but-
-        // malformed pvRequest is an INIT protocol error, not something
-        // to swallow. The previous `decode_type_desc(..).ok().and_then(
-        // |d| decode_pv_field(..).ok())` collapsed "absent body",
-        // "malformed descriptor", and "malformed value" all into a
-        // silent no-op, so a truncated/corrupt PROCESS INIT was
-        // acknowledged with `Status::ok()` and the op registered. Mirror
-        // the generic policy: a malformed descriptor or value replies an
-        // op error and returns WITHOUT registering the IOID (an absent
-        // value body is tolerated for Rust↔Rust interop, exactly as the
-        // generic path tolerates it). pvxs `from_wire_type_value` +
-        // `if(!M.good()) bev.reset()` (serverget.cpp:369-374) is even
-        // stricter (connection-fatal); the op-error boundary is the
-        // codebase's deliberate, uniform choice.
+        // malformed pvRequest is a peer wire-decode fault. The previous
+        // `decode_type_desc(..).ok().and_then(|d| decode_pv_field(..)
+        // .ok())` collapsed "absent body", "malformed descriptor", and
+        // "malformed value" all into a silent no-op, so a truncated/
+        // corrupt PROCESS INIT was acknowledged with `Status::ok()` and
+        // the op registered. Mirror pvxs `from_wire_type_value` +
+        // `if(!M.good()) bev.reset()` (serverget.cpp:371-375): a malformed
+        // descriptor or value is connection-fatal (the read loop closes
+        // the circuit, no op reply), uniform with the generic INIT path.
+        // An ABSENT value body is still tolerated for Rust↔Rust interop.
         let req_desc = match decode_type_desc(&mut cur, order) {
             Ok(d) => d,
             Err(e) => {
-                send_op_error(
-                    tx,
-                    OpKind::Process,
-                    ioid,
-                    subcmd,
-                    &format!("invalid pvRequest descriptor: {e}"),
-                    order,
-                )
-                .await?;
-                return Ok(());
+                return Err(PvaError::Decode(format!(
+                    "PROCESS INIT pvRequest descriptor: {e}"
+                )));
             }
         };
         if let Err(e) = decode_init_pv_request_value(&mut cur, &req_desc, order) {
-            send_op_error(tx, OpKind::Process, ioid, subcmd, &e, order).await?;
-            return Ok(());
+            return Err(PvaError::Decode(format!(
+                "PROCESS INIT pvRequest value: {e}"
+            )));
         }
         let mask = BitSet::all_set(intro.total_bits());
         ch.ops
@@ -4065,47 +4053,32 @@ async fn handle_op(
         // clientget.cpp:351-352) and translate it to a field mask the
         // emit side will consult.
         //
-        // pvxs `serverget.cpp:367-375` and
-        // `servermon.cpp:491-502` treat an invalid pvRequest type/value
-        // decode as bad INIT and close the connection;
-        // `pvrequest.cpp:61-62` throws on an empty mask. Pre-fix Rust
-        // discarded both errors and silently fell back to
-        // `BitSet::all_set(...)`, leaking fields the client didn't
-        // request. Reply with an INIT-status error to the client,
-        // then return Ok so the connection stays up — pvxs closes
-        // the whole connection but the per-op error path here is a
-        // less invasive parity choice that still surfaces the
-        // condition. Tests that pin the all-set fallback will need
-        // to specify `field()` or omit the pvRequest sub-structure.
+        // pvxs `serverget.cpp:366-376` and `servermon.cpp:489-502`:
+        // `from_wire_type_value(M, rxRegistry, pvRequest)` followed by
+        // `if(!M.good()) { bev.reset(); return; }` — a peer wire-decode
+        // fault of the pvRequest type/value is connection-fatal and is
+        // NOT answered with an op reply. Mirror that: return a
+        // connection-fatal `Decode` error (the read loop closes the
+        // circuit) instead of a per-op Status that left a malformed-INIT
+        // peer free to keep reusing the connection. The EMPTY-MASK case
+        // below is different — pvxs builds the mask inside the source's
+        // `onOp` (`serverget.cpp:198-203`), whose throw is caught and
+        // signalled as a remote *op* error (`serverget.cpp:407-413`),
+        // so that stays an op-level Status reply.
         let req_desc = match decode_type_desc(&mut cur, order) {
             Ok(d) => d,
             Err(e) => {
-                send_op_error(
-                    tx,
-                    kind,
-                    ioid,
-                    subcmd,
-                    &format!("invalid pvRequest descriptor: {e}"),
-                    order,
-                )
-                .await?;
-                return Ok(());
+                return Err(PvaError::Decode(format!("INIT pvRequest descriptor: {e}")));
             }
         };
-        // descriptor decode failure already routed through
-        // `send_op_error` above. For the VALUE body, distinguish an
-        // ABSENT body (the Rust client's RPC INIT sends only the
-        // descriptor — tolerated for interop) from a PRESENT but
-        // malformed one. pvxs `from_wire_type_value` + `!M.good()`
-        // resets on either; we tolerate absence but reject a
-        // present-but-undecodable value, so a malformed pvRequest can no
-        // longer silently drop `_filter` / pipeline / `process`|`block`
-        // options behind an OK INIT. See `decode_init_pv_request_value`.
+        // VALUE body: an ABSENT body is tolerated (the Rust client's RPC
+        // INIT sends only the descriptor — interop), but a PRESENT but
+        // malformed one is the same `!M.good()` bev.reset() wire fault as
+        // the descriptor above, so it is likewise connection-fatal.
         let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, order) {
             Ok(v) => v,
             Err(e) => {
-                send_op_error(tx, kind, ioid, subcmd, &e, order).await?;
-                return Ok(());
+                return Err(PvaError::Decode(format!("INIT pvRequest value: {e}")));
             }
         };
         let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
@@ -7220,6 +7193,97 @@ mod tests {
         }
     }
 
+    /// Regression (PVA parity): a peer wire-decode fault of the INIT
+    /// pvRequest on the shared GET/PUT/RPC/MONITOR handler is
+    /// connection-fatal, matching pvxs `from_wire_type_value` +
+    /// `if(!M.good()) bev.reset()` (`serverget.cpp:371-375`,
+    /// `servermon.cpp:489-502`). The pre-fix handler replied with a
+    /// per-op Status and returned `Ok(())`, leaving a malformed-INIT peer
+    /// free to keep reusing the connection. Verified for both GET and
+    /// MONITOR via a present-but-truncated pvRequest value.
+    #[tokio::test]
+    async fn init_malformed_pvrequest_value_is_connection_fatal() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        async fn run(kind: OpKind, ioid: u32) -> PvaResult<()> {
+            let order = ByteOrder::Little;
+            let sid: u32 = 1;
+            let intro = three_field_intro();
+            let pv = SharedPV::new();
+            pv.open(intro.clone(), three_field_value(0, 0, 0));
+            let shared = SharedSource::new();
+            shared.add("dut", pv);
+            let source: DynSource = Arc::new(shared);
+
+            let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+            channels.insert(
+                sid,
+                ChannelState {
+                    name: "dut".into(),
+                    cid: 0,
+                    sid,
+                    introspection: Some(intro),
+                    source,
+                    ops: HashMap::new(),
+                },
+            );
+            let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let config = PvaServerConfig::default();
+            let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+            let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+            let cred = ClientCredentials::anonymous();
+
+            // INIT: valid Int descriptor, then a truncated (2-byte) i32
+            // value — a present-but-malformed pvRequest body.
+            let req_desc = FieldDesc::Scalar(crate::pvdata::ScalarType::Int);
+            let mut payload = Vec::new();
+            payload.put_u32(sid, order);
+            payload.put_u32(ioid, order);
+            payload.put_u8(0x08); // INIT
+            crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut payload);
+            payload.extend_from_slice(&[1u8, 2u8]); // truncated i32
+            let cmd = match kind {
+                OpKind::Monitor => Command::Monitor,
+                _ => Command::Get,
+            };
+            let frame = synth_frame(cmd, order, payload);
+            handle_op(
+                &frame,
+                &tx,
+                &mut channels,
+                order,
+                kind,
+                &config,
+                &mut encode_cache,
+                peer,
+                &cred,
+                &discard_mon_fin(),
+                &discard_exec_fin(),
+            )
+            .await
+            .map(|()| {
+                // On the (incorrect) op-error path the IOID would be
+                // registered; assert it was not, to catch a silent
+                // downgrade even if the call returned Ok.
+                assert!(
+                    !channels.get(&sid).unwrap().ops.contains_key(&ioid),
+                    "a malformed INIT pvRequest must not register the IOID"
+                );
+            })
+        }
+
+        assert!(
+            run(OpKind::Get, 800).await.is_err(),
+            "a GET INIT with a truncated pvRequest value must be connection-fatal"
+        );
+        assert!(
+            run(OpKind::Monitor, 801).await.is_err(),
+            "a MONITOR INIT with a truncated pvRequest value must be connection-fatal"
+        );
+    }
+
     #[test]
     fn pva_r20_pipeline_bool_false_disables() {
         let req = make_pipeline_request(
@@ -10104,15 +10168,17 @@ mod tests {
         synth_frame(Command::Process, order, payload)
     }
 
-    /// drive `handle_process` for an INIT frame and return the
-    /// `(ops contains ioid, response status success)` pair.
+    /// drive `handle_process` for an INIT frame and return
+    /// `(connection_fatal, ops contains ioid, reply status success)`.
+    /// `reply_success` is `None` when no op reply was emitted (the
+    /// connection-fatal `bev.reset()` path emits no frame).
     #[cfg(test)]
     async fn run_process_init(
         sid: u32,
         ioid: u32,
         pv_request: &[u8],
         order: ByteOrder,
-    ) -> (bool, bool) {
+    ) -> (bool, bool, Option<bool>) {
         let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
         let mut channels = process_channels_no_op(sid, source.clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -10120,7 +10186,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5076".parse().unwrap();
         let frame = process_init_frame(sid, ioid, pv_request, order);
 
-        handle_process(
+        let result = handle_process(
             &frame,
             &tx,
             &mut channels,
@@ -10130,26 +10196,30 @@ mod tests {
             &x509_cred("MyCA"),
             &discard_exec_fin(),
         )
-        .await
-        .expect("handle_process returns Ok (op-error boundary, not connection-fatal)");
+        .await;
+        let fatal = result.is_err();
 
         let registered = channels.get(&sid).unwrap().ops.contains_key(&ioid);
-        let resp = rx.recv().await.expect("a response frame is emitted");
-        let (rframe, _) = try_parse_frame(&resp)
-            .expect("frame parses")
-            .expect("complete frame");
-        let mut cur = rframe.cursor();
-        let _ioid = cur.get_u32(order).expect("ioid");
-        let _subcmd = cur.get_u8().expect("subcmd");
-        let status = Status::decode(&mut cur, order).expect("status");
-        (registered, status.is_success())
+        let reply_success = rx.try_recv().ok().map(|resp| {
+            let (rframe, _) = try_parse_frame(&resp)
+                .expect("frame parses")
+                .expect("complete frame");
+            let mut cur = rframe.cursor();
+            let _ioid = cur.get_u32(order).expect("ioid");
+            let _subcmd = cur.get_u8().expect("subcmd");
+            Status::decode(&mut cur, order)
+                .expect("status")
+                .is_success()
+        });
+        (fatal, registered, reply_success)
     }
 
-    /// Regression: a PROCESS INIT whose pvRequest VALUE is present
-    /// but truncated must be rejected (op-error) and MUST NOT register
-    /// the IOID. The previous `decode_type_desc(..).ok().and_then(|d|
-    /// decode_pv_field(..).ok())` swallowed the value error and
-    /// registered the op with `Status::ok()`.
+    /// Regression: a PROCESS INIT whose pvRequest VALUE is present but
+    /// truncated is a peer wire-decode fault — connection-fatal
+    /// (`bev.reset()` parity, pvxs `serverget.cpp:371-375`), emitting no
+    /// op reply and registering no IOID. The previous
+    /// `decode_type_desc(..).ok().and_then(|d| decode_pv_field(..).ok())`
+    /// swallowed the value error and registered the op with `Status::ok()`.
     #[tokio::test]
     async fn bfr8_process_init_truncated_value_rejected_and_unregistered() {
         let order = ByteOrder::Little;
@@ -10159,34 +10229,35 @@ mod tests {
         crate::pvdata::encode::encode_type_desc(&desc, order, &mut req);
         req.extend_from_slice(&[1u8, 2u8]);
 
-        let (registered, success) = run_process_init(1, 700, &req, order).await;
+        let (fatal, registered, reply) = run_process_init(1, 700, &req, order).await;
+        assert!(
+            fatal,
+            "a malformed PROCESS INIT pvRequest value must be connection-fatal"
+        );
         assert!(
             !registered,
             "a malformed PROCESS INIT pvRequest value must not register the IOID"
         );
-        assert!(
-            !success,
-            "a malformed PROCESS INIT pvRequest value must reply an error status"
-        );
+        assert!(reply.is_none(), "the bev.reset() path emits no op reply");
     }
 
-    /// Regression: a PROCESS INIT with no decodable pvRequest
-    /// descriptor (empty body after subcmd) is rejected and not
-    /// registered — the descriptor is required (mirrors the generic
-    /// GET/PUT INIT descriptor-required policy; pvxs faults the buffer
+    /// Regression: a PROCESS INIT with no decodable pvRequest descriptor
+    /// (empty body after subcmd) is a peer wire-decode fault —
+    /// connection-fatal, not registered, no reply (pvxs faults the buffer
     /// and `bev.reset()`s).
     #[tokio::test]
     async fn bfr8_process_init_missing_descriptor_rejected_and_unregistered() {
         let order = ByteOrder::Little;
-        let (registered, success) = run_process_init(1, 701, &[], order).await;
+        let (fatal, registered, reply) = run_process_init(1, 701, &[], order).await;
+        assert!(
+            fatal,
+            "a PROCESS INIT with no pvRequest descriptor must be connection-fatal"
+        );
         assert!(
             !registered,
             "a PROCESS INIT with no pvRequest descriptor must not register the IOID"
         );
-        assert!(
-            !success,
-            "a PROCESS INIT with no pvRequest descriptor must reply an error status"
-        );
+        assert!(reply.is_none(), "the bev.reset() path emits no op reply");
     }
 
     /// Control: a well-formed PROCESS INIT pvRequest (the Rust
@@ -10206,9 +10277,14 @@ mod tests {
             &mut req,
         );
 
-        let (registered, success) = run_process_init(1, 702, &req, order).await;
+        let (fatal, registered, reply) = run_process_init(1, 702, &req, order).await;
+        assert!(!fatal, "a valid PROCESS INIT must not be connection-fatal");
         assert!(registered, "a valid PROCESS INIT must register the IOID");
-        assert!(success, "a valid PROCESS INIT must reply Status::ok()");
+        assert_eq!(
+            reply,
+            Some(true),
+            "a valid PROCESS INIT must reply Status::ok()"
+        );
     }
 
     /// Regression: the dedicated `handle_put_get` data phase must

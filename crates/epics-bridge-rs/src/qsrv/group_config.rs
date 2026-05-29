@@ -711,23 +711,27 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
     })
 }
 
-/// Convert a JSON value to a PvField for Const mapping.
+/// Convert a JSON value to a PvField for a Const mapping.
 ///
-/// Const values support the full recursive pvData value space:
+/// pvxs's group JSON parser can only assign a SCALAR or `null` to a
+/// `+const`. It registers no array callbacks — "arrays are not used"
+/// (groupconfigprocessor.cpp:772-790) — and rejects object nesting below
+/// a field-definition object with "Group field def. can't contain Object
+/// (too deep)" (:733-739). The const template then builds a `TypeDef`
+/// directly from the parsed scalar/null `Value` (:596-604).
+///
+/// The earlier Rust port accepted the full recursive pvData space
+/// (scalar/structure/variant arrays and nested objects). Those forms
+/// produced const descriptors and payloads that pvxs rejects at IOC
+/// startup, so a group authored against Rust was not portable upstream.
+/// Restrict const values to the node kinds pvxs's parser can actually
+/// assign; an array or nested object is a hard error so the group is
+/// skipped (per-group recovery), matching pvxs's startup rejection.
 ///
 /// * Scalars (`bool`/number/string) map to [`PvField::Scalar`].
-/// * `null` maps to [`PvField::Null`] — pvxs accepts a JSON `null`
-///   const (an empty/unset value), so rejecting it was a gap.
-/// * Arrays map to the tightest container that fits their elements:
-///   an all-scalar array becomes a [`PvField::ScalarArray`], an
-///   all-object array becomes a [`PvField::StructureArray`], and an
-///   array with nested arrays or mixed element kinds becomes a
-///   [`PvField::VariantArray`] (each element kept as a `Variant`).
-///   This lifts the prior "nested arrays/structures not supported in
-///   const array" restriction.
-/// * Objects map to [`PvField::Structure`], recursively.
+/// * `null` maps to [`PvField::Null`] (pvxs accepts an empty/unset const).
 fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvField, String> {
-    use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue, VariantValue};
+    use epics_pva_rs::pvdata::{PvField, ScalarValue};
     match v {
         serde_json::Value::Bool(b) => Ok(PvField::Scalar(ScalarValue::Boolean(*b))),
         serde_json::Value::Number(n) => {
@@ -748,56 +752,17 @@ fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvFie
             }
         }
         serde_json::Value::String(s) => Ok(PvField::Scalar(ScalarValue::String(s.clone()))),
-        serde_json::Value::Array(arr) => {
-            // Decode every element first, then pick the tightest
-            // container that holds all of them.
-            let elems: Vec<PvField> = arr.iter().map(json_to_pv_field).collect::<Result<_, _>>()?;
-
-            if elems.iter().all(|e| matches!(e, PvField::Scalar(_))) {
-                let scalars = elems
-                    .into_iter()
-                    .map(|e| match e {
-                        PvField::Scalar(sv) => sv,
-                        _ => unreachable!("checked all-scalar above"),
-                    })
-                    .collect();
-                Ok(PvField::ScalarArray(scalars))
-            } else if !elems.is_empty() && elems.iter().all(|e| matches!(e, PvField::Structure(_)))
-            {
-                // JSON array elements are all present, so each
-                // maps to a `Some` element.
-                let structs = elems
-                    .into_iter()
-                    .map(|e| match e {
-                        PvField::Structure(s) => Some(s),
-                        _ => unreachable!("checked all-structure above"),
-                    })
-                    .collect();
-                Ok(PvField::StructureArray(structs))
-            } else {
-                // Nested arrays, null elements, or mixed kinds — keep
-                // each element verbatim inside a Variant. All present
-                // (`Some`) here; JSON `null` is handled elsewhere.
-                let items = elems
-                    .into_iter()
-                    .map(|e| {
-                        Some(VariantValue {
-                            desc: Some(e.descriptor()),
-                            value: e,
-                        })
-                    })
-                    .collect();
-                Ok(PvField::VariantArray(items))
-            }
-        }
-        serde_json::Value::Object(map) => {
-            let mut pv = PvStructure::new("");
-            for (key, val) in map {
-                pv.fields.push((key.clone(), json_to_pv_field(val)?));
-            }
-            Ok(PvField::Structure(pv))
-        }
         serde_json::Value::Null => Ok(PvField::Null),
+        serde_json::Value::Array(_) => Err(
+            "group +const cannot be an array: pvxs registers no array callbacks \
+             (groupconfigprocessor.cpp:772-790)"
+                .to_string(),
+        ),
+        serde_json::Value::Object(_) => Err(
+            "group +const cannot be a nested object: pvxs rejects object nesting below a \
+             field definition (groupconfigprocessor.cpp:733-739)"
+                .to_string(),
+        ),
     }
 }
 
@@ -1870,96 +1835,31 @@ mod tests {
         }
     }
 
-    /// B8: a const array of scalars stays a `ScalarArray`.
+    /// BR-81: pvxs's group JSON parser can only assign a scalar or `null`
+    /// to a `+const` — it has no array callbacks
+    /// (groupconfigprocessor.cpp:772-790) and rejects nested objects
+    /// (:733-739). A const whose value is an array (scalar, nested,
+    /// object-element, or null-element) or a nested object is rejected; the
+    /// group is skipped via per-group recovery, matching pvxs's startup
+    /// rejection. The cited values were previously accepted as Rust-only
+    /// `ScalarArray` / `VariantArray` / `StructureArray` / `Structure`
+    /// const forms that pvxs cannot represent.
     #[test]
-    fn parse_const_scalar_array() {
-        use epics_pva_rs::pvdata::{PvField, ScalarValue};
-        let json = r#"{
-            "GRP:c": {
-                "list": { "+type": "const", "+value": [1, 2, 3] }
-            }
-        }"#;
-        let groups = parse_group_config(json).unwrap();
-        let m = &groups[0].members[0];
-        match &m.const_value {
-            Some(PvField::ScalarArray(items)) => {
-                assert_eq!(items.len(), 3);
-                assert!(matches!(items[0], ScalarValue::Long(1)));
-            }
-            other => panic!("expected ScalarArray, got {other:?}"),
-        }
-    }
-
-    /// B8: a const array containing nested arrays is accepted as a
-    /// `VariantArray` instead of being rejected.
-    #[test]
-    fn parse_const_nested_array() {
-        use epics_pva_rs::pvdata::PvField;
-        let json = r#"{
-            "GRP:c": {
-                "matrix": { "+type": "const", "+value": [[1, 2], [3, 4]] }
-            }
-        }"#;
-        let groups = parse_group_config(json).unwrap();
-        let m = &groups[0].members[0];
-        match &m.const_value {
-            Some(PvField::VariantArray(items)) => {
-                assert_eq!(items.len(), 2, "two nested rows");
-                assert!(
-                    matches!(items[0].as_ref().unwrap().value, PvField::ScalarArray(_)),
-                    "each nested element is a scalar array"
-                );
-            }
-            other => panic!("expected VariantArray of nested arrays, got {other:?}"),
-        }
-    }
-
-    /// B8: a const array of objects is accepted as a `StructureArray`.
-    #[test]
-    fn parse_const_array_of_structures() {
-        use epics_pva_rs::pvdata::PvField;
-        let json = r#"{
-            "GRP:c": {
-                "rows": {
-                    "+type": "const",
-                    "+value": [{"a": 1}, {"a": 2}]
-                }
-            }
-        }"#;
-        let groups = parse_group_config(json).unwrap();
-        let m = &groups[0].members[0];
-        match &m.const_value {
-            Some(PvField::StructureArray(items)) => {
-                assert_eq!(items.len(), 2);
-                assert_eq!(items[0].as_ref().unwrap().fields[0].0, "a");
-            }
-            other => panic!("expected StructureArray, got {other:?}"),
-        }
-    }
-
-    /// B8: a nested structure const value is accepted recursively.
-    #[test]
-    fn parse_const_nested_structure() {
-        use epics_pva_rs::pvdata::PvField;
-        let json = r#"{
-            "GRP:c": {
-                "cfg": {
-                    "+type": "const",
-                    "+value": {"limits": {"low": 0, "high": 10}}
-                }
-            }
-        }"#;
-        let groups = parse_group_config(json).unwrap();
-        let m = &groups[0].members[0];
-        match &m.const_value {
-            Some(PvField::Structure(s)) => {
-                assert_eq!(s.fields[0].0, "limits");
-                match &s.fields[0].1 {
-                    PvField::Structure(inner) => assert_eq!(inner.fields.len(), 2),
-                    other => panic!("expected nested structure, got {other:?}"),
-                }
-            }
-            other => panic!("expected Structure, got {other:?}"),
+    fn br_81_const_array_and_nested_object_rejected() {
+        for body in [
+            r#""list": { "+type": "const", "+const": [1, 2, 3] }"#,
+            r#""matrix": { "+type": "const", "+const": [[1, 2], [3, 4]] }"#,
+            r#""rows": { "+type": "const", "+const": [{"a": 1}, {"a": 2}] }"#,
+            r#""mixed": { "+type": "const", "+const": [1, null, 3] }"#,
+            r#""cfg": { "+type": "const", "+const": {"limits": {"low": 0}} }"#,
+        ] {
+            let json = format!(r#"{{ "GRP:c": {{ {body} }} }}"#);
+            let groups =
+                parse_group_config(&json).expect("file still parses; the invalid group is skipped");
+            assert!(
+                groups.is_empty(),
+                "array / nested-object const must be rejected (group skipped) for `{body}`, got {groups:?}"
+            );
         }
     }
 
@@ -1980,27 +1880,6 @@ mod tests {
             "JSON null const must map to PvField::Null, got {:?}",
             m.const_value
         );
-    }
-
-    /// B8: a `null` element inside a const array forces the
-    /// `VariantArray` container (mixed kinds), not a rejection.
-    #[test]
-    fn parse_const_array_with_null_element() {
-        use epics_pva_rs::pvdata::PvField;
-        let json = r#"{
-            "GRP:c": {
-                "mixed": { "+type": "const", "+value": [1, null, 3] }
-            }
-        }"#;
-        let groups = parse_group_config(json).unwrap();
-        let m = &groups[0].members[0];
-        match &m.const_value {
-            Some(PvField::VariantArray(items)) => {
-                assert_eq!(items.len(), 3);
-                assert!(matches!(items[1].as_ref().unwrap().value, PvField::Null));
-            }
-            other => panic!("expected VariantArray with a Null element, got {other:?}"),
-        }
     }
 
     #[test]

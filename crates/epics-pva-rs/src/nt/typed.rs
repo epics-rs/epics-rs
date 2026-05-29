@@ -435,14 +435,22 @@ fn get_str(s: &PvStructure, name: &str) -> Option<String> {
 // Most users will go through `#[derive(NTScalar)]` on a struct, but a
 // bare scalar like `f64` is also useful when wrapping a single-value
 // PV (e.g. `pvget_typed::<f64>`). The descriptor we emit is
-// `epics:nt/NTScalar:1.0 { value: <T> }` — same as
-// `NTScalar::new(<T>).build()` minus the optional meta substructures.
+// `epics:nt/NTScalar:1.0 { value: <T>, alarm, timeStamp }` — the same
+// mandatory field set pvxs `NTScalar::build()` always emits
+// (`nt.cpp:44-53`), produced by routing through the shared NT-baseline
+// owner [`__rt::ensure_nt_meta_desc`] / [`__rt::ensure_nt_meta_value`]
+// so the bare-scalar path cannot advertise a normative structure ID
+// with a truncated field set.
 
-/// Build the `epics:nt/NTScalar:1.0 { value: <st> }` descriptor.
+/// Build the mandatory `epics:nt/NTScalar:1.0 { value: <st>, alarm,
+/// timeStamp }` descriptor for a primitive scalar wrapper.
 fn nt_scalar_root(value_field: FieldDesc) -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalar:1.0".into(),
-        fields: vec![("value".into(), value_field)],
+        fields: __rt::ensure_nt_meta_desc(
+            "epics:nt/NTScalar:1.0",
+            vec![("value".into(), value_field)],
+        ),
     }
 }
 
@@ -465,8 +473,10 @@ macro_rules! impl_typed_nt_scalar {
             }
             fn to_pv_field(&self) -> PvField {
                 let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
-                s.fields
-                    .push(("value".into(), PvField::Scalar(ScalarValue::$sv(*self))));
+                s.fields = __rt::ensure_nt_meta_value(
+                    "epics:nt/NTScalar:1.0",
+                    vec![("value".into(), PvField::Scalar(ScalarValue::$sv(*self)))],
+                );
                 PvField::Structure(s)
             }
             fn from_pv_field(field: &PvField) -> Result<Self, TypedNTError> {
@@ -507,10 +517,13 @@ impl TypedNT for String {
     }
     fn to_pv_field(&self) -> PvField {
         let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
-        s.fields.push((
-            "value".into(),
-            PvField::Scalar(ScalarValue::String(self.clone())),
-        ));
+        s.fields = __rt::ensure_nt_meta_value(
+            "epics:nt/NTScalar:1.0",
+            vec![(
+                "value".into(),
+                PvField::Scalar(ScalarValue::String(self.clone())),
+            )],
+        );
         PvField::Structure(s)
     }
     fn from_pv_field(field: &PvField) -> Result<Self, TypedNTError> {
@@ -541,7 +554,10 @@ impl TypedNT for String {
 fn nt_scalar_array_root(elem_type: crate::pvdata::ScalarType) -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalarArray:1.0".into(),
-        fields: vec![("value".into(), FieldDesc::ScalarArray(elem_type))],
+        fields: __rt::ensure_nt_meta_desc(
+            "epics:nt/NTScalarArray:1.0",
+            vec![("value".into(), FieldDesc::ScalarArray(elem_type))],
+        ),
     }
 }
 
@@ -555,7 +571,10 @@ macro_rules! impl_typed_nt_scalar_array {
                 let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
                 let items: ::std::vec::Vec<ScalarValue> =
                     self.iter().map(|v| ScalarValue::$sv(v.clone())).collect();
-                s.fields.push(("value".into(), PvField::ScalarArray(items)));
+                s.fields = __rt::ensure_nt_meta_value(
+                    "epics:nt/NTScalarArray:1.0",
+                    ::std::vec![("value".into(), PvField::ScalarArray(items))],
+                );
                 PvField::Structure(s)
             }
             fn from_pv_field(field: &PvField) -> Result<Self, TypedNTError> {
@@ -623,24 +642,25 @@ pub struct EnumValue {
 
 impl TypedNT for EnumValue {
     fn descriptor() -> FieldDesc {
+        let value_field = FieldDesc::Structure {
+            struct_id: "enum_t".into(),
+            fields: vec![
+                (
+                    "index".into(),
+                    FieldDesc::Scalar(crate::pvdata::ScalarType::Int),
+                ),
+                (
+                    "choices".into(),
+                    FieldDesc::ScalarArray(crate::pvdata::ScalarType::String),
+                ),
+            ],
+        };
         FieldDesc::Structure {
             struct_id: "epics:nt/NTEnum:1.0".into(),
-            fields: vec![(
-                "value".into(),
-                FieldDesc::Structure {
-                    struct_id: "enum_t".into(),
-                    fields: vec![
-                        (
-                            "index".into(),
-                            FieldDesc::Scalar(crate::pvdata::ScalarType::Int),
-                        ),
-                        (
-                            "choices".into(),
-                            FieldDesc::ScalarArray(crate::pvdata::ScalarType::String),
-                        ),
-                    ],
-                },
-            )],
+            fields: __rt::ensure_nt_meta_desc(
+                "epics:nt/NTEnum:1.0",
+                vec![("value".into(), value_field)],
+            ),
         }
     }
 
@@ -660,8 +680,10 @@ impl TypedNT for EnumValue {
             .push(("choices".into(), PvField::ScalarArray(choices_items)));
 
         let mut root = PvStructure::new("epics:nt/NTEnum:1.0");
-        root.fields
-            .push(("value".into(), PvField::Structure(value_struct)));
+        root.fields = __rt::ensure_nt_meta_value(
+            "epics:nt/NTEnum:1.0",
+            vec![("value".into(), PvField::Structure(value_struct))],
+        );
         PvField::Structure(root)
     }
 
@@ -723,14 +745,79 @@ mod tests {
 
     #[test]
     fn f64_descriptor_shape() {
+        use crate::nt::meta;
+        // pvxs NTScalar::build always emits value, alarm, timeStamp
+        // (nt.cpp:44-53); the bare-scalar wrapper must carry the same
+        // mandatory members, not a truncated value-only structure.
         match f64::descriptor() {
             FieldDesc::Structure { struct_id, fields } => {
                 assert_eq!(struct_id, "epics:nt/NTScalar:1.0");
-                assert_eq!(fields.len(), 1);
-                assert_eq!(fields[0].0, "value");
+                let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(names, vec!["value", "alarm", "timeStamp"]);
+                assert!(matches!(
+                    fields[0].1,
+                    FieldDesc::Scalar(crate::pvdata::ScalarType::Double)
+                ));
+                assert_eq!(&fields[1].1, &meta::alarm_desc());
+                assert_eq!(&fields[2].1, &meta::time_desc());
             }
             other => panic!("expected Structure descriptor, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn primitive_scalar_value_carries_mandatory_metadata() {
+        use crate::nt::meta;
+        let PvField::Structure(s) = (1.5f64).to_pv_field() else {
+            panic!("expected NTScalar structure value");
+        };
+        assert_eq!(s.struct_id, "epics:nt/NTScalar:1.0");
+        let names: Vec<&str> = s.fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["value", "alarm", "timeStamp"]);
+        assert_eq!(s.get_field("alarm"), Some(&meta::alarm_default()));
+        assert_eq!(s.get_field("timeStamp"), Some(&meta::time_default()));
+    }
+
+    #[test]
+    fn primitive_array_descriptor_carries_mandatory_metadata() {
+        use crate::nt::meta;
+        match <Vec<f64>>::descriptor() {
+            FieldDesc::Structure { struct_id, fields } => {
+                assert_eq!(struct_id, "epics:nt/NTScalarArray:1.0");
+                let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(names, vec!["value", "alarm", "timeStamp"]);
+                assert!(matches!(
+                    fields[0].1,
+                    FieldDesc::ScalarArray(crate::pvdata::ScalarType::Double)
+                ));
+                assert_eq!(&fields[1].1, &meta::alarm_desc());
+                assert_eq!(&fields[2].1, &meta::time_desc());
+            }
+            other => panic!("expected Structure descriptor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn primitive_enum_descriptor_carries_full_ntenum_baseline() {
+        use crate::nt::meta;
+        // pvxs NTEnum::build: value, alarm, timeStamp, display{description}
+        // (nt.cpp:121-131).
+        match EnumValue::descriptor() {
+            FieldDesc::Structure { struct_id, fields } => {
+                assert_eq!(struct_id, "epics:nt/NTEnum:1.0");
+                let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(names, vec!["value", "alarm", "timeStamp", "display"]);
+                assert_eq!(&fields[1].1, &meta::alarm_desc());
+                assert_eq!(&fields[2].1, &meta::time_desc());
+            }
+            other => panic!("expected Structure descriptor, got {other:?}"),
+        }
+        // Round-trip still works through the enriched wrapper.
+        let v = EnumValue {
+            index: 2,
+            choices: vec!["a".into(), "b".into(), "c".into()],
+        };
+        assert_eq!(EnumValue::from_pv_field(&v.to_pv_field()).unwrap(), v);
     }
 
     #[test]

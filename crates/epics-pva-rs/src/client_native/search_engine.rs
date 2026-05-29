@@ -35,10 +35,11 @@ use tracing::{debug, warn};
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
-    Command, PvaHeader, ReadExt, decode_size, decode_string, ip_from_bytes_allow_unspec,
+    Command, PVA_VERSION, PvaHeader, ReadExt, decode_size, decode_string,
+    ip_from_bytes_allow_unspec,
 };
 
-use super::beacon_throttle::BeaconTracker;
+use super::beacon_throttle::{BeaconAction, BeaconTracker};
 use super::decode::{PeerRole, decode_search_response, try_parse_frame_role};
 use super::server_conn::{
     DEFAULT_BUFFER_SIZE, DEFAULT_REGISTRY_SIZE, build_client_connection_validation,
@@ -898,11 +899,11 @@ async fn run_engine(
     // `None` = never poked, so the first poke is always allowed. Gates the
     // `POKE_HOLDOFF` rate limit inside `maybe_poke`.
     let mut last_poke: Option<Instant> = None;
-    // (server, guid) pairs already announced via discover(). pvxs's
-    // discover() fires Online once per new server identity; tracker
-    // uses different (reconnect-throttle) semantics so we de-dup here.
-    let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
-        std::collections::HashSet::new();
+    // Beacon-identity de-duplication is owned by `beacons` (BeaconTracker):
+    // `observe()` returns New/Changed/Update so there is no separate
+    // "already announced" set to keep in sync (pvxs drives discover()
+    // emission off the same beaconTrack New/Change/Update classification,
+    // client.cpp:784-847).
 
     // pvxs client.cpp:651-667 startNS(): one persistent TCP connection per
     // EPICS_PVA_NAME_SERVERS entry. Each ns_task handles connect/reconnect;
@@ -1075,50 +1076,31 @@ async fn run_engine(
                     // pokes pending searches (client.cpp:773-847 has no
                     // ignore check). So this in-process beacon injection
                     // does NOT consult the blocklist.
-                    let allow_reconnect = beacons.observe(server, guid);
-                    // discover() de-dup: announce each (server, guid) pair
-                    // exactly once until forgotten.
-                    let first_announce = announced.insert((server, guid));
-                    // pvxs `poke()` semantics: only kick pending searches
-                    // when the server identity is FRESH — either a
-                    // brand-new (server, guid) pair, or the same server
-                    // returning with a new GUID after the anomaly window.
-                    // Without the `first_announce` gate every periodic
-                    // beacon would needlessly bring forward every pending
-                    // search's retry deadline.
-                    // pvxs `poke()` (client.cpp:736-759): kick pending
-                    // searches only when the server identity is fresh AND
-                    // `maybe_poke` grants (not already poking, past the 30 s
-                    // holdoff). When granted it switches the tick ring to the
-                    // 200 ms fast cadence for one full revolution.
-                    if allow_reconnect && first_announce {
-                        // pvxs `poke()` (client.cpp:736-759): a fresh server
-                        // identity starts the 200 ms fast search revolution and
-                        // records the poke time — it does NOT touch per-channel
-                        // `nSearch`. The fast cadence sweeps the ring so every
-                        // parked search retransmits within one revolution while
-                        // keeping its accumulated backoff; the tick handler's
-                        // poked branch (client.cpp:1141-1160) skips the `nSearch`
-                        // increment and requeues into the same bucket. The
-                        // previous `attempt = 0` reset turned every pending PV
-                        // into a fresh 1-bucket retry, retransmitting far more
-                        // aggressively than pvxs during mass-disconnect cascades.
+                    // BeaconObserved is the in-process injection path (e.g.
+                    // a co-located server) — there's no UDP datagram, so
+                    // peer == server, proto defaults to "tcp", and the peer
+                    // version is our own protocol version. The tracker
+                    // classifies New/Changed/Update and `emit_beacon_action`
+                    // turns that into the right Discovered events.
+                    let action = beacons.observe(server, "tcp", guid, PVA_VERSION);
+                    let should_poke = emit_beacon_action(
+                        action,
+                        server,
+                        guid,
+                        server,
+                        "tcp".into(),
+                        &mut subscribers,
+                    );
+                    if should_poke {
+                        // pvxs `poke()` (client.cpp:736-759): a fresh/changed
+                        // server identity starts the 200 ms fast search
+                        // revolution and records the poke time — it does NOT
+                        // touch per-channel `nSearch`. The fast cadence sweeps
+                        // the ring so every parked search retransmits within
+                        // one revolution while keeping its accumulated backoff.
+                        // `maybe_poke` enforces the 30 s holdoff + one-active
+                        // -revolution guard.
                         maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
-                    }
-                    if first_announce {
-                        // BeaconObserved is the in-process injection
-                        // path (e.g., a co-located server) — there's
-                        // no UDP datagram, so peer == server and proto
-                        // defaults to "tcp". Real beacons go through
-                        // handle_beacon below where the proto string
-                        // is parsed off the wire.
-                        let evt = Discovered::Online {
-                            server,
-                            guid,
-                            peer: server,
-                            proto: "tcp".into(),
-                        };
-                        publish_discovery(&mut subscribers, evt);
                     }
                 }
                 Some(SearchCommand::Subscribe { responder }) => {
@@ -1160,9 +1142,9 @@ async fn run_engine(
                     // Replace (not merge) so callers can also CLEAR
                     // the list with an empty Vec. pvxs `ignoreServerGUIDs`
                     // (client.cpp:454-460) only stores the vector; it has
-                    // no side effect on beacon tracking or the discovery
-                    // de-dup set, because beacons from ignored GUIDs are
-                    // still announced. So we do NOT prune `announced` here.
+                    // no side effect on beacon tracking, because beacons
+                    // from ignored GUIDs are still reported through
+                    // discover(). So we do NOT touch the BeaconTracker here.
                     ignore_guids = guids.into_iter().collect();
                 }
                 Some(SearchCommand::DiscoverPing) => {
@@ -1199,7 +1181,7 @@ async fn run_engine(
                         let consumed = handle_search_response(
                             &search_buf[pos..n],
                             &mut pending, &mut by_name, &beacons, &ignore_guids,
-                            &mut subscribers, &mut announced, &mut poke, peer, false,
+                            &mut subscribers, &mut poke, peer, false,
                         );
                         if consumed == 0 {
                             break;
@@ -1225,7 +1207,7 @@ async fn run_engine(
                         let consumed = handle_search_response(
                             &search_buf_v6[pos..n],
                             &mut pending, &mut by_name, &beacons, &ignore_guids,
-                            &mut subscribers, &mut announced, &mut poke, peer, false,
+                            &mut subscribers, &mut poke, peer, false,
                         );
                         if consumed == 0 {
                             break;
@@ -1249,7 +1231,7 @@ async fn run_engine(
                     while pos < n {
                         let consumed = handle_beacon(
                             &beacon_buf[pos..n], &beacons, &mut pending,
-                            &mut subscribers, &mut announced, &mut poke,
+                            &mut subscribers, &mut poke,
                             from,
                         );
                         if consumed == 0 {
@@ -1276,7 +1258,7 @@ async fn run_engine(
                     while pos < n {
                         let consumed = handle_beacon(
                             &beacon_buf_v6[pos..n], &beacons, &mut pending,
-                            &mut subscribers, &mut announced, &mut poke,
+                            &mut subscribers, &mut poke,
                             from,
                         );
                         if consumed == 0 {
@@ -1294,7 +1276,6 @@ async fn run_engine(
 
             _ = beacon_clean_tick.tick() => {
                 for (server, guid) in beacons.prune_stale(BEACON_TIMEOUT) {
-                    announced.remove(&(server, guid));
                     let evt = Discovered::Timeout { server, guid };
                     publish_discovery(&mut subscribers, evt);
                 }
@@ -1308,7 +1289,7 @@ async fn run_engine(
                     let mut poke = false;
                     handle_search_response(
                         &bytes, &mut pending, &mut by_name, &beacons, &ignore_guids,
-                        &mut subscribers, &mut announced, &mut poke, ns_addr, true,
+                        &mut subscribers, &mut poke, ns_addr, true,
                     );
                 }
             }
@@ -1709,6 +1690,58 @@ fn publish_discovery(subscribers: &mut Vec<mpsc::Sender<Discovered>>, evt: Disco
     });
 }
 
+/// Emit the `Discovered` events implied by a beacon classification and
+/// report whether pending searches should be poked. Mirrors pvxs
+/// `onBeacon` (client.cpp:807-847): a `Change` emits `Timeout` for the old
+/// GUID then `Online` for the new identity; a `New` emits `Online`; both
+/// poke. `Update`/`CapDropped` emit nothing and do not poke. This is the
+/// single place beacon identity transitions turn into discovery events.
+fn emit_beacon_action(
+    action: BeaconAction,
+    server: SocketAddr,
+    guid: [u8; 12],
+    peer: SocketAddr,
+    proto: String,
+    subscribers: &mut Vec<mpsc::Sender<Discovered>>,
+) -> bool {
+    match action {
+        BeaconAction::New => {
+            publish_discovery(
+                subscribers,
+                Discovered::Online {
+                    server,
+                    guid,
+                    peer,
+                    proto,
+                },
+            );
+            true
+        }
+        BeaconAction::Changed { old_guid } => {
+            // pvxs emits a Timeout for the prior incarnation before the
+            // Online for the new one (client.cpp:814-844).
+            publish_discovery(
+                subscribers,
+                Discovered::Timeout {
+                    server,
+                    guid: old_guid,
+                },
+            );
+            publish_discovery(
+                subscribers,
+                Discovered::Online {
+                    server,
+                    guid,
+                    peer,
+                    proto,
+                },
+            );
+            true
+        }
+        BeaconAction::Update | BeaconAction::CapDropped => false,
+    }
+}
+
 /// Returns bytes consumed from `bytes` so the caller can advance to
 /// the next chained message in the same datagram.
 /// `is_tcp`: true when the response arrived on a TCP name-server connection;
@@ -1721,7 +1754,6 @@ fn handle_search_response(
     beacons: &Arc<BeaconTracker>,
     ignore_guids: &std::collections::HashSet<[u8; 12]>,
     subscribers: &mut Vec<mpsc::Sender<Discovered>>,
-    announced: &mut std::collections::HashSet<(SocketAddr, [u8; 12])>,
     poke_request: &mut bool,
     peer: SocketAddr,
     is_tcp: bool,
@@ -1763,23 +1795,26 @@ fn handle_search_response(
             && !ignore_guids.contains(&resp.guid)
         {
             let server = rewrite_loopback(resp.server_addr, peer);
-            let allow_reconnect = beacons.observe(server, resp.guid);
-            let first_announce = announced.insert((server, resp.guid));
-            if allow_reconnect && first_announce {
+            // pvxs converts the pong into a fake beacon and runs it through
+            // onBeacon (client.cpp:889-899); the tracker classifies it and
+            // emit_beacon_action produces Online (or Timeout+Online on a
+            // changed identity). peerVersion is the reply frame's header
+            // version, matching pvxs `peerVersion=head.version`.
+            let action = beacons.observe(server, &resp.protocol, resp.guid, frame.header.version);
+            let should_poke = emit_beacon_action(
+                action,
+                server,
+                resp.guid,
+                peer,
+                resp.protocol.clone(),
+                subscribers,
+            );
+            if should_poke {
                 *poke_request = true;
                 for p in pending.values_mut() {
                     p.last_attempt = Instant::now() - Duration::from_secs(60);
                     p.attempt = 0;
                 }
-            }
-            if first_announce {
-                let evt = Discovered::Online {
-                    server,
-                    guid: resp.guid,
-                    peer,
-                    proto: resp.protocol,
-                };
-                publish_discovery(subscribers, evt);
             }
         }
         return consumed;
@@ -1841,7 +1876,6 @@ fn handle_beacon(
     beacons: &Arc<BeaconTracker>,
     pending: &mut HashMap<u32, Pending>,
     subscribers: &mut Vec<mpsc::Sender<Discovered>>,
-    announced: &mut std::collections::HashSet<(SocketAddr, [u8; 12])>,
     poke_request: &mut bool,
     peer: SocketAddr,
 ) -> usize {
@@ -1912,20 +1946,24 @@ fn handle_beacon(
     let server = SocketAddr::new(resolved_ip, port);
 
     // NOTE: pvxs `ignoreServerGUIDs` does NOT filter beacons. `onBeacon()`
-    // (client.cpp:773-847) keys the tracker, fires Discovered::Online, and
-    // pokes regardless of the ignore list; the list is only consulted in
-    // procSearchReply (client.cpp:880). So a beacon from an ignored GUID
-    // still flows through here — it just won't resolve a searched channel
-    // when its SEARCH_RESPONSE is later dropped by the ignore check.
-    let allow_reconnect = beacons.observe(server, guid_arr);
-    let first_announce = announced.insert((server, guid_arr));
-    // pvxs poke() — only kick on FRESH server identity (mirror of the
-    // SearchCommand::BeaconObserved path). A long-running server's
-    // periodic beacons should not constantly bring pending searches'
-    // retry deadlines forward. Set the poke_request flag so the main
-    // loop can also flip the tick cadence to fast (200 ms × 30) for
-    // one revolution.
-    if allow_reconnect && first_announce {
+    // (client.cpp:773-847) keys the tracker by (server, proto), fires
+    // Discovered events, and pokes regardless of the ignore list; the list
+    // is only consulted in procSearchReply (client.cpp:880). So a beacon
+    // from an ignored GUID still flows through here — it just won't resolve
+    // a searched channel when its SEARCH_RESPONSE is later dropped.
+    //
+    // peerVersion is the beacon frame's header version, matching pvxs
+    // `beaconMsg.peerVersion = head.version` (udp_collector.cpp:465). The
+    // tracker classifies New/Changed/Update keyed by (server, proto), so a
+    // tcp and a tls beacon for the same server/GUID are distinct identities
+    // and a peerVersion bump on the same GUID is a Change (client.cpp:807).
+    let action = beacons.observe(server, &proto, guid_arr, frame.header.version);
+    // pvxs poke()/event emission fires only on New or Change (not a steady
+    // Update) — mirror of the SearchCommand::BeaconObserved path. Set the
+    // poke_request flag so the main loop can flip the tick cadence to fast
+    // (200 ms × 30) for one revolution.
+    let should_poke = emit_beacon_action(action, server, guid_arr, peer, proto, subscribers);
+    if should_poke {
         *poke_request = true;
         for p in pending.values_mut() {
             p.last_attempt = Instant::now() - Duration::from_secs(60);
@@ -1936,15 +1974,6 @@ fn handle_beacon(
             // channel recovery.
             p.attempt = 0;
         }
-    }
-    if first_announce {
-        let evt = Discovered::Online {
-            server,
-            guid: guid_arr,
-            peer,
-            proto,
-        };
-        publish_discovery(subscribers, evt);
     }
     consumed
 }
@@ -2361,8 +2390,6 @@ mod tests {
         let mut by_name: HashMap<String, u32> = HashMap::new();
         let ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
         let mut subscribers: Vec<mpsc::Sender<Discovered>> = Vec::new(); // no discover() active
-        let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
-            std::collections::HashSet::new();
         let mut poke = false;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
 
@@ -2373,7 +2400,6 @@ mod tests {
             &beacons,
             &ignore_guids,
             &mut subscribers,
-            &mut announced,
             &mut poke,
             peer,
             false, // UDP
@@ -2384,9 +2410,11 @@ mod tests {
             !poke,
             "no discover() outstanding ⇒ discovery-pong poke must NOT fire"
         );
+        // No subscriber ⇒ the pong never reaches the tracker.
+        let server = SocketAddr::new(peer.ip(), 5075);
         assert!(
-            announced.is_empty(),
-            "no discover() outstanding ⇒ server must NOT be announced"
+            beacons.guid_for(server).is_none(),
+            "no discover() outstanding ⇒ server must NOT enter the beacon tracker"
         );
     }
 
@@ -2403,8 +2431,6 @@ mod tests {
         let ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
         let (tx, mut rx) = mpsc::channel::<Discovered>(8);
         let mut subscribers: Vec<mpsc::Sender<Discovered>> = vec![tx]; // discover() active
-        let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
-            std::collections::HashSet::new();
         let mut poke = false;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
 
@@ -2415,7 +2441,6 @@ mod tests {
             &beacons,
             &ignore_guids,
             &mut subscribers,
-            &mut announced,
             &mut poke,
             peer,
             false, // UDP
@@ -2426,7 +2451,13 @@ mod tests {
             poke,
             "fresh server via discovery pong must poke pending searches"
         );
-        assert_eq!(announced.len(), 1, "server must be announced exactly once");
+        // The fake beacon enters the tracker (the de-dup owner) exactly once.
+        let server = SocketAddr::new(peer.ip(), 5075);
+        assert_eq!(
+            beacons.guid_for(server),
+            Some([0x42u8; 12]),
+            "server must be tracked exactly once via the fake-beacon path"
+        );
         match rx.try_recv() {
             Ok(Discovered::Online { guid, .. }) => assert_eq!(guid, [0x42u8; 12]),
             other => panic!("expected Discovered::Online for discovery pong, got {other:?}"),
@@ -2456,20 +2487,26 @@ mod tests {
         let ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
         let (tx, mut rx) = mpsc::channel::<Discovered>(8);
         let mut subscribers: Vec<mpsc::Sender<Discovered>> = vec![tx]; // discover() active
-        let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
-            std::collections::HashSet::new();
         let mut poke = false;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
 
         let consumed = handle_search_response(
-            &frame, &mut pending, &mut by_name, &beacons, &ignore_guids, &mut subscribers,
-            &mut announced, &mut poke, peer, false,
+            &frame,
+            &mut pending,
+            &mut by_name,
+            &beacons,
+            &ignore_guids,
+            &mut subscribers,
+            &mut poke,
+            peer,
+            false,
         );
 
         assert!(consumed > 0, "frame must still be consumed/advanced");
         assert!(!poke, "wrong-sequence reply must not poke");
+        let server = SocketAddr::new(peer.ip(), 5075);
         assert!(
-            announced.is_empty(),
+            beacons.guid_for(server).is_none(),
             "wrong-sequence found=false reply must NOT be promoted to a fake beacon"
         );
         assert!(
@@ -2508,14 +2545,25 @@ mod tests {
         let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
         let beacons = BeaconTracker::new();
         let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
-        let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
-            std::collections::HashSet::new();
         let mut poke = false;
-        let found_true =
-            crate::server_native::udp::build_search_response_proto(IG, 0, 5075, &[1], ByteOrder::Little, "tcp");
+        let found_true = crate::server_native::udp::build_search_response_proto(
+            IG,
+            0,
+            5075,
+            &[1],
+            ByteOrder::Little,
+            "tcp",
+        );
         handle_search_response(
-            &found_true, &mut pending, &mut by_name, &beacons, &ignore, &mut subs,
-            &mut announced, &mut poke, peer, false,
+            &found_true,
+            &mut pending,
+            &mut by_name,
+            &beacons,
+            &ignore,
+            &mut subs,
+            &mut poke,
+            peer,
+            false,
         );
         assert!(
             pending.contains_key(&1),
@@ -2524,10 +2572,8 @@ mod tests {
 
         // (2) found=false discovery pong with an ignored GUID, even with an
         // active discover() subscriber, must NOT announce.
-        let (txd, _rxd) = mpsc::channel::<Discovered>(8);
+        let (txd, mut rxd) = mpsc::channel::<Discovered>(8);
         let mut subs2: Vec<mpsc::Sender<Discovered>> = vec![txd];
-        let mut announced2: std::collections::HashSet<(SocketAddr, [u8; 12])> =
-            std::collections::HashSet::new();
         let mut poke2 = false;
         let pong = crate::server_native::udp::build_search_response_proto(
             IG,
@@ -2538,12 +2584,24 @@ mod tests {
             "tcp",
         );
         handle_search_response(
-            &pong, &mut pending, &mut by_name, &beacons, &ignore, &mut subs2,
-            &mut announced2, &mut poke2, peer, false,
+            &pong,
+            &mut pending,
+            &mut by_name,
+            &beacons,
+            &ignore,
+            &mut subs2,
+            &mut poke2,
+            peer,
+            false,
+        );
+        let server = SocketAddr::new(peer.ip(), 5075);
+        assert!(
+            beacons.guid_for(server).is_none(),
+            "ignored-GUID discovery pong must be dropped, not tracked"
         );
         assert!(
-            announced2.is_empty(),
-            "ignored-GUID discovery pong must be dropped, not announced"
+            rxd.try_recv().is_err(),
+            "ignored-GUID discovery pong must emit no Discovered event"
         );
 
         // (3) BEACON with the ignored GUID still announces + emits Online.
@@ -2565,16 +2623,12 @@ mod tests {
 
         let (txb, mut rxb) = mpsc::channel::<Discovered>(8);
         let mut subs3: Vec<mpsc::Sender<Discovered>> = vec![txb];
-        let mut announced3: std::collections::HashSet<(SocketAddr, [u8; 12])> =
-            std::collections::HashSet::new();
         let mut poke3 = false;
-        handle_beacon(
-            &frame, &beacons, &mut pending, &mut subs3, &mut announced3, &mut poke3, peer,
-        );
+        handle_beacon(&frame, &beacons, &mut pending, &mut subs3, &mut poke3, peer);
         assert_eq!(
-            announced3.len(),
-            1,
-            "ignored-GUID BEACON must still announce the server (pvxs onBeacon has no ignore check)"
+            beacons.guid_for(server),
+            Some(IG),
+            "ignored-GUID BEACON must still track the server (pvxs onBeacon has no ignore check)"
         );
         assert!(
             matches!(rxb.try_recv(), Ok(Discovered::Online { guid, .. }) if guid == IG),
@@ -2676,8 +2730,6 @@ mod tests {
             let beacons = BeaconTracker::new();
             let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
             let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
-            let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
-                std::collections::HashSet::new();
             let mut poke = false;
             handle_search_response(
                 &found_true(proto),
@@ -2686,7 +2738,6 @@ mod tests {
                 &beacons,
                 &ignore,
                 &mut subs,
-                &mut announced,
                 &mut poke,
                 peer,
                 false,
@@ -2702,8 +2753,6 @@ mod tests {
         let beacons = BeaconTracker::new();
         let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
         let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
-        let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
-            std::collections::HashSet::new();
         let mut poke = false;
         handle_search_response(
             &found_true("tcp"),
@@ -2712,7 +2761,6 @@ mod tests {
             &beacons,
             &ignore,
             &mut subs,
-            &mut announced,
             &mut poke,
             peer,
             false,
@@ -2759,46 +2807,38 @@ mod tests {
             frame
         };
 
-        let run = |frame: &[u8]| -> (bool, usize) {
+        // Returns (Discovered::Online fired, server entered the tracker).
+        let run = |frame: &[u8]| -> (bool, bool) {
             let beacons = BeaconTracker::new();
             let mut pending: HashMap<u32, Pending> = HashMap::new();
             let (tx, mut rx) = mpsc::channel::<Discovered>(8);
             let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
-            let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
-                std::collections::HashSet::new();
             let mut poke = false;
-            handle_beacon(
-                frame,
-                &beacons,
-                &mut pending,
-                &mut subs,
-                &mut announced,
-                &mut poke,
-                peer,
-            );
-            (rx.try_recv().is_ok(), announced.len())
+            handle_beacon(frame, &beacons, &mut pending, &mut subs, &mut poke, peer);
+            let server = SocketAddr::new(peer.ip(), 5075);
+            (rx.try_recv().is_ok(), beacons.guid_for(server).is_some())
         };
 
-        // Valid "tcp" beacon → announced + Discovered::Online fires.
+        // Valid "tcp" beacon → tracked + Discovered::Online fires.
         let valid = build_beacon(&|p| encode_string_into("tcp", order, p));
-        let (online, announced) = run(&valid);
+        let (online, tracked) = run(&valid);
         assert!(online, "valid BEACON must emit Discovered::Online");
-        assert_eq!(announced, 1, "valid BEACON must announce the server once");
+        assert!(tracked, "valid BEACON must enter the tracker once");
 
         // Truncated protocol: size claims 5 bytes, none follow.
         let truncated = build_beacon(&|p| encode_size_into(5, order, p));
-        let (online, announced) = run(&truncated);
+        let (online, tracked) = run(&truncated);
         assert!(!online, "truncated-protocol BEACON must not announce");
-        assert_eq!(announced, 0, "truncated-protocol BEACON must be dropped");
+        assert!(!tracked, "truncated-protocol BEACON must be dropped");
 
         // Invalid UTF-8 protocol payload (0xC3 0x28 is not valid UTF-8).
         let bad_utf8 = build_beacon(&|p| {
             encode_size_into(2, order, p);
             p.extend_from_slice(&[0xC3, 0x28]);
         });
-        let (online, announced) = run(&bad_utf8);
+        let (online, tracked) = run(&bad_utf8);
         assert!(!online, "invalid-UTF8-protocol BEACON must not announce");
-        assert_eq!(announced, 0, "invalid-UTF8-protocol BEACON must be dropped");
+        assert!(!tracked, "invalid-UTF8-protocol BEACON must be dropped");
     }
 
     /// pvxs `Channel::disconnect` (client.cpp:213) parity: a

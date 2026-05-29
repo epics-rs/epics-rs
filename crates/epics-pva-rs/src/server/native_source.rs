@@ -127,6 +127,15 @@ impl PvDatabaseSource {
 // ── EpicsValue → PvField (NTScalar / NTScalarArray) ─────────────────────
 
 fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
+    // pvxs single-record QSRV builds an NTEnum prototype whenever the
+    // backing DBR type is DBR_ENUM (`ioc/singlesource.cpp:200-201`), and
+    // `NTEnum::build()` defines `value` as an `enum_t { index, choices }`
+    // (`src/nt.cpp:121-131`). A Rust `EpicsValue::Enum` *is* that DBR_ENUM
+    // scalar, so it must surface as `epics:nt/NTEnum:1.0` carrying the
+    // discoverable `value.choices`, not as a bare numeric NTScalar.
+    if let EpicsValue::Enum(v) = &snap.value {
+        return build_nt_enum(i32::from(*v), snap);
+    }
     let value_field = match &snap.value {
         EpicsValue::Double(v) => PvField::Scalar(ScalarValue::Double(*v)),
         EpicsValue::Float(v) => PvField::Scalar(ScalarValue::Float(*v)),
@@ -188,6 +197,12 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
 }
 
 fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
+    // Mirror `snapshot_to_pv_field`: a DBR_ENUM scalar advertises the
+    // NTEnum descriptor (`epics:nt/NTEnum:1.0`) so value and introspection
+    // stay in lockstep (pvxs `ioc/singlesource.cpp:200-201`, `src/nt.cpp:121-131`).
+    if matches!(&snap.value, EpicsValue::Enum(_)) {
+        return nt_enum_desc();
+    }
     let (value_desc, is_array) = match &snap.value {
         EpicsValue::Double(_) => (FieldDesc::Scalar(ScalarType::Double), false),
         EpicsValue::Float(_) => (FieldDesc::Scalar(ScalarType::Float), false),
@@ -227,6 +242,84 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         struct_id: struct_id.into(),
         fields,
     }
+}
+
+/// pvxs `NTEnum::build()` (`src/nt.cpp:117-134`): `epics:nt/NTEnum:1.0`
+/// with `value` an `enum_t { index: Int32, choices: StringA }`, plus
+/// `alarm`, `timeStamp`, and a description-only `display`. Distinct from
+/// the NTScalar shape: no `control`/`valueAlarm`, and `display` carries
+/// only `description`.
+fn nt_enum_desc() -> FieldDesc {
+    FieldDesc::Structure {
+        struct_id: "epics:nt/NTEnum:1.0".into(),
+        fields: vec![
+            (
+                "value".into(),
+                FieldDesc::Structure {
+                    struct_id: "enum_t".into(),
+                    fields: vec![
+                        ("index".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ("choices".into(), FieldDesc::ScalarArray(ScalarType::String)),
+                    ],
+                },
+            ),
+            ("alarm".into(), alarm_desc()),
+            ("timeStamp".into(), timestamp_desc()),
+            (
+                "display".into(),
+                FieldDesc::Structure {
+                    struct_id: String::new(),
+                    fields: vec![("description".into(), FieldDesc::Scalar(ScalarType::String))],
+                },
+            ),
+        ],
+    }
+}
+
+/// Build an NTEnum value from a DBR_ENUM snapshot. `value.choices` comes
+/// from `Snapshot.enums.strings` (pvxs fills it from the DBR enum metadata,
+/// `ioc/iocsource.cpp:274-285`); an enum snapshot with no choice metadata
+/// yields an empty `choices` array, matching pvxs when the menu is empty.
+fn build_nt_enum(index: i32, snap: &Snapshot) -> PvField {
+    let choices: Vec<ScalarValue> = snap
+        .enums
+        .as_ref()
+        .map(|e| {
+            e.strings
+                .iter()
+                .map(|s| ScalarValue::String(s.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut value = PvStructure::new("enum_t");
+    value
+        .fields
+        .push(("index".into(), PvField::Scalar(ScalarValue::Int(index))));
+    value
+        .fields
+        .push(("choices".into(), PvField::ScalarArray(choices)));
+
+    // pvxs NTEnum `display` is the anonymous `Struct("display", {description})`
+    // (no `display_t` id, no limits/units) — distinct from the NTScalar display.
+    let mut display = PvStructure::new("");
+    let description = snap
+        .display
+        .as_ref()
+        .map(|d| d.description.clone())
+        .unwrap_or_default();
+    display.fields.push((
+        "description".into(),
+        PvField::Scalar(ScalarValue::String(description)),
+    ));
+
+    let mut s = PvStructure::new("epics:nt/NTEnum:1.0");
+    s.fields.push(("value".into(), PvField::Structure(value)));
+    s.fields.push(("alarm".into(), build_alarm(snap)));
+    s.fields.push(("timeStamp".into(), build_timestamp(snap)));
+    s.fields
+        .push(("display".into(), PvField::Structure(display)));
+    PvField::Structure(s)
 }
 
 fn alarm_desc() -> FieldDesc {
@@ -543,7 +636,14 @@ impl ChannelSource for PvDatabaseSource {
             // The WRITE gate ran in `put_value_checked` before reaching here,
             // so every failure below is operational (Failed), not a denial.
             let scalar = match &value {
-                PvField::Structure(s) => s.get_field("value").cloned(),
+                PvField::Structure(s) => match s.get_field("value") {
+                    // NTEnum PUT: `value` is an `enum_t` struct; pvxs
+                    // dereferences the put through `value.index` before
+                    // converting to the DBR enum (`ioc/iocsource.cpp:589-593`).
+                    // The bare-scalar NTScalar PUT keeps `value` directly.
+                    Some(PvField::Structure(inner)) => inner.get_field("index").cloned(),
+                    other => other.cloned(),
+                },
                 _ => Some(value),
             };
             let scalar = scalar.ok_or_else(|| OpError::failed("PUT missing 'value' field"))?;
@@ -905,6 +1005,138 @@ mod tests {
             scalar(&a, "message"),
             ScalarValue::String(s) if s.is_empty()
         ));
+    }
+
+    #[test]
+    fn enum_snapshot_builds_nt_enum_value_and_desc() {
+        // pvxs `ioc/singlesource.cpp:200-201`: a DBR_ENUM scalar surfaces
+        // as `epics:nt/NTEnum:1.0` with `value.index` + `value.choices`,
+        // not a numeric NTScalar.
+        use epics_base_rs::server::snapshot::EnumInfo;
+        let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, std::time::UNIX_EPOCH);
+        snap.enums = Some(EnumInfo {
+            strings: vec!["OFF".into(), "ON".into()],
+        });
+
+        // value: NTEnum struct id + nested enum_t { index, choices }.
+        let PvField::Structure(s) = snapshot_to_pv_field(&snap) else {
+            panic!("NTEnum value must be a structure");
+        };
+        assert_eq!(s.struct_id, "epics:nt/NTEnum:1.0");
+        // pvxs NTEnum carries no control/valueAlarm.
+        assert!(s.get_field("control").is_none(), "NTEnum has no control");
+        assert!(
+            s.get_field("valueAlarm").is_none(),
+            "NTEnum has no valueAlarm"
+        );
+        let Some(PvField::Structure(value)) = s.get_field("value") else {
+            panic!("NTEnum.value must be an enum_t structure");
+        };
+        assert_eq!(value.struct_id, "enum_t");
+        assert!(matches!(
+            value.get_field("index"),
+            Some(PvField::Scalar(ScalarValue::Int(1)))
+        ));
+        let Some(PvField::ScalarArray(choices)) = value.get_field("choices") else {
+            panic!("NTEnum.value.choices must be a scalar array");
+        };
+        assert_eq!(
+            choices,
+            &vec![
+                ScalarValue::String("OFF".into()),
+                ScalarValue::String("ON".into())
+            ]
+        );
+
+        // descriptor must stay in lockstep with the value shape.
+        let FieldDesc::Structure {
+            struct_id, fields, ..
+        } = snapshot_to_field_desc(&snap)
+        else {
+            panic!("NTEnum descriptor must be a structure");
+        };
+        assert_eq!(struct_id, "epics:nt/NTEnum:1.0");
+        let value_desc = &fields.iter().find(|(n, _)| n == "value").unwrap().1;
+        let FieldDesc::Structure {
+            struct_id: vid,
+            fields: vfields,
+            ..
+        } = value_desc
+        else {
+            panic!("NTEnum value descriptor must be a structure");
+        };
+        assert_eq!(vid, "enum_t");
+        assert!(matches!(
+            vfields.iter().find(|(n, _)| n == "index").unwrap().1,
+            FieldDesc::Scalar(ScalarType::Int)
+        ));
+        assert!(matches!(
+            vfields.iter().find(|(n, _)| n == "choices").unwrap().1,
+            FieldDesc::ScalarArray(ScalarType::String)
+        ));
+
+        // An enum snapshot with no choice metadata yields empty choices,
+        // not a panic or a missing field.
+        let bare = Snapshot::new(EpicsValue::Enum(0), 0, 0, std::time::UNIX_EPOCH);
+        let PvField::Structure(bs) = snapshot_to_pv_field(&bare) else {
+            panic!("structure");
+        };
+        let Some(PvField::Structure(bv)) = bs.get_field("value") else {
+            panic!("enum_t");
+        };
+        assert!(matches!(
+            bv.get_field("choices"),
+            Some(PvField::ScalarArray(c)) if c.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn put_nt_enum_dereferences_value_index() {
+        // pvxs `ioc/iocsource.cpp:589-593`: an NTEnum PUT is dereferenced
+        // through `value.index`. A round trip through the native source
+        // must land the index on the backing enum record.
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("ENUM:PV", Box::new(MbbiRecord::new(0)))
+            .await
+            .unwrap();
+        let src = PvDatabaseSource::new(db.clone());
+
+        // NTEnum-shaped PUT carrying value.index = 1.
+        let mut value = PvStructure::new("enum_t");
+        value
+            .fields
+            .push(("index".into(), PvField::Scalar(ScalarValue::Int(1))));
+        let mut nt = PvStructure::new("epics:nt/NTEnum:1.0");
+        nt.fields.push(("value".into(), PvField::Structure(value)));
+
+        src.put_value_ctx(
+            "ENUM:PV",
+            PvField::Structure(nt),
+            make_ctx("127.0.0.1", "anon", "ca"),
+        )
+        .await
+        .expect("NTEnum PUT must succeed");
+
+        // Read back: value.index must reflect the put.
+        let got = src
+            .get_value_ctx("ENUM:PV", make_ctx("127.0.0.1", "anon", "ca"))
+            .await
+            .expect("GET must return a value");
+        let PvField::Structure(s) = got else {
+            panic!("expected NTEnum structure");
+        };
+        let Some(PvField::Structure(v)) = s.get_field("value") else {
+            panic!("expected enum_t value");
+        };
+        assert!(
+            matches!(
+                v.get_field("index"),
+                Some(PvField::Scalar(ScalarValue::Int(1)))
+            ),
+            "NTEnum PUT must land on value.index"
+        );
     }
 
     /// Regression: PVA PUT must be gated through ACF when

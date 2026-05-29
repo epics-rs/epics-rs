@@ -144,6 +144,27 @@ pub struct ServerConn {
     ioid_to_cmd: Arc<DashMap<u32, u8>>,
     /// Per-connection FieldDesc cache for 0xFD/0xFE wire markers.
     type_cache: Arc<Mutex<crate::pvdata::encode::TypeCache>>,
+    /// Per-channel (by server-assigned SID) byte counters + PV name, for
+    /// pvxs `Context::report` per-channel `Report::Channel` parity
+    /// (client.cpp:464-501). pvxs bumps `chan->statTx` on each op-body send
+    /// (clientget.cpp:321, clientmon.cpp:143, …) and `chan->statRx` on each
+    /// op reply decode (clientget.cpp:496, clientmon.cpp:608); we mirror that
+    /// via [`Self::send_for_channel`] and the IOID→SID attribution in
+    /// `route_frame`. Connection-level `bytes_rx`/`bytes_tx` stay the socket
+    /// aggregate — the per-channel counters are a subset, exactly as pvxs
+    /// keeps both `Connection::statTx` and `Channel::statTx`.
+    chan_stats: Arc<DashMap<u32, ChanStat>>,
+}
+
+/// Per-channel byte counters tracked on a [`ServerConn`], keyed by the
+/// server-assigned SID. Mirrors pvxs `Channel::statTx` / `statRx` +
+/// `Channel::name` (the fields `Context::report` copies into each
+/// `Report::Channel`, client.cpp:495-496).
+#[derive(Debug)]
+struct ChanStat {
+    name: String,
+    rx: AtomicU64,
+    tx: AtomicU64,
 }
 
 // NOTE: ServerConn intentionally does NOT have a Drop impl that fires
@@ -289,6 +310,7 @@ impl ServerConn {
             Arc::new(DashMap::new());
         let ioid_to_sid: Arc<DashMap<u32, u32>> = Arc::new(DashMap::new());
         let ioid_to_cmd: Arc<DashMap<u32, u8>> = Arc::new(DashMap::new());
+        let chan_stats: Arc<DashMap<u32, ChanStat>> = Arc::new(DashMap::new());
 
         // Writer task
         let cancel_writer = cancel.clone();
@@ -331,6 +353,7 @@ impl ServerConn {
         let by_sid_close_reader = by_sid_close.clone();
         let ioid_to_sid_reader = ioid_to_sid.clone();
         let ioid_to_cmd_reader = ioid_to_cmd.clone();
+        let chan_stats_reader = chan_stats.clone();
         let writer_tx_reader = writer_tx.clone();
         let order_reader = byte_order;
         tokio::spawn(async move {
@@ -536,7 +559,7 @@ impl ServerConn {
                                     &mut dispatch_frame,
                                     &mut reader_type_cache,
                                 );
-                                route_frame(dispatch_frame, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, &ioid_to_cmd_reader, &writer_tx_reader, &cancel_reader);
+                                route_frame(dispatch_frame, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, &ioid_to_cmd_reader, &chan_stats_reader, &writer_tx_reader, &cancel_reader);
                             }
                         }
                         Err(_) => break,
@@ -558,6 +581,10 @@ impl ServerConn {
             by_sid_close_reader.clear();
             ioid_to_sid_reader.clear();
             ioid_to_cmd_reader.clear();
+            // pvxs drops the per-channel counters with the connection
+            // (Channel objects are torn down on disconnect); clear them so
+            // a reconnect's fresh SIDs start from zero.
+            chan_stats_reader.clear();
         });
 
         // Heartbeat task
@@ -615,6 +642,7 @@ impl ServerConn {
             ioid_to_sid,
             ioid_to_cmd,
             type_cache: Arc::new(Mutex::new(crate::pvdata::encode::TypeCache::new())),
+            chan_stats,
         }))
     }
 
@@ -642,6 +670,50 @@ impl ServerConn {
                 self.bytes_tx.load(Ordering::Relaxed),
             )
         }
+    }
+
+    /// Register a channel's PV name under its server-assigned SID so this
+    /// connection can attribute per-channel byte traffic for
+    /// `PvaClient::report` (pvxs adds the channel to `conn->chanBySID`,
+    /// client.cpp:495). Idempotent: re-registering the same SID refreshes
+    /// the name and keeps existing counters.
+    pub fn register_channel(&self, sid: u32, name: &str) {
+        self.chan_stats.entry(sid).or_insert_with(|| ChanStat {
+            name: name.to_owned(),
+            rx: AtomicU64::new(0),
+            tx: AtomicU64::new(0),
+        });
+    }
+
+    /// Drop a channel's per-channel counters when it leaves this
+    /// connection (reconnect to a different server, explicit close, or a
+    /// server-initiated DESTROY_CHANNEL). pvxs removes the channel from
+    /// `chanBySID` on the same transitions.
+    pub fn unregister_channel(&self, sid: u32) {
+        self.chan_stats.remove(&sid);
+    }
+
+    /// Per-channel `(name, sid, bytes_rx, bytes_tx)` snapshot for
+    /// `PvaClient::report`. When `zero` is true each channel's counters are
+    /// reset after the read, matching the connection-level
+    /// [`Self::byte_counters`] delta semantics and pvxs
+    /// `Context::report(zero)` (client.cpp:499).
+    pub fn channel_reports(&self, zero: bool) -> Vec<(String, u32, u64, u64)> {
+        self.chan_stats
+            .iter()
+            .map(|e| {
+                let s = e.value();
+                let (rx, tx) = if zero {
+                    (
+                        s.rx.swap(0, Ordering::Relaxed),
+                        s.tx.swap(0, Ordering::Relaxed),
+                    )
+                } else {
+                    (s.rx.load(Ordering::Relaxed), s.tx.load(Ordering::Relaxed))
+                };
+                (s.name.clone(), *e.key(), rx, tx)
+            })
+            .collect()
     }
 
     /// The server peer's verified X.509 identity, or `None` for a
@@ -689,6 +761,26 @@ impl ServerConn {
     /// New code should prefer `send_sync` to avoid unnecessary async overhead.
     pub async fn send(&self, frame: Vec<u8>) -> PvaResult<()> {
         self.send_sync(frame)
+    }
+
+    /// Like [`Self::send_sync`] but attributes the frame's wire length to
+    /// the channel `sid`'s transmit counter first. Mirrors pvxs
+    /// `chan->statTx += conn->enqueueTxBody(...)` at every op-body send
+    /// (clientget.cpp:321/354, clientmon.cpp:143/350/451,
+    /// clientintrospect.cpp:93). The connection-level `bytes_tx` is still
+    /// bumped by the writer task, so the per-channel counter is a subset of
+    /// the aggregate — exactly as pvxs keeps both. A frame for an
+    /// unregistered SID just bumps the connection aggregate.
+    pub fn send_for_channel_sync(&self, sid: u32, frame: Vec<u8>) -> PvaResult<()> {
+        if let Some(s) = self.chan_stats.get(&sid) {
+            s.tx.fetch_add(frame.len() as u64, Ordering::Relaxed);
+        }
+        self.send_sync(frame)
+    }
+
+    /// Async wrapper around [`Self::send_for_channel_sync`].
+    pub async fn send_for_channel(&self, sid: u32, frame: Vec<u8>) -> PvaResult<()> {
+        self.send_for_channel_sync(sid, frame)
     }
 
     /// Best-effort, non-blocking enqueue. Returns `false` if the
@@ -956,10 +1048,18 @@ fn route_frame(
     by_sid_close: &Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>>,
     ioid_to_sid: &Arc<DashMap<u32, u32>>,
     ioid_to_cmd: &Arc<DashMap<u32, u8>>,
+    chan_stats: &Arc<DashMap<u32, ChanStat>>,
     writer_tx: &mpsc::UnboundedSender<Vec<u8>>,
     cancel: &CancellationToken,
 ) {
     let cmd = frame.header.command;
+    // pvxs attributes the received frame's wire length to the owning
+    // channel's `statRx` at op reply decode (clientget.cpp:496,
+    // clientmon.cpp:608, clientintrospect.cpp:151). We do the same here:
+    // any frame carrying an IOID we can resolve to a SID adds its wire
+    // length (8-byte header + payload) to that channel's receive counter.
+    // The connection-level `bytes_rx` (socket aggregate) is unchanged.
+    let rx_wire_len = (PvaHeader::SIZE + frame.payload.len()) as u64;
     // Route by THIS frame's header byte order, not the startup handshake
     // order. pvxs sets `peerBE = header[2]&pva_flags::MSB` per received
     // application frame before command dispatch (conn.cpp:195-198) and
@@ -1045,6 +1145,15 @@ fn route_frame(
 
     // Application op responses (GET/PUT/MONITOR/RPC/GET_FIELD) route by IOID.
     if let Some(ioid) = peek_u32(&frame.payload, 0, order) {
+        // Attribute this reply's wire length to the owning channel's
+        // receive counter (pvxs `chan->statRx += rxlen`). The IOID→SID map
+        // resolves the channel; unmapped IOIDs (already torn down) just
+        // miss the per-channel counter, leaving the connection aggregate.
+        if let Some(sid) = ioid_to_sid.get(&ioid).map(|r| *r.value()) {
+            if let Some(s) = chan_stats.get(&sid) {
+                s.rx.fetch_add(rx_wire_len, Ordering::Relaxed);
+            }
+        }
         // verify the incoming frame's command matches the
         // command the IOID was opened with. Mirrors pvxs
         // `clientget.cpp:463-470` / `clientmon.cpp:570-579` per-op
@@ -1387,6 +1496,84 @@ mod tests {
         )
     }
 
+    /// pvxs `chan->statRx += rxlen` (clientmon.cpp:608, clientget.cpp:496):
+    /// a reply frame routed by IOID must add its full wire length
+    /// (8-byte header + payload) to the owning channel's receive counter,
+    /// resolved via the IOID→SID map. A frame whose IOID has no SID mapping
+    /// leaves the per-channel counters untouched.
+    #[test]
+    fn route_frame_attributes_rx_bytes_to_channel_by_ioid() {
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, writer_tx, cancel) =
+            fresh_router();
+        let chan_stats: Arc<DashMap<u32, ChanStat>> = Arc::new(DashMap::new());
+        let sid = 5u32;
+        let ioid = 77u32;
+        chan_stats.insert(
+            sid,
+            ChanStat {
+                name: "X:PV".into(),
+                rx: AtomicU64::new(0),
+                tx: AtomicU64::new(0),
+            },
+        );
+        ioid_to_sid.insert(ioid, sid);
+        ioid_to_cmd.insert(ioid, Command::Monitor.code());
+        let (tx, _rx) = mpsc::unbounded_channel::<Frame>();
+        by_ioid.insert(ioid, IoidSlot::Stream(tx));
+
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(ioid, order);
+        payload.extend_from_slice(&[0u8; 10]); // body
+        let wire_len = (PvaHeader::SIZE + payload.len()) as u64;
+        let header =
+            PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
+        route_frame(
+            Frame { header, payload },
+            &by_ioid,
+            &by_cid,
+            &by_sid_close,
+            &ioid_to_sid,
+            &ioid_to_cmd,
+            &chan_stats,
+            &writer_tx,
+            &cancel,
+        );
+        assert_eq!(
+            chan_stats.get(&sid).unwrap().rx.load(Ordering::Relaxed),
+            wire_len
+        );
+
+        // A frame on an unmapped IOID must not touch any channel counter.
+        let unmapped_ioid = 999u32;
+        let (tx2, _rx2) = mpsc::unbounded_channel::<Frame>();
+        by_ioid.insert(unmapped_ioid, IoidSlot::Stream(tx2));
+        ioid_to_cmd.insert(unmapped_ioid, Command::Monitor.code());
+        let mut payload2 = Vec::new();
+        payload2.put_u32(unmapped_ioid, order);
+        let header2 =
+            PvaHeader::application(true, order, Command::Monitor.code(), payload2.len() as u32);
+        route_frame(
+            Frame {
+                header: header2,
+                payload: payload2,
+            },
+            &by_ioid,
+            &by_cid,
+            &by_sid_close,
+            &ioid_to_sid,
+            &ioid_to_cmd,
+            &chan_stats,
+            &writer_tx,
+            &cancel,
+        );
+        assert_eq!(
+            chan_stats.get(&sid).unwrap().rx.load(Ordering::Relaxed),
+            wire_len,
+            "unmapped IOID must not change the channel counter"
+        );
+    }
+
     #[test]
     fn destroy_channel_fires_registered_close_signal() {
         use std::sync::atomic::Ordering as AtoOrd;
@@ -1415,6 +1602,7 @@ mod tests {
             &by_sid_close,
             &ioid_to_sid,
             &ioid_to_cmd,
+            &Arc::new(DashMap::new()),
             &writer_tx,
             &cancel,
         );
@@ -1450,6 +1638,7 @@ mod tests {
             &by_sid_close,
             &ioid_to_sid,
             &ioid_to_cmd,
+            &Arc::new(DashMap::new()),
             &writer_tx,
             &cancel,
         );
@@ -1500,6 +1689,7 @@ mod tests {
             &by_sid_close,
             &ioid_to_sid,
             &ioid_to_cmd,
+            &Arc::new(DashMap::new()),
             &writer_tx,
             &cancel,
         );
@@ -1579,6 +1769,7 @@ mod tests {
             &by_sid_close,
             &ioid_to_sid,
             &ioid_to_cmd,
+            &Arc::new(DashMap::new()),
             &writer_tx,
             &cancel,
         );
@@ -1632,6 +1823,7 @@ mod tests {
             &by_sid_close,
             &ioid_to_sid,
             &ioid_to_cmd,
+            &Arc::new(DashMap::new()),
             &writer_tx,
             &cancel,
         );
@@ -1674,6 +1866,7 @@ mod tests {
             &by_sid_close,
             &ioid_to_sid,
             &ioid_to_cmd,
+            &Arc::new(DashMap::new()),
             &writer_tx,
             &cancel,
         );

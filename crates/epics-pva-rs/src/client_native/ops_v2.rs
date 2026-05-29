@@ -289,7 +289,7 @@ async fn op_get_inner(
                     // one.
                     let order = server.byte_order;
                     let dr = codec.build_destroy_request(sid, warm_ioid);
-                    let _ = server.send(dr).await;
+                    let _ = server.send_for_channel(sid, dr).await;
                     server.unregister_ioid(warm_ioid);
                     let _ = order;
                     // Cache stale (server forgot ioid, channel reset, etc.).
@@ -326,7 +326,7 @@ async fn op_get_inner(
     combined.extend_from_slice(&codec.build_get(sid, ioid));
     // Sync send into the unbounded writer queue — no scheduler hop,
     // mirrors CA's `DirectServerWriter::send_frame`.
-    server.send_sync(combined)?;
+    server.send_for_channel_sync(sid, combined)?;
 
     // Receive INIT response
     let init_frame = await_oneshot_frame(rx_init, op_timeout).await?;
@@ -438,7 +438,7 @@ async fn try_warm_get(
     let (tx, rx) = tokio::sync::oneshot::channel();
     *warm.slot.lock() = Some(tx);
     let frame = codec.build_get(warm.sid, warm.ioid);
-    if server.send_sync(frame).is_err() {
+    if server.send_for_channel_sync(warm.sid, frame).is_err() {
         warm.slot.lock().take();
         return Err(PvaError::Protocol("warm GET send failed".into()));
     }
@@ -481,7 +481,7 @@ pub async fn op_get_field(
     let _ioid_guard = IoidGuard::new(server.clone(), ioid);
 
     let req = codec.build_get_field(sid, ioid, subfield);
-    let send_result = server.send(req).await;
+    let send_result = server.send_for_channel(sid, req).await;
     if send_result.is_err() {
         server.unregister_ioid(ioid);
         return Err(PvaError::Protocol("GET_FIELD send failed".into()));
@@ -559,7 +559,7 @@ pub async fn op_put_field(
     let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
     let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
@@ -606,7 +606,7 @@ pub async fn op_put_field(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
     let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
@@ -629,7 +629,7 @@ pub async fn op_put_field(
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
@@ -700,7 +700,7 @@ pub async fn op_put_fields(
     let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
     let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
@@ -752,7 +752,7 @@ pub async fn op_put_fields(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
     let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
@@ -775,7 +775,7 @@ pub async fn op_put_fields(
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
@@ -807,7 +807,7 @@ pub async fn op_put_field_with_request(
     let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
     let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
@@ -851,7 +851,7 @@ pub async fn op_put_field_with_request(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
     let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
@@ -874,7 +874,7 @@ pub async fn op_put_field_with_request(
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
@@ -912,7 +912,7 @@ pub async fn op_put_value_field_with_request(
     let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
     let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
@@ -964,7 +964,7 @@ pub async fn op_put_value_field_with_request(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
     let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
@@ -987,7 +987,7 @@ pub async fn op_put_value_field_with_request(
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
@@ -1119,7 +1119,7 @@ pub async fn op_put_value(
     let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
     let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
@@ -1163,7 +1163,7 @@ pub async fn op_put_value(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
     let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
@@ -1186,7 +1186,7 @@ pub async fn op_put_value(
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     result
 }
 
@@ -1212,7 +1212,7 @@ pub async fn op_put_value_raw(
     let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
     let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
@@ -1253,7 +1253,7 @@ pub async fn op_put_value_raw(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
     let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
@@ -1276,7 +1276,7 @@ pub async fn op_put_value_raw(
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     result
 }
 
@@ -1302,7 +1302,7 @@ async fn op_put_inner(
 
     // INIT
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
     let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
@@ -1348,7 +1348,7 @@ async fn op_put_inner(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
     let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
@@ -1371,7 +1371,7 @@ async fn op_put_inner(
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
@@ -1545,7 +1545,9 @@ impl SubscriptionHandle {
         if let Some((server, sid, ioid)) = snapshot {
             let big_endian = matches!(server.byte_order, ByteOrder::Big);
             let codec = PvaCodec { big_endian };
-            let _ = server.send(codec.build_monitor_pause(sid, ioid)).await;
+            let _ = server
+                .send_for_channel(sid, codec.build_monitor_pause(sid, ioid))
+                .await;
         }
     }
 
@@ -1563,7 +1565,9 @@ impl SubscriptionHandle {
         if let Some((server, sid, ioid)) = snapshot {
             let big_endian = matches!(server.byte_order, ByteOrder::Big);
             let codec = PvaCodec { big_endian };
-            let _ = server.send(codec.build_monitor_resume(sid, ioid)).await;
+            let _ = server
+                .send_for_channel(sid, codec.build_monitor_resume(sid, ioid))
+                .await;
         }
     }
 
@@ -1687,7 +1691,9 @@ impl Pauser {
         if let Some((server, sid, ioid)) = snapshot {
             let big_endian = matches!(server.byte_order, ByteOrder::Big);
             let codec = PvaCodec { big_endian };
-            let _ = server.send(codec.build_monitor_pause(sid, ioid)).await;
+            let _ = server
+                .send_for_channel(sid, codec.build_monitor_pause(sid, ioid))
+                .await;
         }
     }
 
@@ -1704,7 +1710,9 @@ impl Pauser {
         if let Some((server, sid, ioid)) = snapshot {
             let big_endian = matches!(server.byte_order, ByteOrder::Big);
             let codec = PvaCodec { big_endian };
-            let _ = server.send(codec.build_monitor_resume(sid, ioid)).await;
+            let _ = server
+                .send_for_channel(sid, codec.build_monitor_resume(sid, ioid))
+                .await;
         }
     }
 }
@@ -1963,7 +1971,7 @@ where
         (pipeline_size > 0).then_some(pipeline_size),
     );
     server
-        .send(init_req)
+        .send_for_channel(sid, init_req)
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
     let init_frame = stream.recv().await.ok_or(MonitorEnd::ConnectionLost)?;
@@ -2003,7 +2011,7 @@ where
         codec.build_monitor_start(sid, ioid)
     };
     server
-        .send(start)
+        .send_for_channel(sid, start)
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
     if let Some(s) = &state {
@@ -2111,7 +2119,7 @@ where
         }
         if pipeline_size > 0 && events_since_ack >= ack_threshold(pipeline_size) {
             let ack = codec.build_monitor_ack(sid, ioid, events_since_ack);
-            if server.send(ack).await.is_err() {
+            if server.send_for_channel(sid, ack).await.is_err() {
                 server.unregister_ioid(ioid);
                 return Err(MonitorEnd::ConnectionLost);
             }
@@ -2428,7 +2436,7 @@ where
         (pipeline_size > 0).then_some(pipeline_size),
     );
     server
-        .send(init_req)
+        .send_for_channel(sid, init_req)
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
     let init_frame = stream.recv().await.ok_or(MonitorEnd::ConnectionLost)?;
@@ -2468,7 +2476,7 @@ where
         codec.build_monitor_start(sid, ioid)
     };
     server
-        .send(start)
+        .send_for_channel(sid, start)
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
 
@@ -2557,7 +2565,7 @@ where
                 // (d was destructured above when computing `value`.)
                 if pipeline_size > 0 && events_since_ack >= ack_threshold(pipeline_size) {
                     let ack = codec.build_monitor_ack(sid, ioid, events_since_ack);
-                    if server.send(ack).await.is_err() {
+                    if server.send_for_channel(sid, ack).await.is_err() {
                         server.unregister_ioid(ioid);
                         return Err(MonitorEnd::ConnectionLost);
                     }
@@ -2652,7 +2660,7 @@ pub async fn op_rpc(
     let mut init_frame = Vec::with_capacity(8 + init.len());
     init_h.write_into(&mut init_frame);
     init_frame.extend_from_slice(&init);
-    server.send(init_frame).await?;
+    server.send_for_channel(sid, init_frame).await?;
 
     let init_resp_frame = await_frame(&mut stream, op_timeout).await?;
     let init_resp = match decode_op_or_reset(&server, &init_resp_frame, None)? {
@@ -2689,7 +2697,7 @@ pub async fn op_rpc(
     let mut data_frame = Vec::with_capacity(8 + data.len());
     data_h.write_into(&mut data_frame);
     data_frame.extend_from_slice(&data);
-    server.send(data_frame).await?;
+    server.send_for_channel(sid, data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
     // RPC response carries its own type — `response_intro` from INIT is
@@ -2717,7 +2725,7 @@ pub async fn op_rpc(
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
@@ -2764,7 +2772,7 @@ pub async fn op_put_get(
     let mut init_frame = Vec::with_capacity(8 + init.len());
     init_h.write_into(&mut init_frame);
     init_frame.extend_from_slice(&init);
-    server.send(init_frame).await?;
+    server.send_for_channel(sid, init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
     let intro = match decode_put_get_init(&init_resp, &mut cache.lock()) {
@@ -2805,7 +2813,7 @@ pub async fn op_put_get(
     let mut data_frame = Vec::with_capacity(8 + data.len());
     data_h.write_into(&mut data_frame);
     data_frame.extend_from_slice(&data);
-    server.send(data_frame).await?;
+    server.send_for_channel(sid, data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
     let result = match decode_put_get_data(&resp_frame, &intro, &mut cache.lock()) {
@@ -2820,7 +2828,7 @@ pub async fn op_put_get(
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result.map(|v| (intro, v))
 }
@@ -2938,7 +2946,7 @@ pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResu
     let mut init_frame = Vec::with_capacity(8 + init.len());
     init_h.write_into(&mut init_frame);
     init_frame.extend_from_slice(&init);
-    server.send(init_frame).await?;
+    server.send_for_channel(sid, init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
     let init_status = match decode_process_status(&init_resp) {
@@ -2966,7 +2974,7 @@ pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResu
     let mut data_frame = Vec::with_capacity(8 + data.len());
     data_h.write_into(&mut data_frame);
     data_frame.extend_from_slice(&data);
-    server.send(data_frame).await?;
+    server.send_for_channel(sid, data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
     let result = match decode_process_status(&resp_frame) {
@@ -2981,7 +2989,7 @@ pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResu
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }

@@ -239,20 +239,29 @@ impl ConnectionPool {
         *self.max_message_size.lock() = cap;
     }
 
-    /// per-connection `(peer, bytes_rx, bytes_tx, alive)`
-    /// snapshot for `PvaClient::report`. When `zero` is true each
-    /// connection's byte counters are reset after the read (pvxs
-    /// `report(bool zero)` delta semantics).
+    /// per-connection `(peer, bytes_rx, bytes_tx, alive, channels)`
+    /// snapshot for `PvaClient::report`, where `channels` is the
+    /// per-channel `(name, sid, bytes_rx, bytes_tx)` list pvxs copies into
+    /// each `Report::Connection::channels` (client.cpp:495-496). When `zero`
+    /// is true both the connection and the per-channel counters are reset
+    /// after the read (pvxs `report(bool zero)` delta semantics).
+    #[allow(clippy::type_complexity)]
     pub fn connection_byte_reports(
         &self,
         zero: bool,
-    ) -> Vec<(std::net::SocketAddr, u64, u64, bool)> {
+    ) -> Vec<(
+        std::net::SocketAddr,
+        u64,
+        u64,
+        bool,
+        Vec<(String, u32, u64, u64)>,
+    )> {
         self.inner
             .lock()
             .iter()
             .map(|(addr, c)| {
                 let (rx, tx) = c.byte_counters(zero);
-                (*addr, rx, tx, c.is_alive())
+                (*addr, rx, tx, c.is_alive(), c.channel_reports(zero))
             })
             .collect()
     }
@@ -894,6 +903,9 @@ impl Channel {
         let prev_reg = self.last_close_registration.lock().take();
         if let Some((old_sid, old_server)) = prev_reg {
             old_server.unregister_sid_close(old_sid);
+            // Drop the old SID's per-channel report counters too — the
+            // channel is leaving that (server, sid) binding.
+            old_server.unregister_channel(old_sid);
         }
 
         // Entering Active: clear the destroyed flag for the fresh SID and
@@ -913,6 +925,10 @@ impl Channel {
                 Arc::clone(&self.server_destroyed),
                 Arc::clone(&self.server_destroyed_notify),
             );
+            // Register the PV name under this SID so the connection can
+            // attribute per-channel byte traffic for `PvaClient::report`
+            // (pvxs `conn->chanBySID`, client.cpp:495).
+            server.register_channel(sid, &self.pv_name);
             *self.last_close_registration.lock() = Some((sid, server.clone()));
             self.has_been_active
                 .store(true, std::sync::atomic::Ordering::Relaxed);

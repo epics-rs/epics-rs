@@ -1413,10 +1413,10 @@ impl PvaClient {
     }
 
     /// Snapshot of the client's current state — channel cache size,
-    /// connection-pool peers, name-server count, etc. Mirrors pvxs
-    /// `Context::report` (client.h:599) at the "summary counters"
-    /// level. Per-channel detail (peer, RX/TX bytes) isn't surfaced
-    /// here yet; pvxs's full Report is heavier than most callers need.
+    /// connection-pool peers, name-server count, and per-connection /
+    /// per-channel byte counters. Mirrors pvxs `Context::report`
+    /// (client.h:599 / client.cpp:464-501): each [`ConnReport`] carries its
+    /// [`ConnReport::channels`] list with per-channel RX/TX counters.
     pub fn report(&self) -> ClientReport {
         self.report_zeroed(false)
     }
@@ -1459,11 +1459,20 @@ impl PvaClient {
             .pool
             .connection_byte_reports(zero)
             .into_iter()
-            .map(|(peer, bytes_rx, bytes_tx, alive)| ConnReport {
+            .map(|(peer, bytes_rx, bytes_tx, alive, channels)| ConnReport {
                 peer,
                 bytes_rx,
                 bytes_tx,
                 alive,
+                channels: channels
+                    .into_iter()
+                    .map(|(name, sid, bytes_rx, bytes_tx)| ChanReport {
+                        name,
+                        sid,
+                        bytes_rx,
+                        bytes_tx,
+                    })
+                    .collect(),
             })
             .collect();
         ClientReport {
@@ -1779,7 +1788,8 @@ pub struct ClientReport {
 }
 
 /// one entry in [`ClientReport::connections`] — a live
-/// connection to a PVA server with its byte counters.
+/// connection to a PVA server with its byte counters and the channels it
+/// carries. Mirrors pvxs `Report::Connection` (netcommon.h:54-68).
 #[derive(Debug, Clone)]
 pub struct ConnReport {
     /// Server endpoint this connection talks to.
@@ -1791,6 +1801,26 @@ pub struct ConnReport {
     pub bytes_tx: u64,
     /// Whether the connection is currently alive.
     pub alive: bool,
+    /// The channels currently bound to this connection, each with its own
+    /// byte counters. pvxs `Report::Connection::channels`
+    /// (client.cpp:495-496).
+    pub channels: Vec<ChanReport>,
+}
+
+/// one channel entry in [`ConnReport::channels`]. Mirrors pvxs
+/// `Report::Channel` (netcommon.h:43-52): the PV name plus the channel's
+/// own transmit/receive byte counters.
+#[derive(Debug, Clone)]
+pub struct ChanReport {
+    /// PV name of the channel.
+    pub name: String,
+    /// Server-assigned channel id (SID).
+    pub sid: u32,
+    /// Bytes received for this channel's operations (since the last
+    /// `report_zeroed(true)`).
+    pub bytes_rx: u64,
+    /// Bytes transmitted for this channel's operations.
+    pub bytes_tx: u64,
 }
 
 /// Callback type for [`ConnectBuilder::on_connect`] /

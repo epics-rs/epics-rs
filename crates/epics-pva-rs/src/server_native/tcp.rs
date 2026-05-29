@@ -970,6 +970,33 @@ fn apply_exec_finish(channels: &mut HashMap<u32, ChannelState>, fin: ExecFinishe
     }
 }
 
+/// True when `ioid` already names a live operation on *any* channel of
+/// this connection.
+///
+/// pvxs scopes operation IDs to the whole connection, not to one channel:
+/// `ServerConn::opByIOID` (`serverconn.h:142`) is the connection-wide map an
+/// INIT consults to reject a reused IOID (`serverget.cpp:378-384`,
+/// `servermon.cpp:505-511`, `serverintrospect.cpp:157-178`). Modelling that as
+/// the per-channel `ChannelState::ops` lets two channels hold the same IOID,
+/// and because operation replies are tagged by IOID alone the two reply streams
+/// become indistinguishable to the client. The single source of truth stays
+/// `channels`; this helper widens the uniqueness *scope* to the connection so
+/// the duplicate-IOID rule holds across channels by construction rather than
+/// maintaining a redundant secondary index that could desync.
+fn ioid_live_on_conn(channels: &HashMap<u32, ChannelState>, ioid: u32) -> bool {
+    channels.values().any(|c| c.ops.contains_key(&ioid))
+}
+
+/// SID of the channel that owns the operation `ioid`, scanning the whole
+/// connection. pvxs keys CANCEL/DESTROY/MESSAGE on the connection-wide
+/// `opByIOID` and only then consults the SID (`serverconn.cpp:262-346`); with
+/// connection-wide IOID uniqueness an IOID maps to at most one channel.
+fn op_owner_sid(channels: &HashMap<u32, ChannelState>, ioid: u32) -> Option<u32> {
+    channels
+        .iter()
+        .find_map(|(sid, c)| c.ops.contains_key(&ioid).then_some(*sid))
+}
+
 /// await a user-supplied source handler so that a panic inside it
 /// becomes a recoverable `Err` instead of unwinding the spawned exec task.
 ///
@@ -2804,6 +2831,10 @@ async fn handle_put_get(
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
+    // Connection-wide IOID uniqueness (pvxs `ServerConn::opByIOID`),
+    // evaluated before the per-channel borrow below.
+    let dup_ioid = subcmd & QosFlags::INIT != 0 && ioid_live_on_conn(channels, ioid);
+
     let ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
@@ -2828,8 +2859,8 @@ async fn handle_put_get(
 
     if subcmd & QosFlags::INIT != 0 {
         // duplicate INIT on a live IOID is connection-fatal
-        // (mirror of `handle_op`).
-        if ch.ops.contains_key(&ioid) {
+        // (mirror of `handle_op`; connection-wide scope per pvxs `opByIOID`).
+        if dup_ioid {
             return Err(PvaError::Decode(format!(
                 "duplicate PUT_GET INIT on live IOID {ioid}"
             )));
@@ -3133,6 +3164,10 @@ async fn handle_process(
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
+    // Connection-wide IOID uniqueness (pvxs `ServerConn::opByIOID`),
+    // evaluated before the per-channel borrow below.
+    let dup_ioid = subcmd & QosFlags::INIT != 0 && ioid_live_on_conn(channels, ioid);
+
     let ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
@@ -3155,8 +3190,9 @@ async fn handle_process(
     }
 
     if subcmd & QosFlags::INIT != 0 {
-        // duplicate INIT on a live IOID is connection-fatal.
-        if ch.ops.contains_key(&ioid) {
+        // duplicate INIT on a live IOID is connection-fatal
+        // (connection-wide scope per pvxs `opByIOID`).
+        if dup_ioid {
             return Err(PvaError::Decode(format!(
                 "duplicate PROCESS INIT on live IOID {ioid}"
             )));
@@ -3644,24 +3680,39 @@ fn handle_cancel_request(
     let ioid = cur
         .get_u32(order)
         .map_err(|e| PvaError::Decode(format!("CANCEL_REQUEST ioid: {e}")))?;
-    if let Some(ch) = channels.get_mut(&sid) {
-        if let Some(op) = ch.ops.get(&ioid) {
-            // Suspend without aborting the subscriber task. pvxs
-            // models cancel as Executing→Idle; the subscriber stays
-            // around for the next START to flip back to Executing.
-            // Only MONITOR has a long-lived subscriber to pause —
-            // GET/PUT/RPC are two-shot so the field is effectively a
-            // no-op for them (`monitor_paused` is never consulted off
-            // the MONITOR path).
-            op.monitor_paused
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            // CANCEL_REQUEST is Executing->Idle. Route through
-            // the op's single start-control owner so notify_monitor_start(
-            // false) fires once on the edge (no-op if already paused or
-            // never started). DESTROY's terminal stop comes from Drop.
-            if let Some(ctl) = &op.monitor_start_ctl {
-                ctl.set(false);
-            }
+    // pvxs `serverconn.cpp:262-291` keys CANCEL on the connection-wide
+    // `opByIOID`, then rejects it when the located op's channel SID does not
+    // match the supplied SID ("Cancel inconsistent Op"). Locate by IOID across
+    // the connection so the SID is validated against the op's real owner.
+    let osid = match op_owner_sid(channels, ioid) {
+        Some(s) if s == sid => s,
+        Some(_) => {
+            debug!(sid, ioid, "CANCEL_REQUEST with inconsistent SID: dropping");
+            return Ok(());
+        }
+        None => {
+            debug!(sid, ioid, "CANCEL_REQUEST for non-existent op: dropping");
+            return Ok(());
+        }
+    };
+    if let Some(ch) = channels.get_mut(&osid)
+        && let Some(op) = ch.ops.get(&ioid)
+    {
+        // Suspend without aborting the subscriber task. pvxs
+        // models cancel as Executing→Idle; the subscriber stays
+        // around for the next START to flip back to Executing.
+        // Only MONITOR has a long-lived subscriber to pause —
+        // GET/PUT/RPC are two-shot so the field is effectively a
+        // no-op for them (`monitor_paused` is never consulted off
+        // the MONITOR path).
+        op.monitor_paused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // CANCEL_REQUEST is Executing->Idle. Route through
+        // the op's single start-control owner so notify_monitor_start(
+        // false) fires once on the edge (no-op if already paused or
+        // never started). DESTROY's terminal stop comes from Drop.
+        if let Some(ctl) = &op.monitor_start_ctl {
+            ctl.set(false);
         }
     }
     Ok(())
@@ -3707,7 +3758,16 @@ fn handle_destroy_request(
     let ioid = cur
         .get_u32(order)
         .map_err(|e| PvaError::Decode(format!("DESTROY_REQUEST ioid: {e}")))?;
-    if let Some(ch) = channels.get_mut(&sid) {
+    // pvxs `serverconn.cpp:295-319` keys DESTROY on the connection-wide
+    // `opByIOID` and erases + `cleanup()`s the op whenever the IOID is found,
+    // even if the supplied SID does not match the op's channel (the
+    // channel-local erase merely warns). Locating the op by IOID across the
+    // connection — rather than only inside the frame's SID — destroys the op a
+    // mis-addressed DESTROY would otherwise leak.
+    let _ = sid;
+    if let Some(osid) = op_owner_sid(channels, ioid)
+        && let Some(ch) = channels.get_mut(&osid)
+    {
         // Removing the op drops `monitor_abort: Option<Arc<AbortOnDrop>>`.
         // Once the last clone is dropped, the subscriber task aborts.
         ch.ops.remove(&ioid);
@@ -3795,6 +3855,10 @@ async fn handle_op(
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
+    // Connection-wide IOID uniqueness, evaluated before the per-channel
+    // borrow below (pvxs `ServerConn::opByIOID`, serverget.cpp:378-384).
+    let dup_ioid = subcmd & 0x08 != 0 && ioid_live_on_conn(channels, ioid);
+
     let ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
@@ -3818,8 +3882,10 @@ async fn handle_op(
         // Rust let the insert below silently REPLACE the existing
         // OpState, which could drop a MONITOR subscriber task and
         // redirect later data frames to a different descriptor/mask
-        // than the original operation negotiated.
-        if ch.ops.contains_key(&ioid) {
+        // than the original operation negotiated. pvxs scopes this to the
+        // whole connection (`opByIOID`), so a reused IOID on a *different*
+        // channel is equally fatal.
+        if dup_ioid {
             return Err(PvaError::Decode(format!(
                 "duplicate INIT on live IOID {ioid} (pvxs serverget.cpp:378-384 protocol error)"
             )));
@@ -10689,6 +10755,115 @@ mod tests {
         assert!(
             !status.is_success(),
             "data-phase GET failure carries an error status"
+        );
+    }
+
+    /// build a two-channel connection (sid 1 and sid 2), each advertising
+    /// `three_field_intro`, with no ops yet. Mirrors the connection-wide IOID
+    /// scope of pvxs `ServerConn` (one `opByIOID` across all channels).
+    fn two_channel_conn() -> HashMap<u32, ChannelState> {
+        let mut channels = HashMap::new();
+        for sid in [1u32, 2u32] {
+            channels.insert(
+                sid,
+                ChannelState {
+                    name: format!("dut{sid}"),
+                    cid: sid - 1,
+                    sid,
+                    introspection: Some(three_field_intro()),
+                    ops: HashMap::new(),
+                },
+            );
+        }
+        channels
+    }
+
+    /// An IOID already live on one channel makes an INIT reusing it on a
+    /// *different* channel connection-fatal — pvxs scopes IOIDs to
+    /// `ServerConn::opByIOID`, not per channel (serverget.cpp:378-384).
+    #[tokio::test]
+    async fn pva_conn_wide_ioid_init_duplicate_across_channels_is_fatal() {
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::tcp::ClientCredentials;
+
+        let order = ByteOrder::Little;
+        let ioid = 5u32;
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        let mut channels = two_channel_conn();
+        // A live GET op on channel sid=1 reserves ioid=5 connection-wide.
+        channels.get_mut(&1).unwrap().ops.insert(
+            ioid,
+            non_monitor_op_state(
+                three_field_intro(),
+                OpKind::Get,
+                BitSet::all_set(three_field_intro().total_bits()),
+            ),
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // INIT a fresh GET on channel sid=2 reusing ioid=5.
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(2, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        bfr13_init_pv_request(order, &mut init_payload);
+        let init_frame = synth_frame(Command::Get, order, init_payload);
+        let err = handle_op(
+            &source,
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect_err("reusing an IOID live on another channel is connection-fatal");
+        assert!(
+            matches!(err, PvaError::Decode(_)),
+            "cross-channel duplicate INIT must reset the connection, got {err:?}"
+        );
+    }
+
+    /// DESTROY_REQUEST is keyed on the connection-wide IOID: a DESTROY whose
+    /// SID does not match the op's channel still destroys the op (pvxs
+    /// serverconn.cpp:295-319 erases by IOID even when the channel-local erase
+    /// fails). The pre-fix per-channel lookup would have leaked the op.
+    #[tokio::test]
+    async fn pva_conn_wide_destroy_request_routes_by_ioid_ignoring_sid() {
+        let order = ByteOrder::Little;
+        let ioid = 9u32;
+        let mut channels = two_channel_conn();
+        channels.get_mut(&1).unwrap().ops.insert(
+            ioid,
+            non_monitor_op_state(
+                three_field_intro(),
+                OpKind::Get,
+                BitSet::all_set(three_field_intro().total_bits()),
+            ),
+        );
+
+        // DESTROY addressed to the wrong SID (2) for an op owned by SID 1.
+        let mut payload = Vec::new();
+        payload.put_u32(2, order);
+        payload.put_u32(ioid, order);
+        let frame = synth_frame(Command::DestroyRequest, order, payload);
+        handle_destroy_request(&frame, &mut channels, order).expect("DESTROY_REQUEST ok");
+
+        assert!(
+            !channels.get(&1).unwrap().ops.contains_key(&ioid),
+            "DESTROY keyed by IOID must remove the op from its real channel \
+             regardless of the supplied SID"
         );
     }
 

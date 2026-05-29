@@ -166,10 +166,6 @@ async fn main() {
     // 3. Post-PUT read for the `New :` echo line.
     let new_get = client.pvget_full(&pv_name).await;
 
-    if args.quiet {
-        return;
-    }
-
     let echo_line = |label: &str, value: &PvField| -> Option<String> {
         let s = match value {
             PvField::Structure(s) => s,
@@ -178,7 +174,13 @@ async fn main() {
         Some(format_old_new_line(label, s))
     };
 
-    if let Some(old_get) = &old_get {
+    // pvAccessCPP `pvput -q` (pvput.cpp:403-428) suppresses the `Old :`
+    // line and the `New :` label but still prints the post-PUT value.
+    // So quiet drops the old echo entirely and prints the new value
+    // with an empty label, while a non-quiet run keeps both labels.
+    if !args.quiet
+        && let Some(old_get) = &old_get
+    {
         match old_get {
             Ok(r) => match echo_line("Old : ", &r.value) {
                 Some(line) => print!("{line}"),
@@ -187,11 +189,16 @@ async fn main() {
             Err(e) => println!("Old : *** {e}"),
         }
     }
+    let new_label = new_echo_label(args.quiet);
     match &new_get {
-        Ok(r) => match echo_line("New : ", &r.value) {
+        Ok(r) => match echo_line(new_label, &r.value) {
             Some(line) => print!("{line}"),
+            None if args.quiet => println!("(non-NT value)"),
             None => println!("New : (non-NT value)"),
         },
+        // A readback GET failure is not the PUT result (already checked);
+        // report it to stderr so quiet's stdout stays value-only.
+        Err(e) if args.quiet => eprintln!("pvput-rs: readback failed: {e}"),
         Err(e) => println!("New : *** {e}"),
     }
 
@@ -246,6 +253,13 @@ fn parse_put_args(values: &[String]) -> Result<PutInput, String> {
         }
     }
     Ok(PutInput::Fields(assignments))
+}
+
+/// Label for the post-PUT `New :` echo line. pvAccessCPP `pvput -q`
+/// (pvput.cpp:403-428) drops the `New :` label but still prints the
+/// value, so quiet mode uses an empty label.
+fn new_echo_label(quiet: bool) -> &'static str {
+    if quiet { "" } else { "New : " }
 }
 
 /// Render an `Old :` / `New :` echo line in legacy `pvput.cpp` shape:
@@ -328,5 +342,13 @@ mod tests {
     fn read_back_flag_enables_readback() {
         let args = Args::parse_from(["pvput-rs", "--read-back", "PV", "42"]);
         assert!(args.read_back);
+    }
+
+    /// pvAccessCPP `pvput -q` drops the `New :` label but still prints
+    /// the value, so quiet uses an empty label and non-quiet keeps it.
+    #[test]
+    fn quiet_suppresses_new_label_only() {
+        assert_eq!(new_echo_label(false), "New : ");
+        assert_eq!(new_echo_label(true), "");
     }
 }

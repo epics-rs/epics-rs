@@ -26,7 +26,11 @@ struct Args {
     #[arg(short = 'w', default_value = "5.0")]
     timeout: f64,
 
-    /// Quiet mode, print only error messages
+    /// Deprecated, ignored. pvAccessCPP routes `pvmonitor` through the
+    /// same `pvget.cpp` that treats `-q` as a deprecated no-op
+    /// (`pvtoolsSrc/pvget.cpp:332-338`, included via `pvmonitor.cpp`)
+    /// and still prints monitor updates; pvxs `tools/monitor.cpp` has
+    /// no such option. Accepted for legacy compatibility, no effect.
     #[arg(short = 'q')]
     quiet: bool,
 
@@ -67,7 +71,6 @@ async fn main() {
         } else {
             args.mode.clone()
         };
-        let quiet = args.quiet;
         let request = request.clone();
         let handle = tokio::spawn(async move {
             let client = PvaClient::new().expect("failed to create PVA client");
@@ -76,9 +79,8 @@ async fn main() {
             let desc = client.pvinfo(&pv_name).await.ok();
 
             let render = |value: &epics_pva_rs::pvdata::PvField| {
-                if quiet {
-                    return;
-                }
+                // `-q` is a deprecated no-op (see Args::quiet); monitor
+                // updates are always printed, matching pvAccessCPP.
                 let output = if let Some(ref d) = desc {
                     match mode.as_str() {
                         "json" => format::format_json(&pv_name, value),
@@ -105,5 +107,20 @@ async fn main() {
 
     for handle in handles {
         let _ = handle.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `-q` is accepted but a deprecated no-op: monitor updates must
+    /// still print (pvAccessCPP pvget.cpp:332-338, shared by pvmonitor).
+    /// This locks the flag; the print-always behavior is enforced
+    /// structurally in the render closure.
+    #[test]
+    fn quiet_flag_is_accepted_as_deprecated_noop() {
+        let args = Args::parse_from(["pvmonitor-rs", "-q", "PV"]);
+        assert!(args.quiet);
     }
 }

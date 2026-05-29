@@ -523,11 +523,25 @@ fn format_timestamp(s: &PvStructure) -> String {
         Some(PvField::Scalar(ScalarValue::UInt(v))) => *v,
         _ => 0,
     };
+    // EPICS Base `printTimeTx` (pvData printer.cpp:135-139) appends the
+    // `userTag` after the timestamp text when the field is present and
+    // nonzero (e.g. a QSRV pulse-id / event tag). The CLI dropped it.
+    let user_tag = match s.get_field("userTag") {
+        Some(PvField::Scalar(ScalarValue::Int(v))) => *v as i64,
+        Some(PvField::Scalar(ScalarValue::Long(v))) => *v,
+        Some(PvField::Scalar(ScalarValue::UInt(v))) => *v as i64,
+        _ => 0,
+    };
     let dt = chrono::DateTime::from_timestamp(sec, nsec);
     match dt {
         Some(dt) => {
             let local = dt.with_timezone(&chrono::Local);
-            format!("{}", local.format("%Y-%m-%d %H:%M:%S.%3f"))
+            let ts = local.format("%Y-%m-%d %H:%M:%S.%3f");
+            if user_tag != 0 {
+                format!("{ts} {user_tag}")
+            } else {
+                format!("{ts}")
+            }
         }
         None => "<undefined>".to_string(),
     }
@@ -623,6 +637,38 @@ mod tests {
         let out = format_nt("MY:PV", &desc, &val);
         assert!(out.contains("MY:PV"));
         assert!(out.contains("42.5"));
+    }
+
+    #[test]
+    fn nt_scalar_timestamp_renders_nonzero_user_tag() {
+        // EPICS Base `printTimeTx` (pvData printer.cpp:135-139) appends the
+        // userTag after the timestamp when it is nonzero; pvxs/QSRV forces
+        // e.g. UTAG 142 (testqsingle.cpp:280-283).
+        let (desc, val) = nt_scalar_double(1.0, 1_700_000_000, 0);
+        let PvField::Structure(mut s) = val else {
+            panic!("nt scalar must be a structure");
+        };
+        if let Some(PvField::Structure(ts)) = s.get_field_mut("timeStamp") {
+            ts.set("userTag", PvField::Scalar(ScalarValue::Int(142)));
+        }
+        let out = format_nt("MY:PV", &desc, &PvField::Structure(s));
+        assert!(
+            out.contains(" 142 "),
+            "nonzero userTag must appear after the timestamp, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn nt_scalar_timestamp_omits_zero_user_tag() {
+        // userTag == 0 must not be rendered (Base prints it only when nonzero).
+        let (desc, val) = nt_scalar_double(1.0, 1_700_000_000, 0);
+        let out = format_nt("MY:PV", &desc, &val);
+        // The only standalone integer token would be a userTag; assert the
+        // zero tag is absent (value 1 renders as "1", tag would be " 0 ").
+        assert!(
+            !out.contains(" 0 "),
+            "zero userTag must not be rendered, got: {out:?}"
+        );
     }
 
     #[test]

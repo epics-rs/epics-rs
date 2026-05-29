@@ -26,5 +26,5 @@ pub mod search;
 pub mod search_engine;
 pub mod server_conn;
 
-pub use context::{AssertedIdentity, PvGetResult, PvaClient, PvaClientBuilder};
+pub use context::{AssertedIdentity, CacheAction, PvGetResult, PvaClient, PvaClientBuilder};
 pub use operation::PvaOperation;

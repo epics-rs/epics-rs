@@ -83,15 +83,17 @@ pub struct Channel {
     /// a fresh UDP search.
     alternatives: parking_lot::Mutex<Vec<std::net::SocketAddr>>,
     /// Earliest instant at which `ensure_active` is allowed to attempt a
-    /// fresh connect. Set after a connect/CreateChannel failure to throttle
-    /// reconnect storms — pvxs Channel::disconnect (client.cpp:155-163)
-    /// pushes Connecting-stage failures 10 buckets (≈10 s) into the
-    /// future. We accumulate exponentially per consecutive failure with a
-    /// hard cap so a flapping server can't make every monitor caller spin.
+    /// fresh connect, or `None` when reconnect may proceed immediately.
+    /// Set per pvxs failure class (see `reconnect_holdoff`): a
+    /// Connecting-stage TCP failure arms the fixed 10-bucket reconnect
+    /// holdoff (pvxs `Channel::disconnect`, client.cpp:156-165, pushed via
+    /// :206-214), a searched `CREATE_CHANNEL` refusal arms nothing (pvxs
+    /// sets the channel back to Searching in the current bucket,
+    /// clientconn.cpp:368-378), and a direct/forced-server refusal arms the
+    /// fixed holdoff to stand in for pvxs "wait for reconnect"
+    /// (clientconn.cpp:379-385). No Rust-only exponential counter is carried
+    /// across these pvxs-distinct transitions.
     holdoff_until: parking_lot::Mutex<Option<std::time::Instant>>,
-    /// Consecutive connect failures since the last successful Active
-    /// transition. Used to scale `holdoff_until`.
-    connect_fail_count: std::sync::atomic::AtomicU32,
     /// Set to true by `ServerConn::route_frame` when a server-initiated
     /// `CMD_DESTROY_CHANNEL` arrives for this channel's current SID.
     /// `is_active` consults the flag so the next `ensure_active` falls
@@ -237,20 +239,29 @@ impl ConnectionPool {
         *self.max_message_size.lock() = cap;
     }
 
-    /// per-connection `(peer, bytes_rx, bytes_tx, alive)`
-    /// snapshot for `PvaClient::report`. When `zero` is true each
-    /// connection's byte counters are reset after the read (pvxs
-    /// `report(bool zero)` delta semantics).
+    /// per-connection `(peer, bytes_rx, bytes_tx, alive, channels)`
+    /// snapshot for `PvaClient::report`, where `channels` is the
+    /// per-channel `(name, sid, bytes_rx, bytes_tx)` list pvxs copies into
+    /// each `Report::Connection::channels` (client.cpp:495-496). When `zero`
+    /// is true both the connection and the per-channel counters are reset
+    /// after the read (pvxs `report(bool zero)` delta semantics).
+    #[allow(clippy::type_complexity)]
     pub fn connection_byte_reports(
         &self,
         zero: bool,
-    ) -> Vec<(std::net::SocketAddr, u64, u64, bool)> {
+    ) -> Vec<(
+        std::net::SocketAddr,
+        u64,
+        u64,
+        bool,
+        Vec<(String, u32, u64, u64)>,
+    )> {
         self.inner
             .lock()
             .iter()
             .map(|(addr, c)| {
                 let (rx, tx) = c.byte_counters(zero);
-                (*addr, rx, tx, c.is_alive())
+                (*addr, rx, tx, c.is_alive(), c.channel_reports(zero))
             })
             .collect()
     }
@@ -271,6 +282,15 @@ impl ConnectionPool {
         op_timeout: std::time::Duration,
         tcp_timeout: std::time::Duration,
     ) -> PvaResult<Arc<ServerConn>> {
+        // Closed-context gate (pvxs 4d12da87205e): once `close()` /
+        // `clear()` has run, refuse to dial. This is the dial-boundary
+        // half of the single shutdown owner — without it an in-flight
+        // operation tearing down (or a name-server reconnect path) could
+        // still open a fresh socket after the context was closed, and
+        // the channel-factory gate alone would be a false invariant.
+        if self.is_shutdown() {
+            return Err(PvaError::Protocol("context closed".into()));
+        }
         // Fast path: existing alive conn.
         {
             let map = self.inner.lock();
@@ -437,6 +457,51 @@ impl ConnectionPool {
     }
 }
 
+/// pvxs `Channel::disconnect` applies a fixed 10-bucket reconnect holdoff
+/// for a Connecting-stage TCP failure; with a 1 s bucket interval that is
+/// ~10 s (client.cpp:156-165, pushed onto the ring at :206-214). We reuse
+/// the same constant for the direct/forced-server refusal case, which pvxs
+/// resolves by waiting for reconnect rather than fast re-searching
+/// (clientconn.cpp:379-385).
+const RECONNECT_HOLDOFF: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How a single candidate attempt failed inside `ensure_active`. pvxs
+/// paces reconnect differently for a Connecting-stage TCP failure vs a
+/// `CREATE_CHANNEL` refusal, so the two must not collapse into one
+/// exponential counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureClass {
+    /// TCP connect failed before `CREATE_CHANNEL` was sent.
+    Connect,
+    /// TCP connected but the server's `CREATE_CHANNEL` response was an
+    /// error (or the circuit dropped mid-create).
+    CreateRefusal,
+}
+
+/// Map a candidate-loop failure to the reconnect holdoff pvxs would apply,
+/// replacing the previous Rust-only `2^n` ladder armed on every failure:
+///
+/// - Connecting-stage TCP failure → fixed 10-bucket reconnect placement
+///   (pvxs client.cpp:156-165 / :206-214).
+/// - searched-channel `CREATE_CHANNEL` refusal → no holdoff; pvxs sets the
+///   channel back to Searching in the current bucket and the ≤1 s ring tick
+///   paces the re-search (clientconn.cpp:368-378).
+/// - direct/forced-server `CREATE_CHANNEL` refusal → fixed holdoff; pvxs
+///   logs and waits for reconnect with no search ring (clientconn.cpp:379-385),
+///   so a fixed delay stands in for "wait for reconnect" and keeps the
+///   pull-driven reconnect caller from hot-spinning where no bucket tick
+///   exists to pace it.
+fn reconnect_holdoff(class: Option<FailureClass>, is_direct: bool) -> Option<std::time::Duration> {
+    match class {
+        Some(FailureClass::Connect) => Some(RECONNECT_HOLDOFF),
+        Some(FailureClass::CreateRefusal) if is_direct => Some(RECONNECT_HOLDOFF),
+        Some(FailureClass::CreateRefusal) => None,
+        // No classified failure (e.g. empty candidate set already returned
+        // earlier) — apply the conservative connect-stage holdoff.
+        None => Some(RECONNECT_HOLDOFF),
+    }
+}
+
 impl Channel {
     pub fn new(
         pv_name: String,
@@ -461,7 +526,6 @@ impl Channel {
             resolver: Resolver::Search(search),
             alternatives: parking_lot::Mutex::new(Vec::new()),
             holdoff_until: parking_lot::Mutex::new(None),
-            connect_fail_count: std::sync::atomic::AtomicU32::new(0),
             server_destroyed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             server_destroyed_notify: Arc::new(Notify::new()),
             last_close_registration: parking_lot::Mutex::new(None),
@@ -494,7 +558,6 @@ impl Channel {
             resolver: Resolver::Direct(addr),
             alternatives: parking_lot::Mutex::new(Vec::new()),
             holdoff_until: parking_lot::Mutex::new(None),
-            connect_fail_count: std::sync::atomic::AtomicU32::new(0),
             server_destroyed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             server_destroyed_notify: Arc::new(Notify::new()),
             last_close_registration: parking_lot::Mutex::new(None),
@@ -772,6 +835,7 @@ impl Channel {
 
         // Try each candidate in order; stash the rest as alternatives.
         let mut last_err: Option<PvaError> = None;
+        let mut last_failure: Option<FailureClass> = None;
         for (idx, server_addr) in candidates.iter().enumerate() {
             self.set_state(ChannelState::Connecting);
             match self
@@ -787,6 +851,7 @@ impl Channel {
             {
                 Err(e) => {
                     last_err = Some(e);
+                    last_failure = Some(FailureClass::Connect);
                     continue;
                 }
                 Ok(server) => match self.do_create_channel(&server).await {
@@ -804,32 +869,29 @@ impl Channel {
                             // ensure_active path can detect it.
                             expected_guid: self.resolver.last_guid_for(server.addr),
                         });
-                        // Successful Active — clear holdoff state so the
-                        // next eventual disconnect starts the backoff
-                        // ladder from scratch instead of inheriting an
-                        // old failure count.
-                        self.connect_fail_count
-                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                        // Successful Active — clear any pending reconnect
+                        // holdoff; the next disconnect re-derives its pacing
+                        // from its own failure class.
                         *self.holdoff_until.lock() = None;
                         return Ok((server, sid));
                     }
                     Err(e) => {
                         last_err = Some(e);
+                        last_failure = Some(FailureClass::CreateRefusal);
                         continue;
                     }
                 },
             }
         }
-        // Every candidate failed (search returned but TCP setup or
-        // CREATE_CHANNEL bounced). Bump the consecutive-failure counter
-        // and arm the holdoff window for the next call.
-        let fails = self
-            .connect_fail_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        let secs = 1u64 << fails.saturating_sub(1).min(4); // 1, 2, 4, 8, 16
+        // Every candidate failed. Pace the next attempt by the pvxs failure
+        // class (see `reconnect_holdoff`) instead of a Rust-only exponential
+        // ladder: a Connecting-stage TCP failure earns the fixed 10-bucket
+        // holdoff, a searched `CREATE_CHANNEL` refusal earns none (the search
+        // ring's ≤1 s tick paces the re-search), and a direct-server refusal
+        // earns the fixed holdoff in lieu of pvxs "wait for reconnect".
+        let is_direct = matches!(self.resolver, Resolver::Direct(_));
         *self.holdoff_until.lock() =
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+            reconnect_holdoff(last_failure, is_direct).map(|d| std::time::Instant::now() + d);
         Err(last_err.unwrap_or_else(|| PvaError::Protocol("connect failed".into())))
     }
 
@@ -841,6 +903,9 @@ impl Channel {
         let prev_reg = self.last_close_registration.lock().take();
         if let Some((old_sid, old_server)) = prev_reg {
             old_server.unregister_sid_close(old_sid);
+            // Drop the old SID's per-channel report counters too — the
+            // channel is leaving that (server, sid) binding.
+            old_server.unregister_channel(old_sid);
         }
 
         // Entering Active: clear the destroyed flag for the fresh SID and
@@ -860,6 +925,10 @@ impl Channel {
                 Arc::clone(&self.server_destroyed),
                 Arc::clone(&self.server_destroyed_notify),
             );
+            // Register the PV name under this SID so the connection can
+            // attribute per-channel byte traffic for `PvaClient::report`
+            // (pvxs `conn->chanBySID`, client.cpp:495).
+            server.register_channel(sid, &self.pv_name);
             *self.last_close_registration.lock() = Some((sid, server.clone()));
             self.has_been_active
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -948,6 +1017,39 @@ mod tests {
             pool,
             addr,
         )
+    }
+
+    /// pvxs reconnect pacing by failure class (client.cpp:156-165,
+    /// clientconn.cpp:368-385): a Connecting-stage TCP failure earns the
+    /// fixed 10-bucket holdoff; a searched `CREATE_CHANNEL` refusal earns
+    /// none (the search ring tick paces it); a direct-server refusal earns
+    /// the fixed holdoff. No exponential ladder across these transitions.
+    #[test]
+    fn reconnect_holdoff_matches_pvxs_failure_classes() {
+        // Connecting-stage TCP failure → fixed 10-bucket holdoff,
+        // independent of whether the resolver is searched or direct.
+        assert_eq!(
+            reconnect_holdoff(Some(FailureClass::Connect), false),
+            Some(RECONNECT_HOLDOFF)
+        );
+        assert_eq!(
+            reconnect_holdoff(Some(FailureClass::Connect), true),
+            Some(RECONNECT_HOLDOFF)
+        );
+        // Searched CREATE_CHANNEL refusal → no holdoff (re-enter the
+        // current search bucket; the ≤1 s ring tick paces the re-search).
+        assert_eq!(
+            reconnect_holdoff(Some(FailureClass::CreateRefusal), false),
+            None
+        );
+        // Direct/forced-server CREATE_CHANNEL refusal → fixed holdoff in
+        // lieu of pvxs "wait for reconnect" (no search ring to pace it).
+        assert_eq!(
+            reconnect_holdoff(Some(FailureClass::CreateRefusal), true),
+            Some(RECONNECT_HOLDOFF)
+        );
+        // No classified failure → conservative connect-stage holdoff.
+        assert_eq!(reconnect_holdoff(None, false), Some(RECONNECT_HOLDOFF));
     }
 
     /// `close()` must route through `set_state` so the SID-close

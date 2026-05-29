@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::net::AsyncUdpV4;
@@ -35,12 +35,15 @@ use tracing::{debug, warn};
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
-    ByteOrder, Command, ControlCommand, PvaHeader, ReadExt, WriteExt, decode_size, decode_string,
-    encode_string_into, ip_from_bytes_allow_unspec,
+    Command, PvaHeader, ReadExt, decode_size, decode_string, ip_from_bytes_allow_unspec,
 };
 
 use super::beacon_throttle::BeaconTracker;
 use super::decode::{PeerRole, decode_search_response, try_parse_frame_role};
+use super::server_conn::{
+    DEFAULT_BUFFER_SIZE, DEFAULT_REGISTRY_SIZE, build_client_connection_validation,
+    read_handshake_init, select_client_auth, wait_for_validated,
+};
 
 /// Search retry intervals in seconds.
 ///
@@ -54,6 +57,13 @@ pub const BACKOFF_SECS: &[u64] = &[1, 1, 2, 5, 10, 15, 30, 60, 120, 210];
 
 /// Default UDP broadcast port for SEARCH/BEACON messages (5076).
 pub const DEFAULT_BROADCAST_PORT: u16 = 5076;
+
+/// Per-frame read deadline for a TCP name-server CONNECTION_VALIDATION
+/// handshake when no client timeout is threaded in (the credential-less
+/// [`SearchEngine::spawn`] path). Bounds a name server that accepts the TCP
+/// connection but never completes the PVA handshake; [`SearchEngine::spawn_with_auth`]
+/// supplies the client's own connection timeout instead.
+const NS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// PR #205 IPv6 Stage 4: default v6 multicast group for PVA SEARCH.
 /// pvxs `udp_collector.cpp` uses `ff0e::400` (organization-local,
@@ -192,9 +202,53 @@ pub struct SearchEngine {
 impl SearchEngine {
     /// Spawn the engine. Returns a handle that channels use to issue
     /// `find()` requests.
+    /// Spawn a search engine without TCP name-server credentials: name-server
+    /// handshakes still select `"ca"` if the server offers it but send empty
+    /// user/host. The public entry point for discovery-only callers that
+    /// configure no name servers (`name_servers` empty → no NS handshake runs).
     pub async fn spawn(
+        extra_targets: Vec<SocketAddr>,
+        name_servers: Vec<SocketAddr>,
+    ) -> PvaResult<Self> {
+        Self::spawn_inner(
+            extra_targets,
+            name_servers,
+            String::new(),
+            String::new(),
+            NS_HANDSHAKE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Spawn with the client's CA credentials for TCP name-server connections,
+    /// so a name-server handshake authenticates as the same user/host as a
+    /// normal server connection. pvxs builds name-server peers with the same
+    /// `Connection::build()` and auth negotiation as ordinary TCP servers and
+    /// only flips `nameserver = true` afterward (client.cpp:674-685); there is
+    /// no separate name-server auth policy.
+    pub async fn spawn_with_auth(
+        extra_targets: Vec<SocketAddr>,
+        name_servers: Vec<SocketAddr>,
+        ns_user: String,
+        ns_host: String,
+        ns_handshake_timeout: Duration,
+    ) -> PvaResult<Self> {
+        Self::spawn_inner(
+            extra_targets,
+            name_servers,
+            ns_user,
+            ns_host,
+            ns_handshake_timeout,
+        )
+        .await
+    }
+
+    async fn spawn_inner(
         mut extra_targets: Vec<SocketAddr>,
         name_servers: Vec<SocketAddr>,
+        ns_user: String,
+        ns_host: String,
+        ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         let beacons = BeaconTracker::new();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>(256);
@@ -312,6 +366,9 @@ impl SearchEngine {
             extra_targets,
             beacons_clone,
             name_servers,
+            ns_user,
+            ns_host,
+            ns_handshake_timeout,
         ));
 
         Ok(Self { cmd_tx, beacons })
@@ -747,6 +804,33 @@ fn cascade_smoothed_next(
     }
 }
 
+/// Single owner of a search's post-send retry decision: returns the
+/// `(next_bucket, next_attempt)` to requeue it with.
+///
+/// pvxs `tickSearch(..., poked)` (client.cpp:1141-1160): on a poked tick (during
+/// the fast poke revolution) `ninc = 0`, so the channel keeps its accumulated
+/// `nSearch` backoff and is requeued into the SAME bucket — because
+/// `current_bucket` has already advanced, it waits for the fast revolution to
+/// wrap rather than becoming a fresh 1-bucket retry. On a normal tick `nSearch`
+/// is incremented first and the channel escalates forward by that count with
+/// cascade smoothing (client.cpp:1193-1206).
+fn rearm_after_send(
+    poked: bool,
+    current_bucket: usize,
+    attempt: u32,
+    bucket_sizes: impl Fn(usize) -> usize,
+) -> (usize, u32) {
+    if poked {
+        (current_bucket, attempt)
+    } else {
+        let next_attempt = attempt.saturating_add(1);
+        (
+            cascade_smoothed_next(current_bucket, next_attempt, bucket_sizes),
+            next_attempt,
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_engine(
     mut cmd_rx: mpsc::Receiver<SearchCommand>,
@@ -757,6 +841,9 @@ async fn run_engine(
     extra_targets: Vec<SocketAddr>,
     beacons: Arc<BeaconTracker>,
     name_servers: Vec<SocketAddr>,
+    ns_user: String,
+    ns_host: String,
+    ns_handshake_timeout: Duration,
 ) {
     static NEXT_SEARCH_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -802,12 +889,31 @@ async fn run_engine(
     // EPICS_PVA_NAME_SERVERS entry. Each ns_task handles connect/reconnect;
     // ns_senders receives SEARCH frame bytes to forward over the connection.
     let (ns_response_tx, mut ns_response_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
-    let mut ns_senders: Vec<mpsc::Sender<Vec<u8>>> = Vec::with_capacity(name_servers.len());
+    let mut ns_senders: Vec<NsHandle> = Vec::with_capacity(name_servers.len());
     for ns_addr in name_servers {
         let (search_tx, search_rx) = mpsc::channel::<Vec<u8>>(64);
-        ns_senders.push(search_tx);
+        // Per-NS readiness gate. pvxs (client.cpp:1221-1225) skips a name
+        // server during a search tick unless `serv->ready && serv->connection()`
+        // are both true, and keeps no disconnected-side queue (client.cpp:1227-1235).
+        // The flag is owned by `ns_task`: false until CONNECTION_VALIDATED, false
+        // again the instant the connection drops. Without it, the bounded channel
+        // buffered up to 64 stale SEARCH frames while the NS was offline or still
+        // handshaking and replayed them as a burst on reconnect.
+        let ready = Arc::new(AtomicBool::new(false));
+        ns_senders.push(NsHandle {
+            tx: search_tx,
+            ready: Arc::clone(&ready),
+        });
         let resp_tx = ns_response_tx.clone();
-        tokio::spawn(ns_task(ns_addr, search_rx, resp_tx));
+        tokio::spawn(ns_task(
+            ns_addr,
+            search_rx,
+            resp_tx,
+            ready,
+            ns_user.clone(),
+            ns_host.clone(),
+            ns_handshake_timeout,
+        ));
     }
 
     let mut tick = interval(Duration::from_secs(1));
@@ -897,15 +1003,7 @@ async fn run_engine(
                             p.last_attempt = Instant::now();
                             let pkt = codec.build_search(0, sid, &p.pv_name, [0,0,0,0], response_port, false);
                             broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
-                            // pvxs client.cpp:1193-1196: also SEARCH over each TCP
-                            // name-server connection. unicast bit=0x80, port=0 (NS
-                            // replies on the same TCP connection).
-                            if !ns_senders.is_empty() {
-                                let ns_pkt = codec.build_search(0, sid, &p.pv_name, [0, 0, 0, 0], 0, true);
-                                for tx in &ns_senders {
-                                    let _ = tx.try_send(ns_pkt.clone());
-                                }
-                            }
+                            ns_search_to_ready(&ns_senders, &codec, sid, &p.pv_name);
                         }
                     }
                 }
@@ -939,12 +1037,7 @@ async fn run_engine(
                             p.last_attempt = Instant::now();
                             let pkt = codec.build_search(0, sid, &p.pv_name, [0,0,0,0], response_port, false);
                             broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
-                            if !ns_senders.is_empty() {
-                                let ns_pkt = codec.build_search(0, sid, &p.pv_name, [0, 0, 0, 0], 0, true);
-                                for tx in &ns_senders {
-                                    let _ = tx.try_send(ns_pkt.clone());
-                                }
-                            }
+                            ns_search_to_ready(&ns_senders, &codec, sid, &p.pv_name);
                         }
                     }
                 }
@@ -975,27 +1068,19 @@ async fn run_engine(
                     // `maybe_poke` grants (not already poking, past the 30 s
                     // holdoff). When granted it switches the tick ring to the
                     // 200 ms fast cadence for one full revolution.
-                    if allow_reconnect
-                        && first_announce
-                        && maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await
-                    {
-                        let now = Instant::now();
-                        for p in pending.values_mut() {
-                            p.last_attempt = now - Duration::from_secs(60);
-                            // Reset `attempt` so the kicked retry re-enters at
-                            // the 1-bucket forward push instead of inheriting
-                            // the prior escalation. NOTE: this is MORE
-                            // aggressive than pvxs `tickSearch` line 1194
-                            // (`if !poked`), which skips the nSearch increment
-                            // for one tick (search re-pushed to SAME bucket).
-                            // Our reset-to-0 means post-poke retries cascade at
-                            // the normal 1, 2, 3, … bucket-forward pattern from
-                            // scratch, giving rapid retransmits during the
-                            // fast-tick window. Acceptable trade for single-
-                            // channel recovery; under mass-disconnect cascades
-                            // it spends more UDP bandwidth than pvxs would.
-                            p.attempt = 0;
-                        }
+                    if allow_reconnect && first_announce {
+                        // pvxs `poke()` (client.cpp:736-759): a fresh server
+                        // identity starts the 200 ms fast search revolution and
+                        // records the poke time — it does NOT touch per-channel
+                        // `nSearch`. The fast cadence sweeps the ring so every
+                        // parked search retransmits within one revolution while
+                        // keeping its accumulated backoff; the tick handler's
+                        // poked branch (client.cpp:1141-1160) skips the `nSearch`
+                        // increment and requeues into the same bucket. The
+                        // previous `attempt = 0` reset turned every pending PV
+                        // into a fresh 1-bucket retry, retransmitting far more
+                        // aggressively than pvxs during mass-disconnect cascades.
+                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
                     }
                     if first_announce {
                         // BeaconObserved is the in-process injection
@@ -1019,29 +1104,30 @@ async fn run_engine(
                     let _ = responder.send(rx);
                 }
                 Some(SearchCommand::HurryUp) => {
-                    // Same effect as a fresh-server beacon, routed through the
-                    // rate-limited `maybe_poke`. pvxs `hurryUp()` calls the
-                    // same `poke()`, so it is equally subject to the 30 s
-                    // holdoff and the skip-while-active guard (poke() even
-                    // logs "Ignoring hurryUp()" when it declines). On grant,
-                    // reset every pending search's retry counter so they all
-                    // retry within ~6 s. SEE NOTE in the BeaconObserved arm
-                    // above — our `attempt = 0` reset is more aggressive than
-                    // pvxs's `poked` semantic (which preserves nSearch and
-                    // just skips the increment for one tick). Tradeoff is
-                    // documented there.
-                    if maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await {
-                        let now = Instant::now();
-                        for p in pending.values_mut() {
-                            p.last_attempt = now - Duration::from_secs(60);
-                            p.attempt = 0;
-                        }
-                    }
+                    // pvxs `hurryUp()` routes through the same rate-limited
+                    // `poke()` (client.cpp:736-759): it is equally subject to the
+                    // 30 s holdoff and the skip-while-active guard. Start the fast
+                    // revolution WITHOUT resetting per-PV backoff: the fast cadence
+                    // retransmits every pending search within ~6 s while preserving
+                    // its `nSearch` state (the tick handler's poked branch skips
+                    // the increment and requeues into the same bucket). The prior
+                    // `attempt = 0` reset was more aggressive than pvxs's poked
+                    // semantic.
+                    maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
                 }
                 Some(SearchCommand::CacheClear { pv_name }) => {
                     // Same drop-the-name path as Cancel, but the name
-                    // is the public identifier.
-                    if let Some(sid) = by_name.remove(&pv_name) {
+                    // is the public identifier. An empty name is a
+                    // wildcard over every pending search, matching pvxs
+                    // cacheClean's `name.empty()` skip-the-filter rule
+                    // (client.cpp:1341-1348).
+                    if pv_name.is_empty() {
+                        by_name.clear();
+                        pending.clear();
+                        for bucket in &mut search_buckets {
+                            bucket.clear();
+                        }
+                    } else if let Some(sid) = by_name.remove(&pv_name) {
                         if let Some(p) = pending.remove(&sid) {
                             search_buckets[p.bucket].retain(|x| *x != sid);
                         }
@@ -1259,6 +1345,14 @@ async fn run_engine(
                 //    to `next+1` (mirrors pvxs `client.cpp:1199-1206`).
                 //    Lets a mass-disconnect spread across two ticks
                 //    instead of one.
+                // pvxs `tickSearch(..., poked)` (client.cpp:1141-1160): a tick
+                // during the fast poke revolution skips the `nSearch++` backoff
+                // increment and requeues each channel into the SAME bucket. Since
+                // `current_bucket` has already advanced, the channel waits for the
+                // fast revolution to wrap rather than becoming a fresh 1-bucket
+                // retry. Preserving `attempt` keeps each search's accumulated
+                // backoff across the poke.
+                let poked = fast_ticks_remaining > 0;
                 let bucket_ids = std::mem::take(&mut search_buckets[current_bucket]);
                 for sid in bucket_ids {
                     let responder_dead = match pending.get(&sid) {
@@ -1302,7 +1396,6 @@ async fn run_engine(
                             }
                         }
                         p.last_attempt = now;
-                        p.attempt = p.attempt.saturating_add(1);
                         codec.build_search(
                             0, sid, &p.pv_name, [0, 0, 0, 0], response_port, false,
                         )
@@ -1310,30 +1403,22 @@ async fn run_engine(
                     if let Some(pkt) = pkt_opt {
                         broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs)
                             .await;
-                        // Re-arm into the escalation bucket. Read
-                        // attempt under a fresh borrow so the closure
-                        // above doesn't have to outlive the
+                        // Re-arm via the single owner of the post-send retry
+                        // decision. Read attempt under a fresh borrow so the
+                        // closure above doesn't have to outlive the
                         // search_buckets borrow we need below.
                         if let Some(p) = pending.get(&sid) {
                             let attempt = p.attempt;
-                            // pvxs client.cpp:1193-1196: TCP name-server SEARCH.
-                            // unicast bit=0x80, port=0 (replies on same TCP connection).
-                            if !ns_senders.is_empty() {
-                                let ns_pkt = codec.build_search(0, sid, &p.pv_name, [0, 0, 0, 0], 0, true);
-                                for tx in &ns_senders {
-                                    let _ = tx.try_send(ns_pkt.clone());
-                                }
-                            }
-                            let bucket_sizes = |idx: usize| search_buckets[idx].len();
-                            let next = cascade_smoothed_next(
-                                current_bucket,
-                                attempt,
-                                bucket_sizes,
-                            );
-                            // Update the pending's bucket BEFORE the
-                            // mutable push so the in-place state and
-                            // the buckets agree if we re-enter.
+                            ns_search_to_ready(&ns_senders, &codec, sid, &p.pv_name);
+                            let (next, next_attempt) = {
+                                let bucket_sizes = |idx: usize| search_buckets[idx].len();
+                                rearm_after_send(poked, current_bucket, attempt, bucket_sizes)
+                            };
+                            // Update the pending's bucket/attempt BEFORE the
+                            // mutable push so the in-place state and the
+                            // buckets agree if we re-enter.
                             if let Some(p) = pending.get_mut(&sid) {
+                                p.attempt = next_attempt;
                                 p.bucket = next;
                             }
                             search_buckets[next].push(sid);
@@ -1398,6 +1483,61 @@ async fn maybe_poke(
     true
 }
 
+/// Build the deduplicated UDP SEARCH destination list for one broadcast
+/// tick.
+///
+/// pvxs sends SEARCH only to the effective address list: the configured
+/// `addressList` (here `extra_targets`, parsed and DNS-resolved once at
+/// `SearchEngine::spawn`) plus auto-added broadcast destinations ONLY when
+/// `EPICS_PVA_AUTO_ADDR_LIST` is enabled. pvxs skips `expandAddrList()`
+/// entirely when `autoAddrList` is false (config.cpp:624-643) and sends
+/// only to `effective.addressList` (client.cpp:601-619) — there is NO
+/// unconditional `255.255.255.255` fallback. So with `AUTO_ADDR_LIST=NO`
+/// and an empty address list this returns an EMPTY list and no SEARCH is
+/// emitted, instead of leaking limited-broadcast traffic onto a LAN the
+/// operator intentionally restricted.
+fn search_targets(
+    bport: u16,
+    auto_addr_list: bool,
+    extra_targets: &[SocketAddr],
+) -> Vec<SocketAddr> {
+    let mut targets: Vec<SocketAddr> = Vec::with_capacity(8);
+
+    // Auto-expansion destinations — gated on AUTO_ADDR_LIST, matching
+    // pvxs's `expandAddrList()` which only runs when autoAddrList is true.
+    if auto_addr_list {
+        // Limited broadcast. pvxs uses per-interface directed broadcasts;
+        // the 255.255.255.255 + per-NIC fanout below is the Rust
+        // cross-NIC equivalent. On multi-NIC hosts (and macOS) the kernel
+        // may not translate 255.255.255.255 to every NIC's per-subnet
+        // broadcast, so we also enumerate each up-non-loopback NIC's IPv4
+        // broadcast address (otherwise local IOCs on `192.168.X.255:5076`
+        // are never reached).
+        targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), bport));
+        for sa in crate::config::env::list_broadcast_addresses(bport) {
+            // The helper appends 255.255.255.255 too — the dedup below
+            // collapses the duplicate.
+            targets.push(sa);
+        }
+        // Zero-config local-IOC convenience: also unicast to 127.0.0.1.
+        // pvxs/EPICS rely on the local IOC also binding the NIC broadcast
+        // addr, which breaks on hosts whose only interface is loopback
+        // (CI containers, isolated VMs). One extra datagram per burst.
+        targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bport));
+    }
+
+    // Explicitly configured / programmatic targets are always sent — they
+    // are the `addressList` itself, present regardless of autoAddrList.
+    for &t in extra_targets {
+        targets.push(t);
+    }
+
+    // Dedup while preserving insertion order.
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|t| seen.insert(*t));
+    targets
+}
+
 async fn broadcast(
     socket: &AsyncUdpV4,
     socket_v6: Option<&Arc<UdpSocket>>,
@@ -1405,56 +1545,15 @@ async fn broadcast(
     extra_targets: &[SocketAddr],
     send_errs: &mut HashSet<SocketAddr>,
 ) {
-    let mut targets: Vec<SocketAddr> = Vec::with_capacity(8);
-
-    // Limited broadcast to default UDP port.
     let bport = std::env::var("EPICS_PVA_BROADCAST_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(DEFAULT_BROADCAST_PORT);
-    targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), bport));
-
-    // pvxs `clientconfig.cpp::expand` parity: when EPICS_PVA_AUTO_ADDR_LIST
-    // is YES (the default), enumerate every up-non-loopback NIC's IPv4
-    // broadcast address and add it to the search target list. Without
-    // this, on multi-NIC hosts (and macOS in particular) we send only
-    // to 255.255.255.255 — which the kernel may not translate to the
-    // NIC's per-subnet broadcast in all cases, so SEARCHes never reach
-    // local IOCs that happen to be listening on `192.168.X.255:5076`.
-    // Symptom: `pvget-rs <PV>` against a local pva-rs server hangs
-    // until first SEARCH timeout while pvxs `pvget` connects fine.
-    if crate::config::env::auto_addr_list_enabled() {
-        for sa in crate::config::env::list_broadcast_addresses(bport) {
-            // The helper appends 255.255.255.255 as a fallback — we
-            // already pushed it above; the post-loop dedup catches it.
-            targets.push(sa);
-        }
-        // Defensive deviation from pvxs: also add `127.0.0.1:port`
-        // explicitly. pvxs and EPICS convention rely on the local IOC
-        // also binding the NIC broadcast addr (so a NIC-broadcast
-        // SEARCH reaches it via `192.168.X.255`). That breaks down on
-        // hosts with no usable NIC (CI containers, isolated dev VMs,
-        // build sandboxes — anywhere `getifaddrs` returns only
-        // loopback). pvxs users hit this and have to set
-        // `EPICS_PVA_ADDR_LIST=127.0.0.1` by hand; we send the extra
-        // unicast unconditionally to make the zero-config local-IOC
-        // workflow work. Cost: one extra UDP datagram per SEARCH
-        // burst — negligible.
-        targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bport));
-    }
-
-    // EPICS_PVA_ADDR_LIST is parsed once at SearchEngine::spawn and
-    // merged into `extra_targets` (with DNS hostnames resolved). Per-
-    // tick re-reading is redundant and would re-pay the DNS cost on
-    // every SEARCH burst.
-    for &t in extra_targets {
-        targets.push(t);
-    }
-
-    // Dedup while preserving insertion order — limited broadcast wins
-    // its slot, NIC broadcasts/extras come after.
-    let mut seen = std::collections::HashSet::new();
-    targets.retain(|t| seen.insert(*t));
+    let targets = search_targets(
+        bport,
+        crate::config::env::auto_addr_list_enabled(),
+        extra_targets,
+    );
 
     for t in targets {
         // Limited broadcast (255.255.255.255) and multicast (224/4)
@@ -1628,15 +1727,18 @@ fn handle_search_response(
         }
         return consumed;
     }
-    // pvxs `client.cpp:849-880` ignores SEARCH_RESPONSE
-    // frames whose `proto != "tcp"`. The Rust UDP search engine
-    // only opens plain TCP connections to resolved servers; a
-    // server advertising a non-tcp transport (tls without an
-    // established trust path, or an experimental scheme) must be
-    // dropped — connecting on plain TCP would fail at handshake.
-    // Accept "tcp" only here. An empty protocol is tolerated for
-    // back-compat with older shims that omit the field.
-    if !resp.protocol.is_empty() && resp.protocol != "tcp" {
+    // pvxs `client.cpp:872-904` drops any found SEARCH_RESPONSE whose
+    // `proto != "tcp"`. The comparison is exact: pvxs's string decoder
+    // can map a null/omitted marker to an empty `std::string`, but that
+    // empty string still fails `proto != "tcp"` (pvaproto.h:392-405,
+    // client.cpp:902-904) — there is no empty-protocol exception for
+    // found=true channel resolution. The Rust UDP search engine only
+    // opens plain TCP connections, so a server that did not advertise
+    // exactly `"tcp"` (empty, a null marker, "tls", or an experimental
+    // scheme) must be dropped rather than dialed on a transport it never
+    // offered. The discovery-pong (found=false) path above is the only
+    // place an empty/other protocol is tolerated, matching pvxs.
+    if resp.protocol != "tcp" {
         return consumed;
     }
     // pvxs procSearchReply (client.cpp:857-863) drops responses whose
@@ -1718,10 +1820,21 @@ fn handle_beacon(
     let Ok(port) = cur.get_u16(order) else {
         return consumed;
     };
-    let proto = decode_string(&mut cur, order)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "tcp".into());
+    // pvxs decodes the BEACON protocol with `from_wire(M, beaconMsg.proto)`
+    // and only invokes the beacon callbacks when the decode buffer is
+    // still good afterward (udp_collector.cpp:464-488). A truncated or
+    // invalid-UTF8 protocol string leaves the buffer bad — that is a
+    // malformed BEACON and must be dropped, NOT coerced to a fabricated
+    // `"tcp"` that enters the tracker and fires a false
+    // `Discovered::Online`. Map the decode outcome to pvxs's `M.good()`:
+    // a decode error drops the beacon; a successfully decoded string
+    // (including the empty/null-marker case, where the buffer stays
+    // good) proceeds with the decoded value verbatim.
+    let proto = match decode_string(&mut cur, order) {
+        Ok(Some(p)) => p,
+        Ok(None) => String::new(),
+        Err(_) => return consumed,
+    };
     let _status_size = decode_size(&mut cur, order).ok();
 
     let mut guid_arr = [0u8; 12];
@@ -1778,27 +1891,70 @@ fn handle_beacon(
 }
 
 fn rewrite_loopback(addr: SocketAddr, peer: SocketAddr) -> SocketAddr {
-    if addr.ip().is_unspecified() || addr.ip().is_loopback() {
-        if !peer.ip().is_loopback() {
-            SocketAddr::new(peer.ip(), addr.port())
-        } else {
-            // PR #205 IPv6 Stage 4: when both ends are loopback, mirror
-            // the peer's family rather than hard-coding `127.0.0.1`.
-            // For a v6 SEARCH that arrived from `[::1]` the resolved
-            // address must stay on `[::1]` so the subsequent TCP
-            // connect targets the v6 listener.
-            let lo = match peer.ip() {
-                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-            };
-            SocketAddr::new(lo, addr.port())
-        }
+    // pvxs `procSearchReply` (client.cpp:851-870) substitutes the
+    // datagram source address ONLY when the advertised server address is
+    // wildcard/unspecified (`serv.isAny()`). An explicit address is taken
+    // verbatim — there is no `is_loopback()` rewrite upstream. Rewriting
+    // an explicit `127.0.0.1` / `::1` would turn a deliberately
+    // loopback-only advertisement into a remote connection attempt that
+    // pvxs never makes, and would diverge the chosen endpoint on hosts
+    // where the peer also listens on the rewritten address.
+    if !addr.ip().is_unspecified() {
+        return addr;
+    }
+    if !peer.ip().is_loopback() {
+        SocketAddr::new(peer.ip(), addr.port())
     } else {
-        addr
+        // PR #205 IPv6 Stage 4: a wildcard advertisement from a loopback
+        // peer resolves to loopback of the peer's family rather than a
+        // hard-coded `127.0.0.1`, so a v6 SEARCH from `[::1]` targets the
+        // v6 listener.
+        let lo = match peer.ip() {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        };
+        SocketAddr::new(lo, addr.port())
     }
 }
 
 // ── TCP name-server tasks ───────────────────────────────────────────────
+
+/// Engine-side handle for one TCP name-server connection.
+///
+/// `ready` is the per-NS readiness gate owned by [`ns_task`]: it is `false`
+/// until the connection reaches CONNECTION_VALIDATED and flips back to `false`
+/// the instant the connection drops. The engine consults it before forwarding
+/// a SEARCH so frames are never buffered across a disconnected/handshaking NS.
+struct NsHandle {
+    tx: mpsc::Sender<Vec<u8>>,
+    ready: Arc<AtomicBool>,
+}
+
+/// Forward the current tick's SEARCH for `sid`/`pv_name` to every name-server
+/// connection that is currently *ready* (validated and connected).
+///
+/// pvxs SEARCHes over each NS connection (client.cpp:1193-1196) but skips any
+/// name server unless `serv->ready && serv->connection()` are both true
+/// (client.cpp:1221-1225), and keeps no disconnected-side queue that is replayed
+/// after reconnect (client.cpp:1227-1235). A not-ready NS is simply skipped for
+/// this tick; the search is retried on a later tick by the normal bucket cadence
+/// once the NS is ready, instead of replaying a stale backlog. The unicast bit
+/// is set and port=0 so the NS replies on the same TCP connection.
+fn ns_search_to_ready(handles: &[NsHandle], codec: &PvaCodec, sid: u32, pv_name: &str) {
+    if handles.iter().all(|h| !h.ready.load(Ordering::SeqCst)) {
+        return;
+    }
+    let pkt = codec.build_search(0, sid, pv_name, [0, 0, 0, 0], 0, true);
+    for ns in handles {
+        if ns.ready.load(Ordering::SeqCst) {
+            // Bounded channel: a `Full` error means the NS writer is
+            // backpressured — pvxs likewise skips a NS whose libevent TX
+            // buffer is already >64 KiB (client.cpp:1227-1235). Drop the
+            // frame for this tick rather than growing an unbounded backlog.
+            let _ = ns.tx.try_send(pkt.clone());
+        }
+    }
+}
 
 /// Long-running task for one EPICS_PVA_NAME_SERVERS entry.
 /// Loops forever: connect, handshake, forward SEARCHes / receive responses,
@@ -1807,11 +1963,29 @@ async fn ns_task(
     ns_addr: SocketAddr,
     mut search_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    ready: Arc<AtomicBool>,
+    user: String,
+    host: String,
+    handshake_timeout: Duration,
 ) {
     // pvxs client.cpp:68: tcpNSCheckInterval = 10s.
     const RECONNECT_INTERVAL: Duration = Duration::from_secs(10);
     loop {
-        if let Err(e) = ns_run_once(ns_addr, &mut search_rx, &response_tx).await {
+        let res = ns_run_once(
+            ns_addr,
+            &mut search_rx,
+            &response_tx,
+            &ready,
+            &user,
+            &host,
+            handshake_timeout,
+        )
+        .await;
+        // Connection is gone: clear readiness immediately so the engine skips
+        // this NS for every tick until the next CONNECTION_VALIDATED, rather
+        // than enqueuing frames into a channel nobody is draining.
+        ready.store(false, Ordering::SeqCst);
+        if let Err(e) = res {
             debug!(
                 target: "epics_pva_rs::client",
                 "NS {ns_addr} disconnected: {e}; reconnecting in {RECONNECT_INTERVAL:?}"
@@ -1827,6 +2001,10 @@ async fn ns_run_once(
     ns_addr: SocketAddr,
     search_rx: &mut mpsc::Receiver<Vec<u8>>,
     response_tx: &mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    ready: &AtomicBool,
+    user: &str,
+    host: &str,
+    handshake_timeout: Duration,
 ) -> std::io::Result<()> {
     let stream = TcpStream::connect(ns_addr).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -1834,79 +2012,42 @@ async fn ns_run_once(
     let mut rx_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
 
-    // ── Handshake: wait for SET_BYTE_ORDER + CONNECTION_VALIDATION request ──
-    let mut byte_order = ByteOrder::Little;
-    loop {
-        let n = reader.read(&mut tmp).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "NS closed during handshake",
-            ));
-        }
-        rx_buf.extend_from_slice(&tmp[..n]);
-        let mut pos = 0;
-        let mut got_validation_req = false;
-        while rx_buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
-            let Ok(hdr) = PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[pos..])) else {
-                break;
-            };
-            let frame_end = pos + PvaHeader::SIZE + hdr.payload_length as usize;
-            if rx_buf.len() < frame_end {
-                break;
-            }
-            if hdr.flags.is_control() {
-                if hdr.command == ControlCommand::SetByteOrder.code() {
-                    byte_order = hdr.flags.byte_order();
-                }
-            } else if hdr.command == Command::ConnectionValidation.code() {
-                got_validation_req = true;
-            }
-            pos = frame_end;
-        }
-        rx_buf.drain(..pos);
-        if got_validation_req {
-            break;
-        }
-    }
+    // CONNECTION_VALIDATION handshake. pvxs builds name-server peers with the
+    // same Connection::build()/auth negotiation as ordinary TCP servers and
+    // only flips `nameserver = true` afterward (client.cpp:674-685); there is
+    // no name-server auth exception (clientconn.cpp:215-263). Reuse the normal
+    // client handshake helpers so the NS sees the same "ca"-preferred user/host
+    // identity a regular server connection presents, instead of forced anonymous.
+    // `None` message cap = pvxs-parity unbounded; the read is deadlined by
+    // `handshake_timeout`.
+    let (byte_order, _server_buf, _server_reg, auth_methods) =
+        read_handshake_init(&mut reader, &mut rx_buf, handshake_timeout, None)
+            .await
+            .map_err(std::io::Error::other)?;
+    let negotiated_auth = select_client_auth(&auth_methods);
+    let reply = build_client_connection_validation(
+        byte_order,
+        DEFAULT_BUFFER_SIZE,
+        DEFAULT_REGISTRY_SIZE,
+        0,
+        negotiated_auth,
+        user,
+        host,
+    );
+    writer.write_all(&reply).await?;
+    wait_for_validated(&mut reader, &mut rx_buf, handshake_timeout, None)
+        .await
+        .map_err(std::io::Error::other)?;
 
-    // ── Send anonymous CONNECTION_VALIDATION reply ───────────────────────────
-    // pvxs clientconn.cpp:163-174: NS only needs SEARCH routing, not channel
-    // ops — anonymous auth is sufficient.
-    writer
-        .write_all(&build_ns_connection_validation(byte_order))
-        .await?;
-
-    // ── Wait for CONNECTION_VALIDATED ────────────────────────────────────────
-    loop {
-        let n = reader.read(&mut tmp).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "NS closed before validated",
-            ));
-        }
-        rx_buf.extend_from_slice(&tmp[..n]);
-        let mut pos = 0;
-        let mut validated = false;
-        while rx_buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
-            let Ok(hdr) = PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[pos..])) else {
-                break;
-            };
-            let frame_end = pos + PvaHeader::SIZE + hdr.payload_length as usize;
-            if rx_buf.len() < frame_end {
-                break;
-            }
-            if !hdr.flags.is_control() && hdr.command == Command::ConnectionValidated.code() {
-                validated = true;
-            }
-            pos = frame_end;
-        }
-        rx_buf.drain(..pos);
-        if validated {
-            break;
-        }
-    }
+    // Discard any SEARCH frames that the engine enqueued while this connection
+    // was down or handshaking. pvxs keeps no disconnected-side queue to replay
+    // (client.cpp:1227-1235); the still-pending searches are re-sent on the next
+    // ready tick by the normal bucket cadence, so replaying a stale backlog would
+    // only generate load for CIDs whose callers may already be gone. Only after
+    // draining do we publish readiness, so the engine never races a frame into
+    // the about-to-be-drained window.
+    while search_rx.try_recv().is_ok() {}
+    ready.store(true, Ordering::SeqCst);
 
     // ── Main loop: forward SEARCH frames out; route SEARCH_RESPONSE back ────
     loop {
@@ -1952,34 +2093,13 @@ async fn ns_run_once(
     }
 }
 
-/// Minimal CONNECTION_VALIDATION payload for anonymous NS connections.
-/// pvxs clientconn.cpp:163-174: buffer_size=1MiB, registry=0x7FFF, QOS=0,
-/// auth="anonymous", null variant (0xFF).
-fn build_ns_connection_validation(order: ByteOrder) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.put_u32(1024 * 1024, order);
-    payload.put_u16(0x7FFF, order);
-    payload.put_u16(0, order);
-    encode_string_into("anonymous", order, &mut payload);
-    payload.push(0xFF); // null variant
-    let h = PvaHeader::application(
-        false,
-        order,
-        Command::ConnectionValidation.code(),
-        payload.len() as u32,
-    );
-    let mut out = Vec::with_capacity(PvaHeader::SIZE + payload.len());
-    h.write_into(&mut out);
-    out.extend_from_slice(&payload);
-    out
-}
-
 #[allow(dead_code)]
 fn _suppress(_: PvaHeader) {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{ByteOrder, ControlCommand, WriteExt, encode_string_into};
     use serial_test::serial;
 
     // ---- maybe_poke rate-limit invariant (pvxs pokeHoldoff, A8-R2-1) ----
@@ -2126,19 +2246,21 @@ mod tests {
         assert_eq!(r, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5075));
     }
 
-    // Extends pvxs `procSearchReply`, which only rewrites `isAny()`. A
-    // pvAccessCPP server bound via `EPICS_PVAS_INTF_ADDR_LIST=127.0.0.1`
-    // emits a literal 127.0.0.1 in its search reply; treat the wire
-    // address as unreliable when the UDP packet came from a non-loopback
-    // peer.
+    // PVA-RS-2026-05-28-123: pvxs `procSearchReply` rewrites ONLY
+    // `isAny()` (wildcard/unspecified) — never an explicit address. An
+    // explicit `127.0.0.1` advertised in a SEARCH_RESPONSE that arrives
+    // from a non-loopback peer must be PRESERVED, not rewritten to the
+    // packet source; rewriting it would dial a remote endpoint pvxs
+    // would not. (This previously asserted the opposite, divergent
+    // behavior.)
     #[test]
-    fn rewrite_loopback_explicit_loopback_overridden_by_remote_peer() {
+    fn rewrite_loopback_explicit_loopback_preserved_from_remote_peer() {
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5075);
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5076);
         let r = rewrite_loopback(a, peer);
         assert_eq!(
-            r,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5075)
+            r, a,
+            "an explicit loopback advertisement must be used verbatim (pvxs parity)"
         );
     }
 
@@ -2249,6 +2371,183 @@ mod tests {
             Ok(Discovered::Online { guid, .. }) => assert_eq!(guid, [0x42u8; 12]),
             other => panic!("expected Discovered::Online for discovery pong, got {other:?}"),
         }
+    }
+
+    /// PVA-RS-2026-05-28-114: a found=true SEARCH_RESPONSE is resolved
+    /// only when its transport protocol is exactly `"tcp"`. pvxs drops
+    /// any other found reply — including an empty/null-marker protocol —
+    /// and keeps searching (client.cpp:872-904). An empty protocol used
+    /// to be tolerated as a back-compat exception, which let a malformed
+    /// or legacy responder satisfy a search and make the client dial a
+    /// plain TCP circuit to an endpoint that never advertised `"tcp"`.
+    #[test]
+    fn found_true_requires_exact_tcp_protocol() {
+        use tokio::sync::oneshot;
+
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
+
+        let make_pending = || -> (HashMap<u32, Pending>, HashMap<String, u32>, oneshot::Receiver<SocketAddr>) {
+            let (tx, rx) = oneshot::channel::<SocketAddr>();
+            let mut pending: HashMap<u32, Pending> = HashMap::new();
+            pending.insert(
+                1,
+                Pending {
+                    pv_name: "dut".into(),
+                    responder: Responder::Single(tx),
+                    last_attempt: Instant::now(),
+                    attempt: 1,
+                    bucket: 0,
+                },
+            );
+            let mut by_name: HashMap<String, u32> = HashMap::new();
+            by_name.insert("dut".into(), 1);
+            (pending, by_name, rx)
+        };
+
+        let found_true = |proto: &str| -> Vec<u8> {
+            crate::server_native::udp::build_search_response_proto(
+                [0x42u8; 12],
+                0,
+                5075,
+                &[1], // non-empty cids ⇒ found byte encodes true
+                ByteOrder::Little,
+                proto,
+            )
+        };
+
+        // `""` here also stands in for the null-string-marker case: the
+        // decoder maps a null marker to an empty protocol, which must
+        // fail the exact `== "tcp"` gate just like a literal empty field.
+        for proto in ["", "tls", "TCP", "udp"] {
+            let (mut pending, mut by_name, _rx) = make_pending();
+            let beacons = BeaconTracker::new();
+            let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+            let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+            let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
+                std::collections::HashSet::new();
+            let mut poke = false;
+            handle_search_response(
+                &found_true(proto),
+                &mut pending,
+                &mut by_name,
+                &beacons,
+                &ignore,
+                &mut subs,
+                &mut announced,
+                &mut poke,
+                peer,
+                false,
+            );
+            assert!(
+                pending.contains_key(&1),
+                "found=true with protocol {proto:?} must be ignored, not resolved"
+            );
+        }
+
+        // Exactly "tcp" resolves the pending channel.
+        let (mut pending, mut by_name, mut rx) = make_pending();
+        let beacons = BeaconTracker::new();
+        let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
+            std::collections::HashSet::new();
+        let mut poke = false;
+        handle_search_response(
+            &found_true("tcp"),
+            &mut pending,
+            &mut by_name,
+            &beacons,
+            &ignore,
+            &mut subs,
+            &mut announced,
+            &mut poke,
+            peer,
+            false,
+        );
+        assert!(
+            !pending.contains_key(&1),
+            "found=true with protocol \"tcp\" must resolve the pending channel"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "the resolver must receive the server address"
+        );
+    }
+
+    /// PVA-RS-2026-05-28-128: a BEACON whose protocol string fails to
+    /// decode (truncated, or invalid UTF-8) is malformed and must be
+    /// dropped — it must NOT enter the beacon tracker, announce the
+    /// server, or emit `Discovered::Online`. pvxs only invokes beacon
+    /// callbacks when the buffer is still good after the protocol decode
+    /// (udp_collector.cpp:464-488). The pre-fix code coerced any decode
+    /// failure to a fabricated `"tcp"` protocol and proceeded.
+    #[test]
+    fn malformed_beacon_protocol_is_dropped() {
+        use crate::proto::{WriteExt, encode_size_into, encode_string_into};
+
+        let order = ByteOrder::Little;
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
+
+        // proto_writer appends the protocol-string region of the payload.
+        let build_beacon = |proto_writer: &dyn Fn(&mut Vec<u8>)| -> Vec<u8> {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&[0x42u8; 12]); // guid
+            payload.put_u8(0); // flags
+            payload.put_u8(0); // seq
+            payload.put_u16(0, order); // change
+            payload.extend_from_slice(&[0u8; 16]); // addr (wildcard → peer)
+            payload.put_u16(5075, order); // port
+            proto_writer(&mut payload);
+            let header =
+                PvaHeader::application(true, order, Command::Beacon.code(), payload.len() as u32);
+            let mut frame = Vec::new();
+            header.write_into(&mut frame);
+            frame.extend_from_slice(&payload);
+            frame
+        };
+
+        let run = |frame: &[u8]| -> (bool, usize) {
+            let beacons = BeaconTracker::new();
+            let mut pending: HashMap<u32, Pending> = HashMap::new();
+            let (tx, mut rx) = mpsc::channel::<Discovered>(8);
+            let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+            let mut announced: std::collections::HashSet<(SocketAddr, [u8; 12])> =
+                std::collections::HashSet::new();
+            let mut poke = false;
+            let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+            handle_beacon(
+                frame,
+                &beacons,
+                &mut pending,
+                &mut subs,
+                &mut announced,
+                &mut poke,
+                &ignore,
+                peer,
+            );
+            (rx.try_recv().is_ok(), announced.len())
+        };
+
+        // Valid "tcp" beacon → announced + Discovered::Online fires.
+        let valid = build_beacon(&|p| encode_string_into("tcp", order, p));
+        let (online, announced) = run(&valid);
+        assert!(online, "valid BEACON must emit Discovered::Online");
+        assert_eq!(announced, 1, "valid BEACON must announce the server once");
+
+        // Truncated protocol: size claims 5 bytes, none follow.
+        let truncated = build_beacon(&|p| encode_size_into(5, order, p));
+        let (online, announced) = run(&truncated);
+        assert!(!online, "truncated-protocol BEACON must not announce");
+        assert_eq!(announced, 0, "truncated-protocol BEACON must be dropped");
+
+        // Invalid UTF-8 protocol payload (0xC3 0x28 is not valid UTF-8).
+        let bad_utf8 = build_beacon(&|p| {
+            encode_size_into(2, order, p);
+            p.extend_from_slice(&[0xC3, 0x28]);
+        });
+        let (online, announced) = run(&bad_utf8);
+        assert!(!online, "invalid-UTF8-protocol BEACON must not announce");
+        assert_eq!(announced, 0, "invalid-UTF8-protocol BEACON must be dropped");
     }
 
     /// pvxs `Channel::disconnect` (client.cpp:213) parity: a
@@ -2373,6 +2672,42 @@ mod tests {
         assert_eq!(
             cascade_smoothed_next(current, attempt, sizes_reverse_overload),
             6,
+        );
+    }
+
+    /// pvxs poke preserves per-channel `nSearch` (client.cpp:1141-1160): a poked
+    /// tick must NOT escalate the backoff. An aged search at `attempt = 7`,
+    /// after a HurryUp/beacon poke, must requeue into the SAME bucket with its
+    /// attempt unchanged — not restart as a fresh 1-bucket retry at attempt 1.
+    #[test]
+    fn rearm_poked_preserves_backoff_and_requeues_same_bucket() {
+        let no_imbalance = |_| 0usize;
+        let current = 5;
+
+        // Poked tick: attempt preserved, requeued into the same bucket
+        // regardless of how large the accumulated backoff is.
+        assert_eq!(
+            rearm_after_send(true, current, 7, no_imbalance),
+            (current, 7),
+            "a poked tick keeps nSearch and requeues into the same bucket"
+        );
+        assert_eq!(
+            rearm_after_send(true, current, 1, no_imbalance),
+            (current, 1),
+            "poked requeue is independent of attempt value"
+        );
+
+        // Normal tick: nSearch increments first, then escalates forward by the
+        // incremented count.
+        assert_eq!(
+            rearm_after_send(false, current, 7, no_imbalance),
+            ((current + 8) % N_SEARCH_BUCKETS, 8),
+            "a normal tick increments nSearch and escalates the bucket"
+        );
+        assert_eq!(
+            rearm_after_send(false, current, 0, no_imbalance),
+            ((current + 1) % N_SEARCH_BUCKETS, 1),
+            "first normal retry escalates one bucket forward"
         );
     }
 
@@ -3156,6 +3491,234 @@ mod tests {
             resolved.ip(),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "resolved IP must be 127.0.0.1 (rewrite_loopback from unspecified)"
+        );
+    }
+
+    /// A TCP name server that advertises `anonymous, ca` must see the client
+    /// select `ca` and send the configured user/host — pvxs negotiates CA on
+    /// name-server connections exactly as on normal servers (clientconn.cpp:215-263),
+    /// rather than forcing anonymous. Captures the client's CONNECTION_VALIDATION
+    /// reply on the mock NS and asserts the negotiated method + credentials.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial(epics_env)]
+    async fn pva_rs_51_tcp_nameserver_selects_ca_with_credentials() {
+        use std::io::Cursor as IoCursor;
+        use tokio::net::TcpListener;
+
+        let ns_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock NS listener bind");
+        let ns_addr = ns_listener.local_addr().unwrap();
+
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+        ]);
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+
+        let ns_handle = tokio::spawn(async move {
+            let (mut stream, _peer) = ns_listener.accept().await.expect("mock NS: accept");
+            let order = ByteOrder::Little;
+
+            // SET_BYTE_ORDER
+            let mut sbo = Vec::with_capacity(PvaHeader::SIZE);
+            PvaHeader::control(true, order, ControlCommand::SetByteOrder.code(), 0)
+                .write_into(&mut sbo);
+            stream.write_all(&sbo).await.expect("mock NS: write SBO");
+
+            // CONNECTION_VALIDATION request advertising both methods.
+            {
+                let mut payload = Vec::new();
+                payload.put_u32(0x10000, order);
+                payload.put_u16(32_767, order);
+                payload.push(2u8); // auth_methods count (size-encoded, < 254)
+                encode_string_into("anonymous", order, &mut payload);
+                encode_string_into("ca", order, &mut payload);
+                let h = PvaHeader::application(
+                    true,
+                    order,
+                    Command::ConnectionValidation.code(),
+                    payload.len() as u32,
+                );
+                let mut frame = Vec::new();
+                h.write_into(&mut frame);
+                frame.extend_from_slice(&payload);
+                stream
+                    .write_all(&frame)
+                    .await
+                    .expect("mock NS: write val req");
+            }
+
+            // Capture the client's CONNECTION_VALIDATION reply payload.
+            let mut buf = Vec::<u8>::new();
+            let mut tmp = [0u8; 4096];
+            let reply_payload = 'capture: loop {
+                let n = stream
+                    .read(&mut tmp)
+                    .await
+                    .expect("mock NS: read val reply");
+                assert!(n > 0, "mock NS: client closed before validation");
+                buf.extend_from_slice(&tmp[..n]);
+                let mut pos = 0usize;
+                while buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
+                    let Ok(hdr) = PvaHeader::decode(&mut IoCursor::new(&buf[pos..])) else {
+                        break;
+                    };
+                    let frame_end = pos + PvaHeader::SIZE + hdr.payload_length as usize;
+                    if buf.len() < frame_end {
+                        break;
+                    }
+                    if !hdr.flags.is_control()
+                        && hdr.command == Command::ConnectionValidation.code()
+                    {
+                        break 'capture buf[pos + PvaHeader::SIZE..frame_end].to_vec();
+                    }
+                    pos = frame_end;
+                }
+            };
+            let _ = reply_tx.send(reply_payload);
+        });
+
+        let _engine = SearchEngine::spawn_with_auth(
+            Vec::new(),
+            vec![ns_addr],
+            "operator".to_string(),
+            "myhost".to_string(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("spawn engine");
+
+        let payload = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("client must send CONNECTION_VALIDATION reply within 5 s")
+            .expect("mock NS captured the reply");
+        ns_handle.abort();
+
+        // Reply layout: buffer_size(4) + registry_size(2) + qos(2) + auth(string).
+        let auth = decode_string(&mut Cursor::new(&payload[8..]), ByteOrder::Little)
+            .expect("decode negotiated auth method")
+            .expect("auth method string present");
+        assert_eq!(
+            auth, "ca",
+            "client must select ca when the NS advertises anonymous, ca"
+        );
+        // The CA variant carries the user/host as string values; assert the
+        // configured credentials appear (distinct from the b\"user\"/b\"host\"
+        // field-name descriptors).
+        assert!(
+            payload.windows(b"operator".len()).any(|w| w == b"operator"),
+            "CA reply must carry the configured user"
+        );
+        assert!(
+            payload.windows(b"myhost".len()).any(|w| w == b"myhost"),
+            "CA reply must carry the configured host"
+        );
+    }
+
+    // ---- search_targets: AUTO_ADDR_LIST gating (pvxs expandAddrList) ----
+
+    /// AUTO_ADDR_LIST=NO with an empty configured address list must yield
+    /// NO destinations — pvxs skips expandAddrList and sends only to the
+    /// (empty) addressList, so no SEARCH is emitted at all. The pre-fix
+    /// code unconditionally pushed 255.255.255.255, leaking broadcast onto
+    /// a LAN the operator intentionally restricted.
+    #[test]
+    fn search_targets_empty_when_auto_off_and_no_extras() {
+        let targets = search_targets(5076, false, &[]);
+        assert!(
+            targets.is_empty(),
+            "AUTO_ADDR_LIST=NO + empty list must emit no broadcast; got {targets:?}"
+        );
+    }
+
+    /// AUTO_ADDR_LIST=NO sends only to the explicitly configured targets,
+    /// never the limited broadcast.
+    #[test]
+    fn search_targets_auto_off_sends_only_configured_extras() {
+        let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
+        let targets = search_targets(5076, false, &[extra]);
+        assert_eq!(targets, vec![extra]);
+        assert!(
+            !targets
+                .iter()
+                .any(|t| matches!(t, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
+            "no limited broadcast may be added when AUTO_ADDR_LIST is off"
+        );
+    }
+
+    /// AUTO_ADDR_LIST=YES (the default) still includes the limited
+    /// broadcast destination, and the configured extras are appended.
+    #[test]
+    fn search_targets_auto_on_includes_limited_broadcast_and_extras() {
+        let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
+        let targets = search_targets(5076, true, &[extra]);
+        assert!(
+            targets.contains(&SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 5076)),
+            "AUTO_ADDR_LIST=YES must add the limited broadcast destination"
+        );
+        assert!(
+            targets.contains(&extra),
+            "configured extras are always included"
+        );
+    }
+
+    // ── TCP name-server readiness gate (no replayed backlog) ────────────────
+
+    #[test]
+    fn ns_search_to_ready_skips_not_ready_and_keeps_no_backlog() {
+        let codec = PvaCodec { big_endian: false };
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let ready = Arc::new(AtomicBool::new(false));
+        let handles = vec![NsHandle {
+            tx,
+            ready: Arc::clone(&ready),
+        }];
+
+        // NS offline/handshaking: ticks far exceeding the channel capacity must
+        // not buffer a single frame, so there is nothing to burst on reconnect.
+        for sid in 0..200u32 {
+            ns_search_to_ready(&handles, &codec, sid, "PV:NS");
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no SEARCH may be queued while the NS is not ready"
+        );
+
+        // NS validated: only the current tick is written, once.
+        ready.store(true, Ordering::SeqCst);
+        ns_search_to_ready(&handles, &codec, 42, "PV:NS");
+        assert!(
+            rx.try_recv().is_ok(),
+            "the current-tick SEARCH is delivered once the NS is ready"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one current-tick frame, no replayed stale backlog"
+        );
+    }
+
+    #[test]
+    fn ns_search_to_ready_targets_only_ready_connections() {
+        let codec = PvaCodec { big_endian: false };
+        let (tx_a, mut rx_a) = mpsc::channel::<Vec<u8>>(64);
+        let (tx_b, mut rx_b) = mpsc::channel::<Vec<u8>>(64);
+        let handles = vec![
+            NsHandle {
+                tx: tx_a,
+                ready: Arc::new(AtomicBool::new(true)),
+            },
+            NsHandle {
+                tx: tx_b,
+                ready: Arc::new(AtomicBool::new(false)),
+            },
+        ];
+        ns_search_to_ready(&handles, &codec, 7, "PV:X");
+        assert!(rx_a.try_recv().is_ok(), "ready NS receives the SEARCH");
+        assert!(
+            rx_b.try_recv().is_err(),
+            "not-ready NS is skipped this tick"
         );
     }
 }

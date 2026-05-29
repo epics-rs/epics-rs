@@ -36,7 +36,47 @@ use crate::pvdata::{
 };
 
 use super::channel::Channel;
-use super::decode::{OpResponse, decode_op_response, decode_op_response_cached};
+use super::decode::{
+    Frame, GetFieldResponse, OpResponse, decode_get_field_response, decode_op_response,
+    decode_op_response_cached,
+};
+use super::server_conn::ServerConn;
+
+/// Decode a one-shot GET/PUT/RPC op-response frame, closing the virtual
+/// circuit on a wire-decode fault.
+///
+/// pvxs treats a malformed op-response body (bad cursor / truncated payload,
+/// `M.fault()`) — or a wrong op-state — as a connection-level protocol
+/// violation and forces `bev.reset()` (`clientget.cpp:456-493`), not a
+/// per-operation error. A non-success `Status` is decoded *successfully*
+/// (it is data, not a fault) and is surfaced per-op by the caller. Closing
+/// here matters because a circuit left alive after a bad frame would carry a
+/// corrupted peer / type-cache state into later ops on the same connection.
+fn decode_op_or_reset(
+    server: &ServerConn,
+    frame: &Frame,
+    introspection: Option<&FieldDesc>,
+) -> PvaResult<OpResponse> {
+    decode_op_response(frame, introspection).inspect_err(|_| server.close())
+}
+
+/// `TypeCache`-threaded variant of [`decode_op_or_reset`] for INIT frames
+/// (0xFD/0xFE marker resolution). Same connection-fatal contract.
+fn decode_op_cached_or_reset(
+    server: &ServerConn,
+    frame: &Frame,
+    introspection: Option<&FieldDesc>,
+    type_cache: &mut crate::pvdata::encode::TypeCache,
+) -> PvaResult<OpResponse> {
+    decode_op_response_cached(frame, introspection, type_cache).inspect_err(|_| server.close())
+}
+
+/// GET_FIELD analog: pvxs resets the circuit on a bad GET_FIELD descriptor
+/// buffer (`clientintrospect.cpp:115-133`). A non-success `Status` decodes
+/// to `Ok` (no introspection) and stays per-op at the caller.
+fn decode_get_field_or_reset(server: &ServerConn, frame: &Frame) -> PvaResult<GetFieldResponse> {
+    decode_get_field_response(frame).inspect_err(|_| server.close())
+}
 
 static NEXT_IOID: AtomicU32 = AtomicU32::new(1);
 fn alloc_ioid() -> u32 {
@@ -249,7 +289,7 @@ async fn op_get_inner(
                     // one.
                     let order = server.byte_order;
                     let dr = codec.build_destroy_request(sid, warm_ioid);
-                    let _ = server.send(dr).await;
+                    let _ = server.send_for_channel(sid, dr).await;
                     server.unregister_ioid(warm_ioid);
                     let _ = order;
                     // Cache stale (server forgot ioid, channel reset, etc.).
@@ -286,13 +326,16 @@ async fn op_get_inner(
     combined.extend_from_slice(&codec.build_get(sid, ioid));
     // Sync send into the unbounded writer queue — no scheduler hop,
     // mirrors CA's `DirectServerWriter::send_frame`.
-    server.send_sync(combined)?;
+    server.send_for_channel_sync(sid, combined)?;
 
     // Receive INIT response
     let init_frame = await_oneshot_frame(rx_init, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected GET INIT, got {other:?}"
@@ -312,7 +355,7 @@ async fn op_get_inner(
     // Receive DATA response (already sent, just waiting for the reply)
     let data_frame = await_oneshot_frame(rx_data, op_timeout).await?;
     let intro_arc = Arc::new(intro);
-    let result = match decode_op_response(&data_frame, Some(&intro_arc))? {
+    let result = match decode_op_or_reset(&server, &data_frame, Some(&intro_arc))? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
                 Ok(((*intro_arc).clone(), d.value))
@@ -325,9 +368,14 @@ async fn op_get_inner(
         // so it decodes to OpResponse::Status. Surface the server status
         // instead of mislabelling it "expected GET data, got Status".
         OpResponse::Status(s) => Err(PvaError::Protocol(format!("GET data: {:?}", s.status))),
-        other => Err(PvaError::Protocol(format!(
-            "expected GET data, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the GET data step == impossible op
+            // state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected GET data, got {other:?}"
+            )))
+        }
     };
 
     // Cache (sid, ioid, intro) so the next default GET on this
@@ -390,12 +438,12 @@ async fn try_warm_get(
     let (tx, rx) = tokio::sync::oneshot::channel();
     *warm.slot.lock() = Some(tx);
     let frame = codec.build_get(warm.sid, warm.ioid);
-    if server.send_sync(frame).is_err() {
+    if server.send_for_channel_sync(warm.sid, frame).is_err() {
         warm.slot.lock().take();
         return Err(PvaError::Protocol("warm GET send failed".into()));
     }
     let data_frame = await_oneshot_frame(rx, op_timeout).await?;
-    match decode_op_response(&data_frame, Some(&warm.intro))? {
+    match decode_op_or_reset(server, &data_frame, Some(&warm.intro))? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
                 Ok(Some((warm.intro.clone(), d.value)))
@@ -433,7 +481,7 @@ pub async fn op_get_field(
     let _ioid_guard = IoidGuard::new(server.clone(), ioid);
 
     let req = codec.build_get_field(sid, ioid, subfield);
-    let send_result = server.send(req).await;
+    let send_result = server.send_for_channel(sid, req).await;
     if send_result.is_err() {
         server.unregister_ioid(ioid);
         return Err(PvaError::Protocol("GET_FIELD send failed".into()));
@@ -441,7 +489,7 @@ pub async fn op_get_field(
     let frame = await_frame(&mut stream, op_timeout).await;
     server.unregister_ioid(ioid);
     let frame = frame?;
-    let resp = super::decode::decode_get_field_response(&frame)?;
+    let resp = decode_get_field_or_reset(&server, &frame)?;
     if !resp.status.is_success() {
         return Err(PvaError::Protocol(format!(
             "GET_FIELD failed: {:?}",
@@ -511,11 +559,14 @@ pub async fn op_put_field(
     let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
@@ -555,10 +606,10 @@ pub async fn op_put_field(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -566,14 +617,19 @@ pub async fn op_put_field(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
@@ -644,11 +700,14 @@ pub async fn op_put_fields(
     let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
@@ -693,10 +752,10 @@ pub async fn op_put_fields(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -704,14 +763,19 @@ pub async fn op_put_fields(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
@@ -743,11 +807,14 @@ pub async fn op_put_field_with_request(
     let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
@@ -784,10 +851,10 @@ pub async fn op_put_field_with_request(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -795,14 +862,19 @@ pub async fn op_put_field_with_request(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
@@ -840,11 +912,14 @@ pub async fn op_put_value_field_with_request(
     let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
@@ -889,10 +964,10 @@ pub async fn op_put_value_field_with_request(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -900,14 +975,19 @@ pub async fn op_put_value_field_with_request(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
@@ -1039,11 +1119,14 @@ pub async fn op_put_value(
     let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
             )));
@@ -1080,10 +1163,10 @@ pub async fn op_put_value(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -1091,14 +1174,19 @@ pub async fn op_put_value(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     result
 }
 
@@ -1124,11 +1212,14 @@ pub async fn op_put_value_raw(
     let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
             )));
@@ -1162,10 +1253,10 @@ pub async fn op_put_value_raw(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -1173,14 +1264,19 @@ pub async fn op_put_value_raw(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     result
 }
 
@@ -1206,11 +1302,14 @@ async fn op_put_inner(
 
     // INIT
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
-    server.send(init_req).await?;
+    server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected PUT INIT, got {other:?}"
@@ -1249,10 +1348,10 @@ async fn op_put_inner(
     let mut frame = Vec::new();
     header.write_into(&mut frame);
     frame.extend_from_slice(&payload);
-    server.send(frame).await?;
+    server.send_for_channel(sid, frame).await?;
 
     let done_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&done_frame, Some(&intro))? {
+    let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
         OpResponse::Status(s) => {
             if s.status.is_success() {
                 Ok(())
@@ -1260,14 +1359,19 @@ async fn op_put_inner(
                 Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
             }
         }
-        other => Err(PvaError::Protocol(format!(
-            "expected PUT done, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the PUT completion step == impossible
+            // op state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected PUT done, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
@@ -1312,30 +1416,52 @@ impl Default for MonitorEventMask {
     }
 }
 
-/// Per-subscription metrics. Mirrors pvxs `SubscriptionStat`
-/// (client.h:166). Values are observable via [`SubscriptionHandle::stats`]
-/// — queue counters reflect the local async pipeline; client-squash
-/// is the count of `MonitorOp::Data` frames the loop coalesced
-/// because the consumer was slower than the network feed.
+/// Per-subscription metrics, mirroring pvxs `SubscriptionStat`
+/// (client.h:165-178).
+///
+/// pvxs's queue fields describe a client-side monitor queue the consumer
+/// pops from (`Subscription::pop()`). This client instead delivers every
+/// update synchronously through the user callback inside the monitor loop,
+/// so there is no pop()-able queue — the pvxs queue fields (`n_queue`,
+/// `n_cli_squash`, `max_queue`) are therefore 0 *by construction*, not
+/// merely unimplemented. The remaining counters are Rust-specific delivery
+/// / ACK telemetry pvxs does not define and are named distinctly so they
+/// are not mistaken for the pvxs queue surface — in particular
+/// `max_events_per_ack` is the ACK-window high-water mark that the previous
+/// `max_queue` field conflated with pvxs `maxQueue`.
 #[derive(Debug, Clone, Default)]
 pub struct SubscriptionStat {
+    // ── pvxs `SubscriptionStat` surface ──
+    /// pvxs `nQueue`: updates currently queued awaiting consumer pop().
+    /// Always 0 — this client has no pop()-able queue (callback delivery).
+    pub n_queue: u32,
+    /// pvxs `nSrvSquash`: count of value updates where the server reported
+    /// at least one update dropped/squashed (overrun bitset non-empty).
+    /// Populated by the decoded monitor loop. The RAW monitor loop forwards
+    /// bytes without decoding the trailing overrun bitset, so raw-handle
+    /// stats leave this 0 (the raw stream still carries the overrun bits to
+    /// the consumer; see `op_monitor_raw*`).
+    pub n_srv_squash: u64,
+    /// pvxs `nCliSquash`: updates dropped due to client queue overflow.
+    /// Always 0 — there is no client queue to overflow.
+    pub n_cli_squash: u64,
+    /// pvxs `maxQueue`: max client queue depth observed. Always 0 (no
+    /// client queue). For the ACK-window high-water mark see
+    /// `max_events_per_ack`.
+    pub max_queue: u32,
+    /// pvxs `limitQueue`: the configured pipeline/queue limit
+    /// (`pipeline_size`). Preserved across `stats(reset)`.
+    pub limit_queue: u32,
+
+    // ── Rust-specific delivery / ACK telemetry (not in pvxs) ──
     /// Total updates delivered to the user callback.
     pub n_delivered: u64,
-    /// Total events dropped due to consumer back-pressure (when the
-    /// callback can't keep up — currently always zero since the user
-    /// callback is synchronous and serial; reserved for future async
-    /// flow control).
-    pub n_cli_squash: u64,
-    /// Number of squash-on-server events reported by the wire (CMD
-    /// MONITOR overrun bitset). pvxs surfaces the same field.
-    pub n_srv_squash: u64,
     /// Number of MONITOR_ACK frames sent (pipelined window cycles).
     pub n_acks: u64,
-    /// Highest events-since-ack value the loop saw. With a healthy
-    /// `pipeline_size` this stays close to `pipeline_size`.
-    pub max_queue: u32,
-    /// Configured `pipeline_size` (call it `limitQueue` in pvxs).
-    pub limit_queue: u32,
+    /// Highest `events_since_ack` value the loop observed between ACKs.
+    /// This is ACK-window telemetry, NOT pvxs `maxQueue`; with a healthy
+    /// `pipeline_size` it stays close to `pipeline_size`.
+    pub max_events_per_ack: u32,
 }
 
 /// Internal shared state — the monitor loop publishes to this on every
@@ -1354,6 +1480,42 @@ struct SubscriptionState {
     paused: std::sync::atomic::AtomicBool,
     stop: std::sync::atomic::AtomicBool,
     stats: parking_lot::Mutex<SubscriptionStat>,
+    /// Wakes a monitor loop that is parked in `stream.recv().await` so a
+    /// cancel issued while no server data is arriving takes effect
+    /// immediately instead of waiting for the next (possibly never)
+    /// frame. `Notify` stores a single permit, so a cancel that races
+    /// ahead of the loop reaching its `select!` is not lost.
+    cancel: tokio::sync::Notify,
+}
+
+impl SubscriptionState {
+    /// Single teardown owner for an active subscription. Mirrors pvxs
+    /// `SubscriptionImpl::_cancel` (clientmon.cpp:295-317): it sets the
+    /// terminal stop flag, atomically takes the live `(server, sid,
+    /// ioid)` triple, sends a best-effort `DESTROY_REQUEST` so the
+    /// server releases the IOID rather than waiting for the TCP circuit
+    /// to die, unregisters the IOID, and finally wakes the monitor loop.
+    ///
+    /// `try_send` (not an awaiting send) is used so this is callable from
+    /// both `Drop` (no async context) and the async cancel paths through
+    /// the same owner. The destroy frame is enqueued to the writer task
+    /// before any caller blocks on the loop — pvxs likewise performs the
+    /// cancel operation before `syncCancel(true)` waits.
+    fn teardown(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let snapshot = self.active.lock().take();
+        if let Some((server, sid, ioid)) = snapshot {
+            let codec = PvaCodec {
+                big_endian: matches!(server.byte_order, ByteOrder::Big),
+            };
+            let _ = server.try_send(codec.build_destroy_request(sid, ioid));
+            server.unregister_ioid(ioid);
+        }
+        // Wake any loop parked in `stream.recv().await`. Even if the loop
+        // has not reached its `select!` yet, `Notify` holds the permit so
+        // the next `notified()` completes at once.
+        self.cancel.notify_one();
+    }
 }
 
 /// User-facing handle returned by [`op_monitor_handle`]. Drops cleanly
@@ -1383,7 +1545,9 @@ impl SubscriptionHandle {
         if let Some((server, sid, ioid)) = snapshot {
             let big_endian = matches!(server.byte_order, ByteOrder::Big);
             let codec = PvaCodec { big_endian };
-            let _ = server.send(codec.build_monitor_pause(sid, ioid)).await;
+            let _ = server
+                .send_for_channel(sid, codec.build_monitor_pause(sid, ioid))
+                .await;
         }
     }
 
@@ -1401,7 +1565,9 @@ impl SubscriptionHandle {
         if let Some((server, sid, ioid)) = snapshot {
             let big_endian = matches!(server.byte_order, ByteOrder::Big);
             let codec = PvaCodec { big_endian };
-            let _ = server.send(codec.build_monitor_resume(sid, ioid)).await;
+            let _ = server
+                .send_for_channel(sid, codec.build_monitor_resume(sid, ioid))
+                .await;
         }
     }
 
@@ -1420,21 +1586,26 @@ impl SubscriptionHandle {
         snap
     }
 
-    /// Signal the inner task to terminate at its next opportunity
-    /// (async — pvxs `syncCancel(false)` analog). Drop alone does not
-    /// stop the task — call this explicitly.
+    /// Signal the inner task to terminate (async — pvxs
+    /// `syncCancel(false)` analog). Routes through the single teardown
+    /// owner so the server-side IOID is released and a loop parked in
+    /// `stream.recv().await` is woken immediately; does not await the
+    /// task. Drop alone does not stop the task — call this explicitly.
     pub fn stop(&self) {
-        self.state
-            .stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.state.teardown();
     }
 
     /// Stop and await termination. pvxs `syncCancel(true)` analog —
     /// once this returns no further callbacks will fire.
+    ///
+    /// The teardown (DESTROY_REQUEST + IOID unregister + loop wake) runs
+    /// **before** awaiting the task, matching pvxs `_cancel`, which
+    /// performs the cancel operation before `syncCancel(true)` blocks
+    /// (clientmon.cpp:295-317, 810-824). Without this the task could be
+    /// parked forever in `stream.recv().await` on an idle monitor and
+    /// the await would never return.
     pub async fn stop_sync(mut self) {
-        self.state
-            .stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.state.teardown();
         if let Some(t) = self.task.take() {
             let _ = t.await;
         }
@@ -1484,25 +1655,16 @@ impl SubscriptionHandle {
 /// stall a runtime worker.
 impl Drop for SubscriptionHandle {
     fn drop(&mut self) {
-        // Cooperative: tell the loop to terminate at its next stop check.
-        self.state
-            .stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        // Server-side teardown: only fire while we still have a live
-        // (server, sid, ioid) triple. Reconnect-gap drops have nothing
-        // to send, which is fine — the next reconnect cycle won't fire
-        // because `stop` is now set.
-        let snapshot = self.state.active.lock().take();
-        if let Some((server, sid, ioid)) = snapshot {
-            let codec = PvaCodec {
-                big_endian: matches!(server.byte_order, ByteOrder::Big),
-            };
-            let frame = codec.build_destroy_request(sid, ioid);
-            let _ = server.try_send(frame);
-            server.unregister_ioid(ioid);
-        }
+        // Route through the single teardown owner: sets stop, takes the
+        // live (server, sid, ioid) triple, sends a best-effort
+        // DESTROY_REQUEST, unregisters the IOID, and wakes the loop.
+        // Reconnect-gap drops have nothing to send (active is None),
+        // which is fine — the next reconnect cycle won't fire because
+        // `stop` is now set. Idempotent, so a drop after `stop_sync`
+        // (which already tore down) is a no-op.
+        self.state.teardown();
         // Don't await/abort the task here — letting it run to a clean
-        // exit on the next `stop` check matches the existing
+        // exit on the woken `select!` matches the existing
         // `stop()`-then-drop semantics. Callers that need synchronous
         // teardown should call `stop_sync().await`.
     }
@@ -1529,7 +1691,9 @@ impl Pauser {
         if let Some((server, sid, ioid)) = snapshot {
             let big_endian = matches!(server.byte_order, ByteOrder::Big);
             let codec = PvaCodec { big_endian };
-            let _ = server.send(codec.build_monitor_pause(sid, ioid)).await;
+            let _ = server
+                .send_for_channel(sid, codec.build_monitor_pause(sid, ioid))
+                .await;
         }
     }
 
@@ -1546,7 +1710,9 @@ impl Pauser {
         if let Some((server, sid, ioid)) = snapshot {
             let big_endian = matches!(server.byte_order, ByteOrder::Big);
             let codec = PvaCodec { big_endian };
-            let _ = server.send(codec.build_monitor_resume(sid, ioid)).await;
+            let _ = server
+                .send_for_channel(sid, codec.build_monitor_resume(sid, ioid))
+                .await;
         }
     }
 }
@@ -1695,6 +1861,7 @@ where
             limit_queue: pipeline_size,
             ..Default::default()
         }),
+        cancel: tokio::sync::Notify::new(),
     });
     let state_for_task = state.clone();
 
@@ -1804,7 +1971,7 @@ where
         (pipeline_size > 0).then_some(pipeline_size),
     );
     server
-        .send(init_req)
+        .send_for_channel(sid, init_req)
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
     let init_frame = stream.recv().await.ok_or(MonitorEnd::ConnectionLost)?;
@@ -1844,7 +2011,7 @@ where
         codec.build_monitor_start(sid, ioid)
     };
     server
-        .send(start)
+        .send_for_channel(sid, start)
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
     if let Some(s) = &state {
@@ -1854,21 +2021,48 @@ where
     loop {
         // Honour stop() — caller dropped the handle or called
         // stop_sync().
-        if let Some(s) = &state {
-            if s.stop.load(std::sync::atomic::Ordering::Relaxed) {
-                server.unregister_ioid(ioid);
-                return Err(MonitorEnd::ChannelClosed);
-            }
-        }
-        let frame = match stream.recv().await {
-            Some(f) => f,
-            None => {
-                server.unregister_ioid(ioid);
-                if let Some(s) = &state {
+        let frame = match &state {
+            // Handle present: race the next frame against an explicit
+            // cancel so a stop issued while no server data is arriving
+            // wakes the loop immediately instead of parking forever on an
+            // idle monitor. pvxs wakes the worker the same way — `_cancel`
+            // runs through `loop.tryInvoke` (clientmon.cpp:810-824).
+            Some(s) => {
+                if s.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    server.unregister_ioid(ioid);
                     s.active.lock().take();
+                    return Err(MonitorEnd::ChannelClosed);
                 }
-                return Err(MonitorEnd::ConnectionLost);
+                tokio::select! {
+                    biased;
+                    _ = s.cancel.notified() => {
+                        // The teardown owner already took `active` and
+                        // unregistered the IOID; both calls are
+                        // idempotent, repeated here so the no-handle path
+                        // and this path converge on the same cleanup.
+                        server.unregister_ioid(ioid);
+                        s.active.lock().take();
+                        return Err(MonitorEnd::ChannelClosed);
+                    }
+                    f = stream.recv() => match f {
+                        Some(f) => f,
+                        None => {
+                            server.unregister_ioid(ioid);
+                            s.active.lock().take();
+                            return Err(MonitorEnd::ConnectionLost);
+                        }
+                    },
+                }
             }
+            // No handle: nothing can cancel this loop, so just await the
+            // next frame.
+            None => match stream.recv().await {
+                Some(f) => f,
+                None => {
+                    server.unregister_ioid(ioid);
+                    return Err(MonitorEnd::ConnectionLost);
+                }
+            },
         };
         // classify the frame through the single control-frame
         // owner. A too-short frame and a FINISH with a missing/malformed
@@ -1919,13 +2113,13 @@ where
             // downstream consumer; the typed `run_monitor_loop` path
             // populates `n_srv_squash`. Adding a full value decode purely
             // to read the overrun would defeat this path's purpose.
-            if events_since_ack > st.max_queue {
-                st.max_queue = events_since_ack;
+            if events_since_ack > st.max_events_per_ack {
+                st.max_events_per_ack = events_since_ack;
             }
         }
         if pipeline_size > 0 && events_since_ack >= ack_threshold(pipeline_size) {
             let ack = codec.build_monitor_ack(sid, ioid, events_since_ack);
-            if server.send(ack).await.is_err() {
+            if server.send_for_channel(sid, ack).await.is_err() {
                 server.unregister_ioid(ioid);
                 return Err(MonitorEnd::ConnectionLost);
             }
@@ -2043,6 +2237,7 @@ where
             limit_queue: pipeline_size,
             ..Default::default()
         }),
+        cancel: tokio::sync::Notify::new(),
     });
     let state_for_task = state.clone();
 
@@ -2241,7 +2436,7 @@ where
         (pipeline_size > 0).then_some(pipeline_size),
     );
     server
-        .send(init_req)
+        .send_for_channel(sid, init_req)
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
     let init_frame = stream.recv().await.ok_or(MonitorEnd::ConnectionLost)?;
@@ -2281,7 +2476,7 @@ where
         codec.build_monitor_start(sid, ioid)
     };
     server
-        .send(start)
+        .send_for_channel(sid, start)
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
 
@@ -2298,21 +2493,48 @@ where
     // the cumulative state pvxs guarantees.
     let mut prior: Option<PvField> = None;
     loop {
-        if let Some(s) = &state {
-            if s.stop.load(std::sync::atomic::Ordering::Relaxed) {
-                server.unregister_ioid(ioid);
-                return Err(MonitorEnd::ChannelClosed);
-            }
-        }
-        let frame = match stream.recv().await {
-            Some(f) => f,
-            None => {
-                server.unregister_ioid(ioid);
-                if let Some(s) = &state {
+        let frame = match &state {
+            // Handle present: race the next frame against an explicit
+            // cancel so a stop issued while no server data is arriving
+            // wakes the loop immediately instead of parking forever on an
+            // idle monitor. pvxs wakes the worker the same way — `_cancel`
+            // runs through `loop.tryInvoke` (clientmon.cpp:810-824).
+            Some(s) => {
+                if s.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    server.unregister_ioid(ioid);
                     s.active.lock().take();
+                    return Err(MonitorEnd::ChannelClosed);
                 }
-                return Err(MonitorEnd::ConnectionLost);
+                tokio::select! {
+                    biased;
+                    _ = s.cancel.notified() => {
+                        // The teardown owner already took `active` and
+                        // unregistered the IOID; both calls are
+                        // idempotent, repeated here so the no-handle path
+                        // and this path converge on the same cleanup.
+                        server.unregister_ioid(ioid);
+                        s.active.lock().take();
+                        return Err(MonitorEnd::ChannelClosed);
+                    }
+                    f = stream.recv() => match f {
+                        Some(f) => f,
+                        None => {
+                            server.unregister_ioid(ioid);
+                            s.active.lock().take();
+                            return Err(MonitorEnd::ConnectionLost);
+                        }
+                    },
+                }
             }
+            // No handle: nothing can cancel this loop, so just await the
+            // next frame.
+            None => match stream.recv().await {
+                Some(f) => f,
+                None => {
+                    server.unregister_ioid(ioid);
+                    return Err(MonitorEnd::ConnectionLost);
+                }
+            },
         };
         match decode_op_response(&frame, Some(&intro)) {
             Ok(OpResponse::Data(d)) => {
@@ -2336,14 +2558,14 @@ where
                     if srv_squash {
                         st.n_srv_squash += 1;
                     }
-                    if events_since_ack > st.max_queue {
-                        st.max_queue = events_since_ack;
+                    if events_since_ack > st.max_events_per_ack {
+                        st.max_events_per_ack = events_since_ack;
                     }
                 }
                 // (d was destructured above when computing `value`.)
                 if pipeline_size > 0 && events_since_ack >= ack_threshold(pipeline_size) {
                     let ack = codec.build_monitor_ack(sid, ioid, events_since_ack);
-                    if server.send(ack).await.is_err() {
+                    if server.send_for_channel(sid, ack).await.is_err() {
                         server.unregister_ioid(ioid);
                         return Err(MonitorEnd::ConnectionLost);
                     }
@@ -2368,10 +2590,39 @@ where
                 }
             }
             Ok(OpResponse::Init(_)) => {
-                // Spurious INIT — ignore.
+                // A second INIT while the monitor is already Running is a
+                // state-machine violation. pvxs accepts only Creating+INIT,
+                // Idle+non-INIT, or Running+non-INIT and resets the
+                // connection otherwise (clientmon.cpp:568-605). Surface it
+                // as fatal — matching the raw path, which classifies
+                // unexpected control frames as `RawMonitorFrameKind::Fatal`
+                // — instead of treating the violation as harmless.
+                server.unregister_ioid(ioid);
+                if let Some(s) = &state {
+                    s.active.lock().take();
+                }
+                return Err(MonitorEnd::Fatal(PvaError::Protocol(
+                    "MONITOR: unexpected second INIT on a running subscription".into(),
+                )));
             }
             Err(e) => {
-                debug!("MONITOR decode error: {e}");
+                // A decode fault on a post-INIT MONITOR frame (truncated
+                // DATA body, missing trailing overrun bitset, malformed
+                // FINISH Status) is a connection-level protocol fault in
+                // pvxs: it logs an invalid MONITOR and resets the
+                // connection (clientmon.cpp:601-605). Surface it as fatal
+                // instead of logging and skipping under the same IOID —
+                // a silent skip also desyncs pipeline ACK accounting (the
+                // skipped frame's credit is never returned), which can
+                // stall a window-limited server. This mirrors the raw
+                // path's `MonitorEnd::Fatal` on a bad classification.
+                server.unregister_ioid(ioid);
+                if let Some(s) = &state {
+                    s.active.lock().take();
+                }
+                return Err(MonitorEnd::Fatal(PvaError::Protocol(format!(
+                    "MONITOR decode error: {e}"
+                ))));
             }
         }
     }
@@ -2409,12 +2660,15 @@ pub async fn op_rpc(
     let mut init_frame = Vec::with_capacity(8 + init.len());
     init_h.write_into(&mut init_frame);
     init_frame.extend_from_slice(&init);
-    server.send(init_frame).await?;
+    server.send_for_channel(sid, init_frame).await?;
 
     let init_resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let init_resp = match decode_op_response(&init_resp_frame, None)? {
+    let init_resp = match decode_op_or_reset(&server, &init_resp_frame, None)? {
         OpResponse::Init(i) => i,
         other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
                 "expected RPC INIT, got {other:?}"
@@ -2443,13 +2697,13 @@ pub async fn op_rpc(
     let mut data_frame = Vec::with_capacity(8 + data.len());
     data_h.write_into(&mut data_frame);
     data_frame.extend_from_slice(&data);
-    server.send(data_frame).await?;
+    server.send_for_channel(sid, data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
     // RPC response carries its own type — `response_intro` from INIT is
     // unused (RPC INIT has no introspection per pvxs).
     let _ = response_intro;
-    let result = match decode_op_response(&resp_frame, None)? {
+    let result = match decode_op_or_reset(&server, &resp_frame, None)? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
                 let desc = d.response_desc.unwrap_or(FieldDesc::Variant);
@@ -2459,14 +2713,19 @@ pub async fn op_rpc(
             }
         }
         OpResponse::Status(s) => Err(PvaError::Protocol(format!("RPC: {:?}", s.status))),
-        other => Err(PvaError::Protocol(format!(
-            "expected RPC data, got {other:?}"
-        ))),
+        other => {
+            // Wrong response kind for the RPC data step == impossible op
+            // state → connection-fatal (pvxs clientget.cpp:456-493).
+            server.close();
+            Err(PvaError::Protocol(format!(
+                "expected RPC data, got {other:?}"
+            )))
+        }
     };
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
@@ -2513,10 +2772,23 @@ pub async fn op_put_get(
     let mut init_frame = Vec::with_capacity(8 + init.len());
     init_h.write_into(&mut init_frame);
     init_frame.extend_from_slice(&init);
-    server.send(init_frame).await?;
+    server.send_for_channel(sid, init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
-    let intro = decode_put_get_init(&init_resp, &mut cache.lock())?;
+    let intro = match decode_put_get_init(&init_resp, &mut cache.lock()) {
+        Ok(Ok(intro)) => intro,
+        Ok(Err(status)) => {
+            server.unregister_ioid(ioid);
+            return Err(PvaError::Protocol(format!(
+                "PUT_GET INIT failed: {status:?}"
+            )));
+        }
+        Err(e) => {
+            // Command/subcommand mismatch or truncated INIT body is fatal.
+            server.close();
+            return Err(e);
+        }
+    };
     ioid_guard.arm_destroy(sid);
 
     // Build the value against the negotiated introspection.
@@ -2541,26 +2813,39 @@ pub async fn op_put_get(
     let mut data_frame = Vec::with_capacity(8 + data.len());
     data_h.write_into(&mut data_frame);
     data_frame.extend_from_slice(&data);
-    server.send(data_frame).await?;
+    server.send_for_channel(sid, data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = decode_put_get_data(&resp_frame, &intro, &mut cache.lock());
+    let result = match decode_put_get_data(&resp_frame, &intro, &mut cache.lock()) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(status)) => Err(PvaError::Protocol(format!("PUT_GET: {status:?}"))),
+        Err(e) => {
+            // Command mismatch or truncated data body is fatal.
+            server.close();
+            Err(e)
+        }
+    };
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result.map(|v| (intro, v))
 }
 
 /// Decode a `PUT_GET` INIT response: `ioid + subcmd + status + putIF +
-/// getIF`. Returns the get-leg introspection (used to encode the put
-/// value and decode the readback). On a non-success status this is an
-/// error.
+/// getIF`. On success returns the get-leg introspection (used to encode
+/// the put value and decode the readback).
+///
+/// The two-level result separates connection-fatal faults from per-op
+/// failures: an outer `Err` (command/subcommand mismatch, truncated body)
+/// is a protocol violation pvxs answers with `bev.reset()`
+/// (clientget.cpp:456-493); an inner `Ok(Err(status))` is a non-success
+/// INIT — a per-operation error the caller surfaces without resetting.
 fn decode_put_get_init(
     frame: &super::decode::Frame,
     type_cache: &mut crate::pvdata::encode::TypeCache,
-) -> PvaResult<FieldDesc> {
+) -> PvaResult<Result<FieldDesc, crate::proto::Status>> {
     if frame.header.command != Command::PutGet.code() {
         return Err(PvaError::Protocol(format!(
             "expected PUT_GET INIT, got command {}",
@@ -2581,9 +2866,7 @@ fn decode_put_get_init(
     let status = crate::proto::Status::decode(&mut cur, order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     if !status.is_success() {
-        return Err(PvaError::Protocol(format!(
-            "PUT_GET INIT failed: {status:?}"
-        )));
+        return Ok(Err(status));
     }
     // putIF then getIF. The put structure is decoded (advancing the
     // cursor + populating the type cache) but the get structure is
@@ -2592,16 +2875,20 @@ fn decode_put_get_init(
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let get_if = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    Ok(get_if)
+    Ok(Ok(get_if))
 }
 
 /// Decode a `PUT_GET` data response: `ioid + subcmd + status + get
 /// bitset + get value`.
+///
+/// Same two-level result as [`decode_put_get_init`]: an outer `Err`
+/// (command mismatch, truncated body) is connection-fatal; an inner
+/// `Ok(Err(status))` is a non-success per-op result.
 fn decode_put_get_data(
     frame: &super::decode::Frame,
     intro: &FieldDesc,
     type_cache: &mut crate::pvdata::encode::TypeCache,
-) -> PvaResult<PvField> {
+) -> PvaResult<Result<PvField, crate::proto::Status>> {
     if frame.header.command != Command::PutGet.code() {
         return Err(PvaError::Protocol(format!(
             "expected PUT_GET data, got command {}",
@@ -2617,17 +2904,34 @@ fn decode_put_get_data(
     let status = crate::proto::Status::decode(&mut cur, order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     if !status.is_success() {
-        return Err(PvaError::Protocol(format!("PUT_GET: {status:?}")));
+        return Ok(Err(status));
     }
     let changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
     let value = crate::pvdata::encode::decode_pv_field_with_bitset_cached(
         intro, &changed, 0, &mut cur, order, type_cache,
     )
     .map_err(|e| PvaError::Decode(e.to_string()))?;
-    Ok(value)
+    Ok(Ok(value))
 }
 
 // ── PROCESS (cmd 16) ────────────────────────────────────────────────────
+
+/// Build a PROCESS INIT frame (`sid + ioid + 0x08 + pvRequest`) carrying
+/// the caller-supplied `pv_req` bytes verbatim. Factored out so the
+/// caller's request can be verified at the wire level (PVA-RS-2026-05-28-62
+/// regression).
+fn build_process_init(sid: u32, ioid: u32, pv_req: &[u8], order: ByteOrder) -> Vec<u8> {
+    let mut init = Vec::with_capacity(9 + pv_req.len());
+    init.put_u32(sid, order);
+    init.put_u32(ioid, order);
+    init.put_u8(QosFlags::INIT);
+    init.extend_from_slice(pv_req);
+    let init_h = PvaHeader::application(false, order, Command::Process.code(), init.len() as u32);
+    let mut init_frame = Vec::with_capacity(8 + init.len());
+    init_h.write_into(&mut init_frame);
+    init_frame.extend_from_slice(&init);
+    init_frame
+}
 
 /// PVA `PROCESS` (cmd 16) — trigger record processing without
 /// transferring a value.
@@ -2638,31 +2942,56 @@ fn decode_put_get_data(
 /// 2. PROCESS (`subcmd 0x00`): no payload; server runs the processing
 ///    hook and replies `status`.
 /// 3. DESTROY (`subcmd 0x10`): release the op.
+///
+/// The empty default request — `[`sentinel_all_fields`]` — matches EPICS
+/// base pvaClient `createProcess("")` (pvaClientChannel.cpp:316-333), whose
+/// parsed empty pvRequest is serialized into PROCESS INIT
+/// (clientContextImpl.cpp:528-536) and handed to the provider's
+/// `createChannelProcess` (responseHandlers.cpp:2556-2561). Use
+/// [`op_process_with_request`] to send a provider-specific request.
 pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResult<()> {
+    op_process_with_request(channel, sentinel_all_fields(), op_timeout).await
+}
+
+/// `op_process` variant that sends a caller-supplied PROCESS pvRequest
+/// (e.g. `record[block=true]` or a provider-specific option set) instead of
+/// the empty default. pvAccess serializes this request on PROCESS INIT and
+/// the provider can inspect it during `createChannelProcess`
+/// (responseHandlers.cpp:2504-2511). Mirrors pvaClient
+/// `PvaClientChannel::createProcess(pvRequest)` (pvaClientProcess.cpp:198-200).
+pub async fn op_process_with_request(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    op_timeout: Duration,
+) -> PvaResult<()> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order;
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
 
-    let pv_req = build_pv_request_value_only(big_endian);
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Process.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
 
     // INIT — `sid + ioid + 0x08 + pvRequest`.
-    let mut init = Vec::with_capacity(9 + pv_req.len());
-    init.put_u32(sid, order);
-    init.put_u32(ioid, order);
-    init.put_u8(QosFlags::INIT);
-    init.extend_from_slice(&pv_req);
-    let init_h = PvaHeader::application(false, order, Command::Process.code(), init.len() as u32);
-    let mut init_frame = Vec::with_capacity(8 + init.len());
-    init_h.write_into(&mut init_frame);
-    init_frame.extend_from_slice(&init);
-    server.send(init_frame).await?;
+    let init_frame = build_process_init(sid, ioid, pv_req, order);
+    server.send_for_channel(sid, init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
-    decode_process_status(&init_resp, QosFlags::INIT)?;
+    let init_status = match decode_process_status(&init_resp) {
+        Ok(s) => s,
+        Err(e) => {
+            // Decode fault / command mismatch on the INIT reply is fatal.
+            server.close();
+            return Err(e);
+        }
+    };
+    if !init_status.is_success() {
+        server.unregister_ioid(ioid);
+        return Err(PvaError::Protocol(format!(
+            "PROCESS INIT failed: {init_status:?}"
+        )));
+    }
     ioid_guard.arm_destroy(sid);
 
     // PROCESS data — `sid + ioid + 0x00`, no payload.
@@ -2674,22 +3003,35 @@ pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResu
     let mut data_frame = Vec::with_capacity(8 + data.len());
     data_h.write_into(&mut data_frame);
     data_frame.extend_from_slice(&data);
-    server.send(data_frame).await?;
+    server.send_for_channel(sid, data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = decode_process_status(&resp_frame, 0x00);
+    let result = match decode_process_status(&resp_frame) {
+        Ok(s) if s.is_success() => Ok(()),
+        Ok(s) => Err(PvaError::Protocol(format!("PROCESS failed: {s:?}"))),
+        Err(e) => {
+            // Decode fault / command mismatch on the done reply is fatal.
+            server.close();
+            Err(e)
+        }
+    };
 
     ioid_guard.disarm();
     let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
+    let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
 }
 
-/// Decode a `PROCESS` response: `ioid + subcmd + status`.
-/// `expected_init` is `QosFlags::INIT` when an INIT reply is expected,
-/// `0x00` for the PROCESS-done reply — only used to label errors.
-fn decode_process_status(frame: &super::decode::Frame, expected_init: u8) -> PvaResult<()> {
+/// Decode a `PROCESS` response: `ioid + subcmd + status`. Returns the
+/// decoded `Status`.
+///
+/// An `Err` from this decoder is always connection-fatal — a command
+/// mismatch or a truncated body is a protocol violation that pvxs answers
+/// with `bev.reset()` (clientget.cpp:456-493). A non-success `Status`
+/// decodes to `Ok`: it is a per-operation result, NOT a fault, so the
+/// caller surfaces it without resetting the circuit.
+fn decode_process_status(frame: &super::decode::Frame) -> PvaResult<crate::proto::Status> {
     if frame.header.command != Command::Process.code() {
         return Err(PvaError::Protocol(format!(
             "expected PROCESS response, got command {}",
@@ -2704,15 +3046,7 @@ fn decode_process_status(frame: &super::decode::Frame, expected_init: u8) -> Pva
     let _subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
     let status = crate::proto::Status::decode(&mut cur, order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    if !status.is_success() {
-        let phase = if expected_init & QosFlags::INIT != 0 {
-            "PROCESS INIT"
-        } else {
-            "PROCESS"
-        };
-        return Err(PvaError::Protocol(format!("{phase} failed: {status:?}")));
-    }
-    Ok(())
+    Ok(status)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -3042,6 +3376,43 @@ mod tests {
     use super::*;
     use crate::pvdata::encode::{decode_pv_field, encode_pv_field};
     use std::io::Cursor;
+
+    /// PVA-RS-2026-05-28-62: the PROCESS INIT frame must carry the
+    /// caller-supplied pvRequest verbatim (after the 9-byte
+    /// `sid + ioid + subcmd` prefix), not a hard-coded `field(value)`
+    /// request. Mirrors pvAccess serializing the stored PROCESS pvRequest
+    /// on INIT (clientContextImpl.cpp:528-536).
+    #[test]
+    fn process_init_embeds_caller_pv_request() {
+        let order = ByteOrder::Little;
+        let sid = 0x11223344u32;
+        let ioid = 0x55667788u32;
+        // A distinctive caller request the value-only default never produces.
+        let pv_req: &[u8] = &[
+            0xFD, 0x09, 0x00, 0x80, 0x01, 0x07, b'r', b'e', b'c', b'o', b'r', b'd', 0x00,
+        ];
+
+        let frame = build_process_init(sid, ioid, pv_req, order);
+        // header (8) + sid (4) + ioid (4) + subcmd (1) = 17-byte prefix.
+        let body = &frame[8..];
+        let mut cur = Cursor::new(body);
+        assert_eq!(cur.get_u32(order).unwrap(), sid);
+        assert_eq!(cur.get_u32(order).unwrap(), ioid);
+        assert_eq!(cur.get_u8().unwrap(), QosFlags::INIT);
+        assert_eq!(
+            &body[9..],
+            pv_req,
+            "PROCESS INIT must contain caller request"
+        );
+
+        // And it must differ from the empty/value-only defaults — i.e. the
+        // request is genuinely caller-controlled, not ignored.
+        let default_frame = build_process_init(sid, ioid, sentinel_all_fields(), order);
+        assert_ne!(frame, default_frame);
+        let value_only = build_pv_request_value_only(false);
+        let value_only_frame = build_process_init(sid, ioid, &value_only, order);
+        assert_ne!(frame, value_only_frame);
+    }
 
     /// Round-trip a built PUT value through encode/decode against its
     /// descriptor — proves the value built by `build_put_value` is
@@ -3513,5 +3884,245 @@ mod tests {
         assert_eq!(ack_threshold(4), 2); // the DEFAULT_PIPELINE_SIZE case
         assert_eq!(ack_threshold(8), 4);
         assert_eq!(ack_threshold(33), 16);
+    }
+
+    fn idle_sub_state() -> Arc<SubscriptionState> {
+        Arc::new(SubscriptionState {
+            active: parking_lot::Mutex::new(None),
+            paused: std::sync::atomic::AtomicBool::new(false),
+            stop: std::sync::atomic::AtomicBool::new(false),
+            stats: parking_lot::Mutex::new(SubscriptionStat::default()),
+            cancel: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Regression for PVA-RS-2026-05-28-46: a monitor loop parked in
+    /// `stream.recv().await` waits on `cancel` via `select!`. The single
+    /// teardown owner must wake it. Model the loop's wait with a task
+    /// that only awaits `cancel.notified()`; `teardown()` must make it
+    /// return promptly instead of hanging forever.
+    #[tokio::test]
+    async fn teardown_wakes_a_parked_monitor_loop() {
+        let state = idle_sub_state();
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            task_state.cancel.notified().await;
+        });
+        // Give the task a chance to reach `.notified().await`.
+        tokio::task::yield_now().await;
+        state.teardown();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("parked loop must wake on teardown, not hang")
+            .expect("loop task panicked");
+        assert!(
+            state.stop.load(std::sync::atomic::Ordering::Relaxed),
+            "teardown must set the terminal stop flag"
+        );
+    }
+
+    /// `Notify` stores a single permit, so a cancel that races ahead of
+    /// the loop reaching its `select!` is not lost: a later `notified()`
+    /// completes immediately. Without this guarantee `stop_sync()` issued
+    /// on a not-yet-parked loop could still hang.
+    #[tokio::test]
+    async fn teardown_before_park_is_not_lost() {
+        let state = idle_sub_state();
+        state.teardown(); // notify_one() with no waiter -> stored permit.
+        tokio::time::timeout(std::time::Duration::from_secs(1), state.cancel.notified())
+            .await
+            .expect("stored cancel permit must satisfy a later notified()");
+    }
+
+    /// `teardown()` is the shared owner for `stop()`, `stop_sync()`, and
+    /// `Drop`; calling it more than once (e.g. `stop_sync` then `Drop`)
+    /// must be a harmless no-op.
+    #[tokio::test]
+    async fn teardown_is_idempotent() {
+        let state = idle_sub_state();
+        state.teardown();
+        state.teardown();
+        assert!(state.stop.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(state.active.lock().is_none());
+    }
+
+    // ── op-response decode-fault → circuit close regressions ─────────────
+    //
+    // pvxs resets the circuit (`bev.reset()`, clientget.cpp:456-493) on a
+    // malformed op-response body or a command/subcommand mismatch, but
+    // delivers a non-success Status to the operation without resetting.
+    // The PUT_GET/PROCESS decoders carry that distinction structurally: an
+    // outer `Err` is connection-fatal (the caller closes the `ServerConn`);
+    // a non-success Status is a per-op result, NOT an `Err`. These tests
+    // lock that split so a later edit cannot fold the two meanings back
+    // together (which is what left the circuit reusable after a bad frame).
+
+    fn scalar_int_struct() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+        }
+    }
+
+    /// PUT_GET INIT: `ioid + subcmd + status [+ putIF + getIF]`.
+    fn put_get_init_frame(
+        order: ByteOrder,
+        status: crate::proto::Status,
+        with_types: bool,
+    ) -> Frame {
+        let mut payload = Vec::new();
+        payload.put_u32(7, order);
+        payload.put_u8(QosFlags::INIT);
+        status.write_into(order, &mut payload);
+        if with_types {
+            let desc = scalar_int_struct();
+            encode_type_desc(&desc, order, &mut payload); // putIF
+            encode_type_desc(&desc, order, &mut payload); // getIF
+        }
+        let header =
+            PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    #[test]
+    fn put_get_init_non_success_status_is_per_op_not_fatal() {
+        let frame = put_get_init_frame(
+            ByteOrder::Little,
+            crate::proto::Status::error("denied"),
+            false,
+        );
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        match decode_put_get_init(&frame, &mut cache) {
+            Ok(Err(s)) => assert!(!s.is_success(), "expected the carried non-success status"),
+            other => panic!("non-success INIT must be per-op Ok(Err(status)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_get_init_success_decodes_get_introspection() {
+        let frame = put_get_init_frame(ByteOrder::Little, crate::proto::Status::ok(), true);
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        match decode_put_get_init(&frame, &mut cache) {
+            Ok(Ok(intro)) => assert!(matches!(intro, FieldDesc::Structure { .. })),
+            other => panic!("successful INIT must yield Ok(Ok(getIF)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_get_init_truncated_status_is_fatal_err() {
+        // ioid + subcmd only — the Status decode runs off the end.
+        let mut frame = put_get_init_frame(ByteOrder::Little, crate::proto::Status::ok(), false);
+        frame.payload.truncate(5); // u32 ioid + u8 subcmd, no status
+        frame.header.payload_length = frame.payload.len() as u32;
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        assert!(
+            decode_put_get_init(&frame, &mut cache).is_err(),
+            "a truncated INIT body must be a connection-fatal Err, not Ok"
+        );
+    }
+
+    #[test]
+    fn put_get_init_wrong_command_is_fatal_err() {
+        let mut frame = put_get_init_frame(ByteOrder::Little, crate::proto::Status::ok(), true);
+        frame.header.command = Command::Get.code(); // command mismatch
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        assert!(
+            decode_put_get_init(&frame, &mut cache).is_err(),
+            "a command mismatch must be a connection-fatal Err"
+        );
+    }
+
+    /// PUT_GET data: `ioid + subcmd + status [+ get bitset + get value]`.
+    fn put_get_data_frame(
+        order: ByteOrder,
+        status: crate::proto::Status,
+        with_value: bool,
+    ) -> Frame {
+        let mut payload = Vec::new();
+        payload.put_u32(7, order);
+        payload.put_u8(0x00);
+        status.write_into(order, &mut payload);
+        if with_value {
+            let desc = scalar_int_struct();
+            let mut changed = BitSet::new();
+            changed.set(desc.bit_for_path("value").unwrap());
+            changed.write_into(order, &mut payload);
+            let value = build_put_value(&desc, "11").unwrap();
+            encode_pv_field_with_bitset(&value, &desc, &changed, 0, order, &mut payload);
+        }
+        let header =
+            PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    #[test]
+    fn put_get_data_non_success_status_is_per_op_not_fatal() {
+        let frame = put_get_data_frame(
+            ByteOrder::Little,
+            crate::proto::Status::error("nope"),
+            false,
+        );
+        let desc = scalar_int_struct();
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        match decode_put_get_data(&frame, &desc, &mut cache) {
+            Ok(Err(s)) => assert!(!s.is_success()),
+            other => panic!("non-success data must be per-op Ok(Err(status)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_get_data_truncated_value_is_fatal_err() {
+        // ok status but the bitset/value never arrive.
+        let frame = put_get_data_frame(ByteOrder::Little, crate::proto::Status::ok(), false);
+        let desc = scalar_int_struct();
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        assert!(
+            decode_put_get_data(&frame, &desc, &mut cache).is_err(),
+            "a truncated successful data body must be a connection-fatal Err"
+        );
+    }
+
+    /// PROCESS response: `ioid + subcmd + status`.
+    fn process_frame(order: ByteOrder, status: crate::proto::Status, full: bool) -> Frame {
+        let mut payload = Vec::new();
+        payload.put_u32(7, order);
+        payload.put_u8(0x00);
+        if full {
+            status.write_into(order, &mut payload);
+        }
+        let header =
+            PvaHeader::application(true, order, Command::Process.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    #[test]
+    fn process_non_success_status_is_per_op_not_fatal() {
+        let frame = process_frame(ByteOrder::Little, crate::proto::Status::error("busy"), true);
+        match decode_process_status(&frame) {
+            Ok(s) => assert!(
+                !s.is_success(),
+                "non-success PROCESS status is data, not Err"
+            ),
+            Err(e) => panic!("non-success PROCESS must decode to Ok(status), got Err({e:?})"),
+        }
+    }
+
+    #[test]
+    fn process_truncated_is_fatal_err() {
+        let frame = process_frame(ByteOrder::Little, crate::proto::Status::ok(), false);
+        assert!(
+            decode_process_status(&frame).is_err(),
+            "a truncated PROCESS body must be a connection-fatal Err"
+        );
+    }
+
+    #[test]
+    fn process_wrong_command_is_fatal_err() {
+        let mut frame = process_frame(ByteOrder::Little, crate::proto::Status::ok(), true);
+        frame.header.command = Command::Get.code();
+        assert!(
+            decode_process_status(&frame).is_err(),
+            "a command mismatch must be a connection-fatal Err"
+        );
     }
 }

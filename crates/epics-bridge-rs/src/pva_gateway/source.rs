@@ -30,7 +30,9 @@ use epics_pva_rs::server_native::source::{
     AccessChecked, ChannelContext, ChannelSource, OpError, WatermarkEvent, WatermarkKind,
 };
 
-use super::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL, DEFAULT_MAX_ENTRIES};
+use super::channel_cache::{
+    CacheStatus, ChannelCache, DEFAULT_CLEANUP_INTERVAL, DEFAULT_MAX_ENTRIES,
+};
 
 /// Raw upstream MONITOR DATA body bytes flowing through the
 /// per-entry broadcast channel. `body` is the wire-format
@@ -682,6 +684,38 @@ impl GatewayChannelSource {
     /// Diagnostic: live subscribe-bridge tasks.
     pub fn live_subscribers(&self) -> usize {
         self.subscriber_count.load(Ordering::Relaxed)
+    }
+
+    /// number of distinct upstream cache layers this source
+    /// owns: the one shared (anonymous-identity) cache plus one per live
+    /// credential. pva2pva reports the live client/cache count separately
+    /// from the channel count (`p2pApp/server.cpp:158-175`), so the
+    /// control surface can tell "many channels on one upstream" apart from
+    /// "many credentialed upstreams" — the old single `cacheSize` counter
+    /// conflated the two (BRIDGE-RS-2026-05-28-77).
+    pub fn upstream_cache_count(&self) -> usize {
+        1 + self.upstream_caches.lock().values().len()
+    }
+
+    /// Per-cache status snapshots across the shared cache AND every
+    /// per-credential upstream cache, for the control `<prefix>:report`
+    /// PV. `per_cache_row_limit` caps the entry rows EACH cache
+    /// contributes so a large multi-tenant gateway cannot produce an
+    /// unbounded report. Mirrors pva2pva's per-client status emission
+    /// (`p2pApp/server.cpp:158-230`), which walks every configured client
+    /// and lists its cached channels rather than collapsing to a single
+    /// global count.
+    pub async fn cache_status(&self, per_cache_row_limit: usize) -> Vec<CacheStatus> {
+        // Clone the per-credential caches out from under the (sync) pool
+        // lock before the async `entry_status` calls, same discipline as
+        // `flush_all_caches` / `total_cached_entry_count`.
+        let per_cred = self.upstream_caches.lock().values();
+        let mut out = Vec::with_capacity(1 + per_cred.len());
+        out.push(self.cache.entry_status(per_cache_row_limit).await);
+        for c in per_cred {
+            out.push(c.entry_status(per_cache_row_limit).await);
+        }
+        out
     }
 
     /// Test accessor: returns the upstream cache that would be

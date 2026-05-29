@@ -14,7 +14,7 @@
 //! | PV | Type | Description |
 //! |----|------|-------------|
 //! | `<prefix>:cacheSize` | Long | Live count of cached upstream entries |
-//! | `<prefix>:upstreamCount` | Long | Alias of cacheSize (pva2pva-compat) |
+//! | `<prefix>:upstreamCount` | Long | Count of upstream cache layers (shared + per-credential), distinct from channel count |
 //! | `<prefix>:liveSubscribers` | Long | Current bridge-task count (downstream sub bridges) |
 //! | `<prefix>:report` | String | Multi-line diagnostic snapshot |
 //!
@@ -173,6 +173,49 @@ impl ControlSource {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
         }
+    }
+
+    /// Per-cache cap on entry rows the `<prefix>:report` PV lists, so a
+    /// gateway proxying tens of thousands of channels cannot produce a
+    /// multi-megabyte report string. Omitted rows are summarized as a
+    /// `(+N more)` tail.
+    const REPORT_ROWS_PER_CACHE: usize = 64;
+
+    /// Build the multi-line `<prefix>:report` snapshot
+    /// (BRIDGE-RS-2026-05-28-77). pva2pva's status RPC walks every
+    /// configured client and lists its cached channels with per-channel
+    /// state (`p2pApp/server.cpp:158-230`); the old single-line report
+    /// collapsed everything to three counters (and aliased
+    /// `upstreamCount` to `cacheSize`), so an operator could not see
+    /// which channels were connected, how many downstream subscribers
+    /// each carried, or whether the idle-eviction loop was running. This
+    /// reproduces the per-channel detail across every tenant and cache
+    /// layer, including the cleaner counters.
+    async fn build_report(&self, cache_size: i64, upstream_count: i64, live_subs: i64) -> String {
+        let mut out = format!(
+            "cacheSize={cache_size} upstreamCount={upstream_count} liveSubscribers={live_subs} tenants={}\n",
+            self.gateway_sources.len()
+        );
+        for (ti, src) in self.gateway_sources.iter().enumerate() {
+            let caches = src.cache_status(Self::REPORT_ROWS_PER_CACHE).await;
+            out.push_str(&format!("tenant[{ti}] caches={}\n", caches.len()));
+            for (ci, cache) in caches.iter().enumerate() {
+                out.push_str(&format!(
+                    "  cache[{ci}] entries={} max={} cleanerRuns={} cleanerRemoved={}\n",
+                    cache.total, cache.max_entries, cache.cleaner_runs, cache.cleaner_removed
+                ));
+                for e in &cache.entries {
+                    out.push_str(&format!(
+                        "    {} connected={} subscribers={} dropPoke={}\n",
+                        e.pv_name, e.connected, e.subscribers, e.drop_poke
+                    ));
+                }
+                if cache.truncated > 0 {
+                    out.push_str(&format!("    (+{} more)\n", cache.truncated));
+                }
+            }
+        }
+        out
     }
 
     /// B6: RPC reply descriptor — an NTScalar Long `value` plus a
@@ -384,20 +427,30 @@ impl ChannelSource for ControlSource {
         // credentialed upstream monitors remain alive
         // (BRIDGE-RS-2026-05-28-73).
         let mut cache_size = 0i64;
+        let mut upstream_count = 0i64;
         let mut live_subs = 0i64;
         for src in &self.gateway_sources {
             cache_size += src.total_cached_entry_count().await as i64;
+            upstream_count += src.upstream_cache_count() as i64;
             live_subs += src.live_subscribers() as i64;
         }
 
-        if name.ends_with(":cacheSize") || name.ends_with(":upstreamCount") {
+        if name.ends_with(":cacheSize") {
             Some(Self::nt_scalar_long(cache_size))
+        } else if name.ends_with(":upstreamCount") {
+            // Distinct from cacheSize: the count of upstream cache layers
+            // (shared + per-credential, summed over tenants), NOT the
+            // channel count. pva2pva reports these separately
+            // (`p2pApp/server.cpp:158-175`); the old alias collapsed them
+            // so an operator could not tell "many channels, one upstream"
+            // from "many credentialed upstreams" (BRIDGE-RS-2026-05-28-77).
+            Some(Self::nt_scalar_long(upstream_count))
         } else if name.ends_with(":liveSubscribers") {
             Some(Self::nt_scalar_long(live_subs))
         } else if name.ends_with(":report") {
-            let report = format!(
-                "cacheSize={cache_size} upstreamCount={cache_size} liveSubscribers={live_subs}"
-            );
+            let report = self
+                .build_report(cache_size, upstream_count, live_subs)
+                .await;
             Some(Self::nt_scalar_string(report))
         } else {
             None
@@ -614,6 +667,16 @@ mod tests {
         }
     }
 
+    fn reply_string(reply: &PvField) -> String {
+        let PvField::Structure(s) = reply else {
+            panic!("reply not a structure");
+        };
+        match s.fields.iter().find(|(n, _)| n == "value") {
+            Some((_, PvField::Scalar(ScalarValue::String(v)))) => v.clone(),
+            _ => panic!("reply has no string value field"),
+        }
+    }
+
     /// Helper: mint an AccessChecked token via an Open gate so tests
     /// can exercise `rpc_checked` without an ACF.
     async fn checked(pv: &str) -> AccessChecked {
@@ -692,6 +755,65 @@ mod tests {
 
         let v = ctrl.get_value("gw:cacheSize").await.expect("cacheSize");
         assert_eq!(reply_value(&v), 0, "drop + flush must empty all tenants");
+    }
+
+    /// BRIDGE-RS-2026-05-28-77: `upstreamCount` must be distinct from
+    /// `cacheSize` (the old code aliased them), and `:report` must carry
+    /// per-channel detail plus the cleaner counters rather than three
+    /// collapsed numbers.
+    #[tokio::test]
+    async fn status_report_distinguishes_upstream_count_and_lists_channels() {
+        let s0 = make_source();
+        let s1 = make_source();
+        // Tenant 0 holds two channels; tenant 1 holds one. Both ride only
+        // their shared cache (no per-credential layer), so there are two
+        // upstream cache layers total but three cached channels.
+        s0.cache().insert_test_entry("A:PV1").await;
+        s0.cache().insert_test_entry("A:PV2").await;
+        s1.cache().insert_test_entry("B:PV1").await;
+        let ctrl = ControlSource::new("gw", s0).with_source(s1);
+
+        let cache_size = reply_value(&ctrl.get_value("gw:cacheSize").await.expect("cacheSize"));
+        let upstream = reply_value(
+            &ctrl
+                .get_value("gw:upstreamCount")
+                .await
+                .expect("upstreamCount"),
+        );
+        assert_eq!(cache_size, 3, "cacheSize counts every cached channel");
+        assert_eq!(
+            upstream, 2,
+            "upstreamCount counts cache layers (one shared per tenant), not channels"
+        );
+        assert_ne!(
+            cache_size, upstream,
+            "upstreamCount must not alias cacheSize"
+        );
+
+        let report = reply_string(&ctrl.get_value("gw:report").await.expect("report"));
+        // Header carries the distinct counters and tenant count.
+        assert!(report.contains("cacheSize=3"), "report header: {report}");
+        assert!(
+            report.contains("upstreamCount=2"),
+            "report header: {report}"
+        );
+        assert!(report.contains("tenants=2"), "report header: {report}");
+        // Per-channel detail for every tenant, not just the first.
+        assert!(report.contains("A:PV1"), "report lists tenant-0 channel");
+        assert!(report.contains("A:PV2"), "report lists tenant-0 channel");
+        assert!(
+            report.contains("B:PV1"),
+            "report lists non-first tenant channel"
+        );
+        // Cleaner counters are exposed (zero before any sweep, but present).
+        assert!(
+            report.contains("cleanerRuns="),
+            "report exposes cleaner counters: {report}"
+        );
+        assert!(
+            report.contains("subscribers="),
+            "report exposes per-channel subscriber count"
+        );
     }
 
     #[tokio::test]

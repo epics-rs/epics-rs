@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -520,6 +521,40 @@ pub struct ChannelCache {
     /// monitor tasks. New inserts past this limit return
     /// `GwError::CacheFull` so the downstream sees a clean error.
     max_entries: usize,
+    /// Lifetime count of cleanup-tick sweeps (pva2pva `cleanerRuns`,
+    /// `p2pApp/chancache.cpp:230-262`). Surfaced in the control status
+    /// report so an operator can confirm the idle-eviction loop is live.
+    cleaner_runs: AtomicU64,
+    /// Lifetime count of entries evicted by the cleanup tick (pva2pva
+    /// `cleanerDust`, same path). Distinguishes "cache shrank because
+    /// idle entries aged out" from "downstream dropped its interest".
+    cleaner_removed: AtomicU64,
+}
+
+/// One cached channel's status row for the control report.
+#[derive(Debug, Clone)]
+pub struct EntryStatus {
+    pub pv_name: String,
+    /// Upstream has delivered ≥1 event (snapshot populated).
+    pub connected: bool,
+    /// Live downstream subscribers across both fan-outs (decoded + raw).
+    pub subscribers: usize,
+    /// Idle-eviction grace bit (lowered by the cleanup tick).
+    pub drop_poke: bool,
+}
+
+/// One cache's status for the control report: cleaner counters plus a
+/// (possibly truncated) list of per-entry rows.
+#[derive(Debug, Clone)]
+pub struct CacheStatus {
+    /// Total cached entries (before any row truncation).
+    pub total: usize,
+    /// Rows omitted from `entries` due to the row cap.
+    pub truncated: usize,
+    pub entries: Vec<EntryStatus>,
+    pub cleaner_runs: u64,
+    pub cleaner_removed: u64,
+    pub max_entries: usize,
 }
 
 impl ChannelCache {
@@ -544,6 +579,8 @@ impl ChannelCache {
             entries: Arc::new(Mutex::new(HashMap::new())),
             cleanup_task: parking_lot::Mutex::new(None),
             max_entries,
+            cleaner_runs: AtomicU64::new(0),
+            cleaner_removed: AtomicU64::new(0),
         });
         let weak = Arc::downgrade(&cache);
         let task = tokio::spawn(async move {
@@ -961,6 +998,7 @@ impl ChannelCache {
     /// `cacheClean::expire`.
     async fn cleanup_tick(&self) {
         let mut map = self.entries.lock().await;
+        let before = map.len();
         map.retain(|_, entry| {
             // Same keep-predicate as the cache-full emergency sweep.
             let retained = entry.is_retained();
@@ -974,6 +1012,13 @@ impl ChannelCache {
             }
             retained
         });
+        // pva2pva bumps `cleanerRuns` every sweep and `cleanerDust` by the
+        // number of evicted entries (`chancache.cpp:230-262`); both surface
+        // in the operator status report. Relaxed is sufficient — these are
+        // monotonic diagnostic counters with no ordering dependency.
+        self.cleaner_runs.fetch_add(1, Ordering::Relaxed);
+        self.cleaner_removed
+            .fetch_add((before - map.len()) as u64, Ordering::Relaxed);
     }
 
     /// Snapshot of cached PV names — used by `ChannelSource::list_pvs`.
@@ -992,6 +1037,48 @@ impl ChannelCache {
     /// (BRIDGE-RS-2026-05-28-26) and for control-status reporting.
     pub fn max_entries(&self) -> usize {
         self.max_entries
+    }
+
+    /// Number of cleanup-tick sweeps run so far (pva2pva `cleanerRuns`).
+    pub fn cleaner_runs(&self) -> u64 {
+        self.cleaner_runs.load(Ordering::Relaxed)
+    }
+
+    /// Total entries evicted by the cleanup tick (pva2pva `cleanerDust`).
+    pub fn cleaner_removed(&self) -> u64 {
+        self.cleaner_removed.load(Ordering::Relaxed)
+    }
+
+    /// Per-entry status snapshot for the control status report
+    /// (BRIDGE-RS-2026-05-28-77). Mirrors the per-channel detail
+    /// pva2pva's `status_client` emits at verbose levels
+    /// (`p2pApp/server.cpp:203-230`): upstream connection state,
+    /// downstream subscriber count, and the idle-eviction grace bit.
+    /// `limit` caps the returned rows so a 50 k-entry cache cannot
+    /// produce a multi-megabyte report PV; the returned `truncated`
+    /// flag reports how many rows were dropped.
+    pub async fn entry_status(&self, limit: usize) -> CacheStatus {
+        let map = self.entries.lock().await;
+        let total = map.len();
+        let mut entries: Vec<EntryStatus> = Vec::with_capacity(total.min(limit));
+        for entry in map.values().take(limit) {
+            entries.push(EntryStatus {
+                pv_name: entry.pv_name.clone(),
+                // "connected" == the upstream has delivered at least one
+                // event (the snapshot is populated) — pva2pva `haveData`.
+                connected: entry.state.read().latest.is_some(),
+                subscribers: entry.tx.receiver_count() + entry.tx_raw.receiver_count(),
+                drop_poke: *entry.drop_poke.lock(),
+            });
+        }
+        CacheStatus {
+            total,
+            truncated: total.saturating_sub(entries.len()),
+            entries,
+            cleaner_runs: self.cleaner_runs(),
+            cleaner_removed: self.cleaner_removed(),
+            max_entries: self.max_entries,
+        }
     }
 
     /// B6: operator-driven cache flush. Drops every cached

@@ -459,6 +459,17 @@ impl SharedPV {
                 "SharedPV already open; close() first".to_string(),
             ));
         }
+        // The seeded value must fit its descriptor — the SAME guard
+        // `try_post_checked`/`put_delta` enforce on every later write.
+        // Without it the first value had weaker invariants than all
+        // subsequent ones, so a startup-only descriptor/value mismatch
+        // could be encoded under the advertised descriptor on the very
+        // first GET / monitor snapshot.
+        if let Err(e) = crate::pvdata::value_matches_descriptor(&initial, &desc) {
+            return Err(crate::error::PvaError::InvalidValue(format!(
+                "SharedPV::open: initial value does not fit descriptor ({e})"
+            )));
+        }
         g.state = PvState::Open {
             desc,
             value: initial,
@@ -1322,6 +1333,53 @@ mod tests {
             .unwrap();
         assert!(pv.is_open());
         assert!(pv.current().is_some());
+    }
+
+    /// Regression: `open()` must enforce the same descriptor/value guard
+    /// every later post does — a scalar-type mismatch is rejected and the
+    /// PV stays Closed, so a startup-only mismatch cannot be encoded under
+    /// the advertised descriptor on the first GET. The same value also
+    /// fails identically through `try_post_checked`.
+    #[test]
+    fn shared_pv_open_rejects_descriptor_value_type_mismatch() {
+        // Descriptor says NTScalar<Double>, value is NTScalar<Int>.
+        let double_desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let double_value = || {
+            let mut s = crate::pvdata::PvStructure::new("epics:nt/NTScalar:1.0");
+            s.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+            PvField::Structure(s)
+        };
+        let pv = SharedPV::new();
+        let err = pv
+            .open(double_desc.clone(), nt_scalar_int_value(42))
+            .expect_err("type mismatch must be rejected");
+        assert!(matches!(err, crate::error::PvaError::InvalidValue(_)));
+        assert!(!pv.is_open(), "PV must stay Closed after a rejected open");
+
+        // The same mismatch fails identically on the post path once the
+        // PV is correctly opened with a matching Double value.
+        let pv2 = SharedPV::build_mailbox();
+        pv2.open(double_desc, double_value()).unwrap();
+        assert!(pv2.try_post_checked(nt_scalar_int_value(42)).is_err());
+    }
+
+    /// A `Variant` ("any") root is a deliberate Rust generalization for
+    /// generic RPC-method slots (the service framework registers each
+    /// method as a SharedPV opened with `FieldDesc::Variant`). Unlike
+    /// pvxs's Struct-only root, it is accepted — but the seeded value
+    /// must still fit the descriptor, so `Null` (an unset `any`) opens
+    /// while a concrete value that the variant cannot faithfully carry
+    /// does not.
+    #[test]
+    fn shared_pv_open_accepts_variant_root_with_null_value() {
+        let pv = SharedPV::new();
+        pv.open(FieldDesc::Variant, PvField::Null)
+            .expect("variant root with null value must open");
+        assert!(pv.is_open());
     }
 
     #[tokio::test]

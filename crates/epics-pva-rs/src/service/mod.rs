@@ -44,7 +44,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::pvdata::{FieldDesc, PvField, PvStructure};
+use crate::pvdata::{FieldDesc, PvField};
 
 pub mod types;
 
@@ -151,13 +151,15 @@ pub fn add_rpc_service<S: PvaService>(
         // Open with a generic Variant descriptor so any struct
         // can flow in/out of this RPC slot. Concrete responses
         // carry their own descriptor (encoded by the framework).
+        // The slot has no concrete current value yet — seed it with a
+        // null `any` so the value is consistent with the Variant root
+        // (open() now enforces value_matches_descriptor; a placeholder
+        // NTRPC struct under a Variant descriptor is exactly the
+        // descriptor/value mismatch that guard rejects).
         // Freshly constructed PV: this is the only open() and cannot
         // collide with a prior one, so the close()-first guard never trips.
-        pv.open(
-            FieldDesc::Variant,
-            PvField::Structure(PvStructure::new("epics:nt/NTRPC:1.0")),
-        )
-        .expect("freshly built service PV opens");
+        pv.open(FieldDesc::Variant, PvField::Null)
+            .expect("freshly built service PV opens");
         let dispatch = method.dispatch.clone();
         // Use the async on_rpc variant so dispatch runs on the
         // calling task's runtime — no `block_in_place` (which

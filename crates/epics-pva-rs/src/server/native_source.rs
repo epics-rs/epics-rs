@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::client_native::context::PvGetResult; // not used; kept for re-export hygiene
-use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 use crate::server_native::{ChannelSource, OpError};
 
 use epics_base_rs::server::access_security::AccessSecurityConfig;
@@ -830,12 +830,52 @@ fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
         PvField::ScalarArray(items) => scalar_array_to_epics(items),
         // the PVA wire decoder delivers a decoded scalar array
         // as the refcount-shared `ScalarArrayTyped` form, not the
-        // generic `ScalarArray`. The earlier arm only matched
-        // `ScalarArray`, so a real wire `ulong[]` (or any typed
-        // array) PUT fell through to `None` and was rejected. Route
-        // the typed form through the same converter.
-        PvField::ScalarArrayTyped(t) => scalar_array_to_epics(&t.to_scalar_values()),
+        // generic `ScalarArray`. Convert it directly from the typed
+        // variant — never erase the element tag through
+        // `to_scalar_values()` first. The earlier code did exactly
+        // that and then recovered the type from the slice's first
+        // element, so an empty typed array (`double[] {}`, `string[]
+        // {}`) lost its type and was rejected, even though
+        // `TypedScalarArray` still carries its `ScalarType` at length
+        // zero. A PVA client could therefore not clear a waveform by
+        // PUTing an empty typed array. pvxs encodes/decodes scalar
+        // arrays by descriptor type, not by inspecting the first
+        // element (`dataencode.cpp:315-352`), so a zero-length typed
+        // array keeps its element type.
+        PvField::ScalarArrayTyped(t) => Some(typed_array_to_epics(t)),
         _ => None,
+    }
+}
+
+/// Convert a wire-decoded [`TypedScalarArray`] directly to the matching
+/// [`EpicsValue`] array, preserving the element type at every length
+/// (including zero). The per-variant element mapping mirrors
+/// [`scalar_to_epics`] exactly, so a typed array and a scalar of the
+/// same PVA type land in the same `EpicsValue` family — there is no
+/// length boundary where the rule changes.
+fn typed_array_to_epics(t: &TypedScalarArray) -> EpicsValue {
+    match t {
+        TypedScalarArray::Double(a) => EpicsValue::DoubleArray(a.to_vec()),
+        TypedScalarArray::Float(a) => EpicsValue::FloatArray(a.to_vec()),
+        TypedScalarArray::Int(a) => EpicsValue::LongArray(a.to_vec()),
+        TypedScalarArray::Long(a) => EpicsValue::Int64Array(a.to_vec()),
+        // PVA `uint`/`uint[]` carries the full `epicsUInt32` range; the
+        // Rust value model has no unsigned-32 scalar, so `Int64Array`
+        // is the lossless carrier (same rule as the scalar `UInt` arm).
+        TypedScalarArray::UInt(a) => EpicsValue::Int64Array(a.iter().map(|x| *x as i64).collect()),
+        // PVA `ulong[]` → `UInt64Array` keeps the full unsigned 64-bit width.
+        TypedScalarArray::ULong(a) => EpicsValue::UInt64Array(a.to_vec()),
+        TypedScalarArray::Short(a) => EpicsValue::ShortArray(a.to_vec()),
+        // Byte/UByte → Char (bit-preserving), UShort/Boolean → Enum —
+        // the same element rules `scalar_to_epics` applies to the
+        // corresponding scalars.
+        TypedScalarArray::Byte(a) => EpicsValue::CharArray(a.iter().map(|x| *x as u8).collect()),
+        TypedScalarArray::UByte(a) => EpicsValue::CharArray(a.to_vec()),
+        TypedScalarArray::UShort(a) => EpicsValue::EnumArray(a.to_vec()),
+        TypedScalarArray::Boolean(a) => {
+            EpicsValue::EnumArray(a.iter().map(|b| u16::from(*b)).collect())
+        }
+        TypedScalarArray::String(a) => EpicsValue::StringArray(a.to_vec()),
     }
 }
 
@@ -1827,6 +1867,102 @@ ASG(LOCKED) {
             snap.value,
             EpicsValue::Int64Array(values.iter().map(|v| i64::from(*v)).collect()),
             "wire-decoded uint[] PUT must round-trip the full epicsUInt32 elements, got {:?}",
+            snap.value,
+        );
+    }
+
+    /// PVA-04 regression: a wire-decoded *empty* typed scalar array must
+    /// PUT successfully and clear the waveform. Pre-fix the typed array
+    /// was erased to `Vec<ScalarValue>` and its element type recovered
+    /// from `items[0]`; an empty slice has no first element, so the PUT
+    /// was rejected before the database could set NORD to zero. The
+    /// element type now comes from the `TypedScalarArray` tag, which is
+    /// present at length zero. Covers `double[]`, `string[]`, and an
+    /// integer array per the finding.
+    #[tokio::test]
+    async fn pva_04_empty_typed_double_array_put_clears_waveform() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "EMPTY:DBL",
+            Box::new(WaveformRecord::new(4, DbFieldType::Double)),
+        )
+        .await
+        .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::Double(Arc::from([] as [f64; 0])));
+        source
+            .put_value_ctx("EMPTY:DBL", put, make_ctx("h", "anyone", "anonymous"))
+            .await
+            .expect("empty double[] PUT must be accepted, not rejected");
+
+        let snap = snapshot_for(&db, "EMPTY:DBL").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::DoubleArray(vec![]),
+            "empty double[] PUT must clear the waveform to zero elements, got {:?}",
+            snap.value,
+        );
+    }
+
+    #[tokio::test]
+    async fn pva_04_empty_typed_string_array_put_accepted() {
+        // `WaveformRecord` has no DBF_STRING storage, so a string array
+        // lives on a simple PV, which stores the value verbatim and thus
+        // isolates the source-layer typed-array conversion under test.
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv(
+            "EMPTY:STR",
+            EpicsValue::StringArray(vec!["seed".into(), "other".into()]),
+        )
+        .await
+        .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::String(Arc::from([] as [String; 0])));
+        source
+            .put_value_ctx("EMPTY:STR", put, make_ctx("h", "anyone", "anonymous"))
+            .await
+            .expect("empty string[] PUT must be accepted, not rejected");
+
+        let snap = snapshot_for(&db, "EMPTY:STR").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::StringArray(vec![]),
+            "empty string[] PUT must store zero string elements, got {:?}",
+            snap.value,
+        );
+    }
+
+    #[tokio::test]
+    async fn pva_04_empty_typed_int_array_put_clears_waveform() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "EMPTY:INT",
+            Box::new(WaveformRecord::new(4, DbFieldType::Long)),
+        )
+        .await
+        .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+
+        // PVA `int` (i32) → `EpicsValue::LongArray` (the i32 array family).
+        let put = PvField::ScalarArrayTyped(TypedScalarArray::Int(Arc::from([] as [i32; 0])));
+        source
+            .put_value_ctx("EMPTY:INT", put, make_ctx("h", "anyone", "anonymous"))
+            .await
+            .expect("empty int[] PUT must be accepted, not rejected");
+
+        let snap = snapshot_for(&db, "EMPTY:INT").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::LongArray(vec![]),
+            "empty int[] PUT must clear the waveform to zero elements, got {:?}",
             snap.value,
         );
     }

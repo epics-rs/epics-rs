@@ -272,6 +272,24 @@ pub trait ChannelSource: Send + Sync + 'static {
         OPEN_GATE.get_or_init(AccessGate::open)
     }
 
+    /// Monotonic counter of source-registry topology changes, mirroring
+    /// pvxs `Server::pvt->beaconChange` (server.cpp:90-115). pvxs bumps
+    /// this on every `addSource`/`removeSource`/`addPV`/`removePV` and
+    /// writes it into every BEACON frame (server.cpp:751-767), so a
+    /// client can detect a server-side registry change even when the
+    /// enumerated PV-name set is unchanged (a source replaced by another
+    /// serving the same names, or a priority change).
+    ///
+    /// Default `0` for leaf sources whose registry never changes; the
+    /// registry owner ([`crate::server_native::CompositeSource`])
+    /// overrides this to return its live counter. The beacon task folds
+    /// this into the beacon `change_count`, keeping the PV-set hash only
+    /// as a fallback for sources that mutate their own list without
+    /// going through a registry mutation API.
+    fn beacon_change(&self) -> u64 {
+        0
+    }
+
     /// Enumerate every PV name this source can serve.
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send;
 
@@ -291,6 +309,28 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// this to return `false`.
     fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
         self.has_pv(name)
+    }
+
+    /// True iff `name` should be answered to a SEARCH from `requester`.
+    ///
+    /// pvxs exposes the requester endpoint to a source's `onSearch` as
+    /// [`Search::source()`] — filled from `msg.replyDest` for UDP
+    /// (server.cpp:674-704) and from the established TCP peer for
+    /// circuit search (serverchan.cpp:197-222) — so a source can scope
+    /// advertisement by requester (claim a PV only for a local subnet,
+    /// hide private aliases from some peers, pick a redirect policy that
+    /// depends on the client endpoint).
+    ///
+    /// Default ignores the endpoint and defers to [`Self::searchable`],
+    /// so simple sources keep answering every requester the same way.
+    /// A source that wants endpoint-scoped advertisement overrides this.
+    fn searchable_from(
+        &self,
+        name: &str,
+        requester: SocketAddr,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        let _ = requester;
+        self.searchable(name)
     }
 
     /// Fetch the type descriptor for a PV (used by GET-INIT and GET_FIELD).
@@ -970,6 +1010,12 @@ pub trait ChannelSourceObj: Send + Sync {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    /// Dyn forwarder for [`ChannelSource::searchable_from`].
+    fn searchable_from<'a>(
+        &'a self,
+        name: &'a str,
+        requester: SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     fn get_introspection<'a>(
         &'a self,
         name: &'a str,
@@ -1004,6 +1050,8 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>>;
     /// Per-source access gate. Dyn forwarder.
     fn access_gate(&self) -> &AccessGate;
+    /// Source-registry beacon-change counter. Dyn forwarder.
+    fn beacon_change(&self) -> u64;
     /// Monitor reload revalidation owner.
     fn revalidate_read<'a>(
         &'a self,
@@ -1150,6 +1198,15 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::searchable(self, name))
     }
+    fn searchable_from<'a>(
+        &'a self,
+        name: &'a str,
+        requester: SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::searchable_from(
+            self, name, requester,
+        ))
+    }
     fn get_introspection<'a>(
         &'a self,
         name: &'a str,
@@ -1196,6 +1253,9 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn access_gate(&self) -> &AccessGate {
         <Self as ChannelSource>::access(self)
+    }
+    fn beacon_change(&self) -> u64 {
+        <Self as ChannelSource>::beacon_change(self)
     }
     fn revalidate_read<'a>(
         &'a self,

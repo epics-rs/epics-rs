@@ -118,8 +118,9 @@ async fn rpc_channels_lists_hosted_pvs() {
     drop(server);
 }
 
-/// `op=info` returns the server-info structure with a GUID, a version
-/// string equal to the crate version, and `implLang = rust`.
+/// `op=info` returns a bare structure with exactly `version` and
+/// `implLang = rust` — pvxs `ServerSource::info` (serversource.cpp:19-22)
+/// carries only `implLang` + `version`, no guid/peer/channel counters.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rpc_info_returns_server_identity() {
     let (server, client) = server_with_two_pvs();
@@ -137,12 +138,6 @@ async fn rpc_info_returns_server_identity() {
         PvField::Structure(s) => s,
         other => panic!("unexpected info wrapper: {other:?}"),
     };
-    match s.get_field("guid") {
-        Some(PvField::Scalar(ScalarValue::String(g))) => {
-            assert_eq!(g.len(), 24, "GUID hex must be 24 chars: {g}");
-        }
-        other => panic!("unexpected guid field: {other:?}"),
-    }
     match s.get_field("version") {
         Some(PvField::Scalar(ScalarValue::String(v))) => {
             assert_eq!(v, epics_pva_rs::VERSION);
@@ -153,34 +148,30 @@ async fn rpc_info_returns_server_identity() {
         Some(PvField::Scalar(ScalarValue::String(l))) => assert_eq!(l, "rust"),
         other => panic!("unexpected implLang field: {other:?}"),
     }
-    match s.get_field("channelCount") {
-        Some(PvField::Scalar(ScalarValue::UInt(n))) => {
-            assert_eq!(*n, 2, "two user PVs hosted");
-        }
-        other => panic!("unexpected channelCount field: {other:?}"),
-    }
+    // Rust-only fields are gone (pvxs parity).
+    assert!(s.get_field("guid").is_none(), "guid must not be present");
+    assert!(
+        s.get_field("channelCount").is_none(),
+        "channelCount must not be present"
+    );
 
     drop(server);
 }
 
-/// A plain GET against the `server` PV returns the server-info
-/// structure — pvxs's `ServerSource` answers GET the same way.
+/// A GET against the `server` PV must FAIL — pvxs `ServerSource`
+/// installs only `onRPC` and no `onOp`, so `server` has no GET surface
+/// (serversource.cpp:30-94). `op=info` over RPC is the supported path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn get_server_pv_returns_info() {
+async fn get_server_pv_has_no_surface() {
     let (server, client) = server_with_two_pvs();
 
     let resp = tokio::time::timeout(Duration::from_secs(5), client.pvget("server"))
         .await
-        .expect("GET server timed out")
-        .expect("GET server failed");
-
-    match resp {
-        PvField::Structure(s) => {
-            assert!(s.get_field("guid").is_some(), "info struct has guid");
-            assert!(s.get_field("version").is_some(), "info struct has version");
-        }
-        other => panic!("unexpected GET server response: {other:?}"),
-    }
+        .expect("GET server timed out");
+    assert!(
+        resp.is_err(),
+        "GET server must fail (pvxs has no onOp for `server`), got {resp:?}"
+    );
 
     drop(server);
 }
@@ -228,17 +219,24 @@ async fn builtin_server_source_shadows_default_order_user_server_pv() {
     let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
     let client = server.client_config();
 
-    // GET `server` must return the built-in info structure (guid +
-    // version), not the user's NTScalar<f64> sentinel.
-    let resp = tokio::time::timeout(Duration::from_secs(5), client.pvget("server"))
-        .await
-        .expect("GET server timed out")
-        .expect("GET server failed");
+    // RPC `op=info` against `server` must reach the built-in __server
+    // source (returning the implLang/version identity), not the user's
+    // NTScalar<f64> PV which has no RPC handler. GET is no longer the
+    // discriminator — the built-in source has no GET surface (pvxs
+    // onRPC-only); shadowing is proven by RPC reaching the built-in.
+    let (desc, value) = nturi_op("info");
+    let (_, resp) = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.pvrpc("server", &desc, &value),
+    )
+    .await
+    .expect("op=info rpc timed out")
+    .expect("built-in __server must answer op=info, shadowing the user PV");
     match resp {
         PvField::Structure(s) => {
             assert!(
-                s.get_field("guid").is_some() && s.get_field("version").is_some(),
-                "built-in __server source must answer GET server, not the user PV: {s:?}"
+                s.get_field("implLang").is_some() && s.get_field("version").is_some(),
+                "built-in __server source must answer op=info, not the user PV: {s:?}"
             );
         }
         other => panic!(

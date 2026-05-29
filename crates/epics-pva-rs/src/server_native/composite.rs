@@ -15,6 +15,7 @@
 //! union of every source's PV list.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::pvdata::{FieldDesc, PvField};
@@ -47,6 +48,13 @@ pub struct CompositeSource {
     /// is permissive and is NOT consulted for allow/deny on the
     /// reload path).
     access_gate: epics_base_rs::server::access_security::AccessGate,
+    /// Monotonic registry-topology counter, mirroring pvxs
+    /// `Server::pvt->beaconChange` (server.cpp:90-115). Bumped on every
+    /// [`Self::add_source`] / [`Self::remove_source`] and surfaced
+    /// through [`ChannelSource::beacon_change`] so the UDP beacon task
+    /// advances the beacon `change_count` on a registry mutation even
+    /// when the enumerated PV-name set is unchanged.
+    beacon_change: Arc<AtomicU64>,
 }
 
 impl Default for CompositeSource {
@@ -81,6 +89,7 @@ impl Default for CompositeSource {
         Self {
             entries,
             access_gate,
+            beacon_change: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -104,6 +113,10 @@ impl CompositeSource {
             source,
         });
         e.sort_by_key(|x| x.order);
+        // pvxs `Server::addSource` bumps `beaconChange` unconditionally
+        // (server.cpp:90-96) so the next BEACON signals the topology
+        // change. Bump after the successful insert only.
+        self.beacon_change.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -112,7 +125,18 @@ impl CompositeSource {
     pub fn remove_source(&self, name: &str, order: i32) -> Option<DynSource> {
         let mut e = self.entries.write();
         let idx = e.iter().position(|x| x.name == name && x.order == order)?;
-        Some(e.remove(idx).source)
+        let removed = e.remove(idx).source;
+        // pvxs `Server::removeSource` bumps `beaconChange` on a real
+        // erase (server.cpp:100-115). Bump only when something was
+        // removed (the `?` above already returned on a miss).
+        self.beacon_change.fetch_add(1, Ordering::Relaxed);
+        Some(removed)
+    }
+
+    /// Current registry beacon-change counter. Mirrors pvxs
+    /// `Server::pvt->beaconChange` (server.cpp:90-115).
+    pub fn beacon_change(&self) -> u64 {
+        self.beacon_change.load(Ordering::Relaxed)
     }
 
     /// Look up a previously added source by (name, order).
@@ -177,6 +201,13 @@ impl CompositeSource {
 impl ChannelSource for CompositeSource {
     fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
         &self.access_gate
+    }
+
+    /// Surface the registry beacon-change counter so the UDP beacon task
+    /// advances its `change_count` on a source add/remove (pvxs
+    /// `beaconChange`, server.cpp:90-115).
+    fn beacon_change(&self) -> u64 {
+        self.beacon_change.load(Ordering::Relaxed)
     }
 
     /// Monitor-reload READ
@@ -274,6 +305,29 @@ impl ChannelSource for CompositeSource {
             for src in sources {
                 if src.has_pv(&name).await {
                     return src.searchable(&name).await;
+                }
+            }
+            false
+        }
+    }
+
+    /// Endpoint-scoped counterpart of [`Self::searchable`]: route to the
+    /// owning source and let IT decide using both the name and the
+    /// requester endpoint. Same "first source that hosts the name wins"
+    /// rule — a name hosted by a non-searchable source must stay
+    /// unanswered even though `has_pv` is true, so we cannot OR
+    /// `searchable_from` across sources.
+    fn searchable_from(
+        &self,
+        name: &str,
+        requester: std::net::SocketAddr,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        let sources = self.snapshot();
+        let name = name.to_string();
+        async move {
+            for src in sources {
+                if src.has_pv(&name).await {
+                    return src.searchable_from(&name, requester).await;
                 }
             }
             false
@@ -1086,6 +1140,84 @@ mod tests {
             "composite gate must detect a sub-max inner bump: \
              v0={v0} v1={v1} (max-style aggregation would have left it equal)"
         );
+    }
+
+    /// The registry beacon-change counter must advance on every source
+    /// add/remove — including the two cases the PV-set hash cannot
+    /// detect: replacing a source with another serving the SAME
+    /// `list_pvs()` output, and changing a source's priority for the
+    /// same PV name. Mirrors pvxs `beaconChange` (server.cpp:90-115).
+    #[tokio::test]
+    async fn beacon_change_advances_on_registry_mutations() {
+        let comp = CompositeSource::new();
+        let v0 = comp.beacon_change();
+
+        // Add a source serving "pv" → counter advances.
+        comp.add_source(
+            "a",
+            Arc::new(PvSrc {
+                name: "pv",
+                value: 1,
+            }) as DynSource,
+            0,
+        )
+        .unwrap();
+        let v1 = comp.beacon_change();
+        assert!(v1 > v0, "add_source must bump beacon_change: {v0} -> {v1}");
+
+        // Replace it with a DIFFERENT source serving the SAME name
+        // (identical list_pvs output) — the PV-set hash would not move,
+        // but the registry counter must.
+        comp.remove_source("a", 0).expect("source a removed");
+        let v2 = comp.beacon_change();
+        assert!(
+            v2 > v1,
+            "remove_source must bump beacon_change: {v1} -> {v2}"
+        );
+        comp.add_source(
+            "b",
+            Arc::new(PvSrc {
+                name: "pv",
+                value: 2,
+            }) as DynSource,
+            0,
+        )
+        .unwrap();
+        let v3 = comp.beacon_change();
+        assert!(
+            v3 > v2,
+            "re-add with the same PV set must still bump beacon_change: {v2} -> {v3}"
+        );
+
+        // Change the source's priority for the same PV name (remove at
+        // order 0, re-add at order 5) — again no PV-set change, but two
+        // registry mutations.
+        comp.remove_source("b", 0).expect("source b removed");
+        comp.add_source(
+            "b",
+            Arc::new(PvSrc {
+                name: "pv",
+                value: 2,
+            }) as DynSource,
+            5,
+        )
+        .unwrap();
+        let v4 = comp.beacon_change();
+        assert!(
+            v4 > v3,
+            "a priority change for the same PV must bump beacon_change: {v3} -> {v4}"
+        );
+
+        // A failed remove (no such entry) must NOT bump the counter.
+        assert!(comp.remove_source("nope", 0).is_none());
+        assert_eq!(
+            comp.beacon_change(),
+            v4,
+            "a no-op remove must not advance beacon_change"
+        );
+
+        // The trait-level accessor reports the same value.
+        assert_eq!(<CompositeSource as ChannelSource>::beacon_change(&comp), v4);
     }
 
     #[tokio::test]

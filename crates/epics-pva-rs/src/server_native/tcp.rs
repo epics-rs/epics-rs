@@ -29,8 +29,8 @@ use crate::proto::{
     Status, WriteExt, encode_size_into, encode_string_into,
 };
 use crate::pvdata::encode::{
-    EncodeTypeCache, decode_pv_field, decode_pv_field_with_bitset, decode_type_desc,
-    encode_pv_field, encode_type_desc, encode_type_desc_cached,
+    EncodeTypeCache, TypeCache, decode_pv_field_cached, decode_pv_field_with_bitset_cached,
+    decode_type_desc_cached, encode_pv_field, encode_type_desc, encode_type_desc_cached,
 };
 use crate::pvdata::{FieldDesc, PvField};
 
@@ -50,6 +50,16 @@ const CREATE_CHANNEL_NO_SID: u32 = u32::MAX;
 struct PipelineOptions {
     enabled: bool,
     queue_size: u32,
+    /// The client-requested `record._options.queueSize`, recorded ONLY
+    /// when it was present and valid (`>= 2`), independent of pipeline
+    /// enablement. pvxs assigns `op->limit = qSize` for any valid
+    /// `queueSize` outside the `if(op->pipeline)` block
+    /// (`servermon.cpp:533-543`), so a non-pipeline monitor's queue depth
+    /// is the requested value too. `None` means absent/invalid → the
+    /// server keeps its configured default depth. `queue_size` above is
+    /// the pipeline credit window (defaults to 4 when absent) and is a
+    /// separate concept from this squash-threshold override.
+    requested_queue_size: Option<u32>,
     /// pvxs `MonitorOp::ackAt` (`servermon.cpp:68`) — the pipeline
     /// ACK-refill threshold parsed from `record._options.ackAny`. It
     /// caps the source-provided monitor watermarks at `ack_at - 1`
@@ -718,12 +728,20 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
         .fields
         .iter()
         .find_map(|(k, v)| (k == "ackAny").then_some(v));
+    // A valid (`>= 2`) explicit `queueSize` is the per-op queue-depth
+    // override regardless of pipeline (pvxs `op->limit = qSize` sits
+    // OUTSIDE the `if(op->pipeline)` block, servermon.cpp:533-543).
+    let requested_queue_size = match queue_size {
+        Some(n) if n >= 2 => Some(n),
+        _ => None,
+    };
     let opts = if enabled {
         match queue_size {
             // Valid: use the requested window (pvxs `op->limit = qSize`).
             Some(n) if n >= 2 => PipelineOptions {
                 enabled: true,
                 queue_size: n,
+                requested_queue_size,
                 ack_at: ack_at_from(ack_any, n),
             },
             // PRESENT but invalid (`<2` or unparseable): pvxs
@@ -736,13 +754,16 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
             _ => PipelineOptions {
                 enabled: true,
                 queue_size: 4,
+                requested_queue_size,
                 ack_at: ack_at_from(ack_any, 4),
             },
         }
     } else {
         // Non-pipeline: a valid `queueSize` sets the queue depth
         // (pvxs sets `op->limit` regardless of pipeline); an invalid or
-        // absent one keeps the default 4 (pvxs warns and ignores).
+        // absent one keeps the default 4 for the pipeline-window field
+        // (unused here) while `requested_queue_size` carries the squash
+        // override to the send loop.
         let queue_size = match queue_size {
             Some(n) if n >= 2 => n,
             _ => 4,
@@ -750,6 +771,7 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
         PipelineOptions {
             enabled: false,
             queue_size,
+            requested_queue_size,
             ack_at: 1,
         }
     };
@@ -772,6 +794,13 @@ struct ChannelState {
     /// (`serverchan.cpp:70-112`); a later `removeSource` does not rewrite
     /// them (`server.cpp:100-112`).
     source: DynSource,
+    /// Shared per-channel report counters (name + tx/rx + ReportInfo),
+    /// the SAME `Arc` registered in this connection's `PeerEntry` under
+    /// the channel's SID. Handlers attribute per-PV traffic through this
+    /// (`stat.add_tx`/`add_rx`) so [`crate::server_native::PvaServer::report`]
+    /// can show per-channel byte counters (pvxs `chan->statTx/statRx`,
+    /// server.cpp:260-268).
+    stat: Arc<crate::server_native::peers::ChannelStat>,
     /// ioid → (introspection negotiated for this op, kind)
     ops: HashMap<u32, OpState>,
 }
@@ -787,6 +816,7 @@ impl std::fmt::Debug for ChannelState {
             .field("sid", &self.sid)
             .field("introspection", &self.introspection)
             .field("source", &"<bound owner>")
+            .field("stat", &self.stat)
             .field("ops", &self.ops)
             .finish()
     }
@@ -800,15 +830,6 @@ struct AbortOnDrop(tokio::task::AbortHandle);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
-    }
-}
-
-impl AbortOnDrop {
-    /// True once the guarded task has finished (completed, panicked, or
-    /// was aborted). Used to prune guards for one-shot ops that have no
-    /// op-map slot to be removed from on completion.
-    fn is_finished(&self) -> bool {
-        self.0.is_finished()
     }
 }
 
@@ -1486,6 +1507,12 @@ enum OpKind {
     PutGet,
     /// PVA `PROCESS` (cmd 16): trigger record processing, no value.
     Process,
+    /// PVA `GET_FIELD` (cmd 17): one-shot introspection. pvxs models this
+    /// as a real `ServerIntrospect` op in `opByIOID`
+    /// (serverintrospect.cpp:141-178); the Rust slow path reserves its
+    /// IOID in `ch.ops` under this kind while the source introspection is
+    /// in flight.
+    GetField,
 }
 
 impl OpKind {
@@ -1498,6 +1525,7 @@ impl OpKind {
             OpKind::Rpc => Command::Rpc,
             OpKind::PutGet => Command::PutGet,
             OpKind::Process => Command::Process,
+            OpKind::GetField => Command::GetField,
         }
     }
 }
@@ -1876,10 +1904,157 @@ impl ClientCredentials {
 /// `Ok(Some(creds))` only when the auth Value decoded successfully;
 /// `Err(...)` on any decode fault past the method string (so the
 /// caller can disconnect, mirroring pvxs `bev.reset()`).
+/// Auth methods this server advertises in CONNECTION_VALIDATION
+/// (pvxs serverconn.cpp:103-114 — exactly "anonymous"/"ca"). Any other
+/// spelling, including case variants like "CA", is treated as an
+/// unadvertised method and rejected (serverconn.cpp:238-241).
+const ADVERTISED_AUTH_METHODS: &[&str] = &["anonymous", "ca"];
+
+/// Process a single CONNECTION_VALIDATION frame: parse the client's auth
+/// payload, commit the resulting credential into `cred`, reply
+/// CONNECTION_VALIDATED, and fire the `auth_complete` hook.
+///
+/// pvxs routes CONNECTION_VALIDATION through one `handle_CONNECTION_VALIDATION`
+/// path on every dispatch — both the initial handshake and any later
+/// re-auth ("Client begins (restarts?) Auth handshake",
+/// serverconn.cpp:196-251). Running the full parse → commit →
+/// validated-reply sequence on each frame is what lets a post-handshake
+/// re-auth update the connection identity and emit a fresh
+/// CONNECTION_VALIDATED, so this helper is the single owner of that
+/// transition and is invoked from both the pre-handshake branch and the
+/// application dispatcher.
+#[allow(clippy::too_many_arguments)]
+async fn process_connection_validation(
+    frame: &Frame,
+    tx: &SrvTx,
+    order: ByteOrder,
+    x509_locked: bool,
+    cred: &mut ClientCredentials,
+    peer: SocketAddr,
+    peer_entry: &crate::server_native::peers::PeerEntry,
+    config: &PvaServerConfig,
+    decode_cache: &mut TypeCache,
+) -> PvaResult<()> {
+    // Parse the client's auth payload: skip buffer_size (u32),
+    // introspection_size (u16), qos (u16); read selected method
+    // (string); when method == "ca", read the type+value of the
+    // auth Value and pull out the `user` / `host` fields. Pure
+    // metadata for audit/logging.
+    // when the connection is mTLS-authenticated, the
+    // x509 identity from the verified cert chain wins — the
+    // client's CONNECTION_VALIDATION claim is parsed only
+    // for diagnostics and never replaces it.
+    if x509_locked {
+        // a decode fault here is still fatal —
+        // log + propagate. Pre-fix swallowed; pvxs
+        // `serverconn.cpp:211-216` calls `bev.reset()`.
+        match parse_client_credentials(frame, decode_cache)? {
+            Some(claimed) => debug!(
+                ?peer,
+                x509_account = %cred.account,
+                x509_authority = %cred.authority,
+                claimed_method = %claimed.method,
+                claimed_account = %claimed.account,
+                "PVA client over mTLS — x509 identity overrides CONNECTION_VALIDATION claim"
+            ),
+            None => debug!(
+                ?peer,
+                "PVA client over mTLS sent anonymous CONNECTION_VALIDATION"
+            ),
+        }
+    } else {
+        // a decode fault is now connection-fatal
+        // (matches pvxs `serverconn.cpp:211-216`
+        // bev.reset). An anonymous handshake (empty
+        // method) returns Ok(None) and keeps the
+        // existing anonymous credential. Only a fully
+        // decoded auth structure replaces `cred`.
+        if let Some(claimed) = parse_client_credentials(frame, decode_cache)? {
+            *cred = claimed;
+        }
+    }
+    debug!(?peer, method = %cred.method, account = %cred.account,
+        authority = %cred.authority, roles = ?cred.roles,
+        "PVA client credentials");
+    // pvxs `serverconn.cpp:238-241` parity: when the client
+    // picks an auth method we never advertised, reply
+    // CONNECTION_VALIDATED with Status::Error so the client
+    // knows its elevated identity claim was rejected. pvxs
+    // keeps the connection open and falls back to whatever
+    // identity is recorded (typically anonymous via the
+    // empty-method path inside parse_client_credentials);
+    // matches "No practical way to handle auth failure. So
+    // we accept all credentials, but may not grant rights."
+    // an mTLS connection is authenticated by its
+    // verified certificate chain — `cred.method` is
+    // `"x509"` regardless of the CONNECTION_VALIDATION
+    // claim, and that is always a valid method when TLS is
+    // in use (pvxs advertises `x509` for TLS transports).
+    // So the unadvertised-method rejection only applies to
+    // the plain-TCP `ca`/`anonymous` negotiation.
+    let advertised = x509_locked || ADVERTISED_AUTH_METHODS.iter().any(|m| *m == cred.method);
+    let validated_status = if advertised {
+        Status::ok()
+    } else {
+        debug!(
+            ?peer,
+            method = %cred.method,
+            "PVA client selects unadvertised auth method — replying Status::Error"
+        );
+        // the client picked an auth method the
+        // server never advertised. The handshake completes
+        // (pvxs keeps the connection open) but the claimed
+        // credential MUST NOT survive — the server is about
+        // to return Status::Error rejecting it. Leaving
+        // `cred` as the unadvertised claim would let the
+        // `auth_complete` hook and every later ACF-gated
+        // operation see an identity the server just
+        // rejected: a legacy rule without a METHOD(...)
+        // clause would still match the claimed account.
+        // Revert to anonymous so the rejected claim never
+        // becomes the connection identity.
+        *cred = ClientCredentials::anonymous();
+        Status::error("Client selects unadvertised auth".to_string())
+    };
+    let mut payload = Vec::new();
+    validated_status.write_into(order, &mut payload);
+    let h = PvaHeader::application(
+        true,
+        order,
+        Command::ConnectionValidated.code(),
+        payload.len() as u32,
+    );
+    let mut buf = Vec::new();
+    h.write_into(&mut buf);
+    buf.extend_from_slice(&payload);
+    // Commit the validated credential BEFORE the
+    // CONNECTION_VALIDATED frame leaves. pvxs finalises
+    // `cred` (serverconn.cpp:234) before `auth_complete()`
+    // enqueues CONNECTION_VALIDATED (serverconn.cpp:191), so
+    // any observer that has seen VALIDATED must already see
+    // the committed identity. Record it for the per-peer
+    // report and fire the user-installed `auth_complete`
+    // hook (pvxs serverconn.cpp:181 parity — peer addr +
+    // credentials snapshot; ACF integration goes here)
+    // first, then send. Sending first left a window where a
+    // client that observed VALIDATED could race ahead of the
+    // hook (the cause of the flaky auth-hook regression).
+    peer_entry.set_credentials(&cred.account, &cred.method);
+    if let Some(hook) = config.auth_complete.as_ref() {
+        hook(peer, cred);
+    }
+    let _ = tx.send(buf).await;
+    Ok(())
+}
+
 fn parse_client_credentials(
     frame: &Frame,
-    order: ByteOrder,
+    decode_cache: &mut TypeCache,
 ) -> PvaResult<Option<ClientCredentials>> {
+    // Inbound application payloads are decoded with the frame's own header
+    // byte order (pvxs latches `peerBE` per received message,
+    // conn.cpp:195-198), never the server's configured outbound order.
+    let order = frame.order();
     let mut cur = frame.cursor();
     let _buffer_size = cur
         .get_u32(order)
@@ -1939,9 +2114,14 @@ fn parse_client_credentials(
     if peek != 0xFF {
         // Rewind and decode the real descriptor.
         cur.set_position(pos);
-        let desc = decode_type_desc(&mut cur, order)
+        // Route through the connection-scope decode cache so a client that
+        // advertises its auth structure with a `0xFD <slot>` define here can
+        // later reference it by `0xFE <slot>` from a pvRequest/EXEC body, and
+        // vice versa — pvxs shares one connection `rxRegistry` (conn.h:23)
+        // across every inbound decode, including CONNECTION_VALIDATION.
+        let desc = decode_type_desc_cached(&mut cur, order, decode_cache)
             .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth desc: {e}")))?;
-        let value = decode_pv_field(&desc, &mut cur, order)
+        let value = decode_pv_field_cached(&desc, &mut cur, order, decode_cache)
             .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth value: {e}")))?;
         if let PvField::Structure(s) = value {
             for (name, field) in &s.fields {
@@ -1998,6 +2178,54 @@ type SrvWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 /// receiver; subsequent sends fail and the read loop independently
 /// observes the dead socket and tears down.
 type SrvTx = tokio::sync::mpsc::Sender<Vec<u8>>;
+
+/// Connection writer handle bound to one channel's byte accounting.
+///
+/// pvxs increments `chan->statTx` by the encoded length at *every*
+/// per-channel send site (`serverget.cpp:124`, `servermon.cpp:186`,
+/// `serverintrospect.cpp:45`, `serverchan.cpp:151-152`). The writer
+/// task here owns only an opaque `Vec<u8>` stream and cannot recover
+/// the owning channel, so the count has to be taken where the channel
+/// is known. Threading a raw `SrvTx` plus a manual `stat.add_tx(..)`
+/// before each `send` re-opens the exact defect this finding names —
+/// a missed site silently under-counts. `ChannelTx` is the single
+/// owner of that accounting: holding one is the only way an op task
+/// can emit a per-channel frame, so the count cannot be skipped by
+/// construction. Connection-level frames (heartbeat, SET_BYTE_ORDER,
+/// validation, pre-resolution errors) keep the raw `SrvTx` — they
+/// belong to no channel.
+#[derive(Clone)]
+struct ChannelTx {
+    tx: SrvTx,
+    stat: Arc<crate::server_native::peers::ChannelStat>,
+}
+
+impl ChannelTx {
+    fn new(tx: SrvTx, stat: Arc<crate::server_native::peers::ChannelStat>) -> Self {
+        Self { tx, stat }
+    }
+
+    /// Emit a per-channel frame, charging its length to the channel's
+    /// `statTx` first so the report stays exact even if the send races
+    /// a writer-task shutdown.
+    async fn send(&self, buf: Vec<u8>) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
+        self.stat.add_tx(buf.len());
+        self.tx.send(buf).await
+    }
+
+    /// Current free capacity of the underlying writer channel — used by
+    /// the monitor outbound-queue-depth diagnostic. Delegates to the
+    /// wrapped `Sender`; carries no byte accounting.
+    fn capacity(&self) -> usize {
+        self.tx.capacity()
+    }
+
+    /// Total capacity of the underlying writer channel (see
+    /// [`Self::capacity`]).
+    fn max_capacity(&self) -> usize {
+        self.tx.max_capacity()
+    }
+}
 
 /// result of a spawned CREATE_CHANNEL resolver task. The read
 /// loop's `channels` HashMap is owned by the loop task; spawned
@@ -2146,7 +2374,6 @@ async fn handle_connection_io(
     // ACF decisions even though the comment claimed pvxs parity.
     // Modern pvxs clients explicitly prefer `ca`; validation still
     // accepts both, only the wire order changes.
-    const ADVERTISED_AUTH_METHODS: &[&str] = &["anonymous", "ca"];
     // match pvxs serverconn.cpp:103-104 — serverReceiveBufferSize = 0x10000 ("not used").
     let val_req =
         build_server_connection_validation(order, 0x10000, 32_767, ADVERTISED_AUTH_METHODS);
@@ -2177,6 +2404,17 @@ async fn handle_connection_io(
     // `config.emit_type_cache` is true (off by default for pvAccessCPP
     // compatibility — that client does not parse 0xFD/0xFE markers).
     let mut encode_type_cache = crate::pvdata::encode::EncodeTypeCache::new();
+    // Per-connection inbound (decode-side) TypeStore — the receiver mirror
+    // of `encode_type_cache`. pvxs keeps one connection-scoped `rxRegistry`
+    // (conn.h:23) shared by every inbound decode; a client may define a
+    // descriptor with `0xFD <slot> <desc>` in one frame (auth body,
+    // pvRequest INIT, RPC/PUT EXEC value) and reference it with `0xFE <slot>`
+    // in any later frame on the same connection. The read loop dispatches
+    // every frame synchronously in wire order, so a define is always folded
+    // into this cache before a later reference resolves against it — the
+    // read loop is the single owner of inbound type-cache state, exactly as
+    // the connection reader task owns it client-side.
+    let mut rx_type_cache = TypeCache::new();
 
     let max_msg_size = config.max_message_size;
     // segmented-message reassembly state. pvxs conn.cpp:228-291
@@ -2189,6 +2427,13 @@ async fn handle_connection_io(
     // buffer-size hint negotiated in CONNECTION_VALIDATION.
     let mut seg_buf: Vec<u8> = Vec::new();
     let mut seg_cmd: u8 = 0;
+    // Byte order of the message's initiating (SegFirst) frame. The
+    // reassembled synthetic frame must carry this order, not the server's
+    // configured outbound order, so downstream handlers decode the payload
+    // with the peer's actual order (pvxs latches `peerBE` once per logical
+    // message, conn.cpp:195-198). Seeded with `order` but always overwritten
+    // on the first segment before any synthetic frame is built.
+    let mut seg_order = order;
     let mut expect_seg = false;
     // CREATE_CHANNEL completion channel. Spawned resolver
     // tasks send results here; the read loop's select! arm applies
@@ -2215,10 +2460,6 @@ async fn handle_connection_io(
     // against the limit to prevent a burst of concurrent requests from
     // racing past it before the first completions arrive.
     let mut pending_channel_spawns: usize = 0;
-    // abort guards for GET_FIELD slow-path introspect tasks. Dropping
-    // on connection close cancels any task whose source hasn't returned yet,
-    // matching pvxs opByIOID cleanup (serverconn.cpp:366-382).
-    let mut gf_abort_guards: Vec<AbortOnDrop> = Vec::new();
     // Drive the read loop inside a block so EVERY exit path funnels
     // through the channel-close fan-out below: the writer-died
     // `return Ok(())`, any `?`-propagated decode/IO error, and the
@@ -2254,21 +2495,32 @@ async fn handle_connection_io(
                     pending_channel_spawns = pending_channel_spawns.saturating_sub(1);
                     let mut payload = Vec::new();
                     payload.put_u32(cc.cid, order);
+                    // On success the CREATE_CHANNEL reply is charged to the
+                    // newly-created channel (pvxs serverchan.cpp:151-152
+                    // `ch->statTx += 16u`); the failure reply belongs to no
+                    // channel and stays connection-level.
+                    let mut reply_stat: Option<Arc<crate::server_native::peers::ChannelStat>> = None;
                     if let Some(resolved) = cc.resolved {
                         payload.put_u32(cc.sid, order);
                         Status::ok().write_into(order, &mut payload);
+                        // One shared per-channel report counter, held by both
+                        // the connection's channel table and the PeerEntry
+                        // (keyed by SID) so handler-side tx/rx attribution is
+                        // visible to the report (pvxs chan->statTx/statRx).
+                        let stat = crate::server_native::peers::ChannelStat::new(cc.name.clone());
+                        reply_stat = Some(stat.clone());
                         channels.insert(cc.sid, ChannelState {
                             name: cc.name,
                             cid: cc.cid,
                             sid: cc.sid,
                             introspection: resolved.intro,
                             source: resolved.owner,
+                            stat: stat.clone(),
                             ops: HashMap::new(),
                         });
-                        peer_entry.channel_added();
-                        // mirror live channel names for the report.
-                        peer_entry
-                            .set_channel_names(channels.values().map(|c| c.name.clone()).collect());
+                        // Register the channel (live + lifetime counts and
+                        // the per-channel report entry) in one owner call.
+                        peer_entry.channel_opened(cc.sid, stat);
                         // Notify the bound source that a channel attached,
                         // matching pvxs `SharedPV::attach` running
                         // `onFirstConnect` on the empty→non-empty edge
@@ -2296,6 +2548,9 @@ async fn handle_connection_io(
                     let mut buf = Vec::new();
                     h.write_into(&mut buf);
                     buf.extend_from_slice(&payload);
+                    if let Some(stat) = &reply_stat {
+                        stat.add_tx(buf.len());
+                    }
                     let _ = tx.send(buf).await;
                 }
                 continue;
@@ -2377,6 +2632,7 @@ async fn handle_connection_io(
             // below).
             expect_seg = true;
             seg_cmd = frame.header.command;
+            seg_order = frame.order();
             seg_buf.clear();
         }
         // Cap reassembly when an opt-in `max_message_size` is set.
@@ -2411,7 +2667,7 @@ async fn handle_connection_io(
             Frame {
                 header: PvaHeader {
                     version: frame.header.version,
-                    flags: HeaderFlags::new(false, false, order),
+                    flags: HeaderFlags::new(false, false, seg_order),
                     command: seg_cmd,
                     payload_length: seg_buf.len() as u32,
                 },
@@ -2424,123 +2680,18 @@ async fn handle_connection_io(
         // and respond CONNECTION_VALIDATED.
         if !handshake_complete {
             if frame.header.command == Command::ConnectionValidation.code() {
-                // Parse the client's auth payload: skip buffer_size (u32),
-                // introspection_size (u16), qos (u16); read selected method
-                // (string); when method == "ca", read the type+value of the
-                // auth Value and pull out the `user` / `host` fields. Pure
-                // metadata for audit/logging.
-                // when the connection is mTLS-authenticated, the
-                // x509 identity from the verified cert chain wins — the
-                // client's CONNECTION_VALIDATION claim is parsed only
-                // for diagnostics and never replaces it.
-                if x509_locked {
-                    // a decode fault here is still fatal —
-                    // log + propagate. Pre-fix swallowed; pvxs
-                    // `serverconn.cpp:211-216` calls `bev.reset()`.
-                    match parse_client_credentials(&frame, order)? {
-                        Some(claimed) => debug!(
-                            ?peer,
-                            x509_account = %cred.account,
-                            x509_authority = %cred.authority,
-                            claimed_method = %claimed.method,
-                            claimed_account = %claimed.account,
-                            "PVA client over mTLS — x509 identity overrides CONNECTION_VALIDATION claim"
-                        ),
-                        None => debug!(
-                            ?peer,
-                            "PVA client over mTLS sent anonymous CONNECTION_VALIDATION"
-                        ),
-                    }
-                } else {
-                    // a decode fault is now connection-fatal
-                    // (matches pvxs `serverconn.cpp:211-216`
-                    // bev.reset). An anonymous handshake (empty
-                    // method) returns Ok(None) and keeps the
-                    // existing anonymous credential. Only a fully
-                    // decoded auth structure replaces `cred`.
-                    if let Some(claimed) = parse_client_credentials(&frame, order)? {
-                        cred = claimed;
-                    }
-                }
-                debug!(?peer, method = %cred.method, account = %cred.account,
-                    authority = %cred.authority, roles = ?cred.roles,
-                    "PVA client credentials");
-                // pvxs `serverconn.cpp:238-241` parity: when the client
-                // picks an auth method we never advertised, reply
-                // CONNECTION_VALIDATED with Status::Error so the client
-                // knows its elevated identity claim was rejected. pvxs
-                // keeps the connection open and falls back to whatever
-                // identity is recorded (typically anonymous via the
-                // empty-method path inside parse_client_credentials);
-                // matches "No practical way to handle auth failure. So
-                // we accept all credentials, but may not grant rights."
-                // an mTLS connection is authenticated by its
-                // verified certificate chain — `cred.method` is
-                // `"x509"` regardless of the CONNECTION_VALIDATION
-                // claim, and that is always a valid method when TLS is
-                // in use (pvxs advertises `x509` for TLS transports).
-                // So the unadvertised-method rejection only applies to
-                // the plain-TCP `ca`/`anonymous` negotiation.
-                // Byte-exact membership in the advertised set. pvxs
-                // advertises exactly "anonymous"/"ca" (serverconn.cpp:108-114)
-                // and rejects any other spelling — including case variants
-                // like "CA" — as unadvertised auth (serverconn.cpp:238-241).
-                // A case-insensitive compare here would admit "CA"/"Anonymous"
-                // that pvxs refuses, letting an unadvertised method's account
-                // reach the ACF gate.
-                let advertised =
-                    x509_locked || ADVERTISED_AUTH_METHODS.iter().any(|m| *m == cred.method);
-                let validated_status = if advertised {
-                    Status::ok()
-                } else {
-                    debug!(
-                        ?peer,
-                        method = %cred.method,
-                        "PVA client selects unadvertised auth method — replying Status::Error"
-                    );
-                    // the client picked an auth method the
-                    // server never advertised. The handshake completes
-                    // (pvxs keeps the connection open) but the claimed
-                    // credential MUST NOT survive — the server is about
-                    // to return Status::Error rejecting it. Leaving
-                    // `cred` as the unadvertised claim would let the
-                    // `auth_complete` hook and every later ACF-gated
-                    // operation see an identity the server just
-                    // rejected: a legacy rule without a METHOD(...)
-                    // clause would still match the claimed account.
-                    // Revert to anonymous so the rejected claim never
-                    // becomes the connection identity.
-                    cred = ClientCredentials::anonymous();
-                    Status::error("Client selects unadvertised auth".to_string())
-                };
-                let mut payload = Vec::new();
-                validated_status.write_into(order, &mut payload);
-                let h = PvaHeader::application(
-                    true,
+                process_connection_validation(
+                    &frame,
+                    &tx,
                     order,
-                    Command::ConnectionValidated.code(),
-                    payload.len() as u32,
-                );
-                let mut buf = Vec::new();
-                h.write_into(&mut buf);
-                buf.extend_from_slice(&payload);
-                // Commit the validated credential BEFORE the
-                // CONNECTION_VALIDATED frame leaves. pvxs finalises
-                // `cred` (serverconn.cpp:234) before `auth_complete()`
-                // enqueues CONNECTION_VALIDATED (serverconn.cpp:191), so
-                // any observer that has seen VALIDATED must already see
-                // the committed identity. Record it for the per-peer
-                // report and fire the user-installed `auth_complete`
-                // hook (pvxs serverconn.cpp:181 parity — peer addr +
-                // credentials snapshot; ACF integration goes here)
-                // first, then send. Sending first left a window where a
-                // client that observed VALIDATED could race ahead of the
-                // hook (the cause of the flaky auth-hook regression).
-                peer_entry.set_credentials(&cred.account, &cred.method);
-                if let Some(hook) = config.auth_complete.as_ref() {
-                    hook(peer, &cred);
-                }
-                let _ = tx.send(buf).await;
+                    x509_locked,
+                    &mut cred,
+                    peer,
+                    &peer_entry,
+                    &config,
+                    &mut rx_type_cache,
+                )
+                .await?;
                 handshake_complete = true;
                 continue;
             } else {
@@ -2556,8 +2707,9 @@ async fn handle_connection_io(
                 // spawning version. Resolver tasks run
                 // has_pv() + get_introspection() in the background;
                 // results arrive via cc_rx and are applied at the top
-                // of the loop. channel_added() is called there, so we
-                // do not track it here.
+                // of the loop. `peer_entry.channel_opened()` registers the
+                // channel (and its report stat) there, so we do not track
+                // it here.
                 handle_create_channel(
                     &source,
                     &frame,
@@ -2573,13 +2725,12 @@ async fn handle_connection_io(
                 .await?;
             }
             Some(Command::DestroyChannel) => {
-                let before = channels.len();
-                handle_destroy_channel(&frame, &tx, &mut channels, order, peer, &cred).await?;
-                if channels.len() < before {
-                    peer_entry.channel_removed();
-                    // keep the report's channel-name mirror current.
-                    peer_entry
-                        .set_channel_names(channels.values().map(|c| c.name.clone()).collect());
+                if let Some(removed_sid) =
+                    handle_destroy_channel(&frame, &tx, &mut channels, order, peer, &cred).await?
+                {
+                    // Drop the per-channel report entry + live count in one
+                    // owner call (pvxs removes from conn->chanBySID).
+                    peer_entry.channel_closed(removed_sid);
                 }
             }
             Some(Command::Get) => {
@@ -2592,6 +2743,7 @@ async fn handle_connection_io(
                     OpKind::Get,
                     &config,
                     &mut encode_type_cache,
+                    &mut rx_type_cache,
                     peer,
                     &cred,
                     &mon_fin_tx,
@@ -2609,6 +2761,7 @@ async fn handle_connection_io(
                     OpKind::Put,
                     &config,
                     &mut encode_type_cache,
+                    &mut rx_type_cache,
                     peer,
                     &cred,
                     &mon_fin_tx,
@@ -2626,6 +2779,7 @@ async fn handle_connection_io(
                     OpKind::Monitor,
                     &config,
                     &mut encode_type_cache,
+                    &mut rx_type_cache,
                     peer,
                     &cred,
                     &mon_fin_tx,
@@ -2643,6 +2797,7 @@ async fn handle_connection_io(
                     OpKind::Rpc,
                     &config,
                     &mut encode_type_cache,
+                    &mut rx_type_cache,
                     peer,
                     &cred,
                     &mon_fin_tx,
@@ -2651,21 +2806,14 @@ async fn handle_connection_io(
                 .await?;
             }
             Some(Command::GetField) => {
-                if let Some(guard) =
-                    handle_get_field(&frame, &tx, &channels, order, peer, &cred).await?
-                {
-                    // GET_FIELD is a one-shot op with no IOID-keyed slot to
-                    // be removed from on completion, so its guard cannot be
-                    // dropped by the op lifecycle the way data_task_abort /
-                    // monitor_abort are. Drop guards whose introspect task
-                    // has already finished before pushing the new one, so
-                    // the vec tracks only in-flight GET_FIELD ops — mirrors
-                    // pvxs removing the op from opByIOID on completion
-                    // (serverconn.cpp:366-382). Without this, completed
-                    // guards accumulate for the life of the connection.
-                    gf_abort_guards.retain(|g| !g.is_finished());
-                    gf_abort_guards.push(guard);
-                }
+                // GET_FIELD is a real IOID-keyed operation (pvxs models it as
+                // `ServerIntrospect` in `opByIOID`, serverintrospect.cpp:141-178).
+                // The slow path reserves its IOID in `ch.ops` before spawning
+                // the introspection task and releases it through the same
+                // `ExecFinished` completion owner GET/PUT/RPC use, so duplicate
+                // IOIDs, DESTROY_REQUEST, and teardown are handled uniformly.
+                handle_get_field(&frame, &tx, &mut channels, order, peer, &cred, &exec_fin_tx)
+                    .await?;
             }
             Some(Command::Search) => {
                 // TCP-circuit SEARCH (pvxs
@@ -2676,16 +2824,16 @@ async fn handle_connection_io(
                 // had no arm here and the frame fell through to
                 // the silent default — the redirector hung waiting
                 // for SEARCH_RESPONSE.
-                handle_tcp_search(&source, &frame, &tx, &config).await?;
+                handle_tcp_search(&source, &frame, &tx, &config, peer).await?;
             }
             Some(Command::DestroyRequest) => {
-                handle_destroy_request(&frame, &mut channels, order)?;
+                handle_destroy_request(&frame, &mut channels)?;
             }
             Some(Command::CancelRequest) => {
-                handle_cancel_request(&frame, &mut channels, order)?;
+                handle_cancel_request(&frame, &mut channels)?;
             }
             Some(Command::Message) => {
-                handle_message(&frame, order, &peer)?;
+                handle_message(&frame, &channels, &peer)?;
             }
             Some(Command::PutGet) => {
                 // atomic put-then-get. The PVA wire spec defines
@@ -2701,6 +2849,7 @@ async fn handle_connection_io(
                     order,
                     &config,
                     &mut encode_type_cache,
+                    &mut rx_type_cache,
                     peer,
                     &cred,
                     &exec_fin_tx,
@@ -2719,6 +2868,7 @@ async fn handle_connection_io(
                     &mut channels,
                     order,
                     &config,
+                    &mut rx_type_cache,
                     peer,
                     &cred,
                     &exec_fin_tx,
@@ -2773,6 +2923,29 @@ async fn handle_connection_io(
                 buf.extend_from_slice(&frame.payload);
                 let _ = tx.send(buf).await;
             }
+            Some(Command::ConnectionValidation) => {
+                // Post-handshake re-authentication. pvxs keeps
+                // CONNECTION_VALIDATION in the live command switch
+                // (conn.cpp:247-260) and re-runs handle_CONNECTION_VALIDATION
+                // ("Client begins (restarts?) Auth handshake",
+                // serverconn.cpp:196-251) on every dispatch, replacing the
+                // credential and re-issuing CONNECTION_VALIDATED. Route it
+                // through the same owner so the new identity takes effect for
+                // subsequent ACF-gated operations (`cred` is captured by
+                // reference by every later handle_* call).
+                process_connection_validation(
+                    &frame,
+                    &tx,
+                    order,
+                    x509_locked,
+                    &mut cred,
+                    peer,
+                    &peer_entry,
+                    &config,
+                    &mut rx_type_cache,
+                )
+                .await?;
+            }
             _ => {
                 // Unhandled — keep going.
             }
@@ -2815,11 +2988,12 @@ fn decode_init_pv_request_value(
     cur: &mut std::io::Cursor<&[u8]>,
     req_desc: &FieldDesc,
     order: ByteOrder,
+    decode_cache: &mut TypeCache,
 ) -> Result<Option<PvField>, String> {
     if cur.position() as usize >= cur.get_ref().len() {
         return Ok(None);
     }
-    decode_pv_field(req_desc, cur, order)
+    decode_pv_field_cached(req_desc, cur, order, decode_cache)
         .map(Some)
         .map_err(|e| format!("invalid pvRequest value: {e}"))
 }
@@ -2860,6 +3034,7 @@ fn decode_init_pv_request_value(
 fn decode_rpc_exec_arg(
     cur: &mut std::io::Cursor<&[u8]>,
     order: ByteOrder,
+    decode_cache: &mut TypeCache,
 ) -> Result<(FieldDesc, PvField), String> {
     // Absent body (no payload after subcmd): parameterless RPC.
     if cur.position() as usize >= cur.get_ref().len() {
@@ -2875,9 +3050,9 @@ fn decode_rpc_exec_arg(
     // Present, non-null descriptor: decode type + full value or fail
     // fatally — a present-but-undecodable body is a protocol error, not
     // a parameterless call.
-    let desc = decode_type_desc(cur, order)
+    let desc = decode_type_desc_cached(cur, order, decode_cache)
         .map_err(|e| format!("invalid RPC argument descriptor: {e}"))?;
-    let value = decode_pv_field(&desc, cur, order)
+    let value = decode_pv_field_cached(&desc, cur, order, decode_cache)
         .map_err(|e| format!("invalid RPC argument value: {e}"))?;
     Ok((desc, value))
 }
@@ -2940,6 +3115,8 @@ async fn handle_put_get(
     order: ByteOrder,
     config: &PvaServerConfig,
     encode_cache: &mut EncodeTypeCache,
+    // Connection-scope inbound decode cache (pvxs `rxRegistry`, conn.h:23).
+    decode_cache: &mut TypeCache,
     peer: std::net::SocketAddr,
     cred: &ClientCredentials,
     // data-phase-completion sender (see [`handle_op`]). The spawned
@@ -2947,12 +3124,16 @@ async fn handle_put_get(
     // the op to `Idle` when its readback reply is sent.
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
 ) -> PvaResult<()> {
+    // Inbound payload decodes with the frame's own header order (pvxs
+    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // (config) is used only for outbound reply frames.
+    let inbound_order = frame.order();
     let mut cur = frame.cursor();
     let sid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let ioid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
@@ -2976,6 +3157,12 @@ async fn handle_put_get(
         }
     };
 
+    // Attribute the inbound PUT_GET frame to the channel and route every
+    // reply through `chan_tx` (pvxs `chan->statRx`/`statTx`; see
+    // `handle_op`).
+    ch.stat.add_rx(frame.payload.len());
+    let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
+
     // Dispatch to the CREATE_CHANNEL-bound owner, not the registry
     // (pvxs serverchan.cpp:70-112 / server.cpp:100-112; see `handle_op`).
     let source = ch.source.clone();
@@ -2990,8 +3177,8 @@ async fn handle_put_get(
             )));
         }
         if ch.ops.len() >= config.max_ops_per_channel {
-            send_op_error(
-                tx,
+            send_chan_op_error(
+                &chan_tx,
                 OpKind::PutGet,
                 ioid,
                 subcmd,
@@ -3005,8 +3192,8 @@ async fn handle_put_get(
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
-                send_op_error(
-                    tx,
+                send_chan_op_error(
+                    &chan_tx,
                     OpKind::PutGet,
                     ioid,
                     subcmd,
@@ -3022,7 +3209,7 @@ async fn handle_put_get(
         // A peer wire-decode fault of the INIT pvRequest type/value is
         // connection-fatal (pvxs `serverget.cpp:371-375` bev.reset()), not
         // a per-op Status — the empty-mask case below stays op-level.
-        let req_desc = match decode_type_desc(&mut cur, order) {
+        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
             Ok(d) => d,
             Err(e) => {
                 return Err(PvaError::Decode(format!(
@@ -3030,20 +3217,21 @@ async fn handle_put_get(
                 )));
             }
         };
-        let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, order) {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(PvaError::Decode(format!(
-                    "PUT_GET INIT pvRequest value: {e}"
-                )));
-            }
-        };
+        let req_value =
+            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(PvaError::Decode(format!(
+                        "PUT_GET INIT pvRequest value: {e}"
+                    )));
+                }
+            };
         // empty mask is an INIT error.
         let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
             Ok(m) => m,
             Err(e) => {
-                send_op_error(
-                    tx,
+                send_chan_op_error(
+                    &chan_tx,
                     OpKind::PutGet,
                     ioid,
                     subcmd,
@@ -3085,7 +3273,7 @@ async fn handle_put_get(
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
-        let _ = tx.send(buf).await;
+        let _ = chan_tx.send(buf).await;
         return Ok(());
     }
 
@@ -3113,8 +3301,8 @@ async fn handle_put_get(
             (o.intro, o.mask, o.pv_request)
         }
         None => {
-            send_op_error(
-                tx,
+            send_chan_op_error(
+                &chan_tx,
                 OpKind::PutGet,
                 ioid,
                 subcmd,
@@ -3128,9 +3316,17 @@ async fn handle_put_get(
     let pv_name = ch.name.clone();
 
     // Decode the put payload inline (cursor is borrowed from the stack frame).
-    let changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
-    let put_delta = decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, order)
-        .map_err(|e| PvaError::Decode(format!("PUT_GET requires a value payload: {e}")))?;
+    let changed =
+        BitSet::decode(&mut cur, inbound_order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    let put_delta = decode_pv_field_with_bitset_cached(
+        &intro,
+        &changed,
+        0,
+        &mut cur,
+        inbound_order,
+        decode_cache,
+    )
+    .map_err(|e| PvaError::Decode(format!("PUT_GET requires a value payload: {e}")))?;
 
     let ctx = crate::server_native::source::ChannelContext {
         peer,
@@ -3143,7 +3339,7 @@ async fn handle_put_get(
     };
 
     let src = source.clone();
-    let tx_clone = tx.clone();
+    let tx_clone = chan_tx.clone();
     // run this PUT_GET exec only when the op is `Idle`, and ignore a
     // second EXEC while the first is in flight rather than aborting it (pvxs
     // `serverget.cpp:467-476`/`:511-514`).
@@ -3276,6 +3472,10 @@ async fn handle_process(
     channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
     config: &PvaServerConfig,
+    // Connection-scope inbound decode cache (pvxs `rxRegistry`, conn.h:23).
+    // PROCESS transfers no value but its INIT pvRequest descriptor is still
+    // decoded, so it shares the same cache as every other inbound decode.
+    decode_cache: &mut TypeCache,
     peer: std::net::SocketAddr,
     cred: &ClientCredentials,
     // data-phase-completion sender (see [`handle_op`]). The spawned
@@ -3283,12 +3483,16 @@ async fn handle_process(
     // the op to `Idle` when its reply is sent.
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
 ) -> PvaResult<()> {
+    // Inbound payload decodes with the frame's own header order (pvxs
+    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // (config) is used only for outbound reply frames.
+    let inbound_order = frame.order();
     let mut cur = frame.cursor();
     let sid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let ioid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
@@ -3312,6 +3516,12 @@ async fn handle_process(
         }
     };
 
+    // Attribute the inbound PROCESS frame to the channel and route every
+    // reply through `chan_tx` (pvxs `chan->statRx`/`statTx`; see
+    // `handle_op`).
+    ch.stat.add_rx(frame.payload.len());
+    let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
+
     // Dispatch to the CREATE_CHANNEL-bound owner, not the registry
     // (pvxs serverchan.cpp:70-112 / server.cpp:100-112; see `handle_op`).
     let source = ch.source.clone();
@@ -3326,8 +3536,8 @@ async fn handle_process(
             )));
         }
         if ch.ops.len() >= config.max_ops_per_channel {
-            send_op_error(
-                tx,
+            send_chan_op_error(
+                &chan_tx,
                 OpKind::Process,
                 ioid,
                 subcmd,
@@ -3345,8 +3555,8 @@ async fn handle_process(
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
-                send_op_error(
-                    tx,
+                send_chan_op_error(
+                    &chan_tx,
                     OpKind::Process,
                     ioid,
                     subcmd,
@@ -3371,7 +3581,7 @@ async fn handle_process(
         // descriptor or value is connection-fatal (the read loop closes
         // the circuit, no op reply), uniform with the generic INIT path.
         // An ABSENT value body is still tolerated for Rust↔Rust interop.
-        let req_desc = match decode_type_desc(&mut cur, order) {
+        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
             Ok(d) => d,
             Err(e) => {
                 return Err(PvaError::Decode(format!(
@@ -3379,7 +3589,9 @@ async fn handle_process(
                 )));
             }
         };
-        if let Err(e) = decode_init_pv_request_value(&mut cur, &req_desc, order) {
+        if let Err(e) =
+            decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache)
+        {
             return Err(PvaError::Decode(format!(
                 "PROCESS INIT pvRequest value: {e}"
             )));
@@ -3398,7 +3610,7 @@ async fn handle_process(
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
-        let _ = tx.send(buf).await;
+        let _ = chan_tx.send(buf).await;
         return Ok(());
     }
 
@@ -3437,7 +3649,7 @@ async fn handle_process(
         pv_request: None,
     };
     let src = source.clone();
-    let tx_clone = tx.clone();
+    let tx_clone = chan_tx.clone();
     // run this PROCESS exec only when the op is `Idle`, and ignore a
     // second EXEC while the first is in flight rather than aborting it (pvxs
     // `serverget.cpp:467-476`/`:511-514`).
@@ -3598,12 +3810,16 @@ async fn handle_create_channel(
     cc_tx: &CcTx,
     pending_channel_spawns: &mut usize,
 ) -> PvaResult<()> {
+    // Inbound payload decodes with the frame's own header order (pvxs
+    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // (config) is used only for outbound reply frames.
+    let inbound_order = frame.order();
     let mut cur = frame.cursor();
     // pvxs `serverchan.cpp:269-358`: a single CREATE_CHANNEL frame
     // can carry `count` (cid, name) pairs and the server must emit
     // one CREATE_CHANNEL response frame per pair, in arrival order.
     let count = cur
-        .get_u16(order)
+        .get_u16(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
 
     // Collect entries to resolve asynchronously. We allocate SIDs
@@ -3616,9 +3832,9 @@ async fn handle_create_channel(
         // truncated CID / malformed string is a protocol-
         // fatal decode error. pvxs `serverchan.cpp:364-368`.
         let cid = cur
-            .get_u32(order)
+            .get_u32(inbound_order)
             .map_err(|e| PvaError::Decode(format!("CREATE_CHANNEL cid: {e}")))?;
-        let name = match crate::proto::decode_string(&mut cur, order)
+        let name = match crate::proto::decode_string(&mut cur, inbound_order)
             .map_err(|e| PvaError::Decode(format!("CREATE_CHANNEL name: {e}")))?
         {
             Some(s) => s,
@@ -3750,6 +3966,9 @@ fn close_channel(ch: ChannelState, peer: SocketAddr, cred: &ClientCredentials) {
     source.notify_channel_close(&name, &ctx);
 }
 
+/// Returns the SID actually removed (`Some`) so the connection owner can
+/// drop its `PeerEntry` report entry, or `None` when the SID was unknown
+/// (no-op, no reply — pvxs serverchan.cpp:382-386).
 async fn handle_destroy_channel(
     frame: &Frame,
     tx: &SrvTx,
@@ -3757,13 +3976,17 @@ async fn handle_destroy_channel(
     order: ByteOrder,
     peer: SocketAddr,
     cred: &ClientCredentials,
-) -> PvaResult<()> {
+) -> PvaResult<Option<u32>> {
+    // Inbound payload decodes with the frame's own header order (pvxs
+    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // (config) is used only for the outbound reply below.
+    let inbound_order = frame.order();
     let mut cur = frame.cursor();
     let sid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let cid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     // pvxs `serverchan.cpp:382-386`: when the SID is unknown the server
     // logs at debug and silently returns — no DESTROY_CHANNEL reply is
@@ -3776,7 +3999,7 @@ async fn handle_destroy_channel(
     // remove + reply only on hit.
     if !channels.contains_key(&sid) {
         debug!(sid, cid, "DESTROY_CHANNEL on unknown SID: dropping");
-        return Ok(());
+        return Ok(None);
     }
     // pvxs also warns when `chan->cid != cid` (line 390-393) but proceeds
     // with the destroy. We don't keep the wire CID alongside the SID
@@ -3801,6 +4024,12 @@ async fn handle_destroy_channel(
     let ch = channels
         .remove(&sid)
         .expect("SID presence verified by contains_key above");
+    // The DESTROY_CHANNEL reply is charged to the channel being torn
+    // down (pvxs serverchan.cpp:409 `statTx += 16u`); capture its
+    // counter before `close_channel` consumes the state. pvxs charges no
+    // per-channel `statRx` for CREATE/DESTROY (serverchan.cpp has only
+    // statTx) — only the reply is attributed here.
+    let stat = ch.stat.clone();
     close_channel(ch, peer, cred);
     let mut payload = Vec::new();
     payload.put_u32(sid, order);
@@ -3814,8 +4043,9 @@ async fn handle_destroy_channel(
     let mut buf = Vec::new();
     h.write_into(&mut buf);
     buf.extend_from_slice(&payload);
+    stat.add_tx(buf.len());
     let _ = tx.send(buf).await;
-    Ok(())
+    Ok(Some(sid))
 }
 
 /// Handle CANCEL_REQUEST (cmd 21). pvxs serverconn.cpp:262 — moves the op
@@ -3840,8 +4070,9 @@ async fn handle_destroy_channel(
 fn handle_cancel_request(
     frame: &Frame,
     channels: &mut HashMap<u32, ChannelState>,
-    order: ByteOrder,
 ) -> PvaResult<()> {
+    // Decode with the frame's own header order (pvxs conn.cpp:195-198).
+    let order = frame.order();
     let mut cur = frame.cursor();
     // pvxs `serverconn.cpp:262-270` throws on truncated
     // CANCEL_REQUEST (`if(!M.good()) throw ...`), which the conn
@@ -3915,9 +4146,24 @@ fn handle_cancel_request(
 }
 
 /// Handle MESSAGE (cmd 18). pvxs serverconn.cpp:323 — clients send
-/// log messages tagged with severity (Info/Warning/Error/Fatal). We
-/// surface them through the `tracing` crate at the matching level.
-fn handle_message(frame: &Frame, order: ByteOrder, peer: &SocketAddr) -> PvaResult<()> {
+/// log messages tagged with severity (Info/Warning/Error/Fatal) bound
+/// to an operation IOID. We surface them through the `tracing` crate
+/// at the matching level.
+///
+/// pvxs (`serverconn.cpp:338-354`) looks the IOID up in the
+/// connection-wide `opByIOID` FIRST: a MESSAGE for an IOID no operation
+/// owns is logged only at debug and dropped — it never reaches the
+/// warning/error severity path. Only a live IOID gets the severity
+/// mapping, with the owning channel name in the log line. Without this
+/// gate a peer could emit warning/error-level server logs for an
+/// arbitrary IOID it never opened.
+fn handle_message(
+    frame: &Frame,
+    channels: &HashMap<u32, ChannelState>,
+    peer: &SocketAddr,
+) -> PvaResult<()> {
+    // Decode with the frame's own header order (pvxs conn.cpp:195-198).
+    let order = frame.order();
     let mut cur = frame.cursor();
     // pvxs `serverconn.cpp:323-336` throws on malformed
     // MESSAGE; conn loop turns into a reset. Pre-fix Rust silently
@@ -3931,11 +4177,23 @@ fn handle_message(frame: &Frame, order: ByteOrder, peer: &SocketAddr) -> PvaResu
     let msg = crate::proto::decode_string(&mut cur, order)
         .map_err(|e| PvaError::Decode(format!("MESSAGE string: {e}")))?
         .unwrap_or_default();
+    // IOID lookup gate (pvxs serverconn.cpp:338-342): absent → debug
+    // only, no severity escalation.
+    let channel = op_owner_sid(channels, ioid).and_then(|sid| channels.get(&sid));
+    let Some(channel) = channel else {
+        debug!(
+            ?peer,
+            ioid, mtype, message = %msg,
+            "client MESSAGE for unknown IOID: dropping (no owning operation)"
+        );
+        return Ok(());
+    };
+    let pv = channel.name.as_str();
     match mtype {
-        0 => debug!(?peer, ioid, message = %msg, "client info"),
-        1 => warn!(?peer, ioid, message = %msg, "client warning"),
-        2 | 3 => error!(?peer, ioid, message = %msg, "client error"),
-        _ => debug!(?peer, ioid, mtype, message = %msg, "client message (unknown type)"),
+        0 => debug!(?peer, ioid, pv, message = %msg, "client info"),
+        1 => warn!(?peer, ioid, pv, message = %msg, "client warning"),
+        2 | 3 => error!(?peer, ioid, pv, message = %msg, "client error"),
+        _ => debug!(?peer, ioid, pv, mtype, message = %msg, "client message (unknown type)"),
     }
     Ok(())
 }
@@ -3943,8 +4201,9 @@ fn handle_message(frame: &Frame, order: ByteOrder, peer: &SocketAddr) -> PvaResu
 fn handle_destroy_request(
     frame: &Frame,
     channels: &mut HashMap<u32, ChannelState>,
-    order: ByteOrder,
 ) -> PvaResult<()> {
+    // Decode with the frame's own header order (pvxs conn.cpp:195-198).
+    let order = frame.order();
     let mut cur = frame.cursor();
     // pvxs `serverconn.cpp:297-305` throws on malformed
     // DESTROY_REQUEST. Pre-fix Rust silently returned.
@@ -3983,6 +4242,7 @@ async fn handle_tcp_search(
     frame: &Frame,
     tx: &SrvTx,
     config: &PvaServerConfig,
+    peer: SocketAddr,
 ) -> PvaResult<()> {
     // Rebuild the raw frame bytes so the UDP parser sees the same
     // shape (header + payload). `parse_search_request` reads from
@@ -4014,7 +4274,10 @@ async fn handle_tcp_search(
     // Protocol-gated match set, shared with the v4/v6 UDP responders.
     // See `udp::search_matched_cids`.
     let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
-    let matched = super::udp::search_matched_cids(source, &req, protocol).await;
+    // pvxs fills `Search::source` from the TCP peer for circuit search
+    // (serverchan.cpp:197-222), so a source can scope advertisement by
+    // the established peer endpoint.
+    let matched = super::udp::search_matched_cids(source, &req, protocol, peer).await;
     // pvxs `serverchan.cpp:240-249`: emit the response only when
     // there's a match OR MustReply was set. Skip otherwise to
     // avoid leaking server presence on every probe.
@@ -4041,6 +4304,10 @@ async fn handle_op(
     kind: OpKind,
     config: &PvaServerConfig,
     encode_cache: &mut EncodeTypeCache,
+    // Connection-scope inbound decode cache (pvxs `rxRegistry`, conn.h:23).
+    // Threaded so a 0xFD-defined descriptor in the pvRequest/EXEC body of one
+    // op resolves a later 0xFE reference on the same connection.
+    decode_cache: &mut TypeCache,
     peer: std::net::SocketAddr,
     cred: &ClientCredentials,
     // read-loop owner's MONITOR subscriber-completion sender. The
@@ -4053,12 +4320,18 @@ async fn handle_op(
     // the owner returns the op to `Idle` when the response is sent.
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
 ) -> PvaResult<()> {
+    // Inbound payload decodes with the frame's own header order (pvxs
+    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // (config) is used only for outbound reply frames. Each data-phase
+    // frame re-enters this handler, so `frame.order()` is the order of
+    // whichever INIT/EXEC/ACK frame is being decoded right now.
+    let inbound_order = frame.order();
     let mut cur = frame.cursor();
     let sid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let ioid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
@@ -4080,6 +4353,14 @@ async fn handle_op(
             return Ok(());
         }
     };
+
+    // Attribute this inbound op frame's body to the channel's report
+    // counter (pvxs `chan->statRx += rxlen`, serverget.cpp:386 /
+    // servermon.cpp:513). All per-channel reply/data frames go out
+    // through `chan_tx`, the single owner of `statTx` accounting, so the
+    // outbound count cannot be skipped at any send site.
+    ch.stat.add_rx(frame.payload.len());
+    let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
 
     // Dispatch every operation to the source bound at CREATE_CHANNEL,
     // not the top-level registry. pvxs installs the accepting source's
@@ -4110,8 +4391,8 @@ async fn handle_op(
         // so a malicious peer can't accumulate IOID state forever
         // by sending INIT … INIT … without ever issuing DESTROY.
         if ch.ops.len() >= config.max_ops_per_channel {
-            send_op_error(
-                tx,
+            send_chan_op_error(
+                &chan_tx,
                 kind,
                 ioid,
                 subcmd,
@@ -4134,7 +4415,15 @@ async fn handle_op(
             (OpKind::Rpc, None) => FieldDesc::Variant,
             (_, Some(d)) => d,
             (_, None) => {
-                send_op_error(tx, kind, ioid, subcmd, "must provide prototype", order).await?;
+                send_chan_op_error(
+                    &chan_tx,
+                    kind,
+                    ioid,
+                    subcmd,
+                    "must provide prototype",
+                    order,
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -4155,7 +4444,7 @@ async fn handle_op(
         // `onOp` (`serverget.cpp:198-203`), whose throw is caught and
         // signalled as a remote *op* error (`serverget.cpp:407-413`),
         // so that stays an op-level Status reply.
-        let req_desc = match decode_type_desc(&mut cur, order) {
+        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
             Ok(d) => d,
             Err(e) => {
                 return Err(PvaError::Decode(format!("INIT pvRequest descriptor: {e}")));
@@ -4165,12 +4454,13 @@ async fn handle_op(
         // INIT sends only the descriptor — interop), but a PRESENT but
         // malformed one is the same `!M.good()` bev.reset() wire fault as
         // the descriptor above, so it is likewise connection-fatal.
-        let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, order) {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(PvaError::Decode(format!("INIT pvRequest value: {e}")));
-            }
-        };
+        let req_value =
+            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(PvaError::Decode(format!("INIT pvRequest value: {e}")));
+                }
+            };
         let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
             Ok(m) => m,
             Err(e) => {
@@ -4181,8 +4471,8 @@ async fn handle_op(
                 // (`pvrequest.cpp:61-62`). Pre-fix Rust silently
                 // fell back to all-fields, leaking fields the client
                 // didn't request.
-                send_op_error(
-                    tx,
+                send_chan_op_error(
+                    &chan_tx,
                     kind,
                     ioid,
                     subcmd,
@@ -4202,6 +4492,16 @@ async fn handle_op(
         // window credits). Without pipeline=true we don't gate the
         // emit loop — mpsc backpressure remains the only limiter.
         let pipeline_req = req_value.as_ref().and_then(monitor_pipeline_options);
+        // The client-requested `queueSize` overrides the server's default
+        // monitor queue depth for THIS operation, whether or not pipeline
+        // flow control is enabled (pvxs `op->limit = qSize` sits outside
+        // `if(op->pipeline)`, servermon.cpp:533-543). Captured before
+        // `pipeline_req` is consumed by the move below; `None` means the
+        // server keeps its configured `monitor_queue_depth`.
+        let requested_queue_size = match &pipeline_req {
+            Some(MonitorPipelineRequest::Options(o)) => o.requested_queue_size,
+            _ => None,
+        };
         // pvxs `servermon.cpp:537-540`: a MONITOR pipeline request whose
         // PRESENT `queueSize` is invalid (`<2`/unparseable) is a
         // negotiation error — reject the INIT (`ctrl->error(...)` +
@@ -4210,8 +4510,8 @@ async fn handle_op(
         // `serverget` ignores these options), so the reject is
         // monitor-only.
         if kind == OpKind::Monitor && matches!(pipeline_req, Some(MonitorPipelineRequest::Reject)) {
-            send_op_error(
-                tx,
+            send_chan_op_error(
+                &chan_tx,
                 kind,
                 ioid,
                 subcmd,
@@ -4237,7 +4537,7 @@ async fn handle_op(
         // the connection on `!M.good()`, so propagating the decode error
         // here tears down the connection (matches `bev.reset()`). It is a
         // framing violation, not a legacy omission.
-        let pipeline_initial_nack = parse_monitor_init_nack(kind, subcmd, &mut cur, order)?;
+        let pipeline_initial_nack = parse_monitor_init_nack(kind, subcmd, &mut cur, inbound_order)?;
         let (monitor_window, monitor_window_notify) = if kind == OpKind::Monitor
             && let Some(opt) = pipeline_opt.as_ref()
         {
@@ -4298,16 +4598,16 @@ async fn handle_op(
 
         // capture the event-affecting MONITOR pvRequest
         // options so the START path can hand them to the source's
-        // `subscribe_*_checked_opts`. `pipeline_opt` was already
-        // filtered to `enabled`; `queue_size` is recorded only when
-        // the client requested pipeline mode (pvxs `servermon.cpp:533`
-        // only honours `queueSize` for pipeline subscriptions).
-        // `server_filter` reflects whether a non-empty `_filter`
-        // chain was present.
+        // `subscribe_*_checked_opts`. `queue_size` carries the
+        // client-requested `queueSize` whether or not pipeline mode is
+        // enabled (pvxs `op->limit = qSize` is honoured for plain
+        // monitors too, servermon.cpp:533-543) — the START path reads it
+        // as the per-op squash threshold. `server_filter` reflects
+        // whether a non-empty `_filter` chain was present.
         let monitor_options = if kind == OpKind::Monitor {
             crate::server_native::source::MonitorOptions {
                 pipeline: pipeline_opt.is_some(),
-                queue_size: pipeline_opt.as_ref().map(|o| o.queue_size),
+                queue_size: requested_queue_size,
                 server_filter: !monitor_filters.is_empty(),
             }
         } else {
@@ -4380,7 +4680,9 @@ async fn handle_op(
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
-        let _ = tx.send(buf).await;
+        // Attribute the op INIT reply to the channel (pvxs
+        // `chan->statTx += enqueueTxBody(cmd)`, serverget.cpp:124).
+        let _ = chan_tx.send(buf).await;
         return Ok(());
     }
 
@@ -4419,7 +4721,7 @@ async fn handle_op(
             // continue parsing frames while the source future runs.
             let pv_name = ch.name.clone();
             let src = source.clone();
-            let tx_clone = tx.clone();
+            let tx_clone = chan_tx.clone();
             let intro_t = intro.clone();
             let mask_t = mask.clone();
             let cred_account = cred.account.clone();
@@ -4476,7 +4778,7 @@ async fn handle_op(
                 let value = match catch_handler_panic(src.get_value_checked(checked, ctx)).await {
                     Ok(Some(v)) => v,
                     Ok(None) => {
-                        let _ = send_op_error(
+                        let _ = send_chan_op_error(
                             &tx_clone,
                             OpKind::Get,
                             ioid,
@@ -4489,13 +4791,14 @@ async fn handle_op(
                     }
                     Err(msg) => {
                         let _ =
-                            send_op_error(&tx_clone, OpKind::Get, ioid, subcmd, &msg, order).await;
+                            send_chan_op_error(&tx_clone, OpKind::Get, ioid, subcmd, &msg, order)
+                                .await;
                         return;
                     }
                 };
                 // source-side mismatch gate.
                 if let Err(e) = crate::pvdata::value_matches_descriptor(&value, &intro_t) {
-                    let _ = send_op_error(
+                    let _ = send_chan_op_error(
                         &tx_clone,
                         OpKind::Get,
                         ioid,
@@ -4546,7 +4849,7 @@ async fn handle_op(
                 // source.get_value_checked which can be slow.
                 let pv_name = ch.name.clone();
                 let src = source.clone();
-                let tx_clone = tx.clone();
+                let tx_clone = chan_tx.clone();
                 let intro_t = intro.clone();
                 let mask_t = mask.clone();
                 let cred_account = cred.account.clone();
@@ -4601,7 +4904,7 @@ async fn handle_op(
                     {
                         Ok(Some(v)) => v,
                         Ok(None) => {
-                            let _ = send_op_error(
+                            let _ = send_chan_op_error(
                                 &tx_clone,
                                 OpKind::Put,
                                 ioid,
@@ -4613,9 +4916,15 @@ async fn handle_op(
                             return;
                         }
                         Err(msg) => {
-                            let _ =
-                                send_op_error(&tx_clone, OpKind::Put, ioid, subcmd, &msg, order)
-                                    .await;
+                            let _ = send_chan_op_error(
+                                &tx_clone,
+                                OpKind::Put,
+                                ioid,
+                                subcmd,
+                                &msg,
+                                order,
+                            )
+                            .await;
                             return;
                         }
                     };
@@ -4660,22 +4969,29 @@ async fn handle_op(
             // marked. Decode with the changed-BitSet so exactly the
             // present fields are consumed (pvData spec §5.4 bit
             // numbering).
-            let changed =
-                BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+            let changed = BitSet::decode(&mut cur, inbound_order)
+                .map_err(|e| PvaError::Decode(e.to_string()))?;
             // pvxs `serverget.cpp:488-492` calls `onPut` immediately
             // on every CMD_PUT !init — the client's autoExec setting
             // is purely a client-side timing knob (clientget.cpp:213)
             // for whether the PUT EXEC fires automatically after INIT
             // or waits for `reExec()`. Each EXEC frame still carries
             // exactly one value and triggers exactly one write.
-            let delta = decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, order)
-                .map_err(|e| PvaError::Decode(format!("PUT requires a value payload: {e}")))?;
+            let delta = decode_pv_field_with_bitset_cached(
+                &intro,
+                &changed,
+                0,
+                &mut cur,
+                inbound_order,
+                decode_cache,
+            )
+            .map_err(|e| PvaError::Decode(format!("PUT requires a value payload: {e}")))?;
             let pv_name = ch.name.clone();
             // spawn PUT exec — put_delta_checked can be slow.
             // Decode frame data synchronously (above) so the cursor is
             // consumed before returning; source calls happen in the task.
             let src = source.clone();
-            let tx_clone = tx.clone();
+            let tx_clone = chan_tx.clone();
             let intro_t = intro.clone();
             let cred_account = cred.account.clone();
             let cred_method = cred.method.clone();
@@ -4876,7 +5192,7 @@ async fn handle_op(
                 // non-existent IOID was already rejected with "operation
                 // not initialised" above, so by here the op exists; this
                 // read is the only remaining ACK-payload validation.)
-                let ack_count = cur.get_u32(order).map_err(|e| {
+                let ack_count = cur.get_u32(inbound_order).map_err(|e| {
                     PvaError::Decode(format!(
                         "malformed MONITOR ACK (ioid {ioid}): missing u32 ack-count: {e}"
                     ))
@@ -4972,9 +5288,21 @@ async fn handle_op(
                 let pv_name = ch.name.clone();
                 let intro_clone = intro.clone();
                 let mask_clone = mask.clone();
-                let tx_clone = tx.clone();
+                let tx_clone = chan_tx.clone();
                 let src = source.clone();
-                let queue_depth = config.monitor_queue_depth;
+                // Per-operation monitor queue depth: the client-requested
+                // `record._options.queueSize` (captured at INIT into
+                // `monitor_options.queue_size`) overrides the server-wide
+                // default, matching pvxs `op->limit = qSize` for both
+                // pipeline and plain monitors (servermon.cpp:533-543). The
+                // squash threshold below keys on this, not the config
+                // default, so `record[queueSize=2]` squashes at 2.
+                let queue_depth = ch
+                    .ops
+                    .get(&ioid)
+                    .and_then(|s| s.monitor_options.queue_size)
+                    .map(|n| n as usize)
+                    .unwrap_or(config.monitor_queue_depth);
                 let high_watermark = config.monitor_high_watermark;
                 // ACF-aware MONITOR: capture the peer's credentials
                 // so the spawned task can consult ctx-aware
@@ -5766,12 +6094,12 @@ async fn handle_op(
             // RPC; a present-but-malformed descriptor or value is a
             // connection-fatal decode error (pvxs `serverget.cpp:454-458`
             // `bev.reset()`), not a fabricated `Null` argument.
-            let (req_desc, req_value) =
-                decode_rpc_exec_arg(&mut cur, order).map_err(PvaError::Decode)?;
+            let (req_desc, req_value) = decode_rpc_exec_arg(&mut cur, inbound_order, decode_cache)
+                .map_err(PvaError::Decode)?;
             let pv_name = ch.name.clone();
             let _ = intro;
             let src = source.clone();
-            let tx_clone = tx.clone();
+            let tx_clone = chan_tx.clone();
             let rpc_ctx_val = crate::server_native::source::ChannelContext {
                 peer,
                 account: cred.account.clone(),
@@ -5843,10 +6171,13 @@ async fn handle_op(
             });
             finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
         }
-        // PUT_GET / PROCESS have dedicated handlers (`handle_put_get`,
-        // `handle_process`) and are never dispatched into `handle_op`.
-        OpKind::PutGet | OpKind::Process => {
-            unreachable!("PUT_GET / PROCESS are routed to their own handlers, not handle_op")
+        // PUT_GET / PROCESS / GET_FIELD have dedicated handlers
+        // (`handle_put_get`, `handle_process`, `handle_get_field`) and are
+        // never dispatched into `handle_op`.
+        OpKind::PutGet | OpKind::Process | OpKind::GetField => {
+            unreachable!(
+                "PUT_GET / PROCESS / GET_FIELD are routed to their own handlers, not handle_op"
+            )
         }
     }
     Ok(())
@@ -5857,19 +6188,28 @@ async fn handle_op(
 async fn handle_get_field(
     frame: &Frame,
     tx: &SrvTx,
-    channels: &HashMap<u32, ChannelState>,
+    channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
     peer: SocketAddr,
     cred: &ClientCredentials,
-) -> PvaResult<Option<AbortOnDrop>> {
+    // data-phase-completion sender (see [`handle_op`]). The slow-path
+    // introspection task installs an `ExecFinishGuard` so the read-loop
+    // owner releases the reserved GET_FIELD IOID once the reply is sent
+    // (or the task is aborted by DESTROY / teardown).
+    exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
+) -> PvaResult<()> {
+    // Inbound payload decodes with the frame's own header order (pvxs
+    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // (config) is used only for outbound reply frames.
+    let inbound_order = frame.order();
     let mut cur = frame.cursor();
     let sid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let ioid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let _sub = crate::proto::decode_string(&mut cur, order)
+    let _sub = crate::proto::decode_string(&mut cur, inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
 
     // pvxs serverintrospect.cpp:159 silently returns on
@@ -5891,96 +6231,132 @@ async fn handle_get_field(
         Some(c) => c,
         None => {
             debug!(sid, ioid, "GET_FIELD on unknown SID: dropping");
-            return Ok(None);
+            return Ok(());
         }
     };
-    if chan.ops.contains_key(&ioid) {
+    // pvxs rejects GET_FIELD when the IOID is already live on the
+    // connection (`opByIOID.find(ioid)!=end()`, serverintrospect.cpp:157).
+    // A reserved slow-path GET_FIELD op lives in `ch.ops` too (below), so a
+    // duplicate GET_FIELD frame for an in-flight introspection is caught by
+    // this same check rather than spawning a second task that double-replies.
+    if ioid_live_on_conn(channels, ioid) {
         debug!(
             sid,
-            ioid, "GET_FIELD reuses IOID bound to active op: dropping (pvxs parity)"
+            ioid, "GET_FIELD reuses IOID already live on connection: dropping (pvxs parity)"
         );
-        return Ok(None);
+        return Ok(());
     }
-    match chan.introspection.clone() {
-        Some(intro) => {
-            // Fast path: introspection already cached on the channel; no source call needed.
-            let mut payload = Vec::new();
-            payload.put_u32(ioid, order);
-            Status::ok().write_into(order, &mut payload);
-            encode_type_desc(&intro, order, &mut payload);
-            let h =
-                PvaHeader::application(true, order, Command::GetField.code(), payload.len() as u32);
-            let mut buf = Vec::new();
-            h.write_into(&mut buf);
-            buf.extend_from_slice(&payload);
-            let _ = tx.send(buf).await;
-            Ok(None)
-        }
-        None => {
-            // Slow path: introspection not yet cached; fetch from the
-            // CREATE_CHANNEL-bound owner without blocking the read loop —
-            // not the top-level registry (pvxs serverchan.cpp:70-112 /
-            // server.cpp:100-112; see `handle_op`).
-            let pv_name = chan.name.clone();
-            let src = chan.source.clone();
-            let tx_clone = tx.clone();
-            // introspect under the downstream connection's
-            // identity. pvxs builds the GET_FIELD ConnectOp with
-            // `conn->cred` (`serverintrospect.cpp:66`); a gateway must
-            // resolve the upstream type against THIS peer's credentials,
-            // not the shared identity. `pv_request` is `None` —
-            // GET_FIELD carries no per-op pvRequest.
-            let conn_ctx = crate::server_native::source::ChannelContext {
-                peer,
-                account: cred.account.clone(),
-                method: cred.method.clone(),
-                host: cred.host.clone(),
-                authority: cred.authority.clone(),
-                roles: cred.roles.clone(),
-                pv_request: None,
-            };
-            // return the abort handle so the caller stores it for
-            // connection-lifetime abort on teardown, matching pvxs opByIOID
-            // cleanup (serverconn.cpp:366-382).
-            let join = tokio::spawn(async move {
-                let intro = src.get_introspection_checked(&pv_name, conn_ctx).await;
-                let mut payload = Vec::new();
-                payload.put_u32(ioid, order);
-                match intro {
-                    Some(desc) => {
-                        // pvxs `serverintrospect.cpp:38-42`: `ioid + status`
-                        // then the descriptor, written only when non-null.
-                        Status::ok().write_into(order, &mut payload);
-                        encode_type_desc(&desc, order, &mut payload);
-                    }
-                    None => {
-                        // A source that cannot supply a descriptor must reply
-                        // `Status::Error` with NO descriptor — pvxs
-                        // `ServerIntrospectControl::error` →
-                        // `doReply(nullptr, Status::Error)`
-                        // (`serverintrospect.cpp:83-87`), and the `if(type)`
-                        // guard at `:41-42` omits the type word. Fabricating a
-                        // `Variant` here (the old `unwrap_or`) reported success
-                        // and taught the client a wrong type tree, so a later
-                        // GET/PUT/MONITOR would decode against the wrong shape.
-                        Status::error("field introspection unavailable".to_string())
-                            .write_into(order, &mut payload);
-                    }
-                }
-                let h = PvaHeader::application(
-                    true,
-                    order,
-                    Command::GetField.code(),
-                    payload.len() as u32,
-                );
-                let mut buf = Vec::new();
-                h.write_into(&mut buf);
-                buf.extend_from_slice(&payload);
-                let _ = tx_clone.send(buf).await;
-            });
-            Ok(Some(AbortOnDrop(join.abort_handle())))
-        }
+    // Attribute the GET_FIELD request and its reply to the channel
+    // (pvxs serverintrospect.cpp:164 `chan->statRx += rxlen`, :45
+    // `ch->statTx += enqueueTxBody(CMD_GET_FIELD)`); both the cached
+    // fast-path reply and the spawned slow-path reply go through
+    // `chan_tx`.
+    chan.stat.add_rx(frame.payload.len());
+    let chan_tx = ChannelTx::new(tx.clone(), chan.stat.clone());
+    if let Some(intro) = chan.introspection.clone() {
+        // Fast path: introspection already cached on the channel; reply
+        // inline. This completes synchronously before returning to the read
+        // loop, so there is no async window for a duplicate IOID to race —
+        // pvxs inserts+removes the introspect op within one `doReply` here
+        // too. No reservation needed.
+        let mut payload = Vec::new();
+        payload.put_u32(ioid, order);
+        Status::ok().write_into(order, &mut payload);
+        encode_type_desc(&intro, order, &mut payload);
+        let h = PvaHeader::application(true, order, Command::GetField.code(), payload.len() as u32);
+        let mut buf = Vec::new();
+        h.write_into(&mut buf);
+        buf.extend_from_slice(&payload);
+        let _ = chan_tx.send(buf).await;
+        return Ok(());
     }
+
+    // Slow path: introspection not yet cached; fetch from the
+    // CREATE_CHANNEL-bound owner without blocking the read loop — not the
+    // top-level registry (pvxs serverchan.cpp:70-112 / server.cpp:100-112;
+    // see `handle_op`).
+    let pv_name = chan.name.clone();
+    let src = chan.source.clone();
+    let tx_clone = chan_tx.clone();
+    // introspect under the downstream connection's identity. pvxs builds
+    // the GET_FIELD ConnectOp with `conn->cred` (`serverintrospect.cpp:66`);
+    // a gateway must resolve the upstream type against THIS peer's
+    // credentials. `pv_request` is `None` — GET_FIELD carries no pvRequest.
+    let conn_ctx = crate::server_native::source::ChannelContext {
+        peer,
+        account: cred.account.clone(),
+        method: cred.method.clone(),
+        host: cred.host.clone(),
+        authority: cred.authority.clone(),
+        roles: cred.roles.clone(),
+        pv_request: None,
+    };
+    // The immutable borrow of `chan` ends here (all needed values cloned),
+    // so we can take the mutable borrow to reserve the IOID.
+
+    // Reserve the IOID as a real GET_FIELD op before spawning, mirroring
+    // pvxs setting the `ServerIntrospect` op to Executing in `opByIOID`
+    // (serverintrospect.cpp:164-178). The op carries no descriptor yet
+    // (that is what the introspection fetches); `last_request = true` so the
+    // `ExecFinished` owner removes it once the single reply is out
+    // (apply_exec_finish), and `data_task_abort` (installed below) lets
+    // DESTROY_REQUEST / channel teardown abort the in-flight task by
+    // dropping the op — the same lifecycle GET/PUT/RPC use.
+    let mut reserve = non_monitor_op_state(
+        FieldDesc::Variant,
+        OpKind::GetField,
+        BitSet::with_capacity(0),
+    );
+    reserve.exec_state = ExecState::Executing;
+    reserve.last_request = true;
+    let op_id = reserve.monitor_op_id;
+    let chan_mut = channels.get_mut(&sid).expect("SID presence verified above");
+    chan_mut.ops.insert(ioid, reserve);
+
+    let exec_fin = ExecFinished { sid, ioid, op_id };
+    let exec_fin_tx_task = exec_fin_tx.clone();
+    let join = tokio::spawn(async move {
+        // terminal finalizer — releases the reserved IOID on EVERY exit
+        // (reply sent, panic, or abort), like the GET/PUT/RPC exec tasks.
+        let _exec_fin_guard = ExecFinishGuard {
+            tx: exec_fin_tx_task,
+            fin: exec_fin,
+        };
+        let intro = src.get_introspection_checked(&pv_name, conn_ctx).await;
+        let mut payload = Vec::new();
+        payload.put_u32(ioid, order);
+        match intro {
+            Some(desc) => {
+                // pvxs `serverintrospect.cpp:38-42`: `ioid + status`
+                // then the descriptor, written only when non-null.
+                Status::ok().write_into(order, &mut payload);
+                encode_type_desc(&desc, order, &mut payload);
+            }
+            None => {
+                // A source that cannot supply a descriptor must reply
+                // `Status::Error` with NO descriptor — pvxs
+                // `ServerIntrospectControl::error` →
+                // `doReply(nullptr, Status::Error)`
+                // (`serverintrospect.cpp:83-87`), and the `if(type)`
+                // guard at `:41-42` omits the type word. Fabricating a
+                // `Variant` here (the old `unwrap_or`) reported success
+                // and taught the client a wrong type tree, so a later
+                // GET/PUT/MONITOR would decode against the wrong shape.
+                Status::error("field introspection unavailable".to_string())
+                    .write_into(order, &mut payload);
+            }
+        }
+        let h = PvaHeader::application(true, order, Command::GetField.code(), payload.len() as u32);
+        let mut buf = Vec::new();
+        h.write_into(&mut buf);
+        buf.extend_from_slice(&payload);
+        let _ = tx_clone.send(buf).await;
+    });
+    // Install the abort guard on the reserved op so DESTROY_REQUEST /
+    // teardown (which drop the op) cancel this task. `subcmd` is irrelevant
+    // here — `last_request` is already set on the reserved op above.
+    finish_exec_data_task(chan_mut, ioid, 0, join.abort_handle());
+    Ok(())
 }
 
 async fn send_op_error(
@@ -6002,6 +6378,40 @@ async fn send_op_error(
     msg: &str,
     order: ByteOrder,
 ) -> PvaResult<()> {
+    let buf = build_op_error_frame(kind, ioid, subcmd, msg, order);
+    let _ = tx.send(buf).await;
+    Ok(())
+}
+
+/// Per-channel op error reply. pvxs charges every error reply to the
+/// owning channel's counter too (the reply leaves via the same
+/// `enqueueTxBody` → `chan->statTx` primitive as the success reply),
+/// so any error path on a resolved channel must go through `chan_tx`
+/// — the unknown-SID path has no channel and uses [`send_op_error`].
+async fn send_chan_op_error(
+    chan_tx: &ChannelTx,
+    kind: OpKind,
+    ioid: u32,
+    subcmd: u8,
+    msg: &str,
+    order: ByteOrder,
+) -> PvaResult<()> {
+    let buf = build_op_error_frame(kind, ioid, subcmd, msg, order);
+    let _ = chan_tx.send(buf).await;
+    Ok(())
+}
+
+/// Encode a single op error reply frame (`kind` command, `ioid`,
+/// `subcmd`, error `Status`). Shared by the connection-level
+/// [`send_op_error`] and the per-channel [`send_chan_op_error`] so the
+/// two cannot drift on framing.
+fn build_op_error_frame(
+    kind: OpKind,
+    ioid: u32,
+    subcmd: u8,
+    msg: &str,
+    order: ByteOrder,
+) -> Vec<u8> {
     let cmd = kind.command();
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
@@ -6011,8 +6421,7 @@ async fn send_op_error(
     let mut buf = Vec::new();
     h.write_into(&mut buf);
     buf.extend_from_slice(&payload);
-    let _ = tx.send(buf).await;
-    Ok(())
+    buf
 }
 
 #[allow(unused_imports)]
@@ -7251,7 +7660,12 @@ mod tests {
             let buf: &[u8] = &[];
             let mut cur = std::io::Cursor::new(buf);
             assert!(matches!(
-                decode_init_pv_request_value(&mut cur, &desc, ByteOrder::Little),
+                decode_init_pv_request_value(
+                    &mut cur,
+                    &desc,
+                    ByteOrder::Little,
+                    &mut TypeCache::new()
+                ),
                 Ok(None)
             ));
         }
@@ -7263,7 +7677,12 @@ mod tests {
             let buf: &[u8] = &[42, 0, 0, 0]; // i32 LE = 42
             let mut cur = std::io::Cursor::new(buf);
             assert_eq!(
-                decode_init_pv_request_value(&mut cur, &desc, ByteOrder::Little),
+                decode_init_pv_request_value(
+                    &mut cur,
+                    &desc,
+                    ByteOrder::Little,
+                    &mut TypeCache::new()
+                ),
                 Ok(Some(PvField::Scalar(ScalarValue::Int(42)))),
             );
         }
@@ -7277,7 +7696,13 @@ mod tests {
             let buf: &[u8] = &[1, 2]; // truncated i32
             let mut cur = std::io::Cursor::new(buf);
             assert!(
-                decode_init_pv_request_value(&mut cur, &desc, ByteOrder::Little).is_err(),
+                decode_init_pv_request_value(
+                    &mut cur,
+                    &desc,
+                    ByteOrder::Little,
+                    &mut TypeCache::new()
+                )
+                .is_err(),
                 "a present-but-truncated value body must error, not collapse to None",
             );
         }
@@ -7316,6 +7741,7 @@ mod tests {
                     sid,
                     introspection: Some(intro),
                     source,
+                    stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     ops: HashMap::new(),
                 },
             );
@@ -7347,6 +7773,7 @@ mod tests {
                 kind,
                 &config,
                 &mut encode_cache,
+                &mut TypeCache::new(),
                 peer,
                 &cred,
                 &discard_mon_fin(),
@@ -7675,6 +8102,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -7707,6 +8135,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -7731,6 +8160,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -7759,6 +8189,107 @@ mod tests {
             "with queueSize=2 and no ACK the server must send exactly 2 DATA \
              frames (the initial snapshot consumes one credit); got \
              {data_frames} — the initial snapshot bypassed the pipeline window"
+        );
+    }
+
+    /// A NON-pipeline monitor that requests `record[queueSize=2]` must
+    /// have that depth honoured as its server-side squash threshold, not
+    /// silently discarded in favour of `PvaServerConfig::monitor_queue_depth`
+    /// (default 64). pvxs assigns `op->limit = qSize` for any valid
+    /// queueSize OUTSIDE the `if(op->pipeline)` block (servermon.cpp:533-543)
+    /// and the squash compares `queue.size() < limit` (servermon.cpp:271-287).
+    /// Here we drive a plain (pipeline=false) MONITOR INIT and assert the
+    /// negotiated `queueSize` lands on `OpState.monitor_options.queue_size`
+    /// — the exact field the START path reads to set the squash threshold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_pipeline_queue_size_drives_server_squash_threshold() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 909;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0));
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        assert_ne!(
+            config.monitor_queue_depth, 2,
+            "test premise: the requested depth must differ from the server default"
+        );
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // MONITOR INIT, pipeline OFF, queueSize=2.
+        let req_val = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::Int(2)),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Monitor, order, init_payload);
+        handle_op(
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("non-pipeline MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT reply");
+
+        let op = channels
+            .get(&sid)
+            .and_then(|c| c.ops.get(&ioid))
+            .expect("op present after INIT");
+        // pipeline flow control must stay OFF...
+        assert!(
+            op.monitor_window.is_none(),
+            "pipeline=false must not negotiate a credit window"
+        );
+        // ...yet the requested queueSize is preserved as the per-op squash
+        // depth the START path consumes (was discarded before the fix).
+        assert_eq!(
+            op.monitor_options.queue_size,
+            Some(2),
+            "non-pipeline queueSize=2 must be the per-op squash threshold, \
+             not the server default {}",
+            config.monitor_queue_depth
         );
     }
 
@@ -7796,6 +8327,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -7827,6 +8359,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -7866,6 +8399,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -7887,6 +8421,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -7908,6 +8443,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -7966,6 +8502,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -8007,6 +8544,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8058,6 +8596,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8109,6 +8648,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8133,9 +8673,12 @@ mod tests {
         // Wire layout: ioid (u32) + messageType (u8) + message (string).
         // We can't easily inspect tracing output here, so the assertion is
         // simply that the handler tolerates each severity level without
-        // panicking and consumes the cursor cleanly.
+        // panicking and consumes the cursor cleanly. With an empty op
+        // map the IOID is unknown, so each MESSAGE is dropped at debug
+        // (pvxs serverconn.cpp:338-342) — still Ok.
         let order = ByteOrder::Little;
         let peer = "127.0.0.1:5075".parse::<SocketAddr>().unwrap();
+        let channels: HashMap<u32, ChannelState> = HashMap::new();
         for mtype in [0u8, 1, 2, 3, 9] {
             let mut payload = Vec::new();
             payload.put_u32(0xDEADBEEF, order); // ioid
@@ -8144,7 +8687,7 @@ mod tests {
             let frame = synth_frame(Command::Message, order, payload);
             // MESSAGE handler now returns PvaResult; well-formed
             // payload must succeed.
-            handle_message(&frame, order, &peer).expect("well-formed MESSAGE");
+            handle_message(&frame, &channels, &peer).expect("well-formed MESSAGE");
         }
 
         // truncated MESSAGE is now a protocol-fatal decode
@@ -8152,11 +8695,61 @@ mod tests {
         // server loop turns this into a connection reset.
         let frame_short = synth_frame(Command::Message, order, vec![0x01, 0x02]);
         let err =
-            handle_message(&frame_short, order, &peer).expect_err("truncated MESSAGE must Err");
+            handle_message(&frame_short, &channels, &peer).expect_err("truncated MESSAGE must Err");
         assert!(
             matches!(err, PvaError::Decode(_)),
             "expected Decode error, got {err:?}"
         );
+    }
+
+    /// pvxs gates inbound MESSAGE on the connection-wide op map: a
+    /// MESSAGE for an IOID no operation owns is dropped (debug only),
+    /// while a MESSAGE for a live IOID is accepted and (in pvxs) tagged
+    /// with the owning channel name. Both return Ok here; the
+    /// regression pins that an unknown IOID does NOT error and a live
+    /// IOID resolves its owning channel.
+    #[test]
+    fn handle_message_gates_on_live_ioid() {
+        let order = ByteOrder::Little;
+        let peer = "127.0.0.1:5075".parse::<SocketAddr>().unwrap();
+
+        // Build a channel with a live op for ioid 7.
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut ops = HashMap::new();
+        ops.insert(
+            7u32,
+            non_monitor_op_state(
+                FieldDesc::Scalar(ScalarType::Int),
+                OpKind::Get,
+                BitSet::new(),
+            ),
+        );
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            1,
+            ChannelState {
+                name: "dut:pv".into(),
+                cid: 0,
+                sid: 1,
+                introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops,
+            },
+        );
+
+        let msg = |ioid: u32| -> PvaResult<()> {
+            let mut payload = Vec::new();
+            payload.put_u32(ioid, order);
+            payload.put_u8(1); // warning
+            crate::proto::encode_string_into("hi", order, &mut payload);
+            let frame = synth_frame(Command::Message, order, payload);
+            handle_message(&frame, &channels, &peer)
+        };
+        // Live IOID: accepted.
+        msg(7).expect("MESSAGE on live IOID accepted");
+        // Unknown IOID: dropped, not an error, no severity escalation.
+        msg(999).expect("MESSAGE on unknown IOID dropped, not an error");
     }
 
     #[tokio::test]
@@ -8218,6 +8811,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -8227,7 +8821,7 @@ mod tests {
         payload.put_u32(sid, order);
         payload.put_u32(ioid, order);
         let frame = synth_frame(Command::CancelRequest, order, payload);
-        handle_cancel_request(&frame, &mut channels, order).expect("well-formed CancelRequest");
+        handle_cancel_request(&frame, &mut channels).expect("well-formed CancelRequest");
 
         // pvxs parity: op stays in the map, started flag stays set, abort
         // guard stays attached, pause flag flips on. Subsequent START
@@ -8314,6 +8908,7 @@ mod tests {
                 sid,
                 introspection: Some(FieldDesc::Variant),
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -8322,7 +8917,7 @@ mod tests {
         payload.put_u32(sid, order);
         payload.put_u32(ioid, order);
         let frame = synth_frame(Command::CancelRequest, order, payload);
-        handle_cancel_request(&frame, &mut channels, order).expect("well-formed CancelRequest");
+        handle_cancel_request(&frame, &mut channels).expect("well-formed CancelRequest");
 
         let op = channels
             .get_mut(&sid)
@@ -8534,7 +9129,7 @@ mod tests {
         // does not advance.
         let mut cur = std::io::Cursor::new([].as_slice());
         assert_eq!(
-            decode_rpc_exec_arg(&mut cur, order).unwrap(),
+            decode_rpc_exec_arg(&mut cur, order, &mut TypeCache::new()).unwrap(),
             (FieldDesc::Variant, PvField::Null)
         );
         assert_eq!(cur.position(), 0);
@@ -8546,7 +9141,7 @@ mod tests {
         let buf = [0xFFu8, 0xAA, 0xBB];
         let mut cur = std::io::Cursor::new(buf.as_slice());
         assert_eq!(
-            decode_rpc_exec_arg(&mut cur, order).unwrap(),
+            decode_rpc_exec_arg(&mut cur, order, &mut TypeCache::new()).unwrap(),
             (FieldDesc::Variant, PvField::Null)
         );
         assert_eq!(
@@ -8565,7 +9160,7 @@ mod tests {
         encode_pv_field(&value, &desc, order, &mut wire);
         let mut cur = std::io::Cursor::new(wire.as_slice());
         assert_eq!(
-            decode_rpc_exec_arg(&mut cur, order).unwrap(),
+            decode_rpc_exec_arg(&mut cur, order, &mut TypeCache::new()).unwrap(),
             (desc.clone(), value.clone())
         );
         assert_eq!(cur.position() as usize, wire.len());
@@ -8574,13 +9169,15 @@ mod tests {
         // is a connection-fatal decode error, not a parameterless call.
         let buf = [0x80u8]; // TAG_STRUCTURE, no id/field body
         let mut cur = std::io::Cursor::new(buf.as_slice());
-        decode_rpc_exec_arg(&mut cur, order).expect_err("truncated RPC descriptor must be fatal");
+        decode_rpc_exec_arg(&mut cur, order, &mut TypeCache::new())
+            .expect_err("truncated RPC descriptor must be fatal");
 
         // Valid descriptor plus a truncated value (a 4-byte Int cut to
         // two bytes) is also fatal.
         let truncated = &wire[..desc_len + 2];
         let mut cur = std::io::Cursor::new(truncated);
-        decode_rpc_exec_arg(&mut cur, order).expect_err("truncated RPC value must be fatal");
+        decode_rpc_exec_arg(&mut cur, order, &mut TypeCache::new())
+            .expect_err("truncated RPC value must be fatal");
     }
 
     /// pvxs `serverchan.cpp:382-386`: when the SID in DESTROY_CHANNEL
@@ -8638,6 +9235,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -8659,6 +9257,113 @@ mod tests {
         // Header (8) + ioid placeholder isn't part of DESTROY_CHANNEL;
         // payload is sid (4) + cid (4) = 8 total, so frame length = 16.
         assert_eq!(reply.len(), PvaHeader::SIZE + 8);
+    }
+
+    /// Inbound application frames must be decoded with the byte order in
+    /// the frame's own header, not the server's configured outbound order
+    /// (pvxs latches `peerBE` per received message, conn.cpp:195-198, and
+    /// builds every handler's input buffer from it, serverchan.cpp:262-373).
+    /// Here a big-endian-encoded DESTROY_CHANNEL reaches a server whose
+    /// configured (outbound) order is little-endian: the SID/CID must still
+    /// decode correctly so the channel is found and removed. Before the fix
+    /// the handler decoded the payload with the little-endian config order,
+    /// byte-swapping the SID into a value no channel owned — silently
+    /// dropping the request.
+    #[tokio::test]
+    async fn handle_destroy_channel_decodes_with_frame_header_order_not_config() {
+        let config_order = ByteOrder::Little;
+        let inbound_order = ByteOrder::Big;
+        let sid: u32 = 0x0102_0304;
+        let cid: u32 = 0x0506_0708;
+
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid,
+                sid,
+                introspection: None,
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops: HashMap::new(),
+            },
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+        // Payload encoded big-endian; header flagged big-endian.
+        let mut payload = Vec::new();
+        payload.put_u32(sid, inbound_order);
+        payload.put_u32(cid, inbound_order);
+        let frame = synth_frame(Command::DestroyChannel, inbound_order, payload);
+
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        // Server configured little-endian (config_order) for its OWN
+        // outbound frames; the inbound frame is big-endian.
+        handle_destroy_channel(&frame, &tx, &mut channels, config_order, peer, &cred)
+            .await
+            .expect("handler returns Ok");
+
+        assert!(
+            !channels.contains_key(&sid),
+            "BE-encoded SID must decode via the frame header order and find the channel"
+        );
+        let reply = rx.try_recv().expect("reply emitted for the decoded SID");
+        assert_eq!(reply.len(), PvaHeader::SIZE + 8);
+    }
+
+    /// Same per-frame-order rule for a data operation: a MONITOR ACK
+    /// encoded big-endian against a little-endian-configured server must
+    /// decode its SID/IOID/ack-count from the frame header order. Before
+    /// the fix the SID/IOID byte-swapped, the ACK matched no live op, and
+    /// the credit window was never refilled.
+    #[tokio::test]
+    async fn monitor_ack_decodes_with_frame_header_order_not_config() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let config_order = ByteOrder::Little;
+        let inbound_order = ByteOrder::Big;
+        let sid: u32 = 3;
+        let ioid: u32 = 88;
+
+        let window = Arc::new(AtomicU32::new(0));
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut channels = ack_test_channels(sid, ioid, window.clone(), source.clone());
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let config = crate::server_native::runtime::PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, inbound_order);
+        payload.put_u32(ioid, inbound_order);
+        payload.put_u8(0x80);
+        payload.put_u32(3, inbound_order); // ack-count, big-endian
+        let frame = synth_frame(Command::Monitor, inbound_order, payload);
+        handle_op(
+            &frame,
+            &tx,
+            &mut channels,
+            config_order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("well-formed BE MONITOR ACK ok");
+        assert_eq!(
+            window.load(Ordering::Relaxed),
+            3,
+            "BE ack-count must decode via the frame header order and refill the window"
+        );
     }
 
     /// pvxs `ServerChan::cleanup` (serverchan.cpp:43-60, :115-127) runs
@@ -8722,6 +9427,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -8782,7 +9488,7 @@ mod tests {
         let ioid: u32 = 100;
 
         // Build a SharedSource with one PV "dut" of type NTScalar<f64>.
-        let pv = SharedPV::new();
+        let pv = SharedPV::build_mailbox();
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
@@ -8808,6 +9514,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -8840,6 +9547,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8875,6 +9583,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8911,7 +9620,7 @@ mod tests {
         let sid: u32 = 1;
         let ioid: u32 = 200;
 
-        let pv = SharedPV::new();
+        let pv = SharedPV::build_mailbox();
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
@@ -8935,6 +9644,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -8965,6 +9675,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -8998,6 +9709,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9074,6 +9786,7 @@ mod tests {
                     sid,
                     introspection: Some(intro.clone()),
                     source: source.clone(),
+                    stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     ops,
                 },
             );
@@ -9101,6 +9814,7 @@ mod tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9160,6 +9874,7 @@ mod tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9188,6 +9903,325 @@ mod tests {
             ExecState::Idle,
             "a completed non-last-request EXEC returns the op to Idle"
         );
+    }
+
+    /// A client may advertise an inbound descriptor once with a
+    /// `0xFD <slot>` define and reference it later on the *same connection*
+    /// with `0xFE <slot>` — pvxs keeps one connection-scope `rxRegistry`
+    /// (conn.h:23) shared by every inbound decode. The native server's read
+    /// loop owns one `rx_type_cache` threaded through every handler, so an
+    /// INIT pvRequest descriptor defined by one operation resolves the
+    /// reference made by a later operation. The negative control proves the
+    /// shared cache is what closes the gap: a *fresh* cache (the pre-fix
+    /// per-call behaviour) rejects the reference with a typecache miss.
+    #[tokio::test]
+    async fn init_pv_request_descriptor_resolves_cached_reference_across_ops() {
+        use crate::pvdata::FieldDesc;
+        use crate::pvdata::encode::{decode_type_desc_cached, encode_type_desc};
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0));
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // The "empty pvRequest" structure (no `field` child) → wildcard
+        // mask. Its only role here is to be a real descriptor the client can
+        // cache and reference.
+        let req_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: Vec::new(),
+        };
+        const SLOT: u16 = 0x0001;
+
+        // GET INIT #1 (ioid 801): pvRequest descriptor is a `0xFD <slot>`
+        // define carrying the full inline descriptor.
+        let ioid1: u32 = 801;
+        let mut def_payload = Vec::new();
+        def_payload.put_u32(sid, order);
+        def_payload.put_u32(ioid1, order);
+        def_payload.put_u8(0x08); // INIT
+        def_payload.put_u8(0xFD);
+        def_payload.put_u16(SLOT, order);
+        encode_type_desc(&req_desc, order, &mut def_payload);
+        let def_frame = synth_frame(Command::Get, order, def_payload);
+
+        // GET INIT #2 (ioid 802): pvRequest descriptor is a bare `0xFE <slot>`
+        // reference to the descriptor defined by INIT #1.
+        let ioid2: u32 = 802;
+        let mut ref_payload = Vec::new();
+        ref_payload.put_u32(sid, order);
+        ref_payload.put_u32(ioid2, order);
+        ref_payload.put_u8(0x08); // INIT
+        ref_payload.put_u8(0xFE);
+        ref_payload.put_u16(SLOT, order);
+        let ref_frame = synth_frame(Command::Get, order, ref_payload);
+
+        // Shared connection cache: INIT #1 defines, INIT #2 resolves.
+        let mut decode_cache = TypeCache::new();
+        handle_op(
+            &def_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            &mut decode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("GET INIT defining the pvRequest descriptor must succeed");
+        let _ = rx.recv().await.expect("INIT #1 reply");
+        assert!(
+            decode_cache.contains_key(&SLOT),
+            "INIT #1 must fold the 0xFD define into the connection cache"
+        );
+
+        handle_op(
+            &ref_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            &mut decode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("GET INIT referencing the cached pvRequest descriptor must succeed");
+        let _ = rx.recv().await.expect("INIT #2 reply");
+        assert!(
+            channels.get(&sid).unwrap().ops.contains_key(&ioid2),
+            "INIT #2's 0xFE reference resolved against the shared cache and registered the op"
+        );
+
+        // Negative control: a fresh per-call cache (pre-fix behaviour) cannot
+        // resolve the reference — the INIT is rejected as connection-fatal.
+        let mut empty_channels: HashMap<u32, ChannelState> = HashMap::new();
+        empty_channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops: HashMap::new(),
+            },
+        );
+        let mut fresh_cache = TypeCache::new();
+        let err = handle_op(
+            &ref_frame,
+            &tx,
+            &mut empty_channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            &mut fresh_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect_err("a 0xFE reference with no prior define must be a decode error");
+        assert!(
+            matches!(err, PvaError::Decode(_)),
+            "unresolved type-cache reference is a connection-fatal decode error, got {err:?}"
+        );
+
+        // Sanity: the descriptor a fresh cache decodes from the *define*
+        // frame matches the one stored from the connection cache, proving the
+        // reference resolved to the same type.
+        let mut probe = std::io::Cursor::new(&def_frame.payload[9..]);
+        let defined = decode_type_desc_cached(&mut probe, order, &mut TypeCache::new())
+            .expect("define frame descriptor decodes");
+        assert_eq!(
+            decode_cache.get(&SLOT),
+            Some(&defined),
+            "cached slot holds exactly the descriptor the define carried"
+        );
+    }
+
+    /// RPC EXEC argument descriptors share the same connection cache as the
+    /// pvRequest INIT descriptors (pvxs decodes both through the one
+    /// `rxRegistry`). A define seen on an earlier frame must resolve a `0xFE`
+    /// reference in a later RPC EXEC argument. `decode_rpc_exec_arg` is the
+    /// exact decoder the RPC EXEC branch of `handle_op` invokes with the
+    /// read-loop cache.
+    #[test]
+    fn rpc_exec_arg_resolves_cached_descriptor_reference() {
+        use crate::pvdata::encode::{decode_type_desc_cached, encode_pv_field, encode_type_desc};
+        use crate::pvdata::{FieldDesc, ScalarType, ScalarValue};
+
+        let order = ByteOrder::Little;
+        const SLOT: u16 = 0x0007;
+        let arg_desc = FieldDesc::Scalar(ScalarType::Int);
+        let arg_val = PvField::Scalar(ScalarValue::Int(42));
+
+        // Frame 1: a `0xFD <slot>` define + value (a fully self-contained RPC
+        // argument that also populates the cache).
+        let mut def_buf = Vec::new();
+        def_buf.put_u8(0xFD);
+        def_buf.put_u16(SLOT, order);
+        encode_type_desc(&arg_desc, order, &mut def_buf);
+        encode_pv_field(&arg_val, &arg_desc, order, &mut def_buf);
+
+        // Frame 2: a `0xFE <slot>` reference + value.
+        let mut ref_buf = Vec::new();
+        ref_buf.put_u8(0xFE);
+        ref_buf.put_u16(SLOT, order);
+        encode_pv_field(&arg_val, &arg_desc, order, &mut ref_buf);
+
+        let mut cache = TypeCache::new();
+        let mut cur1 = std::io::Cursor::new(def_buf.as_slice());
+        let (d1, v1) =
+            decode_rpc_exec_arg(&mut cur1, order, &mut cache).expect("define frame decodes");
+        assert_eq!(d1, arg_desc);
+        assert_eq!(v1, arg_val);
+
+        let mut cur2 = std::io::Cursor::new(ref_buf.as_slice());
+        let (d2, v2) = decode_rpc_exec_arg(&mut cur2, order, &mut cache)
+            .expect("reference frame resolves against the shared cache");
+        assert_eq!(d2, arg_desc, "0xFE resolved to the defined descriptor");
+        assert_eq!(v2, arg_val);
+
+        // Negative control: a fresh cache rejects the reference.
+        let mut cur_fresh = std::io::Cursor::new(ref_buf.as_slice());
+        decode_rpc_exec_arg(&mut cur_fresh, order, &mut TypeCache::new())
+            .expect_err("a 0xFE reference with no prior define must be fatal");
+
+        // Make the cross-frame intent explicit: pre-seeding only the cache
+        // (no value bytes) is enough for the reference to resolve.
+        let mut seed = TypeCache::new();
+        let mut seed_cur = std::io::Cursor::new(&def_buf[..3 + 1]); // 0xFD + slot + 1-byte scalar code
+        let _ = decode_type_desc_cached(&mut seed_cur, order, &mut seed).expect("seed define");
+        let mut cur3 = std::io::Cursor::new(ref_buf.as_slice());
+        let (d3, _) = decode_rpc_exec_arg(&mut cur3, order, &mut seed)
+            .expect("reference resolves against a cache seeded by a prior define-only frame");
+        assert_eq!(d3, arg_desc);
+    }
+
+    /// A PUT EXEC payload whose value embeds an `any` (Variant) field may
+    /// carry the variant's element descriptor as a `0xFE <slot>` reference to
+    /// a descriptor defined earlier on the connection.
+    /// `decode_pv_field_with_bitset_cached` is the exact decoder the PUT EXEC
+    /// branch of `handle_op` now invokes with the read-loop cache; it must
+    /// resolve the embedded reference rather than fault the stream.
+    #[test]
+    fn put_exec_any_value_resolves_cached_variant_descriptor() {
+        use crate::pvdata::encode::{
+            decode_pv_field_with_bitset_cached, decode_type_desc_cached, encode_scalar_value,
+            encode_type_desc,
+        };
+        use crate::pvdata::{FieldDesc, ScalarType, ScalarValue};
+
+        let order = ByteOrder::Little;
+        const SLOT: u16 = 0x0003;
+
+        // Value type: a structure with a single `any` (Variant) leaf.
+        // Bit numbering: root=0, `v`=1.
+        let intro = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("v".into(), FieldDesc::Variant)],
+        };
+        let inner_desc = FieldDesc::Scalar(ScalarType::Int);
+        let inner_val = ScalarValue::Int(7);
+
+        // Prior frame defines the variant's element descriptor in the cache.
+        let mut def_buf = Vec::new();
+        def_buf.put_u8(0xFD);
+        def_buf.put_u16(SLOT, order);
+        encode_type_desc(&inner_desc, order, &mut def_buf);
+        let mut cache = TypeCache::new();
+        let mut def_cur = std::io::Cursor::new(def_buf.as_slice());
+        decode_type_desc_cached(&mut def_cur, order, &mut cache).expect("define inner descriptor");
+
+        // PUT EXEC delta: changed bitset selects the `v` leaf (bit 1); the
+        // variant body is `0xFE <slot>` + the inner scalar value.
+        let mut changed = crate::proto::BitSet::new();
+        changed.set(1);
+        let mut delta_buf = Vec::new();
+        delta_buf.put_u8(0xFE);
+        delta_buf.put_u16(SLOT, order);
+        encode_scalar_value(&inner_val, order, &mut delta_buf);
+
+        let mut cur = std::io::Cursor::new(delta_buf.as_slice());
+        let decoded =
+            decode_pv_field_with_bitset_cached(&intro, &changed, 0, &mut cur, order, &mut cache)
+                .expect("PUT EXEC any value with a cached variant descriptor decodes");
+        let PvField::Structure(s) = decoded else {
+            panic!("expected a structure, got {decoded:?}");
+        };
+        let (_, v) = s
+            .fields
+            .iter()
+            .find(|(n, _)| n == "v")
+            .expect("field v present");
+        // The `any` leaf carries its resolved element descriptor + value; the
+        // 0xFE reference must have resolved to the cached `Int` descriptor.
+        let PvField::Variant(var) = v else {
+            panic!("expected an `any`/Variant leaf, got {v:?}");
+        };
+        assert_eq!(
+            var.desc.as_ref(),
+            Some(&inner_desc),
+            "the 0xFE reference resolved to the cached Int descriptor"
+        );
+        assert_eq!(
+            var.value,
+            PvField::Scalar(ScalarValue::Int(7)),
+            "the variant value decoded against the resolved descriptor"
+        );
+
+        // Negative control: a fresh cache cannot resolve the reference.
+        let mut cur_fresh = std::io::Cursor::new(delta_buf.as_slice());
+        decode_pv_field_with_bitset_cached(
+            &intro,
+            &changed,
+            0,
+            &mut cur_fresh,
+            order,
+            &mut TypeCache::new(),
+        )
+        .expect_err("a 0xFE variant reference with no prior define must fault");
     }
 
     /// Build a flat 3-field NTScalar-like structure descriptor with
@@ -9380,7 +10414,7 @@ mod tests {
         let ioid: u32 = 300;
 
         let intro = three_field_intro();
-        let pv = SharedPV::new();
+        let pv = SharedPV::build_mailbox();
         pv.open(intro.clone(), three_field_value(10, 20, 30));
 
         let shared = SharedSource::new();
@@ -9396,6 +10430,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -9427,6 +10462,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9467,6 +10503,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -9504,7 +10541,7 @@ mod tests {
         let ioid: u32 = 400;
 
         let intro = three_field_intro();
-        let pv = SharedPV::new();
+        let pv = SharedPV::build_mailbox();
         pv.open(intro.clone(), three_field_value(10, 20, 30));
 
         let shared = SharedSource::new();
@@ -9520,6 +10557,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -9550,6 +10588,7 @@ mod tests {
             order,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_exec_fin(),
@@ -9585,6 +10624,7 @@ mod tests {
             order,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_exec_fin(),
@@ -9660,7 +10700,9 @@ mod tests {
         // Run many trials to give the scheduler a chance to surface
         // any residual interleaving race.
         for trial in 0..200 {
-            let pv = SharedPV::new();
+            // Writable PV: a plain SharedPV is not writable (pvxs
+            // parity), so the atomic-merge PUT path needs a mailbox.
+            let pv = SharedPV::build_mailbox();
             pv.open(intro.clone(), three_field_value(0, 0, 0));
             let shared = SharedSource::new();
             shared.add("dut", pv);
@@ -9840,6 +10882,7 @@ mod tests {
                 sid,
                 introspection: Some(intro),
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -9911,7 +10954,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, order)
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
             .expect("decode must succeed")
             .expect("ca with a user field yields Some");
 
@@ -9955,7 +10998,8 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let parsed = parse_client_credentials(&frame, order).expect("decode must succeed");
+        let parsed =
+            parse_client_credentials(&frame, &mut TypeCache::new()).expect("decode must succeed");
         assert!(
             parsed.is_none(),
             "ca + null auth must yield the anonymous fallback (None), \
@@ -9998,7 +11042,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, order)
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
             .expect("decode must succeed")
             .expect("non-anonymous method yields Some");
         assert_eq!(
@@ -10036,7 +11080,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, order)
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
             .expect("decode must succeed")
             .expect("mixed-case `Ca` is not the exact `ca` fallback → Some");
         assert_eq!(
@@ -10074,7 +11118,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, order)
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
             .expect("decode must succeed")
             .expect("capitalized `Anonymous` is not the exact fold → Some");
         assert_eq!(
@@ -10122,6 +11166,7 @@ mod tests {
             &mut channels,
             order,
             &config,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -10179,6 +11224,7 @@ mod tests {
             &mut channels,
             order,
             &config,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("OtherCA"),
             &discard_exec_fin(),
@@ -10227,6 +11273,7 @@ mod tests {
                 sid,
                 introspection: Some(intro),
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -10268,6 +11315,7 @@ mod tests {
             &mut channels,
             order,
             &config,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -10312,6 +11360,7 @@ mod tests {
             &mut channels,
             order,
             &config,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -10343,6 +11392,7 @@ mod tests {
                 sid,
                 introspection: Some(intro),
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -10385,6 +11435,7 @@ mod tests {
             &mut channels,
             order,
             &config,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -10525,6 +11576,7 @@ mod tests {
             order,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -10577,6 +11629,7 @@ mod tests {
             order,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -10621,6 +11674,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -10657,6 +11711,7 @@ mod tests {
             order,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
@@ -10726,6 +11781,7 @@ mod tests {
             &mut channels,
             order,
             &config,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &exec_fin_tx,
@@ -10801,6 +11857,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -10837,6 +11894,7 @@ mod tests {
             order,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
             &exec_fin_tx,
@@ -10937,6 +11995,7 @@ mod tests {
                 sid,
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -10952,9 +12011,17 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_get_field(&frame, &tx, &channels, order, peer, &cred)
-            .await
-            .expect("handler returns Ok");
+        handle_get_field(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("handler returns Ok");
 
         assert!(
             rx.try_recv().is_err(),
@@ -10987,6 +12054,7 @@ mod tests {
                 sid,
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -11000,15 +12068,98 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_get_field(&frame, &tx, &channels, order, peer, &cred)
-            .await
-            .expect("handler returns Ok");
+        handle_get_field(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("handler returns Ok");
 
         let resp = rx
             .try_recv()
             .expect("clean GET_FIELD must emit introspection reply");
         // ioid (4) + status (1 + ...) + type descriptor
         assert!(resp.len() > PvaHeader::SIZE + 4);
+    }
+
+    /// Per-channel report attribution wiring: a GET_FIELD request charges
+    /// the inbound body to the channel's `statRx` and the reply to its
+    /// `statTx` (pvxs serverintrospect.cpp:45/164). Drives the real
+    /// handler and reads back the SHARED `ChannelStat` Arc the report
+    /// would observe, so a future send site that bypasses `chan_tx` (or a
+    /// missing rx charge) regresses this test.
+    #[tokio::test]
+    async fn get_field_attributes_tx_rx_to_channel_stat() {
+        use crate::pvdata::FieldDesc;
+        use crate::server_native::SharedSource;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 7;
+        let ioid: u32 = 4242;
+
+        let source: DynSource = Arc::new(SharedSource::new());
+        // Keep our own handle on the channel's stat — this is the exact
+        // Arc a `PeerEntry::channel_opened` registration would share with
+        // the report.
+        let stat = crate::server_native::peers::ChannelStat::new("dut".into());
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(FieldDesc::Variant),
+                source: source.clone(),
+                stat: stat.clone(),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        crate::proto::encode_string_into("", order, &mut payload);
+        let frame = synth_frame(Command::GetField, order, payload);
+        let inbound_body = frame.payload.len();
+
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        handle_get_field(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("handler returns Ok");
+
+        let resp = rx
+            .try_recv()
+            .expect("clean GET_FIELD must emit introspection reply");
+
+        assert_eq!(
+            stat.rx.load(Ordering::Relaxed),
+            inbound_body as u64,
+            "GET_FIELD inbound body must be charged to the channel statRx"
+        );
+        assert_eq!(
+            stat.tx.load(Ordering::Relaxed),
+            resp.len() as u64,
+            "GET_FIELD reply must be charged to the channel statTx"
+        );
     }
 
     /// GET_FIELD slow path on a channel whose source returns no
@@ -11040,6 +12191,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -11053,10 +12205,20 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        // Keep the guard alive until after the slow-path reply is received.
-        let _guard = handle_get_field(&frame, &tx, &channels, order, peer, &cred)
-            .await
-            .expect("handler returns Ok");
+        // The reserved GET_FIELD op (holding the task's abort guard) lives
+        // in `channels`, which stays in scope until after the reply below,
+        // so the slow-path task is not aborted before it replies.
+        handle_get_field(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("handler returns Ok");
 
         // Slow path spawns the source call; await its reply.
         let resp = rx.recv().await.expect("GET_FIELD slow-path reply emitted");
@@ -11112,6 +12274,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -11125,10 +12288,20 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        // Keep the guard alive until after the slow-path reply is received.
-        let _guard = handle_get_field(&frame, &tx, &channels, order, peer, &cred)
-            .await
-            .expect("handler returns Ok");
+        // The reserved GET_FIELD op (holding the task's abort guard) lives
+        // in `channels`, which stays in scope until after the reply below,
+        // so the slow-path task is not aborted before it replies.
+        handle_get_field(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("handler returns Ok");
 
         let resp = rx.recv().await.expect("GET_FIELD slow-path reply emitted");
         let (rframe, _) = try_parse_frame(&resp).unwrap().unwrap();
@@ -11138,6 +12311,136 @@ mod tests {
             decoded.introspection.as_ref(),
             Some(&intro),
             "slow path must return the exact source descriptor"
+        );
+    }
+
+    /// A slow GET_FIELD reserves its IOID before spawning the source
+    /// introspection, so a second GET_FIELD reusing the same `(sid, ioid)`
+    /// while the first is still in flight is dropped silently and never
+    /// spawns a second task — only one reply reaches the client. Mirrors
+    /// pvxs `opByIOID.find(ioid)!=end()` rejection (serverintrospect.cpp:157)
+    /// once the introspect op is inserted Executing (:164-178).
+    #[tokio::test]
+    async fn slow_get_field_reserves_ioid_against_duplicate() {
+        use crate::pvdata::FieldDesc;
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Source whose introspection blocks on a semaphore so the first
+        // GET_FIELD stays in flight while the duplicate arrives, and which
+        // counts how many times introspection is actually invoked.
+        struct GatedIntrospectSource {
+            gate: Arc<tokio::sync::Semaphore>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl ChannelSource for GatedIntrospectSource {
+            async fn list_pvs(&self) -> Vec<String> {
+                vec!["dut".into()]
+            }
+            async fn has_pv(&self, name: &str) -> bool {
+                name == "dut"
+            }
+            async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _permit = self.gate.acquire().await.unwrap();
+                Some(FieldDesc::Variant)
+            }
+            async fn get_value(&self, _name: &str) -> Option<PvField> {
+                None
+            }
+            async fn put_value(&self, _name: &str, _v: PvField) -> Result<(), OpError> {
+                Ok(())
+            }
+            async fn is_writable(&self, _name: &str) -> bool {
+                false
+            }
+            async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+                None
+            }
+        }
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 7;
+        let ioid: u32 = 9001;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source: DynSource = Arc::new(GatedIntrospectSource {
+            gate: gate.clone(),
+            calls: calls.clone(),
+        });
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: None,
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let build = || {
+            let mut payload = Vec::new();
+            payload.put_u32(sid, order);
+            payload.put_u32(ioid, order);
+            crate::proto::encode_string_into("", order, &mut payload);
+            synth_frame(Command::GetField, order, payload)
+        };
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // First GET_FIELD: reserves the IOID and spawns the (blocked) task.
+        let frame1 = build();
+        handle_get_field(
+            &frame1,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("first GET_FIELD Ok");
+        assert!(
+            channels[&sid].ops.contains_key(&ioid),
+            "slow GET_FIELD must reserve its IOID in ch.ops"
+        );
+
+        // Duplicate GET_FIELD on the same IOID while the first is in flight:
+        // must be dropped without spawning a second introspection.
+        let frame2 = build();
+        handle_get_field(
+            &frame2,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("duplicate GET_FIELD Ok (silently dropped)");
+
+        // Release the first task and let it reply.
+        gate.add_permits(1);
+        let _first = rx.recv().await.expect("the one reserved GET_FIELD replies");
+        // No second reply: drain briefly and assert empty.
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a duplicate-IOID GET_FIELD must not produce a second reply"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the duplicate GET_FIELD must not invoke source introspection a second time"
         );
     }
 
@@ -11496,6 +12799,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: src.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -11634,6 +12938,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -11666,6 +12971,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon_fin_tx,
@@ -11693,6 +12999,7 @@ mod tests {
             OpKind::Monitor,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon_fin_tx,
@@ -11804,6 +13111,7 @@ mod tests {
                 sid: 1,
                 introspection: intro,
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -11871,6 +13179,7 @@ mod tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -11894,6 +13203,7 @@ mod tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -11928,6 +13238,7 @@ mod tests {
                     sid,
                     introspection: Some(three_field_intro()),
                     source: source.clone(),
+                    stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     ops: HashMap::new(),
                 },
             );
@@ -11978,6 +13289,7 @@ mod tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -12015,7 +13327,7 @@ mod tests {
         payload.put_u32(2, order);
         payload.put_u32(ioid, order);
         let frame = synth_frame(Command::DestroyRequest, order, payload);
-        handle_destroy_request(&frame, &mut channels, order).expect("DESTROY_REQUEST ok");
+        handle_destroy_request(&frame, &mut channels).expect("DESTROY_REQUEST ok");
 
         assert!(
             !channels.get(&1).unwrap().ops.contains_key(&ioid),
@@ -12057,6 +13369,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -12081,6 +13394,7 @@ mod tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -12135,6 +13449,7 @@ mod tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &discard_mon_fin(),
@@ -12189,6 +13504,140 @@ mod tests {
                 panic!("data-phase GET error must decode to OpResponse::Status, got {other:?}")
             }
         }
+    }
+
+    /// Build a client CONNECTION_VALIDATION frame selecting method "ca"
+    /// with an auth structure carrying the given `user`.
+    fn build_ca_validation_frame(order: ByteOrder, user: &str) -> Frame {
+        use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
+        let auth_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("user".into(), FieldDesc::Scalar(ScalarType::String))],
+        };
+        let mut auth_struct = PvStructure::new("");
+        auth_struct.fields.push((
+            "user".into(),
+            PvField::Scalar(ScalarValue::String(user.into())),
+        ));
+        let auth_val = PvField::Structure(auth_struct);
+
+        let mut payload: Vec<u8> = Vec::new();
+        payload.put_u32(0x10000, order);
+        payload.put_u16(32_767, order);
+        payload.put_u16(0, order);
+        encode_string_into("ca", order, &mut payload);
+        encode_type_desc(&auth_desc, order, &mut payload);
+        encode_pv_field(&auth_val, &auth_desc, order, &mut payload);
+        let header = PvaHeader::application(
+            false,
+            order,
+            Command::ConnectionValidation.code(),
+            payload.len() as u32,
+        );
+        Frame { header, payload }
+    }
+
+    /// Post-handshake CONNECTION_VALIDATION must re-run the full
+    /// parse/commit/validated-reply sequence (pvxs keeps it in the live
+    /// command switch, conn.cpp:247-260, and re-runs
+    /// handle_CONNECTION_VALIDATION on each dispatch,
+    /// serverconn.cpp:196-251). A second valid frame after a successful
+    /// handshake must: emit a SECOND CONNECTION_VALIDATED, replace the
+    /// connection credential, update the per-peer credential record, and
+    /// re-fire the auth_complete hook with the new identity.
+    #[tokio::test]
+    async fn process_connection_validation_reauth_replaces_identity() {
+        use std::sync::Mutex as StdMutex;
+
+        let order = ByteOrder::Little;
+        let observed: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let observed_hook = observed.clone();
+        let config = PvaServerConfig {
+            auth_complete: Some(Arc::new(move |_peer, cred: &ClientCredentials| {
+                observed_hook
+                    .lock()
+                    .unwrap()
+                    .push((cred.method.clone(), cred.account.clone()));
+            })),
+            ..Default::default()
+        };
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let peer_entry = crate::server_native::peers::PeerEntry::new(false);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let mut cred = ClientCredentials::anonymous();
+        // One connection-scope inbound decode cache shared across both
+        // validation frames, mirroring the read loop's single `rx_type_cache`.
+        let mut decode_cache = TypeCache::new();
+
+        // First (initial) handshake: identity becomes alice.
+        let f1 = build_ca_validation_frame(order, "alice");
+        process_connection_validation(
+            &f1,
+            &tx,
+            order,
+            false,
+            &mut cred,
+            peer,
+            &peer_entry,
+            &config,
+            &mut decode_cache,
+        )
+        .await
+        .expect("initial validation");
+        assert_eq!(cred.account, "alice", "initial handshake commits alice");
+        let v1 = rx.try_recv().expect("first CONNECTION_VALIDATED emitted");
+        assert_eq!(
+            v1[3],
+            Command::ConnectionValidated.code(),
+            "reply is CONNECTION_VALIDATED"
+        );
+        assert_eq!(
+            *peer_entry.credentials.lock(),
+            Some(("alice".to_string(), "ca".to_string())),
+            "peer credential record set to alice"
+        );
+
+        // Second (post-handshake) re-auth: identity becomes bob.
+        let f2 = build_ca_validation_frame(order, "bob");
+        process_connection_validation(
+            &f2,
+            &tx,
+            order,
+            false,
+            &mut cred,
+            peer,
+            &peer_entry,
+            &config,
+            &mut decode_cache,
+        )
+        .await
+        .expect("re-auth validation");
+        assert_eq!(
+            cred.account, "bob",
+            "post-handshake re-auth replaces the connection identity"
+        );
+        let v2 = rx.try_recv().expect("second CONNECTION_VALIDATED emitted");
+        assert_eq!(
+            v2[3],
+            Command::ConnectionValidated.code(),
+            "re-auth re-issues CONNECTION_VALIDATED"
+        );
+        assert_eq!(
+            *peer_entry.credentials.lock(),
+            Some(("bob".to_string(), "ca".to_string())),
+            "peer credential record updated to bob"
+        );
+
+        // The hook fired once per frame, observing each committed identity
+        // in order — proving the new identity is used downstream.
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![
+                ("ca".to_string(), "alice".to_string()),
+                ("ca".to_string(), "bob".to_string()),
+            ],
+            "auth_complete fires on every validation with the new identity"
+        );
     }
 }
 
@@ -12348,6 +13797,7 @@ mod r14_tests {
                 sid,
                 introspection: Some(intro),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -12376,6 +13826,7 @@ mod r14_tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon_fin_tx,
@@ -12529,6 +13980,7 @@ mod bfr15_tests {
                 sid,
                 introspection: Some(intro),
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -12633,6 +14085,7 @@ mod bfr15_tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,
@@ -12653,6 +14106,7 @@ mod bfr15_tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,
@@ -12713,6 +14167,7 @@ mod bfr15_tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,
@@ -12732,6 +14187,7 @@ mod bfr15_tests {
             OpKind::Put,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,
@@ -12789,6 +14245,7 @@ mod bfr15_tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,
@@ -12801,7 +14258,7 @@ mod bfr15_tests {
         assert!(op_abort_armed(&channels, sid, ioid));
 
         // DESTROY_REQUEST removes the op → drops AbortOnDrop → aborts the task.
-        handle_destroy_request(&destroy_frame(sid, ioid, order), &mut channels, order)
+        handle_destroy_request(&destroy_frame(sid, ioid, order), &mut channels)
             .expect("DESTROY_REQUEST ok");
         wait_for(&get_cancelled, 1).await;
         assert!(
@@ -12845,6 +14302,7 @@ mod bfr15_tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,
@@ -12870,6 +14328,7 @@ mod bfr15_tests {
             OpKind::Get,
             &config,
             &mut encode_cache,
+            &mut TypeCache::new(),
             peer,
             &cred,
             &mon,

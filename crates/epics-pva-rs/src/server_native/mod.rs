@@ -16,7 +16,7 @@ pub use monitor_control::{MonitorControlOp, MonitorReceiver, PostError};
 pub use op_handle::{
     ClientCredentials, ExecOp, ExecResult, MessageLevel, OpBase, OpMessage, RemoteLogger,
 };
-pub use peers::{PeerEntry, PeerRegistry, PeerSnapshot};
+pub use peers::{ChannelReport, PeerEntry, PeerRegistry, PeerSnapshot};
 pub use runtime::{PvaServer, PvaServerConfig, run_pva_server};
 pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource};
 pub use shared_pv::{SharedPV, SharedSource};

@@ -251,6 +251,15 @@ pub async fn run_udp_responder_with_config(
         // and topology changes regardless of cadence.
         let mut beacon_seq: u8 = 0;
         let mut change_count: u16 = 0;
+        // pvxs writes `beaconChange` (bumped on every source add/remove)
+        // directly into the beacon (server.cpp:751-767). Track the
+        // registry counter so a topology change advances `change_count`
+        // even when the PV-set hash below is unchanged (source replaced
+        // by another serving the same names, or a priority change).
+        // Initialise to the value at task start so the startup source
+        // registrations do not register as a runtime change on the first
+        // beacon.
+        let mut last_registry_change: u64 = beacon_source.beacon_change();
         let mut last_set_hash: u64 = 0;
         let mut emitted: u32 = 0;
         let mut beacon_send_errs: HashSet<SocketAddr> = HashSet::new();
@@ -279,6 +288,18 @@ pub async fn run_udp_responder_with_config(
             sorted.sort();
             sorted.hash(&mut h);
             let cur_hash = h.finish();
+            // Primary, pvxs-faithful signal: a source registry mutation
+            // bumped `beaconChange`. Advance `change_count` by the delta
+            // so each add/remove is reflected even if the PV-name set is
+            // identical before and after (source swap / priority change).
+            let cur_registry_change = beacon_source.beacon_change();
+            if cur_registry_change != last_registry_change {
+                let delta = cur_registry_change.wrapping_sub(last_registry_change);
+                change_count = change_count.wrapping_add(delta as u16);
+                last_registry_change = cur_registry_change;
+            }
+            // Fallback signal: the enumerated PV set changed without a
+            // registry mutation (e.g. a source mutated its own PV list).
             let topology_changed = cur_hash != last_set_hash && last_set_hash != 0;
             if topology_changed {
                 change_count = change_count.wrapping_add(1);
@@ -465,21 +486,29 @@ pub async fn run_udp_responder_with_config(
                     continue;
                 }
                 let raw = &lo_buf[..n];
-                // Peel the CMD_ORIGIN_TAG prefix; if it isn't one,
-                // pvxs `udp_collector.cpp:402-405` allows processing
-                // an unprefixed forward from peers that don't
-                // implement ORIGIN_TAG. We're stricter for now: drop
-                // the packet rather than risk reply amplification on
-                // unprefixed mcast.
-                let Some((peeled_dest, inner)) = PvaCodec::try_peel_origin_tag(raw) else {
-                    debug!("loopback mcast missing/invalid ORIGIN_TAG prefix; dropping");
-                    continue;
+                // Peel the CMD_ORIGIN_TAG prefix. When present we know the
+                // peeled destination NIC and process as FromOriginTag.
+                // When ABSENT, pvxs (`udp_collector.cpp:401-404`) still
+                // processes the SEARCH: some PVA implementations forward
+                // unicast SEARCHes to `224.0.0.128` without adding the
+                // tag. Mirror that — process the raw packet as a
+                // `Forwarded` origin (no peeled NIC, so reply routing is
+                // left to the OS via the UNSPECIFIED sentinel). The
+                // `Forwarded`/`FromOriginTag` rules forbid re-forwarding
+                // (anti-loop) and reject `isAny()` reply addresses, so
+                // there is no amplification risk.
+                let (inner, reply_iface_ip, origin) = match PvaCodec::try_peel_origin_tag(raw) {
+                    // peeled_dest = None means the forwarder set 0.0.0.0
+                    // (no NIC info). Use UNSPECIFIED as a sentinel — the
+                    // reply path checks for it and skips the per-NIC pin,
+                    // letting OS routing pick a source NIC.
+                    Some((peeled_dest, inner)) => (
+                        inner,
+                        peeled_dest.unwrap_or(Ipv4Addr::UNSPECIFIED),
+                        Origin::FromOriginTag,
+                    ),
+                    None => (raw, Ipv4Addr::UNSPECIFIED, Origin::Forwarded),
                 };
-                // peeled_dest = None means the forwarder set 0.0.0.0
-                // (no NIC info). Use UNSPECIFIED as a sentinel — the
-                // reply path checks for it and skips the per-NIC pin,
-                // letting OS routing pick a source NIC.
-                let reply_iface_ip = peeled_dest.unwrap_or(Ipv4Addr::UNSPECIFIED);
                 process_search_datagram(
                     &source,
                     &socket,
@@ -488,7 +517,7 @@ pub async fn run_udp_responder_with_config(
                     inner,
                     src,
                     reply_iface_ip,
-                    Origin::FromOriginTag,
+                    origin,
                     tcp_port,
                     guid,
                     protocol,
@@ -634,10 +663,19 @@ async fn process_search_datagram(
             // for the forward-frame rewriter.
             if let Some(req) = parse_search_request(frame) {
                 if req.unicast {
-                    let reply_ip = req.reply_addr.unwrap_or_else(|| match udp_src.ip() {
-                        IpAddr::V4(v4) => v4,
-                        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
-                    });
+                    // The loopback ORIGIN_TAG forward channel is IPv4-only,
+                    // so a forwarded reply destination must resolve to a v4
+                    // address: prefer the SEARCH-payload addr when it is v4,
+                    // else the UDP source's v4 (a v6 reply addr or v6 source
+                    // has no place on this channel — fall back to
+                    // UNSPECIFIED so OS routing/the recipient sorts it out).
+                    let reply_ip = match req.reply_addr {
+                        Some(IpAddr::V4(v4)) => v4,
+                        _ => match udp_src.ip() {
+                            IpAddr::V4(v4) => v4,
+                            IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+                        },
+                    };
                     let reply_dest = SocketAddrV4::new(reply_ip, req.reply_port);
                     if let Some(forward) = try_build_forward_frame(frame, reply_dest) {
                         let prefix = PvaCodec::build_origin_tag_prefix(reply_iface_ip);
@@ -670,11 +708,19 @@ async fn process_search_datagram(
                 // sentinel arrives via ORIGIN_TAG (the forwarder is
                 // not the original requester).
                 let reply_dest = match req.reply_addr {
-                    Some(ip) => SocketAddr::V4(std::net::SocketAddrV4::new(ip, req.reply_port)),
+                    Some(ip) => SocketAddr::new(ip, req.reply_port),
                     None => {
-                        if origin == Origin::FromOriginTag {
+                        // Any forwarded origin (tagged ORIGIN_TAG or
+                        // untagged local forward) cannot reply to the
+                        // sender: the UDP source is the forwarder, not the
+                        // original requester. pvxs drops these
+                        // (`udp_collector.cpp:367-371`,
+                        // "Forwarded SEARCH with reply to sender never
+                        // works"). Only `Origin::Direct` keeps the UDP
+                        // source as the reply target.
+                        if origin != Origin::Direct {
                             debug!(
-                                "ORIGIN_TAG SEARCH announced isAny() reply addr; dropping per pvxs"
+                                "forwarded SEARCH announced isAny() reply addr; dropping per pvxs"
                             );
                             return;
                         }
@@ -687,7 +733,10 @@ async fn process_search_datagram(
 
                 // Protocol-gated match set, shared with the v6 UDP and
                 // TCP-circuit responders. See `search_matched_cids`.
-                let matched_cids = search_matched_cids(source, &req, protocol).await;
+                // The requester endpoint is the resolved reply
+                // destination (pvxs fills Search::source from
+                // msg.replyDest, server.cpp:674-704).
+                let matched_cids = search_matched_cids(source, &req, protocol, reply_dest).await;
                 // pvxs `server.cpp:730-732`: when `nreply==0` AND the
                 // SEARCH header did not set `MustReply`, drop the
                 // SEARCH silently. Honouring `MustReply` even with
@@ -822,12 +871,45 @@ pub async fn run_udp_responder_v6(
     }
 }
 
+/// Resolve a SEARCH_RESPONSE destination from the announced reply
+/// address/port and the UDP source, for the IPv6 responder.
+///
+/// - Explicit (non-wildcard) reply address: trust the advertised
+///   address AND port (pvxs `udp_collector.cpp:377-380`). This is the
+///   capability the pre-fix v6 responder lacked — it always replied to
+///   the UDP source and ignored an explicit v6 reply endpoint.
+/// - Wildcard reply address: reply to the sender's actual socket tuple.
+///   pvxs additionally overrides the port with the advertised value
+///   (`:380 setPort`), which assumes the client advertises the port it
+///   listens on. The in-repo Rust v6 client advertises its v4
+///   search-socket port while listening on a distinct v6 socket
+///   (`client_native/search_engine.rs` `bind_ephemeral_udp_v6` binds an
+///   independent ephemeral port), so adopting the advertised port on the
+///   wildcard path would route the reply to a port nothing listens on.
+///   Replying to the real source tuple is the robust "reply to sender".
+///   Aligning the client's advertised v6 `response_port` (so the server
+///   can take pvxs's unconditional `setPort`) is a client-side change
+///   tracked as a cross-request.
+fn resolve_reply_dest(
+    reply_addr: Option<IpAddr>,
+    reply_port: u16,
+    udp_src: SocketAddr,
+) -> SocketAddr {
+    match reply_addr {
+        Some(ip) => SocketAddr::new(ip, reply_port),
+        None => udp_src,
+    }
+}
+
 /// Stripped-down `process_search_datagram` for the v6 responder.
 /// Skips the IPv4-only ORIGIN_TAG forwarding path entirely (v6 has
-/// its own group conventions that aren't wired yet) and always
-/// replies to the UDP source address rather than honouring the
-/// in-payload `reply_addr` field (which is IPv4-typed and stays
-/// `None` for v6 peers anyway).
+/// its own group conventions that aren't wired yet) but honours the
+/// in-payload reply address/port: pvxs decodes that field into a full
+/// `SockAddr` and uses an advertised non-wildcard destination
+/// (`udp_collector.cpp:367-380`), so a v6 SEARCH that points the reply
+/// at a different v6 address or port than the UDP source tuple is
+/// answered there. Wildcard falls back to the UDP source IP with the
+/// advertised port.
 async fn process_v6_search_datagram(
     source: &DynSource,
     socket: &tokio::net::UdpSocket,
@@ -843,19 +925,19 @@ async fn process_v6_search_datagram(
         let consumed = match parse_search_request(chunk) {
             Some(req) => {
                 let consumed = req.consumed;
-                // For IPv6 SEARCH we reply directly to the UDP source
-                // (ip + port). The wire `reply_port` field is parsed
-                // from an IPv4-typed payload and may not match what
-                // the v6 client actually listens on (a v6 client
-                // builds its packet via the same codec that encodes
-                // the v4 socket's port). Using `udp_src.port()` keeps
-                // the response on the same socket pair the SEARCH
-                // arrived on — natural for v6 unicast.
-                let reply_dest = udp_src;
+                // Honour the SEARCH's announced reply destination: an
+                // advertised non-wildcard v6 address/port wins (pvxs
+                // `udp_collector.cpp:377-380`); a wildcard falls back to
+                // the UDP source tuple. Pre-fix the v6 responder always
+                // replied to the UDP source and ignored an explicit v6
+                // reply endpoint. See `resolve_reply_dest` for the
+                // wildcard-port deviation and its cross-request.
+                let reply_dest = resolve_reply_dest(req.reply_addr, req.reply_port, udp_src);
                 // The v6 responder must apply the same protocol gate as
                 // v4/TCP — without it a TLS-only client gets `found=1`
-                // from a tcp-only server. Shared helper.
-                let matched_cids = search_matched_cids(source, &req, protocol).await;
+                // from a tcp-only server. Shared helper. Requester
+                // endpoint is the resolved reply destination.
+                let matched_cids = search_matched_cids(source, &req, protocol, reply_dest).await;
                 // pvxs `server.cpp:730-732` (also reached for v6
                 // SEARCH via the same handler): honour `MustReply`
                 // with an empty (`found=0`, `nreply=0`) response so
@@ -903,10 +985,16 @@ async fn process_v6_search_datagram(
 ///
 /// Returns an empty vec on protocol mismatch, so each responder's
 /// `found`/`MustReply` decision is identical regardless of family.
+///
+/// `requester` is the SEARCH's resolved reply destination (UDP) or the
+/// established peer (TCP circuit); it is forwarded to
+/// [`ChannelSource::searchable_from`] so a source can scope
+/// advertisement by client endpoint (pvxs `Search::source()`).
 pub(crate) async fn search_matched_cids(
     source: &DynSource,
     req: &SearchRequest,
     protocol: &str,
+    requester: SocketAddr,
 ) -> Vec<u32> {
     // Byte-exact protocol gate (pvxs udp_collector.cpp:408-421 compares
     // the raw wire string to "tcp"). An empty list is a legacy SEARCH
@@ -924,7 +1012,11 @@ pub(crate) async fn search_matched_cids(
     }
     let mut matched = Vec::with_capacity(req.queries.len());
     for (cid, name) in &req.queries {
-        if source.searchable(name).await {
+        // Endpoint-scoped advertisement: a source may claim a name only
+        // for some requesters (pvxs `Search::source()`). The `requester`
+        // is the SEARCH's resolved reply destination for UDP and the
+        // established peer for TCP-circuit search.
+        if source.searchable_from(name, requester).await {
             matched.push(*cid);
         }
     }
@@ -1028,7 +1120,12 @@ pub(crate) struct SearchRequest {
     /// was the unspecified sentinel (`0.0.0.0` / `::`), in which case
     /// pvxs falls back to the UDP source address. The port is always
     /// populated, even when `reply_addr` is `None`.
-    pub(crate) reply_addr: Option<Ipv4Addr>,
+    ///
+    /// Stored as a full [`IpAddr`] (not IPv4-only) so the IPv6 responder
+    /// can honour an advertised v6 reply address; pvxs decodes the field
+    /// into a full `SockAddr` regardless of family
+    /// (`udp_collector.cpp:367-370`).
+    pub(crate) reply_addr: Option<IpAddr>,
     pub(crate) reply_port: u16,
     /// True when the SEARCH header had the Unicast flag (`0x80`,
     /// `pva_search_flags::Unicast`) set. pvxs uses this as a marker
@@ -1069,10 +1166,19 @@ pub(crate) struct SearchRequest {
 ///   destination. Do NOT re-forward (anti-loop) and reject SEARCHes
 ///   with `server.isAny()` per pvxs `udp_collector.cpp:367-371`
 ///   ("Forwarded SEARCH with reply to sender never works").
+/// - [`Origin::Forwarded`]: arrived on the loopback mcast socket
+///   WITHOUT a CMD_ORIGIN_TAG prefix. pvxs tolerates these because some
+///   PVA implementations forward unicast SEARCHes to `224.0.0.128`
+///   without adding the tag (`udp_collector.cpp:401-404`), and still
+///   parses/matches the SEARCH (`udp_collector.cpp:385-407`). Same
+///   processing rules as `FromOriginTag`: do NOT re-forward (anti-loop)
+///   and reject `server.isAny()` reply addresses. There is no peeled
+///   destination, so the reply NIC is left to OS routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
     Direct,
     FromOriginTag,
+    Forwarded,
 }
 
 pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
@@ -1105,9 +1211,13 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     addr16.copy_from_slice(&addr_bytes);
     // pvxs `udp_collector.cpp:351-360`: `server.isAny()` means "reply
     // to UDP source"; otherwise the SEARCH carries a specific reply
-    // destination. Filter to IPv4 since this stack is IPv4-only.
+    // destination. Keep any concrete address (v4 or v6); fold only the
+    // wildcard sentinel (`0.0.0.0` / `::`, in either raw or v4-mapped
+    // form) to `None`. pvxs decodes a full `SockAddr` here
+    // (`udp_collector.cpp:367-370`), so an IPv6 reply address must
+    // survive rather than being dropped by an IPv4-only filter.
     let reply_addr = match ip_from_bytes(&addr16) {
-        Some(IpAddr::V4(v4)) if !v4.is_unspecified() => Some(v4),
+        Some(ip) if !ip.is_unspecified() => Some(ip),
         _ => None,
     };
     let reply_port = p.get_u16(order).ok()?;
@@ -1282,7 +1392,7 @@ mod tests {
         );
         assert_eq!(
             req.reply_addr,
-            Some(Ipv4Addr::new(127, 0, 0, 1)),
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             "reply addr preserved from original SEARCH"
         );
         assert_eq!(req.reply_port, 9999);
@@ -1477,6 +1587,118 @@ mod tests {
         );
     }
 
+    /// An UNPREFIXED forwarded SEARCH on the loopback mcast path
+    /// (`Origin::Forwarded`) MUST still be processed — pvxs tolerates
+    /// peers that forward without CMD_ORIGIN_TAG
+    /// (`udp_collector.cpp:401-404`) and parses/matches the SEARCH
+    /// (`:385-407`). With a concrete (non-isAny) reply address a hosted
+    /// PV gets a SEARCH_RESPONSE, and the packet is NOT re-forwarded
+    /// (anti-loop: only `Origin::Direct` re-forwards).
+    #[tokio::test]
+    async fn forwarded_origin_unprefixed_search_is_answered_without_reforward() {
+        use crate::pvdata::{FieldDesc, PvField, ScalarType};
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        struct PresentSource;
+        #[allow(clippy::manual_async_fn)]
+        impl ChannelSource for PresentSource {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { vec!["MY:PV".into()] }
+            }
+            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == "MY:PV";
+                async move { m }
+            }
+            fn get_introspection(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { Some(FieldDesc::Scalar(ScalarType::Double)) }
+            }
+            fn get_value(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _name: &str,
+                _value: PvField,
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+                async { Err("read-only".into()) }
+            }
+            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let source: DynSource = Arc::new(PresentSource);
+        let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        let lo_mcast = Arc::new(bind_loopback_mcast(0).expect("lo_mcast bind"));
+        let port = lo_mcast.local_addr().unwrap().port();
+        // Observer joined to the forward group would catch any re-forward.
+        let observer = bind_loopback_mcast(port).expect("observer bind");
+        // Requester socket — the concrete reply destination.
+        let requester = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("requester bind");
+        let requester_addr = requester.local_addr().unwrap();
+
+        // Unprefixed SEARCH for "MY:PV" with a concrete reply addr/port.
+        let codec = PvaCodec { big_endian: false };
+        let frame =
+            codec.build_search(7, 42, "MY:PV", [127, 0, 0, 1], requester_addr.port(), false);
+
+        process_search_datagram(
+            &source,
+            &socket,
+            Some(&lo_mcast),
+            port,
+            &frame,
+            // simulated forwarder as the UDP source (not the requester)
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30000)),
+            Ipv4Addr::UNSPECIFIED,
+            Origin::Forwarded,
+            5076,
+            [0u8; 12],
+            "tcp",
+        )
+        .await;
+
+        // The requester MUST receive a SEARCH_RESPONSE.
+        let mut buf = [0u8; 4096];
+        let got = tokio::time::timeout(Duration::from_millis(500), requester.recv_from(&mut buf))
+            .await
+            .expect("requester must receive a SEARCH_RESPONSE for the forwarded SEARCH")
+            .expect("recv ok");
+        let resp = PvaHeader::decode(&mut Cursor::new(&buf[..got.0])).expect("decode header");
+        assert_eq!(
+            resp.command,
+            Command::SearchResponse.code(),
+            "reply to a forwarded SEARCH must be a SEARCH_RESPONSE"
+        );
+
+        // The observer MUST NOT see a re-forward (anti-loop).
+        let mut obuf = [0u8; 4096];
+        let reforward =
+            tokio::time::timeout(Duration::from_millis(150), observer.recv_from(&mut obuf)).await;
+        assert!(
+            reforward.is_err(),
+            "Forwarded origin must NOT re-forward, but observer got {reforward:?}"
+        );
+    }
+
     /// a UDP SEARCH for the built-in `server` PV MUST NOT be
     /// answered — pvxs `ServerSource::onSearch` is empty so `server`
     /// resolves only by direct TCP connect, never by broadcast
@@ -1486,16 +1708,13 @@ mod tests {
     /// `get_value("server")` — the direct-connect GET path — still
     /// returns the server-info structure.
     #[tokio::test]
-    async fn server_pv_not_answered_to_udp_search_but_direct_get_works() {
-        use crate::server_native::peers::PeerRegistry;
+    async fn server_pv_not_answered_to_udp_search_but_direct_connect_works() {
         use crate::server_native::server_info::{SERVER_PV_NAME, ServerInfoSource};
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
         use std::time::Duration;
 
-        let peers = PeerRegistry::new();
-        let server_src =
-            ServerInfoSource::new([0xCD; 12], peers, || async { Vec::<String>::new() });
+        let server_src = ServerInfoSource::new(|| async { Vec::<String>::new() });
 
         // Direct-connect path still resolves `server`.
         assert!(
@@ -1506,9 +1725,11 @@ mod tests {
             !server_src.searchable(SERVER_PV_NAME).await,
             "`server` must NOT be UDP-search-advertised"
         );
+        // pvxs `server` has no GET surface (onRPC only); the direct
+        // path reaches it via RPC, and a GET returns no prototype/value.
         assert!(
-            server_src.get_value(SERVER_PV_NAME).await.is_some(),
-            "direct GET of `server` must still return the info structure"
+            server_src.get_value(SERVER_PV_NAME).await.is_none(),
+            "`server` has no GET surface (pvxs onRPC-only)"
         );
 
         // UDP search path: a broadcast SEARCH naming `server` must
@@ -1552,6 +1773,97 @@ mod tests {
         assert!(
             r.is_err(),
             "UDP SEARCH for `server` must NOT be answered; sniffer got {r:?}"
+        );
+    }
+
+    /// The shared SEARCH match rule forwards the requester endpoint to
+    /// `ChannelSource::searchable_from`, so a source can claim a PV only
+    /// for some requesters (pvxs `Search::source()`). Because the v4
+    /// UDP, v6 UDP, and TCP-circuit responders all call this one rule,
+    /// the endpoint scope governs every search path.
+    #[tokio::test]
+    async fn search_matched_cids_honors_requester_endpoint() {
+        use crate::pvdata::{FieldDesc, PvField};
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        // Claims "MY:PV" only for a requester at 10.0.0.5.
+        struct ScopedSource;
+        #[allow(clippy::manual_async_fn)]
+        impl ChannelSource for ScopedSource {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { vec!["MY:PV".into()] }
+            }
+            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == "MY:PV";
+                async move { m }
+            }
+            fn searchable_from(
+                &self,
+                name: &str,
+                requester: SocketAddr,
+            ) -> impl std::future::Future<Output = bool> + Send {
+                let ok =
+                    name == "MY:PV" && requester.ip() == IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+                async move { ok }
+            }
+            fn get_introspection(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { None }
+            }
+            fn get_value(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _name: &str,
+                _value: PvField,
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+                async { Err("read-only".into()) }
+            }
+            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let source: DynSource = Arc::new(ScopedSource);
+        let req = SearchRequest {
+            seq: 1,
+            byte_order: ByteOrder::Little,
+            queries: vec![(7, "MY:PV".into())],
+            reply_addr: None,
+            reply_port: 0,
+            unicast: false,
+            must_reply: false,
+            protocols: vec![],
+            consumed: 0,
+        };
+        let allowed: SocketAddr = "10.0.0.5:5076".parse().unwrap();
+        let denied: SocketAddr = "192.168.1.1:5076".parse().unwrap();
+
+        assert_eq!(
+            search_matched_cids(&source, &req, "tcp", allowed).await,
+            vec![7],
+            "the scoped source must claim the PV for the allowed requester"
+        );
+        assert!(
+            search_matched_cids(&source, &req, "tcp", denied)
+                .await
+                .is_empty(),
+            "the scoped source must NOT claim the PV for a different requester"
         );
     }
 
@@ -1610,6 +1922,7 @@ mod tests {
         }
 
         let source: DynSource = Arc::new(PresentSource);
+        let requester: SocketAddr = "127.0.0.1:5076".parse().unwrap();
         let req = |protocols: Vec<Vec<u8>>| SearchRequest {
             seq: 1,
             byte_order: ByteOrder::Little,
@@ -1624,18 +1937,18 @@ mod tests {
 
         // Server speaks "tcp". Matching protocol → searchable CID returned.
         assert_eq!(
-            search_matched_cids(&source, &req(vec![b"tcp".to_vec()]), "tcp").await,
+            search_matched_cids(&source, &req(vec![b"tcp".to_vec()]), "tcp", requester).await,
             vec![7]
         );
         // Client asks for "tls" only → no match off a tcp server.
         assert!(
-            search_matched_cids(&source, &req(vec![b"tls".to_vec()]), "tcp")
+            search_matched_cids(&source, &req(vec![b"tls".to_vec()]), "tcp", requester)
                 .await
                 .is_empty()
         );
         // Empty/legacy protocol list → wildcard, still matched.
         assert_eq!(
-            search_matched_cids(&source, &req(vec![]), "tcp").await,
+            search_matched_cids(&source, &req(vec![]), "tcp", requester).await,
             vec![7]
         );
         // A protocol entry that is not valid UTF-8 must compare as raw
@@ -1645,7 +1958,7 @@ mod tests {
         // where a non-UTF-8 protocol downgraded to an empty list and
         // matched every tcp server.
         assert!(
-            search_matched_cids(&source, &req(vec![vec![0xff, 0xfe]]), "tcp")
+            search_matched_cids(&source, &req(vec![vec![0xff, 0xfe]]), "tcp", requester)
                 .await
                 .is_empty(),
             "non-UTF-8 protocol must not be treated as a wildcard match"
@@ -1671,7 +1984,10 @@ mod tests {
         // must reflect the resolved dest.
         let req = parse_search_request(&out).expect("re-parse ok");
         assert!(!req.unicast, "unicast flag must be cleared");
-        assert_eq!(req.reply_addr, Some(Ipv4Addr::new(192, 168, 1, 5)));
+        assert_eq!(
+            req.reply_addr,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)))
+        );
         assert_eq!(req.reply_port, 54321);
 
         // Non-unicast SEARCH: forward returns None (no rewrite).
@@ -1689,7 +2005,10 @@ mod tests {
         // Specific reply addr 192.168.5.10:9999.
         let frame = codec.build_search(7, 42, "MY:PV", [192, 168, 5, 10], 9999, false);
         let req = parse_search_request(&frame).expect("parse ok");
-        assert_eq!(req.reply_addr, Some(Ipv4Addr::new(192, 168, 5, 10)));
+        assert_eq!(
+            req.reply_addr,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 5, 10)))
+        );
         assert_eq!(req.reply_port, 9999);
 
         // Unspecified addr → None (sentinel for "use UDP source").
@@ -1697,6 +2016,67 @@ mod tests {
         let req_any = parse_search_request(&frame_any).expect("parse ok");
         assert_eq!(req_any.reply_addr, None);
         assert_eq!(req_any.reply_port, 5076);
+    }
+
+    /// `parse_search_request` must keep a concrete IPv6 reply address
+    /// instead of folding it to `None`. pvxs decodes the 16-byte address
+    /// field into a full `SockAddr` (`udp_collector.cpp:367-370`); the
+    /// pre-fix IPv4-only filter dropped every v6 address.
+    #[test]
+    fn parse_search_request_keeps_ipv6_reply_addr() {
+        use std::net::Ipv6Addr;
+        let codec = PvaCodec { big_endian: false };
+        // Build a v4 frame, then overwrite the 16-byte response_addr
+        // field (payload offset 8) with a real IPv6 address.
+        let mut frame = codec.build_search(7, 42, "MY:PV", [0, 0, 0, 0], 9999, false);
+        let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let off = PvaHeader::SIZE + 8;
+        frame[off..off + 16].copy_from_slice(&ip_to_bytes(IpAddr::V6(v6)));
+        let req = parse_search_request(&frame).expect("parse ok");
+        assert_eq!(req.reply_addr, Some(IpAddr::V6(v6)));
+        assert_eq!(req.reply_port, 9999);
+
+        // Raw-zero `::` (v6 wildcard) still folds to None.
+        let mut frame_any = codec.build_search(7, 42, "MY:PV", [0, 0, 0, 0], 5076, false);
+        frame_any[off..off + 16].copy_from_slice(&[0u8; 16]);
+        let req_any = parse_search_request(&frame_any).expect("parse ok");
+        assert_eq!(req_any.reply_addr, None);
+        assert_eq!(req_any.reply_port, 5076);
+    }
+
+    /// `resolve_reply_dest` invariant boundaries: an explicit advertised
+    /// address is honoured with its advertised port (pvxs
+    /// `udp_collector.cpp:377-380`), including a port that differs from
+    /// the UDP source port; a wildcard (`None`) replies to the full UDP
+    /// source tuple (see the helper doc for the deliberate deviation
+    /// from pvxs's wildcard `setPort`).
+    #[test]
+    fn resolve_reply_dest_boundaries() {
+        use std::net::Ipv6Addr;
+        let src: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5000);
+
+        // Wildcard reply addr → full UDP source tuple (source port kept).
+        assert_eq!(
+            resolve_reply_dest(None, 9876, src),
+            src,
+            "wildcard replies to the sender's actual socket tuple"
+        );
+
+        // Explicit v6 reply addr → that addr, advertised port (differs
+        // from the UDP source port 5000).
+        let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        assert_eq!(
+            resolve_reply_dest(Some(IpAddr::V6(v6)), 9876, src),
+            SocketAddr::new(IpAddr::V6(v6), 9876),
+            "explicit v6 reply addr/port is honoured over the UDP source"
+        );
+
+        // Explicit v4 reply addr with a differing port.
+        let v4 = Ipv4Addr::new(192, 168, 9, 9);
+        assert_eq!(
+            resolve_reply_dest(Some(IpAddr::V4(v4)), 1234, src),
+            SocketAddr::new(IpAddr::V4(v4), 1234),
+        );
     }
 
     /// `filter_inbound`: mcast-source packets and blocklisted peers

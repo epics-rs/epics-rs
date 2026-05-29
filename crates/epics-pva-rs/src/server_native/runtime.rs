@@ -501,17 +501,13 @@ impl PvaServer {
         // — harmless since its `list_pvs` is empty, but enumerating
         // the user half keeps the intent explicit).
         let user_source: DynSource = source as Arc<dyn ChannelSourceObj>;
-        let server_info = Arc::new(super::server_info::ServerInfoSource::new(
-            guid,
-            peers.clone(),
-            {
+        let server_info = Arc::new(super::server_info::ServerInfoSource::new({
+            let user_source = user_source.clone();
+            move || {
                 let user_source = user_source.clone();
-                move || {
-                    let user_source = user_source.clone();
-                    async move { user_source.list_pvs().await }
-                }
-            },
-        ));
+                async move { user_source.list_pvs().await }
+            }
+        }));
 
         // Composite registry: built-in `__server` at order -1, BEFORE
         // default-order (0) user sources, matching pvxs registering its
@@ -727,18 +723,18 @@ impl PvaServer {
     }
 
     /// Snapshot summary-level diagnostics. pvxs `Server::report`
-    /// counterpart at the "is the server up, how is it configured"
-    /// level. Per-peer / per-channel counters require book-keeping the
-    /// TCP loop doesn't yet maintain; surface what we have today.
+    /// counterpart: server liveness/config plus per-peer connection
+    /// counters and per-channel tx/rx byte counters (see
+    /// [`crate::server_native::PeerSnapshot::channels_detail`]).
     pub fn report(&self) -> ServerReport {
         self.report_zeroed(false)
     }
 
-    /// like [`Self::report`] but, when `zero` is true, resets
-    /// each peer's byte counters after the snapshot — pvxs
-    /// `Server::report(bool zero)`, so a subsequent report returns the
-    /// deltas since this one. Channel counts and credentials are not
-    /// reset.
+    /// like [`Self::report`] but, when `zero` is true, resets each peer's
+    /// connection byte counters AND every per-channel tx/rx counter after
+    /// the snapshot — pvxs `Server::report(bool zero)` (server.cpp:256-272),
+    /// so a subsequent report returns the deltas since this one. Channel
+    /// membership and credentials are not reset.
     pub fn report_zeroed(&self, zero: bool) -> ServerReport {
         ServerReport {
             tcp_port: self.bound_tcp_port,

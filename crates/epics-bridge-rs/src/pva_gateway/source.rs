@@ -1358,10 +1358,18 @@ impl ChannelSource for GatewayChannelSource {
         // PROCESS runs through the per-credential client, which resolves
         // existence and returns the upstream error itself.
         let client = self.upstream_client_for(&ctx);
-        client
-            .pvprocess(name)
-            .await
-            .map_err(|e| OpError::failed(e.to_string()))
+        // Forward the downstream PROCESS INIT pvRequest — captured into
+        // `ctx.pv_request` at PROCESS INIT — upstream, matching
+        // pva2pva createChannelProcess(..., pvRequest) (channel.cpp:98-106).
+        // The prior code validated but discarded it, so an upstream
+        // provider that interprets PROCESS `record._options` saw the
+        // gateway's default request. Fall back to the default empty
+        // pvRequest when the downstream sent none.
+        let result = match ctx.pv_request.as_ref() {
+            Some(req) => client.pvprocess_with_request_value(name, req).await,
+            None => client.pvprocess(name).await,
+        };
+        result.map_err(|e| OpError::failed(e.to_string()))
     }
 
     async fn subscribe_raw(

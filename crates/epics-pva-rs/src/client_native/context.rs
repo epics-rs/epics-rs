@@ -31,7 +31,7 @@ use super::ops_v2::{
     DEFAULT_PIPELINE_SIZE, MonitorEvent, MonitorEventMask, RpcArg, SubscriptionHandle, op_get,
     op_get_get, op_get_put, op_monitor, op_monitor_events, op_monitor_handle,
     op_monitor_raw_frames_handle, op_monitor_raw_frames_handle_with_request, op_process,
-    op_process_with_request, op_put, op_put_get, op_rpc,
+    op_process_with_request, op_process_with_request_value, op_put, op_put_get, op_rpc,
 };
 use super::search_engine::SearchEngine;
 
@@ -1689,6 +1689,22 @@ impl PvaClient {
     pub async fn pvprocess_with_request(&self, pv_name: &str, pv_request: &[u8]) -> PvaResult<()> {
         let ch = self.channel(pv_name).await?;
         op_process_with_request(&ch, pv_request, self.inner.timeout).await
+    }
+
+    /// Like [`Self::pvprocess_with_request`] but takes the PROCESS INIT
+    /// pvRequest as a decoded [`PvField`] value rather than pre-encoded
+    /// bytes; it is serialized in the connection's negotiated byte order.
+    /// A PVA-to-PVA gateway uses this to forward the downstream PROCESS
+    /// create-time pvRequest — preserved into `ChannelContext.pv_request`
+    /// — upstream, matching pva2pva `createChannelProcess(..., pvRequest)`
+    /// (channel.cpp:98-106).
+    pub async fn pvprocess_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &PvField,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        op_process_with_request_value(&ch, pv_request, self.inner.timeout).await
     }
 
     /// Snapshot of the client's current state — channel cache size,

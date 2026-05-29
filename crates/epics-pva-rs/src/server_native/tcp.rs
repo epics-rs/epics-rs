@@ -3610,7 +3610,11 @@ async fn handle_process(
         // route the PROCESS INIT pvRequest through the SAME
         // structured boundary as the generic GET/PUT/MONITOR INIT path
         // (`decode_init_pv_request_value`). PROCESS transfers no value,
-        // so the decoded pvRequest is discarded — but a present-but-
+        // but the create-time pvRequest carries `record._options` a
+        // provider can interpret (and a gateway must forward through
+        // `createChannelProcess(..., pvRequest)`, pva2pva
+        // channel.cpp:98-106), so it is preserved into the op state and
+        // surfaced as `ChannelContext.pv_request` at EXEC. A present-but-
         // malformed pvRequest is a peer wire-decode fault. The previous
         // `decode_type_desc(..).ok().and_then(|d| decode_pv_field(..)
         // .ok())` collapsed "absent body", "malformed descriptor", and
@@ -3629,16 +3633,19 @@ async fn handle_process(
                 )));
             }
         };
-        if let Err(e) =
-            decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache)
-        {
-            return Err(PvaError::Decode(format!(
-                "PROCESS INIT pvRequest value: {e}"
-            )));
-        }
+        let req_value =
+            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(PvaError::Decode(format!(
+                        "PROCESS INIT pvRequest value: {e}"
+                    )));
+                }
+            };
         let mask = BitSet::all_set(intro.total_bits());
-        ch.ops
-            .insert(ioid, non_monitor_op_state(intro, OpKind::Process, mask));
+        let mut process_op = non_monitor_op_state(intro, OpKind::Process, mask);
+        process_op.pv_request = req_value;
+        ch.ops.insert(ioid, process_op);
 
         // INIT response: ioid + subcmd + status. No type descriptor —
         // PROCESS negotiates no value.
@@ -3655,7 +3662,7 @@ async fn handle_process(
     }
 
     // PROCESS data phase — no payload to decode.
-    match ch.ops.get(&ioid) {
+    let init_pv_request = match ch.ops.get(&ioid) {
         None => {
             // silently drop — pvxs serverget.cpp:423-428 and servermon.cpp:611-619
             // return without reply here to handle the DESTROY_REQUEST race.
@@ -3676,8 +3683,9 @@ async fn handle_process(
                     o.kind
                 )));
             }
+            o.pv_request.clone()
         }
-    }
+    };
     let pv_name = ch.name.clone();
     let ctx = crate::server_native::source::ChannelContext {
         peer,
@@ -3686,7 +3694,10 @@ async fn handle_process(
         host: cred.host.clone(),
         authority: cred.authority.clone(),
         roles: cred.roles.clone(),
-        pv_request: None,
+        // PROCESS INIT pvRequest, preserved from the op state so a source
+        // — and a gateway forwarding createChannelProcess(..., pvRequest)
+        // — can inspect `record._options`.
+        pv_request: init_pv_request,
     };
     let src = source.clone();
     let tx_clone = chan_tx.clone();

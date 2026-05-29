@@ -526,6 +526,179 @@ pub fn qsrv_stats_command(provider: Arc<BridgeProvider>) -> CommandDef {
     )
 }
 
+/// `pvxsl [<detail>]` — list the single-record source PV names served
+/// by QSRV. Mirrors pvxs `pvxsl` (`singlesourcehooks.cpp:33-65`,
+/// registered at `:162-166`): `detail=0` prints just the PV names, one
+/// per line; a non-zero `detail` prints a source header followed by an
+/// indented record list. The Rust single-record source is the
+/// `BridgeProvider` database (records + aliases), excluding group PVs
+/// (those are listed by `pvxgl`).
+pub fn pvxsl_command(provider: Arc<BridgeProvider>) -> CommandDef {
+    CommandDef::new(
+        "pvxsl",
+        vec![ArgDesc {
+            name: "detail",
+            arg_type: ArgType::Int,
+            optional: true,
+        }],
+        "pvxsl [<detail>]",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let detail = match args.first() {
+                Some(ArgValue::Int(n)) => *n,
+                _ => 0,
+            };
+            let db = provider.database().clone();
+            let mut names = ctx.block_on(async {
+                let mut n = db.all_record_names().await;
+                n.extend(db.all_alias_names().await);
+                n
+            });
+            names.sort();
+            names.dedup();
+            // pvxs prints the SOURCE header only when the source has at
+            // least one name (`list.names && !list.names->empty()`).
+            if detail != 0 && !names.is_empty() {
+                ctx.println("------------------");
+                ctx.println("SOURCE: qsrv single records");
+                ctx.println("------------------");
+                ctx.println("RECORDS: ");
+            }
+            for n in names {
+                if detail != 0 {
+                    ctx.println(&format!("  {n}"));
+                } else {
+                    ctx.println(&n);
+                }
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `pvxgl [<level>] [<pattern>]` — list QSRV group PV names, optionally
+/// filtered by a glob `pattern` and, when `level > 0`, with group
+/// detail. Mirrors pvxs `pvxsgl` (`groupsourcehooks.cpp:50-83`,
+/// registered at `:233-240`) and `Group::show` (`group.cpp`): an empty
+/// pattern matches every group; `level > 0` prints the atomic flag and
+/// member count; `level > 1` prints one line per member.
+pub fn pvxgl_command(provider: Arc<BridgeProvider>) -> CommandDef {
+    CommandDef::new(
+        "pvxgl",
+        vec![
+            ArgDesc {
+                name: "level",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "pattern",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+        ],
+        "pvxgl [<level>] [<pattern>]",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let level = match args.first() {
+                Some(ArgValue::Int(n)) => *n,
+                _ => 0,
+            };
+            let pattern = match args.get(1) {
+                Some(ArgValue::String(s)) => s.as_str(),
+                _ => "",
+            };
+            let groups = provider.groups();
+            let mut names: Vec<&String> = groups.keys().collect();
+            names.sort();
+            for name in names {
+                // empty pattern matches everything (pvxs `!pattern[0]`).
+                if !pattern.is_empty() && !glob_match(name, pattern) {
+                    continue;
+                }
+                ctx.println(name);
+                if level > 0 {
+                    let def = &groups[name];
+                    // pvxs `Group::show`: atomic flag + member count.
+                    ctx.println(&format!(
+                        "  Atomic Get/Put:{} Atomic Members:{}",
+                        if def.atomic { "yes" } else { "no" },
+                        def.members.len()
+                    ));
+                    if level > 1 {
+                        for m in &def.members {
+                            // "  grp.fld <mapping> id=foo chan=pv chan ..."
+                            let id = m
+                                .struct_id
+                                .as_ref()
+                                .map(|s| format!(" id={s}"))
+                                .unwrap_or_default();
+                            let chan = if m.channel.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" chan={}", m.channel)
+                            };
+                            let trig =
+                                if matches!(m.triggers, super::group_config::TriggerDef::None) {
+                                    ""
+                                } else {
+                                    " has triggers"
+                                };
+                            ctx.println(&format!(
+                                "  {}\t<{:?}>{id}{chan}{trig}",
+                                m.field_name, m.mapping
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Port of EPICS Base `epicsStrGlobMatch` (`misc/epicsString.c`):
+/// `*` matches any run of characters, `?` matches exactly one, all
+/// other characters are literal. Used by `pvxgl` to filter group names,
+/// matching pvxs `epicsStrGlobMatch(groupName, pattern)`.
+fn glob_match(s: &str, pattern: &str) -> bool {
+    let text: Vec<char> = s.chars().collect();
+    let pat: Vec<char> = pattern.chars().collect();
+    let mut i = 0usize; // index into text
+    let mut p = 0usize; // index into pattern
+    let mut mp: Option<usize> = None; // pattern resume pos after a '*'
+    let mut cp = 0usize; // text resume pos for that '*'
+
+    while i < text.len() && p < pat.len() && pat[p] != '*' {
+        if pat[p] != text[i] && pat[p] != '?' {
+            return false;
+        }
+        p += 1;
+        i += 1;
+    }
+    while i < text.len() {
+        if p < pat.len() && pat[p] == '*' {
+            p += 1;
+            if p >= pat.len() {
+                return true;
+            }
+            mp = Some(p);
+            cp = i + 1;
+        } else if p < pat.len() && (pat[p] == text[i] || pat[p] == '?') {
+            p += 1;
+            i += 1;
+        } else if let Some(m) = mp {
+            p = m;
+            i = cp;
+            cp += 1;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == '*' {
+        p += 1;
+    }
+    p >= pat.len()
+}
+
 /// `resetGroups` — clear the group-PV registry. Mirrors pvxs
 /// `resetGroups` (groupsourcehooks.cpp:222). Used between IOC reload
 /// cycles in tests.
@@ -543,14 +716,17 @@ pub fn reset_groups_command(provider: Arc<BridgeProvider>) -> CommandDef {
 }
 
 /// Convenience: build the full QSRV iocsh command set (`dbLoadGroup`,
-/// `processGroups`, `qsrvStats`, `resetGroups`) bound to `provider`.
-/// Drop the returned vector into
+/// `processGroups`, `qsrvStats`, the pvxs-compatible `pvxsl` / `pvxgl`
+/// list diagnostics, and `resetGroups`) bound to `provider`. Drop the
+/// returned vector into
 /// [`epics_base_rs::server::ioc_app::IocRunConfig::shell_commands`].
 pub fn register_qsrv_commands(provider: Arc<BridgeProvider>) -> Vec<CommandDef> {
     vec![
         db_load_group_command(provider.clone()),
         process_groups_command(provider.clone()),
         qsrv_stats_command(provider.clone()),
+        pvxsl_command(provider.clone()),
+        pvxgl_command(provider.clone()),
         reset_groups_command(provider),
     ]
 }
@@ -586,16 +762,33 @@ mod tests {
     }
 
     #[test]
-    fn register_qsrv_commands_returns_four() {
+    fn register_qsrv_commands_includes_pvxs_list_commands() {
         let db = Arc::new(PvDatabase::new());
         let provider = Arc::new(BridgeProvider::new(db));
         let cmds = register_qsrv_commands(provider);
-        assert_eq!(cmds.len(), 4);
+        assert_eq!(cmds.len(), 6);
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"dbLoadGroup"));
         assert!(names.contains(&"processGroups"));
         assert!(names.contains(&"qsrvStats"));
+        // pvxs-compatible list diagnostics.
+        assert!(names.contains(&"pvxsl"));
+        assert!(names.contains(&"pvxgl"));
         assert!(names.contains(&"resetGroups"));
+    }
+
+    #[test]
+    fn glob_match_star_question_literal() {
+        // EPICS `epicsStrGlobMatch` semantics.
+        assert!(glob_match("TEST:grp", "TEST:*"));
+        assert!(glob_match("TEST:grp", "*grp"));
+        assert!(glob_match("TEST:grp", "TEST:gr?"));
+        assert!(glob_match("TEST:grp", "*"));
+        assert!(glob_match("abc", "a*c"));
+        assert!(!glob_match("TEST:grp", "OTHER:*"));
+        assert!(!glob_match("TEST:grp", "TEST:gr"));
+        assert!(!glob_match("abc", "a?"));
+        assert!(glob_match("", "*"));
     }
 
     #[test]

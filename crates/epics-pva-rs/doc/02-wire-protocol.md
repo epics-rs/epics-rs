@@ -119,7 +119,6 @@ The pvData type tree is encoded as a stream of type tags:
 0x80 + body   structure
 0x81 + body   union
 0x82          variant
-0x83 + size   bounded string
 0x88 + 0x80 + body  structure array
 0x89 + 0x81 + body  union array
 0x8A          variant array

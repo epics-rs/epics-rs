@@ -4,7 +4,7 @@
 //! Source: pvxs `dataencode.cpp` + `data.cpp`. Designed to be byte-exact with
 //! `spvirit_codec::spvd_encode`/`spvd_decode` for the shapes our `FieldDesc`
 //! covers (scalars, scalar arrays, structures, structure arrays, unions,
-//! union arrays, variants, bounded strings).
+//! union arrays, variants).
 //!
 //! Wire-format type tags (from pvxs `dataencode.cpp`):
 //!
@@ -17,7 +17,6 @@
 //! | 0x80   | structure (followed by descriptor body)  |
 //! | 0x81   | union     (followed by descriptor body)  |
 //! | 0x82   | variant ("any")                          |
-//! | 0x83   | bounded string + size word               |
 //! | 0x88   | structure array (followed by 0x80 + body)|
 //! | 0x89   | union array     (followed by 0x81 + body)|
 //! | 0x8A   | variant array                            |
@@ -400,14 +399,6 @@ pub fn encode_type_desc(desc: &FieldDesc, order: ByteOrder, out: &mut Vec<u8>) {
         }
         FieldDesc::Variant => out.put_u8(TAG_VARIANT),
         FieldDesc::VariantArray => out.put_u8(TAG_VARIANT_ARRAY),
-        // pvxs has no bounded-string TypeCode: `TypeCode::valid()`
-        // (type.cpp:44-70) accepts only the plain `String` scalar, and
-        // `dataencode.cpp:120-123,186-206` faults any fixed/bounded
-        // descriptor on decode. A `BoundedString` is a plain string
-        // everywhere in our value space (the bound is never enforced),
-        // so it must reach the wire as the ordinary string scalar —
-        // never the Rust-only 0x83 tag a pvxs peer would reject.
-        FieldDesc::BoundedString(_) => out.put_u8(ScalarType::String.type_code()),
     }
 }
 
@@ -489,7 +480,7 @@ pub fn encode_field_desc_cached(
 /// [`encode_type_desc`] threading an [`EncodeTypeCache`]. On first sight
 /// of a cacheable descriptor emits `0xFD <slot>` followed by the inline
 /// body; on later sights of the same descriptor emits `0xFE <slot>`.
-/// Non-cacheable descriptors (scalars, variants, bounded strings) always
+/// Non-cacheable descriptors (scalars, variants) always
 /// fall through to the inline encoding.
 pub fn encode_type_desc_cached(
     desc: &FieldDesc,
@@ -553,9 +544,6 @@ fn encode_type_desc_inline_cached(
         }
         FieldDesc::Variant => out.put_u8(TAG_VARIANT),
         FieldDesc::VariantArray => out.put_u8(TAG_VARIANT_ARRAY),
-        // See `encode_type_desc`: a `BoundedString` is normalized to the
-        // plain string scalar on the wire (pvxs has no 0x83 TypeCode).
-        FieldDesc::BoundedString(_) => out.put_u8(ScalarType::String.type_code()),
     }
 }
 
@@ -760,9 +748,11 @@ fn decode_type_desc_cached_at_depth(
         TAG_VARIANT_ARRAY => Ok(FieldDesc::VariantArray),
         // pvxs faults on a bounded/fixed descriptor (`dataencode.cpp:120-123`
         // for the fixed-size bit, `:186-206` leaves bounded unhandled in the
-        // default switch). The 0x83 tag is never emitted by a pvxs peer — nor,
-        // since this fix, by us (see `encode_type_desc`) — so reject it rather
-        // than reconstruct a `FieldDesc::BoundedString` no parity peer produces.
+        // default switch). The 0x83 tag is never emitted by a pvxs peer, and
+        // there is no `FieldDesc` variant that produces it; reject it as an
+        // invalid type code (also catches the legacy Rust-only 0x83 tag that
+        // earlier builds emitted before the bounded-string descriptor was
+        // dropped) rather than fall through to the scalar lookup.
         TAG_BOUNDED_STRING => Err(decode_err!(
             "bounded string descriptor (0x{TAG_BOUNDED_STRING:02X}) is not a pvAccess type code"
         )),
@@ -1021,9 +1011,6 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
                 }
             }
         }
-        (FieldDesc::BoundedString(_), PvField::Scalar(ScalarValue::String(s))) => {
-            encode_string_into(s, order, out);
-        }
         // ── Generic fallback ────────────────────────────────────
         //
         // The typed arms above cover the case where the value variant
@@ -1156,14 +1143,6 @@ fn encode_pv_field_generic(value: &PvField, desc: &FieldDesc, order: ByteOrder, 
             // Non-VariantArray value → empty array.
             encode_size_into(0, order, out);
         }
-        FieldDesc::BoundedString(_) => {
-            // Coerce any scalar to its string form; non-scalar → empty.
-            let s = match value {
-                PvField::Scalar(v) => scalar_to_string(v),
-                _ => String::new(),
-            };
-            encode_string_into(&s, order, out);
-        }
     }
 }
 
@@ -1246,7 +1225,6 @@ fn value_fits_desc(value: &PvField, desc: &FieldDesc) -> bool {
         (FieldDesc::UnionArray { .. }, PvField::UnionArray(_)) => true,
         (FieldDesc::Variant, PvField::Variant(_)) => true,
         (FieldDesc::VariantArray, PvField::VariantArray(_)) => true,
-        (FieldDesc::BoundedString(_), PvField::Scalar(ScalarValue::String(_))) => true,
         _ => false,
     }
 }
@@ -1479,7 +1457,6 @@ pub fn encode_pv_field_with_bitset(
         | FieldDesc::ScalarArray(_)
         | FieldDesc::Variant
         | FieldDesc::VariantArray
-        | FieldDesc::BoundedString(_)
         | FieldDesc::Union { .. }
         | FieldDesc::UnionArray { .. }
         | FieldDesc::StructureArray { .. } => {
@@ -1563,7 +1540,6 @@ pub fn decode_pv_field_with_bitset(
         | FieldDesc::ScalarArray(_)
         | FieldDesc::Variant
         | FieldDesc::VariantArray
-        | FieldDesc::BoundedString(_)
         | FieldDesc::Union { .. }
         | FieldDesc::UnionArray { .. }
         | FieldDesc::StructureArray { .. } => {
@@ -1629,7 +1605,6 @@ pub fn decode_pv_field_with_bitset_cached(
         | FieldDesc::ScalarArray(_)
         | FieldDesc::Variant
         | FieldDesc::VariantArray
-        | FieldDesc::BoundedString(_)
         | FieldDesc::Union { .. }
         | FieldDesc::UnionArray { .. }
         | FieldDesc::StructureArray { .. } => {
@@ -1682,7 +1657,6 @@ pub fn fill_unmarked_from_prior(
         | FieldDesc::ScalarArray(_)
         | FieldDesc::Variant
         | FieldDesc::VariantArray
-        | FieldDesc::BoundedString(_)
         | FieldDesc::Union { .. }
         | FieldDesc::UnionArray { .. }
         | FieldDesc::StructureArray { .. } => {
@@ -1991,10 +1965,6 @@ fn decode_pv_field_at_depth(
             }
             PvField::VariantArray(items)
         }
-        FieldDesc::BoundedString(_) => {
-            let s = decode_string(cur, order)?.unwrap_or_default();
-            PvField::Scalar(ScalarValue::String(s))
-        }
     })
 }
 
@@ -2023,7 +1993,6 @@ pub fn default_value_for(desc: &FieldDesc) -> PvField {
             value: PvField::Null,
         })),
         FieldDesc::VariantArray => PvField::VariantArray(Vec::new()),
-        FieldDesc::BoundedString(_) => PvField::Scalar(ScalarValue::String(String::new())),
     }
 }
 

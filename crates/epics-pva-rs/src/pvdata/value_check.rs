@@ -158,8 +158,6 @@ pub fn value_matches_descriptor(
         // payload because the value carries its own descriptor.
         (PvField::Variant(_), FieldDesc::Variant) => Ok(()),
         (PvField::VariantArray(_), FieldDesc::VariantArray) => Ok(()),
-        // Bounded string ≈ Scalar(String) on the value side.
-        (PvField::Scalar(ScalarValue::String(_)), FieldDesc::BoundedString(_)) => Ok(()),
         // Null value with any descriptor: allowed only for an
         // unspecified Variant slot (pvxs writes 0xFF for null Any).
         (PvField::Null, FieldDesc::Variant) => Ok(()),
@@ -271,7 +269,6 @@ fn desc_label(d: &FieldDesc) -> &'static str {
         FieldDesc::UnionArray { .. } => "UnionArray",
         FieldDesc::Variant => "Variant",
         FieldDesc::VariantArray => "VariantArray",
-        FieldDesc::BoundedString(_) => "BoundedString",
     }
 }
 

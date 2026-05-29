@@ -18,7 +18,6 @@ Union { id, variants }          Union { selector: i32, value: Box<PvField>, ... 
 UnionArray { id, variants }     UnionArray(Vec<UnionItem>)
 Variant                         Variant(VariantValue)
 VariantArray                    VariantArray(Vec<VariantValue>)
-BoundedString(usize)            Scalar(ScalarValue::String(_))
 ```
 
 | Module | Type |

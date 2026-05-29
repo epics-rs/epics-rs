@@ -271,14 +271,12 @@ impl Value {
                     let _ = self.write_field(&path, PvField::ScalarArray(converted));
                 }
                 // Compound / "any" leaves: same-shape copy of the source
-                // store. BoundedString is a string scalar on the value
-                // side, so a clone is the faithful copy here too.
+                // store.
                 FieldDesc::StructureArray { .. }
                 | FieldDesc::Union { .. }
                 | FieldDesc::UnionArray { .. }
                 | FieldDesc::Variant
-                | FieldDesc::VariantArray
-                | FieldDesc::BoundedString(_) => {
+                | FieldDesc::VariantArray => {
                     let _ = self.write_field(&path, src_field.clone());
                 }
                 // A marked structure node represents its whole subtree
@@ -494,7 +492,6 @@ fn default_for(desc: &FieldDesc) -> PvField {
             value: PvField::Null,
         })),
         FieldDesc::VariantArray => PvField::VariantArray(Vec::new()),
-        FieldDesc::BoundedString(_) => PvField::Scalar(ScalarValue::String(String::new())),
         FieldDesc::Structure { struct_id, fields } => {
             let mut s = PvStructure::new(struct_id);
             for (n, child) in fields {

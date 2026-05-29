@@ -541,6 +541,25 @@ pub struct BridgeProvider {
     /// their *next* check (matches C++ QSRV — ACF reload takes effect
     /// without recreating channels).
     access_cell: Arc<parking_lot::RwLock<Arc<dyn AccessControl>>>,
+    /// Source registry for file-loaded group definitions:
+    /// `(filename, raw-macros)` → the group names that load placed into
+    /// `groups`. pvxs keeps a `groupConfigFiles` list so
+    /// `dbLoadGroup("-file.json")` can remove a previously added file
+    /// and `dbLoadGroup("-*")` can clear them all
+    /// (ioc/groupsourcehooks.cpp:133-183). The Rust port parses eagerly
+    /// into `groups` (the daemon serves without `processGroups`), so the
+    /// source identity is retained here to make the same add / replace /
+    /// remove contract expressible without a deferred-parse rearchitecture.
+    group_files: parking_lot::RwLock<Vec<GroupFileEntry>>,
+}
+
+/// One `dbLoadGroup(filename, macros)` registration: its source
+/// identity plus the group names that load placed into the live
+/// registry, so the same file can later be removed.
+struct GroupFileEntry {
+    filename: String,
+    macros: String,
+    names: Vec<String>,
 }
 
 /// Proxy that re-reads the live access-control policy on every check.
@@ -578,6 +597,7 @@ impl BridgeProvider {
             ops_get: std::sync::atomic::AtomicU64::new(0),
             ops_put: std::sync::atomic::AtomicU64::new(0),
             ops_subscribe: std::sync::atomic::AtomicU64::new(0),
+            group_files: parking_lot::RwLock::new(Vec::new()),
         }
     }
 
@@ -707,6 +727,84 @@ impl BridgeProvider {
     pub fn load_group_file(&self, path: &str) -> BridgeResult<()> {
         let content = std::fs::read_to_string(path)?;
         self.load_group_config(&content)
+    }
+
+    /// Load a group config under its `dbLoadGroup` source identity
+    /// `(filename, macros)`, recording which group names this load
+    /// places so the same file can later be removed. Mirrors pvxs
+    /// `dbLoadGroup(file, macros)` (ioc/groupsourcehooks.cpp:147-183):
+    /// re-loading the same `(filename, macros)` first removes the groups
+    /// the previous load of that identity placed (pvxs erases the
+    /// matching entry before appending), then installs the freshly
+    /// parsed definitions. Parsing happens before any mutation so a
+    /// parse error leaves the existing registry untouched.
+    pub fn load_group_file_tracked(
+        &self,
+        filename: &str,
+        macros: &str,
+        json: &str,
+    ) -> BridgeResult<()> {
+        let defs = super::group_config::parse_group_config(json)?;
+        // Drop a prior load of the same source identity (pvxs erases
+        // the matching entry before appending the new one).
+        self.remove_group_file(filename, macros);
+        let mut names = Vec::with_capacity(defs.len());
+        {
+            let mut g = self.groups.write();
+            for def in defs {
+                names.push(def.name.clone());
+                g.insert(def.name.clone(), def);
+            }
+        }
+        self.group_files.write().push(GroupFileEntry {
+            filename: filename.to_string(),
+            macros: macros.to_string(),
+            names,
+        });
+        Ok(())
+    }
+
+    /// Remove every group placed by a prior `dbLoadGroup(filename,
+    /// macros)` with the matching source identity. Mirrors pvxs
+    /// `dbLoadGroup("-file.json", "MAC")` (groupsourcehooks.cpp:174-179),
+    /// which compares the raw filename and raw macros string. Returns the
+    /// number of group definitions removed.
+    pub fn remove_group_file(&self, filename: &str, macros: &str) -> usize {
+        let mut files = self.group_files.write();
+        let mut groups = self.groups.write();
+        let mut removed = 0;
+        files.retain(|e| {
+            if e.filename == filename && e.macros == macros {
+                for n in &e.names {
+                    if groups.remove(n).is_some() {
+                        removed += 1;
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
+    /// Remove every file-loaded group. Mirrors pvxs `dbLoadGroup("-*")`
+    /// (groupsourcehooks.cpp:140-143), which clears the registered file
+    /// list. `info(Q:group)` groups are not file-sourced and are left
+    /// intact; use [`Self::reset_groups`] to clear everything. Returns
+    /// the number of group definitions removed.
+    pub fn clear_group_files(&self) -> usize {
+        let mut files = self.group_files.write();
+        let mut groups = self.groups.write();
+        let mut removed = 0;
+        for e in files.drain(..) {
+            for n in &e.names {
+                if groups.remove(n).is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        removed
     }
 
     /// Load group definitions from a record's info(Q:group, ...) tag.
@@ -846,6 +944,9 @@ impl BridgeProvider {
         let mut g = self.groups.write();
         let n = g.len();
         g.clear();
+        // Drop the file-source registry too, so a later
+        // remove/clear or re-load starts from a clean slate.
+        self.group_files.write().clear();
         n
     }
 
@@ -1133,6 +1234,42 @@ mod tests {
             list.iter().any(|n| n == "GRP:ONLY"),
             "the non-colliding group must still be listed"
         );
+    }
+
+    /// `dbLoadGroup` source identity: a tracked file load can later be
+    /// removed by its `(filename, macros)` identity, re-loading the same
+    /// identity replaces rather than duplicates, and `-*` clears all
+    /// file-loaded groups — mirroring pvxs groupsourcehooks.cpp:133-183.
+    #[tokio::test]
+    async fn group_file_load_is_removable_by_source_identity() {
+        use epics_base_rs::server::database::PvDatabase;
+
+        let provider = BridgeProvider::new(Arc::new(PvDatabase::new()));
+        let ga = r#"{ "GA": { "v": { "+channel": "X.VAL", "+type": "plain" } } }"#;
+        let gb = r#"{ "GB": { "v": { "+channel": "Y.VAL", "+type": "plain" } } }"#;
+
+        provider.load_group_file_tracked("a.json", "", ga).unwrap();
+        provider
+            .load_group_file_tracked("b.json", "M=1", gb)
+            .unwrap();
+        assert_eq!(provider.group_count(), 2);
+
+        // Removal is identity-based: wrong macros string does not match.
+        assert_eq!(provider.remove_group_file("b.json", ""), 0);
+        assert_eq!(provider.group_count(), 2);
+
+        // Exact (filename, macros) removes only that file's groups.
+        assert_eq!(provider.remove_group_file("b.json", "M=1"), 1);
+        assert!(provider.has_group_pv("GA"));
+        assert!(!provider.has_group_pv("GB"));
+
+        // Re-loading the same identity replaces (no duplicate entry).
+        provider.load_group_file_tracked("a.json", "", ga).unwrap();
+        assert_eq!(provider.group_count(), 1);
+
+        // `-*` clears every file-loaded group.
+        assert_eq!(provider.clear_group_files(), 1);
+        assert_eq!(provider.group_count(), 0);
     }
 
     /// Access control that denies all writes, allows all reads.

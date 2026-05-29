@@ -64,16 +64,39 @@ pub fn db_load_group_command(provider: Arc<BridgeProvider>) -> CommandDef {
                 Some(ArgValue::String(s)) => s.clone(),
                 _ => return Err("dbLoadGroup: missing filename".into()),
             };
-            let macros = match args.get(1) {
-                Some(ArgValue::String(s)) => parse_macros(s),
-                _ => Default::default(),
+            let macros_str = match args.get(1) {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => String::new(),
             };
+
+            // pvxs leading-`-` removal syntax
+            // (groupsourcehooks.cpp:133-183): `-*` clears all file-loaded
+            // groups; `-file.json` removes the groups a previous
+            // `dbLoadGroup(file.json, macros)` of the matching identity
+            // placed. Removal is identity-based (raw filename + raw
+            // macros), so it never touches the filesystem.
+            if let Some(rest) = filename.strip_prefix('-') {
+                if rest == "*" {
+                    let n = provider.clear_group_files();
+                    ctx.println(&format!(
+                        "dbLoadGroup: cleared all file groups ({n} removed)"
+                    ));
+                } else {
+                    let n = provider.remove_group_file(rest, &macros_str);
+                    ctx.println(&format!("dbLoadGroup: removed '{rest}' ({n} group(s))"));
+                }
+                return Ok(CommandOutcome::Continue);
+            }
+
+            let macros = parse_macros(&macros_str);
             let raw = match std::fs::read_to_string(&filename) {
                 Ok(s) => s,
                 Err(e) => return Err(format!("dbLoadGroup '{filename}': {e}")),
             };
             let expanded = expand_macros(&raw, &macros);
-            match provider.load_group_config(&expanded) {
+            // Track under the raw (filename, macros) identity so a later
+            // `dbLoadGroup("-filename", macros)` can remove these groups.
+            match provider.load_group_file_tracked(&filename, &macros_str, &expanded) {
                 Ok(()) => {
                     ctx.println(&format!(
                         "dbLoadGroup: loaded '{filename}' ({} groups total)",

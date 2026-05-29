@@ -3169,7 +3169,12 @@ mod tests {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
             fields: vec![("value".into(), PvField::ScalarArray(vec![]))],
         });
-        let pv = SharedPV::new();
+        // A writable mailbox PV: a plain `SharedPV::new()` rejects every
+        // PUT ("PUT not supported by this PV" — pvxs `sharedpv.cpp:209-227`
+        // makes a handler-less SharedPV non-writable). The typed PUT must
+        // land and store so the readback below can verify the typed
+        // encoder produced the right elements.
+        let pv = SharedPV::build_mailbox();
         pv.open(desc, initial).unwrap();
         let source = SharedSource::new();
         source.add(pv_name, pv.clone());

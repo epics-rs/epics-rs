@@ -2530,8 +2530,11 @@ mod tests {
         use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
 
         // Structure PV with a root `value` array and an `aux` array
-        // sub-field. The default SharedPV has no on_put handler, so
-        // an inbound PUT lands directly in `current()`.
+        // sub-field, built as a writable mailbox so the field-targeted
+        // PUT stores and posts. A plain `SharedPV::new()` rejects every
+        // PUT ("PUT not supported by this PV" — pvxs `sharedpv.cpp:209-227`
+        // makes a handler-less SharedPV non-writable), which would mask
+        // what this test checks: that a typed write lands in `aux`.
         let desc = FieldDesc::Structure {
             struct_id: "structure".into(),
             fields: vec![
@@ -2552,7 +2555,7 @@ mod tests {
                 ),
             ],
         });
-        let pv = SharedPV::new();
+        let pv = SharedPV::build_mailbox();
         pv.open(desc, initial).unwrap();
         let source = SharedSource::new();
         source.add("MR_R4:PV", pv.clone());

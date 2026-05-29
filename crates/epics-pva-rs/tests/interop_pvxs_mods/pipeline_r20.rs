@@ -188,7 +188,8 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
                 PvField::Scalar(ScalarValue::Double(0.0)),
             )],
         }),
-    );
+    )
+    .unwrap();
     let source = SharedSource::new();
     source.add("R20:PV", pv.clone());
     let source_arc = Arc::new(source);

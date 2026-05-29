@@ -76,30 +76,34 @@ async fn interop_put_a_pvxput_writes_into_rust_server() {
     // SharedPV has no on_put handler, so the inbound PUT lands
     // directly in `current()`).
     let str_pv = SharedPV::new();
-    str_pv.open(
-        FieldDesc::Structure {
-            struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
-        },
-        PvField::Structure(PvStructure {
-            struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![(
-                "value".into(),
-                PvField::Scalar(ScalarValue::String("initial".into())),
-            )],
-        }),
-    );
+    str_pv
+        .open(
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
+            },
+            PvField::Structure(PvStructure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![(
+                    "value".into(),
+                    PvField::Scalar(ScalarValue::String("initial".into())),
+                )],
+            }),
+        )
+        .unwrap();
     let int_pv = SharedPV::new();
-    int_pv.open(
-        FieldDesc::Structure {
-            struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
-        },
-        PvField::Structure(PvStructure {
-            struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), PvField::Scalar(ScalarValue::Int(0)))],
-        }),
-    );
+    int_pv
+        .open(
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+            },
+            PvField::Structure(PvStructure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), PvField::Scalar(ScalarValue::Int(0)))],
+            }),
+        )
+        .unwrap();
 
     let src = SharedSource::new();
     src.add("W:A:STR", str_pv.clone());

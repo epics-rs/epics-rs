@@ -3399,7 +3399,7 @@ mod tests {
         ]);
 
         let pv = SharedPV::new();
-        pv.open(f64::descriptor(), f64::to_pv_field(&2.5));
+        pv.open(f64::descriptor(), f64::to_pv_field(&2.5)).unwrap();
         let source = Arc::new(SharedSource::new());
         source.add("V6:SEARCH:PV", pv);
 

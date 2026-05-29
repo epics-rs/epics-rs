@@ -948,7 +948,7 @@ mod tcp_fallback_tests {
         };
 
         let pv = crate::server_native::SharedPV::new();
-        pv.open(f64::descriptor(), f64::to_pv_field(&1.0));
+        pv.open(f64::descriptor(), f64::to_pv_field(&1.0)).unwrap();
         let source = Arc::new(SharedSource::new());
         source.add("V6:UDP:PV", pv);
 
@@ -1053,7 +1053,8 @@ mod tcp_fallback_tests {
         // `pvget_typed_primitive_f64` shape.
         let pv = crate::server_native::SharedPV::new();
         let value: f64 = 42.5;
-        pv.open(f64::descriptor(), f64::to_pv_field(&value));
+        pv.open(f64::descriptor(), f64::to_pv_field(&value))
+            .unwrap();
         let source = Arc::new(SharedSource::new());
         source.add("V6:LOOP", pv);
         let config = PvaServerConfig {

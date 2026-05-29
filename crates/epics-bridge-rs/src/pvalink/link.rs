@@ -2553,7 +2553,7 @@ mod tests {
             ],
         });
         let pv = SharedPV::new();
-        pv.open(desc, initial);
+        pv.open(desc, initial).unwrap();
         let source = SharedSource::new();
         source.add("MR_R4:PV", pv.clone());
         let server = PvaServer::isolated(Arc::new(source)).expect("test PVA server must start");

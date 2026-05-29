@@ -39,7 +39,8 @@ async fn interop_access_denied_a_pvxput_to_rejecting_handler_fails() {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![("value".into(), PvField::Scalar(ScalarValue::Int(0)))],
         }),
-    );
+    )
+    .unwrap();
     // Reject every PUT — same wire-shape as an ASG deny.
     pv.on_put(|_pv, _val| Err("not allowed by test policy".into()));
 

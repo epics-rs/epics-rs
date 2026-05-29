@@ -66,7 +66,8 @@ ASG(DEFAULT) {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![("value".into(), PvField::Scalar(ScalarValue::Int(0)))],
         }),
-    );
+    )
+    .unwrap();
     let src = SharedSource::new();
     src.add("ASG:DENY:PV", pv);
     src.set_access_gate(gate).expect("install gate");

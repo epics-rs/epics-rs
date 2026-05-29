@@ -7727,7 +7727,7 @@ mod tests {
             let sid: u32 = 1;
             let intro = three_field_intro();
             let pv = SharedPV::new();
-            pv.open(intro.clone(), three_field_value(0, 0, 0));
+            pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
             let shared = SharedSource::new();
             shared.add("dut", pv);
             let source: DynSource = Arc::new(shared);
@@ -8086,7 +8086,7 @@ mod tests {
 
         let intro = three_field_intro();
         let pv = SharedPV::new();
-        pv.open(intro.clone(), three_field_value(0, 0, 0));
+        pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
         let pusher = pv.clone();
 
         let shared = SharedSource::new();
@@ -8213,7 +8213,7 @@ mod tests {
 
         let intro = three_field_intro();
         let pv = SharedPV::new();
-        pv.open(intro.clone(), three_field_value(0, 0, 0));
+        pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
         let shared = SharedSource::new();
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
@@ -8313,7 +8313,7 @@ mod tests {
 
         let intro = three_field_intro();
         let pv = SharedPV::new();
-        pv.open(intro.clone(), three_field_value(0, 0, 0));
+        pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
         let shared = SharedSource::new();
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
@@ -9497,7 +9497,7 @@ mod tests {
         initial
             .fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
-        pv.open(intro.clone(), PvField::Structure(initial));
+        pv.open(intro.clone(), PvField::Structure(initial)).unwrap();
 
         let shared = SharedSource::new();
         shared.add("dut", pv);
@@ -9629,7 +9629,7 @@ mod tests {
         initial
             .fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
-        pv.open(intro.clone(), PvField::Structure(initial));
+        pv.open(intro.clone(), PvField::Structure(initial)).unwrap();
 
         let shared = SharedSource::new();
         shared.add("dut", pv);
@@ -9758,7 +9758,7 @@ mod tests {
         initial
             .fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.5))));
-        pv.open(intro.clone(), PvField::Structure(initial));
+        pv.open(intro.clone(), PvField::Structure(initial)).unwrap();
         let shared = SharedSource::new();
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
@@ -9927,7 +9927,7 @@ mod tests {
 
         let intro = three_field_intro();
         let pv = SharedPV::new();
-        pv.open(intro.clone(), three_field_value(0, 0, 0));
+        pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
         let shared = SharedSource::new();
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
@@ -10415,7 +10415,8 @@ mod tests {
 
         let intro = three_field_intro();
         let pv = SharedPV::build_mailbox();
-        pv.open(intro.clone(), three_field_value(10, 20, 30));
+        pv.open(intro.clone(), three_field_value(10, 20, 30))
+            .unwrap();
 
         let shared = SharedSource::new();
         shared.add("dut", pv);
@@ -10542,7 +10543,8 @@ mod tests {
 
         let intro = three_field_intro();
         let pv = SharedPV::build_mailbox();
-        pv.open(intro.clone(), three_field_value(10, 20, 30));
+        pv.open(intro.clone(), three_field_value(10, 20, 30))
+            .unwrap();
 
         let shared = SharedSource::new();
         shared.add("dut", pv);
@@ -10703,7 +10705,7 @@ mod tests {
             // Writable PV: a plain SharedPV is not writable (pvxs
             // parity), so the atomic-merge PUT path needs a mailbox.
             let pv = SharedPV::build_mailbox();
-            pv.open(intro.clone(), three_field_value(0, 0, 0));
+            pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
             let shared = SharedSource::new();
             shared.add("dut", pv);
             let source = Arc::new(shared);
@@ -12259,7 +12261,7 @@ mod tests {
         initial
             .fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
-        pv.open(intro.clone(), PvField::Structure(initial));
+        pv.open(intro.clone(), PvField::Structure(initial)).unwrap();
         let shared = SharedSource::new();
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);

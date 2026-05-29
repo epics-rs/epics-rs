@@ -44,7 +44,7 @@ fn build_large_array_pv() -> SharedPV {
         fields: vec![("value".into(), PvField::ScalarArray(values))],
     });
     let pv = SharedPV::new();
-    pv.open(desc, value);
+    pv.open(desc, value).unwrap();
     pv
 }
 

@@ -57,7 +57,7 @@ fn nt_double_value(v: f64) -> PvField {
 /// return (server, addr, shared_pv).
 fn spawn_upstream(pv_name: &str, initial: f64) -> (PvaServer, SocketAddr, SharedPV) {
     let pv = SharedPV::new();
-    pv.open(nt_double_desc(), nt_double_value(initial));
+    pv.open(nt_double_desc(), nt_double_value(initial)).unwrap();
     let source = SharedSource::new();
     source.add(pv_name, pv.clone());
 
@@ -796,7 +796,7 @@ async fn br_r6_gateway_typed_put_passthrough() {
         );
         s
     });
-    pv.open(desc, initial);
+    pv.open(desc, initial).unwrap();
     let source = SharedSource::new();
     source.add("BR:R6:PV", pv.clone());
 
@@ -912,7 +912,7 @@ async fn br_r41_typed_subscribe_delivers_updates() {
         s.set("value", PvField::Scalar(ScalarValue::Double(1.0)));
         s
     });
-    pv.open(desc, initial);
+    pv.open(desc, initial).unwrap();
     let source = SharedSource::new();
     source.add("BR:R41:PV", pv.clone());
 

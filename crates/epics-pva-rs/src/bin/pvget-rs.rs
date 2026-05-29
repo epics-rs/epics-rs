@@ -1,5 +1,6 @@
 use clap::Parser;
 use epics_pva_rs::client::PvaClient;
+use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::{cli, format};
 
 #[derive(Parser)]
@@ -50,25 +51,6 @@ struct Args {
     quiet: bool,
 }
 
-/// Parse a pvRequest string like "field(value,alarm,timeStamp)" into field names.
-fn parse_pv_request(request: &str) -> Vec<&str> {
-    let trimmed = request.trim();
-    if trimmed.is_empty() {
-        return vec![];
-    }
-    // Strip "field(...)" wrapper if present
-    let inner = if let Some(rest) = trimmed.strip_prefix("field(") {
-        rest.strip_suffix(')').unwrap_or(rest)
-    } else {
-        trimmed
-    };
-    inner
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -87,16 +69,35 @@ async fn main() {
         cli::print_effective_config();
     }
 
+    // Parse the pvRequest once with the full grammar so `record[...]`
+    // options, server-side `_filter` chains, per-field option brackets,
+    // and nested field selections all reach the server verbatim — not
+    // just a field-name list. pvxs `pvget.cpp:375-380` hands the whole
+    // `-r` string to `createRequest`. Empty `-r` means the default
+    // all-fields GET. An invalid request exits before any GET.
+    let request: Option<PvRequestExpr> = {
+        let trimmed = args.request.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            match PvRequestExpr::parse(trimmed) {
+                Ok(req) => Some(req),
+                Err(e) => {
+                    eprintln!("error: invalid pvRequest {:?}: {e}", args.request);
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
     let client = PvaClient::new().expect("failed to create PVA client");
     let mode = args.mode.as_str();
-    let fields = parse_pv_request(&args.request);
 
     let mut failed = false;
     for pv_name in &args.pv_names {
-        let result = if fields.is_empty() {
-            client.pvget_full(pv_name).await
-        } else {
-            client.pvget_fields(pv_name, &fields).await
+        let result = match &request {
+            None => client.pvget_full(pv_name).await,
+            Some(req) => client.pvget_with_request_full(pv_name, req).await,
         };
         match result {
             Ok(result) => {
@@ -132,5 +133,30 @@ mod tests {
     fn quiet_flag_is_accepted_as_deprecated_noop() {
         let args = Args::parse_from(["pvget-rs", "-q", "PV"]);
         assert!(args.quiet);
+    }
+
+    /// `-r` is parsed with the full pvRequest grammar, so `record[...]`
+    /// options survive instead of being dropped by a field-list split.
+    /// Pre-fix the ad-hoc parser would have treated `record[process=true]`
+    /// as a field name. pvxs `pvget.cpp:375-380` hands the whole string
+    /// to `createRequest`.
+    #[test]
+    fn request_record_options_parse_via_full_grammar() {
+        let args = Args::parse_from(["pvget-rs", "-r", "record[process=true]field(value)", "PV"]);
+        let req = PvRequestExpr::parse(args.request.trim()).expect("valid pvRequest");
+        assert_eq!(
+            req.record_options,
+            vec![("process".to_string(), "true".to_string())],
+            "record[...] options must be preserved, not parsed as a field"
+        );
+        assert_eq!(req.fields, vec!["value".to_string()]);
+    }
+
+    /// Empty `-r` (the default) selects the all-fields GET — no request
+    /// is built.
+    #[test]
+    fn empty_request_is_default_get() {
+        let args = Args::parse_from(["pvget-rs", "PV"]);
+        assert!(args.request.trim().is_empty());
     }
 }

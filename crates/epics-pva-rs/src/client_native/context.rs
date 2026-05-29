@@ -760,6 +760,23 @@ impl PvaClient {
         pv_name: &str,
         request: &crate::pv_request::PvRequestExpr,
     ) -> PvaResult<PvField> {
+        Ok(self.pvget_with_request_full(pv_name, request).await?.value)
+    }
+
+    /// Like [`Self::pvget_with_request`] but returns the full
+    /// [`PvGetResult`] (value **plus** the response introspection and
+    /// the answering server) so callers can format the result with the
+    /// descriptor the GET actually negotiated — the parity-correct path
+    /// for `pvget -r '<pvRequest>'`, where `record[...]` options and
+    /// server-side `_filter` chains must reach the server verbatim
+    /// rather than being reduced to a field-name list. pvxs
+    /// `pvget.cpp:375-380` passes the whole `-r` string to
+    /// `createRequest`.
+    pub async fn pvget_with_request_full(
+        &self,
+        pv_name: &str,
+        request: &crate::pv_request::PvRequestExpr,
+    ) -> PvaResult<PvGetResult> {
         let ch = self.channel(pv_name).await?;
         let big_endian = matches!(
             crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
@@ -769,9 +786,18 @@ impl PvaClient {
             crate::proto::ByteOrder::Big
         );
         let bytes = request.encode(big_endian);
-        let (_, v) =
+        let (introspection, value) =
             crate::client_native::ops_v2::op_get_raw(&ch, &bytes, self.inner.timeout).await?;
-        Ok(v)
+        let server_addr = match ch.current_state() {
+            super::channel::ChannelState::Active { server, .. } => server.addr,
+            _ => SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+        };
+        Ok(PvGetResult {
+            pv_name: pv_name.to_string(),
+            value,
+            introspection,
+            server_addr,
+        })
     }
 
     /// Force the search engine into fast-tick mode for one revolution

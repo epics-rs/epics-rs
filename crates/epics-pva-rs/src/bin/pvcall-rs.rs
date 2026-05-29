@@ -10,9 +10,12 @@
 //! the CLI doesn't know the server's schema), submits it via
 //! `PvaClient::pvrpc`, and prints the response.
 //!
-//! Numeric values may be passed bare (`gain=2.5`) — the CLI parses
-//! best-effort as `i64` first, then `f64`, then falls back to
-//! `String`.
+//! Every bare `field=value` token is sent as a PVA string, matching
+//! pvxs `tools/call.cpp:104-118` (each query member is declared
+//! `String(key)` and assigned the raw token text). The CLI does not
+//! infer numeric types: `gain=2` and `gain=2.5` are both sent as the
+//! strings `"2"` / `"2.5"`, leaving the receiving RPC service to
+//! coerce per its own schema.
 
 use clap::Parser;
 use epics_pva_rs::client::PvaClient;
@@ -30,7 +33,7 @@ struct Args {
     pv_name: String,
 
     /// `field=value` arguments. Repeat for multiple args.
-    /// Values are parsed as i64 → f64 → String (first match wins).
+    /// Values are sent verbatim as PVA strings (pvxs CLI semantics).
     args: Vec<String>,
 
     /// Wait time in seconds for the RPC to complete
@@ -42,23 +45,17 @@ struct Args {
     mode: String,
 }
 
-/// Parse a `key=value` pair into a typed [`ScalarValue`]. Best-effort
-/// — i64 first, then f64, then String. Mirrors pvxs's `call.cpp`
-/// argument parser at the type-coercion level (pvxs goes further by
-/// asking the server for the request schema and coercing
-/// per-field; we keep it simple).
+/// Parse a `key=value` pair into a string-valued [`ScalarValue`]. pvxs
+/// `tools/call.cpp:86-118` splits on the first `=`, stores the value
+/// as a `std::string`, and declares each query member as `String(key)`
+/// — bare numeric-looking tokens are sent as strings, never coerced to
+/// PVA integers/doubles. The receiving RPC service coerces per its own
+/// schema; the CLI must not guess the type before that schema is known.
 fn parse_arg(arg: &str) -> Result<(String, ScalarValue), String> {
     let (k, v) = arg
         .split_once('=')
         .ok_or_else(|| format!("expected key=value, got {arg:?}"))?;
-    let value = if let Ok(n) = v.parse::<i64>() {
-        ScalarValue::Long(n)
-    } else if let Ok(n) = v.parse::<f64>() {
-        ScalarValue::Double(n)
-    } else {
-        ScalarValue::String(v.to_string())
-    };
-    Ok((k.to_string(), value))
+    Ok((k.to_string(), ScalarValue::String(v.to_string())))
 }
 
 /// Build an NTURI-shaped pvRequest carrying the parsed args under
@@ -141,5 +138,63 @@ async fn main() {
             eprintln!("pvcall-rs: RPC failed: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// pvxs `tools/call.cpp:104-118` sends every bare token as a PVA
+    /// string; integer- and float-looking values must not be coerced.
+    #[test]
+    fn bare_values_are_strings() {
+        for (raw, key, want) in [
+            ("gain=2", "gain", "2"),
+            ("gain=2.5", "gain", "2.5"),
+            ("name=hello", "name", "hello"),
+            ("flag=true", "flag", "true"),
+            ("neg=-7", "neg", "-7"),
+        ] {
+            let (k, v) = parse_arg(raw).expect("valid key=value");
+            assert_eq!(k, key);
+            assert_eq!(v, ScalarValue::String(want.to_string()), "for {raw:?}");
+        }
+    }
+
+    /// The NTURI query descriptor declares each member as a string,
+    /// regardless of how the value text looks.
+    #[test]
+    fn nturi_query_members_are_string_typed() {
+        let args = [
+            ("gain".to_string(), ScalarValue::String("2".to_string())),
+            ("rate".to_string(), ScalarValue::String("2.5".to_string())),
+        ];
+        let (desc, _value) = build_nturi("svc", &args);
+        let FieldDesc::Structure { fields, .. } = desc else {
+            panic!("expected NTURI structure descriptor");
+        };
+        let query = fields
+            .iter()
+            .find(|(n, _)| n == "query")
+            .map(|(_, d)| d)
+            .expect("query substructure");
+        let FieldDesc::Structure { fields: q, .. } = query else {
+            panic!("expected query substructure");
+        };
+        for (name, fd) in q {
+            assert_eq!(
+                fd,
+                &FieldDesc::Scalar(ScalarType::String),
+                "query member {name:?} must be string-typed"
+            );
+        }
+    }
+
+    /// A token without `=` is a usage error, mirroring pvxs
+    /// `tools/call.cpp:88-91`.
+    #[test]
+    fn missing_equals_is_error() {
+        assert!(parse_arg("novalue").is_err());
     }
 }

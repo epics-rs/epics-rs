@@ -956,17 +956,29 @@ impl GroupChannel {
         // group default when the option is absent.
         let atomic = atomic_override.unwrap_or(self.def.atomic);
 
-        // only members with an explicit `+putorder` are
-        // writable. pvxs sentinel `i64::MIN` (fieldconfig.h:37)
-        // → "not putable" (groupsource.cpp:503); a member without
-        // `+putorder` must be ignored, NOT written under an
-        // implicit `0`. Drop None-order members from the PUT path
-        // up-front so the apply loops below never see them.
+        // Build the PUT apply order. A *value* member is putable only
+        // with an explicit `+putorder`: pvxs's sentinel `i64::MIN`
+        // (fieldconfig.h:37) means "not putable" (groupsource.cpp:503),
+        // so a no-`+putorder` value member is ignored, never written
+        // under an implicit `0`.
+        //
+        // A `proc` member is the exception: pvxs's `doPostProcessing`
+        // returns true for `MappingInfo::Proc` independent of putable
+        // (groupsource.cpp:547-573), so a proc hook runs on every group
+        // PUT even without `+putorder`. Keep proc members in the apply
+        // list regardless; a no-`+putorder` proc sorts at the sentinel
+        // position (first), matching the absent-putOrder ordering. Before
+        // this fix the `filter_map` dropped them, so a proc-only save/apply
+        // hook without `+putorder` silently never ran.
         let mut ordered: Vec<(&GroupMember, i32)> = self
             .def
             .members
             .iter()
-            .filter_map(|m| m.put_order.map(|po| (m, po)))
+            .filter_map(|m| match m.put_order {
+                Some(po) => Some((m, po)),
+                None if m.mapping == FieldMapping::Proc => Some((m, i32::MIN)),
+                None => None,
+            })
             .collect();
         ordered.sort_by_key(|(_, po)| *po);
         let ordered: Vec<&GroupMember> = ordered.into_iter().map(|(m, _)| m).collect();
@@ -2529,6 +2541,63 @@ mod tests {
         let def = defs.pop().unwrap();
         assert!(def.atomic);
         (db, def)
+    }
+
+    /// A `proc` group member WITHOUT `+putorder` must still process its
+    /// target record on every group PUT, on both the atomic and
+    /// non-atomic paths. pvxs's `doPostProcessing` returns true for
+    /// `MappingInfo::Proc` independent of putable (groupsource.cpp:
+    /// 547-573); a no-`+putorder` proc keeps the sentinel order
+    /// (fieldconfig.h:37) and is still processed. Before the fix the
+    /// PUT-candidate `filter_map(put_order)` dropped it, so a proc-only
+    /// save/apply hook silently never ran. Observable: a freshly added
+    /// AiRecord has `INIT=0`; its first process sets `INIT=1`.
+    #[tokio::test]
+    async fn proc_member_without_putorder_is_processed_atomic_and_nonatomic() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::types::EpicsValue;
+
+        async fn init_flag(db: &Arc<PvDatabase>, rec: &str) -> i64 {
+            match db.get_pv(&format!("{rec}.INIT")).await.unwrap() {
+                EpicsValue::Char(c) => c as i64,
+                EpicsValue::Long(v) => v as i64,
+                other => panic!("unexpected INIT type: {other:?}"),
+            }
+        }
+
+        for atomic in [false, true] {
+            let db = Arc::new(PvDatabase::new());
+            db.add_record("HOOK:rec", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+            // A proc-only member, no `+putorder`.
+            let cfg = format!(
+                r#"{{ "PROC:GRP": {{ "+atomic": {atomic},
+                    "go": {{ "+type": "proc", "+channel": "HOOK:rec" }} }} }}"#
+            );
+            let mut defs = super::super::group_config::parse_group_config(&cfg).unwrap();
+            let def = defs.pop().unwrap();
+            let channel = GroupChannel::new(db.clone(), def);
+
+            assert_eq!(
+                init_flag(&db, "HOOK:rec").await,
+                0,
+                "fresh record not processed"
+            );
+
+            // An empty PUT still fires the proc hook (proc runs regardless
+            // of which value fields the client supplied).
+            channel
+                .put(&PvStructure::new("structure"))
+                .await
+                .expect("proc-only group PUT must succeed");
+
+            assert_eq!(
+                init_flag(&db, "HOOK:rec").await,
+                1,
+                "proc member without +putorder must process its record (atomic={atomic})"
+            );
+        }
     }
 
     /// Regression. Two boundaries in one

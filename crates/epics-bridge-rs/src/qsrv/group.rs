@@ -1164,10 +1164,19 @@ impl GroupChannel {
                     epics_base_rs::server::database::parse_pv_name(&member.channel);
 
                 if member.mapping == FieldMapping::Proc {
-                    // `_already_locked` — this atomic PUT owns
-                    // every member-record gate via `lock_records`.
+                    // A `+proc` member forces a full record-processing
+                    // cycle on every group PUT — pvxs's `doPostProcessing`
+                    // calls `dbProcess(precord)` for a proc field
+                    // (iocsource.cpp:397-417), the link-aware entry that
+                    // runs INP/OUT/FLNK side effects. Route through
+                    // `process_record_with_links`, not the value-only
+                    // `process_record` (process_local + notify) which
+                    // skips the link chain. `_already_locked` — this
+                    // atomic PUT owns every member-record gate via
+                    // `lock_records` (the gate `Mutex` is not reentrant).
+                    let mut visited = std::collections::HashSet::new();
                     self.db
-                        .process_record_already_locked(record_name)
+                        .process_record_with_links_already_locked(record_name, &mut visited, 0)
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     did_something = true;
@@ -1210,8 +1219,16 @@ impl GroupChannel {
                     epics_base_rs::server::database::parse_pv_name(&member.channel);
 
                 if member.mapping == FieldMapping::Proc {
+                    // Force a full record-processing cycle (INP/OUT/FLNK)
+                    // through the link-aware owner, matching pvxs
+                    // `doPostProcessing` → `dbProcess` for a proc field
+                    // (iocsource.cpp:397-417). The non-atomic path holds
+                    // no member gate, so this is a foreign gate-acquiring
+                    // entry. The bare `process_record` would run only the
+                    // local record body and skip the link chain.
+                    let mut visited = std::collections::HashSet::new();
                     self.db
-                        .process_record(record_name)
+                        .process_record_with_links(record_name, &mut visited, 0)
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     did_something = true;

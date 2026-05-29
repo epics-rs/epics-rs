@@ -622,7 +622,17 @@ impl BridgeChannel {
 
         // pvxs distinguishes Force vs Passive — both write the
         // bound field, but Force *also* triggers an explicit
-        // process-record afterwards.
+        // full record-processing cycle afterwards. pvxs's
+        // `doPostProcessing(forceProcessing==True)` calls
+        // `dbProcess(precord)` (iocsource.cpp:397-417), the full
+        // record-processing entry that runs record support, OUT
+        // links, and FLNK side effects — not a value-only local
+        // notification. The Rust analogue is `process_record_with_links`
+        // (INP/OUT/FLNK traversal with cycle/depth tracking), the same
+        // owner the CA-style passive PUT (`put_record_field_from_ca`)
+        // re-enters; the bare `process_record` (process_local + notify)
+        // would reply success after only the local record body ran,
+        // skipping the link chain.
         match opts.process {
             ProcessMode::Inhibit => {
                 self.db
@@ -647,8 +657,9 @@ impl BridgeChannel {
                     .put_pv(&format!("{}.{}", self.record_name, self.field), epics_val)
                     .await
                     .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                let mut visited = std::collections::HashSet::new();
                 self.db
-                    .process_record(&self.record_name)
+                    .process_record_with_links(&self.record_name, &mut visited, 0)
                     .await
                     .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
             }

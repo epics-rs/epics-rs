@@ -636,11 +636,15 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// success even though no processing fired. Route through the
     /// provider's resolved record so the operation has the same
     /// observable effect as PUT with `record._options.process=true`:
-    /// the record is processed via `PvDatabase::process_record`,
-    /// alarms / FLNK / output links all run. Single-record-only —
-    /// group / native PVA PVs have no processing semantics and are
-    /// returned an unsupported-op error so callers don't silently
-    /// trust a no-op.
+    /// the record is processed via `PvDatabase::process_record_with_links`
+    /// — the link-aware owner that runs INP/OUT/FLNK traversal, so
+    /// alarms / FLNK / output links all run (pvxs routes forced PROCESS
+    /// through `dbProcess`, iocsource.cpp:397-417). The bare
+    /// `process_record` (process_local + notify) would report success
+    /// after only the local record body ran, skipping the link chain.
+    /// Single-record-only — group / native PVA PVs have no processing
+    /// semantics and are returned an unsupported-op error so callers
+    /// don't silently trust a no-op.
     fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
@@ -657,9 +661,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 )));
             }
             let (record_name, _field) = epics_base_rs::server::database::parse_pv_name(&name);
+            let mut visited = std::collections::HashSet::new();
             provider
                 .database()
-                .process_record(record_name)
+                .process_record_with_links(record_name, &mut visited, 0)
                 .await
                 .map_err(|e| OpError::failed(format!("PROCESS on '{name}': {e}")))
         }
@@ -1714,7 +1719,7 @@ mod tests {
             .expect("put_value_checked must succeed");
 
         // VAL must reflect the put. ProcessMode::Force routes through
-        // put_pv + process_record; under either ProcessMode the value
+        // put_pv + process_record_with_links; under either ProcessMode the value
         // lands at 2.5 here — the per-mode semantic divergence is
         // exercised in dedicated tests. The point of THIS test is that
         // option routing from ctx.pv_request reached the bridge: a
@@ -1874,6 +1879,100 @@ mod tests {
             after > before,
             "TIME must strictly advance after PROCESS (clock too \
              coarse to discriminate the fix): {before:?} -> {after:?}"
+        );
+    }
+
+    /// QSRV forced PUT (`record._options.process=true`) and QSRV
+    /// PROCESS must run the *link-aware* processing chain, not a
+    /// value-only local notification: a record whose FLNK targets a
+    /// second record must process that target before the operation
+    /// replies success. pvxs routes both through `dbProcess`
+    /// (iocsource.cpp:397-417), which runs FLNK / OUT links; the bare
+    /// `process_record` (process_local + notify) would skip them.
+    ///
+    /// Discriminator: B is processed only when A's FLNK chain fires,
+    /// which advances B's `common.time`. With the pre-fix local-only
+    /// path B's TIME would never move.
+    #[tokio::test]
+    async fn forced_put_and_process_run_the_flnk_link_chain() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::types::EpicsValue;
+        use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("FLNK:a", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("FLNK:b", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // A.FLNK -> B (both default to SCAN=Passive, so FLNK processes B).
+        db.put_pv("FLNK:a.FLNK", EpicsValue::String("FLNK:b".into()))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        let store = QsrvPvStore::new(provider);
+
+        let b_time = |db: Arc<PvDatabase>| async move {
+            let rec = db.get_record("FLNK:b").await.unwrap();
+            let inst = rec.read().await;
+            inst.common.time
+        };
+
+        // --- Forced PUT path ---
+        let b_before = b_time(db.clone()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let mut value = PvStructure::new("epics:nt/NTScalar:1.0");
+        value
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        let mut opts = PvStructure::new("");
+        opts.fields.push((
+            "process".into(),
+            PvField::Scalar(ScalarValue::String("true".into())),
+        ));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(opts)));
+        let mut req = PvStructure::new("");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "anonymous".into(),
+            method: "anonymous".into(),
+            host: "127.0.0.1".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: Some(PvField::Structure(req)),
+        };
+        let checked = AccessGate::open()
+            .check("FLNK:a", "127.0.0.1", "anonymous", "anonymous", "")
+            .await;
+        store
+            .put_value_checked(checked, PvField::Structure(value), ctx)
+            .await
+            .expect("forced PUT must succeed");
+        let b_after_put = b_time(db.clone()).await;
+        assert!(
+            b_after_put > b_before,
+            "forced PUT must run A's FLNK chain and process B \
+             (B.TIME must advance): {b_before:?} -> {b_after_put:?}"
+        );
+
+        // --- PROCESS path ---
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        store.process("FLNK:a").await.expect("PROCESS must run");
+        let b_after_process = b_time(db.clone()).await;
+        assert!(
+            b_after_process > b_after_put,
+            "PROCESS must run A's FLNK chain and process B \
+             (B.TIME must advance): {b_after_put:?} -> {b_after_process:?}"
         );
     }
 

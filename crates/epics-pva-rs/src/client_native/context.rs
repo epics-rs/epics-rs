@@ -28,8 +28,8 @@ use crate::pvdata::{FieldDesc, PvField};
 
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
-    DEFAULT_PIPELINE_SIZE, MonitorEvent, MonitorEventMask, SubscriptionHandle, op_get, op_monitor,
-    op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle,
+    DEFAULT_PIPELINE_SIZE, MonitorEvent, MonitorEventMask, SubscriptionHandle, op_get, op_get_get,
+    op_get_put, op_monitor, op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle,
     op_monitor_raw_frames_handle_with_request, op_process, op_process_with_request, op_put,
     op_put_get, op_rpc,
 };
@@ -1543,6 +1543,25 @@ impl PvaClient {
     ) -> PvaResult<(FieldDesc, PvField)> {
         let ch = self.channel(pv_name).await?;
         op_put_get(&ch, value_str, self.inner.timeout).await
+    }
+
+    /// PVA `PUT_GET` `getGet` subcommand (`QOS_GET`, 0x40) — read the
+    /// channel's current get-side data with no put leg, returning the
+    /// readback `(introspection, value)`. The EPICS pvAccess
+    /// `ChannelPutGet::getGet()` (`clientContextImpl.cpp:1233-1255`)
+    /// counterpart; unlike [`Self::pvput_get`] it never writes.
+    pub async fn pvget_get(&self, pv_name: &str) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        op_get_get(&ch, self.inner.timeout).await
+    }
+
+    /// PVA `PUT_GET` `getPut` subcommand (`QOS_GET_PUT`, 0x80) — read the
+    /// channel's current put-side data with no put leg. The EPICS pvAccess
+    /// `ChannelPutGet::getPut()` (`clientContextImpl.cpp:1262-1288`)
+    /// counterpart.
+    pub async fn pvget_put(&self, pv_name: &str) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        op_get_put(&ch, self.inner.timeout).await
     }
 
     /// PVA `PROCESS` (cmd 16) — trigger record processing without

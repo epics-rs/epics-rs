@@ -3327,18 +3327,39 @@ async fn handle_put_get(
     };
     let pv_name = ch.name.clone();
 
-    // Decode the put payload inline (cursor is borrowed from the stack frame).
-    let changed =
-        BitSet::decode(&mut cur, inbound_order).map_err(|e| PvaError::Decode(e.to_string()))?;
-    let put_delta = decode_pv_field_with_bitset_cached(
-        &intro,
-        &changed,
-        0,
-        &mut cur,
-        inbound_order,
-        decode_cache,
-    )
-    .map_err(|e| PvaError::Decode(format!("PUT_GET requires a value payload: {e}")))?;
+    // EPICS ChannelPutGet has three data-phase subcommands sharing the
+    // PUT_GET command byte (pvAccess remote.h:78-82): the default putGet
+    // (0x00) writes then reads back, getGet (`QOS_GET`, 0x40) reads the
+    // current get-side data, and getPut (`QOS_GET_PUT`, 0x80) reads the
+    // current put-side data. Only putGet carries a put payload —
+    // clientContextImpl.cpp:1100-1112 serializes the put BitSet + value
+    // solely for the default branch and sends nothing for getGet/getPut.
+    // Decoding a BitSet/value for those payload-less frames is what made
+    // the operation fail, so gate both the decode and the write leg on the
+    // subcommand. Our INIT serves the same introspection for the put and
+    // get structures (see above), so both read-only legs reply with the
+    // current value under the negotiated mask, echoing the subcommand the
+    // client dispatches on (getGetDone vs getPutDone).
+    let read_only = subcmd & (QosFlags::GET | QosFlags::GET_PUT) != 0;
+
+    // Decode the put payload inline (cursor is borrowed from the stack
+    // frame) only for the write/readback putGet path.
+    let put_payload = if read_only {
+        None
+    } else {
+        let changed =
+            BitSet::decode(&mut cur, inbound_order).map_err(|e| PvaError::Decode(e.to_string()))?;
+        let put_delta = decode_pv_field_with_bitset_cached(
+            &intro,
+            &changed,
+            0,
+            &mut cur,
+            inbound_order,
+            decode_cache,
+        )
+        .map_err(|e| PvaError::Decode(format!("PUT_GET requires a value payload: {e}")))?;
+        Some((changed, put_delta))
+    };
 
     let ctx = crate::server_native::source::ChannelContext {
         peer,
@@ -3375,44 +3396,51 @@ async fn handle_put_get(
         payload.put_u32(ioid, order);
         payload.put_u8(subcmd);
 
-        // PUT leg — WRITE-gated.
-        let put_result = {
-            let checked = src
-                .access_gate()
-                .check_with_roles(
-                    &pv_name,
-                    &ctx.host,
-                    &ctx.account,
-                    &ctx.roles,
-                    &ctx.method,
-                    &ctx.authority,
-                )
-                .await;
-            // a panic in the user PUT handler becomes an error
-            // reply instead of skipping the reply below.
-            catch_handler_panic(src.put_delta_checked(
-                checked,
-                intro.clone(),
-                changed,
-                put_delta,
-                ctx.clone(),
-            ))
-            .await
-            .map_err(|e| OpError::failed(e))
-            .and_then(|r| r)
-        };
-        if let Err(msg) = put_result {
-            Status::error(msg).write_into(order, &mut payload);
-            let h =
-                PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
-            let mut buf = Vec::new();
-            h.write_into(&mut buf);
-            buf.extend_from_slice(&payload);
-            let _ = tx_clone.send(buf).await;
-            return;
+        // PUT leg — WRITE-gated. Skipped for getGet/getPut (read-only):
+        // those subcommands carry no put payload and only read back.
+        if let Some((changed, put_delta)) = put_payload {
+            let put_result = {
+                let checked = src
+                    .access_gate()
+                    .check_with_roles(
+                        &pv_name,
+                        &ctx.host,
+                        &ctx.account,
+                        &ctx.roles,
+                        &ctx.method,
+                        &ctx.authority,
+                    )
+                    .await;
+                // a panic in the user PUT handler becomes an error
+                // reply instead of skipping the reply below.
+                catch_handler_panic(src.put_delta_checked(
+                    checked,
+                    intro.clone(),
+                    changed,
+                    put_delta,
+                    ctx.clone(),
+                ))
+                .await
+                .map_err(|e| OpError::failed(e))
+                .and_then(|r| r)
+            };
+            if let Err(msg) = put_result {
+                Status::error(msg).write_into(order, &mut payload);
+                let h = PvaHeader::application(
+                    true,
+                    order,
+                    Command::PutGet.code(),
+                    payload.len() as u32,
+                );
+                let mut buf = Vec::new();
+                h.write_into(&mut buf);
+                buf.extend_from_slice(&payload);
+                let _ = tx_clone.send(buf).await;
+                return;
+            }
         }
 
-        // GET leg — READ-gated.
+        // GET leg — READ-gated. For getGet/getPut this is the only leg.
         let read_checked = src
             .access_gate()
             .check_with_roles(
@@ -11735,7 +11763,10 @@ mod tests {
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
 
-        // PUT_GET data-phase frame (subcmd 0x40 = readback wanted):
+        // PUT_GET data-phase frame, default putGet subcommand 0x00 (write
+        // then read back). 0x40/0x80 are the read-only getGet/getPut
+        // subcommands that carry no put payload, so the write+readback
+        // this test exercises uses 0x00 — the subcommand op_put_get sends.
         // sid + ioid + subcmd + changed-bitset + delta(field a → 55).
         let bit_a = intro.bit_for_path("a").expect("a has a bit");
         let mut changed = BitSet::new();
@@ -11743,7 +11774,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
         payload.put_u32(ioid, order);
-        payload.put_u8(0x40);
+        payload.put_u8(0x00);
         changed.write_into(order, &mut payload);
         crate::pvdata::encode::encode_pv_field_with_bitset(
             &three_field_value(55, 0, 0),

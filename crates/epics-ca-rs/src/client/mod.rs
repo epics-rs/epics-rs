@@ -391,6 +391,13 @@ enum CoordRequest {
         deadband: f64,
         callback_tx: mpsc::Sender<CaResult<Snapshot>>,
         coalesce_slot: std::sync::Arc<subscription::CoalesceSlot>,
+        /// Requested element-count cap (`camonitor -#`), or `None` for the
+        /// full native count. Carried onto the subscription record and
+        /// clamped to the channel's native element count at connect-time by
+        /// the single owner [`subscription::resolve_subscription_count`]
+        /// (C `camonitor.c:169`), so it works even though the subscribe is
+        /// issued before the channel connects.
+        req_count: Option<u32>,
         /// When set, an ENUM field is subscribed in its `DBR_TIME_STRING`
         /// form so monitor values arrive as state labels (the `camonitor`
         /// default; C `camonitor.c:156-160`). The plain library subscribe
@@ -2057,8 +2064,46 @@ impl CaChannel {
         Ok(self.snapshot()?.native_type)
     }
 
+    /// The channel's native element count, known once connected. Mirrors
+    /// libca `ca_element_count(chid)` — the CLI tools read it after connect
+    /// to clamp a `-#` requested element count to the array bound before
+    /// issuing the request (C `caget.c:200` / `camonitor.c:169`). Returns
+    /// `Err(Disconnected)` before the channel is operational.
+    pub fn element_count(&self) -> CaResult<u32> {
+        Ok(self.snapshot()?.element_count)
+    }
+
     pub async fn get_with_timeout(&self, timeout: Duration) -> CaResult<(DbFieldType, EpicsValue)> {
+        self.get_with_timeout_count(timeout, 0).await
+    }
+
+    /// Plain (no-metadata) GET requesting at most `count` array elements;
+    /// `count == 0` requests the full native count. The count-aware sibling
+    /// of [`Self::get_with_timeout`], mirroring the metadata/exact-type GET
+    /// paths ([`Self::get_with_metadata_count`], [`Self::get_with_dbr_type`])
+    /// so `caget -# N` bounds the CA payload at the request boundary instead
+    /// of transferring the whole array and truncating in rendering
+    /// (C `caget.c:200-215` applies `reqElems` to the wire request count).
+    ///
+    /// A `count` greater than the channel element count is rejected as
+    /// `ECA_BADCOUNT`, matching libca `nciu::read`; the tool front-end
+    /// clamps to the native count first (C `caget.c:200`
+    /// `reqElems > nElems ? nElems : reqElems`), so this guards only
+    /// programmatic misuse.
+    pub async fn get_with_timeout_count(
+        &self,
+        timeout: Duration,
+        count: u32,
+    ) -> CaResult<(DbFieldType, EpicsValue)> {
         let snap = self.snapshot()?;
+        if count > 0 && count > snap.element_count {
+            return Err(CaError::Protocol(format!(
+                "get count {} exceeds channel element count {} \
+                 (matches libca nciu::read ECA_BADCOUNT)",
+                count, snap.element_count
+            )));
+        }
+        let request_count = if count > 0 { count } else { snap.element_count };
 
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2081,7 +2126,7 @@ impl CaChannel {
         );
 
         if let Err(e) =
-            self.send_read_notify_fast(&snap, snap.native_type as u16, snap.element_count, ioid)
+            self.send_read_notify_fast(&snap, snap.native_type as u16, request_count, ioid)
         {
             self.in_flight.reads.remove(&ioid);
             return Err(e);
@@ -2509,6 +2554,33 @@ impl CaChannel {
         enum_as_string: bool,
         float_as_string: bool,
     ) -> CaResult<MonitorHandle> {
+        self.subscribe_with_mask_readback_count(
+            deadband,
+            mask,
+            enum_as_string,
+            float_as_string,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::subscribe_with_mask_readback`], but bounds the monitor
+    /// to at most `req_count` array elements (`camonitor -#`); `None`
+    /// requests the full native count. The cap is clamped to the channel's
+    /// native element count at connect-time — `reqElems > nElems` requests
+    /// `nElems`, mirroring C `camonitor.c:169` — and re-clamped on reconnect
+    /// against the fresh native count, so a large-waveform monitor transfers
+    /// and decodes only the requested slice on every event instead of the
+    /// whole array (C `camonitor.c:168-180` applies `reqElems` to the
+    /// `ca_create_subscription` count).
+    pub async fn subscribe_with_mask_readback_count(
+        &self,
+        deadband: f64,
+        mask: u16,
+        enum_as_string: bool,
+        float_as_string: bool,
+        req_count: Option<u32>,
+    ) -> CaResult<MonitorHandle> {
         let env = epics_base_rs::runtime::env::get("EPICS_CA_MONITOR_QUEUE")
             .and_then(|s| s.parse::<usize>().ok());
         let queue_size = resolve_monitor_queue_size(env);
@@ -2522,6 +2594,7 @@ impl CaChannel {
             deadband,
             callback_tx,
             coalesce_slot: coalesce_slot.clone(),
+            req_count,
             enum_as_string,
             float_as_string,
             reply: reply_tx,
@@ -3010,7 +3083,7 @@ async fn run_coordinator(
                                 .push(reply);
                         }
                     }
-                    CoordRequest::Subscribe { cid, mask, deadband, callback_tx, coalesce_slot, enum_as_string, float_as_string, reply } => {
+                    CoordRequest::Subscribe { cid, mask, deadband, callback_tx, coalesce_slot, req_count, enum_as_string, float_as_string, reply } => {
                         if let Some(ch) = channels.get(&cid) {
                             let server_addr = ch.server_addr.unwrap_or_else(|| {
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
@@ -3025,7 +3098,13 @@ async fn run_coordinator(
                             let data_type = ch
                                 .native_type
                                 .map(|t| subscription_readback_dbr(t, enum_as_string, float_as_string));
-                            let count = ch.native_type.map(|_| ch.element_count);
+                            // Single owner of the reqElems→wire-count rule:
+                            // clamp the requested cap to the native element
+                            // count (C camonitor.c:169). Reconnect re-clamps
+                            // via restore_for_channel against the fresh count.
+                            let count = ch
+                                .native_type
+                                .map(|_| subscription::resolve_subscription_count(req_count, ch.element_count));
 
                             // allocate the subid here, where the
                             // live subscription table lives, so the wrap
@@ -3039,6 +3118,10 @@ async fn run_coordinator(
                                 cid,
                                 data_type,
                                 count,
+                                // Requested cap preserved across reconnects;
+                                // restore_for_channel re-clamps it to the
+                                // fresh native count each connect.
+                                req_count,
                                 // The public subscribe API auto-derives the
                                 // DBR type from the channel's native type, so
                                 // it must re-derive on NativeTypeChanged. The

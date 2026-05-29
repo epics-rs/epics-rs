@@ -571,6 +571,11 @@ async fn main() {
     // enum/float substitutions below use `want_time` to pick the TIME
     // vs plain string form (C `caget.c:176-187`).
     let want_time = mode == OutputMode::All;
+    // C `caget.c:200` clamps the user's `-#` count to the native element
+    // count before the wire request (`reqElems > nElems ? nElems :
+    // reqElems`); `None` (no `-#`) requests the full count. Captured as a
+    // Copy so each spawned task owns it without moving `args`.
+    let max_elements = args.max_elements;
     let mut handles = Vec::new();
     for (name, ch) in &channels {
         let name = name.clone();
@@ -581,6 +586,14 @@ async fn main() {
             if connect.is_err() {
                 return (name, Err("not connected".to_string()));
             }
+            // Bound the CA payload at the request boundary: clamp `-# N` to
+            // the connected channel's native element count (C `caget.c:200`).
+            // `0` requests the full count, which the count-aware GET paths
+            // translate to the native element count.
+            let req_count: u32 = match max_elements {
+                Some(n) => (n as u32).min(ch.element_count().unwrap_or(0)),
+                None => 0,
+            };
             // C `caget.c:172-187`: the request DBR type depends on the
             // output format. `specifiedDbr` carries the `-d` type verbatim
             // (`pvs[n].dbrType = dbrType`) and keeps the full snapshot for
@@ -593,7 +606,7 @@ async fn main() {
                 let rt = req_dbr_type
                     .expect("specifiedDbr mode implies a resolved -d type (else reverts to plain)");
                 let native = ch.native_field_type().ok();
-                match tokio::time::timeout(t, ch.get_with_dbr_type(rt, 0)).await {
+                match tokio::time::timeout(t, ch.get_with_dbr_type(rt, req_count)).await {
                     Ok(Ok(snap)) => Ok(GetResult::Specified {
                         native,
                         req_type: rt,
@@ -620,7 +633,7 @@ async fn main() {
                 if let Some(rt) = sub_dbr {
                     // Under `-a` the TIME-class string (DBR_TIME_STRING)
                     // still carries timestamp + alarm, so wrap it as `Time`.
-                    match tokio::time::timeout(t, ch.get_with_dbr_type(rt, 0)).await {
+                    match tokio::time::timeout(t, ch.get_with_dbr_type(rt, req_count)).await {
                         Ok(Ok(snap)) => Ok(if want_time {
                             GetResult::Time(Box::new(snap))
                         } else {
@@ -631,7 +644,12 @@ async fn main() {
                         Err(_) => Err("timeout".to_string()),
                     }
                 } else if want_time {
-                    match tokio::time::timeout(t, ch.get_with_metadata(DbrClass::Time)).await {
+                    match tokio::time::timeout(
+                        t,
+                        ch.get_with_metadata_count(DbrClass::Time, req_count),
+                    )
+                    .await
+                    {
                         Ok(Ok(snap)) => Ok(GetResult::Time(Box::new(snap))),
                         Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
                         Ok(Err(e)) => Err(format!("{e}")),
@@ -639,7 +657,7 @@ async fn main() {
                     }
                 } else {
                     // plain / terse: cheap typed value, no metadata payload.
-                    match ch.get_with_timeout(t).await {
+                    match ch.get_with_timeout_count(t, req_count).await {
                         Ok((_dbr, value)) => Ok(GetResult::Plain(value)),
                         Err(CaError::Timeout) => Err("timeout".to_string()),
                         Err(e) => Err(format!("{e}")),

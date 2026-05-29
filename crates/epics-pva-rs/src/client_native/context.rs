@@ -1431,10 +1431,17 @@ impl PvaClient {
     /// Snapshot of the client's current state — channel cache size,
     /// connection-pool peers, name-server count, and per-connection /
     /// per-channel byte counters. Mirrors pvxs `Context::report`
-    /// (client.h:599 / client.cpp:464-501): each [`ConnReport`] carries its
-    /// [`ConnReport::channels`] list with per-channel RX/TX counters.
+    /// (client.h:597-599 / client.cpp:464-501): each [`ConnReport`] carries
+    /// its [`ConnReport::channels`] list with per-channel RX/TX counters.
+    ///
+    /// Like pvxs `Report report(bool zero=true)`, the no-argument form
+    /// **zeros** the byte counters after snapshotting, so periodic
+    /// `report()` calls yield per-interval deltas rather than ever-growing
+    /// cumulative totals (client.cpp:464-500 resets `statTx`/`statRx` when
+    /// `zero`). Use [`Self::report_zeroed`]`(false)` for a non-resetting
+    /// cumulative snapshot.
     pub fn report(&self) -> ClientReport {
-        self.report_zeroed(false)
+        self.report_zeroed(true)
     }
 
     /// like [`Self::report`] but, when `zero` is true, resets
@@ -1810,8 +1817,8 @@ pub struct ClientReport {
 pub struct ConnReport {
     /// Server endpoint this connection talks to.
     pub peer: std::net::SocketAddr,
-    /// Bytes read off this connection's socket (since the last
-    /// `report_zeroed(true)`).
+    /// Bytes read off this connection's socket (since the last zeroing
+    /// report — `report()` or `report_zeroed(true)`).
     pub bytes_rx: u64,
     /// Bytes written to this connection's socket.
     pub bytes_tx: u64,
@@ -1833,7 +1840,7 @@ pub struct ChanReport {
     /// Server-assigned channel id (SID).
     pub sid: u32,
     /// Bytes received for this channel's operations (since the last
-    /// `report_zeroed(true)`).
+    /// zeroing report — `report()` or `report_zeroed(true)`).
     pub bytes_rx: u64,
     /// Bytes transmitted for this channel's operations.
     pub bytes_tx: u64,

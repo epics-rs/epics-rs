@@ -229,15 +229,26 @@ async fn main() {
             (false, None) => ch.get_with_timeout(timeout).await.map(|(_t, v)| (v, None)),
         }
     };
-    let (old_value, old_snap) = match read_display(ch.clone()).await {
-        Ok(pair) => pair,
-        Err(CaError::Timeout) => {
-            eprintln!("Read operation timed out: PV data was not read.");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+    // C caput.c:532-535 gates the pre-put "Old :" read+print on
+    // `if (format != terse)`. Terse mode prints only the new value, so the
+    // pre-put GET must NOT be issued: C never issues it, and a PV that is slow
+    // to read, read-denied before a write-side access transition, or backed by
+    // an expensive/side-effecting read path must still proceed to the write.
+    // The post-put read below is kept in every mode (C still calls caget()
+    // after the put, caput.c:583; terse only suppresses the `New :` label).
+    let (old_value, old_snap) = if args.terse {
+        (None, None)
+    } else {
+        match read_display(ch.clone()).await {
+            Ok((v, s)) => (Some(v), s),
+            Err(CaError::Timeout) => {
+                eprintln!("Read operation timed out: PV data was not read.");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
     };
 
@@ -307,7 +318,12 @@ async fn main() {
         fmt.field_separator = c;
     }
     let sep = fmt.field_separator;
-    let old_rendered = format_value(&old_value, &fmt, None, false);
+    // In terse mode `old_value` is `None` (no pre-put read was issued) and the
+    // rendered old value is unused; non-terse modes always carry `Some`.
+    let old_rendered = old_value
+        .as_ref()
+        .map(|v| format_value(v, &fmt, None, false))
+        .unwrap_or_default();
     let new_rendered = format_value(&new_value, &fmt, None, false);
     let is_scalar = new_value.count() == 1;
     let pad = |name: &str| -> String {

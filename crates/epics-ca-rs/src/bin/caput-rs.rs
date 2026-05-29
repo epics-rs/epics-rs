@@ -508,13 +508,40 @@ fn raw_from_escaped(s: &str) -> Vec<u8> {
     out
 }
 
+/// Max raw payload of a CA `DBR_STRING` element: `MAX_STRING_SIZE` (40)
+/// minus the trailing NUL. C `caput` decodes each string/ENUM-name value
+/// into a fixed `EpicsStr[MAX_STRING_SIZE]` buffer, so at most 39 raw
+/// bytes survive (`epicsStrnRawFromEscaped` writes while `--rem > 0` from
+/// `rem = 40`, then NUL-terminates — epicsString.c:55-118).
+const DBR_STRING_PAYLOAD_MAX: usize = 39;
+
 /// `raw_from_escaped` decoded into a `String` for the DBR_STRING / ENUM-
 /// by-name put paths. The common escapes (`\n`, `\t`, `\\`, …) decode to
 /// ASCII; a high-byte `\xNN` that is not valid UTF-8 falls back to lossy
 /// decoding (the Rust `EpicsValue::String` is UTF-8, whereas C carries a
 /// raw byte buffer).
+///
+/// The decoded value is truncated to [`DBR_STRING_PAYLOAD_MAX`] bytes, the
+/// way C `caput` decodes into its fixed `EpicsStr` buffer and forces a
+/// trailing NUL (caput.c:484-489 for ENUM names, caput.c:523-528 for
+/// native DBR_STRING): an overlong CLI value is written as its 39-byte
+/// prefix, not rejected. The Rust client's `validate_put_strings` /
+/// libca's `nciu::stringVerify` reject `>= 40`, so the cap must happen in
+/// the CLI builder to keep C-tool parity. `-S` long strings take the
+/// DBR_CHAR path (`raw_from_escaped`, not this helper) and stay uncapped.
+/// The truncation lands on a UTF-8 char boundary — C's buffer is
+/// byte-oriented, but for the printable/ASCII values this targets the two
+/// coincide.
 fn raw_from_escaped_string(s: &str) -> String {
-    String::from_utf8_lossy(&raw_from_escaped(s)).into_owned()
+    let mut decoded = String::from_utf8_lossy(&raw_from_escaped(s)).into_owned();
+    if decoded.len() > DBR_STRING_PAYLOAD_MAX {
+        let mut end = DBR_STRING_PAYLOAD_MAX;
+        while !decoded.is_char_boundary(end) {
+            end -= 1;
+        }
+        decoded.truncate(end);
+    }
+    decoded
 }
 
 /// Build the value to write, in C `caput`'s precedence order
@@ -971,6 +998,65 @@ mod tests {
                 }
                 other => panic!("CHAR scalar without -S must be a DBR_STRING Wire, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn overlong_dbr_string_values_truncate_to_39_bytes() {
+        // C `caput` decodes each DBR_STRING / ENUM-name value into a fixed
+        // EpicsStr[40] buffer and keeps 39 raw bytes (caput.c:484-489,
+        // 523-528); an overlong value is TRUNCATED before libca, not
+        // rejected. The Rust client rejects >= 40, so caput-rs must cap.
+        let long = "a".repeat(50); // 50 ASCII bytes
+        // Non-ENUM string scalar -> DBR_STRING capped to 39.
+        match build_write_value(&vals(&[long.as_str()]), DbFieldType::String, false, false, false, false)
+        {
+            Ok(WriteValue::Wire {
+                value: EpicsValue::String(s),
+                ..
+            }) => {
+                assert_eq!(s.len(), 39, "scalar string truncated to 39 bytes");
+                assert_eq!(s, "a".repeat(39));
+            }
+            other => panic!("expected truncated DBR_STRING Wire, got {other:?}"),
+        }
+        // Non-ENUM string array element -> each capped to 39 (the leading
+        // token is the skipped -a count).
+        match build_write_value(
+            &vals(&["2", long.as_str(), "short"]),
+            DbFieldType::String,
+            false,
+            false,
+            false,
+            true,
+        ) {
+            Ok(WriteValue::Wire {
+                value: EpicsValue::StringArray(a),
+                ..
+            }) => {
+                assert_eq!(a[0].len(), 39, "array element truncated to 39 bytes");
+                assert_eq!(a[1], "short");
+            }
+            other => panic!("expected truncated DBR_STRING[] Wire, got {other:?}"),
+        }
+        // ENUM-by-name scalar (`-s`) -> EnumString capped to 39.
+        match build_write_value(&vals(&[long.as_str()]), DbFieldType::Enum, false, true, false, false) {
+            Ok(WriteValue::EnumString(s)) => {
+                assert_eq!(s.len(), 39, "enum-by-name value truncated to 39 bytes")
+            }
+            other => panic!("expected truncated EnumString, got {other:?}"),
+        }
+        // `-S` long strings take the DBR_CHAR path and stay UNCAPPED — all
+        // 50 bytes + NUL survive (finding: -S is not 39-byte limited).
+        match build_write_value(&vals(&[long.as_str()]), DbFieldType::Char, false, false, true, false) {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::CharArray(b),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::Char as u16);
+                assert_eq!(b.len(), 51, "-S keeps all 50 bytes + NUL, uncapped");
+            }
+            other => panic!("expected uncapped DBR_CHAR Wire, got {other:?}"),
         }
     }
 }

@@ -4726,23 +4726,30 @@ async fn handle_op(
             finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
         }
         OpKind::Monitor => {
-            // MONITOR_START / pipeline-ack: pvxs uses subcmd 0x40 for
-            // START and 0x80 for ACK (the high bit signals "ack"
-            // followed by a u32 ack-count payload that refills the
-            // pipeline window). Either signals "produce events".
-            // Plain 0x00 also accepted for legacy compatibility.
+            // pvxs `servermon.cpp:643-708` splits the data-phase MONITOR
+            // subcmd into three INDEPENDENT actions, each gated by its
+            // own bit — they are not interchangeable triggers:
+            //   * ACK  (`0x80`): refill the pipeline window only. Never
+            //     moves the op out of Idle and never fires onStart.
+            //   * START/STOP (`0x04`): set Executing/Idle and fire
+            //     `onStart(start)`, where `start = subcmd & 0x40`
+            //     (`servermon.cpp:671-683`). So START is `0x44` and STOP
+            //     is `0x04`; the `0x40` bit alone, without `0x04`, is
+            //     NOT a start.
+            //   * DESTROY (`0x10`): handled by the dedicated
+            //     DESTROY_REQUEST path in this server.
+            // A frame carrying none of these bits (notably plain `0x00`)
+            // performs no stream-control action — pvxs leaves the monitor
+            // Idle. Gating the task spawn and the onStart edge on a real
+            // START (`is_start`) rather than the old
+            // "0x40 | ack | 0x00" union keeps the monitor idle until the
+            // client actually starts delivery.
             let is_ack = subcmd & 0x80 != 0;
-            let is_start_or_ack = subcmd & 0x40 != 0 || is_ack || subcmd == 0x00;
-            // subcmd 0x04 alone is PAUSE (pvxs Subscription::
-            // pause(true)). subcmd 0x44 (start | process bit) is
-            // RESUME — clears the paused flag in addition to its
-            // existing start handling. We honour PAUSE by setting
-            // the paused atomic; the subscriber loop checks before
-            // emit. The flag also clears on RESUME and on START.
-            let is_pause = subcmd == 0x04;
-            let is_resume = subcmd & 0x40 != 0;
+            let is_start_stop = subcmd & 0x04 != 0;
+            let is_start = is_start_stop && (subcmd & 0x40 != 0);
+            let is_stop = is_start_stop && (subcmd & 0x40 == 0);
             if let Some(op) = ch.ops.get(&ioid) {
-                if is_pause {
+                if is_stop {
                     op.monitor_paused
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     // Executing->Idle. The op's single
@@ -4751,7 +4758,7 @@ async fn handle_op(
                     if let Some(ctl) = &op.monitor_start_ctl {
                         ctl.set(false);
                     }
-                } else if is_resume {
+                } else if is_start {
                     let prev = op
                         .monitor_paused
                         .swap(false, std::sync::atomic::Ordering::Relaxed);
@@ -4898,7 +4905,7 @@ async fn handle_op(
                 .get(&ioid)
                 .map(|s| s.monitor_started)
                 .unwrap_or(false);
-            if is_start_or_ack && !already_running {
+            if is_start && !already_running {
                 let pv_name = ch.name.clone();
                 let intro_clone = intro.clone();
                 let mask_clone = mask.clone();
@@ -7598,6 +7605,165 @@ mod tests {
             "with queueSize=2 and no ACK the server must send exactly 2 DATA \
              frames (the initial snapshot consumes one credit); got \
              {data_frames} — the initial snapshot bypassed the pipeline window"
+        );
+    }
+
+    /// Regression (PVA parity): only a real START frame (`0x44`) may
+    /// move a MONITOR from Idle to Executing. pvxs gates START/STOP on
+    /// `subcmd & 0x04` with `start = subcmd & 0x40` (`servermon.cpp:671-683`)
+    /// and treats an ACK (`0x80`) as window-refill only (`:643-669`); a
+    /// plain `0x00` carries no stream-control bit and does nothing. The
+    /// pre-fix `is_start_or_ack = 0x40 | ack | 0x00` union let an
+    /// ACK-only or `0x00` frame spawn the subscriber task and fire the
+    /// initial `onStart(true)` before the client ever sent START.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn monitor_ack_only_or_zero_subcmd_does_not_start_until_real_start() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 720;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0));
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // MONITOR INIT (pipeline, queueSize=4 so an ACK is well-formed).
+        let req_val = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(4)),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Monitor, order, init_payload);
+        handle_op(
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT reply");
+
+        let started = |chs: &HashMap<u32, ChannelState>| -> bool {
+            chs.get(&sid)
+                .and_then(|c| c.ops.get(&ioid))
+                .map(|o| o.monitor_started)
+                .expect("op present")
+        };
+        assert!(!started(&channels), "monitor must be idle right after INIT");
+
+        // Sync builder for a data-phase control frame with a given subcmd
+        // (and optional trailing pipeline ack-count).
+        let control_frame = |subcmd: u8, ack_count: Option<u32>| -> Frame {
+            let mut payload = Vec::new();
+            payload.put_u32(sid, order);
+            payload.put_u32(ioid, order);
+            payload.put_u8(subcmd);
+            if let Some(c) = ack_count {
+                payload.put_u32(c, order);
+            }
+            synth_frame(Command::Monitor, order, payload)
+        };
+
+        // Plain 0x00: no stream-control bit → monitor stays idle.
+        handle_op(
+            &control_frame(0x00, None),
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("0x00 control ok");
+        assert!(
+            !started(&channels),
+            "a plain 0x00 control frame must not start the monitor"
+        );
+
+        // ACK-only 0x80 (+count): refills the window, never starts.
+        handle_op(
+            &control_frame(0x80, Some(4)),
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("ACK control ok");
+        assert!(
+            !started(&channels),
+            "an ACK-only frame must refill credit only, never start the monitor"
+        );
+
+        // Real START 0x44 (0x04 START/STOP | 0x40 start) → Executing.
+        handle_op(
+            &control_frame(0x44, None),
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("START control ok");
+        assert!(
+            started(&channels),
+            "a real START (0x44) must move the monitor to Executing"
         );
     }
 

@@ -1364,7 +1364,13 @@ fn is_array_value(value: &EpicsValue) -> bool {
 /// closure, which surfaces as "no link value" upstream (record alarm
 /// LINK/INVALID).
 fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
-    match field {
+    // Follow a selected union / non-empty variant to its concrete member
+    // before conversion — pvxs `value.lookup("->")` for an Any/Union
+    // value (`pvalink_lset.cpp:278-279`). The standard NTNDArray carries
+    // its pixels in a discriminated union `value` member; without this an
+    // INP pvalink pointed at an NTNDArray reported no usable value.
+    // Idempotent on plain scalars/arrays/structures.
+    match field.deref_selected() {
         PvField::Scalar(sv) => Some(scalar_to_epics(sv)),
         PvField::Structure(s) => {
             // NTEnum (pvxs `pvalink_lset.cpp:331`, gated on
@@ -1699,6 +1705,36 @@ mod tests {
         s.fields
             .push(("labels".into(), PvField::Scalar(ScalarValue::Int(1))));
         assert_eq!(pvfield_to_epics_value(&PvField::Structure(s)), None);
+    }
+
+    /// An NTNDArray `value` is a discriminated union; conversion must
+    /// follow it to its active member (pvxs `value.lookup("->")`,
+    /// `pvalink_lset.cpp:278-279`). Pre-fix a `PvField::Union` hit the
+    /// catch-all and returned `None`, so an INP pvalink on an NTNDArray
+    /// reported no usable value.
+    #[test]
+    fn pvfield_ntndarray_union_value_converts_to_active_member() {
+        use epics_pva_rs::pvdata::PvStructure;
+        let union = PvField::Union {
+            selector: 9,
+            variant_name: "floatValue".into(),
+            value: Box::new(PvField::scalar_array_float(vec![1.5f32, 2.5, 3.5])),
+        };
+        // Directly on the selected union (the value-read path hands the
+        // already-selected field here).
+        assert_eq!(
+            pvfield_to_epics_value(&union),
+            Some(EpicsValue::FloatArray(vec![1.5, 2.5, 3.5])),
+            "selected union must convert to its floatValue member"
+        );
+        // And on the whole NTNDArray struct: the `value`-child recursion
+        // dereferences the union too.
+        let mut nd = PvStructure::new("epics:nt/NTNDArray:1.0");
+        nd.fields.push(("value".into(), union));
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::Structure(nd)),
+            Some(EpicsValue::FloatArray(vec![1.5, 2.5, 3.5])),
+        );
     }
 
     /// string / float / short / char / typed-array shapes the

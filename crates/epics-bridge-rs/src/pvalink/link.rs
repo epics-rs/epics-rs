@@ -1323,25 +1323,38 @@ fn select_target(root: &PvField, field: &str) -> PvField {
 /// `value` child, and that an explicitly selected sub-structure drills
 /// into its own `.value`.
 fn select_link_value(root: &PvField, field: &str) -> PvField {
-    match select_target(root, field) {
-        PvField::Structure(s) => s.get_field("value").cloned().unwrap_or(PvField::Null),
-        other => other,
+    // A selected union / non-empty variant resolves to its concrete
+    // member before the value is read — pvxs `value.lookup("->")`
+    // (`pvalink_lset.cpp:278-279`); the NTNDArray `value` member is a
+    // discriminated union. `deref_selected` is idempotent on plain
+    // structures/scalars, so the NTScalar `.value` path is unchanged.
+    match select_target(root, field).deref_selected() {
+        PvField::Structure(s) => s
+            .get_field("value")
+            .map(|v| v.deref_selected().clone())
+            .unwrap_or(PvField::Null),
+        other => other.clone(),
     }
 }
 
 /// Walk a dotted field path through a [`PvField`] and return the leaf value.
+///
+/// A selected union / non-empty variant is dereferenced to its concrete
+/// member at every descent step and at the leaf (pvxs `lookup("->")`),
+/// so a path that crosses an NTNDArray-style union resolves to the
+/// active member instead of stopping at the union.
 fn extract_field(root: &PvField, path: &str) -> PvField {
     if path.is_empty() {
-        return root.clone();
+        return root.deref_selected().clone();
     }
     let mut cursor = root.clone();
     for segment in path.split('.') {
-        cursor = match cursor {
+        cursor = match cursor.deref_selected() {
             PvField::Structure(s) => s.get_field(segment).cloned().unwrap_or(PvField::Null),
-            other => return other,
+            other => return other.clone(),
         };
     }
-    cursor
+    cursor.deref_selected().clone()
 }
 
 fn scalar_as_f64(field: &PvField) -> Option<f64> {
@@ -1384,6 +1397,11 @@ fn scalar_value_to_f64(v: &ScalarValue) -> f64 {
 /// record then keeps its own field type).
 fn link_dbf_type(value_field: &PvField) -> Option<epics_base_rs::server::database::LinkDbfType> {
     use epics_base_rs::server::database::LinkDbfType;
+
+    // Follow a selected union / non-empty variant to its concrete member
+    // first — pvxs reads `fld_value.lookup("->")` for an Any/Union value
+    // (`pvalink_lset.cpp:278-279`). Idempotent on plain scalars/arrays.
+    let value_field = value_field.deref_selected();
 
     let from_scalar = |sv: &ScalarValue| match sv {
         ScalarValue::Byte(_) => Some(LinkDbfType::Char),
@@ -1461,7 +1479,10 @@ fn link_dbf_type(value_field: &PvField) -> Option<epics_base_rs::server::databas
 /// the array length, or `1` for a scalar. Mirrors pvxs
 /// `pvaGetElements` (`pvxs/ioc/pvalink_lset.cpp:242`).
 fn link_element_count(value_field: &PvField) -> Option<i64> {
-    match value_field {
+    // Selected union / non-empty variant → concrete member first, so an
+    // NTNDArray union reports the active array's length, not the union
+    // (pvxs `lookup("->")`, `pvalink_lset.cpp:278-279`). Idempotent.
+    match value_field.deref_selected() {
         PvField::Scalar(_) => Some(1),
         PvField::ScalarArray(arr) => Some(arr.len() as i64),
         PvField::ScalarArrayTyped(arr) => Some(arr.len() as i64),
@@ -1616,6 +1637,60 @@ mod tests {
             meta.dbf_type,
             Some(LinkDbfType::Int64),
             "DBF type must come from the selected sub-structure's .value"
+        );
+    }
+
+    /// An NTNDArray carries its pixels in a discriminated `value` union
+    /// (pvxs `nt.cpp:196-220`; `testNTNDArray` writes `value->floatValue`).
+    /// A pvalink reading it must follow the union to its active member —
+    /// pvxs `value.lookup("->")` (`pvalink_lset.cpp:278-279`) — so the
+    /// field-path extraction, DBF-type mapping and element-count mapping
+    /// all resolve `floatValue`, not the opaque union.
+    #[test]
+    fn ntndarray_union_value_reads_through_selected_member() {
+        use epics_base_rs::server::database::LinkDbfType;
+
+        let mut nd = PvStructure::new("epics:nt/NTNDArray:1.0");
+        nd.fields.push((
+            "value".into(),
+            PvField::Union {
+                // exact discriminant index is immaterial to the deref
+                // (any `selector >= 0` selects the active member).
+                selector: 9,
+                variant_name: "floatValue".into(),
+                value: Box::new(PvField::scalar_array_float(vec![1.5f32, 2.5, 3.5])),
+            },
+        ));
+        // monitor=true so the sync cached-read accessor is live; the
+        // for_test link reports connected (a cached value is present).
+        let cfg = PvaLinkConfig {
+            monitor: true,
+            ..PvaLinkConfig::defaults_for("ND:PV", LinkDirection::Inp)
+        };
+        let link = PvaLink::for_test(cfg, Some(PvField::Structure(nd)));
+
+        // field-path extraction follows the union to its active member.
+        let selected = link
+            .try_read_cached_with_field("")
+            .expect("cached value present");
+        assert_eq!(
+            selected,
+            PvField::scalar_array_float(vec![1.5f32, 2.5, 3.5]),
+            "selected value must be the union's active floatValue member"
+        );
+
+        // DBF type / element count map the dereferenced array, not the
+        // union (pre-fix both were `None` for a `PvField::Union`).
+        let meta = link.link_metadata().expect("metadata present");
+        assert_eq!(
+            meta.dbf_type,
+            Some(LinkDbfType::Float),
+            "DBF type must come from the selected floatValue member"
+        );
+        assert_eq!(
+            meta.element_count,
+            Some(3),
+            "element count is the active array's length"
         );
     }
 

@@ -97,14 +97,19 @@ struct Args {
     #[arg(long, default_value_t = 5076)]
     udp_port: u16,
 
-    /// Per-PV upstream connect timeout in seconds.
-    #[arg(long, default_value_t = 5)]
-    connect_timeout_secs: u64,
+    /// Per-PV upstream connect timeout in seconds. Precedence: this
+    /// flag overrides `EPICS_PVA_GW_CONNECT_TMO`, which overrides the
+    /// 5 s default. Omit to take the env value (or the default).
+    #[arg(long)]
+    connect_timeout_secs: Option<u64>,
 
     /// Cache cleanup interval in seconds (idle entries dropped after
-    /// one full tick with zero downstream subscribers).
-    #[arg(long, default_value_t = 30)]
-    cleanup_interval_secs: u64,
+    /// one full tick with zero downstream subscribers). Precedence:
+    /// this flag overrides `EPICS_PVA_GW_CLEANUP_INTERVAL`, which
+    /// overrides the 30 s default. Omit to take the env value (or the
+    /// default).
+    #[arg(long)]
+    cleanup_interval_secs: Option<u64>,
 
     /// Pre-warm the cache with these PV names (flag mode only). Useful
     /// when you know the workload ahead of time and want the first
@@ -263,14 +268,23 @@ fn parse_addr_list(list: &str, default_port: u16) -> Result<Vec<SocketAddr>, Str
 
 /// Build (but do not run) the multi-tenant gateway described by `cfg`.
 /// Assumes `cfg` already passed [`validate`].
+///
+/// `cleanup` / `connect` / `max_cache_entries` / `max_subscribers` are the
+/// gateway-rs knobs absent from the pva2pva JSON schema; they arrive already
+/// resolved against `EPICS_PVA_GW_*` env. The schema's `readOnly` /
+/// `control_prefix` stay file-authoritative and are read from `cfg`.
 fn build_gateway(
     cfg: &GatewayConfigFile,
     cleanup: Duration,
     connect: Duration,
+    max_cache_entries: usize,
+    max_subscribers: usize,
 ) -> Result<MultiTenantPvaGateway, String> {
     let mut builder = MultiTenantPvaGatewayBuilder::new()
         .cleanup_interval(cleanup)
-        .connect_timeout(connect);
+        .connect_timeout(connect)
+        .max_cache_entries(max_cache_entries)
+        .max_subscribers(max_subscribers);
 
     for c in &cfg.clients {
         // addrlist × serverport → TCP name servers (the gateway pins its
@@ -341,6 +355,8 @@ async fn run_from_config(
     check_only: bool,
     cleanup: Duration,
     connect: Duration,
+    max_cache_entries: usize,
+    max_subscribers: usize,
 ) -> ExitCode {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
@@ -371,7 +387,7 @@ async fn run_from_config(
         return ExitCode::SUCCESS;
     }
 
-    let gw = match build_gateway(&cfg, cleanup, connect) {
+    let gw = match build_gateway(&cfg, cleanup, connect, max_cache_entries, max_subscribers) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("pva-gateway-rs: failed to start: {e}");
@@ -403,18 +419,88 @@ fn init_tracing(verbose: u8) {
         .try_init();
 }
 
+/// Single owner of `EPICS_PVA_GW_*` resolution, shared by both run modes.
+///
+/// Precedence is **type default < `EPICS_PVA_GW_*` env < explicit CLI
+/// flag**. `base` is [`PvaGatewayConfig::default`] with [`with_env`]
+/// applied, so it already carries env-resolved `max_cache_entries` /
+/// `max_subscribers` / `control_prefix` / `read_only`; `cleanup` /
+/// `connect` then layer the explicit CLI flag (the `Option` timeout
+/// args) over the env value, so an explicit flag wins by construction
+/// rather than by a runtime "was it the default?" check.
+///
+/// [`with_env`]: PvaGatewayConfig::with_env
+struct ResolvedConfig {
+    base: PvaGatewayConfig,
+    cleanup: Duration,
+    connect: Duration,
+}
+
+impl ResolvedConfig {
+    fn from_args(args: &Args) -> Self {
+        let base = PvaGatewayConfig::default().with_env();
+        let cleanup = args
+            .cleanup_interval_secs
+            .map(Duration::from_secs)
+            .unwrap_or(base.cleanup_interval);
+        let connect = args
+            .connect_timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(base.connect_timeout);
+        Self {
+            base,
+            cleanup,
+            connect,
+        }
+    }
+
+    /// Flag-mode single-gateway config: the env-resolved base with the
+    /// CLI-derived downstream `server_config` and the env/CLI timeouts.
+    /// `server_config` keeps `..PvaServerConfig::default()` (not the
+    /// base's server config) so the existing flag-mode server defaults
+    /// are unchanged by this resolution.
+    fn into_flag_config(self, args: &Args) -> PvaGatewayConfig {
+        // epics-base PR #205 IPv6 Stage 1: `PvaServerConfig::bind_ip` is
+        // `IpAddr` so v4 and v6 bind addresses pass through unchanged.
+        let server_config = PvaServerConfig {
+            tcp_port: args.tcp_port,
+            udp_port: args.udp_port,
+            bind_ip: args.bind,
+            ..PvaServerConfig::default()
+        };
+        PvaGatewayConfig {
+            server_config,
+            cleanup_interval: self.cleanup,
+            connect_timeout: self.connect,
+            ..self.base
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
     init_tracing(args.verbose);
 
-    let cleanup = Duration::from_secs(args.cleanup_interval_secs);
-    let connect = Duration::from_secs(args.connect_timeout_secs);
+    // Single owner of EPICS_PVA_GW_* resolution (type default < env <
+    // explicit CLI flag), shared by both run modes.
+    let resolved = ResolvedConfig::from_args(&args);
 
     // Config mode (pva2pva-compatible JSON) takes precedence over the
-    // single-gateway flags when a <CONFIG> path is supplied.
+    // single-gateway flags when a <CONFIG> path is supplied. The JSON
+    // `readOnly` / `control_prefix` stay file-authoritative (pva2pva
+    // gwmain.cpp has no env layer); only the gateway-rs knobs with no
+    // pva2pva schema field are taken from the env layer here.
     if let Some(path) = args.config.as_ref() {
-        return run_from_config(path, args.check_config, cleanup, connect).await;
+        return run_from_config(
+            path,
+            args.check_config,
+            resolved.cleanup,
+            resolved.connect,
+            resolved.base.max_cache_entries,
+            resolved.base.max_subscribers,
+        )
+        .await;
     }
     if args.check_config {
         eprintln!("pva-gateway-rs: --check-config requires a <CONFIG> file");
@@ -422,25 +508,7 @@ async fn main() -> ExitCode {
     }
 
     // Flag mode: one upstream client, one downstream server.
-    // epics-base PR #205 IPv6 Stage 1: `PvaServerConfig::bind_ip` is
-    // `IpAddr` so v4 and v6 bind addresses pass through unchanged.
-    let server_config = PvaServerConfig {
-        tcp_port: args.tcp_port,
-        udp_port: args.udp_port,
-        bind_ip: args.bind,
-        ..PvaServerConfig::default()
-    };
-
-    let cfg = PvaGatewayConfig {
-        upstream_client: None,
-        server_config,
-        cleanup_interval: cleanup,
-        connect_timeout: connect,
-        // Inherit from the type's defaults — operators tune these via
-        // EPICS_PVA_GW_MAX_CACHE_ENTRIES / EPICS_PVA_GW_MAX_SUBSCRIBERS
-        // in PvaGatewayConfig::with_env, or via PvaGatewayConfig::default().
-        ..PvaGatewayConfig::default()
-    };
+    let cfg = resolved.into_flag_config(&args);
 
     let gateway = match PvaGateway::start(cfg) {
         Ok(g) => g,
@@ -591,6 +659,59 @@ mod tests {
         .expect("parse");
         assert_eq!(cfg.version, 0);
         validate(&cfg).expect("version 0 (missing) is accepted as 1");
+    }
+
+    #[test]
+    fn flag_config_applies_env_with_cli_precedence() {
+        // The defect this guards: flag mode used to build the config with
+        // `..PvaGatewayConfig::default()`, so the documented EPICS_PVA_GW_*
+        // knobs (incl. EPICS_PVA_GW_READONLY -> ReadOnlyLayer) had no effect.
+        //
+        // SAFETY: nextest runs each test in its own process; within this bin
+        // test binary no sibling test reads/writes EPICS_PVA_GW_*, so these
+        // mutations cannot race another test. We restore them before return.
+        unsafe {
+            std::env::set_var("EPICS_PVA_GW_READONLY", "YES");
+            std::env::set_var("EPICS_PVA_GW_MAX_SUBSCRIBERS", "7");
+            std::env::set_var("EPICS_PVA_GW_MAX_CACHE_ENTRIES", "13");
+            std::env::set_var("EPICS_PVA_GW_CLEANUP_INTERVAL", "11");
+        }
+
+        // No --cleanup-interval-secs flag: env value applies.
+        // Explicit --connect-timeout-secs: CLI overrides env/default.
+        let args = Args::parse_from(["pva-gateway-rs", "--connect-timeout-secs", "9"]);
+        let resolved = ResolvedConfig::from_args(&args);
+        let cfg = resolved.into_flag_config(&args);
+
+        assert!(
+            cfg.read_only,
+            "EPICS_PVA_GW_READONLY=YES must enable the ReadOnlyLayer"
+        );
+        assert_eq!(
+            cfg.max_subscribers, 7,
+            "EPICS_PVA_GW_MAX_SUBSCRIBERS applied"
+        );
+        assert_eq!(
+            cfg.max_cache_entries, 13,
+            "EPICS_PVA_GW_MAX_CACHE_ENTRIES applied"
+        );
+        assert_eq!(
+            cfg.cleanup_interval,
+            Duration::from_secs(11),
+            "env cleanup interval applies when the flag is omitted"
+        );
+        assert_eq!(
+            cfg.connect_timeout,
+            Duration::from_secs(9),
+            "explicit --connect-timeout-secs overrides EPICS_PVA_GW_CONNECT_TMO"
+        );
+
+        unsafe {
+            std::env::remove_var("EPICS_PVA_GW_READONLY");
+            std::env::remove_var("EPICS_PVA_GW_MAX_SUBSCRIBERS");
+            std::env::remove_var("EPICS_PVA_GW_MAX_CACHE_ENTRIES");
+            std::env::remove_var("EPICS_PVA_GW_CLEANUP_INTERVAL");
+        }
     }
 
     #[test]

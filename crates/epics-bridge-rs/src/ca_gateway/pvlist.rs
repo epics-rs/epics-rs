@@ -493,10 +493,23 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
             if let Some(t) = tokens.next() {
                 if t.eq_ignore_ascii_case("FROM") {
                     for h in tokens {
+                        // C ca-gateway tokenizes the DENY FROM host list
+                        // with `strtok(NULL, ", \t\n")` (gateAs.cc:469-472,
+                        // :540-552) — comma is a host delimiter just like
+                        // whitespace, so `FROM bad1,bad2` is two hosts.
+                        // `split_whitespace` above only split on
+                        // whitespace, leaving `bad1,bad2` as one token that
+                        // resolves to nothing and (when it is the rule's
+                        // only host) collapses the rule into a global deny
+                        // (see `resolve_hosts`). Split each token on commas
+                        // and drop empties so `h1,h2`, `h1, h2`, and
+                        // `h1 ,h2` all yield the same host set.
                         // Stored as-is here; PvList::resolve_hosts() converts
                         // hostnames to IP strings at load time,
                         // mirroring C aToIPAddr (gateAs.cc:488-506).
-                        from_hosts.push(h.to_string());
+                        for host in h.split(',').filter(|s| !s.is_empty()) {
+                            from_hosts.push(host.to_string());
+                        }
                     }
                 } else {
                     return Err(BridgeError::GroupConfigError(format!(
@@ -649,6 +662,39 @@ mod tests {
         let list = parse_pvlist("test.* DENY FROM bad.host evil.host").unwrap();
         if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
             assert_eq!(from_hosts, &["bad.host", "evil.host"]);
+        } else {
+            panic!("expected Deny");
+        }
+    }
+
+    /// C ca-gateway tokenizes DENY FROM host lists on comma AND
+    /// whitespace (`strtok(NULL, ", \t\n")`, gateAs.cc:469-472). A
+    /// comma-joined list must parse to one entry per host, not a single
+    /// unresolvable `bad1,bad2` token that collapses into a global deny.
+    #[test]
+    fn parse_deny_from_comma_separated_hosts() {
+        // No spaces around the comma.
+        let list = parse_pvlist("test.* DENY FROM bad1.example,bad2.example").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert_eq!(from_hosts, &["bad1.example", "bad2.example"]);
+        } else {
+            panic!("expected Deny");
+        }
+
+        // Space after the comma → split_whitespace already separates the
+        // second host; comma-stripping must not leave a trailing comma.
+        let list = parse_pvlist("test.* DENY FROM bad1.example, bad2.example").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert_eq!(from_hosts, &["bad1.example", "bad2.example"]);
+        } else {
+            panic!("expected Deny");
+        }
+
+        // Mixed: leading-comma token and a three-host comma list with a
+        // stray space — every host is recovered, no empty entries.
+        let list = parse_pvlist("test.* DENY FROM h1,h2 ,h3").unwrap();
+        if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
+            assert_eq!(from_hosts, &["h1", "h2", "h3"]);
         } else {
             panic!("expected Deny");
         }

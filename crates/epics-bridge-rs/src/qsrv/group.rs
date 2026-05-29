@@ -195,8 +195,9 @@ pub fn negotiated_queue_size(pv_request: &PvStructure) -> i32 {
 /// `_options` already exists (e.g. composed by an earlier read).
 ///
 /// `queue_size` is the negotiated monitor queue depth (see
-/// [`negotiated_queue_size`]); the GET path passes
-/// [`GROUP_DEFAULT_QUEUE_SIZE`] since a GET has no subscription queue.
+/// [`negotiated_queue_size`]) on the MONITOR path; the GET path passes
+/// `0` — pvxs's GET stamps the value-template default and never a queue
+/// depth (groupsource.cpp:480-485, test/testqgroup.cpp:60-66).
 pub fn push_record_options(pv: &mut PvStructure, atomic: bool, queue_size: i32) {
     use epics_pva_rs::pvdata::ScalarValue;
     let mut options = PvStructure::new("");
@@ -512,14 +513,21 @@ pub struct GroupChannel {
     /// `Some(n)` when a `GroupMonitor` built this channel from the
     /// MONITOR INIT pvRequest's negotiated `queueSize`.
     monitor_queue_size: Option<i32>,
-    /// When `true`, the composed value stamps `record._options.atomic =
-    /// true` regardless of the group/operation atomicity. pvxs's group
-    /// MONITOR path sets `currentValue["record._options.atomic"] = true`
-    /// unconditionally (ioc/groupsource.cpp:401-405), whereas group GET
-    /// stamps the *selected* operation atomicity (groupsource.cpp:480-485).
+    /// Marks this channel as a MONITOR source, selecting pvxs's
+    /// monitor-path `record._options` stamping over the GET path:
+    ///   - `atomic` is stamped `true` unconditionally
+    ///     (ioc/groupsource.cpp:401-405), whereas GET stamps the
+    ///     *selected* operation atomicity (groupsource.cpp:480-485);
+    ///   - `queueSize` is stamped with the negotiated monitor queue
+    ///     depth (groupsource.cpp:359 `stats.limitQueue`), whereas GET
+    ///     leaves the value-template default `0` — pvxs's GET path
+    ///     (groupsource.cpp:480-485) stamps only `atomic` and never
+    ///     `queueSize`, so a GET reports `queueSize int32_t = 0`
+    ///     (test/testqgroup.cpp:60-66), not a monitor queue depth.
+    ///
     /// Only a `GroupMonitor`-built channel sets this; the GET path leaves
-    /// it `false` so it keeps reflecting the request/default atomicity.
-    monitor_atomic_stamp: bool,
+    /// it `false`.
+    monitor_stamp: bool,
 }
 
 impl GroupChannel {
@@ -529,7 +537,7 @@ impl GroupChannel {
             def,
             access: super::provider::AccessContext::allow_all(),
             monitor_queue_size: None,
-            monitor_atomic_stamp: false,
+            monitor_stamp: false,
         }
     }
 
@@ -548,12 +556,14 @@ impl GroupChannel {
         self
     }
 
-    /// Mark this channel as a MONITOR source so composed values stamp
-    /// `record._options.atomic = true` unconditionally, matching pvxs
-    /// group MONITOR (ioc/groupsource.cpp:401-405). The GET path never
-    /// calls this, so GET keeps stamping the request/default atomicity.
-    pub fn with_monitor_atomic_stamp(mut self) -> Self {
-        self.monitor_atomic_stamp = true;
+    /// Mark this channel as a MONITOR source so composed values use pvxs's
+    /// monitor-path `record._options` stamping (`atomic = true`
+    /// unconditionally per ioc/groupsource.cpp:401-405, and the negotiated
+    /// `queueSize` per groupsource.cpp:359). The GET path never calls this,
+    /// so GET stamps the request/default atomicity and the `queueSize=0`
+    /// value-template default (groupsource.cpp:480-485).
+    pub fn with_monitor_stamp(mut self) -> Self {
+        self.monitor_stamp = true;
         self
     }
 
@@ -633,38 +643,34 @@ impl GroupChannel {
             }
         }
 
-        // pvxs `groupsource.cpp:359` stamps
-        // `record._options.queueSize` (negotiated monitor queue depth)
-        // and `record._options.atomic` (operation atomicity) into the
-        // group monitor value. Clients that introspect these branches
-        // — strict pvRequest matchers, archiver appliances tracking
-        // the negotiated queue — would otherwise see a structure-shape
-        // mismatch and reject the operation.
+        // `record._options` stamping differs between the MONITOR and GET
+        // paths in pvxs; `monitor_stamp` selects between them (only the
+        // cached monitor `group_channel` sets it).
         //
-        // `queueSize` is now the *per-operation
-        // negotiated* depth. A `GroupMonitor` resolves it from the
-        // MONITOR INIT pvRequest (`negotiated_queue_size`,
-        // mirroring pvxs `servermon.cpp:533-540`) and threads it in
-        // via `with_monitor_queue_size`. The GET path keeps
-        // `GROUP_DEFAULT_QUEUE_SIZE` — a GET has no subscription
-        // queue, matching pvxs's monitor-only `limitQueue`.
-        let queue_size = self.monitor_queue_size.unwrap_or(GROUP_DEFAULT_QUEUE_SIZE);
-        // pvxs `groupsource.cpp:401-405` (GroupMonitor::onStart) stamps
-        // `record._options.atomic = true` unconditionally on every group
-        // *monitor* value, regardless of the group's configured `atomic`
-        // default or a `+atomic:false` annotation: a monitor always
-        // delivers a single consistent snapshot, so it reports itself as
-        // atomic. The GET path (`groupsource.cpp:480-485`,
-        // GroupSource::onOp) instead stamps the *operation* atomicity
-        // (`record._options.atomic` from the pvRequest, defaulting to the
-        // group default). `monitor_atomic_stamp` distinguishes the two
-        // callers: the cached monitor `group_channel` sets it, GET does
-        // not. Locking still uses the real `atomic` mode above.
-        let stamp_atomic = if self.monitor_atomic_stamp {
-            true
+        // queueSize: a MONITOR stamps the negotiated subscription queue
+        // depth (`groupsource.cpp:359` `stats.limitQueue`), resolved from
+        // the MONITOR INIT pvRequest via `negotiated_queue_size`
+        // (`servermon.cpp:533-540`) and threaded in by
+        // `with_monitor_queue_size`. A GET has no subscription queue, so
+        // pvxs leaves the value-template default `0` —
+        // `groupsource.cpp:480-485` (GroupSource::onOp) stamps only
+        // `atomic`, never `queueSize`, and `test/testqgroup.cpp:60-66`
+        // confirms a GET reports `record._options.queueSize int32_t = 0`.
+        // Before this split a GET stamped GROUP_DEFAULT_QUEUE_SIZE (4),
+        // reporting a monitor-looking depth for an operation with none.
+        //
+        // atomic: a MONITOR stamps `true` unconditionally
+        // (`groupsource.cpp:401-405`, GroupMonitor::onStart — a monitor
+        // delivers a single consistent snapshot, so it reports itself
+        // atomic), while a GET stamps the *operation* atomicity (the
+        // pvRequest value, defaulting to the group default). Locking still
+        // uses the real `atomic` mode resolved above.
+        let queue_size = if self.monitor_stamp {
+            self.monitor_queue_size.unwrap_or(GROUP_DEFAULT_QUEUE_SIZE)
         } else {
-            atomic
+            0
         };
+        let stamp_atomic = if self.monitor_stamp { true } else { atomic };
         push_record_options(&mut pv, stamp_atomic, queue_size);
 
         Ok(pv)
@@ -1723,7 +1729,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
         let group_channel = GroupChannel::new(self.db.clone(), self.def.clone())
             .with_access(self.access.clone())
             .with_monitor_queue_size(self.monitor_queue_size)
-            .with_monitor_atomic_stamp();
+            .with_monitor_stamp();
 
         // Check if all members are already primed (e.g., all Const/Structure).
         let all_primed = self

@@ -318,9 +318,11 @@ async fn group_get_carries_record_options_queue_size_and_atomic() {
         PvField::Structure(s) => s,
         other => panic!("expected _options to be structure, got {other:?}"),
     };
-    // queueSize: pvxs stamps a positive int; we don't pin the
-    // exact value because per-op negotiation lands later, but it
-    // must be present and > 0.
+    // queueSize: a GET has no monitor subscription queue, so pvxs leaves
+    // the value-template default 0 — `groupsource.cpp:480-485` stamps only
+    // `atomic`, and `test/testqgroup.cpp:60-66` shows GET reports
+    // `record._options.queueSize int32_t = 0`. The negotiated depth is a
+    // monitor-only concern (see br_r33_group_monitor_stamps_negotiated_queue_size).
     let qs = options_struct
         .fields
         .iter()
@@ -329,7 +331,10 @@ async fn group_get_carries_record_options_queue_size_and_atomic() {
         .expect("queueSize must be present");
     match qs {
         PvField::Scalar(ScalarValue::Int(n)) => {
-            assert!(*n > 0, "queueSize must be positive, got {n}")
+            assert_eq!(
+                *n, 0,
+                "GET must report the template-default queueSize 0, got {n}"
+            )
         }
         other => panic!("expected int queueSize, got {other:?}"),
     }

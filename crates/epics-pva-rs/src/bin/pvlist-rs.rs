@@ -208,15 +208,13 @@ fn channel_names(value: &PvField) -> Vec<String> {
 }
 
 /// Query one server's `server` PV and print either its info or its
-/// hosted-channel list. Returns `Ok(())` so a failing server doesn't
-/// abort enumeration of the remaining ones.
-async fn query_server(
-    client: &PvaClient,
-    raw: &str,
-    addr: SocketAddr,
-    info: bool,
-    verbose: bool,
-) -> Result<(), ()> {
+/// hosted-channel list. A failing server reports the error to stderr
+/// but does NOT fail the command: pvxs `pvxlist` query mode catches the
+/// per-server exception, prints `From <server> : <error>`, and never
+/// updates the process return code (`tools/list.cpp:162-194`), returning
+/// 0 unconditionally after the wait (`:200-205`). Only invalid
+/// invocation (a parse error, handled in `main`) is a command failure.
+async fn query_server(client: &PvaClient, raw: &str, addr: SocketAddr, info: bool, verbose: bool) {
     let op = if info { "info" } else { "channels" };
     let (desc, value) = build_server_query(op);
     match client.pvrpc_from("server", addr, &desc, &value).await {
@@ -244,11 +242,9 @@ async fn query_server(
                     println!("{name}");
                 }
             }
-            Ok(())
         }
         Err(e) => {
             eprintln!("pvlist-rs: from {raw}: {e}");
-            Err(())
         }
     }
 }
@@ -436,15 +432,18 @@ async fn main() {
     // unreachable earlier server cannot delay or block later servers;
     // the shared `client` timeout bounds the whole batch to one wait
     // window instead of `N * -w`.
-    let results = join_all(
+    //
+    // Per-server RPC failures are reported by `query_server` but do not
+    // fail the command — pvxs query mode returns 0 unconditionally
+    // (`:200-205`), so `pvlist-rs good bad` still prints `good`'s
+    // channels and exits 0. Only invalid invocation (the parse loop
+    // above, exit 2) is a command failure.
+    join_all(
         addrs
             .iter()
             .map(|(raw, addr)| query_server(&client, raw, *addr, args.info, args.verbose)),
     )
     .await;
-    if results.iter().any(|r| r.is_err()) {
-        std::process::exit(1);
-    }
 }
 
 #[cfg(test)]

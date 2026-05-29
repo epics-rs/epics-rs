@@ -27,7 +27,10 @@ struct Args {
     #[arg(short = 'w', default_value = "5.0")]
     timeout: f64,
 
-    /// Default provider name (parity-only; we always speak PVA).
+    /// Provider name. pvAccessCPP defaults this to `pva`
+    /// (`pvtoolsSrc/pvutils.cpp:32`); only the native PVA provider is
+    /// supported here, so a non-`pva` value is rejected rather than
+    /// silently performing a PVA write.
     #[arg(short = 'p', long = "provider", default_value = "pva")]
     provider: String,
 
@@ -70,6 +73,14 @@ async fn main() {
     if args.version {
         println!("{VERSION_INFO}");
         return;
+    }
+
+    // Only the native PVA provider is implemented. pvAccessCPP would
+    // route `-p ca` through its CA provider (pvput.cpp:368-399); we
+    // cannot, so reject it instead of silently writing over PVA.
+    if let Err(e) = check_provider(&args.provider) {
+        eprintln!("pvput-rs: {e}");
+        std::process::exit(1);
     }
 
     let pv_name = args.pv_name.expect("clap enforces required");
@@ -160,7 +171,20 @@ async fn main() {
     }
 
     // Suppress unused-warning for parity-only flags.
-    let _ = (args.provider, args.mode, args.verbose, args.debug);
+    let _ = (args.mode, args.verbose, args.debug);
+}
+
+/// Validate the requested provider. Only the native PVA provider is
+/// supported; pvAccessCPP's `-p ca` CA-provider path (pvput.cpp:368-399)
+/// is not implemented, so it is rejected rather than silently dropped.
+fn check_provider(provider: &str) -> Result<(), String> {
+    if provider == "pva" {
+        Ok(())
+    } else {
+        Err(format!(
+            "provider {provider:?} not supported (only \"pva\")"
+        ))
+    }
 }
 
 /// Parsed CLI value tokens. pvxs `pvxput` accepts either one bare
@@ -252,5 +276,17 @@ mod tests {
     fn mixed_bare_and_field_is_rejected() {
         let err = parse_put_args(&v(&["42", "alarm.severity=2"])).unwrap_err();
         assert!(err.contains("expected <field>=<value>"), "got: {err}");
+    }
+
+    #[test]
+    fn pva_provider_is_accepted() {
+        assert!(check_provider("pva").is_ok());
+    }
+
+    #[test]
+    fn non_pva_provider_is_rejected() {
+        // pvxs has no provider switch; pvAccessCPP `-p ca` is unsupported.
+        assert!(check_provider("ca").is_err());
+        assert!(check_provider("").is_err());
     }
 }

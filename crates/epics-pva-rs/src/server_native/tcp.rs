@@ -1876,10 +1876,11 @@ impl ClientCredentials {
 /// `Ok(Some(creds))` only when the auth Value decoded successfully;
 /// `Err(...)` on any decode fault past the method string (so the
 /// caller can disconnect, mirroring pvxs `bev.reset()`).
-fn parse_client_credentials(
-    frame: &Frame,
-    order: ByteOrder,
-) -> PvaResult<Option<ClientCredentials>> {
+fn parse_client_credentials(frame: &Frame) -> PvaResult<Option<ClientCredentials>> {
+    // Inbound application payloads are decoded with the frame's own header
+    // byte order (pvxs latches `peerBE` per received message,
+    // conn.cpp:195-198), never the server's configured outbound order.
+    let order = frame.order();
     let mut cur = frame.cursor();
     let _buffer_size = cur
         .get_u32(order)
@@ -2189,6 +2190,13 @@ async fn handle_connection_io(
     // buffer-size hint negotiated in CONNECTION_VALIDATION.
     let mut seg_buf: Vec<u8> = Vec::new();
     let mut seg_cmd: u8 = 0;
+    // Byte order of the message's initiating (SegFirst) frame. The
+    // reassembled synthetic frame must carry this order, not the server's
+    // configured outbound order, so downstream handlers decode the payload
+    // with the peer's actual order (pvxs latches `peerBE` once per logical
+    // message, conn.cpp:195-198). Seeded with `order` but always overwritten
+    // on the first segment before any synthetic frame is built.
+    let mut seg_order = order;
     let mut expect_seg = false;
     // CREATE_CHANNEL completion channel. Spawned resolver
     // tasks send results here; the read loop's select! arm applies
@@ -2377,6 +2385,7 @@ async fn handle_connection_io(
             // below).
             expect_seg = true;
             seg_cmd = frame.header.command;
+            seg_order = frame.order();
             seg_buf.clear();
         }
         // Cap reassembly when an opt-in `max_message_size` is set.
@@ -2411,7 +2420,7 @@ async fn handle_connection_io(
             Frame {
                 header: PvaHeader {
                     version: frame.header.version,
-                    flags: HeaderFlags::new(false, false, order),
+                    flags: HeaderFlags::new(false, false, seg_order),
                     command: seg_cmd,
                     payload_length: seg_buf.len() as u32,
                 },
@@ -2437,7 +2446,7 @@ async fn handle_connection_io(
                     // a decode fault here is still fatal —
                     // log + propagate. Pre-fix swallowed; pvxs
                     // `serverconn.cpp:211-216` calls `bev.reset()`.
-                    match parse_client_credentials(&frame, order)? {
+                    match parse_client_credentials(&frame)? {
                         Some(claimed) => debug!(
                             ?peer,
                             x509_account = %cred.account,
@@ -2458,7 +2467,7 @@ async fn handle_connection_io(
                     // method) returns Ok(None) and keeps the
                     // existing anonymous credential. Only a fully
                     // decoded auth structure replaces `cred`.
-                    if let Some(claimed) = parse_client_credentials(&frame, order)? {
+                    if let Some(claimed) = parse_client_credentials(&frame)? {
                         cred = claimed;
                     }
                 }
@@ -2679,13 +2688,13 @@ async fn handle_connection_io(
                 handle_tcp_search(&source, &frame, &tx, &config).await?;
             }
             Some(Command::DestroyRequest) => {
-                handle_destroy_request(&frame, &mut channels, order)?;
+                handle_destroy_request(&frame, &mut channels)?;
             }
             Some(Command::CancelRequest) => {
-                handle_cancel_request(&frame, &mut channels, order)?;
+                handle_cancel_request(&frame, &mut channels)?;
             }
             Some(Command::Message) => {
-                handle_message(&frame, &channels, order, &peer)?;
+                handle_message(&frame, &channels, &peer)?;
             }
             Some(Command::PutGet) => {
                 // atomic put-then-get. The PVA wire spec defines
@@ -2947,12 +2956,16 @@ async fn handle_put_get(
     // the op to `Idle` when its readback reply is sent.
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
 ) -> PvaResult<()> {
+    // Inbound payload decodes with the frame's own header order (pvxs
+    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // (config) is used only for outbound reply frames.
+    let inbound_order = frame.order();
     let mut cur = frame.cursor();
     let sid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let ioid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
@@ -3022,7 +3035,7 @@ async fn handle_put_get(
         // A peer wire-decode fault of the INIT pvRequest type/value is
         // connection-fatal (pvxs `serverget.cpp:371-375` bev.reset()), not
         // a per-op Status — the empty-mask case below stays op-level.
-        let req_desc = match decode_type_desc(&mut cur, order) {
+        let req_desc = match decode_type_desc(&mut cur, inbound_order) {
             Ok(d) => d,
             Err(e) => {
                 return Err(PvaError::Decode(format!(
@@ -3030,7 +3043,7 @@ async fn handle_put_get(
                 )));
             }
         };
-        let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, order) {
+        let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order) {
             Ok(v) => v,
             Err(e) => {
                 return Err(PvaError::Decode(format!(
@@ -3128,8 +3141,9 @@ async fn handle_put_get(
     let pv_name = ch.name.clone();
 
     // Decode the put payload inline (cursor is borrowed from the stack frame).
-    let changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
-    let put_delta = decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, order)
+    let changed =
+        BitSet::decode(&mut cur, inbound_order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    let put_delta = decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, inbound_order)
         .map_err(|e| PvaError::Decode(format!("PUT_GET requires a value payload: {e}")))?;
 
     let ctx = crate::server_native::source::ChannelContext {
@@ -3283,12 +3297,16 @@ async fn handle_process(
     // the op to `Idle` when its reply is sent.
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
 ) -> PvaResult<()> {
+    // Inbound payload decodes with the frame's own header order (pvxs
+    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // (config) is used only for outbound reply frames.
+    let inbound_order = frame.order();
     let mut cur = frame.cursor();
     let sid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let ioid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
@@ -3371,7 +3389,7 @@ async fn handle_process(
         // descriptor or value is connection-fatal (the read loop closes
         // the circuit, no op reply), uniform with the generic INIT path.
         // An ABSENT value body is still tolerated for Rust↔Rust interop.
-        let req_desc = match decode_type_desc(&mut cur, order) {
+        let req_desc = match decode_type_desc(&mut cur, inbound_order) {
             Ok(d) => d,
             Err(e) => {
                 return Err(PvaError::Decode(format!(
@@ -3379,7 +3397,7 @@ async fn handle_process(
                 )));
             }
         };
-        if let Err(e) = decode_init_pv_request_value(&mut cur, &req_desc, order) {
+        if let Err(e) = decode_init_pv_request_value(&mut cur, &req_desc, inbound_order) {
             return Err(PvaError::Decode(format!(
                 "PROCESS INIT pvRequest value: {e}"
             )));
@@ -3598,12 +3616,16 @@ async fn handle_create_channel(
     cc_tx: &CcTx,
     pending_channel_spawns: &mut usize,
 ) -> PvaResult<()> {
+    // Inbound payload decodes with the frame's own header order (pvxs
+    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // (config) is used only for outbound reply frames.
+    let inbound_order = frame.order();
     let mut cur = frame.cursor();
     // pvxs `serverchan.cpp:269-358`: a single CREATE_CHANNEL frame
     // can carry `count` (cid, name) pairs and the server must emit
     // one CREATE_CHANNEL response frame per pair, in arrival order.
     let count = cur
-        .get_u16(order)
+        .get_u16(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
 
     // Collect entries to resolve asynchronously. We allocate SIDs
@@ -3616,9 +3638,9 @@ async fn handle_create_channel(
         // truncated CID / malformed string is a protocol-
         // fatal decode error. pvxs `serverchan.cpp:364-368`.
         let cid = cur
-            .get_u32(order)
+            .get_u32(inbound_order)
             .map_err(|e| PvaError::Decode(format!("CREATE_CHANNEL cid: {e}")))?;
-        let name = match crate::proto::decode_string(&mut cur, order)
+        let name = match crate::proto::decode_string(&mut cur, inbound_order)
             .map_err(|e| PvaError::Decode(format!("CREATE_CHANNEL name: {e}")))?
         {
             Some(s) => s,
@@ -3758,12 +3780,16 @@ async fn handle_destroy_channel(
     peer: SocketAddr,
     cred: &ClientCredentials,
 ) -> PvaResult<()> {
+    // Inbound payload decodes with the frame's own header order (pvxs
+    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // (config) is used only for the outbound reply below.
+    let inbound_order = frame.order();
     let mut cur = frame.cursor();
     let sid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let cid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     // pvxs `serverchan.cpp:382-386`: when the SID is unknown the server
     // logs at debug and silently returns — no DESTROY_CHANNEL reply is
@@ -3840,8 +3866,9 @@ async fn handle_destroy_channel(
 fn handle_cancel_request(
     frame: &Frame,
     channels: &mut HashMap<u32, ChannelState>,
-    order: ByteOrder,
 ) -> PvaResult<()> {
+    // Decode with the frame's own header order (pvxs conn.cpp:195-198).
+    let order = frame.order();
     let mut cur = frame.cursor();
     // pvxs `serverconn.cpp:262-270` throws on truncated
     // CANCEL_REQUEST (`if(!M.good()) throw ...`), which the conn
@@ -3929,9 +3956,10 @@ fn handle_cancel_request(
 fn handle_message(
     frame: &Frame,
     channels: &HashMap<u32, ChannelState>,
-    order: ByteOrder,
     peer: &SocketAddr,
 ) -> PvaResult<()> {
+    // Decode with the frame's own header order (pvxs conn.cpp:195-198).
+    let order = frame.order();
     let mut cur = frame.cursor();
     // pvxs `serverconn.cpp:323-336` throws on malformed
     // MESSAGE; conn loop turns into a reset. Pre-fix Rust silently
@@ -3969,8 +3997,9 @@ fn handle_message(
 fn handle_destroy_request(
     frame: &Frame,
     channels: &mut HashMap<u32, ChannelState>,
-    order: ByteOrder,
 ) -> PvaResult<()> {
+    // Decode with the frame's own header order (pvxs conn.cpp:195-198).
+    let order = frame.order();
     let mut cur = frame.cursor();
     // pvxs `serverconn.cpp:297-305` throws on malformed
     // DESTROY_REQUEST. Pre-fix Rust silently returned.
@@ -4079,12 +4108,18 @@ async fn handle_op(
     // the owner returns the op to `Idle` when the response is sent.
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
 ) -> PvaResult<()> {
+    // Inbound payload decodes with the frame's own header order (pvxs
+    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // (config) is used only for outbound reply frames. Each data-phase
+    // frame re-enters this handler, so `frame.order()` is the order of
+    // whichever INIT/EXEC/ACK frame is being decoded right now.
+    let inbound_order = frame.order();
     let mut cur = frame.cursor();
     let sid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let ioid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
@@ -4181,7 +4216,7 @@ async fn handle_op(
         // `onOp` (`serverget.cpp:198-203`), whose throw is caught and
         // signalled as a remote *op* error (`serverget.cpp:407-413`),
         // so that stays an op-level Status reply.
-        let req_desc = match decode_type_desc(&mut cur, order) {
+        let req_desc = match decode_type_desc(&mut cur, inbound_order) {
             Ok(d) => d,
             Err(e) => {
                 return Err(PvaError::Decode(format!("INIT pvRequest descriptor: {e}")));
@@ -4191,7 +4226,7 @@ async fn handle_op(
         // INIT sends only the descriptor — interop), but a PRESENT but
         // malformed one is the same `!M.good()` bev.reset() wire fault as
         // the descriptor above, so it is likewise connection-fatal.
-        let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, order) {
+        let req_value = match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order) {
             Ok(v) => v,
             Err(e) => {
                 return Err(PvaError::Decode(format!("INIT pvRequest value: {e}")));
@@ -4263,7 +4298,7 @@ async fn handle_op(
         // the connection on `!M.good()`, so propagating the decode error
         // here tears down the connection (matches `bev.reset()`). It is a
         // framing violation, not a legacy omission.
-        let pipeline_initial_nack = parse_monitor_init_nack(kind, subcmd, &mut cur, order)?;
+        let pipeline_initial_nack = parse_monitor_init_nack(kind, subcmd, &mut cur, inbound_order)?;
         let (monitor_window, monitor_window_notify) = if kind == OpKind::Monitor
             && let Some(opt) = pipeline_opt.as_ref()
         {
@@ -4686,16 +4721,17 @@ async fn handle_op(
             // marked. Decode with the changed-BitSet so exactly the
             // present fields are consumed (pvData spec §5.4 bit
             // numbering).
-            let changed =
-                BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+            let changed = BitSet::decode(&mut cur, inbound_order)
+                .map_err(|e| PvaError::Decode(e.to_string()))?;
             // pvxs `serverget.cpp:488-492` calls `onPut` immediately
             // on every CMD_PUT !init — the client's autoExec setting
             // is purely a client-side timing knob (clientget.cpp:213)
             // for whether the PUT EXEC fires automatically after INIT
             // or waits for `reExec()`. Each EXEC frame still carries
             // exactly one value and triggers exactly one write.
-            let delta = decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, order)
-                .map_err(|e| PvaError::Decode(format!("PUT requires a value payload: {e}")))?;
+            let delta =
+                decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, inbound_order)
+                    .map_err(|e| PvaError::Decode(format!("PUT requires a value payload: {e}")))?;
             let pv_name = ch.name.clone();
             // spawn PUT exec — put_delta_checked can be slow.
             // Decode frame data synchronously (above) so the cursor is
@@ -4902,7 +4938,7 @@ async fn handle_op(
                 // non-existent IOID was already rejected with "operation
                 // not initialised" above, so by here the op exists; this
                 // read is the only remaining ACK-payload validation.)
-                let ack_count = cur.get_u32(order).map_err(|e| {
+                let ack_count = cur.get_u32(inbound_order).map_err(|e| {
                     PvaError::Decode(format!(
                         "malformed MONITOR ACK (ioid {ioid}): missing u32 ack-count: {e}"
                     ))
@@ -5793,7 +5829,7 @@ async fn handle_op(
             // connection-fatal decode error (pvxs `serverget.cpp:454-458`
             // `bev.reset()`), not a fabricated `Null` argument.
             let (req_desc, req_value) =
-                decode_rpc_exec_arg(&mut cur, order).map_err(PvaError::Decode)?;
+                decode_rpc_exec_arg(&mut cur, inbound_order).map_err(PvaError::Decode)?;
             let pv_name = ch.name.clone();
             let _ = intro;
             let src = source.clone();
@@ -5888,14 +5924,18 @@ async fn handle_get_field(
     peer: SocketAddr,
     cred: &ClientCredentials,
 ) -> PvaResult<Option<AbortOnDrop>> {
+    // Inbound payload decodes with the frame's own header order (pvxs
+    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // (config) is used only for outbound reply frames.
+    let inbound_order = frame.order();
     let mut cur = frame.cursor();
     let sid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let ioid = cur
-        .get_u32(order)
+        .get_u32(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let _sub = crate::proto::decode_string(&mut cur, order)
+    let _sub = crate::proto::decode_string(&mut cur, inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
 
     // pvxs serverintrospect.cpp:159 silently returns on
@@ -8173,15 +8213,15 @@ mod tests {
             let frame = synth_frame(Command::Message, order, payload);
             // MESSAGE handler now returns PvaResult; well-formed
             // payload must succeed.
-            handle_message(&frame, &channels, order, &peer).expect("well-formed MESSAGE");
+            handle_message(&frame, &channels, &peer).expect("well-formed MESSAGE");
         }
 
         // truncated MESSAGE is now a protocol-fatal decode
         // error (matches pvxs `serverconn.cpp:323-336` throw). The
         // server loop turns this into a connection reset.
         let frame_short = synth_frame(Command::Message, order, vec![0x01, 0x02]);
-        let err = handle_message(&frame_short, &channels, order, &peer)
-            .expect_err("truncated MESSAGE must Err");
+        let err =
+            handle_message(&frame_short, &channels, &peer).expect_err("truncated MESSAGE must Err");
         assert!(
             matches!(err, PvaError::Decode(_)),
             "expected Decode error, got {err:?}"
@@ -8229,7 +8269,7 @@ mod tests {
             payload.put_u8(1); // warning
             crate::proto::encode_string_into("hi", order, &mut payload);
             let frame = synth_frame(Command::Message, order, payload);
-            handle_message(&frame, &channels, order, &peer)
+            handle_message(&frame, &channels, &peer)
         };
         // Live IOID: accepted.
         msg(7).expect("MESSAGE on live IOID accepted");
@@ -8305,7 +8345,7 @@ mod tests {
         payload.put_u32(sid, order);
         payload.put_u32(ioid, order);
         let frame = synth_frame(Command::CancelRequest, order, payload);
-        handle_cancel_request(&frame, &mut channels, order).expect("well-formed CancelRequest");
+        handle_cancel_request(&frame, &mut channels).expect("well-formed CancelRequest");
 
         // pvxs parity: op stays in the map, started flag stays set, abort
         // guard stays attached, pause flag flips on. Subsequent START
@@ -8400,7 +8440,7 @@ mod tests {
         payload.put_u32(sid, order);
         payload.put_u32(ioid, order);
         let frame = synth_frame(Command::CancelRequest, order, payload);
-        handle_cancel_request(&frame, &mut channels, order).expect("well-formed CancelRequest");
+        handle_cancel_request(&frame, &mut channels).expect("well-formed CancelRequest");
 
         let op = channels
             .get_mut(&sid)
@@ -8737,6 +8777,111 @@ mod tests {
         // Header (8) + ioid placeholder isn't part of DESTROY_CHANNEL;
         // payload is sid (4) + cid (4) = 8 total, so frame length = 16.
         assert_eq!(reply.len(), PvaHeader::SIZE + 8);
+    }
+
+    /// Inbound application frames must be decoded with the byte order in
+    /// the frame's own header, not the server's configured outbound order
+    /// (pvxs latches `peerBE` per received message, conn.cpp:195-198, and
+    /// builds every handler's input buffer from it, serverchan.cpp:262-373).
+    /// Here a big-endian-encoded DESTROY_CHANNEL reaches a server whose
+    /// configured (outbound) order is little-endian: the SID/CID must still
+    /// decode correctly so the channel is found and removed. Before the fix
+    /// the handler decoded the payload with the little-endian config order,
+    /// byte-swapping the SID into a value no channel owned — silently
+    /// dropping the request.
+    #[tokio::test]
+    async fn handle_destroy_channel_decodes_with_frame_header_order_not_config() {
+        let config_order = ByteOrder::Little;
+        let inbound_order = ByteOrder::Big;
+        let sid: u32 = 0x0102_0304;
+        let cid: u32 = 0x0506_0708;
+
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid,
+                sid,
+                introspection: None,
+                source: source.clone(),
+                ops: HashMap::new(),
+            },
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+        // Payload encoded big-endian; header flagged big-endian.
+        let mut payload = Vec::new();
+        payload.put_u32(sid, inbound_order);
+        payload.put_u32(cid, inbound_order);
+        let frame = synth_frame(Command::DestroyChannel, inbound_order, payload);
+
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        // Server configured little-endian (config_order) for its OWN
+        // outbound frames; the inbound frame is big-endian.
+        handle_destroy_channel(&frame, &tx, &mut channels, config_order, peer, &cred)
+            .await
+            .expect("handler returns Ok");
+
+        assert!(
+            !channels.contains_key(&sid),
+            "BE-encoded SID must decode via the frame header order and find the channel"
+        );
+        let reply = rx.try_recv().expect("reply emitted for the decoded SID");
+        assert_eq!(reply.len(), PvaHeader::SIZE + 8);
+    }
+
+    /// Same per-frame-order rule for a data operation: a MONITOR ACK
+    /// encoded big-endian against a little-endian-configured server must
+    /// decode its SID/IOID/ack-count from the frame header order. Before
+    /// the fix the SID/IOID byte-swapped, the ACK matched no live op, and
+    /// the credit window was never refilled.
+    #[tokio::test]
+    async fn monitor_ack_decodes_with_frame_header_order_not_config() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let config_order = ByteOrder::Little;
+        let inbound_order = ByteOrder::Big;
+        let sid: u32 = 3;
+        let ioid: u32 = 88;
+
+        let window = Arc::new(AtomicU32::new(0));
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut channels = ack_test_channels(sid, ioid, window.clone(), source.clone());
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let config = crate::server_native::runtime::PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, inbound_order);
+        payload.put_u32(ioid, inbound_order);
+        payload.put_u8(0x80);
+        payload.put_u32(3, inbound_order); // ack-count, big-endian
+        let frame = synth_frame(Command::Monitor, inbound_order, payload);
+        handle_op(
+            &frame,
+            &tx,
+            &mut channels,
+            config_order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("well-formed BE MONITOR ACK ok");
+        assert_eq!(
+            window.load(Ordering::Relaxed),
+            3,
+            "BE ack-count must decode via the frame header order and refill the window"
+        );
     }
 
     /// pvxs `ServerChan::cleanup` (serverchan.cpp:43-60, :115-127) runs
@@ -9991,7 +10136,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, order)
+        let creds = parse_client_credentials(&frame)
             .expect("decode must succeed")
             .expect("ca with a user field yields Some");
 
@@ -10035,7 +10180,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let parsed = parse_client_credentials(&frame, order).expect("decode must succeed");
+        let parsed = parse_client_credentials(&frame).expect("decode must succeed");
         assert!(
             parsed.is_none(),
             "ca + null auth must yield the anonymous fallback (None), \
@@ -10078,7 +10223,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, order)
+        let creds = parse_client_credentials(&frame)
             .expect("decode must succeed")
             .expect("non-anonymous method yields Some");
         assert_eq!(
@@ -10116,7 +10261,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, order)
+        let creds = parse_client_credentials(&frame)
             .expect("decode must succeed")
             .expect("mixed-case `Ca` is not the exact `ca` fallback → Some");
         assert_eq!(
@@ -10154,7 +10299,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, order)
+        let creds = parse_client_credentials(&frame)
             .expect("decode must succeed")
             .expect("capitalized `Anonymous` is not the exact fold → Some");
         assert_eq!(
@@ -12095,7 +12240,7 @@ mod tests {
         payload.put_u32(2, order);
         payload.put_u32(ioid, order);
         let frame = synth_frame(Command::DestroyRequest, order, payload);
-        handle_destroy_request(&frame, &mut channels, order).expect("DESTROY_REQUEST ok");
+        handle_destroy_request(&frame, &mut channels).expect("DESTROY_REQUEST ok");
 
         assert!(
             !channels.get(&1).unwrap().ops.contains_key(&ioid),
@@ -12881,7 +13026,7 @@ mod bfr15_tests {
         assert!(op_abort_armed(&channels, sid, ioid));
 
         // DESTROY_REQUEST removes the op → drops AbortOnDrop → aborts the task.
-        handle_destroy_request(&destroy_frame(sid, ioid, order), &mut channels, order)
+        handle_destroy_request(&destroy_frame(sid, ioid, order), &mut channels)
             .expect("DESTROY_REQUEST ok");
         wait_for(&get_cancelled, 1).await;
         assert!(

@@ -65,7 +65,9 @@ struct Args {
     #[arg(long = "read-back")]
     read_back: bool,
 
-    /// Enable debug log output (currently a no-op; kept for parity).
+    /// Raise the `epics_pva_rs` library log level to DEBUG. Mirrors pvxs
+    /// `pvxput -d` mapping to `logger_level_set("pvxs.*", Level::Debug)`
+    /// (`tools/put.cpp:41-64`).
     #[arg(short = 'd')]
     debug: bool,
 
@@ -97,6 +99,13 @@ async fn main() {
         print!("{}", cli::version_information());
         return;
     }
+
+    // Install the shared tracing subscriber (honours EPICS_PVA_LOG /
+    // RUST_LOG) and apply `-d` as a DEBUG bump of the library namespace.
+    // pvxs runs `logger_config_env()` + maps `-d` to a debug level set
+    // before the PUT (tools/put.cpp:41-64). This replaces the prior
+    // no-op `-d` that silently discarded the flag.
+    epics_pva_rs::log::install_cli_logging(args.debug);
 
     // Only the native PVA provider is implemented. pvAccessCPP would
     // route `-p ca` through its CA provider (pvput.cpp:368-399); we
@@ -239,9 +248,6 @@ async fn main() {
         Err(e) if args.quiet => eprintln!("pvput-rs: readback failed: {e}"),
         Err(e) => println!("New : *** {e}"),
     }
-
-    // Suppress unused-warning for the remaining parity-only flag.
-    let _ = args.debug;
 }
 
 /// Validate the requested provider. Only the native PVA provider is
@@ -415,5 +421,14 @@ mod tests {
         let raw = Args::parse_from(["pvput-rs", "-M", "raw", "PV", "42"]);
         assert_eq!(raw.mode, "raw", "-M raw selects the raw echo formatter");
         assert_eq!(raw.verbose, 0, "-M raw does not imply verbose");
+    }
+
+    /// `-d` is no longer a no-op: it parses into a real flag wired to
+    /// `install_cli_logging` (pvxs `pvxput -d`, put.cpp:41-64). Default
+    /// off so ordinary puts stay quiet.
+    #[test]
+    fn debug_flag_parses() {
+        assert!(Args::parse_from(["pvput-rs", "-d", "PV", "42"]).debug);
+        assert!(!Args::parse_from(["pvput-rs", "PV", "42"]).debug);
     }
 }

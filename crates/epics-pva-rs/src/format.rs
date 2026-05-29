@@ -257,7 +257,13 @@ pub fn format_nt(pv_name: &str, desc: &FieldDesc, value: &PvField) -> String {
         PvField::Structure(s) => s,
         _ => return format!("{pv_name} {value}\n"),
     };
-    if id.starts_with("epics:nt/NTScalar:") {
+    if id.starts_with("epics:nt/NTTable:") {
+        // EPICS Base routes the `epics:nt/NTTable:1` prefix to
+        // printTable (printer.cpp:414-421). printTable cowardly refuses
+        // a malformed table (`return false`); we mirror that by falling
+        // back to the raw formatter when the table is not well-formed.
+        format_nt_table(pv_name, s).unwrap_or_else(|| format_raw(pv_name, desc, value))
+    } else if id.starts_with("epics:nt/NTScalar:") {
         format_nt_scalar(pv_name, s)
     } else if id.starts_with("epics:nt/NTEnum:") {
         format_nt_enum(pv_name, s)
@@ -408,6 +414,194 @@ fn format_nt_enum(pv_name: &str, s: &PvStructure) -> String {
     format!("{pv_name} {ts} {alarm}({idx}) {choice}\n")
 }
 
+/// Render an NTTable the way EPICS Base `printTable` does
+/// (pvData printer.cpp:194-283): a metadata line (timeStamp / alarm),
+/// then a right-aligned grid of CSV-escaped columns with per-column
+/// widths and ragged columns truncated to the shortest length.
+///
+/// Returns `None` when the structure is not a well-formed table — no
+/// `value` substructure, an empty column set, or a column that is not a
+/// scalar array — so the caller falls back to the raw formatter, exactly
+/// as printTable returns `false` for those cases (printer.cpp:196-205).
+///
+/// The PV name and a separating space are prepended here so the shape
+/// matches the other NT formatters (`<pv_name> <metadata>\n<header>\n
+/// <rows>`), mirroring pvAccessCPP `pvget` which streams
+/// `name << ' ' << formatter` (pvtoolsSrc/pvget.cpp:76,93).
+fn format_nt_table(pv_name: &str, s: &PvStructure) -> Option<String> {
+    let PvField::Structure(value) = s.get_field("value")? else {
+        return None;
+    };
+    if value.fields.is_empty() {
+        return None;
+    }
+
+    // Every column must be a scalar array (printTable refuses anything
+    // else, printer.cpp:200-204). Render each element to its string form,
+    // then CSV-escape it (escaping happens before width measurement).
+    let mut columns: Vec<(&str, Vec<String>)> = Vec::with_capacity(value.fields.len());
+    for (name, field) in &value.fields {
+        let cells = scalar_array_cells(field)?;
+        let escaped: Vec<String> = cells.iter().map(|c| csv_escape(c)).collect();
+        columns.push((name.as_str(), escaped));
+    }
+
+    // Labels from the `labels` field; a column with no corresponding
+    // label falls back to its field name (printer.cpp:240-246). Labels
+    // taken from the `labels` field are CSV-escaped; field-name fallbacks
+    // are not (field names are already token-safe).
+    let labels = string_array_values(s.get_field("labels"));
+    let widths: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, (name, cells))| {
+            let label_len = labels
+                .get(i)
+                .map(|l| csv_escape(l).len())
+                .unwrap_or_else(|| name.len());
+            cells.iter().map(String::len).fold(label_len, usize::max)
+        })
+        .collect();
+
+    // Ragged columns truncate to the shortest length (printer.cpp:233).
+    let nrows = columns
+        .iter()
+        .map(|(_, cells)| cells.len())
+        .min()
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    let _ = write!(out, "{pv_name} ");
+
+    // Metadata line (printer.cpp:207-222): timeStamp then alarm, each
+    // followed by a space, then a newline — printed whenever either is
+    // present (and an empty line otherwise). Reuses the same
+    // printTimeTx/printAlarmTx-derived helpers as the NTScalar path; the
+    // upstream `setw(24)` timestamp padding is approximated identically.
+    if let Some(PvField::Structure(ts)) = s.get_field("timeStamp") {
+        let _ = write!(out, "{} ", format_timestamp(ts));
+    }
+    if matches!(s.get_field("alarm"), Some(PvField::Structure(_))) {
+        let _ = write!(out, "{} ", top_alarm_summary(s));
+    }
+    out.push('\n');
+
+    // Header line: each label right-justified to its column width, single
+    // space between columns, no trailing space (printer.cpp:264-272).
+    write_table_row(
+        &mut out,
+        &widths,
+        columns.iter().enumerate().map(|(i, (name, _))| {
+            labels
+                .get(i)
+                .map(|l| csv_escape(l))
+                .unwrap_or_else(|| (*name).to_string())
+        }),
+    );
+
+    // Data rows (printer.cpp:274-282).
+    for r in 0..nrows {
+        write_table_row(
+            &mut out,
+            &widths,
+            columns.iter().map(|(_, cells)| cells[r].clone()),
+        );
+    }
+
+    Some(out)
+}
+
+/// Write one right-justified, single-space-separated table row (no
+/// trailing space), terminated by a newline. Column cells are already
+/// CSV-escaped, so each is ASCII and its byte length equals its display
+/// width — `{:>width$}` aligns identically to Base's
+/// `std::setw(width)<<std::right` (printer.cpp:266-270).
+fn write_table_row<I: Iterator<Item = String>>(out: &mut String, widths: &[usize], cells: I) {
+    let n = widths.len();
+    for (c, cell) in cells.enumerate() {
+        let w = widths.get(c).copied().unwrap_or(0);
+        let _ = write!(out, "{cell:>w$}");
+        if c + 1 != n {
+            out.push(' ');
+        }
+    }
+    out.push('\n');
+}
+
+/// Extract a scalar-array column as per-element strings, or `None` if the
+/// field is not a scalar array (the case printTable refuses).
+fn scalar_array_cells(field: &PvField) -> Option<Vec<String>> {
+    match field {
+        PvField::ScalarArray(items) => Some(items.iter().map(scalar_to_inline).collect()),
+        PvField::ScalarArrayTyped(arr) => Some(
+            arr.to_scalar_values()
+                .iter()
+                .map(scalar_to_inline)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Read a string-array field (e.g. NTTable `labels`) into owned strings,
+/// rendering any non-string element through its scalar Display. Returns
+/// an empty vec when the field is absent or not a scalar array.
+fn string_array_values(field: Option<&PvField>) -> Vec<String> {
+    let to_strings = |items: &[ScalarValue]| -> Vec<String> {
+        items
+            .iter()
+            .map(|sv| match sv {
+                ScalarValue::String(x) => x.clone(),
+                other => other.to_string(),
+            })
+            .collect()
+    };
+    match field {
+        Some(PvField::ScalarArray(items)) => to_strings(items),
+        Some(PvField::ScalarArrayTyped(arr)) => to_strings(&arr.to_scalar_values()),
+        _ => Vec::new(),
+    }
+}
+
+/// Mirror EPICS Base `csvEscape` (pvData printer.cpp:178-192): escape the
+/// string with the CSV style (control characters `\a \b \f \n \r \t \v`,
+/// `\\`, `\'`; a literal `"` doubled to `""` per RFC4180; any other
+/// non-printable byte as `\xHH`), then wrap the whole token in double
+/// quotes iff the original contained any of `"`, space, `,`, or `\`.
+///
+/// Escaping is byte-wise to match Base's `isprint((unsigned char)C)`, so
+/// a non-ASCII UTF-8 byte becomes `\xHH`. Hex digits are emitted
+/// correctly as `{:02X}`; Base's `hexdigit` has an off-by-one that maps a
+/// nibble value of 9 to `@`, which this does not reproduce.
+fn csv_escape(s: &str) -> String {
+    let mut esc = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            0x07 => esc.push_str("\\a"),
+            0x08 => esc.push_str("\\b"),
+            0x0c => esc.push_str("\\f"),
+            b'\n' => esc.push_str("\\n"),
+            b'\r' => esc.push_str("\\r"),
+            b'\t' => esc.push_str("\\t"),
+            0x0b => esc.push_str("\\v"),
+            b'\\' => esc.push_str("\\\\"),
+            b'\'' => esc.push_str("\\'"),
+            b'"' => esc.push_str("\"\""),
+            0x20..=0x7e => esc.push(b as char),
+            other => {
+                let _ = write!(esc, "\\x{other:02X}");
+            }
+        }
+    }
+    if s.bytes()
+        .any(|b| b == b'"' || b == b' ' || b == b',' || b == b'\\')
+    {
+        format!("\"{esc}\"")
+    } else {
+        esc
+    }
+}
+
 // ─── JSON formatting ────────────────────────────────────────────────────────
 
 /// Format value as JSON (pvget -M json style).
@@ -466,18 +660,36 @@ fn value_to_json(value: &PvField) -> String {
     }
 }
 
+/// Emit a single JSON string token, delegating all escaping to
+/// `serde_json`. This is the one owner of "string → JSON token" for the
+/// CLI JSON formatter: both structure member names and string scalars
+/// go through it, so quotes, backslashes, control characters (newline,
+/// tab, NUL, …), and non-ASCII are emitted as valid JSON instead of the
+/// prior hand-rolled escaper that quoted neither keys nor control chars.
+/// EPICS Base routes the same tokens through YAJL's `yg_string()`
+/// (`pvData/src/json/jprint.cpp:112-164`).
+fn json_string(s: &str) -> String {
+    // `Value::String(..).to_string()` is the compact, fully-escaped
+    // JSON token (e.g. `"a\nb"`); it never fails.
+    serde_json::Value::String(s.to_owned()).to_string()
+}
+
 fn structure_to_json(s: &PvStructure) -> String {
+    // Member order is preserved by iterating `fields` in declared order
+    // (EPICS Base prints `names[i]` in structure order); a
+    // `serde_json::Map` would re-sort keys and break that parity, so the
+    // generator owns only token escaping, not container assembly.
     let parts: Vec<String> = s
         .fields
         .iter()
-        .map(|(n, v)| format!("{n}:{}", value_to_json(v)))
+        .map(|(n, v)| format!("{}:{}", json_string(n), value_to_json(v)))
         .collect();
     format!("{{{}}}", parts.join(","))
 }
 
 fn scalar_to_json(v: &ScalarValue) -> String {
     match v {
-        ScalarValue::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        ScalarValue::String(s) => json_string(s),
         ScalarValue::Float(f) => {
             if f.fract() == 0.0 {
                 format!("{f:.1}")
@@ -811,6 +1023,177 @@ mod tests {
         let v = PvField::ScalarArray(vec![ScalarValue::Int(1), ScalarValue::Int(2)]);
         let out = format_json("X", &v);
         assert_eq!(out, "X [1,2]\n");
+    }
+
+    /// Extract the JSON payload from a `format_json("X", ..)` line:
+    /// `"X <json>\n"` → `<json>`.
+    fn json_payload(out: &str) -> &str {
+        out.strip_prefix("X ")
+            .and_then(|s| s.strip_suffix('\n'))
+            .expect("format_json output shape")
+    }
+
+    /// A structure member name that is not a bare JSON5 identifier
+    /// (space, dash) must be emitted as a quoted, escaped key, and the
+    /// whole line must be strict-JSON parseable. Pre-fix the key was
+    /// spliced in unquoted (`{alarm message:...}`), which no JSON parser
+    /// accepts. Member order must survive (declared order, not sorted).
+    #[test]
+    fn json_quotes_and_escapes_structure_keys() {
+        let mut s = PvStructure::new("");
+        s.set("alarm message", PvField::Scalar(ScalarValue::Int(1)));
+        s.set("a-b", PvField::Scalar(ScalarValue::Int(2)));
+        let out = format_json("X", &PvField::Structure(s));
+        let payload = json_payload(&out);
+        let parsed: serde_json::Value = serde_json::from_str(payload).expect("must be strict JSON");
+        assert_eq!(parsed["alarm message"], serde_json::json!(1));
+        assert_eq!(parsed["a-b"], serde_json::json!(2));
+        // Declared order preserved (not lexicographically re-sorted).
+        assert_eq!(payload, r#"{"alarm message":1,"a-b":2}"#);
+    }
+
+    /// A string scalar carrying control characters (newline, tab, NUL,
+    /// carriage return) plus a quote and a backslash must be escaped by
+    /// the JSON generator, not emitted raw. The result must parse as
+    /// strict JSON and round-trip back to the exact original bytes.
+    #[test]
+    fn json_escapes_string_control_characters() {
+        let raw = "line1\nline2\tx\r\0\"q\\z";
+        let v = PvField::Scalar(ScalarValue::String(raw.to_string()));
+        let out = format_json("X", &v);
+        let payload = json_payload(&out);
+        let parsed: serde_json::Value = serde_json::from_str(payload).expect("must be strict JSON");
+        assert_eq!(parsed, serde_json::Value::String(raw.to_string()));
+        // No raw newline leaked into the token.
+        assert!(!payload.contains('\n'));
+    }
+
+    /// A string-array element with control characters is escaped per
+    /// element and the array stays strict JSON.
+    #[test]
+    fn json_escapes_string_array_elements() {
+        let v = PvField::ScalarArray(vec![
+            ScalarValue::String("a\nb".to_string()),
+            ScalarValue::String("c\"d".to_string()),
+        ]);
+        let out = format_json("X", &v);
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_payload(&out)).expect("must be strict JSON");
+        assert_eq!(parsed, serde_json::json!(["a\nb", "c\"d"]));
+    }
+
+    /// Build an NTTable descriptor + value with the given string columns
+    /// and labels (no timeStamp/alarm). The descriptor only needs the
+    /// NTTable struct id; the table formatter reads the value side.
+    fn nt_table(labels: &[&str], columns: &[(&str, Vec<ScalarValue>)]) -> (FieldDesc, PvField) {
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTTable:1.0".into(),
+            fields: vec![],
+        };
+        let mut value = PvStructure::new("");
+        for (name, cells) in columns {
+            value.set(name, PvField::ScalarArray(cells.clone()));
+        }
+        let mut top = PvStructure::new("epics:nt/NTTable:1.0");
+        if !labels.is_empty() {
+            top.set(
+                "labels",
+                PvField::ScalarArray(
+                    labels
+                        .iter()
+                        .map(|l| ScalarValue::String((*l).to_string()))
+                        .collect(),
+                ),
+            );
+        }
+        top.set("value", PvField::Structure(value));
+        (desc, PvField::Structure(top))
+    }
+
+    /// A well-formed NTTable renders as Base `printTable` does: a
+    /// (here empty) metadata line, a right-justified header, and
+    /// right-justified rows truncated to the shortest column. Column 0
+    /// width = max(label "A"=1, cells 1/22/333) = 3; column 1 width =
+    /// max(label "Beta"=4, cells x/yy) = 4; ragged columns truncate to
+    /// 2 rows.
+    #[test]
+    fn nt_table_renders_aligned_grid() {
+        let (desc, value) = nt_table(
+            &["A", "Beta"],
+            &[
+                (
+                    "colA",
+                    vec![
+                        ScalarValue::Int(1),
+                        ScalarValue::Int(22),
+                        ScalarValue::Int(333),
+                    ],
+                ),
+                (
+                    "colB",
+                    vec![
+                        ScalarValue::String("x".into()),
+                        ScalarValue::String("yy".into()),
+                    ],
+                ),
+            ],
+        );
+        let out = format_nt("PV", &desc, &value);
+        assert_eq!(out, "PV \n  A Beta\n  1    x\n 22   yy\n");
+    }
+
+    /// When the `labels` field has fewer entries than columns, the
+    /// missing labels fall back to the column field names
+    /// (printer.cpp:240-246).
+    #[test]
+    fn nt_table_label_fallback_to_field_name() {
+        let (desc, value) = nt_table(
+            &["First"],
+            &[
+                ("first", vec![ScalarValue::Int(1)]),
+                ("second", vec![ScalarValue::Int(2)]),
+            ],
+        );
+        let out = format_nt("PV", &desc, &value);
+        // col0 width=max("First"=5, "1"=1)=5; col1 width=max("second"=6, "2"=1)=6.
+        assert_eq!(out, "PV \nFirst second\n    1      2\n");
+    }
+
+    /// `csv_escape` mirrors Base `csvEscape`: a literal `"` is doubled,
+    /// control chars get backslash escapes, and the whole token is quoted
+    /// only when the original held `"`, space, `,`, or `\`.
+    #[test]
+    fn csv_escape_matches_base_rules() {
+        assert_eq!(csv_escape("plain"), "plain");
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
+        assert_eq!(csv_escape("a b"), "\"a b\"");
+        assert_eq!(csv_escape("he\"llo"), "\"he\"\"llo\"");
+        // tab is escaped to \t, but no quote/space/comma/backslash → no wrap.
+        assert_eq!(csv_escape("tab\there"), "tab\\there");
+        // a non-printable byte (0x01) → \x01.
+        assert_eq!(csv_escape("\u{01}"), "\\x01");
+    }
+
+    /// A CSV-significant cell (comma) is quoted in the grid, and the
+    /// quoted token drives the column width.
+    #[test]
+    fn nt_table_csv_escapes_cells() {
+        let (desc, value) = nt_table(&["c"], &[("c", vec![ScalarValue::String("a,b".into())])]);
+        let out = format_nt("PV", &desc, &value);
+        // cell "a,b" → quoted "\"a,b\"" (len 5); label "c" (len 1) → width 5.
+        assert_eq!(out, "PV \n    c\n\"a,b\"\n");
+    }
+
+    /// printTable refuses a `value` whose column is not a scalar array
+    /// (printer.cpp:200-204); `format_nt_table` returns None so the
+    /// caller falls back to the raw formatter.
+    #[test]
+    fn nt_table_rejects_non_scalar_array_column() {
+        let mut value = PvStructure::new("");
+        value.set("notarray", PvField::Scalar(ScalarValue::Int(7)));
+        let mut top = PvStructure::new("epics:nt/NTTable:1.0");
+        top.set("value", PvField::Structure(value));
+        assert!(format_nt_table("PV", &top).is_none());
     }
 
     #[test]

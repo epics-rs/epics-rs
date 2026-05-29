@@ -67,6 +67,12 @@ struct Args {
     #[arg(short = 'i', long = "info")]
     info: bool,
 
+    /// Raise the `epics_pva_rs` library log level to DEBUG. Mirrors pvxs
+    /// `pvxlist -d` mapping to `logger_level_set("pvxs.*",
+    /// Level::Debug)` (`tools/list.cpp:66-99`).
+    #[arg(short = 'd')]
+    debug: bool,
+
     /// Server address(es) to query, `ip[:port]`. When given, switches
     /// from discovery mode to per-server channel enumeration.
     servers: Vec<String>,
@@ -395,6 +401,11 @@ async fn main() {
         return;
     }
 
+    // Install the shared tracing subscriber (honours EPICS_PVA_LOG /
+    // RUST_LOG) and apply `-d` as a DEBUG bump of the library namespace,
+    // mirroring pvxs `logger_config_env()` + `-d` (tools/list.cpp:66-99).
+    epics_pva_rs::log::install_cli_logging(args.debug);
+
     if args.servers.is_empty() {
         if args.info {
             eprintln!("pvlist-rs: -i requires at least one server address");
@@ -480,6 +491,14 @@ mod tests {
     #[test]
     fn active_and_passive_conflict() {
         assert!(Args::try_parse_from(["pvlist-rs", "-A", "-p"]).is_err());
+    }
+
+    /// `-d` parses into a real flag wired to `install_cli_logging`
+    /// (pvxs `pvxlist -d`, list.cpp:66-99). Default off.
+    #[test]
+    fn debug_flag_parses() {
+        assert!(Args::parse_from(["pvlist-rs", "-d"]).debug);
+        assert!(!Args::parse_from(["pvlist-rs"]).debug);
     }
 
     /// `pvlist-rs -w 0` is "no timeout" in BOTH discovery and query

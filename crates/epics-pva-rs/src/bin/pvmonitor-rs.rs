@@ -56,6 +56,12 @@ struct Args {
     /// server-side filters: `-r 'record[_filter="{\"dec\":{\"n\":3}}"]'`.
     #[arg(short = 'r', default_value = "")]
     request: String,
+
+    /// Raise the `epics_pva_rs` library log level to DEBUG. Mirrors pvxs
+    /// `pvxmonitor -d` mapping to `logger_level_set("pvxs.*",
+    /// Level::Debug)` (`tools/monitor.cpp:48-70`).
+    #[arg(short = 'd')]
+    debug: bool,
 }
 
 #[tokio::main]
@@ -68,6 +74,11 @@ async fn main() {
         print!("{}", cli::version_information());
         return;
     }
+
+    // Install the shared tracing subscriber (honours EPICS_PVA_LOG /
+    // RUST_LOG) and apply `-d` as a DEBUG bump of the library namespace,
+    // mirroring pvxs `logger_config_env()` + `-d` (tools/monitor.cpp:48-70).
+    epics_pva_rs::log::install_cli_logging(args.debug);
 
     // Parse the custom pvRequest once, up front, so an invalid string
     // exits before any subscription task is spawned. `None` means use
@@ -196,5 +207,13 @@ mod tests {
         // Default mirrors the other PVA CLIs (5s).
         let dflt = Args::parse_from(["pvmonitor-rs", "PV"]);
         assert_eq!(dflt.timeout, 5.0);
+    }
+
+    /// `-d` parses into a real flag wired to `install_cli_logging`
+    /// (pvxs `pvxmonitor -d`, monitor.cpp:48-70). Default off.
+    #[test]
+    fn debug_flag_parses() {
+        assert!(Args::parse_from(["pvmonitor-rs", "-d", "PV"]).debug);
+        assert!(!Args::parse_from(["pvmonitor-rs", "PV"]).debug);
     }
 }

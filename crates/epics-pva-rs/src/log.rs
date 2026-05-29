@@ -70,6 +70,49 @@ pub fn set_global_handle(handle: FilterReloadHandle) {
     let _ = GLOBAL_HANDLE.set(handle);
 }
 
+/// Install the process-global tracing subscriber for a PVA CLI binary
+/// and register its reload handle, optionally raising the library log
+/// level to `DEBUG`.
+///
+/// This is the single wiring entry point every `pv*-rs` tool calls from
+/// `main`, mirroring pvxs where each tool opens with
+/// `logger_config_env()` (read `$PVXS_LOG`) and maps `-d` to
+/// `logger_level_set("pvxs.*", Level::Debug)` (`tools/get.cpp:47-70`,
+/// `monitor.cpp:48-70`, `put.cpp:41-64`, `list.cpp:66-99`,
+/// `info.cpp:47-66`, `call.cpp:47-64`).
+///
+/// The filter is seeded by [`init_filter`] (`EPICS_PVA_LOG`, then
+/// `RUST_LOG`, then `"info"`), so `EPICS_PVA_LOG=... pvget-rs PV` works
+/// for these tools the way `PVXS_LOG=... pvxget PV` does for pvxs. Log
+/// records go to **stderr**, never stdout, so they cannot corrupt the
+/// value output a script parses.
+///
+/// `debug` (the `-d` flag) raises the `epics_pva_rs` library namespace
+/// to `DEBUG` on top of the env base — the analogue of pvxs's
+/// `pvxs.* = Debug`. `EnvFilter` matches targets by module-path prefix,
+/// so this also enables every `epics_pva_rs::*` submodule.
+///
+/// Call once per process from `main`. If a subscriber is already
+/// installed (e.g. by a test harness), installation is skipped and the
+/// existing subscriber is left intact.
+pub fn install_cli_logging(debug: bool) {
+    use tracing_subscriber::prelude::*;
+
+    let (filter, handle) = init_filter();
+    let installed = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .try_init()
+        .is_ok();
+    if !installed {
+        return;
+    }
+    set_global_handle(handle);
+    if debug {
+        let _ = set_log_level("epics_pva_rs", LevelFilter::DEBUG);
+    }
+}
+
 /// Replace the active log filter spec. `spec` follows the standard
 /// `tracing_subscriber::EnvFilter` syntax — same as pvxs's
 /// `logger_config_str` (log.cpp:343), e.g.,

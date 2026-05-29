@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::net::AsyncUdpV4;
@@ -802,12 +802,23 @@ async fn run_engine(
     // EPICS_PVA_NAME_SERVERS entry. Each ns_task handles connect/reconnect;
     // ns_senders receives SEARCH frame bytes to forward over the connection.
     let (ns_response_tx, mut ns_response_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
-    let mut ns_senders: Vec<mpsc::Sender<Vec<u8>>> = Vec::with_capacity(name_servers.len());
+    let mut ns_senders: Vec<NsHandle> = Vec::with_capacity(name_servers.len());
     for ns_addr in name_servers {
         let (search_tx, search_rx) = mpsc::channel::<Vec<u8>>(64);
-        ns_senders.push(search_tx);
+        // Per-NS readiness gate. pvxs (client.cpp:1221-1225) skips a name
+        // server during a search tick unless `serv->ready && serv->connection()`
+        // are both true, and keeps no disconnected-side queue (client.cpp:1227-1235).
+        // The flag is owned by `ns_task`: false until CONNECTION_VALIDATED, false
+        // again the instant the connection drops. Without it, the bounded channel
+        // buffered up to 64 stale SEARCH frames while the NS was offline or still
+        // handshaking and replayed them as a burst on reconnect.
+        let ready = Arc::new(AtomicBool::new(false));
+        ns_senders.push(NsHandle {
+            tx: search_tx,
+            ready: Arc::clone(&ready),
+        });
         let resp_tx = ns_response_tx.clone();
-        tokio::spawn(ns_task(ns_addr, search_rx, resp_tx));
+        tokio::spawn(ns_task(ns_addr, search_rx, resp_tx, ready));
     }
 
     let mut tick = interval(Duration::from_secs(1));
@@ -897,15 +908,7 @@ async fn run_engine(
                             p.last_attempt = Instant::now();
                             let pkt = codec.build_search(0, sid, &p.pv_name, [0,0,0,0], response_port, false);
                             broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
-                            // pvxs client.cpp:1193-1196: also SEARCH over each TCP
-                            // name-server connection. unicast bit=0x80, port=0 (NS
-                            // replies on the same TCP connection).
-                            if !ns_senders.is_empty() {
-                                let ns_pkt = codec.build_search(0, sid, &p.pv_name, [0, 0, 0, 0], 0, true);
-                                for tx in &ns_senders {
-                                    let _ = tx.try_send(ns_pkt.clone());
-                                }
-                            }
+                            ns_search_to_ready(&ns_senders, &codec, sid, &p.pv_name);
                         }
                     }
                 }
@@ -939,12 +942,7 @@ async fn run_engine(
                             p.last_attempt = Instant::now();
                             let pkt = codec.build_search(0, sid, &p.pv_name, [0,0,0,0], response_port, false);
                             broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
-                            if !ns_senders.is_empty() {
-                                let ns_pkt = codec.build_search(0, sid, &p.pv_name, [0, 0, 0, 0], 0, true);
-                                for tx in &ns_senders {
-                                    let _ = tx.try_send(ns_pkt.clone());
-                                }
-                            }
+                            ns_search_to_ready(&ns_senders, &codec, sid, &p.pv_name);
                         }
                     }
                 }
@@ -1316,14 +1314,7 @@ async fn run_engine(
                         // search_buckets borrow we need below.
                         if let Some(p) = pending.get(&sid) {
                             let attempt = p.attempt;
-                            // pvxs client.cpp:1193-1196: TCP name-server SEARCH.
-                            // unicast bit=0x80, port=0 (replies on same TCP connection).
-                            if !ns_senders.is_empty() {
-                                let ns_pkt = codec.build_search(0, sid, &p.pv_name, [0, 0, 0, 0], 0, true);
-                                for tx in &ns_senders {
-                                    let _ = tx.try_send(ns_pkt.clone());
-                                }
-                            }
+                            ns_search_to_ready(&ns_senders, &codec, sid, &p.pv_name);
                             let bucket_sizes = |idx: usize| search_buckets[idx].len();
                             let next = cascade_smoothed_next(
                                 current_bucket,
@@ -1834,6 +1825,43 @@ fn rewrite_loopback(addr: SocketAddr, peer: SocketAddr) -> SocketAddr {
 
 // ── TCP name-server tasks ───────────────────────────────────────────────
 
+/// Engine-side handle for one TCP name-server connection.
+///
+/// `ready` is the per-NS readiness gate owned by [`ns_task`]: it is `false`
+/// until the connection reaches CONNECTION_VALIDATED and flips back to `false`
+/// the instant the connection drops. The engine consults it before forwarding
+/// a SEARCH so frames are never buffered across a disconnected/handshaking NS.
+struct NsHandle {
+    tx: mpsc::Sender<Vec<u8>>,
+    ready: Arc<AtomicBool>,
+}
+
+/// Forward the current tick's SEARCH for `sid`/`pv_name` to every name-server
+/// connection that is currently *ready* (validated and connected).
+///
+/// pvxs SEARCHes over each NS connection (client.cpp:1193-1196) but skips any
+/// name server unless `serv->ready && serv->connection()` are both true
+/// (client.cpp:1221-1225), and keeps no disconnected-side queue that is replayed
+/// after reconnect (client.cpp:1227-1235). A not-ready NS is simply skipped for
+/// this tick; the search is retried on a later tick by the normal bucket cadence
+/// once the NS is ready, instead of replaying a stale backlog. The unicast bit
+/// is set and port=0 so the NS replies on the same TCP connection.
+fn ns_search_to_ready(handles: &[NsHandle], codec: &PvaCodec, sid: u32, pv_name: &str) {
+    if handles.iter().all(|h| !h.ready.load(Ordering::SeqCst)) {
+        return;
+    }
+    let pkt = codec.build_search(0, sid, pv_name, [0, 0, 0, 0], 0, true);
+    for ns in handles {
+        if ns.ready.load(Ordering::SeqCst) {
+            // Bounded channel: a `Full` error means the NS writer is
+            // backpressured — pvxs likewise skips a NS whose libevent TX
+            // buffer is already >64 KiB (client.cpp:1227-1235). Drop the
+            // frame for this tick rather than growing an unbounded backlog.
+            let _ = ns.tx.try_send(pkt.clone());
+        }
+    }
+}
+
 /// Long-running task for one EPICS_PVA_NAME_SERVERS entry.
 /// Loops forever: connect, handshake, forward SEARCHes / receive responses,
 /// reconnect after 10 s on any failure. pvxs client.cpp:651-667 + 1295-1305.
@@ -1841,11 +1869,17 @@ async fn ns_task(
     ns_addr: SocketAddr,
     mut search_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    ready: Arc<AtomicBool>,
 ) {
     // pvxs client.cpp:68: tcpNSCheckInterval = 10s.
     const RECONNECT_INTERVAL: Duration = Duration::from_secs(10);
     loop {
-        if let Err(e) = ns_run_once(ns_addr, &mut search_rx, &response_tx).await {
+        let res = ns_run_once(ns_addr, &mut search_rx, &response_tx, &ready).await;
+        // Connection is gone: clear readiness immediately so the engine skips
+        // this NS for every tick until the next CONNECTION_VALIDATED, rather
+        // than enqueuing frames into a channel nobody is draining.
+        ready.store(false, Ordering::SeqCst);
+        if let Err(e) = res {
             debug!(
                 target: "epics_pva_rs::client",
                 "NS {ns_addr} disconnected: {e}; reconnecting in {RECONNECT_INTERVAL:?}"
@@ -1861,6 +1895,7 @@ async fn ns_run_once(
     ns_addr: SocketAddr,
     search_rx: &mut mpsc::Receiver<Vec<u8>>,
     response_tx: &mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    ready: &AtomicBool,
 ) -> std::io::Result<()> {
     let stream = TcpStream::connect(ns_addr).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -1941,6 +1976,16 @@ async fn ns_run_once(
             break;
         }
     }
+
+    // Discard any SEARCH frames that the engine enqueued while this connection
+    // was down or handshaking. pvxs keeps no disconnected-side queue to replay
+    // (client.cpp:1227-1235); the still-pending searches are re-sent on the next
+    // ready tick by the normal bucket cadence, so replaying a stale backlog would
+    // only generate load for CIDs whose callers may already be gone. Only after
+    // draining do we publish readiness, so the engine never races a frame into
+    // the about-to-be-drained window.
+    while search_rx.try_recv().is_ok() {}
+    ready.store(true, Ordering::SeqCst);
 
     // ── Main loop: forward SEARCH frames out; route SEARCH_RESPONSE back ────
     loop {
@@ -3416,6 +3461,64 @@ mod tests {
         assert!(
             targets.contains(&extra),
             "configured extras are always included"
+        );
+    }
+
+    // ── TCP name-server readiness gate (no replayed backlog) ────────────────
+
+    #[test]
+    fn ns_search_to_ready_skips_not_ready_and_keeps_no_backlog() {
+        let codec = PvaCodec { big_endian: false };
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let ready = Arc::new(AtomicBool::new(false));
+        let handles = vec![NsHandle {
+            tx,
+            ready: Arc::clone(&ready),
+        }];
+
+        // NS offline/handshaking: ticks far exceeding the channel capacity must
+        // not buffer a single frame, so there is nothing to burst on reconnect.
+        for sid in 0..200u32 {
+            ns_search_to_ready(&handles, &codec, sid, "PV:NS");
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no SEARCH may be queued while the NS is not ready"
+        );
+
+        // NS validated: only the current tick is written, once.
+        ready.store(true, Ordering::SeqCst);
+        ns_search_to_ready(&handles, &codec, 42, "PV:NS");
+        assert!(
+            rx.try_recv().is_ok(),
+            "the current-tick SEARCH is delivered once the NS is ready"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one current-tick frame, no replayed stale backlog"
+        );
+    }
+
+    #[test]
+    fn ns_search_to_ready_targets_only_ready_connections() {
+        let codec = PvaCodec { big_endian: false };
+        let (tx_a, mut rx_a) = mpsc::channel::<Vec<u8>>(64);
+        let (tx_b, mut rx_b) = mpsc::channel::<Vec<u8>>(64);
+        let handles = vec![
+            NsHandle {
+                tx: tx_a,
+                ready: Arc::new(AtomicBool::new(true)),
+            },
+            NsHandle {
+                tx: tx_b,
+                ready: Arc::new(AtomicBool::new(false)),
+            },
+        ];
+        ns_search_to_ready(&handles, &codec, 7, "PV:X");
+        assert!(rx_a.try_recv().is_ok(), "ready NS receives the SEARCH");
+        assert!(
+            rx_b.try_recv().is_err(),
+            "not-ready NS is skipped this tick"
         );
     }
 }

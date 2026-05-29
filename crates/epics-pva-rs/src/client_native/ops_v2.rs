@@ -2916,6 +2916,23 @@ fn decode_put_get_data(
 
 // ── PROCESS (cmd 16) ────────────────────────────────────────────────────
 
+/// Build a PROCESS INIT frame (`sid + ioid + 0x08 + pvRequest`) carrying
+/// the caller-supplied `pv_req` bytes verbatim. Factored out so the
+/// caller's request can be verified at the wire level (PVA-RS-2026-05-28-62
+/// regression).
+fn build_process_init(sid: u32, ioid: u32, pv_req: &[u8], order: ByteOrder) -> Vec<u8> {
+    let mut init = Vec::with_capacity(9 + pv_req.len());
+    init.put_u32(sid, order);
+    init.put_u32(ioid, order);
+    init.put_u8(QosFlags::INIT);
+    init.extend_from_slice(pv_req);
+    let init_h = PvaHeader::application(false, order, Command::Process.code(), init.len() as u32);
+    let mut init_frame = Vec::with_capacity(8 + init.len());
+    init_h.write_into(&mut init_frame);
+    init_frame.extend_from_slice(&init);
+    init_frame
+}
+
 /// PVA `PROCESS` (cmd 16) — trigger record processing without
 /// transferring a value.
 ///
@@ -2925,27 +2942,39 @@ fn decode_put_get_data(
 /// 2. PROCESS (`subcmd 0x00`): no payload; server runs the processing
 ///    hook and replies `status`.
 /// 3. DESTROY (`subcmd 0x10`): release the op.
+///
+/// The empty default request — `[`sentinel_all_fields`]` — matches EPICS
+/// base pvaClient `createProcess("")` (pvaClientChannel.cpp:316-333), whose
+/// parsed empty pvRequest is serialized into PROCESS INIT
+/// (clientContextImpl.cpp:528-536) and handed to the provider's
+/// `createChannelProcess` (responseHandlers.cpp:2556-2561). Use
+/// [`op_process_with_request`] to send a provider-specific request.
 pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResult<()> {
+    op_process_with_request(channel, sentinel_all_fields(), op_timeout).await
+}
+
+/// `op_process` variant that sends a caller-supplied PROCESS pvRequest
+/// (e.g. `record[block=true]` or a provider-specific option set) instead of
+/// the empty default. pvAccess serializes this request on PROCESS INIT and
+/// the provider can inspect it during `createChannelProcess`
+/// (responseHandlers.cpp:2504-2511). Mirrors pvaClient
+/// `PvaClientChannel::createProcess(pvRequest)` (pvaClientProcess.cpp:198-200).
+pub async fn op_process_with_request(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    op_timeout: Duration,
+) -> PvaResult<()> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order;
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
 
-    let pv_req = build_pv_request_value_only(big_endian);
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Process.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
 
     // INIT — `sid + ioid + 0x08 + pvRequest`.
-    let mut init = Vec::with_capacity(9 + pv_req.len());
-    init.put_u32(sid, order);
-    init.put_u32(ioid, order);
-    init.put_u8(QosFlags::INIT);
-    init.extend_from_slice(&pv_req);
-    let init_h = PvaHeader::application(false, order, Command::Process.code(), init.len() as u32);
-    let mut init_frame = Vec::with_capacity(8 + init.len());
-    init_h.write_into(&mut init_frame);
-    init_frame.extend_from_slice(&init);
+    let init_frame = build_process_init(sid, ioid, pv_req, order);
     server.send_for_channel(sid, init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
@@ -3347,6 +3376,43 @@ mod tests {
     use super::*;
     use crate::pvdata::encode::{decode_pv_field, encode_pv_field};
     use std::io::Cursor;
+
+    /// PVA-RS-2026-05-28-62: the PROCESS INIT frame must carry the
+    /// caller-supplied pvRequest verbatim (after the 9-byte
+    /// `sid + ioid + subcmd` prefix), not a hard-coded `field(value)`
+    /// request. Mirrors pvAccess serializing the stored PROCESS pvRequest
+    /// on INIT (clientContextImpl.cpp:528-536).
+    #[test]
+    fn process_init_embeds_caller_pv_request() {
+        let order = ByteOrder::Little;
+        let sid = 0x11223344u32;
+        let ioid = 0x55667788u32;
+        // A distinctive caller request the value-only default never produces.
+        let pv_req: &[u8] = &[
+            0xFD, 0x09, 0x00, 0x80, 0x01, 0x07, b'r', b'e', b'c', b'o', b'r', b'd', 0x00,
+        ];
+
+        let frame = build_process_init(sid, ioid, pv_req, order);
+        // header (8) + sid (4) + ioid (4) + subcmd (1) = 17-byte prefix.
+        let body = &frame[8..];
+        let mut cur = Cursor::new(body);
+        assert_eq!(cur.get_u32(order).unwrap(), sid);
+        assert_eq!(cur.get_u32(order).unwrap(), ioid);
+        assert_eq!(cur.get_u8().unwrap(), QosFlags::INIT);
+        assert_eq!(
+            &body[9..],
+            pv_req,
+            "PROCESS INIT must contain caller request"
+        );
+
+        // And it must differ from the empty/value-only defaults — i.e. the
+        // request is genuinely caller-controlled, not ignored.
+        let default_frame = build_process_init(sid, ioid, sentinel_all_fields(), order);
+        assert_ne!(frame, default_frame);
+        let value_only = build_pv_request_value_only(false);
+        let value_only_frame = build_process_init(sid, ioid, &value_only, order);
+        assert_ne!(frame, value_only_frame);
+    }
 
     /// Round-trip a built PUT value through encode/decode against its
     /// descriptor — proves the value built by `build_put_value` is

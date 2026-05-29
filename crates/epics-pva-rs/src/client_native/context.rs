@@ -29,8 +29,8 @@ use crate::pvdata::{FieldDesc, PvField};
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
     DEFAULT_PIPELINE_SIZE, MonitorEvent, MonitorEventMask, SubscriptionHandle, op_get, op_monitor,
-    op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle, op_process, op_put,
-    op_put_get, op_rpc,
+    op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle, op_process,
+    op_process_with_request, op_put, op_put_get, op_rpc,
 };
 use super::search_engine::SearchEngine;
 
@@ -1407,9 +1407,25 @@ impl PvaClient {
     /// transferring a value. The wire equivalent of an EPICS
     /// `caput .PROC` / `dbProcess`. Succeeds with `()`; a processing
     /// failure surfaces as a [`PvaError::Protocol`].
+    ///
+    /// Sends the empty default pvRequest, matching EPICS base pvaClient
+    /// `createProcess("")`. Use [`Self::pvprocess_with_request`] to send a
+    /// provider-specific PROCESS request.
     pub async fn pvprocess(&self, pv_name: &str) -> PvaResult<()> {
         let ch = self.channel(pv_name).await?;
         op_process(&ch, self.inner.timeout).await
+    }
+
+    /// Like [`Self::pvprocess`] but sends a caller-supplied PROCESS
+    /// pvRequest (e.g. built via [`Self::request`] →
+    /// [`crate::pv_request::PvRequestExpr::encode`], or
+    /// `record[block=true]`). pvAccess serializes the request on PROCESS
+    /// INIT and the server provider can inspect it during
+    /// `createChannelProcess`. Mirrors pvaClient
+    /// `PvaClientChannel::createProcess(pvRequest)`.
+    pub async fn pvprocess_with_request(&self, pv_name: &str, pv_request: &[u8]) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        op_process_with_request(&ch, pv_request, self.inner.timeout).await
     }
 
     /// Snapshot of the client's current state — channel cache size,

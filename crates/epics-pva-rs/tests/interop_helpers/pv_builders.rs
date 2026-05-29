@@ -224,7 +224,7 @@ fn nt_nd_array_4byte() -> (FieldDesc, PvField) {
         }],
         attribute: vec![NdAttribute {
             name: "ColorMode".into(),
-            value: ScalarValue::Int(0),
+            value: VariantValue::scalar(ScalarValue::Int(0)),
             descriptor: "Mono".into(),
             source: "driver".into(),
             ..NdAttribute::default()

@@ -39,10 +39,18 @@ use super::provider::BridgeProvider;
 
 /// `dbLoadGroup <jsonFilename> [<macros>]` — load a JSON group config
 /// file into the [`BridgeProvider`]. Mirrors pvxs `dbLoadGroup`
-/// (groupsourcehooks.cpp:99). The `macros` argument supports the
-/// pvxs/iocsh `name=value,...` form — `${name}` tokens in the JSON
-/// expand to the supplied value, and any unbound `${X}` falls back
-/// to `std::env::var("X")` so site configs can pull in shell vars.
+/// (groupsourcehooks.cpp:99). The `macros` argument is the pvxs/iocsh
+/// `name=value,...` form, and the JSON text is run through the full
+/// EPICS Base `macLib` engine (`macCore.c` `trans`/`refer`) before the
+/// group parser sees it — `$(NAME)` / `${NAME}` references, defaults
+/// (`$(NAME=default)`), nested references (`${BAR=${FOO}}`), scoped
+/// definitions (`${BAR,BAR=$(FOO)}`), and environment fallback.
+///
+/// pvxs only creates the `MAC_HANDLE` when the macros argument is
+/// non-empty (`groupconfigprocessor.cpp` guards on `macros[0]!='\0'`,
+/// `groupsourcehooks.cpp:153`); with an empty macros argument the JSON
+/// lines are used verbatim and no macro/env expansion happens at all.
+/// We mirror that: an empty `macros` string skips expansion entirely.
 pub fn db_load_group_command(provider: Arc<BridgeProvider>) -> CommandDef {
     CommandDef::new(
         "dbLoadGroup",
@@ -88,12 +96,18 @@ pub fn db_load_group_command(provider: Arc<BridgeProvider>) -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
 
-            let macros = parse_macros(&macros_str);
             let raw = match std::fs::read_to_string(&filename) {
                 Ok(s) => s,
                 Err(e) => return Err(format!("dbLoadGroup '{filename}': {e}")),
             };
-            let expanded = expand_macros(&raw, &macros);
+            // pvxs only builds a MAC_HANDLE (and so only expands macros)
+            // when the macros argument is non-empty; an empty argument
+            // means the JSON is used verbatim.
+            let expanded = if macros_str.is_empty() {
+                raw
+            } else {
+                expand_macros(&raw, &parse_macros(&macros_str))
+            };
             // Track under the raw (filename, macros) identity so a later
             // `dbLoadGroup("-filename", macros)` can remove these groups.
             match provider.load_group_file_tracked(&filename, &macros_str, &expanded) {
@@ -126,37 +140,301 @@ fn parse_macros(s: &str) -> std::collections::HashMap<String, String> {
     out
 }
 
-/// Expand `${NAME}` tokens in `s` against `macros`, falling back to
-/// `std::env::var("NAME")`. Unbound names are left literal so the
-/// downstream JSON parser surfaces them as parse errors.
+/// Expand `$(...)` / `${...}` macro references in `s`, mirroring the C
+/// EPICS Base `macLib` engine (`modules/libcom/src/macLib/macCore.c`
+/// `trans` / `refer` / `lookup`) that pvxs drives through `macDefExpand`
+/// (`groupconfigprocessor.cpp:88-101`). Implemented behaviors:
+///
+///   - `$(NAME)` and `${NAME}` are both references; `\<char>` blocks
+///     detection and copies both bytes verbatim (`trans:740-749`).
+///   - macros are NOT expanded inside single quotes (`trans:722-733`).
+///   - a reference name is itself macro-expanded before lookup, so
+///     `$($(WHICH))` resolves the inner reference first.
+///   - the name terminates at `=`, `,`, or the closing bracket
+///     (`macEnd = "=,)"`): `$(NAME=default)` supplies a default and
+///     `$(NAME,key=val)` introduces scoped macros visible only inside
+///     that reference's expansion.
+///   - lookup order is scoped frames (innermost first), then the
+///     supplied `macros`, then the process environment (pvxs creates
+///     the handle with the `{"","environ"}` pair —
+///     `groupsourcehooks.cpp:154`, `lookup`+`FLAG_USE_ENVIRONMENT`).
+///   - a resolved (macro or env) value is re-scanned for further
+///     references (chained expansion); a self-referential macro emits
+///     its value once without recursing (`refentry->visited`).
+///   - an undefined name with no default emits the `macLib` placeholder
+///     `$(name,undefined)` (`refer:errval`), which the JSON parser then
+///     rejects rather than silently producing wrong output.
 fn expand_macros(s: &str, macros: &std::collections::HashMap<String, String>) -> String {
-    let bytes = s.as_bytes();
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
+    mac_trans(&chars, macros, &mut Vec::new(), &mut Vec::new(), &mut out);
+    out
+}
+
+/// Translate `chars` into `out`, expanding macro references.
+///
+/// `scopes` is the stack of scoped-macro frames pushed by enclosing
+/// `$(name,key=val)` references; lookup walks it innermost-first, then
+/// `macros`, then the environment. `visiting` is the stack of macro
+/// names currently being expanded — it guards a self-referential macro
+/// (`A=$(A)`) against infinite recursion, mirroring C `macCore.c`'s
+/// per-entry `visited` flag.
+fn mac_trans(
+    chars: &[char],
+    macros: &std::collections::HashMap<String, String>,
+    scopes: &mut Vec<std::collections::HashMap<String, String>>,
+    visiting: &mut Vec<String>,
+    out: &mut String,
+) {
+    let mut quote: Option<char> = None;
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$'
-            && i + 1 < bytes.len()
-            && bytes[i + 1] == b'{'
-            && let Some(end) = s[i + 2..].find('}')
-        {
-            let name = &s[i + 2..i + 2 + end];
-            if let Some(v) = macros.get(name) {
-                out.push_str(v);
-            } else if let Ok(v) = std::env::var(name) {
-                out.push_str(&v);
-            } else {
-                // Leave the token literal so the JSON parser
-                // errors on the unbound macro instead of silently
-                // producing wrong output.
-                out.push_str(&s[i..i + 3 + end]);
+    while i < chars.len() {
+        let c = chars[i];
+
+        // Track single/double quote state (C `trans` `quote` var).
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
             }
-            i += 3 + end;
+        } else if c == '"' || c == '\'' {
+            quote = Some(c);
+        }
+
+        // `\<char>`: emit both verbatim, skip macro detection.
+        if c == '\\' && i + 1 < chars.len() {
+            out.push('\\');
+            out.push(chars[i + 1]);
+            i += 2;
             continue;
         }
-        out.push(bytes[i] as char);
+
+        // Macro reference: `$` followed by `(` or `{`, NOT inside single
+        // quotes (C `macRef && quote != '\''`).
+        let mac_ref =
+            c == '$' && i + 1 < chars.len() && (chars[i + 1] == '(' || chars[i + 1] == '{');
+        if mac_ref && quote != Some('\'') {
+            if let Some(next) = mac_refer(chars, i, macros, scopes, visiting, out) {
+                i = next;
+                continue;
+            }
+        }
+
+        out.push(c);
         i += 1;
     }
-    out
+}
+
+/// Expand one macro reference starting at `chars[start]` (`$`). Returns
+/// the index just past the closing bracket, or `None` if the reference
+/// is unterminated (caller then copies `$` raw).
+fn mac_refer(
+    chars: &[char],
+    start: usize,
+    macros: &std::collections::HashMap<String, String>,
+    scopes: &mut Vec<std::collections::HashMap<String, String>>,
+    visiting: &mut Vec<String>,
+    out: &mut String,
+) -> Option<usize> {
+    let close = if chars[start + 1] == '(' { ')' } else { '}' };
+    // Find the matching close bracket, honoring nested `$(`/`${`.
+    let body_start = start + 2;
+    let mut depth = 1usize;
+    let mut j = body_start;
+    while j < chars.len() && depth > 0 {
+        if j + 1 < chars.len() && chars[j] == '$' && (chars[j + 1] == '(' || chars[j + 1] == '{') {
+            depth += 1;
+            j += 2;
+            continue;
+        }
+        if depth == 1 && chars[j] == close || depth > 1 && (chars[j] == ')' || chars[j] == '}') {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+        }
+        j += 1;
+    }
+    if depth != 0 {
+        return None; // unterminated — caller emits '$' literally
+    }
+    let body = &chars[body_start..j];
+    let after = j + 1;
+
+    // Split the body at the first top-level `=` or `,` (the C `macEnd`
+    // terminator set). Nested `$(...)` brackets are skipped so a `=`/`,`
+    // inside an inner reference does not terminate.
+    let (name_chars, rest) = match mac_top_level_terminator(body) {
+        Some(k) => (&body[..k], &body[k..]),
+        None => (body, &body[body.len()..]),
+    };
+
+    // the name itself may contain macro references — expand it.
+    let mut name = String::new();
+    mac_trans(name_chars, macros, scopes, visiting, &mut name);
+
+    // Default value (`=...`) and scoped definitions (`,k=v`).
+    let mut default: Option<&[char]> = None;
+    let mut scoped: Vec<(String, String)> = Vec::new();
+    if let Some(first) = rest.first() {
+        if *first == '=' {
+            let dflt = &rest[1..];
+            match mac_top_level_comma(dflt) {
+                Some(k) => {
+                    default = Some(&dflt[..k]);
+                    mac_parse_scoped(&dflt[k..], macros, scopes, visiting, &mut scoped);
+                }
+                None => default = Some(dflt),
+            }
+        } else if *first == ',' {
+            mac_parse_scoped(rest, macros, scopes, visiting, &mut scoped);
+        }
+    }
+
+    // Push the scoped frame (visible only inside this expansion).
+    let mut frame: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (k, v) in scoped {
+        frame.insert(k, v);
+    }
+    scopes.push(frame);
+
+    // Look up: innermost scope first, then base macros, then the
+    // environment (pvxs's `{"","environ"}` handle / FLAG_USE_ENVIRONMENT).
+    let resolved = scopes
+        .iter()
+        .rev()
+        .find_map(|s| s.get(&name).cloned())
+        .or_else(|| macros.get(&name).cloned())
+        .or_else(|| {
+            if name.is_empty() {
+                None
+            } else {
+                std::env::var(&name).ok()
+            }
+        });
+
+    match resolved {
+        Some(val) => {
+            if visiting.contains(&name) {
+                // Recursive reference (C `refentry->visited`): emit the
+                // resolved value once WITHOUT re-expansion to break the
+                // cycle, rather than recursing forever.
+                out.push_str(&val);
+            } else {
+                visiting.push(name.clone());
+                let val_chars: Vec<char> = val.chars().collect();
+                mac_trans(&val_chars, macros, scopes, visiting, out);
+                visiting.pop();
+            }
+        }
+        None => match default {
+            Some(def_chars) => {
+                // Strip a single layer of surrounding quotes from the
+                // default (`$(NAME="value")` → value).
+                let def = mac_strip_outer_quotes(def_chars);
+                mac_trans(def, macros, scopes, visiting, out);
+            }
+            None => {
+                // Undefined macro placeholder (C `refer` `errval`).
+                out.push_str("$(");
+                out.push_str(&name);
+                out.push_str(",undefined)");
+            }
+        },
+    }
+
+    scopes.pop();
+    Some(after)
+}
+
+/// Parse a `,key=val,key2=val2,...` scoped-definition tail. A bare
+/// `,key` with no `=` defines nothing (C silently skips it).
+fn mac_parse_scoped(
+    rest: &[char],
+    macros: &std::collections::HashMap<String, String>,
+    scopes: &mut Vec<std::collections::HashMap<String, String>>,
+    visiting: &mut Vec<String>,
+    out: &mut Vec<(String, String)>,
+) {
+    let mut k = 0;
+    while k < rest.len() {
+        if rest[k] != ',' {
+            break;
+        }
+        k += 1; // step over ','
+        let seg = &rest[k..];
+        let (name_part, tail) = match mac_top_level_terminator(seg) {
+            Some(t) => (&seg[..t], &seg[t..]),
+            None => (seg, &seg[seg.len()..]),
+        };
+        let mut sname = String::new();
+        mac_trans(name_part, macros, scopes, visiting, &mut sname);
+        k += name_part.len();
+        if let Some('=') = tail.first() {
+            let valseg = &tail[1..];
+            let (val_part, _) = match mac_top_level_comma(valseg) {
+                Some(t) => (&valseg[..t], &valseg[t..]),
+                None => (valseg, &valseg[valseg.len()..]),
+            };
+            let mut sval = String::new();
+            mac_trans(val_part, macros, scopes, visiting, &mut sval);
+            out.push((sname, sval));
+            k += 1 + val_part.len();
+        }
+        // else: bare `,name` — no value, defines nothing.
+    }
+}
+
+/// Index of the first top-level `=` or `,` in `body`, skipping any
+/// nested `$(...)` / `${...}` reference.
+fn mac_top_level_terminator(body: &[char]) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < body.len() {
+        let c = body[i];
+        if c == '$' && i + 1 < body.len() && (body[i + 1] == '(' || body[i + 1] == '{') {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if (c == ')' || c == '}') && depth > 0 {
+            depth -= 1;
+        } else if depth == 0 && (c == '=' || c == ',') {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index of the first top-level `,` in `body` (splits a default value
+/// from trailing scoped definitions).
+fn mac_top_level_comma(body: &[char]) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < body.len() {
+        let c = body[i];
+        if c == '$' && i + 1 < body.len() && (body[i + 1] == '(' || body[i + 1] == '{') {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if (c == ')' || c == '}') && depth > 0 {
+            depth -= 1;
+        } else if depth == 0 && c == ',' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Strip one layer of matching surrounding double quotes from a slice.
+fn mac_strip_outer_quotes(s: &[char]) -> &[char] {
+    if s.len() >= 2 && s[0] == '"' && s[s.len() - 1] == '"' {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// `processGroups` — finalize group config after `dbLoadGroup` calls
@@ -248,6 +526,179 @@ pub fn qsrv_stats_command(provider: Arc<BridgeProvider>) -> CommandDef {
     )
 }
 
+/// `pvxsl [<detail>]` — list the single-record source PV names served
+/// by QSRV. Mirrors pvxs `pvxsl` (`singlesourcehooks.cpp:33-65`,
+/// registered at `:162-166`): `detail=0` prints just the PV names, one
+/// per line; a non-zero `detail` prints a source header followed by an
+/// indented record list. The Rust single-record source is the
+/// `BridgeProvider` database (records + aliases), excluding group PVs
+/// (those are listed by `pvxgl`).
+pub fn pvxsl_command(provider: Arc<BridgeProvider>) -> CommandDef {
+    CommandDef::new(
+        "pvxsl",
+        vec![ArgDesc {
+            name: "detail",
+            arg_type: ArgType::Int,
+            optional: true,
+        }],
+        "pvxsl [<detail>]",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let detail = match args.first() {
+                Some(ArgValue::Int(n)) => *n,
+                _ => 0,
+            };
+            let db = provider.database().clone();
+            let mut names = ctx.block_on(async {
+                let mut n = db.all_record_names().await;
+                n.extend(db.all_alias_names().await);
+                n
+            });
+            names.sort();
+            names.dedup();
+            // pvxs prints the SOURCE header only when the source has at
+            // least one name (`list.names && !list.names->empty()`).
+            if detail != 0 && !names.is_empty() {
+                ctx.println("------------------");
+                ctx.println("SOURCE: qsrv single records");
+                ctx.println("------------------");
+                ctx.println("RECORDS: ");
+            }
+            for n in names {
+                if detail != 0 {
+                    ctx.println(&format!("  {n}"));
+                } else {
+                    ctx.println(&n);
+                }
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `pvxgl [<level>] [<pattern>]` — list QSRV group PV names, optionally
+/// filtered by a glob `pattern` and, when `level > 0`, with group
+/// detail. Mirrors pvxs `pvxsgl` (`groupsourcehooks.cpp:50-83`,
+/// registered at `:233-240`) and `Group::show` (`group.cpp`): an empty
+/// pattern matches every group; `level > 0` prints the atomic flag and
+/// member count; `level > 1` prints one line per member.
+pub fn pvxgl_command(provider: Arc<BridgeProvider>) -> CommandDef {
+    CommandDef::new(
+        "pvxgl",
+        vec![
+            ArgDesc {
+                name: "level",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "pattern",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+        ],
+        "pvxgl [<level>] [<pattern>]",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let level = match args.first() {
+                Some(ArgValue::Int(n)) => *n,
+                _ => 0,
+            };
+            let pattern = match args.get(1) {
+                Some(ArgValue::String(s)) => s.as_str(),
+                _ => "",
+            };
+            let groups = provider.groups();
+            let mut names: Vec<&String> = groups.keys().collect();
+            names.sort();
+            for name in names {
+                // empty pattern matches everything (pvxs `!pattern[0]`).
+                if !pattern.is_empty() && !glob_match(name, pattern) {
+                    continue;
+                }
+                ctx.println(name);
+                if level > 0 {
+                    let def = &groups[name];
+                    // pvxs `Group::show`: atomic flag + member count.
+                    ctx.println(&format!(
+                        "  Atomic Get/Put:{} Atomic Members:{}",
+                        if def.atomic { "yes" } else { "no" },
+                        def.members.len()
+                    ));
+                    if level > 1 {
+                        for m in &def.members {
+                            // "  grp.fld <mapping> id=foo chan=pv chan ..."
+                            let id = m
+                                .struct_id
+                                .as_ref()
+                                .map(|s| format!(" id={s}"))
+                                .unwrap_or_default();
+                            let chan = if m.channel.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" chan={}", m.channel)
+                            };
+                            let trig =
+                                if matches!(m.triggers, super::group_config::TriggerDef::None) {
+                                    ""
+                                } else {
+                                    " has triggers"
+                                };
+                            ctx.println(&format!(
+                                "  {}\t<{:?}>{id}{chan}{trig}",
+                                m.field_name, m.mapping
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Port of EPICS Base `epicsStrGlobMatch` (`misc/epicsString.c`):
+/// `*` matches any run of characters, `?` matches exactly one, all
+/// other characters are literal. Used by `pvxgl` to filter group names,
+/// matching pvxs `epicsStrGlobMatch(groupName, pattern)`.
+fn glob_match(s: &str, pattern: &str) -> bool {
+    let text: Vec<char> = s.chars().collect();
+    let pat: Vec<char> = pattern.chars().collect();
+    let mut i = 0usize; // index into text
+    let mut p = 0usize; // index into pattern
+    let mut mp: Option<usize> = None; // pattern resume pos after a '*'
+    let mut cp = 0usize; // text resume pos for that '*'
+
+    while i < text.len() && p < pat.len() && pat[p] != '*' {
+        if pat[p] != text[i] && pat[p] != '?' {
+            return false;
+        }
+        p += 1;
+        i += 1;
+    }
+    while i < text.len() {
+        if p < pat.len() && pat[p] == '*' {
+            p += 1;
+            if p >= pat.len() {
+                return true;
+            }
+            mp = Some(p);
+            cp = i + 1;
+        } else if p < pat.len() && (pat[p] == text[i] || pat[p] == '?') {
+            p += 1;
+            i += 1;
+        } else if let Some(m) = mp {
+            p = m;
+            i = cp;
+            cp += 1;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == '*' {
+        p += 1;
+    }
+    p >= pat.len()
+}
+
 /// `resetGroups` — clear the group-PV registry. Mirrors pvxs
 /// `resetGroups` (groupsourcehooks.cpp:222). Used between IOC reload
 /// cycles in tests.
@@ -265,14 +716,17 @@ pub fn reset_groups_command(provider: Arc<BridgeProvider>) -> CommandDef {
 }
 
 /// Convenience: build the full QSRV iocsh command set (`dbLoadGroup`,
-/// `processGroups`, `qsrvStats`, `resetGroups`) bound to `provider`.
-/// Drop the returned vector into
+/// `processGroups`, `qsrvStats`, the pvxs-compatible `pvxsl` / `pvxgl`
+/// list diagnostics, and `resetGroups`) bound to `provider`. Drop the
+/// returned vector into
 /// [`epics_base_rs::server::ioc_app::IocRunConfig::shell_commands`].
 pub fn register_qsrv_commands(provider: Arc<BridgeProvider>) -> Vec<CommandDef> {
     vec![
         db_load_group_command(provider.clone()),
         process_groups_command(provider.clone()),
         qsrv_stats_command(provider.clone()),
+        pvxsl_command(provider.clone()),
+        pvxgl_command(provider.clone()),
         reset_groups_command(provider),
     ]
 }
@@ -308,16 +762,33 @@ mod tests {
     }
 
     #[test]
-    fn register_qsrv_commands_returns_four() {
+    fn register_qsrv_commands_includes_pvxs_list_commands() {
         let db = Arc::new(PvDatabase::new());
         let provider = Arc::new(BridgeProvider::new(db));
         let cmds = register_qsrv_commands(provider);
-        assert_eq!(cmds.len(), 4);
+        assert_eq!(cmds.len(), 6);
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"dbLoadGroup"));
         assert!(names.contains(&"processGroups"));
         assert!(names.contains(&"qsrvStats"));
+        // pvxs-compatible list diagnostics.
+        assert!(names.contains(&"pvxsl"));
+        assert!(names.contains(&"pvxgl"));
         assert!(names.contains(&"resetGroups"));
+    }
+
+    #[test]
+    fn glob_match_star_question_literal() {
+        // EPICS `epicsStrGlobMatch` semantics.
+        assert!(glob_match("TEST:grp", "TEST:*"));
+        assert!(glob_match("TEST:grp", "*grp"));
+        assert!(glob_match("TEST:grp", "TEST:gr?"));
+        assert!(glob_match("TEST:grp", "*"));
+        assert!(glob_match("abc", "a*c"));
+        assert!(!glob_match("TEST:grp", "OTHER:*"));
+        assert!(!glob_match("TEST:grp", "TEST:gr"));
+        assert!(!glob_match("abc", "a?"));
+        assert!(glob_match("", "*"));
     }
 
     #[test]
@@ -325,15 +796,67 @@ mod tests {
         let mut m = std::collections::HashMap::new();
         m.insert("PVNAME".to_string(), "TEST:val".to_string());
         m.insert("UNIT".to_string(), "deg".to_string());
-        let s = expand_macros(r#"{"+id": "${PVNAME}_${UNIT}", "+atomic": false}"#, &m);
+        // both `${...}` and `$(...)` forms resolve (macLib `macEnd`).
+        let s = expand_macros(r#"{"+id": "${PVNAME}_$(UNIT)", "+atomic": false}"#, &m);
         assert_eq!(s, r#"{"+id": "TEST:val_deg", "+atomic": false}"#);
     }
 
     #[test]
-    fn macro_unbound_left_literal() {
+    fn macro_unbound_emits_maclib_placeholder() {
+        // macLib (`macCore.c` `refer`) replaces an undefined macro with
+        // the `$(name,undefined)` marker so the JSON parser then errors,
+        // rather than leaving the raw `${name}` token.
         let m = std::collections::HashMap::new();
-        let s = expand_macros("${MISSING}", &m);
-        assert_eq!(s, "${MISSING}");
+        let s = expand_macros("${THIS_MACRO_IS_NOT_SET_ANYWHERE}", &m);
+        assert_eq!(s, "$(THIS_MACRO_IS_NOT_SET_ANYWHERE,undefined)");
+    }
+
+    #[test]
+    fn macro_default_value() {
+        // `$(NAME=default)` / `${NAME=default}` supply a fallback used
+        // when the macro is otherwise undefined (macLib default arm).
+        let m = std::collections::HashMap::new();
+        assert_eq!(expand_macros("${P=DEFAULT}", &m), "DEFAULT");
+        let mut m2 = std::collections::HashMap::new();
+        m2.insert("P".to_string(), "SET".to_string());
+        assert_eq!(expand_macros("$(P=DEFAULT)", &m2), "SET");
+    }
+
+    #[test]
+    fn macro_nested_reference() {
+        // `${BAR=${FOO}}`: the default is itself macro-expanded
+        // (macLib `macDefExpandTest.c:193-218`).
+        let mut m = std::collections::HashMap::new();
+        m.insert("FOO".to_string(), "fromfoo".to_string());
+        assert_eq!(expand_macros("${BAR=${FOO}}", &m), "fromfoo");
+    }
+
+    #[test]
+    fn macro_scoped_definition() {
+        // `${BAR,BAR=$(FOO)}`: a scoped definition assigns BAR for the
+        // duration of this reference's expansion.
+        let mut m = std::collections::HashMap::new();
+        m.insert("FOO".to_string(), "scopedval".to_string());
+        assert_eq!(expand_macros("${BAR,BAR=$(FOO)}", &m), "scopedval");
+    }
+
+    #[test]
+    fn macro_chained_reexpansion() {
+        // a resolved value is re-scanned for further references.
+        let mut m = std::collections::HashMap::new();
+        m.insert("A".to_string(), "$(B)".to_string());
+        m.insert("B".to_string(), "deep".to_string());
+        assert_eq!(expand_macros("$(A)", &m), "deep");
+    }
+
+    #[test]
+    fn macro_self_reference_terminates() {
+        // `A=$(A)` must not recurse forever (macLib `visited`).
+        let mut m = std::collections::HashMap::new();
+        m.insert("A".to_string(), "$(A)".to_string());
+        // emits the resolved value once; the inner self-ref is emitted
+        // raw (not re-expanded) so it cannot loop.
+        assert_eq!(expand_macros("$(A)", &m), "$(A)");
     }
 
     #[test]

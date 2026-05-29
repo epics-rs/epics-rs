@@ -1110,3 +1110,146 @@ async fn br76_any_member_is_variant_descriptor_value_and_put() {
         other => panic!("scalar any member must be a Variant after put, got {other:?}"),
     }
 }
+
+/// A group member whose field path uses `[N]` index notation
+/// (`a[0].x`) must build a PVA `StructureArray`, not a plain nested
+/// structure. pvxs wraps each indexed path component in `StructA(...)`
+/// when assembling the group type (groupconfigprocessor.cpp:1005-1035)
+/// and lands the runtime value in element `[N]` of that structure array
+/// (groupsource.cpp:414-425). Before the fix the value/descriptor
+/// builders ignored `comp.index` and produced a plain `Structure`, so
+/// the `[N]` notation in the config was silently dropped.
+///
+/// Homogeneous case: `a[0].x` and `a[1].x` share one element schema.
+#[tokio::test]
+async fn br52_indexed_member_builds_homogeneous_structure_array() {
+    use epics_pva_rs::pvdata::FieldDesc;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("B52:r0", Box::new(AiRecord::new(10.0)))
+        .await
+        .unwrap();
+    db.add_record("B52:r1", Box::new(AiRecord::new(20.0)))
+        .await
+        .unwrap();
+
+    let json = r#"{
+        "B52:grp": {
+            "+atomic": true,
+            "a[0].x": { "+channel": "B52:r0.VAL", "+type": "plain" },
+            "a[1].x": { "+channel": "B52:r1.VAL", "+type": "plain" }
+        }
+    }"#;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(json).expect("load");
+    let def = provider
+        .groups()
+        .get("B52:grp")
+        .cloned()
+        .expect("registered");
+    let ch = GroupChannel::new(db, def);
+
+    // Descriptor: `a` is a StructureArray whose element carries `x`.
+    let desc = ch.get_field().await.expect("get_field");
+    let root = match &desc {
+        FieldDesc::Structure { fields, .. } => fields,
+        other => panic!("group descriptor must be a structure, got {other:?}"),
+    };
+    match root.iter().find(|(n, _)| n == "a").map(|(_, d)| d) {
+        Some(FieldDesc::StructureArray { fields, .. }) => {
+            assert_eq!(
+                fields.len(),
+                1,
+                "homogeneous element schema must hold exactly the shared `x` field"
+            );
+            assert_eq!(fields[0].0, "x");
+        }
+        other => panic!("`a[N].x` must advertise a StructureArray descriptor, got {other:?}"),
+    }
+
+    // Value: `a` is a StructureArray with element [0].x=10, [1].x=20.
+    let val = ch.get(&empty_request()).await.expect("get");
+    match find_field(&val, "a") {
+        Some(PvField::StructureArray(items)) => {
+            assert_eq!(items.len(), 2, "two indexed members → two array elements");
+            assert_eq!(
+                extract_double(items[0].as_ref().expect("a[0]"), "x"),
+                Some(10.0)
+            );
+            assert_eq!(
+                extract_double(items[1].as_ref().expect("a[1]"), "x"),
+                Some(20.0)
+            );
+        }
+        other => panic!("`a[N].x` value must be a StructureArray, got {other:?}"),
+    }
+}
+
+/// Heterogeneous case: `a[0].x` and `a[1].y` differ in their leaf
+/// field. The element descriptor is the union of both leaves (`x`,
+/// `y`); each value element carries only its own field, and the wire
+/// encoder fills the absent sibling with a default
+/// (encode.rs `encode_pv_field`). This confirms the StructureArray
+/// builder accumulates a shared element schema across indices.
+#[tokio::test]
+async fn br52_indexed_member_builds_heterogeneous_structure_array() {
+    use epics_pva_rs::pvdata::FieldDesc;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("B52:hx", Box::new(AiRecord::new(3.0)))
+        .await
+        .unwrap();
+    db.add_record("B52:hy", Box::new(AiRecord::new(4.0)))
+        .await
+        .unwrap();
+
+    let json = r#"{
+        "B52:hgrp": {
+            "+atomic": true,
+            "a[0].x": { "+channel": "B52:hx.VAL", "+type": "plain" },
+            "a[1].y": { "+channel": "B52:hy.VAL", "+type": "plain" }
+        }
+    }"#;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(json).expect("load");
+    let def = provider
+        .groups()
+        .get("B52:hgrp")
+        .cloned()
+        .expect("registered");
+    let ch = GroupChannel::new(db, def);
+
+    // Descriptor element schema is the union {x, y}.
+    let desc = ch.get_field().await.expect("get_field");
+    let root = match &desc {
+        FieldDesc::Structure { fields, .. } => fields,
+        other => panic!("group descriptor must be a structure, got {other:?}"),
+    };
+    match root.iter().find(|(n, _)| n == "a").map(|(_, d)| d) {
+        Some(FieldDesc::StructureArray { fields, .. }) => {
+            let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+            assert!(
+                names.contains(&"x") && names.contains(&"y"),
+                "heterogeneous element schema must union both leaves, got {names:?}"
+            );
+        }
+        other => panic!("`a[N]` must advertise a StructureArray descriptor, got {other:?}"),
+    }
+
+    // Each value element carries only its own configured leaf.
+    let val = ch.get(&empty_request()).await.expect("get");
+    match find_field(&val, "a") {
+        Some(PvField::StructureArray(items)) => {
+            assert_eq!(items.len(), 2);
+            assert_eq!(
+                extract_double(items[0].as_ref().expect("a[0]"), "x"),
+                Some(3.0)
+            );
+            assert_eq!(
+                extract_double(items[1].as_ref().expect("a[1]"), "y"),
+                Some(4.0)
+            );
+        }
+        other => panic!("`a[N]` value must be a StructureArray, got {other:?}"),
+    }
+}

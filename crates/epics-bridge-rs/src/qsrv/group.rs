@@ -305,12 +305,35 @@ fn set_nested_field_recursive(
         return;
     }
 
-    // Navigate/create the intermediate structure
-    let sub = get_or_create_struct_field(pv, &comp.name);
+    // An indexed component (`field[N]…`) addresses a StructureArray
+    // element, not a plain sub-structure. pvxs builds the group type
+    // leaf-to-root and wraps indexed components with `StructA(...)`
+    // (groupconfigprocessor.cpp:1005-1035); the runtime value then lands
+    // in element `[N]` of that structure array (groupsource.cpp:414-425).
+    if let Some(idx) = comp.index {
+        let arr = get_or_create_struct_array_field(pv, &comp.name);
+        let i = idx as usize;
+        if arr.len() <= i {
+            arr.resize_with(i + 1, || None);
+        }
+        if components.len() == 1 {
+            // Terminal indexed component: the element itself is the value.
+            // Only a Structure can inhabit a StructureArray element; group
+            // configs always recurse into a child field after the index,
+            // so a scalar terminal index has no representation and is
+            // dropped.
+            if let PvField::Structure(s) = value {
+                arr[i] = Some(s);
+            }
+            return;
+        }
+        let element = arr[i].get_or_insert_with(|| PvStructure::new(""));
+        set_nested_field_recursive(element, &components[1..], value);
+        return;
+    }
 
-    // If this component has an array index, we don't currently support
-    // structure arrays in PvField. Skip the index and navigate as if
-    // it were a plain structure (matches current epics-rs PvField limitation).
+    // Plain (non-indexed) intermediate: navigate/create a sub-structure.
+    let sub = get_or_create_struct_field(pv, &comp.name);
     set_nested_field_recursive(sub, &components[1..], value);
 }
 
@@ -332,6 +355,36 @@ fn get_or_create_struct_field<'a>(pv: &'a mut PvStructure, name: &str) -> &'a mu
             .push((name.to_string(), PvField::Structure(PvStructure::new(""))));
         if let PvField::Structure(ref mut s) = pv.fields.last_mut().unwrap().1 {
             s
+        } else {
+            unreachable!()
+        }
+    }
+}
+
+/// Find or create a named `StructureArray` field within `pv`, returning
+/// its element vector. A field that exists but is not already a
+/// `StructureArray` (e.g. a plain Structure built before an indexed
+/// component was seen) is replaced — the configured `[N]` notation is
+/// authoritative for the field's shape.
+fn get_or_create_struct_array_field<'a>(
+    pv: &'a mut PvStructure,
+    name: &str,
+) -> &'a mut Vec<Option<PvStructure>> {
+    let pos = pv.fields.iter().position(|(n, _)| n == name);
+    if let Some(pos) = pos {
+        if !matches!(pv.fields[pos].1, PvField::StructureArray(_)) {
+            pv.fields[pos].1 = PvField::StructureArray(Vec::new());
+        }
+        if let PvField::StructureArray(ref mut v) = pv.fields[pos].1 {
+            v
+        } else {
+            unreachable!()
+        }
+    } else {
+        pv.fields
+            .push((name.to_string(), PvField::StructureArray(Vec::new())));
+        if let PvField::StructureArray(ref mut v) = pv.fields.last_mut().unwrap().1 {
+            v
         } else {
             unreachable!()
         }
@@ -400,6 +453,36 @@ fn set_nested_field_desc_recursive(
         return;
     }
 
+    // Indexed component → StructureArray descriptor (pvxs `StructA`,
+    // groupconfigprocessor.cpp:1005-1035), symmetric with the value
+    // builder. Members at different indices of the same array share one
+    // element schema, so their leaf descriptors accumulate into the same
+    // element field list.
+    if comp.index.is_some() {
+        if components.len() == 1 {
+            // Terminal indexed component: a Structure leaf supplies the
+            // element schema directly; any other leaf yields an empty
+            // element type.
+            let (struct_id, elem_fields) = match leaf {
+                FieldDesc::Structure { struct_id, fields } => (struct_id, fields),
+                _ => (String::new(), Vec::new()),
+            };
+            let sa = FieldDesc::StructureArray {
+                struct_id,
+                fields: elem_fields,
+            };
+            if let Some(pos) = fields.iter().position(|(n, _)| n == &comp.name) {
+                fields[pos].1 = sa;
+            } else {
+                fields.push((comp.name.clone(), sa));
+            }
+            return;
+        }
+        let elem_fields = get_or_create_struct_array_desc(fields, &comp.name);
+        set_nested_field_desc_recursive(elem_fields, &components[1..], leaf);
+        return;
+    }
+
     // Find or create the intermediate structure descriptor
     let sub_fields: &mut Vec<(String, FieldDesc)> =
         if let Some(pos) = fields.iter().position(|(n, _)| n == &comp.name) {
@@ -433,6 +516,42 @@ fn set_nested_field_desc_recursive(
         };
 
     set_nested_field_desc_recursive(sub_fields, &components[1..], leaf);
+}
+
+/// Find or create a named `StructureArray` descriptor within `fields`,
+/// returning its element field list. Symmetric with
+/// [`get_or_create_struct_array_field`] on the value side; a field that
+/// exists but is not a `StructureArray` is replaced.
+fn get_or_create_struct_array_desc<'a>(
+    fields: &'a mut Vec<(String, FieldDesc)>,
+    name: &str,
+) -> &'a mut Vec<(String, FieldDesc)> {
+    if let Some(pos) = fields.iter().position(|(n, _)| n == name) {
+        if !matches!(fields[pos].1, FieldDesc::StructureArray { .. }) {
+            fields[pos].1 = FieldDesc::StructureArray {
+                struct_id: String::new(),
+                fields: Vec::new(),
+            };
+        }
+        if let FieldDesc::StructureArray { fields: f, .. } = &mut fields[pos].1 {
+            f
+        } else {
+            unreachable!()
+        }
+    } else {
+        fields.push((
+            name.to_string(),
+            FieldDesc::StructureArray {
+                struct_id: String::new(),
+                fields: Vec::new(),
+            },
+        ));
+        if let FieldDesc::StructureArray { fields: f, .. } = &mut fields.last_mut().unwrap().1 {
+            f
+        } else {
+            unreachable!()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

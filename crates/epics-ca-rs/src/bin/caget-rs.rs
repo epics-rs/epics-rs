@@ -1,12 +1,59 @@
 use chrono::{DateTime, Local};
-use clap::Parser;
-use epics_base_rs::server::snapshot::DbrClass;
-use epics_ca_rs::CaError;
+use clap::{CommandFactory, FromArgMatches, Parser};
+use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
+use epics_base_rs::types::DBR_CLASS_NAME;
 use epics_ca_rs::cli::{
     FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value,
 };
 use epics_ca_rs::client::{CaClient, enum_string_readback_dbr, float_as_string_readback_dbr};
+use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
+
+/// C `caget` output format (`caget.c:45`, `typedef enum { plain, terse,
+/// all, specifiedDbr }`). The request DBR type and the output format are
+/// independent: only `specifiedDbr` carries the `-d` type to the wire;
+/// every other format requests the native TIME-derived type and prints
+/// the value through the ordinary formatter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OutputMode {
+    Plain,
+    Terse,
+    All,
+    SpecifiedDbr,
+}
+
+/// C `caget.c:369-375` `complainIfNotPlainAndSet`: `-t`, `-a`, `-d` are
+/// mutually exclusive output formats applied in command-line order — the
+/// second one warns and the later option wins. clap collapses the three
+/// into independent fields, so the order is recovered from the parsed
+/// argument indices.
+fn resolve_output_mode(matches: &clap::ArgMatches) -> OutputMode {
+    use clap::parser::ValueSource;
+    // `index_of` returns a bogus index for an arg left at its default,
+    // so only an option actually supplied on the command line counts —
+    // gate on `ValueSource::CommandLine`, then use its index for order.
+    let mut opts: Vec<(usize, OutputMode)> = Vec::new();
+    for (id, m) in [
+        ("terse", OutputMode::Terse),
+        ("wide", OutputMode::All),
+        ("dbr_type", OutputMode::SpecifiedDbr),
+    ] {
+        if matches.value_source(id) == Some(ValueSource::CommandLine)
+            && let Some(i) = matches.index_of(id)
+        {
+            opts.push((i, m));
+        }
+    }
+    opts.sort_by_key(|&(i, _)| i);
+    let mut format = OutputMode::Plain;
+    for (_, requested) in opts {
+        if format != OutputMode::Plain {
+            eprintln!("Options t,d,a are mutually exclusive. ('caget -h' for help.)");
+        }
+        format = requested;
+    }
+    format
+}
 
 // C `caget -V` prints a blank line then
 //   "EPICS Version EPICS 7.0.10.1-DEV, CA Protocol version 4.13"
@@ -166,10 +213,19 @@ impl Args {
 /// the DBR_TIME variant produced by `-a` so the print loop can lift
 /// the real server timestamp + alarm pair onto the wire.
 enum GetResult {
-    Plain(epics_ca_rs::EpicsValue),
+    Plain(EpicsValue),
     // Boxed to keep the enum variants size-balanced after Snapshot
     // gained a class_name: Option<String> field for DBR_CLASS_NAME.
-    Time(Box<epics_base_rs::server::snapshot::Snapshot>),
+    Time(Box<Snapshot>),
+    /// `caget.c:298-340` specifiedDbr: the full snapshot for the `-d`
+    /// type plus the channel's native field type, so the report can
+    /// print native/request type, class name or element-count/value, and
+    /// the extended metadata block.
+    Specified {
+        native: Option<DbFieldType>,
+        req_type: u16,
+        snap: Box<Snapshot>,
+    },
 }
 
 fn format_server_timestamp(ts: SystemTime) -> String {
@@ -215,9 +271,240 @@ fn stat_to_str(stat: u16) -> &'static str {
     }
 }
 
+/// C `dbf_type_to_text`: native field type → `DBF_*` mnemonic.
+fn dbf_text(t: DbFieldType) -> &'static str {
+    match t {
+        DbFieldType::String => "DBF_STRING",
+        DbFieldType::Short => "DBF_SHORT",
+        DbFieldType::Float => "DBF_FLOAT",
+        DbFieldType::Enum => "DBF_ENUM",
+        DbFieldType::Char => "DBF_CHAR",
+        DbFieldType::Long => "DBF_LONG",
+        DbFieldType::Double => "DBF_DOUBLE",
+        DbFieldType::Int64 => "DBF_INT64",
+        DbFieldType::UInt64 => "DBF_UINT64",
+    }
+}
+
+/// C `dbr_type_to_text`: DBR type code (0..=38) → `DBR_*` mnemonic
+/// (db_access.c `dbr_text[]`). Out-of-range codes mirror C's
+/// `"DBR_invalid"`.
+fn dbr_text(code: u16) -> &'static str {
+    const NAMES: [&str; 39] = [
+        "DBR_STRING",
+        "DBR_SHORT",
+        "DBR_FLOAT",
+        "DBR_ENUM",
+        "DBR_CHAR",
+        "DBR_LONG",
+        "DBR_DOUBLE",
+        "DBR_STS_STRING",
+        "DBR_STS_SHORT",
+        "DBR_STS_FLOAT",
+        "DBR_STS_ENUM",
+        "DBR_STS_CHAR",
+        "DBR_STS_LONG",
+        "DBR_STS_DOUBLE",
+        "DBR_TIME_STRING",
+        "DBR_TIME_SHORT",
+        "DBR_TIME_FLOAT",
+        "DBR_TIME_ENUM",
+        "DBR_TIME_CHAR",
+        "DBR_TIME_LONG",
+        "DBR_TIME_DOUBLE",
+        "DBR_GR_STRING",
+        "DBR_GR_SHORT",
+        "DBR_GR_FLOAT",
+        "DBR_GR_ENUM",
+        "DBR_GR_CHAR",
+        "DBR_GR_LONG",
+        "DBR_GR_DOUBLE",
+        "DBR_CTRL_STRING",
+        "DBR_CTRL_SHORT",
+        "DBR_CTRL_FLOAT",
+        "DBR_CTRL_ENUM",
+        "DBR_CTRL_CHAR",
+        "DBR_CTRL_LONG",
+        "DBR_CTRL_DOUBLE",
+        "DBR_PUT_ACKT",
+        "DBR_PUT_ACKS",
+        "DBR_STSACK_STRING",
+        "DBR_CLASS_NAME",
+    ];
+    NAMES.get(code as usize).copied().unwrap_or("DBR_invalid")
+}
+
+/// C `dbr2str` (tool_lib.c:335): the extended-metadata block printed
+/// after the value for a `specifiedDbr` response whose request type is
+/// `> DBR_DOUBLE`. Returns an empty string for basic value types
+/// (`DBR_STRING..DBR_DOUBLE`), which carry no extra info. The request
+/// type code selects the metadata class; the snapshot supplies the
+/// values. Each line is indented with four spaces and the block carries
+/// no trailing newline.
+///
+/// Numeric limit formatting follows the C macros' spirit (`%8d` for
+/// integer classes, `%g` for float/double) but exact `sprint_long`/`%g`
+/// byte-parity is the separate concern of CA-RS-2026-05-28-11.
+fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
+    if req_type <= 6 {
+        return String::new();
+    }
+    let stat = snap.alarm.status;
+    let sevr = snap.alarm.severity;
+    let sts = format!(
+        "    Status:           {}\n    Severity:         {}",
+        stat_to_str(stat),
+        sevr_to_str(sevr)
+    );
+    match req_type {
+        // STS_* (7..=13): status + severity only.
+        7..=13 => sts,
+        // TIME_* (14..=20): timestamp then status + severity.
+        14..=20 => format!(
+            "    Timestamp:        {}\n{sts}",
+            format_server_timestamp(snap.timestamp)
+        ),
+        // GR_ENUM (24) / CTRL_ENUM (31): status/severity then the enum
+        // state table (C `PRN_DBR_X_ENUM`).
+        24 | 31 => {
+            let labels = snap
+                .enums
+                .as_ref()
+                .map(|e| e.strings.as_slice())
+                .unwrap_or(&[]);
+            let mut out = sts;
+            out.push_str(&format!("\n    Enums:            ({:2})", labels.len()));
+            for (i, label) in labels.iter().enumerate() {
+                out.push_str(&format!("\n                      [{i:2}] {label}"));
+            }
+            out
+        }
+        // GR_* (21..=27) / CTRL_* (28..=34) numeric: status/severity,
+        // units, [precision for float/double], 6 graphic limits, and
+        // (CTRL only) 2 control limits.
+        21..=34 => {
+            let is_ctrl = req_type >= 28;
+            let is_float = matches!(req_type, 23 | 27 | 30 | 34); // GR/CTRL FLOAT/DOUBLE
+            let is_int = matches!(req_type, 22 | 25 | 26 | 29 | 32 | 33); // SHORT/CHAR/LONG
+            let d = snap.display.clone().unwrap_or_default();
+            let lim = |v: f64| -> String {
+                if is_int {
+                    format!("{:8}", v as i64)
+                } else {
+                    format!("{v}")
+                }
+            };
+            let mut out = sts;
+            out.push_str(&format!("\n    Units:            {}", d.units));
+            if is_float {
+                out.push_str(&format!("\n    Precision:        {}", d.precision));
+            }
+            out.push_str(&format!(
+                "\n    Lo disp limit:    {}",
+                lim(d.lower_disp_limit)
+            ));
+            out.push_str(&format!(
+                "\n    Hi disp limit:    {}",
+                lim(d.upper_disp_limit)
+            ));
+            out.push_str(&format!(
+                "\n    Lo alarm limit:   {}",
+                lim(d.lower_alarm_limit)
+            ));
+            out.push_str(&format!(
+                "\n    Lo warn limit:    {}",
+                lim(d.lower_warning_limit)
+            ));
+            out.push_str(&format!(
+                "\n    Hi warn limit:    {}",
+                lim(d.upper_warning_limit)
+            ));
+            out.push_str(&format!(
+                "\n    Hi alarm limit:   {}",
+                lim(d.upper_alarm_limit)
+            ));
+            if is_ctrl {
+                let c = snap.control.clone().unwrap_or_default();
+                out.push_str(&format!(
+                    "\n    Lo ctrl limit:    {}",
+                    lim(c.lower_ctrl_limit)
+                ));
+                out.push_str(&format!(
+                    "\n    Hi ctrl limit:    {}",
+                    lim(c.upper_ctrl_limit)
+                ));
+            }
+            out
+        }
+        // STSACK_STRING (37): status/severity then the ack pair
+        // (C `PRN_DBR_STSACK`).
+        37 => {
+            let ackt = snap.alarm.ackt.unwrap_or(0);
+            let acks = snap.alarm.acks.unwrap_or(0);
+            format!(
+                "{sts}\n    Ack transient?:   {}\n    Ack severity:     {}",
+                if ackt != 0 { "YES" } else { "NO" },
+                sevr_to_str(acks)
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+/// C `caget.c:298-340` `specifiedDbr`: PV name on its own line, then the
+/// indented native/request-type lines, then either the `Class Name:`
+/// line (for `DBR_CLASS_NAME`) or `Element count:` + `Value:` plus the
+/// extended-metadata block (for any type `> DBR_DOUBLE`). Returns the
+/// full block including its trailing newline.
+fn specified_dbr_report(
+    pv_name: &str,
+    native: Option<DbFieldType>,
+    req_type: u16,
+    snap: &Snapshot,
+    fmt: &ValueFormat,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "{pv_name}");
+    let _ = writeln!(
+        out,
+        "    Native data type: {}",
+        native.map(dbf_text).unwrap_or("DBF_NO_ACCESS")
+    );
+    let _ = writeln!(out, "    Request type:     {}", dbr_text(req_type));
+    if req_type == DBR_CLASS_NAME {
+        let cn = snap
+            .class_name
+            .clone()
+            .or_else(|| match &snap.value {
+                EpicsValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let _ = writeln!(out, "    Class Name:       {cn}");
+    } else {
+        let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
+        // C's specifiedDbr Value line joins elements WITHOUT a leading
+        // count (unlike plain mode), so render with req_elems_present=false;
+        // a scalar therefore renders as the bare value.
+        let rendered = format_value(&snap.value, fmt, enum_strings, false);
+        let _ = writeln!(out, "    Element count:    {}", snap.value.count());
+        let _ = writeln!(out, "    Value:            {rendered}");
+        let ext = dbr_extended_str(req_type, snap);
+        if !ext.is_empty() {
+            let _ = writeln!(out, "{ext}");
+        }
+    }
+    out
+}
+
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    // Parse via ArgMatches (not the plain derive) so the command-line
+    // order of `-t`/`-a`/`-d` is recoverable for the C mutual-exclusion
+    // rule (`resolve_output_mode`).
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches).expect("clap validated the arguments");
 
     if args.version {
         println!("{VERSION_INFO}");
@@ -250,7 +537,6 @@ async fn main() {
 
     // Connect + read all PVs in parallel within single timeout window
     // (C: connect_pvs → ca_pend_io → ca_array_get → ca_pend_io).
-    let want_time = args.wide;
     // `-n`: render ENUM fields as the numeric index. Without it the
     // default readback requests the STRING form (state label), see the
     // per-PV get below (C `caget.c:178-181`).
@@ -260,11 +546,7 @@ async fn main() {
     let float_as_string = args.string_format;
     // resolve `-d <type>` ONCE here, mirroring C `caget.c`'s
     // getopt-time resolution (`caget.c:416-434`). The "out of range or
-    // invalid" diagnostic prints exactly once (not per PV), and an
-    // unresolved/invalid token reverts to the plain native GET, exactly
-    // as C sets `format = plain`. `-a` (wide) forces the DBR_TIME class
-    // regardless of `-d`, matching C's `complainIfNotPlainAndSet`
-    // format precedence.
+    // invalid" diagnostic prints exactly once (not per PV).
     let req_dbr_type: Option<u16> = match args.dbr_type.as_deref() {
         Some(s) => {
             let t = parse_dbr_type(s);
@@ -278,6 +560,17 @@ async fn main() {
         }
         None => None,
     };
+    // Resolve the output format from `-t`/`-a`/`-d` (command-line order,
+    // mutual-exclusion warning). C `caget.c:430-434`: an invalid `-d`
+    // type reverts `format` to plain.
+    let mut mode = resolve_output_mode(&matches);
+    if mode == OutputMode::SpecifiedDbr && req_dbr_type.is_none() {
+        mode = OutputMode::Plain;
+    }
+    // Only `all` needs the DBR_TIME class for its native readback; the
+    // enum/float substitutions below use `want_time` to pick the TIME
+    // vs plain string form (C `caget.c:176-187`).
+    let want_time = mode == OutputMode::All;
     let mut handles = Vec::new();
     for (name, ch) in &channels {
         let name = name.clone();
@@ -288,68 +581,69 @@ async fn main() {
             if connect.is_err() {
                 return (name, Err("not connected".to_string()));
             }
-            // C `caget.c:177-187` `if (format != specifiedDbr)` readback
-            // substitution, in C's precedence: an ENUM field is read back in
-            // its STRING form (state label unless `-n` keeps the index),
-            // ELSE a `-s` request on a native FLOAT/DOUBLE field is read back
-            // as `DBR_TIME_STRING` so the SERVER converts it (honoring record
-            // precision). `native_field_type` is libca `ca_field_type`, valid
-            // now that the channel is connected. An explicit `-d`
-            // (`format == specifiedDbr`, `req_dbr_type` set) suppresses BOTH
-            // substitutions — the requested type is carried verbatim.
-            let sub_dbr = if req_dbr_type.is_some() {
-                None
-            } else {
-                let nt = ch.native_field_type().ok();
-                nt.and_then(|nt| enum_string_readback_dbr(nt, want_time, !enum_as_number))
-                    .or_else(|| {
-                        float_as_string
-                            .then(|| nt.and_then(float_as_string_readback_dbr))
-                            .flatten()
-                    })
-            };
-            // For `-a` (wide / DBR_TIME) we need timestamp + alarm, so
-            // route through the DBR_TIME class (native value type) and
-            // wrap the response in the `Time` variant. `-d <type>`
-            // requests the EXACT DBR type verbatim — C keeps the chosen
-            // `dbrType` without re-deriving it from the native type
-            // (`caget.c:172`), so `-d DBR_TIME_FLOAT` on a DOUBLE PV
-            // requests a float, and `-d 38`/`DBR_CLASS_NAME` reaches the
-            // record-class introspection type. The plain path stays on
-            // the cheap `get_with_timeout` (no metadata payload).
-            let outcome = if let Some(rt) = sub_dbr {
-                // ENUM default or `-s` float-as-string → request the STRING
-                // form. Under `-a` the TIME-class string (DBR_TIME_STRING)
-                // still carries timestamp + alarm, so wrap it as `Time`.
+            // C `caget.c:172-187`: the request DBR type depends on the
+            // output format. `specifiedDbr` carries the `-d` type verbatim
+            // (`pvs[n].dbrType = dbrType`) and keeps the full snapshot for
+            // the report; EVERY other format re-derives the native
+            // TIME-class type and applies the ENUM (`-n`) / float (`-s`)
+            // substitutions, discarding any `-d` type. `native_field_type`
+            // is libca `ca_field_type`, valid now that the channel is
+            // connected.
+            let outcome = if mode == OutputMode::SpecifiedDbr {
+                let rt = req_dbr_type
+                    .expect("specifiedDbr mode implies a resolved -d type (else reverts to plain)");
+                let native = ch.native_field_type().ok();
                 match tokio::time::timeout(t, ch.get_with_dbr_type(rt, 0)).await {
-                    Ok(Ok(snap)) => Ok(if want_time {
-                        GetResult::Time(Box::new(snap))
-                    } else {
-                        GetResult::Plain(snap.value)
+                    Ok(Ok(snap)) => Ok(GetResult::Specified {
+                        native,
+                        req_type: rt,
+                        snap: Box::new(snap),
                     }),
                     Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
                     Ok(Err(e)) => Err(format!("{e}")),
                     Err(_) => Err("timeout".to_string()),
                 }
-            } else if want_time {
-                match tokio::time::timeout(t, ch.get_with_metadata(DbrClass::Time)).await {
-                    Ok(Ok(snap)) => Ok(GetResult::Time(Box::new(snap))),
-                    Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
-                    Ok(Err(e)) => Err(format!("{e}")),
-                    Err(_) => Err("timeout".to_string()),
-                }
-            } else if let Some(rt) = req_dbr_type {
-                match tokio::time::timeout(t, ch.get_with_dbr_type(rt, 0)).await {
-                    Ok(Ok(snap)) => Ok(GetResult::Plain(snap.value)),
-                    Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
-                    Ok(Err(e)) => Err(format!("{e}")),
-                    Err(_) => Err("timeout".to_string()),
-                }
             } else {
-                match ch.get_with_timeout(t).await {
-                    Ok((_dbr, value)) => Ok(GetResult::Plain(value)),
-                    Err(CaError::Timeout) => Err("timeout".to_string()),
-                    Err(e) => Err(format!("{e}")),
+                // C `caget.c:177-187` readback substitution, in C's
+                // precedence: an ENUM field is read back in its STRING form
+                // (state label unless `-n` keeps the index), ELSE a `-s`
+                // request on a native FLOAT/DOUBLE field is read back as
+                // DBR_TIME_STRING so the SERVER converts it.
+                let nt = ch.native_field_type().ok();
+                let sub_dbr = nt
+                    .and_then(|nt| enum_string_readback_dbr(nt, want_time, !enum_as_number))
+                    .or_else(|| {
+                        float_as_string
+                            .then(|| nt.and_then(float_as_string_readback_dbr))
+                            .flatten()
+                    });
+                if let Some(rt) = sub_dbr {
+                    // Under `-a` the TIME-class string (DBR_TIME_STRING)
+                    // still carries timestamp + alarm, so wrap it as `Time`.
+                    match tokio::time::timeout(t, ch.get_with_dbr_type(rt, 0)).await {
+                        Ok(Ok(snap)) => Ok(if want_time {
+                            GetResult::Time(Box::new(snap))
+                        } else {
+                            GetResult::Plain(snap.value)
+                        }),
+                        Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
+                        Ok(Err(e)) => Err(format!("{e}")),
+                        Err(_) => Err("timeout".to_string()),
+                    }
+                } else if want_time {
+                    match tokio::time::timeout(t, ch.get_with_metadata(DbrClass::Time)).await {
+                        Ok(Ok(snap)) => Ok(GetResult::Time(Box::new(snap))),
+                        Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
+                        Ok(Err(e)) => Err(format!("{e}")),
+                        Err(_) => Err("timeout".to_string()),
+                    }
+                } else {
+                    // plain / terse: cheap typed value, no metadata payload.
+                    match ch.get_with_timeout(t).await {
+                        Ok((_dbr, value)) => Ok(GetResult::Plain(value)),
+                        Err(CaError::Timeout) => Err("timeout".to_string()),
+                        Err(e) => Err(format!("{e}")),
+                    }
                 }
             };
             (name, outcome)
@@ -385,7 +679,7 @@ async fn main() {
             Ok(GetResult::Plain(value)) => {
                 let rendered = format_value(value, &fmt, None, req_elems_present);
                 let is_scalar = value.count() == 1;
-                if args.terse {
+                if mode == OutputMode::Terse {
                     println!("{rendered}");
                 } else {
                     println!("{}{}{}", pad_name(is_scalar, pv_name), sep, rendered);
@@ -404,9 +698,7 @@ async fn main() {
                 let ts = format_server_timestamp(snap.timestamp);
                 let stat = snap.alarm.status;
                 let sevr = snap.alarm.severity;
-                if args.terse {
-                    println!("{rendered}");
-                } else if stat == 0 && sevr == 0 {
+                if stat == 0 && sevr == 0 {
                     println!(
                         "{name}{sep}{ts}{sep}{val}{sep}{sep}",
                         name = pad_name(is_scalar, pv_name),
@@ -424,22 +716,34 @@ async fn main() {
                     );
                 }
             }
+            Ok(GetResult::Specified {
+                native,
+                req_type,
+                snap,
+            }) => {
+                print!(
+                    "{}",
+                    specified_dbr_report(pv_name, *native, *req_type, snap, &fmt)
+                );
+            }
             Err(e) if e.contains("not connected") || e.contains("isconnect") => {
-                // C prints two different strings: plain/terse mode
-                // (caget.c:265) prints lowercase `*** not connected`;
-                // only `-a`/wide mode (print_time_val_sts,
-                // tool_lib.c:521) prints `*** Not connected (PV not
-                // found)`.
-                if args.wide {
-                    println!(
+                // C prints different strings per format: plain/terse
+                // (caget.c:265) print lowercase `*** not connected`;
+                // `-a`/wide (print_time_val_sts, tool_lib.c:521) prints
+                // `*** Not connected (PV not found)`; specifiedDbr
+                // (caget.c:301) prints the name line then an indented
+                // `    *** not connected`.
+                match mode {
+                    OutputMode::All => println!(
                         "{}{}*** Not connected (PV not found)",
                         pad_name(true, pv_name),
                         sep
-                    );
-                } else if args.terse {
-                    println!("*** not connected");
-                } else {
-                    println!("{}{}*** not connected", pad_name(true, pv_name), sep);
+                    ),
+                    OutputMode::Terse => println!("*** not connected"),
+                    OutputMode::SpecifiedDbr => println!("{pv_name}\n    *** not connected"),
+                    OutputMode::Plain => {
+                        println!("{}{}*** not connected", pad_name(true, pv_name), sep)
+                    }
                 }
                 failed = true;
             }
@@ -450,14 +754,16 @@ async fn main() {
                 // whose GET times out therefore does NOT change the
                 // exit code — print the timeout line but leave
                 // `failed` untouched.
-                if args.terse {
-                    println!("*** no data available (timeout)");
-                } else {
-                    println!(
+                match mode {
+                    OutputMode::Terse => println!("*** no data available (timeout)"),
+                    OutputMode::SpecifiedDbr => {
+                        println!("{pv_name}\n    *** no data available (timeout)")
+                    }
+                    _ => println!(
                         "{}{}*** no data available (timeout)",
                         pad_name(true, pv_name),
                         sep
-                    );
+                    ),
                 }
             }
             Err(e) => {
@@ -538,10 +844,155 @@ fn parse_dbr_type(s: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_dbr_type, scan_leading_i64};
-    use epics_base_rs::types::{
-        DBR_CLASS_NAME, DBR_DOUBLE, DBR_STRING, DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
+    use super::{
+        Args, OutputMode, dbr_extended_str, dbr_text, parse_dbr_type, resolve_output_mode,
+        scan_leading_i64, specified_dbr_report,
     };
+    use clap::CommandFactory;
+    use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
+    use epics_base_rs::types::{
+        DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_DOUBLE, DBR_STRING, DBR_STSACK_STRING,
+        DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
+    };
+    use epics_ca_rs::EpicsValue;
+    use epics_ca_rs::cli::ValueFormat;
+    use std::time::SystemTime;
+
+    fn mode_of(argv: &[&str]) -> OutputMode {
+        let m = Args::command().get_matches_from(argv);
+        resolve_output_mode(&m)
+    }
+
+    // C `complainIfNotPlainAndSet` (caget.c:369): -t/-a/-d are mutually
+    // exclusive output formats, applied in command-line order — the LATER
+    // option wins. Boundary: each single option, and both orderings of the
+    // -a/-d pair the finding called out.
+    #[test]
+    fn output_mode_resolves_in_command_line_order() {
+        assert_eq!(mode_of(&["caget", "PV"]), OutputMode::Plain);
+        assert_eq!(mode_of(&["caget", "-t", "PV"]), OutputMode::Terse);
+        assert_eq!(mode_of(&["caget", "-a", "PV"]), OutputMode::All);
+        assert_eq!(
+            mode_of(&["caget", "-d", "DBR_TIME_DOUBLE", "PV"]),
+            OutputMode::SpecifiedDbr
+        );
+        // `-a -d X`: -d is later → specifiedDbr wins (the finding's case).
+        assert_eq!(
+            mode_of(&["caget", "-a", "-d", "DBR_TIME_DOUBLE", "PV"]),
+            OutputMode::SpecifiedDbr
+        );
+        // `-d X -a`: -a is later → all wins.
+        assert_eq!(
+            mode_of(&["caget", "-d", "DBR_TIME_DOUBLE", "-a", "PV"]),
+            OutputMode::All
+        );
+    }
+
+    fn ctrl_double_snap() -> Snapshot {
+        let mut s = Snapshot::new(EpicsValue::Double(1.5), 0, 0, SystemTime::UNIX_EPOCH);
+        s.display = Some(DisplayInfo {
+            units: "mm".to_string(),
+            precision: 3,
+            upper_disp_limit: 10.0,
+            lower_disp_limit: -10.0,
+            upper_alarm_limit: 8.0,
+            upper_warning_limit: 6.0,
+            lower_warning_limit: -6.0,
+            lower_alarm_limit: -8.0,
+            ..Default::default()
+        });
+        s.control = Some(ControlInfo {
+            upper_ctrl_limit: 9.0,
+            lower_ctrl_limit: -9.0,
+        });
+        s
+    }
+
+    // C `caget.c:307-338` specifiedDbr for a CTRL_DOUBLE: name, native /
+    // request type, element count + value, then the dbr2str CTRL block
+    // (status, severity, units, precision, 6 graphic + 2 control limits).
+    #[test]
+    fn specified_report_ctrl_double_has_full_metadata_block() {
+        let snap = ctrl_double_snap();
+        let out = specified_dbr_report(
+            "ai:temp",
+            Some(DbFieldType::Double),
+            DBR_CTRL_DOUBLE,
+            &snap,
+            &ValueFormat::default(),
+        );
+        assert!(out.starts_with("ai:temp\n"), "{out}");
+        assert!(out.contains("    Native data type: DBF_DOUBLE\n"), "{out}");
+        assert!(
+            out.contains("    Request type:     DBR_CTRL_DOUBLE\n"),
+            "{out}"
+        );
+        assert!(out.contains("    Element count:    1\n"), "{out}");
+        assert!(out.contains("    Value:            1.5\n"), "{out}");
+        assert!(out.contains("    Units:            mm\n"), "{out}");
+        assert!(out.contains("    Precision:        3\n"), "{out}");
+        assert!(out.contains("    Lo ctrl limit:    -9\n"), "{out}");
+        assert!(out.contains("    Hi ctrl limit:    9\n"), "{out}");
+    }
+
+    // C `caget.c:312-316`: DBR_CLASS_NAME prints only the Class Name line
+    // (no element count / value / extended block).
+    #[test]
+    fn specified_report_class_name_prints_class_line_only() {
+        let mut snap = Snapshot::new(
+            EpicsValue::String("ai".to_string()),
+            0,
+            0,
+            SystemTime::UNIX_EPOCH,
+        );
+        snap.class_name = Some("ai".to_string());
+        let out = specified_dbr_report(
+            "ai:temp",
+            Some(DbFieldType::Double),
+            DBR_CLASS_NAME,
+            &snap,
+            &ValueFormat::default(),
+        );
+        assert!(
+            out.contains("    Request type:     DBR_CLASS_NAME\n"),
+            "{out}"
+        );
+        assert!(out.contains("    Class Name:       ai\n"), "{out}");
+        assert!(!out.contains("Element count"), "{out}");
+        assert!(!out.contains("Value:"), "{out}");
+    }
+
+    // C dbr2str: basic value types carry no extended block; TIME adds a
+    // Timestamp line; GR_ENUM lists the enum states.
+    #[test]
+    fn extended_block_by_class_boundary() {
+        let basic = Snapshot::new(EpicsValue::Double(1.0), 0, 0, SystemTime::UNIX_EPOCH);
+        assert_eq!(dbr_extended_str(DBR_DOUBLE, &basic), "");
+        // TIME_DOUBLE (20): timestamp + status + severity.
+        let t = dbr_extended_str(DBR_TIME_DOUBLE, &basic);
+        assert!(t.contains("    Timestamp:        "), "{t}");
+        assert!(t.contains("    Status:           NO_ALARM"), "{t}");
+        // GR_ENUM (24): status/severity then the enum table.
+        let mut e = Snapshot::new(EpicsValue::Enum(1), 0, 0, SystemTime::UNIX_EPOCH);
+        e.enums = Some(EnumInfo {
+            strings: vec!["OFF".to_string(), "ON".to_string()],
+        });
+        let es = dbr_extended_str(24, &e);
+        assert!(es.contains("    Enums:            ( 2)"), "{es}");
+        assert!(es.contains("[ 0] OFF"), "{es}");
+        assert!(es.contains("[ 1] ON"), "{es}");
+    }
+
+    // C db_access dbr_text[]: code → mnemonic, out-of-range → invalid.
+    #[test]
+    fn dbr_text_maps_codes() {
+        assert_eq!(dbr_text(DBR_DOUBLE), "DBR_DOUBLE");
+        assert_eq!(dbr_text(DBR_CTRL_DOUBLE), "DBR_CTRL_DOUBLE");
+        assert_eq!(dbr_text(DBR_CLASS_NAME), "DBR_CLASS_NAME");
+        assert_eq!(dbr_text(99), "DBR_invalid");
+    }
+
+    use epics_ca_rs::DbFieldType;
 
     #[test]
     fn scan_leading_i64_matches_sscanf_d() {

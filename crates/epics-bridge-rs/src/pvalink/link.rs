@@ -767,6 +767,80 @@ impl PvaLink {
         }
     }
 
+    /// Raw remote `(severity, message)` from the cached NT value at the
+    /// selected field root — ungated by `sevr`, no disconnect check.
+    /// This is the snapshot pvxs `pvaGetValue` latches into
+    /// `snap_severity` / `snap_message` on every connected read
+    /// (`pvxs/ioc/pvalink_lset.cpp:412-422`): the severity defaults to
+    /// `NO_ALARM` when the alarm sub-field is absent, and the message is
+    /// the remote `alarm.message` — blank unless the severity is
+    /// non-`NO_ALARM` (pvxs clears `snap_message` when `snap_severity == 0`).
+    /// `None` only when no value is cached (the pvxs `valid()` root
+    /// requirement); the caller adds the disconnect/`CHECK_VALID` gate.
+    fn cached_remote_alarm(&self, field: &str) -> Option<(i32, String)> {
+        let v = self.latest.lock().clone()?;
+        let PvField::Structure(s) = select_target(&v, field) else {
+            // A cached value that is not a structure carries no alarm
+            // sub-field — `NO_ALARM`, no message (pvxs default snapshot).
+            return Some((0, String::new()));
+        };
+        let alarm = match s.get_field("alarm") {
+            Some(PvField::Structure(a)) => Some(a),
+            _ => None,
+        };
+        let severity = alarm
+            .and_then(|a| a.get_field("severity"))
+            .and_then(|sv| match sv {
+                PvField::Scalar(sv) => Some(scalar_value_to_f64(sv) as i32),
+                _ => None,
+            })
+            .unwrap_or(0);
+        // pvxs only latches the message when `snap_severity != 0`
+        // (`pvalink_lset.cpp:418-422`); a NO_ALARM snapshot has none.
+        let message = if severity != 0 {
+            alarm
+                .and_then(|a| a.get_field("message"))
+                .and_then(|m| match m {
+                    PvField::Scalar(ScalarValue::String(m)) if !m.is_empty() => Some(m.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Some((severity, message))
+    }
+
+    /// Ungated remote alarm snapshot — the remote `(severity, status,
+    /// message)` after a successful value read, WITHOUT the
+    /// maximize-severity (`MS`/`NMS`/`MSI`) gate that
+    /// [`Self::link_alarm_severity_with`] applies for owning-record
+    /// propagation.
+    ///
+    /// The Rust counterpart of pvxs `pvaGetAlarmMsg`
+    /// (`pvxs/ioc/pvalink_lset.cpp:542-575`): it reads the cached
+    /// `snap_severity` / `snap_message` directly and never consults the
+    /// link's `sevr` mode, so a default `NMS` link still reports its
+    /// remote severity here even though it leaves the owning record
+    /// unraised. The status is derived from severity by
+    /// [`RemoteAlarm::from_severity_message`].
+    ///
+    /// `CHECK_VALID` is honoured (`pvalink_lset.cpp:545`): a
+    /// disconnected-stale monitor link serves no snapshot even though
+    /// its last value is retained, and a link with no cached value
+    /// yields `None`.
+    pub fn remote_alarm_snapshot(
+        &self,
+        field: &str,
+    ) -> Option<epics_base_rs::server::database::RemoteAlarm> {
+        use epics_base_rs::server::database::RemoteAlarm;
+        if self.monitor_disconnected_stale() {
+            return None;
+        }
+        let (severity, message) = self.cached_remote_alarm(field)?;
+        Some(RemoteAlarm::from_severity_message(severity, message))
+    }
+
     /// true iff this monitor link previously delivered a
     /// value but its subscription is now down — the cached `latest` is
     /// stale. This is the precise "disconnected after connect" state
@@ -2036,6 +2110,88 @@ mod tests {
         let link = PvaLink::for_test(inp_cfg(SevrMode::Ms), None);
         assert_eq!(link.link_alarm_severity(), None);
         assert_eq!(link.alarm_message(), None);
+    }
+
+    // ---- ungated remote alarm snapshot (pvxs pvaGetAlarmMsg) ----
+
+    /// Default `NMS` link with a remote MINOR alarm: the gated
+    /// owning-record contribution stays empty (the record is NOT
+    /// maximized), but the ungated remote alarm snapshot still reports
+    /// the remote severity/status/message. This is pvxs `testMeta()`:
+    /// after `dbGetLink()` on a default `NMS` pvalink, `dbGetAlarm()`
+    /// still reports `LINK_ALARM` / `MINOR`
+    /// (`pvxs/test/testpvalink.cpp:414-420`), because `pvaGetAlarmMsg`
+    /// does not consult `sevr` (`pvalink_lset.cpp:542-575`).
+    #[test]
+    fn alarm_snapshot_ungated_for_nms_while_record_unraised() {
+        let link = PvaLink::for_test(inp_cfg(SevrMode::Nms), Some(nt_with_alarm(1, Some("hi"))));
+        // gated path: NMS propagates nothing to the owning record.
+        assert_eq!(link.link_alarm_severity(), None);
+        assert_eq!(link.alarm_message(), None);
+        // ungated snapshot: remote MINOR + LINK_ALARM(14) + message.
+        let snap = link.remote_alarm_snapshot("").expect("connected snapshot");
+        assert_eq!(snap.severity, 1);
+        assert_eq!(snap.status, 14); // LINK_ALARM
+        assert_eq!(snap.message, "hi");
+    }
+
+    /// `MS` link with a remote MAJOR alarm: BOTH the gated owning-record
+    /// contribution (record raised) AND the ungated snapshot report the
+    /// remote severity. pvxs `testMetaMS()` — `sevr:"MS"` raises the
+    /// owning record's pending alarm (`testpvalink.cpp:467-514`); the
+    /// snapshot is unchanged by the gate.
+    #[test]
+    fn alarm_snapshot_matches_gated_path_for_ms() {
+        let link = PvaLink::for_test(inp_cfg(SevrMode::Ms), Some(nt_with_alarm(2, Some("oops"))));
+        // gated path: MS raises the owning record.
+        assert_eq!(link.link_alarm_severity(), Some(2));
+        // ungated snapshot: same remote MAJOR + LINK_ALARM + message.
+        let snap = link.remote_alarm_snapshot("").expect("connected snapshot");
+        assert_eq!(snap.severity, 2);
+        assert_eq!(snap.status, 14); // LINK_ALARM
+        assert_eq!(snap.message, "oops");
+    }
+
+    /// A NO_ALARM cached value yields a snapshot with severity 0, status
+    /// NO_ALARM(0), and an empty message — pvxs clears `snap_message`
+    /// unless `snap_severity != 0` (`pvalink_lset.cpp:418-422`) and sets
+    /// `status = snap_severity ? LINK_ALARM : NO_ALARM`
+    /// (`pvalink_lset.cpp:551`).
+    #[test]
+    fn alarm_snapshot_no_alarm_has_zero_status_and_blank_message() {
+        let link = PvaLink::for_test(
+            inp_cfg(SevrMode::Nms),
+            Some(nt_with_alarm(0, Some("ignored"))),
+        );
+        let snap = link.remote_alarm_snapshot("").expect("connected snapshot");
+        assert_eq!(snap.severity, 0);
+        assert_eq!(snap.status, 0); // NO_ALARM
+        assert_eq!(snap.message, "", "NO_ALARM snapshot carries no message");
+    }
+
+    /// CHECK_VALID: a disconnected-stale monitor link serves no snapshot
+    /// even though its last value is retained, and a link with no cached
+    /// value yields `None` (pvxs `pvaGetAlarmMsg` returns -1 while
+    /// `!valid()` — `pvalink_lset.cpp:545`).
+    #[test]
+    fn alarm_snapshot_refuses_stale_while_disconnected() {
+        let (link, flag) = PvaLink::for_test_with_monitor_flag(
+            inp_cfg(SevrMode::Nms),
+            Some(nt_with_alarm(2, Some("was-major"))),
+        );
+        flag.store(true, Ordering::Release);
+        assert!(
+            link.remote_alarm_snapshot("").is_some(),
+            "connected monitor serves the snapshot"
+        );
+        flag.store(false, Ordering::Release);
+        assert!(
+            link.remote_alarm_snapshot("").is_none(),
+            "disconnected-stale monitor refuses the snapshot (CHECK_VALID)"
+        );
+        // no cached value at all → None regardless of connection state.
+        let empty = PvaLink::for_test(inp_cfg(SevrMode::Nms), None);
+        assert!(empty.remote_alarm_snapshot("").is_none());
     }
 
     // ---- B4: monitor_request (Q / pipeline) ----

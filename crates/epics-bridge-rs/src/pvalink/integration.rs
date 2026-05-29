@@ -1130,6 +1130,28 @@ impl LinkSet for PvaLinkResolver {
         link.link_alarm_severity_with(&field, sevr)
     }
 
+    fn remote_alarm(&self, name: &str) -> Option<epics_base_rs::server::database::RemoteAlarm> {
+        // Ungated remote alarm snapshot for DB-link inspection
+        // (`dbGetAlarm`/`dbGetAlarmMsg`). Unlike `alarm_severity`, this
+        // applies NO `sevr` gate — a default `NMS` link still reports
+        // its remote severity here. pvxs `pvaGetAlarmMsg`
+        // (`pvalink_lset.cpp:542-575`) reads the snapshot directly. The
+        // per-link `field` still selects the metadata root, matching the
+        // value/alarm getters.
+        let full = strip_scheme(name)?;
+        let bare = link_pv_name(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
+        let field = cfg.field.clone();
+        let link = block_in_place_or_warn(|| {
+            self.handle
+                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
+        })?;
+        link.remote_alarm_snapshot(&field)
+    }
+
     fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
         let full = strip_scheme(name)?;
         let bare = link_pv_name(full);
@@ -3151,6 +3173,16 @@ mod tests {
             Some(2),
             "resolver-level link_alarm_severity must use the caller's MS mode"
         );
+
+        // Ungated snapshot (pvxs pvaGetAlarmMsg / dbGetAlarm): even the
+        // NMS caller — whose gated contribution is None above — must see
+        // the remote MAJOR severity, LINK_ALARM(14) status, and message.
+        // The `sevr` mode does not gate this path.
+        let snap = LinkSet::remote_alarm(&resolver, nms_name)
+            .expect("NMS caller still gets the ungated remote alarm snapshot");
+        assert_eq!(snap.severity, 2, "ungated snapshot reports remote MAJOR");
+        assert_eq!(snap.status, 14, "LINK_ALARM status derived from severity");
+        assert_eq!(snap.message, "HIGH", "ungated snapshot carries the message");
 
         // The shared cached link is time=false → a bare caller adopts
         // no timestamp. A caller asking `?time=true` must adopt it.

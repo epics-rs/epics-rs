@@ -99,6 +99,53 @@ pub struct LinkMetadata {
     pub description: Option<String>,
 }
 
+/// Ungated remote alarm snapshot for a link — the remote
+/// `(severity, status, message)` the upstream PV carried at the last
+/// successful value read, WITHOUT the maximize-severity
+/// (`MS`/`NMS`/`MSI`) gate that [`LinkSet::alarm_severity`] applies for
+/// owning-record propagation.
+///
+/// This is the DB-link inspection counterpart pvxs exposes through
+/// `dbGetAlarm` / `dbGetAlarmMsg` — `pvaGetAlarmMsg` returns the cached
+/// `snap_severity` / `snap_message` directly and never consults the
+/// link's `sevr` mode (`pvxs/ioc/pvalink_lset.cpp:542-575`). A default
+/// `NMS` link must still report its remote severity here even though it
+/// does not maximize the owning record's severity.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RemoteAlarm {
+    /// Remote alarm severity (`0 = NO_ALARM` … `3 = INVALID`), the raw
+    /// cached `alarm.severity` — never gated by the link's `sevr` mode.
+    pub severity: i32,
+    /// Remote alarm status code, derived from `severity` exactly as
+    /// pvxs `pvaGetAlarmMsg` does (`LINK_ALARM` when severity is
+    /// non-`NO_ALARM`, else `NO_ALARM` — `pvalink_lset.cpp:551`). See
+    /// [`RemoteAlarm::from_severity_message`].
+    pub status: i32,
+    /// Remote `alarm.message`. Empty when the remote carried none or
+    /// the severity is `NO_ALARM` (pvxs clears `snap_message` unless
+    /// `snap_severity != 0` — `pvalink_lset.cpp:418-422`).
+    pub message: String,
+}
+
+impl RemoteAlarm {
+    /// Build a snapshot whose `status` is derived from `severity`
+    /// exactly as pvxs `pvaGetAlarmMsg` (`pvalink_lset.cpp:551`):
+    /// `LINK_ALARM` when the remote severity is non-`NO_ALARM`, else
+    /// `NO_ALARM`. status and severity cannot disagree by construction.
+    pub fn from_severity_message(severity: i32, message: String) -> Self {
+        let status = if severity != 0 {
+            crate::server::recgbl::alarm_status::LINK_ALARM as i32
+        } else {
+            crate::server::recgbl::alarm_status::NO_ALARM as i32
+        };
+        Self {
+            severity,
+            status,
+            message,
+        }
+    }
+}
+
 /// Pluggable backend for one URL scheme's link operations.
 ///
 /// All methods take `&self` so the implementation must use interior
@@ -177,6 +224,29 @@ pub trait LinkSet: Send + Sync {
     /// this default. Mirrors pvxs `pvalink_lset.cpp` `pvaGetAlarm`
     /// surfacing the remote `alarm.status` to `recGblSetSevrMsg`.
     fn alarm_status(&self, _name: &str) -> Option<i32> {
+        None
+    }
+
+    /// Ungated remote alarm snapshot — the remote `(severity, status,
+    /// message)` after a successful value read, WITHOUT the
+    /// maximize-severity (`MS`/`NMS`/`MSI`) gate that
+    /// [`LinkSet::alarm_severity`] applies.
+    ///
+    /// This is the split pvxs draws between two operations: `pvaGetValue`
+    /// applies the `sevr` gate only when raising the *owning record's*
+    /// `LINK_ALARM` (`pvxs/ioc/pvalink_lset.cpp:424-431` — surfaced here
+    /// through [`LinkSet::alarm_severity`]), whereas `pvaGetAlarmMsg`
+    /// returns the cached `snap_severity` / `snap_message` snapshot
+    /// directly and never consults `sevr`
+    /// (`pvxs/ioc/pvalink_lset.cpp:542-575` — surfaced here). A caller
+    /// inspecting the DB link's alarm (`dbGetAlarm` / `dbGetAlarmMsg`)
+    /// therefore sees the remote severity even on a default `NMS` link
+    /// that leaves the owning record unraised.
+    ///
+    /// `None` means the lset cannot report a snapshot: no cache, the
+    /// link is not connected (pvxs `CHECK_VALID` — `pvalink_lset.cpp:545`),
+    /// or the link set does not track remote alarms. Default: none.
+    fn remote_alarm(&self, _name: &str) -> Option<RemoteAlarm> {
         None
     }
 

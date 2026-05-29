@@ -380,6 +380,46 @@ impl PvDatabase {
         })
     }
 
+    /// Ungated remote alarm snapshot for an external (`pva://` /
+    /// `ca://`) link — the DB-link inspection counterpart of
+    /// [`Self::external_link_alarm`].
+    ///
+    /// Where `external_link_alarm` returns the **gated** maximize-severity
+    /// contribution folded into the owning record's `LINK_ALARM` (pvxs
+    /// `pvaGetValue` applying the `MS`/`NMS`/`MSI` gate,
+    /// `pvalink_lset.cpp:424-431`), this returns the **ungated** remote
+    /// `(severity, status, message)` snapshot pvxs exposes through
+    /// `dbGetAlarm` / `dbGetAlarmMsg` (`pvaGetAlarmMsg`,
+    /// `pvalink_lset.cpp:542-575`). A default `NMS` link reports its
+    /// remote severity here even though it leaves the owning record
+    /// unraised.
+    ///
+    /// `None` when no lset is registered for the scheme, the link is not
+    /// connected, or the lset does not track remote alarms. Scheme
+    /// dispatch mirrors [`Self::external_link_alarm`].
+    pub async fn external_link_alarm_snapshot(
+        &self,
+        name: &str,
+    ) -> Option<crate::server::database::RemoteAlarm> {
+        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
+            ("pva", rest)
+        } else if let Some(rest) = name.strip_prefix("ca://") {
+            ("ca", rest)
+        } else {
+            let registry = self.inner.link_sets.read().await;
+            for s in registry.schemes() {
+                if let Some(lset) = registry.get(&s) {
+                    if let Some(snap) = lset.remote_alarm(name) {
+                        return Some(snap);
+                    }
+                }
+            }
+            return None;
+        };
+        let lset = self.inner.link_sets.read().await.get(scheme)?;
+        lset.remote_alarm(body)
+    }
+
     /// Remote display / control / valueAlarm metadata for an external
     /// (`pva://` / `ca://`) link, resolved through the registered
     /// lset's [`LinkSet::link_metadata`] hook.

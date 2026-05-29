@@ -18,7 +18,50 @@ use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::DbFieldType;
 use epics_ca_rs::client::{CaChannel, CaClient};
+use epics_ca_rs::protocol::{DBE_ALARM, DBE_VALUE};
 use parking_lot::RwLock;
+
+/// CA record-link monitor event mask — `DBE_VALUE | DBE_ALARM`, matching
+/// C `dbCa`'s `ca_add_array_event` (`dbCa.c:1258-1269`), whose libca macro
+/// expands to `ca_add_masked_array_event(..., DBE_VALUE | DBE_ALARM)`
+/// (`cadef.h:2004-2012`). Deliberately excludes `DBE_LOG` / `DBE_ARCHIVE`
+/// (a separate event-trigger class, `cadef.h:1148-1158`) that `dbCa` never
+/// requests, so archive/log-only posts on the upstream PV never refresh a
+/// CP/CPP record link's cache or wake a scan. The default
+/// `CaChannel::subscribe()` would add `DBE_LOG`.
+const CALINK_EVENT_MASK: u16 = DBE_VALUE | DBE_ALARM;
+
+/// A cached monitor snapshot plus the channel native element count it was
+/// produced under.
+///
+/// The native DBR *type* is intrinsic to `snapshot.value` (recomputed at
+/// read time via [`EpicsValue::dbr_type`]), but the native element *count*
+/// is not recoverable from a possibly-partial waveform payload, so it is
+/// captured here at store time. [`CaLink`]'s read accessors serve this only
+/// while both still match the channel's current native description — see
+/// [`CaLink::with_servable`] / C `dbCa.c:865-889`.
+struct CachedSnapshot {
+    snapshot: Snapshot,
+    native_count: u32,
+}
+
+/// True iff a cached snapshot remains servable: the value's CA-wire DBR
+/// type and the channel native element count it was taken under both still
+/// equal the channel's current native description. Mirrors C
+/// `dbCa.c:865-889`, which refuses the old cache once a reconnect changes
+/// the element count or DBR type, until a matching monitor event
+/// repopulates it (`dbCaGetLink` invalid-cache path `dbCa.c:484-492`).
+///
+/// Pure (no `self`) so the type/count gate is unit-testable without a live
+/// CA channel — the same factoring as [`note_conn_event`].
+fn cache_native_matches(
+    cached_type: DbFieldType,
+    cached_count: u32,
+    current_type: DbFieldType,
+    current_count: u32,
+) -> bool {
+    cached_type == current_type && cached_count == current_count
+}
 
 /// Errors from the CA-link resolver setup path.
 #[derive(Debug, thiserror::Error)]
@@ -38,10 +81,12 @@ pub enum CaLinkError {
 /// thing the synchronous [`LinkSet`] read path touches. An opaque
 /// handle — construct it via [`CaLinkResolver::open`].
 pub struct CaLink {
-    /// Latest monitor snapshot. `None` until the first event arrives
-    /// (channel not yet connected / no value cached) — the C
-    /// `dbCaGetLink` "not connected" case.
-    cache: Arc<ArcSwap<Option<Snapshot>>>,
+    /// Latest monitor snapshot plus the native description it was produced
+    /// under. `None` until the first event arrives (channel not yet
+    /// connected / no value cached) — the C `dbCaGetLink` "not connected"
+    /// case. Served only while the cached description still matches the
+    /// channel's current native description (see [`Self::with_servable`]).
+    cache: Arc<ArcSwap<Option<CachedSnapshot>>>,
     /// Live-connection flag, mirroring `pvalink`'s
     /// `PvaLink::monitor_connected`. The connection-event watcher task
     /// flips this `true` on `ConnectionEvent::Connected` and `false`
@@ -88,45 +133,85 @@ impl Drop for AbortOnDrop {
 }
 
 impl CaLink {
-    /// True when the CA circuit is currently up AND at least one
-    /// monitor event has been cached. C `dbCaGetLink` (`dbCa.c:448`)
-    /// treats a CA link as readable only when `pca->connected` is set
-    /// (the `connectionCallback` clears it on disconnect) *and* the
-    /// monitor callback has populated `pca->pgetNative`. We mirror
-    /// both: a circuit-state flag (`connected`, driven by
-    /// `CaChannel::connection_events()`) AND cache presence.
+    /// Run `f` over the currently-servable cached snapshot, or return
+    /// `None`. The single gate every value-derived accessor shares — the C
+    /// `dbCaGetLink` readable-cache check (`dbCa.c:448`, `:484-492`):
     ///
-    /// Pre-fix this keyed off cache presence alone, so an upstream
-    /// IOC restart was invisible — `is_connected()` stayed `true` and
-    /// stale data was served with no LINK alarm.
-    pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Acquire) && self.cache.load().as_ref().is_some()
-    }
-
-    /// Current cached value, or `None` when the link is not connected
-    /// (no event yet, or the circuit is currently down). A
-    /// disconnected link serves no value — the C `dbCaGetLink`
-    /// "not connected" error path — so a downstream IOC outage does
-    /// not leak the last stale value into the owning record.
-    pub fn value(&self) -> Option<EpicsValue> {
+    /// 1. the circuit is up (`connected`, driven by
+    ///    `CaChannel::connection_events()`);
+    /// 2. a monitor snapshot is cached (the C `pca->pgetNative` populated
+    ///    case); AND
+    /// 3. that snapshot's native description (DBR type + element count)
+    ///    still matches the channel's CURRENT native description.
+    ///
+    /// (3) is the BRIDGE-106 fix: after an upstream reconnect changes the
+    /// type or element count (C `dbCa.c:865-889`), the snapshot cached
+    /// under the old description stops being servable until a new monitor
+    /// event repopulates a matching cache. The check is read-side and
+    /// value-intrinsic, so it has no dependence on the ordering between the
+    /// connection-event watcher and the monitor task.
+    fn with_servable<R>(&self, f: impl FnOnce(&Snapshot) -> R) -> Option<R> {
         if !self.connected.load(Ordering::Acquire) {
             return None;
         }
-        self.cache.load().as_ref().as_ref().map(|s| s.value.clone())
+        let guard = self.cache.load();
+        let cached = guard.as_ref().as_ref()?;
+        if !self.cache_matches_channel(cached) {
+            return None;
+        }
+        Some(f(&cached.snapshot))
+    }
+
+    /// Whether `cached`'s native description still matches the channel's
+    /// current one. A disconnected channel (no current description) is not
+    /// servable. Thin wrapper over the pure [`cache_native_matches`].
+    fn cache_matches_channel(&self, cached: &CachedSnapshot) -> bool {
+        match (
+            self.channel.native_field_type(),
+            self.channel.element_count(),
+        ) {
+            (Ok(cur_type), Ok(cur_count)) => cache_native_matches(
+                cached.snapshot.value.dbr_type(),
+                cached.native_count,
+                cur_type,
+                cur_count,
+            ),
+            _ => false,
+        }
+    }
+
+    /// True when the CA circuit is currently up AND a monitor event whose
+    /// native description still matches the channel has been cached. C
+    /// `dbCaGetLink` (`dbCa.c:448`) treats a CA link as readable only when
+    /// `pca->connected` is set (the `connectionCallback` clears it on
+    /// disconnect) *and* the monitor callback has populated a matching
+    /// `pca->pgetNative` (cleared by `dbCa.c:865-889` on a type/count
+    /// change).
+    ///
+    /// Pre-fix this keyed off cache presence alone, so an upstream IOC
+    /// restart was invisible — `is_connected()` stayed `true` and stale
+    /// data was served with no LINK alarm; a later refinement added the
+    /// circuit-state flag, and BRIDGE-106 added the type/count match.
+    pub fn is_connected(&self) -> bool {
+        self.with_servable(|_| ()).is_some()
+    }
+
+    /// Current cached value, or `None` when the link is not servable: no
+    /// event yet, the circuit is down, or the cached snapshot's type/count
+    /// no longer matches the channel after an upstream type/count change
+    /// (C `dbCaGetLink` "not connected" / invalid-cache paths). A
+    /// non-servable link serves no value, so a downstream IOC outage or
+    /// type change does not leak a stale/mis-shaped value into the owning
+    /// record.
+    pub fn value(&self) -> Option<EpicsValue> {
+        self.with_servable(|s| s.value.clone())
     }
 
     /// Current cached alarm severity (0..3), or `None` when the link
     /// is not connected. Mirrors C `dbCaGetAlarmLimits` reading the
     /// cached `pca->sevr` — gated on `pca->connected`.
     pub fn alarm_severity(&self) -> Option<i32> {
-        if !self.connected.load(Ordering::Acquire) {
-            return None;
-        }
-        self.cache
-            .load()
-            .as_ref()
-            .as_ref()
-            .map(|s| s.alarm.severity as i32)
+        self.with_servable(|s| s.alarm.severity as i32)
     }
 
     /// Cached alarm *status* code (the EPICS `alarm_status` enum), or
@@ -135,14 +220,7 @@ impl CaLink {
     /// record instead of the generic `LINK_ALARM`. Gated on `connected`
     /// exactly like [`Self::alarm_severity`].
     pub fn alarm_status(&self) -> Option<i32> {
-        if !self.connected.load(Ordering::Acquire) {
-            return None;
-        }
-        self.cache
-            .load()
-            .as_ref()
-            .as_ref()
-            .map(|s| s.alarm.status as i32)
+        self.with_servable(|s| s.alarm.status as i32)
     }
 
     /// Cached timestamp as `(seconds_past_epoch, nanoseconds, userTag)`,
@@ -150,13 +228,11 @@ impl CaLink {
     /// protocol's `DBR_TIME_*` payload carries no user tag, so the tag is
     /// always `0` — only PVA links can adopt a remote `timeStamp.userTag`.
     pub fn time_stamp(&self) -> Option<(i64, i32, u64)> {
-        if !self.connected.load(Ordering::Acquire) {
-            return None;
-        }
-        let snap = self.cache.load();
-        let snap = snap.as_ref().as_ref()?;
-        let dur = snap.timestamp.duration_since(std::time::UNIX_EPOCH).ok()?;
-        Some((dur.as_secs() as i64, dur.subsec_nanos() as i32, 0))
+        self.with_servable(|s| {
+            let dur = s.timestamp.duration_since(std::time::UNIX_EPOCH).ok()?;
+            Some((dur.as_secs() as i64, dur.subsec_nanos() as i32, 0))
+        })
+        .flatten()
     }
 
     /// Cached remote metadata (display/control/alarm limits, precision,
@@ -234,14 +310,23 @@ impl CaLinkResolver {
         // await would emit `Connected` before the watcher existed, leaving
         // `meta` permanently empty until the next reconnect.
         let conn_rx = channel.connection_events();
+        // C `dbCa` opens the record-link monitor with `ca_add_array_event`
+        // (`dbCa.c:1258-1269`), whose libca macro expands to
+        // `ca_add_masked_array_event(..., DBE_VALUE | DBE_ALARM)`
+        // (`cadef.h:2004-2012`). DBE_LOG / DBE_ARCHIVE is a separate
+        // event-trigger class (`cadef.h:1148-1158`) that `dbCa` never
+        // requests, so a CP/CPP record link must not refresh its cache (or
+        // wake a scan) on archive/log-only posts. The default
+        // `CaChannel::subscribe()` requests `DBE_VALUE | DBE_LOG |
+        // DBE_ALARM`, so request the dbCa mask explicitly here.
         let monitor = channel
-            .subscribe()
+            .subscribe_with_mask(0.0, CALINK_EVENT_MASK)
             .await
             .map_err(|e| CaLinkError::Subscribe {
                 pv: pv_name.to_string(),
                 reason: e.to_string(),
             })?;
-        let cache: Arc<ArcSwap<Option<Snapshot>>> = Arc::new(ArcSwap::from_pointee(None));
+        let cache: Arc<ArcSwap<Option<CachedSnapshot>>> = Arc::new(ArcSwap::from_pointee(None));
         let connected = Arc::new(AtomicBool::new(false));
         let meta: Arc<ArcSwap<Option<LinkMetadata>>> = Arc::new(ArcSwap::from_pointee(None));
         // Connection-event watcher: keeps `connected` in sync with the
@@ -261,6 +346,7 @@ impl CaLinkResolver {
             monitor,
             cache.clone(),
             connected.clone(),
+            channel.clone(),
             pv_name.to_string(),
         ));
         let link = Arc::new(CaLink {
@@ -335,8 +421,9 @@ impl CaLinkResolver {
 /// `dbCaGetLink` later serves.
 async fn run_monitor(
     mut monitor: epics_ca_rs::client::MonitorHandle,
-    cache: Arc<ArcSwap<Option<Snapshot>>>,
+    cache: Arc<ArcSwap<Option<CachedSnapshot>>>,
     connected: Arc<AtomicBool>,
+    channel: Arc<CaChannel>,
     pv_name: String,
 ) {
     while let Some(event) = monitor.recv().await {
@@ -347,7 +434,20 @@ async fn run_monitor(
                 // `Connected` lifecycle event has not been observed
                 // yet (race-free, mirrors `pvalink`'s callback).
                 connected.store(true, Ordering::Release);
-                cache.store(Arc::new(Some(snapshot)));
+                // Capture the channel's native element count this event was
+                // produced under, so a later type/count change makes the
+                // cache unservable (the DBR type is intrinsic to the
+                // value). The channel is connected here — we just received
+                // an event — so `element_count()` is `Ok`; fall back to the
+                // payload count only if the description is momentarily
+                // unavailable.
+                let native_count = channel
+                    .element_count()
+                    .unwrap_or_else(|_| snapshot.value.count());
+                cache.store(Arc::new(Some(CachedSnapshot {
+                    snapshot,
+                    native_count,
+                })));
             }
             // A monitor error event (e.g. a transient server-side
             // problem) leaves the last cached value in place — the
@@ -662,6 +762,27 @@ mod tests {
         assert_eq!(strip_ca_scheme("OTHER:PV"), "OTHER:PV");
     }
 
+    /// The CA record-link monitor mask matches C `dbCa`'s
+    /// `ca_add_array_event` = `DBE_VALUE | DBE_ALARM` and EXCLUDES
+    /// `DBE_LOG` (`cadef.h:2004-2012` / `:1148-1158`). `open()` subscribes
+    /// with this exact constant, so an archive/log-only upstream post does
+    /// not refresh a CP/CPP link's cache. Guards against a regression back
+    /// to the default `subscribe()` mask, which adds `DBE_LOG`.
+    #[test]
+    fn calink_monitor_mask_is_dbca_value_alarm_without_log() {
+        use epics_ca_rs::protocol::{DBE_ALARM, DBE_LOG, DBE_VALUE};
+        assert_eq!(
+            CALINK_EVENT_MASK,
+            DBE_VALUE | DBE_ALARM,
+            "calink monitor mask must equal dbCa's DBE_VALUE | DBE_ALARM"
+        );
+        assert_eq!(
+            CALINK_EVENT_MASK & DBE_LOG,
+            0,
+            "calink must not request DBE_LOG — dbCa.c never does"
+        );
+    }
+
     /// BUG 1 regression: the connection-event → `connected` flag
     /// transition, which [`note_conn_event`] owns (the watcher loop only
     /// calls it). A disconnect MUST flip the flag false; pre-fix
@@ -747,6 +868,37 @@ mod tests {
         assert!(
             is_connected,
             "reconnected link with cache must be connected"
+        );
+    }
+
+    /// BRIDGE-106 regression: after an upstream reconnect changes the DBR
+    /// type or element count, the snapshot cached under the old description
+    /// is no longer servable (so `value()`/`is_connected()` report nothing
+    /// until a new monitor event repopulates a matching cache). Mirrors C
+    /// `dbCa.c:865-889` / the `dbCaGetLink` invalid-cache path
+    /// (`dbCa.c:484-492`). Tests the type/count gate directly — the
+    /// live-channel `cache_matches_channel` is a thin wrapper. By invariant
+    /// boundary: unchanged, DBR-type-changed, element-count-changed.
+    #[test]
+    fn calink_cache_invalidated_on_native_type_or_count_change() {
+        // Unchanged description ⇒ still servable.
+        assert!(
+            cache_native_matches(DbFieldType::Double, 1, DbFieldType::Double, 1),
+            "matching scalar type+count stays servable"
+        );
+        assert!(
+            cache_native_matches(DbFieldType::Short, 10, DbFieldType::Short, 10),
+            "matching waveform type+count stays servable"
+        );
+        // DBR type changed (Short -> Double), same count ⇒ unservable.
+        assert!(
+            !cache_native_matches(DbFieldType::Short, 1, DbFieldType::Double, 1),
+            "a DBR-type change invalidates the old cache"
+        );
+        // Element count changed (NELM 10 -> 5), same type ⇒ unservable.
+        assert!(
+            !cache_native_matches(DbFieldType::Short, 10, DbFieldType::Short, 5),
+            "an element-count change invalidates the old cache"
         );
     }
 

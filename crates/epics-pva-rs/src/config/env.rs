@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 /// Expand `$(VAR)` and `${VAR}` references in `input` against the
 /// process environment. Mirrors pvxs `Config::expand()` (server.h:219).
@@ -310,27 +311,36 @@ pub fn auto_beacon_addr_list_enabled() -> bool {
 
 /// `EPICS_PVAS_BEACON_PERIOD` — default 15s. Controls the *short*
 /// burst-interval; see [`crate::server_native::runtime::PvaServerConfig`]
-/// for the burst-then-slowdown semantics.
-pub fn beacon_period_secs() -> u64 {
+/// for the burst-then-slowdown semantics. Rust extension — pvxs has no
+/// configurable beacon interval (fixed 15s/180s, `server.cpp:45-46`).
+///
+/// Returns a [`Duration`] built with [`Duration::from_secs_f64`] so a
+/// sub-second positive request (`0.5`) is honored as 500ms rather than
+/// truncated to zero. The 100ms floor is applied *after* the float
+/// conversion, so every `0 < value` survives as a real delay instead of
+/// collapsing into a `Duration::ZERO` emit-loop.
+pub fn beacon_period() -> Duration {
     std::env::var("EPICS_PVAS_BEACON_PERIOD")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        // Reject negatives, NaN, infinity, and zero — `f as u64` would
-        // saturate to 0 silently, producing `Duration::ZERO` and a
-        // beacon emit-loop that spins at memory bandwidth.
+        // Reject negatives, NaN, infinity, and zero.
         .filter(|f| f.is_finite() && *f > 0.0)
-        .map(|f| f.max(0.1) as u64)
-        .unwrap_or(15)
+        .map(Duration::from_secs_f64)
+        .map(|d| d.max(Duration::from_millis(100)))
+        .unwrap_or(Duration::from_secs(15))
 }
 
 /// `EPICS_PVAS_BEACON_PERIOD_LONG` — explicit long-interval override.
 /// `None` falls back to 12× the short interval (pvxs 15→180 ratio).
-pub fn beacon_period_long_secs() -> Option<u64> {
+/// Sub-second precision preserved via [`Duration::from_secs_f64`] with a
+/// post-conversion 100ms floor, same as [`beacon_period`].
+pub fn beacon_period_long() -> Option<Duration> {
     std::env::var("EPICS_PVAS_BEACON_PERIOD_LONG")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|f| f.is_finite() && *f > 0.0)
-        .map(|f| f.max(0.1) as u64)
+        .map(Duration::from_secs_f64)
+        .map(|d| d.max(Duration::from_millis(100)))
 }
 
 /// `EPICS_PVAS_MAX_CONNECTIONS` — server hard cap on simultaneous

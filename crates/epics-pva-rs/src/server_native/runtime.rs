@@ -301,15 +301,14 @@ impl PvaServerConfig {
         self.max_connections = env::max_connections();
         self.max_channels_per_connection = env::max_channels_per_connection();
         self.max_ops_per_channel = env::max_ops_per_channel();
-        self.beacon_period = Duration::from_secs(env::beacon_period_secs());
+        self.beacon_period = env::beacon_period();
         // Keep the pvxs short:long = 15:180 = 1:12 ratio when the
         // operator tunes only the short period; an explicit
         // `EPICS_PVAS_BEACON_PERIOD_LONG` override wins. Floor at
         // `beacon_period + 1s` so the long path never goes faster
         // than the burst path (beacon_loop assumes long > short).
-        let long = env::beacon_period_long_secs()
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| self.beacon_period.saturating_mul(12));
+        let long =
+            env::beacon_period_long().unwrap_or_else(|| self.beacon_period.saturating_mul(12));
         self.beacon_period_long = long.max(self.beacon_period + Duration::from_secs(1));
         self.beacon_destinations = env::server_beacon_addr_list();
         self.auto_beacon = env::auto_beacon_addr_list_enabled();

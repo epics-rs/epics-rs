@@ -97,16 +97,32 @@ impl PvaLinkRegistry {
         self.map.read().get(&key).cloned()
     }
 
-    /// Return the first cached link for `(pv_name, direction)` regardless
-    /// of `pipeline` / `queue_size`. Used by hot paths that only want
-    /// "any cached value" (fast-path read, connected check, alarm
-    /// severity) and don't care about which monitor variant they land on.
-    pub fn try_get_any(&self, pv_name: &str, direction: LinkDirection) -> Option<Arc<PvaLink>> {
-        self.map
-            .read()
-            .iter()
-            .find(|((name, _, _, dir, _), _)| name == pv_name && *dir == direction)
-            .map(|(_, link)| link.clone())
+    /// Exact INP lookup by monitor-variant identity `(pv_name,
+    /// pipeline, queue_size)`. Returns the cached INP link for that
+    /// exact variant, or `None`.
+    ///
+    /// INP links never carry `out_opts` (always `None` in the key), so
+    /// the monitor variant is fully described by these three fields —
+    /// matching pvxs's `channels_key_t = (channelName, pvRequest)` where
+    /// the pvRequest encodes `pipeline` / `queueSize`
+    /// (`pvxs/ioc/pvalink.h:115-120`). Resolver hot paths use this
+    /// instead of a bare-PV-name match so a `Q=1` record reads from its
+    /// own monitor, never from a `Q=64` sibling that merely shares the
+    /// upstream PV name.
+    pub fn try_get_inp(
+        &self,
+        pv_name: &str,
+        pipeline: bool,
+        queue_size: usize,
+    ) -> Option<Arc<PvaLink>> {
+        let key: RegistryKey = (
+            pv_name.to_string(),
+            pipeline,
+            queue_size,
+            LinkDirection::Inp,
+            None,
+        );
+        self.map.read().get(&key).cloned()
     }
 
     /// Get an existing link or open a new one. Concurrent calls
@@ -264,33 +280,35 @@ impl PvaLinkRegistry {
         self.len() == 0
     }
 
-    /// distinct upstream PV names of every opened INP
-    /// link, sorted for a stable order.
+    /// Distinct monitor-variant identities `(pv_name, pipeline,
+    /// queue_size)` of every opened INP link, sorted for a stable order.
     ///
     /// The base iocInit external-link wait
     /// (`PvDatabase::wait_for_external_links`) drives off
-    /// `LinkSet::link_names()` and then queries `is_connected(name)`
-    /// for each. Only INP links carry a monitor connection signal —
-    /// `PvaLinkResolver::is_connected` resolves through
-    /// `try_get_any(.., Inp)`, and OUT links install no monitor so
-    /// they would report perpetually disconnected. Returning INP names
-    /// only keeps the wait set inside the resolver's own key family.
+    /// `LinkSet::link_names()` and then queries `is_connected(name)` for
+    /// each. Only INP links carry a monitor connection signal — OUT
+    /// links install no monitor — so OUT keys are excluded here.
     ///
-    /// Distinct per-option INP links to the same upstream PV (differing
-    /// `pipeline` / `queue_size`) collapse to a single name here:
-    /// `is_connected` answers for any of them via `try_get_any`, so the
-    /// wait needs each upstream PV exactly once.
-    pub fn inp_link_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
+    /// Two INP links to the same upstream PV with different `pipeline` /
+    /// `queue_size` are DISTINCT monitor variants (distinct
+    /// subscriptions in pvxs, `pvxs/ioc/pvalink.h:115-120`), so each is
+    /// reported separately: the wait must confirm every variant's own
+    /// monitor connected, not just the first to share the PV name. Links
+    /// that share the exact `(pv_name, pipeline, queue_size)` variant
+    /// (differing only in `field` / `sevr`, which the registry folds
+    /// onto one entry) collapse to a single identity, matching the one
+    /// shared subscription that actually backs them.
+    pub fn inp_identities(&self) -> Vec<(String, bool, usize)> {
+        let mut ids: Vec<(String, bool, usize)> = self
             .map
             .read()
             .keys()
             .filter(|(_, _, _, dir, _)| *dir == LinkDirection::Inp)
-            .map(|(name, _, _, _, _)| name.clone())
+            .map(|(name, pipeline, qsize, _, _)| (name.clone(), *pipeline, *qsize))
             .collect();
-        names.sort();
-        names.dedup();
-        names
+        ids.sort();
+        ids.dedup();
+        ids
     }
 }
 
@@ -308,17 +326,24 @@ mod tests {
         assert_eq!(reg.len(), 0);
     }
 
-    /// `inp_link_names` feeds the base iocInit
-    /// external-link wait. It must (a) report each opened INP upstream
-    /// PV exactly once even when two option-variants of the same PV are
-    /// cached under distinct registry keys, and (b) exclude OUT links
-    /// (which carry no monitor connection signal `is_connected` could
-    /// answer for). `insert_for_test` seeds links without a PVA server.
+    /// `inp_identities` feeds the base iocInit external-link wait. It
+    /// must (a) report each DISTINCT INP monitor variant — two links to
+    /// the same upstream PV with different `queue_size` / `pipeline` are
+    /// distinct subscriptions and each must be waited on independently;
+    /// (b) collapse links that share the exact `(pv, pipeline, Q)`
+    /// variant (the registry already folds `field`/`sevr` differences
+    /// onto one entry); and (c) exclude OUT links (no monitor signal).
+    /// `insert_for_test` seeds links without a PVA server.
+    ///
+    /// BRIDGE-RS-2026-05-28-128: pre-fix this deduped by bare PV name,
+    /// collapsing the `Q=1` and `Q=8` variants of `A:PV` into one wait
+    /// entry — so a record could begin processing before its own
+    /// monitor variant connected.
     #[tokio::test]
-    async fn fr15_inp_link_names_dedups_by_pv_and_excludes_out() {
+    async fn fr15_inp_identities_separate_variants_and_exclude_out() {
         let reg = PvaLinkRegistry::new();
 
-        // Two INP option-variants of the same upstream PV.
+        // Two INP monitor-variants of the same upstream PV.
         let a1 = PvaLinkConfig {
             queue_size: 1,
             ..PvaLinkConfig::defaults_for("A:PV", LinkDirection::Inp)
@@ -327,18 +352,35 @@ mod tests {
             queue_size: 8,
             ..PvaLinkConfig::defaults_for("A:PV", LinkDirection::Inp)
         };
+        // Same variant as a1 but a different sub-field — registry folds
+        // it onto a1's entry, so it must NOT add a second identity.
+        let a1_field = PvaLinkConfig {
+            queue_size: 1,
+            field: "alarm.severity".to_string(),
+            ..PvaLinkConfig::defaults_for("A:PV", LinkDirection::Inp)
+        };
         let b = PvaLinkConfig::defaults_for("B:PV", LinkDirection::Inp);
         let c_out = PvaLinkConfig::defaults_for("C:OUT", LinkDirection::Out);
 
         reg.insert_for_test(&a1, Arc::new(PvaLink::for_test(a1.clone(), None)));
         reg.insert_for_test(&a2, Arc::new(PvaLink::for_test(a2.clone(), None)));
+        reg.insert_for_test(
+            &a1_field,
+            Arc::new(PvaLink::for_test(a1_field.clone(), None)),
+        );
         reg.insert_for_test(&b, Arc::new(PvaLink::for_test(b.clone(), None)));
         reg.insert_for_test(&c_out, Arc::new(PvaLink::for_test(c_out.clone(), None)));
 
+        let default_q = PvaLinkConfig::defaults_for("B:PV", LinkDirection::Inp).queue_size;
         assert_eq!(
-            reg.inp_link_names(),
-            vec!["A:PV".to_string(), "B:PV".to_string()],
-            "INP names deduped by PV (A:PV once), OUT (C:OUT) excluded"
+            reg.inp_identities(),
+            vec![
+                ("A:PV".to_string(), false, 1),
+                ("A:PV".to_string(), false, 8),
+                ("B:PV".to_string(), false, default_q),
+            ],
+            "distinct Q variants of A:PV reported separately; field-only \
+             variant folded; OUT (C:OUT) excluded"
         );
     }
 

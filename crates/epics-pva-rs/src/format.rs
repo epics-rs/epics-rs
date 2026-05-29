@@ -846,20 +846,34 @@ fn format_value_inline(v: &PvField) -> String {
 
 /// Render a scalar array for raw / NT inline display: `[` elements `]`.
 /// Each element goes through [`scalar_to_inline`], so string elements are
-/// `maybeQuote`-escaped (Base `PVValueArray<std::string>::dumpValue`,
-/// PVDataCreateFactory.cpp:240-251) while numeric elements print bare.
+/// `maybeQuote`-escaped while numeric elements print bare with six
+/// significant digits. The element separator follows Base's per-type
+/// array dump: a string array uses `", "`
+/// (`PVValueArray<std::string>::dumpValue`, PVDataCreateFactory.cpp:
+/// 240-251) while every numeric/bool array uses a bare `","`
+/// (`PVValueArray<T>::dumpValue`, :216-229).
 fn format_scalar_array_inline(items: &[ScalarValue]) -> String {
     let parts: Vec<String> = items.iter().map(scalar_to_inline).collect();
-    format!("[{}]", parts.join(", "))
+    let sep = if matches!(items.first(), Some(ScalarValue::String(_))) {
+        ", "
+    } else {
+        ","
+    };
+    format!("[{}]", parts.join(sep))
 }
 
 /// Inline display rendering of a scalar for raw / NT output. Mirrors the
 /// EPICS Base PVField stream operator: a string is `maybeQuote`-escaped
-/// (`PVString::dumpValue`, PVDataCreateFactory.cpp:145-149) and other
-/// scalars print their plain value text.
+/// (`PVString::dumpValue`, PVDataCreateFactory.cpp:145-149); a float is
+/// printed with six significant digits, matching Base's C++ stream
+/// default precision for `PVScalarValue<T>::dumpValue` (`o << get()`,
+/// PVDataCreateFactory.cpp:64-68) and the NT formatter's explicit
+/// `precision(6)` (printer.cpp:428-440); other scalars print exact text.
 fn scalar_to_inline(v: &ScalarValue) -> String {
     match v {
         ScalarValue::String(s) => maybe_quote(s),
+        ScalarValue::Double(f) => format_g(*f, 6),
+        ScalarValue::Float(f) => format_g(*f as f64, 6),
         other => scalar_cell_text(other),
     }
 }
@@ -1332,6 +1346,43 @@ mod tests {
             ]),
         );
         assert_eq!(format_enum_summary(&e), "(1) \"on hold\"");
+    }
+
+    /// A raw double scalar prints with six significant digits, matching
+    /// Base's C++ stream default precision (PVDataCreateFactory.cpp:64-68),
+    /// not Rust's shortest-round-trip Display.
+    #[test]
+    fn raw_double_scalar_six_significant_digits() {
+        assert_eq!(
+            format_value_inline(&PvField::Scalar(ScalarValue::Double(1.23456789))),
+            "1.23457"
+        );
+    }
+
+    /// Numeric (and bool) scalar arrays join elements with a bare comma,
+    /// matching Base `PVValueArray<T>::dumpValue` (PVDataCreateFactory.cpp:
+    /// 216-229) — not `, `.
+    #[test]
+    fn numeric_array_uses_bare_comma_separator() {
+        let ints = PvField::ScalarArray(vec![
+            ScalarValue::Int(1),
+            ScalarValue::Int(2),
+            ScalarValue::Int(3),
+        ]);
+        assert_eq!(format_value_inline(&ints), "[1,2,3]");
+        let dbls = PvField::ScalarArray(vec![ScalarValue::Double(1.5), ScalarValue::Double(2.25)]);
+        assert_eq!(format_value_inline(&dbls), "[1.5,2.25]");
+    }
+
+    /// Decoupling guard: table cells use `scalar_cell_text` (Base
+    /// `getAs<std::string>`, full precision), NOT the six-significant-digit
+    /// raw/NT display path — so the same double renders differently in a
+    /// table cell vs an inline scalar.
+    #[test]
+    fn nt_table_double_cell_keeps_full_precision() {
+        let (desc, value) = nt_table(&["d"], &[("d", vec![ScalarValue::Double(1.23456789)])]);
+        let out = format_nt("PV", &desc, &value);
+        assert_eq!(out, "PV \n         d\n1.23456789\n");
     }
 
     #[test]

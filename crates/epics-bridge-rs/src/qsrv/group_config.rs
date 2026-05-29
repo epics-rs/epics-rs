@@ -333,13 +333,18 @@ pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<Group
                 continue;
             }
         };
-        // Apply channel prefix: bare field names get record_name prefix
+        // pvxs prefixes EVERY `+channel` in a record's info(Q:group) with
+        // `"{record}."` — `channelPrefix = dbRecordName + "."` is applied
+        // unconditionally (groupprocessorcontext.cpp:65-66,
+        // groupconfigprocessor.cpp:810-818); it does NOT skip values that
+        // already contain ':' or '.'. Record-info group JSON is always
+        // record-relative; absolute PV names are reachable only through the
+        // file-based dbLoadGroup path (the empty-prefix case). The earlier
+        // ':'/'.' scan let an info(Q:group) member reference an unrelated
+        // absolute PV that pvxs would not model. Skip only the channel-less
+        // Structure/Const members (empty channel).
         for member in &mut def.members {
-            // Structure/Const have empty channels — skip prefix.
-            if !member.channel.is_empty()
-                && !member.channel.contains(':')
-                && !member.channel.contains('.')
-            {
+            if !member.channel.is_empty() {
                 member.channel = format!("{}.{}", record_name, member.channel);
             }
         }
@@ -1456,8 +1461,12 @@ mod tests {
         assert_eq!(groups[0].members[0].channel, "TEMP:sensor.VAL");
     }
 
+    /// pvxs prefixes the owning record name onto EVERY info(Q:group)
+    /// `+channel`, including values that contain ':' or '.' — record-info
+    /// group JSON is always record-relative (groupprocessorcontext.cpp:
+    /// 65-66). A ':'-bearing value is NOT treated as an absolute PV here.
     #[test]
-    fn parse_info_group_absolute_channel() {
+    fn br_65_info_group_prefixes_colon_bearing_channel() {
         let json = r#"{
             "TEMP:group": {
                 "pressure": {
@@ -1468,8 +1477,27 @@ mod tests {
         }"#;
 
         let groups = parse_info_group("TEMP:sensor", json).unwrap();
-        // Absolute channel (contains ':') should be kept as-is
-        assert_eq!(groups[0].members[0].channel, "PRESS:ai");
+        assert_eq!(
+            groups[0].members[0].channel, "TEMP:sensor.PRESS:ai",
+            "info(Q:group) channel must be record-relative even when it contains ':'"
+        );
+    }
+
+    /// The prefix rule must not depend on '.' scanning either: a dotted
+    /// relative field string is still prefixed with the owning record.
+    #[test]
+    fn br_65_info_group_prefixes_dotted_channel() {
+        let json = r#"{
+            "TEMP:group": {
+                "sub": {
+                    "+channel": "A.B",
+                    "+type": "scalar"
+                }
+            }
+        }"#;
+
+        let groups = parse_info_group("TEMP:sensor", json).unwrap();
+        assert_eq!(groups[0].members[0].channel, "TEMP:sensor.A.B");
     }
 
     #[test]

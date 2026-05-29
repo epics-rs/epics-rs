@@ -151,6 +151,11 @@ pub struct UpstreamManagerConfig {
     pub putlog: Option<Arc<PutLog>>,
     pub stats: Arc<Stats>,
     pub read_only: bool,
+    /// Upstream connect-timeout budget for lazy search resolution.
+    /// Threaded from `GatewayConfig::timeouts.connect_timeout` so the
+    /// CLI/API connect-timeout knob also governs first-search resolution,
+    /// not just cache cleanup (a single connect-timeout owner).
+    pub connect_timeout: Duration,
     pub beacon_anomaly: Arc<super::beacon::BeaconAnomaly>,
     /// B10: optional TLS client config for the upstream `CaClient`
     /// circuits to the real IOC. `None` keeps upstream traffic
@@ -187,6 +192,14 @@ pub struct UpstreamManager {
     /// the same PV awaits the Notify instead of duplicating the
     /// upstream channel + subscribe + spawn work.
     pending: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    /// Budget for the lazy-resolution `wait_connected` gate in
+    /// `ensure_subscribed`. Sourced from `CacheTimeouts::connect_timeout`
+    /// so the connect-timeout policy has ONE owner shared with the cache
+    /// reaper — mirrors C ca-gateway routing every pending-connect budget
+    /// through the single `global_resources->connectTimeout()`
+    /// (gateServer.cc:1294-1356, set once via setConnectTimeout,
+    /// gateway.cc:1147) rather than a second hard-coded clock.
+    connect_timeout: Duration,
 }
 
 impl UpstreamManager {
@@ -239,6 +252,7 @@ impl UpstreamManager {
             },
             subs: parking_lot::Mutex::new(HashMap::new()),
             pending: parking_lot::Mutex::new(HashMap::new()),
+            connect_timeout: cfg.connect_timeout,
         })
     }
 
@@ -357,10 +371,12 @@ impl UpstreamManager {
         // C ca-gateway answers does-not-exist for an unconnected PV
         // (gatePvData::death → pverDoesNotExistHere, gatePv.cc:622) and
         // exists-here only after connect (life → pverExistsHere,
-        // gatePv.cc:518). The connect budget matches the cache reaper's
-        // CacheTimeouts::connect_timeout (cache.rs:181).
-        const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-        if let Err(e) = channel.wait_connected(UPSTREAM_CONNECT_TIMEOUT).await {
+        // gatePv.cc:518). The connect budget is the configured
+        // `CacheTimeouts::connect_timeout`, the SAME value the cache
+        // reaper uses to drop stuck Connecting entries (cache.rs:323) —
+        // one owner, so a longer CLI/API connect-timeout governs lazy
+        // resolution too instead of being overridden by a local constant.
+        if let Err(e) = channel.wait_connected(self.connect_timeout).await {
             // Drop the Connecting cache entry created above; no shadow PV
             // is registered, so the resolver answers does-not-exist. The
             // dedup PendingGuard notifies waiters, who then see no live
@@ -1178,6 +1194,7 @@ mod tests {
             putlog: None,
             stats: env.stats.clone(),
             read_only: false,
+            connect_timeout: Duration::from_secs(1),
             beacon_anomaly: env.beacon_anomaly.clone(),
             #[cfg(feature = "ca-gateway-tls")]
             upstream_tls: None,
@@ -1201,6 +1218,7 @@ mod tests {
             putlog: None,
             stats: env.stats.clone(),
             read_only: false,
+            connect_timeout: Duration::from_secs(1),
             beacon_anomaly: env.beacon_anomaly.clone(),
             #[cfg(feature = "ca-gateway-tls")]
             upstream_tls: None,
@@ -1240,6 +1258,7 @@ mod tests {
             putlog: None,
             stats: env.stats.clone(),
             read_only: false,
+            connect_timeout: Duration::from_secs(1),
             beacon_anomaly: env.beacon_anomaly.clone(),
             upstream_tls: Some(tls),
             upstream_tls_server_name: Some("ioc.example.com".to_string()),
@@ -1539,8 +1558,7 @@ ASG(NewGroup) {
     #[serial(epics_env)]
     async fn br_r64_dead_upstream_not_registered() {
         // A free port with NO server bound: the upstream search never
-        // resolves and the connect budget (UPSTREAM_CONNECT_TIMEOUT)
-        // expires.
+        // resolves and the configured connect_timeout expires.
         let port = free_port();
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
@@ -1560,6 +1578,53 @@ ASG(NewGroup) {
         assert!(
             !mgr.is_subscribed(name),
             "no subscription may be tracked for a never-connected upstream"
+        );
+
+        mgr.shutdown().await;
+    }
+
+    /// the lazy-resolution connect gate must honor the configured
+    /// `CacheTimeouts::connect_timeout`, not a hard-coded constant. Build
+    /// a manager with a short 150 ms budget against a dead port and assert
+    /// the search miss is reported well under the old 1 s constant —
+    /// proving the configured value flows into `wait_connected` (one
+    /// connect-timeout owner shared with the cache reaper).
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn br_2026_22_lazy_connect_honors_configured_timeout() {
+        let port = free_port();
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let env = dummy_env();
+        let mgr = UpstreamManager::new(UpstreamManagerConfig {
+            cache: Arc::new(RwLock::new(PvCache::new())),
+            shadow_db: db.clone(),
+            access: env.access.clone(),
+            pvlist: env.pvlist.clone(),
+            putlog: None,
+            stats: env.stats.clone(),
+            read_only: false,
+            connect_timeout: Duration::from_millis(150),
+            beacon_anomaly: env.beacon_anomaly.clone(),
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls: None,
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls_server_name: None,
+        })
+        .await
+        .expect("manager builds");
+
+        let start = tokio::time::Instant::now();
+        let result = mgr
+            .ensure_subscribed("Ghost:cfg", "Ghost:cfg", None, 0)
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "dead upstream must miss");
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "configured 150ms connect_timeout must govern (not the old 1s \
+             constant); elapsed = {elapsed:?}"
         );
 
         mgr.shutdown().await;

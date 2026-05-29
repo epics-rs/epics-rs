@@ -255,6 +255,11 @@ impl GatewayServer {
             putlog: putlog.clone(),
             stats: stats.clone(),
             read_only: config.read_only,
+            // Single connect-timeout owner: the lazy-resolution
+            // `wait_connected` gate uses the same configured budget as the
+            // cache reaper instead of a local constant (parity with C
+            // gateResources::connectTimeout).
+            connect_timeout: config.timeouts.connect_timeout,
             beacon_anomaly: beacon_anomaly.clone(),
             // B10: forward the upstream-side TLS config so the
             // gateway's CaClient to the real IOC can also use TLS,

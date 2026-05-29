@@ -584,6 +584,19 @@ impl PvaServer {
         };
         std_listener.set_nonblocking(true)?;
         let bound_tcp_port = std_listener.local_addr()?.port();
+        // Single bound-port source of truth: stamp the actually-bound
+        // port back onto `config` so every consumer of `config.tcp_port`
+        // — the TCP-circuit SEARCH_RESPONSE (handle_tcp_search), beacons,
+        // report(), and client_config() — advertises the live listener
+        // port, not the requested value. pvxs writes the TCP SEARCH
+        // server port from the bound interface address
+        // (`iface->bind_addr.port()`, serverchan.cpp:238-242). Without
+        // this, a `tcp_port = 0` or occupied-port fallback made UDP
+        // discovery advertise the real port while TCP-circuit SEARCH
+        // handed out 0 or the occupied requested port. The ephemeral
+        // fallback above already consumed the original `tcp_port`, so
+        // overwriting it here is safe.
+        config.tcp_port = bound_tcp_port;
         let tokio_listener = tokio::net::TcpListener::from_std(std_listener)?;
 
         let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };

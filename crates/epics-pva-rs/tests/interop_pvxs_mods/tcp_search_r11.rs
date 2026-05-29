@@ -181,7 +181,22 @@ async fn interop_r11_tcp_circuit_search_returns_matching_cid() {
     let _ = cur.get_bytes(12).expect("guid");
     let _seq = cur.get_u32(order).expect("seq");
     let _ = cur.get_bytes(16).expect("addr");
-    let _ = cur.get_u16(order).expect("port");
+    // Parity: the advertised server port must be the ACTUAL bound
+    // listener port. `PvaServer::isolated` binds with tcp_port = 0
+    // (ephemeral), so pre-fix the TCP SEARCH_RESPONSE carried
+    // config.tcp_port = 0 while UDP discovery advertised the real port.
+    // pvxs writes the bound interface port (`iface->bind_addr.port()`,
+    // serverchan.cpp:238-242).
+    let resp_port = cur.get_u16(order).expect("port");
+    assert_ne!(
+        resp_port, 0,
+        "TCP SEARCH_RESPONSE must not advertise port 0"
+    );
+    assert_eq!(
+        resp_port,
+        addr.port(),
+        "TCP SEARCH_RESPONSE port must equal the bound listener port"
+    );
     // protocol string: Size(u8) + bytes (always < 254 for "tcp"/"tls").
     let proto_len = cur.get_u8().expect("proto len") as usize;
     let _ = cur.get_bytes(proto_len).expect("proto");

@@ -22,11 +22,13 @@ struct Args {
     #[arg(short = 'w', long = "wait")]
     timeout: Option<f64>,
 
-    /// `ca_client_status` interest level (0-10). Accepted for parity;
-    /// today the Rust client surfaces the equivalent diagnostics via
-    /// `--diag` instead.
+    /// `ca_client_status` interest level. A non-zero level prints the
+    /// client status dump *instead of* per-PV info (C `cainfo.c:77-79`,
+    /// `:202-205`); `-s 0` (and an unparseable value, C `:167-173`) is
+    /// normal per-PV mode. Kept as a raw string so the C "invalid →
+    /// ignored, reset to 0" rule is reproduced rather than clap erroring.
     #[arg(short = 's', long = "stat-level", value_name = "LEVEL")]
-    stat_level: Option<u8>,
+    stat_level: Option<String>,
 
     /// CA priority (0-99). Opens the channel on the matching priority
     /// virtual circuit (libca `ca_create_channel` priority parameter).
@@ -34,12 +36,32 @@ struct Args {
     priority: Option<u8>,
 
     /// Show client diagnostic counters and event history (Rust-only,
-    /// no C analogue).
+    /// no C analogue). Unlike `-s`, this is *additive*: per-PV info still
+    /// prints, with the diagnostics appended.
     #[arg(short = 'd', long)]
     diag: bool,
 
-    /// PV names to query (omit for diagnostics only).
+    /// PV names to query.
     pv_names: Vec<String>,
+}
+
+/// `cainfo.c:167-173` `sscanf(optarg, "%u", &statLevel)` parity: parse a
+/// leading unsigned integer; an unparseable value is ignored (reset to 0)
+/// with the C warning, so both `-s 0` and a bad `-s` are normal per-PV
+/// mode rather than a diagnostics-only invocation.
+fn parse_stat_level(s: &str) -> u32 {
+    let digits: String = s
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    match digits.parse::<u32>() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("'{s}' is not a valid interest level - ignored. ('cainfo -h' for help.)");
+            0
+        }
+    }
 }
 
 #[tokio::main]
@@ -51,7 +73,36 @@ async fn main() {
         return;
     }
 
+    // C `cainfo.c`: `statLevel` non-zero selects `ca_client_status`
+    // mode, which prints the client status dump *instead of* per-PV
+    // info and does not require PV names. Zero (or an unparseable `-s`)
+    // is normal per-PV mode. `--diag` is the Rust-only additive flag.
+    let stat_level = args
+        .stat_level
+        .as_deref()
+        .map(parse_stat_level)
+        .unwrap_or(0);
+    let stat_mode = stat_level != 0;
+
+    // C `cainfo.c:202-205`: a missing PV list is an error unless a
+    // non-zero `-s` level was selected. `--diag` (Rust-only) is an
+    // explicit diagnostics request, so it likewise exempts the error.
+    if !stat_mode && !args.diag && args.pv_names.is_empty() {
+        eprintln!("No pv name specified. ('cainfo -h' for help.)");
+        std::process::exit(1);
+    }
+
     let client = CaClient::new().await.expect("failed to create CA client");
+
+    // C `cainfo.c:77-79`: in `ca_client_status` mode, print only the
+    // client status dump (the Rust equivalent is `diagnostics()`) and
+    // skip the per-PV block entirely.
+    if stat_mode {
+        println!("--- Client Diagnostics ---");
+        println!("{}", client.diagnostics());
+        return;
+    }
+
     let timeout = epics_ca_rs::cli::timeout_duration(
         args.timeout
             .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
@@ -109,10 +160,10 @@ async fn main() {
         }
     }
 
-    // `-s <level>` is the `ca_client_status(level)` analog —
-    // emit the client diagnostics (the Rust equivalent), as `--diag`
-    // does, and without requiring PV names.
-    if args.diag || args.stat_level.is_some() || args.pv_names.is_empty() {
+    // `--diag` (Rust-only) appends the client diagnostics after the
+    // per-PV block. `-s` never reaches here — its non-zero mode returned
+    // above, and `-s 0` is plain per-PV mode.
+    if args.diag {
         if !args.pv_names.is_empty() {
             println!();
         }
@@ -154,5 +205,27 @@ fn dbr_name(t: DbFieldType) -> &'static str {
         DbFieldType::Double => "DBR_DOUBLE",
         DbFieldType::Int64 => "DBR_DOUBLE", // Int64 has no CA wire type; appears as Double
         DbFieldType::UInt64 => "DBR_DOUBLE", // UInt64 has no CA wire type; appears as Double
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // C `cainfo.c:167-173` `sscanf("%u")` semantics by boundary:
+    // valid → that level; `0` → 0 (normal mode, NOT diagnostics);
+    // unparseable → reset to 0 (ignored).
+    #[test]
+    fn stat_level_parses_like_sscanf_u() {
+        assert_eq!(parse_stat_level("0"), 0);
+        assert_eq!(parse_stat_level("1"), 1);
+        assert_eq!(parse_stat_level("10"), 10);
+        // Leading digits with trailing junk: sscanf("%u") stops at junk.
+        assert_eq!(parse_stat_level("3abc"), 3);
+        // No leading digits → ignored (reset to 0).
+        assert_eq!(parse_stat_level("abc"), 0);
+        assert_eq!(parse_stat_level(""), 0);
+        // A negative is not a `%u` match → reset to 0.
+        assert_eq!(parse_stat_level("-1"), 0);
     }
 }

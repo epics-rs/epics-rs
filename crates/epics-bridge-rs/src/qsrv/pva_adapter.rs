@@ -910,8 +910,9 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// groups whose every member uses the default `+trigger`
     /// (self-trigger); single-record / native-PVA PVs and groups with
     /// explicit `+trigger` members keep the full request mask.
-    fn monitor_emits_partial(&self, name: &str) -> bool {
-        self.provider.group_is_pure_self_trigger(name)
+    fn monitor_emits_partial(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+        let partial = self.provider.group_is_pure_self_trigger(name);
+        async move { partial }
     }
 }
 

@@ -5804,7 +5804,7 @@ async fn handle_op(
                     // marked-leaf semantics (`servermon.cpp:174`
                     // `to_wire_valid(R, ent, &pvMask)`). `prev_value`
                     // holds the last emitted snapshot for that diff.
-                    let emits_partial = src.monitor_emits_partial(&pv_name);
+                    let emits_partial = src.monitor_emits_partial(&pv_name).await;
                     let mut prev_value: Option<PvField> = None;
                     // Emit initial snapshot via the ACF-aware path —
                     // a peer with NoAccess on the record's ASG sees

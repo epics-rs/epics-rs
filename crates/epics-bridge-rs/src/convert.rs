@@ -291,12 +291,48 @@ pub fn epics_to_pv_field(val: &EpicsValue) -> PvField {
     }
 }
 
+/// Empty-array `EpicsValue` carrier for a declared PVA element type.
+///
+/// Mirrors the non-empty `PvField::ScalarArray` element→variant dispatch
+/// in [`pv_field_to_epics`] exactly, so an empty and a populated array of
+/// the same wire type always select the same `EpicsValue` variant — no
+/// type drift at the zero-length boundary. `Long`/`Boolean` have no
+/// dedicated empty carrier here because the non-empty path routes them
+/// through its `_ => DoubleArray` arm; matching that keeps the boundary
+/// uniform (promoting `long[]` to `Int64Array` is a separate concern in
+/// the non-empty arms, not this empty-type-preservation fix).
+fn empty_typed_array(ty: ScalarType) -> EpicsValue {
+    match ty {
+        ScalarType::Double => EpicsValue::DoubleArray(vec![]),
+        ScalarType::Float => EpicsValue::FloatArray(vec![]),
+        ScalarType::Short => EpicsValue::ShortArray(vec![]),
+        ScalarType::Int => EpicsValue::LongArray(vec![]),
+        ScalarType::Byte => EpicsValue::CharArray(vec![]),
+        ScalarType::UByte => EpicsValue::ShortArray(vec![]),
+        ScalarType::UShort => EpicsValue::EnumArray(vec![]),
+        ScalarType::String => EpicsValue::StringArray(vec![]),
+        ScalarType::UInt => EpicsValue::Int64Array(vec![]),
+        ScalarType::ULong => EpicsValue::UInt64Array(vec![]),
+        ScalarType::Long | ScalarType::Boolean => EpicsValue::DoubleArray(vec![]),
+    }
+}
+
 /// Extract EpicsValue from a PvField.
 pub fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
-    // transition: typed scalar arrays land here too. Convert
-    // back through `to_scalar_values` so the existing per-type
-    // dispatch keeps working without duplicating the logic.
+    // Typed scalar arrays carry an authoritative element type tag. An
+    // empty typed array has no element to infer from, so it MUST take
+    // its variant from the tag — routing it through the untyped
+    // first-element/empty path below would collapse it to `double[]`
+    // and a typed empty PUT would silently retype a string/int/float
+    // waveform carrier. pvxs keeps the descriptor element type at zero
+    // count and selects the DBR type from the array's `original_type()`
+    // (dataencode.cpp:315-352, iocsource.cpp:538-567). A non-empty typed
+    // array still flows through the legacy per-element dispatch, which
+    // agrees element-for-element with `empty_typed_array`.
     if let PvField::ScalarArrayTyped(arr) = field {
+        if arr.is_empty() {
+            return Some(empty_typed_array(arr.scalar_type()));
+        }
         let legacy = PvField::ScalarArray(arr.to_scalar_values());
         return pv_field_to_epics(&legacy);
     }
@@ -304,6 +340,11 @@ pub fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
         PvField::Scalar(sv) => Some(scalar_to_epics(sv)),
         PvField::ScalarArray(arr) => {
             if arr.is_empty() {
+                // Genuinely untyped empty array (legacy `ScalarArray`
+                // with no type tag): there is no element type to recover,
+                // so `double[]` is the only available carrier. Typed
+                // empty arrays never reach here — they are resolved from
+                // their tag by `empty_typed_array` above.
                 return Some(EpicsValue::DoubleArray(vec![]));
             }
             // Numeric arms dispatch on the homogeneous element type, so a
@@ -712,6 +753,91 @@ mod tests {
             EpicsValue::UInt64(big),
             "the full single-record PUT conversion chain must round-trip \
              the submitted u64 without an f64 precision loss"
+        );
+    }
+
+    /// An EMPTY typed scalar array (e.g. clearing a waveform) must keep
+    /// its declared element type instead of collapsing to `double[]`.
+    /// Before the fix every empty array — typed or not — was funneled
+    /// through the untyped `ScalarArray` path and returned
+    /// `EpicsValue::DoubleArray(vec![])`, silently retyping a string /
+    /// int / float waveform carrier on an empty PUT. pvxs keeps the
+    /// descriptor element type at zero count (dataencode.cpp:315-352)
+    /// and selects the DBR type from `original_type()`
+    /// (iocsource.cpp:538-567).
+    #[test]
+    fn empty_typed_array_preserves_element_type() {
+        use epics_pva_rs::pvdata::TypedScalarArray;
+        use std::sync::Arc;
+
+        let cases: &[(TypedScalarArray, EpicsValue)] = &[
+            (
+                TypedScalarArray::String(Arc::from([] as [String; 0])),
+                EpicsValue::StringArray(vec![]),
+            ),
+            (
+                TypedScalarArray::Int(Arc::from([] as [i32; 0])),
+                EpicsValue::LongArray(vec![]),
+            ),
+            (
+                TypedScalarArray::Float(Arc::from([] as [f32; 0])),
+                EpicsValue::FloatArray(vec![]),
+            ),
+            (
+                TypedScalarArray::Double(Arc::from([] as [f64; 0])),
+                EpicsValue::DoubleArray(vec![]),
+            ),
+            (
+                TypedScalarArray::Byte(Arc::from([] as [i8; 0])),
+                EpicsValue::CharArray(vec![]),
+            ),
+            (
+                TypedScalarArray::Short(Arc::from([] as [i16; 0])),
+                EpicsValue::ShortArray(vec![]),
+            ),
+            (
+                TypedScalarArray::UInt(Arc::from([] as [u32; 0])),
+                EpicsValue::Int64Array(vec![]),
+            ),
+            (
+                TypedScalarArray::ULong(Arc::from([] as [u64; 0])),
+                EpicsValue::UInt64Array(vec![]),
+            ),
+        ];
+
+        for (typed, expected) in cases {
+            let got = pv_field_to_epics(&PvField::ScalarArrayTyped(typed.clone()))
+                .expect("empty typed array converts");
+            assert_eq!(
+                &got,
+                expected,
+                "empty {:?} must preserve its element type, not become double[]",
+                typed.scalar_type()
+            );
+        }
+    }
+
+    /// Boundary uniformity: an empty typed array and a one-element typed
+    /// array of the SAME wire type must select the same `EpicsValue`
+    /// variant, so the zero-length case introduces no type drift.
+    #[test]
+    fn empty_and_singleton_typed_arrays_share_variant() {
+        use epics_pva_rs::pvdata::TypedScalarArray;
+        use std::mem::discriminant;
+        use std::sync::Arc;
+
+        let empty = pv_field_to_epics(&PvField::ScalarArrayTyped(TypedScalarArray::Int(
+            Arc::from([] as [i32; 0]),
+        )))
+        .unwrap();
+        let one = pv_field_to_epics(&PvField::ScalarArrayTyped(TypedScalarArray::Int(
+            Arc::from([7i32]),
+        )))
+        .unwrap();
+        assert_eq!(
+            discriminant(&empty),
+            discriminant(&one),
+            "empty int[] and [7] must both map to the same EpicsValue variant"
         );
     }
 }

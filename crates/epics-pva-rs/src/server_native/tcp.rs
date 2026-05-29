@@ -50,6 +50,16 @@ const CREATE_CHANNEL_NO_SID: u32 = u32::MAX;
 struct PipelineOptions {
     enabled: bool,
     queue_size: u32,
+    /// The client-requested `record._options.queueSize`, recorded ONLY
+    /// when it was present and valid (`>= 2`), independent of pipeline
+    /// enablement. pvxs assigns `op->limit = qSize` for any valid
+    /// `queueSize` outside the `if(op->pipeline)` block
+    /// (`servermon.cpp:533-543`), so a non-pipeline monitor's queue depth
+    /// is the requested value too. `None` means absent/invalid → the
+    /// server keeps its configured default depth. `queue_size` above is
+    /// the pipeline credit window (defaults to 4 when absent) and is a
+    /// separate concept from this squash-threshold override.
+    requested_queue_size: Option<u32>,
     /// pvxs `MonitorOp::ackAt` (`servermon.cpp:68`) — the pipeline
     /// ACK-refill threshold parsed from `record._options.ackAny`. It
     /// caps the source-provided monitor watermarks at `ack_at - 1`
@@ -718,12 +728,20 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
         .fields
         .iter()
         .find_map(|(k, v)| (k == "ackAny").then_some(v));
+    // A valid (`>= 2`) explicit `queueSize` is the per-op queue-depth
+    // override regardless of pipeline (pvxs `op->limit = qSize` sits
+    // OUTSIDE the `if(op->pipeline)` block, servermon.cpp:533-543).
+    let requested_queue_size = match queue_size {
+        Some(n) if n >= 2 => Some(n),
+        _ => None,
+    };
     let opts = if enabled {
         match queue_size {
             // Valid: use the requested window (pvxs `op->limit = qSize`).
             Some(n) if n >= 2 => PipelineOptions {
                 enabled: true,
                 queue_size: n,
+                requested_queue_size,
                 ack_at: ack_at_from(ack_any, n),
             },
             // PRESENT but invalid (`<2` or unparseable): pvxs
@@ -736,13 +754,16 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
             _ => PipelineOptions {
                 enabled: true,
                 queue_size: 4,
+                requested_queue_size,
                 ack_at: ack_at_from(ack_any, 4),
             },
         }
     } else {
         // Non-pipeline: a valid `queueSize` sets the queue depth
         // (pvxs sets `op->limit` regardless of pipeline); an invalid or
-        // absent one keeps the default 4 (pvxs warns and ignores).
+        // absent one keeps the default 4 for the pipeline-window field
+        // (unused here) while `requested_queue_size` carries the squash
+        // override to the send loop.
         let queue_size = match queue_size {
             Some(n) if n >= 2 => n,
             _ => 4,
@@ -750,6 +771,7 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
         PipelineOptions {
             enabled: false,
             queue_size,
+            requested_queue_size,
             ack_at: 1,
         }
     };
@@ -4263,6 +4285,16 @@ async fn handle_op(
         // window credits). Without pipeline=true we don't gate the
         // emit loop — mpsc backpressure remains the only limiter.
         let pipeline_req = req_value.as_ref().and_then(monitor_pipeline_options);
+        // The client-requested `queueSize` overrides the server's default
+        // monitor queue depth for THIS operation, whether or not pipeline
+        // flow control is enabled (pvxs `op->limit = qSize` sits outside
+        // `if(op->pipeline)`, servermon.cpp:533-543). Captured before
+        // `pipeline_req` is consumed by the move below; `None` means the
+        // server keeps its configured `monitor_queue_depth`.
+        let requested_queue_size = match &pipeline_req {
+            Some(MonitorPipelineRequest::Options(o)) => o.requested_queue_size,
+            _ => None,
+        };
         // pvxs `servermon.cpp:537-540`: a MONITOR pipeline request whose
         // PRESENT `queueSize` is invalid (`<2`/unparseable) is a
         // negotiation error — reject the INIT (`ctrl->error(...)` +
@@ -4359,16 +4391,16 @@ async fn handle_op(
 
         // capture the event-affecting MONITOR pvRequest
         // options so the START path can hand them to the source's
-        // `subscribe_*_checked_opts`. `pipeline_opt` was already
-        // filtered to `enabled`; `queue_size` is recorded only when
-        // the client requested pipeline mode (pvxs `servermon.cpp:533`
-        // only honours `queueSize` for pipeline subscriptions).
-        // `server_filter` reflects whether a non-empty `_filter`
-        // chain was present.
+        // `subscribe_*_checked_opts`. `queue_size` carries the
+        // client-requested `queueSize` whether or not pipeline mode is
+        // enabled (pvxs `op->limit = qSize` is honoured for plain
+        // monitors too, servermon.cpp:533-543) — the START path reads it
+        // as the per-op squash threshold. `server_filter` reflects
+        // whether a non-empty `_filter` chain was present.
         let monitor_options = if kind == OpKind::Monitor {
             crate::server_native::source::MonitorOptions {
                 pipeline: pipeline_opt.is_some(),
-                queue_size: pipeline_opt.as_ref().map(|o| o.queue_size),
+                queue_size: requested_queue_size,
                 server_filter: !monitor_filters.is_empty(),
             }
         } else {
@@ -5036,7 +5068,19 @@ async fn handle_op(
                 let mask_clone = mask.clone();
                 let tx_clone = tx.clone();
                 let src = source.clone();
-                let queue_depth = config.monitor_queue_depth;
+                // Per-operation monitor queue depth: the client-requested
+                // `record._options.queueSize` (captured at INIT into
+                // `monitor_options.queue_size`) overrides the server-wide
+                // default, matching pvxs `op->limit = qSize` for both
+                // pipeline and plain monitors (servermon.cpp:533-543). The
+                // squash threshold below keys on this, not the config
+                // default, so `record[queueSize=2]` squashes at 2.
+                let queue_depth = ch
+                    .ops
+                    .get(&ioid)
+                    .and_then(|s| s.monitor_options.queue_size)
+                    .map(|n| n as usize)
+                    .unwrap_or(config.monitor_queue_depth);
                 let high_watermark = config.monitor_high_watermark;
                 // ACF-aware MONITOR: capture the peer's credentials
                 // so the spawned task can consult ctx-aware
@@ -7825,6 +7869,105 @@ mod tests {
             "with queueSize=2 and no ACK the server must send exactly 2 DATA \
              frames (the initial snapshot consumes one credit); got \
              {data_frames} — the initial snapshot bypassed the pipeline window"
+        );
+    }
+
+    /// A NON-pipeline monitor that requests `record[queueSize=2]` must
+    /// have that depth honoured as its server-side squash threshold, not
+    /// silently discarded in favour of `PvaServerConfig::monitor_queue_depth`
+    /// (default 64). pvxs assigns `op->limit = qSize` for any valid
+    /// queueSize OUTSIDE the `if(op->pipeline)` block (servermon.cpp:533-543)
+    /// and the squash compares `queue.size() < limit` (servermon.cpp:271-287).
+    /// Here we drive a plain (pipeline=false) MONITOR INIT and assert the
+    /// negotiated `queueSize` lands on `OpState.monitor_options.queue_size`
+    /// — the exact field the START path reads to set the squash threshold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_pipeline_queue_size_drives_server_squash_threshold() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 909;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0));
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        assert_ne!(
+            config.monitor_queue_depth, 2,
+            "test premise: the requested depth must differ from the server default"
+        );
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // MONITOR INIT, pipeline OFF, queueSize=2.
+        let req_val = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::Int(2)),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Monitor, order, init_payload);
+        handle_op(
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("non-pipeline MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT reply");
+
+        let op = channels
+            .get(&sid)
+            .and_then(|c| c.ops.get(&ioid))
+            .expect("op present after INIT");
+        // pipeline flow control must stay OFF...
+        assert!(
+            op.monitor_window.is_none(),
+            "pipeline=false must not negotiate a credit window"
+        );
+        // ...yet the requested queueSize is preserved as the per-op squash
+        // depth the START path consumes (was discarded before the fix).
+        assert_eq!(
+            op.monitor_options.queue_size,
+            Some(2),
+            "non-pipeline queueSize=2 must be the per-op squash threshold, \
+             not the server default {}",
+            config.monitor_queue_depth
         );
     }
 

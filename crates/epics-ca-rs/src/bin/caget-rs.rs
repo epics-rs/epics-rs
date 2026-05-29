@@ -5,7 +5,7 @@ use epics_ca_rs::CaError;
 use epics_ca_rs::cli::{
     FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value,
 };
-use epics_ca_rs::client::{CaClient, enum_string_readback_dbr};
+use epics_ca_rs::client::{CaClient, enum_string_readback_dbr, float_as_string_readback_dbr};
 use std::time::SystemTime;
 
 // C `caget -V` prints a blank line then
@@ -224,12 +224,6 @@ async fn main() {
         return;
     }
 
-    // Acknowledge parity-only flags so the user knows we accepted but
-    // are no-oping. Routed via stderr to avoid corrupting tool output
-    // pipelines.
-    if args.string_format {
-        eprintln!("caget-rs: -s (string format) is accepted for parity but not yet honoured");
-    }
     if args.callback {
         // GET already waits for the response — note silently.
     }
@@ -261,6 +255,9 @@ async fn main() {
     // default readback requests the STRING form (state label), see the
     // per-PV get below (C `caget.c:178-181`).
     let enum_as_number = args.enum_as_number;
+    // `-s` (C `floatAsString`): request a native FLOAT/DOUBLE field's value
+    // in string form so the SERVER converts it (C `caget.c:183-187`).
+    let float_as_string = args.string_format;
     // resolve `-d <type>` ONCE here, mirroring C `caget.c`'s
     // getopt-time resolution (`caget.c:416-434`). The "out of range or
     // invalid" diagnostic prints exactly once (not per PV), and an
@@ -291,18 +288,25 @@ async fn main() {
             if connect.is_err() {
                 return (name, Err("not connected".to_string()));
             }
-            // C `caget.c:177-182`: with no `-d`, an ENUM field is read
-            // back in its STRING form so the value renders as the state
-            // label, unless `-n` keeps the numeric index. `native_field_type`
-            // is libca `ca_field_type`, valid now that the channel is
-            // connected. The substitution does not apply when `-d` set an
-            // explicit type (C `format == specifiedDbr`).
-            let enum_dbr = if req_dbr_type.is_none() {
-                ch.native_field_type()
-                    .ok()
-                    .and_then(|nt| enum_string_readback_dbr(nt, want_time, !enum_as_number))
-            } else {
+            // C `caget.c:177-187` `if (format != specifiedDbr)` readback
+            // substitution, in C's precedence: an ENUM field is read back in
+            // its STRING form (state label unless `-n` keeps the index),
+            // ELSE a `-s` request on a native FLOAT/DOUBLE field is read back
+            // as `DBR_TIME_STRING` so the SERVER converts it (honoring record
+            // precision). `native_field_type` is libca `ca_field_type`, valid
+            // now that the channel is connected. An explicit `-d`
+            // (`format == specifiedDbr`, `req_dbr_type` set) suppresses BOTH
+            // substitutions — the requested type is carried verbatim.
+            let sub_dbr = if req_dbr_type.is_some() {
                 None
+            } else {
+                let nt = ch.native_field_type().ok();
+                nt.and_then(|nt| enum_string_readback_dbr(nt, want_time, !enum_as_number))
+                    .or_else(|| {
+                        float_as_string
+                            .then(|| nt.and_then(float_as_string_readback_dbr))
+                            .flatten()
+                    })
             };
             // For `-a` (wide / DBR_TIME) we need timestamp + alarm, so
             // route through the DBR_TIME class (native value type) and
@@ -313,10 +317,10 @@ async fn main() {
             // requests a float, and `-d 38`/`DBR_CLASS_NAME` reaches the
             // record-class introspection type. The plain path stays on
             // the cheap `get_with_timeout` (no metadata payload).
-            let outcome = if let Some(rt) = enum_dbr {
-                // ENUM default → request the STRING form. Under `-a` the
-                // TIME-class string (DBR_TIME_STRING) still carries
-                // timestamp + alarm, so wrap it as `Time`.
+            let outcome = if let Some(rt) = sub_dbr {
+                // ENUM default or `-s` float-as-string → request the STRING
+                // form. Under `-a` the TIME-class string (DBR_TIME_STRING)
+                // still carries timestamp + alarm, so wrap it as `Time`.
                 match tokio::time::timeout(t, ch.get_with_dbr_type(rt, 0)).await {
                     Ok(Ok(snap)) => Ok(if want_time {
                         GetResult::Time(Box::new(snap))

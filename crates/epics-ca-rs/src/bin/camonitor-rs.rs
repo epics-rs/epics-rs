@@ -141,10 +141,6 @@ async fn main() {
         return;
     }
 
-    if args.string_format {
-        eprintln!("camonitor-rs: -s (string format) is accepted for parity but not yet honoured");
-    }
-
     let client = CaClient::new().await.expect("failed to create CA client");
     // -p selects the priority virtual circuit.
     let priority = args.priority.unwrap_or(0);
@@ -165,6 +161,10 @@ async fn main() {
     // incremental timestamp renderings.
     let mask = parse_event_mask(args.event_mask.as_deref());
     let spec = parse_timestamp_spec(args.timestamp_key.as_deref());
+    // `-s` (`floatAsString`): request DBR_TIME_STRING for FLOAT/DOUBLE
+    // fields so the server renders the value at record precision
+    // (C `camonitor.c:162-166`).
+    let float_as_string = args.string_format;
     let start = SystemTime::now();
     // `tsFirst` (`tool_lib.c:40`): the first SERVER stamp seen across all
     // channels, captured once — the server-relative (`-t sr`) baseline.
@@ -189,6 +189,7 @@ async fn main() {
                 pv,
                 flag,
                 fmt,
+                float_as_string,
                 req_elems_present,
                 mask,
                 spec,
@@ -287,6 +288,7 @@ async fn monitor_pv(
     pv_name: String,
     connected_flag: Arc<AtomicBool>,
     fmt: Arc<ValueFormat>,
+    float_as_string: bool,
     req_elems_present: bool,
     mask: u16,
     spec: TimestampSpec,
@@ -334,10 +336,13 @@ async fn monitor_pv(
 
     // honour `-m <msk>` via the caller-resolved DBE_* mask.
     // C `camonitor.c:156-160` requests DBR_TIME_STRING for an ENUM field
-    // unless `-n`, so the monitor delivers state labels by default.
+    // unless `-n`, so the monitor delivers state labels by default;
+    // C `camonitor.c:162-166` requests DBR_TIME_STRING for a FLOAT/DOUBLE
+    // field under `-s` so the server renders it to a string. The ENUM
+    // case takes precedence over the float case (C `if/else if`).
     let enum_as_string = !fmt.enum_as_number;
     let Ok(mut monitor) = channel
-        .subscribe_with_mask_enum_as_string(0.0, mask, enum_as_string)
+        .subscribe_with_mask_readback(0.0, mask, enum_as_string, float_as_string)
         .await
     else {
         return;

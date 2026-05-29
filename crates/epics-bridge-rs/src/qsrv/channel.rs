@@ -377,7 +377,23 @@ impl BridgeChannel {
 
         let instance = rec.read().await;
         let rtyp = instance.record.record_type();
-        let nt_type = Self::nt_type_for_field(rtyp, &field_upper);
+        // A long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL) is a
+        // `DBF_CHAR` array that semantically holds a NUL-terminated
+        // string. Serve it as a scalar-string NTScalar (pvxs's
+        // `form = "String"` view), not the byte scalar the `DBF_CHAR`
+        // type would otherwise select. The record declares these fields
+        // via `Record::long_string_fields`, so the bridge does not have
+        // to hard-code record-type names.
+        let nt_type = if instance
+            .record
+            .long_string_fields()
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(&field_upper))
+        {
+            NtType::LongString
+        } else {
+            Self::nt_type_for_field(rtyp, &field_upper)
+        };
 
         // DBF type for the bound field. Falls back to Double if the
         // record's `field_list` does not enumerate it explicitly —
@@ -453,36 +469,55 @@ impl BridgeChannel {
             got: value.struct_id.to_string(),
         })?;
 
-        // Use typed conversion to match the bound field's actual DBF
-        // type. `UInt64`/`Int64` MUST be in this scalar arm.
-        // `pv_structure_to_epics` now preserves a scalar PVA `ulong`
-        // as `EpicsValue::UInt64` (and `long` as `Int64`) instead of
-        // folding it into `Double`; routing it back through
-        // `epics_to_scalar` recovers `ScalarValue::ULong`/`Long`, so
-        // `scalar_to_epics_typed` sees the original 64-bit scalar and
-        // retypes it to the bound field's DBF without an `f64`
-        // round-trip. Omitting them here would (a) skip retyping for a
-        // `ulong` PUT into a non-`UINT64` field and (b) — before the
-        // `scalar_to_epics` fix — still see a precision-lost `Double`.
-        let epics_val = match &raw_val {
-            EpicsValue::Double(_)
-            | EpicsValue::Float(_)
-            | EpicsValue::Short(_)
-            | EpicsValue::Long(_)
-            | EpicsValue::Int64(_)
-            | EpicsValue::UInt64(_)
-            | EpicsValue::Char(_)
-            | EpicsValue::Enum(_)
-            | EpicsValue::String(_) => {
-                let sv = crate::convert::epics_to_scalar(&raw_val);
-                // A string value bound for a numeric field that cannot be
-                // parsed is rejected here (pvxs `parseTo<T>` →
-                // `NoConvert`), not silently written as 0.
-                scalar_to_epics_typed(&sv, self.value_dbf)
-                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?
+        let epics_val = if self.nt_type == NtType::LongString {
+            // Long-string channel: the QSRV value is a scalar string. The
+            // backing record's `put_field` accepts `EpicsValue::String`
+            // (and a legacy `CharArray`) directly and applies its own
+            // SIZV bound. Do NOT retype the string to the bound
+            // `DBF_CHAR` storage, which would try to parse the whole
+            // string as a single integer and reject the PUT.
+            match raw_val {
+                EpicsValue::String(_) | EpicsValue::CharArray(_) => raw_val,
+                // A non-string scalar PUT into a long-string field is
+                // rendered to its textual form (pvxs string conversion);
+                // the record then stores it.
+                other => EpicsValue::String(match crate::convert::epics_to_scalar(&other) {
+                    ScalarValue::String(s) => s,
+                    sv => sv.to_string(),
+                }),
             }
-            // Arrays pass through directly
-            _ => raw_val,
+        } else {
+            // Use typed conversion to match the bound field's actual DBF
+            // type. `UInt64`/`Int64` MUST be in this scalar arm.
+            // `pv_structure_to_epics` preserves a scalar PVA `ulong` as
+            // `EpicsValue::UInt64` (and `long` as `Int64`) instead of
+            // folding it into `Double`; routing it back through
+            // `epics_to_scalar` recovers `ScalarValue::ULong`/`Long`, so
+            // `scalar_to_epics_typed` sees the original 64-bit scalar and
+            // retypes it to the bound field's DBF without an `f64`
+            // round-trip. Omitting them would (a) skip retyping for a
+            // `ulong` PUT into a non-`UINT64` field and (b) — before the
+            // `scalar_to_epics` fix — still see a precision-lost `Double`.
+            match &raw_val {
+                EpicsValue::Double(_)
+                | EpicsValue::Float(_)
+                | EpicsValue::Short(_)
+                | EpicsValue::Long(_)
+                | EpicsValue::Int64(_)
+                | EpicsValue::UInt64(_)
+                | EpicsValue::Char(_)
+                | EpicsValue::Enum(_)
+                | EpicsValue::String(_) => {
+                    let sv = crate::convert::epics_to_scalar(&raw_val);
+                    // A string value bound for a numeric field that cannot
+                    // be parsed is rejected here (pvxs `parseTo<T>` →
+                    // `NoConvert`), not silently written as 0.
+                    scalar_to_epics_typed(&sv, self.value_dbf)
+                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?
+                }
+                // Arrays pass through directly
+                _ => raw_val,
+            }
         };
 
         // pvxs distinguishes Force vs Passive — both write the

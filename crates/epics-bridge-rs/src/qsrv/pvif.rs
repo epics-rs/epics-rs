@@ -40,6 +40,14 @@ pub enum NtType {
     Enum,
     /// waveform, compress, histogram
     ScalarArray,
+    /// A long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL): a
+    /// `DBF_CHAR` array that semantically holds a NUL-terminated string.
+    /// Served as a scalar-string NTScalar — the `CharArray` storage is
+    /// decoded to a `pvString` value at the QSRV boundary, matching
+    /// pvxs's `form = "String"` view (`ioc/iocsource.cpp:619-643`). This
+    /// removes the dual meaning of a `CharArray` snapshot (byte array vs.
+    /// string) by making the channel's intent explicit.
+    LongString,
 }
 
 impl NtType {
@@ -329,12 +337,48 @@ pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
     pv
 }
 
+/// Decode a long-string field's stored value into a Rust `String`.
+///
+/// The record keeps the string as a `DBF_CHAR` `CharArray` (its native CA
+/// representation); the QSRV boundary reads it back as a NUL-terminated,
+/// UTF-8 string, matching the record's own `put_field` decode (e.g.
+/// `lsiRecord` `String::from_utf8_lossy(&bytes[..first_nul])`).
+fn long_string_value(value: &EpicsValue) -> String {
+    match value {
+        EpicsValue::CharArray(bytes) => {
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        }
+        EpicsValue::String(s) => s.clone(),
+        // Any other shape is unexpected for a long-string channel; fall
+        // back to the scalar rendering so a value is still produced.
+        other => match epics_to_scalar(other) {
+            ScalarValue::String(s) => s,
+            sv => sv.to_string(),
+        },
+    }
+}
+
+/// Convert a long-string Snapshot into a scalar-string NTScalar.
+///
+/// pvxs serves a `form = "String"` `DBF_CHAR` view as a `pvString`
+/// NTScalar (`ioc/iocsource.cpp:123-137`, `singlesource.cpp:189-205`).
+/// We decode the `CharArray` to a `String` and reuse the standard
+/// NTScalar builder, which emits the string-scalar metadata set
+/// (`display = {description, units}`, no numeric `control`/`valueAlarm`).
+fn snapshot_to_nt_long_string(snapshot: &Snapshot) -> PvStructure {
+    let mut snap = snapshot.clone();
+    snap.value = EpicsValue::String(long_string_value(&snapshot.value));
+    snapshot_to_nt_scalar(&snap)
+}
+
 /// Convert a Snapshot to the appropriate NormativeType based on NtType.
 pub fn snapshot_to_pv_structure(snapshot: &Snapshot, nt_type: NtType) -> PvStructure {
     match nt_type {
         NtType::Scalar => snapshot_to_nt_scalar(snapshot),
         NtType::Enum => snapshot_to_nt_enum(snapshot),
         NtType::ScalarArray => snapshot_to_nt_scalar_array(snapshot),
+        NtType::LongString => snapshot_to_nt_long_string(snapshot),
     }
 }
 
@@ -536,6 +580,10 @@ pub fn build_field_desc_for_nt(nt_type: NtType, scalar_type: ScalarType) -> Fiel
         NtType::Scalar => build_nt_scalar_desc(scalar_type),
         NtType::Enum => build_nt_enum_desc(),
         NtType::ScalarArray => build_nt_scalar_array_desc(scalar_type),
+        // A long-string field is advertised as a scalar-string NTScalar,
+        // independent of the bound field's `DBF_CHAR` storage type, so
+        // the descriptor matches the `pvString` value the GET path emits.
+        NtType::LongString => build_nt_scalar_desc(ScalarType::String),
     }
 }
 
@@ -955,6 +1003,63 @@ mod tests {
             lower_ctrl_limit: 0.0,
         });
         snap
+    }
+
+    /// A long-string `DBF_CHAR` field (`lsi`/`lso` VAL, `printf` VAL) is
+    /// served as a scalar-string NTScalar: the `CharArray` storage is
+    /// decoded to a `pvString` value, and the descriptor advertises
+    /// `value` as `String`, not `pvByte`. Before the fix the byte-array
+    /// snapshot was collapsed to a single `pvByte` (the first byte).
+    #[test]
+    fn long_string_field_builds_string_ntscalar() {
+        let text = "abc"; // 3 bytes; byte-collapse would yield 97 ('a')
+        let snap = Snapshot::new(
+            EpicsValue::CharArray(text.as_bytes().to_vec()),
+            0,
+            0,
+            UNIX_EPOCH,
+        );
+        let pv = snapshot_to_pv_structure(&snap, NtType::LongString);
+        assert_eq!(pv.struct_id, "epics:nt/NTScalar:1.0");
+        match pv.get_field("value") {
+            Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, text),
+            other => panic!("expected scalar string value, got {other:?}"),
+        }
+
+        // Descriptor must advertise a string `value`, matching the GET
+        // value shape (no pvByte, no numeric control/valueAlarm).
+        let desc = build_field_desc_for_nt(NtType::LongString, ScalarType::Byte);
+        match desc {
+            FieldDesc::Structure { struct_id, fields } => {
+                assert_eq!(struct_id, "epics:nt/NTScalar:1.0");
+                let value_desc = fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d);
+                assert!(
+                    matches!(value_desc, Some(FieldDesc::Scalar(ScalarType::String))),
+                    "value must be advertised as pvString, got {value_desc:?}"
+                );
+                // String scalars carry no numeric control/valueAlarm.
+                assert!(!fields.iter().any(|(n, _)| n == "control"));
+                assert!(!fields.iter().any(|(n, _)| n == "valueAlarm"));
+            }
+            other => panic!("expected NTScalar structure descriptor, got {other:?}"),
+        }
+    }
+
+    /// A NUL terminator inside the `CharArray` truncates the decoded
+    /// string, mirroring the record's own `put_field` decode.
+    #[test]
+    fn long_string_value_stops_at_nul() {
+        let snap = Snapshot::new(
+            EpicsValue::CharArray(b"hi\0junk".to_vec()),
+            0,
+            0,
+            UNIX_EPOCH,
+        );
+        let pv = snapshot_to_pv_structure(&snap, NtType::LongString);
+        match pv.get_field("value") {
+            Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, "hi"),
+            other => panic!("expected scalar string value, got {other:?}"),
+        }
     }
 
     fn alarm_scalar_int(s: &PvStructure, name: &str) -> i32 {

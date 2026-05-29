@@ -565,6 +565,10 @@ impl Record for PrintfRecord {
         PRINTF_FIELDS
     }
 
+    fn long_string_fields(&self) -> &'static [&'static str] {
+        &["VAL"]
+    }
+
     fn uses_monitor_deadband(&self) -> bool {
         false
     }

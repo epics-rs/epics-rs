@@ -933,6 +933,84 @@ impl GroupChannel {
         }
     }
 
+    /// Apply one ordinary (value) group-member write under the
+    /// requested [`ProcessMode`], the single owner of the tri-state →
+    /// write mapping for group member application. Mirrors pvxs
+    /// `putGroupField` → `IOCSource::put` + `doPostProcessing(
+    /// forceProcessing)` (groupsource.cpp:563-571, iocsource.cpp:
+    /// 397-420), which preserves the full `TriState forceProcessing`
+    /// per member rather than collapsing it to a boolean:
+    ///
+    /// - `Force` (process=true): raw-write the field, then run a full
+    ///   link-aware processing cycle (`dbProcess` equivalent), so a
+    ///   forced group PUT processes the backing record even when the
+    ///   target field is not process-passive or the record is not
+    ///   Passive-scanned.
+    /// - `Passive` (process unset): the CA-style put, which processes
+    ///   only a `pp(TRUE)` field on a `SCAN=Passive` record
+    ///   (`forceProcessing == Unset`).
+    /// - `Inhibit` (process=false): raw-write the field, no processing.
+    ///
+    /// `already_locked` selects the gate-holding variants for the
+    /// atomic PUT (which owns every member gate via `lock_records`; the
+    /// gate `Mutex` is not reentrant) vs the gate-acquiring variants for
+    /// the non-atomic per-member path.
+    async fn apply_member_value(
+        &self,
+        record_name: &str,
+        field_name: &str,
+        value: epics_base_rs::types::EpicsValue,
+        process: super::channel::ProcessMode,
+        already_locked: bool,
+    ) -> BridgeResult<()> {
+        use super::channel::ProcessMode;
+        let to_err = |e: epics_base_rs::error::CaError| BridgeError::PutRejected(e.to_string());
+        match process {
+            ProcessMode::Inhibit => {
+                let pv = format!("{record_name}.{field_name}");
+                if already_locked {
+                    self.db.put_pv_already_locked(&pv, value).await
+                } else {
+                    self.db.put_pv(&pv, value).await
+                }
+                .map_err(to_err)?;
+            }
+            ProcessMode::Passive => {
+                if already_locked {
+                    self.db
+                        .put_record_field_from_ca_already_locked(record_name, field_name, value)
+                        .await
+                } else {
+                    self.db
+                        .put_record_field_from_ca(record_name, field_name, value)
+                        .await
+                }
+                .map_err(to_err)?;
+            }
+            ProcessMode::Force => {
+                let pv = format!("{record_name}.{field_name}");
+                if already_locked {
+                    self.db.put_pv_already_locked(&pv, value).await
+                } else {
+                    self.db.put_pv(&pv, value).await
+                }
+                .map_err(to_err)?;
+                let mut visited = std::collections::HashSet::new();
+                if already_locked {
+                    self.db
+                        .process_record_with_links_already_locked(record_name, &mut visited, 0)
+                        .await
+                } else {
+                    self.db
+                        .process_record_with_links(record_name, &mut visited, 0)
+                        .await
+                }
+                .map_err(to_err)?;
+            }
+        }
+        Ok(())
+    }
+
     /// group PUT with explicit per-operation options.
     ///
     /// pvAccess delivers PUT options (`record._options.process`,
@@ -963,8 +1041,6 @@ impl GroupChannel {
                 self.def.name, self.access.user, self.access.host
             )));
         }
-
-        let use_process = opts.process != super::channel::ProcessMode::Inhibit;
 
         // pvRequest can override the group default atomicity
         // (`record._options.atomic = true|false`). Falls back to the
@@ -1181,24 +1257,10 @@ impl GroupChannel {
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     did_something = true;
                 } else if let Some(epics_val) = val {
-                    if use_process {
-                        self.db
-                            .put_record_field_from_ca_already_locked(
-                                record_name,
-                                field_name,
-                                epics_val,
-                            )
-                            .await
-                            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                    } else {
-                        self.db
-                            .put_pv_already_locked(
-                                &format!("{record_name}.{field_name}"),
-                                epics_val,
-                            )
-                            .await
-                            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                    }
+                    // `_already_locked` — this atomic PUT owns every
+                    // member-record gate via `lock_records`.
+                    self.apply_member_value(record_name, field_name, epics_val, opts.process, true)
+                        .await?;
                     did_something = true;
                 }
             }
@@ -1260,17 +1322,9 @@ impl GroupChannel {
                     }
                 };
 
-                if use_process {
-                    self.db
-                        .put_record_field_from_ca(record_name, field_name, epics_val)
-                        .await
-                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                } else {
-                    self.db
-                        .put_pv(&format!("{record_name}.{field_name}"), epics_val)
-                        .await
-                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                }
+                // non-atomic per-member write — gate-acquiring variants.
+                self.apply_member_value(record_name, field_name, epics_val, opts.process, false)
+                    .await?;
                 did_something = true;
             }
         }

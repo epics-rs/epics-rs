@@ -2126,6 +2126,135 @@ mod tests {
         );
     }
 
+    /// QSRV group PUT with `record._options.process=true` must run a
+    /// FORCED record-processing cycle for an ordinary member even when
+    /// the member field would not be passively processed — pvxs threads
+    /// the full `TriState forceProcessing` into
+    /// `doPostProcessing(forceProcessing==True)` (groupsource.cpp:
+    /// 563-571, iocsource.cpp:397-420). Before the fix the group apply
+    /// collapsed the tri-state to `use_process = process != Inhibit` and
+    /// routed Force through `put_record_field_from_ca`, which processes
+    /// only a `pp(TRUE)` field on a `SCAN=Passive` record.
+    ///
+    /// Discriminator: the member record is set to a NON-Passive SCAN, so
+    /// the passive put path never processes it (`should_process` gates on
+    /// `scan == Passive`). A Passive-mode group PUT must leave `common.time`
+    /// untouched; a `process=true` group PUT must force processing and
+    /// advance it. Verified for both non-atomic and atomic groups.
+    #[tokio::test]
+    async fn group_put_forces_processing_of_non_passive_member_on_process_true() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::record::ScanType;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::types::EpicsValue;
+        use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+
+        // One PUT against `group_pv` carrying the given process option
+        // (None = omit the option entirely → ProcessMode::Passive).
+        async fn do_put(
+            store: &QsrvPvStore,
+            group_pv: &str,
+            member: &str,
+            v: f64,
+            process: Option<&str>,
+        ) {
+            let mut value = PvStructure::new("structure");
+            value
+                .fields
+                .push((member.into(), PvField::Scalar(ScalarValue::Double(v))));
+
+            let mut record = PvStructure::new("");
+            if let Some(p) = process {
+                let mut opts = PvStructure::new("");
+                opts.fields.push((
+                    "process".into(),
+                    PvField::Scalar(ScalarValue::String(p.into())),
+                ));
+                record
+                    .fields
+                    .push(("_options".into(), PvField::Structure(opts)));
+            }
+            let mut req = PvStructure::new("");
+            req.fields
+                .push(("record".into(), PvField::Structure(record)));
+            let ctx = ChannelContext {
+                peer: "127.0.0.1:5075".parse().unwrap(),
+                account: "anonymous".into(),
+                method: "anonymous".into(),
+                host: "127.0.0.1".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+                pv_request: Some(PvField::Structure(req)),
+            };
+            let checked = AccessGate::open()
+                .check(group_pv, "127.0.0.1", "anonymous", "anonymous", "")
+                .await;
+            store
+                .put_value_checked(checked, PvField::Structure(value), ctx)
+                .await
+                .expect("group PUT must succeed");
+        }
+
+        const GROUP_JSON: &str = r#"{
+            "B119:na": {
+                "+atomic": false,
+                "v": { "+channel": "B119:rna.VAL", "+type": "plain", "+putorder": 0 }
+            },
+            "B119:at": {
+                "+atomic": true,
+                "v": { "+channel": "B119:rat.VAL", "+type": "plain", "+putorder": 0 }
+            }
+        }"#;
+
+        let db = Arc::new(PvDatabase::new());
+        for rec in ["B119:rna", "B119:rat"] {
+            db.add_record(rec, Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+            // Non-Passive scan: a passive put will NOT process this record.
+            db.put_pv(
+                &format!("{rec}.SCAN"),
+                EpicsValue::Enum(ScanType::Sec1 as u16),
+            )
+            .await
+            .unwrap();
+        }
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(GROUP_JSON).expect("load group");
+        let store = QsrvPvStore::new(provider);
+
+        let rec_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
+            let r = db.get_record(rec).await.unwrap();
+            r.read().await.common.time
+        };
+
+        for (group_pv, rec) in [("B119:na", "B119:rna"), ("B119:at", "B119:rat")] {
+            // Passive (process unset): a non-Passive record must NOT be
+            // processed — its TIME must stay put.
+            let t0 = rec_time(db.clone(), rec).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            do_put(&store, group_pv, "v", 5.0, None).await;
+            let t_passive = rec_time(db.clone(), rec).await;
+            assert_eq!(
+                t_passive, t0,
+                "{group_pv}: passive group PUT must NOT process \
+                 non-Passive member {rec} (TIME {t0:?} -> {t_passive:?})"
+            );
+
+            // Force (process=true): must process regardless of SCAN.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            do_put(&store, group_pv, "v", 7.0, Some("true")).await;
+            let t_force = rec_time(db.clone(), rec).await;
+            assert!(
+                t_force > t_passive,
+                "{group_pv}: process=true group PUT must force-process \
+                 member {rec} (TIME {t_passive:?} -> {t_force:?})"
+            );
+        }
+    }
+
     /// Partial group PUT must write/process only the marked member.
     /// The generic `put_delta_checked` default reads the full group and
     /// overlays marked leaves, so every putorder member ends up present

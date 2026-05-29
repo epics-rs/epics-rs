@@ -1,10 +1,15 @@
-//! Beacon anomaly throttle.
+//! Beacon tracker.
 //!
-//! pvxs `clientconn.cpp` 5-minute rule: if we see a server's GUID change
-//! (i.e. the server restarted) within a 5-minute window, suppress
-//! reconnect attempts for the rest of that window. Without this rule, a
-//! server that's flapping (stuck in a restart loop) would cause connection
-//! storms from every client trying to reconnect on every beacon.
+//! Tracks which `(server, guid)` incarnations have been seen so the search
+//! engine can de-duplicate `Discovered` events and pace reconnect pokes.
+//! Bounded by [`BEACON_TRACK_LIMIT`] and aged out by [`prune_stale`].
+//!
+//! Note: there is intentionally **no** per-server GUID-change suppression.
+//! pvxs treats a GUID change as a `Change` and pokes pending searches
+//! immediately, subject only to the engine's global 30-second
+//! `pokeHoldoff` and one-active-revolution guard (client.cpp:805-847,
+//! 736-759). The only overload protection at this layer is the
+//! size cap, mirroring pvxs `beaconTrackLimit` (client.cpp:791-797).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -14,9 +19,6 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
-
-/// 5-minute window for the anomaly throttle.
-const ANOMALY_WINDOW: Duration = Duration::from_secs(300);
 
 /// Hard cap on tracked (server, guid) entries. Mirrors pvxs
 /// `beaconTrackLimit` (client.cpp commit 3f3e394 "Limit beaconTrack by
@@ -29,11 +31,7 @@ const BEACON_TRACK_LIMIT: usize = 20_000;
 #[derive(Debug, Clone)]
 struct ServerEntry {
     guid: [u8; 12],
-    first_seen: Instant,
     last_seen: Instant,
-    /// `Some(deadline)` means: ignore reconnect attempts for this server
-    /// until `Instant::now() >= deadline`.
-    suppress_until: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -53,9 +51,12 @@ impl BeaconTracker {
 
     /// Record an observed beacon.
     ///
-    /// Returns `true` if this beacon should trigger a reconnect (i.e. the
-    /// server is *not* currently throttled), `false` if it should be
-    /// suppressed.
+    /// Returns `true` if this beacon may trigger a reconnect poke, `false`
+    /// only when the new entry was cap-dropped. A GUID change (server
+    /// restart) is allowed immediately — pvxs treats it as a `Change` and
+    /// pokes at once, with pacing handled by the engine's global
+    /// `pokeHoldoff`, not by a per-server suppression window
+    /// (client.cpp:805-847).
     pub fn observe(&self, server: SocketAddr, guid: [u8; 12]) -> bool {
         let mut map = self.inner.write();
         let now = Instant::now();
@@ -81,40 +82,16 @@ impl BeaconTracker {
                     }
                     return false;
                 }
-                map.insert(
-                    server,
-                    ServerEntry {
-                        guid,
-                        first_seen: now,
-                        last_seen: now,
-                        suppress_until: None,
-                    },
-                );
+                map.insert(server, ServerEntry { guid, last_seen: now });
                 true
             }
             Some(entry) => {
                 entry.last_seen = now;
-                if entry.guid == guid {
-                    // Same server, same incarnation — pass-through.
-                    let allow = !matches!(entry.suppress_until, Some(deadline) if now < deadline);
-                    if allow {
-                        entry.suppress_until = None;
-                    }
-                    allow
-                } else {
-                    // GUID changed → server restarted.
-                    entry.guid = guid;
-                    if now.duration_since(entry.first_seen) < ANOMALY_WINDOW {
-                        // Anomaly: GUID flipped within 5 min of first seen.
-                        // Throttle reconnects for the remainder of the window.
-                        entry.suppress_until = Some(entry.first_seen + ANOMALY_WINDOW);
-                        false
-                    } else {
-                        entry.first_seen = now;
-                        entry.suppress_until = None;
-                        true
-                    }
-                }
+                // Same incarnation or a restart (new GUID) both pass
+                // through; the engine's `first_announce` gate + global
+                // pokeHoldoff decide whether a poke actually fires.
+                entry.guid = guid;
+                true
             }
         }
     }
@@ -124,18 +101,6 @@ impl BeaconTracker {
     /// to detect server replacement at the same address.
     pub fn guid_for(&self, server: SocketAddr) -> Option<[u8; 12]> {
         self.inner.read().get(&server).map(|e| e.guid)
-    }
-
-    /// True iff the server is currently in the throttle window.
-    pub fn is_throttled(&self, server: SocketAddr) -> bool {
-        let map = self.inner.read();
-        match map.get(&server) {
-            Some(entry) => match entry.suppress_until {
-                Some(deadline) => Instant::now() < deadline,
-                None => false,
-            },
-            None => false,
-        }
     }
 
     /// Forget a server (called when we explicitly disconnect & don't intend
@@ -188,12 +153,23 @@ mod tests {
         assert!(t.observe(addr(), [1u8; 12]));
     }
 
+    /// A GUID change (server restart) is NOT suppressed: pvxs pokes
+    /// immediately on a `Change` (client.cpp:805-847), so `observe` keeps
+    /// returning `true` and updates the tracked GUID. Pacing is the
+    /// engine's global pokeHoldoff, not a per-server window.
     #[test]
-    fn guid_change_within_window_throttles() {
+    fn guid_change_allows_reconnect() {
         let t = BeaconTracker::new();
         assert!(t.observe(addr(), [1u8; 12]));
-        assert!(!t.observe(addr(), [2u8; 12]));
-        assert!(t.is_throttled(addr()));
+        assert!(
+            t.observe(addr(), [2u8; 12]),
+            "a GUID change must not be throttled — pvxs pokes at once"
+        );
+        assert_eq!(
+            t.guid_for(addr()),
+            Some([2u8; 12]),
+            "the tracker adopts the new incarnation's GUID"
+        );
     }
 
     #[test]
@@ -201,7 +177,7 @@ mod tests {
         let t = BeaconTracker::new();
         t.observe(addr(), [1u8; 12]);
         t.forget(addr());
-        assert!(!t.is_throttled(addr()));
+        assert!(t.guid_for(addr()).is_none());
     }
 
     /// Stale entries — last_seen older than `max_age` — are pruned and

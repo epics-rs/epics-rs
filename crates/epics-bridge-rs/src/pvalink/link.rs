@@ -1393,8 +1393,14 @@ fn scalar_value_to_f64(v: &ScalarValue) -> f64 {
 ///
 /// An NT `enum_t` structure (an `index` integer + `choices` string
 /// array) maps to `Enum`; a scalar / scalar array maps by element
-/// type; anything else has no DBF mapping and yields `None` (the
-/// record then keeps its own field type).
+/// type. Every other *connected* value shape — an unknown structure, a
+/// `Null`/missing selected field, a null union — maps to `Long`, the
+/// `default:` arm of pvxs `pvaGetDBFtype` (`pvalink_lset.cpp:199-236`),
+/// which returns `DBF_LONG` for any unmappable value type. This getter
+/// is only reached for a connected link (the caller gates on the
+/// disconnect/no-cache case and returns no metadata at all), so it
+/// never returns `None`: `None` from the lset means "not connected",
+/// `Some(Long)` means "connected but unmappable".
 fn link_dbf_type(value_field: &PvField) -> Option<epics_base_rs::server::database::LinkDbfType> {
     use epics_base_rs::server::database::LinkDbfType;
 
@@ -1423,7 +1429,12 @@ fn link_dbf_type(value_field: &PvField) -> Option<epics_base_rs::server::databas
 
     match value_field {
         PvField::Scalar(sv) => from_scalar(sv),
-        PvField::ScalarArray(arr) => arr.first().and_then(from_scalar),
+        // An empty generic array has lost its element type; a connected
+        // link still reports a type, so fall back to the pvxs default.
+        PvField::ScalarArray(arr) => arr
+            .first()
+            .and_then(from_scalar)
+            .or(Some(LinkDbfType::Long)),
         PvField::ScalarArrayTyped(arr) => {
             use epics_pva_rs::pvdata::ScalarType;
             Some(match arr.scalar_type() {
@@ -1467,17 +1478,29 @@ fn link_dbf_type(value_field: &PvField) -> Option<epics_base_rs::server::databas
                 // A struct carrying a `value` sub-field (an NT struct)
                 // — recurse into `value` so a link with an empty
                 // field path still resolves the DBF type, matching
-                // pvxs's "if fieldName empty, use top struct value".
-                s.get_field("value").and_then(link_dbf_type)
+                // pvxs's "if fieldName empty, use top struct value". An
+                // unknown struct with no mappable `value` is the
+                // connected-but-unmappable case → `Long`.
+                Some(
+                    s.get_field("value")
+                        .and_then(link_dbf_type)
+                        .unwrap_or(LinkDbfType::Long),
+                )
             }
         }
-        _ => None,
+        // Null, a missing selected field, a null union — connected but
+        // unmappable → pvxs `pvaGetDBFtype` default `DBF_LONG`.
+        _ => Some(LinkDbfType::Long),
     }
 }
 
 /// Element count for the cached NT value at the link's field path:
 /// the array length, or `1` for a scalar. Mirrors pvxs
-/// `pvaGetElements` (`pvxs/ioc/pvalink_lset.cpp:242`).
+/// `pvaGetElements` (`pvxs/ioc/pvalink_lset.cpp:242-254`), whose
+/// non-array branch sets `*nelements = 1`. Like [`link_dbf_type`] this
+/// getter is only reached for a connected link, so every connected
+/// non-array / unmappable shape reports `1` and `None` is reserved for
+/// "not connected".
 fn link_element_count(value_field: &PvField) -> Option<i64> {
     // Selected union / non-empty variant → concrete member first, so an
     // NTNDArray union reports the active array's length, not the union
@@ -1486,16 +1509,11 @@ fn link_element_count(value_field: &PvField) -> Option<i64> {
         PvField::Scalar(_) => Some(1),
         PvField::ScalarArray(arr) => Some(arr.len() as i64),
         PvField::ScalarArrayTyped(arr) => Some(arr.len() as i64),
-        PvField::Structure(s) => {
-            // NTEnum / NT struct: the meaningful count is the `value`
-            // sub-field's count (scalar index → 1).
-            match s.get_field("value") {
-                Some(v) => link_element_count(v),
-                None if s.get_field("index").is_some() => Some(1),
-                None => None,
-            }
-        }
-        _ => None,
+        // NT struct: count the `value` sub-field (NTEnum index → 1); a
+        // struct with no `value` is a connected non-array shape → 1.
+        PvField::Structure(s) => s.get_field("value").map_or(Some(1), link_element_count),
+        // Null / missing field / null union — connected, one element.
+        _ => Some(1),
     }
 }
 
@@ -1691,6 +1709,63 @@ mod tests {
             meta.element_count,
             Some(3),
             "element count is the active array's length"
+        );
+    }
+
+    /// pvxs `pvaGetDBFtype` returns `DBF_LONG` and `pvaGetElements`
+    /// returns `1` for any *connected* but unmappable value
+    /// (`pvalink_lset.cpp:199-254` default arms). The Rust getters
+    /// previously returned `None` for those shapes, which the DB link
+    /// API reads as "not connected". The connected fallback must be
+    /// distinct from the genuine no-cache (disconnected) case, which
+    /// alone yields `None`.
+    #[test]
+    fn connected_unmappable_value_falls_back_to_dbf_long_one_element() {
+        use epics_base_rs::server::database::LinkDbfType;
+
+        // (a) connected NT struct with no mappable `value` child.
+        let mut tbl = PvStructure::new("epics:nt/NTTable:1.0");
+        tbl.fields
+            .push(("labels".into(), PvField::Scalar(ScalarValue::Int(1))));
+        let link = PvaLink::for_test(
+            PvaLinkConfig::defaults_for("U:PV", LinkDirection::Inp),
+            Some(PvField::Structure(tbl)),
+        );
+        let meta = link.link_metadata().expect("connected → Some metadata");
+        assert_eq!(
+            meta.dbf_type,
+            Some(LinkDbfType::Long),
+            "connected unmappable struct → DBF_LONG"
+        );
+        assert_eq!(meta.element_count, Some(1), "connected unmappable → 1");
+
+        // (b) connected value but the selected field is missing.
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        let link2 = PvaLink::for_test(
+            PvaLinkConfig {
+                field: "nonexistent".into(),
+                ..PvaLinkConfig::defaults_for("U:PV", LinkDirection::Inp)
+            },
+            Some(PvField::Structure(nt)),
+        );
+        let meta2 = link2.link_metadata().expect("connected → Some metadata");
+        assert_eq!(
+            meta2.dbf_type,
+            Some(LinkDbfType::Long),
+            "connected, missing field → DBF_LONG"
+        );
+        assert_eq!(meta2.element_count, Some(1), "missing field → 1");
+
+        // (c) the no-cache (disconnected) case is the only `None`.
+        let link3 = PvaLink::for_test(
+            PvaLinkConfig::defaults_for("U:PV", LinkDirection::Inp),
+            None,
+        );
+        assert!(
+            link3.link_metadata().is_none(),
+            "no cached value → None (not connected), distinct from the fallback"
         );
     }
 

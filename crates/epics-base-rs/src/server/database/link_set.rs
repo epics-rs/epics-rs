@@ -73,10 +73,15 @@ pub enum LinkDbfType {
 /// then keeps its local/default metadata, exactly as the C path does.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LinkMetadata {
-    /// DBF type the remote value maps to (`pvaGetDBFtype`).
+    /// DBF type the remote value maps to (`pvaGetDBFtype`). A connected
+    /// link always reports a type — an unmappable value shape falls back
+    /// to `Long`, the `default:` arm of pvxs `pvaGetDBFtype`
+    /// (`pvalink_lset.cpp:199-236`). `None` therefore means "not
+    /// connected" (no cached value), never "connected but unmappable".
     pub dbf_type: Option<LinkDbfType>,
-    /// Element count: array length, or `1` for a scalar
-    /// (`pvaGetElements`).
+    /// Element count: array length, or `1` for a scalar / any connected
+    /// non-array shape (`pvaGetElements`, `pvalink_lset.cpp:242-254`).
+    /// As with `dbf_type`, `None` means "not connected".
     pub element_count: Option<i64>,
     /// `display.limitLow` / `display.limitHigh` (`pvaGetGraphicLimits`).
     pub graphic_limits: Option<(f64, f64)>,

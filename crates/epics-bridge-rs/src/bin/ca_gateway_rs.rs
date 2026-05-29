@@ -93,6 +93,15 @@ struct Args {
     #[arg(long)]
     read_only: bool,
 
+    /// Upstream monitor event mask (C `-mask`). A string of DBE selector
+    /// characters: `v`=value, `a`=alarm, `l`=log/archive, `p`=property
+    /// (case-insensitive; e.g. `va`, `v`, `vap`). Unset — or a value that
+    /// names no recognised selector — keeps the ca-gateway default
+    /// `va` (DBE_VALUE|DBE_ALARM); notably the default does NOT include
+    /// `l`, so the gateway does not request DBE_LOG traffic unless asked.
+    #[arg(long)]
+    mask: Option<String>,
+
     /// Disable statistics PV publication.
     #[arg(long)]
     no_stats: bool,
@@ -371,6 +380,11 @@ async fn async_main(args: Args) -> ExitCode {
             Some(std::time::Duration::from_secs(args.heartbeat_interval))
         },
         read_only: args.read_only,
+        // C `-mask` resolution (gateway.cc:736-766 char→DBE, :1146
+        // keep-default-if-empty): an absent/unrecognised spec keeps the
+        // DBE_VALUE|DBE_ALARM default rather than the DBE_LOG-bearing
+        // CaChannel subscribe() default.
+        event_mask: epics_bridge_rs::ca_gateway::resolve_event_mask(args.mask.as_deref()),
         #[cfg(feature = "ca-gateway-tls")]
         tls: build_tls(&args).unwrap_or_else(|e| {
             tracing::error!(error = %e, "ca-gateway-rs: TLS init failed");

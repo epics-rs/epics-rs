@@ -29,7 +29,8 @@
 //!
 //! ## Auto-restart
 //!
-//! The monitor-forwarding task wraps `channel.subscribe()` in an
+//! The monitor-forwarding task wraps `channel.subscribe_with_mask(..)`
+//! (the configured `-mask` event mask) in an
 //! exponential-backoff retry loop so a transient upstream disconnect
 //! does not strand the cache entry forever (the entry's `cached`
 //! snapshot would otherwise be served indefinitely while no further
@@ -210,6 +211,12 @@ pub struct UpstreamManagerConfig {
     /// CLI/API connect-timeout knob also governs first-search resolution,
     /// not just cache cleanup (a single connect-timeout owner).
     pub connect_timeout: Duration,
+    /// Upstream monitor event mask (C `-mask`). Threaded from
+    /// `GatewayConfig::event_mask` so every upstream subscription requests
+    /// exactly the configured `DBE_*` bits (default `DBE_VALUE|DBE_ALARM`)
+    /// instead of the `CaChannel::subscribe()` default that adds
+    /// `DBE_LOG`.
+    pub event_mask: u16,
     pub beacon_anomaly: Arc<super::beacon::BeaconAnomaly>,
     /// B10: optional TLS client config for the upstream `CaClient`
     /// circuits to the real IOC. `None` keeps upstream traffic
@@ -254,6 +261,13 @@ pub struct UpstreamManager {
     /// (gateServer.cc:1294-1356, set once via setConnectTimeout,
     /// gateway.cc:1147) rather than a second hard-coded clock.
     connect_timeout: Duration,
+    /// Upstream monitor event mask (C `-mask`, default
+    /// `DBE_VALUE|DBE_ALARM`). Both the initial `ensure_subscribed`
+    /// subscribe and the reconnect re-subscribe inside the forwarding
+    /// task pass this mask, so the gateway never requests `DBE_LOG`
+    /// unless `-mask l` was configured. Mirrors ca-gateway passing
+    /// `GR->eventMask()` to `ca_create_subscription` (gatePv.cc:771-774).
+    event_mask: u16,
     /// Detachable handle that re-pushes `CA_PROTO_ACCESS_RIGHTS` to
     /// already-connected downstream clients. Installed via
     /// [`Self::install_access_notifier`] once the downstream `CaServer`
@@ -320,6 +334,7 @@ impl UpstreamManager {
             subs: parking_lot::Mutex::new(HashMap::new()),
             pending: parking_lot::Mutex::new(HashMap::new()),
             connect_timeout: cfg.connect_timeout,
+            event_mask: cfg.event_mask,
             access_notifier: Arc::new(ArcSwapOption::empty()),
         })
     }
@@ -601,11 +616,16 @@ impl UpstreamManager {
         }
 
         // Subscribe (monitor receiver is independent of the channel handle).
+        // Use the configured `-mask` event mask (default DBE_VALUE|DBE_ALARM)
+        // rather than the CaChannel default (which also requests DBE_LOG):
+        // ca-gateway passes `GR->eventMask()` to `ca_create_subscription`
+        // (gatePv.cc:771-774). `deadband` is 0.0 — ca-gateway applies no
+        // client-side deadband, the server-side mask alone gates events.
         // On failure we MUST also remove the just-added shadow PV — otherwise
         // it lingers in `simple_pvs` with a hook pointing at a dead channel,
         // and the next downstream search resolves it without re-running
         // the resolver, leaving the gateway in a stuck state.
-        let mut monitor = match channel.subscribe().await {
+        let mut monitor = match channel.subscribe_with_mask(0.0, self.event_mask).await {
             Ok(m) => m,
             Err(e) => {
                 self.shadow_db.remove_simple_pv(served_name).await;
@@ -650,6 +670,10 @@ impl UpstreamManager {
         let channel_for_task = channel.clone();
         let stats_for_task = self.write_env.stats.clone();
         let beacon_anomaly_for_task = self.write_env.beacon_anomaly.clone();
+        // The reconnect re-subscribe below must use the same configured
+        // `-mask` event mask as the initial subscribe, not the DBE_LOG-
+        // bearing CaChannel default.
+        let event_mask = self.event_mask;
         // the forwarding task addresses the cache entry,
         // shadow PV, and alarm post by `served_name` — the same key the
         // shadow PV and cache were registered under above.
@@ -764,7 +788,7 @@ impl UpstreamManager {
                     return;
                 }
 
-                match channel_for_task.subscribe().await {
+                match channel_for_task.subscribe_with_mask(0.0, event_mask).await {
                     Ok(new_monitor) => {
                         monitor = new_monitor;
                         // The next successful event will flip state
@@ -1502,6 +1526,7 @@ mod tests {
             stats: env.stats.clone(),
             read_only: false,
             connect_timeout: Duration::from_secs(1),
+            event_mask: crate::ca_gateway::server::DEFAULT_EVENT_MASK,
             beacon_anomaly: env.beacon_anomaly.clone(),
             #[cfg(feature = "ca-gateway-tls")]
             upstream_tls: None,
@@ -1527,6 +1552,7 @@ mod tests {
             stats: env.stats.clone(),
             read_only: false,
             connect_timeout: Duration::from_secs(1),
+            event_mask: crate::ca_gateway::server::DEFAULT_EVENT_MASK,
             beacon_anomaly: env.beacon_anomaly.clone(),
             #[cfg(feature = "ca-gateway-tls")]
             upstream_tls: None,
@@ -1568,6 +1594,7 @@ mod tests {
             stats: env.stats.clone(),
             read_only: false,
             connect_timeout: Duration::from_secs(1),
+            event_mask: crate::ca_gateway::server::DEFAULT_EVENT_MASK,
             beacon_anomaly: env.beacon_anomaly.clone(),
             upstream_tls: Some(tls),
             upstream_tls_server_name: Some("ioc.example.com".to_string()),
@@ -1915,6 +1942,7 @@ ASG(NewGroup) {
             stats: env.stats.clone(),
             read_only: false,
             connect_timeout: Duration::from_millis(150),
+            event_mask: crate::ca_gateway::server::DEFAULT_EVENT_MASK,
             beacon_anomaly: env.beacon_anomaly.clone(),
             #[cfg(feature = "ca-gateway-tls")]
             upstream_tls: None,

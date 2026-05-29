@@ -632,26 +632,40 @@ impl ChannelSource for PvDatabaseSource {
         let db = self.db.clone();
         let name = name.to_string();
         async move {
-            // Extract the inner value field (NTScalar.value or top-level scalar).
-            // The WRITE gate ran in `put_value_checked` before reaching here,
-            // so every failure below is operational (Failed), not a denial.
-            let scalar = match &value {
-                PvField::Structure(s) => match s.get_field("value") {
-                    // NTEnum PUT: `value` is an `enum_t` struct; pvxs
-                    // dereferences the put through `value.index` before
-                    // converting to the DBR enum (`ioc/iocsource.cpp:589-593`).
-                    // The bare-scalar NTScalar PUT keeps `value` directly.
-                    Some(PvField::Structure(inner)) => inner.get_field("index").cloned(),
-                    other => other.cloned(),
-                },
-                _ => Some(value),
-            };
-            let scalar = scalar.ok_or_else(|| OpError::failed("PUT missing 'value' field"))?;
-            let epics = pv_field_to_epics(&scalar)
-                .ok_or_else(|| OpError::failed("PUT value not representable as EpicsValue"))?;
-            db.put_pv(&name, epics)
-                .await
-                .map_err(|e| OpError::failed(e.to_string()))
+            // The WRITE gate ran in `put_value_checked` before reaching
+            // here, so every failure below is operational (Failed), not a
+            // denial.
+            //
+            // A simple (non-record) PV is a pvxs-style mailbox SharedPV: a
+            // full-structure PUT updates the *whole* current value — value,
+            // alarm and timeStamp together — not just the `value` leaf
+            // (pvxs `serverget.cpp:488-490` hands `onPut` the full decoded
+            // Value; `SharedPV::post()` assigns the entire posted value,
+            // `sharedpv.cpp:417-432`). Persisting only the value dropped any
+            // client-supplied alarm/timeStamp, so a later GET reconstructed
+            // them from local defaults. A record-backed channel keeps the
+            // field-write path: the record owns its alarm/time through
+            // processing, and the client cannot stamp them.
+            match db.find_entry(&name).await {
+                Some(PvEntry::Simple(pv)) => {
+                    let prior = pv.snapshot().await;
+                    let snap = pv_field_to_snapshot(&value, &prior).ok_or_else(|| {
+                        OpError::failed("PUT value not representable as EpicsValue")
+                    })?;
+                    pv.set_snapshot(snap).await;
+                    Ok(())
+                }
+                _ => {
+                    let scalar = extract_put_value_leaf(&value)
+                        .ok_or_else(|| OpError::failed("PUT missing 'value' field"))?;
+                    let epics = pv_field_to_epics(&scalar).ok_or_else(|| {
+                        OpError::failed("PUT value not representable as EpicsValue")
+                    })?;
+                    db.put_pv(&name, epics)
+                        .await
+                        .map_err(|e| OpError::failed(e.to_string()))
+                }
+            }
         }
     }
 
@@ -737,6 +751,78 @@ impl ChannelSource for PvDatabaseSource {
 }
 
 // ── PvField → EpicsValue (PUT path) ────────────────────────────────────
+
+/// Extract the value leaf of a PUT `PvField`: the `value` member of an
+/// NT structure, or the field itself for a bare scalar/array. An NTEnum
+/// PUT carries `value` as an `enum_t { index, choices }`; pvxs writes
+/// through `value.index` (`ioc/iocsource.cpp:589-593`).
+fn extract_put_value_leaf(value: &PvField) -> Option<PvField> {
+    match value {
+        PvField::Structure(s) => match s.get_field("value") {
+            Some(PvField::Structure(inner)) => inner.get_field("index").cloned(),
+            other => other.cloned(),
+        },
+        other => Some(other.clone()),
+    }
+}
+
+/// Read an integer-typed scalar field of a structure as `i64`, tolerating
+/// whatever integer width the client encoded (NTScalar spec uses `int`
+/// for alarm severity/status/userTag and `long` for secondsPastEpoch).
+fn scalar_field_i64(s: &PvStructure, field: &str) -> Option<i64> {
+    match s.get_field(field)? {
+        PvField::Scalar(sv) => match sv {
+            ScalarValue::Byte(x) => Some(i64::from(*x)),
+            ScalarValue::Short(x) => Some(i64::from(*x)),
+            ScalarValue::Int(x) => Some(i64::from(*x)),
+            ScalarValue::Long(x) => Some(*x),
+            ScalarValue::UByte(x) => Some(i64::from(*x)),
+            ScalarValue::UShort(x) => Some(i64::from(*x)),
+            ScalarValue::UInt(x) => Some(i64::from(*x)),
+            ScalarValue::ULong(x) => i64::try_from(*x).ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Build a full `Snapshot` from a mailbox PUT's NT structure: value plus
+/// any explicitly-supplied `alarm` (severity/status) and `timeStamp`
+/// (secondsPastEpoch/nanoseconds/userTag). Sub-fields the client did not
+/// supply carry over from `prior` (which, after the delta merge, already
+/// reflects the last posted value for unmarked members).
+fn pv_field_to_snapshot(value: &PvField, prior: &Snapshot) -> Option<Snapshot> {
+    let leaf = extract_put_value_leaf(value)?;
+    let epics = pv_field_to_epics(&leaf)?;
+    let mut snap = prior.clone();
+    snap.value = epics;
+    if let PvField::Structure(s) = value {
+        if let Some(PvField::Structure(alarm)) = s.get_field("alarm") {
+            if let Some(sev) = scalar_field_i64(alarm, "severity") {
+                snap.alarm.severity = sev as u16;
+            }
+            if let Some(status) = scalar_field_i64(alarm, "status") {
+                snap.alarm.status = status as u16;
+            }
+        }
+        if let Some(PvField::Structure(ts)) = s.get_field("timeStamp") {
+            if let (Some(secs), nanos) = (
+                scalar_field_i64(ts, "secondsPastEpoch"),
+                scalar_field_i64(ts, "nanoseconds").unwrap_or(0),
+            ) {
+                if secs >= 0 {
+                    let nanos = nanos.clamp(0, 999_999_999) as u32;
+                    snap.timestamp =
+                        std::time::UNIX_EPOCH + std::time::Duration::new(secs as u64, nanos);
+                }
+            }
+            if let Some(tag) = scalar_field_i64(ts, "userTag") {
+                snap.user_tag = tag as i32;
+            }
+        }
+    }
+    Some(snap)
+}
 
 fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
     match field {
@@ -1743,6 +1829,67 @@ ASG(LOCKED) {
             "wire-decoded uint[] PUT must round-trip the full epicsUInt32 elements, got {:?}",
             snap.value,
         );
+    }
+
+    /// Regression: a full NTScalar PUT with explicit alarm + timeStamp
+    /// into a simple PV must round-trip those fields on a later GET.
+    /// Pre-fix `put_value` extracted only the `value` leaf and dropped
+    /// alarm/timeStamp, so a later GET rebuilt them from local defaults
+    /// (NO_ALARM + wall-clock-now). pvxs mailbox SharedPV assigns the
+    /// whole posted value (`sharedpv.cpp:417-432`).
+    #[tokio::test]
+    async fn pva_60_simple_pv_put_persists_alarm_and_timestamp() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("MB:PV", EpicsValue::Double(0.0)).await.unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+
+        let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+        put.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(42.5))));
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(2)))); // MAJOR
+        alarm
+            .fields
+            .push(("status".into(), PvField::Scalar(ScalarValue::Int(3))));
+        put.fields.push(("alarm".into(), PvField::Structure(alarm)));
+        let mut ts = PvStructure::new("time_t");
+        ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(1_600_000_000)),
+        ));
+        ts.fields.push((
+            "nanoseconds".into(),
+            PvField::Scalar(ScalarValue::Int(123_456_789)),
+        ));
+        ts.fields
+            .push(("userTag".into(), PvField::Scalar(ScalarValue::Int(7))));
+        put.fields
+            .push(("timeStamp".into(), PvField::Structure(ts)));
+
+        source
+            .put_value_ctx(
+                "MB:PV",
+                PvField::Structure(put),
+                make_ctx("h", "anyone", "anonymous"),
+            )
+            .await
+            .expect("full NTScalar PUT must succeed");
+
+        // Read the snapshot back; the simple PV must have persisted the
+        // client-supplied alarm + timeStamp, not local defaults.
+        let snap = snapshot_for(&db, "MB:PV").await.unwrap();
+        assert_eq!(snap.value, EpicsValue::Double(42.5), "value");
+        assert_eq!(snap.alarm.severity, 2, "alarm.severity persisted");
+        assert_eq!(snap.alarm.status, 3, "alarm.status persisted");
+        assert_eq!(snap.user_tag, 7, "timeStamp.userTag persisted");
+        let dur = snap
+            .timestamp
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("post-epoch");
+        assert_eq!(dur.as_secs(), 1_600_000_000, "secondsPastEpoch persisted");
+        assert_eq!(dur.subsec_nanos(), 123_456_789, "nanoseconds persisted");
     }
 
     /// The per-record ASL must gate `RULE(N, …)`

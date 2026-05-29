@@ -251,6 +251,15 @@ pub async fn run_udp_responder_with_config(
         // and topology changes regardless of cadence.
         let mut beacon_seq: u8 = 0;
         let mut change_count: u16 = 0;
+        // pvxs writes `beaconChange` (bumped on every source add/remove)
+        // directly into the beacon (server.cpp:751-767). Track the
+        // registry counter so a topology change advances `change_count`
+        // even when the PV-set hash below is unchanged (source replaced
+        // by another serving the same names, or a priority change).
+        // Initialise to the value at task start so the startup source
+        // registrations do not register as a runtime change on the first
+        // beacon.
+        let mut last_registry_change: u64 = beacon_source.beacon_change();
         let mut last_set_hash: u64 = 0;
         let mut emitted: u32 = 0;
         let mut beacon_send_errs: HashSet<SocketAddr> = HashSet::new();
@@ -279,6 +288,18 @@ pub async fn run_udp_responder_with_config(
             sorted.sort();
             sorted.hash(&mut h);
             let cur_hash = h.finish();
+            // Primary, pvxs-faithful signal: a source registry mutation
+            // bumped `beaconChange`. Advance `change_count` by the delta
+            // so each add/remove is reflected even if the PV-name set is
+            // identical before and after (source swap / priority change).
+            let cur_registry_change = beacon_source.beacon_change();
+            if cur_registry_change != last_registry_change {
+                let delta = cur_registry_change.wrapping_sub(last_registry_change);
+                change_count = change_count.wrapping_add(delta as u16);
+                last_registry_change = cur_registry_change;
+            }
+            // Fallback signal: the enumerated PV set changed without a
+            // registry mutation (e.g. a source mutated its own PV list).
             let topology_changed = cur_hash != last_set_hash && last_set_hash != 0;
             if topology_changed {
                 change_count = change_count.wrapping_add(1);

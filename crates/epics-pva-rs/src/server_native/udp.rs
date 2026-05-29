@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
-    ByteOrder, Command, PvaHeader, ReadExt, WriteExt, decode_size, decode_string,
+    ByteOrder, Command, PvaHeader, ReadExt, WriteExt, decode_size, decode_string, encode_size_into,
     encode_string_into, ip_from_bytes, ip_to_bytes,
 };
 
@@ -1286,6 +1286,223 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     })
 }
 
+/// A decoded BEACON, holding only the fields the multicast shim
+/// re-emits. pvxs forwards a beacon by writing guid, a zeroed
+/// flags/seq/change word, the (resolved) server address + TCP port, the
+/// protocol, and a null serverStatus (`tools/mshim.cpp:176-200`), so the
+/// transient flags/seq/change are decoded-and-discarded here.
+struct BeaconForward {
+    order: ByteOrder,
+    guid: [u8; 12],
+    /// Server address announced in the beacon. `None` when it is the
+    /// unspecified sentinel (`0.0.0.0` / `::`), in which case the shim
+    /// resolves it to the datagram source — matching pvxs `UDPManager`,
+    /// which fills `Beacon.server` from the source on `isAny`.
+    server_addr: Option<IpAddr>,
+    server_port: u16,
+    /// Advertised protocol, raw bytes (no UTF-8 validation — pvxs treats
+    /// it as an opaque `std::string`).
+    protocol: Vec<u8>,
+    consumed: usize,
+}
+
+/// Decode a single BEACON message at the start of `frame`. `None` for a
+/// non-beacon / malformed frame (mirrors [`parse_search_request`]).
+fn parse_beacon(frame: &[u8]) -> Option<BeaconForward> {
+    if frame.len() < PvaHeader::SIZE {
+        return None;
+    }
+    let mut cur = Cursor::new(frame);
+    let header = PvaHeader::decode(&mut cur).ok()?;
+    if header.command != Command::Beacon.code() || header.flags.is_control() {
+        return None;
+    }
+    let order = header.flags.byte_order();
+    let payload_len = header.payload_length as usize;
+    let avail = frame.len().saturating_sub(PvaHeader::SIZE);
+    if avail < payload_len {
+        return None;
+    }
+    let payload = &frame[PvaHeader::SIZE..PvaHeader::SIZE + payload_len];
+    let mut p = Cursor::new(payload);
+    let guid_bytes = p.get_bytes(12).ok()?;
+    let mut guid = [0u8; 12];
+    guid.copy_from_slice(&guid_bytes);
+    // flags(u8) + seq(u8) + change(u16): transient, decoded-and-discarded
+    // (pvxs writes a zero word in their place when forwarding).
+    let _ = p.get_u8().ok()?;
+    let _ = p.get_u8().ok()?;
+    let _ = p.get_u16(order).ok()?;
+    let addr_bytes = p.get_bytes(16).ok()?;
+    let mut addr16 = [0u8; 16];
+    addr16.copy_from_slice(&addr_bytes);
+    let server_addr = match ip_from_bytes(&addr16) {
+        Some(ip) if !ip.is_unspecified() => Some(ip),
+        _ => None,
+    };
+    let server_port = p.get_u16(order).ok()?;
+    let plen = decode_size(&mut p, order).ok().flatten()? as usize;
+    let protocol = p.get_bytes(plen).ok()?;
+    // A serverStatus field follows (a null-type `0xFF` marker or a full
+    // Field/Value). The shim always re-emits a null serverStatus, so its
+    // exact bytes are irrelevant — requiring the fixed prefix above to
+    // parse cleanly is enough to recognize the frame.
+    Some(BeaconForward {
+        order,
+        guid,
+        server_addr,
+        server_port,
+        protocol,
+        consumed: PvaHeader::SIZE + payload_len,
+    })
+}
+
+/// A PVA UDP datagram the multicast shim (`mshim-rs`) recognizes and
+/// rewrites before forwarding.
+///
+/// pvxs `tools/mshim.cpp` does NOT relay the original datagram bytes: it
+/// decodes each packet as a `UDPManager::Search` / `UDPManager::Beacon`,
+/// drops anything it cannot decode, and reconstructs a fresh wire body
+/// per forward destination (mshim.cpp:95-200). This type captures that
+/// decode so the shim can forward only recognized SEARCH/BEACON and, for
+/// SEARCH, set the `Unicast` flag (`0x80`) per destination.
+///
+/// The inner representation is private so the public API stays the two
+/// methods below; the shim never needs the decoded fields directly.
+pub struct ForwardableDatagram(ForwardKind);
+
+enum ForwardKind {
+    Search(SearchRequest),
+    Beacon(BeaconForward),
+}
+
+impl ForwardableDatagram {
+    /// Decode every chained SEARCH/BEACON message in one UDP datagram,
+    /// in wire order. A datagram normally carries exactly one message;
+    /// PVA permits several back-to-back, so this drains them all (pvxs
+    /// `UDPManager` dispatches each message in a datagram separately).
+    /// Stops at the first undecodable / non-SEARCH-or-BEACON message:
+    /// the returned vec holds the recognized prefix. An empty vec means
+    /// "drop the datagram" (the shim forwards nothing it cannot decode).
+    pub fn decode_all(datagram: &[u8]) -> Vec<Self> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos < datagram.len() {
+            let rest = &datagram[pos..];
+            if let Some(req) = parse_search_request(rest) {
+                let advance = req.consumed;
+                out.push(Self(ForwardKind::Search(req)));
+                if advance == 0 {
+                    break;
+                }
+                pos += advance;
+            } else if let Some(b) = parse_beacon(rest) {
+                let advance = b.consumed;
+                out.push(Self(ForwardKind::Beacon(b)));
+                if advance == 0 {
+                    break;
+                }
+                pos += advance;
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    /// True for a SEARCH — only SEARCH carries the destination-dependent
+    /// `Unicast` flag. A BEACON forwards identically to every
+    /// destination, so the shim can log/handle the two cases distinctly.
+    pub fn is_search(&self) -> bool {
+        matches!(self.0, ForwardKind::Search(_))
+    }
+
+    /// Rebuild the wire frame to forward to one destination.
+    ///
+    /// * SEARCH — re-encodes preserving the search ID, `MustReply`,
+    ///   reply destination, protocol list, and channel queries, setting
+    ///   the `Unicast` flag iff `dest_unicast` (pvxs mshim.cpp:140-146:
+    ///   clear for multicast/broadcast, set otherwise). An `isAny` reply
+    ///   address is resolved to `source`, so the forwarded SEARCH names
+    ///   the ORIGINAL requester as the reply target rather than the shim.
+    /// * BEACON — re-encodes guid, a zeroed flags/seq/change word, the
+    ///   server address (resolved to `source` when the beacon announced
+    ///   `isAny`), TCP port, protocol, and a null serverStatus. The
+    ///   header command is `CMD_BEACON`; `dest_unicast` is unused.
+    pub fn rebuild_for(&self, dest_unicast: bool, source: SocketAddr) -> Vec<u8> {
+        match &self.0 {
+            ForwardKind::Search(req) => rebuild_search_forward(req, dest_unicast, source),
+            ForwardKind::Beacon(b) => rebuild_beacon_forward(b, source),
+        }
+    }
+}
+
+fn rebuild_search_forward(req: &SearchRequest, dest_unicast: bool, source: SocketAddr) -> Vec<u8> {
+    let order = req.byte_order;
+    // isAny reply addr means "reply to the UDP source"; the forwarded
+    // SEARCH must carry the resolved requester address or the downstream
+    // server would reply to the shim. Mirrors `resolve_reply_dest` and
+    // pvxs UDPManager filling `Search.replyDest` from the source.
+    let reply_ip = req.reply_addr.unwrap_or_else(|| source.ip());
+    let mut flags: u8 = 0;
+    if dest_unicast {
+        flags |= 0x80; // pva_search_flags::Unicast
+    }
+    if req.must_reply {
+        flags |= 0x01; // pva_search_flags::MustReply, preserved verbatim
+    }
+
+    let mut p = Vec::new();
+    p.put_u32(req.seq, order);
+    p.put_u8(flags);
+    p.extend_from_slice(&[0u8; 3]); // reserved
+    p.extend_from_slice(&ip_to_bytes(reply_ip));
+    p.put_u16(req.reply_port, order);
+    // protocol list, preserved verbatim (raw bytes — "tcp"/"tls"/legacy).
+    encode_size_into(req.protocols.len() as u32, order, &mut p);
+    for proto in &req.protocols {
+        encode_size_into(proto.len() as u32, order, &mut p);
+        p.extend_from_slice(proto);
+    }
+    // channel queries, preserved verbatim.
+    p.put_u16(req.queries.len() as u16, order);
+    for (cid, name) in &req.queries {
+        p.put_u32(*cid, order);
+        encode_string_into(name, order, &mut p);
+    }
+    let header = PvaHeader::application(false, order, Command::Search.code(), p.len() as u32);
+    let mut out = Vec::new();
+    header.write_into(&mut out);
+    out.extend_from_slice(&p);
+    out
+}
+
+fn rebuild_beacon_forward(b: &BeaconForward, source: SocketAddr) -> Vec<u8> {
+    let order = b.order;
+    let server_ip = b.server_addr.unwrap_or_else(|| source.ip());
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&b.guid);
+    // flags + seq + change: pvxs writes a single zero word here
+    // (mshim.cpp:182 "skip flags, seq, and change count. unused").
+    payload.put_u8(0);
+    payload.put_u8(0);
+    payload.put_u16(0, order);
+    payload.extend_from_slice(&ip_to_bytes(server_ip));
+    payload.put_u16(b.server_port, order);
+    encode_size_into(b.protocol.len() as u32, order, &mut payload);
+    payload.extend_from_slice(&b.protocol);
+    payload.put_u8(0xFF); // null serverStatus (pvxs mshim.cpp:188)
+    // Header command is CMD_BEACON. pvxs mshim.cpp:199 writes CMD_SEARCH
+    // here (a copy-paste slip from onSearch — the adjacent log string on
+    // :191 is also the onSearch message); forwarding a beacon mislabeled
+    // as a search would be malformed, so we emit the correct command.
+    let header = PvaHeader::application(true, order, Command::Beacon.code(), payload.len() as u32);
+    let mut out = Vec::new();
+    header.write_into(&mut out);
+    out.extend_from_slice(&payload);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2269,5 +2486,147 @@ mod tests {
         // Sanity check: non-empty CIDs still emit found=1.
         let bytes2 = build_search_response_proto(guid, 42, 5075, &[7u32], ByteOrder::Little, "tcp");
         assert_eq!(bytes2[found_off], 1, "found must be 1 when CIDs present");
+    }
+
+    // ── mshim forward rewrite (PVA SEARCH/BEACON per destination) ───────────
+
+    fn req_with(unicast: bool, must_reply: bool, reply: Option<IpAddr>) -> SearchRequest {
+        SearchRequest {
+            seq: 42,
+            byte_order: ByteOrder::Little,
+            queries: vec![(7, "PV:A".to_string()), (8, "PV:B".to_string())],
+            reply_addr: reply,
+            reply_port: 5566,
+            unicast,
+            must_reply,
+            protocols: vec![b"tcp".to_vec()],
+            consumed: 0,
+        }
+    }
+
+    /// A unicast-flagged SEARCH forwarded to a MULTICAST destination must
+    /// have the Unicast flag CLEARED; MustReply, reply addr/port, and
+    /// channel queries are preserved (pvxs mshim.cpp:140-146).
+    #[test]
+    fn mshim_search_unicast_to_multicast_clears_unicast() {
+        let req = req_with(true, true, Some(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))));
+        let source = "192.168.9.9:1111".parse().unwrap();
+        let frame = rebuild_search_forward(&req, /*dest_unicast=*/ false, source);
+        let out = parse_search_request(&frame).expect("rebuilt SEARCH parses");
+        assert!(!out.unicast, "Unicast must be cleared for a multicast dest");
+        assert!(out.must_reply, "MustReply must be preserved");
+        assert_eq!(out.reply_addr, Some(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))));
+        assert_eq!(out.reply_port, 5566);
+        assert_eq!(
+            out.queries,
+            vec![(7, "PV:A".to_string()), (8, "PV:B".to_string())]
+        );
+    }
+
+    /// A non-unicast SEARCH forwarded to a UNICAST destination must have
+    /// the Unicast flag SET (pvxs mshim.cpp:144-145).
+    #[test]
+    fn mshim_search_multicast_to_unicast_sets_unicast() {
+        let req = req_with(false, false, Some(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))));
+        let source = "192.168.9.9:1111".parse().unwrap();
+        let frame = rebuild_search_forward(&req, /*dest_unicast=*/ true, source);
+        let out = parse_search_request(&frame).expect("rebuilt SEARCH parses");
+        assert!(out.unicast, "Unicast must be set for a unicast dest");
+        assert!(!out.must_reply);
+    }
+
+    /// An `isAny` reply address (unspecified) must be resolved to the
+    /// datagram source so the forwarded SEARCH names the original
+    /// requester as the reply target, not the shim. The announced reply
+    /// PORT is preserved.
+    #[test]
+    fn mshim_search_isany_reply_resolves_to_source() {
+        let req = req_with(true, false, None);
+        let source: SocketAddr = "192.168.5.9:1111".parse().unwrap();
+        let frame = rebuild_search_forward(&req, true, source);
+        let out = parse_search_request(&frame).expect("rebuilt SEARCH parses");
+        assert_eq!(
+            out.reply_addr,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 5, 9))),
+            "isAny reply addr must resolve to the source IP"
+        );
+        assert_eq!(out.reply_port, 5566, "announced reply port is kept");
+    }
+
+    /// The full protocol list is preserved verbatim, including non-`tcp`
+    /// entries — a `tls` SEARCH must still advertise `tls` downstream.
+    #[test]
+    fn mshim_search_preserves_protocol_list() {
+        let mut req = req_with(false, false, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        req.protocols = vec![b"tls".to_vec(), b"tcp".to_vec()];
+        let source = "192.168.9.9:1111".parse().unwrap();
+        let frame = rebuild_search_forward(&req, true, source);
+        let out = parse_search_request(&frame).expect("rebuilt SEARCH parses");
+        assert_eq!(out.protocols, vec![b"tls".to_vec(), b"tcp".to_vec()]);
+    }
+
+    /// End-to-end decode: a real SEARCH datagram built by the codec is
+    /// recognized by `decode_all` and rebuilt for a multicast dest with
+    /// the Unicast bit cleared.
+    #[test]
+    fn mshim_decode_all_recognizes_real_search() {
+        let codec = PvaCodec { big_endian: false };
+        let frame = codec.build_search(1, 7, "MY:PV", [10, 1, 2, 3], 5076, true);
+        let msgs = ForwardableDatagram::decode_all(&frame);
+        assert_eq!(msgs.len(), 1, "one SEARCH message decoded");
+        assert!(msgs[0].is_search());
+        let source = "192.168.9.9:1111".parse().unwrap();
+        let rebuilt = msgs[0].rebuild_for(/*dest_unicast=*/ false, source);
+        let out = parse_search_request(&rebuilt).expect("rebuilt parses");
+        assert!(!out.unicast);
+        assert_eq!(out.queries, vec![(7, "MY:PV".to_string())]);
+    }
+
+    /// A BEACON is rebuilt as a valid CMD_BEACON (NOT mislabeled as
+    /// SEARCH the way pvxs mshim.cpp:199 does), preserving the GUID,
+    /// protocol, and TCP port, with the server address resolved to the
+    /// source when the beacon announced `isAny`.
+    #[test]
+    fn mshim_beacon_rebuild_is_valid_beacon() {
+        let guid = [0xABu8; 12];
+        // build_beacon writes an UNSPECIFIED server address (servers send
+        // 0.0.0.0; receivers use the UDP source), so this exercises the
+        // isAny→source resolution.
+        let frame = build_beacon(guid, 5075, ByteOrder::Little, 3, 9, "tcp");
+        let msgs = ForwardableDatagram::decode_all(&frame);
+        assert_eq!(msgs.len(), 1, "one BEACON message decoded");
+        assert!(!msgs[0].is_search(), "a beacon is not a search");
+        let source: SocketAddr = "192.168.7.7:9".parse().unwrap();
+        let rebuilt = msgs[0].rebuild_for(false, source);
+        // Re-parse as a beacon — this also asserts the header command is
+        // CMD_BEACON (parse_beacon rejects any other command).
+        let b = parse_beacon(&rebuilt).expect("rebuilt BEACON parses as a beacon");
+        assert_eq!(b.guid, guid);
+        assert_eq!(b.server_port, 5075);
+        assert_eq!(b.protocol, b"tcp".to_vec());
+        assert_eq!(
+            b.server_addr,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 7, 7))),
+            "isAny beacon server addr must resolve to the source"
+        );
+        // The rebuilt frame must NOT decode as a SEARCH (no CMD_SEARCH
+        // mislabel).
+        assert!(parse_search_request(&rebuilt).is_none());
+    }
+
+    /// Unrecognized datagrams (garbage, or a valid-but-non-SEARCH/BEACON
+    /// command) are dropped — `decode_all` returns empty so the shim
+    /// forwards nothing rather than relaying raw bytes.
+    #[test]
+    fn mshim_unrecognized_datagram_is_dropped() {
+        assert!(ForwardableDatagram::decode_all(&[]).is_empty());
+        assert!(ForwardableDatagram::decode_all(b"not a pva frame at all").is_empty());
+        // A well-formed but non-forwardable command (CREATE_CHANNEL).
+        let codec = PvaCodec { big_endian: false };
+        let cc = codec.build_create_channel(1, "PV:X");
+        assert!(
+            ForwardableDatagram::decode_all(&cc).is_empty(),
+            "only SEARCH/BEACON are forwardable"
+        );
     }
 }

@@ -833,15 +833,6 @@ impl Drop for AbortOnDrop {
     }
 }
 
-impl AbortOnDrop {
-    /// True once the guarded task has finished (completed, panicked, or
-    /// was aborted). Used to prune guards for one-shot ops that have no
-    /// op-map slot to be removed from on completion.
-    fn is_finished(&self) -> bool {
-        self.0.is_finished()
-    }
-}
-
 /// Apply the data-phase op continuation after a GET/PUT/RPC EXEC task
 /// has been spawned.
 ///
@@ -1516,6 +1507,12 @@ enum OpKind {
     PutGet,
     /// PVA `PROCESS` (cmd 16): trigger record processing, no value.
     Process,
+    /// PVA `GET_FIELD` (cmd 17): one-shot introspection. pvxs models this
+    /// as a real `ServerIntrospect` op in `opByIOID`
+    /// (serverintrospect.cpp:141-178); the Rust slow path reserves its
+    /// IOID in `ch.ops` under this kind while the source introspection is
+    /// in flight.
+    GetField,
 }
 
 impl OpKind {
@@ -1528,6 +1525,7 @@ impl OpKind {
             OpKind::Rpc => Command::Rpc,
             OpKind::PutGet => Command::PutGet,
             OpKind::Process => Command::Process,
+            OpKind::GetField => Command::GetField,
         }
     }
 }
@@ -2301,10 +2299,6 @@ async fn handle_connection_io(
     // against the limit to prevent a burst of concurrent requests from
     // racing past it before the first completions arrive.
     let mut pending_channel_spawns: usize = 0;
-    // abort guards for GET_FIELD slow-path introspect tasks. Dropping
-    // on connection close cancels any task whose source hasn't returned yet,
-    // matching pvxs opByIOID cleanup (serverconn.cpp:366-382).
-    let mut gf_abort_guards: Vec<AbortOnDrop> = Vec::new();
     // Drive the read loop inside a block so EVERY exit path funnels
     // through the channel-close fan-out below: the writer-died
     // `return Ok(())`, any `?`-propagated decode/IO error, and the
@@ -2752,21 +2746,14 @@ async fn handle_connection_io(
                 .await?;
             }
             Some(Command::GetField) => {
-                if let Some(guard) =
-                    handle_get_field(&frame, &tx, &channels, order, peer, &cred).await?
-                {
-                    // GET_FIELD is a one-shot op with no IOID-keyed slot to
-                    // be removed from on completion, so its guard cannot be
-                    // dropped by the op lifecycle the way data_task_abort /
-                    // monitor_abort are. Drop guards whose introspect task
-                    // has already finished before pushing the new one, so
-                    // the vec tracks only in-flight GET_FIELD ops — mirrors
-                    // pvxs removing the op from opByIOID on completion
-                    // (serverconn.cpp:366-382). Without this, completed
-                    // guards accumulate for the life of the connection.
-                    gf_abort_guards.retain(|g| !g.is_finished());
-                    gf_abort_guards.push(guard);
-                }
+                // GET_FIELD is a real IOID-keyed operation (pvxs models it as
+                // `ServerIntrospect` in `opByIOID`, serverintrospect.cpp:141-178).
+                // The slow path reserves its IOID in `ch.ops` before spawning
+                // the introspection task and releases it through the same
+                // `ExecFinished` completion owner GET/PUT/RPC use, so duplicate
+                // IOIDs, DESTROY_REQUEST, and teardown are handled uniformly.
+                handle_get_field(&frame, &tx, &mut channels, order, peer, &cred, &exec_fin_tx)
+                    .await?;
             }
             Some(Command::Search) => {
                 // TCP-circuit SEARCH (pvxs
@@ -6066,10 +6053,13 @@ async fn handle_op(
             });
             finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
         }
-        // PUT_GET / PROCESS have dedicated handlers (`handle_put_get`,
-        // `handle_process`) and are never dispatched into `handle_op`.
-        OpKind::PutGet | OpKind::Process => {
-            unreachable!("PUT_GET / PROCESS are routed to their own handlers, not handle_op")
+        // PUT_GET / PROCESS / GET_FIELD have dedicated handlers
+        // (`handle_put_get`, `handle_process`, `handle_get_field`) and are
+        // never dispatched into `handle_op`.
+        OpKind::PutGet | OpKind::Process | OpKind::GetField => {
+            unreachable!(
+                "PUT_GET / PROCESS / GET_FIELD are routed to their own handlers, not handle_op"
+            )
         }
     }
     Ok(())
@@ -6080,11 +6070,16 @@ async fn handle_op(
 async fn handle_get_field(
     frame: &Frame,
     tx: &SrvTx,
-    channels: &HashMap<u32, ChannelState>,
+    channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
     peer: SocketAddr,
     cred: &ClientCredentials,
-) -> PvaResult<Option<AbortOnDrop>> {
+    // data-phase-completion sender (see [`handle_op`]). The slow-path
+    // introspection task installs an `ExecFinishGuard` so the read-loop
+    // owner releases the reserved GET_FIELD IOID once the reply is sent
+    // (or the task is aborted by DESTROY / teardown).
+    exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
+) -> PvaResult<()> {
     // Inbound payload decodes with the frame's own header order (pvxs
     // latches `peerBE` per received message, conn.cpp:195-198); `order`
     // (config) is used only for outbound reply frames.
@@ -6118,15 +6113,20 @@ async fn handle_get_field(
         Some(c) => c,
         None => {
             debug!(sid, ioid, "GET_FIELD on unknown SID: dropping");
-            return Ok(None);
+            return Ok(());
         }
     };
-    if chan.ops.contains_key(&ioid) {
+    // pvxs rejects GET_FIELD when the IOID is already live on the
+    // connection (`opByIOID.find(ioid)!=end()`, serverintrospect.cpp:157).
+    // A reserved slow-path GET_FIELD op lives in `ch.ops` too (below), so a
+    // duplicate GET_FIELD frame for an in-flight introspection is caught by
+    // this same check rather than spawning a second task that double-replies.
+    if ioid_live_on_conn(channels, ioid) {
         debug!(
             sid,
-            ioid, "GET_FIELD reuses IOID bound to active op: dropping (pvxs parity)"
+            ioid, "GET_FIELD reuses IOID already live on connection: dropping (pvxs parity)"
         );
-        return Ok(None);
+        return Ok(());
     }
     // Attribute the GET_FIELD request and its reply to the channel
     // (pvxs serverintrospect.cpp:164 `chan->statRx += rxlen`, :45
@@ -6135,86 +6135,110 @@ async fn handle_get_field(
     // `chan_tx`.
     chan.stat.add_rx(frame.payload.len());
     let chan_tx = ChannelTx::new(tx.clone(), chan.stat.clone());
-    match chan.introspection.clone() {
-        Some(intro) => {
-            // Fast path: introspection already cached on the channel; no source call needed.
-            let mut payload = Vec::new();
-            payload.put_u32(ioid, order);
-            Status::ok().write_into(order, &mut payload);
-            encode_type_desc(&intro, order, &mut payload);
-            let h =
-                PvaHeader::application(true, order, Command::GetField.code(), payload.len() as u32);
-            let mut buf = Vec::new();
-            h.write_into(&mut buf);
-            buf.extend_from_slice(&payload);
-            let _ = chan_tx.send(buf).await;
-            Ok(None)
-        }
-        None => {
-            // Slow path: introspection not yet cached; fetch from the
-            // CREATE_CHANNEL-bound owner without blocking the read loop —
-            // not the top-level registry (pvxs serverchan.cpp:70-112 /
-            // server.cpp:100-112; see `handle_op`).
-            let pv_name = chan.name.clone();
-            let src = chan.source.clone();
-            let tx_clone = chan_tx.clone();
-            // introspect under the downstream connection's
-            // identity. pvxs builds the GET_FIELD ConnectOp with
-            // `conn->cred` (`serverintrospect.cpp:66`); a gateway must
-            // resolve the upstream type against THIS peer's credentials,
-            // not the shared identity. `pv_request` is `None` —
-            // GET_FIELD carries no per-op pvRequest.
-            let conn_ctx = crate::server_native::source::ChannelContext {
-                peer,
-                account: cred.account.clone(),
-                method: cred.method.clone(),
-                host: cred.host.clone(),
-                authority: cred.authority.clone(),
-                roles: cred.roles.clone(),
-                pv_request: None,
-            };
-            // return the abort handle so the caller stores it for
-            // connection-lifetime abort on teardown, matching pvxs opByIOID
-            // cleanup (serverconn.cpp:366-382).
-            let join = tokio::spawn(async move {
-                let intro = src.get_introspection_checked(&pv_name, conn_ctx).await;
-                let mut payload = Vec::new();
-                payload.put_u32(ioid, order);
-                match intro {
-                    Some(desc) => {
-                        // pvxs `serverintrospect.cpp:38-42`: `ioid + status`
-                        // then the descriptor, written only when non-null.
-                        Status::ok().write_into(order, &mut payload);
-                        encode_type_desc(&desc, order, &mut payload);
-                    }
-                    None => {
-                        // A source that cannot supply a descriptor must reply
-                        // `Status::Error` with NO descriptor — pvxs
-                        // `ServerIntrospectControl::error` →
-                        // `doReply(nullptr, Status::Error)`
-                        // (`serverintrospect.cpp:83-87`), and the `if(type)`
-                        // guard at `:41-42` omits the type word. Fabricating a
-                        // `Variant` here (the old `unwrap_or`) reported success
-                        // and taught the client a wrong type tree, so a later
-                        // GET/PUT/MONITOR would decode against the wrong shape.
-                        Status::error("field introspection unavailable".to_string())
-                            .write_into(order, &mut payload);
-                    }
-                }
-                let h = PvaHeader::application(
-                    true,
-                    order,
-                    Command::GetField.code(),
-                    payload.len() as u32,
-                );
-                let mut buf = Vec::new();
-                h.write_into(&mut buf);
-                buf.extend_from_slice(&payload);
-                let _ = tx_clone.send(buf).await;
-            });
-            Ok(Some(AbortOnDrop(join.abort_handle())))
-        }
+    if let Some(intro) = chan.introspection.clone() {
+        // Fast path: introspection already cached on the channel; reply
+        // inline. This completes synchronously before returning to the read
+        // loop, so there is no async window for a duplicate IOID to race —
+        // pvxs inserts+removes the introspect op within one `doReply` here
+        // too. No reservation needed.
+        let mut payload = Vec::new();
+        payload.put_u32(ioid, order);
+        Status::ok().write_into(order, &mut payload);
+        encode_type_desc(&intro, order, &mut payload);
+        let h = PvaHeader::application(true, order, Command::GetField.code(), payload.len() as u32);
+        let mut buf = Vec::new();
+        h.write_into(&mut buf);
+        buf.extend_from_slice(&payload);
+        let _ = chan_tx.send(buf).await;
+        return Ok(());
     }
+
+    // Slow path: introspection not yet cached; fetch from the
+    // CREATE_CHANNEL-bound owner without blocking the read loop — not the
+    // top-level registry (pvxs serverchan.cpp:70-112 / server.cpp:100-112;
+    // see `handle_op`).
+    let pv_name = chan.name.clone();
+    let src = chan.source.clone();
+    let tx_clone = chan_tx.clone();
+    // introspect under the downstream connection's identity. pvxs builds
+    // the GET_FIELD ConnectOp with `conn->cred` (`serverintrospect.cpp:66`);
+    // a gateway must resolve the upstream type against THIS peer's
+    // credentials. `pv_request` is `None` — GET_FIELD carries no pvRequest.
+    let conn_ctx = crate::server_native::source::ChannelContext {
+        peer,
+        account: cred.account.clone(),
+        method: cred.method.clone(),
+        host: cred.host.clone(),
+        authority: cred.authority.clone(),
+        roles: cred.roles.clone(),
+        pv_request: None,
+    };
+    // The immutable borrow of `chan` ends here (all needed values cloned),
+    // so we can take the mutable borrow to reserve the IOID.
+
+    // Reserve the IOID as a real GET_FIELD op before spawning, mirroring
+    // pvxs setting the `ServerIntrospect` op to Executing in `opByIOID`
+    // (serverintrospect.cpp:164-178). The op carries no descriptor yet
+    // (that is what the introspection fetches); `last_request = true` so the
+    // `ExecFinished` owner removes it once the single reply is out
+    // (apply_exec_finish), and `data_task_abort` (installed below) lets
+    // DESTROY_REQUEST / channel teardown abort the in-flight task by
+    // dropping the op — the same lifecycle GET/PUT/RPC use.
+    let mut reserve = non_monitor_op_state(
+        FieldDesc::Variant,
+        OpKind::GetField,
+        BitSet::with_capacity(0),
+    );
+    reserve.exec_state = ExecState::Executing;
+    reserve.last_request = true;
+    let op_id = reserve.monitor_op_id;
+    let chan_mut = channels.get_mut(&sid).expect("SID presence verified above");
+    chan_mut.ops.insert(ioid, reserve);
+
+    let exec_fin = ExecFinished { sid, ioid, op_id };
+    let exec_fin_tx_task = exec_fin_tx.clone();
+    let join = tokio::spawn(async move {
+        // terminal finalizer — releases the reserved IOID on EVERY exit
+        // (reply sent, panic, or abort), like the GET/PUT/RPC exec tasks.
+        let _exec_fin_guard = ExecFinishGuard {
+            tx: exec_fin_tx_task,
+            fin: exec_fin,
+        };
+        let intro = src.get_introspection_checked(&pv_name, conn_ctx).await;
+        let mut payload = Vec::new();
+        payload.put_u32(ioid, order);
+        match intro {
+            Some(desc) => {
+                // pvxs `serverintrospect.cpp:38-42`: `ioid + status`
+                // then the descriptor, written only when non-null.
+                Status::ok().write_into(order, &mut payload);
+                encode_type_desc(&desc, order, &mut payload);
+            }
+            None => {
+                // A source that cannot supply a descriptor must reply
+                // `Status::Error` with NO descriptor — pvxs
+                // `ServerIntrospectControl::error` →
+                // `doReply(nullptr, Status::Error)`
+                // (`serverintrospect.cpp:83-87`), and the `if(type)`
+                // guard at `:41-42` omits the type word. Fabricating a
+                // `Variant` here (the old `unwrap_or`) reported success
+                // and taught the client a wrong type tree, so a later
+                // GET/PUT/MONITOR would decode against the wrong shape.
+                Status::error("field introspection unavailable".to_string())
+                    .write_into(order, &mut payload);
+            }
+        }
+        let h = PvaHeader::application(true, order, Command::GetField.code(), payload.len() as u32);
+        let mut buf = Vec::new();
+        h.write_into(&mut buf);
+        buf.extend_from_slice(&payload);
+        let _ = tx_clone.send(buf).await;
+    });
+    // Install the abort guard on the reserved op so DESTROY_REQUEST /
+    // teardown (which drop the op) cancel this task. `subcmd` is irrelevant
+    // here — `last_request` is already set on the reserved op above.
+    finish_exec_data_task(chan_mut, ioid, 0, join.abort_handle());
+    Ok(())
 }
 
 async fn send_op_error(
@@ -11499,9 +11523,17 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_get_field(&frame, &tx, &channels, order, peer, &cred)
-            .await
-            .expect("handler returns Ok");
+        handle_get_field(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("handler returns Ok");
 
         assert!(
             rx.try_recv().is_err(),
@@ -11548,9 +11580,17 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_get_field(&frame, &tx, &channels, order, peer, &cred)
-            .await
-            .expect("handler returns Ok");
+        handle_get_field(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("handler returns Ok");
 
         let resp = rx
             .try_recv()
@@ -11606,9 +11646,17 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_get_field(&frame, &tx, &channels, order, peer, &cred)
-            .await
-            .expect("handler returns Ok");
+        handle_get_field(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("handler returns Ok");
 
         let resp = rx
             .try_recv()
@@ -11669,10 +11717,20 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        // Keep the guard alive until after the slow-path reply is received.
-        let _guard = handle_get_field(&frame, &tx, &channels, order, peer, &cred)
-            .await
-            .expect("handler returns Ok");
+        // The reserved GET_FIELD op (holding the task's abort guard) lives
+        // in `channels`, which stays in scope until after the reply below,
+        // so the slow-path task is not aborted before it replies.
+        handle_get_field(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("handler returns Ok");
 
         // Slow path spawns the source call; await its reply.
         let resp = rx.recv().await.expect("GET_FIELD slow-path reply emitted");
@@ -11742,10 +11800,20 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        // Keep the guard alive until after the slow-path reply is received.
-        let _guard = handle_get_field(&frame, &tx, &channels, order, peer, &cred)
-            .await
-            .expect("handler returns Ok");
+        // The reserved GET_FIELD op (holding the task's abort guard) lives
+        // in `channels`, which stays in scope until after the reply below,
+        // so the slow-path task is not aborted before it replies.
+        handle_get_field(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("handler returns Ok");
 
         let resp = rx.recv().await.expect("GET_FIELD slow-path reply emitted");
         let (rframe, _) = try_parse_frame(&resp).unwrap().unwrap();
@@ -11755,6 +11823,136 @@ mod tests {
             decoded.introspection.as_ref(),
             Some(&intro),
             "slow path must return the exact source descriptor"
+        );
+    }
+
+    /// A slow GET_FIELD reserves its IOID before spawning the source
+    /// introspection, so a second GET_FIELD reusing the same `(sid, ioid)`
+    /// while the first is still in flight is dropped silently and never
+    /// spawns a second task — only one reply reaches the client. Mirrors
+    /// pvxs `opByIOID.find(ioid)!=end()` rejection (serverintrospect.cpp:157)
+    /// once the introspect op is inserted Executing (:164-178).
+    #[tokio::test]
+    async fn slow_get_field_reserves_ioid_against_duplicate() {
+        use crate::pvdata::FieldDesc;
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Source whose introspection blocks on a semaphore so the first
+        // GET_FIELD stays in flight while the duplicate arrives, and which
+        // counts how many times introspection is actually invoked.
+        struct GatedIntrospectSource {
+            gate: Arc<tokio::sync::Semaphore>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl ChannelSource for GatedIntrospectSource {
+            async fn list_pvs(&self) -> Vec<String> {
+                vec!["dut".into()]
+            }
+            async fn has_pv(&self, name: &str) -> bool {
+                name == "dut"
+            }
+            async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _permit = self.gate.acquire().await.unwrap();
+                Some(FieldDesc::Variant)
+            }
+            async fn get_value(&self, _name: &str) -> Option<PvField> {
+                None
+            }
+            async fn put_value(&self, _name: &str, _v: PvField) -> Result<(), OpError> {
+                Ok(())
+            }
+            async fn is_writable(&self, _name: &str) -> bool {
+                false
+            }
+            async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+                None
+            }
+        }
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 7;
+        let ioid: u32 = 9001;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source: DynSource = Arc::new(GatedIntrospectSource {
+            gate: gate.clone(),
+            calls: calls.clone(),
+        });
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: None,
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let build = || {
+            let mut payload = Vec::new();
+            payload.put_u32(sid, order);
+            payload.put_u32(ioid, order);
+            crate::proto::encode_string_into("", order, &mut payload);
+            synth_frame(Command::GetField, order, payload)
+        };
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // First GET_FIELD: reserves the IOID and spawns the (blocked) task.
+        let frame1 = build();
+        handle_get_field(
+            &frame1,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("first GET_FIELD Ok");
+        assert!(
+            channels[&sid].ops.contains_key(&ioid),
+            "slow GET_FIELD must reserve its IOID in ch.ops"
+        );
+
+        // Duplicate GET_FIELD on the same IOID while the first is in flight:
+        // must be dropped without spawning a second introspection.
+        let frame2 = build();
+        handle_get_field(
+            &frame2,
+            &tx,
+            &mut channels,
+            order,
+            peer,
+            &cred,
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("duplicate GET_FIELD Ok (silently dropped)");
+
+        // Release the first task and let it reply.
+        gate.add_permits(1);
+        let _first = rx.recv().await.expect("the one reserved GET_FIELD replies");
+        // No second reply: drain briefly and assert empty.
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a duplicate-IOID GET_FIELD must not produce a second reply"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the duplicate GET_FIELD must not invoke source introspection a second time"
         );
     }
 

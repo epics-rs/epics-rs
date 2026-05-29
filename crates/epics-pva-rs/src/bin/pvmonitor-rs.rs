@@ -112,17 +112,17 @@ async fn main() {
         let mode = args.mode.clone();
         let request = request.clone();
         let client = client.clone();
+        let verbose = args.verbose > 0;
         let handle = tokio::spawn(async move {
-            // Format every update with the descriptor carried by the
-            // monitor's own INIT response (`MonitorEvent::Data.intro`),
-            // not a separate GET_FIELD. A projected request
-            // (`-r 'field(alarm)'`) then formats against the projected
-            // monitor shape — and no extra wire op is issued that a server
-            // or gateway might fail or authorize differently from MONITOR.
-            // pvxs formats the Value popped from the subscription itself
-            // (tools/monitor.cpp:133-146).
-            let on_event = |event: MonitorEvent| {
-                if let MonitorEvent::Data { intro, value } = event {
+            // Format every Data update with the descriptor carried by the
+            // monitor's own INIT response (`MonitorEvent::Data.intro`), not
+            // a separate GET_FIELD, and surface the connect/disconnect/
+            // finished lifecycle the way pvxs does. Data goes to stdout;
+            // lifecycle goes to stderr (pvxs `tools/monitor.cpp:140-163`:
+            // `std::cout` for the value, `std::cerr` for Connected /
+            // Disconnected / Finished, the last only when verbose).
+            let on_event = |event: MonitorEvent| match event {
+                MonitorEvent::Data { intro, value } => {
                     // `-q` is a deprecated no-op (see Args::quiet); monitor
                     // updates are always printed, matching pvAccessCPP.
                     let output = match mode.as_str() {
@@ -132,13 +132,25 @@ async fn main() {
                     };
                     print!("{output}");
                 }
+                MonitorEvent::Connected { peer } => {
+                    eprintln!("{pv_name} Connected to {peer}");
+                }
+                MonitorEvent::Disconnected => {
+                    eprintln!("{pv_name} Disconnected");
+                }
+                MonitorEvent::Finished => {
+                    if verbose {
+                        eprintln!("{pv_name} Finished");
+                    }
+                }
             };
 
-            // Value-only output: lifecycle events stay suppressed at this
-            // step so the descriptor-source change is isolated.
+            // pvxs monitors with maskConnected=false, maskDisconnected=false
+            // so the CLI reports the subscription lifecycle
+            // (tools/monitor.cpp:111-112).
             let mask = MonitorEventMask {
-                mask_connected: true,
-                mask_disconnected: true,
+                mask_connected: false,
+                mask_disconnected: false,
             };
             let result = client
                 .pvmonitor_events(&pv_name, request.as_ref(), mask, on_event)

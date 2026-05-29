@@ -1572,8 +1572,10 @@ where
 #[derive(Debug, Clone)]
 pub enum MonitorEvent {
     /// Channel just transitioned to Active and the server has
-    /// confirmed our INIT/START. Fires once per connect cycle.
-    Connected,
+    /// confirmed our INIT/START. Fires once per connect cycle. Carries
+    /// the server endpoint so callers can report `Connected to <peer>`
+    /// like pvxs (`tools/monitor.cpp:152`).
+    Connected { peer: std::net::SocketAddr },
     /// Server pushed a value update.
     Data { intro: FieldDesc, value: PvField },
     /// Channel left Active (TCP closed, op error, channel closed).
@@ -2603,7 +2605,7 @@ where
             }
         };
         if !mask.mask_connected {
-            callback(MonitorEvent::Connected);
+            callback(MonitorEvent::Connected { peer: server.addr });
         }
         let mut data_callback = |intro: &FieldDesc, value: &PvField| {
             callback(MonitorEvent::Data {

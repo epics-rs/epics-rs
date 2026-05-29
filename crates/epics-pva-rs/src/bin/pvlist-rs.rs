@@ -18,7 +18,7 @@
 //! them even though the Rust server does not yet host the `server` PV.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use clap::Parser;
@@ -84,9 +84,26 @@ fn fmt_guid(guid: &[u8; 12]) -> String {
     s
 }
 
-/// Parse `ip[:port]`, defaulting to the PVA server TCP port (5075,
-/// or `$EPICS_PVA_SERVER_PORT`). IPv6 literals must be bracketed
-/// (`[::1]:5075`) to disambiguate the colon.
+/// Resolve `host` to a single [`SocketAddr`] at `port`, mirroring the
+/// synchronous DNS fallback in pvxs `SockAddr::setAddress`
+/// (`src/util.cpp:523-549`): when the token is not a literal IP it is
+/// resolved through the system resolver. The first returned address is
+/// used (pvxs likewise takes the first `getaddrinfo` result).
+fn resolve_host_port(host: &str, port: u16) -> Result<SocketAddr, String> {
+    (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {host:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("no address found for {host:?}"))
+}
+
+/// Parse `host[:port]`, defaulting to the PVA server TCP port (5075, or
+/// `$EPICS_PVA_SERVER_PORT`). A literal IPv4/IPv6 is used directly;
+/// anything else is resolved through DNS, matching pvxs `pvxlist`, which
+/// passes the raw argument into `forceServer.setAddress(...)`
+/// (`src/client.cpp:347-359`) where `SockAddr::setAddress`
+/// (`src/util.cpp:523-549`) resolves hostnames. IPv6 literals must be
+/// bracketed (`[::1]:5075`) to disambiguate the colon.
 fn parse_server_addr(s: &str, default_port: u16) -> Result<SocketAddr, String> {
     // Already a full socket address (handles bracketed IPv6 + port).
     if let Ok(addr) = s.parse::<SocketAddr>() {
@@ -103,17 +120,18 @@ fn parse_server_addr(s: &str, default_port: u16) -> Result<SocketAddr, String> {
     if let Ok(ip) = s.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, default_port));
     }
-    // `ipv4:port`.
-    if let Some((host, port)) = s.rsplit_once(':') {
-        let port: u16 = port
-            .parse()
-            .map_err(|e| format!("port {port:?} invalid: {e}"))?;
-        let ip: std::net::IpAddr = host
-            .parse()
-            .map_err(|e| format!("ip {host:?} invalid: {e}"))?;
-        return Ok(SocketAddr::new(ip, port));
+    // `host:port` — explicit port on an IPv4 literal or a hostname.
+    if let Some((host, port_str)) = s.rsplit_once(':')
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        return match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => Ok(SocketAddr::new(ip, port)),
+            // Not a literal IP → resolve the hostname (pvxs setAddress).
+            Err(_) => resolve_host_port(host, port),
+        };
     }
-    Err(format!("address {s:?} is not a valid ip[:port]"))
+    // Bare hostname (no port) — resolve with the default port.
+    resolve_host_port(s, default_port)
 }
 
 /// Build the NTURI RPC request that the pvxs/Java `server` PV expects:
@@ -522,6 +540,55 @@ mod tests {
             p.on_online(addr("10.0.0.5:5076"), [3u8; 12], addr("10.0.0.5:1"), "tls")
                 .is_none()
         );
+    }
+
+    /// A numeric IPv4 with no port takes the default port (no DNS).
+    #[test]
+    fn parse_addr_numeric_ipv4_default_port() {
+        assert_eq!(
+            parse_server_addr("1.2.3.4", 5075).unwrap(),
+            addr("1.2.3.4:5075")
+        );
+        assert_eq!(
+            parse_server_addr("1.2.3.4:5099", 5075).unwrap(),
+            addr("1.2.3.4:5099")
+        );
+    }
+
+    /// A bracketed IPv6 with explicit port parses without DNS.
+    #[test]
+    fn parse_addr_bracketed_ipv6_with_port() {
+        assert_eq!(
+            parse_server_addr("[::1]:5075", 5075).unwrap(),
+            addr("[::1]:5075")
+        );
+        // Bracketed IPv6 without a port takes the default.
+        assert_eq!(
+            parse_server_addr("[::1]", 5075).unwrap(),
+            addr("[::1]:5075")
+        );
+    }
+
+    /// finding 66: a hostname must resolve (pvxs setAddress DNS
+    /// fallback), not be rejected. `localhost` resolves offline via
+    /// the hosts file, with and without an explicit port.
+    #[test]
+    fn parse_addr_resolves_hostname() {
+        let bare = parse_server_addr("localhost", 5075).expect("localhost resolves");
+        assert!(bare.ip().is_loopback(), "got {bare}");
+        assert_eq!(bare.port(), 5075);
+
+        let with_port = parse_server_addr("localhost:5099", 5075).expect("localhost:port resolves");
+        assert!(with_port.ip().is_loopback(), "got {with_port}");
+        assert_eq!(with_port.port(), 5099);
+    }
+
+    /// An invalid bracketed address yields a diagnostic, not a panic
+    /// (the synchronous failure path; hostname resolution failures use
+    /// the same `Result`-based reporting).
+    #[test]
+    fn parse_addr_invalid_is_error() {
+        assert!(parse_server_addr("[not-an-ip]", 5075).is_err());
     }
 
     /// Verbose mode keeps the detailed ONLINE/OFFLINE status lines.

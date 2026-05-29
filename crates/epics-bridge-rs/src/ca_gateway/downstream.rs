@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_ca_rs::server::{CaServer, ServerConnectionEvent};
+use epics_ca_rs::server::{AccessRightsNotifier, CaServer, ServerConnectionEvent};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 
@@ -407,6 +407,18 @@ impl DownstreamServer {
     pub async fn beacon_anomaly_handle(&self) -> Option<Arc<tokio::sync::Notify>> {
         let guard = self.server.lock().await;
         guard.as_ref().map(|s| s.beacon_anomaly_handle())
+    }
+
+    /// Snapshot the inner CaServer's [`AccessRightsNotifier`] so the gateway
+    /// can re-push `CA_PROTO_ACCESS_RIGHTS` to already-connected downstream
+    /// clients after an upstream write-access flip or an `.acf`/`.pvlist`
+    /// reload. Like [`Self::beacon_anomaly_handle`] this must be called
+    /// BEFORE [`Self::run`] consumes the inner CaServer, but the returned
+    /// handle stays valid afterwards (the broadcast receivers live in the
+    /// per-client tasks). Returns None once `run` has consumed the server.
+    pub async fn access_rights_notifier(&self) -> Option<AccessRightsNotifier> {
+        let guard = self.server.lock().await;
+        guard.as_ref().map(|s| s.access_rights_notifier())
     }
 
     /// Run the CA server (blocks until shutdown).

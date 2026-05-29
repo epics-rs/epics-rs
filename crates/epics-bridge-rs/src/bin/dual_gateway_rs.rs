@@ -77,17 +77,46 @@ struct Args {
     #[arg(long)]
     ca_command: Option<PathBuf>,
 
+    /// CA gateway: R1/R2/R3 report file (C `-report`). When set, report
+    /// commands and the SIGUSR2 shortcut append C-compatible sections here.
+    #[arg(long)]
+    ca_report: Option<PathBuf>,
+
     /// CA server port (downstream side). 0 = use default 5064.
     #[arg(long, default_value_t = 0)]
     ca_port: u16,
+
+    /// CA gateway: downstream listen-interface list (C `-sip`), sets
+    /// `EPICS_CAS_INTF_ADDR_LIST`. Space-separated.
+    #[arg(long)]
+    ca_sip: Option<String>,
+
+    /// CA gateway: downstream ignore-address list (C `-signore`), sets
+    /// `EPICS_CAS_IGNORE_ADDR_LIST`. Space-separated.
+    #[arg(long)]
+    ca_signore: Option<String>,
+
+    /// CA gateway: upstream search-address list (C `-cip`), sets
+    /// `EPICS_CA_ADDR_LIST` AND forces `EPICS_CA_AUTO_ADDR_LIST=NO` for the
+    /// upstream client. Space-separated.
+    #[arg(long)]
+    ca_cip: Option<String>,
+
+    /// CA gateway: upstream CA search port (C `-cport`), sets
+    /// `EPICS_CA_SERVER_PORT` for the upstream client.
+    #[arg(long)]
+    ca_cport: Option<u16>,
 
     /// CA gateway: read-only mode (rejects all puts).
     #[arg(long)]
     ca_read_only: bool,
 
-    /// CA gateway: stats PV prefix (empty disables stats).
-    #[arg(long, default_value = "gateway:")]
-    ca_stats_prefix: String,
+    /// CA gateway: stats PV namespace (C `-prefix`). The `:` separator is
+    /// inserted automatically (`<prefix>:<name>`); pass the bare namespace.
+    /// Defaults to the host name (fallback `gateway`); an explicit empty
+    /// string disables stats PVs.
+    #[arg(long)]
+    ca_stats_prefix: Option<String>,
 
     /// CA gateway: heartbeat interval in seconds (0 = disable).
     #[arg(long, default_value_t = 1)]
@@ -100,6 +129,30 @@ struct Args {
     /// CA gateway: stats refresh interval in seconds.
     #[arg(long, default_value_t = 10)]
     ca_stats_interval: u64,
+
+    /// CA gateway: upstream connect timeout in seconds
+    /// (C `-connect_timeout`).
+    #[arg(long, default_value_t = 1)]
+    ca_connect_timeout: u64,
+
+    /// CA gateway: inactive-PV retention in seconds
+    /// (C `-inactive_timeout`).
+    #[arg(long, default_value_t = 60 * 60 * 2)]
+    ca_inactive_timeout: u64,
+
+    /// CA gateway: dead-PV retention in seconds (C `-dead_timeout`).
+    #[arg(long, default_value_t = 60 * 2)]
+    ca_dead_timeout: u64,
+
+    /// CA gateway: disconnected-PV retention in seconds
+    /// (C `-disconnect_timeout`).
+    #[arg(long, default_value_t = 60 * 60 * 2)]
+    ca_disconnect_timeout: u64,
+
+    /// CA gateway: reconnect beacon-anomaly inhibit window in seconds
+    /// (C `-reconnect_inhibit`).
+    #[arg(long, default_value_t = 60 * 5)]
+    ca_reconnect_inhibit: u64,
 
     // ── PVA-side flags ───────────────────────────────────────────────
     /// Disable the PVA gateway entirely (CA-only mode). Alias:
@@ -177,12 +230,22 @@ struct CaSection {
     putlog_all: Option<bool>,
     preload: Option<PathBuf>,
     command: Option<PathBuf>,
+    report: Option<PathBuf>,
     port: Option<u16>,
+    sip: Option<String>,
+    signore: Option<String>,
+    cip: Option<String>,
+    cport: Option<u16>,
     read_only: Option<bool>,
     stats_prefix: Option<String>,
     heartbeat_interval: Option<u64>,
     cleanup_interval: Option<u64>,
     stats_interval: Option<u64>,
+    connect_timeout: Option<u64>,
+    inactive_timeout: Option<u64>,
+    dead_timeout: Option<u64>,
+    disconnect_timeout: Option<u64>,
+    reconnect_inhibit: Option<u64>,
 }
 
 #[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -216,12 +279,22 @@ fn default_config_toml() -> &'static str {
 # putlog_all = false                    # true = broader fail-loud audit (non-C)
 # preload = "/etc/gw/preload.txt"
 # command = "/etc/gw/command.cmd"      # SIGUSR1-triggered (Unix)
+# report = "/var/log/gateway.report"   # R1/R2/R3 + SIGUSR2 report file
 # port = 5064
+# sip = "192.168.1.10"                   # -sip: EPICS_CAS_INTF_ADDR_LIST
+# signore = "192.168.9.0"                # -signore: EPICS_CAS_IGNORE_ADDR_LIST
+# cip = "10.0.0.1 10.0.0.2"              # -cip: EPICS_CA_ADDR_LIST (+AUTO=NO)
+# cport = 5066                           # -cport: EPICS_CA_SERVER_PORT
 # read_only = false
-# stats_prefix = "gateway:"
+# stats_prefix = "gateway"               # bare namespace; ':' added at publish
 # heartbeat_interval = 1
 # cleanup_interval = 10
 # stats_interval = 10
+# connect_timeout = 1                    # upstream connect timeout (s)
+# inactive_timeout = 7200                # idle PV -> inactive (s)
+# dead_timeout = 120                     # disconnected PV -> dead (s)
+# disconnect_timeout = 7200              # active PV disconnect grace (s)
+# reconnect_inhibit = 300                # post-beacon reconnect inhibit (s)
 
 [pva]
 # enabled = true                        # set false to disable the PVA gateway
@@ -260,10 +333,20 @@ async fn run_ca_gateway(args: &Args) -> Result<(), String> {
             PutLogScope::TrapWrite
         },
         command_path: args.ca_command.clone(),
+        report_path: args.ca_report.clone(),
         preload_path: args.ca_preload.clone(),
         server_port: args.ca_port,
-        timeouts: Default::default(),
-        stats_prefix: args.ca_stats_prefix.clone(),
+        timeouts: epics_bridge_rs::ca_gateway::CacheTimeouts {
+            connect_timeout: Duration::from_secs(args.ca_connect_timeout),
+            inactive_timeout: Duration::from_secs(args.ca_inactive_timeout),
+            dead_timeout: Duration::from_secs(args.ca_dead_timeout),
+            disconnect_timeout: Duration::from_secs(args.ca_disconnect_timeout),
+        },
+        reconnect_inhibit: Duration::from_secs(args.ca_reconnect_inhibit),
+        stats_prefix: args
+            .ca_stats_prefix
+            .clone()
+            .unwrap_or_else(epics_bridge_rs::ca_gateway::default_stats_prefix),
         cleanup_interval: Duration::from_secs(args.ca_cleanup_interval),
         stats_interval: Duration::from_secs(args.ca_stats_interval),
         heartbeat_interval: if args.ca_heartbeat_interval == 0 {
@@ -366,20 +449,33 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile) {
     if args.ca_command.is_none() {
         args.ca_command = cfg.ca.command.clone();
     }
+    if args.ca_report.is_none() {
+        args.ca_report = cfg.ca.report.clone();
+    }
     if args.ca_port == 0 {
         if let Some(p) = cfg.ca.port {
             args.ca_port = p;
         }
+    }
+    if args.ca_sip.is_none() {
+        args.ca_sip = cfg.ca.sip.clone();
+    }
+    if args.ca_signore.is_none() {
+        args.ca_signore = cfg.ca.signore.clone();
+    }
+    if args.ca_cip.is_none() {
+        args.ca_cip = cfg.ca.cip.clone();
+    }
+    if args.ca_cport.is_none() {
+        args.ca_cport = cfg.ca.cport;
     }
     if !args.ca_read_only {
         if let Some(true) = cfg.ca.read_only {
             args.ca_read_only = true;
         }
     }
-    if args.ca_stats_prefix == "gateway:" {
-        if let Some(s) = &cfg.ca.stats_prefix {
-            args.ca_stats_prefix = s.clone();
-        }
+    if args.ca_stats_prefix.is_none() {
+        args.ca_stats_prefix = cfg.ca.stats_prefix.clone();
     }
     if args.ca_heartbeat_interval == 1 {
         if let Some(v) = cfg.ca.heartbeat_interval {
@@ -394,6 +490,31 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile) {
     if args.ca_stats_interval == 10 {
         if let Some(v) = cfg.ca.stats_interval {
             args.ca_stats_interval = v;
+        }
+    }
+    if args.ca_connect_timeout == 1 {
+        if let Some(v) = cfg.ca.connect_timeout {
+            args.ca_connect_timeout = v;
+        }
+    }
+    if args.ca_inactive_timeout == 60 * 60 * 2 {
+        if let Some(v) = cfg.ca.inactive_timeout {
+            args.ca_inactive_timeout = v;
+        }
+    }
+    if args.ca_dead_timeout == 60 * 2 {
+        if let Some(v) = cfg.ca.dead_timeout {
+            args.ca_dead_timeout = v;
+        }
+    }
+    if args.ca_disconnect_timeout == 60 * 60 * 2 {
+        if let Some(v) = cfg.ca.disconnect_timeout {
+            args.ca_disconnect_timeout = v;
+        }
+    }
+    if args.ca_reconnect_inhibit == 60 * 5 {
+        if let Some(v) = cfg.ca.reconnect_inhibit {
+            args.ca_reconnect_inhibit = v;
         }
     }
 
@@ -442,8 +563,7 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile) {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let mut args = Args::parse();
     init_tracing(args.verbose);
 
@@ -467,6 +587,42 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Apply the CA gateway's split network routing (-sip/-signore/-cip/-cport)
+    // by exporting the EPICS env vars C's `startEverything` sets
+    // (gateway.cc:359-402) BEFORE the tokio runtime spawns worker threads, so
+    // the downstream CaServer (EPICS_CAS_*) and upstream CaClient (EPICS_CA_*)
+    // read them at construction. Only when the CA side is enabled; the PVA
+    // side uses the EPICS_PVA_* namespace and is unaffected.
+    if !args.no_ca {
+        let routing = epics_bridge_rs::ca_gateway::routing_env_pairs(
+            args.ca_sip.as_deref(),
+            args.ca_signore.as_deref(),
+            args.ca_cip.as_deref(),
+            args.ca_cport,
+        );
+        // SAFETY: still single-threaded — the multi-thread runtime is built
+        // on the next statement, after this loop returns.
+        unsafe {
+            for (key, value) in &routing {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("dual-gateway-rs: failed to build tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> ExitCode {
     tracing::info!(
         ca_enabled = !args.no_ca,
         pva_enabled = !args.no_pva,

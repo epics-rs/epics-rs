@@ -42,6 +42,8 @@ pub mod downstream;
 pub mod master;
 pub mod putlog;
 pub mod pvlist;
+pub mod report;
+pub mod routing;
 pub mod server;
 pub mod stats;
 pub mod upstream;
@@ -54,6 +56,7 @@ pub use downstream::{ConnEventRecv, ConnEventReplay, DownstreamServer, Replaying
 pub use master::{RestartPolicy, SuperviseError, supervise};
 pub use putlog::{PutLog, PutLogScope, PutOutcome};
 pub use pvlist::{EvaluationOrder, PvList, PvListEntry, PvListMatch};
+pub use routing::routing_env_pairs;
 pub use server::{GatewayConfig, GatewayServer};
-pub use stats::Stats;
+pub use stats::{Stats, default_stats_prefix};
 pub use upstream::UpstreamManager;

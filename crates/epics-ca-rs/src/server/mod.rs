@@ -14,7 +14,7 @@ pub mod signed_beacon;
 pub mod tcp;
 pub mod udp;
 
-pub use ca_server::{CaServer, CaServerBuilder, ServerStats};
+pub use ca_server::{AccessRightsNotifier, CaServer, CaServerBuilder, ServerStats};
 pub use tcp::ServerConnectionEvent;
 
 use epics_base_rs::error::CaResult;

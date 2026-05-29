@@ -181,6 +181,19 @@ impl AccessConfig {
     pub fn has_rules(&self) -> bool {
         matches!(self.mode, Mode::Rules(_))
     }
+
+    /// One-line description of the effective access mode, for the R3
+    /// access-security report. The full parsed UAG/HAG/ASG/RULE dump C's
+    /// `as->report` emits is not reachable from here (base-rs does not
+    /// expose the parsed structures), so R3 pairs this summary with the
+    /// verbatim `.access` file contents.
+    pub fn mode_summary(&self) -> &'static str {
+        match self.mode {
+            Mode::ReadOnly => "read-only default (ASG(DEFAULT){RULE(1,READ)}, no .access file)",
+            Mode::AllowAll => "allow-all (no .access file)",
+            Mode::Rules(_) => "rules parsed from .access file",
+        }
+    }
 }
 
 impl Default for AccessConfig {

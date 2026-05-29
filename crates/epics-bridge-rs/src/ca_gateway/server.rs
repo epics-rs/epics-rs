@@ -31,7 +31,7 @@ use super::access::AccessConfig;
 use super::beacon::BeaconAnomaly;
 use super::cache::{CacheTimeouts, PvCache};
 // Used by the cfg(unix) signal handler AND the control-PV command owner.
-use super::command::CommandHandler;
+use super::command::{CommandHandler, GatewayCommand};
 use super::downstream::DownstreamServer;
 use super::putlog::{PutLog, PutLogScope};
 use super::pvlist::PvList;
@@ -63,6 +63,12 @@ pub struct GatewayConfig {
     /// Optional path to a command file processed on SIGUSR1 (Unix only).
     /// Each non-comment line is a [`super::command::GatewayCommand`].
     pub command_path: Option<PathBuf>,
+    /// Optional path to the R1/R2/R3 report file (C `-report`, default
+    /// `gateway.report`). When set, the `R1`/`R2`/`R3` commands and the
+    /// SIGUSR2 shortcut append C-compatible report sections here instead
+    /// of only logging a status line (`gateServer.cc:689-979`). `None`
+    /// keeps the log-only behaviour.
+    pub report_path: Option<PathBuf>,
     /// Optional path to a file containing literal upstream PV names to
     /// pre-subscribe (one per line). When set, the gateway pre-fetches
     /// each name on startup. Used because lazy resolution is not yet
@@ -72,7 +78,11 @@ pub struct GatewayConfig {
     pub server_port: u16,
     /// Cache timeouts.
     pub timeouts: CacheTimeouts,
-    /// Statistics PV prefix (e.g. `"gateway:"`). Empty disables stats PVs.
+    /// Statistics PV namespace, the bare C `-prefix` string (e.g.
+    /// `"gateway"` or a host name). The `:` separator is inserted at
+    /// publish time, so PVs appear as `<prefix>:<name>` — matching C
+    /// `sprintf("%s:%s", stat_prefix, name)` (`gateServer.cc:2097`). Do NOT
+    /// include a trailing `:`. Empty disables stats (and control) PVs.
     pub stats_prefix: String,
     /// Cleanup sweep interval.
     pub cleanup_interval: Duration,
@@ -80,6 +90,11 @@ pub struct GatewayConfig {
     pub stats_interval: Duration,
     /// Heartbeat increment interval. `None` disables the heartbeat PV.
     pub heartbeat_interval: Option<Duration>,
+    /// Reconnect beacon-anomaly inhibit window (C `-reconnect_inhibit`,
+    /// gateServer.cc:414-432). Minimum spacing between upstream-reconnect
+    /// beacon anomalies. Defaults to 5 minutes
+    /// (C++ `GATE_RECONNECT_INHIBIT`).
+    pub reconnect_inhibit: Duration,
     /// Read-only mode: rejects all puts.
     pub read_only: bool,
     /// Optional TLS server config for downstream connections.
@@ -114,13 +129,17 @@ impl Default for GatewayConfig {
             putlog_path: None,
             putlog_scope: PutLogScope::default(),
             command_path: None,
+            report_path: None,
             preload_path: None,
             server_port: 0,
             timeouts: CacheTimeouts::default(),
-            stats_prefix: "gateway:".to_string(),
+            // Bare C `-prefix`; the `:` separator is inserted at publish.
+            stats_prefix: "gateway".to_string(),
             cleanup_interval: Duration::from_secs(10),
             stats_interval: Duration::from_secs(10),
             heartbeat_interval: Some(Duration::from_secs(1)),
+            // C++ GATE_RECONNECT_INHIBIT default (BeaconAnomaly::new).
+            reconnect_inhibit: Duration::from_secs(60 * 5),
             read_only: false,
             #[cfg(feature = "ca-gateway-tls")]
             tls: None,
@@ -146,6 +165,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("putlog_path", &self.putlog_path)
             .field("putlog_scope", &self.putlog_scope)
             .field("command_path", &self.command_path)
+            .field("report_path", &self.report_path)
             .field("preload_path", &self.preload_path)
             .field("server_port", &self.server_port)
             .field("timeouts", &self.timeouts)
@@ -153,6 +173,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("cleanup_interval", &self.cleanup_interval)
             .field("stats_interval", &self.stats_interval)
             .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("reconnect_inhibit", &self.reconnect_inhibit)
             .field("read_only", &self.read_only);
         #[cfg(feature = "ca-gateway-tls")]
         {
@@ -278,9 +299,16 @@ impl GatewayServer {
         let cache = Arc::new(RwLock::new(PvCache::new()));
         let shadow_db = Arc::new(PvDatabase::new());
 
+        // Normalise the stats namespace once: `config.stats_prefix` is the
+        // bare C `-prefix`, and the `:` separator is inserted at publish
+        // (C `sprintf("%s:%s", stat_prefix, name)`, gateServer.cc:2097).
+        // The single normalised value feeds BOTH the stats PVs and the
+        // control PVs so they cannot diverge. Empty stays empty (disabled).
+        let stats_prefix = super::stats::prefix_with_separator(&config.stats_prefix);
+
         // Stats — needed before UpstreamManager so per-PV WriteHook
         // closures can capture the same Arc.
-        let stats = Arc::new(Stats::new(config.stats_prefix.clone()));
+        let stats = Arc::new(Stats::new(stats_prefix.clone()));
 
         // Put-event logger (optional) — also captured by every WriteHook.
         let putlog = config
@@ -297,7 +325,11 @@ impl GatewayServer {
         // honored `request()` calls actually emit a beacon — without
         // this the throttle just tracked timestamps and
         // `generateBeaconAnomaly` was silent on the wire.
-        let beacon_anomaly = Arc::new(BeaconAnomaly::new());
+        // Honour the configured reconnect-inhibit window (C
+        // `-reconnect_inhibit`, gateServer.cc:414-432) instead of the
+        // compiled-in 5-minute default, so the CLI/API knob governs how
+        // often an upstream-reconnect beacon anomaly may fire.
+        let beacon_anomaly = Arc::new(BeaconAnomaly::with_inhibit(config.reconnect_inhibit));
 
         // Upstream manager — receives the full WriteHook environment so
         // every PV's hook can enforce read_only / ACL / host-deny / putlog
@@ -359,14 +391,24 @@ impl GatewayServer {
             beacon_anomaly.install_pulse(pulse);
         }
 
+        // Snapshot the downstream CaServer's access-rights notifier and
+        // install it on the upstream manager (built above, before the
+        // server existed). With it, an upstream IOC write-access flip or an
+        // AS/PVL reload re-pushes CA_PROTO_ACCESS_RIGHTS to already-connected
+        // clients instead of only updating the hook flag (gateVc.cc:1624-1638
+        // postAccessRights). Captured BEFORE `downstream.run()` consumes the
+        // inner CaServer; the handle stays valid afterwards.
+        if let Some(notifier) = downstream.access_rights_notifier().await {
+            upstream.install_access_notifier(notifier);
+        }
+
         // Publish C-compatible control flag PVs (commandFlag, report*Flag,
         // newAsFlag, quitFlag, quitServerFlag) under the stats prefix so
         // operators can trigger command-file execution, reports, reload,
         // and shutdown via `caput` — the cross-platform alternative to
         // SIGUSR1 (gateServer.cc:1877-2102). The receiver is drained by a
         // single command owner in `run()`; `None` when stats are disabled.
-        let control_rx =
-            super::control::publish_control_pvs(&shadow_db, &config.stats_prefix).await;
+        let control_rx = super::control::publish_control_pvs(&shadow_db, &stats_prefix).await;
 
         let server = Self {
             config,
@@ -733,7 +775,9 @@ impl GatewayServer {
                     self.config.access_path.clone(),
                 )
                 .with_upstream(self.upstream.clone())
-                .with_beacon_anomaly(self.beacon_anomaly.clone());
+                .with_beacon_anomaly(self.beacon_anomaly.clone())
+                .with_stats(stats.clone())
+                .with_report_path(self.config.report_path.clone());
                 super::control::spawn_control_owner(
                     rx,
                     handler,
@@ -911,18 +955,28 @@ impl GatewayServer {
         downstream_result
     }
 
-    /// Spawn a Unix SIGUSR1 watcher that re-reads the command file.
-    /// Returns None on non-Unix or when no command file is configured.
+    /// Spawn the Unix signal watchers.
+    ///
+    /// - **SIGUSR1** re-reads the command file (when one is configured),
+    ///   dispatching each command token.
+    /// - **SIGUSR2** is C ca-gateway's shortcut for the R2 process-variable
+    ///   report (`report2_flag`, gateServer.cc:2403-2407): it runs `R2`
+    ///   directly, so it works even without a command file.
+    ///
+    /// Returns None only on non-Unix. On Unix the watcher is always armed
+    /// (SIGUSR2 needs no command file); the handle is aborted at shutdown.
     #[cfg(unix)]
     fn spawn_signal_handler(&self) -> Option<tokio::task::JoinHandle<()>> {
-        let cmd_path = self.config.command_path.clone()?;
+        let cmd_path = self.config.command_path.clone();
         let pvlist_path = self.config.pvlist_path.clone();
         let access_path = self.config.access_path.clone();
+        let report_path = self.config.report_path.clone();
         let cache = self.cache.clone();
         let pvlist = self.pvlist.clone();
         let access = self.access.clone();
         let upstream = self.upstream.clone();
         let beacon_anomaly = self.beacon_anomaly.clone();
+        let stats = self.stats.clone();
 
         Some(tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
@@ -933,33 +987,73 @@ impl GatewayServer {
                     return;
                 }
             };
+            let mut sigusr2 = match signal(SignalKind::user_defined2()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "ca-gateway-rs: failed to install SIGUSR2 handler");
+                    return;
+                }
+            };
             let handler = CommandHandler::new(cache, pvlist, access, pvlist_path, access_path)
                 .with_upstream(upstream)
-                .with_beacon_anomaly(beacon_anomaly);
+                .with_beacon_anomaly(beacon_anomaly)
+                .with_stats(stats)
+                .with_report_path(report_path);
             tracing::info!(
-                command_file = %cmd_path.display(),
-                "ca-gateway-rs: SIGUSR1 handler armed"
+                command_file = ?cmd_path.as_ref().map(|p| p.display().to_string()),
+                "ca-gateway-rs: SIGUSR1/SIGUSR2 handlers armed"
             );
             loop {
-                if sigusr1.recv().await.is_none() {
-                    break;
-                }
-                tracing::info!("ca-gateway-rs: SIGUSR1 received — processing command file");
-                match handler.process_file(&cmd_path).await {
-                    Ok(out) => {
-                        if !out.is_empty() {
-                            tracing::info!(output = %out.trim_end(), "ca-gateway-rs: command output");
+                tokio::select! {
+                    r = sigusr1.recv() => {
+                        if r.is_none() {
+                            break;
+                        }
+                        match &cmd_path {
+                            Some(path) => {
+                                tracing::info!(
+                                    "ca-gateway-rs: SIGUSR1 received — processing command file"
+                                );
+                                match handler.process_file(path).await {
+                                    Ok(out) if !out.is_empty() => tracing::info!(
+                                        output = %out.trim_end(),
+                                        "ca-gateway-rs: command output"
+                                    ),
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!(
+                                        error = %e,
+                                        "ca-gateway-rs: command file error"
+                                    ),
+                                }
+                            }
+                            None => tracing::warn!(
+                                "ca-gateway-rs: SIGUSR1 received but no command file configured"
+                            ),
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "ca-gateway-rs: command file error");
+                    r = sigusr2.recv() => {
+                        if r.is_none() {
+                            break;
+                        }
+                        // C report2_flag shortcut: run R2 directly.
+                        tracing::info!(
+                            "ca-gateway-rs: SIGUSR2 received — running R2 (process variable report)"
+                        );
+                        match handler.dispatch(GatewayCommand::ReportSummary).await {
+                            Ok(out) if !out.is_empty() => tracing::info!(
+                                status = %out.trim_end(),
+                                "ca-gateway-rs: R2 report"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "ca-gateway-rs: R2 report error"),
+                        }
                     }
                 }
             }
         }))
     }
 
-    /// Stub for non-Unix platforms (no SIGUSR1).
+    /// Stub for non-Unix platforms (no SIGUSR1/SIGUSR2).
     #[cfg(not(unix))]
     fn spawn_signal_handler(&self) -> Option<tokio::task::JoinHandle<()>> {
         None

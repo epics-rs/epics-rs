@@ -53,9 +53,41 @@ struct Args {
     #[arg(long)]
     command: Option<PathBuf>,
 
+    /// Path to the R1/R2/R3 report file (C `-report`). When set, the
+    /// R1/R2/R3 commands and the SIGUSR2 shortcut append C-compatible
+    /// report sections here; otherwise the report is logged only.
+    #[arg(long)]
+    report: Option<PathBuf>,
+
     /// CA server port (downstream side). 0 = use default 5064.
     #[arg(long, default_value_t = 0)]
     port: u16,
+
+    /// Downstream listen-interface list (C `-sip`): sets
+    /// `EPICS_CAS_INTF_ADDR_LIST` so the gateway's CA server binds only the
+    /// given interfaces. Space-separated, EPICS env-list syntax.
+    #[arg(long)]
+    sip: Option<String>,
+
+    /// Downstream ignore-address list (C `-signore`): sets
+    /// `EPICS_CAS_IGNORE_ADDR_LIST` so searches from these addresses are
+    /// dropped. Space-separated.
+    #[arg(long)]
+    signore: Option<String>,
+
+    /// Upstream search-address list (C `-cip`): sets `EPICS_CA_ADDR_LIST`
+    /// for the gateway's upstream CA client AND forces
+    /// `EPICS_CA_AUTO_ADDR_LIST=NO`, so the gateway searches only the named
+    /// IOC domain and never broadcasts back onto its own downstream
+    /// segment. Space-separated.
+    #[arg(long)]
+    cip: Option<String>,
+
+    /// Upstream CA search port (C `-cport`): sets `EPICS_CA_SERVER_PORT`
+    /// for the gateway's upstream client, letting it search an IOC domain
+    /// on a non-default port.
+    #[arg(long)]
+    cport: Option<u16>,
 
     /// Read-only mode: reject all puts.
     #[arg(long)]
@@ -65,9 +97,13 @@ struct Args {
     #[arg(long)]
     no_stats: bool,
 
-    /// Statistics PV prefix (default: "gateway:").
-    #[arg(long, default_value = "gateway:")]
-    stats_prefix: String,
+    /// Statistics PV namespace (C `-prefix`). The `:` separator is added
+    /// automatically, so PVs are published as `<prefix>:<name>` — pass the
+    /// bare namespace, not a trailing `:`. Defaults to the host name
+    /// (falling back to `gateway`), matching C ca-gateway. Use --no-stats
+    /// to disable stats PVs entirely.
+    #[arg(long)]
+    stats_prefix: Option<String>,
 
     /// Heartbeat interval in seconds (0 = disable).
     #[arg(long, default_value_t = 1)]
@@ -80,6 +116,33 @@ struct Args {
     /// Statistics refresh interval in seconds.
     #[arg(long, default_value_t = 10)]
     stats_interval: u64,
+
+    /// Upstream connect timeout in seconds (C `-connect_timeout`): how
+    /// long a first search waits for the upstream IOC before the shadow
+    /// PV is demoted from Connecting to Dead.
+    #[arg(long, default_value_t = 1)]
+    connect_timeout: u64,
+
+    /// Inactive-PV retention in seconds (C `-inactive_timeout`): how long
+    /// a cached PV with no downstream clients is kept before eviction.
+    #[arg(long, default_value_t = 60 * 60 * 2)]
+    inactive_timeout: u64,
+
+    /// Dead-PV retention in seconds (C `-dead_timeout`): how long a PV
+    /// whose upstream search never resolved is kept before eviction.
+    #[arg(long, default_value_t = 60 * 2)]
+    dead_timeout: u64,
+
+    /// Disconnected-PV retention in seconds (C `-disconnect_timeout`):
+    /// how long a PV is kept after its upstream disconnects.
+    #[arg(long, default_value_t = 60 * 60 * 2)]
+    disconnect_timeout: u64,
+
+    /// Reconnect beacon-anomaly inhibit window in seconds
+    /// (C `-reconnect_inhibit`): minimum spacing between
+    /// upstream-reconnect beacon anomalies.
+    #[arg(long, default_value_t = 60 * 5)]
+    reconnect_inhibit: u64,
 
     /// Run under auto-restart supervisor (NRESTARTS pattern).
     #[arg(long)]
@@ -223,8 +286,44 @@ async fn run_once(config: GatewayConfig) -> Result<(), String> {
         .map_err(|e| format!("runtime error: {e}"))
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let args = Args::parse();
+
+    // Apply C ca-gateway's split network routing (-sip/-signore/-cip/-cport)
+    // by exporting the EPICS env vars `startEverything` sets
+    // (gateway.cc:359-402) BEFORE the tokio runtime spawns worker threads,
+    // so the downstream CaServer (EPICS_CAS_*) and upstream CaClient
+    // (EPICS_CA_*) read them at construction. Distinct namespaces => the
+    // two sides cannot collide. Done here, while the process is still
+    // single-threaded, to satisfy `set_var`'s safety contract.
+    let routing = epics_bridge_rs::ca_gateway::routing_env_pairs(
+        args.sip.as_deref(),
+        args.signore.as_deref(),
+        args.cip.as_deref(),
+        args.cport,
+    );
+    // SAFETY: no runtime threads exist yet — the multi-thread tokio runtime
+    // is built below, after this loop returns.
+    unsafe {
+        for (key, value) in &routing {
+            std::env::set_var(key, value);
+        }
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("ca-gateway-rs: failed to build tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> ExitCode {
     // Initialize structured logging — RUST_LOG controls verbosity. The
     // gateway's hot paths (cache eviction, command processing, signal
     // handler, conn-event dispatch) all emit via `tracing` so a
@@ -235,8 +334,6 @@ async fn main() -> ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .try_init();
-
-    let args = Args::parse();
 
     let config = GatewayConfig {
         pvlist_path: args.pvlist.clone(),
@@ -249,13 +346,22 @@ async fn main() -> ExitCode {
             PutLogScope::TrapWrite
         },
         command_path: args.command.clone(),
+        report_path: args.report.clone(),
         preload_path: args.preload.clone(),
         server_port: args.port,
-        timeouts: Default::default(),
+        timeouts: epics_bridge_rs::ca_gateway::CacheTimeouts {
+            connect_timeout: std::time::Duration::from_secs(args.connect_timeout),
+            inactive_timeout: std::time::Duration::from_secs(args.inactive_timeout),
+            dead_timeout: std::time::Duration::from_secs(args.dead_timeout),
+            disconnect_timeout: std::time::Duration::from_secs(args.disconnect_timeout),
+        },
+        reconnect_inhibit: std::time::Duration::from_secs(args.reconnect_inhibit),
         stats_prefix: if args.no_stats {
             String::new()
         } else {
-            args.stats_prefix.clone()
+            args.stats_prefix
+                .clone()
+                .unwrap_or_else(epics_bridge_rs::ca_gateway::default_stats_prefix)
         },
         cleanup_interval: std::time::Duration::from_secs(args.cleanup_interval),
         stats_interval: std::time::Duration::from_secs(args.stats_interval),

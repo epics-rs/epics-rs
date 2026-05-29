@@ -111,6 +111,137 @@ fn ack_threshold(pipeline_size: u32) -> u32 {
     (pipeline_size / 2).max(1)
 }
 
+/// Negotiated monitor flow control for one subscription cycle.
+///
+/// Replaces the bare `pipeline_size: u32` that used to drive three
+/// distinct wire decisions at once — whether the MONITOR INIT carries
+/// the pipeline bit, the initial `nack` (credit window) trailer value,
+/// and the MONITOR_ACK refill cadence. When a caller supplies a custom
+/// pvRequest those three must come from the request's
+/// `record._options` (pvxs `clientmon.cpp:761-808`), not from the
+/// builder default, or the wire `queueSize`/`pipeline` and the client's
+/// local accounting disagree. Deriving all three into one struct, once,
+/// makes that disagreement unrepresentable.
+#[derive(Clone, Copy, Debug)]
+pub struct MonitorFlow {
+    /// pvxs `op->pipeline`. When false no credit window is negotiated:
+    /// INIT carries no pipeline bit / `nack` trailer and no ACK is sent.
+    pub pipeline: bool,
+    /// pvxs `op->queueSize` — the credit window written as the INIT
+    /// `nack` trailer. Only meaningful when `pipeline`.
+    pub queue_size: u32,
+    /// pvxs `op->ackAt` — refill the server's window after this many
+    /// delivered events. Only meaningful when `pipeline`.
+    pub ack_at: u32,
+}
+
+impl MonitorFlow {
+    /// Default-path flow control: the client's configured pipeline
+    /// window is the single source of truth (no caller pvRequest to
+    /// honor). `pipeline_size == 0` disables pipelining entirely,
+    /// matching the pre-`MonitorFlow` `pipeline_size > 0` gate.
+    pub fn window(pipeline_size: u32) -> Self {
+        if pipeline_size > 0 {
+            Self {
+                pipeline: true,
+                queue_size: pipeline_size,
+                ack_at: ack_threshold(pipeline_size),
+            }
+        } else {
+            Self {
+                pipeline: false,
+                queue_size: 0,
+                ack_at: 0,
+            }
+        }
+    }
+
+    /// Derive flow control from a caller-supplied pvRequest's
+    /// `record._options`, mirroring pvxs `MonitorBuilder::exec()`
+    /// (`clientmon.cpp:761-808`): `pipeline` defaults false; `queueSize`
+    /// is honored only when present, parseable, and `> 1`, otherwise the
+    /// builder default stands; `ackAny` resolves to a percent of, or an
+    /// absolute count within, the window. This is the structural fix for
+    /// the custom-request path — the wire `pipeline`/`queueSize`/`nack`
+    /// and the ACK cadence now share one origin instead of the wire
+    /// coming from the request and the accounting from the builder
+    /// default.
+    ///
+    /// `default_window` is the client's configured pipeline window
+    /// (`PvaClientBuilder::pipeline_size`), used as the `queueSize`
+    /// fallback the way pvxs uses its `MonitorBuilder` default of 4.
+    pub fn from_record_options(record_options: &[(String, String)], default_window: u32) -> Self {
+        let get = |key: &str| {
+            record_options
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.trim())
+        };
+        // pvxs `options["pipeline"].as(op->pipeline)` — absent ⟹ false.
+        let pipeline = get("pipeline")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+        if !pipeline {
+            // No pipeline ⟹ no credit window and no ACK trailer. A
+            // requested `queueSize` still travels inside the pvRequest
+            // bytes (the server's squash depth) but the client sends no
+            // `nack` and never ACKs — pvxs only writes the trailer
+            // `if(pipeline)` (`clientmon.cpp:340-348`).
+            return Self {
+                pipeline: false,
+                queue_size: 0,
+                ack_at: 0,
+            };
+        }
+        // pvxs `clientmon.cpp:763-773`: `queueSize` honored only when
+        // present, parseable, and `Q > 1`; else the builder default. A
+        // pipeline window must be `>= 2`, so a 0/1 configured default
+        // falls back to the pvxs default of 4.
+        let fallback = if default_window > 1 {
+            default_window
+        } else {
+            DEFAULT_PIPELINE_SIZE
+        };
+        let queue_size = get("queueSize")
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&q| q > 1)
+            .unwrap_or(fallback);
+        let ack_at = ack_at_from_request(get("ackAny"), queue_size);
+        Self {
+            pipeline: true,
+            queue_size,
+            ack_at,
+        }
+    }
+}
+
+/// pvxs `clientmon.cpp:777-808` — derive the pipeline ACK-refill
+/// threshold `ackAt` from a string-valued `record._options.ackAny` and
+/// the negotiated `queue_size`. A `"N%"` value is a percent of the
+/// window (honored only for `0 < N <= 100`); otherwise an integer
+/// count. An absent/unparseable/out-of-range value, or an explicit `0`,
+/// resolves to `queue_size / 2`; the result clamps to `[1, queue_size]`.
+/// This is the client-string twin of the server's `ack_at_from`
+/// (which reads a typed `PvField`); `queue_size` is always `>= 2` here.
+fn ack_at_from_request(ack_any: Option<&str>, queue_size: u32) -> u32 {
+    let mut ack_at: u32 = 0;
+    if let Some(s) = ack_any {
+        if let Some(pct) = s.strip_suffix('%') {
+            if let Ok(percent) = pct.trim().parse::<f64>() {
+                if percent > 0.0 && percent <= 100.0 {
+                    ack_at = (percent / 100.0 * queue_size as f64) as u32;
+                }
+            }
+        } else if let Ok(count) = s.parse::<u32>() {
+            ack_at = count;
+        }
+    }
+    if ack_at == 0 {
+        ack_at = queue_size / 2;
+    }
+    ack_at.clamp(1, queue_size)
+}
+
 /// Drop-guard for the per-IOID router entry.
 ///
 /// **Client-side**: `unregister_ioid` is always called, even on `?`
@@ -1788,6 +1919,21 @@ fn classify_raw_monitor_frame(payload: &[u8], order: ByteOrder) -> RawMonitorFra
     RawMonitorFrameKind::Skip
 }
 
+/// Serialize a pvRequest VALUE to its on-wire `descriptor + value`
+/// form in `order`. This is the byte shape a MONITOR INIT pvRequest
+/// takes (pvxs `clientget.cpp:351-352` writes
+/// `to_wire_type_value(M, pvRequest)`), so the result is suitable both
+/// as a [`crate::codec::PvaCodec::build_monitor_init`] argument and as
+/// a stable cache key for "same pvRequest" deduplication. Two equal
+/// pvRequest values produce identical bytes for a fixed `order`.
+pub fn encode_pv_request_value(req: &PvField, order: ByteOrder) -> Vec<u8> {
+    let desc = req.descriptor();
+    let mut out = Vec::new();
+    encode_type_desc(&desc, order, &mut out);
+    encode_pv_field(req, &desc, order, &mut out);
+    out
+}
+
 /// Raw-frame monitor entry: like [`op_monitor`] but the
 /// callback receives the **raw MONITOR DATA body bytes** (the
 /// `changed | value | overrun` triplet from the wire) instead of a
@@ -1827,6 +1973,7 @@ where
             server.clone(),
             sid,
             &fields_owned,
+            None,
             pipeline_size,
             &mut callback,
             None,
@@ -1859,12 +2006,53 @@ pub fn op_monitor_raw_frames_handle<F>(
     channel: Arc<Channel>,
     fields: &[&str],
     pipeline_size: u32,
-    mut callback: F,
+    callback: F,
 ) -> SubscriptionHandle
 where
     F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send + 'static,
 {
     let fields_owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+    spawn_raw_frames_handle(channel, fields_owned, None, pipeline_size, callback)
+}
+
+/// Raw-frame monitor handle that forwards a caller-supplied pvRequest
+/// VALUE verbatim (re-encoded per upstream connection) instead of
+/// deriving the request from a field-name list. The PVA gateway uses
+/// this to open an upstream monitor carrying the DOWNSTREAM client's
+/// MONITOR INIT pvRequest, so the upstream server applies the same field
+/// projection / `record._options._filter` chain the client asked for —
+/// pva2pva `p2pApp/channel.cpp:157-193` forwards the serialized
+/// downstream pvRequest rather than a gateway-default request, and
+/// `moncache.cpp:34-37` caches one upstream monitor per distinct
+/// request.
+pub fn op_monitor_raw_frames_handle_with_request<F>(
+    channel: Arc<Channel>,
+    pv_request: PvField,
+    pipeline_size: u32,
+    callback: F,
+) -> SubscriptionHandle
+where
+    F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send + 'static,
+{
+    spawn_raw_frames_handle(
+        channel,
+        Vec::new(),
+        Some(pv_request),
+        pipeline_size,
+        callback,
+    )
+}
+
+fn spawn_raw_frames_handle<F>(
+    channel: Arc<Channel>,
+    fields_owned: Vec<String>,
+    pv_request: Option<PvField>,
+    pipeline_size: u32,
+    mut callback: F,
+) -> SubscriptionHandle
+where
+    F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send + 'static,
+{
     let state = Arc::new(SubscriptionState {
         active: parking_lot::Mutex::new(None),
         paused: std::sync::atomic::AtomicBool::new(false),
@@ -1904,6 +2092,7 @@ where
                 server.clone(),
                 sid,
                 &fields_owned,
+                pv_request.as_ref(),
                 pipeline_size,
                 &mut callback,
                 Some(state_for_task.clone()),
@@ -1937,6 +2126,7 @@ async fn run_raw_monitor_loop<F>(
     server: Arc<super::server_conn::ServerConn>,
     sid: u32,
     fields: &[String],
+    pv_request: Option<&PvField>,
     pipeline_size: u32,
     callback: &mut F,
     state: Option<Arc<SubscriptionState>>,
@@ -1956,7 +2146,19 @@ where
     // sent the pipeline size on START as a trailer the server never
     // read.
     let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-    let pv_req: std::borrow::Cow<'_, [u8]> = if pipeline_size > 0 {
+    let pv_req: std::borrow::Cow<'_, [u8]> = if let Some(req) = pv_request {
+        // A caller-supplied pvRequest (e.g. the PVA gateway forwarding a
+        // downstream's MONITOR INIT request so the upstream applies the
+        // same field projection / `_filter` chain) is encoded verbatim
+        // in THIS connection's byte order. Re-encoding per reconnect is
+        // why it is carried as a decoded value, not pre-serialized bytes
+        // (a reconnect may land on a peer of the opposite endianness).
+        // The pipeline INIT bit / nack below stays driven by
+        // `pipeline_size` — the gateway's own upstream credit window for
+        // its `Pauser`-based backpressure — independent of the
+        // downstream's options that the forwarded request also carries.
+        std::borrow::Cow::Owned(encode_pv_request_value(req, order))
+    } else if pipeline_size > 0 {
         // Empty field list → empty `field {}` sub-structure, which
         // `request_to_mask` reads as "select the whole structure"
         // (pv_request.rs `request_field.is_empty()`). Forcing a
@@ -2153,7 +2355,14 @@ where
     F: FnMut(&FieldDesc, &PvField) + Send,
 {
     let fields_owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-    op_monitor_inner(channel, fields_owned, None, pipeline_size, callback).await
+    op_monitor_inner(
+        channel,
+        fields_owned,
+        None,
+        MonitorFlow::window(pipeline_size),
+        callback,
+    )
+    .await
 }
 
 /// `op_monitor` variant accepting a pre-built pvRequest blob. Threads
@@ -2165,20 +2374,20 @@ where
 pub async fn op_monitor_raw<F>(
     channel: &Arc<Channel>,
     pv_req: Vec<u8>,
-    pipeline_size: u32,
+    flow: MonitorFlow,
     callback: F,
 ) -> PvaResult<()>
 where
     F: FnMut(&FieldDesc, &PvField) + Send,
 {
-    op_monitor_inner(channel, Vec::new(), Some(pv_req), pipeline_size, callback).await
+    op_monitor_inner(channel, Vec::new(), Some(pv_req), flow, callback).await
 }
 
 async fn op_monitor_inner<F>(
     channel: &Arc<Channel>,
     fields_owned: Vec<String>,
     raw_pv_req: Option<Vec<u8>>,
-    pipeline_size: u32,
+    flow: MonitorFlow,
     mut callback: F,
 ) -> PvaResult<()>
 where
@@ -2204,7 +2413,7 @@ where
             sid,
             &fields_owned,
             raw_pv_req.as_deref(),
-            pipeline_size,
+            flow,
             &mut callback,
             None,
         )
@@ -2241,12 +2450,13 @@ where
     F: FnMut(&FieldDesc, &PvField) + Send + 'static,
 {
     let fields_owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+    let flow = MonitorFlow::window(pipeline_size);
     let state = Arc::new(SubscriptionState {
         active: parking_lot::Mutex::new(None),
         paused: std::sync::atomic::AtomicBool::new(false),
         stop: std::sync::atomic::AtomicBool::new(false),
         stats: parking_lot::Mutex::new(SubscriptionStat {
-            limit_queue: pipeline_size,
+            limit_queue: flow.queue_size,
             ..Default::default()
         }),
         cancel: tokio::sync::Notify::new(),
@@ -2280,7 +2490,7 @@ where
                 sid,
                 &fields_owned,
                 None,
-                pipeline_size,
+                flow,
                 &mut callback,
                 Some(state_for_task.clone()),
             )
@@ -2325,6 +2535,7 @@ where
     F: FnMut(MonitorEvent) + Send,
 {
     let fields_owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+    let flow = MonitorFlow::window(pipeline_size);
     loop {
         let (server, sid) = match channel.ensure_active().await {
             Ok(p) => p,
@@ -2354,7 +2565,7 @@ where
             sid,
             &fields_owned,
             None,
-            pipeline_size,
+            flow,
             &mut data_callback,
             None,
         )
@@ -2402,7 +2613,7 @@ async fn run_monitor_loop<F>(
     sid: u32,
     fields: &[String],
     raw_pv_req: Option<&[u8]>,
-    pipeline_size: u32,
+    flow: MonitorFlow,
     callback: &mut F,
     state: Option<Arc<SubscriptionState>>,
 ) -> Result<(), MonitorEnd>
@@ -2414,20 +2625,22 @@ where
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
 
-    // same pipeline-injection treatment as op_monitor_raw_frames.
-    // A caller-supplied `raw_pv_req` overrides — it already has the
-    // pipeline options the caller wants (or doesn't); auto-injection
-    // only applies on the default-pvRequest path.
+    // A caller-supplied `raw_pv_req` is sent verbatim — `flow` was
+    // derived from that same request's `record._options`, so the wire
+    // pipeline/queueSize and the INIT `nack` trailer below share one
+    // origin. The auto-built pvRequest (no caller request) injects the
+    // pipeline options only when `flow.pipeline`, i.e. the client's
+    // configured window is on.
     let pv_req: std::borrow::Cow<'_, [u8]> = match raw_pv_req {
         Some(b) => std::borrow::Cow::Borrowed(b),
-        None if pipeline_size > 0 => {
+        None if flow.pipeline => {
             // Empty field list → empty `field {}` (= whole structure);
             // see `op_monitor_raw_frames`. Forcing `field(value)` broke
             // bare-scalar PVs with a server-side `EmptyMask` reject.
             let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
             std::borrow::Cow::Owned(crate::pv_request::build_pv_request_pipeline(
                 &refs,
-                pipeline_size,
+                flow.queue_size,
                 big_endian,
             ))
         }
@@ -2440,13 +2653,12 @@ where
 
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Monitor.code());
 
-    // INIT (with pipeline negotiation when applicable).
-    let init_req = codec.build_monitor_init(
-        sid,
-        ioid,
-        &pv_req,
-        (pipeline_size > 0).then_some(pipeline_size),
-    );
+    // INIT — the pipeline bit + initial `nack` (credit window) trailer
+    // are written iff `flow.pipeline`, carrying the negotiated
+    // `queue_size` (pvxs `clientmon.cpp:333-348` writes `queueSize` only
+    // `if(pipeline)`).
+    let init_req =
+        codec.build_monitor_init(sid, ioid, &pv_req, flow.pipeline.then_some(flow.queue_size));
     server
         .send_for_channel(sid, init_req)
         .await
@@ -2582,7 +2794,7 @@ where
                     }
                 }
                 // (d was destructured above when computing `value`.)
-                if pipeline_size > 0 && events_since_ack >= ack_threshold(pipeline_size) {
+                if flow.pipeline && events_since_ack >= flow.ack_at {
                     let ack = codec.build_monitor_ack(sid, ioid, events_since_ack);
                     if server.send_for_channel(sid, ack).await.is_err() {
                         server.unregister_ioid(ioid);
@@ -3892,6 +4104,90 @@ mod tests {
         assert_eq!(ack_threshold(4), 2); // the DEFAULT_PIPELINE_SIZE case
         assert_eq!(ack_threshold(8), 4);
         assert_eq!(ack_threshold(33), 16);
+    }
+
+    fn opts(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// PVA-RS-2026-05-28-45: a custom monitor pvRequest's pipeline
+    /// options must drive the wire pipeline bit / `nack` trailer and ACK
+    /// cadence — not the client's fixed builder window. Boundary cases
+    /// from the finding, plus the pvxs `clientmon.cpp:761-808` defaults.
+    #[test]
+    fn monitor_flow_from_record_options_matches_pvxs() {
+        // pipeline=true,queueSize=16,ackAny=75% → window 16, ackAt 12.
+        let f = MonitorFlow::from_record_options(
+            &opts(&[("pipeline", "true"), ("queueSize", "16"), ("ackAny", "75%")]),
+            DEFAULT_PIPELINE_SIZE,
+        );
+        assert!(f.pipeline);
+        assert_eq!(f.queue_size, 16);
+        assert_eq!(f.ack_at, 12); // 0.75 * 16
+
+        // pipeline=true,queueSize=2 → window 2, ackAt = 2/2 = 1.
+        let f = MonitorFlow::from_record_options(
+            &opts(&[("pipeline", "true"), ("queueSize", "2")]),
+            DEFAULT_PIPELINE_SIZE,
+        );
+        assert!(f.pipeline);
+        assert_eq!(f.queue_size, 2);
+        assert_eq!(f.ack_at, 1);
+
+        // pipeline=false → no window, no ACK, no trailer regardless of
+        // the builder default being nonzero.
+        let f = MonitorFlow::from_record_options(&opts(&[("pipeline", "false")]), 4);
+        assert!(!f.pipeline);
+        assert_eq!(f.queue_size, 0);
+        assert_eq!(f.ack_at, 0);
+
+        // No pipeline option at all → pvxs default false.
+        let f = MonitorFlow::from_record_options(&opts(&[("queueSize", "16")]), 4);
+        assert!(!f.pipeline);
+        assert_eq!(f.queue_size, 0);
+
+        // pipeline=true, no queueSize → builder default window.
+        let f = MonitorFlow::from_record_options(&opts(&[("pipeline", "true")]), 8);
+        assert!(f.pipeline);
+        assert_eq!(f.queue_size, 8);
+        assert_eq!(f.ack_at, 4);
+
+        // pipeline=true, invalid queueSize=1 (< 2) → builder default.
+        let f = MonitorFlow::from_record_options(
+            &opts(&[("pipeline", "true"), ("queueSize", "1")]),
+            DEFAULT_PIPELINE_SIZE,
+        );
+        assert!(f.pipeline);
+        assert_eq!(f.queue_size, DEFAULT_PIPELINE_SIZE);
+
+        // ackAny as an absolute count is honored and clamped to window.
+        let f = MonitorFlow::from_record_options(
+            &opts(&[("pipeline", "true"), ("queueSize", "8"), ("ackAny", "2")]),
+            DEFAULT_PIPELINE_SIZE,
+        );
+        assert_eq!(f.ack_at, 2);
+        let f = MonitorFlow::from_record_options(
+            &opts(&[("pipeline", "true"), ("queueSize", "4"), ("ackAny", "99")]),
+            DEFAULT_PIPELINE_SIZE,
+        );
+        assert_eq!(f.ack_at, 4); // clamp to queue_size
+    }
+
+    /// The default (no-custom-request) path is unchanged: the builder
+    /// window is the single source of truth, matching the pre-fix
+    /// `pipeline_size`-driven behavior exactly.
+    #[test]
+    fn monitor_flow_window_preserves_default_behavior() {
+        let f = MonitorFlow::window(0);
+        assert!(!f.pipeline);
+
+        let f = MonitorFlow::window(4);
+        assert!(f.pipeline);
+        assert_eq!(f.queue_size, 4);
+        assert_eq!(f.ack_at, ack_threshold(4));
     }
 
     fn idle_sub_state() -> Arc<SubscriptionState> {

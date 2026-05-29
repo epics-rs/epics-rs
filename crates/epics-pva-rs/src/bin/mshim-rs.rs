@@ -28,6 +28,7 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 
 use clap::Parser;
+use epics_pva_rs::server_native::udp::ForwardableDatagram;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
 
@@ -412,7 +413,20 @@ async fn main() {
             loop {
                 match sock.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
-                        let payload = &buf[..n];
+                        // pvxs `mshim` does NOT relay the raw datagram: it
+                        // decodes each SEARCH/BEACON, drops anything else,
+                        // and rebuilds a fresh wire body per destination —
+                        // toggling the SEARCH `Unicast` flag and resolving
+                        // an `isAny` reply/server address to the original
+                        // source (mshim.cpp:95-200). A datagram may chain
+                        // several messages; forward each rebuilt message
+                        // as its own datagram.
+                        let messages = ForwardableDatagram::decode_all(&buf[..n]);
+                        if messages.is_empty() {
+                            // Unrecognized / malformed: drop, never relay
+                            // raw bytes (pvxs forwards only decoded msgs).
+                            continue;
+                        }
                         for tgt in &targets {
                             // Avoid an obvious feedback loop: don't
                             // forward back to the source endpoint of
@@ -420,6 +434,13 @@ async fn main() {
                             if tgt.addr == peer {
                                 continue;
                             }
+                            // SEARCH `Unicast` flag: set for a unicast
+                            // destination, cleared for multicast/broadcast
+                            // (pvxs mshim.cpp:140-146). BEACON ignores it.
+                            let dest_unicast = match tgt.addr.ip() {
+                                IpAddr::V4(v4) => !v4.is_multicast() && !v4.is_broadcast(),
+                                IpAddr::V6(v6) => !v6.is_multicast(),
+                            };
                             // Apply per-destination multicast options
                             // before the send — for EVERY multicast
                             // target, override or not (see
@@ -445,10 +466,13 @@ async fn main() {
                                     );
                                 }
                             }
-                            if let Err(e) = send_sock.send_to(payload, tgt.addr).await
-                                && e.kind() != ErrorKind::WouldBlock
-                            {
-                                eprintln!("mshim-rs: forward to {}: {e}", tgt.addr);
+                            for msg in &messages {
+                                let frame = msg.rebuild_for(dest_unicast, peer);
+                                if let Err(e) = send_sock.send_to(&frame, tgt.addr).await
+                                    && e.kind() != ErrorKind::WouldBlock
+                                {
+                                    eprintln!("mshim-rs: forward to {}: {e}", tgt.addr);
+                                }
                             }
                         }
                     }

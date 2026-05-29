@@ -508,12 +508,45 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Cache key: one upstream monitor exists per `(PV name, serialized
+/// downstream pvRequest)`. pva2pva keys its monitor cache by the
+/// serialized request (`p2pApp/moncache.cpp:34-37`,
+/// `channel.cpp:157-193`), so two downstream monitors that ask for
+/// different field sets / `record._options` / `_filter` chains each get
+/// their own upstream monitor opened with their own request rather than
+/// all sharing one gateway-default stream. An empty `pv_request` is the
+/// no-request default fanout (the ctx-less `subscribe`/`subscribe_raw`
+/// paths, which carry no downstream request).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MonitorCacheKey {
+    pv_name: String,
+    pv_request: Vec<u8>,
+}
+
+/// Serialize a downstream pvRequest VALUE into the canonical key bytes
+/// for [`MonitorCacheKey`]. Fixed little-endian so the key is stable
+/// regardless of the downstream connection's byte order — it is a
+/// dedup key, never sent on the wire (the forward path re-encodes per
+/// upstream connection). `None` (no pvRequest captured) maps to the
+/// empty default-fanout key.
+fn pv_request_key(pv_request: Option<&PvField>) -> Vec<u8> {
+    match pv_request {
+        Some(req) => epics_pva_rs::client_native::ops_v2::encode_pv_request_value(
+            req,
+            epics_pva_rs::proto::ByteOrder::Little,
+        ),
+        None => Vec::new(),
+    }
+}
+
 /// Process-wide cache. Handed to the gateway server source as an
 /// `Arc<ChannelCache>`; cheap to clone (only the Arc is bumped).
 pub struct ChannelCache {
     client: Arc<PvaClient>,
-    /// Map of PV name → entry.
-    entries: Arc<Mutex<HashMap<String, Arc<UpstreamEntry>>>>,
+    /// Map of `(PV name, serialized downstream pvRequest)` → entry. See
+    /// [`MonitorCacheKey`]: one upstream monitor per distinct request,
+    /// pva2pva `moncache.cpp` parity.
+    entries: Arc<Mutex<HashMap<MonitorCacheKey, Arc<UpstreamEntry>>>>,
     /// Cleanup-tick handle. Aborted on `ChannelCache` drop.
     cleanup_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Hard cap on `entries.len()` — defends against probe-storm DoS
@@ -613,20 +646,44 @@ impl ChannelCache {
     /// genuinely need to resolve.
     pub async fn peek(&self, pv_name: &str) -> Option<Arc<UpstreamEntry>> {
         let map = self.entries.lock().await;
-        let existing = map.get(pv_name).cloned();
+        // Existence probe by PV name: any cached entry for the name
+        // (under any pvRequest) answers "writable". `is_writable` only
+        // needs presence, not a specific request variant.
+        let existing = map
+            .iter()
+            .find(|(k, _)| k.pv_name == pv_name)
+            .map(|(_, e)| e.clone());
         if let Some(ref e) = existing {
             e.poke();
         }
         existing
     }
 
-    /// Look up or create the entry for `pv_name`. Waits up to
-    /// `connect_timeout` for the first upstream event so downstream
-    /// callers see a populated `snapshot()` before this returns.
-    /// Mirrors `pva2pva ChannelCache::lookup` blocking on `isConnected()`.
+    /// Name-only lookup — the default-fanout entry (empty pvRequest).
+    /// Used by existence-warming paths that carry no downstream request
+    /// (the ctx-less `subscribe`/`subscribe_raw` and existence probes).
+    /// Delegates to [`Self::lookup_with_request`] with `None`.
+    pub async fn lookup(
+        &self,
+        pv_name: &str,
+        connect_timeout: Duration,
+    ) -> GwResult<Arc<UpstreamEntry>> {
+        self.lookup_with_request(pv_name, None, connect_timeout)
+            .await
+    }
+
+    /// Look up or create the entry for `pv_name` under the downstream
+    /// `pv_request` (`None` = the default-fanout key). Each distinct
+    /// `(pv_name, serialized pv_request)` shares exactly one upstream
+    /// monitor, opened with that request — pva2pva keys its monitor
+    /// cache the same way (`p2pApp/moncache.cpp:34-37`,
+    /// `channel.cpp:157-193`). Waits up to `connect_timeout` for the
+    /// first upstream event so downstream callers see a populated
+    /// `snapshot()` before this returns. Mirrors `pva2pva
+    /// ChannelCache::lookup` blocking on `isConnected()`.
     ///
     /// Concurrency: spawn-and-insert happens under the same lock, so
-    /// two concurrent lookups for the same PV cannot each spawn an
+    /// two concurrent lookups for the same key cannot each spawn an
     /// upstream monitor task. The wait for the first upstream event
     /// happens AFTER the lock is released so the lock is never held
     /// across the network round-trip.
@@ -636,7 +693,7 @@ impl ChannelCache {
     /// entry is removed before returning the error. This prevents a
     /// search storm vector where a typo'd PV name would otherwise
     /// pin an upstream-monitor task on every call until the next 30 s
-    /// cleanup tick (review §3f). A subsequent lookup for the same name
+    /// cleanup tick (review §3f). A subsequent lookup for the same key
     /// re-probes upstream — there is no negative-admission TTL that
     /// would keep a now-available PV "not found" (pva2pva parity, see
     /// the module-level note; BRIDGE-RS-2026-05-28-87).
@@ -645,14 +702,19 @@ impl ChannelCache {
     /// a drop guard so an awaiting future being cancelled
     /// (`tokio::select!` losing, deadline-exceeded wrapper, etc.) does
     /// not leave the cache pinned.
-    pub async fn lookup(
+    pub async fn lookup_with_request(
         &self,
         pv_name: &str,
+        pv_request: Option<&PvField>,
         connect_timeout: Duration,
     ) -> GwResult<Arc<UpstreamEntry>> {
+        let key = MonitorCacheKey {
+            pv_name: pv_name.to_string(),
+            pv_request: pv_request_key(pv_request),
+        };
         let (entry, was_fresh) = {
             let mut map = self.entries.lock().await;
-            if let Some(existing) = map.get(pv_name) {
+            if let Some(existing) = map.get(&key) {
                 existing.poke();
                 (existing.clone(), false)
             } else {
@@ -677,8 +739,8 @@ impl ChannelCache {
                     );
                     return Err(GwError::CacheFull(self.max_entries));
                 }
-                let fresh = self.spawn_upstream_monitor(pv_name);
-                map.insert(pv_name.to_string(), fresh.clone());
+                let fresh = self.spawn_upstream_monitor(pv_name, pv_request.cloned());
+                map.insert(key.clone(), fresh.clone());
                 (fresh, true)
             }
         };
@@ -687,7 +749,7 @@ impl ChannelCache {
         // cancellation). Disarmed on success.
         struct CleanupGuard<'a> {
             cache: &'a ChannelCache,
-            pv_name: &'a str,
+            key: &'a MonitorCacheKey,
             armed: bool,
         }
         impl<'a> CleanupGuard<'a> {
@@ -706,7 +768,7 @@ impl ChannelCache {
                 // does not pin an upstream-monitor task. A later lookup
                 // re-probes from scratch.
                 if let Ok(mut map) = self.cache.entries.try_lock() {
-                    map.remove(self.pv_name);
+                    map.remove(self.key);
                     return;
                 }
                 // Lock contended — spawn a tiny task that takes the
@@ -715,16 +777,16 @@ impl ChannelCache {
                 // cleanup_tick treats drop_poke=true (initial state)
                 // as "recently used, keep".
                 let entries = self.cache.entries.clone();
-                let pv_name = self.pv_name.to_string();
+                let key = self.key.clone();
                 tokio::spawn(async move {
-                    entries.lock().await.remove(&pv_name);
+                    entries.lock().await.remove(&key);
                 });
             }
         }
 
         let mut guard = CleanupGuard {
             cache: self,
-            pv_name,
+            key: &key,
             armed: was_fresh,
         };
         match self.await_first_event(entry, connect_timeout).await {
@@ -754,7 +816,11 @@ impl ChannelCache {
     /// the configured ceiling without a successful subscribe AND
     /// nobody is listening anymore, the loop exits and the cleanup
     /// tick eventually evicts the orphan entry.
-    fn spawn_upstream_monitor(&self, pv_name: &str) -> Arc<UpstreamEntry> {
+    fn spawn_upstream_monitor(
+        &self,
+        pv_name: &str,
+        pv_request: Option<PvField>,
+    ) -> Arc<UpstreamEntry> {
         let (tx, _rx0) = broadcast::channel::<PvField>(BROADCAST_CAPACITY);
         let (tx_raw, _rx0_raw) =
             broadcast::channel::<crate::pva_gateway::source::RawEvent>(BROADCAST_CAPACITY);
@@ -772,6 +838,11 @@ impl ChannelCache {
         let first_event_for_task = first_event.clone();
         let pause_for_task = pause.clone();
         let latest_raw_for_task = latest_raw.clone();
+        // The downstream-forwarded pvRequest (if any) is re-cloned per
+        // reconnect because each `pvmonitor_raw_frames_handle_with_request`
+        // call consumes it; the client re-encodes it per upstream
+        // connection.
+        let pv_request_for_task = pv_request;
 
         let join = tokio::spawn(async move {
             let mut backoff = Duration::from_millis(250);
@@ -807,8 +878,10 @@ impl ChannelCache {
                 // was dropped here before the closure captured it, so
                 // bcast_rx.recv() in subscribe_inner blocked forever
                 // after the initial snapshot.
-                let handle_result = client
-                    .pvmonitor_raw_frames_handle(&pv_name_owned, move |desc, body, order| {
+                let raw_cb =
+                    move |desc: &FieldDesc,
+                          body: bytes::Bytes,
+                          order: epics_pva_rs::proto::ByteOrder| {
                         let outcome = apply_monitor_event(&state_inner, desc, &body, order);
                         use crate::pva_gateway::source::RawEvent;
                         if outcome.type_changed {
@@ -871,9 +944,27 @@ impl ChannelCache {
                         *latest_raw_inner.write() = Some(raw_ev.clone());
                         // Fan out raw body — refcount only, no copy.
                         let _ = tx_raw_inner.send(raw_ev);
-                    })
-                    .await;
-                // `pvmonitor_raw_frames_handle` returns immediately
+                    };
+                // Open the upstream monitor with the downstream's
+                // forwarded pvRequest when one was captured (so the
+                // upstream server applies the same field projection /
+                // `record._options._filter` chain the client asked
+                // for), else the default all-fields request. pva2pva
+                // `p2pApp/channel.cpp:157-193` forwards the serialized
+                // downstream pvRequest rather than a gateway default.
+                let handle_result = match pv_request_for_task.clone() {
+                    Some(req) => {
+                        client
+                            .pvmonitor_raw_frames_handle_with_request(&pv_name_owned, req, raw_cb)
+                            .await
+                    }
+                    None => {
+                        client
+                            .pvmonitor_raw_frames_handle(&pv_name_owned, raw_cb)
+                            .await
+                    }
+                };
+                // `pvmonitor_raw_frames_handle*` returns immediately
                 // with a handle whose internal task drives the
                 // monitor loop. We install the pauser into the slot
                 // for downstream watermark callbacks, then wait for
@@ -1022,8 +1113,15 @@ impl ChannelCache {
     }
 
     /// Snapshot of cached PV names — used by `ChannelSource::list_pvs`.
+    /// A PV may have several cache entries (one per distinct pvRequest);
+    /// `list_pvs` wants each name once, so the names are de-duplicated.
     pub async fn names(&self) -> Vec<String> {
-        self.entries.lock().await.keys().cloned().collect()
+        let map = self.entries.lock().await;
+        let mut names: Vec<String> = map.keys().map(|k| k.pv_name.clone()).collect();
+        drop(map);
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 
     /// Diagnostic: total entries in the cache.
@@ -1097,11 +1195,15 @@ impl ChannelCache {
         removed
     }
 
-    /// B6: drop a single cache entry by exact PV name. Returns `true`
-    /// if an entry was present and removed, `false` if the name was
-    /// not cached.
+    /// B6: drop every cache entry for an exact PV name. A PV may have
+    /// several entries (one per distinct downstream pvRequest); an
+    /// operator-driven drop targets the name, so all of them go.
+    /// Returns `true` if at least one entry was present and removed.
     pub async fn drop_entry(&self, pv_name: &str) -> bool {
-        self.entries.lock().await.remove(pv_name).is_some()
+        let mut map = self.entries.lock().await;
+        let before = map.len();
+        map.retain(|k, _| k.pv_name != pv_name);
+        map.len() != before
     }
 
     /// Test-only: insert a synthetic, parked entry under `pv_name` so
@@ -1127,7 +1229,13 @@ impl ChannelCache {
             drop_poke: parking_lot::Mutex::new(false),
             pause: PauseControl::new(),
         });
-        self.entries.lock().await.insert(pv_name.to_string(), entry);
+        self.entries.lock().await.insert(
+            MonitorCacheKey {
+                pv_name: pv_name.to_string(),
+                pv_request: Vec::new(),
+            },
+            entry,
+        );
     }
 }
 

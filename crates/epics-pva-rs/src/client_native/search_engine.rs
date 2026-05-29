@@ -59,6 +59,19 @@ pub const BACKOFF_SECS: &[u64] = &[1, 1, 2, 5, 10, 15, 30, 60, 120, 210];
 /// Default UDP broadcast port for SEARCH/BEACON messages (5076).
 pub const DEFAULT_BROADCAST_PORT: u16 = 5076;
 
+/// pvxs `maxSearchPayload` (`client.cpp:43-52`): keep one SEARCH
+/// datagram under ~MTU so it is not fragmented. A bucket (or a coalesced
+/// initial burst) is packed into as few datagrams as fit under this
+/// limit rather than one datagram per channel name.
+const MAX_SEARCH_PAYLOAD: usize = 1400;
+
+/// pvxs `initialSearchDelay` (`client.cpp:43`): the first SEARCH for a
+/// freshly created channel is deferred by this window so a burst of
+/// channel creation coalesces into one batched datagram instead of one
+/// datagram per channel. Mirrors `ContextImpl::scheduleInitialSearch`
+/// (`client.cpp:766-775`).
+const INITIAL_SEARCH_DELAY: Duration = Duration::from_millis(10);
+
 /// Per-frame read deadline for a TCP name-server CONNECTION_VALIDATION
 /// handshake when no client timeout is threaded in (the credential-less
 /// [`SearchEngine::spawn`] path). Bounds a name server that accepts the TCP
@@ -255,7 +268,21 @@ impl SearchEngine {
         let beacons = BeaconTracker::new();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>(256);
 
-        let search_socket = bind_ephemeral_udp()?;
+        // `EPICS_PVA_INTF_ADDR_LIST` (v4 entries) constrains both the
+        // active-search socket bind and the auto-broadcast address
+        // expansion to the listed interfaces. Empty = all-NIC default
+        // (pvxs threads `client::Config::interfaces` into both, see
+        // `config.cpp:624-648`). v6 entries are not part of the v4
+        // search-socket bundle; the v6 search socket binds wildcard.
+        let client_interfaces: Vec<Ipv4Addr> = crate::config::env::list_intf_addresses()
+            .into_iter()
+            .filter_map(|ip| match ip {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+
+        let search_socket = bind_ephemeral_udp(&client_interfaces)?;
         // PR #205 IPv6 Stage 4: optional v6 send/recv socket. Used
         // alongside the v4 socket — graceful degradation when the
         // host has no usable IPv6 stack.
@@ -371,6 +398,7 @@ impl SearchEngine {
             ns_user,
             ns_host,
             ns_handshake_timeout,
+            client_interfaces,
         ));
 
         Ok(Self { cmd_tx, beacons })
@@ -507,12 +535,21 @@ impl SearchEngine {
 
 // ── UDP socket helpers ──────────────────────────────────────────────────
 
-fn bind_ephemeral_udp() -> PvaResult<AsyncUdpV4> {
+fn bind_ephemeral_udp(interfaces: &[Ipv4Addr]) -> PvaResult<AsyncUdpV4> {
     // SEARCH packets embed a `response_port` that IOCs reply unicast
     // to. With per-NIC sockets we want every NIC's reply port to be
     // identical so the IOC's response lands on the right
     // logical socket regardless of which NIC delivered it back.
-    AsyncUdpV4::bind_ephemeral_same_port(true).map_err(PvaError::Io)
+    //
+    // `EPICS_PVA_INTF_ADDR_LIST` (v4 entries) constrains the active-
+    // search socket to the listed interfaces (pvxs `config.cpp:624-648`
+    // threads `interfaces` into the search-socket bind); empty list =
+    // the historical all-NIC default.
+    if interfaces.is_empty() {
+        AsyncUdpV4::bind_ephemeral_same_port(true).map_err(PvaError::Io)
+    } else {
+        AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(interfaces, true).map_err(PvaError::Io)
+    }
 }
 
 /// PR #205 IPv6 Stage 4: bind a v6-only ephemeral UDP socket used to
@@ -863,6 +900,10 @@ async fn run_engine(
     ns_user: String,
     ns_host: String,
     ns_handshake_timeout: Duration,
+    // `EPICS_PVA_INTF_ADDR_LIST` (v4 entries): when non-empty, the auto
+    // broadcast-target expansion is restricted to these interfaces'
+    // subnets. Empty = all-NIC default.
+    client_interfaces: Vec<Ipv4Addr>,
 ) {
     static NEXT_SEARCH_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -885,6 +926,15 @@ async fn run_engine(
     // tick regardless of how many channels are pending.
     let mut search_buckets: Vec<Vec<u32>> = vec![Vec::new(); N_SEARCH_BUCKETS];
     let mut current_bucket: usize = 0;
+    // Initial-search coalescing window (pvxs `initialSearchBucket` +
+    // `scheduleInitialSearch`, client.cpp:766-775). Freshly created
+    // channels accrue here for INITIAL_SEARCH_DELAY, then their first
+    // SEARCH goes out as one batched datagram instead of one per PV.
+    // `initial_deadline` is the instant the window flushes; `None` means
+    // no window is armed. The sids are also placed in their retry
+    // buckets at command time, so this affects only the first broadcast.
+    let mut initial_pending: Vec<u32> = Vec::new();
+    let mut initial_deadline: Option<Instant> = None;
     // Server-GUID blocklist (pvxs `ignoreServerGUIDs`). Only SEARCH_RESPONSE
     // frames (incl. discovery pongs) with a matching GUID are dropped;
     // BEACONs are not filtered (pvxs onBeacon has no ignore check).
@@ -986,6 +1036,16 @@ async fn run_engine(
             }
         };
 
+        // Fire when the coalescing window for buffered initial searches
+        // elapses (pvxs `initialSearcher` timer). `None` ⟹ no window
+        // armed, so this arm parks forever.
+        let initial_arm = async {
+            match initial_deadline {
+                Some(d) => tokio::time::sleep_until(d.into()).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(SearchCommand::Find { pv_name, responder, reason }) => {
@@ -1021,9 +1081,14 @@ async fn run_engine(
                             // Reconnect, false for Initial).
                             p.attempt = 1;
                             p.last_attempt = Instant::now();
-                            let pkt = codec.build_search(0, sid, &p.pv_name, [0,0,0,0], response_port, false);
-                            broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
-                            ns_search_to_ready(&ns_senders, &codec, sid, &p.pv_name);
+                        }
+                        // Defer the first broadcast into the coalescing
+                        // window instead of sending one datagram now — a
+                        // burst of channel creation is packed into one
+                        // batched SEARCH on flush (pvxs initialSearcher).
+                        initial_pending.push(sid);
+                        if initial_deadline.is_none() {
+                            initial_deadline = Some(Instant::now() + INITIAL_SEARCH_DELAY);
                         }
                     }
                 }
@@ -1055,9 +1120,12 @@ async fn run_engine(
                         if let Some(p) = pending.get_mut(&sid) {
                             p.attempt = 1;
                             p.last_attempt = Instant::now();
-                            let pkt = codec.build_search(0, sid, &p.pv_name, [0,0,0,0], response_port, false);
-                            broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
-                            ns_search_to_ready(&ns_senders, &codec, sid, &p.pv_name);
+                        }
+                        // Coalesce with any other initial searches in the
+                        // window (see the Find branch above).
+                        initial_pending.push(sid);
+                        if initial_deadline.is_none() {
+                            initial_deadline = Some(Instant::now() + INITIAL_SEARCH_DELAY);
                         }
                     }
                 }
@@ -1164,7 +1232,7 @@ async fn run_engine(
                     // unrelated found=false reply is not promoted to a fake
                     // beacon.
                     let pkt = codec.build_discover_search(DISCOVER_SEQ, response_port);
-                    broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
+                    broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &client_interfaces, &mut search_send_errs).await;
                 }
                 None => break,
             },
@@ -1311,6 +1379,26 @@ async fn run_engine(
                 );
             }
 
+            _ = initial_arm => {
+                // The initial-search coalescing window elapsed: send the
+                // burst as one batched SEARCH (broadcast + name-server
+                // forward), then disarm until the next initial Find.
+                flush_initial_searches(
+                    &mut initial_pending,
+                    &pending,
+                    &codec,
+                    response_port,
+                    &search_socket,
+                    search_socket_v6.as_ref(),
+                    &extra_targets,
+                    &client_interfaces,
+                    &mut search_send_errs,
+                    &ns_senders,
+                )
+                .await;
+                initial_deadline = None;
+            }
+
             _ = tick.tick() => {
                 let now = Instant::now();
 
@@ -1362,6 +1450,13 @@ async fn run_engine(
                 // backoff across the poke.
                 let poked = fast_ticks_remaining > 0;
                 let bucket_ids = std::mem::take(&mut search_buckets[current_bucket]);
+                // Phase 1: prune dead responders, re-anchor first-attempt
+                // FindAll deadlines, and collect the live (sid, name)
+                // entries so the whole bucket goes out as ONE batched
+                // SEARCH rather than one datagram per channel per
+                // destination.
+                let mut to_send: Vec<(u32, String)> = Vec::with_capacity(bucket_ids.len());
+                let mut rearm_ids: Vec<u32> = Vec::with_capacity(bucket_ids.len());
                 for sid in bucket_ids {
                     let responder_dead = match pending.get(&sid) {
                         // drop searches whose oneshot responder
@@ -1385,7 +1480,7 @@ async fn run_engine(
                         continue;
                     }
 
-                    let pkt_opt = pending.get_mut(&sid).map(|p| {
+                    if let Some(p) = pending.get_mut(&sid) {
                         // First-broadcast bookkeeping for FindAll
                         // callers: the deadline was set to
                         // `call_time + MULTI_SERVER_WINDOW` assuming
@@ -1404,33 +1499,50 @@ async fn run_engine(
                             }
                         }
                         p.last_attempt = now;
-                        codec.build_search(
-                            0, sid, &p.pv_name, [0, 0, 0, 0], response_port, false,
+                        to_send.push((sid, p.pv_name.clone()));
+                        rearm_ids.push(sid);
+                    }
+                }
+
+                // Phase 2: pack the bucket into ≤MAX_SEARCH_PAYLOAD
+                // datagrams (channel count once per datagram) and
+                // broadcast each; reuse the packed names for name-server
+                // forwarding with the response port zeroed.
+                if !to_send.is_empty() {
+                    for frame in pack_search_frames(&codec, &to_send, response_port, false) {
+                        broadcast(
+                            &search_socket,
+                            search_socket_v6.as_ref(),
+                            &frame,
+                            &extra_targets,
+                            &client_interfaces,
+                            &mut search_send_errs,
                         )
-                    });
-                    if let Some(pkt) = pkt_opt {
-                        broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs)
-                            .await;
-                        // Re-arm via the single owner of the post-send retry
-                        // decision. Read attempt under a fresh borrow so the
-                        // closure above doesn't have to outlive the
-                        // search_buckets borrow we need below.
-                        if let Some(p) = pending.get(&sid) {
-                            let attempt = p.attempt;
-                            ns_search_to_ready(&ns_senders, &codec, sid, &p.pv_name);
-                            let (next, next_attempt) = {
-                                let bucket_sizes = |idx: usize| search_buckets[idx].len();
-                                rearm_after_send(poked, current_bucket, attempt, bucket_sizes)
-                            };
-                            // Update the pending's bucket/attempt BEFORE the
-                            // mutable push so the in-place state and the
-                            // buckets agree if we re-enter.
-                            if let Some(p) = pending.get_mut(&sid) {
-                                p.attempt = next_attempt;
-                                p.bucket = next;
-                            }
-                            search_buckets[next].push(sid);
+                        .await;
+                    }
+                    ns_forward_frames(&ns_senders, &pack_search_frames(&codec, &to_send, 0, true));
+                }
+
+                // Phase 3: re-arm each sent search into its next retry
+                // bucket via the single owner of the post-send retry
+                // decision. Done in send order so the cascade-smoothing
+                // rule observes bucket sizes grow exactly as before
+                // (broadcast does not mutate the buckets, so deferring
+                // the re-arm past the sends is size-equivalent).
+                for sid in rearm_ids {
+                    if let Some(p) = pending.get(&sid) {
+                        let attempt = p.attempt;
+                        let (next, next_attempt) = {
+                            let bucket_sizes = |idx: usize| search_buckets[idx].len();
+                            rearm_after_send(poked, current_bucket, attempt, bucket_sizes)
+                        };
+                        // Update the pending's bucket/attempt BEFORE the
+                        // push so the in-place state and the buckets agree.
+                        if let Some(p) = pending.get_mut(&sid) {
+                            p.attempt = next_attempt;
+                            p.bucket = next;
                         }
+                        search_buckets[next].push(sid);
                     }
                 }
                 current_bucket = (current_bucket + 1) % N_SEARCH_BUCKETS;
@@ -1508,12 +1620,14 @@ fn search_targets(
     bport: u16,
     auto_addr_list: bool,
     extra_targets: &[SocketAddr],
+    client_interfaces: &[Ipv4Addr],
 ) -> Vec<SocketAddr> {
     let mut targets: Vec<SocketAddr> = Vec::with_capacity(8);
 
     // Auto-expansion destinations — gated on AUTO_ADDR_LIST, matching
     // pvxs's `expandAddrList()` which only runs when autoAddrList is true.
-    if auto_addr_list {
+    if auto_addr_list && client_interfaces.is_empty() {
+        // All-NIC default (`EPICS_PVA_INTF_ADDR_LIST` unset).
         // Limited broadcast. pvxs uses per-interface directed broadcasts;
         // the 255.255.255.255 + per-NIC fanout below is the Rust
         // cross-NIC equivalent. On multi-NIC hosts (and macOS) the kernel
@@ -1532,6 +1646,23 @@ fn search_targets(
         // addr, which breaks on hosts whose only interface is loopback
         // (CI containers, isolated VMs). One extra datagram per burst.
         targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bport));
+    } else if auto_addr_list {
+        // `EPICS_PVA_INTF_ADDR_LIST` set: pvxs expands the auto address
+        // list over the configured interfaces only (`config.cpp:624-648`),
+        // so the directed-broadcast set is restricted to the listed
+        // interfaces' subnets. `list_broadcast_addresses_on` adds the
+        // limited-broadcast 255.255.255.255 fallback iff a non-loopback
+        // interface is listed — a loopback-only list contributes none, so
+        // no broadcast leaves the host.
+        for sa in crate::config::env::list_broadcast_addresses_on(client_interfaces, bport) {
+            targets.push(sa);
+        }
+        // Loopback unicast only when loopback is an explicitly-listed
+        // interface (the all-NIC path adds it unconditionally as a
+        // zero-config convenience; here the operator chose the set).
+        if client_interfaces.iter().any(|ip| ip.is_loopback()) {
+            targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bport));
+        }
     }
 
     // Explicitly configured / programmatic targets are always sent — they
@@ -1551,6 +1682,7 @@ async fn broadcast(
     socket_v6: Option<&Arc<UdpSocket>>,
     packet: &[u8],
     extra_targets: &[SocketAddr],
+    client_interfaces: &[Ipv4Addr],
     send_errs: &mut HashSet<SocketAddr>,
 ) {
     let bport = std::env::var("EPICS_PVA_BROADCAST_PORT")
@@ -1561,6 +1693,7 @@ async fn broadcast(
         bport,
         crate::config::env::auto_addr_list_enabled(),
         extra_targets,
+        client_interfaces,
     );
 
     for t in targets {
@@ -1604,6 +1737,60 @@ async fn broadcast(
             }
         }
     }
+}
+
+/// Send the coalesced initial-search burst as one batched SEARCH.
+///
+/// pvxs `tickSearch(SearchKind::initial)` (`client.cpp:1063-1170`): the
+/// channels that accrued during the [`INITIAL_SEARCH_DELAY`] window are
+/// packed into as few datagrams as fit under [`MAX_SEARCH_PAYLOAD`] and
+/// broadcast once, then forwarded to the name servers (port zeroed).
+/// Each sid is already placed in its retry bucket at command time, so
+/// retry scheduling and Cancel are unaffected — this only sends the
+/// *first* broadcast. A sid that was deduped/cancelled, or whose caller
+/// dropped the responder during the window, is filtered out here (its
+/// `pending` entry is gone or its responder closed), so no SEARCH leaks
+/// for a channel that no longer exists.
+#[allow(clippy::too_many_arguments)]
+async fn flush_initial_searches(
+    initial_pending: &mut Vec<u32>,
+    pending: &HashMap<u32, Pending>,
+    codec: &PvaCodec,
+    response_port: u16,
+    search_socket: &AsyncUdpV4,
+    search_socket_v6: Option<&Arc<UdpSocket>>,
+    extra_targets: &[SocketAddr],
+    client_interfaces: &[Ipv4Addr],
+    send_errs: &mut HashSet<SocketAddr>,
+    ns_senders: &[NsHandle],
+) {
+    let entries: Vec<(u32, String)> = initial_pending
+        .drain(..)
+        .filter_map(|sid| {
+            pending.get(&sid).and_then(|p| {
+                let alive = match &p.responder {
+                    Responder::Single(tx) => !tx.is_closed(),
+                    Responder::Multi { responder, .. } => !responder.is_closed(),
+                };
+                alive.then(|| (sid, p.pv_name.clone()))
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    for frame in pack_search_frames(codec, &entries, response_port, false) {
+        broadcast(
+            search_socket,
+            search_socket_v6,
+            &frame,
+            extra_targets,
+            client_interfaces,
+            send_errs,
+        )
+        .await;
+    }
+    ns_forward_frames(ns_senders, &pack_search_frames(codec, &entries, 0, true));
 }
 
 /// Flush any pending entries whose Multi deadline has elapsed (deliver
@@ -2028,18 +2215,61 @@ struct NsHandle {
 /// this tick; the search is retried on a later tick by the normal bucket cadence
 /// once the NS is ready, instead of replaying a stale backlog. The unicast bit
 /// is set and port=0 so the NS replies on the same TCP connection.
-fn ns_search_to_ready(handles: &[NsHandle], codec: &PvaCodec, sid: u32, pv_name: &str) {
-    if handles.iter().all(|h| !h.ready.load(Ordering::SeqCst)) {
+/// Pack `(search_id, pv_name)` entries into one or more SEARCH frames,
+/// each kept under [`MAX_SEARCH_PAYLOAD`]. Mirrors pvxs `tickSearch`
+/// (`client.cpp:1083-1101`): names accumulate into the current packet
+/// and a name that would push the packet past the limit is deferred to
+/// the next one; a single name that alone exceeds the limit is sent on
+/// its own (no choice but to fragment). The channel count is emitted
+/// once per frame by [`PvaCodec::build_search_batch`], so N channels
+/// cost `ceil(total_bytes / MAX_SEARCH_PAYLOAD)` datagrams instead of N.
+/// `response_port`/`unicast` select the broadcast shape
+/// (`port=response_port`, `unicast=false`) or the name-server shape
+/// (`port=0`, `unicast=true`).
+fn pack_search_frames(
+    codec: &PvaCodec,
+    entries: &[(u32, String)],
+    response_port: u16,
+    unicast: bool,
+) -> Vec<Vec<u8>> {
+    let build = |batch: &[(u32, &str)]| {
+        codec.build_search_batch(0, batch, [0, 0, 0, 0], response_port, unicast)
+    };
+    let mut frames = Vec::new();
+    let mut batch: Vec<(u32, &str)> = Vec::new();
+    for (cid, name) in entries {
+        batch.push((*cid, name.as_str()));
+        if build(&batch).len() > MAX_SEARCH_PAYLOAD && batch.len() > 1 {
+            // This entry overflowed the datagram: emit the batch
+            // without it, then start a fresh batch carrying it.
+            batch.pop();
+            frames.push(build(&batch));
+            batch.clear();
+            batch.push((*cid, name.as_str()));
+        }
+    }
+    if !batch.is_empty() {
+        frames.push(build(&batch));
+    }
+    frames
+}
+
+/// Forward already-packed SEARCH frames to every *ready* name-server
+/// connection. pvxs reuses the same packed `searchMsg` for name-server
+/// forwarding after zeroing the UDP response port (`client.cpp:1217-1234`);
+/// these frames are already built with `port=0` + the unicast bit. A
+/// not-ready NS is skipped this tick (no replayed backlog). The bounded
+/// channel's `Full` error drops the frame rather than growing an
+/// unbounded backlog (pvxs `client.cpp:1227-1235`).
+fn ns_forward_frames(handles: &[NsHandle], frames: &[Vec<u8>]) {
+    if frames.is_empty() || handles.iter().all(|h| !h.ready.load(Ordering::SeqCst)) {
         return;
     }
-    let pkt = codec.build_search(0, sid, pv_name, [0, 0, 0, 0], 0, true);
     for ns in handles {
         if ns.ready.load(Ordering::SeqCst) {
-            // Bounded channel: a `Full` error means the NS writer is
-            // backpressured — pvxs likewise skips a NS whose libevent TX
-            // buffer is already >64 KiB (client.cpp:1227-1235). Drop the
-            // frame for this tick rather than growing an unbounded backlog.
-            let _ = ns.tx.try_send(pkt.clone());
+            for frame in frames {
+                let _ = ns.tx.try_send(frame.clone());
+            }
         }
     }
 }
@@ -3917,10 +4147,37 @@ mod tests {
     /// a LAN the operator intentionally restricted.
     #[test]
     fn search_targets_empty_when_auto_off_and_no_extras() {
-        let targets = search_targets(5076, false, &[]);
+        let targets = search_targets(5076, false, &[], &[]);
         assert!(
             targets.is_empty(),
             "AUTO_ADDR_LIST=NO + empty list must emit no broadcast; got {targets:?}"
+        );
+    }
+
+    /// EPICS_PVA_INTF_ADDR_LIST=127.0.0.1 with AUTO_ADDR_LIST=YES must
+    /// produce no non-loopback broadcast target — the interface list
+    /// constrains auto address expansion (pvxs `config.cpp:624-648`).
+    #[test]
+    fn search_targets_loopback_only_interface_list_no_broadcast() {
+        let targets = search_targets(5076, true, &[], &[Ipv4Addr::LOCALHOST]);
+        assert!(
+            !targets.iter().any(|t| match t {
+                SocketAddr::V4(v4) => !v4.ip().is_loopback(),
+                SocketAddr::V6(_) => true,
+            }),
+            "loopback-only interface list produced a non-loopback target: {targets:?}"
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|t| matches!(t, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
+            "loopback-only interface list must not emit limited broadcast: {targets:?}"
+        );
+        // The loopback unicast convenience is still present (loopback is
+        // the explicitly-listed interface).
+        assert!(
+            targets.contains(&SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5076)),
+            "loopback unicast expected when loopback is the listed interface"
         );
     }
 
@@ -3929,7 +4186,7 @@ mod tests {
     #[test]
     fn search_targets_auto_off_sends_only_configured_extras() {
         let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
-        let targets = search_targets(5076, false, &[extra]);
+        let targets = search_targets(5076, false, &[extra], &[]);
         assert_eq!(targets, vec![extra]);
         assert!(
             !targets
@@ -3944,7 +4201,7 @@ mod tests {
     #[test]
     fn search_targets_auto_on_includes_limited_broadcast_and_extras() {
         let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
-        let targets = search_targets(5076, true, &[extra]);
+        let targets = search_targets(5076, true, &[extra], &[]);
         assert!(
             targets.contains(&SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 5076)),
             "AUTO_ADDR_LIST=YES must add the limited broadcast destination"
@@ -3956,6 +4213,16 @@ mod tests {
     }
 
     // ── TCP name-server readiness gate (no replayed backlog) ────────────────
+
+    /// One-name helper mirroring the production single-PV NS forward:
+    /// pack the name into the name-server frame shape (port 0, unicast)
+    /// and forward to ready connections.
+    fn ns_forward_one(handles: &[NsHandle], codec: &PvaCodec, sid: u32, pv_name: &str) {
+        ns_forward_frames(
+            handles,
+            &pack_search_frames(codec, &[(sid, pv_name.to_string())], 0, true),
+        );
+    }
 
     #[test]
     fn ns_search_to_ready_skips_not_ready_and_keeps_no_backlog() {
@@ -3970,7 +4237,7 @@ mod tests {
         // NS offline/handshaking: ticks far exceeding the channel capacity must
         // not buffer a single frame, so there is nothing to burst on reconnect.
         for sid in 0..200u32 {
-            ns_search_to_ready(&handles, &codec, sid, "PV:NS");
+            ns_forward_one(&handles, &codec, sid, "PV:NS");
         }
         assert!(
             rx.try_recv().is_err(),
@@ -3979,7 +4246,7 @@ mod tests {
 
         // NS validated: only the current tick is written, once.
         ready.store(true, Ordering::SeqCst);
-        ns_search_to_ready(&handles, &codec, 42, "PV:NS");
+        ns_forward_one(&handles, &codec, 42, "PV:NS");
         assert!(
             rx.try_recv().is_ok(),
             "the current-tick SEARCH is delivered once the NS is ready"
@@ -4005,11 +4272,49 @@ mod tests {
                 ready: Arc::new(AtomicBool::new(false)),
             },
         ];
-        ns_search_to_ready(&handles, &codec, 7, "PV:X");
+        ns_forward_one(&handles, &codec, 7, "PV:X");
         assert!(rx_a.try_recv().is_ok(), "ready NS receives the SEARCH");
         assert!(
             rx_b.try_recv().is_err(),
             "not-ready NS is skipped this tick"
         );
+    }
+
+    /// PVA-RS-2026-05-28-63: many channel names pack into as few
+    /// datagrams as fit under MAX_SEARCH_PAYLOAD, each carrying the
+    /// channel count once — not one datagram per name.
+    #[test]
+    fn pack_search_frames_batches_under_payload_limit() {
+        let codec = PvaCodec { big_endian: false };
+
+        // A handful of short names fit in a single datagram.
+        let entries: Vec<(u32, String)> = (0..8u32).map(|i| (i, format!("PV:SHORT:{i}"))).collect();
+        let frames = pack_search_frames(&codec, &entries, 5076, false);
+        assert_eq!(frames.len(), 1, "8 short names must pack into one datagram");
+        assert!(frames[0].len() <= MAX_SEARCH_PAYLOAD);
+        // Channel count is written once: the u16 right after the 8-byte
+        // frame header + 4 (seq) + 1 (flags) + 3 (reserved) + 16 (addr)
+        // + 2 (port) + 1 (proto size) + 4 ("tcp") = offset 39.
+        let count = u16::from_le_bytes([frames[0][39], frames[0][40]]);
+        assert_eq!(count, 8, "all 8 names share one channel-count field");
+
+        // Many names spill into multiple datagrams, each under the limit.
+        let many: Vec<(u32, String)> = (0..400u32)
+            .map(|i| (i, format!("PV:LONGISH:NAME:NUMBER:{i:05}")))
+            .collect();
+        let frames = pack_search_frames(&codec, &many, 5076, false);
+        assert!(
+            frames.len() > 1,
+            "400 names must spill across multiple datagrams, got {}",
+            frames.len()
+        );
+        for f in &frames {
+            assert!(
+                f.len() <= MAX_SEARCH_PAYLOAD,
+                "each packed datagram stays under the MTU guard"
+            );
+        }
+        // Empty input produces no frames.
+        assert!(pack_search_frames(&codec, &[], 5076, false).is_empty());
     }
 }

@@ -81,6 +81,33 @@ impl PvaCodec {
         response_port: u16,
         unicast: bool,
     ) -> Vec<u8> {
+        // One-name SEARCH is just the batched form with a single entry;
+        // the wire bytes (count=1 + one (cid, name)) are identical.
+        self.build_search_batch(
+            sequence_id,
+            &[(search_id, channel_name)],
+            response_addr,
+            response_port,
+            unicast,
+        )
+    }
+
+    /// Build a SEARCH message carrying MANY channel names in one
+    /// datagram. pvxs `tickSearch` (`client.cpp:1063-1090`) writes the
+    /// channel count ONCE and then packs `(cid, name)` entries into the
+    /// same packet up to `maxSearchPayload`; this is the multi-name
+    /// primitive that path requires. Callers are responsible for
+    /// splitting `entries` so the resulting datagram stays under the MTU
+    /// guard (see the client search engine's `pack_search_frames`); this
+    /// builder emits exactly the entries handed to it.
+    pub fn build_search_batch(
+        &self,
+        sequence_id: u32,
+        entries: &[(u32, &str)],
+        response_addr: [u8; 4],
+        response_port: u16,
+        unicast: bool,
+    ) -> Vec<u8> {
         let order = self.order();
         let flags: u8 = if unicast { 0x80 } else { 0x00 };
         let addr = ip_to_bytes(IpAddr::V4(Ipv4Addr::from(response_addr)));
@@ -94,10 +121,13 @@ impl PvaCodec {
         // Single supported protocol: "tcp"
         encode_size_into(1, order, &mut p);
         encode_string_into("tcp", order, &mut p);
-        // Channel list: count (u16) + (cid, name) entries
-        p.put_u16(1, order);
-        p.put_u32(search_id, order);
-        encode_string_into(channel_name, order, &mut p);
+        // Channel list: count (u16) emitted ONCE, then the (cid, name)
+        // entries back-to-back.
+        p.put_u16(entries.len() as u16, order);
+        for (cid, name) in entries {
+            p.put_u32(*cid, order);
+            encode_string_into(name, order, &mut p);
+        }
 
         self.frame(false, CMD_SEARCH, p)
     }

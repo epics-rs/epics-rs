@@ -789,6 +789,7 @@ impl GatewayChannelSource {
         &self,
         cache: Arc<ChannelCache>,
         name: &str,
+        pv_request: Option<&PvField>,
     ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
         // default ON — opt out via EPICS_PVA_GW_RAW_FRAMES=NO.
         if let Some(v) = epics_base_rs::runtime::env::get("EPICS_PVA_GW_RAW_FRAMES") {
@@ -808,7 +809,10 @@ impl GatewayChannelSource {
             );
             return None;
         }
-        let entry = match cache.lookup(name, self.connect_timeout).await {
+        let entry = match cache
+            .lookup_with_request(name, pv_request, self.connect_timeout)
+            .await
+        {
             Ok(e) => e,
             Err(_) => {
                 self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
@@ -928,6 +932,7 @@ impl GatewayChannelSource {
         &self,
         cache: Arc<ChannelCache>,
         name: &str,
+        pv_request: Option<&PvField>,
     ) -> Option<mpsc::Receiver<PvField>> {
         // Gateway-wide subscriber cap.
         let prev = self.subscriber_count.fetch_add(1, Ordering::Relaxed);
@@ -941,7 +946,10 @@ impl GatewayChannelSource {
             );
             return None;
         }
-        let entry = match cache.lookup(name, self.connect_timeout).await {
+        let entry = match cache
+            .lookup_with_request(name, pv_request, self.connect_timeout)
+            .await
+        {
             Ok(e) => e,
             Err(_) => {
                 self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
@@ -1328,11 +1336,12 @@ impl ChannelSource for GatewayChannelSource {
         &self,
         name: &str,
     ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
-        self.subscribe_raw_inner(self.cache.clone(), name).await
+        self.subscribe_raw_inner(self.cache.clone(), name, None)
+            .await
     }
 
     async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
-        self.subscribe_inner(self.cache.clone(), name).await
+        self.subscribe_inner(self.cache.clone(), name, None).await
     }
 
     /// route GET through the per-credential upstream client so the
@@ -1370,8 +1379,12 @@ impl ChannelSource for GatewayChannelSource {
         if !checked.allows_read() {
             return None;
         }
-        self.subscribe_inner(self.upstream_cache_for(&ctx), checked.pv_name())
-            .await
+        self.subscribe_inner(
+            self.upstream_cache_for(&ctx),
+            checked.pv_name(),
+            ctx.pv_request.as_ref(),
+        )
+        .await
     }
 
     /// route raw MONITOR through per-credential upstream cache.
@@ -1383,81 +1396,59 @@ impl ChannelSource for GatewayChannelSource {
         if !checked.allows_read() {
             return None;
         }
-        self.subscribe_raw_inner(self.upstream_cache_for(&ctx), checked.pv_name())
-            .await
+        self.subscribe_raw_inner(
+            self.upstream_cache_for(&ctx),
+            checked.pv_name(),
+            ctx.pv_request.as_ref(),
+        )
+        .await
     }
 
     /// decoded MONITOR with the downstream's event-affecting
     /// pvRequest options.
     ///
-    /// The gateway fans **one** upstream monitor — opened with the
-    /// gateway's default pvRequest — out to every downstream
-    /// subscriber for a PV name (`channel_cache::spawn_upstream_monitor`
-    /// keys the cache by PV name only). Field projection, `pipeline`,
-    /// and `queueSize` are downstream-local — the gateway terminates
-    /// them on its own downstream connection / outbox — and are
-    /// transparent. A server-side `_filter` chain (pvxs
-    /// `servermon.cpp:521-555`), by contrast, changes *upstream event
-    /// production* and cannot be honored across the shared upstream
-    /// monitor: serving such a subscription from the default fanout
-    /// would deliver an event stream that differs from a direct
-    /// upstream monitor.
+    /// The gateway no longer fans a single default-pvRequest upstream
+    /// monitor out to every subscriber for a PV name. Following pva2pva
+    /// (`p2pApp/channel.cpp:157-193`, `p2pApp/moncache.cpp:34-37,56-81`),
+    /// the upstream monitor cache is keyed by `(pv_name, serialized
+    /// pvRequest)`: each distinct downstream pvRequest opens — and shares
+    /// — its own upstream monitor, opened with that exact pvRequest. A
+    /// server-side `_filter` chain, `field(...)` projection, and the
+    /// `record._options` (`queueSize`, `pipeline`) all travel verbatim to
+    /// the upstream IOC, which produces the event stream the option set
+    /// asks for; subscribers with an identical pvRequest still coalesce
+    /// onto one upstream monitor.
     ///
-    /// This source is a documented cache/fanout gateway, so the
-    /// parity-correct behaviour is to **reject** an unsupported
-    /// option set (return `None`) rather than silently serve diverging
-    /// events. A subscription with no event-affecting option delegates
-    /// to the normal ACF-gated `subscribe_checked` path.
+    /// Carrying the request upstream removes the dual meaning that forced
+    /// the old reject-gate: there is no longer a "default fanout" stream
+    /// whose events diverge from what an event-affecting option demands,
+    /// so nothing has to be rejected. `opts` is therefore redundant here —
+    /// the full request is forwarded structurally via `ctx.pv_request`
+    /// (threaded through `subscribe_checked` → `subscribe_inner` →
+    /// `ChannelCache::lookup_with_request`).
     async fn subscribe_checked_opts(
         &self,
         checked: AccessChecked,
         ctx: ChannelContext,
-        opts: epics_pva_rs::server_native::MonitorOptions,
+        _opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> Option<mpsc::Receiver<PvField>> {
-        if opts.affects_upstream_events() {
-            tracing::warn!(
-                pv = %checked.pv_name(),
-                account = %ctx.account,
-                pipeline = opts.pipeline,
-                queue_size = ?opts.queue_size,
-                server_filter = opts.server_filter,
-                "pva-gateway: rejecting MONITOR — event-affecting pvRequest \
-                 options cannot be honored transparently across the gateway's \
-                 single fanout upstream monitor",
-            );
-            return None;
-        }
-        // A subscription with no event-affecting option delegates to the
-        // normal ACF-gated `subscribe_checked` path. The gateway fans out
-        // plain upstream values and carries no QSRV `+trigger` graph; the
-        // cooked `subscribe_checked_opts_marked` variant the server
-        // dispatches on inherits this rejection via the trait default
-        // (which routes through this method) and wraps each value with
-        // `marked: None`, like every non-group source.
+        // Delegate to the ACF-gated `subscribe_checked` path, which
+        // forwards `ctx.pv_request` to a per-pvRequest upstream monitor.
+        // The cooked `subscribe_checked_opts_marked` variant the server
+        // dispatches on routes through this method via the trait default
+        // and wraps each value with `marked: None`, like every non-group
+        // source.
         self.subscribe_checked(checked, ctx).await
     }
 
-    /// Raw-path counterpart of [`Self::subscribe_checked_opts`].
-    /// Same reject-on-unsupported-option contract.
+    /// Raw-path counterpart of [`Self::subscribe_checked_opts`]. Same
+    /// per-pvRequest upstream-monitor forwarding via `ctx.pv_request`.
     async fn subscribe_raw_checked_opts(
         &self,
         checked: AccessChecked,
         ctx: ChannelContext,
-        opts: epics_pva_rs::server_native::MonitorOptions,
+        _opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
-        if opts.affects_upstream_events() {
-            tracing::warn!(
-                pv = %checked.pv_name(),
-                account = %ctx.account,
-                pipeline = opts.pipeline,
-                queue_size = ?opts.queue_size,
-                server_filter = opts.server_filter,
-                "pva-gateway: rejecting raw MONITOR — event-affecting pvRequest \
-                 options cannot be honored transparently across the gateway's \
-                 single fanout upstream monitor",
-            );
-            return None;
-        }
         self.subscribe_raw_checked(checked, ctx).await
     }
 
@@ -2143,75 +2134,7 @@ ASG(DEFAULT) {
         assert_eq!(asserted.downstream_authority, "");
     }
 
-    /// the gateway fans one upstream monitor (opened with the
-    /// gateway's default pvRequest) out to N downstream subscribers.
-    /// A downstream MONITOR pvRequest carrying a server-side `_filter`
-    /// chain (pvxs `servermon.cpp:521-555`) changes *upstream event
-    /// production* and cannot be honored transparently across that
-    /// shared monitor, so the gateway must reject it (return `None`)
-    /// rather than serve fanout events that differ from a direct
-    /// upstream monitor.
-    ///
-    /// `pipeline` / `queueSize`, by contrast, are downstream
-    /// client↔gateway flow control the gateway terminates on its own
-    /// downstream connection / outbox, so they must NOT be rejected:
-    /// every default-configured PVA client enables pipeline, and
-    /// rejecting it would make the gateway's monitor feature unusable.
-    #[tokio::test]
-    async fn br_r14_server_filter_monitor_rejected_by_gateway() {
-        use epics_pva_rs::server_native::MonitorOptions;
-
-        let src = make_source();
-        let ctx = make_ctx("ws03.lab", "carol", "anonymous");
-
-        // pipeline + queueSize are downstream-local flow control —
-        // transparent through the fanout gateway, NOT rejected.
-        let pipeline_opts = MonitorOptions {
-            pipeline: true,
-            queue_size: Some(16),
-            server_filter: false,
-        };
-        assert!(
-            !pipeline_opts.affects_upstream_events(),
-            "pipeline / queueSize are downstream-local and must not be \
-             treated as upstream-event-affecting",
-        );
-
-        // A server-side `_filter` chain DOES change upstream event
-        // production and must be rejected on both the decoded and the
-        // raw fast path. The reject returns immediately — no upstream
-        // lookup — so this does not block on connect_timeout.
-        let filter_opts = MonitorOptions {
-            pipeline: false,
-            queue_size: None,
-            server_filter: true,
-        };
-        assert!(
-            filter_opts.affects_upstream_events(),
-            "a server-side _filter chain must count as event-affecting",
-        );
-        let token = check(&src, "some:pv", &ctx).await;
-        let rx = src
-            .subscribe_checked_opts(token, ctx.clone(), filter_opts.clone())
-            .await;
-        assert!(
-            rx.is_none(),
-            "gateway must reject a decoded MONITOR carrying a \
-             server-side _filter chain",
-        );
-
-        let raw_token = check(&src, "some:pv", &ctx).await;
-        let raw_rx = src
-            .subscribe_raw_checked_opts(raw_token, ctx, filter_opts)
-            .await;
-        assert!(
-            raw_rx.is_none(),
-            "gateway must reject a raw MONITOR carrying a server-side \
-             _filter chain",
-        );
-    }
-
-    /// Companion: an option set with no event-affecting option
+    /// An option set with no event-affecting option
     /// (`affects_upstream_events() == false`) is transparent through
     /// the gateway — the gateway does not reject it on the basis of
     /// options. (It still goes through the normal ACF + upstream

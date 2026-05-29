@@ -117,7 +117,6 @@ fn type_name(desc: &FieldDesc) -> &'static str {
         FieldDesc::ScalarArray(st) => scalar_array_type_name(*st),
         FieldDesc::Variant => "any",
         FieldDesc::VariantArray => "any[]",
-        FieldDesc::BoundedString(_) => "string",
         FieldDesc::Structure { .. } => "structure",
         FieldDesc::StructureArray { .. } => "structure[]",
         FieldDesc::Union { .. } => "union",

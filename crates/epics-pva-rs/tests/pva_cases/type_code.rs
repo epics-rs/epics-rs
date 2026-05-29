@@ -132,37 +132,12 @@ fn type_code_roundtrip_variant_array() {
 }
 
 #[test]
-fn bounded_string_descriptor_normalizes_to_plain_string_on_wire() {
-    // pvxs has no bounded-string TypeCode (`type.cpp:44-70` accepts only
-    // the plain `String` scalar; `dataencode.cpp:120-123,186-206` faults a
-    // bounded descriptor on decode). A `BoundedString(N)` must therefore
-    // reach the wire byte-identically to `Scalar(String)` regardless of the
-    // bound, and decode back as a plain string.
-    for order in [ByteOrder::Big, ByteOrder::Little] {
-        for bound in [0u32, 64, u32::MAX] {
-            let mut bounded = Vec::new();
-            encode_type_desc(&FieldDesc::BoundedString(bound), order, &mut bounded);
-            let mut plain = Vec::new();
-            encode_type_desc(&FieldDesc::Scalar(ScalarType::String), order, &mut plain);
-            assert_eq!(
-                bounded, plain,
-                "BoundedString({bound}) must encode as plain string ({order:?})"
-            );
-
-            let mut cur = Cursor::new(bounded.as_slice());
-            let decoded = decode_type_desc(&mut cur, order).expect("decode plain string");
-            assert!(
-                matches!(decoded, FieldDesc::Scalar(ScalarType::String)),
-                "BoundedString({bound}) must decode as Scalar(String), got {decoded:?}"
-            );
-        }
-    }
-}
-
-#[test]
 fn bounded_string_wire_tag_is_rejected_on_decode() {
-    // The legacy Rust-only 0x83 tag (bounded string + size word) must be
-    // rejected, matching pvxs faulting on a bounded descriptor.
+    // pvxs has no bounded-string TypeCode (`type.cpp:44-70` accepts only the
+    // plain `String` scalar; `dataencode.cpp:120-123,186-206` faults a bounded
+    // descriptor on decode), and `FieldDesc` has no bounded-string variant —
+    // so the legacy Rust-only 0x83 tag (bounded string + size word) emitted by
+    // older builds must be rejected rather than decoded.
     for order in [ByteOrder::Big, ByteOrder::Little] {
         let bytes = [0x83u8, 0x40]; // tag + a one-byte size
         let mut cur = Cursor::new(bytes.as_slice());

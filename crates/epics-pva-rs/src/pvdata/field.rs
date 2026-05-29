@@ -17,7 +17,6 @@ use super::scalar::ScalarType;
 /// - `Union` / `UnionArray` are tagged unions over a fixed list of variants.
 /// - `Variant` / `VariantArray` are "any" — the value carries its own
 ///   descriptor on the wire.
-/// - `BoundedString` is a string with a wire-side maximum length tag.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FieldDesc {
     Scalar(ScalarType),
@@ -40,7 +39,6 @@ pub enum FieldDesc {
     },
     Variant,
     VariantArray,
-    BoundedString(u32),
 }
 
 impl FieldDesc {
@@ -97,13 +95,9 @@ impl FieldDesc {
         find_bit_for_path(self, 0, &parts).map(|(idx, _)| idx)
     }
 
-    /// True iff this descriptor names a string type (Scalar/String,
-    /// BoundedString).
+    /// True iff this descriptor names a string type (Scalar/String).
     pub fn is_string_like(&self) -> bool {
-        matches!(
-            self,
-            FieldDesc::Scalar(ScalarType::String) | FieldDesc::BoundedString(_)
-        )
+        matches!(self, FieldDesc::Scalar(ScalarType::String))
     }
 }
 
@@ -139,7 +133,6 @@ impl FieldDesc {
             FieldDesc::ScalarArray(st) => write!(f, "{st}[]"),
             FieldDesc::Variant => write!(f, "any"),
             FieldDesc::VariantArray => write!(f, "any[]"),
-            FieldDesc::BoundedString(_) => write!(f, "string"),
             FieldDesc::Structure { struct_id, fields }
             | FieldDesc::StructureArray { struct_id, fields } => {
                 let suffix = if matches!(self, FieldDesc::StructureArray { .. }) {

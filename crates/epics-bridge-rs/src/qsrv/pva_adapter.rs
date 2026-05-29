@@ -187,7 +187,6 @@ fn root_kind_name_desc(d: &FieldDesc) -> &'static str {
         FieldDesc::UnionArray { .. } => "UnionArray",
         FieldDesc::Variant => "Variant",
         FieldDesc::VariantArray => "VariantArray",
-        FieldDesc::BoundedString(_) => "BoundedString",
     }
 }
 

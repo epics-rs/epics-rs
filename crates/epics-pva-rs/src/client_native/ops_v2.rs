@@ -3271,9 +3271,6 @@ fn build_put_value(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
             }
             Ok(PvField::StructureArray(items))
         }
-        FieldDesc::BoundedString(_) => {
-            Ok(PvField::Scalar(ScalarValue::String(value_str.to_string())))
-        }
     }
 }
 
@@ -3698,14 +3695,6 @@ mod tests {
             }
             other => panic!("expected variant array, got {other:?}"),
         }
-        assert_round_trips(&desc, &v);
-    }
-
-    #[test]
-    fn put_bounded_string() {
-        let desc = FieldDesc::BoundedString(16);
-        let v = build_put_value(&desc, "abc").unwrap();
-        assert_eq!(v, PvField::Scalar(ScalarValue::String("abc".into())));
         assert_round_trips(&desc, &v);
     }
 

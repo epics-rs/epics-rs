@@ -170,7 +170,7 @@ fn pvxs_name_servers_empty_when_unset() {
 fn pvxs_conn_tmo_default_is_30_seconds() {
     let prev = std::env::var("EPICS_PVA_CONN_TMO").ok();
     unsafe { std::env::remove_var("EPICS_PVA_CONN_TMO") };
-    assert_eq!(env::conn_timeout_secs(), 30);
+    assert_eq!(env::conn_timeout_secs(), 30.0);
     if let Some(v) = prev {
         unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", v) };
     }

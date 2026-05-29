@@ -483,19 +483,28 @@ pub fn max_ops_per_channel_opt() -> Option<usize> {
 /// uses 30s for ECHO probe interval too). When the connection is idle
 /// for this long, the client sends an ECHO; without a response within
 /// the same window it declares the link dead.
-pub fn conn_timeout_secs() -> u64 {
-    conn_timeout_secs_opt().unwrap_or(30)
+///
+/// Returned as `f64` so an operator's fractional seconds survive to the
+/// TCP-timeout owners. pvxs keeps the configured value as a `double`
+/// (`config.cpp:211-227 parse_timeout`) and each owner applies the
+/// `tmoScale` (4/3) and the `enforceTimeout` floor (`config.cpp:373-391`);
+/// truncating to integer seconds here would shorten e.g. `2.5` to `2`
+/// before any owner scaled it.
+pub fn conn_timeout_secs() -> f64 {
+    conn_timeout_secs_opt().unwrap_or(30.0)
 }
 
 /// Presence-aware [`conn_timeout_secs`] — `None` when `EPICS_PVA_CONN_TMO`
 /// is unset (or non-positive/non-finite), so `with_env` preserves a
-/// caller-supplied `idle_timeout`.
-pub fn conn_timeout_secs_opt() -> Option<u64> {
+/// caller-supplied `idle_timeout`. The 4/3 scale and the `>= 2s` clamp
+/// belong to each effective-timeout owner (pvxs `parse_timeout` /
+/// `enforceTimeout`), not to this parser, so the raw positive-finite
+/// double is returned unscaled.
+pub fn conn_timeout_secs_opt() -> Option<f64> {
     std::env::var("EPICS_PVA_CONN_TMO")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|f| f.is_finite() && *f > 0.0)
-        .map(|f| f.max(1.0) as u64)
 }
 
 /// `EPICS_PVAS_SEND_TMO` — server-side per-write timeout (default 5s).
@@ -1261,6 +1270,37 @@ mod tests {
             match prev_pva {
                 Some(v) => std::env::set_var("EPICS_PVA_TLS_KEYCHAIN", v),
                 None => std::env::remove_var("EPICS_PVA_TLS_KEYCHAIN"),
+            }
+        }
+    }
+
+    /// `EPICS_PVA_CONN_TMO` keeps fractional seconds. pvxs parses it as a
+    /// `double` (`config.cpp:211-227`); the effective-timeout owners apply
+    /// the 4/3 scale + floor on that double. Truncating to integer seconds
+    /// here (the pre-fix `as u64`) shortened e.g. `2.5` to `2` before any
+    /// owner scaled it.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn conn_tmo_preserves_fractional_seconds() {
+        let prev = std::env::var("EPICS_PVA_CONN_TMO").ok();
+        unsafe {
+            std::env::set_var("EPICS_PVA_CONN_TMO", "2.5");
+        }
+        assert_eq!(
+            conn_timeout_secs_opt(),
+            Some(2.5),
+            "fractional CONN_TMO must survive un-truncated"
+        );
+        assert_eq!(conn_timeout_secs(), 2.5);
+        unsafe {
+            std::env::remove_var("EPICS_PVA_CONN_TMO");
+        }
+        assert_eq!(conn_timeout_secs_opt(), None, "unset → None");
+        assert_eq!(conn_timeout_secs(), 30.0, "unset → 30s default");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("EPICS_PVA_CONN_TMO", v),
+                None => std::env::remove_var("EPICS_PVA_CONN_TMO"),
             }
         }
     }

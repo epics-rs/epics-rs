@@ -52,7 +52,7 @@ use super::decode::{
 /// window. Default 15 s when the env var is unset (CONN_TMO defaults
 /// to 30 s).
 pub fn heartbeat_interval() -> Duration {
-    let configured = crate::config::env::conn_timeout_secs() as f64;
+    let configured = crate::config::env::conn_timeout_secs();
     Duration::from_secs_f64((configured / 2.0).max(1.0))
 }
 
@@ -61,7 +61,7 @@ pub fn heartbeat_interval() -> Duration {
 /// (config.cpp:187 tmoScale) — without the margin a healthy client
 /// races with its second ECHO. Floored at 2 s like pvxs `enforceTimeout`.
 pub fn heartbeat_timeout() -> Duration {
-    let configured = crate::config::env::conn_timeout_secs() as f64;
+    let configured = crate::config::env::conn_timeout_secs();
     Duration::from_secs_f64((configured * 4.0 / 3.0).max(2.0))
 }
 
@@ -1414,6 +1414,48 @@ mod tests {
             "anonymous",
             "must fall back to anonymous when no methods are advertised"
         );
+    }
+
+    /// `heartbeat_timeout` is the effective TCP idle-timeout owner: it
+    /// scales the configured `EPICS_PVA_CONN_TMO` by pvxs `tmoScale` (4/3)
+    /// and floors at 2s (`enforceTimeout`, config.cpp:373-391). A
+    /// fractional CONN_TMO must scale from the full double, not a value
+    /// truncated to integer seconds first. Boundaries: below the 2s
+    /// effective floor, exactly at it, and above it.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn heartbeat_timeout_scales_fractional_conn_tmo_with_floor() {
+        let prev = std::env::var("EPICS_PVA_CONN_TMO").ok();
+        let set = |v: &str| unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", v) };
+
+        // Below floor: 1.0 × 4/3 = 1.333 < 2 → clamped to 2s.
+        set("1.0");
+        assert_eq!(heartbeat_timeout(), Duration::from_secs_f64(2.0));
+
+        // At floor: 1.5 × 4/3 = 2.0 exactly.
+        set("1.5");
+        assert_eq!(heartbeat_timeout(), Duration::from_secs_f64(2.0));
+
+        // Above floor: 2.5 × 4/3 = 3.333…s. Pre-fix truncation to 2s gave
+        // 2 × 4/3 = 2.667s, so assert both the exact value and the
+        // inequality against the truncated result.
+        set("2.5");
+        assert_eq!(
+            heartbeat_timeout(),
+            Duration::from_secs_f64(2.5 * 4.0 / 3.0)
+        );
+        assert_ne!(
+            heartbeat_timeout(),
+            Duration::from_secs_f64(2.0 * 4.0 / 3.0),
+            "fractional CONN_TMO must not be truncated to integer seconds"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("EPICS_PVA_CONN_TMO", v),
+                None => std::env::remove_var("EPICS_PVA_CONN_TMO"),
+            }
+        }
     }
 
     fn build_message_payload(order: ByteOrder, ioid: u32, mtype: u8, msg: &str) -> Vec<u8> {

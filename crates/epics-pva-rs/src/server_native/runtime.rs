@@ -363,7 +363,7 @@ impl PvaServerConfig {
         // with a healthy client's second ECHO and disconnect it.
         // Floor at 2s mirrors pvxs `enforceTimeout`.
         if let Some(c) = env::conn_timeout_secs_opt() {
-            let scaled = (c as f64 * 4.0 / 3.0).max(2.0);
+            let scaled = (c * 4.0 / 3.0).max(2.0);
             self.idle_timeout = Duration::from_secs_f64(scaled);
         }
         if let Some(v) = env::server_ignore_addr_list_opt() {

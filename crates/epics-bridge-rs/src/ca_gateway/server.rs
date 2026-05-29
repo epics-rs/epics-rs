@@ -381,6 +381,12 @@ impl GatewayServer {
         // for, check the .pvlist and (if allowed) subscribe upstream.
         server.install_search_resolver().await;
 
+        // Install the per-request existence gate: an already-cached shadow
+        // PV must re-run host-scoped `.pvlist` admission before it is
+        // advertised to a requester, so a denied host cannot reuse a PV an
+        // allowed host already instantiated.
+        server.install_existence_gate().await;
+
         Ok(server)
     }
 
@@ -478,6 +484,57 @@ impl GatewayServer {
         );
 
         self.shadow_db.set_search_resolver(resolver).await;
+    }
+
+    /// Install the per-request existence gate into the shadow PvDatabase.
+    ///
+    /// The lazy search resolver admits *new* names host-aware, but an
+    /// already-instantiated shadow PV is returned straight from the
+    /// simple-PV cache by `find_entry_from` / `has_name_from` without
+    /// re-checking the requester. That makes a `DENY FROM host` rule
+    /// "first creator wins": a host an allowed peer already cached the PV
+    /// for could then create a channel to it. This gate closes that
+    /// short-circuit — the database consults it before returning a cached
+    /// shadow PV — so host-scoped admission is re-evaluated on every
+    /// request, parity with C ca-gateway re-running
+    /// `gateAs::findEntry(pvname, host)` on each `pvExistTest`
+    /// (gateServer.cc:1516-1545).
+    ///
+    /// Called once during build().
+    async fn install_existence_gate(&self) {
+        let pvlist = self.pvlist.clone();
+        let cache = self.cache.clone();
+
+        let gate: epics_base_rs::server::database::ExistenceGate = std::sync::Arc::new(
+            move |name: String,
+                  peer: Option<std::net::SocketAddr>|
+                  -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+                let pvlist = pvlist.clone();
+                let cache = cache.clone();
+                Box::pin(async move {
+                    // Stats / heartbeat PVs are not gateway-managed (they
+                    // are published straight into the shadow DB and never
+                    // enter the upstream cache); they always exist and are
+                    // not subject to `.pvlist` admission.
+                    if cache.read().await.get(&name).is_none() {
+                        return true;
+                    }
+                    // Gateway-managed shadow PV: re-run host-scoped
+                    // `.pvlist` admission for this requester. A host-less
+                    // internal lookup (`peer: None`) falls back to the
+                    // global rule decision, matching the search resolver.
+                    let pvlist = pvlist.load_full();
+                    match peer {
+                        Some(addr) => pvlist
+                            .match_name_for_host(&name, &addr.ip().to_string())
+                            .is_some(),
+                        None => pvlist.match_name(&name).is_some(),
+                    }
+                })
+            },
+        );
+
+        self.shadow_db.set_existence_gate(gate).await;
     }
 
     /// Pre-subscribe to upstream PVs from the preload file.
@@ -966,6 +1023,61 @@ mod tests {
         assert!(
             pvlist.match_name("Any:Random:PV").is_none(),
             "explicit empty pvlist must deny all (distinct from no-config)"
+        );
+    }
+
+    #[tokio::test]
+    async fn existence_gate_hides_cached_shadow_pv_from_denied_host() {
+        // `PV.*` is allowed in general but denied from 127.0.0.1. Even
+        // after an allowed host instantiated the shadow PV, a denied
+        // host's search/create must answer does-not-exist — closing the
+        // "first creator wins" bypass (parity with C re-running
+        // gateAs::findEntry per pvExistTest).
+        use std::net::SocketAddr;
+
+        let config = GatewayConfig {
+            pvlist_content: Some("PV.* ALLOW\nPV.* DENY FROM 127.0.0.1\n".to_string()),
+            ..Default::default()
+        };
+        let server = GatewayServer::build(config).await.unwrap();
+
+        // Simulate an allowed host having already cached PV:x: register
+        // the shadow PV and mark its cache entry connected (Active).
+        server
+            .shadow_db
+            .add_pv("PV:x", epics_base_rs::types::EpicsValue::Double(0.0))
+            .await
+            .unwrap();
+        {
+            let mut cache = server.cache.write().await;
+            let entry = cache.get_or_create("PV:x");
+            entry
+                .write()
+                .await
+                .set_state(crate::ca_gateway::PvState::Active);
+        }
+
+        let denied: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let allowed: SocketAddr = "192.0.2.5:5064".parse().unwrap();
+
+        // Denied host: not advertised on either path.
+        assert!(!server.shadow_db.has_name_from("PV:x", Some(denied)).await);
+        assert!(
+            server
+                .shadow_db
+                .find_entry_from("PV:x", Some(denied))
+                .await
+                .is_none()
+        );
+
+        // Allowed host: still served from the cache.
+        assert!(server.shadow_db.has_name_from("PV:x", Some(allowed)).await);
+        assert!(
+            server
+                .shadow_db
+                .find_entry_from("PV:x", Some(allowed))
+                .await
+                .is_some()
         );
     }
 

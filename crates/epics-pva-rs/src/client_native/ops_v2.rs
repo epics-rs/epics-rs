@@ -1354,6 +1354,42 @@ struct SubscriptionState {
     paused: std::sync::atomic::AtomicBool,
     stop: std::sync::atomic::AtomicBool,
     stats: parking_lot::Mutex<SubscriptionStat>,
+    /// Wakes a monitor loop that is parked in `stream.recv().await` so a
+    /// cancel issued while no server data is arriving takes effect
+    /// immediately instead of waiting for the next (possibly never)
+    /// frame. `Notify` stores a single permit, so a cancel that races
+    /// ahead of the loop reaching its `select!` is not lost.
+    cancel: tokio::sync::Notify,
+}
+
+impl SubscriptionState {
+    /// Single teardown owner for an active subscription. Mirrors pvxs
+    /// `SubscriptionImpl::_cancel` (clientmon.cpp:295-317): it sets the
+    /// terminal stop flag, atomically takes the live `(server, sid,
+    /// ioid)` triple, sends a best-effort `DESTROY_REQUEST` so the
+    /// server releases the IOID rather than waiting for the TCP circuit
+    /// to die, unregisters the IOID, and finally wakes the monitor loop.
+    ///
+    /// `try_send` (not an awaiting send) is used so this is callable from
+    /// both `Drop` (no async context) and the async cancel paths through
+    /// the same owner. The destroy frame is enqueued to the writer task
+    /// before any caller blocks on the loop — pvxs likewise performs the
+    /// cancel operation before `syncCancel(true)` waits.
+    fn teardown(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let snapshot = self.active.lock().take();
+        if let Some((server, sid, ioid)) = snapshot {
+            let codec = PvaCodec {
+                big_endian: matches!(server.byte_order, ByteOrder::Big),
+            };
+            let _ = server.try_send(codec.build_destroy_request(sid, ioid));
+            server.unregister_ioid(ioid);
+        }
+        // Wake any loop parked in `stream.recv().await`. Even if the loop
+        // has not reached its `select!` yet, `Notify` holds the permit so
+        // the next `notified()` completes at once.
+        self.cancel.notify_one();
+    }
 }
 
 /// User-facing handle returned by [`op_monitor_handle`]. Drops cleanly
@@ -1420,21 +1456,26 @@ impl SubscriptionHandle {
         snap
     }
 
-    /// Signal the inner task to terminate at its next opportunity
-    /// (async — pvxs `syncCancel(false)` analog). Drop alone does not
-    /// stop the task — call this explicitly.
+    /// Signal the inner task to terminate (async — pvxs
+    /// `syncCancel(false)` analog). Routes through the single teardown
+    /// owner so the server-side IOID is released and a loop parked in
+    /// `stream.recv().await` is woken immediately; does not await the
+    /// task. Drop alone does not stop the task — call this explicitly.
     pub fn stop(&self) {
-        self.state
-            .stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.state.teardown();
     }
 
     /// Stop and await termination. pvxs `syncCancel(true)` analog —
     /// once this returns no further callbacks will fire.
+    ///
+    /// The teardown (DESTROY_REQUEST + IOID unregister + loop wake) runs
+    /// **before** awaiting the task, matching pvxs `_cancel`, which
+    /// performs the cancel operation before `syncCancel(true)` blocks
+    /// (clientmon.cpp:295-317, 810-824). Without this the task could be
+    /// parked forever in `stream.recv().await` on an idle monitor and
+    /// the await would never return.
     pub async fn stop_sync(mut self) {
-        self.state
-            .stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.state.teardown();
         if let Some(t) = self.task.take() {
             let _ = t.await;
         }
@@ -1484,25 +1525,16 @@ impl SubscriptionHandle {
 /// stall a runtime worker.
 impl Drop for SubscriptionHandle {
     fn drop(&mut self) {
-        // Cooperative: tell the loop to terminate at its next stop check.
-        self.state
-            .stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        // Server-side teardown: only fire while we still have a live
-        // (server, sid, ioid) triple. Reconnect-gap drops have nothing
-        // to send, which is fine — the next reconnect cycle won't fire
-        // because `stop` is now set.
-        let snapshot = self.state.active.lock().take();
-        if let Some((server, sid, ioid)) = snapshot {
-            let codec = PvaCodec {
-                big_endian: matches!(server.byte_order, ByteOrder::Big),
-            };
-            let frame = codec.build_destroy_request(sid, ioid);
-            let _ = server.try_send(frame);
-            server.unregister_ioid(ioid);
-        }
+        // Route through the single teardown owner: sets stop, takes the
+        // live (server, sid, ioid) triple, sends a best-effort
+        // DESTROY_REQUEST, unregisters the IOID, and wakes the loop.
+        // Reconnect-gap drops have nothing to send (active is None),
+        // which is fine — the next reconnect cycle won't fire because
+        // `stop` is now set. Idempotent, so a drop after `stop_sync`
+        // (which already tore down) is a no-op.
+        self.state.teardown();
         // Don't await/abort the task here — letting it run to a clean
-        // exit on the next `stop` check matches the existing
+        // exit on the woken `select!` matches the existing
         // `stop()`-then-drop semantics. Callers that need synchronous
         // teardown should call `stop_sync().await`.
     }
@@ -1695,6 +1727,7 @@ where
             limit_queue: pipeline_size,
             ..Default::default()
         }),
+        cancel: tokio::sync::Notify::new(),
     });
     let state_for_task = state.clone();
 
@@ -1854,21 +1887,48 @@ where
     loop {
         // Honour stop() — caller dropped the handle or called
         // stop_sync().
-        if let Some(s) = &state {
-            if s.stop.load(std::sync::atomic::Ordering::Relaxed) {
-                server.unregister_ioid(ioid);
-                return Err(MonitorEnd::ChannelClosed);
-            }
-        }
-        let frame = match stream.recv().await {
-            Some(f) => f,
-            None => {
-                server.unregister_ioid(ioid);
-                if let Some(s) = &state {
+        let frame = match &state {
+            // Handle present: race the next frame against an explicit
+            // cancel so a stop issued while no server data is arriving
+            // wakes the loop immediately instead of parking forever on an
+            // idle monitor. pvxs wakes the worker the same way — `_cancel`
+            // runs through `loop.tryInvoke` (clientmon.cpp:810-824).
+            Some(s) => {
+                if s.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    server.unregister_ioid(ioid);
                     s.active.lock().take();
+                    return Err(MonitorEnd::ChannelClosed);
                 }
-                return Err(MonitorEnd::ConnectionLost);
+                tokio::select! {
+                    biased;
+                    _ = s.cancel.notified() => {
+                        // The teardown owner already took `active` and
+                        // unregistered the IOID; both calls are
+                        // idempotent, repeated here so the no-handle path
+                        // and this path converge on the same cleanup.
+                        server.unregister_ioid(ioid);
+                        s.active.lock().take();
+                        return Err(MonitorEnd::ChannelClosed);
+                    }
+                    f = stream.recv() => match f {
+                        Some(f) => f,
+                        None => {
+                            server.unregister_ioid(ioid);
+                            s.active.lock().take();
+                            return Err(MonitorEnd::ConnectionLost);
+                        }
+                    },
+                }
             }
+            // No handle: nothing can cancel this loop, so just await the
+            // next frame.
+            None => match stream.recv().await {
+                Some(f) => f,
+                None => {
+                    server.unregister_ioid(ioid);
+                    return Err(MonitorEnd::ConnectionLost);
+                }
+            },
         };
         // classify the frame through the single control-frame
         // owner. A too-short frame and a FINISH with a missing/malformed
@@ -2043,6 +2103,7 @@ where
             limit_queue: pipeline_size,
             ..Default::default()
         }),
+        cancel: tokio::sync::Notify::new(),
     });
     let state_for_task = state.clone();
 
@@ -2298,21 +2359,48 @@ where
     // the cumulative state pvxs guarantees.
     let mut prior: Option<PvField> = None;
     loop {
-        if let Some(s) = &state {
-            if s.stop.load(std::sync::atomic::Ordering::Relaxed) {
-                server.unregister_ioid(ioid);
-                return Err(MonitorEnd::ChannelClosed);
-            }
-        }
-        let frame = match stream.recv().await {
-            Some(f) => f,
-            None => {
-                server.unregister_ioid(ioid);
-                if let Some(s) = &state {
+        let frame = match &state {
+            // Handle present: race the next frame against an explicit
+            // cancel so a stop issued while no server data is arriving
+            // wakes the loop immediately instead of parking forever on an
+            // idle monitor. pvxs wakes the worker the same way — `_cancel`
+            // runs through `loop.tryInvoke` (clientmon.cpp:810-824).
+            Some(s) => {
+                if s.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    server.unregister_ioid(ioid);
                     s.active.lock().take();
+                    return Err(MonitorEnd::ChannelClosed);
                 }
-                return Err(MonitorEnd::ConnectionLost);
+                tokio::select! {
+                    biased;
+                    _ = s.cancel.notified() => {
+                        // The teardown owner already took `active` and
+                        // unregistered the IOID; both calls are
+                        // idempotent, repeated here so the no-handle path
+                        // and this path converge on the same cleanup.
+                        server.unregister_ioid(ioid);
+                        s.active.lock().take();
+                        return Err(MonitorEnd::ChannelClosed);
+                    }
+                    f = stream.recv() => match f {
+                        Some(f) => f,
+                        None => {
+                            server.unregister_ioid(ioid);
+                            s.active.lock().take();
+                            return Err(MonitorEnd::ConnectionLost);
+                        }
+                    },
+                }
             }
+            // No handle: nothing can cancel this loop, so just await the
+            // next frame.
+            None => match stream.recv().await {
+                Some(f) => f,
+                None => {
+                    server.unregister_ioid(ioid);
+                    return Err(MonitorEnd::ConnectionLost);
+                }
+            },
         };
         match decode_op_response(&frame, Some(&intro)) {
             Ok(OpResponse::Data(d)) => {
@@ -3513,5 +3601,65 @@ mod tests {
         assert_eq!(ack_threshold(4), 2); // the DEFAULT_PIPELINE_SIZE case
         assert_eq!(ack_threshold(8), 4);
         assert_eq!(ack_threshold(33), 16);
+    }
+
+    fn idle_sub_state() -> Arc<SubscriptionState> {
+        Arc::new(SubscriptionState {
+            active: parking_lot::Mutex::new(None),
+            paused: std::sync::atomic::AtomicBool::new(false),
+            stop: std::sync::atomic::AtomicBool::new(false),
+            stats: parking_lot::Mutex::new(SubscriptionStat::default()),
+            cancel: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Regression for PVA-RS-2026-05-28-46: a monitor loop parked in
+    /// `stream.recv().await` waits on `cancel` via `select!`. The single
+    /// teardown owner must wake it. Model the loop's wait with a task
+    /// that only awaits `cancel.notified()`; `teardown()` must make it
+    /// return promptly instead of hanging forever.
+    #[tokio::test]
+    async fn teardown_wakes_a_parked_monitor_loop() {
+        let state = idle_sub_state();
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            task_state.cancel.notified().await;
+        });
+        // Give the task a chance to reach `.notified().await`.
+        tokio::task::yield_now().await;
+        state.teardown();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("parked loop must wake on teardown, not hang")
+            .expect("loop task panicked");
+        assert!(
+            state.stop.load(std::sync::atomic::Ordering::Relaxed),
+            "teardown must set the terminal stop flag"
+        );
+    }
+
+    /// `Notify` stores a single permit, so a cancel that races ahead of
+    /// the loop reaching its `select!` is not lost: a later `notified()`
+    /// completes immediately. Without this guarantee `stop_sync()` issued
+    /// on a not-yet-parked loop could still hang.
+    #[tokio::test]
+    async fn teardown_before_park_is_not_lost() {
+        let state = idle_sub_state();
+        state.teardown(); // notify_one() with no waiter -> stored permit.
+        tokio::time::timeout(std::time::Duration::from_secs(1), state.cancel.notified())
+            .await
+            .expect("stored cancel permit must satisfy a later notified()");
+    }
+
+    /// `teardown()` is the shared owner for `stop()`, `stop_sync()`, and
+    /// `Drop`; calling it more than once (e.g. `stop_sync` then `Drop`)
+    /// must be a harmless no-op.
+    #[tokio::test]
+    async fn teardown_is_idempotent() {
+        let state = idle_sub_state();
+        state.teardown();
+        state.teardown();
+        assert!(state.stop.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(state.active.lock().is_none());
     }
 }

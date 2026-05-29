@@ -444,6 +444,22 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         }
 
         let member = parse_member(field_name, value)?;
+        // pvxs `defineFields` only permits an empty top-level field name
+        // for a metadata mapping: `+type:"meta"` merges alarm/timeStamp at
+        // the struct root, every other mapping must be named
+        // (groupconfigprocessor.cpp:215-231 logs `only +type:"meta" can be
+        // mapped at struct top` and skips that field). Without this guard
+        // an empty-key scalar/plain/any/const/structure/proc member was
+        // accepted, then reached `set_nested_field` with an empty path
+        // (group.rs) and silently produced no runtime value AND no
+        // descriptor member — a misconfigured group that loaded clean.
+        if member.field_name.is_empty() && member.mapping != FieldMapping::Meta {
+            eprintln!(
+                "warning: group '{}': only +type:\"meta\" can be mapped at struct top; ignoring empty-named field with mapping {:?}",
+                name, member.mapping
+            );
+            continue;
+        }
         members.push(member);
     }
 
@@ -1589,6 +1605,55 @@ mod tests {
             "in-range const is still Long (not Int), got {:?}",
             get("mid")
         );
+    }
+
+    /// pvxs `defineFields` only allows an empty top-level field name for a
+    /// metadata mapping (groupconfigprocessor.cpp:215-231). Empty-keyed
+    /// scalar / plain / const mappings must be skipped, not silently
+    /// accepted as zero-value members.
+    #[test]
+    fn parse_empty_field_name_non_meta_is_skipped() {
+        // Default (scalar) mapping with an empty key, plus a valid sibling.
+        for empty_member in [
+            r#""": { "+channel": "REC.VAL" }"#,
+            r#""": { "+type": "plain", "+channel": "REC.VAL" }"#,
+            r#""": { "+type": "any", "+channel": "REC.VAL" }"#,
+            r#""": { "+type": "const", "+const": 1 }"#,
+            r#""": { "+type": "structure" }"#,
+            r#""": { "+type": "proc", "+channel": "REC.PROC" }"#,
+        ] {
+            let json =
+                format!(r#"{{ "GRP:e": {{ {empty_member}, "ok": {{ "+channel": "R.VAL" }} }} }}"#);
+            let groups = parse_group_config(&json).unwrap();
+            let names: Vec<&str> = groups[0]
+                .members
+                .iter()
+                .map(|m| m.field_name.as_str())
+                .collect();
+            assert!(
+                !names.contains(&""),
+                "empty-named non-meta member must be skipped for `{empty_member}`, got {names:?}"
+            );
+            assert!(
+                names.contains(&"ok"),
+                "valid sibling must survive for `{empty_member}`, got {names:?}"
+            );
+        }
+    }
+
+    /// The one allowed empty key: `+type:"meta"` is preserved so its
+    /// alarm/timeStamp members flatten to the struct root (pvxs
+    /// groupconfigprocessor.cpp:940-952).
+    #[test]
+    fn parse_empty_field_name_meta_is_kept() {
+        let json = r#"{ "GRP:m": { "": { "+type": "meta", "+channel": "REC" } } }"#;
+        let groups = parse_group_config(json).unwrap();
+        let m = groups[0]
+            .members
+            .iter()
+            .find(|m| m.field_name.is_empty())
+            .expect("empty-named meta member must be kept");
+        assert_eq!(m.mapping, FieldMapping::Meta);
     }
 
     #[test]

@@ -25,6 +25,7 @@ use tokio::sync::{Mutex, Notify, broadcast};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::ops_v2::Pauser;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
+use epics_pva_rs::server_native::MonitorUpdate;
 use epics_pva_rs::server_native::source::WatermarkKind;
 
 use super::error::{GwError, GwResult};
@@ -71,7 +72,7 @@ pub struct UpstreamEntry {
     /// Fan-out for upstream monitor events. Subscribers receive a
     /// fresh `broadcast::Receiver` from `subscribe()`. Holding the
     /// sender keeps the channel alive across re-subscribes.
-    tx: broadcast::Sender<PvField>,
+    tx: broadcast::Sender<MonitorUpdate>,
     /// Raw-frame fan-out. Carries the upstream MONITOR DATA
     /// body (`changed | value | overrun`) as a refcounted
     /// `bytes::Bytes` so N downstream subscribers all share the
@@ -352,14 +353,41 @@ fn apply_monitor_event(
     }
 }
 
+/// Emit a subscription-boundary marker to **both** downstream fanout
+/// streams — the raw `tx_raw` (`RawEvent { type_changed: true }`) and the
+/// decoded `tx` (`MonitorUpdate::type_change()`). Single owner of the
+/// "a boundary reaches every downstream monitor" invariant: a downstream
+/// monitor takes the raw fast path only with a full field mask, no
+/// pipeline, and no server-side filter — otherwise it is on the decoded
+/// path. A boundary (upstream descriptor change or disconnect) MUST reach
+/// it on whichever stream it subscribed, or it keeps serving values under
+/// the stale INIT descriptor. Both emit sites — the
+/// descriptor-change branch in `spawn_upstream_monitor`'s callback and
+/// `signal_disconnect_boundary` — route through here so neither can notify
+/// one stream and silently drop the other.
+fn broadcast_boundary(
+    tx: &broadcast::Sender<MonitorUpdate>,
+    tx_raw: &broadcast::Sender<crate::pva_gateway::source::RawEvent>,
+    byte_order: epics_pva_rs::proto::ByteOrder,
+) {
+    let _ = tx_raw.send(crate::pva_gateway::source::RawEvent {
+        body: bytes::Bytes::new(),
+        byte_order,
+        type_changed: true,
+    });
+    let _ = tx.send(MonitorUpdate::type_change());
+}
+
 /// Surface an upstream disconnect to downstream monitors as a
 /// subscription boundary, mirroring pva2pva `moncache.cpp:212-235`
 /// (`MonitorCacheEntry`'s lost upstream → downstream *unlisten* / MONITOR
 /// FINISH, **not** a fabricated alarm value). Reuses the same empty
 /// `type_changed` marker the descriptor-change path emits (the
-/// `outcome.type_changed` branch in `spawn_upstream_monitor`): the native
-/// server turns it into MONITOR FINISH (`server_native/tcp.rs`
-/// `build_monitor_finish`) so each downstream re-opens with a fresh INIT.
+/// `outcome.type_changed` branch in `spawn_upstream_monitor`) via
+/// [`broadcast_boundary`], so the boundary reaches BOTH raw and decoded
+/// downstream subscribers: the native server turns it into MONITOR FINISH
+/// (`server_native/tcp.rs` `build_monitor_finish`) so each downstream
+/// re-opens with a fresh INIT.
 ///
 /// Also clears the cached snapshot (`latest_raw` + `state.latest`): after
 /// the boundary there is no live value, so a subscriber attaching during
@@ -375,6 +403,7 @@ fn apply_monitor_event(
 fn signal_disconnect_boundary(
     state: &RwLock<EntryState>,
     latest_raw: &RwLock<Option<crate::pva_gateway::source::RawEvent>>,
+    tx: &broadcast::Sender<MonitorUpdate>,
     tx_raw: &broadcast::Sender<crate::pva_gateway::source::RawEvent>,
 ) {
     // No cached snapshot ⇒ nothing was delivered downstream this connection
@@ -385,11 +414,7 @@ fn signal_disconnect_boundary(
     };
     *latest_raw.write() = None;
     state.write().latest = None;
-    let _ = tx_raw.send(crate::pva_gateway::source::RawEvent {
-        body: bytes::Bytes::new(),
-        byte_order,
-        type_changed: true,
-    });
+    broadcast_boundary(tx, tx_raw, byte_order);
 }
 
 impl UpstreamEntry {
@@ -405,8 +430,11 @@ impl UpstreamEntry {
 
     /// Subscribe to upstream events. The receiver is fresh — pre-existing
     /// values are NOT replayed (broadcast semantics). Callers needing
-    /// the current value should also call [`Self::snapshot`].
-    pub fn subscribe(&self) -> broadcast::Receiver<PvField> {
+    /// the current value should also call [`Self::snapshot`]. The stream
+    /// carries `MonitorUpdate` so an upstream descriptor change reaches
+    /// decoded subscribers as a `type_changed` boundary, the
+    /// decoded-path counterpart of [`Self::subscribe_raw`]'s `RawEvent`.
+    pub fn subscribe(&self) -> broadcast::Receiver<MonitorUpdate> {
         self.poke();
         self.tx.subscribe()
     }
@@ -821,7 +849,7 @@ impl ChannelCache {
         pv_name: &str,
         pv_request: Option<PvField>,
     ) -> Arc<UpstreamEntry> {
-        let (tx, _rx0) = broadcast::channel::<PvField>(BROADCAST_CAPACITY);
+        let (tx, _rx0) = broadcast::channel::<MonitorUpdate>(BROADCAST_CAPACITY);
         let (tx_raw, _rx0_raw) =
             broadcast::channel::<crate::pva_gateway::source::RawEvent>(BROADCAST_CAPACITY);
         let first_event = Arc::new(Notify::new());
@@ -905,11 +933,15 @@ impl ChannelCache {
                             // clear stale bytes so new raw
                             // subscribers don't replay the old descriptor.
                             *latest_raw_inner.write() = None;
-                            let _ = tx_raw_inner.send(RawEvent {
-                                body: bytes::Bytes::new(),
-                                byte_order: order,
-                                type_changed: true,
-                            });
+                            // Emit the boundary on BOTH fanout streams through
+                            // the single owner: the raw `RawEvent` for raw-path
+                            // subscribers AND the decoded
+                            // `MonitorUpdate::type_change()` so a field-masked /
+                            // pipelined / filtered downstream monitor — forced
+                            // onto the decoded path — also gets a MONITOR FINISH
+                            // instead of the next value re-encoded under its
+                            // stale INIT descriptor.
+                            broadcast_boundary(&tx_inner, &tx_raw_inner, order);
                             // Skip the normal body forward — the bytes are
                             // for the NEW descriptor; sending them under
                             // the old INIT descriptor is exactly the
@@ -930,7 +962,8 @@ impl ChannelCache {
                         // state_inner.read() re-acquisition needed.
                         if !outcome.was_first {
                             if let Some(val) = outcome.value {
-                                let _ = tx_inner.send(val);
+                                let _ = tx_inner
+                                    .send(epics_pva_rs::server_native::MonitorUpdate::from(val));
                             }
                         }
                         // cache latest raw event for initial
@@ -987,6 +1020,7 @@ impl ChannelCache {
                         signal_disconnect_boundary(
                             &state_for_task,
                             &latest_raw_for_task,
+                            &tx_for_task,
                             &tx_raw_for_task,
                         );
                         // guard removed — cleanup_tick aborts via AbortOnDrop.
@@ -1014,7 +1048,12 @@ impl ChannelCache {
                 // alive for transparent reconnect; the first real upstream
                 // event after reconnect repopulates the snapshot via the
                 // normal monitor callback path.
-                signal_disconnect_boundary(&state_for_task, &latest_raw_for_task, &tx_raw_for_task);
+                signal_disconnect_boundary(
+                    &state_for_task,
+                    &latest_raw_for_task,
+                    &tx_for_task,
+                    &tx_raw_for_task,
+                );
                 if let Err(e) = raw_result {
                     tracing::warn!(
                         pv = %pv_name_owned,
@@ -1213,7 +1252,7 @@ impl ChannelCache {
     /// exercised without a live upstream IOC.
     #[cfg(test)]
     pub(crate) async fn insert_test_entry(&self, pv_name: &str) {
-        let (tx, rx0) = broadcast::channel::<PvField>(4);
+        let (tx, rx0) = broadcast::channel::<MonitorUpdate>(4);
         drop(rx0);
         let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
         drop(rx0_raw);
@@ -1670,7 +1709,7 @@ mod tests {
     /// real client) and exercise the subscribe / poke counters.
     #[tokio::test]
     async fn entry_subscribe_returns_fresh_receivers() {
-        let (tx, rx0) = broadcast::channel::<PvField>(4);
+        let (tx, rx0) = broadcast::channel::<MonitorUpdate>(4);
         drop(rx0);
         let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
         drop(rx0_raw);
@@ -1704,7 +1743,7 @@ mod tests {
     #[tokio::test]
     async fn is_retained_keeps_subscribers_and_poked_evicts_idle() {
         fn make(drop_poke: bool) -> UpstreamEntry {
-            let (tx, rx0) = broadcast::channel::<PvField>(4);
+            let (tx, rx0) = broadcast::channel::<MonitorUpdate>(4);
             drop(rx0);
             let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
             drop(rx0_raw);
@@ -1749,7 +1788,11 @@ mod tests {
     /// On upstream disconnect the gateway emits a monitor-unlisten boundary
     /// (empty `type_changed` marker) and clears the cached snapshot — it
     /// does NOT fabricate an INVALID alarm value. Mirrors pva2pva
-    /// `moncache.cpp:212-235` (lost upstream → downstream FINISH).
+    /// `moncache.cpp:212-235` (lost upstream → downstream FINISH). The
+    /// boundary MUST land on BOTH the raw and the decoded fanout streams: a
+    /// field-masked / pipelined downstream monitor rides the decoded stream
+    /// and would otherwise miss the disconnect boundary (the defect this
+    /// closes, on the disconnect arm).
     #[test]
     fn disconnect_emits_unlisten_boundary_and_clears_snapshot() {
         use crate::pva_gateway::source::RawEvent;
@@ -1761,14 +1804,20 @@ mod tests {
             byte_order: ByteOrder::Big,
             type_changed: false,
         }));
+        let (tx, mut rx) = broadcast::channel::<MonitorUpdate>(8);
         let (tx_raw, mut rx_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(8);
 
-        signal_disconnect_boundary(&state, &latest_raw, &tx_raw);
+        signal_disconnect_boundary(&state, &latest_raw, &tx, &tx_raw);
 
-        let ev = rx_raw.try_recv().expect("boundary event emitted");
+        let ev = rx_raw.try_recv().expect("raw boundary event emitted");
         assert!(ev.type_changed, "must be a subscription-boundary marker");
         assert!(ev.body.is_empty(), "boundary marker carries no body");
         assert_eq!(ev.byte_order, ByteOrder::Big);
+        let dev = rx.try_recv().expect("decoded boundary event emitted");
+        assert!(
+            dev.type_changed,
+            "decoded fanout must also carry the boundary"
+        );
         assert!(
             latest_raw.read().is_none(),
             "latest_raw cleared on disconnect"
@@ -1788,32 +1837,45 @@ mod tests {
         use tokio::sync::broadcast;
         let state = RwLock::new(EntryState::default());
         let latest_raw = RwLock::new(None::<crate::pva_gateway::source::RawEvent>);
+        let (tx, mut rx) = broadcast::channel::<MonitorUpdate>(8);
         let (tx_raw, mut rx_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(8);
 
-        // No cached snapshot ⇒ nothing to revoke ⇒ no emission.
-        signal_disconnect_boundary(&state, &latest_raw, &tx_raw);
+        // No cached snapshot ⇒ nothing to revoke ⇒ no emission on either stream.
+        signal_disconnect_boundary(&state, &latest_raw, &tx, &tx_raw);
         assert!(
             rx_raw.try_recv().is_err(),
-            "no boundary without a prior snapshot"
+            "no raw boundary without a prior snapshot"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no decoded boundary without a prior snapshot"
         );
 
-        // Arm with a snapshot, fire once.
+        // Arm with a snapshot, fire once — both streams get exactly one.
         *latest_raw.write() = Some(RawEvent {
             body: bytes::Bytes::from_static(&[9]),
             byte_order: ByteOrder::Little,
             type_changed: false,
         });
-        signal_disconnect_boundary(&state, &latest_raw, &tx_raw);
+        signal_disconnect_boundary(&state, &latest_raw, &tx, &tx_raw);
         assert!(
             rx_raw.try_recv().is_ok(),
-            "first disconnect emits a boundary"
+            "first disconnect emits a raw boundary"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "first disconnect emits a decoded boundary"
         );
 
-        // Second call within one outage: snapshot already cleared, no-op.
-        signal_disconnect_boundary(&state, &latest_raw, &tx_raw);
+        // Second call within one outage: snapshot already cleared, no-op on both.
+        signal_disconnect_boundary(&state, &latest_raw, &tx, &tx_raw);
         assert!(
             rx_raw.try_recv().is_err(),
-            "second call within one outage must not re-emit"
+            "second call within one outage must not re-emit raw"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "second call within one outage must not re-emit decoded"
         );
     }
 }

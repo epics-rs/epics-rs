@@ -999,6 +999,33 @@ pub struct MonitorUpdate {
     /// Explicit changed field paths, or `None` to let the server
     /// derive the changed-bitset.
     pub marked: Option<Vec<String>>,
+    /// When `true`, this event signals an upstream **descriptor
+    /// change** — a subscription boundary, not a value. `value`/`marked`
+    /// are meaningless and MUST NOT be encoded under the monitor's
+    /// negotiated INIT descriptor: the next decoded value is shaped for
+    /// the new upstream descriptor and would be mis-encoded against the
+    /// stale one. The decoded monitor dispatch loop checks this flag
+    /// FIRST and emits `MONITOR FINISH` before reading `value`, so the
+    /// client reopens with a fresh INIT — the decoded-path counterpart of
+    /// [`RawMonitorEvent::type_changed`]. pvxs treats reconnect /
+    /// type-change as a subscription boundary
+    /// (pvalink_channel.cpp:342-351 `onTypeChange()`). Only the PVA
+    /// gateway's fanout sets this; sources that own their descriptor
+    /// leave it `false`.
+    pub type_changed: bool,
+}
+
+impl MonitorUpdate {
+    /// A descriptor-change boundary marker. Carries a placeholder value
+    /// that consumers MUST NOT encode — the decoded monitor loop emits
+    /// `MONITOR FINISH` on `type_changed` before any value read.
+    pub fn type_change() -> Self {
+        Self {
+            value: PvField::Null,
+            marked: None,
+            type_changed: true,
+        }
+    }
 }
 
 impl From<PvField> for MonitorUpdate {
@@ -1008,6 +1035,7 @@ impl From<PvField> for MonitorUpdate {
         Self {
             value,
             marked: None,
+            type_changed: false,
         }
     }
 }

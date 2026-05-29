@@ -1093,3 +1093,123 @@ async fn br_r41_typed_subscribe_delivers_updates() {
         "typed subscribe must deliver the post-initial update",
     );
 }
+
+/// Regression: a downstream monitor forced onto the DECODED path
+/// (pipelined / field-masked / filtered) must receive the same
+/// subscription-boundary (MONITOR FINISH) on an upstream descriptor change
+/// as a raw-path-eligible monitor — it must NOT keep serving values under
+/// its stale INIT descriptor.
+///
+/// Pre-fix the gateway carried the type-change / disconnect boundary only on
+/// the RAW fanout (`RawEvent.type_changed`, and `signal_disconnect_boundary`
+/// emitting solely to `tx_raw`). A downstream monitor that negotiated a
+/// pipeline window (or a field projection / server-side filter) is served by
+/// the gateway's DECODED path (`subscribe_seeded` → `MonitorUpdate` stream),
+/// which carried bare values with no boundary marker — so the boundary was
+/// invisible to it. Post-fix `broadcast_boundary` emits on BOTH streams and
+/// the decoded server loop turns the `MonitorUpdate::type_change()` into
+/// MONITOR FINISH before encoding any value under the stale descriptor.
+///
+/// Upstream parity: pva2pva stops a monitor on a new upstream type
+/// (`moncache.cpp:56-83`) and surfaces a lost upstream as downstream
+/// *unlisten* (`moncache.cpp:212-235`); pvxs treats reconnect / type-change
+/// as a subscription boundary (`pvalink_channel.cpp:342-351 onTypeChange()`).
+///
+/// Topology: two downstream clients on the SAME gateway PV. The raw-vs-
+/// decoded split is driven entirely by the pvRequest's pipeline option,
+/// because every high-level client monitor builds `MonitorFlow` from it:
+///   * `field(value)` — no pipeline option ⟹ `MonitorFlow.pipeline == false`
+///     ⟹ the server negotiates no credit window ⟹ `window.is_none()` and
+///     (full mask, no filter) ⟹ `raw_path_eligible` ⟹ gateway serves it via
+///     the RAW fanout (`subscribe_raw_seeded`).
+///   * `record[pipeline=true,queueSize=4]` — `pipeline == true` ⟹
+///     `window.is_some()` defeats the raw-path gate ⟹ DECODED path
+///     (`subscribe_seeded`, the `MonitorUpdate` stream this finding fixes).
+/// After the upstream SharedPV is closed (descriptor change: old descriptor
+/// revoked), BOTH `pvmonitor_events` tasks must observe
+/// `MonitorEvent::Finished` and complete. Pre-fix the pipelined one never
+/// gets a boundary on the decoded stream and hangs until this test's timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
+    use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
+    use epics_pva_rs::pv_request::PvRequestExpr;
+
+    let (_us_server, us_addr, us_pv) = spawn_upstream("GW:BR99:PV", 1.0);
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+
+    let c_raw = gw.client_config();
+    let c_pipe = gw.client_config();
+
+    // Each monitor signals once it observes a subscription boundary
+    // (`Finished`, or `Disconnected` as a fallback boundary shape).
+    let (fin_raw_tx, mut fin_raw_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (fin_pipe_tx, mut fin_pipe_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // pvxs default mask: maskConnected=true, maskDisconnected=false — so
+    // both Finished and Disconnected reach the callback.
+    let mask = MonitorEventMask::default();
+
+    // Monitor #1: RAW-path eligible — `field(value)` is the full mask for
+    // this single-field PV and carries no pipeline option, so the server
+    // negotiates no credit window and routes it onto the raw fanout.
+    let raw_req = PvRequestExpr::parse("field(value)").expect("parse pvRequest");
+    let h_raw = tokio::spawn(async move {
+        let _ = c_raw
+            .pvmonitor_events("GW:BR99:PV", Some(&raw_req), mask, move |ev| {
+                if matches!(ev, MonitorEvent::Finished | MonitorEvent::Disconnected) {
+                    let _ = fin_raw_tx.try_send(());
+                }
+            })
+            .await;
+    });
+
+    // Monitor #2: pipelined → DECODED path. `window.is_some()` makes
+    // `raw_path_eligible` false in the native server, so this monitor is
+    // served from the gateway's decoded `MonitorUpdate` stream.
+    let pipe_req =
+        PvRequestExpr::parse("record[pipeline=true,queueSize=4]").expect("parse pvRequest");
+    let h_pipe = tokio::spawn(async move {
+        let _ = c_pipe
+            .pvmonitor_events("GW:BR99:PV", Some(&pipe_req), mask, move |ev| {
+                if matches!(ev, MonitorEvent::Finished | MonitorEvent::Disconnected) {
+                    let _ = fin_pipe_tx.try_send(());
+                }
+            })
+            .await;
+    });
+
+    // Let both subscriptions establish; the gateway's shared upstream
+    // monitor delivers the seed (1.0) and caches `latest_raw`, which arms
+    // `signal_disconnect_boundary` (it no-ops without a cached snapshot).
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    us_pv.try_post(nt_double_value(2.0));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Upstream descriptor change: close() revokes the descriptor and drops
+    // all subscribers. The upstream server sends MONITOR FINISH to the
+    // gateway's upstream client; the gateway's upstream monitor task ends and
+    // `signal_disconnect_boundary` fires the boundary on BOTH fanout streams.
+    us_pv.close();
+
+    // BOTH monitors must observe the boundary within the timeout. Pre-fix
+    // the pipelined (decoded) monitor never does → its recv times out.
+    tokio::time::timeout(Duration::from_secs(5), fin_raw_rx.recv())
+        .await
+        .expect(
+            "raw-path monitor must observe a boundary on upstream descriptor change (timed out)",
+        )
+        .expect("raw-path monitor boundary channel must not close empty");
+    tokio::time::timeout(Duration::from_secs(5), fin_pipe_rx.recv())
+        .await
+        .expect("decoded/pipelined monitor must observe a boundary on upstream descriptor change (pre-fix this hangs)")
+        .expect("decoded/pipelined monitor boundary channel must not close empty");
+
+    h_raw.abort();
+    h_pipe.abort();
+}

@@ -940,7 +940,10 @@ impl GatewayChannelSource {
         cache: Arc<ChannelCache>,
         name: &str,
         pv_request: Option<&PvField>,
-    ) -> Option<(Option<PvField>, mpsc::Receiver<PvField>)> {
+    ) -> Option<(
+        Option<PvField>,
+        mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>,
+    )> {
         // Gateway-wide subscriber cap.
         let prev = self.subscriber_count.fetch_add(1, Ordering::Relaxed);
         if prev >= self.max_subscribers {
@@ -980,8 +983,16 @@ impl GatewayChannelSource {
             // server, NOT replayed into this stream (double-seed fix).
             loop {
                 match bcast_rx.recv().await {
-                    Ok(v) => {
-                        if mpsc_tx.send(v).await.is_err() {
+                    Ok(update) => {
+                        // A `type_changed` boundary is the last event
+                        // the decoded stream carries: forward it so the server
+                        // emits MONITOR FINISH, then end the forwarder —
+                        // mirroring the raw forwarder's `type_changed` return.
+                        let is_boundary = update.type_changed;
+                        if mpsc_tx.send(update).await.is_err() {
+                            return;
+                        }
+                        if is_boundary {
                             return;
                         }
                     }
@@ -991,7 +1002,7 @@ impl GatewayChannelSource {
                     // PvField fan-out cannot — the downstream native server
                     // encodes a typed monitor with an empty overrun bitset
                     // (epics-pva-rs server_native/tcp.rs `BitSet::new(); //
-                    // no overruns`) and the `mpsc<PvField>` item carries no
+                    // no overruns`) and the `MonitorUpdate` item carries no
                     // bitset to thread one through. Faithful overrun on the
                     // typed path needs an epics-pva-rs API that accepts an
                     // overrun bitset alongside the typed value (cross-crate).
@@ -1002,6 +1013,30 @@ impl GatewayChannelSource {
         });
         Some((initial, mpsc_rx))
     }
+}
+
+/// Adapt the internal `MonitorUpdate` fanout into a bare `PvField` stream
+/// for the legacy ctx-less `subscribe` / `subscribe_checked` trait methods
+/// (direct/test callers, NOT the server's wire-dispatch path). A
+/// `type_changed` boundary has no representation in a bare `PvField`
+/// stream, so it is dropped here — only the server's `subscribe_seeded`
+/// path keeps the `MonitorUpdate` stream and turns the boundary into
+/// MONITOR FINISH.
+fn monitor_updates_to_values(
+    mut rx: mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>,
+) -> mpsc::Receiver<PvField> {
+    let (tx, out) = mpsc::channel(64);
+    tokio::spawn(async move {
+        while let Some(update) = rx.recv().await {
+            if update.type_changed {
+                continue;
+            }
+            if tx.send(update.value).await.is_err() {
+                break;
+            }
+        }
+    });
+    out
 }
 
 impl ChannelSource for GatewayChannelSource {
@@ -1404,10 +1439,12 @@ impl ChannelSource for GatewayChannelSource {
 
     async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
         // legacy ctx-less path: updates-only, seed discarded (the
-        // single-seed server path uses `subscribe_seeded`).
+        // single-seed server path uses `subscribe_seeded`). The internal
+        // stream is `MonitorUpdate`; adapt to bare `PvField` for this
+        // legacy signature (boundary dropped — not a wire-dispatch path).
         self.subscribe_inner(self.cache.clone(), name, None)
             .await
-            .map(|(_initial, updates)| updates)
+            .map(|(_initial, updates)| monitor_updates_to_values(updates))
     }
 
     /// route GET through the per-credential upstream client so the
@@ -1451,7 +1488,7 @@ impl ChannelSource for GatewayChannelSource {
             ctx.pv_request.as_ref(),
         )
         .await
-        .map(|(_initial, updates)| updates)
+        .map(|(_initial, updates)| monitor_updates_to_values(updates))
     }
 
     /// route raw MONITOR through per-credential upstream cache.
@@ -1551,10 +1588,11 @@ impl ChannelSource for GatewayChannelSource {
                 ctx.pv_request.as_ref(),
             )
             .await?;
-        Some(epics_pva_rs::server_native::source::SubscriptionSeed {
-            initial,
-            updates: epics_pva_rs::server_native::source::plain_monitor_updates(updates),
-        })
+        // `subscribe_inner` already yields a `MonitorUpdate` stream that
+        // carries the `type_changed` boundary; forward it as the
+        // seed's update stream so the server's decoded loop emits MONITOR
+        // FINISH on an upstream descriptor change.
+        Some(epics_pva_rs::server_native::source::SubscriptionSeed { initial, updates })
     }
 
     /// Raw-path counterpart of [`Self::subscribe_seeded`]. Same cached

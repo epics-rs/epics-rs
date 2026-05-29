@@ -5923,10 +5923,11 @@ async fn handle_op(
                         // paused we keep receiving and squash to the
                         // latest without emitting, waking on resume to
                         // flush it (pvxs queues posts while Idle and
-                        // drains on START). The decoded path has no
-                        // subscription-boundary event, so nothing is
-                        // yielded early while paused (`|_| false`).
-                        // events coalesced during a pause
+                        // drains on START). A `type_changed` boundary is
+                        // the one exception: `|u| u.type_changed` yields
+                        // it immediately even while paused, so an upstream
+                        // descriptor change is never squashed behind a
+                        // later value. Events coalesced during a pause
                         // union their marked-leaf sets via
                         // `coalesce_monitor_update`.
                         // Emit a queued entry first — one per reply (pvxs
@@ -5945,7 +5946,13 @@ async fn handle_op(
                                 &mut held,
                                 &paused_flag,
                                 &resume_notify,
-                                |_| false,
+                                // An upstream descriptor change arrives as a
+                                // `type_changed` boundary on the decoded stream
+                                // too (the PVA gateway fanout). Yield it
+                                // immediately — even while paused — so it is
+                                // never squashed behind a later,
+                                // descriptor-incompatible value.
+                                |u| u.type_changed,
                                 coalesce_monitor_update,
                             )
                             .await
@@ -5954,6 +5961,24 @@ async fn handle_op(
                                 None => break,
                             }
                         };
+                        // Subscription boundary: the upstream descriptor
+                        // changed. The decoded values that follow are shaped
+                        // for the NEW descriptor and would be mis-encoded
+                        // against the `intro_clone` negotiated at this
+                        // monitor's INIT. Emit MONITOR FINISH BEFORE reading
+                        // `value` (it is a placeholder on a boundary) so the
+                        // client reopens with a fresh INIT — the decoded-path
+                        // counterpart of the raw fast path's `type_changed`
+                        // branch. This covers both acquisition paths: a
+                        // boundary popped from `pending` (drained ahead) and
+                        // one yielded live by `next_monitor_event`, including
+                        // one surfaced through a pause-hold/queue-overflow
+                        // coalesce (which preserves the boundary).
+                        if value.type_changed {
+                            let finish = build_monitor_finish(ioid, order);
+                            let _ = tx_clone.send(finish).await;
+                            return;
+                        }
                         // ACL re-check on policy reload (same
                         // shape as the raw-fast-path branch above).
                         // The gate's `acl_version` bumps on every
@@ -6745,10 +6770,21 @@ fn build_monitor_payload_marked(
 /// field that changed across the coalesced burst. A `None` on either
 /// side means "no explicit set — derive by diff", which over-marks
 /// safely, so the union of `None` with anything stays `None`.
+///
+/// A `type_changed` boundary must SURVIVE the squash: once the upstream
+/// descriptor changed, no value (squashed-old or post-boundary-new) may
+/// be delivered under the negotiated descriptor, so if either side is a
+/// boundary the result is the boundary — the dispatch loop then emits
+/// MONITOR FINISH instead of encoding a stale-descriptor value. This is
+/// what keeps the decoded type-change marker from being lost when the
+/// pause-hold or the `drain_monitor_queue` overflow coalesces a burst.
 fn coalesce_monitor_update(
     older: crate::server_native::MonitorUpdate,
     newer: crate::server_native::MonitorUpdate,
 ) -> crate::server_native::MonitorUpdate {
+    if older.type_changed || newer.type_changed {
+        return crate::server_native::MonitorUpdate::type_change();
+    }
     let marked = match (older.marked, newer.marked) {
         (Some(mut a), Some(b)) => {
             for p in b {
@@ -6763,6 +6799,7 @@ fn coalesce_monitor_update(
     crate::server_native::MonitorUpdate {
         value: newer.value,
         marked,
+        type_changed: false,
     }
 }
 
@@ -7407,6 +7444,7 @@ mod tests {
         let upd = |tag: i32, marked: Option<Vec<&str>>| crate::server_native::MonitorUpdate {
             value: val(tag),
             marked: marked.map(|v| v.into_iter().map(str::to_string).collect()),
+            type_changed: false,
         };
 
         // Some + Some → union of paths, deduped; newer value wins.
@@ -7448,6 +7486,7 @@ mod tests {
         let upd = |tag: i32| crate::server_native::MonitorUpdate {
             value: val(tag),
             marked: None,
+            type_changed: false,
         };
 
         // Three posts into a queue of limit 4 (the finding's exact case):

@@ -144,6 +144,15 @@ pub struct PvaLink {
     /// (pvxs replays the queued put on the client reconnect event,
     /// `pvalink.rst:99-100`).
     retry_pending: AtomicBool,
+    /// `(seconds_past_epoch, nanoseconds)` captured at the moment the
+    /// INP monitor subscription last dropped — pvxs `snap_time = e.time`
+    /// set in `onDisconnect` (`pvalink_channel.cpp:372`). A `time=true`
+    /// link in the disconnected-stale state adopts THIS into the owning
+    /// record's time, not the stale last-value timestamp and not local
+    /// processing time, mirroring pvxs `pvaGetValue` copying `snap_time`
+    /// on the invalid read (`pvalink_lset.cpp:268-270`). `None` until the
+    /// first disconnect; shared with the monitor task, so it is an `Arc`.
+    disconnect_time: Arc<Mutex<Option<(i64, i32)>>>,
 }
 
 /// A queued OUT-link Put, preserving the caller's original value
@@ -195,6 +204,7 @@ impl PvaLink {
         let client = PvaClient::builder().timeout(Duration::from_secs(5)).build();
 
         let latest = Arc::new(Mutex::new(None));
+        let disconnect_time: Arc<Mutex<Option<(i64, i32)>>> = Arc::new(Mutex::new(None));
         let mut notify_rx = None;
         let mut monitor_abort = None;
         let mut monitor_connected = None;
@@ -215,6 +225,7 @@ impl PvaLink {
             let connected = Arc::new(AtomicBool::new(false));
             let connected_for_task = connected.clone();
             monitor_connected = Some(connected);
+            let disconnect_time_task = disconnect_time.clone();
             // B4-pipeline / B4-Q: when the link asks for pipeline
             // flow-control or a non-default queue depth, build a
             // pvRequest carrying `record[pipeline=...,queueSize=N]`
@@ -266,6 +277,19 @@ impl PvaLink {
                     // must not synthesize a spurious disconnect scan.
                     let was_connected = connected_for_task.swap(false, Ordering::AcqRel);
                     if was_connected {
+                        // Capture the disconnect-event time so a
+                        // `time=true` link adopts it (not the stale last
+                        // value's time, nor local processing time) while
+                        // disconnected — pvxs `snap_time = e.time` in
+                        // `onDisconnect` (`pvalink_channel.cpp:372`). We
+                        // have no client-supplied exception time, so the
+                        // observation moment (now) is the closest analogue.
+                        if let Ok(dur) =
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        {
+                            *disconnect_time_task.lock() =
+                                Some((dur.as_secs() as i64, dur.subsec_nanos() as i32));
+                        }
                         // Notify the scan forwarder of the lifecycle
                         // transition so CP / passive-CPP targets process
                         // and expose LINK_ALARM/INVALID even though no
@@ -306,6 +330,7 @@ impl PvaLink {
             notify_rx: Mutex::new(notify_rx),
             out_scratch: Mutex::new(HashMap::new()),
             retry_pending: AtomicBool::new(false),
+            disconnect_time,
             _monitor_abort: monitor_abort,
         })
     }
@@ -878,22 +903,47 @@ impl PvaLink {
         self.latest.lock().clone()
     }
 
-    /// Latest `(seconds, nanoseconds, userTag)` from the NT timeStamp
-    /// slot, if the cached value carries one. Mirrors pvxs
-    /// `pvaGetTimeStampTag`. The `userTag` is the remote
-    /// `timeStamp.userTag` widened to the 64-bit tag WITHOUT sign
-    /// extension (see the read below); `0` when the field is absent.
+    /// Timestamp the owning record adopts on a `time=true` read,
+    /// `(seconds, nanoseconds, userTag)`. This is the value-read
+    /// time-adoption hook (consumed by the database INP read path), the
+    /// Rust counterpart of pvxs `pvaGetValue` setting `precord->time`:
+    ///
+    /// * **Connected** — the remote NT `timeStamp` of the cached value,
+    ///   resolved at the link's selected field root
+    ///   (`pvalink_lset.cpp:394-409`, the connected-read snapshot).
+    /// * **Disconnected-stale** — the *disconnect-event* time captured
+    ///   when the subscription dropped (pvxs `snap_time = e.time`,
+    ///   `pvalink_channel.cpp:372`; adopted on the invalid read at
+    ///   `pvalink_lset.cpp:268-270`). The stale last-value timestamp is
+    ///   NOT served — the record's time means "upstream link
+    ///   disconnected at this moment", not "local process ran" and not
+    ///   "the last value's time". The last value's `userTag` is kept
+    ///   alongside (pvxs leaves `snap_tag` unchanged on disconnect).
+    ///   When no disconnect was ever recorded, `None` (keep local time).
+    ///
+    /// `None` otherwise (no cached value / no timeStamp slot). The
+    /// metadata getter `pvaGetTimeStampTag` stays gated through
+    /// `CHECK_VALID` via [`Self::monitor_disconnected_stale`] in
+    /// [`Self::link_metadata`] — only this value-read hook adopts the
+    /// disconnect time.
     pub fn time_stamp(&self, field: &str) -> Option<(i64, i32, u64)> {
-        // a disconnected monitor link must not serve its
-        // stale latched timestamp — pvxs gates every lset getter
-        // through `CHECK_VALID` (`valid() = connected && root`), so
-        // `pvaGetTimeStampTag` returns no-data once the channel drops
-        // even though the snapshot is retained. Reporting the frozen
-        // timestamp would let the owning record adopt a remote time
-        // that no longer reflects live data.
         if self.monitor_disconnected_stale() {
-            return None;
+            // Adopt the recorded disconnect-event time; keep the last
+            // value's userTag (read from the retained snapshot, 0 when
+            // absent). Without a recorded disconnect, keep local time.
+            let (secs, nsec) = (*self.disconnect_time.lock())?;
+            let utag = self.cached_timestamp(field).map_or(0, |(_, _, u)| u);
+            return Some((secs, nsec, utag));
         }
+        self.cached_timestamp(field)
+    }
+
+    /// `(seconds, nanoseconds, userTag)` from the cached NT value's
+    /// `timeStamp` slot, resolved at the selected field root. The raw
+    /// connected-read snapshot used by [`Self::time_stamp`]; reads the
+    /// retained value regardless of connection state (the caller decides
+    /// whether to serve it).
+    fn cached_timestamp(&self, field: &str) -> Option<(i64, i32, u64)> {
         let v = self.latest.lock().clone()?;
         // Resolve `timeStamp` relative to the selected field root —
         // pvxs reads `fld_seconds`/`fld_nanoseconds`/`fld_usertag` from
@@ -1071,6 +1121,7 @@ impl PvaLink {
             notify_rx: Mutex::new(None),
             out_scratch: Mutex::new(HashMap::new()),
             retry_pending: AtomicBool::new(false),
+            disconnect_time: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1090,6 +1141,7 @@ impl PvaLink {
             notify_rx: Mutex::new(None),
             out_scratch: Mutex::new(HashMap::new()),
             retry_pending: AtomicBool::new(false),
+            disconnect_time: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1114,8 +1166,18 @@ impl PvaLink {
             notify_rx: Mutex::new(None),
             out_scratch: Mutex::new(HashMap::new()),
             retry_pending: AtomicBool::new(false),
+            disconnect_time: Arc::new(Mutex::new(None)),
         };
         (link, flag)
+    }
+
+    /// Test-only: stamp the disconnect-event time the monitor task
+    /// would record on a live circuit drop, so a disconnect-stale
+    /// `time_stamp` read can be exercised without a real subscription
+    /// transition.
+    #[cfg(test)]
+    pub(crate) fn record_disconnect_time_for_test(&self, secs: i64, nsec: i32) {
+        *self.disconnect_time.lock() = Some((secs, nsec));
     }
 }
 
@@ -2393,12 +2455,16 @@ mod tests {
             "connected monitor surfaces the cached metadata"
         );
 
-        // Disconnected: both refuse the stale snapshot, even though it
-        // is still cached for diagnostics.
+        // Disconnected: the metadata getter refuses the stale snapshot
+        // (still gated through CHECK_VALID), and the value-read time hook
+        // refuses the stale *last value* timestamp. With no disconnect
+        // event yet recorded the time hook yields None (keep local time),
+        // never the stale remote 1_700_000_000.
         flag.store(false, Ordering::Release);
         assert!(
             link.time_stamp("").is_none(),
-            "disconnected monitor must not serve the stale latched timestamp"
+            "disconnected monitor with no recorded disconnect time keeps \
+             local time, never the stale latched remote timestamp"
         );
         assert!(
             link.link_metadata().is_none(),
@@ -2407,6 +2473,68 @@ mod tests {
         assert!(
             link.latest_value().is_some(),
             "snapshot retained (pvxs keeps root; CHECK_VALID gates the getters)"
+        );
+
+        // Once the circuit-drop time is recorded (pvxs `snap_time =
+        // e.time`), a `time=true` read adopts THAT moment — not the
+        // stale value's 1_700_000_000 — carrying the last value's
+        // userTag (0 in this fixture). The metadata getter stays gated.
+        link.record_disconnect_time_for_test(1_800_000_500, 7);
+        assert_eq!(
+            link.time_stamp(""),
+            Some((1_800_000_500, 7, 0)),
+            "disconnected monitor adopts the disconnect-event time, not \
+             the stale remote value timestamp"
+        );
+        assert!(
+            link.link_metadata().is_none(),
+            "metadata getter stays gated even after a disconnect time is \
+             recorded"
+        );
+    }
+
+    /// On a disconnect-stale `time=true` read the adopted timestamp is
+    /// the disconnect-event moment, but the `userTag` is carried over
+    /// from the last cached value — pvxs leaves `snap_tag` untouched in
+    /// `onDisconnect` (`pvalink_channel.cpp:372` sets only `snap_time`),
+    /// so the tag the record adopts on the invalid read
+    /// (`pvalink_lset.cpp:268-270`) is whatever the prior connected read
+    /// latched. A fixture with a non-zero tag proves the value's tag —
+    /// not 0, and not the stale value seconds — survives the adoption.
+    #[tokio::test]
+    async fn pvalink_disconnect_time_carries_last_value_usertag() {
+        let mut ts = PvStructure::new("time_t");
+        ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(1_700_000_000)),
+        ));
+        ts.fields
+            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(42))));
+        ts.fields
+            .push(("userTag".into(), PvField::Scalar(ScalarValue::Int(0x55))));
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        root.fields
+            .push(("timeStamp".into(), PvField::Structure(ts)));
+
+        let (link, flag) = PvaLink::for_test_with_monitor_flag(
+            inp_cfg(SevrMode::Nms),
+            Some(PvField::Structure(root)),
+        );
+
+        // Connected: the full remote timestamp+tag.
+        flag.store(true, Ordering::Release);
+        assert_eq!(link.time_stamp(""), Some((1_700_000_000, 42, 0x55)));
+
+        // Disconnected with a recorded drop time: adopt the drop time
+        // (seconds/nanos), but keep the last value's userTag 0x55.
+        flag.store(false, Ordering::Release);
+        link.record_disconnect_time_for_test(1_800_000_500, 7);
+        assert_eq!(
+            link.time_stamp(""),
+            Some((1_800_000_500, 7, 0x55)),
+            "disconnect-event time with the last value's userTag preserved"
         );
     }
 

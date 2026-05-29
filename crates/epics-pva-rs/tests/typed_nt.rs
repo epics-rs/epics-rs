@@ -2,13 +2,20 @@
 //! `pvput_typed` / `pvmonitor_typed`. Spins up an in-process
 //! `PvaServer` with a single SharedPV, then exercises every
 //! typed-NT entry point of `PvaClient`.
+//!
+//! The descriptor tests are builder-parity checks: a `#[derive]`d
+//! Normative Type must carry the mandatory metadata members for the
+//! structure ID it claims, matching the runtime `NTScalar` / `NTTable`
+//! builders (which mirror pvxs `nt.cpp`). A derive that emits only
+//! `value` (+ one user meta) under a normative ID is the bug those
+//! tests guard against.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use epics_pva_rs::nt::derive::{NTScalar, NTTable};
 use epics_pva_rs::nt::typed::EnumValue;
-use epics_pva_rs::nt::{Alarm, TimeStamp, TypedNT};
+use epics_pva_rs::nt::{Alarm, NTScalar as NTScalarBuilder, TypedNT, meta};
 use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
 use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
 // PVA listener tests run in parallel: PvaServer::start now binds
@@ -17,30 +24,83 @@ use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
 // softIoc tests still need cross-binary serialisation because the
 // C process owns the EPICS_CA_SERVER_PORT env var globally.
 
+/// Top-level member names of a structure descriptor, in order.
+fn member_names(d: &FieldDesc) -> Vec<String> {
+    match d {
+        FieldDesc::Structure { fields, .. } => fields.iter().map(|(n, _)| n.clone()).collect(),
+        other => panic!("expected structure descriptor, got {other:?}"),
+    }
+}
+
+/// The descriptor of one named member.
+fn member<'a>(d: &'a FieldDesc, name: &str) -> &'a FieldDesc {
+    match d {
+        FieldDesc::Structure { fields, .. } => {
+            &fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("no member named {name:?}"))
+                .1
+        }
+        other => panic!("expected structure descriptor, got {other:?}"),
+    }
+}
+
+/// User declares the alarm meta explicitly; `timeStamp` must be filled
+/// in by the derive even though it is not a struct field, so the wrapper
+/// matches the normative NTScalar layout (value + alarm + timeStamp).
 #[derive(Debug, Clone, NTScalar, PartialEq)]
 struct MotorPos {
     value: f64,
     #[nt(meta)]
     alarm: Alarm,
-    #[nt(meta)]
-    timestamp: TimeStamp,
 }
 
 #[test]
-fn typed_nt_descriptor_shape() {
+fn typed_nt_descriptor_is_full_ntscalar() {
     let d = MotorPos::descriptor();
-    match d {
-        FieldDesc::Structure { struct_id, fields } => {
+    match &d {
+        FieldDesc::Structure { struct_id, .. } => {
             assert_eq!(struct_id, "epics:nt/NTScalar:1.0");
-            // value + alarm + timestamp
-            assert_eq!(fields.len(), 3);
-            assert_eq!(fields[0].0, "value");
-            assert!(matches!(fields[0].1, FieldDesc::Scalar(ScalarType::Double)));
-            assert_eq!(fields[1].0, "alarm");
-            assert_eq!(fields[2].0, "timestamp");
         }
         other => panic!("unexpected descriptor: {other:?}"),
     }
+    // Mandatory members present, in canonical pvxs order.
+    assert_eq!(member_names(&d), vec!["value", "alarm", "timeStamp"]);
+    assert!(matches!(
+        member(&d, "value"),
+        FieldDesc::Scalar(ScalarType::Double)
+    ));
+    // Builder parity: the metadata members equal what the runtime
+    // NTScalar builder emits for a double (which mirrors pvxs nt.cpp).
+    let rt = NTScalarBuilder::new(ScalarType::Double).build();
+    assert_eq!(member(&d, "alarm"), member(&rt, "alarm"));
+    assert_eq!(member(&d, "timeStamp"), member(&rt, "timeStamp"));
+    assert_eq!(member(&d, "alarm"), &meta::alarm_desc());
+    assert_eq!(member(&d, "timeStamp"), &meta::time_desc());
+}
+
+#[test]
+fn typed_nt_value_carries_mandatory_metadata() {
+    // The value path must mirror the descriptor: alarm + timeStamp
+    // present even though the user only set `value` + `alarm`.
+    let pos = MotorPos {
+        value: 2.71,
+        alarm: Alarm {
+            severity: 1,
+            status: 2,
+            message: "near limit".into(),
+        },
+    };
+    let f = pos.to_pv_field();
+    let epics_pva_rs::pvdata::PvField::Structure(s) = &f else {
+        panic!("expected structure value, got {f:?}");
+    };
+    assert_eq!(s.struct_id, "epics:nt/NTScalar:1.0");
+    let names: Vec<&str> = s.fields.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["value", "alarm", "timeStamp"]);
+    // timeStamp defaulted (epoch zero) since the user did not set it.
+    assert_eq!(s.get_field("timeStamp"), Some(&meta::time_default()));
 }
 
 #[test]
@@ -52,11 +112,6 @@ fn typed_nt_round_trip_local() {
             status: 2,
             message: "near limit".into(),
         },
-        timestamp: TimeStamp {
-            seconds_past_epoch: 1_700_000_000,
-            nanoseconds: 12345,
-            user_tag: 7,
-        },
     };
     let f = pos.to_pv_field();
     let back = MotorPos::from_pv_field(&f).expect("decode");
@@ -65,9 +120,8 @@ fn typed_nt_round_trip_local() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pvget_typed_against_local_server() {
-    // Build a SharedPV holding a 3-field NTScalar (value + alarm +
-    // timestamp). The descriptor we open with must match the
-    // derived MotorPos descriptor exactly.
+    // Build a SharedPV holding the derived NTScalar. The descriptor we
+    // open with must match the derived MotorPos descriptor exactly.
     let pv = SharedPV::new();
     pv.open(MotorPos::descriptor(), {
         let initial = MotorPos {
@@ -77,7 +131,6 @@ async fn pvget_typed_against_local_server() {
                 status: 0,
                 message: String::new(),
             },
-            timestamp: TimeStamp::default(),
         };
         initial.to_pv_field()
     })
@@ -100,8 +153,9 @@ async fn pvget_typed_against_local_server() {
     assert_eq!(pos.alarm.message, "");
 }
 
-/// I-2: same NTScalar derive, value field is `Vec<f64>` — wrapper
-/// struct_id auto-flips to `epics:nt/NTScalarArray:1.0`.
+/// Same NTScalar derive, value field is `Vec<f64>` — wrapper struct_id
+/// auto-flips to `epics:nt/NTScalarArray:1.0`. The user declares only
+/// `alarm`; `timeStamp` must still be filled in.
 #[derive(Debug, Clone, NTScalar, PartialEq)]
 struct Trajectory {
     value: Vec<f64>,
@@ -110,19 +164,24 @@ struct Trajectory {
 }
 
 #[test]
-fn typed_nt_array_descriptor() {
+fn typed_nt_array_descriptor_is_full_ntscalararray() {
     let d = Trajectory::descriptor();
-    match d {
-        FieldDesc::Structure { struct_id, fields } => {
+    match &d {
+        FieldDesc::Structure { struct_id, .. } => {
             assert_eq!(struct_id, "epics:nt/NTScalarArray:1.0");
-            assert_eq!(fields[0].0, "value");
-            assert!(matches!(
-                fields[0].1,
-                FieldDesc::ScalarArray(ScalarType::Double)
-            ));
         }
         other => panic!("unexpected descriptor: {other:?}"),
     }
+    // The mandatory timeStamp the original truncated derive omitted is
+    // now present, in canonical order.
+    assert_eq!(member_names(&d), vec!["value", "alarm", "timeStamp"]);
+    assert!(matches!(
+        member(&d, "value"),
+        FieldDesc::ScalarArray(ScalarType::Double)
+    ));
+    let rt = NTScalarBuilder::array(ScalarType::Double).build();
+    assert_eq!(member(&d, "alarm"), member(&rt, "alarm"));
+    assert_eq!(member(&d, "timeStamp"), member(&rt, "timeStamp"));
 }
 
 #[test]
@@ -136,12 +195,42 @@ fn typed_nt_array_round_trip() {
     assert_eq!(t, back);
 }
 
-/// I-2: NTEnum via EnumValue runtime helper.
+/// NTEnum via the EnumValue runtime helper. The user declares only
+/// `alarm`; the derive must add `timeStamp` AND the NTEnum `display`
+/// baseline (pvxs nt.cpp:121-131).
 #[derive(Debug, Clone, NTScalar, PartialEq)]
 struct ValveState {
     value: EnumValue,
     #[nt(meta)]
     alarm: Alarm,
+}
+
+#[test]
+fn typed_nt_enum_descriptor_has_full_ntenum_baseline() {
+    let d = ValveState::descriptor();
+    match &d {
+        FieldDesc::Structure { struct_id, .. } => {
+            assert_eq!(struct_id, "epics:nt/NTEnum:1.0");
+        }
+        other => panic!("unexpected descriptor: {other:?}"),
+    }
+    // pvxs NTEnum::build: value, alarm, timeStamp, display{description}.
+    assert_eq!(
+        member_names(&d),
+        vec!["value", "alarm", "timeStamp", "display"]
+    );
+    assert_eq!(member(&d, "alarm"), &meta::alarm_desc());
+    assert_eq!(member(&d, "timeStamp"), &meta::time_desc());
+    // display is a bare struct with exactly `description: String`.
+    match member(&d, "display") {
+        FieldDesc::Structure { struct_id, fields } => {
+            assert_eq!(struct_id, "");
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].0, "description");
+            assert!(matches!(fields[0].1, FieldDesc::Scalar(ScalarType::String)));
+        }
+        other => panic!("unexpected display descriptor: {other:?}"),
+    }
 }
 
 #[test]
@@ -156,15 +245,6 @@ fn typed_nt_enum_round_trip() {
     let f = v.to_pv_field();
     let back = ValveState::from_pv_field(&f).expect("decode");
     assert_eq!(v, back);
-
-    // Wrapper struct_id is NTEnum (forwarded from EnumValue::descriptor()).
-    let d = ValveState::descriptor();
-    match d {
-        FieldDesc::Structure { struct_id, .. } => {
-            assert_eq!(struct_id, "epics:nt/NTEnum:1.0");
-        }
-        other => panic!("unexpected descriptor: {other:?}"),
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -187,7 +267,9 @@ async fn pvget_typed_primitive_f64() {
     assert_eq!(temp, 7.5);
 }
 
-/// I-2 follow-up: NTTable derive — multi-column table.
+/// NTTable derive — multi-column table. The derive must add the
+/// normative `descriptor`, `alarm`, and `timeStamp` members pvxs
+/// `NTTable::build()` always emits (nt.cpp:170-176).
 #[derive(Debug, Clone, NTTable, PartialEq)]
 struct ScanResult {
     timestamp: Vec<f64>,
@@ -196,36 +278,65 @@ struct ScanResult {
 }
 
 #[test]
-fn typed_nt_table_descriptor_shape() {
+fn typed_nt_table_descriptor_is_full_nttable() {
     let d = ScanResult::descriptor();
-    match d {
-        FieldDesc::Structure { struct_id, fields } => {
+    match &d {
+        FieldDesc::Structure { struct_id, .. } => {
             assert_eq!(struct_id, "epics:nt/NTTable:1.0");
-            assert_eq!(fields.len(), 2);
-            assert_eq!(fields[0].0, "labels");
-            assert!(matches!(
-                fields[0].1,
-                FieldDesc::ScalarArray(ScalarType::String)
-            ));
-            assert_eq!(fields[1].0, "value");
-            match &fields[1].1 {
-                FieldDesc::Structure { fields: cols, .. } => {
-                    assert_eq!(cols.len(), 3);
-                    assert_eq!(cols[0].0, "timestamp");
-                    assert_eq!(cols[1].0, "position");
-                    assert_eq!(cols[2].0, "intensity");
-                    for (_, col_desc) in cols {
-                        assert!(matches!(
-                            col_desc,
-                            FieldDesc::ScalarArray(ScalarType::Double)
-                        ));
-                    }
-                }
-                other => panic!("unexpected value descriptor: {other:?}"),
-            }
         }
         other => panic!("unexpected NTTable descriptor: {other:?}"),
     }
+    // pvxs order: labels, value, descriptor, alarm, timeStamp.
+    assert_eq!(
+        member_names(&d),
+        vec!["labels", "value", "descriptor", "alarm", "timeStamp"]
+    );
+    assert!(matches!(
+        member(&d, "labels"),
+        FieldDesc::ScalarArray(ScalarType::String)
+    ));
+    assert!(matches!(
+        member(&d, "descriptor"),
+        FieldDesc::Scalar(ScalarType::String)
+    ));
+    assert_eq!(member(&d, "alarm"), &meta::alarm_desc());
+    assert_eq!(member(&d, "timeStamp"), &meta::time_desc());
+    // The column sub-structure is unchanged.
+    match member(&d, "value") {
+        FieldDesc::Structure { fields: cols, .. } => {
+            assert_eq!(cols.len(), 3);
+            assert_eq!(cols[0].0, "timestamp");
+            assert_eq!(cols[1].0, "position");
+            assert_eq!(cols[2].0, "intensity");
+            for (_, col_desc) in cols {
+                assert!(matches!(
+                    col_desc,
+                    FieldDesc::ScalarArray(ScalarType::Double)
+                ));
+            }
+        }
+        other => panic!("unexpected value descriptor: {other:?}"),
+    }
+}
+
+#[test]
+fn typed_nt_table_value_carries_mandatory_metadata() {
+    let scan = ScanResult {
+        timestamp: vec![1.0, 2.0, 3.0],
+        position: vec![10.0, 20.0, 30.0],
+        intensity: vec![0.1, 0.2, 0.3],
+    };
+    let f = scan.to_pv_field();
+    let epics_pva_rs::pvdata::PvField::Structure(s) = &f else {
+        panic!("expected structure value, got {f:?}");
+    };
+    let names: Vec<&str> = s.fields.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["labels", "value", "descriptor", "alarm", "timeStamp"]
+    );
+    assert_eq!(s.get_field("alarm"), Some(&meta::alarm_default()));
+    assert_eq!(s.get_field("timeStamp"), Some(&meta::time_default()));
 }
 
 #[test]

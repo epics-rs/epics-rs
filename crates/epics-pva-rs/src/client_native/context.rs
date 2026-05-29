@@ -1711,11 +1711,9 @@ pub struct ConnectBuilder<'a> {
     /// Per-call forced server pinning. Mirrors pvxs
     /// `ConnectBuilder::server(s)` (client.h:952).
     server: Option<SocketAddr>,
-    /// pvxs `syncCancel(bool)` (client.h:950) — when true, drop on the
-    /// returned handle blocks until the watcher task exits; when
-    /// false, drop just signals and returns. Currently advisory: our
-    /// watcher always tears down within one tick, so the difference
-    /// is bounded.
+    /// pvxs `syncCancel(bool)` (client.h:950). Selects the teardown the
+    /// returned [`ConnectHandle`] performs on `Drop` — see
+    /// [`ConnectHandle`] for the exact async-Rust mapping.
     sync_cancel: bool,
 }
 
@@ -1768,6 +1766,7 @@ impl<'a> ConnectBuilder<'a> {
     /// `connect()` is a self-contained connection primitive instead of
     /// depending on some other operation to resolve the same channel.
     pub async fn exec(self) -> PvaResult<ConnectHandle> {
+        let sync_cancel = self.sync_cancel;
         let ch = match self.server {
             Some(addr) => {
                 self.client
@@ -1877,22 +1876,45 @@ impl<'a> ConnectBuilder<'a> {
         Ok(ConnectHandle {
             cancel,
             task: Some(task),
+            sync_cancel,
         })
     }
 }
 
 /// Handle returned by [`ConnectBuilder::exec`]. Drop to stop the
 /// watcher task; the channel itself is unaffected.
+///
+/// pvxs `~Connect()` runs `loop.tryInvoke(syncCancel, ...)`
+/// (client.cpp:255-267): with `syncCancel(true)` (the pvxs default) the
+/// destructor blocks until the worker has removed the connector and any
+/// in-progress callback boundary has completed; with `syncCancel(false)`
+/// it signals and returns. Async Rust cannot block in `Drop` (no `.await`),
+/// so the modes map as follows:
+///
+/// - `sync_cancel(false)` (async): `Drop` cancels and **detaches** the
+///   watcher. The task observes the cancel token at its next `select!` and
+///   exits cleanly on its own — "signal and return", matching pvxs's
+///   non-blocking mode.
+/// - `sync_cancel(true)` (sync): `Drop` cancels and **aborts** the watcher
+///   for a prompt stop, the closest non-blocking approximation of "no
+///   further callbacks after teardown" (our callbacks are synchronous
+///   `Fn()` invoked between `await` points, so an abort cannot tear one
+///   apart mid-call). For a guaranteed await-for-completion boundary, call
+///   [`ConnectHandle::wait`] instead of relying on `Drop`.
 pub struct ConnectHandle {
     cancel: tokio_util::sync::CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// Teardown mode selected by [`ConnectBuilder::sync_cancel`]; consulted
+    /// only by `Drop` (an explicit `wait()` is always synchronous).
+    sync_cancel: bool,
 }
 
 impl ConnectHandle {
-    /// Wait for the watcher task to terminate. Use after dropping
-    /// callbacks to ensure no further events fire — pvxs
+    /// Cancel the watcher and await its termination. This is the
+    /// guaranteed-synchronous teardown — after it returns, the task has
+    /// fully stopped and no further callbacks can fire (pvxs
     /// `syncCancel(true)` semantics, exposed explicitly so the caller
-    /// can decide when to await.
+    /// chooses when to await). Independent of the builder flag.
     pub async fn wait(mut self) {
         if let Some(t) = self.task.take() {
             self.cancel.cancel();
@@ -1903,9 +1925,16 @@ impl ConnectHandle {
 
 impl Drop for ConnectHandle {
     fn drop(&mut self) {
+        // Single teardown owner: always cancel, then either abort (sync
+        // mode — prompt stop) or detach (async mode — let the task wind
+        // down at its next select). See the type docs for the pvxs mapping.
         self.cancel.cancel();
         if let Some(t) = self.task.take() {
-            t.abort();
+            if self.sync_cancel {
+                t.abort();
+            }
+            // async mode: drop `t` here, detaching the still-running task;
+            // the cancel above guarantees it exits at its next select.
         }
     }
 }
@@ -2084,5 +2113,108 @@ mod tests {
         .expect("initial on_disconnect must fire without a separate operation");
 
         drop(handle);
+    }
+
+    /// `sync_cancel` must actually select the `Drop` teardown path. Built
+    /// directly so the test is deterministic and does not depend on a live
+    /// server: async mode detaches (the task observes the cancel token and
+    /// runs to completion), sync mode aborts (the task is cancelled before
+    /// its pending work finishes).
+    #[tokio::test]
+    async fn pva_rs_49_drop_async_detaches_sync_aborts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        // Async mode: Drop cancels + detaches. The task awaits the cancel
+        // token, then finishes its graceful wind-down and sets the flag.
+        let cancel = CancellationToken::new();
+        let reached_end = Arc::new(AtomicBool::new(false));
+        let handle = ConnectHandle {
+            cancel: cancel.clone(),
+            task: Some(tokio::spawn({
+                let flag = reached_end.clone();
+                let c = cancel.clone();
+                async move {
+                    c.cancelled().await;
+                    tokio::task::yield_now().await;
+                    flag.store(true, Ordering::SeqCst);
+                }
+            })),
+            sync_cancel: false,
+        };
+        drop(handle);
+        let mut detached_finished = false;
+        for _ in 0..100 {
+            if reached_end.load(Ordering::SeqCst) {
+                detached_finished = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            detached_finished,
+            "async sync_cancel(false) Drop must detach and let the task wind down gracefully"
+        );
+
+        // Sync mode: Drop cancels + aborts. The task's pending work (a long
+        // sleep) is cancelled at the await point before it can set the flag.
+        let cancel2 = CancellationToken::new();
+        let did_complete = Arc::new(AtomicBool::new(false));
+        let handle2 = ConnectHandle {
+            cancel: cancel2.clone(),
+            task: Some(tokio::spawn({
+                let flag = did_complete.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    flag.store(true, Ordering::SeqCst);
+                }
+            })),
+            sync_cancel: true,
+        };
+        drop(handle2);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !did_complete.load(Ordering::SeqCst),
+            "sync sync_cancel(true) Drop must abort the task before its pending work completes"
+        );
+    }
+
+    /// `wait()` is the guaranteed-synchronous teardown regardless of the
+    /// builder flag: after it returns the watcher task has stopped and no
+    /// further callbacks fire. Exercised against an unreachable forced
+    /// server so the watcher only fires its initial `on_disconnect`.
+    #[tokio::test]
+    async fn pva_rs_49_wait_is_synchronous_teardown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap(); // nothing listens
+        let client = PvaClient::builder()
+            .server_addr(addr)
+            .timeout(Duration::from_secs(3))
+            .build();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let handle = client
+            .connect("dut")
+            .server(addr)
+            .sync_cancel(true)
+            .on_disconnect(move || {
+                c2.fetch_add(1, Ordering::Relaxed);
+            })
+            .exec()
+            .await
+            .expect("exec");
+
+        tokio::time::timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("wait() must terminate synchronously, not hang");
+
+        let after = calls.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            after,
+            "no callbacks may fire after a synchronous wait() teardown"
+        );
     }
 }

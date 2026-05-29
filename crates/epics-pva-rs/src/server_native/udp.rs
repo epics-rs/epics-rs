@@ -465,21 +465,29 @@ pub async fn run_udp_responder_with_config(
                     continue;
                 }
                 let raw = &lo_buf[..n];
-                // Peel the CMD_ORIGIN_TAG prefix; if it isn't one,
-                // pvxs `udp_collector.cpp:402-405` allows processing
-                // an unprefixed forward from peers that don't
-                // implement ORIGIN_TAG. We're stricter for now: drop
-                // the packet rather than risk reply amplification on
-                // unprefixed mcast.
-                let Some((peeled_dest, inner)) = PvaCodec::try_peel_origin_tag(raw) else {
-                    debug!("loopback mcast missing/invalid ORIGIN_TAG prefix; dropping");
-                    continue;
+                // Peel the CMD_ORIGIN_TAG prefix. When present we know the
+                // peeled destination NIC and process as FromOriginTag.
+                // When ABSENT, pvxs (`udp_collector.cpp:401-404`) still
+                // processes the SEARCH: some PVA implementations forward
+                // unicast SEARCHes to `224.0.0.128` without adding the
+                // tag. Mirror that — process the raw packet as a
+                // `Forwarded` origin (no peeled NIC, so reply routing is
+                // left to the OS via the UNSPECIFIED sentinel). The
+                // `Forwarded`/`FromOriginTag` rules forbid re-forwarding
+                // (anti-loop) and reject `isAny()` reply addresses, so
+                // there is no amplification risk.
+                let (inner, reply_iface_ip, origin) = match PvaCodec::try_peel_origin_tag(raw) {
+                    // peeled_dest = None means the forwarder set 0.0.0.0
+                    // (no NIC info). Use UNSPECIFIED as a sentinel — the
+                    // reply path checks for it and skips the per-NIC pin,
+                    // letting OS routing pick a source NIC.
+                    Some((peeled_dest, inner)) => (
+                        inner,
+                        peeled_dest.unwrap_or(Ipv4Addr::UNSPECIFIED),
+                        Origin::FromOriginTag,
+                    ),
+                    None => (raw, Ipv4Addr::UNSPECIFIED, Origin::Forwarded),
                 };
-                // peeled_dest = None means the forwarder set 0.0.0.0
-                // (no NIC info). Use UNSPECIFIED as a sentinel — the
-                // reply path checks for it and skips the per-NIC pin,
-                // letting OS routing pick a source NIC.
-                let reply_iface_ip = peeled_dest.unwrap_or(Ipv4Addr::UNSPECIFIED);
                 process_search_datagram(
                     &source,
                     &socket,
@@ -488,7 +496,7 @@ pub async fn run_udp_responder_with_config(
                     inner,
                     src,
                     reply_iface_ip,
-                    Origin::FromOriginTag,
+                    origin,
                     tcp_port,
                     guid,
                     protocol,
@@ -672,9 +680,17 @@ async fn process_search_datagram(
                 let reply_dest = match req.reply_addr {
                     Some(ip) => SocketAddr::V4(std::net::SocketAddrV4::new(ip, req.reply_port)),
                     None => {
-                        if origin == Origin::FromOriginTag {
+                        // Any forwarded origin (tagged ORIGIN_TAG or
+                        // untagged local forward) cannot reply to the
+                        // sender: the UDP source is the forwarder, not the
+                        // original requester. pvxs drops these
+                        // (`udp_collector.cpp:367-371`,
+                        // "Forwarded SEARCH with reply to sender never
+                        // works"). Only `Origin::Direct` keeps the UDP
+                        // source as the reply target.
+                        if origin != Origin::Direct {
                             debug!(
-                                "ORIGIN_TAG SEARCH announced isAny() reply addr; dropping per pvxs"
+                                "forwarded SEARCH announced isAny() reply addr; dropping per pvxs"
                             );
                             return;
                         }
@@ -1069,10 +1085,19 @@ pub(crate) struct SearchRequest {
 ///   destination. Do NOT re-forward (anti-loop) and reject SEARCHes
 ///   with `server.isAny()` per pvxs `udp_collector.cpp:367-371`
 ///   ("Forwarded SEARCH with reply to sender never works").
+/// - [`Origin::Forwarded`]: arrived on the loopback mcast socket
+///   WITHOUT a CMD_ORIGIN_TAG prefix. pvxs tolerates these because some
+///   PVA implementations forward unicast SEARCHes to `224.0.0.128`
+///   without adding the tag (`udp_collector.cpp:401-404`), and still
+///   parses/matches the SEARCH (`udp_collector.cpp:385-407`). Same
+///   processing rules as `FromOriginTag`: do NOT re-forward (anti-loop)
+///   and reject `server.isAny()` reply addresses. There is no peeled
+///   destination, so the reply NIC is left to OS routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
     Direct,
     FromOriginTag,
+    Forwarded,
 }
 
 pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
@@ -1474,6 +1499,118 @@ mod tests {
         assert!(
             r.is_err(),
             "isAny() reply addr on FromOriginTag must drop SEARCH; got {r:?}"
+        );
+    }
+
+    /// An UNPREFIXED forwarded SEARCH on the loopback mcast path
+    /// (`Origin::Forwarded`) MUST still be processed — pvxs tolerates
+    /// peers that forward without CMD_ORIGIN_TAG
+    /// (`udp_collector.cpp:401-404`) and parses/matches the SEARCH
+    /// (`:385-407`). With a concrete (non-isAny) reply address a hosted
+    /// PV gets a SEARCH_RESPONSE, and the packet is NOT re-forwarded
+    /// (anti-loop: only `Origin::Direct` re-forwards).
+    #[tokio::test]
+    async fn forwarded_origin_unprefixed_search_is_answered_without_reforward() {
+        use crate::pvdata::{FieldDesc, PvField, ScalarType};
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        struct PresentSource;
+        #[allow(clippy::manual_async_fn)]
+        impl ChannelSource for PresentSource {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { vec!["MY:PV".into()] }
+            }
+            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == "MY:PV";
+                async move { m }
+            }
+            fn get_introspection(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { Some(FieldDesc::Scalar(ScalarType::Double)) }
+            }
+            fn get_value(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _name: &str,
+                _value: PvField,
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+                async { Err("read-only".into()) }
+            }
+            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let source: DynSource = Arc::new(PresentSource);
+        let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        let lo_mcast = Arc::new(bind_loopback_mcast(0).expect("lo_mcast bind"));
+        let port = lo_mcast.local_addr().unwrap().port();
+        // Observer joined to the forward group would catch any re-forward.
+        let observer = bind_loopback_mcast(port).expect("observer bind");
+        // Requester socket — the concrete reply destination.
+        let requester = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("requester bind");
+        let requester_addr = requester.local_addr().unwrap();
+
+        // Unprefixed SEARCH for "MY:PV" with a concrete reply addr/port.
+        let codec = PvaCodec { big_endian: false };
+        let frame =
+            codec.build_search(7, 42, "MY:PV", [127, 0, 0, 1], requester_addr.port(), false);
+
+        process_search_datagram(
+            &source,
+            &socket,
+            Some(&lo_mcast),
+            port,
+            &frame,
+            // simulated forwarder as the UDP source (not the requester)
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30000)),
+            Ipv4Addr::UNSPECIFIED,
+            Origin::Forwarded,
+            5076,
+            [0u8; 12],
+            "tcp",
+        )
+        .await;
+
+        // The requester MUST receive a SEARCH_RESPONSE.
+        let mut buf = [0u8; 4096];
+        let got = tokio::time::timeout(Duration::from_millis(500), requester.recv_from(&mut buf))
+            .await
+            .expect("requester must receive a SEARCH_RESPONSE for the forwarded SEARCH")
+            .expect("recv ok");
+        let resp = PvaHeader::decode(&mut Cursor::new(&buf[..got.0])).expect("decode header");
+        assert_eq!(
+            resp.command,
+            Command::SearchResponse.code(),
+            "reply to a forwarded SEARCH must be a SEARCH_RESPONSE"
+        );
+
+        // The observer MUST NOT see a re-forward (anti-loop).
+        let mut obuf = [0u8; 4096];
+        let reforward =
+            tokio::time::timeout(Duration::from_millis(150), observer.recv_from(&mut obuf)).await;
+        assert!(
+            reforward.is_err(),
+            "Forwarded origin must NOT re-forward, but observer got {reforward:?}"
         );
     }
 

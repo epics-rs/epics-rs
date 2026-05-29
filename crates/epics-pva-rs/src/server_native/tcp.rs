@@ -5147,8 +5147,11 @@ async fn handle_op(
             //     (`servermon.cpp:671-683`). So START is `0x44` and STOP
             //     is `0x04`; the `0x40` bit alone, without `0x04`, is
             //     NOT a start.
-            //   * DESTROY (`0x10`): handled by the dedicated
-            //     DESTROY_REQUEST path in this server.
+            //   * DESTROY (`0x10`): tear the op down, equivalent to the
+            //     dedicated DESTROY_REQUEST command. pvxs accepts destroy
+            //     in any non-INIT MONITOR message (`servermon.cpp:640-642`,
+            //     :691-708) — handled below, after ack/start so a combined
+            //     frame starts-then-destroys in pvxs order.
             // A frame carrying none of these bits (notably plain `0x00`)
             // performs no stream-control action — pvxs leaves the monitor
             // Idle. Gating the task spawn and the onStart edge on a real
@@ -5159,6 +5162,7 @@ async fn handle_op(
             let is_start_stop = subcmd & 0x04 != 0;
             let is_start = is_start_stop && (subcmd & 0x40 != 0);
             let is_stop = is_start_stop && (subcmd & 0x40 == 0);
+            let is_destroy = subcmd & 0x10 != 0;
             if let Some(op) = ch.ops.get(&ioid) {
                 if is_stop {
                     op.monitor_paused
@@ -6115,6 +6119,19 @@ async fn handle_op(
                     // the control.
                     start_ctl.set(true);
                 }
+            }
+            // pvxs `servermon.cpp:691-708`: the destroy bit (`0x10`) on any
+            // non-INIT MONITOR frame frees the op exactly like the dedicated
+            // DESTROY_REQUEST command — pvAccessCPP "will accept destroy in
+            // any !INIT message". Removing the op from `ch.ops` drops its
+            // `monitor_abort` (aborting the subscriber task once the last
+            // clone falls) and `monitor_start_ctl` (firing the gateway's
+            // pause vote withdraw); no reply is emitted. Checked after
+            // ack/start so a combined frame starts-then-destroys, and the
+            // IOID is now free for a fresh INIT (the duplicate-live-op guard
+            // no longer trips).
+            if is_destroy {
+                ch.ops.remove(&ioid);
             }
         }
         OpKind::Rpc => {

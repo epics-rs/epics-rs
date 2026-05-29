@@ -1405,6 +1405,124 @@ async fn create_channel_missing_pv_refused_fatal() {
     h.abort();
 }
 
+/// pvxs `servermon.cpp:691-708` parity: the MONITOR command's destroy bit
+/// (`subcmd & 0x10`) tears the op down in any non-INIT MONITOR frame, the
+/// same as the dedicated `DESTROY_REQUEST` command. Before the fix the
+/// data-phase MONITOR branch had no `0x10` handler, so the op stayed live
+/// and a later INIT reusing the same IOID was rejected as a duplicate
+/// (connection-fatal, tcp.rs:4396-4399). This drives MONITOR INIT → START
+/// → `0x10` and asserts the IOID is re-INITable afterward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitor_command_destroy_subcmd_frees_op_for_reinit() {
+    use std::io::Write;
+
+    use epics_pva_rs::codec::{CMD_CREATE_CHANNEL, CMD_MONITOR, PvaCodec};
+    use epics_pva_rs::proto::encode_string_into;
+    use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, ReadExt, Status, WriteExt};
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("MON:DESTROY:PV", 1.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+
+    let mut sock = read_handshake_prelude(server_addr);
+    let order = ByteOrder::Little;
+
+    // CONNECTION_VALIDATION (anonymous).
+    let mut payload: Vec<u8> = Vec::new();
+    payload.put_u32(0x10000, order);
+    payload.put_u16(32_767, order);
+    payload.put_u16(0, order);
+    encode_string_into("anonymous", order, &mut payload);
+    payload.put_u8(0xFF);
+    let hv = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut req = Vec::new();
+    hv.write_into(&mut req);
+    req.extend_from_slice(&payload);
+    sock.write_all(&req).unwrap();
+    let mut reader = FrameReader::new();
+    let _validated = reader.read(&mut sock);
+
+    // CREATE_CHANNEL for the hosted PV → sid.
+    let mut body = Vec::new();
+    body.put_u16(1, order);
+    body.put_u32(303, order);
+    encode_string_into("MON:DESTROY:PV", order, &mut body);
+    let hc = PvaHeader::application(false, order, CMD_CREATE_CHANNEL, body.len() as u32);
+    let mut frame_bytes = Vec::new();
+    hc.write_into(&mut frame_bytes);
+    frame_bytes.extend_from_slice(&body);
+    sock.write_all(&frame_bytes).unwrap();
+    let resp = reader.read(&mut sock);
+    assert_eq!(resp.header.command, CMD_CREATE_CHANNEL);
+    let mut cur = resp.cursor();
+    let _cid = cur.get_u32(order).unwrap();
+    let sid = cur.get_u32(order).unwrap();
+    assert_ne!(sid, u32::MAX, "channel for a hosted PV must resolve");
+
+    let codec = PvaCodec { big_endian: false };
+    let pv_req = epics_pva_rs::pv_request::build_pv_request_value_only(false);
+    let ioid = 77u32;
+
+    // Read a MONITOR INIT reply (`ioid + subcmd + Status`) and assert it is
+    // a successful INIT echoing the 0x08 INIT subcmd.
+    fn assert_init_ok(
+        reader: &mut FrameReader,
+        sock: &mut std::net::TcpStream,
+        order: ByteOrder,
+        ioid: u32,
+    ) {
+        let f = reader.read(sock);
+        assert_eq!(
+            f.header.command, CMD_MONITOR,
+            "expected a MONITOR INIT reply"
+        );
+        let mut c = f.cursor();
+        assert_eq!(c.get_u32(order).unwrap(), ioid);
+        let sub = c.get_u8().unwrap();
+        assert!(
+            sub & 0x08 != 0,
+            "INIT reply must echo subcmd 0x08, got {sub:#x}"
+        );
+        let st = Status::decode(&mut c, order).unwrap();
+        assert!(st.is_success(), "MONITOR INIT must succeed, got {st:?}");
+    }
+
+    // 1. MONITOR INIT.
+    sock.write_all(&codec.build_monitor_init(sid, ioid, &pv_req, None))
+        .unwrap();
+    assert_init_ok(&mut reader, &mut sock, order, ioid);
+
+    // 2. MONITOR START → drain the initial data frame (exercises teardown
+    //    of a *started* subscriber, not just an idle INIT'd op).
+    sock.write_all(&codec.build_monitor_start(sid, ioid))
+        .unwrap();
+    let data = reader.read(&mut sock);
+    assert_eq!(
+        data.header.command, CMD_MONITOR,
+        "START should yield the initial MONITOR data frame"
+    );
+
+    // 3. Destroy via the MONITOR command's 0x10 bit (no reply expected).
+    sock.write_all(&codec.build_monitor_destroy(sid, ioid))
+        .unwrap();
+
+    // 4. Re-INIT the SAME IOID. Without the 0x10 handler this is a
+    //    duplicate-live-op fault that tears the connection down; with it,
+    //    the IOID is free and the fresh INIT succeeds.
+    sock.write_all(&codec.build_monitor_init(sid, ioid, &pv_req, None))
+        .unwrap();
+    assert_init_ok(&mut reader, &mut sock, order, ioid);
+
+    h.abort();
+}
+
 /// Connect to a freshly started PVA server and drain the server's
 /// SET_BYTE_ORDER + CONNECTION_VALIDATION prologue. Polls for up to
 /// one second so the per-thread spawn race doesn't surface as a

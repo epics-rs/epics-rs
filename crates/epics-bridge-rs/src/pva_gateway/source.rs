@@ -1005,7 +1005,23 @@ impl ChannelSource for GatewayChannelSource {
     }
 
     async fn list_pvs(&self) -> Vec<String> {
-        self.cache.names().await
+        // pva2pva's `GWServerChannelProvider` overrides only `channelFind`
+        // and `createChannel`, NOT `channelList` (p2pApp/server.h:9-31), so
+        // the base `ChannelProvider::channelList` returns
+        // `Status::error("not implemented")` with an empty name array
+        // (pvAccess ChannelAccessFactory.cpp:249-258); a gateway's built-in
+        // `server` `op=channels` is therefore not a PV inventory. Returning
+        // the proxied cache keys here masqueraded as that inventory — a
+        // partial, lazily-populated, possibly-stale snapshot of upstream PVs
+        // (never-touched PVs absent, disconnected entries lingering) that
+        // pva2pva never exposes. Return empty to match: the gateway proxies
+        // channels, it does not own a channel list.
+        //
+        // The operator cache dump is still available, but through a separate
+        // diagnostic surface that does not claim to be `channelList`: the
+        // `<prefix>:report` control RPC (`ControlSource::build_report` →
+        // `cache_status`), with per-channel connected/subscriber detail.
+        Vec::new()
     }
 
     async fn has_pv(&self, name: &str) -> bool {
@@ -1577,6 +1593,27 @@ mod tests {
         // Flush clears the remaining shared entry too.
         assert_eq!(src.flush_all_caches().await, 1);
         assert_eq!(src.total_cached_entry_count().await, 0);
+    }
+
+    /// pva2pva exposes no `channelList`, so a gateway's `server`
+    /// `op=channels` must not be a PV inventory. `list_pvs()` must return
+    /// empty even when the cache holds proxied upstream PVs — those names
+    /// are visible only through the `<prefix>:report` diagnostic, not as
+    /// channel inventory.
+    #[tokio::test]
+    async fn list_pvs_does_not_expose_cached_upstream_pvs() {
+        let src = make_source();
+        src.cache.insert_test_entry("UPSTREAM:PV").await;
+        // The entry really is cached (so the empty list_pvs is a
+        // deliberate hide, not an empty cache).
+        assert!(
+            src.cache.names().await.contains(&"UPSTREAM:PV".to_string()),
+            "test entry must be present in the cache"
+        );
+        assert!(
+            src.list_pvs().await.is_empty(),
+            "gateway list_pvs must not masquerade the cache as channelList (pva2pva parity)"
+        );
     }
 
     /// the gateway source MUST expose pipeline-window

@@ -430,8 +430,9 @@ pub struct CaServer {
     /// connection re-evaluates and re-pushes `CA_PROTO_ACCESS_RIGHTS`
     /// for its open channels. Mirrors RSRV `sendAllUpdateAS`
     /// (caservertask.c:1224) — the broadcast that keeps already-open
-    /// channels in sync with rule changes.
-    // no public `notify_access_change` method to fire this broadcast
+    /// channels in sync with rule changes. Fired by `reload_acf*()`
+    /// after a config swap and by [`Self::notify_access_change`] for
+    /// programmatic access-state changes the server cannot detect.
     acf_reload_tx: tokio::sync::broadcast::Sender<()>,
     autosave_config: Option<autosave::SaveSetConfig>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,

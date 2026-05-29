@@ -1398,6 +1398,61 @@ async fn maybe_poke(
     true
 }
 
+/// Build the deduplicated UDP SEARCH destination list for one broadcast
+/// tick.
+///
+/// pvxs sends SEARCH only to the effective address list: the configured
+/// `addressList` (here `extra_targets`, parsed and DNS-resolved once at
+/// `SearchEngine::spawn`) plus auto-added broadcast destinations ONLY when
+/// `EPICS_PVA_AUTO_ADDR_LIST` is enabled. pvxs skips `expandAddrList()`
+/// entirely when `autoAddrList` is false (config.cpp:624-643) and sends
+/// only to `effective.addressList` (client.cpp:601-619) — there is NO
+/// unconditional `255.255.255.255` fallback. So with `AUTO_ADDR_LIST=NO`
+/// and an empty address list this returns an EMPTY list and no SEARCH is
+/// emitted, instead of leaking limited-broadcast traffic onto a LAN the
+/// operator intentionally restricted.
+fn search_targets(
+    bport: u16,
+    auto_addr_list: bool,
+    extra_targets: &[SocketAddr],
+) -> Vec<SocketAddr> {
+    let mut targets: Vec<SocketAddr> = Vec::with_capacity(8);
+
+    // Auto-expansion destinations — gated on AUTO_ADDR_LIST, matching
+    // pvxs's `expandAddrList()` which only runs when autoAddrList is true.
+    if auto_addr_list {
+        // Limited broadcast. pvxs uses per-interface directed broadcasts;
+        // the 255.255.255.255 + per-NIC fanout below is the Rust
+        // cross-NIC equivalent. On multi-NIC hosts (and macOS) the kernel
+        // may not translate 255.255.255.255 to every NIC's per-subnet
+        // broadcast, so we also enumerate each up-non-loopback NIC's IPv4
+        // broadcast address (otherwise local IOCs on `192.168.X.255:5076`
+        // are never reached).
+        targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), bport));
+        for sa in crate::config::env::list_broadcast_addresses(bport) {
+            // The helper appends 255.255.255.255 too — the dedup below
+            // collapses the duplicate.
+            targets.push(sa);
+        }
+        // Zero-config local-IOC convenience: also unicast to 127.0.0.1.
+        // pvxs/EPICS rely on the local IOC also binding the NIC broadcast
+        // addr, which breaks on hosts whose only interface is loopback
+        // (CI containers, isolated VMs). One extra datagram per burst.
+        targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bport));
+    }
+
+    // Explicitly configured / programmatic targets are always sent — they
+    // are the `addressList` itself, present regardless of autoAddrList.
+    for &t in extra_targets {
+        targets.push(t);
+    }
+
+    // Dedup while preserving insertion order.
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|t| seen.insert(*t));
+    targets
+}
+
 async fn broadcast(
     socket: &AsyncUdpV4,
     socket_v6: Option<&Arc<UdpSocket>>,
@@ -1405,56 +1460,15 @@ async fn broadcast(
     extra_targets: &[SocketAddr],
     send_errs: &mut HashSet<SocketAddr>,
 ) {
-    let mut targets: Vec<SocketAddr> = Vec::with_capacity(8);
-
-    // Limited broadcast to default UDP port.
     let bport = std::env::var("EPICS_PVA_BROADCAST_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(DEFAULT_BROADCAST_PORT);
-    targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), bport));
-
-    // pvxs `clientconfig.cpp::expand` parity: when EPICS_PVA_AUTO_ADDR_LIST
-    // is YES (the default), enumerate every up-non-loopback NIC's IPv4
-    // broadcast address and add it to the search target list. Without
-    // this, on multi-NIC hosts (and macOS in particular) we send only
-    // to 255.255.255.255 — which the kernel may not translate to the
-    // NIC's per-subnet broadcast in all cases, so SEARCHes never reach
-    // local IOCs that happen to be listening on `192.168.X.255:5076`.
-    // Symptom: `pvget-rs <PV>` against a local pva-rs server hangs
-    // until first SEARCH timeout while pvxs `pvget` connects fine.
-    if crate::config::env::auto_addr_list_enabled() {
-        for sa in crate::config::env::list_broadcast_addresses(bport) {
-            // The helper appends 255.255.255.255 as a fallback — we
-            // already pushed it above; the post-loop dedup catches it.
-            targets.push(sa);
-        }
-        // Defensive deviation from pvxs: also add `127.0.0.1:port`
-        // explicitly. pvxs and EPICS convention rely on the local IOC
-        // also binding the NIC broadcast addr (so a NIC-broadcast
-        // SEARCH reaches it via `192.168.X.255`). That breaks down on
-        // hosts with no usable NIC (CI containers, isolated dev VMs,
-        // build sandboxes — anywhere `getifaddrs` returns only
-        // loopback). pvxs users hit this and have to set
-        // `EPICS_PVA_ADDR_LIST=127.0.0.1` by hand; we send the extra
-        // unicast unconditionally to make the zero-config local-IOC
-        // workflow work. Cost: one extra UDP datagram per SEARCH
-        // burst — negligible.
-        targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bport));
-    }
-
-    // EPICS_PVA_ADDR_LIST is parsed once at SearchEngine::spawn and
-    // merged into `extra_targets` (with DNS hostnames resolved). Per-
-    // tick re-reading is redundant and would re-pay the DNS cost on
-    // every SEARCH burst.
-    for &t in extra_targets {
-        targets.push(t);
-    }
-
-    // Dedup while preserving insertion order — limited broadcast wins
-    // its slot, NIC broadcasts/extras come after.
-    let mut seen = std::collections::HashSet::new();
-    targets.retain(|t| seen.insert(*t));
+    let targets = search_targets(
+        bport,
+        crate::config::env::auto_addr_list_enabled(),
+        extra_targets,
+    );
 
     for t in targets {
         // Limited broadcast (255.255.255.255) and multicast (224/4)
@@ -3355,6 +3369,53 @@ mod tests {
             resolved.ip(),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "resolved IP must be 127.0.0.1 (rewrite_loopback from unspecified)"
+        );
+    }
+
+    // ---- search_targets: AUTO_ADDR_LIST gating (pvxs expandAddrList) ----
+
+    /// AUTO_ADDR_LIST=NO with an empty configured address list must yield
+    /// NO destinations — pvxs skips expandAddrList and sends only to the
+    /// (empty) addressList, so no SEARCH is emitted at all. The pre-fix
+    /// code unconditionally pushed 255.255.255.255, leaking broadcast onto
+    /// a LAN the operator intentionally restricted.
+    #[test]
+    fn search_targets_empty_when_auto_off_and_no_extras() {
+        let targets = search_targets(5076, false, &[]);
+        assert!(
+            targets.is_empty(),
+            "AUTO_ADDR_LIST=NO + empty list must emit no broadcast; got {targets:?}"
+        );
+    }
+
+    /// AUTO_ADDR_LIST=NO sends only to the explicitly configured targets,
+    /// never the limited broadcast.
+    #[test]
+    fn search_targets_auto_off_sends_only_configured_extras() {
+        let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
+        let targets = search_targets(5076, false, &[extra]);
+        assert_eq!(targets, vec![extra]);
+        assert!(
+            !targets
+                .iter()
+                .any(|t| matches!(t, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
+            "no limited broadcast may be added when AUTO_ADDR_LIST is off"
+        );
+    }
+
+    /// AUTO_ADDR_LIST=YES (the default) still includes the limited
+    /// broadcast destination, and the configured extras are appended.
+    #[test]
+    fn search_targets_auto_on_includes_limited_broadcast_and_extras() {
+        let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
+        let targets = search_targets(5076, true, &[extra]);
+        assert!(
+            targets.contains(&SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 5076)),
+            "AUTO_ADDR_LIST=YES must add the limited broadcast destination"
+        );
+        assert!(
+            targets.contains(&extra),
+            "configured extras are always included"
         );
     }
 }

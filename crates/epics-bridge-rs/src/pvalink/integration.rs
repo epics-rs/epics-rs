@@ -341,7 +341,8 @@ impl PvaLinkResolver {
         // by *this* IOC. pvxs requires a local channel; here that
         // means the target must be hosted by this IOC under one of
         // three forms:
-        //   * a `PvDatabase` record,
+        //   * a `PvDatabase` record or one of its fields (channel-level,
+        //     like `dbChannelTest()` — see `is_local_in_db`),
         //   * a simple PV registered via `add_pv` (e.g. a QSRV
         //     single-record channel, an iocsh stats PV, a gateway
         //     shadow PV),
@@ -437,20 +438,53 @@ impl PvaLinkResolver {
             .spawn(run_notify_forwarder(key, rx, scan_targets, db));
     }
 
-    /// Whether `pv_name` is hosted by the attached `PvDatabase` as a
-    /// record or a simple `add_pv` PV. Both lookups use the
-    /// no-resolver path so the `local` check never triggers a remote
-    /// search. Returns `false` when no database is attached.
+    /// Whether `pv_name` names a channel hosted by the attached
+    /// `PvDatabase` — the bridge equivalent of EPICS `dbChannelTest()`.
+    ///
+    /// Locality is channel-level, not record-name-only: a `record.FIELD`
+    /// channel is local when the record exists (alias-aware) and the
+    /// field resolves, exactly as `dbChannelTest()` accepts `x`, `x.VAL`,
+    /// `x.NAME`, `x.INP` and rejects nonexistent records/fields
+    /// (`modules/database/test/ioc/db/dbChannelTest.c:173-181`). A
+    /// `{...}` channel-filter suffix and a trailing `$` long-string
+    /// modifier are stripped and ignored for the locality decision, and
+    /// an empty/trailing-dot field (`x.`, `x.{}`) resolves to the
+    /// default value field — matching the modifiers the same test allows
+    /// (`dbChannelTest.c:183-186`).
+    ///
+    /// All lookups are local-only (`find_pv`/`get_record` consult the
+    /// simple-PV, record, and alias maps; never a remote search), so the
+    /// `local` check never resolves off-IOC. Returns `false` when no
+    /// database is attached.
     async fn is_local_in_db(&self, pv_name: &str) -> bool {
+        use epics_base_rs::server::database::{filters::split_channel_name, parse_pv_name};
+
         // Clone the Option out and drop the RwLock guard before any
         // await — holding a parking_lot guard across an await point
         // can stall or deadlock the executor.
         let db = self.db.read().clone();
-        match db {
-            Some(db) => {
-                db.get_record_no_resolve(pv_name).await.is_some()
-                    || db.find_pv(pv_name).await.is_some()
-            }
+        let Some(db) = db else {
+            return false;
+        };
+
+        // Strip any `{...}` channel-filter / JSON suffix first; the
+        // remaining `record[.field]` is what decides locality.
+        let record_path = split_channel_name(pv_name).record_path;
+
+        // Exact simple `add_pv` PV (filter-stripped name).
+        if db.find_pv(&record_path).await.is_some() {
+            return true;
+        }
+
+        // `record[.field]`: the record must exist (alias-aware) and the
+        // field must resolve. `parse_pv_name` maps a bare record to its
+        // default `VAL` field; the same default applies after stripping
+        // a `$` long-string modifier or an empty/trailing-dot field.
+        let (base, field) = parse_pv_name(&record_path);
+        let field = field.strip_suffix('$').unwrap_or(field);
+        let field = if field.is_empty() { "VAL" } else { field };
+        match db.get_record(base).await {
+            Some(rec) => rec.read().await.resolve_field(field).is_some(),
             None => false,
         }
     }
@@ -2496,6 +2530,93 @@ mod tests {
             r.is_ok(),
             "local link to a simple add_pv PV must be accepted"
         );
+    }
+
+    /// B4 `local` (dbChannelTest parity): a `local=true` link to a
+    /// *field* of a local record is accepted — locality is channel-level,
+    /// not record-name-only. Mirrors EPICS `dbChannelTest()` accepting
+    /// `x`, `x.`, `x.VAL`, `x.NAME`, `x.INP`
+    /// (`modules/database/test/ioc/db/dbChannelTest.c:175-179`); pvxs
+    /// gates the option through that same channel parser
+    /// (`ioc/pvalink_lset.cpp:63-75`).
+    #[tokio::test]
+    async fn b4_local_link_accepts_record_field() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("REC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        for name in [
+            "pva://REC?local=true",      // bare record (dbChannelTest "x")
+            "pva://REC.?local=true",     // trailing dot → default field ("x.")
+            "pva://REC.VAL?local=true",  // value field
+            "pva://REC.NAME?local=true", // virtual field
+            "pva://REC.DESC?local=true", // common field
+            "pva://REC.INP?local=true",  // common link field
+        ] {
+            let r = resolver.open_link(name).await;
+            assert!(
+                r.is_ok(),
+                "local link {name} to a local record field must be accepted, got {:?}",
+                r.err()
+            );
+        }
+    }
+
+    /// B4 `local` (dbChannelTest parity): a `local=true` link to a
+    /// *nonexistent* field of a local record is rejected — the field
+    /// must resolve, matching `dbChannelTest("x.NOFIELD")` failing
+    /// (`dbChannelTest.c:181`). A field on a nonexistent record is
+    /// likewise rejected.
+    #[tokio::test]
+    async fn b4_local_link_rejects_nonexistent_field() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("REC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let bad_field = resolver.open_link("pva://REC.NOSUCH?local=true").await;
+        assert!(
+            matches!(bad_field, Err(PvaLinkError::NotLocal(_))),
+            "local link to a nonexistent field must be rejected, got {:?}",
+            bad_field.err()
+        );
+        let bad_record = resolver.open_link("pva://NOPE.VAL?local=true").await;
+        assert!(
+            matches!(bad_record, Err(PvaLinkError::NotLocal(_))),
+            "local link to a nonexistent record must be rejected, got {:?}",
+            bad_record.err()
+        );
+    }
+
+    /// B4 `local` (dbChannelTest parity): field modifiers are accepted
+    /// and ignored for the locality decision — a trailing `$` long-string
+    /// modifier, an empty `{}` filter, and a `{json:true}` filter all
+    /// still resolve the underlying record field. Mirrors
+    /// `dbChannelTest("x.NAME$")`, `dbChannelTest("x.{}")`,
+    /// `dbChannelTest("x.VAL{json:true}")` (`dbChannelTest.c:183-186`).
+    #[tokio::test]
+    async fn b4_local_link_accepts_field_modifiers() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("REC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        for name in [
+            "pva://REC.NAME$?local=true",          // CA long-string modifier
+            "pva://REC.{}?local=true",             // empty filter → default field
+            "pva://REC.VAL{json:true}?local=true", // JSON filter on a field
+        ] {
+            let r = resolver.open_link(name).await;
+            assert!(
+                r.is_ok(),
+                "local link {name} with a field modifier must be accepted, got {:?}",
+                r.err()
+            );
+        }
     }
 
     /// #2: a `local=true` pvalink to a QSRV group composite PV must

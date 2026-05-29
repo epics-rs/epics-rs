@@ -73,6 +73,40 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::cache::PvCache;
 
+/// Insert the C stat-PV namespace separator.
+///
+/// C ca-gateway builds every stat/control PV name as
+/// `sprintf("%s:%s", stat_prefix, name)` (`gateServer.cc:2097-2101`): the
+/// configured `-prefix` is the bare namespace and the `:` is inserted at
+/// publish time. Rust previously baked the separator into the prefix
+/// string, so `--stats-prefix gateway` produced `gatewayvctotal` instead
+/// of `gateway:vctotal`. Normalise once here (the single owner consumed by
+/// both [`Stats`] and the control-PV publisher) so the bare prefix
+/// contract is uniform. The empty string is the "stats disabled" sentinel
+/// and is returned unchanged.
+pub(crate) fn prefix_with_separator(bare: &str) -> String {
+    if bare.is_empty() {
+        String::new()
+    } else {
+        format!("{bare}:")
+    }
+}
+
+/// The default stats-PV prefix when none is supplied on the command line.
+///
+/// C ca-gateway defaults `-prefix` to the host name, falling back to
+/// `gateway` when the name is unavailable (`gateServer.cc:1877-1891`).
+/// Returned as the bare namespace; the `:` separator is added by
+/// [`prefix_with_separator`] at publish time.
+pub fn default_stats_prefix() -> String {
+    let host = epics_base_rs::runtime::env::hostname();
+    if host.is_empty() {
+        "gateway".to_string()
+    } else {
+        host
+    }
+}
+
 /// Gateway runtime statistics.
 pub struct Stats {
     prefix: String,
@@ -472,6 +506,28 @@ pub fn open_fd_count() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_separator_inserted_for_bare_prefix() {
+        // C builds names as "%s:%s" — a bare prefix gets one separator,
+        // so `--stats-prefix gateway` publishes `gateway:vctotal`, not
+        // `gatewayvctotal`.
+        assert_eq!(prefix_with_separator("gateway"), "gateway:");
+        // The empty (stats-disabled) sentinel is preserved verbatim.
+        assert_eq!(prefix_with_separator(""), "");
+        // C treats the prefix as bare and always appends `:`, so a prefix
+        // that already ends in `:` doubles — callers pass the bare name.
+        assert_eq!(prefix_with_separator("gw:"), "gw::");
+    }
+
+    #[test]
+    fn default_stats_prefix_is_non_empty_bare_namespace() {
+        // Defaults to the host name (fallback `gateway`); never empty (an
+        // empty prefix is the disable sentinel) and never pre-separated.
+        let p = default_stats_prefix();
+        assert!(!p.is_empty());
+        assert!(!p.ends_with(':'));
+    }
 
     #[test]
     fn counters_increment() {

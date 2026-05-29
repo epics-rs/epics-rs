@@ -72,7 +72,11 @@ pub struct GatewayConfig {
     pub server_port: u16,
     /// Cache timeouts.
     pub timeouts: CacheTimeouts,
-    /// Statistics PV prefix (e.g. `"gateway:"`). Empty disables stats PVs.
+    /// Statistics PV namespace, the bare C `-prefix` string (e.g.
+    /// `"gateway"` or a host name). The `:` separator is inserted at
+    /// publish time, so PVs appear as `<prefix>:<name>` — matching C
+    /// `sprintf("%s:%s", stat_prefix, name)` (`gateServer.cc:2097`). Do NOT
+    /// include a trailing `:`. Empty disables stats (and control) PVs.
     pub stats_prefix: String,
     /// Cleanup sweep interval.
     pub cleanup_interval: Duration,
@@ -117,7 +121,8 @@ impl Default for GatewayConfig {
             preload_path: None,
             server_port: 0,
             timeouts: CacheTimeouts::default(),
-            stats_prefix: "gateway:".to_string(),
+            // Bare C `-prefix`; the `:` separator is inserted at publish.
+            stats_prefix: "gateway".to_string(),
             cleanup_interval: Duration::from_secs(10),
             stats_interval: Duration::from_secs(10),
             heartbeat_interval: Some(Duration::from_secs(1)),
@@ -278,9 +283,16 @@ impl GatewayServer {
         let cache = Arc::new(RwLock::new(PvCache::new()));
         let shadow_db = Arc::new(PvDatabase::new());
 
+        // Normalise the stats namespace once: `config.stats_prefix` is the
+        // bare C `-prefix`, and the `:` separator is inserted at publish
+        // (C `sprintf("%s:%s", stat_prefix, name)`, gateServer.cc:2097).
+        // The single normalised value feeds BOTH the stats PVs and the
+        // control PVs so they cannot diverge. Empty stays empty (disabled).
+        let stats_prefix = super::stats::prefix_with_separator(&config.stats_prefix);
+
         // Stats — needed before UpstreamManager so per-PV WriteHook
         // closures can capture the same Arc.
-        let stats = Arc::new(Stats::new(config.stats_prefix.clone()));
+        let stats = Arc::new(Stats::new(stats_prefix.clone()));
 
         // Put-event logger (optional) — also captured by every WriteHook.
         let putlog = config
@@ -365,8 +377,7 @@ impl GatewayServer {
         // and shutdown via `caput` — the cross-platform alternative to
         // SIGUSR1 (gateServer.cc:1877-2102). The receiver is drained by a
         // single command owner in `run()`; `None` when stats are disabled.
-        let control_rx =
-            super::control::publish_control_pvs(&shadow_db, &config.stats_prefix).await;
+        let control_rx = super::control::publish_control_pvs(&shadow_db, &stats_prefix).await;
 
         let server = Self {
             config,

@@ -65,9 +65,13 @@ struct Args {
     #[arg(long)]
     no_stats: bool,
 
-    /// Statistics PV prefix (default: "gateway:").
-    #[arg(long, default_value = "gateway:")]
-    stats_prefix: String,
+    /// Statistics PV namespace (C `-prefix`). The `:` separator is added
+    /// automatically, so PVs are published as `<prefix>:<name>` — pass the
+    /// bare namespace, not a trailing `:`. Defaults to the host name
+    /// (falling back to `gateway`), matching C ca-gateway. Use --no-stats
+    /// to disable stats PVs entirely.
+    #[arg(long)]
+    stats_prefix: Option<String>,
 
     /// Heartbeat interval in seconds (0 = disable).
     #[arg(long, default_value_t = 1)]
@@ -255,7 +259,9 @@ async fn main() -> ExitCode {
         stats_prefix: if args.no_stats {
             String::new()
         } else {
-            args.stats_prefix.clone()
+            args.stats_prefix
+                .clone()
+                .unwrap_or_else(epics_bridge_rs::ca_gateway::default_stats_prefix)
         },
         cleanup_interval: std::time::Duration::from_secs(args.cleanup_interval),
         stats_interval: std::time::Duration::from_secs(args.stats_interval),

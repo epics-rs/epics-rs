@@ -55,5 +55,5 @@ pub use master::{RestartPolicy, SuperviseError, supervise};
 pub use putlog::{PutLog, PutLogScope, PutOutcome};
 pub use pvlist::{EvaluationOrder, PvList, PvListEntry, PvListMatch};
 pub use server::{GatewayConfig, GatewayServer};
-pub use stats::Stats;
+pub use stats::{Stats, default_stats_prefix};
 pub use upstream::UpstreamManager;

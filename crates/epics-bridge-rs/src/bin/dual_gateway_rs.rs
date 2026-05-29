@@ -85,9 +85,12 @@ struct Args {
     #[arg(long)]
     ca_read_only: bool,
 
-    /// CA gateway: stats PV prefix (empty disables stats).
-    #[arg(long, default_value = "gateway:")]
-    ca_stats_prefix: String,
+    /// CA gateway: stats PV namespace (C `-prefix`). The `:` separator is
+    /// inserted automatically (`<prefix>:<name>`); pass the bare namespace.
+    /// Defaults to the host name (fallback `gateway`); an explicit empty
+    /// string disables stats PVs.
+    #[arg(long)]
+    ca_stats_prefix: Option<String>,
 
     /// CA gateway: heartbeat interval in seconds (0 = disable).
     #[arg(long, default_value_t = 1)]
@@ -218,7 +221,7 @@ fn default_config_toml() -> &'static str {
 # command = "/etc/gw/command.cmd"      # SIGUSR1-triggered (Unix)
 # port = 5064
 # read_only = false
-# stats_prefix = "gateway:"
+# stats_prefix = "gateway"               # bare namespace; ':' added at publish
 # heartbeat_interval = 1
 # cleanup_interval = 10
 # stats_interval = 10
@@ -263,7 +266,10 @@ async fn run_ca_gateway(args: &Args) -> Result<(), String> {
         preload_path: args.ca_preload.clone(),
         server_port: args.ca_port,
         timeouts: Default::default(),
-        stats_prefix: args.ca_stats_prefix.clone(),
+        stats_prefix: args
+            .ca_stats_prefix
+            .clone()
+            .unwrap_or_else(epics_bridge_rs::ca_gateway::default_stats_prefix),
         cleanup_interval: Duration::from_secs(args.ca_cleanup_interval),
         stats_interval: Duration::from_secs(args.ca_stats_interval),
         heartbeat_interval: if args.ca_heartbeat_interval == 0 {
@@ -376,10 +382,8 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile) {
             args.ca_read_only = true;
         }
     }
-    if args.ca_stats_prefix == "gateway:" {
-        if let Some(s) = &cfg.ca.stats_prefix {
-            args.ca_stats_prefix = s.clone();
-        }
+    if args.ca_stats_prefix.is_none() {
+        args.ca_stats_prefix = cfg.ca.stats_prefix.clone();
     }
     if args.ca_heartbeat_interval == 1 {
         if let Some(v) = cfg.ca.heartbeat_interval {

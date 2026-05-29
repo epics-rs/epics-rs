@@ -818,7 +818,7 @@ fn finish_exec_data_task(
     abort: tokio::task::AbortHandle,
 ) {
     if let Some(op_mut) = ch.ops.get_mut(&ioid) {
-        if subcmd & 0x10 != 0 {
+        if subcmd & QosFlags::DESTROY != 0 {
             op_mut.last_request = true;
         }
         op_mut.data_task_abort = Some(Arc::new(AbortOnDrop(abort)));
@@ -2831,7 +2831,13 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
 ///   value`, run the WRITE-gated `put_value_checked`, then the
 ///   READ-gated `get_value_checked`, and reply
 ///   `ioid + subcmd + status + getBitset + getValue`.
-/// - DESTROY (`subcmd & 0x10`): drop the op slot.
+///   The command-local last-request bit (`subcmd & 0x10`, `QOS_DESTROY`)
+///   is the EPICS `lastRequest()` rider — the ChannelPutGet client sends
+///   `QOS_DESTROY` to mean "run this, then destroy the op"
+///   (`clientContextImpl.cpp:1262-1288`), NOT a standalone destroy. It must
+///   still execute and reply; the op is freed only after the reply, via the
+///   same `finish_exec_data_task` path GET/PUT/RPC use. Standalone op
+///   destruction is `CMD_DESTROY_REQUEST`, handled elsewhere.
 ///
 /// pvxs leaves `handle_PUT_GET` empty; this implements the operation
 /// properly per the wire spec so a PUT_GET-capable client works.
@@ -2879,12 +2885,6 @@ async fn handle_put_get(
             return Ok(());
         }
     };
-
-    // DESTROY phase — release the op slot, no reply.
-    if subcmd & QosFlags::DESTROY != 0 {
-        ch.ops.remove(&ioid);
-        return Ok(());
-    }
 
     if subcmd & QosFlags::INIT != 0 {
         // duplicate INIT on a live IOID is connection-fatal
@@ -3153,9 +3153,11 @@ async fn handle_put_get(
         buf.extend_from_slice(&payload);
         let _ = tx_clone.send(buf).await;
     });
-    if let Some(op_mut) = ch.ops.get_mut(&ioid) {
-        op_mut.data_task_abort = Some(Arc::new(AbortOnDrop(join.abort_handle())));
-    }
+    // Store the abort guard and, when this PUT_GET frame carried the
+    // last-request bit (`subcmd & 0x10`), defer the op's removal until its
+    // reply has been sent — the same completion-owned cleanup GET/PUT/RPC use
+    // (see [`finish_exec_data_task`]).
+    finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
     Ok(())
 }
 
@@ -3168,7 +3170,13 @@ async fn handle_put_get(
 ///   is no value type to negotiate).
 /// - PROCESS (`subcmd & 0x08 == 0`): run the WRITE-gated
 ///   `process_checked` on the source, reply `ioid + subcmd + status`.
-/// - DESTROY (`subcmd & 0x10`): drop the op slot.
+///   The command-local last-request bit (`subcmd & 0x10`, `QOS_DESTROY`)
+///   is the EPICS `lastRequest()` rider — the ChannelProcess client sends
+///   `QOS_DESTROY` to mean "process this, then destroy the op"
+///   (`clientContextImpl.cpp:548-570`), NOT a standalone destroy. It must
+///   still execute and reply; the op is freed only after the reply, via
+///   the same `finish_exec_data_task` path GET/PUT/RPC use. Standalone op
+///   destruction is `CMD_DESTROY_REQUEST`, handled elsewhere.
 #[allow(clippy::too_many_arguments)]
 async fn handle_process(
     source: &DynSource,
@@ -3212,11 +3220,6 @@ async fn handle_process(
             return Ok(());
         }
     };
-
-    if subcmd & QosFlags::DESTROY != 0 {
-        ch.ops.remove(&ioid);
-        return Ok(());
-    }
 
     if subcmd & QosFlags::INIT != 0 {
         // duplicate INIT on a live IOID is connection-fatal
@@ -3398,9 +3401,11 @@ async fn handle_process(
         buf.extend_from_slice(&payload);
         let _ = tx_clone.send(buf).await;
     });
-    if let Some(op_mut) = ch.ops.get_mut(&ioid) {
-        op_mut.data_task_abort = Some(Arc::new(AbortOnDrop(join.abort_handle())));
-    }
+    // Store the abort guard and, when this PROCESS frame carried the
+    // last-request bit (`subcmd & 0x10`), defer the op's removal until its
+    // reply has been sent — the same completion-owned cleanup GET/PUT/RPC use
+    // (see [`finish_exec_data_task`]).
+    finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
     Ok(())
 }
 
@@ -9799,6 +9804,194 @@ mod tests {
         .expect("readback value");
         let (a, _, _) = three_field_extract(&readback);
         assert_eq!(a, 55, "readback must reflect the merged PUT (field a=55)");
+    }
+
+    /// The command-local last-request bit (`subcmd & 0x10`, `QOS_DESTROY`) on
+    /// a PROCESS data frame is the EPICS `lastRequest()` rider — the
+    /// ChannelProcess client sends `QOS_DESTROY` to mean "process this, then
+    /// destroy" (`clientContextImpl.cpp:548-570`). Pre-fix the handler treated
+    /// it as a pure destroy and returned before `process_checked` ran, so the
+    /// client received no processDone reply. The op must execute, reply, and
+    /// only then release its IOID via the deferred completion owner.
+    #[tokio::test]
+    async fn pva_process_last_request_executes_then_defers_destroy() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (1u32, 700u32);
+        let src = AuthorityGatedSource::new();
+        let process_hits = std::sync::Arc::clone(&src.process_hits);
+        let source: DynSource = std::sync::Arc::new(src);
+
+        let mut channels = primed_process_channels(sid, ioid);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
+        let config = PvaServerConfig::default();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+
+        // PROCESS data frame carrying the last-request bit (QOS_DESTROY = 0x10).
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x10);
+        let frame = synth_frame(Command::Process, order, payload);
+
+        handle_process(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            peer,
+            &x509_cred("MyCA"),
+            &exec_fin_tx,
+        )
+        .await
+        .expect("handle_process ok");
+
+        // The process hook ran and a status reply was emitted — the
+        // last-request frame was NOT swallowed as a pure destroy.
+        let resp = rx
+            .recv()
+            .await
+            .expect("PROCESS reply emitted for a last-request frame");
+        let (rframe, _) = try_parse_frame(&resp)
+            .expect("frame parses")
+            .expect("complete frame");
+        let mut cur = rframe.cursor();
+        let _ioid = cur.get_u32(order).expect("ioid");
+        let _subcmd = cur.get_u8().expect("subcmd");
+        let status = Status::decode(&mut cur, order).expect("status");
+        assert!(
+            status.is_success(),
+            "a last-request PROCESS must execute and reply success"
+        );
+        assert_eq!(
+            process_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the process hook runs for a last-request PROCESS"
+        );
+
+        // IOID stays reserved until the reply completes, then the completion
+        // owner frees it (pvxs cleanup() after the reply).
+        assert!(
+            channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            "the op is reserved until its reply is sent"
+        );
+        let fin = exec_fin_rx
+            .recv()
+            .await
+            .expect("process task signals completion");
+        apply_exec_finish(&mut channels, fin);
+        assert!(
+            !channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            "the last-request PROCESS op is freed after its reply"
+        );
+    }
+
+    /// Same lastRequest() rider for PUT_GET: the ChannelPutGet client sends
+    /// `QOS_DESTROY` (here with the `0x40` readback bit, `subcmd = 0x50`) to
+    /// mean "run this, then destroy" (`clientContextImpl.cpp:1262-1288`).
+    /// Pre-fix the handler treated the bit as a pure destroy, so the client
+    /// got no write, no readback, and no status reply. The op must execute,
+    /// reply, and only then release its IOID.
+    #[tokio::test]
+    async fn pva_put_get_last_request_executes_then_defers_destroy() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (1u32, 701u32);
+        let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
+
+        let intro = three_field_intro();
+        let mask = BitSet::all_set(intro.total_bits());
+        let mut ops = HashMap::new();
+        ops.insert(
+            ioid,
+            non_monitor_op_state(intro.clone(), OpKind::PutGet, mask),
+        );
+        let mut channels = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                ops,
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+
+        // PUT_GET last-request: readback (0x40) | QOS_DESTROY (0x10) = 0x50.
+        let bit_a = intro.bit_for_path("a").expect("a has a bit");
+        let mut changed = BitSet::new();
+        changed.set(bit_a);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x50);
+        changed.write_into(order, &mut payload);
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &three_field_value(55, 0, 0),
+            &intro,
+            &changed,
+            0,
+            order,
+            &mut payload,
+        );
+        let frame = synth_frame(Command::PutGet, order, payload);
+
+        handle_put_get(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &x509_cred("MyCA"),
+            &exec_fin_tx,
+        )
+        .await
+        .expect("handle_put_get ok");
+
+        let resp = rx
+            .recv()
+            .await
+            .expect("PUT_GET reply emitted for a last-request frame");
+        let (rframe, _) = try_parse_frame(&resp)
+            .expect("frame parses")
+            .expect("complete frame");
+        let mut cur = rframe.cursor();
+        let _ioid = cur.get_u32(order).expect("ioid");
+        let rsub = cur.get_u8().expect("subcmd");
+        let status = Status::decode(&mut cur, order).expect("status");
+        assert!(
+            status.is_success(),
+            "a last-request PUT_GET must execute and reply success"
+        );
+        assert_eq!(
+            rsub, 0x50,
+            "the reply echoes the last-request PUT_GET subcmd"
+        );
+
+        assert!(
+            channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            "the op is reserved until its reply is sent"
+        );
+        let fin = exec_fin_rx
+            .recv()
+            .await
+            .expect("put_get task signals completion");
+        apply_exec_finish(&mut channels, fin);
+        assert!(
+            !channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            "the last-request PUT_GET op is freed after its reply"
+        );
     }
 
     /// pvxs `serverintrospect.cpp:159`: GET_FIELD's guard is the

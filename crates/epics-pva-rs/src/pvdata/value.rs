@@ -209,16 +209,23 @@ impl Value {
         self.get_as(path).ok()
     }
 
-    /// Assign from another `Value`. Copies all leaf fields whose path
-    /// exists in both, performing type coercion as needed. Marks every
-    /// leaf that the source had marked AND that exists here. Pvxs's
-    /// `assign()` semantics — fields missing on the source side are
-    /// left unchanged.
+    /// Assign from another `Value`, copying the **marked** source fields
+    /// into the destination.
+    ///
+    /// pvxs `Value::assign()` delegates to `copyIn(&o, StoreType::Compound)`
+    /// whose struct branch iterates `src.imarked()` only (data.cpp:731-769):
+    /// an unmarked source field is not part of the update and leaves the
+    /// destination unchanged, and a marked source field with no matching
+    /// destination field throws `NoField` (data.cpp:746-756) rather than
+    /// being silently dropped. Driving the copy from every descriptor leaf
+    /// instead copied stale unmarked values and hid schema mismatches.
     pub fn assign(&mut self, other: &Value) -> Result<(), ValueError> {
-        for path in walk_leaf_paths(other.desc(), "") {
-            if !self.has(&path) {
-                continue;
-            }
+        for path in other.iter_marked() {
+            // Marked source field absent in the destination: pvxs throws
+            // NoField; we do too instead of skipping it.
+            let Some(dst_desc) = self.desc_at(&path).cloned() else {
+                return Err(ValueError::NoField(path));
+            };
             let Some(src_field) = other.lookup_field(&path) else {
                 continue;
             };
@@ -226,12 +233,7 @@ impl Value {
             // type, mirroring pvxs `copyIn()` which switches on
             // `StoreType` (data.cpp:609-769): scalars coerce, scalar
             // arrays copy with element conversion, and Struct/Union/Any
-            // (and their array forms) copy through. The previous loop
-            // only copied scalars, silently dropping every non-scalar
-            // payload while still propagating its mark.
-            let Some(dst_desc) = self.desc_at(&path).cloned() else {
-                continue;
-            };
+            // (and their array forms) copy through.
             match &dst_desc {
                 FieldDesc::Scalar(t) => {
                     if let PvField::Scalar(sv) = src_field {
@@ -270,13 +272,15 @@ impl Value {
                 | FieldDesc::BoundedString(_) => {
                     let _ = self.write_field(&path, src_field.clone());
                 }
-                // Structures are never leaf paths (walk_leaf_paths
-                // recurses into them); nothing to copy at this node.
+                // A marked structure node represents its subtree (see
+                // PVA-RS-2026-05-28-90); copying its scalar leaves is
+                // handled when those leaves are themselves marked. The
+                // node itself carries no own payload to copy here.
                 FieldDesc::Structure { .. } => {}
             }
-            if other.is_marked(&path) {
-                let _ = self.mark(&path);
-            }
+            // Every path here came from the source mark set, so the
+            // destination field is now part of the update.
+            let _ = self.mark(&path);
         }
         Ok(())
     }
@@ -774,6 +778,43 @@ mod tests {
         assert_eq!(a.get_as::<i32>("value").unwrap(), 17);
         assert!(a.is_marked("value"));
         assert!(a.is_marked("alarm.severity"));
+    }
+
+    // ── assign() is driven by the source mark set — PVA-RS-2026-05-28-103 ──
+
+    #[test]
+    fn assign_does_not_copy_unmarked_source_scalar() {
+        // Source carries value=5 but it is NOT marked: pvxs leaves the
+        // destination unchanged for unmarked source fields.
+        let mut src = make_nt_int();
+        src.set("value", 5i32).unwrap();
+        src.unmark("value").unwrap();
+        let mut dst = make_nt_int();
+        dst.assign(&src).unwrap();
+        assert_eq!(dst.get_as::<i32>("value").unwrap(), 0);
+        assert!(!dst.is_marked("value"));
+    }
+
+    #[test]
+    fn assign_marked_field_absent_in_dest_errors() {
+        // Source marks `b`, which the destination descriptor lacks: pvxs
+        // throws NoField rather than silently skipping it.
+        let src_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                ("a".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("b".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        };
+        let dst_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("a".into(), FieldDesc::Scalar(ScalarType::Int))],
+        };
+        let mut src = Value::create_from(src_desc);
+        src.set("b", 1i32).unwrap();
+        let mut dst = Value::create_from(dst_desc);
+        let err = dst.assign(&src).unwrap_err();
+        assert!(matches!(err, ValueError::NoField(ref p) if p == "b"));
     }
 
     // ── assign() copies non-scalar payloads — PVA-RS-2026-05-28-102 ──

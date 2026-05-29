@@ -564,8 +564,14 @@ impl GroupChannel {
                 .map(|(name, g)| (name.as_str(), &**g))
                 .collect();
             for member in &self.def.members {
-                if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Structure
-                {
+                // Only `proc` places no value field. A `+type:"structure"`
+                // member emits an empty struct branch (resolved by
+                // read_member -> read_member_channelless), matching the
+                // advertised descriptor. pvxs adds the empty Struct to the
+                // value template (groupconfigprocessor.cpp:922-930) and
+                // clones it into every GET/MONITOR snapshot
+                // (groupsource.cpp:480-518).
+                if member.mapping == FieldMapping::Proc {
                     continue;
                 }
                 let field = self.read_member_locked(member, &guard_map)?;
@@ -573,8 +579,14 @@ impl GroupChannel {
             }
         } else {
             for member in &self.def.members {
-                if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Structure
-                {
+                // Only `proc` places no value field. A `+type:"structure"`
+                // member emits an empty struct branch (resolved by
+                // read_member -> read_member_channelless), matching the
+                // advertised descriptor. pvxs adds the empty Struct to the
+                // value template (groupconfigprocessor.cpp:922-930) and
+                // clones it into every GET/MONITOR snapshot
+                // (groupsource.cpp:480-518).
+                if member.mapping == FieldMapping::Proc {
                     continue;
                 }
                 let field = self.read_member(member).await?;
@@ -618,7 +630,9 @@ impl GroupChannel {
         let mut pv = PvStructure::new(struct_id);
 
         for member in &self.def.members {
-            if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Structure {
+            // Only `proc` places no value field; a `+type:"structure"`
+            // member emits an empty struct branch like the full read path.
+            if member.mapping == FieldMapping::Proc {
                 continue;
             }
             if !field_names.contains(&member.field_name) {
@@ -643,7 +657,13 @@ impl GroupChannel {
                     .clone()
                     .unwrap_or(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(0))),
             ),
-            FieldMapping::Structure => Some(PvField::Structure(PvStructure::new(""))),
+            // Empty struct branch carrying the member `+id` so the value
+            // matches the descriptor built in `get_field`
+            // (pvxs adds `Struct(id)` to the value template,
+            // groupconfigprocessor.cpp:922-930).
+            FieldMapping::Structure => Some(PvField::Structure(PvStructure::new(
+                member.struct_id.as_deref().unwrap_or(""),
+            ))),
             FieldMapping::Proc => Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(0))),
             _ => None,
         }

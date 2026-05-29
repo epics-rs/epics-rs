@@ -724,3 +724,104 @@ async fn group_config_parses_and_finalizes() {
     assert!(names.contains(&"level"));
     assert!(names.contains(&"count"));
 }
+
+const GROUP_JSON_STRUCT_MEMBER: &str = r#"{
+    "TEST:sgrp": {
+        "+id": "epics:nt/NTGroup:1.0",
+        "+atomic": true,
+        "value": { "+channel": "TEST:level.VAL", "+type": "plain" },
+        "meta":  { "+type": "structure", "+id": "alpha/v1" }
+    }
+}"#;
+
+const GROUP_JSON_STRUCT_MEMBER_NA: &str = r#"{
+    "TEST:sgrp_na": {
+        "+atomic": false,
+        "value": { "+channel": "TEST:level.VAL", "+type": "plain" },
+        "meta":  { "+type": "structure", "+id": "alpha/v1" }
+    }
+}"#;
+
+fn find_field<'a>(s: &'a PvStructure, name: &str) -> Option<&'a PvField> {
+    s.fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+}
+
+/// A `+type:"structure"` member must appear in the GET value as an
+/// empty structure carrying its `+id`, matching the advertised
+/// descriptor. pvxs adds the empty `Struct(id)` to the value template
+/// (groupconfigprocessor.cpp:922-930) and clones it into every GET /
+/// MONITOR snapshot (groupsource.cpp:480-518).
+#[tokio::test]
+async fn structure_member_appears_in_atomic_group_value_and_descriptor() {
+    use epics_pva_rs::pvdata::FieldDesc;
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(GROUP_JSON_STRUCT_MEMBER)
+        .expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:sgrp")
+        .cloned()
+        .expect("registered");
+    let ch = GroupChannel::new(db, def);
+
+    // GET value carries the empty structure branch with the member +id.
+    let result = ch.get(&empty_request()).await.expect("get");
+    match find_field(&result, "meta") {
+        Some(PvField::Structure(s)) => {
+            assert!(s.fields.is_empty(), "structure member value must be empty");
+            assert_eq!(
+                s.struct_id, "alpha/v1",
+                "value struct id must carry member +id"
+            );
+        }
+        other => panic!("group value must contain empty `meta` structure, got {other:?}"),
+    }
+    // The backed member is still present.
+    assert_eq!(extract_double(&result, "value"), Some(1.5));
+
+    // Descriptor advertises the same empty structure with the +id.
+    let desc = ch.get_field().await.expect("get_field");
+    let fields = match &desc {
+        FieldDesc::Structure { fields, .. } => fields,
+        other => panic!("group descriptor must be a structure, got {other:?}"),
+    };
+    match fields.iter().find(|(n, _)| n == "meta").map(|(_, d)| d) {
+        Some(FieldDesc::Structure { struct_id, fields }) => {
+            assert_eq!(struct_id, "alpha/v1");
+            assert!(fields.is_empty(), "structure descriptor must be empty");
+        }
+        other => panic!("descriptor must contain empty `meta` structure with +id, got {other:?}"),
+    }
+}
+
+/// Same as above for a non-atomic group, exercising the non-atomic
+/// read loop which also skipped Structure members before the fix.
+#[tokio::test]
+async fn structure_member_appears_in_nonatomic_group_value() {
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(GROUP_JSON_STRUCT_MEMBER_NA)
+        .expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:sgrp_na")
+        .cloned()
+        .expect("registered");
+    let ch = GroupChannel::new(db, def);
+
+    let result = ch.get(&empty_request()).await.expect("get");
+    match find_field(&result, "meta") {
+        Some(PvField::Structure(s)) => {
+            assert!(s.fields.is_empty());
+            assert_eq!(s.struct_id, "alpha/v1");
+        }
+        other => {
+            panic!("non-atomic group value must contain empty `meta` structure, got {other:?}")
+        }
+    }
+    assert_eq!(extract_double(&result, "value"), Some(1.5));
+}

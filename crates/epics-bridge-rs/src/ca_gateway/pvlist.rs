@@ -10,7 +10,7 @@
 //! # comments start with #
 //! Beam:.*          ALLOW Beam 1
 //! PS.*             ALLOW PowerSupply 1
-//! ps([0-9])        ALIAS PSCurrent\1.ai PowerSupply 1
+//! ps\([0-9]\)      ALIAS PSCurrent\1.ai PowerSupply 1
 //! test.*           DENY
 //! ```
 //!
@@ -23,11 +23,19 @@
 //!
 //! ## Notes
 //!
-//! - Patterns are full regex (Rust `regex` crate). C++ uses POSIX regex
-//!   or PCRE optionally — most simple patterns are compatible.
+//! - Patterns use ca-gateway's DEFAULT GNU basic-regular-expression (BRE)
+//!   dialect — the build with `USE_PCRE` commented out (`configure/CONFIG_SITE`),
+//!   which compiles patterns via `re_compile_pattern` under the GNU
+//!   `re_syntax_options` default of 0 (`gateAs.cc:236`). `build_pattern`
+//!   translates that dialect into the Rust `regex` (RE2) source before
+//!   compiling, so `\(`/`\)` are capture groups, bare `(`/`)` are literal
+//!   parentheses, `\|` is alternation, and braces are literal — matching the
+//!   shipped `example/GATEWAY.pvlist` and `pvlist_bre.txt` rules. (PCRE mode is
+//!   an opt-in upstream build flag; the Rust gateway tracks the default build.)
 //! - Backreference substitution is implemented manually because Rust
 //!   `regex` doesn't support backreferences in the pattern, but
-//!   capture groups are available for replacement.
+//!   capture groups (numbered after the BRE→RE2 translation) are available
+//!   for replacement.
 //! - The DENY `FROM host` clause is host-scoped: it denies only when the
 //!   requester host matches. It is enforced at the put-hook path via
 //!   [`PvList::is_host_denied`] and at downstream search/create
@@ -635,11 +643,182 @@ fn parse_asg_asl<'a>(
 }
 
 fn build_pattern(pat: &str, lineno: usize) -> BridgeResult<Regex> {
-    // Anchor the pattern to match the full PV name (C++ ca-gateway behavior).
-    let anchored = format!("^{pat}$");
+    // C ca-gateway's DEFAULT build compiles `.pvlist` patterns as GNU basic
+    // regular expressions: configure/CONFIG_SITE leaves USE_PCRE commented out
+    // (CONFIG_SITE:15-16), so gateAs::readPvList calls re_compile_pattern
+    // (gateAs.cc:236) with the GNU `re_syntax_options` default of 0 — it never
+    // calls re_set_syntax. Under that syntax the grouping/alternation
+    // metacharacters are INVERTED relative to Rust's `regex` (an ERE/RE2
+    // dialect): `\(`/`\)` open/close a capture group while bare `(`/`)` are
+    // literal, `\|` is alternation while `|` is literal, and intervals are off
+    // so `{`/`}` are literal. Feeding such a pattern straight into
+    // `Regex::new` (the previous behavior) made the shipped GNU example/test
+    // pvlist rules — `gateway:\(.*\) ALIAS ioc:\1` (example/GATEWAY.pvlist:83,
+    // testTop/pyTestsApp/pvlist_bre.txt:6) — compile to literal parentheses
+    // with no capture group, so `\1` alias backreferences expanded to "".
+    //
+    // Translate GNU/BRE → Rust at this single compile boundary (the one owner
+    // of "pattern string -> Regex") so capture-group numbering lines up with
+    // the `\1`..`\9` template expansion in `expand_template` by construction.
+    let translated = translate_gnu_bre_to_rust(pat).map_err(|e| {
+        BridgeError::GroupConfigError(format!("line {lineno}: pvlist pattern '{pat}': {e}"))
+    })?;
+    // Anchor the pattern to match the full PV name (C++ ca-gateway behavior:
+    // re_match against the whole channel name, not a substring).
+    let anchored = format!("^{translated}$");
     Regex::new(&anchored).map_err(|e| {
         BridgeError::GroupConfigError(format!("line {lineno}: invalid regex '{pat}': {e}"))
     })
+}
+
+/// Translate a GNU basic-regular-expression (`re_syntax_options == 0`) pattern
+/// — ca-gateway's default `.pvlist` dialect — into the equivalent Rust `regex`
+/// (ERE/RE2) source.
+///
+/// Only the metacharacters whose meaning is INVERTED between the two dialects
+/// are rewritten; `*`, `+`, `?`, `.`, `^`, `$`, `\.`, `\*` and other escapes
+/// already mean the same thing in both and pass through verbatim:
+///
+/// - `\(` → `(`, `\)` → `)` (BRE group → RE2 group)
+/// - bare `(` → `\(`, `)` → `\)` (BRE literal paren → RE2 literal)
+/// - `\|` → `|` (BRE alternation → RE2 alternation)
+/// - bare `|` → `\|` (BRE literal bar → RE2 literal)
+/// - `{`, `}`, `\{`, `\}` → `\{`, `\}` (GNU syntax-0 has RE_INTERVALS off, so
+///   every brace form is literal; RE2 treats bare `{` as an interval, so it
+///   must be escaped to stay literal)
+///
+/// Inside a `[...]` bracket expression none of those inversions apply (parens,
+/// braces and bars are literal in both dialects), but GNU treats a backslash as
+/// an ordinary character there (RE_BACKSLASH_ESCAPE_IN_LISTS is off) while RE2
+/// treats it as an escape — so a literal `\` inside a list is emitted as `\\`.
+/// POSIX classes `[[:alpha:]]` are recognized so their inner `]` does not close
+/// the list early.
+///
+/// A `\1`..`\9` back-reference inside the *pattern* (a GNU feature RE2 cannot
+/// represent) is rejected with a clear diagnostic rather than silently
+/// mis-compiled. Alias-target backreferences are unaffected — those are
+/// expanded by [`expand_template`], not by the regex engine.
+fn translate_gnu_bre_to_rust(pat: &str) -> Result<String, String> {
+    let bytes = pat.as_bytes();
+    let mut out = String::with_capacity(pat.len() + 8);
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'\\' => {
+                if i + 1 >= bytes.len() {
+                    // Trailing backslash: GNU errors; emit a literal backslash
+                    // so RE2 does not choke on a dangling escape.
+                    out.push_str("\\\\");
+                    i += 1;
+                    continue;
+                }
+                let n = bytes[i + 1];
+                match n {
+                    b'(' => out.push('('),
+                    b')' => out.push(')'),
+                    b'|' => out.push('|'),
+                    b'{' => out.push_str("\\{"),
+                    b'}' => out.push_str("\\}"),
+                    b'1'..=b'9' => {
+                        return Err(format!(
+                            "GNU back-reference '\\{}' in a pattern is unsupported by the Rust \
+                             regex engine; rewrite the rule without an in-pattern backreference \
+                             (alias-target backreferences in the ALIAS target are still supported)",
+                            n as char
+                        ));
+                    }
+                    // Every other escape (\., \*, \\, \w, \s, …) means the same
+                    // in both dialects — copy it through unchanged.
+                    other => {
+                        out.push('\\');
+                        out.push(other as char);
+                    }
+                }
+                i += 2;
+            }
+            b'(' => {
+                out.push_str("\\(");
+                i += 1;
+            }
+            b')' => {
+                out.push_str("\\)");
+                i += 1;
+            }
+            b'|' => {
+                out.push_str("\\|");
+                i += 1;
+            }
+            b'{' => {
+                out.push_str("\\{");
+                i += 1;
+            }
+            b'}' => {
+                out.push_str("\\}");
+                i += 1;
+            }
+            b'[' => {
+                i = translate_bracket_expr(bytes, i, &mut out);
+            }
+            _ => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Copy a `[...]` bracket expression starting at `bytes[start] == b'['`,
+/// applying the GNU→RE2 list rules (literal `\` → `\\`, POSIX-class passthrough,
+/// leading `^`/`]` handling). Returns the index just past the closing `]`, or
+/// past the unterminated tail (so the surrounding `Regex::new` reports the
+/// missing-bracket error, matching GNU's own compile failure).
+fn translate_bracket_expr(bytes: &[u8], start: usize, out: &mut String) -> usize {
+    out.push('[');
+    let mut i = start + 1;
+    // Optional negation.
+    if i < bytes.len() && bytes[i] == b'^' {
+        out.push('^');
+        i += 1;
+    }
+    // A `]` immediately here is a literal member, not the terminator.
+    if i < bytes.len() && bytes[i] == b']' {
+        out.push(']');
+        i += 1;
+    }
+    while i < bytes.len() {
+        match bytes[i] {
+            b']' => {
+                out.push(']');
+                return i + 1;
+            }
+            b'[' if i + 1 < bytes.len() && bytes[i + 1] == b':' => {
+                // POSIX class [:name:] — copy through to the closing ":]".
+                out.push_str("[:");
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b':' && bytes[i + 1] == b']') {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                if i + 1 < bytes.len() {
+                    out.push_str(":]");
+                    i += 2;
+                }
+            }
+            b'\\' => {
+                // GNU: backslash is an ordinary list member. RE2: it escapes,
+                // so emit a literal backslash as `\\`.
+                out.push_str("\\\\");
+                i += 1;
+            }
+            other => {
+                out.push(other as char);
+                i += 1;
+            }
+        }
+    }
+    i
 }
 
 #[cfg(test)]
@@ -1179,8 +1358,8 @@ mod tests {
         let list = parse_pvlist(
             r#"
                 EVALUATION ORDER ALLOW, DENY
-                (.*)        ALIAS general_\1 GenGrp 1
-                SEC:(.*)    ALIAS secure_\1 SecGrp 0
+                \(.*\)        ALIAS general_\1 GenGrp 1
+                SEC:\(.*\)    ALIAS secure_\1 SecGrp 0
             "#,
         )
         .unwrap();
@@ -1211,7 +1390,8 @@ mod tests {
 
     #[test]
     fn match_alias_with_backreference() {
-        let list = parse_pvlist(r"ps([0-9]) ALIAS PSCurrent\1.ai PSGroup 1").unwrap();
+        // BRE grouping `\(...\)` — ca-gateway's default dialect.
+        let list = parse_pvlist(r"ps\([0-9]\) ALIAS PSCurrent\1.ai PSGroup 1").unwrap();
         let m = list.match_name("ps3").unwrap();
         assert!(m.is_alias);
         assert_eq!(m.resolved_name, "PSCurrent3.ai");
@@ -1221,9 +1401,82 @@ mod tests {
 
     #[test]
     fn match_alias_multiple_groups() {
-        let list = parse_pvlist(r"(\w+):(\d+) ALIAS \1_record\2.VAL").unwrap();
+        // BRE grouping with two capture groups.
+        let list = parse_pvlist(r"\([a-z]*\):\([0-9]*\) ALIAS \1_record\2.VAL").unwrap();
         let m = list.match_name("temp:7").unwrap();
         assert_eq!(m.resolved_name, "temp_record7.VAL");
+    }
+
+    /// The grouping defect: ca-gateway's DEFAULT build treats `.pvlist`
+    /// patterns as GNU/BRE, so `\(...\)` is a capture group and bare `(...)`
+    /// is literal. The shipped `example/GATEWAY.pvlist:83` and
+    /// `testTop/pyTestsApp/pvlist_bre.txt:6` alias rules must match and expand
+    /// `\1` exactly as ca-gateway does.
+    #[test]
+    fn bre_grouping_matches_shipped_upstream_examples() {
+        // pvlist_bre.txt:6 — gateway: prefix → ioc: prefix.
+        let list = parse_pvlist(r"gateway:\(.*\) ALIAS ioc:\1").unwrap();
+        let m = list
+            .match_name("gateway:HV:voltage")
+            .expect("BRE alias matches");
+        assert!(m.is_alias);
+        assert_eq!(m.resolved_name, "ioc:HV:voltage");
+
+        // example/GATEWAY.pvlist:80 — ps\([0-9]\) → PSCurrent\1.ai
+        let list = parse_pvlist(r"ps\([0-9]\) ALIAS PSCurrent\1.ai PowerSupply 1").unwrap();
+        let m = list.match_name("ps7").expect("BRE alias matches");
+        assert_eq!(m.resolved_name, "PSCurrent7.ai");
+        // The unescaped form must NOT match the digit — bare parens are literal.
+        assert!(
+            list.match_name("ps(7)").is_none(),
+            "no literal-paren PV exists"
+        );
+    }
+
+    /// Inverse of the grouping rule: under GNU/BRE bare `(`/`)` are LITERAL
+    /// parentheses, so an ERE-style `(.*)` pattern matches a name that actually
+    /// contains parentheses — and yields no capture group (matching C, where
+    /// such a rule is a literal-paren match with an empty `\1`).
+    #[test]
+    fn bare_parens_are_literal_in_bre() {
+        let list = parse_pvlist(r"weird(.*) ALLOW").unwrap();
+        // Bare `(.*)`  ==  literal `(`, `.*`, literal `)`.
+        assert!(
+            list.match_name("weird(abc)").is_some(),
+            "literal parens match"
+        );
+        assert!(
+            list.match_name("weirdabc").is_none(),
+            "without literal parens it must not match"
+        );
+    }
+
+    /// `\|` is BRE alternation; bare `|` is a literal pipe. Grouped so the
+    /// `^…$` anchoring scopes the alternation (un-grouped `^a\|b$` would, by
+    /// regex precedence, mean `^a` OR `b$` in either dialect).
+    #[test]
+    fn bre_alternation_and_literal_pipe() {
+        let list = parse_pvlist(r"\(foo\|bar\) ALLOW").unwrap();
+        assert!(list.match_name("foo").is_some(), "BRE \\| alternates");
+        assert!(list.match_name("bar").is_some(), "BRE \\| alternates");
+        assert!(list.match_name("foobar").is_none());
+
+        let list = parse_pvlist(r"a|b ALLOW").unwrap();
+        assert!(list.match_name("a|b").is_some(), "bare | is literal");
+        assert!(list.match_name("a").is_none(), "bare | does not alternate");
+    }
+
+    /// A GNU back-reference inside the *pattern* is unrepresentable in the Rust
+    /// regex engine; the parser rejects it with a clear diagnostic rather than
+    /// silently mis-compiling (fix-direction option (b)).
+    #[test]
+    fn in_pattern_backreference_is_rejected() {
+        let err = parse_pvlist(r"\(.*\)\1 ALLOW").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("back-reference"),
+            "expected a back-reference diagnostic, got: {msg}"
+        );
     }
 
     #[test]

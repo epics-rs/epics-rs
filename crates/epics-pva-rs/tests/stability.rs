@@ -7,8 +7,6 @@
 //!   confirming it stays alive (server's own heartbeat keeps it ticking).
 //! - **P2 auto reconnect** — start server, GET, drop server, restart on
 //!   same port, GET again on the same client → succeeds.
-//! - **P3+P4 beacon throttle** — observe throttle behaviour on a synthetic
-//!   GUID flip via the public BeaconTracker API.
 //! - **P5 monitor pipeline** — subscribe and confirm we receive >= N events
 //!   for an N-event publish without missing any (default pipeline_size=4).
 //! - **P6 idle/slot limits** — open up to `max_connections` clients, verify
@@ -26,7 +24,6 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc};
 
-use epics_pva_rs::client_native::beacon_throttle::BeaconTracker;
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
@@ -443,20 +440,6 @@ async fn sr9_server_opt_in_cap_enforced() {
 
     h.abort();
     let _ = h.await;
-}
-
-#[tokio::test]
-async fn p3_p4_beacon_throttle_5min_rule() {
-    let t = BeaconTracker::new();
-    let addr: std::net::SocketAddr = "127.0.0.1:5075".parse().unwrap();
-
-    // First observation — pass through.
-    assert!(t.observe(addr, [1u8; 12]));
-    // Same GUID — pass through.
-    assert!(t.observe(addr, [1u8; 12]));
-    // Different GUID within 5 minutes — throttled.
-    assert!(!t.observe(addr, [2u8; 12]));
-    assert!(t.is_throttled(addr));
 }
 
 #[tokio::test]

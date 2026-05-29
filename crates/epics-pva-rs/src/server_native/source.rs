@@ -802,6 +802,24 @@ pub trait ChannelSource: Send + Sync + 'static {
         let _ = (name, ctx, start);
     }
 
+    /// A peer channel to `name` has closed — the client sent
+    /// `DESTROY_CHANNEL` or the TCP connection dropped. Fired exactly
+    /// once per opened channel by the channel-lifecycle owner AFTER the
+    /// channel's operations have been torn down, matching pvxs
+    /// `ServerChan::cleanup()` which cleans every channel op and then
+    /// invokes the moved `onClose` callback once
+    /// (`serverchan.cpp:43-60`, `:115-127`). Unlike
+    /// [`Self::notify_monitor_start`] — a *monitor-operation* edge — this
+    /// is a *channel* edge: it fires even for a channel that only ever
+    /// carried GET/PUT/RPC traffic and never had a monitor. A source uses
+    /// it to release per-channel leases, upstream identities, diagnostics,
+    /// or credential-scoped caches. `ctx` is credential-scoped (no
+    /// `pv_request`) like [`Self::notify_monitor_start`]. Default impl
+    /// ignores it.
+    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
+        let _ = (name, ctx);
+    }
+
     /// the per-PV pipeline-window watermark levels `(low,
     /// high)` for `name`, in window-credit units. The monitor loop fires
     /// [`Self::notify_watermark`] with [`WatermarkKind::Resume`] when an
@@ -1088,6 +1106,7 @@ pub trait ChannelSourceObj: Send + Sync {
     fn monitor_emits_partial(&self, name: &str) -> bool;
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent);
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool);
+    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext);
     fn monitor_watermarks<'a>(
         &'a self,
         name: &'a str,
@@ -1329,6 +1348,9 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
         <Self as ChannelSource>::notify_monitor_start(self, name, ctx, start);
+    }
+    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
+        <Self as ChannelSource>::notify_channel_close(self, name, ctx);
     }
     fn monitor_watermarks<'a>(
         &'a self,

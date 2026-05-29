@@ -2216,7 +2216,15 @@ async fn handle_connection_io(
     // on connection close cancels any task whose source hasn't returned yet,
     // matching pvxs opByIOID cleanup (serverconn.cpp:366-382).
     let mut gf_abort_guards: Vec<AbortOnDrop> = Vec::new();
-    loop {
+    // Drive the read loop inside a block so EVERY exit path funnels
+    // through the channel-close fan-out below: the writer-died
+    // `return Ok(())`, any `?`-propagated decode/IO error, and the
+    // idle/EOF teardown. pvxs runs `ServerChan::cleanup` for each
+    // channel as the owning `ServerConn` is destroyed
+    // (serverconn.cpp), so a per-channel close hook must fire on
+    // connection teardown too, not only on explicit DESTROY_CHANNEL.
+    let conn_result: PvaResult<()> = async {
+        loop {
         // if the writer task has died (send_timeout fired,
         // panic, etc.) the outbound mpsc is closed. Every subsequent
         // `let _ = tx.send(...).await` in the dispatch path silently
@@ -2552,7 +2560,7 @@ async fn handle_connection_io(
             }
             Some(Command::DestroyChannel) => {
                 let before = channels.len();
-                handle_destroy_channel(&frame, &tx, &mut channels, order).await?;
+                handle_destroy_channel(&frame, &tx, &mut channels, order, peer, &cred).await?;
                 if channels.len() < before {
                     peer_entry.channel_removed();
                     // keep the report's channel-name mirror current.
@@ -2755,7 +2763,21 @@ async fn handle_connection_io(
                 // Unhandled — keep going.
             }
         }
+        }
     }
+    .await;
+
+    // Connection teardown. Drain every still-open channel and run the
+    // same op-cleanup-then-`onClose` sequence DESTROY_CHANNEL uses, so a
+    // source learns about channels closed by disconnect/idle/error
+    // exactly as it learns about explicit destroys (pvxs
+    // `ServerChan::cleanup`, serverchan.cpp:43-60). Draining (rather than
+    // letting the map's `Drop` free the ops silently) is what delivers
+    // the close notification the implicit `Drop` cannot.
+    for (_sid, ch) in channels.drain() {
+        close_channel(ch, peer, &cred);
+    }
+    conn_result
 }
 
 /// Decode the VALUE body of an INIT pvRequest, after its descriptor
@@ -3679,11 +3701,38 @@ async fn handle_create_channel(
     Ok(())
 }
 
+/// Tear a single channel down and deliver its `onClose` to the bound
+/// source, in pvxs `ServerChan::cleanup` order: drop the per-op state
+/// first — aborting any monitor subscriber tasks and releasing
+/// source-side subscriptions — then notify the source exactly once
+/// (`serverchan.cpp:43-60`, `:115-127`). `peer`/`cred` reconstruct the
+/// connection-scoped identity the channel was opened under; pvAccess
+/// carries no per-op `pvRequest` on close, so `pv_request` is `None`
+/// (matching the CREATE_CHANNEL resolve context).
+fn close_channel(ch: ChannelState, peer: SocketAddr, cred: &ClientCredentials) {
+    let ChannelState {
+        name, source, ops, ..
+    } = ch;
+    drop(ops);
+    let ctx = crate::server_native::source::ChannelContext {
+        peer,
+        account: cred.account.clone(),
+        method: cred.method.clone(),
+        host: cred.host.clone(),
+        authority: cred.authority.clone(),
+        roles: cred.roles.clone(),
+        pv_request: None,
+    };
+    source.notify_channel_close(&name, &ctx);
+}
+
 async fn handle_destroy_channel(
     frame: &Frame,
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
+    peer: SocketAddr,
+    cred: &ClientCredentials,
 ) -> PvaResult<()> {
     let mut cur = frame.cursor();
     let sid = cur
@@ -3722,8 +3771,13 @@ async fn handle_destroy_channel(
     // Removing the channel drops every OpState in `ops`, which drops
     // each `monitor_abort: Option<Arc<AbortOnDrop>>` and cancels the
     // associated subscriber task — preventing orphaned spawns from
-    // holding the source's broadcast subscription.
-    channels.remove(&sid);
+    // holding the source's broadcast subscription. `close_channel` does
+    // that op teardown first, then notifies the bound source's `onClose`
+    // (pvxs `ServerChan::cleanup`, serverchan.cpp:43-60).
+    let ch = channels
+        .remove(&sid)
+        .expect("SID presence verified by contains_key above");
+    close_channel(ch, peer, cred);
     let mut payload = Vec::new();
     payload.put_u32(sid, order);
     payload.put_u32(cid, order);
@@ -8513,7 +8567,9 @@ mod tests {
         payload.put_u32(cid, order);
         let frame = synth_frame(Command::DestroyChannel, order, payload);
 
-        handle_destroy_channel(&frame, &tx, &mut channels, order)
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        handle_destroy_channel(&frame, &tx, &mut channels, order, peer, &cred)
             .await
             .expect("handler returns Ok");
 
@@ -8556,7 +8612,9 @@ mod tests {
         payload.put_u32(cid, order);
         let frame = synth_frame(Command::DestroyChannel, order, payload);
 
-        handle_destroy_channel(&frame, &tx, &mut channels, order)
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        handle_destroy_channel(&frame, &tx, &mut channels, order, peer, &cred)
             .await
             .expect("handler returns Ok");
 
@@ -8565,6 +8623,105 @@ mod tests {
         // Header (8) + ioid placeholder isn't part of DESTROY_CHANNEL;
         // payload is sid (4) + cid (4) = 8 total, so frame length = 16.
         assert_eq!(reply.len(), PvaHeader::SIZE + 8);
+    }
+
+    /// pvxs `ServerChan::cleanup` (serverchan.cpp:43-60, :115-127) runs
+    /// the per-op teardown and then invokes the channel's `onClose`
+    /// exactly once. The Rust server must deliver the same edge to the
+    /// bound `ChannelSource` via `notify_channel_close` — on explicit
+    /// DESTROY_CHANNEL here, and (by routing both paths through
+    /// `close_channel`) on connection teardown. Before the hook existed a
+    /// source could never observe a channel closing: per-channel leases,
+    /// upstream identities, and credential-scoped caches leaked for the
+    /// life of the process.
+    #[tokio::test]
+    async fn destroy_channel_notifies_bound_source_once() {
+        struct RecordingCloseSource {
+            closed: Arc<parking_lot::Mutex<Vec<String>>>,
+        }
+        impl crate::server_native::source::ChannelSource for RecordingCloseSource {
+            async fn list_pvs(&self) -> Vec<String> {
+                vec!["dut".into()]
+            }
+            async fn has_pv(&self, name: &str) -> bool {
+                name == "dut"
+            }
+            async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+                Some(FieldDesc::Variant)
+            }
+            async fn get_value(&self, _name: &str) -> Option<PvField> {
+                None
+            }
+            async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+                Ok(())
+            }
+            async fn is_writable(&self, _name: &str) -> bool {
+                false
+            }
+            async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+                None
+            }
+            fn notify_channel_close(
+                &self,
+                name: &str,
+                _ctx: &crate::server_native::source::ChannelContext,
+            ) {
+                self.closed.lock().push(name.to_string());
+            }
+        }
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 5;
+        let cid: u32 = 6;
+        let closed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let source: DynSource = Arc::new(RecordingCloseSource {
+            closed: closed.clone(),
+        });
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid,
+                sid,
+                introspection: None,
+                source: source.clone(),
+                ops: HashMap::new(),
+            },
+        );
+        let (tx, mut _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(cid, order);
+        let frame = synth_frame(Command::DestroyChannel, order, payload);
+
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        handle_destroy_channel(&frame, &tx, &mut channels, order, peer, &cred)
+            .await
+            .expect("handler returns Ok");
+
+        assert_eq!(
+            *closed.lock(),
+            vec!["dut".to_string()],
+            "DESTROY_CHANNEL must fire notify_channel_close exactly once for the channel name"
+        );
+
+        // A second destroy of the now-absent SID is a no-op (pvxs unknown-
+        // SID silence) and must NOT re-fire the close hook.
+        let mut payload2 = Vec::new();
+        payload2.put_u32(sid, order);
+        payload2.put_u32(cid, order);
+        let frame2 = synth_frame(Command::DestroyChannel, order, payload2);
+        handle_destroy_channel(&frame2, &tx, &mut channels, order, peer, &cred)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(
+            *closed.lock(),
+            vec!["dut".to_string()],
+            "a destroy on an already-removed SID must not re-fire onClose"
+        );
     }
 
     /// pvxs `serverget.cpp:83` echoes the request `subcmd` byte in the

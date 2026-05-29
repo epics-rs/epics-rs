@@ -660,8 +660,19 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
             // silent. `GroupPvDef::resolve_self_trigger_default` demotes
             // `SelfOnly` → `None` for such mixed groups after all members
             // are assembled.
-            None => TriggerDef::SelfOnly,
-            Some("") => TriggerDef::None,
+            // An explicit `+trigger:""` is NOT distinct from a missing
+            // `+trigger`: pvxs stores both as the empty string
+            // (`fieldconfig.h:50-54`) and sets `hasTriggers` only for a
+            // NON-empty trigger string (`groupconfigprocessor.cpp:297-309`).
+            // So an empty trigger gets the same provisional self-trigger
+            // default and is resolved at group scope — a one-member
+            // `"+trigger":""` group, or an all-empty group, still
+            // self-triggers (`:317-339`). Materializing `None` here made an
+            // explicit `""` permanent silence even with no non-empty sibling
+            // trigger, diverging from pvxs. `None` (silence) is produced
+            // only by `resolve_self_trigger_default` (mixed groups) and for
+            // channel-less Structure/Const members above.
+            None | Some("") => TriggerDef::SelfOnly,
             Some(s) => TriggerDef::Fields(s.split(',').map(|f| f.trim().to_string()).collect()),
         }
     };
@@ -1127,6 +1138,64 @@ mod tests {
         }
     }
 
+    /// pvxs treats an explicit `+trigger:""` identically to a missing
+    /// `+trigger`: when a group has NO non-empty trigger string, every
+    /// channeled member self-triggers (groupconfigprocessor.cpp:317-339).
+    /// A one-member `""` group and an all-empty multi-member group must
+    /// both self-trigger; an empty `""` alongside a non-empty sibling
+    /// stays silent.
+    #[test]
+    fn br_64_empty_trigger_self_triggers_without_nonempty_sibling() {
+        // One member, explicit empty trigger → self-trigger (not silent).
+        let one =
+            parse_group_config(r#"{ "GRP:e1": { "a": {"+channel": "R:a", "+trigger": ""} } }"#)
+                .unwrap();
+        assert!(
+            matches!(one[0].members[0].triggers, TriggerDef::SelfOnly),
+            "single empty-trigger member must self-trigger, got {:?}",
+            one[0].members[0].triggers
+        );
+        assert!(one[0].is_pure_self_trigger());
+
+        // All-empty two-member group (one explicit "", one missing) → both
+        // self-trigger.
+        let all_empty = parse_group_config(
+            r#"{ "GRP:e2": {
+                "a": {"+channel": "R:a", "+trigger": ""},
+                "b": {"+channel": "R:b"}
+            }}"#,
+        )
+        .unwrap();
+        for m in &all_empty[0].members {
+            assert!(
+                matches!(m.triggers, TriggerDef::SelfOnly),
+                "all-empty group member {} must self-trigger, got {:?}",
+                m.field_name,
+                m.triggers
+            );
+        }
+
+        // Mixed group: explicit "" alongside a non-empty trigger → the ""
+        // member is silent (pvxs empty-trigger inside a hasTriggers group).
+        let mixed = parse_group_config(
+            r#"{ "GRP:e3": {
+                "a": {"+channel": "R:a", "+trigger": ""},
+                "b": {"+channel": "R:b", "+trigger": "*"}
+            }}"#,
+        )
+        .unwrap();
+        let a = mixed[0]
+            .members
+            .iter()
+            .find(|m| m.field_name == "a")
+            .unwrap();
+        assert!(
+            matches!(a.triggers, TriggerDef::None),
+            "explicit empty trigger alongside a non-empty sibling stays silent, got {:?}",
+            a.triggers
+        );
+    }
+
     /// the same demotion must happen when a group is assembled
     /// across multiple sources via `merge_group_defs` — a later source
     /// adding an explicit-trigger member demotes the earlier no-trigger
@@ -1300,7 +1369,11 @@ mod tests {
         let groups = parse_group_config(json).unwrap();
         let m = &groups[0].members[0];
         assert_eq!(m.mapping, FieldMapping::Proc);
-        assert!(matches!(m.triggers, TriggerDef::None));
+        // `+trigger:""` in a group with no non-empty trigger is treated
+        // exactly like a missing `+trigger`: pvxs defaults every channeled
+        // field to self-trigger (groupconfigprocessor.cpp:317-339), so this
+        // resolves to `SelfOnly`, not permanent silence.
+        assert!(matches!(m.triggers, TriggerDef::SelfOnly));
     }
 
     #[test]

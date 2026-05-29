@@ -111,6 +111,14 @@ struct Args {
     #[arg(long)]
     ca_read_only: bool,
 
+    /// CA gateway: upstream monitor event mask (C `-mask`). DBE selector
+    /// characters `v`=value, `a`=alarm, `l`=log/archive, `p`=property
+    /// (case-insensitive). Unset — or no recognised selector — keeps the
+    /// ca-gateway default `va` (DBE_VALUE|DBE_ALARM), which excludes
+    /// DBE_LOG.
+    #[arg(long)]
+    ca_mask: Option<String>,
+
     /// CA gateway: stats PV namespace (C `-prefix`). The `:` separator is
     /// inserted automatically (`<prefix>:<name>`); pass the bare namespace.
     /// Defaults to the host name (fallback `gateway`); an explicit empty
@@ -355,6 +363,10 @@ async fn run_ca_gateway(args: &Args) -> Result<(), String> {
             Some(Duration::from_secs(args.ca_heartbeat_interval))
         },
         read_only: args.ca_read_only,
+        // C `-mask` resolution (gateway.cc:736-766 / :1146): absent or
+        // unrecognised spec keeps DBE_VALUE|DBE_ALARM, never the
+        // DBE_LOG-bearing CaChannel subscribe() default.
+        event_mask: epics_bridge_rs::ca_gateway::resolve_event_mask(args.ca_mask.as_deref()),
         #[cfg(feature = "ca-gateway-tls")]
         tls: None,
         // B10: the dual-gateway binary does not yet expose upstream

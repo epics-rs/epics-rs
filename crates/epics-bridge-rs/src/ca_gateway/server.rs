@@ -97,6 +97,13 @@ pub struct GatewayConfig {
     pub reconnect_inhibit: Duration,
     /// Read-only mode: rejects all puts.
     pub read_only: bool,
+    /// Upstream-monitor event mask (C `-mask`). Selects which `DBE_*`
+    /// events the gateway's upstream subscriptions request. Defaults to
+    /// [`DEFAULT_EVENT_MASK`] (`DBE_VALUE | DBE_ALARM`), matching
+    /// ca-gateway `gateResources.cc:339` — notably NOT `DBE_LOG`, which
+    /// the raw `CaChannel::subscribe()` default would add. Build from a
+    /// `-mask` spec string with [`resolve_event_mask`].
+    pub event_mask: u16,
     /// Optional TLS server config for downstream connections.
     /// Available with the `ca-gateway-tls` feature.
     #[cfg(feature = "ca-gateway-tls")]
@@ -141,6 +148,7 @@ impl Default for GatewayConfig {
             // C++ GATE_RECONNECT_INHIBIT default (BeaconAnomaly::new).
             reconnect_inhibit: Duration::from_secs(60 * 5),
             read_only: false,
+            event_mask: DEFAULT_EVENT_MASK,
             #[cfg(feature = "ca-gateway-tls")]
             tls: None,
             #[cfg(feature = "ca-gateway-tls")]
@@ -174,7 +182,8 @@ impl std::fmt::Debug for GatewayConfig {
             .field("stats_interval", &self.stats_interval)
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("reconnect_inhibit", &self.reconnect_inhibit)
-            .field("read_only", &self.read_only);
+            .field("read_only", &self.read_only)
+            .field("event_mask", &self.event_mask);
         #[cfg(feature = "ca-gateway-tls")]
         {
             d.field("tls", &self.tls.as_ref().map(|_| "<ServerConfig>"));
@@ -185,6 +194,54 @@ impl std::fmt::Debug for GatewayConfig {
             d.field("upstream_tls_server_name", &self.upstream_tls_server_name);
         }
         d.finish()
+    }
+}
+
+/// Default upstream-monitor event mask: `DBE_VALUE | DBE_ALARM`.
+///
+/// Mirrors ca-gateway `gateResources.cc:339`
+/// (`setEventMask(DBE_VALUE | DBE_ALARM)`). Notably this is NOT the
+/// `CaChannel::subscribe()` default (`DBE_VALUE | DBE_LOG | DBE_ALARM`):
+/// ca-gateway does not request `DBE_LOG` (archive) traffic by default, so
+/// the gateway must subscribe with an explicit mask rather than the
+/// channel default.
+pub(crate) const DEFAULT_EVENT_MASK: u16 =
+    epics_ca_rs::protocol::DBE_VALUE | epics_ca_rs::protocol::DBE_ALARM;
+
+/// Parse a ca-gateway `-mask` spec string into a `DBE_*` event mask.
+///
+/// Mirrors ca-gateway `gateway.cc:736-766`: each character selects one
+/// DBE bit — `a`/`A` → `DBE_ALARM`, `v`/`V` → `DBE_VALUE`, `l`/`L` →
+/// `DBE_LOG`, `p`/`P` → `DBE_PROPERTY`; any other character is ignored.
+/// Returns `0` when the spec names no recognised bit, which
+/// [`resolve_event_mask`] treats as "keep the default" exactly as
+/// ca-gateway does (`gateway.cc:1146`: `if(mask) gr->setEventMask(mask)`).
+pub(crate) fn parse_event_mask(spec: &str) -> u16 {
+    use epics_ca_rs::protocol::{DBE_ALARM, DBE_LOG, DBE_PROPERTY, DBE_VALUE};
+    let mut mask = 0u16;
+    for c in spec.chars() {
+        match c {
+            'a' | 'A' => mask |= DBE_ALARM,
+            'v' | 'V' => mask |= DBE_VALUE,
+            'l' | 'L' => mask |= DBE_LOG,
+            'p' | 'P' => mask |= DBE_PROPERTY,
+            _ => {}
+        }
+    }
+    mask
+}
+
+/// Resolve the upstream-monitor event mask from an optional `-mask` spec.
+///
+/// Applies ca-gateway's default-keep rule (`gateway.cc:1146`): a spec that
+/// names no recognised DBE bit — or no `-mask` at all — keeps
+/// [`DEFAULT_EVENT_MASK`] (`DBE_VALUE | DBE_ALARM`); otherwise the parsed
+/// mask wins verbatim, so `-mask v`, `-mask va`, and `-mask vap` are all
+/// reproducible.
+pub fn resolve_event_mask(spec: Option<&str>) -> u16 {
+    match spec.map(parse_event_mask) {
+        Some(m) if m != 0 => m,
+        _ => DEFAULT_EVENT_MASK,
     }
 }
 
@@ -348,6 +405,10 @@ impl GatewayServer {
             // cache reaper instead of a local constant (parity with C
             // gateResources::connectTimeout).
             connect_timeout: config.timeouts.connect_timeout,
+            // Upstream monitor mask (C `-mask`, default DBE_VALUE|DBE_ALARM):
+            // the gateway subscribes with this explicit mask instead of the
+            // CaChannel default that would also request DBE_LOG.
+            event_mask: config.event_mask,
             beacon_anomaly: beacon_anomaly.clone(),
             // B10: forward the upstream-side TLS config so the
             // gateway's CaClient to the real IOC can also use TLS,
@@ -1063,6 +1124,55 @@ impl GatewayServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_ca_rs::protocol::{DBE_ALARM, DBE_LOG, DBE_PROPERTY, DBE_VALUE};
+
+    #[test]
+    fn gateway_default_event_mask_is_value_alarm_without_log() {
+        // ca-gateway gateResources.cc:339 sets DBE_VALUE|DBE_ALARM as the
+        // default — NOT the CaChannel subscribe() default that also carries
+        // DBE_LOG. The DBE_LOG-free default is the core of BR-23.
+        let cfg = GatewayConfig::default();
+        assert_eq!(cfg.event_mask, DBE_VALUE | DBE_ALARM);
+        assert_eq!(
+            cfg.event_mask & DBE_LOG,
+            0,
+            "default upstream monitor mask must not request DBE_LOG"
+        );
+    }
+
+    #[test]
+    fn parse_event_mask_maps_dbe_selectors_case_insensitively() {
+        // gateway.cc:736-766 char→DBE map; unrecognised chars ignored.
+        assert_eq!(parse_event_mask("v"), DBE_VALUE);
+        assert_eq!(parse_event_mask("a"), DBE_ALARM);
+        assert_eq!(parse_event_mask("l"), DBE_LOG);
+        assert_eq!(parse_event_mask("p"), DBE_PROPERTY);
+        assert_eq!(parse_event_mask("VA"), DBE_VALUE | DBE_ALARM);
+        assert_eq!(
+            parse_event_mask("vap"),
+            DBE_VALUE | DBE_ALARM | DBE_PROPERTY
+        );
+        assert_eq!(parse_event_mask(""), 0);
+        assert_eq!(parse_event_mask("xyz"), 0);
+        assert_eq!(parse_event_mask("vx?a"), DBE_VALUE | DBE_ALARM);
+    }
+
+    #[test]
+    fn resolve_event_mask_keeps_default_when_empty_or_unrecognised() {
+        // gateway.cc:1146 `if(mask) gr->setEventMask(mask)` — only a spec
+        // that names at least one recognised bit overrides the default.
+        assert_eq!(resolve_event_mask(None), DEFAULT_EVENT_MASK);
+        assert_eq!(resolve_event_mask(Some("")), DEFAULT_EVENT_MASK);
+        assert_eq!(resolve_event_mask(Some("zzz")), DEFAULT_EVENT_MASK);
+        // A recognised spec wins verbatim, so `-mask v` drops DBE_ALARM
+        // and `-mask l` is reproducible (neither stays at the default).
+        assert_eq!(resolve_event_mask(Some("v")), DBE_VALUE);
+        assert_eq!(resolve_event_mask(Some("l")), DBE_LOG);
+        assert_eq!(
+            resolve_event_mask(Some("vap")),
+            DBE_VALUE | DBE_ALARM | DBE_PROPERTY
+        );
+    }
 
     #[tokio::test]
     async fn build_with_minimal_config() {

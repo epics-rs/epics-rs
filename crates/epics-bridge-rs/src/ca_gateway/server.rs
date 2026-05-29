@@ -31,7 +31,7 @@ use super::access::AccessConfig;
 use super::beacon::BeaconAnomaly;
 use super::cache::{CacheTimeouts, PvCache};
 // Used by the cfg(unix) signal handler AND the control-PV command owner.
-use super::command::CommandHandler;
+use super::command::{CommandHandler, GatewayCommand};
 use super::downstream::DownstreamServer;
 use super::putlog::{PutLog, PutLogScope};
 use super::pvlist::PvList;
@@ -63,6 +63,12 @@ pub struct GatewayConfig {
     /// Optional path to a command file processed on SIGUSR1 (Unix only).
     /// Each non-comment line is a [`super::command::GatewayCommand`].
     pub command_path: Option<PathBuf>,
+    /// Optional path to the R1/R2/R3 report file (C `-report`, default
+    /// `gateway.report`). When set, the `R1`/`R2`/`R3` commands and the
+    /// SIGUSR2 shortcut append C-compatible report sections here instead
+    /// of only logging a status line (`gateServer.cc:689-979`). `None`
+    /// keeps the log-only behaviour.
+    pub report_path: Option<PathBuf>,
     /// Optional path to a file containing literal upstream PV names to
     /// pre-subscribe (one per line). When set, the gateway pre-fetches
     /// each name on startup. Used because lazy resolution is not yet
@@ -123,6 +129,7 @@ impl Default for GatewayConfig {
             putlog_path: None,
             putlog_scope: PutLogScope::default(),
             command_path: None,
+            report_path: None,
             preload_path: None,
             server_port: 0,
             timeouts: CacheTimeouts::default(),
@@ -158,6 +165,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("putlog_path", &self.putlog_path)
             .field("putlog_scope", &self.putlog_scope)
             .field("command_path", &self.command_path)
+            .field("report_path", &self.report_path)
             .field("preload_path", &self.preload_path)
             .field("server_port", &self.server_port)
             .field("timeouts", &self.timeouts)
@@ -767,7 +775,9 @@ impl GatewayServer {
                     self.config.access_path.clone(),
                 )
                 .with_upstream(self.upstream.clone())
-                .with_beacon_anomaly(self.beacon_anomaly.clone());
+                .with_beacon_anomaly(self.beacon_anomaly.clone())
+                .with_stats(stats.clone())
+                .with_report_path(self.config.report_path.clone());
                 super::control::spawn_control_owner(
                     rx,
                     handler,
@@ -945,18 +955,28 @@ impl GatewayServer {
         downstream_result
     }
 
-    /// Spawn a Unix SIGUSR1 watcher that re-reads the command file.
-    /// Returns None on non-Unix or when no command file is configured.
+    /// Spawn the Unix signal watchers.
+    ///
+    /// - **SIGUSR1** re-reads the command file (when one is configured),
+    ///   dispatching each command token.
+    /// - **SIGUSR2** is C ca-gateway's shortcut for the R2 process-variable
+    ///   report (`report2_flag`, gateServer.cc:2403-2407): it runs `R2`
+    ///   directly, so it works even without a command file.
+    ///
+    /// Returns None only on non-Unix. On Unix the watcher is always armed
+    /// (SIGUSR2 needs no command file); the handle is aborted at shutdown.
     #[cfg(unix)]
     fn spawn_signal_handler(&self) -> Option<tokio::task::JoinHandle<()>> {
-        let cmd_path = self.config.command_path.clone()?;
+        let cmd_path = self.config.command_path.clone();
         let pvlist_path = self.config.pvlist_path.clone();
         let access_path = self.config.access_path.clone();
+        let report_path = self.config.report_path.clone();
         let cache = self.cache.clone();
         let pvlist = self.pvlist.clone();
         let access = self.access.clone();
         let upstream = self.upstream.clone();
         let beacon_anomaly = self.beacon_anomaly.clone();
+        let stats = self.stats.clone();
 
         Some(tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
@@ -967,33 +987,73 @@ impl GatewayServer {
                     return;
                 }
             };
+            let mut sigusr2 = match signal(SignalKind::user_defined2()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "ca-gateway-rs: failed to install SIGUSR2 handler");
+                    return;
+                }
+            };
             let handler = CommandHandler::new(cache, pvlist, access, pvlist_path, access_path)
                 .with_upstream(upstream)
-                .with_beacon_anomaly(beacon_anomaly);
+                .with_beacon_anomaly(beacon_anomaly)
+                .with_stats(stats)
+                .with_report_path(report_path);
             tracing::info!(
-                command_file = %cmd_path.display(),
-                "ca-gateway-rs: SIGUSR1 handler armed"
+                command_file = ?cmd_path.as_ref().map(|p| p.display().to_string()),
+                "ca-gateway-rs: SIGUSR1/SIGUSR2 handlers armed"
             );
             loop {
-                if sigusr1.recv().await.is_none() {
-                    break;
-                }
-                tracing::info!("ca-gateway-rs: SIGUSR1 received — processing command file");
-                match handler.process_file(&cmd_path).await {
-                    Ok(out) => {
-                        if !out.is_empty() {
-                            tracing::info!(output = %out.trim_end(), "ca-gateway-rs: command output");
+                tokio::select! {
+                    r = sigusr1.recv() => {
+                        if r.is_none() {
+                            break;
+                        }
+                        match &cmd_path {
+                            Some(path) => {
+                                tracing::info!(
+                                    "ca-gateway-rs: SIGUSR1 received — processing command file"
+                                );
+                                match handler.process_file(path).await {
+                                    Ok(out) if !out.is_empty() => tracing::info!(
+                                        output = %out.trim_end(),
+                                        "ca-gateway-rs: command output"
+                                    ),
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!(
+                                        error = %e,
+                                        "ca-gateway-rs: command file error"
+                                    ),
+                                }
+                            }
+                            None => tracing::warn!(
+                                "ca-gateway-rs: SIGUSR1 received but no command file configured"
+                            ),
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "ca-gateway-rs: command file error");
+                    r = sigusr2.recv() => {
+                        if r.is_none() {
+                            break;
+                        }
+                        // C report2_flag shortcut: run R2 directly.
+                        tracing::info!(
+                            "ca-gateway-rs: SIGUSR2 received — running R2 (process variable report)"
+                        );
+                        match handler.dispatch(GatewayCommand::ReportSummary).await {
+                            Ok(out) if !out.is_empty() => tracing::info!(
+                                status = %out.trim_end(),
+                                "ca-gateway-rs: R2 report"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "ca-gateway-rs: R2 report error"),
+                        }
                     }
                 }
             }
         }))
     }
 
-    /// Stub for non-Unix platforms (no SIGUSR1).
+    /// Stub for non-Unix platforms (no SIGUSR1/SIGUSR2).
     #[cfg(not(unix))]
     fn spawn_signal_handler(&self) -> Option<tokio::task::JoinHandle<()>> {
         None

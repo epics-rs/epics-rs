@@ -42,6 +42,7 @@ pub mod downstream;
 pub mod master;
 pub mod putlog;
 pub mod pvlist;
+pub mod report;
 pub mod routing;
 pub mod server;
 pub mod stats;

@@ -53,6 +53,12 @@ struct Args {
     #[arg(long)]
     command: Option<PathBuf>,
 
+    /// Path to the R1/R2/R3 report file (C `-report`). When set, the
+    /// R1/R2/R3 commands and the SIGUSR2 shortcut append C-compatible
+    /// report sections here; otherwise the report is logged only.
+    #[arg(long)]
+    report: Option<PathBuf>,
+
     /// CA server port (downstream side). 0 = use default 5064.
     #[arg(long, default_value_t = 0)]
     port: u16,
@@ -340,6 +346,7 @@ async fn async_main(args: Args) -> ExitCode {
             PutLogScope::TrapWrite
         },
         command_path: args.command.clone(),
+        report_path: args.report.clone(),
         preload_path: args.preload.clone(),
         server_port: args.port,
         timeouts: epics_bridge_rs::ca_gateway::CacheTimeouts {

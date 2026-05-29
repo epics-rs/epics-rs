@@ -15,6 +15,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use arc_swap::ArcSwap;
 use tokio::sync::RwLock;
@@ -24,6 +25,8 @@ use crate::error::BridgeResult;
 use super::access::AccessConfig;
 use super::cache::PvCache;
 use super::pvlist::{PvList, parse_pvlist_file};
+use super::report::{self, PvReportEntry, StatsSnapshot};
+use super::stats::Stats;
 use super::upstream::UpstreamManager;
 
 /// Commands that can be issued to a running gateway at runtime.
@@ -100,6 +103,13 @@ pub struct CommandHandler {
     /// after `reInitialize` "because new PVs may have become available"
     /// (gateServer.cc:684-686). `None` in stat-only/test handlers.
     beacon_anomaly: Option<Arc<super::beacon::BeaconAnomaly>>,
+    /// Stats counters, snapshotted into the R1/R2 report headers. `None`
+    /// in test handlers that don't exercise reports.
+    stats: Option<Arc<Stats>>,
+    /// R1/R2/R3 report file (C `-report`). When set, the report commands
+    /// append C-compatible sections here and return only a status line;
+    /// when `None` they return the rendered section (log-only fallback).
+    report_path: Option<PathBuf>,
 }
 
 impl CommandHandler {
@@ -118,6 +128,8 @@ impl CommandHandler {
             pvlist_path,
             access_path,
             beacon_anomaly: None,
+            stats: None,
+            report_path: None,
         }
     }
 
@@ -126,6 +138,19 @@ impl CommandHandler {
     /// the handler is used; cache-stat commands work without it.
     pub fn with_upstream(mut self, upstream: Arc<UpstreamManager>) -> Self {
         self.upstream = Some(upstream);
+        self
+    }
+
+    /// Attach the stats counters used in R1/R2 report headers.
+    pub fn with_stats(mut self, stats: Arc<Stats>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    /// Set the R1/R2/R3 report file. When present, report commands append
+    /// C-compatible sections to it (C `-report`, gateServer.cc:689-979).
+    pub fn with_report_path(mut self, report_path: Option<PathBuf>) -> Self {
+        self.report_path = report_path;
         self
     }
 
@@ -141,34 +166,38 @@ impl CommandHandler {
         match cmd {
             GatewayCommand::Noop => Ok(String::new()),
             GatewayCommand::Version => Ok(format!("ca-gateway-rs {}\n", env!("CARGO_PKG_VERSION"))),
-            GatewayCommand::ReportSummary => {
-                let cache = self.cache.read().await;
-                Ok(format!("Summary: {} PVs in cache\n", cache.len()))
-            }
             GatewayCommand::ReportFull => {
-                let cache = self.cache.read().await;
-                let mut out = format!("Full report ({} PVs):\n", cache.len());
-                for name in cache.names() {
-                    if let Some(entry_arc) = cache.get(&name) {
-                        let entry = entry_arc.read().await;
-                        out.push_str(&format!(
-                            "  {} state={:?} subs={} events={}\n",
-                            entry.name,
-                            entry.state,
-                            entry.subscriber_count(),
-                            entry.event_count
-                        ));
-                    }
-                }
-                Ok(out)
+                // R1 = C report1(): stats block + one line per virtual
+                // connection (gateServer.cc:689-734).
+                let stats = self.stats_snapshot().await;
+                let pvs = self.collect_pv_report().await;
+                let section = report::render_r1(&stats, &pvs);
+                self.emit_report("R1", section, format!("{} PVs", pvs.len()))
+            }
+            GatewayCommand::ReportSummary => {
+                // R2 = C report2(): state-grouped PV inventory with AS
+                // group/level (gateServer.cc:736-953). Also the SIGUSR2
+                // shortcut.
+                let stats = self.stats_snapshot().await;
+                let pvs = self.collect_pv_report().await;
+                let section = report::render_r2(&stats, &pvs);
+                self.emit_report("R2", section, format!("{} PVs", pvs.len()))
             }
             GatewayCommand::ReportAccess => {
-                let pvlist = self.pvlist.load_full();
-                Ok(format!(
-                    "Access report: {} pvlist rules, order={:?}\n",
-                    pvlist.entries.len(),
-                    pvlist.order
-                ))
+                // R3 = C report3(): the access-security report
+                // (gateServer.cc:955-979).
+                let access = self.access.load_full();
+                let mode = access.mode_summary();
+                let (acf_path, acf_content) = match &self.access_path {
+                    Some(p) => (
+                        Some(p.display().to_string()),
+                        std::fs::read_to_string(p).ok(),
+                    ),
+                    None => (None, None),
+                };
+                let section = report::render_r3(mode, acf_path.as_deref(), acf_content.as_deref());
+                let rules = self.pvlist.load_full().entries.len();
+                self.emit_report("R3", section, format!("{rules} pvlist rules"))
             }
             GatewayCommand::ReloadPvList => match self.reload_pvlist_and_prune().await? {
                 Some((count, pruned)) => Ok(format!(
@@ -209,6 +238,84 @@ impl CommandHandler {
                 Ok(out)
             }
         }
+    }
+
+    /// Append a rendered report section to the configured report file and
+    /// return a status line; or, when no report file is configured, return
+    /// the rendered section itself so the log/programmatic path still
+    /// carries the content (C always writes the file — the log-only
+    /// fallback is a Rust convenience for deployments without `-report`).
+    fn emit_report(&self, tag: &str, section: String, summary: String) -> BridgeResult<String> {
+        match &self.report_path {
+            Some(path) => {
+                report::append_report(path, &section)?;
+                Ok(format!(
+                    "{tag} report appended to {} ({summary})\n",
+                    path.display()
+                ))
+            }
+            None => Ok(section),
+        }
+    }
+
+    /// Snapshot the stats counters for the R1/R2 report headers. Returns a
+    /// zeroed snapshot when no stats handle is attached (test handlers).
+    async fn stats_snapshot(&self) -> StatsSnapshot {
+        match &self.stats {
+            Some(s) => StatsSnapshot {
+                prefix: s.prefix().to_string(),
+                client_event_count: s.total_events.load(Ordering::Relaxed),
+                post_event_count: s.post_event_count.load(Ordering::Relaxed),
+                exist_test_count: s.exist_count.load(Ordering::Relaxed),
+                put_count: s.put_count.load(Ordering::Relaxed),
+                read_only_rejects: s.read_only_rejects.load(Ordering::Relaxed),
+                loop_count: s.loop_count.load(Ordering::Relaxed),
+                heartbeat: s.heartbeat.load(Ordering::Relaxed),
+                connected_hosts: s.host_count().await,
+            },
+            None => StatsSnapshot {
+                prefix: String::new(),
+                client_event_count: 0,
+                post_event_count: 0,
+                exist_test_count: 0,
+                put_count: 0,
+                read_only_rejects: 0,
+                loop_count: 0,
+                heartbeat: 0,
+                connected_hosts: 0,
+            },
+        }
+    }
+
+    /// Collect one [`PvReportEntry`] per cached PV, resolving each PV's AS
+    /// group / level / alias target from the current pvlist match (the
+    /// cache entry itself does not store ASG/ASL — it is a property of the
+    /// matched rule, re-derived here as the report is built).
+    async fn collect_pv_report(&self) -> Vec<PvReportEntry> {
+        let pvlist = self.pvlist.load_full();
+        let cache = self.cache.read().await;
+        let mut out = Vec::with_capacity(cache.len());
+        for name in cache.names() {
+            let entry_arc = match cache.get(&name) {
+                Some(e) => e,
+                None => continue,
+            };
+            let entry = entry_arc.read().await;
+            let (asg, asl, resolved_name) = match pvlist.match_name(&name) {
+                Some(m) => (m.asg.clone(), m.effective_asl(), Some(m.resolved_name)),
+                None => (None, 1, None),
+            };
+            out.push(PvReportEntry {
+                name: entry.name.clone(),
+                state: entry.state,
+                subscribers: entry.subscriber_count(),
+                events: entry.event_count,
+                asg,
+                asl,
+                resolved_name,
+            });
+        }
+        out
     }
 
     /// Reload the pvlist file and prune now-denied PVs. Returns
@@ -325,6 +432,7 @@ impl CommandHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::super::cache::PvState;
     use super::*;
 
     #[test]
@@ -383,11 +491,87 @@ mod tests {
         let pvlist = Arc::new(ArcSwap::from_pointee(PvList::new()));
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
         let handler = CommandHandler::new(cache, pvlist, access, None, None);
+        // No report file configured → the R2 section is returned directly.
         let out = handler
             .dispatch(GatewayCommand::ReportSummary)
             .await
             .unwrap();
-        assert!(out.contains("0 PVs"));
+        assert!(out.contains("R2 (process variable report)"));
+        assert!(out.contains("total PVs=0 connecting=0 dead=0 disconnect=0 inactive=0 active=0"));
+    }
+
+    /// R1/R2/R3 must APPEND C-compatible report sections to the configured
+    /// report file (C report1/report2/report3 open `-report` in append
+    /// mode, gateServer.cc:689-979), returning only a status line — not the
+    /// terse in-memory string the pre-fix handler logged.
+    #[tokio::test]
+    async fn reports_append_c_sections_to_report_file() {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir();
+        let acf_path = dir.join(format!("ca_gw_101_acf_{pid}.access"));
+        let report_path = dir.join(format!("ca_gw_101_report_{pid}.report"));
+        let _ = std::fs::remove_file(&report_path);
+        std::fs::write(&acf_path, "ASG(DEFAULT) {\n    RULE(1, READ)\n}\n").unwrap();
+
+        // Two PVs in distinct states so the R1 virtual-connection list and
+        // the R2 state-grouped inventory both have representative content.
+        let cache = Arc::new(RwLock::new(PvCache::new()));
+        {
+            let mut c = cache.write().await;
+            c.get_or_create("BEAM:CURRENT")
+                .write()
+                .await
+                .set_state(PvState::Active);
+            c.get_or_create("VAC:PRESSURE")
+                .write()
+                .await
+                .set_state(PvState::Dead);
+        }
+        let pvlist = Arc::new(ArcSwap::from_pointee(PvList::new()));
+        // R3's verbatim-content path reads the ACF straight from
+        // `access_path`, independent of the parsed config, so the parsed
+        // mode here is irrelevant to what the report carries.
+        let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
+        let handler = CommandHandler::new(cache, pvlist, access, None, Some(acf_path.clone()))
+            .with_stats(Arc::new(Stats::new("gw".to_string())))
+            .with_report_path(Some(report_path.clone()));
+
+        // R1: appends, status names the file + PV count.
+        let r1 = handler.dispatch(GatewayCommand::ReportFull).await.unwrap();
+        assert!(r1.contains("R1 report appended to"));
+        assert!(r1.contains("(2 PVs)"));
+        // R2 then R3 append to the SAME file.
+        let r2 = handler
+            .dispatch(GatewayCommand::ReportSummary)
+            .await
+            .unwrap();
+        assert!(r2.contains("R2 report appended to"));
+        let r3 = handler
+            .dispatch(GatewayCommand::ReportAccess)
+            .await
+            .unwrap();
+        assert!(r3.contains("R3 report appended to"));
+
+        let body = std::fs::read_to_string(&report_path).unwrap();
+        // R1 section: stats block + virtual connection lines.
+        assert!(body.contains("R1 (PV report)"));
+        assert!(body.contains("virtual connections (2):"));
+        assert!(body.contains("BEAM:CURRENT state=Active"));
+        // R2 section: state-grouped inventory.
+        assert!(body.contains("R2 (process variable report)"));
+        assert!(body.contains("total PVs=2 connecting=0 dead=1 disconnect=0 inactive=0 active=1"));
+        assert!(body.contains("VAC:PRESSURE asg=DEFAULT level=1"));
+        // R3 section: access report carrying the verbatim ACF content.
+        assert!(body.contains("R3 (access security report)"));
+        assert!(body.contains("RULE(1, READ)"));
+        // All three sections appended to one file (append, not truncate).
+        let r1_pos = body.find("R1 (PV report)").unwrap();
+        let r2_pos = body.find("R2 (process variable report)").unwrap();
+        let r3_pos = body.find("R3 (access security report)").unwrap();
+        assert!(r1_pos < r2_pos && r2_pos < r3_pos);
+
+        let _ = std::fs::remove_file(&acf_path);
+        let _ = std::fs::remove_file(&report_path);
     }
 
     /// the `AS` command must reload BOTH the access file and the
@@ -501,9 +685,13 @@ mod tests {
 
         let out = handler.process_file(&cmd_path).await.unwrap();
 
-        // `V` produced a version line; both `R2` tokens produced a summary.
-        assert!(out.contains("ca-gateway-rs"), "V token dispatched: {out:?}");
-        let summaries = out.matches("Summary:").count();
+        // `V` produced a version line; both `R2` tokens produced an R2
+        // section (no report file → the rendered section is returned).
+        assert!(
+            out.contains("ca-gateway-rs 0") || out.contains("ca-gateway-rs v"),
+            "V token dispatched a version line: {out:?}"
+        );
+        let summaries = out.matches("R2 (process variable report)").count();
         assert_eq!(
             summaries, 2,
             "both R2 tokens (line 1 and line 3) must dispatch: {out:?}"
